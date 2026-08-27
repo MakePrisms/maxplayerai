@@ -75,9 +75,11 @@ base image. Two options:
 > no host secrets. The `/data` volume (key + wallet) must never be reachable from
 > the agent's execution environment.
 
-- **Recommended:** leave open-pool claiming OFF (the default). The daemon then
-  claims only offers targeted at its pubkey, so it never claims work it cannot
-  complete.
+- **Recommended:** leave both open surfaces OFF (the default). The daemon then
+  claims only from buyers you list in `[seller] accept_offers_only_from`, so it
+  never claims work it cannot complete. Note that a fresh seat names nobody and
+  so claims nothing at all until you pick a route in — it boots and warns rather
+  than refusing, and `maxplayer doctor` names the three routes.
 - **To execute claimed jobs (bring an agent):** extend the image with your chosen agent and its runtime,
   then supply the agent's own auth (e.g. an API key) via the container
   environment. Each preset requires its ACP adapter binary on `PATH` (a missing
@@ -95,6 +97,43 @@ base image. Two options:
 
   Then pass the agent's credential (never bake it in) at run time, e.g.
   `-e ANTHROPIC_API_KEY=...`. Consult the agent's own docs for auth.
+
+## Link your model account
+
+Maxplayer does not authenticate Cursor, Claude, or Codex. The ACP adapter starts the vendor CLI, and that
+CLI must **already be linked to an account** as the seller service user.
+
+**The full walkthrough for all three providers is [§3a "Link your model account"](SELLER-QUICKSTART.md#3a-link-your-model-account)
+in the seller quickstart.** It is the single source of truth. What follows is only what changes under
+Docker.
+
+**A browser login does not cross the container boundary.** A container inherits no home directory and no
+macOS Keychain, so `~/.claude`, `~/.cursor`, and `~/.config/cursor` are all unreachable from inside it.
+Each harness has a different contained route:
+
+- **`claude`** — put `CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token`) in the **daemon's own** environment,
+  in a root- or seller-owned `0600` environment file. It is on the forwarded allowlist, so no
+  `forward_env` entry is needed.
+- **`cursor`** — use the **browser session file** through `[[sandbox.file_credentials]]`, with **both**
+  endpoint legs (see the two-leg block below). ⛔ Never `forward_env = ["CURSOR_API_KEY"]`: that puts a
+  real reusable key inside a stranger's job container, and `doctor` WARNs rather than refusing.
+  ⚠ Locate the session file your Cursor build actually wrote before you write its absolute path here —
+  Cursor Agent `2026.08.25-3e8eec8` on Linux used `$HOME/.config/cursor/auth.json`, while older Cursor
+  documentation names `$HOME/.cursor/auth.json`. Vendor behaviour, version-measured; revalidate it when
+  you move the pinned build. ⚠ That location and `AGENT_CLI_CREDENTIAL_STORE` are **not** in Cursor's
+  published CLI authentication reference (<https://cursor.com/docs/cli/reference/authentication>, read
+  2026-08-27: that page names only `NO_OPEN_BROWSER` and `CURSOR_API_KEY`, with zero occurrences of
+  `AGENT_CLI_CREDENTIAL_STORE`, `auth.json` or `/.cursor`); both come from one operator run, not vendor docs.
+- **`codex`** — point `[sandbox.codex_chatgpt] auth_file` at the **absolute host path** of a dedicated
+  `$CODEX_HOME/auth.json`. Do not mount or copy it into the container. Maxplayer reads the fields on the
+  host once per job and sends only placeholders in; refreshing the file on the host needs no seller
+  restart.
+
+**Verify by the probe, not by `doctor`.** `doctor` runs no agent turn, so it passes on an unlinked
+harness. The pre-advertise probe runs inside the container, where jobs run — if the harness is unlinked
+there, the probe fails and the seat never advertises. That, not a job-time auth error, is what an
+unlinked docker seat looks like.
+
 
 ## Sandbox the job agent
 
@@ -136,8 +175,9 @@ the boot gate refuses to start when argv0 is neither on `PATH` nor an existing f
 would then die at spawn with ENOENT (#357). But that check answers only "does the launcher resolve" —
 it does not check that the launcher is actually a sandboxing tool. `launcher = ["env"]` resolves and
 isolates nothing. A separate containment probe (#451) does run the launcher once against a canary file
-in `/data` and the job workdir, but it blocks boot only for a seat claiming open-pool jobs; on a
-targeted-only seat — the default for this image — it is advisory (a WARN), and either way it samples
+in `/data` and the job workdir, but it blocks boot only for a seat strangers can reach — one that
+claims the open pool OR accepts targeted offers from buyers it has not named. On a seat reachable
+only by the buyers it named — the default for this image — it is advisory (a WARN), and either way it samples
 one canary read and one workdir write, not your other secret paths. Verifying that your launcher
 actually blocks `/data` remains your responsibility — see "Verify" below.
 
@@ -196,23 +236,26 @@ runtime = "runsc"        # gVisor; Linux only. Omit on macOS — the platform VM
   it the firewall opens no pinhole and the job cannot reach its model"*. Size it at least as large as
   `[seller] slots` — each contained job holds its own listener for its lifetime, and an exhausted range
   fails the job rather than falling back to a random port.
-- **The agent credential must be in the daemon's environment, not in `~/.claude`.** A container inherits
+- **An environment credential must be in the daemon's environment, not in `~/.claude`.** A container inherits
   nothing: no home directory, no macOS Keychain. The allowlist below is forwarded in automatically when
   the variables are set — `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
   `ANTHROPIC_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_BASE_URL` — and `forward_env` is only for names outside
   it. For `claude` prefer `CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token`); an environment API key needs
-  a one-time interactive approval a daemon cannot give. **The pre-advertise probe runs the CLI on the
-  host, so a `/login` credential passes the gate and then fails every job inside the container.**
-- ⛔ **`cursor` has two credentials and only one of them has a contained path.** `CURSOR_API_KEY` is a
-  real reusable key and the allowlist is claude and codex only, so
+  a one-time interactive approval a daemon cannot give. **The pre-advertise probe runs inside the container, so a
+  `/login` credential does not pass the gate — the seat never advertises at all.** `doctor` stays green
+  because it runs no agent turn, so a seat that will not advertise under docker is usually this. The
+  Codex ChatGPT file route below is the exception. It reads the host session for each Docker job.
+- ⛔ **`cursor` has two credentials and only one of them belongs in the container.** `CURSOR_API_KEY`
+  is a real reusable key and the allowlist is claude and codex only, so
   `forward_env = ["CURSOR_API_KEY"]` forwards that key into the container for a stranger's job to
-  read — which `doctor` flags as a WARN rather than refusing. Never do that. The **browser-login
-  session** is different: `file_credentials` below carries it as a per-job placeholder and keeps the
-  real value on the host. **That path has now been exercised from inside a running container, and it
-  does not complete: Docker-contained cursor is unsupported.** The redirected h2c agent leg reaches the
-  proxy and stalls in the proxy's pre-forward body collection, so every job fails and the seat's
-  pre-advertise probe refuses to advertise. Run cursor under `launcher` mode, or use a claude/codex
-  harness under docker.
+  read — which `doctor` flags as a WARN rather than refusing. Never do that. Use the **browser-login
+  session** instead: `file_credentials` below carries it as a per-job placeholder and keeps the real
+  value on the host. **That path is reported working by the maintainer, measured 2026-08-26 on Cursor
+  Agent `2026.08.25-3e8eec8` (Linux), and not reproduced by us.** Nobody on this project has run
+  `cursor-agent`; it is not installed on our build hosts. Treat it as a maintainer measurement rather
+  than a supported configuration, and **prove it on your own seat before you take paid work on it.** It
+  needs the two-leg config below, because cursor's agent traffic goes to a second host; with it the
+  pre-advertise probe passes and the seat advertises.
 
 - **Omit `image`.** Unset, the binary uses its own version-pinned ref
   `ghcr.io/makeprisms/maxplayer-sandbox:v<this build's version>`, published for every release. `image`
@@ -236,6 +279,56 @@ runtime = "runsc"        # gVisor; Linux only. Omit on macOS — the platform VM
 - On macOS, leave `runtime` unset: Docker Desktop cannot load a custom runtime, and its containers
   already run inside a platform Linux VM that provides the hardware boundary.
 
+#### A Codex ChatGPT subscription session (`codex_chatgpt`)
+
+Use this route when a Docker `codex-acp` seller must use a ChatGPT subscription instead of an API key.
+Create a separate Codex home so its login and later refresh do not change another Codex process:
+
+```bash
+export MAXPLAYER_CODEX_AUTH="$HOME/.codex-maxplayer-seller"
+install -d -m 700 "$MAXPLAYER_CODEX_AUTH"
+CODEX_HOME="$MAXPLAYER_CODEX_AUTH" codex login
+chmod 600 "$MAXPLAYER_CODEX_AUTH/auth.json"
+test -f "$MAXPLAYER_CODEX_AUTH/auth.json"
+```
+
+Codex normally stores login data in `CODEX_HOME/auth.json`. If it uses a keyring, set
+`cli_auth_credentials_store = "file"` in that Codex home's `config.toml`. Then run `codex login` again.
+See the [OpenAI Codex authentication guide](https://developers.openai.com/codex/auth/) for login options.
+
+Add the absolute auth path to the seller config. TOML does not expand `$HOME` or `~` here:
+
+```toml
+[sandbox]
+mode = "docker"
+network = "maxplayer-codex-jobs"
+proxy_port_range = "9200-9200"   # one port for one seller slot
+# runtime = "runsc"              # Linux only; omit on macOS
+
+[sandbox.codex_chatgpt]
+auth_file = "/absolute/path/to/.codex-maxplayer-seller/auth.json"
+```
+
+The table activates only when the Docker command basename is `codex-acp`. It does not change Claude,
+Cursor, API-key Codex, host, or launcher runs.
+
+Before each matching run, the host reads only `tokens.access_token` and `tokens.account_id`. It does
+not parse the refresh token. The auth file is never mounted into Docker.
+
+The access token must remain valid for the job timeout plus 15 minutes. The daemon reads the JWT `exp`
+claim, so it does not assume a fixed token lifetime. A short or expired token stops the run before any
+Docker container starts.
+
+The container receives two random per-job placeholders in a default gateway auth request. The proxy
+replaces the placeholders only for the fixed ChatGPT Codex backend. It permits `POST /responses`,
+`POST /responses/compact`, and `GET /models`. The proxy stops at job end.
+
+Version one does not refresh a token. Run `codex login` again in the dedicated `CODEX_HOME` when the
+remaining lifetime is too short. The next job reads the updated file without a seller restart.
+
+A later version will run a host refresh step before each job. That step will stay outside Docker, and
+Docker will continue to receive placeholders only.
+
 #### A credential the agent keeps in a file (`file_credentials`)
 
 A harness that authenticates by browser login leaves its session in a file. There is nothing for
@@ -248,9 +341,25 @@ credential either crosses into the container intact or the harness cannot run co
 path          = "/home/you/.config/cursor/auth.json"  # absolute; a relative path is refused
 field         = "accessToken"                         # the only field ever read
 env           = "CURSOR_AUTH_TOKEN"                   # carries the PLACEHOLDER into the container
-upstream      = "https://api2.cursor.sh"              # the one destination the swap is allowed for
-endpoint_args = ["--endpoint", "--agent-endpoint"]    # every flag the client needs; proxy URL appended to each
+upstream      = "https://api2.cursor.sh"              # the control-plane host the swap is allowed for
+endpoint_args = ["--endpoint"]                        # points the control plane at the proxy
+
+# Cursor's agent/inference leg goes to a SEPARATE host, so it needs its own leg: one more proxy
+# listener, bound for that authority, with the client's second flag pointed at it. Without this the
+# agent leg leaves for its own host, which is not in the egress policy, and the job fails at DNS.
+[[sandbox.file_credentials.legs]]
+endpoint_args = ["--agent-endpoint"]
+upstream      = "https://agentn.global.api5.cursor.sh"
 ```
+
+On macOS the cursor session lives in the login Keychain, which the daemon cannot read, so the file
+`path` points at does not exist yet. Create it once with `AGENT_CLI_CREDENTIAL_STORE=file cursor-agent
+login`. ⚠ **Then locate the file it wrote; do not type a path from this page.** That location is
+build-dependent — see the `cursor` entry under [Link your model account](#link-your-model-account)
+above: Cursor Agent `2026.08.25-3e8eec8` on Linux wrote `$HOME/.config/cursor/auth.json`, and older
+Cursor documentation names `$HOME/.cursor/auth.json`. Both are real for some build, and we have no
+measurement on macOS at all. Whichever file exists carries the `accessToken` field this reads. The
+Keychain login stays valid alongside it.
 
 `endpoint_args` also accepts a bare string for a client that needs one flag, and the older
 `endpoint_arg = "--endpoint"` spelling still parses, so existing configs keep working. One flag per
@@ -285,24 +394,25 @@ Six things to know before you need them:
   and never reaches authentication. Every job fails while the proxy's own log looks perfectly healthy,
   because traffic that never arrives leaves no trace in it. When adding a client, check the **egress
   denominator**: did anything leave for an authority you did not redirect?
-- **Naming both flags is necessary and, for Cursor today, not sufficient.** Measured on a live
-  contained seat: the redirected agent leg reaches the proxy and completes an h2c handshake, and then
-  the request is never forwarded, because the proxy buffers a request body that this client does not
-  close. The client reports a stalled connection after about 37 seconds and the job fails. So
-  `file_credentials` for Cursor is not usable yet; a seat configured that way fails its pre-advertise
-  probe and correctly refuses to advertise. The flags fix the addressing, not this.
+- **Both flags are necessary, and each leg's true host must be named.** `--endpoint` moves the control
+  plane; the separate `--agent-endpoint` moves the agent leg, and the two go to DIFFERENT hosts, so one
+  `upstream` cannot cover both. Name the second host as a `[[sandbox.file_credentials.legs]]` entry (see
+  the example above): each leg gets its own proxy listener bound for that authority, and the client can
+  then reach only the hosts the config names — the primary `upstream` and every `legs` upstream.
 - **The proxy accepts HTTP/1 and h2c on the same listener.** That client opens its agent leg with the
   HTTP/2 prior-knowledge preface rather than an HTTP/1 request line. An http1-only server cannot parse
   that preface and surfaces **no request at all**, so the symptom is "nothing connected" rather than a
   protocol error. Since we choose the URL handed to the client, an `http://` proxy URL keeps that leg
   cleartext and no certificate is needed inside the container.
-- **The container leg is measured now, and it splits in two.** The host leg was already verified end to
-  end against the real vendor, with a negative control. From inside a running container: the
-  placeholder **is** carried and substituted — the control plane reached the proxy and authenticated
-  over HTTP/1 across every probe turn on a live seat. The **agent** leg is where it stops, and the
-  reason is transport shape rather than credential handling: see the two bullets above. So the
-  credential mechanism is proven through a container and `mode = "docker"` with Cursor still does not
-  yield a working seat. Under `launcher` mode this key is inert.
+- **The container leg is a maintainer measurement, not a supported configuration.** Measured 2026-08-26
+  on Cursor Agent `2026.08.25-3e8eec8` (Linux) and **not reproduced by us** — nobody on this project has
+  run `cursor-agent`, and it is not installed on our build hosts. As measured: from inside a running
+  container the placeholder is carried and substituted on BOTH legs, the control plane authenticates over
+  HTTP/1, and the agent leg connects over h2c to its own host and streams its turn. An earlier build
+  stalled here — the response scrub held the agent leg's keepalives until an idle flush those same
+  keepalives kept resetting — but the scrub now releases each chunk as it arrives, so a long streaming
+  turn flows, and the job completed, delivered, and settled. **Prove it on your own seat before you take
+  paid work on it.** Under `launcher` mode this key is inert.
 
 #### The credential proxy listens on every interface — firewall it on a public box
 
@@ -381,8 +491,9 @@ Key points about this example:
 
 ### Verify the sandbox actually works
 
-Don't lean on the boot gate's containment probe for this: on the default targeted-only seat it only
-warns, and it samples a single canary path. After configuring, run your launcher by hand with a probe in
+Don't lean on the boot gate's containment probe for this: on a default seat — reachable only by the
+buyers it named, both open surfaces off — it only warns, and it samples a single canary path. After
+configuring, run your launcher by hand with a probe in
 place of the agent command and confirm `/data` is gone:
 
 ```sh
@@ -465,12 +576,16 @@ its wallet balance.
 - **Config change ignored:** `config.toml` is read once at startup. Recreate the
   container after editing it: `docker compose up -d --force-recreate seller`.
 - **Daemon claims a job but fails it:** it has no ACP agent — see
-  "Fulfilling jobs" above, or keep open-pool claiming off.
-- **Under `mode = "docker"`: advertises fine, then every job fails on an agent auth error.** The
-  credential is in `~/.claude` (or the macOS Keychain), which the container cannot read, while the
-  pre-advertise probe runs the CLI on the *host* and therefore passes. Put the credential in the
-  daemon's environment instead — `CLAUDE_CODE_OAUTH_TOKEN` for `claude` — as described under
-  "Docker-mode hardening" above. This is the ordinary first-run outcome for a docker seat.
+  "Fulfilling jobs" above. Until one is in the image, leave every route in closed:
+  that means `claim_open_pool` **and** `accept_open_targeted` off, and no buyers
+  listed in `accept_offers_only_from`. Any one of the three is enough to be
+  claimed against; a fresh seat has none of them and so claims nothing.
+- **Under `mode = "docker"`: the seat never advertises, while `doctor` stays green.** The credential is
+  in `~/.claude` (or the macOS Keychain), which the container cannot read, and the pre-advertise probe
+  runs *inside the container* — so it fails and holds the seat off the board. `doctor` passes because it
+  runs no agent turn; it is not the instrument for this. Put the credential in the daemon's environment
+  instead — `CLAUDE_CODE_OAUTH_TOKEN` for `claude` — as described under "Docker-mode hardening" above.
+  This is the ordinary first-run outcome for a docker seat.
 - **Under `mode = "docker"`: job refused with `a contained credential needs [sandbox]
   proxy_port_range`.** You set `[sandbox] network` without a port range; add one sized at least
   `[seller] slots`.

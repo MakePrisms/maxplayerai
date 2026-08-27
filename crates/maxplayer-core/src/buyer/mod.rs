@@ -54,7 +54,7 @@ use crate::job_lifecycle::{
 };
 use crate::payment::{PaymentMachine, PaymentRecord, PaymentState};
 use lifecycle::{
-    AwardError, AwardFilters, AwardOutcome, MissingOfferAction, PaymentProgress, RearmAction,
+    AwardError, AwardOutcome, MissingOfferAction, PaymentProgress, RearmAction,
     SettleError,
 };
 use lock::{HomeLock, LockError};
@@ -427,13 +427,30 @@ struct PostJobParams {
     /// never auto-awards a claim it cannot pay or priced above this.
     #[serde(default)]
     max_sats: Option<u64>,
-    /// Auto-award preferences recorded with the intent. `harness` is ALSO posted on the offer as
-    /// its requested agent, so it is a hard award filter: only a seller advertising that harness
-    /// can be awarded. `model` has no wire field yet and stays a recorded preference.
+    /// Auto-award preferences recorded with the intent. BOTH are also posted on the offer and are
+    /// therefore hard award filters: only a seller advertising them can be awarded.
+    ///
+    /// `harness` names a PRESET and is matched against the claim's `agents`. `model` (#897) is matched
+    /// against the family/model PAIR a seat advertises, and so REQUIRES `harness` — the preset is the
+    /// only axis dispatch reads, so it is the only one that can bind the model to the harness that
+    /// will actually run. The family is DERIVED from the preset when it is not stated. A model with
+    /// no preset refuses every claim rather than being ignored.
     #[serde(default)]
     harness: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    /// Harness FAMILY the job requires (#897). Posted on the offer and enforced as a hard award
+    /// filter on BOTH award paths. Distinct from `harness`, which names a preset: a family spans the
+    /// presets sharing a harness, so a family request selects which seats may CLAIM the job and does
+    /// NOT bind which harness a multi-harness seat dispatches — only `harness` does that. When both
+    /// are given they must AGREE: a family naming a harness the preset would not run is refused.
+    #[serde(default)]
+    harness_family: Option<String>,
+    /// Capability tokens the job requires (#897) — a subset of
+    /// [`maxplayer_core::capability::CAPABILITIES`]. Posted on the offer and enforced as a hard
+    /// award filter on BOTH award paths. Omitted or empty ⇒ no requirement.
+    #[serde(default)]
+    capabilities: Option<Vec<String>>,
 }
 
 /// Resolve the offer kind from the contribution pins: all four present ⇒ contribution; none ⇒
@@ -490,6 +507,12 @@ async fn post_job(context: &Arc<BuyerContext>, id: Value, params: Value) -> Resp
         branch: params.branch,
         job,
         requested_agent: harness.clone(),
+        requested_harness_family: params.harness_family,
+        // #897: `model` now reaches the WIRE as well as the intent. It stays recorded on the intent
+        // because that is a separate fact — what the buyer asked for locally — from what the signed
+        // offer says, and the award filter reads only the offer.
+        requested_model: model.clone(),
+        required_capabilities: params.capabilities.unwrap_or_default(),
     };
     match job_lifecycle::post_job_async(&context.home, request).await {
         Ok(outcome) => {
@@ -795,17 +818,21 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
             };
             let offer_amount = offer.amount_sats;
             let max_sats = params.max_sats.unwrap_or(offer_amount);
-            let filters = AwardFilters {
-                offer_amount_sats: offer_amount,
+            // ONE constructor, shared with `drive_auto_award` — the capability request (#897) and
+            // every other filter come from the SIGNED OFFER, never from award params, so the request
+            // cannot be changed after the fact. Sharing the constructor is what makes "both paths
+            // filter identically" structural instead of a convention someone has to keep noticing.
+            let filters = lifecycle::award_filters_for_offer(
+                offer,
                 max_sats,
-                buyer_mint: context.home.config.default_mint(),
-                allow_real_mints: context.home.config.allow_real_mints,
-                requested_agent: offer.requested_agent.as_deref(),
-            };
+                context.home.config.default_mint(),
+                context.home.config.allow_real_mints,
+            );
 
-            // Manual award names the claim but applies the SAME hard filters (max_sats, price,
-            // mint) as auto-award — max_sats is enforced, not ignored, on the manual path.
-            // Auto-award selects the first live payable claim.
+            // Manual award names the claim but applies the SAME hard filters as auto-award —
+            // max_sats, price, mint AND the #784 capability request. Naming a claim chooses which
+            // claim is judged, never whether it is. Auto-award selects the first live payable
+            // claim that passes those same filters.
             let claim_id = match params.claim_id.clone() {
                 Some(claim_id) => {
                     if let Err(refused) = lifecycle::named_claim_awardable(&view, &claim_id, &filters) {
@@ -1282,6 +1309,20 @@ async fn drive_auto_award(
             return Ok(());
         };
         unconfirmed_reads = 0;
+        // THE SAME constructor the manual award path uses, so the two cannot apply different filters.
+        // Both selection entry points then consult `claim_meets_capability_request`:
+        // `select_awardable_claim` here, `named_claim_awardable` on the manual path.
+        let filters = lifecycle::award_filters_for_offer(
+            offer,
+            max_sats,
+            context.home.config.default_mint(),
+            context.home.config.allow_real_mints,
+        );
+
+        // Built AFTER `filters` so the deadline park can name the capability request that refused
+        // everything, instead of only reporting that time ran out. The order of these two blocks is
+        // the only thing that makes an actionable reason available here; the decision itself is
+        // unchanged, and a job with no request parks with the wording it always did.
         if now_unix() as u64 > offer.deadline_unix {
             // A pinned attempt past its deadline is NOT "no awardable claim appeared" — a claim
             // was selected and signed for. Reflect the ATTEMPT's truth on the intent instead of
@@ -1289,25 +1330,14 @@ async fn drive_auto_award(
             if settle_intent_from_attempt(context, &keys, job_id).await {
                 return Ok(());
             }
-            crate::opline!(
-                "{}",
-                auto_award_park_line(job_id, "offer deadline passed before an awardable claim appeared")
+            let reason = lifecycle::park_reason_deadline_passed(
+                lifecycle::capability_park_reason(&view, &filters).as_deref(),
             );
-            let _ = context.store.mark_award_parked(
-                job_id,
-                "offer deadline passed before an awardable claim appeared",
-                now_unix(),
-            );
+            crate::opline!("{}", auto_award_park_line(job_id, &reason));
+            let _ = context.store.mark_award_parked(job_id, &reason, now_unix());
             return Ok(());
         }
 
-        let filters = AwardFilters {
-            offer_amount_sats: offer.amount_sats,
-            max_sats,
-            buyer_mint: context.home.config.default_mint(),
-            allow_real_mints: context.home.config.allow_real_mints,
-            requested_agent: offer.requested_agent.as_deref(),
-        };
         if let Some(claim_id) = lifecycle::select_awardable_claim(&view, &filters) {
             return finalize_auto_award(context, job_id, offer.amount_sats, claim_id).await;
         }
@@ -2396,17 +2426,32 @@ async fn release_on_failure_feedback(context: &BuyerContext, event: &nostr_sdk::
 /// emitting site pairs them ([`crate::gateway::error_draft`]) — requiring both keeps a malformed
 /// event inert.
 ///
-/// The releasable set is exactly the three POST-AWARD failure codes — `delivery_failed`,
-/// `execution_failed`, and `no_sentinel` ([`crate::gateway::ReasonCode`]): each means the awarded
+/// The releasable set is the POST-AWARD failure codes — `delivery_failed`, `execution_failed`,
+/// `no_sentinel` and `capability_missing` ([`crate::gateway::ReasonCode`]): each means the awarded
 /// seller will not deliver a payable result, so the buyer's held reservation should be freed (#562
-/// shipped `delivery_failed`; #574 widened to its two siblings). The siblings ride the byte-identical
-/// wire — same kind, same tags, `status=error` — so this broadens ONLY the discriminator; the author
-/// gate + idempotency + money lock downstream are reason-code-agnostic and inherited unchanged. The
-/// remaining codes (`below_rate`, `unsupported_version`, `mint_incompatible`, `at_capacity`) are
-/// PRE-award offer declines: no award — hence no reservation — exists when they are emitted, so they
-/// are deliberately NOT releasable. A future POST-AWARD failure code must be added here explicitly;
-/// an unrecognised code is inert (funds stay held until the deadline reconcile — the conservative
-/// default).
+/// shipped `delivery_failed`; #574 widened to two siblings; #821 added `capability_missing`). The
+/// siblings ride the byte-identical wire — same kind, same tags, `status=error` — so this broadens
+/// ONLY the discriminator; the author gate + idempotency + money lock downstream are
+/// reason-code-agnostic and inherited unchanged. The remaining codes (`below_rate`,
+/// `unsupported_version`, `mint_incompatible`, `at_capacity`) are PRE-award offer declines: no award
+/// — hence no reservation — exists when they are emitted, so they are deliberately NOT releasable. A
+/// future POST-AWARD failure code must be added here explicitly; an unrecognised code is inert (funds
+/// stay held until the deadline reconcile — the conservative default).
+///
+/// ⚠ **`capability_missing` is the first code emitted from BOTH positions, so the pre/post-award
+/// partition above no longer classifies the vocabulary cleanly.** The seat emits it post-award when
+/// dispatch finds no serving harness (`seller_node::run`, the arm below `job_award_time`), and the
+/// claim gate can also refuse on capability PRE-award. Membership here is therefore no longer
+/// derivable from the code alone.
+///
+/// **That is safe, and NOT because of this discriminator.** A pre-award emit frees nothing by two
+/// independent downstream mechanisms: a job that was never awarded is not in
+/// `awarded_unsettled_job_ids()` at all, and a job awarded to a DIFFERENT seat fails the author gate
+/// in [`release_reservation_on_failure_feedback`] (`author != award.seller_pubkey` ⇒ strict
+/// no-op). This predicate only decides whether a feedback is worth taking the money lock for; the
+/// authorization is reason-code-agnostic and downstream. ⛔ Both of those are now load-bearing for
+/// this member rather than incidental, so they are pinned by test — do not refactor either into a
+/// property that "the reason code already guarantees", because for this code it does not.
 fn is_releasable_failure_feedback(event: &nostr_sdk::Event) -> bool {
     let tag_value = |name: &str| {
         event.tags.iter().find_map(|tag| {
@@ -2423,6 +2468,7 @@ fn is_releasable_failure_feedback(event: &nostr_sdk::Event) -> bool {
     code == Some(crate::gateway::ReasonCode::DeliveryFailed.as_str())
         || code == Some(crate::gateway::ReasonCode::ExecutionFailed.as_str())
         || code == Some(crate::gateway::ReasonCode::NoSentinel.as_str())
+        || code == Some(crate::gateway::ReasonCode::CapabilityMissing.as_str())
 }
 
 /// The authorized core of the post-award failure release, split out so its authorization +
@@ -4025,6 +4071,111 @@ mod tests {
         assert_settled_sibling_is_no_op("no_sentinel");
     }
 
+    #[test]
+    fn a_capability_missing_from_the_awarded_seller_releases_the_reservation() {
+        assert_awarded_failure_releases("capability_missing");
+    }
+    #[test]
+    fn a_capability_missing_from_a_non_awarded_pubkey_does_not_release() {
+        assert_non_awarded_sibling_does_not_release("capability_missing");
+    }
+    #[test]
+    fn a_capability_missing_for_an_already_settled_job_is_a_no_op() {
+        assert_settled_sibling_is_no_op("capability_missing");
+    }
+
+    // ⭐ #821 CROSS-MODULE INVARIANT — the coupling whose ABSENCE made the regression invisible.
+    //
+    // The seller's dispatch-refusal arm is POST-AWARD, so whatever reason code it emits must be
+    // releasable here, or a buyer whose awarded job died at dispatch waits for the deadline reconcile
+    // instead of being freed on the feedback. Before #821 nothing tied the two together: the
+    // `#574 SIBLING WIDENING` block parametrises its codes so THEY cannot diverge, but it asserts on
+    // codes and never on an emit site — so the emitter could move to a non-releasable code with every
+    // test in this file still green. That is exactly what a `capability_missing` relabel would have
+    // done.
+    //
+    // Asserts on the EMITTER'S OWN CONST, not on a literal spelling of it, so the two cannot drift:
+    // repoint `UNDISPATCHABLE_REASON_CODE` at any code outside the releasable set and this goes red at
+    // the assertion below. A literal `"capability_missing"` here would keep passing and prove nothing
+    // about what the seller actually sends.
+    #[test]
+    fn the_undispatchable_arms_reason_code_is_releasable() {
+        let code = crate::seller_node::run::UNDISPATCHABLE_REASON_CODE;
+        let event = failure_feedback(&"a".repeat(64), &nostr_sdk::Keys::generate(), code.as_str());
+
+        assert!(
+            is_releasable_failure_feedback(&event),
+            "the post-award dispatch-refusal arm emits {:?} ({}), which is NOT in the releasable set — \
+             a buyer's awarded job would die at dispatch with its reservation held until the deadline \
+             reconcile",
+            code,
+            code.as_str()
+        );
+    }
+
+    // ⭐ #821 — THE ASSERTION ONLY THIS CODE NEEDS, because only this code breaks the set's organising
+    // principle. Its three siblings are releasable AND post-award-only, so for them "is it in the set"
+    // and "can it arrive pre-award" are the same question. `capability_missing` is emitted post-award
+    // when dispatch finds no serving harness AND pre-award when the claim gate refuses on capability,
+    // so membership here is no longer derivable from the code itself.
+    //
+    // What keeps that safe is a mechanism this predicate does not own: a job with no award record is
+    // not in `awarded_unsettled_job_ids()`, so the release never runs. That was incidental for the
+    // other three and is LOAD-BEARING for this one, which is why it is pinned rather than left as a
+    // property a refactor could fold into "the reason code already guarantees it".
+    //
+    // Shape: a RESERVATION but NO AWARD — the exact pre-award state — so the awarded-set join is the
+    // only thing that can refuse. The second half is the POSITIVE CONTROL: recording the award and
+    // re-running the SAME event on the SAME store releases. Without it, `None` would also be the
+    // answer for a malformed event or a job id that never matched, and the test would pass while
+    // proving nothing. Red-on-revert: scope the release to every reserved job instead of the
+    // awarded-unsettled JOIN → the first assertion releases and fails.
+    #[test]
+    fn a_pre_award_capability_missing_for_a_job_we_never_awarded_does_not_release() {
+        let root = temp_home("cap-preaward");
+        let seller = nostr_sdk::Keys::generate();
+        let job = "a".repeat(64);
+        std::fs::create_dir_all(&root).expect("temp dir");
+        let store = store::BuyerStore::open(root.join("buyer.sqlite")).expect("open store");
+        store.reserve(&job, 100, 10_000, now_unix()).expect("reserve");
+
+        let event = failure_feedback(&job, &seller, "capability_missing");
+        let outcome =
+            release_reservation_on_failure_feedback(&store, &event, now_unix()).expect("no store error");
+
+        assert_eq!(
+            outcome, None,
+            "a capability_missing for a job we never awarded must free nothing — no award, no reservation to release"
+        );
+        assert_eq!(
+            store.reservation(&job).expect("read").map(|(state, _)| state),
+            Some(reservations::ReservationState::Reserved),
+            "the reservation must stay held: nothing has been awarded, so nothing has failed"
+        );
+
+        // POSITIVE CONTROL — the same event and store, now WITH an award. If this did not release, the
+        // no-op above would be evidence of a broken fixture rather than of the awarded-set join.
+        store
+            .record_award(
+                &job,
+                &"c".repeat(64),
+                &"e".repeat(64),
+                &seller.public_key().to_hex(),
+                100,
+                now_unix(),
+            )
+            .expect("record award");
+        let after_award =
+            release_reservation_on_failure_feedback(&store, &event, now_unix()).expect("no store error");
+        assert_eq!(
+            after_award,
+            Some((job.clone(), 100)),
+            "positive control: the identical event DOES release once the award exists — so the refusal above was the missing award, not a dead fixture"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // BOUNDARY — the widening must NOT over-broaden to "any status=error feedback". The PRE-award
     // decline codes (below_rate / unsupported_version / mint_incompatible / at_capacity) name an offer
     // decline for which no award — hence no reservation — exists, and an unrecognised code is
@@ -4959,6 +5110,10 @@ mod tests {
 
         fn claim_with(status: &str, seller_pubkey: String) -> job_lifecycle::ClaimView {
             job_lifecycle::ClaimView {
+                // The UNSTATED capability — a seat advertising nothing. Set explicitly because `ClaimView`
+                // has no `Default` derive and must not gain one: a default `SandboxConfig` is a meaningful
+                // object, but a default `ClaimView` is a claim that never existed.
+                capability: crate::heartbeat::SeatCapability::default(),
                 claim_id: "c".repeat(64),
                 created_at: 1,
                 seller_pubkey,
@@ -5630,7 +5785,7 @@ mod tests {
             &seller_hex,
         )
         .expect("creq");
-        let claim_draft = crate::gateway::claim_draft(&job_id, &buyer_hex, &seller_hex, &creq, &[]);
+        let claim_draft = crate::gateway::claim_draft(&job_id, &buyer_hex, &seller_hex, &creq, &[], &crate::heartbeat::SeatCapability::default());
         let claim_id = publish(&seller, &claim_draft).await.to_hex();
 
         // The buyer AWARDED this claim on the relay (kind-3405) — collect resolves the delivery

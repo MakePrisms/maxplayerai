@@ -3,6 +3,11 @@ pub mod announce;
 #[cfg(all(feature = "wallet", feature = "gateway"))]
 pub mod authorize_pay;
 pub mod budget;
+// Unconditional on purpose: a build that emits or reads a filterable field must be able to name the
+// token set that field is bound to, so the vocabulary cannot sit behind a feature. The one item that
+// needs an executor — `probe_capabilities`, which takes a `wallet`-gated `SandboxPolicy` — carries
+// the gate itself rather than dragging the whole module behind it.
+pub mod capability;
 pub mod checks;
 #[cfg(feature = "wallet")]
 pub mod collect;
@@ -106,6 +111,9 @@ pub mod seller_exec;
 /// that yet".
 #[cfg(feature = "wallet")]
 pub mod credential_proxy;
+/// Host-only ChatGPT session parsing for the Docker Codex credential proxy.
+#[cfg(feature = "wallet")]
+pub mod codex_subscription;
 /// Which of a node's resolved harnesses are serving right now: the live availability layer over the
 /// boot registry, so a harness that cannot deliver stops being advertised and stops attracting awards.
 pub mod seller_roster;

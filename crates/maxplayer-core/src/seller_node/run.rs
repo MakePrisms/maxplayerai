@@ -74,6 +74,22 @@ const RESULT_PUBLISH_WINDOW_SECS: i64 = 86_400;
 /// error detail — the operator log carries the specifics) but enough that the buyer learns the job
 /// failed instead of waiting on a delivery that will never come.
 const EXEC_FAILURE_FEEDBACK: &str = "seller could not complete the job (execution failed before delivery)";
+/// Buyer-facing reason when the requested harness is not available on this seat, so the job was
+/// never dispatched — a display-only mirror of the `capability_missing` reason_code (§10; the tag
+/// governs). Worded as NEVER STARTED, not as failed: the buyer's useful next move is another seat,
+/// where a retry here would only reproduce the same refusal.
+const CAPABILITY_MISSING_FEEDBACK: &str =
+    "seller could not start the job: the requested harness is not available on this seat";
+/// The reason code the dispatch-refusal arm of `execute_job` emits — a job that reached execution
+/// with no serving harness for the harness its buyer asked for (#821).
+///
+/// ⛔ **Named as a `pub(crate)` const rather than written inline so the BUYER side can assert on the
+/// very value this emitter uses.** That arm is POST-AWARD, so whatever code it emits must be a member
+/// of `buyer::is_releasable_failure_feedback`: a code outside that set leaves the buyer's reservation
+/// held until the deadline reconcile instead of freeing it on the feedback. Nothing related the emit
+/// site to that predicate before, so the label could move out of the releasable set with every test
+/// green — see `the_undispatchable_arms_reason_code_is_releasable`.
+pub(crate) const UNDISPATCHABLE_REASON_CODE: ReasonCode = ReasonCode::CapabilityMissing;
 /// Buyer-facing reason when execution succeeded but the delivery (snapshot/push/publish) failed —
 /// a display-only mirror of the `delivery_failed` reason_code (§10; the tag governs).
 const DELIVERY_FAILURE_FEEDBACK: &str =
@@ -357,6 +373,19 @@ enum SkipReason {
     /// buyer) is not on it — a hard fence (#482). Named (not silent) so the operator log records the
     /// declined pubkey; no buyer feedback is emitted (a private seller does not advertise the fence).
     NotAllowlisted,
+    /// A buyer this seat has not named targeted it directly, and the seat has not opted in to the
+    /// targeted-open surface (`accept_open_targeted = false`, the default).
+    ///
+    /// DELIBERATELY NOT FOLDED INTO [`Self::NotAllowlisted`], for the reason
+    /// [`Self::TakenElsewhere`] is not folded into [`Self::Settled`]: the two answer different
+    /// operator questions. `NotAllowlisted` means "this buyer is not on the list you wrote" and the
+    /// fix is to edit the list. This means "you named no buyers and you are not open to strangers"
+    /// — the operator has NO list to edit, so the same string would send them looking for one that
+    /// does not exist. It is also the line that makes the silent migration audible: a seat upgraded
+    /// past the three-knob change stops accepting targeted work with no config error, and this
+    /// reason is what tells its operator which knob restores it. Like the fence, it emits no buyer
+    /// feedback — a seat that is not open does not advertise why.
+    OpenTargetedRefused,
     /// Rate-gate refused: untargeted without open-pool opt-in, or below the seller's rate floor.
     RateGate,
     /// The offer asked for a harness this node does not run.
@@ -391,6 +420,11 @@ impl SkipReason {
             Self::Lapsed => "offer deadline already passed (lapsed; never resurrected)",
             Self::TooOld => "offer authored too long ago (aged historical; not re-admitted from backfill)",
             Self::NotAllowlisted => "buyer not in accept_offers_only_from allowlist",
+            Self::OpenTargetedRefused => {
+                "targeted by a buyer this seat has not named, and accept_open_targeted=false \
+                 (set accept_open_targeted=true to accept strangers, or list the buyer in \
+                 accept_offers_only_from)"
+            }
             Self::RateGate => "rate-gate refused (untargeted without opt-in / below rate)",
             Self::AgentUnavailable => "requested agent harness not available on this node",
             Self::SlotsBusy => "all execution slots busy (node fully loaded; not claiming)",
@@ -2057,9 +2091,17 @@ async fn contribution_result_envelope_tags(
 /// Decide whether to claim `offer`, applying the always-on money-safety gates in the legacy order:
 /// a lapsed offer is refused BEFORE its deadline is re-derived (never resurrect a stale offer with a
 /// fresh `now + timeout`), then the #604 offer-age gate (a long-aged historical the backfill keeps
-/// re-surfacing is refused so it cannot park a slot on work that will not be awarded), then the
-/// buyer-allowlist fence (#482), then the targeting/rate gate, then the harness the offer asked for.
+/// re-surfacing is refused so it cannot park a slot on work that will not be awarded), then buyer
+/// eligibility, then the targeting/rate gate, then the harness the offer asked for.
 /// Pure over (offer, config, registry, buyer, now, offer_created_at).
+///
+/// Buyer eligibility is TWO clauses over three independent knobs, and no knob is inferred from
+/// another being empty. The allowlist fence (#482) refuses an unlisted buyer whenever the operator
+/// populated a list, on either surface. The targeted-surface opt-in then refuses a buyer the
+/// operator did NOT name when the offer targets this seat and `accept_open_targeted` is false — the
+/// clause that stops an empty allowlist meaning accept-all. The untargeted (open-pool) surface is
+/// left wholly to `claim_open_pool` in the rate gate, so the two open surfaces stay separable.
+/// A populated allowlist wins: while one is set, `accept_open_targeted` cannot re-open the seat.
 ///
 /// The harness gate is a CLAIM-time decision, not a delivery-time one: a node that cannot run the
 /// requested harness never parks a claim at all, so the buyer's offer stays visible to a seller
@@ -2088,14 +2130,28 @@ fn classify_offer(
     if now_unix.saturating_sub(offer_created_at) > MAX_OFFER_ADMIT_AGE_SECS {
         return ClaimDecision::Skip(SkipReason::TooOld);
     }
-    // Private-seller fence (#482): a populated `accept_offers_only_from` claims ONLY from a named
-    // buyer. Empty/absent ⇒ accept-all (unchanged). Consulted after the lapsed refusal but before
-    // the rate/harness gates, so a stranger's offer is declined outright; the caller names the
-    // declined pubkey in the skip log (this pure fn cannot, and stays silent to the buyer).
-    if !seller.accept_offers_only_from.is_empty()
-        && !seller.accept_offers_only_from.iter().any(|allowed| allowed == buyer_pubkey)
-    {
+    // Buyer-eligibility, in two independent clauses. Consulted after the lapsed refusal but before
+    // the rate/harness gates, so an ineligible buyer's offer is declined outright; the caller names
+    // the declined pubkey in the skip log (this pure fn cannot, and stays silent to the buyer).
+    let buyer_is_named = seller.accept_offers_only_from.iter().any(|allowed| allowed == buyer_pubkey);
+    // (1) Private-seller fence (#482), UNCHANGED: a POPULATED `accept_offers_only_from` claims ONLY
+    // from a named buyer, on both the targeted and the open-pool surface. `is_empty()` is kept here
+    // deliberately — it is what scopes the fence to operators who set one, and deleting it would
+    // turn an empty list into deny-all by a second route, which is exactly what the separate flag
+    // below exists to avoid.
+    if !seller.accept_offers_only_from.is_empty() && !buyer_is_named {
         return ClaimDecision::Skip(SkipReason::NotAllowlisted);
+    }
+    // (2) Targeted-surface opt-in: a buyer this seat did not name may target it only with
+    // `accept_open_targeted`. This is the clause that stops an empty allowlist from meaning
+    // accept-all. It is scoped to offers whose `p` tag is THIS seat, so it leaves the untargeted
+    // (open-pool) surface entirely to `claim_open_pool` in the rate gate below — the two open
+    // surfaces are independent knobs, and neither is inferred from the allowlist being empty.
+    if !buyer_is_named
+        && !seller.accept_open_targeted
+        && offer.seller_pubkey.as_deref() == Some(seller_pubkey)
+    {
+        return ClaimDecision::Skip(SkipReason::OpenTargetedRefused);
     }
     if rate_gate_allows(offer, seller_pubkey, seller.rate_sats, seller.claim_open_pool).is_err() {
         return ClaimDecision::Skip(SkipReason::RateGate);
@@ -2106,6 +2162,61 @@ fn classify_offer(
     ClaimDecision::Claim {
         deadline_unix: crate::seller::job_deadline_unix(offer, seller, now_unix),
     }
+}
+
+/// The boot siren for a seat whose config can claim NOTHING: no buyer named, and neither open
+/// surface opted in to. Returns the operator line, or `None` when at least one route in exists.
+///
+/// ⛔ THIS EXISTS BECAUSE THE THREE-KNOB MIGRATION IS SILENT, AND THE SILENCE IS THE HAZARD, NOT THE
+/// STRICTNESS. Before the split, an empty `accept_offers_only_from` meant accept-all on the targeted
+/// surface; after it, that same config accepts no one. Every already-deployed seller with no
+/// allowlist — including outside operators running our releases — stops accepting targeted work the
+/// moment it upgrades, and nothing about it is an error: the config still parses, the node still
+/// boots, the relay subscription is still live, and the seat still advertises. It simply never
+/// claims again. The strict default is intended and stays; a seat going quiet without saying so is
+/// not, so this is REQUIRED rather than advisory.
+///
+/// Pure over the config so it is testable without a relay, a home lock or a boot. The caller emits.
+fn unreachable_seat_warning(seller: &crate::home::SellerConfig) -> Option<String> {
+    // Counted, never `is_empty()`. An entry is matched byte-for-byte against a wire pubkey, so one
+    // that cannot be a wire pubkey is not a narrow route in — it is no route, while still fencing
+    // everyone else out. Keying this on emptiness silenced the siren for exactly the seat it exists
+    // to catch: a list of typos claims nothing and looked configured.
+    let usable_buyers = seller
+        .accept_offers_only_from
+        .iter()
+        .filter(|entry| crate::home::buyer_pubkey_is_reachable(entry))
+        .count();
+    if usable_buyers > 0 {
+        return None;
+    }
+    // With NO list, either open flag is a way in. With a populated one the fence shuts both
+    // surfaces, so the flags cannot rescue a list that matches nobody.
+    if seller.accept_offers_only_from.is_empty()
+        && (seller.accept_open_targeted || seller.claim_open_pool)
+    {
+        return None;
+    }
+    if !seller.accept_offers_only_from.is_empty() {
+        return Some(format!(
+            "seller node WARNING: this seat can claim NOTHING as configured — all {} entr(y/ies) in \
+             [seller] accept_offers_only_from are unusable, and a populated allowlist fences out \
+             everyone else on BOTH surfaces, so no offer can reach this seat at all. {}. Correct \
+             the entries, or remove them. THREE ROUTES BACK IN: {}.",
+            seller.accept_offers_only_from.len(),
+            crate::home::USABLE_BUYER_ENTRY,
+            crate::home::ROUTES_BACK_IN
+        ));
+    }
+    Some(format!(
+        "seller node WARNING: this seat can claim NOTHING as configured — it names no buyers \
+         (accept_offers_only_from is empty), does not accept targeted offers from buyers it has not \
+         named (accept_open_targeted=false), and does not claim the open pool \
+         (claim_open_pool=false). It will advertise and stay connected, but never claim a job. If \
+         this seat used to serve, an upgrade closed the targeted surface that an empty allowlist \
+         used to leave open. THREE ROUTES BACK IN: {}.",
+        crate::home::ROUTES_BACK_IN
+    ))
 }
 
 /// Resolve + report the harness registry at boot: one PASS/FAIL line per configured preset, then
@@ -2279,9 +2390,22 @@ const HARNESS_PROBE_MAX_ATTEMPTS: usize = 3;
 ///
 /// ⇒ so `CompletedNoArtifact` carries the agent's own last message, which is the only thing in the turn
 /// that can name the cause. Retrying it is still right; asserting the model's mood is not.
+///
+/// `Debug` so a failing probe assertion names the shape it actually got. The three shapes are what
+/// the diagnostic is ABOUT, and a bare "assertion failed" cannot tell an unrunnable launcher from a
+/// harness that ran and wrote nothing.
+#[derive(Debug)]
 enum ProbeAttempt {
     /// The harness produced the sentinel artifact: a proven turn.
-    Proven,
+    ///
+    /// Carries the model the harness reported for this turn, which is the ONLY moment it is
+    /// observable: the probe is the one place the node runs the harness and reads its usage back
+    /// before serving. Dropping it here is what leaves a production roster's `models` empty, and an
+    /// empty roster cannot emit `harness_model` on a heartbeat or a claim.
+    ///
+    /// `None` is a real answer, not a gap: a harness that exposes no usage has no model to
+    /// advertise, and absent-stays-absent all the way to the wire rather than being filled in.
+    Proven { model: Option<String> },
     /// The ACP turn completed but left no artifact carrying the sentinel. Carries the agent's own last
     /// message when it said anything — the cause is in there or nowhere.
     CompletedNoArtifact { agent_message: Option<String> },
@@ -2296,8 +2420,16 @@ enum ProbeAttempt {
 enum ProbeStep {
     /// The flaky shape, with turns still left: probe again.
     Retry,
-    /// Stop: this is the verdict the gate records (an `Err` is fail-closed).
-    Done(Result<(), (String, Fault)>),
+    /// Stop: this is the verdict the gate records (an `Err` is fail-closed). The `Ok` payload is the
+    /// model this turn's `session/new` reported, carried forward so the roster records a
+    /// MACHINE-SOURCED value rather than an operator-typed one.
+    ///
+    /// ⚠ Reported, not executed. [`crate::driver::AcpDriver`] captures the resolved session model off
+    /// the `session/new` response, from either wire shape it carries (#896); it does not select, pin
+    /// or verify what the harness runs. The
+    /// value's worth is its PROVENANCE — the harness said it about itself — never a record of
+    /// execution.
+    Done(Result<Option<String>, (String, Fault)>),
 }
 
 /// How much of an agent's message an operator line carries. Long enough for a vendor error string
@@ -2418,7 +2550,7 @@ fn unrunnable_reason(error: &ExecError) -> String {
 ///   shape that retries, and only up to `max_attempts`.
 fn probe_step(attempt: usize, max_attempts: usize, outcome: ProbeAttempt) -> ProbeStep {
     match outcome {
-        ProbeAttempt::Proven => ProbeStep::Done(Ok(())),
+        ProbeAttempt::Proven { model } => ProbeStep::Done(Ok(model)),
         ProbeAttempt::Unrunnable { reason, fault } => ProbeStep::Done(Err((reason, fault))),
         ProbeAttempt::CompletedNoArtifact { agent_message } => {
             if attempt + 1 < max_attempts {
@@ -2496,7 +2628,9 @@ async fn run_harness_probe_once(
     // The turn "succeeded" — now ask the only question that separates a working harness from an
     // exhausted one: is the sentinel actually here?
     if probe_sentinel_present(workdir, sentinel) {
-        ProbeAttempt::Proven
+        ProbeAttempt::Proven {
+            model: report.usage.and_then(|usage| usage.model),
+        }
     } else {
         ProbeAttempt::CompletedNoArtifact {
             agent_message: report.last_agent_message,
@@ -2516,9 +2650,9 @@ async fn run_harness_probe(
     identity: &DeliveryAgentIdentity,
     workdir: &std::path::Path,
     sentinel: &str,
-) -> Result<(), (String, Fault)> {
+) -> Result<Option<String>, (String, Fault)> {
     match run_harness_probe_once(argv, sandbox, identity, workdir, sentinel).await {
-        ProbeAttempt::Proven => Ok(()),
+        ProbeAttempt::Proven { model } => Ok(model),
         ProbeAttempt::Unrunnable { reason, fault } => Err((reason, fault)),
         ProbeAttempt::CompletedNoArtifact { agent_message } => Err((
             flaky_harness_reason(1, agent_message.as_deref()),
@@ -2579,7 +2713,7 @@ enum ProbeOutcome {
 async fn supervise_harness_probe(
     roster: Arc<LiveRoster>,
     harness: usize,
-    probe: impl std::future::Future<Output = Result<(), (String, Fault)>>,
+    probe: impl std::future::Future<Output = Result<Option<String>, (String, Fault)>>,
 ) -> ProbeOutcome {
     // Armed before the await: releases `probing` even if `probe` panics through it. Idempotent with the
     // verdict arms below, which clear the mark themselves on the paths that reach a verdict.
@@ -2588,7 +2722,18 @@ async fn supervise_harness_probe(
         harness,
     };
     match tokio::time::timeout(HARNESS_PROBE_WALL_TIMEOUT, probe).await {
-        Ok(Ok(())) => {
+        Ok(Ok(model)) => {
+            // RECORD BEFORE RESTORE, and the order is the property. `fault` leaves `model` untouched
+            // and `restore` clears only availability, so the model standing here is the one from
+            // BEFORE the harness was dropped — and a harness is dropped for exactly as long as an
+            // operator might re-point it at something else. Restoring first would publish that stale
+            // value on any beat landing between the two calls: the roster read takes its own lock, so
+            // the window is real, and what it emits is a filterable claim a buyer can be awarded on.
+            //
+            // `None` is written THROUGH rather than skipped, for the reason the setter takes an
+            // `Option` at all: a harness that has stopped reporting a model must come back stating
+            // none, not still advertising what it last said a fault ago.
+            roster.record_model(harness, model);
             roster.restore(harness);
             ProbeOutcome::Restored
         }
@@ -2636,10 +2781,20 @@ fn probe_sentinel_present(workdir: &std::path::Path, sentinel: &str) -> bool {
 /// logs), and whether it PROVED it can deliver. `Err` carries the operator reason and the `Fault` to
 /// record against the roster — the same `(reason, Fault)` a real job's failure produces, so a dead
 /// harness narrows the roster identically whether the fault is found here or at runtime.
+#[derive(Debug)]
 pub struct HarnessProbeVerdict {
     pub index: usize,
     pub name: Option<String>,
-    pub result: Result<(), (String, Fault)>,
+    /// `Ok` carries the model the harness reported on its proving turn's `session/new`, or `None`
+    /// when it exposed no usage. This is the value the roster records, and it is sourced from the
+    /// harness itself rather than from configuration.
+    ///
+    /// ⚠ The reason is PROVENANCE, not enforcement. Reading it from config would destroy the one
+    /// property this value has — that the harness said it about itself — and substitute a number an
+    /// operator typed, which can drift from the harness with nothing to notice. Neither form is a
+    /// promise about execution: ACP reports the model before any work happens, and nothing here pins
+    /// it.
+    pub result: Result<Option<String>, (String, Fault)>,
 }
 
 /// Probe ONE configured harness under the retry policy (#472), returning the verdict the gate records.
@@ -2655,7 +2810,7 @@ async fn probe_one_harness(
     sandbox: &SandboxPolicy,
     identity: &DeliveryAgentIdentity,
     home: &MaxplayerHome,
-) -> Result<(), (String, Fault)> {
+) -> Result<Option<String>, (String, Fault)> {
     for attempt in 0..HARNESS_PROBE_MAX_ATTEMPTS {
         let probe = mint_probe_identity(index, attempt, now_unix() as u64);
         let workdir = job_workdir(home, &probe.dir_label);
@@ -2736,11 +2891,25 @@ pub async fn probe_configured_harnesses(
     #[cfg(feature = "acp")]
     if sandbox.sandbox_network().is_some() {
         match crate::sandbox_netns::reap_orphans(identity.seller_pubkey_hex()).await {
-            Ok(reaped) if !reaped.is_empty() => opline!(
-                "seller node: reaped {} containment holder(s) left by an earlier run of this seat",
-                reaped.len()
-            ),
-            Ok(_) => {}
+            Ok(report) => {
+                if !report.removed.is_empty() {
+                    opline!(
+                        "seller node: reaped {} containment holder(s) left by an earlier run of this seat",
+                        report.removed.len()
+                    );
+                }
+                // Still never a gate — see above. `reap_orphans` returns its per-holder failures
+                // (#905) instead of printing them, so they now reach the operator log this daemon
+                // already writes rather than raw process stderr. Reporting them, not acting on them,
+                // is the whole difference from the operator command, which exits nonzero on the same
+                // input.
+                for (holder, error) in &report.failed {
+                    opline!(
+                        "seller node: could not reap this seat's stale containment holder {holder} \
+                         ({error}) — harmless to this boot, but it will accumulate until it succeeds"
+                    );
+                }
+            }
             Err(error) => opline!(
                 "seller node: could not reap this seat's stale containment holders ({error}) — \
                  harmless to this boot, but they will accumulate until it succeeds"
@@ -2803,6 +2972,19 @@ pub async fn boot_advertising_only_proven(
         )));
     }
 
+    // Say it BEFORE the wire work, so an operator watching a boot scroll past sees it whether or not
+    // the relay legs succeed — a seat that will never claim is worth knowing about even if boot then
+    // fails for an unrelated reason. Emitted every boot, not once: the condition is a standing state
+    // of the config, not an event, and a seat can be restarted long after the upgrade that closed it.
+    if let Some(warning) = home
+        .config
+        .seller
+        .as_ref()
+        .and_then(unreachable_seat_warning)
+    {
+        opline!("{warning}");
+    }
+
     // Take the home lock BEFORE anything reaches the relay. The publish below is the first thing this
     // path puts on the wire, and a second seller started on the same home used to reach it, announce
     // its identity, and only then fail the lock inside boot — leaving a kind-0 on the relay for a node
@@ -2810,6 +2992,26 @@ pub async fn boot_advertising_only_proven(
     // claim on the wire. It is threaded into boot rather than re-taken, which would deadlock.
     let lock =
         crate::seller_node::lock::HomeLock::acquire(home.root.join(crate::seller_node::LOCK_FILE))?;
+
+    // Prove seat CAPABILITY before anything reaches the wire (#784). The probe runs in the SAME
+    // executor a job runs in, in a throwaway workdir under the seller-jobs root, so it answers for the
+    // machine jobs land on rather than the seller host. A capability that cannot be MEASURED — a render
+    // failure, a launcher that will not spawn, a probe that times out — fails boot LOUDLY here, before
+    // the kind-0 publish, rather than advertising a silently shorter set: a buyer commits sats on this
+    // field, so "we could not check" must never look like "checked, and no". The proven set is recorded
+    // into the roster below, before the first heartbeat or claim can read it.
+    let sandbox = crate::seller_exec::SandboxPolicy::from_config(home.config.sandbox.as_ref())
+        .map_err(|error| NodeError::Sandbox(format!("capability probe policy: {error}")))?;
+    let probe_dir = crate::seller_exec::ProbeWorkdir::create(&home)
+        .map_err(|error| NodeError::Sandbox(format!("capability probe workdir: {error}")))?;
+    let capabilities = crate::capability::probe_seat_capabilities(&sandbox, probe_dir.path())
+        .map_err(|error| {
+            NodeError::Sandbox(format!(
+                "capability probe could not be measured; refusing to advertise: {error}"
+            ))
+        })?;
+    drop(probe_dir);
+    opline!("seller node capability probe proved: [{}]", capabilities.join(", "));
 
     let disco = crate::profile::publish_seller_discoverability_async(&mut home)
         .await
@@ -2823,6 +3025,10 @@ pub async fn boot_advertising_only_proven(
 
     let runner = SellerNodeRunner::boot_with_lock(home, lock).await?;
     runner.narrow_roster_to(&verdicts);
+    // Record the proven capability set into the live roster BEFORE the runner is handed back and can
+    // serve. The first heartbeat and the first claim both read the roster, so recording here — not on
+    // first use — is what makes the very first advertisement honest.
+    runner.agents.record_capabilities(capabilities);
     Ok(runner)
 }
 
@@ -3163,6 +3369,13 @@ impl SellerNodeRunner {
                 deadline_unix: row.deadline_unix as u64,
                 seller_pubkey: row.targeted.then(|| seller_pubkey.clone()),
                 requested_agent: row.requested_agent.clone(),
+                // The seller's own claim decision is capability-blind: the buyer's request filters
+                // which claims may be AWARDED, and it is judged buyer-side against what this seat
+                // advertises. Reconstructing it here would be a second reading of the request that
+                // could disagree with the one that decides.
+                requested_harness_family: None,
+                requested_model: None,
+                required_capabilities: Vec::new(),
             };
             match classify_offer(
                 &offer,
@@ -4157,12 +4370,17 @@ impl SellerNodeRunner {
         // the pay path validates against, so what a buyer reads here is what this seat can settle
         // on — before #645 they were written once into a kind-31990 content at boot, which no
         // config change ever revisited.
+        // `names` is CLONED rather than moved because the capability comes off the SAME
+        // `advertisement()` snapshot: a second call could observe a different roster, and then the
+        // advertised names and the advertised models would describe two different moments. One
+        // snapshot, both reads.
         let draft = crate::heartbeat::heartbeat_for_state(
             in_flight,
             roster.serving,
             seller.rate_sats,
             self.node.home().config.accepted_mints.clone(),
-            roster.names,
+            roster.names.clone(),
+            roster.capability(&self.node.home().config.seat),
         )
         .to_event_draft();
         self.publish_seat_announcement(draft, "heartbeat").await
@@ -4202,11 +4420,15 @@ impl SellerNodeRunner {
         // The roster still names what this seat can run: leaving the market is not a claim to have
         // forgotten how to work, and `accepting` is the field that carries "not taking work".
         let roster = self.agents.advertisement();
+        // The capability rides the terminal beat for the same reason the roster does: leaving the
+        // market is not a claim to have forgotten what this seat could run. `accepting=n` is what
+        // carries "not taking work", and it is passed as a literal by `retraction_for_state`.
         let draft = crate::heartbeat::retraction_for_state(
             self.live_in_flight("retraction"),
             seller.rate_sats,
             self.node.home().config.accepted_mints.clone(),
-            roster.names,
+            roster.names.clone(),
+            roster.capability(&self.node.home().config.seat),
         )
         .to_event_draft();
 
@@ -4490,10 +4712,12 @@ impl SellerNodeRunner {
         {
             ClaimDecision::Claim { deadline_unix } => deadline_unix,
             ClaimDecision::Skip(skip) => {
-                // Every skip is named, never silent. The allowlist fence additionally names the
-                // declined buyer (the other reasons are offer-intrinsic and need no identity).
+                // Every skip is named, never silent. The two buyer-eligibility refusals additionally
+                // name the declined buyer (the other reasons are offer-intrinsic and need no
+                // identity). Both are spelled out rather than left to the catch-all: a refusal the
+                // operator can only fix by knowing WHICH buyer was turned away is useless without it.
                 match skip {
-                    SkipReason::NotAllowlisted => opline!(
+                    SkipReason::NotAllowlisted | SkipReason::OpenTargetedRefused => opline!(
                         "seller node offer skip id={}: {} (buyer={})",
                         event.id,
                         skip.reason(),
@@ -4665,12 +4889,23 @@ impl SellerNodeRunner {
         };
         // The claim advertises what this node can run, so the buyer's award filter can hold it to
         // the harness its job asked for.
+        //
+        // ONE `advertisement()` snapshot feeds both the names and the capability, rather than two
+        // reads of the live roster. The award decides on what THIS claim carries, so a claim whose
+        // names came from one moment and whose models came from another would attribute a model to a
+        // harness the seat was not offering when it said so — and nothing downstream could detect it,
+        // because both halves parse.
+        let roster = self.agents.advertisement();
         let claim = claim_draft(
             job_id,
             buyer_pubkey,
             seller_pubkey,
             &creq,
-            &self.agents.advertised(),
+            &roster.names,
+            // The claim holds the declared colour and emits none of it: `claim_draft` asks only for
+            // the filterable tags. Passing it is not a leak, and passing a stub here instead would
+            // make this the one site whose capability came from somewhere other than the config.
+            &roster.capability(&self.node.home().config.seat),
         );
         // Reserve-at-claim: a fully loaded node has no free slot and simply does not claim, which is
         // how it stays invisible to the market. The gate is consulted only here on the event loop,
@@ -5260,16 +5495,27 @@ impl SellerNodeRunner {
     /// from the very first tick (#357). Provers are left untouched (boot already starts them serving).
     fn narrow_roster_to(&self, verdicts: &[HarnessProbeVerdict]) {
         for verdict in verdicts {
-            if let Err((reason, fault)) = &verdict.result {
-                let state = self.agents.fault(verdict.index, fault.clone(), Instant::now());
-                let label = self
-                    .agents
-                    .label(verdict.index)
-                    .unwrap_or_else(|| "<unlabelled>".to_owned());
-                opline!(
-                    "seller node pre-advertise DROPPED {label}: {reason} — {}",
-                    state.reason()
-                );
+            match &verdict.result {
+                // The proving turn is the one moment the node has run this harness and read its
+                // usage back, so it is the only honest source for the model. Recorded BEFORE the
+                // runner serves, which is what makes the first heartbeat and the first claim carry
+                // the same answer every later one does — an empty roster advertises no
+                // `harness_model` at all, and a buyer filtering on it never matches this seat.
+                //
+                // `None` is written through deliberately rather than skipped: a harness that stopped
+                // reporting usage must not keep advertising the model it reported last boot.
+                Ok(model) => self.agents.record_model(verdict.index, model.clone()),
+                Err((reason, fault)) => {
+                    let state = self.agents.fault(verdict.index, fault.clone(), Instant::now());
+                    let label = self
+                        .agents
+                        .label(verdict.index)
+                        .unwrap_or_else(|| "<unlabelled>".to_owned());
+                    opline!(
+                        "seller node pre-advertise DROPPED {label}: {reason} — {}",
+                        state.reason()
+                    );
+                }
             }
         }
     }
@@ -5579,6 +5825,16 @@ impl SellerNodeRunner {
         // this node cannot serve fails the job rather than substituting another harness — the
         // claim gate should already have refused it, and quietly running the wrong agent is the
         // one outcome the registry exists to prevent.
+        //
+        // The reason_code is `capability_missing`, not `execution_failed` (#821): nothing ran here.
+        // `run_agent_job` is below this arm and is never reached, so there is no execution to have
+        // failed — the seat could not START. `execution_failed` reads as *tried and broke*, which
+        // attributes a fault to a run that never happened and points the buyer at a retry, when the
+        // only move that can succeed is a seat that serves this harness.
+        //
+        // ⛔ This is a LABEL, not a guard. It changes nothing about whether the job is paid: under
+        // award-is-payment the sats were committed at award, upstream of this arm. Never read this
+        // code as protecting money (see `ReasonCode::CapabilityMissing`).
         let requested_agent = offer.requested_agent.clone();
         let Some(selected) = self.agents.dispatch(requested_agent.as_deref()) else {
             opline!(
@@ -5586,7 +5842,7 @@ impl SellerNodeRunner {
                  this node (never substituted)",
                 requested_agent.as_deref().unwrap_or("<any>")
             );
-            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None).await;
+            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, UNDISPATCHABLE_REASON_CODE, CAPABILITY_MISSING_FEEDBACK, None).await;
             return;
         };
         let agent_command = selected.agent.argv.clone();
@@ -5705,6 +5961,16 @@ impl SellerNodeRunner {
             opline!("seller node execute job_id={job_id} agent last message: {quoted}");
         }
         let usage = report.usage;
+        // Refresh the advertised model from THIS run (#784). The boot probe answers for the moment
+        // the node started; an operator can re-point a harness at a different default while it runs,
+        // and an advertisement that sits behind the last restart is a claim the seat no longer keeps.
+        // A real run is the freshest evidence available, and it costs nothing to read here.
+        //
+        // A `None` observation CLEARS rather than preserves, which is the roster's documented
+        // contract: a harness that stops reporting a model must stop advertising one, or the last
+        // value it ever gave outlives the truth. That is the drift this field exists to bound.
+        self.agents
+            .record_model(harness, usage.as_ref().and_then(|u| u.model.clone()));
 
         // Snapshot the agent's final workdir tree into ONE delivery commit at the stored author date.
         // §19: the snapshot writes the execution sentinel into the delivered tree, seeded from this
@@ -6180,8 +6446,13 @@ impl SellerNodeRunner {
             unit: offer.unit.clone(),
             deadline_unix: offer.deadline_unix.max(0) as u64,
             seller_pubkey: offer.targeted.then(|| seller_pubkey.clone()),
-            // The pay path is harness-blind: which harness ran the job never changes the terms.
+            // The pay path is harness-blind: which harness ran the job never changes the terms. It is
+            // capability-blind for the same reason — the request decided WHO could be awarded, and
+            // that decision is upstream of and independent from what the agreed terms are.
             requested_agent: None,
+            requested_harness_family: None,
+            requested_model: None,
+            required_capabilities: Vec::new(),
         };
         let accepted_mints: std::collections::HashSet<cashu::MintUrl> =
             request.mints.iter().cloned().collect();
@@ -6933,7 +7204,7 @@ mod tests {
         let verdicts = vec![HarnessProbeVerdict {
             index: 0,
             name: Some("claude".to_owned()),
-            result: Ok(()),
+            result: Ok(None),
         }];
         let outcome = boot_advertising_only_proven(home, verdicts).await;
 
@@ -6953,6 +7224,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A seat that is REACHABLE by an unnamed buyer, which is deliberately NOT the product default.
+    ///
+    /// `accept_open_targeted` is forced true here so the gate a given test is actually about — rate,
+    /// lapse, age, harness, slots — is the one that decides its outcome. Leave it at the product
+    /// default and every such test would skip on buyer eligibility instead, passing or failing for a
+    /// reason it never meant to exercise.
+    ///
+    /// ⛔ This fixture is therefore NOT evidence about the shipped default, and no test may cite it
+    /// as such. The default that ships is pinned by `open_targeted_is_off_by_default_on_the_wire`
+    /// (deserialization, the only thing an operator's `config.toml` actually goes through) and its
+    /// behavioural twin `default_seat_refuses_a_targeted_offer_from_an_unnamed_buyer`.
     fn seller_cfg(rate_sats: u64, claim_open_pool: bool) -> crate::home::SellerConfig {
         crate::home::SellerConfig {
             agent_command: vec!["claude".to_owned()],
@@ -6961,6 +7243,7 @@ mod tests {
             job_timeout_secs: None,
             agents: Vec::new(),
             claim_open_pool,
+            accept_open_targeted: true,
             accept_offers_only_from: Vec::new(),
             offer_backfill_secs: 0,
             contribution_enabled: true,
@@ -6988,6 +7271,9 @@ mod tests {
             deadline_unix,
             seller_pubkey: targeted_to.map(str::to_owned),
             requested_agent: None,
+            requested_harness_family: None,
+            requested_model: None,
+            required_capabilities: Vec::new(),
         }
     }
 
@@ -7099,18 +7385,333 @@ mod tests {
         );
     }
 
-    // #482 BACKCOMPAT (the accept leg) — an empty/absent allowlist is accept-all: any buyer's in-rate
-    // offer still claims, exactly as before the fence existed. Bite: fire the fence on an empty list
-    // and this claim turns into a NotAllowlisted skip.
+    // THE DEFAULT SEAT IS CLOSED ON THE TARGETED SURFACE. This test replaces the #482-era
+    // `empty_allowlist_accepts_any_buyer`, which asserted the OPPOSITE — that an empty allowlist is
+    // accept-all — and whose precondition line ("default allowlist is empty") read the emptiness as
+    // if it carried the policy. It does not any more: emptiness means the operator named no buyers,
+    // and who else may reach the seat is decided by the two surface flags alone.
+    //
+    // The foil is the same offer from the same buyer at the same instant, with the ONE new flag
+    // flipped — so a gate that stopped consulting `accept_open_targeted` cannot pass this.
     #[test]
-    fn empty_allowlist_accepts_any_buyer() {
-        let cfg = seller_cfg(2, false);
-        assert!(cfg.accept_offers_only_from.is_empty(), "precondition: default allowlist is empty");
+    fn default_seat_refuses_a_targeted_offer_from_an_unnamed_buyer() {
+        let mut cfg = seller_cfg(2, false);
+        cfg.accept_open_targeted = false; // the SHIPPED default; the fixture deliberately differs
+        assert!(cfg.accept_offers_only_from.is_empty(), "precondition: no buyer is named");
+
+        assert_eq!(
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, "anybody99", NOW, NOW),
+            ClaimDecision::Skip(SkipReason::OpenTargetedRefused),
+            "a seat that named no buyers and did not open the targeted surface must refuse a stranger"
+        );
+        cfg.accept_open_targeted = true;
         assert_eq!(
             classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, "anybody99", NOW, NOW),
             ClaimDecision::Claim { deadline_unix: NOW + 600 },
-            "with no allowlist, any buyer's in-rate offer claims"
+            "opting in to the targeted surface must let exactly that same offer through"
         );
+    }
+
+    // The refusal reports its OWN reason, not the allowlist fence's. An operator with no allowlist
+    // told "buyer not in accept_offers_only_from allowlist" goes looking for a list that does not
+    // exist; the two skips answer different questions and must stay distinguishable. Also pins that
+    // the line names the knob that restores service — this is the migration's only audible signal.
+    #[test]
+    fn the_closed_targeted_refusal_names_its_own_knob_not_the_allowlist() {
+        let refusal = SkipReason::OpenTargetedRefused.reason();
+        assert!(
+            refusal.contains("accept_open_targeted"),
+            "the refusal must name the knob that reopens the seat, got: {refusal}"
+        );
+        assert_ne!(
+            refusal,
+            SkipReason::NotAllowlisted.reason(),
+            "a closed seat and a fenced-out buyer must not share one string — they need different fixes"
+        );
+    }
+
+    // THE SHIPPED DEFAULT, read through the path an operator's `config.toml` actually takes. The
+    // fixture above forces this flag TRUE for test reachability, so nothing in this module's
+    // behavioural tests can attest the default; deserialization is the only thing that can.
+    #[test]
+    fn open_targeted_is_off_by_default_on_the_wire() {
+        let cfg: crate::home::SellerConfig = toml::from_str(
+            r#"
+            agent_command = ["claude"]
+            rate_sats = 2
+            git_remote = "https://example.invalid/repo.git"
+            "#,
+        )
+        .expect("a [seller] block with no open-surface keys must still parse");
+
+        assert!(
+            !cfg.accept_open_targeted,
+            "a config that never mentions accept_open_targeted must default to CLOSED"
+        );
+        // The foil: the field is genuinely wired to serde, not merely absent-and-false by accident.
+        let opted_in: crate::home::SellerConfig = toml::from_str(
+            r#"
+            agent_command = ["claude"]
+            rate_sats = 2
+            git_remote = "https://example.invalid/repo.git"
+            accept_open_targeted = true
+            "#,
+        )
+        .expect("an explicit opt-in must parse");
+        assert!(opted_in.accept_open_targeted, "an explicit true must survive deserialization");
+    }
+
+    // KNOB INDEPENDENCE, both directions. The whole point of three knobs is that no one of them is
+    // inferred from another, so each surface must be openable WITHOUT opening the other.
+    #[test]
+    fn the_two_open_surfaces_are_independent() {
+        // Targeted opt-in alone must NOT open the pool — the untargeted offer still needs
+        // `claim_open_pool`, and it is the rate gate (not the buyer gate) that says so.
+        let mut targeted_only = seller_cfg(2, false);
+        targeted_only.accept_open_targeted = true;
+        assert_eq!(
+            classify_offer(&offer(5, None, NOW + 600), &targeted_only, &claude_only(), SELLER, BUYER, NOW, NOW),
+            ClaimDecision::Skip(SkipReason::RateGate),
+            "accept_open_targeted must not silently enrol the seat in the open pool"
+        );
+
+        // Pool opt-in alone must NOT open the targeted surface, and must still claim the pool —
+        // `claim_open_pool` is UNCHANGED by the three-knob split.
+        let mut pool_only = seller_cfg(2, true);
+        pool_only.accept_open_targeted = false;
+        assert_eq!(
+            classify_offer(&offer(5, None, NOW + 600), &pool_only, &claude_only(), SELLER, BUYER, NOW, NOW),
+            ClaimDecision::Claim { deadline_unix: NOW + 600 },
+            "claim_open_pool must still claim an untargeted offer from an unnamed buyer, exactly as before"
+        );
+        assert_eq!(
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &pool_only, &claude_only(), SELLER, BUYER, NOW, NOW),
+            ClaimDecision::Skip(SkipReason::OpenTargetedRefused),
+            "claiming the open pool must not also invite strangers to target the seat directly"
+        );
+    }
+
+    // PRECEDENCE — a populated allowlist WINS over the targeted opt-in, and this test FAILS IF THE
+    // ORDER FLIPS. Run the buyer-eligibility clauses the other way round (targeted opt-in first) and
+    // the stranger below would be admitted, silently dissolving the #482 fence for every operator who
+    // ever sets both. That is the whole reason the order is asserted rather than left to reading.
+    #[test]
+    fn a_populated_allowlist_wins_over_the_targeted_opt_in() {
+        const ALLOWED: &str = "cafe01";
+        const STRANGER: &str = "dead02";
+        let mut cfg = seller_cfg(2, false);
+        cfg.accept_offers_only_from = vec![ALLOWED.to_owned()];
+        cfg.accept_open_targeted = true; // set, and deliberately INERT while a list exists
+
+        assert_eq!(
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, STRANGER, NOW, NOW),
+            ClaimDecision::Skip(SkipReason::NotAllowlisted),
+            "the #482 fence must still fence: accept_open_targeted may not reopen a seat that named its buyers"
+        );
+        assert_eq!(
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, ALLOWED, NOW, NOW),
+            ClaimDecision::Claim { deadline_unix: NOW + 600 },
+            "the named buyer is unaffected"
+        );
+    }
+
+    // A NAMED BUYER REACHES A CLOSED SEAT — the migration path an operator is told to take. Without
+    // this, every assertion above is satisfied by a gate that simply refuses everything.
+    #[test]
+    fn a_named_buyer_reaches_a_seat_with_the_targeted_surface_closed() {
+        const ALLOWED: &str = "cafe01";
+        let mut cfg = seller_cfg(2, false);
+        cfg.accept_offers_only_from = vec![ALLOWED.to_owned()];
+        cfg.accept_open_targeted = false;
+        assert_eq!(
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, ALLOWED, NOW, NOW),
+            ClaimDecision::Claim { deadline_unix: NOW + 600 },
+            "listing a buyer must be sufficient to keep working with the targeted surface closed"
+        );
+    }
+
+    // THE MIGRATION SIREN. The condition is exactly the config an already-deployed seller upgrades
+    // INTO: it had no allowlist (which used to mean accept-all) and never opted in to either surface,
+    // so after the split it claims nothing while looking entirely healthy. Fires there and nowhere
+    // else — each of the three routes in is checked to SILENCE it, so a warning that simply always
+    // fired (or a predicate that lost a clause) fails here rather than training operators to ignore it.
+    #[test]
+    fn the_unreachable_seat_warning_fires_on_exactly_the_closed_config() {
+        let closed = seller_cfg_closed();
+        let warning = unreachable_seat_warning(&closed).expect("a seat with no way in must warn");
+        assert!(
+            warning.contains("accept_open_targeted") && warning.contains("accept_offers_only_from"),
+            "the warning must name the knobs that restore service, got: {warning}"
+        );
+
+        // Route 1 — name a buyer. ⛔ A WIRE-FORM pubkey: the fixture here used to be `cafe01`,
+        // which is fenced-but-unmatchable and therefore NOT a way in. Asserting `None` against it
+        // pinned the bug as the specification.
+        let mut listed = seller_cfg_closed();
+        listed.accept_offers_only_from = vec!["a1".repeat(32)];
+        assert_eq!(unreachable_seat_warning(&listed), None, "a named buyer is a way in");
+
+        // Route 2 — open the targeted surface.
+        let mut open_targeted = seller_cfg_closed();
+        open_targeted.accept_open_targeted = true;
+        assert_eq!(unreachable_seat_warning(&open_targeted), None, "the targeted surface is a way in");
+
+        // Route 3 — claim the open pool.
+        let mut open_pool = seller_cfg_closed();
+        open_pool.claim_open_pool = true;
+        assert_eq!(unreachable_seat_warning(&open_pool), None, "the open pool is a way in");
+    }
+
+    /// ⛔ ASSERTED ON THE REMEDY CLAUSE ALONE, NEVER THE WHOLE STRING. The diagnosis already names
+    /// all three knobs — as the settings that are OFF — so `warning.contains("claim_open_pool")` is
+    /// satisfied by text that tells the operator nothing about how to fix it. The needle is present
+    /// in the WRONG ROLE, and splitting on the marker is what gives this test access to the claim
+    /// it is actually making.
+    /// Extraction only — deliberately NOT an assertion helper. Each branch keeps its own `#[test]`
+    /// and its own assertions, because the runner stops at the first failing assertion: folding the
+    /// two branches into one test would let whichever ran second go unexercised while the suite
+    /// still reported a failure for the right-looking reason.
+    fn remedy_clause_of(warning: &str) -> String {
+        warning
+            .split_once("THREE ROUTES BACK IN:")
+            .expect(
+                "the remedy must be delimited so it can be read apart from the diagnosis, which \
+                 names the same knobs as the settings that are OFF",
+            )
+            .1
+            .to_owned()
+    }
+
+    /// ⛔ ASSERTED ON THE REMEDY CLAUSE ALONE, NEVER THE WHOLE STRING. The diagnosis already names
+    /// all three knobs — as the settings that are OFF — so `warning.contains("claim_open_pool")` is
+    /// satisfied by text that tells the operator nothing about how to fix it. The needle is present
+    /// in the WRONG ROLE.
+    #[test]
+    fn the_empty_list_warning_offers_all_three_routes_back_in() {
+        let warning =
+            unreachable_seat_warning(&seller_cfg_closed()).expect("a closed seat must warn");
+        let remedy = remedy_clause_of(&warning);
+        for route in ["accept_offers_only_from", "accept_open_targeted", "claim_open_pool"] {
+            assert!(remedy.contains(route), "the remedy must offer `{route}`, got: {remedy}");
+        }
+    }
+
+    /// ⛔ THE BRANCH THAT WAS UNCOVERED, AND THE REASON THIS IS A SEPARATE TEST. The remedy used to
+    /// be spelled literally in each branch, and the only test that read one read the EMPTY branch:
+    /// deleting a route from the junk-list copy alone left the suite green. A mutation proves the
+    /// line it touched, never the claim it was chosen to represent — so each branch is asserted
+    /// where it lives, and both now read the one shared constant.
+    #[test]
+    fn the_junk_list_warning_offers_all_three_routes_back_in() {
+        let mut junk = seller_cfg_closed();
+        junk.accept_offers_only_from = vec!["cafe01".to_owned()];
+        let warning =
+            unreachable_seat_warning(&junk).expect("an all-unusable allowlist must warn");
+        let remedy = remedy_clause_of(&warning);
+        for route in ["accept_offers_only_from", "accept_open_targeted", "claim_open_pool"] {
+            assert!(remedy.contains(route), "the remedy must offer `{route}`, got: {remedy}");
+        }
+    }
+
+    /// The two branches must not drift apart again: whatever the diagnosis says, the remedy is the
+    /// SAME text in both. This is the assertion a shared constant makes cheap and two literals make
+    /// impossible — it fails the moment someone re-inlines either copy.
+    #[test]
+    fn both_unreachable_branches_share_one_remedy_text() {
+        let mut junk = seller_cfg_closed();
+        junk.accept_offers_only_from = vec!["cafe01".to_owned()];
+        let empty = remedy_clause_of(
+            &unreachable_seat_warning(&seller_cfg_closed()).expect("closed seat warns"),
+        );
+        let unusable =
+            remedy_clause_of(&unreachable_seat_warning(&junk).expect("junk allowlist warns"));
+        assert_eq!(empty, unusable, "both branches must offer the identical remedy");
+        assert!(!empty.is_empty(), "and it must not be vacuously equal by both being empty");
+    }
+
+    /// ⛔ THE EXPLANATION MUST NAME THE RULE THAT ACTUALLY REFUSED THE ENTRY. Every other test here
+    /// uses a fixture rejected for its SHAPE — `cafe01` is too short, `A1…` is capitalised — so none
+    /// of them can tell a shape-only message from a correct one. This one is rejected for its CURVE
+    /// and nothing else, which is the only fixture that puts the wording under test.
+    ///
+    /// ⛔ WHY IT MATTERS MORE THAN A WORDING NIT: an operator whose entries are all curve-invalid is
+    /// told every entry is unusable and handed a rule their entries already pass. A right diagnosis
+    /// with an unusable correction is worse than a vague one — they have a stated rule that
+    /// demonstrably fails on their input and no way to see why, because this string is their only
+    /// interface to the predicate.
+    ///
+    /// ⛔ THE PRECONDITION ASSERTS ARE THE TEST. Without them this passes on any junk fixture and
+    /// proves nothing about the curve wording — the same trap as picking a negative control by eye.
+    #[test]
+    fn the_unusable_list_explanation_names_the_curve_not_only_the_shape() {
+        let curve_rejected = "0123456789abcdef".repeat(4);
+        assert!(
+            crate::home::buyer_pubkey_is_wire_shaped(&curve_rejected),
+            "precondition: `{curve_rejected}` must be SHAPE-valid, or a shape-only message would be \
+             a correct explanation for it and this test asserts nothing"
+        );
+        assert!(
+            !crate::home::buyer_pubkey_is_reachable(&curve_rejected),
+            "precondition: `{curve_rejected}` must be refused for its CURVE, not its shape"
+        );
+
+        let mut junk = seller_cfg_closed();
+        junk.accept_offers_only_from = vec![curve_rejected.clone()];
+        let warning =
+            unreachable_seat_warning(&junk).expect("a curve-rejected allowlist must warn");
+
+        // Pinned twice, and both are needed: the first fails if this site re-inlines its own copy,
+        // the second fails if the shared constant is weakened back to shape-only. Either alone
+        // leaves one of the two ways this regressed still open.
+        assert!(
+            warning.contains(crate::home::USABLE_BUYER_ENTRY),
+            "the warning must read the SHARED criterion, not a local copy of it, got: {warning}"
+        );
+        assert!(
+            warning.contains("secp256k1"),
+            "the criterion must still name what rejected `{curve_rejected}`, got: {warning}"
+        );
+    }
+
+    /// ⛔ THE FENCE OPENS ON `is_empty()`, SO A LIST OF TYPOS ADMITS NOBODY AND SHUTS BOTH SURFACES.
+    /// The siren keyed on emptiness and therefore stayed silent for precisely the seat it exists to
+    /// catch. Asserted separately from the mixed case below: they are opposite outcomes, and the
+    /// runner stops at the first failing assertion.
+    #[test]
+    fn the_siren_fires_for_an_allowlist_that_can_never_match() {
+        let mut junk = seller_cfg_closed();
+        junk.accept_offers_only_from = vec!["cafe01".to_owned(), "A1".repeat(32)];
+        // Both open flags ON: the fence shuts them anyway, so they must not rescue the seat.
+        junk.accept_open_targeted = true;
+        junk.claim_open_pool = true;
+        let warning = unreachable_seat_warning(&junk)
+            .expect("a seat whose every allowlist entry is unusable can claim nothing");
+        assert!(
+            warning.contains("unusable"),
+            "the operator must be told the entries are the problem, got: {warning}"
+        );
+    }
+
+    /// The foil for the test above: ONE usable entry among unusable ones is a real route in, so the
+    /// siren must stay silent. Without this, a predicate that always fired would pass.
+    #[test]
+    fn the_siren_stays_silent_when_one_allowlist_entry_is_usable() {
+        let mut mixed = seller_cfg_closed();
+        mixed.accept_offers_only_from = vec!["cafe01".to_owned(), "a1".repeat(32)];
+        assert_eq!(
+            unreachable_seat_warning(&mixed),
+            None,
+            "one buyer that can actually match is a way in, whatever else is listed"
+        );
+    }
+
+    /// The fully-closed seat: the config an upgrading seller with no allowlist lands on. Written out
+    /// rather than derived from `seller_cfg`, which deliberately ships an OPEN targeted surface.
+    fn seller_cfg_closed() -> crate::home::SellerConfig {
+        let mut cfg = seller_cfg(2, false);
+        cfg.accept_open_targeted = false;
+        cfg.accept_offers_only_from = Vec::new();
+        cfg
     }
 
     // #482 ORDER — the fence is consulted AFTER the lapsed refusal: a dead offer from an unlisted
@@ -7824,7 +8425,7 @@ mod tests {
                     1,
                 )
                 .expect("record offer");
-            let draft = claim_draft(&job, &buyer, &seller, &creq, &["codex".to_owned()]);
+            let draft = claim_draft(&job, &buyer, &seller, &creq, &["codex".to_owned()], &Default::default());
             store
                 .claim_and_enqueue(&job, &job, &creq, &draft, 1, 9_999_999_999, 1)
                 .expect("claim");
@@ -10073,7 +10674,7 @@ mod tests {
                 now,
             )
             .expect("record offer");
-        let draft = claim_draft(job_id, buyer_hex, &"s".repeat(64), "creq", &[]);
+        let draft = claim_draft(job_id, buyer_hex, &"s".repeat(64), "creq", &[], &Default::default());
         store
             .claim_and_enqueue(job_id, job_id, "creq", &draft, now, now + 3_600, now)
             .expect("claim");
@@ -10399,7 +11000,7 @@ mod tests {
             "nothing delivered yet"
         );
 
-        let draft = claim_draft(&job, &buyer, &seller, &creq, &[]);
+        let draft = claim_draft(&job, &buyer, &seller, &creq, &[], &Default::default());
         let delivered_at = 6_000;
         assert!(store
             .deliver_and_enqueue(
@@ -10666,7 +11267,7 @@ mod tests {
         let job = "a".repeat(64);
         let buyer = "b".repeat(64);
         let (store, root) = store_with_awarded_job(&creq, &job, &buyer, 4242);
-        let draft = claim_draft(&job, &buyer, &seller, &creq, &[]);
+        let draft = claim_draft(&job, &buyer, &seller, &creq, &[], &Default::default());
 
         // Deliver ⇒ state Delivered ⇒ NOT re-execute-eligible (the guard early-returns).
         assert!(store
@@ -10717,7 +11318,7 @@ mod tests {
         let buyer = "b".repeat(64);
         // The helper journals award event A (`w`×64) — that is execution #1's award.
         let (store, root) = store_with_awarded_job(&creq, &job, &buyer, 4242);
-        let draft = claim_draft(&job, &buyer, &seller, &creq, &[]);
+        let draft = claim_draft(&job, &buyer, &seller, &creq, &[], &Default::default());
 
         // Execution #1 finished and published ⇒ Delivered.
         assert!(
@@ -10885,9 +11486,21 @@ mod tests {
             tag(ReasonCode::ExecutionFailed, "reason_code").as_deref(),
             Some("execution_failed")
         );
+        assert_eq!(
+            tag(ReasonCode::CapabilityMissing, "reason_code").as_deref(),
+            Some("capability_missing")
+        );
         // Coarse status is unchanged (historical `error`) for every code — the tag is the discriminator.
         assert_eq!(tag(ReasonCode::BelowRate, "status").as_deref(), Some("error"));
         assert_eq!(tag(ReasonCode::NoSentinel, "status").as_deref(), Some("error"));
+        // #821 keeps the existing convention deliberately: the §10 refusal re-class is a separate view
+        // change, so `capability_missing` rides `status=error` like every other code. This is also what
+        // discharges #821's buyer-side item without a code change — the claim-list view keys on
+        // `status`, so a code that stays `error` is already handled there.
+        assert_eq!(
+            tag(ReasonCode::CapabilityMissing, "status").as_deref(),
+            Some("error")
+        );
     }
 
     // ── Execute-body delivery contract (invariants 2 & 8), no network ────────────────────────────
@@ -11073,7 +11686,7 @@ mod tests {
                 1,
             )
             .expect("record offer");
-        let draft = claim_draft(job, buyer, &"s".repeat(64), creq, &[]);
+        let draft = claim_draft(job, buyer, &"s".repeat(64), creq, &[], &Default::default());
         store
             .claim_and_enqueue(job, job, creq, &draft, 1, 9_999_999_999, 1)
             .expect("claim");
@@ -11110,7 +11723,7 @@ mod tests {
                 1,
             )
             .expect("record offer");
-        let draft = claim_draft(job, buyer, &"s".repeat(64), "creqL", &[]);
+        let draft = claim_draft(job, buyer, &"s".repeat(64), "creqL", &[], &Default::default());
         store
             .claim_and_enqueue(job, job, "creqL", &draft, 1, 9_999_999_999, 1)
             .expect("claim");
@@ -11227,7 +11840,7 @@ mod tests {
                     )
                     .expect("record offer");
                 // A per-job draft (distinct event id) — claim_and_enqueue dedups on `claim:{job}`.
-                let draft = claim_draft(job, &buyer, &seller, creq, &[]);
+                let draft = claim_draft(job, &buyer, &seller, creq, &[], &Default::default());
                 store
                     .claim_and_enqueue(job, job, creq, &draft, 1, 9_999_999_999, 1)
                     .expect("claim");
@@ -11240,7 +11853,7 @@ mod tests {
             seed(&pushed_lapsed, lapsed, &format!("{}4", "w".repeat(63)));
             store.mark_pushed(&pushed_lapsed, "commitX", 3).expect("mark pushed (lapsed)");
             seed(&delivered, live, &format!("{}5", "w".repeat(63)));
-            let ddraft = claim_draft(&delivered, &buyer, &seller, creq, &[]);
+            let ddraft = claim_draft(&delivered, &buyer, &seller, creq, &[], &Default::default());
             store
                 .deliver_and_enqueue(&delivered, &"c".repeat(40), &ddraft, 4, 4 + RESULT_PUBLISH_WINDOW_SECS, 4)
                 .expect("deliver");
@@ -11420,7 +12033,7 @@ mod tests {
         )
         .expect("creq");
         let (store, root) = store_with_awarded_job(&creq, &job, &buyer, author_date);
-        let draft = claim_draft(&job, &buyer, &seller, &creq, &[]);
+        let draft = claim_draft(&job, &buyer, &seller, &creq, &[], &Default::default());
         let now = 5000;
         assert!(
             store
@@ -11674,7 +12287,7 @@ mod tests {
         );
 
         // Re-execution delivers exactly once: deliver_and_enqueue is idempotent on the job.
-        let draft = claim_draft(&job, &buyer, &seller, &creq, &[]);
+        let draft = claim_draft(&job, &buyer, &seller, &creq, &[], &Default::default());
         let now = 5000;
         assert!(
             store
@@ -12751,7 +13364,7 @@ mod tests {
         let verdicts = vec![HarnessProbeVerdict {
             index: 0,
             name: Some("claude".to_owned()),
-            result: Ok(()),
+            result: Ok(None),
         }];
 
         let runner = boot_advertising_only_proven(home, verdicts)
@@ -12773,6 +13386,441 @@ mod tests {
         assert!(
             runner.agents.advertisement().serving,
             "the live roster must serve the proven harness"
+        );
+
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Point ⑤ of #784: the FIRST advertisement carries the MEASURED capability set.
+    ///
+    /// `boot_advertising_only_proven` probes the environment and records the result into the roster
+    /// BEFORE it hands back the runner, so the roster the very first heartbeat and the first claim read
+    /// from already reflects the seat's real capability — never an empty set that fills in later.
+    ///
+    /// Deterministic regardless of which toolchains this host carries: it asserts the roster equals a
+    /// FRESH probe of the same pass-through environment taken moments after, so it holds whether the set
+    /// is empty or full. Delete the `record_capabilities` call in `boot_advertising_only_proven` and the
+    /// roster stays empty while a fresh probe finds this host's tools — reddening this test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_first_advertisement_carries_the_measured_capability_set() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("cap-wired");
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        crate::home::save_config(&mut home, |config| {
+            config.seller = Some(seller_cfg(1, false));
+            config.relay_url = fixture.url();
+        })
+        .expect("persist config");
+
+        let verdicts = vec![HarnessProbeVerdict {
+            index: 0,
+            name: Some("claude".to_owned()),
+            result: Ok(None),
+        }];
+        let runner = boot_advertising_only_proven(home, verdicts)
+            .await
+            .expect("a proven seat must boot");
+
+        // Ground truth: a fresh probe of the SAME pass-through environment, taken now. The host does not
+        // change between boot and here, so the roster must equal this exactly.
+        let probe_dir = crate::seller_exec::ProbeWorkdir::create(runner.node.home())
+            .expect("probe workdir");
+        let expected = crate::capability::probe_seat_capabilities(
+            &crate::seller_exec::SandboxPolicy::passthrough(),
+            probe_dir.path(),
+        )
+        .expect("a pass-through probe is measurable");
+        drop(probe_dir);
+
+        assert_eq!(
+            runner.agents.advertisement().capabilities,
+            expected,
+            "the first heartbeat's roster must carry exactly the probed set — wired at boot, not later"
+        );
+        // The claim emitter reads the SAME snapshot, so both wire events agree.
+        assert_eq!(
+            runner
+                .agents
+                .advertisement()
+                .capability(&runner.node.home().config.seat)
+                .capabilities,
+            expected,
+            "the claim capability must carry the same probed set as the heartbeat"
+        );
+
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The model the PROVING TURN's `session/new` reported must reach the roster before the runner
+    // serves, on both wire surfaces. Without it a production roster's `models` stays empty, no
+    // `harness_model` is emitted at all, and #866's model filter rejects every real seat — a seat
+    // that works perfectly and is unreachable to exactly the buyers who named the model it reports.
+    //
+    // The model arrives here the only way it legitimately can: carried out of the probe on the `Ok`
+    // arm of the verdict. It is NOT read from config, because config would destroy the value's one
+    // property — machine-sourced provenance — and advertise an operator-typed id instead. Neither
+    // source promises what will execute; the advertised value is a self-report either way.
+    #[tokio::test]
+    async fn the_proving_turns_model_reaches_both_wire_surfaces_before_serving() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("model-wired");
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        crate::home::save_config(&mut home, |config| {
+            // A NAMED roster entry, deliberately: a model tag is keyed by the harness it belongs to,
+            // so the unlabelled `--agent-argv` hatch drops an observed model as unattributable. The
+            // wiring this test is about is only observable on a named entry.
+            let mut seller = seller_cfg(1, false);
+            seller.agents = vec!["claude".to_owned()];
+            config.seller = Some(seller);
+            // A preset argv that resolves in any environment. The harness is never RUN here — the
+            // proving turn is supplied as a verdict — so the argv only has to exist; requiring the
+            // real ACP adapter would make this a test of the CI image rather than of the wiring.
+            config.agents.insert(
+                "claude".to_owned(),
+                crate::home::AgentPresetConfig {
+                    argv: vec!["true".to_owned()],
+                },
+            );
+            config.relay_url = fixture.url();
+        })
+        .expect("persist config");
+
+        let verdicts = vec![HarnessProbeVerdict {
+            index: 0,
+            name: Some("claude".to_owned()),
+            result: Ok(Some("claude-opus-5".to_owned())),
+        }];
+        let runner = boot_advertising_only_proven(home, verdicts)
+            .await
+            .expect("a proven seat must boot");
+
+        // The roster pairs the model with the entry's advertised NAME.
+        assert_eq!(
+            runner
+                .agents
+                .advertisement()
+                .models
+                .iter()
+                .map(|entry| (entry.harness.as_str(), entry.model.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("claude", "claude-opus-5")],
+            "the first heartbeat must carry the model the proving turn reported, paired to its \
+             roster entry — an empty `models` here is the defect this test exists for"
+        );
+        // The claim emitter reads the SAME snapshot and canonicalises the name to a wire FAMILY, so
+        // a buyer filtering on a claim and a buyer filtering on a heartbeat cannot get different
+        // answers about this seat. Asserted in the wire vocabulary, which is what a filter matches:
+        // the roster says `claude`, the wire says `claude-code`, and that difference is deliberate.
+        assert_eq!(
+            runner
+                .agents
+                .advertisement()
+                .capability(&runner.node.home().config.seat)
+                .models
+                .iter()
+                .map(|entry| (entry.family.as_str(), entry.model.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("claude-code", "claude-opus-5")],
+            "the claim capability must carry the same model as the heartbeat, in the wire family \
+             vocabulary #866's filter matches on"
+        );
+
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The operator-declared half of #784. `harness_variant` and `hardware` are the two fields no
+    // probe can answer — a fork name and a machine description are facts about the operator, and
+    // nothing the daemon runs measures them — so they come from `[seat]` in config.toml. Without
+    // that key they are emit helpers with no source, and a seat can never state either one.
+    //
+    // Asserted on the event the fixture relay actually RECEIVED, not on a capability built here: a
+    // test that reassembles the beat itself proves its own arithmetic and would stay green with the
+    // production emit path reading nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_operators_declared_colour_reaches_the_beat_and_never_the_claim() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("seat-colour");
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        crate::home::save_config(&mut home, |config| {
+            config.seller = Some(seller_cfg(1, false));
+            config.seat = crate::home::SeatConfig {
+                harness_variant: Some("my-fork".to_owned()),
+                hardware: Some("mac studio, 64GB".to_owned()),
+            };
+            config.relay_url = fixture.url();
+        })
+        .expect("persist config");
+
+        let verdicts = vec![HarnessProbeVerdict {
+            index: 0,
+            name: Some("claude".to_owned()),
+            result: Ok(None),
+        }];
+        let runner = boot_advertising_only_proven(home, verdicts)
+            .await
+            .expect("a proven seat must boot");
+
+        assert!(
+            runner.publish_heartbeat().await,
+            "harness check: the relay must CONFIRM the beat, or the tag assertions below would be \
+             read off an event that never landed"
+        );
+
+        let events = fixture.events().await;
+        let beats = seat_announcements(&events);
+        let beat = beats.last().expect("the seat published an announcement");
+        assert_eq!(
+            beat.tag_value(crate::heartbeat::HARNESS_VARIANT_TAG),
+            Some("my-fork"),
+            "the beat must carry what the operator declared — an absent tag here is the defect \
+             this test exists for"
+        );
+        assert_eq!(
+            beat.tag_value(crate::heartbeat::HARDWARE_TAG),
+            Some("mac studio, 64GB")
+        );
+
+        // The other half of the contract, and the reason passing the config to the CLAIM's
+        // capability is not a leak: display fields are separated at EMIT. `claim_draft` asks for
+        // `filterable_tags` alone, so a claim built from this very capability carries neither field
+        // — asserted on that exact tag set, which is the one a claim publishes.
+        let filterable = runner
+            .agents
+            .advertisement()
+            .capability(&runner.node.home().config.seat)
+            .filterable_tags();
+        assert!(
+            !filterable.iter().any(|tag| {
+                tag.first() == Some(crate::heartbeat::HARNESS_VARIANT_TAG)
+                    || tag.first() == Some(crate::heartbeat::HARDWARE_TAG)
+            }),
+            "a display-only field on a claim would be weight no award decision reads: {filterable:?}"
+        );
+        assert!(
+            !filterable.is_empty(),
+            "POSITIVE CONTROL: the claim states SOMETHING, or the absence above is only an empty \
+             tag list and proves nothing about the split"
+        );
+
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A `/bin/sh` agent that speaks just enough ACP to be probed: it answers `initialize` and
+    /// `session/new`, writes the sentinel, and ends the turn.
+    ///
+    /// It reads the workdir out of the `session/new` PARAMS rather than using its own cwd, because
+    /// that is where a real ACP agent reads it from — the driver carries `cwd` in the protocol and
+    /// does not set the child process's directory. (Distinct from the capability probe, which has no
+    /// protocol channel to carry it and therefore must set the child's cwd.) A stub that wrote to its
+    /// own directory would be testing a mechanism the ACP path does not use.
+    ///
+    /// `model` is the model id the session start reports, emitted in the LEGACY
+    /// `models.currentModelId` shape. `None` omits the block entirely, which is what a harness
+    /// exposing no model looks like on the wire.
+    ///
+    /// ⚠ Coverage bound: this stub speaks the legacy shape only. The Session Config Options shape
+    /// current Claude adapters use (#896) is covered by unit tests over
+    /// `driver::acp_driver::session_model_from_result`, NOT by this end-to-end probe.
+    ///
+    /// `write_sentinel` is the artifact leg. False makes a stub that answers every message
+    /// correctly and does no work — the shape a quota-exhausted harness has (#254).
+    #[cfg(feature = "acp")]
+    fn write_probe_stub(
+        dir: &std::path::Path,
+        label: &str,
+        model: Option<&str>,
+        write_sentinel: bool,
+    ) -> std::path::PathBuf {
+        let models = match model {
+            Some(id) => format!(r#","models":{{"currentModelId":"{id}"}}"#),
+            None => String::new(),
+        };
+        // One `sed` over the RAW request line, and never `grep`: `grep` on this box is `ugrep`, and
+        // a stub that depends on which grep is first on PATH fails for a reason having nothing to do
+        // with the code under test.
+        //
+        // The sentinel is read out of the JSON-escaped prompt, so it cannot be anchored to the start
+        // of a line. The prompt puts `\n\n` before it, which survives into the wire text as literal
+        // backslash-n — and `n` is a sentinel-legal character, so any tokenizer leaves `n` glued to
+        // the front of the value. Matching the PREFIX wherever it sits is the shape that holds.
+        let artifact = if write_sentinel {
+            "sentinel=$(printf '%s' \"$turn\" | \
+             sed -n 's/.*\\(maxplayer-probe-[0-9][0-9-]*[0-9]\\).*/\\1/p')\n\
+             printf '%s\\n' \"$sentinel\" > \"$cwd/probe.txt\"\n"
+        } else {
+            ""
+        };
+        let script = dir.join(format!("stub-acp-{label}.sh"));
+        let body = format!(
+            "#!/bin/sh\n\
+             read -r _init\n\
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":2}}}}'\n\
+             read -r new\n\
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"sessionId\":\"stub\"{models}}}}}'\n\
+             read -r turn\n\
+             cwd=$(printf '%s' \"$new\" | sed 's/.*\"cwd\": *\"\\([^\"]*\\)\".*/\\1/')\n\
+             {artifact}\
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"stopReason\":\"end_turn\"}}}}'\n"
+        );
+        std::fs::write(&script, body).expect("write stub agent");
+        script
+    }
+
+    /// The argv that runs one stub under a pass-through policy — the same `argv` shape a configured
+    /// harness preset supplies.
+    #[cfg(feature = "acp")]
+    fn stub_argv(script: &std::path::Path) -> Vec<String> {
+        vec![
+            "/bin/sh".to_owned(),
+            script.to_string_lossy().into_owned(),
+        ]
+    }
+
+    // The model a seat advertises must come from the harness's OWN `session/new` result, and this
+    // asserts it across the real ACP driver rather than from an injected verdict: a stub agent
+    // reports a model id in the legacy `models.currentModelId` shape, the driver folds it into the
+    // run's usage, and the probe carries it out on the proven arm.
+    //
+    // THREE legs, because the first alone proves almost nothing:
+    //   · a session start that REPORTS a model puts that model on the verdict;
+    //   · one that reports NONE leaves it absent — absence stays absence, never a fabricated default;
+    //   · one that answers every message perfectly and writes NO artifact is NOT proven at all, and
+    //     therefore carries no model however confidently it named one.
+    //
+    // The third leg is also the control on this test's own vehicle. `run_agent_job` opens its event
+    // log INSIDE the probe workdir, and `probe_sentinel_present` scans every file there — so if the
+    // log ever recorded the prompt verbatim, the sentinel would be present without the harness
+    // having done anything, and legs one and two would pass on a probe that cannot fail.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_probe_carries_the_model_its_session_start_reported() {
+        let dir = std::env::temp_dir().join(format!("maxplayer-probe-acp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("stub dir");
+        let identity = DeliveryAgentIdentity::for_seller(&"aa".repeat(32));
+        let sandbox = SandboxPolicy::passthrough();
+
+        let run = |script: std::path::PathBuf, tag: &'static str| {
+            let identity = identity.clone();
+            let sandbox = sandbox.clone();
+            let dir = dir.clone();
+            async move {
+                let probe = mint_probe_identity(0, 0, now_unix() as u64);
+                let workdir = dir.join(format!("wd-{tag}"));
+                let outcome = run_harness_probe_once(
+                    &stub_argv(&script),
+                    &sandbox,
+                    &identity,
+                    &workdir,
+                    &probe.sentinel,
+                )
+                .await;
+                let _ = std::fs::remove_dir_all(&workdir);
+                outcome
+            }
+        };
+
+        let reported = run(
+            write_probe_stub(&dir, "with-model", Some("claude-opus-5"), true),
+            "with-model",
+        )
+        .await;
+        assert!(
+            matches!(&reported, ProbeAttempt::Proven { model } if model.as_deref() == Some("claude-opus-5")),
+            "the model the session start reported must reach the verdict: {reported:?}"
+        );
+
+        let silent = run(write_probe_stub(&dir, "no-model", None, true), "no-model").await;
+        assert!(
+            matches!(&silent, ProbeAttempt::Proven { model: None }),
+            "a harness that reports no model must state none — a default here would advertise a \
+             model no buyer could hold this seat to: {silent:?}"
+        );
+
+        let idle = run(
+            write_probe_stub(&dir, "no-artifact", Some("claude-opus-5"), false),
+            "no-artifact",
+        )
+        .await;
+        assert!(
+            matches!(&idle, ProbeAttempt::CompletedNoArtifact { .. }),
+            "CONTROL: a turn that completed and produced nothing is not proven, whatever model it \
+             named. A pass here would mean the sentinel is reachable without the harness writing \
+             it — and the two legs above would be asserting nothing: {idle:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The whole chain Rocky asked for, with nothing injected: a configured harness preset whose argv
+    // is the ACP stub → the real boot probe → the verdict → the roster → the tags on the event the
+    // relay received. No `SeatCapability` is constructed by this test and no verdict is handed to the
+    // boot; the only thing supplied is an agent that speaks the protocol.
+    //
+    // It is what separates "the pieces are each tested" from "the pieces are connected". Every seam
+    // here has a unit test already, and the seat still advertised no model at all.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_seat_advertises_the_model_its_acp_handshake_reported() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("acp-model-e2e");
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        let script = write_probe_stub(&root, "boot", Some("claude-opus-5"), true);
+        crate::home::save_config(&mut home, |config| {
+            let mut seller = seller_cfg(1, false);
+            seller.agents = vec!["claude".to_owned()];
+            config.seller = Some(seller);
+            config.agents.insert(
+                "claude".to_owned(),
+                crate::home::AgentPresetConfig {
+                    argv: stub_argv(&script),
+                },
+            );
+            config.relay_url = fixture.url();
+        })
+        .expect("persist config");
+
+        // The REAL boot probe: it runs the harness, reads its handshake, and decides on the artifact.
+        let verdicts = probe_configured_harnesses(&home)
+            .await
+            .expect("the boot probe must run");
+        assert_eq!(
+            verdicts.len(),
+            1,
+            "harness check: exactly the configured preset was probed: {verdicts:?}"
+        );
+        assert_eq!(
+            verdicts[0].result.as_ref().map(Option::as_deref),
+            Ok(Some("claude-opus-5")),
+            "the boot probe must carry the handshake's model — everything below reads from this"
+        );
+
+        let runner = boot_advertising_only_proven(home, verdicts)
+            .await
+            .expect("a proven seat must boot");
+        assert!(
+            runner.publish_heartbeat().await,
+            "harness check: the relay must CONFIRM the beat"
+        );
+
+        let events = fixture.events().await;
+        let beat = seat_announcements(&events)
+            .last()
+            .copied()
+            .expect("the seat published an announcement");
+        assert!(
+            beat.tags.contains(&vec![
+                crate::heartbeat::HARNESS_MODEL_TAG.to_owned(),
+                "claude-code".to_owned(),
+                "claude-opus-5".to_owned(),
+            ]),
+            "the beat must pair the reported model with its wire FAMILY — the vocabulary #866's \
+             filter matches on, not the roster's preset name: {:?}",
+            beat.tags
         );
 
         runner.client.disconnect().await;
@@ -12901,8 +13949,8 @@ mod tests {
     fn probe_step_stops_on_a_proven_turn() {
         // A proven turn ends the loop immediately — the gate's healthy direction is unchanged.
         assert!(matches!(
-            probe_step(0, 3, ProbeAttempt::Proven),
-            ProbeStep::Done(Ok(()))
+            probe_step(0, 3, ProbeAttempt::Proven { model: None }),
+            ProbeStep::Done(Ok(None))
         ));
     }
 
@@ -12982,7 +14030,7 @@ mod tests {
         let script = [
             ProbeAttempt::CompletedNoArtifact { agent_message: None },
             ProbeAttempt::CompletedNoArtifact { agent_message: None },
-            ProbeAttempt::Proven,
+            ProbeAttempt::Proven { model: None },
         ];
         let mut verdict = None;
         for (attempt, outcome) in script.into_iter().enumerate() {
@@ -12995,7 +14043,7 @@ mod tests {
             }
         }
         assert!(
-            matches!(verdict, Some(Ok(()))),
+            matches!(verdict, Some(Ok(None))),
             "a harness that delivers on its third turn must be proven, not grounded: {verdict:?}"
         );
     }
@@ -13011,7 +14059,7 @@ mod tests {
                 reason: launcher_unrunnable_reason(&ExecError::AcpRequired),
                 fault: Fault::Incapable(MissingCapability::AcpFeature),
             },
-            ProbeAttempt::Proven,
+            ProbeAttempt::Proven { model: None },
         ];
         let mut consumed = 0;
         let mut verdict = None;
@@ -13106,6 +14154,71 @@ mod supervised_probe_tests {
         );
     }
 
+    /// The advertised model for the one harness in `claimed_probe`'s roster, as the wire would carry
+    /// it. `None` means the seat states no model for it.
+    fn advertised_model(roster: &LiveRoster) -> Option<String> {
+        roster
+            .advertisement()
+            .models
+            .into_iter()
+            .find(|entry| entry.harness == "claude")
+            .map(|entry| entry.model)
+    }
+
+    // A restore self-probe must publish the model IT observed, not the one standing from before the
+    // harness was dropped.
+    //
+    // The stale value is not hypothetical and neither half of the drop clears it: `fault` leaves
+    // `model` untouched and `restore` clears only availability. So a harness that faults, gets
+    // re-pointed at a different default while it is out of service, and is then proven by a self-probe
+    // comes back advertising what it ran BEFORE the fault — a filterable claim, on both the beat and
+    // the claim, that #866's model filter will match and award against.
+    //
+    // BOTH LEGS, because a replacement test alone cannot see the worse direction: a harness that has
+    // stopped reporting a model must come back UNSTATED, not merely un-updated. The `Option` in the
+    // setter exists for exactly that, and writing `None` through is what makes absence reachable.
+    #[tokio::test]
+    async fn a_restored_harness_advertises_the_model_its_probe_observed() {
+        let now = Instant::now();
+
+        // LEG 1 — REPLACEMENT. The pre-fault model must not survive the restore.
+        let (roster, _due) = claimed_probe(now);
+        roster.record_model(0, Some("claude-opus-4".to_owned()));
+        assert_eq!(
+            advertised_model(&roster),
+            None,
+            "harness check: a DROPPED harness advertises nothing at all, so the assertion after the \
+             restore below is about the restore and not about a model that was already visible"
+        );
+
+        let outcome = supervise_harness_probe(
+            Arc::clone(&roster),
+            0,
+            std::future::ready(Ok(Some("claude-opus-5".to_owned()))),
+        )
+        .await;
+        assert!(matches!(outcome, ProbeOutcome::Restored), "{outcome:?}");
+        assert_eq!(
+            advertised_model(&roster).as_deref(),
+            Some("claude-opus-5"),
+            "the restored harness must advertise the model its PROBE observed — `claude-opus-4` here \
+             is the pre-fault value, and advertising it is a claim this seat can no longer keep"
+        );
+
+        // LEG 2 — CLEARING. A harness that reports no model comes back stating none.
+        let (roster, _due) = claimed_probe(now);
+        roster.record_model(0, Some("claude-opus-4".to_owned()));
+        let outcome =
+            supervise_harness_probe(Arc::clone(&roster), 0, std::future::ready(Ok(None))).await;
+        assert!(matches!(outcome, ProbeOutcome::Restored), "{outcome:?}");
+        assert_eq!(
+            advertised_model(&roster),
+            None,
+            "a harness that has stopped reporting a model must come back UNSTATED — keeping the last \
+             value it ever gave outlives the truth, and absent is the only honest spelling"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_hung_probe_hits_the_wall_clock_ceiling_and_the_harness_is_re_probed() {
         // A probe the 120s ACP IDLE timeout can never bound: it never resolves (in the wild it holds
@@ -13117,7 +14230,7 @@ mod supervised_probe_tests {
         let outcome = supervise_harness_probe(
             Arc::clone(&roster),
             0,
-            std::future::pending::<Result<(), (String, Fault)>>(),
+            std::future::pending::<Result<Option<String>, (String, Fault)>>(),
         )
         .await;
         assert!(

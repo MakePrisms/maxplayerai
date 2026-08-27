@@ -780,6 +780,7 @@ mod tests {
             job_timeout_secs: None,
             agents: vec!["claude".into()],
             claim_open_pool: false,
+            accept_open_targeted: false,
             accept_offers_only_from: Vec::new(),
             offer_backfill_secs: home::default_offer_backfill_secs(),
             contribution_enabled: true,

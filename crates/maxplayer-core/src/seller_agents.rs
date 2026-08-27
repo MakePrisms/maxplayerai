@@ -184,21 +184,37 @@ pub fn normalize_request(requested: Option<&str>) -> Option<String> {
     Some(value)
 }
 
-/// The on-disk credential directory for a registered harness, if we know one.
+/// The on-disk credential directories for a registered harness — every location we know its
+/// session file may occupy. Empty when we know none.
 ///
-/// Only the three built-in preset labels have a known directory under `user_home`:
-/// `claude` → `<home>/.claude`, `cursor` → `<home>/.cursor`, `codex` → `<home>/.codex`.
-/// A raw `--agent-argv` hatch (`name == None`) and any other label return `None`.
+/// Only the three built-in preset labels resolve. A raw `--agent-argv` hatch (`name == None`) and
+/// any other label return an empty list.
 ///
-/// The argv is never consulted. Guessing a path from a binary name would inspect the wrong
-/// directory and pass — worse than reporting that we cannot resolve (issue #715). Absence is
-/// carried, not invented.
-pub fn harness_credential_dir(agent: &RegisteredAgent, user_home: &Path) -> Option<PathBuf> {
-    match agent.name.as_deref()?.trim().to_ascii_lowercase().as_str() {
-        "claude" => Some(user_home.join(".claude")),
-        "cursor" => Some(user_home.join(".cursor")),
-        "codex" => Some(user_home.join(".codex")),
-        _ => None,
+/// **A LIST, BECAUSE ONE HARNESS DOES NOT ALWAYS MEAN ONE DIRECTORY.** `claude` and `codex` have one
+/// each (`<home>/.claude`, `<home>/.codex`). Cursor has two, and returning only the documented one
+/// made the inspection cover a directory the running build does not use: Cursor Agent
+/// `2026.08.25-3e8eec8` on Linux wrote its session to `<home>/.config/cursor/auth.json`
+/// (operator-measured, 2026-08-26) even with `AGENT_CLI_CREDENTIAL_STORE=file`, while the seller docs
+/// still name `<home>/.cursor`. That is vendor behaviour we do not control, so both are carried and
+/// the caller inspects whichever exists rather than deciding for the operator's build.
+///
+/// A one-directory answer there was the failure #715 exists to prevent, arrived at from the other
+/// side: not a path guessed from a binary name, but a real path that stopped being the one in use.
+/// Either way the check PASSES having looked at the wrong directory, which is worse than reporting
+/// that we cannot resolve.
+///
+/// The argv is never consulted. Absence is carried, not invented.
+pub fn harness_credential_dirs(agent: &RegisteredAgent, user_home: &Path) -> Vec<PathBuf> {
+    let Some(name) = agent.name.as_deref() else {
+        return Vec::new();
+    };
+    match name.trim().to_ascii_lowercase().as_str() {
+        "claude" => vec![user_home.join(".claude")],
+        // Documented location first, then the location measured on 2026.08.25-3e8eec8. Order is the
+        // caller's reporting order only; neither is authoritative for an arbitrary build.
+        "cursor" => vec![user_home.join(".cursor"), user_home.join(".config").join("cursor")],
+        "codex" => vec![user_home.join(".codex")],
+        _ => Vec::new(),
     }
 }
 
@@ -319,6 +335,7 @@ mod tests {
             job_timeout_secs: None,
             agents,
             claim_open_pool: false,
+            accept_open_targeted: false,
             accept_offers_only_from: Vec::new(),
             offer_backfill_secs: 0,
             contribution_enabled: true,
@@ -499,7 +516,7 @@ mod tests {
     /// pass — the failure #715 names as worse than no check. Drop the `name == None ⇒ None`
     /// arm (or consult argv) and this goes red.
     #[test]
-    fn harness_credential_dir_never_guesses_from_an_unlabelled_hatch() {
+    fn harness_credential_dirs_never_guesses_from_an_unlabelled_hatch() {
         use std::path::Path;
         let home = Path::new("/home/seat");
         let hatch = RegisteredAgent {
@@ -510,18 +527,18 @@ mod tests {
             ],
         };
         assert_eq!(
-            harness_credential_dir(&hatch, home),
-            None,
+            harness_credential_dirs(&hatch, home),
+            Vec::<PathBuf>::new(),
             "an unlabelled hatch must not resolve, even when argv names a known harness"
         );
         assert_eq!(
-            harness_credential_dir(&labelled("grok"), home),
-            None,
+            harness_credential_dirs(&labelled("grok"), home),
+            Vec::<PathBuf>::new(),
             "an unknown label must not fall back to a built-in's directory"
         );
         assert_eq!(
-            harness_credential_dir(&labelled("my-claude"), home),
-            None,
+            harness_credential_dirs(&labelled("my-claude"), home),
+            Vec::<PathBuf>::new(),
             "a substring of a built-in name is not a built-in"
         );
     }
@@ -535,20 +552,51 @@ mod tests {
         use std::path::Path;
         let home = Path::new("/home/seat");
         for name in crate::agent_presets::BUILTIN_PRESETS {
-            let dir = harness_credential_dir(&labelled(name), home)
+            let dirs = harness_credential_dirs(&labelled(name), home);
+            let dir = dirs
+                .first()
                 .unwrap_or_else(|| panic!("built-in preset {name} has no credential directory"));
-            assert_eq!(dir, home.join(format!(".{name}")));
-            assert!(
-                dir.starts_with(home),
-                "{name} credential dir must live under the given user home, not a hardcoded path: {}",
-                dir.display()
-            );
+            assert_eq!(dir, &home.join(format!(".{name}")));
+            for dir in &dirs {
+                assert!(
+                    dir.starts_with(home),
+                    "{name} credential dir must live under the given user home, not a hardcoded path: {}",
+                    dir.display()
+                );
+            }
         }
         // Case/whitespace follow the same normalisation as dispatch, so a label the registry
         // stored in any case still finds its directory.
         assert_eq!(
-            harness_credential_dir(&labelled(" Claude "), home),
-            harness_credential_dir(&labelled("claude"), home)
+            harness_credential_dirs(&labelled(" Claude "), home),
+            harness_credential_dirs(&labelled("claude"), home)
         );
+    }
+
+    /// A harness whose session file location is not one fixed directory must offer EVERY measured
+    /// candidate, or the inspection silently covers a directory the build does not use.
+    ///
+    /// Cursor is that harness. Cursor Agent `2026.08.25-3e8eec8` on Linux wrote its session to
+    /// `$HOME/.config/cursor/auth.json` (operator-measured, 2026-08-26) even with
+    /// `AGENT_CLI_CREDENTIAL_STORE=file`, while the shipped seller docs still name `$HOME/.cursor`.
+    /// Resolving only `.cursor` is the exact failure this module's doctrine forbids — inspecting the
+    /// wrong directory and PASSING is worse than reporting that we cannot resolve (issue #715).
+    #[test]
+    fn cursor_offers_both_measured_session_directories() {
+        use std::path::Path;
+        let home = Path::new("/home/seat");
+        let dirs = harness_credential_dirs(&labelled("cursor"), home);
+        assert!(
+            dirs.contains(&home.join(".cursor")),
+            "the documented location must stay a candidate: {dirs:?}"
+        );
+        assert!(
+            dirs.contains(&home.join(".config").join("cursor")),
+            "the measured 2026.08.25 location must be a candidate: {dirs:?}"
+        );
+        // Single-location harnesses are unchanged: one candidate each, so doctor keeps treating a
+        // missing directory there as a real finding rather than an unknown build.
+        assert_eq!(harness_credential_dirs(&labelled("claude"), home), vec![home.join(".claude")]);
+        assert_eq!(harness_credential_dirs(&labelled("codex"), home), vec![home.join(".codex")]);
     }
 }

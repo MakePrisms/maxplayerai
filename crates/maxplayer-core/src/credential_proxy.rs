@@ -84,7 +84,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::{combinators::BoxBody, BodyExt, Full, Limited, StreamBody};
+use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
@@ -92,13 +92,24 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use tokio::sync::Semaphore;
 
+/// Emit a `proxy: …` diagnostic line to stderr, but only under `MAXPLAYER_VERBOSE`. These per-request
+/// lines are how a stalled leg gets diagnosed; unconditional they flood the operator console on every
+/// job, so they are gated exactly like [`crate::oplog::opline_verbose`] — but WITHOUT its `HH:MM:SSZ`
+/// prefix, because each line already carries its own `ts=<ms>` field.
+macro_rules! plog {
+    ($($arg:tt)*) => {
+        if $crate::oplog::verbose_enabled() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 /// The proxy listener terminates INSIDE the seller daemon (a money-path process), and the caller is a
 /// stranger's job. These bound what one job can make the daemon hold or spawn, so an unbounded or
 /// trickled request cannot OOM or exhaust it.
 ///
-/// The request body is buffered (it must be, to find and substitute the placeholder before egress);
-/// this caps that buffer. 32 MiB is far above any real model request and far below a memory hazard.
-pub const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// There is deliberately **no request-body size limit**. The body is relayed as it arrives and never
+/// accumulates, so its size is bounded by the network rather than by memory — see [`handle_request`].
 /// Concurrent connections the proxy will service at once. A per-job proxy serves ONE agent, so a
 /// modest ceiling is generous for legitimate use and caps a connection flood. Excess connections wait
 /// at the OS accept backlog rather than each spawning an unbounded task.
@@ -117,18 +128,22 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 /// listener.
 ///
 /// ⚠ **This is a PER-CONNECTION bound and it is not, on its own, a ceiling on work.** 64 connections
-/// each running 64 streams is 4096 requests in flight, and at [`MAX_REQUEST_BODY_BYTES`] each that is
-/// the very resource hazard the connection cap exists to prevent. The aggregate ceiling is
-/// [`MAX_IN_FLIGHT_REQUESTS`]; this constant only stops one connection from monopolising it.
+/// each running 64 streams is 4096 requests in flight, each holding an upstream connection and a
+/// credential — the very resource hazard the connection cap exists to prevent. The aggregate ceiling
+/// is [`MAX_IN_FLIGHT_REQUESTS`]; this constant only stops one connection from monopolising it.
 const MAX_CONCURRENT_H2_STREAMS: u32 = 64;
 /// Requests in flight across the whole listener, both protocols, whatever the connection count.
 ///
 /// The real ceiling on concurrent work, and the only one of the three that does not change meaning
 /// with the protocol. [`MAX_CONCURRENT_CONNECTIONS`] bounds sockets and
 /// [`MAX_CONCURRENT_H2_STREAMS`] bounds streams within one socket; under HTTP/1 those coincide with
-/// requests, and under HTTP/2 they multiply. **Bounding the product is what keeps the buffered-body
-/// memory ceiling honest** — without it, adding h2c support would have silently widened a limit
-/// nobody edited, which is exactly the failure mode this module's other bounds exist to avoid.
+/// requests, and under HTTP/2 they multiply. **Bounding the product is what keeps the count of
+/// simultaneously-live upstream connections honest** — without it, adding h2c support would have
+/// silently widened a limit nobody edited, which is exactly the failure mode this module's other
+/// bounds exist to avoid.
+///
+/// This is now the ONLY aggregate bound on concurrent work: with the body streamed rather than
+/// buffered, an in-flight request costs a socket pair and a credential in a header, not megabytes.
 const MAX_IN_FLIGHT_REQUESTS: usize = 64;
 /// How long the head (request line + headers) may take to arrive. hyper enforces this itself; without
 /// it a trickled header stream pins a connection open indefinitely.
@@ -136,10 +151,39 @@ const MAX_IN_FLIGHT_REQUESTS: usize = 64;
 /// HTTP/1 only: HTTP/2 has no equivalent head-read deadline to set, so the body deadline and the
 /// stream bound above are what bound a slow HTTP/2 peer.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long the request BODY may take to arrive in full. Bounds a slow-loris body that dribbles bytes
-/// under the size cap forever. It bounds only the REQUEST read — the upstream RESPONSE (an SSE stream)
-/// is relayed without any such deadline, so a long completion is never cut off.
-const BODY_READ_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long the request body may go **silent** before the relay gives up on it.
+///
+/// This is an INACTIVITY deadline, not a total one, and the distinction is the whole point. A total
+/// deadline cannot tell a stalled client from a healthy long upload: both exceed it, so any value
+/// large enough to permit the second is too large to catch the first. Measuring the GAP between chunks
+/// separates them — a client that keeps sending is never cut off however long it takes, and one that
+/// stops is dropped `BODY_IDLE_TIMEOUT` later regardless of how much it already sent.
+///
+/// It bounds only the REQUEST read. The upstream RESPONSE (an SSE stream) is relayed with no deadline
+/// at all, so a long completion is never cut off.
+const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The largest request body one job may relay through an approved credential.
+///
+/// The proxy listener terminates INSIDE the seller daemon (a money-path process), and the caller is a
+/// stranger's job. This bounds what one job can push through it.
+///
+/// The body is no longer buffered, so this is no longer a bound on memory — [`size_bounded`] counts
+/// the stream and fails the request the moment it passes the cap, holding one chunk either way. It is
+/// kept because the OOM ceiling was never the only thing it did: it is also the ceiling on what a
+/// stranger's job may send upstream on the seller's credential. 32 MiB is far above any real model
+/// request.
+pub const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// Period of the response-body heartbeat: [`StreamMeter`] emits a log-only `*_idle` line this often
+/// while the upstream response body is producing no bytes.
+///
+/// It is a CLOCK, not a deadline — contrast [`BODY_IDLE_TIMEOUT`], which cancels the request body. The
+/// heartbeat has no power to cancel anything; it only EMITS, so it cannot manufacture the terminator it
+/// exists to observe. Its whole purpose is to turn "nothing arrived for N seconds" from an ABSENCE — a
+/// reading indistinguishable from an instrument that was never reached — into an explicit line with a
+/// denominator. That is the exact failure under investigation: a response header, then silence.
+const BODY_HEARTBEAT_PERIOD: Duration = Duration::from_secs(5);
 
 /// The default real upstream for the Anthropic API-key path when the operator has not pointed the
 /// daemon at a custom gateway. Any resolved destination must appear on the proxy's allowlist before
@@ -181,14 +225,37 @@ const HOP_BY_HOP: &[&str] = &[
 ];
 
 /// One job's containment secret: the placeholder the container was handed, the real credential it
-/// stands in for, and the single approved upstream that credential may be substituted for.
+/// stands in for, and the approved upstream base URLs that credential may be substituted for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobCredential {
     /// The format-plausible value inside the container (`sk-ant-…`). Worthless if it leaks.
     pub placeholder: String,
     /// The real credential. Never enters the container; held only in this host process.
     pub real: String,
-    /// The approved real upstream base URL (scheme + host[:port]) this credential is valid for.
+    /// The approved real upstream base URLs (scheme + host[:port]) this credential is valid for.
+    ///
+    /// The FIRST entry is the primary: it is where [`ProxyEngine::authorize`] — the primary
+    /// listener's path — forwards, exactly as a single-upstream credential always has. Every entry
+    /// past the first exists for a client whose separate legs go to separate hosts (measured on
+    /// cursor-agent: `--endpoint` moves the control plane and `--agent-endpoint` moves the agent
+    /// leg, and the two legs' true destinations differ). Each such entry is reachable only through
+    /// [`ProxyEngine::authorize_via`] from the leg listener bound for its authority.
+    ///
+    /// [`ProxyEngine::register`] refuses an empty list and refuses two entries naming the same
+    /// authority, so order inside the list never has to break a tie: at most one entry can match
+    /// any listener.
+    pub upstreams: Vec<String>,
+}
+
+/// One Codex ChatGPT session whose two required headers must move as one unit.
+///
+/// This type has no `Debug` implementation. Both real fields must stay out of logs and errors.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CodexSessionCredential {
+    pub access_placeholder: String,
+    pub access_token: String,
+    pub account_placeholder: String,
+    pub account_id: String,
     pub upstream: String,
 }
 
@@ -199,10 +266,22 @@ pub enum Refusal {
     /// No registered placeholder was found anywhere in the request. The proxy cannot identify a job,
     /// so it will not substitute any credential (no-fallback): the request fails.
     NoKnownPlaceholder,
-    /// A placeholder was found, but the resolved destination host is not on the allowlist. The real
-    /// credential is withheld and the request is refused — the load-bearing invariant that keeps this
-    /// from being worse than the status quo.
+    /// A placeholder was found, but the resolved destination host is not on the allowlist — or, on a
+    /// leg listener, not on the identified credential's own upstream list. The real credential is
+    /// withheld and the request is refused — the load-bearing invariant that keeps this from being
+    /// worse than the status quo.
     DestinationNotAllowed { host: String },
+    /// A request carried a known Codex access placeholder but did not carry both exact auth headers.
+    InvalidCodexHeaders,
+    /// A known Codex session tried a method or path outside its narrow backend route.
+    RequestNotAllowed { method: String, path: String },
+    /// A credential was offered for registration with no upstream at all. Refused at registration so
+    /// the registry can never hold a credential with nowhere approved to go.
+    NoUpstream,
+    /// Two entries of one credential's upstream list resolve to the same authority. Refused rather
+    /// than tie-broken: a duplicate is a config error, and any tie-break rule would silently pick a
+    /// base URL the operator may not have meant (`https://a` vs `https://a:443/v2`).
+    DuplicateUpstream { host: String },
 }
 
 impl std::fmt::Display for Refusal {
@@ -214,13 +293,26 @@ impl std::fmt::Display for Refusal {
             Self::DestinationNotAllowed { host } => {
                 write!(f, "destination {host} not on the credential-substitution allowlist")
             }
+            Self::InvalidCodexHeaders => write!(
+                f,
+                "Codex session request did not carry both exact per-job placeholder headers"
+            ),
+            Self::RequestNotAllowed { method, path } => {
+                write!(f, "Codex session request {method} {path} is not allowed")
+            }
+            Self::NoUpstream => {
+                write!(f, "credential lists no upstream; refusing registration")
+            }
+            Self::DuplicateUpstream { host } => {
+                write!(f, "credential lists {host} more than once; refusing registration")
+            }
         }
     }
 }
 
 /// The outcome of authorizing one request against the engine: either a forward plan whose HEADERS
 /// carry the real credential (destination approved) or a typed [`Refusal`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Decision {
     /// Forward to `upstream` (base URL) with these substituted headers.
     ///
@@ -232,20 +324,55 @@ pub enum Decision {
     Forward {
         upstream: String,
         headers: Vec<(String, String)>,
+        /// Real-to-placeholder substitutions for the response leg only.
+        scrub: Vec<(String, String)>,
+        /// The redirect rule for this credential type.
+        redirects: RedirectMode,
     },
     Refuse(Refusal),
+}
+
+/// The redirect rule for one authorized request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedirectMode {
+    /// Follow redirects only while they stay on the credential's paired authority.
+    PairedAuthority,
+    /// Return the redirect response without another upstream request.
+    Disabled,
+}
+
+impl std::fmt::Debug for Decision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Forward {
+                upstream,
+                headers,
+                scrub,
+                redirects,
+            } => f
+                .debug_struct("Forward")
+                .field("upstream", upstream)
+                .field("header_count", &headers.len())
+                .field("scrub_count", &scrub.len())
+                .field("redirects", redirects)
+                .finish(),
+            Self::Refuse(reason) => f.debug_tuple("Refuse").field(reason).finish(),
+        }
+    }
 }
 
 /// The credential-substitution core: the destination allowlist plus the live per-job registry. Pure
 /// decision logic ([`Self::authorize`]) is separated from all socket I/O so the invariants are
 /// unit-testable without a container, a network, or a real credential.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ProxyEngine {
     /// Approved upstream hosts (lowercased, `host` or `host:port`). The real credential is substituted
     /// only when the resolved destination's host is in this set.
     allowlist: Vec<String>,
     /// Registered per-job credentials, keyed by placeholder value for O(1) identification.
     creds: Mutex<HashMap<String, JobCredential>>,
+    /// Typed Codex sessions, keyed by the access placeholder that identifies the job.
+    codex_sessions: Mutex<HashMap<String, CodexSessionCredential>>,
 }
 
 impl ProxyEngine {
@@ -254,6 +381,7 @@ impl ProxyEngine {
         Self {
             allowlist: hosts.into_iter().map(|h| host_key(&h)).collect(),
             creds: Mutex::new(HashMap::new()),
+            codex_sessions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -268,14 +396,26 @@ impl ProxyEngine {
         self.allowlist.iter().any(|allowed| same_authority(allowed, &key))
     }
 
-    /// Register a job's credential. Refuses (returns `Err`) if the credential's upstream is not on the
-    /// allowlist — a belt that keeps an unapproved destination from ever entering the registry, so a
-    /// registration bug cannot defeat the [`Self::authorize`] allowlist check downstream.
+    /// Register a job's credential. Refuses (returns `Err`) unless EVERY listed upstream is a
+    /// parseable base URL on the allowlist — a belt that keeps an unapproved destination from ever
+    /// entering the registry, so a registration bug cannot defeat the [`Self::authorize`] allowlist
+    /// check downstream. An empty list and two entries naming the same authority are refused here
+    /// too, which is what lets every later lookup treat the list as non-empty and tie-free.
     pub fn register(&self, cred: JobCredential) -> Result<(), Refusal> {
-        let host = authority_of(&cred.upstream)
-            .ok_or_else(|| Refusal::DestinationNotAllowed { host: cred.upstream.clone() })?;
-        if !self.allows(&host) {
-            return Err(Refusal::DestinationNotAllowed { host });
+        if cred.upstreams.is_empty() {
+            return Err(Refusal::NoUpstream);
+        }
+        let mut authorities: Vec<String> = Vec::with_capacity(cred.upstreams.len());
+        for upstream in &cred.upstreams {
+            let host = authority_of(upstream)
+                .ok_or_else(|| Refusal::DestinationNotAllowed { host: upstream.clone() })?;
+            if !self.allows(&host) {
+                return Err(Refusal::DestinationNotAllowed { host });
+            }
+            if authorities.iter().any(|seen| same_authority(seen, &host)) {
+                return Err(Refusal::DuplicateUpstream { host });
+            }
+            authorities.push(host);
         }
         self.creds.lock().unwrap().insert(cred.placeholder.clone(), cred);
         Ok(())
@@ -284,6 +424,40 @@ impl ProxyEngine {
     /// Drop a job's credential (job end = revocation point). Returns whether one was present.
     pub fn deregister(&self, placeholder: &str) -> bool {
         self.creds.lock().unwrap().remove(placeholder).is_some()
+    }
+
+    /// Register one two-header Codex session. The access placeholder is the sole route identifier.
+    pub fn register_codex_session(&self, cred: CodexSessionCredential) -> Result<(), Refusal> {
+        let host = authority_of(&cred.upstream).ok_or_else(|| Refusal::DestinationNotAllowed {
+            host: cred.upstream.clone(),
+        })?;
+        if !self.allows(&host) {
+            return Err(Refusal::DestinationNotAllowed { host });
+        }
+        if [
+            cred.access_placeholder.as_str(),
+            cred.access_token.as_str(),
+            cred.account_placeholder.as_str(),
+            cred.account_id.as_str(),
+        ]
+        .iter()
+        .any(|value| value.trim().is_empty())
+        {
+            return Err(Refusal::InvalidCodexHeaders);
+        }
+        let placeholders = [&cred.access_placeholder, &cred.account_placeholder];
+        let real_values = [&cred.access_token, &cred.account_id];
+        if placeholders
+            .iter()
+            .any(|placeholder| real_values.contains(placeholder))
+        {
+            return Err(Refusal::InvalidCodexHeaders);
+        }
+        self.codex_sessions
+            .lock()
+            .unwrap()
+            .insert(cred.access_placeholder.clone(), cred);
+        Ok(())
     }
 
     /// The decision for one request, from its headers alone.
@@ -300,6 +474,41 @@ impl ProxyEngine {
     ///    [`Refusal::DestinationNotAllowed`] with NO substitution.
     /// 3. **Substitute** — replace the placeholder with the real credential in every header value.
     pub fn authorize(&self, headers: &[(String, String)]) -> Decision {
+        self.decide(headers, |cred| match cred.upstreams.first() {
+            Some(upstream) => Ok(upstream.clone()),
+            // Unreachable through `register`, which refuses an empty list. Refused rather than
+            // panicked so a future construction path turns a config error into a 4xx, not a crash.
+            None => Err(Refusal::NoUpstream),
+        })
+    }
+
+    /// The decision for one request arriving on the LEG listener bound for `via_authority`.
+    ///
+    /// Same steps as [`Self::authorize`], one difference: the destination is the identified
+    /// credential's OWN entry whose authority matches `via_authority`. The listener the request
+    /// physically arrived on is the selector — the container picks a destination only by which of
+    /// the base URLs it was handed it dials, every one of which this host chose. A credential that
+    /// never listed this authority is refused: a leg listener serves exactly the credentials that
+    /// named its leg, so one job's extra leg never widens where another job's credential may go.
+    pub fn authorize_via(&self, headers: &[(String, String)], via_authority: &str) -> Decision {
+        let via = host_key(via_authority);
+        self.decide(headers, move |cred| {
+            cred.upstreams
+                .iter()
+                .find(|u| authority_of(u).is_some_and(|a| same_authority(&a, &via)))
+                .cloned()
+                .ok_or(Refusal::DestinationNotAllowed { host: via })
+        })
+    }
+
+    /// Shared spine of [`Self::authorize`] and [`Self::authorize_via`]: identify the job by its
+    /// placeholder, let `select` pick the destination from the credential itself, hold that
+    /// destination to the allowlist, then substitute in header values only.
+    fn decide(
+        &self,
+        headers: &[(String, String)],
+        select: impl FnOnce(&JobCredential) -> Result<String, Refusal>,
+    ) -> Decision {
         let creds = self.creds.lock().unwrap();
         let Some(cred) = creds
             .values()
@@ -310,10 +519,12 @@ impl ProxyEngine {
         };
         drop(creds);
 
-        let Some(host) = authority_of(&cred.upstream) else {
-            return Decision::Refuse(Refusal::DestinationNotAllowed {
-                host: cred.upstream.clone(),
-            });
+        let upstream = match select(&cred) {
+            Ok(upstream) => upstream,
+            Err(refusal) => return Decision::Refuse(refusal),
+        };
+        let Some(host) = authority_of(&upstream) else {
+            return Decision::Refuse(Refusal::DestinationNotAllowed { host: upstream });
         };
         if !self.allows(&host) {
             return Decision::Refuse(Refusal::DestinationNotAllowed { host });
@@ -325,23 +536,107 @@ impl ProxyEngine {
             .map(|(name, value)| (name.clone(), value.replace(&cred.placeholder, &cred.real)))
             .collect();
         Decision::Forward {
-            upstream: cred.upstream,
+            upstream,
             headers,
+            scrub: vec![(cred.real, cred.placeholder)],
+            redirects: RedirectMode::PairedAuthority,
         }
     }
 
-    /// The real credential registered under `placeholder`, for the response scrub in [`relay`].
+    /// Authorize a transport request. A typed Codex session takes the narrow route; all other
+    /// requests use the existing generic credential behavior.
     ///
-    /// Returned as `(real, placeholder)` so the caller can run the substitution in REVERSE on the way
-    /// back. Not a leak of anything the caller does not already hold: [`Self::authorize`] just put this
-    /// same value into the outgoing headers.
-    fn scrub_pair_for(&self, headers: &[(String, String)]) -> Option<(String, String)> {
-        let creds = self.creds.lock().unwrap();
-        creds
+    /// `via_authority` is the LEG the request arrived on: `None` for the primary listener, and the
+    /// leg's authority for a leg listener. It selects which generic entry point decides — see
+    /// [`Self::authorize_via`]. A typed Codex session is checked BEFORE either and is not routed by a
+    /// leg: its destination is the one fixed upstream its session was registered for, so a leg listener
+    /// carries no Codex session and falls through to the generic path exactly as it did before.
+    pub fn authorize_request(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(String, String)],
+        via_authority: Option<&str>,
+    ) -> Decision {
+        let sessions = self.codex_sessions.lock().unwrap();
+        let matched = sessions
             .values()
-            .find(|c| placeholder_present(&c.placeholder, headers))
-            .map(|c| (c.real.clone(), c.placeholder.clone()))
+            .find(|session| {
+                headers.iter().any(|(name, value)| {
+                    name.eq_ignore_ascii_case("authorization")
+                        && value == &format!("Bearer {}", session.access_placeholder)
+                })
+            })
+            .cloned();
+        drop(sessions);
+        let Some(session) = matched else {
+            return match via_authority {
+                None => self.authorize(headers),
+                Some(authority) => self.authorize_via(headers, authority),
+            };
+        };
+
+        if !codex_request_allowed(method, path) {
+            return Decision::Refuse(Refusal::RequestNotAllowed {
+                method: method.to_owned(),
+                path: path.to_owned(),
+            });
+        }
+        let authorization = format!("Bearer {}", session.access_placeholder);
+        let auth_values: Vec<&str> = headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        let account_values: Vec<&str> = headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("chatgpt-account-id"))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        if auth_values.as_slice() != [authorization.as_str()]
+            || account_values.as_slice() != [session.account_placeholder.as_str()]
+        {
+            return Decision::Refuse(Refusal::InvalidCodexHeaders);
+        }
+
+        let Some(host) = authority_of(&session.upstream) else {
+            return Decision::Refuse(Refusal::DestinationNotAllowed {
+                host: session.upstream.clone(),
+            });
+        };
+        if !self.allows(&host) {
+            return Decision::Refuse(Refusal::DestinationNotAllowed { host });
+        }
+
+        let mut outgoing: Vec<(String, String)> = headers
+            .iter()
+            .filter(|(name, _)| {
+                !is_hop_by_hop(name)
+                    && !name.eq_ignore_ascii_case("authorization")
+                    && !name.eq_ignore_ascii_case("chatgpt-account-id")
+            })
+            .cloned()
+            .collect();
+        outgoing.push((
+            "authorization".to_owned(),
+            format!("Bearer {}", session.access_token),
+        ));
+        outgoing.push(("chatgpt-account-id".to_owned(), session.account_id.clone()));
+        Decision::Forward {
+            upstream: session.upstream,
+            headers: outgoing,
+            scrub: vec![
+                (session.access_token, session.access_placeholder),
+                (session.account_id, session.account_placeholder),
+            ],
+            redirects: RedirectMode::Disabled,
+        }
     }
+}
+
+fn codex_request_allowed(method: &str, path: &str) -> bool {
+    (method.eq_ignore_ascii_case("POST") && matches!(path, "/responses" | "/responses/compact"))
+        || (method.eq_ignore_ascii_case("GET") && path == "/models")
 }
 
 /// Whether `placeholder` appears in any header value. Header *names* are not searched: the placeholder
@@ -354,27 +649,99 @@ fn placeholder_present(placeholder: &str, headers: &[(String, String)]) -> bool 
     headers.iter().any(|(_, v)| v.contains(placeholder))
 }
 
-/// Replace every occurrence of `needle` with `replacement` in a byte buffer. Bodies are not required to
-/// be UTF-8, so this works on raw bytes rather than going through `String`.
+fn replace_bytes_many(haystack: &[u8], substitutions: &[(String, String)]) -> Vec<u8> {
+    let mut buffer = haystack.to_vec();
+    scrub_buffer(&mut buffer, substitutions, true)
+}
+
+/// Scrub the safe prefix of an ORIGINAL byte buffer.
 ///
-/// Used on the RESPONSE leg only (real ⇒ placeholder). The request leg deliberately has no body
-/// substitution at all.
-fn replace_bytes(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
-    if needle.is_empty() {
-        return haystack.to_vec();
+/// When `finish` is false, the function retains enough original bytes to match a value across the
+/// next stream chunk. It never puts replacement bytes back into `buffer`, so a replacement length
+/// cannot change the next input boundary.
+fn scrub_buffer(
+    buffer: &mut Vec<u8>,
+    substitutions: &[(String, String)],
+    finish: bool,
+) -> Vec<u8> {
+    let max_real_len = substitutions
+        .iter()
+        .map(|(real, _)| real.len())
+        .max()
+        .unwrap_or(0);
+    if max_real_len == 0 {
+        return std::mem::take(buffer);
     }
-    let mut out = Vec::with_capacity(haystack.len());
-    let mut i = 0;
-    while i < haystack.len() {
-        if haystack[i..].starts_with(needle) {
-            out.extend_from_slice(replacement);
-            i += needle.len();
+
+    let safe_start_limit = if finish {
+        buffer.len()
+    } else {
+        buffer.len().saturating_sub(max_real_len.saturating_sub(1))
+    };
+    let mut output = Vec::with_capacity(buffer.len());
+    let mut cursor = 0;
+    while cursor < safe_start_limit {
+        let matched = substitutions
+            .iter()
+            .filter(|(real, _)| !real.is_empty() && buffer[cursor..].starts_with(real.as_bytes()))
+            .max_by_key(|(real, _)| real.len());
+        if let Some((real, placeholder)) = matched {
+            output.extend_from_slice(placeholder.as_bytes());
+            cursor += real.len();
         } else {
-            out.push(haystack[i]);
-            i += 1;
+            output.push(buffer[cursor]);
+            cursor += 1;
         }
     }
-    out
+    buffer.drain(..cursor);
+    output
+}
+
+/// Length of the longest suffix of `buf` that is a proper prefix of `needle` — the only trailing bytes
+/// that a not-yet-arrived chunk could complete into a `needle` occurrence. [`scrub_buffer`] has already
+/// removed every COMPLETE occurrence, so a split match can hold at most `needle.len() - 1` bytes here;
+/// everything before this suffix is provably not part of any `needle`, whole or split, whatever arrives
+/// next. [`scrub_stream`] uses it to flush a stalled holdback without ever releasing a partial credential.
+fn straddle_prefix_len(buf: &[u8], needle: &[u8]) -> usize {
+    let max = buf.len().min(needle.len().saturating_sub(1));
+    (1..=max).rev().find(|&j| buf[buf.len() - j..] == needle[..j]).unwrap_or(0)
+}
+
+/// The widest [`straddle_prefix_len`] across every substitution.
+///
+/// A byte must stay held if ANY real value could still be completed through it, so the hold is the
+/// maximum over the set, never the first match.
+fn straddle_prefix_len_many(buf: &[u8], substitutions: &[(String, String)]) -> usize {
+    substitutions
+        .iter()
+        .map(|(real, _)| straddle_prefix_len(buf, real.as_bytes()))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Drain from `carry` everything that provably cannot begin a split credential, and return the
+/// scrubbed bytes ready to forward. What stays behind is ONLY the longest suffix that is still a
+/// proper prefix of some real value — the sole bytes a later chunk could complete into a match.
+///
+/// Two passes, and the order matters. The first is the ordinary fixed-width scrub, which leaves
+/// `max_real_len - 1` bytes held. The second asks what those held bytes actually ARE:
+/// [`straddle_prefix_len_many`] finds the longest tail that could still start a real value, so
+/// everything ahead of it is safe and is scrubbed to completion and released. The bytes still held
+/// are a strict subset of what the EOF flush would hold, for ANY input — which is why this is safe to
+/// run on every chunk, not only after an idle gap.
+///
+/// Running it per chunk is what keeps a slow keepalive stream flowing: the fixed-width scrub alone
+/// withholds up to `max_real_len - 1` bytes, so a response that dribbles fewer than that between
+/// flushes (a contained cursor agent leg sends ~9-byte keepalives) forwards NOTHING and the client
+/// times the connection out. Here the hold shrinks to the real straddling prefix — normally zero.
+fn scrub_release_safe(carry: &mut Vec<u8>, substitutions: &[(String, String)]) -> Vec<u8> {
+    let mut emit = scrub_buffer(carry, substitutions, false);
+    let held = straddle_prefix_len_many(carry, substitutions);
+    if held < carry.len() {
+        let mut releasable: Vec<u8> = carry.drain(..carry.len() - held).collect();
+        emit.extend_from_slice(&scrub_buffer(&mut releasable, substitutions, true));
+    }
+    emit
 }
 
 fn is_hop_by_hop(name: &str) -> bool {
@@ -419,6 +786,58 @@ fn same_authority(a: &str, b: &str) -> bool {
 ///
 /// Either side unresolvable is refused: the credential must not move to a destination this proxy
 /// cannot name, and an empty redirect chain reaches here as an unresolvable `original`.
+/// The client every credential-bearing relay forwards through, and the only one [`start`] will use.
+///
+/// The proxy is header-agnostic by design: it forwards whatever the container sent, and the forwarded
+/// agent credential rides `x-api-key`. reqwest's default redirect policy is `Policy::limited(10)`, and
+/// its cross-host scrub covers only AUTHORIZATION, COOKIE, cookie2, PROXY_AUTHORIZATION and
+/// WWW_AUTHENTICATE (`src/redirect.rs:239-251` in 0.12.28) — `x-api-key` is in none of them. So under
+/// the default policy a `3xx` from an allowlisted host carries the real credential onward to a host the
+/// allowlist never approved: the destination is decided BEFORE the redirect moves it.
+///
+/// That is measured, not inferred. `the_streamed_body_redirect_matrix_is_pinned_per_status` was first
+/// written against a default client and recorded the real credential arriving at an unapproved host on
+/// a cross-authority `301`. This construction is why that is not what ships, and it lives in this module
+/// rather than at the call site because a safety property a caller can forget is not a safety property.
+///
+/// A redirect is followed only while it stays on the upstream the credential in flight was registered
+/// for. That upstream is not the allowlist: [`ProxyEngine::authorize`] picks the destination from the
+/// credential itself, and the allowlist is the UNION of every present credential's upstream. A union
+/// check would approve a `3xx` from one registered vendor to ANOTHER — handing an Anthropic key to
+/// OpenAI's host — because both are on it. A refused attempt is `stop()`, which returns the `3xx` for
+/// the proxy to relay to the container unchanged.
+///
+/// `301`, `302` and `303` are the only statuses this policy ever judges. `307` and `308` preserve the
+/// request body, and a relayed body is a stream that cannot be replayed, so `tower-http` surfaces those
+/// two unchanged without consulting any policy — see
+/// [`the_streamed_body_redirect_matrix_is_pinned_per_status`], which measures all five. The container
+/// receives such a `3xx` verbatim and may act on it with its own placeholder-bearing client; what it
+/// cannot do is have this proxy carry the real credential there.
+///
+/// The pairing is available without per-request state, which is why one client serves every request:
+/// `Policy::custom` closes over nothing but the pure predicate, so no credential is reachable from
+/// here — while the attempt carries its own chain, whose FIRST entry is the original request URL that
+/// [`relay`] built from that credential's upstream.
+///
+/// EVERY HOP, not just the first, and each judged against the ORIGINAL rather than its predecessor:
+/// judging hop-against-predecessor would let a chain walk one authority at a time to anywhere. Verified
+/// in reqwest 0.12.28 rather than assumed — `TowerRedirectPolicy::redirect` (`src/redirect.rs:306`)
+/// pushes the previous URL onto an accumulating chain (`:315`) and then calls this policy with THAT
+/// hop's target (`:317`), so `previous()[0]` is the original request URL on every hop. An empty chain
+/// yields no original and is refused rather than followed.
+fn forwarding_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            let original = attempt.previous().first().map(|url| url.as_str()).unwrap_or("");
+            if allows_paired_redirect(original, attempt.url().as_str()) {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
+        .build()
+}
+
 pub fn allows_paired_redirect(original: &str, target: &str) -> bool {
     match (authority_of(original), authority_of(target)) {
         (Some(from), Some(to)) => same_authority(&from, &to),
@@ -536,8 +955,11 @@ fn random_token(len: usize) -> String {
 /// revocation point.
 pub struct RunningProxy {
     addr: SocketAddr,
+    /// `(authority, bound address)` for each leg listener, in the order handed to
+    /// [`start_with_legs`]. Empty for a proxy started without legs.
+    leg_addrs: Vec<(String, SocketAddr)>,
     engine: Arc<ProxyEngine>,
-    task: tokio::task::JoinHandle<()>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl RunningProxy {
@@ -571,13 +993,47 @@ impl RunningProxy {
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
     }
+
+    /// The base URL a container uses to reach the LEG listener bound for `authority`, reaching this
+    /// proxy at `host` — or `None` when no such leg was started. The same host/pinhole reasoning as
+    /// [`Self::container_base_url_via`] applies: every leg listener sits on the same address, only
+    /// the port differs, so the one pinholed address covers them all.
+    pub fn leg_base_url_via(&self, host: &str, authority: &str) -> Option<String> {
+        let want = host_key(authority);
+        self.leg_addrs
+            .iter()
+            .find(|(a, _)| same_authority(&host_key(a), &want))
+            .map(|(_, addr)| format!("http://{host}:{}", addr.port()))
+    }
+
+    /// The bound address of the leg listener for `authority` (for tests / diagnostics).
+    pub fn leg_addr(&self, authority: &str) -> Option<SocketAddr> {
+        let want = host_key(authority);
+        self.leg_addrs
+            .iter()
+            .find(|(a, _)| same_authority(&host_key(a), &want))
+            .map(|(_, addr)| *addr)
+    }
 }
 
 impl Drop for RunningProxy {
     fn drop(&mut self) {
-        // Job end = revocation: kill the listener so the placeholder stops working the instant the job
-        // is done, even if a caller forgets to deregister.
-        self.task.abort();
+        // JOB END IS A REVOCATION, and it has to reach connections that are ALREADY OPEN — not only
+        // the listener. Aborting each task drops that accept loop's `JoinSet`, and dropping a `JoinSet`
+        // aborts every task in it, so every accepted connection dies here too.
+        //
+        // Closing the listener alone would not be revocation. It stops the NEXT client and says
+        // nothing about the current one: an h2 or keep-alive connection accepted a moment earlier
+        // still holds `Arc<ProxyEngine>`, so its placeholder still resolves and it can keep a
+        // credential-bearing stream open, or start new requests, for as long as it likes. With a
+        // relayed body and no byte cap, "as long as it likes" is unbounded — see
+        // `dropping_the_proxy_revokes_connections_it_has_already_accepted`.
+        //
+        // The legs die with the primary: a leg outliving the job would be a credential-bearing
+        // listener nobody owns.
+        for task in &self.tasks {
+            task.abort();
+        }
     }
 }
 
@@ -627,13 +1083,48 @@ async fn bind_listener(
 /// port: that would place the listener outside the range the firewall pinhole names, and the job
 /// would then fail to reach its model with no indication that the port was the reason. Same
 /// no-fallback rule the rest of this path follows.
+///
+/// The forwarding client is built HERE and cannot be supplied. See [`forwarding_client`] for why: the
+/// redirect policy is the control that keeps the real credential on the upstream it was issued for, and
+/// a caller able to pass a client is a caller able to omit it.
 pub async fn start(
     engine: Arc<ProxyEngine>,
-    client: reqwest::Client,
     ports: Option<crate::sandbox_net::PortRange>,
 ) -> std::io::Result<RunningProxy> {
+    start_with_legs(engine, ports, &[]).await
+}
+
+/// [`start`], plus one LEG listener per entry of `leg_authorities`.
+///
+/// A leg listener is the routing selector for a multi-upstream credential: a request arriving on it
+/// is authorized via [`ProxyEngine::authorize_via`] with that leg's authority, so it forwards to the
+/// identified credential's own entry for that authority — see [`JobCredential::upstreams`]. The
+/// primary listener keeps the exact semantics [`start`] always had.
+///
+/// Every listener binds from the SAME `ports` range, so a namespace-contained job's firewall
+/// pinhole — rendered from the range, never from a bound port — covers the legs with no new rules.
+/// One job therefore consumes `1 + leg_authorities.len()` ports from the range for its lifetime.
+/// All listeners share one connection ceiling and one in-flight ceiling: the bounds stay job-global,
+/// so an extra leg never widens what one job may hold open.
+pub async fn start_with_legs(
+    engine: Arc<ProxyEngine>,
+    ports: Option<crate::sandbox_net::PortRange>,
+    leg_authorities: &[String],
+) -> std::io::Result<RunningProxy> {
+    // Two clients, because the redirect rule is a property of the CREDENTIAL, not of the listener.
+    // `paired_redirects` follows a 3xx only while it stays on the upstream the credential in flight was
+    // registered for; `no_redirects` follows none at all, and is what a typed Codex session forwards
+    // through, its credential being valid for a fixed set of paths. Neither is supplied by a caller —
+    // see [`forwarding_client`].
+    let clients = ForwardClients {
+        paired_redirects: forwarding_client().map_err(std::io::Error::other)?,
+        no_redirects: reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(std::io::Error::other)?,
+    };
     // KNOWN EXPOSURE, deliberately unchanged for now. `0.0.0.0` is every interface, so on a seller with
-    // a public IP and no firewall this per-job listener is internet-reachable on a random high port.
+    // a public IP and no firewall each per-job listener is internet-reachable on a random high port.
     // The placeholder is the bearer — a caller without it gets `NoKnownPlaceholder` — so this is not an
     // open relay. But the job HOLDS the placeholder by construction, so it can hand placeholder+port to
     // an outside accomplice, who can then burn the seller's model quota for the job's lifetime. Quota
@@ -644,16 +1135,76 @@ pub async fn start(
     // bridge gateway (`--add-host …:host-gateway`), where a `127.0.0.1` bind is unreachable and the
     // correct target is the bridge address. Changing this needs a Linux docker seat to verify against;
     // until then, seller-operators on a public box should firewall inbound ports.
+    let connections = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    // Shared across every connection, every listener, and both protocols, so neither multiplexing nor
+    // an extra leg can widen it.
+    let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS));
+
     let listener = bind_listener(ports).await?;
     let addr = listener.local_addr()?;
-    let engine_for_task = Arc::clone(&engine);
-    let connections = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
-    // Shared across every connection and both protocols, so multiplexing cannot widen it.
-    let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS));
-    let task = tokio::spawn(async move {
+    let mut tasks = Vec::with_capacity(1 + leg_authorities.len());
+    tasks.push(spawn_accept_loop(
+        listener,
+        Arc::clone(&engine),
+        clients.clone(),
+        Arc::clone(&connections),
+        Arc::clone(&in_flight),
+        None,
+    ));
+
+    let mut leg_addrs = Vec::with_capacity(leg_authorities.len());
+    for authority in leg_authorities {
+        let listener = bind_listener(ports).await?;
+        leg_addrs.push((authority.clone(), listener.local_addr()?));
+        tasks.push(spawn_accept_loop(
+            listener,
+            Arc::clone(&engine),
+            clients.clone(),
+            Arc::clone(&connections),
+            Arc::clone(&in_flight),
+            Some(authority.clone()),
+        ));
+    }
+
+    plog!("proxy: listener kind=primary port={}", addr.port());
+    for (authority, leg_addr) in &leg_addrs {
+        plog!("proxy: listener kind=leg authority={authority} port={}", leg_addr.port());
+    }
+
+    Ok(RunningProxy { addr, leg_addrs, engine, tasks })
+}
+
+/// One listener's accept loop. `via_authority` is `None` for the primary listener and the leg's
+/// authority for a leg listener — it decides which authorize entry point every request on this
+/// listener goes through, and nothing else about the connection handling differs.
+fn spawn_accept_loop(
+    listener: tokio::net::TcpListener,
+    engine: Arc<ProxyEngine>,
+    clients: ForwardClients,
+    connections: Arc<Semaphore>,
+    in_flight: Arc<Semaphore>,
+    via_authority: Option<String>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // EVERY CONNECTION IS OWNED BY THIS TASK, and that ownership is what makes job end a
+        // revocation rather than a request to stop.
+        //
+        // A detached `tokio::spawn` per connection would not be: tokio tasks are not scoped to their
+        // spawner, so aborting this accept loop would close the listener while every ALREADY-ACCEPTED
+        // connection kept running — each holding `Arc<ProxyEngine>` and so the live credential map.
+        // An h2 or keep-alive client could then hold a credential-bearing stream open past job end and
+        // start new requests on it, and the listener being shut would say nothing about any of it.
+        // Dropping a `JoinSet` aborts every task in it, so aborting this task now reaches them all.
+        let mut live: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
         loop {
-            let Ok((stream, _peer)) = listener.accept().await else {
-                continue;
+            let (stream, _peer) = tokio::select! {
+                accepted = listener.accept() => match accepted {
+                    Ok(accepted) => accepted,
+                    Err(_) => continue,
+                },
+                // Reap finished connections so a long-lived proxy does not accumulate their handles.
+                // Guarded, because `join_next` on an empty set is instantly `None` and would spin.
+                _ = live.join_next(), if !live.is_empty() => continue,
             };
             // Bound concurrent connections: acquire a permit before spawning, hold it for the life of
             // the connection. When all permits are out, this awaits — new connections queue at the OS
@@ -661,21 +1212,23 @@ pub async fn start(
             let Ok(permit) = Arc::clone(&connections).acquire_owned().await else {
                 continue; // semaphore closed — proxy shutting down
             };
-            let engine = Arc::clone(&engine_for_task);
-            let client = client.clone();
+            let engine = Arc::clone(&engine);
+            let clients = clients.clone();
             let in_flight = Arc::clone(&in_flight);
-            tokio::spawn(async move {
+            let via_authority = via_authority.clone();
+            live.spawn(async move {
                 let _permit = permit; // released when the connection ends
                 let io = TokioIo::new(stream);
                 let service = service_fn(move |req| {
                     let engine = Arc::clone(&engine);
-                    let client = client.clone();
+                    let clients = clients.clone();
                     let in_flight = Arc::clone(&in_flight);
+                    let via_authority = via_authority.clone();
                     async move {
                         // Held for the life of THIS request, so the ceiling counts requests rather
                         // than sockets. Excess requests wait here instead of each buffering a body.
                         let _in_flight = in_flight.acquire().await;
-                        handle_request(req, engine, client).await
+                        handle_request(req, engine, clients, via_authority).await
                     }
                 });
                 // Auto-negotiating server: it sniffs the HTTP/2 prior-knowledge preface
@@ -698,27 +1251,357 @@ pub async fn start(
                 let _ = builder.serve_connection(io, service).await;
             });
         }
-    });
-    Ok(RunningProxy { addr, engine, task })
+    })
 }
 
 type ProxyBody = BoxBody<Bytes, std::io::Error>;
 
-/// Serve one request: buffer it, run it through [`ProxyEngine::authorize`], and — only on a
-/// substituted forward — relay it to the real upstream and stream the response back. A refusal returns
-/// a `4xx`/`5xx` to the container with the real credential never in play.
+/// The two forwarding clients, selected per request by the authorized [`RedirectMode`].
+#[derive(Clone)]
+struct ForwardClients {
+    paired_redirects: reqwest::Client,
+    no_redirects: reqwest::Client,
+}
+
+// --- Per-request diagnostic logging (leg-level observability) --------------------------------------
+//
+// Emitted to stderr as `proxy: key=value` lines, matching the daemon's existing `sandbox:` convention:
+// no logging dependency, no subscriber, so a line always reaches the seat's captured stderr. A line
+// NEVER carries a credential value, a placeholder, or any header/body byte — only authorities, hosts,
+// ports, protocols, phases, wall-clock timings and outcomes.
+//
+// The question this exists to answer is WHO ended a stalled await — the container that gave up, or the
+// upstream that dropped the request. A log recording only "no response" cannot tell those apart: they
+// are byte-identical downstream. `terminated_by=` is that field.
+static PROXY_REQ_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Milliseconds since the Unix epoch. The FORWARD line's stamp is the anchor every wait is measured
+/// from: the container's outbound send time is not otherwise observable, so a duration differenced
+/// against the nearest visible ACP event (a title notification, say) is anchored to the wrong instant.
+fn proxy_log_now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or(0)
+}
+
+/// Records `terminated_by=downstream` if dropped before the upstream terminated the await.
+///
+/// A forwarded request holds one of these across [`relay`]. [`AwaitGuard::settle`] is called the instant
+/// the upstream returns a response header OR an error, disarming it. If instead the container closes its
+/// connection while the proxy is still awaiting the upstream, hyper drops the request future, this value
+/// is dropped un-settled, and the drop records that the CONTAINER (downstream) ended the wait. That is
+/// the single field separating a client-side timeout from an upstream-side one.
+struct AwaitGuard {
+    req: u64,
+    host: String,
+    settled: bool,
+}
+
+impl AwaitGuard {
+    fn settle(&mut self) {
+        self.settled = true;
+    }
+}
+
+impl Drop for AwaitGuard {
+    fn drop(&mut self) {
+        if !self.settled {
+            plog!(
+                "proxy: req#{} ts={} phase=await_response terminated_by=downstream host={}",
+                self.req,
+                proxy_log_now_ms(),
+                self.host,
+            );
+        }
+    }
+}
+
+/// Formats an optional timestamp as the number or `none`, so a `body_end` line for a stream that never
+/// yielded a byte still carries both fields — a missing field would read as a logging bug, not as "zero".
+struct OptTs(Option<u128>);
+
+impl std::fmt::Display for OptTs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(ts) => write!(f, "{ts}"),
+            None => f.write_str("none"),
+        }
+    }
+}
+
+/// Formats an optional byte length as the number or `none`, so a `forward_end` line for a leg with no
+/// credential to scrub still carries the `real_len` field. A missing field would read as a logging bug,
+/// and a `0` would read as "an empty credential" rather than "no credential on this leg". This is a
+/// LENGTH only — never the credential value; a length is not a secret, a prefix is.
+struct OptLen(Option<usize>);
+
+impl std::fmt::Display for OptLen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(len) => write!(f, "{len}"),
+            None => f.write_str("none"),
+        }
+    }
+}
+
+/// One frame's forwardable byte length, so [`StreamMeter`] counts bytes without knowing whether it
+/// wraps a raw upstream `Bytes` stream or a scrubbed `Frame<Bytes>` stream.
+trait MeteredItem {
+    fn payload_len(&self) -> usize;
+}
+impl MeteredItem for Bytes {
+    fn payload_len(&self) -> usize {
+        self.len()
+    }
+}
+impl MeteredItem for Frame<Bytes> {
+    // Only DATA frames carry body bytes; a trailers frame contributes zero.
+    fn payload_len(&self) -> usize {
+        self.data_ref().map_or(0, Bytes::len)
+    }
+}
+
+/// Which leg a [`StreamMeter`] observes. Selects the `phase=` label so `body_*` and `forward_*` lines
+/// for one request read directly against each other.
+#[derive(Clone, Copy)]
+enum MeterLeg {
+    /// Bytes RECEIVED from the upstream, before the scrub.
+    Upstream,
+    /// Bytes FORWARDED downstream to the container, after the scrub.
+    Forward,
+}
+impl MeterLeg {
+    fn first(self) -> &'static str {
+        match self {
+            Self::Upstream => "body_first_byte",
+            Self::Forward => "forward_first",
+        }
+    }
+    fn idle(self) -> &'static str {
+        match self {
+            Self::Upstream => "body_idle",
+            Self::Forward => "forward_idle",
+        }
+    }
+    fn end(self) -> &'static str {
+        match self {
+            Self::Upstream => "body_end",
+            Self::Forward => "forward_end",
+        }
+    }
+}
+
+/// Observes ONE leg of the response body — the region after the response header that [`AwaitGuard`] and
+/// the `await_response` line structurally cannot see. One meter wraps the raw upstream stream
+/// ([`MeterLeg::Upstream`]); a second wraps the scrubbed forwarded stream ([`MeterLeg::Forward`]).
+/// Reading the two together separates "the upstream sent little" from "the proxy forwarded little of
+/// what it received" — the gap between them is the credential-scrub holdback.
+///
+/// PASSIVE: it forwards every item unchanged and records only counts, timings and the terminator. It
+/// answers the body-phase form of the WHO-ended question:
+/// - `terminated_by=upstream kind=eof completed=true` — the leg ended naturally.
+/// - `terminated_by=upstream kind=error completed=false` — the leg errored (reset / GOAWAY / decode).
+/// - `terminated_by=downstream completed=false` — dropped before either terminal, i.e. hyper dropped
+///   the body because the container closed its connection mid-stream. This is the body-phase analogue
+///   of [`AwaitGuard`], and the ONLY way to observe a client that gives up AFTER the header.
+///
+/// `last_ts` is the discriminator for a mid-stream stall: the gap from it to the `*_end` line is the
+/// stall interval. While the leg produces nothing, a [`BODY_HEARTBEAT_PERIOD`] clock emits `*_idle`
+/// lines, so "a header then N seconds of nothing" is a POSITIVE reading with a denominator, not the
+/// absence of an end line. The clock only EMITS; it never cancels, so it cannot manufacture the
+/// terminator this meter finds. LOGS NO CREDENTIAL MATERIAL: `real_len` is the LENGTH of the credential
+/// string only, never its value, never the carry buffer, never a matched region or offset.
+struct StreamMeter<T, E> {
+    // `+ Sync` as well as `+ Send`: the boxed response body (`BoxBody` via `BodyExt::boxed`) requires
+    // `Send + Sync`, and the concrete streams satisfy both — erasing to `dyn … + Send` alone would drop
+    // `Sync` and fail the bound.
+    inner: std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<T, E>> + Send + Sync>>,
+    leg: MeterLeg,
+    req: u64,
+    host: String,
+    // The observed response-header instant: the anchor `*_first` and every `*_idle` gap are measured
+    // from it, both ends real events in this log rather than a value differenced against the nearest
+    // ACP notification.
+    header_ts: u128,
+    bytes: u64,
+    first_ts: Option<u128>,
+    last_ts: Option<u128>,
+    // LENGTH of the credential scrubbed on this leg (`None` when there is no scrub, e.g. the upstream
+    // leg). The holdback is `real_len - 1` bytes, so this is the parameter that predicts how much a
+    // stalled stream withholds. Printed as `none` when absent.
+    real_len: Option<usize>,
+    // Log-only clock: fires while the leg yields nothing, so an idle stall is an explicit line rather
+    // than silence. Polled but NEVER used to cancel — see [`BODY_HEARTBEAT_PERIOD`].
+    heartbeat: tokio::time::Interval,
+    // Set once the inner stream terminates (EOF or error) so Drop does not then record a spurious
+    // `terminated_by=downstream` — the inner terminal and the eventual drop are the same stream's end.
+    ended: bool,
+}
+
+impl<T, E> StreamMeter<T, E> {
+    fn new(
+        inner: std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<T, E>> + Send + Sync>>,
+        leg: MeterLeg,
+        req: u64,
+        host: String,
+        header_ts: u128,
+        real_len: Option<usize>,
+    ) -> Self {
+        // First tick one full period out, not immediately; `Skip` so a delayed poll collapses missed
+        // ticks to a single line rather than a catch-up burst.
+        let mut heartbeat = tokio::time::interval_at(
+            tokio::time::Instant::now() + BODY_HEARTBEAT_PERIOD,
+            BODY_HEARTBEAT_PERIOD,
+        );
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        Self {
+            inner,
+            leg,
+            req,
+            host,
+            header_ts,
+            bytes: 0,
+            first_ts: None,
+            last_ts: None,
+            real_len,
+            heartbeat,
+            ended: false,
+        }
+    }
+}
+
+impl<T: MeteredItem, E: std::fmt::Display> futures_util::Stream for StreamMeter<T, E> {
+    type Item = Result<T, E>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        // `Self: Unpin` (every field is), so unwrapping the pin needs no projection crate.
+        let this = self.get_mut();
+        match futures_util::Stream::poll_next(this.inner.as_mut(), cx) {
+            std::task::Poll::Ready(Some(Ok(item))) => {
+                let now = proxy_log_now_ms();
+                if this.first_ts.is_none() {
+                    this.first_ts = Some(now);
+                    plog!(
+                        "proxy: req#{} ts={now} phase={} host={} gap_from_header_ms={}",
+                        this.req,
+                        this.leg.first(),
+                        this.host,
+                        now.saturating_sub(this.header_ts),
+                    );
+                }
+                this.bytes += item.payload_len() as u64;
+                this.last_ts = Some(now);
+                std::task::Poll::Ready(Some(Ok(item)))
+            }
+            std::task::Poll::Ready(Some(Err(error))) => {
+                this.ended = true;
+                plog!(
+                    "proxy: req#{} ts={} phase={} terminated_by=upstream kind=error host={} bytes={} real_len={} completed=false first_ts={} last_ts={} msg={error}",
+                    this.req,
+                    proxy_log_now_ms(),
+                    this.leg.end(),
+                    this.host,
+                    this.bytes,
+                    OptLen(this.real_len),
+                    OptTs(this.first_ts),
+                    OptTs(this.last_ts),
+                );
+                std::task::Poll::Ready(Some(Err(error)))
+            }
+            std::task::Poll::Ready(None) => {
+                this.ended = true;
+                let now = proxy_log_now_ms();
+                plog!(
+                    "proxy: req#{} ts={now} phase={} terminated_by=upstream kind=eof host={} bytes={} real_len={} completed=true first_ts={} last_ts={}",
+                    this.req,
+                    this.leg.end(),
+                    this.host,
+                    this.bytes,
+                    OptLen(this.real_len),
+                    OptTs(this.first_ts),
+                    OptTs(this.last_ts),
+                );
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => {
+                // The leg has nothing right now — the inner stream is parked (or scrub is holding its
+                // carry). Drive the heartbeat so the withheld case is an explicit line rather than an
+                // absence. Polling the interval registers its waker on `cx`, so the task is re-polled
+                // each period even while the inner stays parked; the inner's own waker is already
+                // registered from the `poll_next` above, so a real item still wakes us. Draining every
+                // ready tick keeps it to one line per elapsed period.
+                while this.heartbeat.poll_tick(cx).is_ready() {
+                    let now = proxy_log_now_ms();
+                    plog!(
+                        "proxy: req#{} ts={now} phase={} host={} bytes={} gap_from_header_ms={}",
+                        this.req,
+                        this.leg.idle(),
+                        this.host,
+                        this.bytes,
+                        now.saturating_sub(this.header_ts),
+                    );
+                }
+                std::task::Poll::Pending
+            }
+        }
+    }
+}
+
+impl<T, E> Drop for StreamMeter<T, E> {
+    fn drop(&mut self) {
+        // Un-ended at drop ⇒ the leg was torn down before the inner stream finished, i.e. hyper dropped
+        // the body because the container closed its connection mid-stream. `bytes` is then the total the
+        // proxy managed to move before the client gave up.
+        if !self.ended {
+            plog!(
+                "proxy: req#{} ts={} phase={} terminated_by=downstream host={} bytes={} real_len={} completed=false first_ts={} last_ts={}",
+                self.req,
+                proxy_log_now_ms(),
+                self.leg.end(),
+                self.host,
+                self.bytes,
+                OptLen(self.real_len),
+                OptTs(self.first_ts),
+                OptTs(self.last_ts),
+            );
+        }
+    }
+}
+
+/// Serve one request: run its HEADERS through [`ProxyEngine::authorize`] and — only on a substituted
+/// forward — stream its body to the real upstream and stream the response back. A refusal returns a
+/// `4xx`/`5xx` to the container with the real credential never in play, and without reading the body.
+///
+/// Nothing here accumulates a request. The body is a stream from the container's socket to the
+/// upstream's, which is what lets a client that holds its request open — an agent streaming a turn —
+/// be served at all: waiting for such a body to END is waiting forever.
 async fn handle_request(
     req: Request<Incoming>,
     engine: Arc<ProxyEngine>,
-    client: reqwest::Client,
+    clients: ForwardClients,
+    via_authority: Option<String>,
 ) -> Result<Response<ProxyBody>, std::convert::Infallible> {
     let method = req.method().clone();
+    let proxy_req = PROXY_REQ_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // `req.version()` is the NEGOTIATED protocol (HTTP/2.0 for the h2c legs, HTTP/1.1 otherwise) — it
+    // decides whether an http1-only timeout like `header_read_timeout` is even in scope for this leg.
+    let listener_label = via_authority.as_deref().unwrap_or("primary").to_owned();
+    plog!(
+        "proxy: req#{proxy_req} ts={} phase=arrived listener={listener_label} proto={:?} method={method}",
+        proxy_log_now_ms(),
+        req.version(),
+    );
     // The path+query is forwarded verbatim; it is never a substitution input.
     let path_and_query = req
         .uri()
         .path_and_query()
         .map(|pq| pq.as_str().to_owned())
         .unwrap_or_else(|| "/".to_owned());
+    let request_path = req.uri().path().to_owned();
     let headers: Vec<(String, String)> = req
         .headers()
         .iter()
@@ -726,55 +1609,123 @@ async fn handle_request(
             value.to_str().ok().map(|v| (name.as_str().to_owned(), v.to_owned()))
         })
         .collect();
-    // Buffer the body under a size cap AND a read deadline: the listener lives in the seller daemon,
-    // so a stranger's job must not be able to OOM it with an unbounded body or pin memory by
-    // trickling one under the cap forever. `Limited` stops reading past the cap (413); the timeout
-    // bounds a slow-loris body (408). Neither touches the upstream RESPONSE stream.
-    let capped = Limited::new(req.into_body(), MAX_REQUEST_BODY_BYTES);
-    let body = match tokio::time::timeout(BODY_READ_TIMEOUT, capped.collect()).await {
-        Ok(Ok(collected)) => collected.to_bytes(),
-        Ok(Err(error)) => {
-            let over_cap = error
-                .downcast_ref::<http_body_util::LengthLimitError>()
-                .is_some();
-            return Ok(if over_cap {
-                refusal_response(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "request body exceeds the proxy limit",
-                )
-            } else {
-                refusal_response(StatusCode::BAD_GATEWAY, "failed to read request body")
-            });
-        }
-        Err(_) => {
-            return Ok(refusal_response(
-                StatusCode::REQUEST_TIMEOUT,
-                "request body read timed out",
-            ))
-        }
-    };
-
-    // The reverse-substitution pair for the response leg, resolved from the SAME header match that
-    // authorizes the request. Taken before `authorize` consumes nothing — both read the incoming
-    // headers, so they agree on which job this is.
-    let scrub = engine.scrub_pair_for(&headers);
-
-    match engine.authorize(&headers) {
+    // AUTHORIZE BEFORE READING A SINGLE BODY BYTE. `authorize_request` takes the request line and the
+    // headers only, and the body is deliberately not a substitution surface (see "Why the BODY is never
+    // a substitution surface" in the module header), so the body was never an input to this decision.
+    // Deciding first means a request we refuse costs us nothing at all: we answer from the headers and
+    // drop the body unread.
+    //
+    // Which entry point decides is a property of the LISTENER the request arrived on: the primary
+    // listener forwards to the credential's primary upstream, a leg listener to the credential's own
+    // entry for that leg's authority. Same steps, same refusals — only the selector differs. A typed
+    // Codex session takes its own narrow route ahead of both, on the primary listener only.
+    let decision = engine.authorize_request(
+        method.as_str(),
+        &request_path,
+        &headers,
+        via_authority.as_deref(),
+    );
+    match decision {
         Decision::Refuse(reason) => {
+            plog!(
+                "proxy: req#{proxy_req} ts={} phase=authorize outcome=refuse reason={reason}",
+                proxy_log_now_ms(),
+            );
             let status = match reason {
                 Refusal::DestinationNotAllowed { .. } => StatusCode::FORBIDDEN,
                 Refusal::NoKnownPlaceholder => StatusCode::BAD_GATEWAY,
+                Refusal::InvalidCodexHeaders | Refusal::RequestNotAllowed { .. } => {
+                    StatusCode::FORBIDDEN
+                }
+                // Registration-time refusals; reachable here only through `authorize`'s defensive
+                // empty-list arm, never through a credential `register` accepted.
+                Refusal::NoUpstream | Refusal::DuplicateUpstream { .. } => StatusCode::FORBIDDEN,
             };
             Ok(refusal_response(status, &reason.to_string()))
         }
-        // `body` is the ORIGINAL buffered request body, forwarded verbatim: the decision never
-        // carried it, so nothing substituted a credential into it.
-        Decision::Forward { upstream, headers } => {
-            match relay(&client, &method, &upstream, &path_and_query, headers, body, scrub).await {
+        Decision::Forward {
+            upstream,
+            headers,
+            scrub,
+            redirects,
+        } => {
+            let host = authority_of(&upstream).unwrap_or_else(|| upstream.clone());
+            plog!(
+                "proxy: req#{proxy_req} ts={} phase=forward host={host}",
+                proxy_log_now_ms(),
+            );
+            // The redirect rule belongs to the CREDENTIAL, not to the listener: a paired-authority
+            // credential may follow a 3xx that stays on its own upstream, and a typed Codex session may
+            // not follow one at all, because its credential is valid for fixed paths only.
+            let client = match redirects {
+                RedirectMode::PairedAuthority => &clients.paired_redirects,
+                RedirectMode::Disabled => &clients.no_redirects,
+            };
+            // The body is RELAYED, never accumulated: each chunk goes upstream as it arrives, so the
+            // daemon holds one chunk rather than a whole request, and a client that never closes its
+            // body is no longer a client we wait for forever. It is forwarded VERBATIM — the decision
+            // did not carry it, so nothing substituted a credential into it.
+            //
+            // Both bounds the buffered read used to provide are KEPT, now enforced on the stream
+            // instead of on a collected buffer: the size cap below, and `idle_bounded`, which fails the
+            // request after BODY_IDLE_TIMEOUT of silence. Streaming answers the OOM half of the old cap
+            // by itself — the daemon holds one chunk — but a ceiling on what one job may push through an
+            // approved credential is a separate control, so it stays.
+            //
+            // The cap is checked TWICE, because a stream can only answer one of the two questions early.
+            // A declared `content-length` is known before a byte moves, so an over-cap body is refused
+            // with the same `413` the buffered read gave it, and nothing is sent upstream. A body with no
+            // declared length (chunked, or HTTP/2) cannot be judged until it arrives, so `size_bounded`
+            // is the backstop: it fails the request the moment the cap is passed, mid-flight, which
+            // surfaces as a `502` because the upstream request is already open by then.
+            let declared = req
+                .headers()
+                .get(hyper::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|text| text.parse::<u64>().ok());
+            if declared.is_some_and(|length| length > MAX_REQUEST_BODY_BYTES as u64) {
+                plog!(
+                    "proxy: req#{proxy_req} ts={} phase=forward outcome=refuse reason=body_over_cap host={host}",
+                    proxy_log_now_ms(),
+                );
+                return Ok(refusal_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request body exceeds the proxy limit",
+                ));
+            }
+            let body = reqwest::Body::wrap_stream(size_bounded(
+                idle_bounded(req.into_body().into_data_stream(), BODY_IDLE_TIMEOUT),
+                MAX_REQUEST_BODY_BYTES,
+            ));
+            // Held across the await. `settle` disarms it the instant the upstream terminates the await
+            // (a response header or an error); if the CONTAINER closes first, this drops un-settled and
+            // records `terminated_by=downstream` — the field that tells a client timeout from an
+            // upstream drop, which are otherwise byte-identical as "no response".
+            let mut await_guard = AwaitGuard { req: proxy_req, host: host.clone(), settled: false };
+            let outcome = relay(
+                client,
+                &method,
+                &upstream,
+                &path_and_query,
+                headers,
+                body,
+                scrub,
+                proxy_req,
+                &host,
+            )
+            .await;
+            await_guard.settle();
+            match outcome {
                 Ok(response) => Ok(response),
                 // No-fallback: an upstream failure fails the request; it never resends without the
                 // proxy or with the real credential in the container.
-                Err(message) => Ok(refusal_response(StatusCode::BAD_GATEWAY, &message)),
+                Err(message) => {
+                    plog!(
+                        "proxy: req#{proxy_req} ts={} phase=await_response terminated_by=upstream kind=error host={host} msg={message}",
+                        proxy_log_now_ms(),
+                    );
+                    Ok(refusal_response(StatusCode::BAD_GATEWAY, &message))
+                }
             }
         }
     }
@@ -795,62 +1746,213 @@ async fn relay(
     upstream: &str,
     path_and_query: &str,
     headers: Vec<(String, String)>,
-    body: Bytes,
-    scrub: Option<(String, String)>,
+    body: reqwest::Body,
+    scrub: Vec<(String, String)>,
+    req: u64,
+    host: &str,
 ) -> Result<Response<ProxyBody>, String> {
     let url = format!("{}{}", upstream.trim_end_matches('/'), path_and_query);
     let method = reqwest::Method::from_bytes(method.as_str().as_bytes())
         .map_err(|error| format!("bad method: {error}"))?;
-    let mut request = client.request(method, &url).body(body.to_vec());
+    let mut request = client.request(method, &url).body(body);
     for (name, value) in headers {
+        if name.eq_ignore_ascii_case("accept-encoding") {
+            continue;
+        }
         request = request.header(name, value);
     }
+    request = request.header(reqwest::header::ACCEPT_ENCODING, "identity");
+    // The anchor for this request's wait: the outbound send, otherwise unobservable. Every duration
+    // derived downstream is measured from THIS `ts`, never from the nearest visible event.
+    plog!(
+        "proxy: req#{req} ts={} phase=await_send host={host}",
+        proxy_log_now_ms(),
+    );
     let upstream_response = request
         .send()
         .await
         .map_err(|error| format!("upstream request failed: {error}"))?;
 
+    let supported_encoding = upstream_response
+        .headers()
+        .get_all(reqwest::header::CONTENT_ENCODING)
+        .iter()
+        .all(|value| {
+            value.to_str().is_ok_and(|text| {
+                let mut encodings = text.split(',').map(str::trim);
+                let first = encodings.next();
+                first.is_some_and(|encoding| encoding.eq_ignore_ascii_case("identity"))
+                    && encodings.all(|encoding| encoding.eq_ignore_ascii_case("identity"))
+            })
+        });
+    if !supported_encoding {
+        return Err("upstream response uses an unsupported Content-Encoding".to_owned());
+    }
+
     let status = upstream_response.status();
+    // The upstream terminated the await by answering. Pairs with `await_send` above: the interval
+    // between these two `ts` values IS the send->response-header wait for this request. Held as the
+    // anchor `StreamMeter` measures time-to-first-byte from — the same event, not a nearby proxy for it.
+    let header_ts = proxy_log_now_ms();
+    plog!(
+        "proxy: req#{req} ts={header_ts} phase=await_response terminated_by=upstream kind=response_header host={host} status={}",
+        status.as_u16(),
+    );
     let mut builder = Response::builder().status(status.as_u16());
     for (name, value) in upstream_response.headers() {
         if is_hop_by_hop(name.as_str()) {
             continue;
         }
-        // Response headers are scrubbed too: an upstream that reflects the credential in a header
-        // (`www-authenticate`, a debug echo) must not hand it to the container.
-        match (&scrub, value.to_str()) {
-            (Some((real, placeholder)), Ok(text)) if text.contains(real.as_str()) => {
-                builder = builder.header(name, text.replace(real.as_str(), placeholder));
-            }
-            _ => builder = builder.header(name, value),
-        }
+        // Scrub raw bytes. A valid HTTP header can contain non-UTF-8 `obs-text`, so a text-only branch
+        // would pass the real credential unchanged when any neighboring byte was non-UTF-8.
+        let scrubbed = replace_bytes_many(value.as_bytes(), &scrub);
+        let scrubbed = hyper::header::HeaderValue::from_bytes(&scrubbed)
+            .map_err(|_| "upstream response has an unsafe header value".to_owned())?;
+        builder = builder.header(name, scrubbed);
     }
-    let upstream_body = Box::pin(upstream_response.bytes_stream());
-    let body = match scrub {
-        Some((real, placeholder)) => {
-            BodyExt::boxed(StreamBody::new(scrub_stream(upstream_body, real, placeholder)))
-        }
-        None => BodyExt::boxed(StreamBody::new(
-            upstream_body.map(|chunk| chunk.map(Frame::data).map_err(std::io::Error::other)),
-        )),
+    // Instrument the response body — the region after the header that `await_response` cannot see.
+    // Two meters wrap the same body: the UPSTREAM leg counts what the upstream sent (before scrub), the
+    // FORWARD leg counts what the proxy forwards downstream (after scrub). Both are passive — they
+    // forward every item unchanged and record only timings and the terminator; on Drop (hyper dropping
+    // the body because the container closed mid-stream) each records `terminated_by=downstream`, the
+    // body-phase analogue of `AwaitGuard`.
+    let metered = StreamMeter::new(
+        Box::pin(upstream_response.bytes_stream()),
+        MeterLeg::Upstream,
+        req,
+        host.to_owned(),
+        header_ts,
+        None, // the upstream leg is not scrubbed, so it has no holdback width to report
+    );
+    // The WIDEST real value in play, not the only one: it is what sets `scrub_stream`'s holdback, so it
+    // is the number that explains a short forward. Captured before `scrub` is consumed below.
+    let real_len = scrub.iter().map(|(real, _)| real.len()).max();
+    let forwarded: std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<Frame<Bytes>, std::io::Error>> + Send + Sync>,
+    > = if scrub.is_empty() {
+        Box::pin(metered.map(|chunk| chunk.map(Frame::data).map_err(std::io::Error::other)))
+    } else {
+        Box::pin(scrub_stream(metered, scrub))
     };
+    let forward_metered =
+        StreamMeter::new(forwarded, MeterLeg::Forward, req, host.to_owned(), header_ts, real_len);
+    let body = BodyExt::boxed(StreamBody::new(forward_metered));
     builder
         .body(body)
         .map_err(|error| format!("building proxied response failed: {error}"))
 }
 
-/// Rewrite `real` back to `placeholder` across a streamed response body, without buffering the stream.
+/// Relay a request body chunk-by-chunk, dropping a client that goes SILENT without cutting off one
+/// that is merely slow.
 ///
-/// A credential can straddle a chunk boundary, so a naive per-chunk replace would miss it. This holds
-/// back the last `real.len() - 1` bytes of what it would otherwise emit — the longest possible partial
-/// match — and re-examines them once the next chunk arrives. The held-back tail is flushed when the
-/// upstream stream ends.
+/// The deadline is measured on the GAP between chunks, so it does not care how long a body takes or
+/// how large it is — only that it is still arriving. A client that keeps sending is never interrupted;
+/// one that stops errors the stream `idle` later, and that error aborts the upstream request, so a
+/// credential-bearing connection never outlives the client that justified it. Cancellation the other
+/// way is already covered: if the upstream dies, `relay`'s response stream errors and hyper closes the
+/// container's connection.
+///
+/// Trailers are dropped. This is a byte relay onto a fresh upstream request, whose framing is hyper's
+/// to generate; forwarding the container's trailers onto it would be forwarding metadata about a
+/// different HTTP exchange.
+/// Takes a chunk STREAM rather than the [`Incoming`] body it is used on, because `Incoming` cannot be
+/// constructed outside hyper — a synthetic one is the only way to test this at all, and an untested
+/// deadline is the one thing standing between a silent client and a pinned daemon connection.
+fn idle_bounded<S, E>(
+    chunks: S,
+    idle: Duration,
+) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static
+where
+    S: futures_util::Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    // `None` inner ⇒ the stream is finished (ended, errored, or timed out); stop yielding.
+    futures_util::stream::unfold(
+        Some(Box::pin(chunks)),
+        move |inner| async move {
+            let mut inner = inner?;
+            match tokio::time::timeout(idle, inner.next()).await {
+                Err(_) => Some((
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "request body went silent",
+                    )),
+                    None,
+                )),
+                Ok(None) => None,
+                Ok(Some(Ok(chunk))) => Some((Ok(chunk), Some(inner))),
+                Ok(Some(Err(error))) => Some((Err(std::io::Error::other(error)), None)),
+            }
+        },
+    )
+}
+
+/// Fail a request body that runs past `max` bytes, counting as it streams.
+///
+/// This is the streaming form of the size cap the buffered read used to apply with `Limited`. It is
+/// the same limit and the same refusal point — the request dies the moment the cap is passed — but it
+/// no longer needs the body in memory to enforce it: the count is a running total, and the bytes
+/// themselves are already gone upstream. A body that stays under the cap is never touched.
+///
+/// The cap is on the RELAYED request only. It says nothing about the upstream's response, which is a
+/// stream this proxy never bounds by size.
+fn size_bounded<S>(
+    chunks: S,
+    max: usize,
+) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static
+where
+    S: futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+{
+    // `None` inner ⇒ the stream is finished (ended, errored, or over the cap); stop yielding.
+    futures_util::stream::unfold(
+        (Some(Box::pin(chunks)), 0usize),
+        move |(inner, seen)| async move {
+            let mut inner = inner?;
+            match inner.next().await {
+                None => None,
+                Some(Err(error)) => Some((Err(error), (None, seen))),
+                Some(Ok(chunk)) => {
+                    let seen = seen.saturating_add(chunk.len());
+                    if seen > max {
+                        return Some((
+                            Err(std::io::Error::other("request body exceeds the proxy limit")),
+                            (None, seen),
+                        ));
+                    }
+                    Some((Ok(chunk), (Some(inner), seen)))
+                }
+            }
+        },
+    )
+}
+
+/// Rewrite every real value back to its placeholder across a streamed response body, without
+/// buffering the stream.
+///
+/// A credential can straddle a chunk boundary, so a naive per-chunk replace would miss it. On every
+/// chunk [`scrub_release_safe`] forwards everything that provably cannot begin a split credential and
+/// holds back ONLY the longest tail that is still a proper prefix of some real value — normally
+/// nothing. The held-back tail is flushed in full when the upstream stream ends, because no later
+/// chunk can then straddle into it.
+///
+/// Holding only the true straddling prefix — rather than a flat `max_real_len - 1` bytes every chunk —
+/// is what lets a slow stream flow. A response that dribbles fewer than `max_real_len - 1` bytes
+/// between reads (a contained cursor agent leg sends ~9-byte keepalives, real value 424 B) would
+/// otherwise forward NOTHING and the client would time the connection out mid-body; here each
+/// keepalive passes straight through.
+///
+/// No idle timer, on purpose. The per-chunk release already forwards every provably-safe byte the
+/// instant its chunk arrives, so the only bytes ever held are a straddling credential prefix — which
+/// no timer may release, because a later chunk could still complete it into the real value. An earlier
+/// design flushed the holdback on an inactivity timer; once the release runs per chunk that timer can
+/// only ever re-hold the same prefix, so it is gone. A genuinely silent upstream (no bytes, no EOF) is
+/// bounded upstream of here by [`BODY_IDLE_TIMEOUT`] on the request leg and by the client's own read
+/// deadline; the scrub itself just waits for the next chunk or the EOF.
 ///
 /// SSE responses stay streaming: each chunk is forwarded as it arrives, minus that small carry-over.
 fn scrub_stream<S>(
     inner: S,
-    real: String,
-    placeholder: String,
+    substitutions: Vec<(String, String)>,
 ) -> impl futures_util::Stream<Item = Result<Frame<Bytes>, std::io::Error>>
 where
     S: futures_util::Stream<Item = reqwest::Result<Bytes>> + Unpin,
@@ -859,7 +1961,7 @@ where
     futures_util::stream::unfold(
         (Some(inner), Vec::<u8>::new()),
         move |(inner, carry)| {
-            let (real, placeholder) = (real.clone(), placeholder.clone());
+            let substitutions = substitutions.clone();
             async move {
                 let mut inner = inner?;
                 let mut carry = carry;
@@ -867,26 +1969,24 @@ where
                     match inner.next().await {
                         Some(Ok(chunk)) => {
                             carry.extend_from_slice(&chunk);
-                            let replaced =
-                                replace_bytes(&carry, real.as_bytes(), placeholder.as_bytes());
-                            // Everything but a possible split match at the tail is safe to emit.
-                            let hold = real.len().saturating_sub(1).min(replaced.len());
-                            let split = replaced.len() - hold;
-                            if split == 0 {
-                                // Nothing emittable yet — keep pulling rather than yielding empty.
-                                carry = replaced;
+                            // Release everything provably safe on THIS chunk, holding only a genuine
+                            // straddling prefix (normally nothing) — not the flat `max_real_len - 1`
+                            // tail, which starves a slow keepalive stream (see `scrub_release_safe`).
+                            let emit = scrub_release_safe(&mut carry, &substitutions);
+                            if emit.is_empty() {
+                                // Nothing provably safe yet — keep pulling rather than yielding empty.
                                 continue;
                             }
-                            let emit = Bytes::copy_from_slice(&replaced[..split]);
-                            let rest = replaced[split..].to_vec();
-                            return Some((Ok(Frame::data(emit)), (Some(inner), rest)));
+                            return Some((
+                                Ok(Frame::data(Bytes::from(emit))),
+                                (Some(inner), carry),
+                            ));
                         }
                         Some(Err(error)) => {
                             return Some((Err(std::io::Error::other(error)), (None, Vec::new())));
                         }
                         None => {
-                            let tail =
-                                replace_bytes(&carry, real.as_bytes(), placeholder.as_bytes());
+                            let tail = scrub_buffer(&mut carry, &substitutions, true);
                             if tail.is_empty() {
                                 return None;
                             }
@@ -920,6 +2020,10 @@ mod tests {
 
     const REAL: &str = "sk-ant-api03-REALaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const UPSTREAM: &str = ANTHROPIC_DEFAULT_UPSTREAM;
+    const CODEX_ACCESS_PLACEHOLDER: &str = "synthetic.header.access-placeholder";
+    const CODEX_ACCOUNT_PLACEHOLDER: &str = "account-placeholder";
+    const CODEX_REAL_ACCESS: &str = "real-access-token-sentinel";
+    const CODEX_REAL_ACCOUNT: &str = "real-account-sentinel";
 
     fn engine_with_job(placeholder: &str, upstream: &str) -> ProxyEngine {
         let engine = ProxyEngine::new([authority_of(UPSTREAM).unwrap()]);
@@ -930,7 +2034,7 @@ mod tests {
             JobCredential {
                 placeholder: placeholder.to_owned(),
                 real: REAL.to_owned(),
-                upstream: upstream.to_owned(),
+                upstreams: vec![upstream.to_owned()],
             },
         );
         engine
@@ -938,6 +2042,146 @@ mod tests {
 
     fn hdr(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    fn register_codex_session(engine: &ProxyEngine, upstream: &str) {
+        engine
+            .register_codex_session(CodexSessionCredential {
+                access_placeholder: CODEX_ACCESS_PLACEHOLDER.to_owned(),
+                access_token: CODEX_REAL_ACCESS.to_owned(),
+                account_placeholder: CODEX_ACCOUNT_PLACEHOLDER.to_owned(),
+                account_id: CODEX_REAL_ACCOUNT.to_owned(),
+                upstream: upstream.to_owned(),
+            })
+            .expect("register the synthetic Codex session");
+    }
+
+    #[test]
+    fn codex_session_rewrites_both_exact_headers_for_an_approved_request() {
+        let engine = ProxyEngine::new(["chatgpt.com".to_owned()]);
+        register_codex_session(&engine, "https://chatgpt.com/backend-api/codex");
+        let headers = hdr(&[
+            ("Authorization", &format!("Bearer {CODEX_ACCESS_PLACEHOLDER}")),
+            ("ChatGPT-Account-ID", CODEX_ACCOUNT_PLACEHOLDER),
+            ("content-type", "application/json"),
+            ("connection", "keep-alive"),
+        ]);
+
+        match engine.authorize_request("POST", "/responses", &headers, None) {
+            Decision::Forward {
+                upstream,
+                headers,
+                scrub,
+                redirects,
+            } => {
+                assert_eq!(upstream, "https://chatgpt.com/backend-api/codex");
+                assert_eq!(redirects, RedirectMode::Disabled);
+                assert_eq!(
+                    headers
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                        .map(|(_, value)| value.as_str()),
+                    Some("Bearer real-access-token-sentinel")
+                );
+                assert_eq!(
+                    headers
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case("chatgpt-account-id"))
+                        .map(|(_, value)| value.as_str()),
+                    Some(CODEX_REAL_ACCOUNT)
+                );
+                assert!(
+                    !headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("connection")),
+                    "the typed route must still remove hop-by-hop headers"
+                );
+                assert_eq!(
+                    scrub,
+                    vec![
+                        (CODEX_REAL_ACCESS.to_owned(), CODEX_ACCESS_PLACEHOLDER.to_owned()),
+                        (CODEX_REAL_ACCOUNT.to_owned(), CODEX_ACCOUNT_PLACEHOLDER.to_owned()),
+                    ]
+                );
+            }
+            other => panic!("expected the Codex session to forward, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_session_refuses_unapproved_methods_paths_and_headers() {
+        let engine = ProxyEngine::new(["chatgpt.com".to_owned()]);
+        register_codex_session(&engine, "https://chatgpt.com/backend-api/codex");
+        let valid = hdr(&[
+            ("authorization", &format!("Bearer {CODEX_ACCESS_PLACEHOLDER}")),
+            ("chatgpt-account-id", CODEX_ACCOUNT_PLACEHOLDER),
+        ]);
+
+        for (method, path) in [("DELETE", "/responses"), ("POST", "/other")] {
+            assert_eq!(
+                engine.authorize_request(method, path, &valid, None),
+                Decision::Refuse(Refusal::RequestNotAllowed {
+                    method: method.to_owned(),
+                    path: path.to_owned(),
+                })
+            );
+        }
+
+        for headers in [
+            hdr(&[(
+                "authorization",
+                &format!("Bearer {CODEX_ACCESS_PLACEHOLDER}"),
+            )]),
+            hdr(&[
+                ("authorization", &format!("Bearer {CODEX_ACCESS_PLACEHOLDER}")),
+                ("chatgpt-account-id", "wrong-account-placeholder"),
+            ]),
+            hdr(&[
+                ("authorization", &format!("Bearer {CODEX_ACCESS_PLACEHOLDER}")),
+                ("authorization", "Bearer second-value"),
+                ("chatgpt-account-id", CODEX_ACCOUNT_PLACEHOLDER),
+            ]),
+            hdr(&[
+                ("authorization", &format!("Bearer {CODEX_ACCESS_PLACEHOLDER}")),
+                ("chatgpt-account-id", CODEX_ACCOUNT_PLACEHOLDER),
+                ("chatgpt-account-id", "second-account"),
+            ]),
+        ] {
+            assert_eq!(
+                engine.authorize_request("POST", "/responses", &headers, None),
+                Decision::Refuse(Refusal::InvalidCodexHeaders)
+            );
+        }
+
+        assert!(matches!(
+            engine.authorize_request("GET", "/models", &valid, None),
+            Decision::Forward { .. }
+        ));
+
+        let unsafe_placeholder = CodexSessionCredential {
+            access_placeholder: CODEX_REAL_ACCESS.to_owned(),
+            access_token: CODEX_REAL_ACCESS.to_owned(),
+            account_placeholder: CODEX_ACCOUNT_PLACEHOLDER.to_owned(),
+            account_id: CODEX_REAL_ACCOUNT.to_owned(),
+            upstream: "https://chatgpt.com/backend-api/codex".to_owned(),
+        };
+        assert_eq!(
+            engine.register_codex_session(unsafe_placeholder),
+            Err(Refusal::InvalidCodexHeaders),
+            "a placeholder must never equal a real session value"
+        );
+    }
+
+    #[test]
+    fn codex_session_decision_debug_text_redacts_real_values() {
+        let engine = ProxyEngine::new(["chatgpt.com".to_owned()]);
+        register_codex_session(&engine, "https://chatgpt.com/backend-api/codex");
+        let headers = hdr(&[
+            ("authorization", &format!("Bearer {CODEX_ACCESS_PLACEHOLDER}")),
+            ("chatgpt-account-id", CODEX_ACCOUNT_PLACEHOLDER),
+        ]);
+
+        let debug = format!("{:?}", engine.authorize_request("POST", "/responses", &headers, None));
+        assert!(!debug.contains(CODEX_REAL_ACCESS));
+        assert!(!debug.contains(CODEX_REAL_ACCOUNT));
     }
 
     /// Substring search over raw bytes, for asserting a credential is (or is not) present.
@@ -1002,6 +2246,194 @@ mod tests {
         }
     }
 
+    // BACK-COMPAT IS THE ACCEPTANCE: a credential listing ONE upstream is decided exactly as it
+    // always was — same Forward, same substitution target, same refusal shapes. The claude/codex
+    // path IS this case (every env-sourced credential registers a one-entry list), so this test is
+    // the direct answer to "does multi-upstream change anything for the existing seats".
+    #[test]
+    fn a_single_upstream_credential_is_decided_exactly_as_before() {
+        let upstream = "https://api.anthropic.com".to_owned();
+        let engine = ProxyEngine::new([authority_of(&upstream).unwrap()]);
+        engine
+            .register(JobCredential {
+                placeholder: "PLACEHOLDER".into(),
+                real: "REAL_VALUE".into(),
+                upstreams: vec![upstream.clone()],
+            })
+            .expect("a single-upstream credential must register exactly as before");
+        let headers = vec![("authorization".to_owned(), "Bearer PLACEHOLDER".to_owned())];
+        match engine.authorize(&headers) {
+            Decision::Forward { upstream: chosen, headers, .. } => {
+                assert_eq!(chosen, upstream, "the primary path must forward to the one upstream");
+                assert_eq!(
+                    headers,
+                    vec![("authorization".to_owned(), "Bearer REAL_VALUE".to_owned())],
+                    "substitution must be unchanged"
+                );
+            }
+            other => panic!("expected Forward, got {other:?}"),
+        }
+    }
+
+    // The primary path never looks past the first entry: extra legs change nothing for traffic on
+    // the primary listener.
+    #[test]
+    fn the_primary_path_ignores_extra_legs() {
+        let a = "https://api2.cursor.sh".to_owned();
+        let b = "https://agent.cursor.example".to_owned();
+        let engine =
+            ProxyEngine::new([authority_of(&a).unwrap(), authority_of(&b).unwrap()]);
+        engine
+            .register(JobCredential {
+                placeholder: "PLACEHOLDER".into(),
+                real: "REAL_VALUE".into(),
+                upstreams: vec![a.clone(), b],
+            })
+            .expect("a two-upstream credential must register");
+        let headers = vec![("authorization".to_owned(), "PLACEHOLDER".to_owned())];
+        match engine.authorize(&headers) {
+            Decision::Forward { upstream, .. } => {
+                assert_eq!(upstream, a, "authorize must pick the FIRST entry, always");
+            }
+            other => panic!("expected Forward, got {other:?}"),
+        }
+    }
+
+    // A leg listener serves exactly the credentials that listed its authority: one job's extra leg
+    // never widens where another job's credential may go, even with both authorities allowlisted.
+    #[test]
+    fn a_leg_listener_serves_only_credentials_that_listed_its_authority() {
+        let a = "https://api2.cursor.sh".to_owned();
+        let b = "https://agent.cursor.example".to_owned();
+        let b_authority = authority_of(&b).unwrap();
+        let engine =
+            ProxyEngine::new([authority_of(&a).unwrap(), b_authority.clone()]);
+        engine
+            .register(JobCredential {
+                placeholder: "LISTS_BOTH".into(),
+                real: "REAL_BOTH".into(),
+                upstreams: vec![a.clone(), b.clone()],
+            })
+            .expect("the two-upstream credential must register");
+        engine
+            .register(JobCredential {
+                placeholder: "LISTS_A_ONLY".into(),
+                real: "REAL_A".into(),
+                upstreams: vec![a],
+            })
+            .expect("the one-upstream credential must register");
+
+        let both = vec![("authorization".to_owned(), "LISTS_BOTH".to_owned())];
+        match engine.authorize_via(&both, &b_authority) {
+            Decision::Forward { upstream, .. } => {
+                assert_eq!(upstream, b, "the leg must forward to the credential's OWN entry for it");
+            }
+            other => panic!("expected Forward, got {other:?}"),
+        }
+
+        let a_only = vec![("authorization".to_owned(), "LISTS_A_ONLY".to_owned())];
+        match engine.authorize_via(&a_only, &b_authority) {
+            Decision::Refuse(Refusal::DestinationNotAllowed { host }) => {
+                assert_eq!(host, b_authority, "the refusal must name the leg it refused");
+            }
+            other => panic!(
+                "a credential that never listed this leg must be refused on it, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn register_refuses_an_empty_upstream_list() {
+        let engine = ProxyEngine::new(["api.anthropic.com".to_owned()]);
+        let refusal = engine
+            .register(JobCredential {
+                placeholder: "PLACEHOLDER".into(),
+                real: "REAL_VALUE".into(),
+                upstreams: vec![],
+            })
+            .expect_err("an upstream-less credential must be refused");
+        assert_eq!(refusal, Refusal::NoUpstream);
+    }
+
+    // Two entries naming one authority are refused rather than tie-broken — including the shape
+    // where they differ only by an explicit default port and a path, which is how a real config
+    // would most plausibly produce the duplicate.
+    #[test]
+    fn register_refuses_two_entries_naming_one_authority() {
+        let engine = ProxyEngine::new(["api2.cursor.sh".to_owned()]);
+        let refusal = engine
+            .register(JobCredential {
+                placeholder: "PLACEHOLDER".into(),
+                real: "REAL_VALUE".into(),
+                upstreams: vec![
+                    "https://api2.cursor.sh".to_owned(),
+                    "https://api2.cursor.sh:443/v2".to_owned(),
+                ],
+            })
+            .expect_err("two entries for one authority must be refused");
+        assert_eq!(
+            refusal,
+            Refusal::DuplicateUpstream { host: "api2.cursor.sh:443".to_owned() }
+        );
+    }
+
+    // MULTI-UPSTREAM END TO END: WHICH LISTENER A REQUEST ARRIVES ON IS THE SELECTOR. One
+    // credential lists two upstreams; the SAME placeholder sent to the primary listener reaches the
+    // primary stub and sent to the leg listener reaches the leg stub, each with the REAL credential
+    // substituted. The container-side story in one test: the base URL a leg was handed is the only
+    // thing that routes it, and it can reach nothing the credential did not list.
+    #[tokio::test]
+    async fn the_listener_a_request_arrives_on_selects_the_upstream() {
+        let (primary_addr, _primary_stub) = spawn_stub("PRIMARY_OK").await;
+        let (leg_addr, leg_stub) = spawn_stub("LEG_OK").await;
+        let primary = format!("http://{primary_addr}");
+        let leg = format!("http://{leg_addr}");
+        let leg_authority = authority_of(&leg).unwrap();
+        let engine = Arc::new(ProxyEngine::new([
+            authority_of(&primary).unwrap(),
+            leg_authority.clone(),
+        ]));
+        let placeholder = mint_anthropic_placeholder();
+        engine
+            .register(JobCredential {
+                placeholder: placeholder.clone(),
+                real: REAL.to_owned(),
+                upstreams: vec![primary, leg],
+            })
+            .expect("a two-upstream credential must register");
+        let running = start_with_legs(Arc::clone(&engine), None, &[leg_authority.clone()])
+            .await
+            .expect("a proxy with one leg must start");
+
+        let client = reqwest::Client::new();
+        let primary_answer = client
+            .get(format!("http://127.0.0.1:{}/v1/messages", running.local_addr().port()))
+            .header("x-api-key", &placeholder)
+            .send()
+            .await
+            .expect("the primary listener must answer");
+        assert_eq!(primary_answer.text().await.unwrap(), "PRIMARY_OK");
+
+        let leg_port = running
+            .leg_addr(&leg_authority)
+            .expect("the leg listener must exist")
+            .port();
+        let leg_answer = client
+            .get(format!("http://127.0.0.1:{leg_port}/v1/agent"))
+            .header("x-api-key", &placeholder)
+            .send()
+            .await
+            .expect("the leg listener must answer");
+        assert_eq!(leg_answer.text().await.unwrap(), "LEG_OK");
+
+        let seen_by_leg = leg_stub.await.expect("the leg stub must have been reached");
+        assert_eq!(
+            seen_by_leg.api_key.as_deref(),
+            Some(REAL),
+            "the leg upstream must see the REAL credential, substituted from the placeholder"
+        );
+    }
+
     // THE ATTACK THIS MODULE'S BODY EXCLUSION EXISTS FOR, end to end through a live proxy.
     //
     // A job authors its own request body. When the proxy substituted there, a job could plant its
@@ -1018,10 +2450,10 @@ mod tests {
             .register(JobCredential {
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
-                upstream: upstream.clone(),
+                upstreams: vec![upstream.clone()],
             })
             .unwrap();
-        let proxy = start(Arc::clone(&engine), reqwest::Client::new(), None).await.unwrap();
+        let proxy = start(Arc::clone(&engine), None).await.unwrap();
         let port = proxy.local_addr().port();
 
         // The hostile shape: placeholder in the auth header (to authenticate) AND inside a prompt
@@ -1052,6 +2484,132 @@ mod tests {
         assert_eq!(
             seen.body, hostile_body,
             "the body reaches the upstream byte-for-byte, placeholder and all"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_session_proxy_keeps_the_body_and_scrubs_both_response_values() {
+        let response_body = format!("access={CODEX_REAL_ACCESS};account={CODEX_REAL_ACCOUNT}");
+        let response_header = format!(
+            "x-session-echo: Bearer {CODEX_REAL_ACCESS}; account={CODEX_REAL_ACCOUNT}"
+        );
+        let (stub_addr, stub) = spawn_stub_with(response_body, Some(response_header)).await;
+        let upstream = format!("http://{stub_addr}");
+        let engine = Arc::new(ProxyEngine::new([authority_of(&upstream).unwrap()]));
+        register_codex_session(&engine, &upstream);
+        let proxy = start(Arc::clone(&engine), None)
+            .await
+            .expect("start the local proxy");
+        let hostile_body = format!(
+            "{{\"input\":\"{CODEX_ACCESS_PLACEHOLDER}:{CODEX_ACCOUNT_PLACEHOLDER}\"}}"
+        );
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/responses?test=1", proxy.local_addr()))
+            .header(
+                "authorization",
+                format!("Bearer {CODEX_ACCESS_PLACEHOLDER}"),
+            )
+            .header("chatgpt-account-id", CODEX_ACCOUNT_PLACEHOLDER)
+            .body(hostile_body.clone())
+            .send()
+            .await
+            .expect("send through the local proxy");
+
+        assert_eq!(response.status(), 200);
+        let echoed_header = response
+            .headers()
+            .get("x-session-echo")
+            .expect("the upstream response header")
+            .to_str()
+            .expect("text response header")
+            .to_owned();
+        let returned_body = response.text().await.expect("response body");
+        assert!(!echoed_header.contains(CODEX_REAL_ACCESS));
+        assert!(!echoed_header.contains(CODEX_REAL_ACCOUNT));
+        assert!(echoed_header.contains(CODEX_ACCESS_PLACEHOLDER));
+        assert!(echoed_header.contains(CODEX_ACCOUNT_PLACEHOLDER));
+        assert_eq!(
+            returned_body,
+            format!("access={CODEX_ACCESS_PLACEHOLDER};account={CODEX_ACCOUNT_PLACEHOLDER}")
+        );
+
+        let seen = stub.await.expect("stub result");
+        assert_eq!(seen.authorization.as_deref(), Some("Bearer real-access-token-sentinel"));
+        assert_eq!(seen.account_id.as_deref(), Some(CODEX_REAL_ACCOUNT));
+        assert_eq!(seen.body, hostile_body, "the request body must stay byte-identical");
+        assert!(seen.request_line.contains("/responses?test=1"));
+    }
+
+    #[tokio::test]
+    async fn codex_session_proxy_does_not_follow_a_same_host_redirect() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind redirect stub");
+        let stub_addr = listener.local_addr().expect("redirect stub address");
+        let stub = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.expect("first request");
+            let mut request = [0_u8; 8192];
+            let first_len = first.read(&mut request).await.expect("read first request");
+            assert!(
+                String::from_utf8_lossy(&request[..first_len]).contains("/responses"),
+                "the first request must use the approved Codex route"
+            );
+            first
+                .write_all(
+                    b"HTTP/1.1 307 Temporary Redirect\r\nlocation: /outside\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write redirect");
+            first.flush().await.expect("flush redirect");
+
+            match tokio::time::timeout(Duration::from_millis(500), listener.accept()).await {
+                Ok(Ok((mut second, _))) => {
+                    let second_len = second.read(&mut request).await.expect("read redirect target");
+                    second
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                        )
+                        .await
+                        .expect("write redirect target response");
+                    Some(String::from_utf8_lossy(&request[..second_len]).into_owned())
+                }
+                _ => None,
+            }
+        });
+
+        let upstream = format!("http://{stub_addr}");
+        let engine = Arc::new(ProxyEngine::new([authority_of(&upstream).unwrap()]));
+        register_codex_session(&engine, &upstream);
+        let proxy = start(Arc::clone(&engine), None)
+            .await
+            .expect("start the local proxy");
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("build no-redirect test client");
+        let response = client
+            .post(format!("http://{}/responses", proxy.local_addr()))
+            .header(
+                "authorization",
+                format!("Bearer {CODEX_ACCESS_PLACEHOLDER}"),
+            )
+            .header("chatgpt-account-id", CODEX_ACCOUNT_PLACEHOLDER)
+            .body("{}")
+            .send()
+            .await
+            .expect("send through the local proxy");
+
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::TEMPORARY_REDIRECT,
+            "the proxy must return the redirect without another upstream request"
+        );
+        assert!(
+            stub.await.expect("redirect stub result").is_none(),
+            "the real Codex headers must not reach a redirected path"
         );
     }
 
@@ -1105,13 +2663,13 @@ mod tests {
         let bad = JobCredential {
             placeholder: mint_anthropic_placeholder(),
             real: REAL.to_owned(),
-            upstream: "https://evil.example.com".to_owned(),
+            upstreams: vec!["https://evil.example.com".to_owned()],
         };
         assert!(matches!(engine.register(bad), Err(Refusal::DestinationNotAllowed { .. })));
         let good = JobCredential {
             placeholder: mint_anthropic_placeholder(),
             real: REAL.to_owned(),
-            upstream: UPSTREAM.to_owned(),
+            upstreams: vec![UPSTREAM.to_owned()],
         };
         assert!(engine.register(good).is_ok());
     }
@@ -1138,6 +2696,9 @@ mod tests {
     struct StubSeen {
         request_line: String,
         api_key: Option<String>,
+        authorization: Option<String>,
+        account_id: Option<String>,
+        accept_encoding: Option<String>,
         /// The request BODY as the upstream received it — the ground truth for "no credential was
         /// written into a job-authored body".
         body: String,
@@ -1145,6 +2706,56 @@ mod tests {
 
     fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// Decode an HTTP/1.1 chunked body, or `None` while the terminal zero-length chunk is still to
+    /// come. `None` means "read more", never "empty" — collapsing those two is how a stub ends up
+    /// asserting against a body it merely has not finished receiving.
+    fn decode_chunked(raw: &[u8]) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut rest = raw;
+        loop {
+            let line_end = find_subslice(rest, b"\r\n")?;
+            // A chunk-size line may carry extensions after a `;`; the size is what precedes it.
+            let size_text = std::str::from_utf8(&rest[..line_end]).ok()?;
+            let size_text = size_text.split(';').next()?.trim();
+            let size = usize::from_str_radix(size_text, 16).ok()?;
+            rest = &rest[line_end + 2..];
+            if size == 0 {
+                return Some(out);
+            }
+            if rest.len() < size + 2 {
+                return None;
+            }
+            out.extend_from_slice(&rest[..size]);
+            rest = &rest[size + 2..];
+        }
+    }
+
+    /// Whatever decoded before the stream cut out. Only for the hung-up-mid-body path, so a test sees a
+    /// short body and can assert on the shortfall instead of the stub blocking forever.
+    fn decode_chunked_prefix(raw: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut rest = raw;
+        while let Some(line_end) = find_subslice(rest, b"\r\n") {
+            let Some(size) = std::str::from_utf8(&rest[..line_end])
+                .ok()
+                .and_then(|t| t.split(';').next().map(str::trim).map(str::to_owned))
+                .and_then(|t| usize::from_str_radix(&t, 16).ok())
+            else {
+                break;
+            };
+            rest = &rest[line_end + 2..];
+            if size == 0 || rest.len() < size {
+                break;
+            }
+            out.extend_from_slice(&rest[..size]);
+            if rest.len() < size + 2 {
+                break;
+            }
+            rest = &rest[size + 2..];
+        }
+        out
     }
 
     /// A one-shot plain-HTTP stub upstream standing in for `api.anthropic.com`. It records the request
@@ -1178,32 +2789,72 @@ mod tests {
                     break;
                 }
             }
-            // Read the body too: `content-length` bytes past the header terminator. Without this the
-            // stub could not prove what the upstream actually received in the body.
+            // Read the body too — without this the stub could not prove what the upstream actually
+            // received in the body.
+            //
+            // BOTH FRAMINGS, because the proxy relays the request body as a stream and so cannot
+            // declare a length it does not know: reqwest frames such a body as `transfer-encoding:
+            // chunked`. A content-length-only stub reads ZERO body bytes from a chunked request, then
+            // answers and closes the socket while the sender is still writing — which surfaces as a
+            // truncated body on a small request and a broken pipe (502) on a large one. Neither is a
+            // fault in the thing under test.
             let head_end = find_subslice(&buf, b"\r\n\r\n").map(|i| i + 4).unwrap_or(buf.len());
             let head_text = String::from_utf8_lossy(&buf[..head_end]).to_string();
-            let content_length = head_text
-                .lines()
-                .find_map(|line| {
+            let header_value = |wanted: &str| -> Option<String> {
+                head_text.lines().find_map(|line| {
                     let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().ok())?
+                    name.eq_ignore_ascii_case(wanted).then(|| value.trim().to_owned())
                 })
-                .unwrap_or(0);
-            while buf.len() < head_end + content_length {
-                let n = sock.read(&mut tmp).await.unwrap();
-                if n == 0 {
-                    break;
+            };
+            let chunked = header_value("transfer-encoding")
+                .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"));
+            let raw_body = if chunked {
+                loop {
+                    if let Some(decoded) = decode_chunked(&buf[head_end..]) {
+                        break decoded;
+                    }
+                    let n = sock.read(&mut tmp).await.unwrap();
+                    if n == 0 {
+                        // Sender hung up mid-body: return what decoded so an assertion can see the
+                        // truncation rather than the stub hanging on it.
+                        break decode_chunked_prefix(&buf[head_end..]);
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
                 }
-                buf.extend_from_slice(&tmp[..n]);
-            }
-            let body = String::from_utf8_lossy(&buf[head_end..]).to_string();
+            } else {
+                let content_length =
+                    header_value("content-length").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+                while buf.len() < head_end + content_length {
+                    let n = sock.read(&mut tmp).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                buf[head_end..].to_vec()
+            };
+            let body = String::from_utf8_lossy(&raw_body).to_string();
 
             let text = head_text;
             let request_line = text.lines().next().unwrap_or_default().to_owned();
             let api_key = text.lines().find_map(|line| {
                 let (name, value) = line.split_once(':')?;
                 name.eq_ignore_ascii_case("x-api-key").then(|| value.trim().to_owned())
+            });
+            let authorization = text.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("authorization")
+                    .then(|| value.trim().to_owned())
+            });
+            let account_id = text.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("chatgpt-account-id")
+                    .then(|| value.trim().to_owned())
+            });
+            let accept_encoding = text.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("accept-encoding")
+                    .then(|| value.trim().to_owned())
             });
             let extra = extra_header.map(|h| format!("{h}\r\n")).unwrap_or_default();
             let response = format!(
@@ -1214,7 +2865,14 @@ mod tests {
             );
             sock.write_all(response.as_bytes()).await.unwrap();
             sock.flush().await.unwrap();
-            StubSeen { request_line, api_key, body }
+            StubSeen {
+                request_line,
+                api_key,
+                authorization,
+                account_id,
+                accept_encoding,
+                body,
+            }
         });
         (addr, handle)
     }
@@ -1237,10 +2895,10 @@ mod tests {
             .register(JobCredential {
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
-                upstream: upstream.clone(),
+                upstreams: vec![upstream.clone()],
             })
             .unwrap();
-        let proxy = start(Arc::clone(&engine), reqwest::Client::new(), None).await.unwrap();
+        let proxy = start(Arc::clone(&engine), None).await.unwrap();
         let port = proxy.local_addr().port();
         let response = reqwest::Client::new()
             .post(format!("http://127.0.0.1:{port}/v1/messages"))
@@ -1260,7 +2918,7 @@ mod tests {
     async fn a_configured_port_range_binds_inside_it_and_an_unset_one_stays_ephemeral() {
         let engine = Arc::new(ProxyEngine::new(["api.anthropic.com".to_owned()]));
         let range = crate::sandbox_net::PortRange::new(49200, 49299).unwrap();
-        let proxy = start(Arc::clone(&engine), reqwest::Client::new(), Some(range))
+        let proxy = start(Arc::clone(&engine), Some(range))
             .await
             .expect("a free port in the range");
         let port = proxy.local_addr().port();
@@ -1273,7 +2931,7 @@ mod tests {
         // A second proxy must take a DIFFERENT port in the range, not collide with the first: the
         // range is walked until a free port is found, and concurrent jobs each hold one for their
         // lifetime.
-        let second = start(Arc::clone(&engine), reqwest::Client::new(), Some(range))
+        let second = start(Arc::clone(&engine), Some(range))
             .await
             .expect("a second free port in the range");
         assert_ne!(
@@ -1284,7 +2942,7 @@ mod tests {
 
         // Control: unset ⇒ the shipped ephemeral behaviour. Without this the range assertion above
         // would also pass against a build that ignored the range entirely.
-        let ephemeral = start(Arc::clone(&engine), reqwest::Client::new(), None)
+        let ephemeral = start(Arc::clone(&engine), None)
             .await
             .expect("an ephemeral port");
         assert_ne!(ephemeral.local_addr().port(), 0, "the kernel must have chosen a real port");
@@ -1303,7 +2961,7 @@ mod tests {
 
         // `expect_err` would need `Debug` on `RunningProxy`, which is merged #647 code this ticket
         // does not touch. Matching says the same thing without widening that type.
-        let Err(error) = start(Arc::clone(&engine), reqwest::Client::new(), Some(range)).await
+        let Err(error) = start(Arc::clone(&engine), Some(range)).await
         else {
             panic!("an occupied single-port range must fail, not fall back to an ephemeral port");
         };
@@ -1316,7 +2974,7 @@ mod tests {
         // Control: the same range binds once the port is free, so the failure above is about
         // occupancy and not about the range being malformed.
         drop(occupied);
-        start(Arc::clone(&engine), reqwest::Client::new(), Some(range))
+        start(Arc::clone(&engine), Some(range))
             .await
             .expect("the same range binds once the port is released");
     }
@@ -1352,6 +3010,100 @@ mod tests {
         assert!(seen.contains("sk-ant-api03-"), "rewritten to the placeholder: {seen}");
     }
 
+    #[tokio::test]
+    async fn an_encoded_upstream_response_is_refused_and_identity_is_requested() {
+        let (stub_addr, stub) = spawn_stub_with(
+            format!("encoded credential echo: {REAL}"),
+            Some("content-encoding: x-maxplayer-test".to_owned()),
+        )
+        .await;
+        let upstream = format!("http://{stub_addr}");
+        let engine = Arc::new(ProxyEngine::new([authority_of(&upstream).unwrap()]));
+        let placeholder = mint_anthropic_placeholder();
+        engine
+            .register(JobCredential {
+                placeholder: placeholder.clone(),
+                real: REAL.to_owned(),
+                upstreams: vec![upstream],
+            })
+            .unwrap();
+        let proxy = start(Arc::clone(&engine), None)
+            .await
+            .expect("start the local proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/v1/messages", proxy.local_addr()))
+            .header("x-api-key", placeholder)
+            .header("accept-encoding", "gzip")
+            .body("{}")
+            .send()
+            .await
+            .expect("send through the local proxy");
+        let status = response.status();
+        let body = response.bytes().await.expect("read refusal body");
+        let seen = stub.await.expect("encoded stub result");
+
+        assert_eq!(status, reqwest::StatusCode::BAD_GATEWAY);
+        assert!(!contains(&body, REAL), "the refusal must not contain the credential");
+        assert_eq!(
+            seen.accept_encoding.as_deref(),
+            Some("identity"),
+            "the proxy must replace a caller-selected encoding"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_utf8_response_header_is_scrubbed_as_raw_bytes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind raw-header stub");
+        let stub_addr = listener.local_addr().expect("raw-header stub address");
+        let stub = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("raw-header request");
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await.expect("read raw-header request");
+            let mut response = b"HTTP/1.1 200 OK\r\nx-raw-echo: prefix-\x80-".to_vec();
+            response.extend_from_slice(REAL.as_bytes());
+            response.extend_from_slice(
+                b"-suffix\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+            );
+            socket
+                .write_all(&response)
+                .await
+                .expect("write raw response header");
+            socket.flush().await.expect("flush raw response header");
+        });
+
+        let upstream = format!("http://{stub_addr}");
+        let response = relay(
+            &reqwest::Client::new(),
+            &hyper::Method::POST,
+            &upstream,
+            "/v1/messages",
+            vec![("x-api-key".to_owned(), REAL.to_owned())],
+            reqwest::Body::from("{}"),
+            vec![(REAL.to_owned(), "safe-placeholder".to_owned())],
+            0,
+            "test-upstream",
+        )
+        .await
+        .expect("relay the raw response header");
+        let raw = response
+            .headers()
+            .get("x-raw-echo")
+            .expect("raw response header")
+            .as_bytes();
+
+        assert!(!contains(raw, REAL), "the raw response header must not contain the credential");
+        assert!(
+            contains(raw, "safe-placeholder"),
+            "the raw response header must contain the placeholder"
+        );
+        stub.await.expect("raw-header stub result");
+    }
+
     // The scrub must survive CHUNK BOUNDARIES. A credential split across two stream frames would slip
     // past a naive per-chunk replace, so `scrub_stream` holds back `len(real) - 1` bytes and re-checks.
     // Driven directly with hand-split frames, since a stub cannot reliably force the split.
@@ -1368,8 +3120,7 @@ mod tests {
         ];
         let scrubbed = scrub_stream(
             futures_util::stream::iter(frames),
-            REAL.to_owned(),
-            placeholder.clone(),
+            vec![(REAL.to_owned(), placeholder.clone())],
         );
         let collected: Vec<u8> = scrubbed
             .try_fold(Vec::new(), |mut acc, frame| async move {
@@ -1389,6 +3140,194 @@ mod tests {
         assert!(!text.contains(REAL), "no fragment of the real credential survives");
     }
 
+    /// Regression for the contained-cursor stall (#: agent leg): a response that dribbles chunks
+    /// SMALLER than `max_real_len - 1` and never sends EOF must still forward each chunk as it
+    /// arrives. The stream yields three keepalives and then pends forever (no EOF, no idle gap
+    /// reached — idle is set to an hour). Before the per-chunk release, `scrub_stream` held every
+    /// sub-`max_real_len` chunk in the fixed-width carry and forwarded nothing until the idle flush,
+    /// so this collected zero and the real client timed out. Now each keepalive passes straight
+    /// through.
+    #[tokio::test]
+    async fn small_keepalive_chunks_stream_through_without_waiting_for_eof_or_idle() {
+        use futures_util::StreamExt as _;
+        let placeholder = mint_anthropic_placeholder();
+        let keepalive = Bytes::from_static(b": keepalive\n"); // 12 B, well under REAL's length
+        let count = 3usize;
+        let frames: Vec<reqwest::Result<Bytes>> =
+            (0..count).map(|_| Ok(keepalive.clone())).collect();
+        // Keepalives, then a stream that never ends — the exact shape of a stalled SSE body. The
+        // stream never EOFs and there is no idle timer, so only the per-chunk release can forward
+        // these bytes.
+        let stream = futures_util::stream::iter(frames).chain(futures_util::stream::pending());
+        let mut scrubbed = Box::pin(scrub_stream(
+            stream,
+            vec![(REAL.to_owned(), placeholder.clone())],
+        ));
+
+        let want = keepalive.len() * count;
+        let mut got: Vec<u8> = Vec::new();
+        // Poll with a short real timeout: the per-chunk release yields in microseconds; the old
+        // hold-until-idle path would yield nothing here and this loop would collect zero.
+        while got.len() < want {
+            match tokio::time::timeout(Duration::from_millis(500), scrubbed.next()).await {
+                Ok(Some(Ok(frame))) => {
+                    if let Ok(data) = frame.into_data() {
+                        got.extend_from_slice(&data);
+                    }
+                }
+                Ok(Some(Err(error))) => panic!("unexpected stream error: {error}"),
+                Ok(None) => break,
+                Err(_) => break, // timed out with nothing more forthcoming
+            }
+        }
+        assert_eq!(
+            got.len(),
+            want,
+            "each keepalive must be forwarded as it arrives, not held for EOF or the idle flush"
+        );
+        assert_eq!(got, b": keepalive\n: keepalive\n: keepalive\n");
+    }
+
+    #[tokio::test]
+    async fn codex_session_response_scrub_catches_both_values_across_chunks() {
+        use futures_util::TryStreamExt as _;
+
+        let (access_head, access_tail) = CODEX_REAL_ACCESS.split_at(8);
+        let (account_head, account_tail) = CODEX_REAL_ACCOUNT.split_at(7);
+        let frames: Vec<reqwest::Result<Bytes>> = vec![
+            Ok(Bytes::from(format!("start-{access_head}"))),
+            Ok(Bytes::from(format!("{access_tail}-middle-{account_head}"))),
+            Ok(Bytes::from(format!("{account_tail}-end"))),
+        ];
+        let scrubbed = scrub_stream(
+            futures_util::stream::iter(frames),
+            vec![
+                (CODEX_REAL_ACCESS.to_owned(), CODEX_ACCESS_PLACEHOLDER.to_owned()),
+                (CODEX_REAL_ACCOUNT.to_owned(), CODEX_ACCOUNT_PLACEHOLDER.to_owned()),
+            ],
+        );
+        let collected: Vec<u8> = scrubbed
+            .try_fold(Vec::new(), |mut acc, frame| async move {
+                if let Ok(data) = frame.into_data() {
+                    acc.extend_from_slice(&data);
+                }
+                Ok(acc)
+            })
+            .await
+            .expect("collect scrubbed frames");
+        assert_eq!(
+            String::from_utf8(collected).expect("UTF-8 result"),
+            format!(
+                "start-{CODEX_ACCESS_PLACEHOLDER}-middle-{CODEX_ACCOUNT_PLACEHOLDER}-end"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn the_response_scrub_handles_adjacent_values_without_reprocessing_output() {
+        use futures_util::TryStreamExt as _;
+
+        let frames: Vec<reqwest::Result<Bytes>> = vec![
+            Ok(Bytes::from_static(b"bb")),
+            Ok(Bytes::from_static(b"bb")),
+        ];
+        let scrubbed = scrub_stream(
+            futures_util::stream::iter(frames),
+            vec![("bb".to_owned(), "ab".to_owned())],
+        );
+        let collected: Vec<u8> = scrubbed
+            .try_fold(Vec::new(), |mut acc, frame| async move {
+                if let Ok(data) = frame.into_data() {
+                    acc.extend_from_slice(&data);
+                }
+                Ok(acc)
+            })
+            .await
+            .expect("collect adjacent scrub result");
+
+        assert_eq!(collected, b"abab");
+        assert!(!contains(&collected, "bb"));
+    }
+
+    // A STALLED upstream — bytes received, then silence with NO EOF — once left scrub_stream's holdback
+    // withheld forever: the tail flushed ONLY on the `None`/EOF arm, which a stalled stream never
+    // reaches, so the container got `received - (real.len() - 1)` bytes and no more — the credential-
+    // scrub half of the "200 header, short-or-empty body, client gives up" symptom. Now the per-chunk
+    // release forwards every provably-safe byte the instant the chunk arrives, so an ordinary body of
+    // any size reaches the container IN FULL on arrival — no EOF, and no idle timer involved.
+    #[tokio::test]
+    async fn a_stalled_ordinary_body_is_forwarded_in_full_on_arrival_without_eof() {
+        use futures_util::StreamExt as _;
+        let placeholder = mint_anthropic_placeholder();
+        let hold = REAL.len() - 1; // the old fixed holdback width — deliberately exceeded
+        // Ordinary bytes — no suffix of them can begin the credential, so the whole body is safe now.
+        let body = vec![b'x'; hold + 27];
+        let stalled = futures_util::stream::iter(vec![Ok(Bytes::from(body.clone()))])
+            .chain(futures_util::stream::pending::<reqwest::Result<Bytes>>());
+        let mut scrubbed =
+            Box::pin(scrub_stream(stalled, vec![(REAL.to_owned(), placeholder.clone())]));
+
+        // The entire body is forwarded on the chunk itself — the old code held `real.len() - 1` bytes
+        // here until an EOF a stalled stream never reaches.
+        let first = tokio::time::timeout(Duration::from_millis(500), scrubbed.next())
+            .await
+            .expect("the safe body must be forwarded on arrival")
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        assert_eq!(
+            first.len(),
+            body.len(),
+            "a stalled ordinary body reaches the container in full on arrival, with no EOF"
+        );
+    }
+
+    // CONTAINMENT — the per-chunk release must never forward a byte that could still begin a credential.
+    // A stalled body ending in a proper PREFIX of the real credential is the exact straddle the holdback
+    // guards: the release forwards only the bytes AHEAD of that prefix, and the prefix stays held even
+    // though the stream never EOFs. The prefix leaves the boundary only by being completed into a full
+    // credential (then replaced — see the split-across-chunks test) or on a real EOF.
+    #[tokio::test]
+    async fn a_stalled_credential_prefix_is_never_released() {
+        use futures_util::StreamExt as _;
+        let placeholder = mint_anthropic_placeholder();
+        let k = 12; // "sk-ant-api03" — a proper, non-empty prefix of REAL
+        let prefix = &REAL.as_bytes()[..k];
+        let mut body = vec![b'x'; 40];
+        body.extend_from_slice(prefix);
+        let stalled = futures_util::stream::iter(vec![Ok(Bytes::from(body.clone()))])
+            .chain(futures_util::stream::pending::<reqwest::Result<Bytes>>());
+        let mut scrubbed =
+            Box::pin(scrub_stream(stalled, vec![(REAL.to_owned(), placeholder.clone())]));
+
+        // The only frame released: exactly the 40 bytes ahead of the prefix. The k prefix bytes are
+        // withheld, so no fragment of the credential is ever forwarded.
+        let flushed = scrubbed.next().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(
+            flushed.as_ref(),
+            vec![b'x'; 40].as_slice(),
+            "the release forwards only the bytes that cannot begin a credential; the prefix stays held"
+        );
+        // A further await is intentionally omitted: with the prefix held and no more data and no EOF,
+        // the stream never yields again — that permanent hold on the prefix IS the containment property.
+    }
+
+    #[test]
+    fn straddle_prefix_len_finds_the_longest_suffix_that_is_a_credential_prefix() {
+        let needle = b"sk-ant-api03-xyz";
+        // Nothing at the tail could begin the needle ⇒ 0 (the whole buffer is safe to flush).
+        assert_eq!(straddle_prefix_len(b"hello world", needle), 0);
+        assert_eq!(straddle_prefix_len(b"", needle), 0);
+        // A trailing partial prefix is detected at exactly its length.
+        assert_eq!(straddle_prefix_len(b"xxxxsk-ant", needle), 6);
+        // The LONGEST qualifying suffix wins, not a shorter coincidence earlier in the buffer.
+        assert_eq!(straddle_prefix_len(b"sk-sk-ant", needle), 6);
+        // The full proper prefix reports its own length — the cap is needle.len() - 1, so a complete
+        // occurrence (which scrub_buffer strips first) is never reported as an unbreakable hold.
+        assert_eq!(straddle_prefix_len(&needle[..needle.len() - 1], needle), needle.len() - 1);
+    }
+
     // #647 acceptance #1 (plumbing): a request carrying the placeholder is forwarded to the approved
     // upstream with the REAL credential substituted, the path unchanged, and the upstream's response
     // streamed back to the caller.
@@ -1402,10 +3341,10 @@ mod tests {
             .register(JobCredential {
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
-                upstream: upstream.clone(),
+                upstreams: vec![upstream.clone()],
             })
             .unwrap();
-        let proxy = start(Arc::clone(&engine), reqwest::Client::new(), None).await.unwrap();
+        let proxy = start(Arc::clone(&engine), None).await.unwrap();
         let port = proxy.local_addr().port();
 
         let response = reqwest::Client::new()
@@ -1442,7 +3381,7 @@ mod tests {
     async fn proxy_returns_403_for_a_non_allowlisted_destination() {
         let placeholder = mint_anthropic_placeholder();
         let engine = arc_engine_with_job(&placeholder, "https://attacker.example.com");
-        let proxy = start(Arc::clone(&engine), reqwest::Client::new(), None).await.unwrap();
+        let proxy = start(Arc::clone(&engine), None).await.unwrap();
         let port = proxy.local_addr().port();
         let response = reqwest::Client::new()
             .post(format!("http://127.0.0.1:{port}/v1/messages"))
@@ -1459,7 +3398,7 @@ mod tests {
     #[tokio::test]
     async fn proxy_refuses_when_no_known_placeholder_is_present() {
         let engine = Arc::new(ProxyEngine::new([authority_of(UPSTREAM).unwrap()]));
-        let proxy = start(Arc::clone(&engine), reqwest::Client::new(), None).await.unwrap();
+        let proxy = start(Arc::clone(&engine), None).await.unwrap();
         let port = proxy.local_addr().port();
         let response = reqwest::Client::new()
             .post(format!("http://127.0.0.1:{port}/v1/messages"))
@@ -1471,24 +3410,214 @@ mod tests {
         assert_eq!(response.status(), 502);
     }
 
-    // P1 regression (babu review): the listener lives in the money-path daemon, so a body over the cap
-    // must be REFUSED (413), not buffered. `Limited` stops reading past `MAX_REQUEST_BODY_BYTES`, so
-    // the proxy never holds more than the cap — the daemon stays under a fixed memory ceiling no matter
-    // how large the body a stranger's job sends. (Cap applies BEFORE authorize, so no registration is
-    // needed to reach it.)
+    // THE BUG THIS CHANGE EXISTS FOR, in miniature. A client that holds its request body OPEN — which
+    // is what a streaming agent turn looks like on the wire — used to be unanswerable: the proxy
+    // collected the body to completion before authorizing, so a body that never ends meant a decision
+    // that never came. The client gave up first and the request was never forwarded at all.
+    //
+    // Authorizing from the headers makes the refusal reachable while the body is still open. The
+    // outer timeout is the assertion: on the buffering code this test does not fail, it HANGS.
     #[tokio::test]
-    async fn proxy_rejects_an_over_cap_body_with_413() {
+    async fn a_request_is_refused_from_its_headers_while_its_body_is_still_open() {
         let engine = Arc::new(ProxyEngine::new([authority_of(UPSTREAM).unwrap()]));
-        let proxy = start(Arc::clone(&engine), reqwest::Client::new(), None).await.unwrap();
+        let proxy = start(Arc::clone(&engine), None).await.unwrap();
         let port = proxy.local_addr().port();
-        let over_cap = vec![b'a'; MAX_REQUEST_BODY_BYTES + 1];
+
+        // One chunk, then never another and never an end — the shape of a client mid-turn.
+        let never_ends = futures_util::stream::once(async {
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"{\"messages\":["))
+        })
+        .chain(futures_util::stream::pending());
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            reqwest::Client::new()
+                .post(format!("http://127.0.0.1:{port}/v1/messages"))
+                .body(reqwest::Body::wrap_stream(never_ends))
+                .send(),
+        )
+        .await
+        .expect("the proxy must answer from the headers, not wait for the body to end")
+        .unwrap();
+
+        // No placeholder anywhere, so this is `NoKnownPlaceholder` — and crucially it is decided
+        // without a single body byte being required.
+        assert_eq!(response.status(), 502);
+    }
+
+    // A large body relays in full and UNBUFFERED. The old cap bounded a buffer that no longer exists,
+    // so the interesting size is no longer "what fits in memory" — it is that nothing between the
+    // container and the upstream truncates. Sized just under MAX_REQUEST_BODY_BYTES so it proves the
+    // relay path carries a large body byte-for-byte while leaving the cap itself to the two tests
+    // below; the assertion is on byte-for-byte arrival rather than on a status alone.
+    #[tokio::test]
+    async fn a_large_body_relays_in_full() {
+        let (stub_addr, stub) = spawn_stub("UPSTREAM_OK").await;
+        let upstream = format!("http://{stub_addr}");
+        let engine = Arc::new(ProxyEngine::new([authority_of(&upstream).unwrap()]));
+        let placeholder = mint_anthropic_placeholder();
+        engine
+            .register(JobCredential {
+                placeholder: placeholder.clone(),
+                real: REAL.to_owned(),
+                upstreams: vec![upstream.clone()],
+            })
+            .unwrap();
+        let proxy = start(Arc::clone(&engine), None).await.unwrap();
+        let port = proxy.local_addr().port();
+
+        // Distinctive bytes so a truncation cannot be mistaken for success.
+        let big = vec![b'z'; MAX_REQUEST_BODY_BYTES - 1];
         let response = reqwest::Client::new()
             .post(format!("http://127.0.0.1:{port}/v1/messages"))
-            .body(over_cap)
+            .header("x-api-key", &placeholder)
+            .body(big.clone())
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), 413, "an over-cap body must be refused, not buffered");
+        assert_eq!(response.status(), 200, "an under-cap body must be relayed, not refused");
+
+        let seen = stub.await.unwrap();
+        assert_eq!(
+            seen.body.len(),
+            big.len(),
+            "the upstream must receive every byte, not a capped prefix"
+        );
+        assert_eq!(seen.api_key.as_deref(), Some(REAL));
+    }
+
+    // The size cap SURVIVED the move to a streamed body. Streaming removed the reason the cap was
+    // sized the way it was — there is no buffer to overflow — but not the cap itself: it is also the
+    // ceiling on what a stranger's job may push through the seller's credential in one request.
+    //
+    // A declared `content-length` is refused with the buffered path's own `413`, and refused BEFORE
+    // anything reaches the upstream, which is the half of the old behaviour a mid-stream check cannot
+    // reproduce.
+    #[tokio::test]
+    async fn a_declared_over_cap_body_is_refused_before_the_upstream_sees_it() {
+        let (stub_addr, stub) = spawn_stub("UPSTREAM_OK").await;
+        let upstream = format!("http://{stub_addr}");
+        let engine = Arc::new(ProxyEngine::new([authority_of(&upstream).unwrap()]));
+        let placeholder = mint_anthropic_placeholder();
+        engine
+            .register(JobCredential {
+                placeholder: placeholder.clone(),
+                real: REAL.to_owned(),
+                upstreams: vec![upstream.clone()],
+            })
+            .unwrap();
+        let proxy = start(Arc::clone(&engine), None).await.unwrap();
+        let port = proxy.local_addr().port();
+
+        // One byte over the cap, declared up front: `reqwest` sets `content-length` for a sized body.
+        let over = vec![b'z'; MAX_REQUEST_BODY_BYTES + 1];
+        let response = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .header("x-api-key", &placeholder)
+            .body(over)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            413,
+            "a declared over-cap body keeps the buffered path's refusal"
+        );
+
+        // The upstream must never have been dialled: the refusal is decided from the header alone, so
+        // the real credential was never put on the wire for this request. Checked WITHOUT a timer —
+        // the stub completes only once it has served a connection, and the `413` above is already in
+        // hand, so "still running" is a settled fact here rather than a race against a deadline.
+        assert!(
+            !stub.is_finished(),
+            "an over-cap request must not reach the upstream at all"
+        );
+    }
+
+    // The backstop for a body whose length is NOT declared: a chunked stream cannot be judged from its
+    // headers, so the cap has to be enforced as the bytes arrive. The request fails mid-flight, which
+    // is a `502` rather than a `413` because the upstream request is already open by then — the cap
+    // still holds, and that difference is the price of not buffering to find out.
+    #[tokio::test]
+    async fn an_undeclared_over_cap_body_is_cut_off_mid_stream() {
+        let (stub_addr, _stub) = spawn_stub("UPSTREAM_OK").await;
+        let upstream = format!("http://{stub_addr}");
+        let engine = Arc::new(ProxyEngine::new([authority_of(&upstream).unwrap()]));
+        let placeholder = mint_anthropic_placeholder();
+        engine
+            .register(JobCredential {
+                placeholder: placeholder.clone(),
+                real: REAL.to_owned(),
+                upstreams: vec![upstream.clone()],
+            })
+            .unwrap();
+        let proxy = start(Arc::clone(&engine), None).await.unwrap();
+        let port = proxy.local_addr().port();
+
+        // A chunk stream carries no `content-length`, so this passes the header check and is caught by
+        // `size_bounded` only once the running total passes the cap.
+        let chunks = futures_util::stream::iter(
+            (0..9).map(|_| Ok::<Bytes, std::io::Error>(Bytes::from(vec![b'z'; 4 * 1024 * 1024]))),
+        );
+        let response = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .header("x-api-key", &placeholder)
+            .body(reqwest::Body::wrap_stream(chunks))
+            .send()
+            .await;
+        // Either the proxy answers 502, or the connection dies under the aborted upstream request.
+        // Both are the request failing; neither is the body being relayed past the cap.
+        match response {
+            Ok(response) => assert_eq!(
+                response.status(),
+                502,
+                "an over-cap chunked body must fail, not relay"
+            ),
+            Err(_) => {}
+        }
+    }
+
+    // The deadline is an INACTIVITY one, and this is the test that tells the two apart: five chunks
+    // spaced under the deadline run PAST it in total. A total-body deadline fails here; a gap deadline
+    // does not. Without this assertion, `BODY_IDLE_TIMEOUT` could be a total deadline under a new name
+    // and every other test would still pass.
+    #[tokio::test]
+    async fn a_slow_but_talking_body_is_not_cut_off_by_the_idle_deadline() {
+        let idle = Duration::from_millis(120);
+        let chunks = futures_util::stream::unfold(0u8, |n| async move {
+            if n == 5 {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            Some((Ok::<Bytes, std::io::Error>(Bytes::from(vec![b'a'; 4])), n + 1))
+        });
+
+        let relayed: Vec<Bytes> = idle_bounded(chunks, idle)
+            .map(|chunk| chunk.expect("a body that keeps arriving must never hit the idle deadline"))
+            .collect()
+            .await;
+
+        assert_eq!(relayed.len(), 5, "every chunk must be relayed");
+        assert_eq!(relayed.iter().map(Bytes::len).sum::<usize>(), 20);
+        // 5 x 40ms = 200ms elapsed against a 120ms deadline: a TOTAL deadline would have fired.
+    }
+
+    // The other half of the same guard: a body that goes SILENT is dropped, so a client cannot pin a
+    // credential-bearing upstream connection open by simply stopping. Errors rather than hanging.
+    #[tokio::test]
+    async fn a_body_that_goes_silent_is_dropped_at_the_idle_deadline() {
+        let one_then_silence = futures_util::stream::once(async {
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"partial"))
+        })
+        .chain(futures_util::stream::pending());
+
+        let outcome: Vec<Result<Bytes, std::io::Error>> =
+            idle_bounded(one_then_silence, Duration::from_millis(80)).collect().await;
+
+        assert_eq!(outcome.len(), 2, "the chunk that did arrive, then the failure");
+        assert_eq!(outcome[0].as_ref().unwrap(), &Bytes::from_static(b"partial"));
+        let error = outcome[1].as_ref().expect_err("silence must end the stream in an error");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     }
 
     // A redirect that stays on the credential's own upstream is followed, so a provider's own
@@ -1709,7 +3838,7 @@ mod tests {
         const FRAME_TYPE_SETTINGS: u8 = 0x04;
 
         let engine = Arc::new(ProxyEngine::new([authority_of("http://127.0.0.1:1").unwrap()]));
-        let proxy = start(Arc::clone(&engine), reqwest::Client::new(), None).await.unwrap();
+        let proxy = start(Arc::clone(&engine), None).await.unwrap();
 
         let mut stream = tokio::net::TcpStream::connect(proxy.local_addr()).await.unwrap();
         stream.write_all(H2_PREFACE).await.unwrap();
@@ -1746,10 +3875,10 @@ mod tests {
             .register(JobCredential {
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
-                upstream: upstream.clone(),
+                upstreams: vec![upstream.clone()],
             })
             .unwrap();
-        let proxy = start(Arc::clone(&engine), reqwest::Client::new(), None).await.unwrap();
+        let proxy = start(Arc::clone(&engine), None).await.unwrap();
         let port = proxy.local_addr().port();
 
         let response = reqwest::Client::new()
@@ -1785,10 +3914,10 @@ mod tests {
             .register(JobCredential {
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
-                upstream: upstream.clone(),
+                upstreams: vec![upstream.clone()],
             })
             .unwrap();
-        let proxy = start(Arc::clone(&engine), reqwest::Client::new(), None).await.unwrap();
+        let proxy = start(Arc::clone(&engine), None).await.unwrap();
         let proxy_addr = proxy.local_addr();
 
         let io = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
@@ -1829,8 +3958,12 @@ mod tests {
     // The aggregate ceiling must survive MULTIPLEXING. `MAX_CONCURRENT_CONNECTIONS` bounds sockets and
     // `MAX_CONCURRENT_H2_STREAMS` bounds streams within one socket; under HTTP/1 those coincide with
     // requests, under HTTP/2 they MULTIPLY. Two connections at the stream cap can attempt 128 requests
-    // against a limit of 64, and at `MAX_REQUEST_BODY_BYTES` each that is the resource hazard the
-    // connection cap exists to prevent.
+    // against a limit of 64, and each admitted request holds a relay open for as long as its body keeps
+    // talking — which is the resource this ceiling exists to bound.
+    //
+    // It bounds CONCURRENCY, not bytes. A relayed body has no size ceiling by design, so the number of
+    // simultaneous relays is the only quantity left to limit, and the per-job lifetime is what bounds
+    // how long any one of them can last.
     //
     // Deterministic, not timing-based: every request parks at a stub that answers nobody until told
     // to, so the assertion is "exactly the ceiling arrives, the overflow does not, and releasing one
@@ -1873,10 +4006,10 @@ mod tests {
             .register(JobCredential {
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
-                upstream: upstream.clone(),
+                upstreams: vec![upstream.clone()],
             })
             .unwrap();
-        let proxy = start(Arc::clone(&engine), reqwest::Client::new(), None).await.unwrap();
+        let proxy = start(Arc::clone(&engine), None).await.unwrap();
         let proxy_addr = proxy.local_addr();
 
         // TWO connections, so the per-connection stream cap cannot be what bounds the total.
@@ -1933,5 +4066,750 @@ mod tests {
         for _ in 0..attempts {
             let _ = release_tx.send(());
         }
+    }
+
+    /// What an early-answering upstream had in hand at the moment it chose to answer.
+    struct EarlySeen {
+        api_key: Option<String>,
+        body_prefix: String,
+    }
+
+    /// A stub upstream that answers as soon as it holds the head and `want` body bytes, WITHOUT waiting
+    /// for the request body to end.
+    ///
+    /// This is the only upstream shape that can witness the property under test. Every other stub here
+    /// drains to the terminal chunk before answering, and once a body has ended, a relayed one and a
+    /// buffered-then-relayed one are indistinguishable — so those stubs cannot tell the two apart no
+    /// matter what is asserted afterwards.
+    ///
+    /// It reports through a channel rather than its `JoinHandle` because the handle does not resolve
+    /// until the socket drains, which is exactly the wait the test exists to avoid.
+    async fn spawn_early_answering_stub(
+        want: usize,
+        body_out: &'static str,
+    ) -> (SocketAddr, tokio::sync::oneshot::Receiver<EarlySeen>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (report_tx, report_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0_u8; 4096];
+
+            while find_subslice(&buf, b"\r\n\r\n").is_none() {
+                let n = sock.read(&mut tmp).await.unwrap();
+                assert!(n > 0, "upstream connection closed before a request head arrived");
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            let head_end = find_subslice(&buf, b"\r\n\r\n").unwrap() + 4;
+            let head_text = String::from_utf8_lossy(&buf[..head_end]).to_string();
+            let api_key = head_text.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("x-api-key").then(|| value.trim().to_owned())
+            });
+
+            // The body PREFIX only. The terminal chunk is never awaited.
+            while decode_chunked_prefix(&buf[head_end..]).len() < want {
+                let n = sock.read(&mut tmp).await.unwrap();
+                assert!(
+                    n > 0,
+                    "upstream connection closed holding {} of {want} body bytes",
+                    decode_chunked_prefix(&buf[head_end..]).len()
+                );
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            let body_prefix =
+                String::from_utf8_lossy(&decode_chunked_prefix(&buf[head_end..])).to_string();
+
+            // Answer now, with the client's request body still open.
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: text/plain\r\n\r\n{}",
+                body_out.len(),
+                body_out
+            );
+            sock.write_all(response.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+            let _ = report_tx.send(EarlySeen { api_key, body_prefix });
+
+            // Keep draining, so finishing the request body upstream never faults on a closed socket.
+            while let Ok(n) = sock.read(&mut tmp).await {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+        (addr, report_rx)
+    }
+
+    // THE PROPERTY THIS CHANGE EXISTS TO DELIVER: a request body that is still open has already been
+    // relayed, and its answer comes back before that body ends. Streaming is what makes this possible;
+    // buffering is what made it impossible.
+    //
+    // No other test in this file can substitute for it, because every other one closes the request body
+    // before asserting anything — and after the body has ended, a streamed relay and a buffered one look
+    // identical from every vantage point a test has. This test cannot pass while buffered: the client
+    // withholds END_STREAM until it is answered, and a proxy that waits for END_STREAM before opening
+    // the upstream connection deadlocks against that, which is the red-prove.
+    //
+    // Each assertion names the production code it requires to have executed, so that coverage is a
+    // property of the assertions and not of the author's confidence:
+    //   - the credential requires `authorize` to have returned `Forward` AND `relay` to have reached a
+    //     real upstream socket, since a refusal never opens one;
+    //   - the body prefix requires the open body to have been relayed AS A STREAM, since the only bytes
+    //     in existence at that moment arrived before END_STREAM;
+    //   - the status requires the upstream's own answer to have travelled back through that relay.
+    #[tokio::test]
+    async fn a_body_still_open_is_already_relayed_and_answered_by_the_upstream() {
+        const PREFIX: &str = r#"{"model":"claude","stream":true,"messages":["#;
+
+        let (stub_addr, seen_rx) = spawn_early_answering_stub(PREFIX.len(), "UPSTREAM_OK").await;
+        let upstream = format!("http://{stub_addr}");
+        let engine = Arc::new(ProxyEngine::new([authority_of(&upstream).unwrap()]));
+        let placeholder = mint_anthropic_placeholder();
+        engine
+            .register(JobCredential {
+                placeholder: placeholder.clone(),
+                real: REAL.to_owned(),
+                upstreams: vec![upstream.clone()],
+            })
+            .unwrap();
+        let proxy = start(Arc::clone(&engine), None).await.unwrap();
+        let proxy_addr = proxy.local_addr();
+
+        let io = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let (send, connection) = h2::client::handshake(io).await.unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let mut send = send.ready().await.unwrap();
+
+        let request = hyper::Request::builder()
+            .method("POST")
+            .uri(format!("http://{proxy_addr}/v1/messages"))
+            .header("x-api-key", &placeholder)
+            .body(())
+            .unwrap();
+        // END_STREAM clear on the HEADERS...
+        let (response, mut body) = send.send_request(request, false).unwrap();
+        // ...and clear on the DATA frame as well. The request is deliberately unfinished.
+        body.reserve_capacity(PREFIX.len());
+        body.send_data(Bytes::from_static(PREFIX.as_bytes()), false).unwrap();
+
+        let response = tokio::time::timeout(Duration::from_secs(10), response)
+            .await
+            .expect(
+                "no response arrived while the request body was still open, so the proxy is waiting \
+                 for the end of a body the client will not end until it has been answered",
+            )
+            .expect("the h2 stream must not be reset");
+
+        // Nothing above this line ends the request stream, so the response necessarily arrived first.
+        // The ordering is structural — a statement that has not run yet cannot have sent END_STREAM —
+        // and so it holds on any machine at any speed, which a sleep or an elapsed-time check would not.
+        assert!(
+            response.status().is_success(),
+            "expected the upstream's 200, got {}",
+            response.status()
+        );
+
+        let seen = tokio::time::timeout(Duration::from_secs(10), seen_rx)
+            .await
+            .expect("the upstream must have been reached while the body was open")
+            .expect("the stub upstream panicked");
+        assert_eq!(
+            seen.api_key.as_deref(),
+            Some(REAL),
+            "the upstream must see the REAL credential, substituted from the placeholder"
+        );
+        assert_eq!(
+            seen.body_prefix, PREFIX,
+            "the upstream must have received the still-open body's first chunk"
+        );
+
+        // Only now does the client finish its request.
+        body.send_data(Bytes::new(), true).unwrap();
+    }
+
+    /// What a never-answering upstream held when the request reached it.
+    struct UpstreamArrival {
+        api_key: Option<String>,
+        body_prefix: String,
+    }
+
+    /// A stub upstream that never answers, reporting TWICE: once when the head and `want` body bytes
+    /// have arrived, and again when its own socket closes.
+    ///
+    /// Both reports are load-bearing. The close tells a test that the upstream request was torn down;
+    /// the arrival is what stops that from being vacuous, because a request that never reached the
+    /// upstream at all also leaves a closed socket and no completed body. Without the first report, a
+    /// client abandoned too early passes the teardown assertion for the wrong reason.
+    ///
+    /// The second report carries whether the chunked request body ever reached its terminal chunk —
+    /// `false` means the upstream saw an INCOMPLETE request, which is the property being asserted.
+    /// "Socket closed" alone cannot distinguish a torn-down relay from one that was quietly completed
+    /// on behalf of a client that had already gone.
+    async fn spawn_never_answering_stub(
+        want: usize,
+    ) -> (
+        SocketAddr,
+        tokio::sync::oneshot::Receiver<UpstreamArrival>,
+        tokio::sync::oneshot::Receiver<bool>,
+    ) {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0_u8; 4096];
+
+            while find_subslice(&buf, b"\r\n\r\n").is_none() {
+                let n = sock.read(&mut tmp).await.unwrap();
+                assert!(n > 0, "upstream connection closed before a request head arrived");
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            let head_end = find_subslice(&buf, b"\r\n\r\n").unwrap() + 4;
+            let head_text = String::from_utf8_lossy(&buf[..head_end]).to_string();
+            let api_key = head_text.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("x-api-key").then(|| value.trim().to_owned())
+            });
+            while decode_chunked_prefix(&buf[head_end..]).len() < want {
+                let n = sock.read(&mut tmp).await.unwrap();
+                assert!(
+                    n > 0,
+                    "upstream connection closed holding {} of {want} body bytes",
+                    decode_chunked_prefix(&buf[head_end..]).len()
+                );
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            let body_prefix =
+                String::from_utf8_lossy(&decode_chunked_prefix(&buf[head_end..])).to_string();
+            let _ = arrived_tx.send(UpstreamArrival { api_key, body_prefix });
+
+            // Now wait to be torn down, answering nothing.
+            loop {
+                match sock.read(&mut tmp).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                }
+            }
+            let _ = closed_tx.send(decode_chunked(&buf[head_end..]).is_some());
+        });
+        (addr, arrived_rx, closed_rx)
+    }
+
+    // CANCELLATION, CLIENT SIDE. A relayed body is only safe if abandoning the client tears the upstream
+    // request down with it. That request carries the REAL credential, so a relay still running after the
+    // job that authorized it has gone is an in-flight credential nobody is waiting for.
+    //
+    // Buffering never had to answer this: there was no upstream request until the body had ended, so
+    // there was nothing to tear down. Streaming opens the upstream while the client can still vanish,
+    // which makes the teardown a new obligation rather than an inherited one.
+    #[tokio::test]
+    async fn abandoning_the_client_tears_down_the_credential_bearing_upstream_request() {
+        const PREFIX: &str = r#"{"model":"claude","stream":true,"messages":["#;
+
+        let (stub_addr, arrived_rx, closed_rx) = spawn_never_answering_stub(PREFIX.len()).await;
+        let upstream = format!("http://{stub_addr}");
+        let engine = Arc::new(ProxyEngine::new([authority_of(&upstream).unwrap()]));
+        let placeholder = mint_anthropic_placeholder();
+        engine
+            .register(JobCredential {
+                placeholder: placeholder.clone(),
+                real: REAL.to_owned(),
+                upstreams: vec![upstream.clone()],
+            })
+            .unwrap();
+        let proxy = start(Arc::clone(&engine), None).await.unwrap();
+        let proxy_addr = proxy.local_addr();
+
+        let io = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let (send, connection) = h2::client::handshake(io).await.unwrap();
+        let connection = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let mut send = send.ready().await.unwrap();
+        let request = hyper::Request::builder()
+            .method("POST")
+            .uri(format!("http://{proxy_addr}/v1/messages"))
+            .header("x-api-key", &placeholder)
+            .body(())
+            .unwrap();
+        let (response, mut body) = send.send_request(request, false).unwrap();
+        body.reserve_capacity(PREFIX.len());
+        body.send_data(Bytes::from_static(PREFIX.as_bytes()), false).unwrap();
+
+        // POSITIVE CONTROL, and the reason this test is not vacuous: there IS a live upstream request,
+        // carrying the real credential, before anything is abandoned.
+        let arrival = tokio::time::timeout(Duration::from_secs(10), arrived_rx)
+            .await
+            .expect("the upstream must be reached while the body is open")
+            .expect("the stub upstream panicked");
+        assert_eq!(
+            arrival.api_key.as_deref(),
+            Some(REAL),
+            "the request under test must be the credential-bearing one"
+        );
+        assert_eq!(arrival.body_prefix, PREFIX, "the open body must have been relayed");
+
+        // The job dies: the container's socket goes away mid-body, with no END_STREAM and no reset.
+        drop(body);
+        drop(send);
+        drop(response);
+        connection.abort();
+
+        let request_completed = tokio::time::timeout(Duration::from_secs(10), closed_rx)
+            .await
+            .expect(
+                "the upstream request outlived the client that authorized it — a credential-bearing \
+                 relay is still running for a job that has gone",
+            )
+            .expect("the stub upstream panicked");
+        assert!(
+            !request_completed,
+            "the abandoned request was relayed upstream as a COMPLETE request: the client vanished \
+             mid-body, so finishing it upstream sends the real credential on a request nobody asked \
+             to finish. A closed socket alone would have hidden this."
+        );
+    }
+
+    // CANCELLATION, UPSTREAM SIDE. An upstream that dies mid-relay must release BOTH the client and the
+    // in-flight permit.
+    //
+    // The permit is the half a single-request test cannot see. One leaked permit per failure is
+    // invisible until the ceiling is reached, and then the proxy stops serving anything at all while
+    // every visible signal — process alive, port listening, no errors — still reads as healthy. So the
+    // assertion is a COUNT, not a case: more failures than the ceiling, all of which must be answered.
+    // With permits leaking, the first `MAX_IN_FLIGHT_REQUESTS` are answered and the remainder hang.
+    #[tokio::test]
+    async fn an_upstream_that_dies_mid_relay_releases_both_the_client_and_its_permit() {
+        use tokio::io::AsyncReadExt;
+
+        const OVERFLOW: usize = 4;
+        let attempts = MAX_IN_FLIGHT_REQUESTS + OVERFLOW;
+
+        // An upstream that accepts, reads, and hangs up without ever answering.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                tokio::spawn(async move {
+                    let mut tmp = [0_u8; 4096];
+                    let _ = sock.read(&mut tmp).await;
+                    // Drop the socket mid-request: the relay fails with the client still waiting.
+                });
+            }
+        });
+
+        let upstream = format!("http://{upstream_addr}");
+        let engine = Arc::new(ProxyEngine::new([authority_of(&upstream).unwrap()]));
+        let placeholder = mint_anthropic_placeholder();
+        engine
+            .register(JobCredential {
+                placeholder: placeholder.clone(),
+                real: REAL.to_owned(),
+                upstreams: vec![upstream.clone()],
+            })
+            .unwrap();
+        let proxy = start(Arc::clone(&engine), None).await.unwrap();
+        let port = proxy.local_addr().port();
+
+        let mut requests = Vec::new();
+        for _ in 0..attempts {
+            let placeholder = placeholder.clone();
+            requests.push(tokio::spawn(async move {
+                reqwest::Client::new()
+                    .post(format!("http://127.0.0.1:{port}/v1/messages"))
+                    .header("x-api-key", &placeholder)
+                    .body("{}")
+                    .send()
+                    .await
+                    .map(|response| response.status())
+            }));
+        }
+
+        // Every one of them must be ANSWERED. The client-release half is that none hangs; the
+        // permit-release half is that there are more of them than the ceiling.
+        for (n, request) in requests.into_iter().enumerate() {
+            let status = tokio::time::timeout(Duration::from_secs(30), request)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "request {n} of {attempts} never got an answer. Past \
+                         {MAX_IN_FLIGHT_REQUESTS}, that is a permit not released on the upstream \
+                         error path, and the proxy is now wedged while looking healthy"
+                    )
+                })
+                .expect("the request task panicked")
+                .expect("a failed upstream must produce a response, not a transport error");
+            assert_eq!(
+                status,
+                StatusCode::BAD_GATEWAY,
+                "an upstream that dies mid-relay must surface as 502 to the container"
+            );
+        }
+    }
+
+    /// A stub upstream that never answers and reports EVERY arrival, plus each socket close.
+    ///
+    /// Multi-arrival is the point: revocation is a claim about a SECOND request, and a stub that can
+    /// only witness one cannot tell "the second was refused" from "the stub stopped listening".
+    #[allow(clippy::type_complexity)]
+    async fn spawn_arrival_counting_stub() -> (
+        SocketAddr,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+        tokio::sync::mpsc::UnboundedReceiver<bool>,
+    ) {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (arrived_tx, arrived_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (closed_tx, closed_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let arrived_tx = arrived_tx.clone();
+                let closed_tx = closed_tx.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0_u8; 4096];
+                    while find_subslice(&buf, b"\r\n\r\n").is_none() {
+                        match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        }
+                    }
+                    let head_end = find_subslice(&buf, b"\r\n\r\n").unwrap() + 4;
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                    let key = head
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("x-api-key")
+                                .then(|| value.trim().to_owned())
+                        })
+                        .unwrap_or_else(|| "<absent>".to_owned());
+                    let _ = arrived_tx.send(key);
+                    // Answer nothing; wait to be torn down, then say whether the body ever finished.
+                    loop {
+                        match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        }
+                    }
+                    let _ = closed_tx.send(decode_chunked(&buf[head_end..]).is_some());
+                });
+            }
+        });
+        (addr, arrived_rx, closed_rx)
+    }
+
+    // REVOCATION MUST REACH CONNECTIONS ALREADY ACCEPTED, not just the listener.
+    //
+    // Every connection used to be a detached `tokio::spawn`, and tokio tasks are not scoped to their
+    // spawner — so `RunningProxy::drop` aborting the accept loop closed the listener while every open
+    // connection kept running with `Arc<ProxyEngine>` in hand. The placeholder still resolved on such a
+    // connection, which makes "the placeholder stops working at job end" false for exactly the client
+    // that already has one. With a relayed body and no byte cap, that outlives the job indefinitely.
+    //
+    // Proving the listener refuses NEW connections would not test this at all: the whole failure lives
+    // on a socket accepted before the drop. So the client here is deliberately kept alive across it.
+    #[tokio::test]
+    async fn dropping_the_proxy_revokes_connections_it_has_already_accepted() {
+        const PREFIX: &str = r#"{"model":"claude","stream":true,"messages":["#;
+
+        let (stub_addr, mut arrived, mut closed) = spawn_arrival_counting_stub().await;
+        let upstream = format!("http://{stub_addr}");
+        let engine = Arc::new(ProxyEngine::new([authority_of(&upstream).unwrap()]));
+        let placeholder = mint_anthropic_placeholder();
+        engine
+            .register(JobCredential {
+                placeholder: placeholder.clone(),
+                real: REAL.to_owned(),
+                upstreams: vec![upstream.clone()],
+            })
+            .unwrap();
+        let proxy = start(Arc::clone(&engine), None).await.unwrap();
+        let proxy_addr = proxy.local_addr();
+
+        let io = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let (send, connection) = h2::client::handshake(io).await.unwrap();
+        let connection = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let open_request = |send: &h2::client::SendRequest<Bytes>| {
+            let request = hyper::Request::builder()
+                .method("POST")
+                .uri(format!("http://{proxy_addr}/v1/messages"))
+                .header("x-api-key", &placeholder)
+                .body(())
+                .unwrap();
+            let mut send = send.clone();
+            let (response, mut body) = send.send_request(request, false).unwrap();
+            body.reserve_capacity(PREFIX.len());
+            body.send_data(Bytes::from_static(PREFIX.as_bytes()), false).unwrap();
+            (response, body)
+        };
+
+        // POSITIVE CONTROL: an authorized stream, credential-bearing, upstream, body still open.
+        let send = send.ready().await.unwrap();
+        let (_first_response, first_body) = open_request(&send);
+        let first_key = tokio::time::timeout(Duration::from_secs(10), arrived.recv())
+            .await
+            .expect("the first request must reach the upstream while its body is open")
+            .expect("the stub upstream closed");
+        assert_eq!(
+            first_key, REAL,
+            "the control stream must be the credential-bearing one, or nothing below is about \
+             revoking a credential"
+        );
+
+        // JOB END, with the client's socket deliberately still alive and still connected.
+        drop(proxy);
+
+        // (a) The credential-bearing upstream request is torn down, and torn down INCOMPLETE.
+        let completed = tokio::time::timeout(Duration::from_secs(10), closed.recv())
+            .await
+            .expect(
+                "the upstream request survived job end: an already-accepted connection is still \
+                 relaying under the real credential after the proxy was dropped",
+            )
+            .expect("the stub upstream closed");
+        assert!(
+            !completed,
+            "the revoked request was finished upstream rather than cut, so job end completed a \
+             credential-bearing request instead of revoking it"
+        );
+
+        // (b) A FURTHER stream on that same already-accepted connection reaches no upstream. The
+        // assertion is an absence, which is only worth anything because the identical call above
+        // produced an arrival on this very connection moments earlier.
+        let second = send.ready().await.map(|ready| open_request(&ready));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(750), arrived.recv()).await.is_err(),
+            "a new stream on a connection accepted BEFORE job end still reached the upstream, so the \
+             placeholder outlives the job on any connection that was already open"
+        );
+
+        drop(first_body);
+        drop(second);
+        connection.abort();
+    }
+
+    /// Serve requests on an already-bound listener, answering the first with `status` and a `Location`
+    /// of `location`, and any later one with `200`. The returned counter is the number of requests that
+    /// reached this host, which is how a test sees whether a redirect was followed to it.
+    ///
+    /// One request per connection, every response `connection: close`. A keep-alive stub would have to
+    /// resynchronise past the bytes of a request body that was aborted mid-flight when the redirect was
+    /// answered, and a stub that mis-parses a leftover chunk would report a request count that no
+    /// assertion could interpret.
+    fn serve_counting(
+        listener: tokio::net::TcpListener,
+        status: u16,
+        location: Option<String>,
+    ) -> (Arc<std::sync::atomic::AtomicUsize>, Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let keys: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let counter = Arc::clone(&hits);
+        let seen_keys = Arc::clone(&keys);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let counter = Arc::clone(&counter);
+                let seen_keys = Arc::clone(&seen_keys);
+                let location = location.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0_u8; 4096];
+                    while find_subslice(&buf, b"\r\n\r\n").is_none() {
+                        match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        }
+                    }
+                    // Capture the credential this host was handed. A hit count says a host was
+                    // CONTACTED; only the header says what it was told, and on a credential path those
+                    // are different findings.
+                    let head = String::from_utf8_lossy(&buf).to_string();
+                    let request_line = head.lines().next().unwrap_or_default().to_owned();
+                    let key = head
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("x-api-key")
+                                .then(|| value.trim().to_owned())
+                        })
+                        .unwrap_or_else(|| "<absent>".to_owned());
+                    seen_keys.lock().unwrap().push(format!("[{request_line}] x-api-key={key}"));
+                    let nth = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                    // The first request gets the redirect; a followed one gets a plain 200, so a test
+                    // can tell "followed" from "surfaced" by the count alone.
+                    let response = match (nth, &location) {
+                        (1, Some(location)) => format!(
+                            "HTTP/1.1 {status} Redirect\r\nlocation: {location}\r\n\
+                             content-length: 0\r\nconnection: close\r\n\r\n"
+                        ),
+                        _ => "HTTP/1.1 200 OK\r\ncontent-length: 8\r\nconnection: close\r\n\r\n\
+                              FOLLOWED"
+                            .to_owned(),
+                    };
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        (hits, keys)
+    }
+
+    // THE STREAMED-BODY REDIRECT MATRIX, measured on sockets rather than deduced from library source.
+    //
+    // A streamed request body cannot be replayed, so a redirect that must resend the body cannot be
+    // followed. That is a behaviour change, so it is pinned here per status instead of described in a
+    // comment, and it is measured end to end: the deduction from `tower-http`'s source is what suggested
+    // these numbers, and only this test establishes them.
+    //
+    // The column that must never move is the last one. A host the credential was never registered for
+    // receives NOTHING, at every status. Losing a follow is a functional regression; sending `x-api-key`
+    // to an unapproved authority would be an incident, so the two are asserted separately and the
+    // security clause is asserted for all ten cases rather than for the interesting ones.
+    #[tokio::test]
+    async fn the_streamed_body_redirect_matrix_is_pinned_per_status() {
+        use std::sync::atomic::Ordering;
+
+        let mut measured = Vec::new();
+        for status in [301_u16, 302, 303, 307, 308] {
+            for cross_authority in [false, true] {
+                // Bind both hosts first: the same-authority Location has to name the upstream's own
+                // address, which does not exist until it is bound.
+                let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr_a = listener_a.local_addr().unwrap();
+                let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr_b = listener_b.local_addr().unwrap();
+                let target = if cross_authority { addr_b } else { addr_a };
+                let (hits_a, keys_a) = serve_counting(
+                    listener_a,
+                    status,
+                    Some(format!("http://{target}/redirected")),
+                );
+                let (hits_b, keys_b) = serve_counting(listener_b, 200, None);
+
+                let upstream = format!("http://{addr_a}");
+                let engine = Arc::new(ProxyEngine::new([authority_of(&upstream).unwrap()]));
+                let placeholder = mint_anthropic_placeholder();
+                engine
+                    .register(JobCredential {
+                        placeholder: placeholder.clone(),
+                        real: REAL.to_owned(),
+                        upstreams: vec![upstream.clone()],
+                    })
+                    .unwrap();
+                let proxy = start(Arc::clone(&engine), None).await.unwrap();
+                let port = proxy.local_addr().port();
+
+                // THE CONTAINER'S CLIENT MUST NOT FOLLOW REDIRECTS, or this test cannot measure the
+                // proxy at all. With the default policy it follows every surfaced `3xx` ITSELF, direct
+                // to the named host and bypassing the proxy entirely — which registers as a hit on
+                // that host and a `200` at the container, and reads exactly like the proxy having
+                // followed the redirect. Measured before this line existed: same-authority 307/308
+                // showed two upstream hits and looked followed, and the second hit was this client.
+                //
+                // The tell was one layer out and had to be asked for: only the proxy holds the REAL
+                // credential, so the second request bearing the PLACEHOLDER named the container as its
+                // author. Hit counts alone cannot separate the two actors.
+                let container = reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .unwrap();
+                let observed = tokio::time::timeout(
+                    Duration::from_secs(20),
+                    container
+                        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+                        .header("x-api-key", &placeholder)
+                        .body(r#"{"model":"claude"}"#)
+                        .send(),
+                )
+                .await
+                .expect("the proxy must answer a redirected request, not hang")
+                .expect("the container must get a response")
+                .status()
+                .as_u16();
+
+                // Settle: a follow that is going to happen has already happened by the time the
+                // container holds a response, because the container's response IS the followed one.
+                let a = hits_a.load(Ordering::SeqCst);
+                let b = hits_b.load(Ordering::SeqCst);
+                let leaked = keys_b.lock().unwrap().iter().any(|seen| seen.contains(REAL));
+                // PROVENANCE, so this test can never again mistake another actor's request for the
+                // proxy's: every request the upstream received must bear the REAL credential, which
+                // only the proxy holds. A placeholder-bearing hit would mean something other than the
+                // relay reached the upstream, and the counts below would be counting the wrong thing.
+                for seen in keys_a.lock().unwrap().iter() {
+                    assert!(
+                        seen.contains(REAL),
+                        "status {status} (cross={cross_authority}): the upstream was reached by a \
+                         request the proxy did not make, so the hit counts do not describe the \
+                         relay. Saw: {seen}"
+                    );
+                }
+                eprintln!(
+                    "MATRIX status={status} cross={cross_authority} \
+                     container_saw={observed} upstream_hits={a} unapproved_host_hits={b} \
+                     REAL_CREDENTIAL_LEAKED={leaked}"
+                );
+                measured.push((status, cross_authority, observed, a, b));
+
+                // THE CLAUSE THAT MUST NOT MOVE, asserted for all ten cases rather than the
+                // interesting ones. Two separate failures, because they are separate findings: being
+                // contacted at all is a policy breach, and being handed the credential is an incident.
+                assert!(
+                    !leaked,
+                    "status {status} (cross={cross_authority}): the REAL credential reached a host it \
+                     was never registered for. reqwest's cross-host scrub does not cover `x-api-key`, \
+                     so the paired-upstream redirect policy is the only thing standing between a `3xx` \
+                     and a leak"
+                );
+                assert_eq!(
+                    b, 0,
+                    "status {status} (cross={cross_authority}): an unapproved host was contacted, so \
+                     the paired-upstream check no longer bounds where a redirect can send this request"
+                );
+            }
+        }
+
+        // Pinned from the measurement above.
+        assert_eq!(
+            measured,
+            vec![
+                // 301/302/303 drop the body by specification, so there is nothing to replay and the
+                // paired-upstream policy still decides: same-authority is followed, cross is refused.
+                (301, false, 200, 2, 0),
+                (301, true, 301, 1, 0),
+                (302, false, 200, 2, 0),
+                (302, true, 302, 1, 0),
+                (303, false, 200, 2, 0),
+                (303, true, 303, 1, 0),
+                // 307/308 preserve method and body, which a streamed body cannot replay. The redirect
+                // is surfaced to the container unchanged and the policy is never consulted — so the
+                // cross-authority row is refused by the ABSENCE of a follow, not by the check.
+                (307, false, 307, 1, 0),
+                (307, true, 307, 1, 0),
+                (308, false, 308, 1, 0),
+                (308, true, 308, 1, 0),
+            ],
+            "the streamed-body redirect matrix moved"
+        );
     }
 }

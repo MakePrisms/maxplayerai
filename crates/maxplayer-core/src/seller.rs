@@ -740,6 +740,9 @@ mod tests {
             deadline_unix: 2_000_000_000,
             seller_pubkey: seller.map(str::to_owned),
             requested_agent: None,
+            requested_harness_family: None,
+            requested_model: None,
+            required_capabilities: Vec::new(),
         }
     }
 
@@ -966,6 +969,7 @@ offer_backfill_secs = {backfill}
                 job_timeout_secs: None,
                 agents: Vec::new(),
                 claim_open_pool: false,
+                accept_open_targeted: false,
                 accept_offers_only_from: Vec::new(),
                 offer_backfill_secs: 0,
                 contribution_enabled: true,

@@ -32,7 +32,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use maxplayer_core::seller_exec::{JobLaunch, SandboxPolicy};
+use maxplayer_core::seller_exec::{
+    force_remove_argv, probe_container_name, JobLaunch, SandboxPolicy,
+};
 
 const SUCCESS: i32 = 0;
 const USAGE_ERROR: i32 = 1;
@@ -429,7 +431,40 @@ fn run_in_container(policy: &SandboxPolicy, canary: &Path, workdir: &Path) -> Co
     let mut argv = Vec::with_capacity(launch.args.len() + 1);
     argv.push(launch.program);
     argv.extend(launch.args);
-    spawn_and_read(&argv)
+
+    // The probe container carries a FIXED name (its workdir leaf is the constant `PROBE_WORKDIR_NAME`,
+    // not a per-boot one), and like every job container it runs with no `--rm`. So a probe left by an
+    // earlier run — a prior boot, an earlier `maxplayer doctor`, a hard kill — sits there exited and the
+    // next `docker run` fails with a name conflict, which surfaces as "the launcher produced no probe
+    // result" and refuses the boot. Force-remove that exact name before AND after: before clears a
+    // leftover so this run can start, after keeps a clean boot from leaving one behind. Both are
+    // best-effort and idempotent (`docker rm -f` exits 0 for an absent container), and this is a
+    // self-probe with no buyer evidence to preserve — unlike a real job, where the missing `--rm` is
+    // deliberate. Scoped to the docker arm; the launcher arm has no container to remove.
+    let probe_container = probe_container_name(policy, workdir);
+    if let Some(name) = &probe_container {
+        remove_probe_container(name);
+    }
+    let verdict = spawn_and_read(&argv);
+    if let Some(name) = &probe_container {
+        remove_probe_container(name);
+    }
+    verdict
+}
+
+/// Best-effort `docker rm -f` of the probe container by exact name. Never fails the probe: a removal
+/// error is not evidence about containment, and the name is force-removed again on the next run.
+fn remove_probe_container(name: &str) {
+    let argv = force_remove_argv(name);
+    let Some((program, args)) = argv.split_first() else {
+        return;
+    };
+    let _ = Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 /// The shell payload the container runs: the two legs, in the image's own `sh`, printing the same
@@ -545,8 +580,13 @@ fn cleanup(workdir: &Path, canary: &Path) {
 /// operator asked for the unsafe path. Pure, because this is the decision the whole check exists to
 /// make and it must be testable without a sandbox.
 ///
-/// Targeted-only seats are advisory: they run work from counterparties they chose, which is a
-/// different risk than executing whatever the open market posts.
+/// ⚠ The advisory softening belongs to a seat reachable ONLY by the buyers its operator named —
+/// those run work from counterparties they chose, a different risk from executing whatever the
+/// market posts. It does NOT belong to "targeted-only": since the three-knob change a seat with
+/// `accept_open_targeted` takes targeted offers from buyers it never named, which is the same
+/// stranger-written code. This function still decides the OPEN-POOL half alone; its caller
+/// (`doctor::checks::check_sandbox_containment`) is what weighs both surfaces and only reaches
+/// here once it has established the seat serves strangers.
 pub fn open_pool_admission(
     claims_open_pool: bool,
     containment: &Containment,

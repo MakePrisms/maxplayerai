@@ -125,7 +125,8 @@ All four are overridable in `config.toml`.
 creation — on a shared host, seller state (key, mint proofs, config, job workdirs) IS the wallet, so a
 group/world-readable home lets any local user read money-bearing material (#473). This is a property of
 the binary, not of your `umask`, and `maxplayer doctor` has a **home permissions** leg that flags a home
-that has since drifted open (WARN for a targeted seat, FAIL for an open-pool one). The one thing the
+that has since drifted open (WARN for a seat only its named buyers can reach, FAIL for one strangers
+can reach by either open surface — see §6). The one thing the
 binary cannot own is state a **harness** writes outside the seat home (e.g. a Cursor config under `~`):
 run the daemon under a service unit with **`UMask=0077`** so that residue is owner-only too.
 
@@ -159,7 +160,7 @@ Notes:
   - no --key (packaged key file only)
   - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (no working nix, agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint
   - --skip-doctor: bypass the startup readiness checks (default: checks-on; not recommended). The nix check still runs — it is an environment requirement (#745) with no bypass
-  - --unsafe-no-sandbox: serve the OPEN POOL with no working sandbox — this box then runs code written by strangers with no containment (waives only that one check)
+  - --unsafe-no-sandbox: serve a STRANGER-FACING surface with no working sandbox (either open surface) — this box then runs code written by strangers with no containment (waives only that one check)
   - open-pool claiming is OFF by default; pass --claim-open-pool to opt in
   - --offer-backfill-secs <n>: see OPEN-POOL offers posted up to n seconds before startup (default 1200; 0 = live-only; targeted offers always backfill)
 ```
@@ -170,12 +171,13 @@ Notes:
 | `--agent-argv <part>` | yes* (repeatable) | Build `agent_command` as an **argv array** (first entry = program). Shell strings refused. Pass either `--agent` **or** `--agent-argv`, not both. |
 | `--rate-sats <n>` | yes (first run) | Claim floor in sats + your net-positive floor. The setup default is `100` (see [§7](#7-fees--rate--set---rate-sats-to-net-positive)). |
 | `--git-remote <url>` | no | Public https delivery remote (BYO). Omit → the hosted relay-git default. |
-| `--claim-open-pool` | no | Opt in to also claim untargeted/open offers (default **off** = targeted-only). `--no-claim-open-pool` forces off. |
+| `--claim-open-pool` | no | Opt in to claim untargeted/open-pool offers (default **off**). `--no-claim-open-pool` forces off. |
+| `--accept-open-targeted` | no | Opt in to accept targeted offers from buyers you have NOT named (default **off**). `--no-accept-open-targeted` forces off. See §6 — with neither this nor an allowlist, the seat claims nothing. |
 | `--name <display>` | no | Optional kind-0 display name published for discoverability. |
 | `--job-timeout-secs <n>` | no | Per-job timeout (seconds). |
 | `--offer-backfill-secs <n>` | no | See OPEN-POOL offers posted up to `n` seconds before startup (default `1200`; `0` = live-only; targeted offers always backfill). |
 | `--skip-doctor` | no | Bypass the startup readiness checks (checks-on by default; not recommended). Does **not** bypass the nix check — that is an environment requirement (#745: "can this box EVER do the work"), so it survives every flag. |
-| `--unsafe-no-sandbox` | no | Serve the open pool with no working sandbox — this box then runs strangers' code uncontained. Waives that one check only. |
+| `--unsafe-no-sandbox` | no | Serve a stranger-facing surface (either open surface) with no working sandbox — this box then runs strangers' code uncontained. Waives that one check only. |
 | `--home <dir>` | no | Home root (else `MAXPLAYER_HOME` / `~/.maxplayer`). |
 
 \* Exactly one of `--agent` / `--agent-argv` is required on the **first** run. After that they are
@@ -233,6 +235,207 @@ text in that workdir, and on completion pushes the tree and publishes kind-3403 
 > fallback commits.
 
 ---
+
+## 3a. Link your model account
+
+Maxplayer does not authenticate Cursor, Claude, or Codex. The ACP adapter starts the vendor CLI, and
+that CLI must **already be linked to an account**. A seat with a correct `config.toml` and an
+unauthenticated CLI is a seat that cannot earn.
+
+### Rules that apply to every provider
+
+- **Link as the seller service user, with its real `HOME` and `PATH`.** A login performed as `root` is
+  invisible to a daemon running as `seller`. An `export` in an interactive shell is invisible to an
+  already-running systemd service — the credential takes effect on the **restart**, not before it.
+- **Keep each runner's login fresh and separate.** Do not copy another runner's credential or reuse its
+  home. Credential directories should be mode `0700`; credential files and service environment files
+  should be mode `0600`.
+- **Subscription login and API-key login are different things.** They use different billing,
+  different entitlements, and sometimes different available models. Choose deliberately.
+- **`maxplayer doctor` cannot tell you the CLI is linked.** It checks configuration, binaries, images,
+  and containment, and it runs **no agent turn**. The seller's pre-advertise probe does run one,
+  through the same sandbox path a paid job uses, so an auth failure there keeps the seat off the board.
+  A green `doctor` beside a seat that never advertises is the normal shape of an unlinked harness.
+- **Never print, commit, paste into chat, or place a durable credential in `config.toml`.** On a
+  headless server, share only the one-time browser URL or code through a private channel, and keep the
+  login process running until approval completes.
+
+### Cursor
+
+For a host or `launcher` seat:
+
+```bash
+# Run as the seller service user, with its real HOME and PATH.
+NO_OPEN_BROWSER=1 cursor-agent login
+cursor-agent status
+```
+
+`NO_OPEN_BROWSER=1` makes a headless runner print the browser URL instead of trying to open a local
+browser. Keep the command running, open the URL on a signed-in computer, approve it, and wait for the
+terminal to report success.
+
+> **Vendor behaviour we do not control.** The `login`, `status` and `logout` commands and the
+> `NO_OPEN_BROWSER=1` environment variable are documented by Cursor at
+> <https://cursor.com/docs/cli/reference/authentication> (read 2026-08-27). Maxplayer neither sets nor
+> validates them, and Cursor may change them in any release.
+>
+> ⚠ **`AGENT_CLI_CREDENTIAL_STORE` is NOT on that page, and neither is any session-file path.** Read
+> 2026-08-27, that article (`<title>Authentication | Cursor Docs</title>`) names exactly two environment
+> variables — `NO_OPEN_BROWSER` and `CURSOR_API_KEY` — and contains **zero** occurrences of
+> `AGENT_CLI_CREDENTIAL_STORE`, `auth.json` or `/.cursor`. So the variable in the command below, and
+> the file location after it, rest on **one operator run — 2026-08-26, Cursor Agent
+> `2026.08.25-3e8eec8` on Linux — not on vendor documentation, and not reproduced by this project.**
+> Treat both as unverified and confirm them on your own machine before you rely on them.
+>
+> The URL earlier editions of this page cited, `docs.cursor.com/en/cli/reference/authentication`, is
+> dead. Every path on that host answers `HTTP 308` to the same `cursor.com/docs` landing page —
+> including a path we invented that cannot exist (measured 2026-08-27). A link that accepts a nonsense
+> path is not a citation, so it was replaced rather than followed.
+
+For a Docker seat, use the **browser session file**, not `CURSOR_API_KEY`. Force file storage during
+login if the platform would otherwise use a Keychain:
+
+```bash
+AGENT_CLI_CREDENTIAL_STORE=file NO_OPEN_BROWSER=1 cursor-agent login
+```
+
+⚠ **Find the session file; do not assume its path.** Cursor Agent `2026.08.25-3e8eec8` on Linux wrote
+`$HOME/.config/cursor/auth.json` even with `AGENT_CLI_CREDENTIAL_STORE=file` (operator-measured,
+2026-08-26), while older Cursor documentation names `$HOME/.cursor/auth.json`. Both locations are real
+for some build. Locate the one **your** build wrote, then lock it down:
+
+```bash
+ls -l "$HOME/.config/cursor/auth.json" "$HOME/.cursor/auth.json" 2>/dev/null
+chmod 600 <the file that exists>
+cursor-agent status
+```
+
+⛔ **Do not read `doctor`'s credential-directory check as proof of this file.** It inspects the
+directories Maxplayer knows for a harness; it does not open your session file, and it cannot tell you
+which location your Cursor build actually uses. `stat` the configured file yourself and confirm the
+owner, the mode, and that the service user can read it — without printing its contents.
+
+Point the contained seat at the file by **absolute path**. Cursor needs **two legs**: its control plane
+and its agent/inference leg go to different hosts, and one `upstream` cannot name both.
+
+```toml
+[[sandbox.file_credentials]]
+path = "/absolute/path/to/.config/cursor/auth.json"   # the path YOU verified above
+field = "accessToken"
+env = "CURSOR_AUTH_TOKEN"
+upstream = "https://api2.cursor.sh"
+endpoint_args = ["--endpoint"]
+
+[[sandbox.file_credentials.legs]]
+endpoint_args = ["--agent-endpoint"]
+upstream = "https://agentn.global.api5.cursor.sh"
+```
+
+If you select a **named agent pool**, pin the model on the named preset, not only on the legacy
+fallback command. `agents = ["cursor"]` alone resolves the built-in preset and drops extra model
+arguments:
+
+```toml
+[seller]
+agents = ["cursor"]
+
+[agents.cursor]
+argv = ["cursor-agent", "--model", "cursor-grok-4.6-high", "acp"]
+```
+
+⛔ **`forward_env = ["CURSOR_API_KEY"]` is unsafe for untrusted Docker jobs.** It puts a real, reusable
+key inside the job container, where a stranger's job reads it. `doctor` WARNs rather than refusing, so
+the seat runs and leaks. Use the session file above instead: the per-job proxy keeps the real value on
+the host and hands the container a placeholder.
+
+The endpoint flags, the upstream hosts, and the session-file location are all **version-measured Cursor
+behaviour**. Revalidate them whenever you move the pinned Cursor build.
+
+### Claude
+
+For a host or `launcher` seat, run `claude`, choose the Claude.ai or Console account in the browser, and
+use `/login` to relink an existing install. Over SSH or in a container, copy the displayed URL into a
+browser and paste the returned code back into the terminal.
+
+```bash
+claude auth status
+```
+
+> **Vendor behaviour we do not control.** Anthropic documents the current flow and its storage locations
+> at <https://code.claude.com/docs/en/authentication> (read 2026-08-26).
+
+`/login` writes a user credential under `~/.claude` on Linux and Windows, and to the **macOS Keychain**.
+That is enough for a host or `launcher` seat. It is **not visible inside Docker**: a container inherits
+no home directory and no Keychain.
+
+For an unattended Docker seller on a Claude subscription, generate the long-lived, model-only token:
+
+```bash
+claude setup-token
+```
+
+Store the result as `CLAUDE_CODE_OAUTH_TOKEN` in a root-owned or seller-owned mode-`0600` systemd
+environment file. Never echo it into docs, logs, shell history, `config.toml`, or chat. Maxplayer's
+contained Claude path takes it from the daemon environment, keeps the real value on the host, and gives
+the job a per-job placeholder.
+
+`ANTHROPIC_API_KEY` is the **usage-billed Console path**, not a subscription login. It also needs a
+one-time interactive approval that a daemon has nobody to give, which is why the OAuth token is the
+right choice for an unattended seat.
+
+### Codex
+
+Use a **dedicated Codex home** for the seller, so its login and refresh state cannot disturb another
+Codex process. Configure file storage before you log in:
+
+```toml
+# $CODEX_HOME/config.toml
+cli_auth_credentials_store = "file"
+```
+
+```bash
+export CODEX_HOME="/absolute/path/to/.codex-maxplayer-seller"
+install -d -m 700 "$CODEX_HOME"
+codex login                 # on a browser-capable host
+codex login --device-auth   # on a headless host
+codex login status
+test -f "$CODEX_HOME/auth.json"
+chmod 600 "$CODEX_HOME/auth.json"
+```
+
+> **Vendor behaviour we do not control.** OpenAI's current auth guide is
+> <https://developers.openai.com/codex/auth/> (read 2026-08-26). `cli_auth_credentials_store` is Codex's
+> own setting. Device-code login may need to be enabled in the user's ChatGPT security settings or by a
+> workspace admin.
+
+For Docker, **do not mount or copy `auth.json` into the job container.** Point Maxplayer at the absolute
+host path:
+
+```toml
+[sandbox.codex_chatgpt]
+auth_file = "/absolute/path/to/.codex-maxplayer-seller/auth.json"
+```
+
+Maxplayer reads the needed ChatGPT fields **on the host, once per job**, and sends only placeholders into
+Docker. The path must be absolute; a relative one is refused at config load. If the stored access token
+is close to expiry, relink or refresh it on the host — **no seller restart is needed** for the next job
+to reread the file.
+
+For usage-billed API access, use the stdin form:
+
+```bash
+printenv OPENAI_API_KEY | codex login --with-api-key
+```
+
+(The removed `--api-key` flag no longer exists; `--with-api-key` and `--device-auth` do.)
+
+### The verification gate — run this for every provider
+
+1. Run the vendor's status command **as the exact seller service user**.
+2. Check only file **existence, owner, mode, and expected JSON field shape** — never print the credential.
+3. Start the seller and require the **real pre-advertise probe** to pass.
+4. Confirm the signed heartbeat advertises the intended harness and model.
+5. Run one small targeted canary job before opening any stranger-facing route.
 
 ## 3b. Setup gotchas — two environment prerequisites that silently break `execute`
 
@@ -395,17 +598,22 @@ proxy_port_range` when egress containment is active — without it the firewall 
 job cannot reach its model"*. Size it at least as large as `[seller] slots`, since each contained job
 holds its own listener for its lifetime.
 
-**2. The credential does not cross the container boundary.** A host executor inherits your environment;
-a container inherits nothing. `claude /login` writes to `~/.claude` (macOS: the Keychain) and neither
-exists inside the container — so the daemon's **own environment** must hold the credential. These names
-are forwarded in automatically when set, with no `forward_env` entry:
+**2. An environment credential does not cross the container boundary.** A host executor inherits your
+environment; a container inherits nothing. `claude /login` writes to `~/.claude` (macOS: the Keychain)
+and neither exists inside the container. The daemon's **own environment** must hold that credential.
+These names are forwarded in automatically when set, with no `forward_env` entry:
 `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_BASE_URL`,
 `OPENAI_API_KEY`, `OPENAI_BASE_URL`. For `claude` prefer `CLAUDE_CODE_OAUTH_TOKEN` (`claude
 setup-token`) — an environment API key needs a one-time interactive approval a daemon cannot give (§3b).
 
-The pre-advertise probe does not catch this: it runs the CLI **on the host**, where `~/.claude` is
-readable, so the seat advertises normally and then fails every job on auth. Set the variable where the
-daemon **actually starts** — a systemd `Environment=`, a launchd plist, or the launcher script that
+Docker Codex has a separate ChatGPT session route. `[sandbox.codex_chatgpt]` reads the host Codex auth
+file for each job and keeps the real session outside Docker. See the controlled setup below.
+
+Whether the pre-advertise probe catches this depends on your sandbox mode, because the probe runs
+wherever jobs run. Under `launcher` or no sandbox it runs the CLI **on the host**, where `~/.claude` is
+readable — so it passes on a credential the daemon environment is missing, and you find out at the first
+job. Under `mode = "docker"` it runs **inside the container**, so it fails and the seat **never
+advertises**. Set the variable where the daemon **actually starts** — a systemd `Environment=`, a launchd plist, or the launcher script that
 `exec`s it. Not your login shell, and note an `export` in an interactive shell cannot reach an
 already-running daemon: the credential change takes effect on the **restart**, not before it.
 
@@ -414,17 +622,92 @@ reusable key; the list above is claude and codex only, and the per-job proxy can
 **`forward_env = ["CURSOR_API_KEY"]` sends your real key into the container for a stranger's job to
 read** — caught by a `doctor` WARN, not a refusal, so the seat runs and leaks. Never do that.
 
-The browser-login **session** does have a contained path. `[[sandbox.file_credentials]]` reads one
-named field out of the session file on the host, once per job, and gives the container a placeholder
-plus a redirect flag; the real value never crosses. That path is verified against the real vendor on
-the host leg. **From inside a running container it has now been exercised, and it does not complete —
-Docker-contained cursor is unsupported.** The redirected h2c agent leg reaches the proxy and stalls in
-the proxy's pre-forward body collection, so every job fails; a seat configured that way fails its
-pre-advertise probe and refuses to advertise rather than taking awards it cannot serve. Run cursor
-under `launcher` mode, or use a claude/codex harness under docker. The fields, the expiry behaviour,
-and the per-client measurement caveat are in [DOCKER.md](DOCKER.md).
+Use the browser-login **session** instead. `[[sandbox.file_credentials]]` reads one named field out of
+the session file on the host, once per job, and gives the container a placeholder plus a redirect flag;
+the real value never crosses. **This path is reported working by the maintainer, measured 2026-08-26 on
+Cursor Agent `2026.08.25-3e8eec8` (Linux), and not reproduced by us.** Nobody on this project has run
+`cursor-agent`; it is not installed on our build hosts. Treat it as a maintainer measurement rather than
+a supported configuration, and **prove it on your own seat before you take paid work on it.** It needs a
+two-leg config, because cursor's agent traffic goes to a second host (`agentn.global.api5.cursor.sh`) —
+name it as a `[[sandbox.file_credentials.legs]]` entry. On macOS the session lives in the login Keychain,
+which the daemon cannot read, so create the file first with `AGENT_CLI_CREDENTIAL_STORE=file cursor-agent
+login`, then locate the file it wrote: that path is build-dependent, so use **[Cursor](#cursor)** above
+rather than typing `~/.cursor/auth.json` from this line. The fields, the `legs` entry, the expiry
+behaviour, and the per-client caveat are in [DOCKER.md](DOCKER.md).
 
-**Leave `image` unset.** Omitted, the binary uses its own version-pinned ref
+#### Controlled Docker Codex seller with ChatGPT auth
+
+Use a separate seller home, Codex home, Docker network, and proxy port. This keeps the current Claude
+seller home and process unchanged.
+
+First, create a dedicated Codex login for the same ChatGPT account:
+
+```bash
+export MAXPLAYER_CODEX_AUTH="$HOME/.codex-maxplayer-test"
+install -d -m 700 "$MAXPLAYER_CODEX_AUTH"
+CODEX_HOME="$MAXPLAYER_CODEX_AUTH" codex login
+chmod 600 "$MAXPLAYER_CODEX_AUTH/auth.json"
+```
+
+Next, build the source-test sandbox image and create its network. A released binary can omit `image`
+and use its versioned image instead.
+
+```bash
+docker build -t maxplayer-sandbox:codex-test docker/maxplayer-sandbox
+docker network create maxplayer-codex-test
+```
+
+Create a new seller identity. `whoami` writes a new key inside only this home and prints public values:
+
+```bash
+export MAXPLAYER_CODEX_SELLER_HOME="$HOME/.maxplayer-codex-test"
+"$MAXPLAYER_BIN" whoami --home "$MAXPLAYER_CODEX_SELLER_HOME"
+```
+
+Edit `$MAXPLAYER_CODEX_SELLER_HOME/config.toml`. Keep its existing root settings. Add these sections
+after you replace all angle-bracket values:
+
+```toml
+[seller]
+agent_command = ["codex-acp"]
+agents = ["codex"]
+rate_sats = 100
+git_remote = "https://relay.maxplayer.ai/git/<SELLER_HEX>/m<FIRST_16_SELLER_HEX>.git"
+claim_open_pool = false
+accept_offers_only_from = ["<TEST_BUYER_HEX>"]
+slots = 1
+
+[sandbox]
+mode = "docker"
+image = "maxplayer-sandbox:codex-test"  # source test only; omit for a released binary
+network = "maxplayer-codex-test"
+proxy_port_range = "9200-9200"
+# runtime = "runsc"                    # Linux only; omit on macOS
+
+[sandbox.codex_chatgpt]
+auth_file = "/absolute/path/to/.codex-maxplayer-test/auth.json"
+```
+
+`<TEST_BUYER_HEX>` is the 64-character buyer public key. The buyer must also target the new seller
+public key. These two checks limit the seller to controlled test jobs.
+
+Run the checks and start only the new home:
+
+```bash
+MAXPLAYER_HOME="$MAXPLAYER_CODEX_SELLER_HOME" "$MAXPLAYER_BIN" doctor
+MAXPLAYER_HOME="$MAXPLAYER_CODEX_SELLER_HOME" "$MAXPLAYER_BIN" seller
+```
+
+The host reads the current access token and account ID before each Codex run. The auth file and refresh
+token never enter Docker. Docker receives only two per-job placeholders.
+
+The token must outlive the job timeout plus 15 minutes. Version one does not refresh it. Run the same
+dedicated Codex login again when the lifetime check fails.
+
+The planned refresh step will run on the host before each job. It will update the same auth file before
+this reader runs. It will never put a refresh token in Docker.
+
+**Leave `image` unset for a released binary.** Omitted, the binary uses its own version-pinned ref
 (`ghcr.io/makeprisms/maxplayer-sandbox:v<installed version>`), published for every release. `image` is
 for a fully custom image and is not a version selector — a bare tag like `maxplayer-sandbox:latest`
 sends docker to Docker Hub, where there is nothing to pull.
@@ -442,7 +725,8 @@ An existing seat on `launcher` is never moved by an upgrade — see *Moving an e
 ### `launcher` mode — only if this box cannot run docker
 
 The launcher below is `bwrap` (bubblewrap), and it is not present on a stock box. Install it before
-you configure the section, or the boot gate refuses to start an open-pool seat:
+you configure the section, or the boot gate refuses to start a seat strangers can reach — one that
+claims the open pool OR accepts targeted offers from buyers it has not named:
 
 ```bash
 command -v bwrap            # prints a path once installed
@@ -495,10 +779,13 @@ and aborts the boot probe without them (read-only is enough — it never writes 
   and the job workdir must be writable. Fail either leg and the seat refuses to start (#451).
   `launcher = ["env"]` resolves perfectly and confines nothing — it is refused on the second leg,
   not the first.
-- **Targeted-only seats stay advisory.** Without `claim_open_pool`, the same probe reports as a WARN:
-  you run work from counterparties you accepted, rather than whatever the market posts.
+- **Seats only their named buyers can reach stay advisory.** With BOTH open surfaces off
+  (`claim_open_pool` and `accept_open_targeted`), the same probe reports as a WARN: every job comes
+  from a buyer you listed, rather than from whoever the market sends. That softening is bought by the
+  allowlist — opening **either** surface makes this a blocking FAIL, because a targeted job from an
+  unnamed buyer is the same stranger-written task text an open-pool job is.
 - **The escape hatch is one flag, and it is narrow on purpose.** `maxplayer seller --unsafe-no-sandbox`
-  serves the open pool uncontained. It waives THIS check only — the relay, mint, key and agent gates
+  serves strangers uncontained. It waives THIS check only — the relay, mint, key and agent gates
   stay blocking, so accepting the code-execution exposure never means switching the rest off.
 
 ### Verify before going live
@@ -554,8 +841,10 @@ maxplayer doctor
 ```
 
 **Check your credential before restarting.** A seat that has run on `launcher` may be authenticated only
-through `~/.claude`, which a container cannot read. That is the usual cause of a switched seat that
-claims jobs and then fails them all on auth — see the two blockers above.
+through `~/.claude`, which a container cannot read. That is the usual cause of a switched seat that comes
+back up and **never advertises**: the pre-advertise probe now runs inside the container, finds no
+credential, and holds the seat off the board. `doctor` stays green throughout — it runs no agent turn —
+so read the probe, not `doctor`. See the two blockers above, and link the account first: [§3a](#3a-link-your-model-account).
 
 Then restart the daemon. Two more things to expect on a seat that is already earning: the first job pulls
 the sandbox image unless it is already local (`doctor` warns and hands you the `docker pull` so you can do
@@ -604,8 +893,20 @@ On start (after `[seller]` is written) the daemon publishes:
 
 So buyers discover the seller **by capability**, not by hand-swapping a pubkey. The heartbeat is
 addressable (same `d` every beat), so each one supersedes the last in place — republishing on that
-cadence is not spam, and every fact on it is current as of that beat rather than frozen at boot.
-Buyers resolve it by `(pubkey, d)`, never by event id.
+cadence is not spam. Buyers resolve it by `(pubkey, d)`, never by event id.
+
+Most facts on a beat are current as of that beat, but **two are not**, and it matters if you are
+tuning a live seat:
+
+- `harness_model` is the model each harness **last reported** — recorded when a harness is probed at
+  boot, when a dropped harness comes back, and when a job finishes. Between those it repeats the
+  last value it saw.
+- `capabilities` is measured **once, at seat start**, and republished unchanged for the life of the
+  process. Install a toolchain into a running seat and it is not advertised until you restart;
+  remove one and the seat keeps advertising it until you restart. **Restart the seat after you
+  change its toolchain**, or the advertisement and the machine disagree.
+
+`docs/protocol-v1.md` §4.5.4 is normative for both.
 
 ### Getting your first jobs — be introduced, don't wait
 
@@ -626,25 +927,57 @@ them to target you:
 A buyer targets you by passing that pubkey as `seller_pubkey` when they post. Those first targeted
 jobs are what build the record other buyers read.
 
-The open pool ([§6](#6-open-pool--targeted-only-is-the-safe-default)) is the other direction, and it
-is not the cold-start path: it is where established seats compete on rate, it requires a working
-sandbox, and it means running code written by strangers. Get targeted work first.
+The open pool ([§6](#6-open-pool--claiming-untargeted-offers)) is the other direction, and it
+is not the cold-start path: it is where established seats compete on rate, and `doctor` requires a
+working sandbox before a seat claims there. Get targeted work first.
 
 ---
 
-## 6. Open-pool — targeted-only is the safe default
+## 6. Who can reach you — three independent knobs
 
-By default the daemon is **targeted-only**: it auto-claims **only** offers whose `#p` equals this
-seller's pubkey (untargeted/open offers are soft-skipped; wrong `#p` refused; then `amount ≥ rate_sats`).
+**A fresh seat claims nothing until you say who may reach it.** Both ways a stranger can hand this
+box work are opt-in, and neither is inferred from the other or from a field being empty:
 
-Opt in to also claim untargeted/open offers that still clear your rate:
-
-```bash
-"$MAXPLAYER_BIN" seller --agent claude --rate-sats 100 --claim-open-pool
+```toml
+[seller]
+accept_offers_only_from = []       # the buyers you name. Default: none named.
+accept_open_targeted    = false    # may a buyer you did NOT name target you directly?
+claim_open_pool         = false    # may you claim untargeted offers from the open pool?
 ```
 
-`--claim-open-pool` (or `claim_open_pool = true` in `config.toml`) widens claiming to the open pool;
-`--no-claim-open-pool` forces it off. **Targeted-only stays the default** — open-pool is your explicit choice.
+| You want | Set |
+| --- | --- |
+| Work only with buyers you know | `accept_offers_only_from = ["<buyer-hex>", …]` |
+| Take targeted offers from anyone | `accept_open_targeted = true` |
+| Compete for untargeted pool offers | `claim_open_pool = true` |
+
+The CLI flags mirror the defaults — both are opt-INs, so the safe posture needs no flag at all:
+
+```bash
+"$MAXPLAYER_BIN" seller --agent claude --rate-sats 100 --accept-open-targeted   # accept strangers
+"$MAXPLAYER_BIN" seller --agent claude --rate-sats 100 --claim-open-pool        # claim the pool
+```
+
+**A populated allowlist wins.** While `accept_offers_only_from` has entries it is a hard fence on
+*both* surfaces, checked before the rate and harness gates: an offer whose author is not on the list
+is skipped (`NotAllowlisted`), silently — a private seller does not tell a stranger why it declined.
+`accept_open_targeted` then has no effect, and `doctor` reports it as INERT rather than letting you
+believe you opened something.
+
+> ⚠ **Upgrading an existing seat? Read this.** An empty `accept_offers_only_from` used to mean
+> *accept from any buyer* on the targeted surface. It no longer does — it means *no buyer named*. A
+> seat with no allowlist and neither flag set will **stop claiming targeted work after the upgrade**:
+> it still boots, connects and advertises, it just never claims. There is no config error, because the
+> config is valid. The daemon says so loudly at boot and `maxplayer doctor` fails the **seat
+> reachability** check. To restore the old behaviour, either list your buyers or set
+> `accept_open_targeted = true`.
+
+**Neither flag is a security boundary, and `#p` never was one.** `#p` names *you*; it does not name
+*who may post*. A targeted job from an unnamed buyer runs the same stranger-written task text an
+open-pool job does, through the same agent, with the same filesystem and credentials — which is why
+opening *either* surface makes containment ([SANDBOXING.md](SANDBOXING.md)) a blocking `doctor` check
+rather than an advisory one. The allowlist is the control over *who* reaches you; containment is the
+control over what they can do once they have.
 
 **What changes when you opt in:** your seat can now *lose*. A targeted offer names you and nobody
 else, so a claim you park is a claim you win. An open-pool offer is claimed by several seats and the
@@ -688,7 +1021,7 @@ offer (3401)  →  claim (3402 status=processing)
 ```
 
 1. **Offer** — buyer posts kind-3401. Offers may be targeted (`#p=<seller>`) or untargeted (open).
-2. **Claim (targeted-only by default)** — the daemon auto-claims only offers `#p`-tagged to this seller and `amount ≥ rate_sats`; untargeted offers are soft-skipped unless `--claim-open-pool`. (Unattended claim-to-collect over a live offer used a harness in testing — see the autonomy caveat above.)
+2. **Claim (nothing, until you say who may reach you)** — the daemon auto-claims an offer only if its author is a buyer you named, or the offer is `#p`-tagged to you and `accept_open_targeted = true`, or it is untargeted and `claim_open_pool = true`; then `amount ≥ rate_sats`. See §6. (Unattended claim-to-collect over a live offer used a harness in testing — see the autonomy caveat above.)
 3. **Execute** — the ACP agent runs the task in the job workdir (real files / commit).
 4. **Deliver** — push to the delivery remote (relay-git default or BYO); publish kind-3403 with the commit OID.
 5. **Collect (working, fee-aware)** — when the buyer pays, a NIP-17 gift-wrapped cashu token (kind-1059) arrives for the seller pubkey. The daemon AUTH-then-reads `#p=seller` on the relay (p-gated), unwraps, predicts the mint fee, refuses dust up front, and redeems against your configured mint. Your wallet nets `face − fee`.
@@ -722,7 +1055,7 @@ wrote [seller] to …/config.toml
 relay-git NIP-34 announce ok id=… remote=…
 relay-git seed probe ok (info/refs reachable)
 discoverable kind0=… name=… pubkey=…
-seller node starting pubkey=… agent=claude rate_sats=100 claim_open_pool=false git_remote=… (never-echo: key omitted)
+seller node starting pubkey=… agent=claude rate_sats=100 claim_open_pool=false accept_open_targeted=false accept_offers_only_from=0 git_remote=… (never-echo: key omitted)
 ```
 
 It must **not** print the secret key. Leave it running: on a matching offer the daemon claims,
@@ -897,6 +1230,6 @@ signed in for you is not signed in for the service unless its config lives under
 → gotcha 2 (NixOS): CLAUDE_CODE_EXECUTABLE points at a NixOS-runnable claude; a PATH shim alone leaves the ACP/agent path dead (§3b)
 → delivery defaults to relay-git (NIP-34 announce → in-process NIP-98 push, no external git/helper); --git-remote for BYO https
 → discoverability: kind-0 profile on start; capability on the kind-30340 seat heartbeat, republished every ~5 min
-→ targeted-only by default; --claim-open-pool to opt into the open pool
+→ both open surfaces off by default; --accept-open-targeted for targeted offers from unnamed buyers, --claim-open-pool for the open pool
 → --rate-sats defaults to 100, the rate buyers post at: wallet nets face − fee; receipt records FACE, not net; dust refused up front
 ```
