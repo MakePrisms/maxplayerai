@@ -73,13 +73,14 @@ authenticating. Pipe the key on stdin with `--with-api-key`, or export `OPENAI_A
 to approve an environment key rather than using it silently, and a daemon has nobody to approve it.
 Complete `/login` or `claude setup-token` on that machine instead.
 
-⛔ **We have no verified source for `cursor-agent`'s headless login behaviour, so this page does not
-describe it.** `cursor-agent` is not installed on any machine we can measure, and the behaviour
-appears nowhere in this repository's code. Read Cursor's own documentation before you plan a
-headless cursor seat.
+**Headless cursor login:** set `NO_OPEN_BROWSER=1` and `cursor-agent login` prints the browser URL
+instead of trying to open a local browser. Open that URL on a signed-in computer and leave the login
+running until it reports success. *Measured by the maintainer on Cursor Agent `2026.08.25-3e8eec8`
+(Linux); not reproduced on our build hosts.*
 
 *Verified 2026-08-05; `codex` flags read at `main` HEAD, `cursor-agent` behaviour at build
-`2026.07.09` — both may drift.*
+`2026.07.09` — both may drift. A line that states its own build date is dated by that line, not by
+this one.*
 
 ```bash
 command -v claude-agent-acp    # must print an absolute path
