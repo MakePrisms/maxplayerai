@@ -248,16 +248,19 @@ impl AcpDriver {
         {
             return Some(model);
         }
-        // The Claude picker is a PREFERENCE, so none of its values identify a model — not just
-        // `default`. `sonnet`, `haiku` and `opus[1m]` each resolve to whatever that name currently
-        // means for the signed-in account, so two sellers reporting `sonnet` can be running
-        // different concrete models and a buyer filtering on it is awarding against ad copy. That is
-        // the same false-advertisement this path exists to remove, arriving by a second door.
+        // EVERY value of the Claude picker is a SELECTOR, so none of them identifies a model — not
+        // just `default`. Each resolves to whatever that name currently means for the signed-in
+        // account, so two sellers reporting `sonnet` can be running different models and a buyer
+        // filtering on it is awarding against ad copy. That is the same false advertisement this path
+        // exists to remove, arriving by a second door.
         //
-        // So on claude-agent-acp the init frame is the ONLY identity, and its absence is absence. A
-        // human who explicitly picked a concrete row (`claude-fable-5[1m]` is the one such row at
-        // 0.70.0) loses attribution on a run whose frame never arrived — that is the honest reading,
-        // because without the frame we did not see what the turn ran on.
+        // No shape test separates the rows, and the committed capture is why. Its picker offers
+        // `opus[1m]`, while the init frame for that same model reads `claude-opus-5[1m]` — one model,
+        // two strings. So passing the rows that LOOK like ids would publish `opus[1m]` to a buyer
+        // filtering on `claude-opus-5[1m]` and miss. The rows that look concrete are selectors too.
+        //
+        // Hence: on claude-agent-acp the init frame is the ONLY identity and its absence is absence.
+        // There is no allow-list or deny-list here to fall behind when the picker gains a row.
         //
         // Every other harness keeps the #896 behaviour byte-for-byte: `session_model` is still the
         // `session/new` value, and codex-acp's legacy `models.currentModelId` is untouched.
@@ -1129,9 +1132,14 @@ mod tests {
 
     #[test]
     fn only_the_exact_default_alias_is_refused() {
-        // The refusal is one exact string in the model category, not a family of aliases. Every other
-        // picker value — including the ones that are equally not concrete ids — passes through
-        // verbatim, because narrowing that is a different decision from this one.
+        // The SESSION-START read stays one exact string in the model category: every other picker
+        // value passes through verbatim, unparsed and unnormalised, so `session_model` keeps
+        // reporting what the field said.
+        //
+        // The narrowing lives one level up, at the attribution chokepoint — see
+        // `AcpDriver::resolved_model` and `no_claude_picker_value_is_published_as_a_model`. Splitting
+        // it that way keeps this read honest about the wire while nothing publishes a selector as a
+        // model.
         for value in [
             "opus[1m]",
             "claude-fable-5[1m]",
@@ -2647,6 +2655,95 @@ mod tests {
             driver.resolved_model(),
             None,
             "the next session must start with no turn-resolved model"
+        );
+    }
+
+
+    /// A `/bin/sh` agent that speaks just enough ACP to drive `ready` -> `start_session` -> `prompt`,
+    /// announcing itself as claude-agent-acp and emitting the init frame DURING the prompt turn,
+    /// which is where a real one arrives.
+    ///
+    /// One `sed` over the raw request line and never `grep`: `grep` on some hosts is `ugrep`, and a
+    /// stub whose behaviour depends on which `grep` is first on `PATH` fails for a reason having
+    /// nothing to do with the code under test.
+    fn claude_ordering_stub() -> AgentCommand {
+        let script = concat!(
+            "while IFS= read -r line; do\n",
+            "  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p')\n",
+            "  case \"$line\" in\n",
+            "    *'\"initialize\"'*)\n",
+            "      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"protocolVersion\":1,",
+            "\"agentInfo\":{\"name\":\"@agentclientprotocol/claude-agent-acp\",\"version\":\"0.70.0\"},",
+            "\"authMethods\":[]}}\\n' \"$id\" ;;\n",
+            "    *'\"session/new\"'*)\n",
+            "      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"sessionId\":\"s1\",",
+            "\"modes\":{\"currentModeId\":\"default\",\"availableModes\":[]},",
+            "\"configOptions\":[{\"id\":\"model\",\"category\":\"model\",\"type\":\"select\",",
+            "\"currentValue\":\"default\",\"options\":[]}]}}\\n' \"$id\" ;;\n",
+            "    *'\"session/prompt\"'*)\n",
+            "      printf '{\"jsonrpc\":\"2.0\",\"method\":\"_claude/sdkMessage\",\"params\":",
+            "{\"sessionId\":\"s1\",\"message\":{\"type\":\"system\",\"subtype\":\"init\",",
+            "\"model\":\"claude-opus-5[1m]\"}}}\\n'\n",
+            "      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"stopReason\":\"end_turn\"}}\\n' \"$id\" ;;\n",
+            "  esac\n",
+            "done\n",
+        );
+        AgentCommand::new("/bin/sh".into(), vec!["-c".into(), script.into()])
+    }
+
+    #[tokio::test]
+    async fn the_session_reset_lands_before_any_init_frame_can() {
+        // The clear in `start_session` is a one-liner, and one-liners that clear state are where
+        // ORDERING bugs hide. The safety is not the line, it is where the line sits: the reset runs
+        // while `session/new` is settling, and an init frame can only arrive once a PROMPT is under
+        // way. Move the reset any later — into `prompt`, or after the first frame is handled — and it
+        // wipes a live value, turning a known model into absence.
+        //
+        // This drives the real driver against a stub that emits the frame during the prompt turn, so
+        // it goes red if the reset ever moves past it.
+        use crate::driver::Driver;
+        let mut driver = AcpDriver::new(
+            claude_ordering_stub(),
+            PermissionOutcome::Allow,
+            Duration::from_secs(5),
+        );
+        driver.ready().await.expect("the stub answers initialize");
+        assert!(
+            driver.is_claude_adapter,
+            "POSITIVE CONTROL: the stub must be taken for claude-agent-acp, or the reset under test \
+             is not even on the path"
+        );
+
+        // Seed a value from a PREVIOUS session. The reset exists for exactly this.
+        *driver.claude_turn_model.lock().expect("lock") = Some("claude-haiku-4-5-20251001".into());
+        let session = driver
+            .start_session(SessionConfig {
+                cwd: std::env::temp_dir(),
+                mcp_servers: Vec::new(),
+                env: Vec::new(),
+            })
+            .await
+            .expect("the stub answers session/new");
+        assert_eq!(
+            driver.claude_turn_model.lock().expect("lock").clone(),
+            None,
+            "the stale model from the previous session must be gone once the session is open"
+        );
+        assert_eq!(
+            driver.usage().and_then(|usage| usage.model),
+            None,
+            "and the picker must supply no fallback, so the run is unattributed until a frame lands"
+        );
+
+        driver
+            .prompt(&session, PromptTurn { input: Vec::new() })
+            .await
+            .expect("the stub answers session/prompt");
+        assert_eq!(
+            driver.usage().and_then(|usage| usage.model).as_deref(),
+            Some("claude-opus-5[1m]"),
+            "the init frame arrived DURING the turn, so the reset must already have happened — a \
+             reset that ran any later would have wiped this"
         );
     }
 
