@@ -1235,46 +1235,122 @@ timeout_secs = 1200
         );
     }
 
+    /// How many lines of `text` declare `package` as a bare list element.
+    ///
+    /// #709. Comment text is stripped before the comparison, so a package named only in prose is
+    /// not counted — to a devshell, commenting a package out and deleting it are the same thing.
+    fn bare_element_count(text: &str, package: &str) -> usize {
+        text.lines()
+            .filter(|line| {
+                let code = line.split('#').next().unwrap_or("");
+                code.trim() == package
+            })
+            .count()
+    }
+
     // #709. The declared npm rows run inside the flake devshell (§9.1), and at d4ccc7f that shell
     // held a Rust toolchain and nothing else — no node, no npm. So the rows this change adds could
     // not have executed there. Delete `nodejs_22` and, without this test, every other test here
     // still passes while the declared rows quietly become unrunnable.
     //
-    // WHAT THIS PROVES, EXACTLY: some line in flake.nix is the bare element `nodejs_22`. That is a
-    // claim about the file's TEXT, and it is the whole claim.
+    // WHAT THIS PROVES, EXACTLY: `flake.nix` contains exactly one line whose trimmed content is
+    // the bare element `nodejs_22`. That is a claim about the file's TEXT, and it is the whole
+    // claim.
     //
-    // WHAT IT DOES NOT PROVE, AND WHY IT DOES NOT TRY. It does not prove the package is in the
-    // DEFAULT devshell's list — a second shell could own it — and it does not prove the devshell
-    // evaluates or that entering it yields a working `npm`.
+    // WHAT IT DOES NOT PROVE. It does not prove WHICH devshell owns that element — a second shell
+    // could — and it is not execution proof: it says nothing about whether the devshell evaluates
+    // or whether entering it yields a working `npm`.
     //
-    // Three attempts bound `nodejs_22` to the default shell by reading the file as text, and each
-    // was defeated by valid Nix. A substring search matched prose. A brace-balanced block ended
-    // early on `shellHook = "echo }"`. Bounding the region by the next `mkShell` truncated on the
-    // word `mkShell` in a COMMENT and — worse — read a package list written inside a STRING as a
-    // real one, reporting a package the shell does not have. Measured, all three.
+    // Why it claims so little, deliberately. Three readers tried to bind the package to the
+    // DEFAULT shell by reading this file as text, and valid Nix defeated each one. A substring
+    // search matched prose. A brace-balanced block ended early on `shellHook = "echo }"`. Bounding
+    // the region by the next `mkShell` truncated on that word inside a COMMENT and — worse — read
+    // a package list written inside a STRING as a real one, reporting a package the shell does not
+    // have. All three measured.
     //
-    // The class is the one this file already learned once for argv: **structure cannot be decided
-    // by inspecting text.** Substrings are to Nix what tokens were to argv. Deciding "nodejs_22 is
-    // in the default shell's list" from raw text needs a Nix parser, and this crate has no other
-    // reason to carry one. So this claims only what text can carry, and says so where it is
-    // asserted rather than implying more. The precise binding is tracked as a follow-on.
+    // That is the class this file already learned for argv: **structure cannot be decided by
+    // inspecting text.** Substrings are to Nix what tokens were to argv. Binding the element to
+    // the default shell needs a Nix parser, and this crate has no other reason to carry one. So
+    // this guard is a TRIPWIRE on the element leaving the file, it says so where it is asserted,
+    // and a guard that overstated its reach is the defect this whole change exists to close.
+    //
+    // The count is exactly one, not at least one: a stray duplicate elsewhere in the file would
+    // otherwise keep this green while the real element moved out of the default shell's list.
     #[test]
-    fn the_flake_still_declares_the_node_the_check_rows_need() {
+    fn the_flake_declares_the_node_the_check_rows_need() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../", "flake.nix");
         let text = std::fs::read_to_string(path).expect("this repo ships flake.nix at its root");
+        assert_eq!(
+            bare_element_count(&text, "nodejs_22"),
+            1,
+            "flake.nix must declare nodejs_22 as a bare package element exactly once — without it \
+             .maxplayer/checks.toml's npm rows cannot execute in the environment they are declared \
+             against. This is a tripwire on that element leaving the file. It does NOT prove which \
+             devshell owns it, and it is NOT execution proof."
+        );
+    }
 
-        // Comment text is stripped before the comparison, so commenting the package out trips this
-        // exactly as deleting it does — to a devshell those are the same thing.
-        let declared = text.lines().any(|line| {
-            let code = line.split('#').next().unwrap_or("");
-            code.trim() == "nodejs_22"
-        });
-        assert!(
-            declared,
-            "flake.nix must still declare nodejs_22 as a package element — without it \
-             .maxplayer/checks.toml's npm rows cannot execute in the environment they are \
-             declared against. This is a tripwire on the package leaving the file, NOT proof \
-             that the default devshell provides it."
+    // #709. The reader, proven against the drift it exists to catch. Each fixture is a way the
+    // element can stop being declared while the file still mentions it.
+    #[test]
+    fn bare_element_reader_counts_elements_not_mentions() {
+        const IN_LIST: &str = r#"
+            packages = with pkgs; [
+              cargo
+              nodejs_22
+            ];
+"#;
+        assert_eq!(
+            bare_element_count(IN_LIST, "nodejs_22"),
+            1,
+            "a package on its own line inside a list IS declared"
+        );
+
+        const COMMENT_ONLY: &str = r#"
+            packages = with pkgs; [
+              cargo
+              # we should probably add nodejs_22 here one day
+            ];
+"#;
+        assert_eq!(
+            bare_element_count(COMMENT_ONLY, "nodejs_22"),
+            0,
+            "prose ABOUT a package is not a declaration of it — the drift that removes a package \
+             most often leaves a comment behind"
+        );
+
+        const COMMENTED_OUT: &str = r#"
+            packages = with pkgs; [
+              cargo
+              # nodejs_22
+            ];
+"#;
+        assert_eq!(
+            bare_element_count(COMMENTED_OUT, "nodejs_22"),
+            0,
+            "commenting a package out removes it from the shell exactly as deleting it does"
+        );
+
+        const DUPLICATED: &str = r#"
+            packages = with pkgs; [
+              nodejs_22
+            ];
+            other = [
+              nodejs_22
+            ];
+"#;
+        assert_eq!(
+            bare_element_count(DUPLICATED, "nodejs_22"),
+            2,
+            "a second occurrence must be visible, so a stray duplicate cannot keep the guard green \
+             while the real element moves out of the list"
+        );
+
+        const ABSENT: &str = "packages = with pkgs; [ cargo ];";
+        assert_eq!(
+            bare_element_count(ABSENT, "nodejs_22"),
+            0,
+            "a file that never names the package declares none of it"
         );
     }
 }
