@@ -2805,8 +2805,12 @@ mod tests {
         //
         // `DirBuilder::mode` applies at creation, so there is no window where the directory exists
         // world-readable. `CaptureDir` removes it on the way out INCLUDING on panic, which is what
-        // a failing assertion below does. Note the bound: a `panic = "abort"` profile skips Drop,
-        // and then the directory survives the run.
+        // a failing assertion below does.
+        //
+        // THE CLEANUP RELIES ON UNWINDING. `Drop` does not run under a `panic = "abort"` profile,
+        // and the directory would then survive the run holding the unredacted frame. No profile
+        // reachable from this workspace sets it today, and nothing asserts that — so the condition
+        // the safety rests on is named here instead of left for a reader to find out.
         struct CaptureDir(std::path::PathBuf);
         impl Drop for CaptureDir {
             fn drop(&mut self) {
