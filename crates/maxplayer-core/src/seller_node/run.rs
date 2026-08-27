@@ -7597,6 +7597,11 @@ mod tests {
              "list + both routes ⇒ all three admissions serve at once"),
         ];
 
+        // ⛔ COUNTED, because `zip` TRUNCATES SILENTLY. Add a fifth probe without a fifth expected
+        // outcome and the pair below still runs, still passes, and quietly stops testing the new
+        // probe — a green matrix that covers less than it says. The count is the only thing between
+        // that and a false all-clear, and this is an admission control.
+        let mut checked = 0usize;
         for (populated, open_targeted, open_pool, expected, what) in matrix {
             let mut cfg = seller_cfg(2, open_pool);
             cfg.accept_open_targeted = open_targeted;
@@ -7616,8 +7621,14 @@ mod tests {
                     "accept_offers_only_from populated={populated} accept_open_targeted=\
                      {open_targeted} claim_open_pool={open_pool} — {what}. Probe: {probe}"
                 );
+                checked += 1;
             }
         }
+        assert_eq!(
+            checked, 32,
+            "the matrix must run all 8 control settings x 4 probes — a short count means a row or a \
+             probe stopped being exercised"
+        );
     }
 
     // THE THIRD OFFER SHAPE, AND THE ONE THIS CHANGE COULD MOST EASILY HAVE OPENED. #923 narrows the
@@ -7640,6 +7651,7 @@ mod tests {
         const STRANGER: &str = "dead02";
         const OTHER_SEAT: &str = "beef03"; // ≠ SELLER — the offer is addressed elsewhere
 
+        let mut checked = 0usize;
         for populated in [false, true] {
             for open_targeted in [false, true] {
                 for open_pool in [false, true] {
@@ -7657,10 +7669,12 @@ mod tests {
                              claim_open_pool={open_pool} buyer={buyer}) — opening a route for THIS \
                              seat may not admit work addressed to a different one"
                         );
+                        checked += 1;
                     }
                 }
             }
         }
+        assert_eq!(checked, 16, "the sweep must cover all 8 control settings x 2 buyers");
     }
 
     // ROUND TRIP — the operator workflow #923 exists to enable: open a public route, then close it
