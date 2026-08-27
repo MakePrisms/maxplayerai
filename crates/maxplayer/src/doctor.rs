@@ -1696,7 +1696,7 @@ mod checks {
     /// narrow the sandbox, or revisit #689's conclusion that a subscription credential cannot be
     /// excluded from the cage.
     ///
-    /// Resolution is [`seller_agents::harness_credential_dir`] over the same registry boot uses.
+    /// Resolution is [`seller_agents::harness_credential_dirs`] over the same registry boot uses.
     /// An unlabelled `--agent-argv` hatch and any non-built-in label cannot be resolved: the check
     /// SAYS so and inspects nothing. Guessing a default harness's directory (or sniffing argv) would
     /// inspect the wrong path and pass — worse than no check.
