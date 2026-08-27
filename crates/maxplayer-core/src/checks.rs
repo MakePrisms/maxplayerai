@@ -1396,8 +1396,9 @@ timeout_secs = 1200
              later shell's list must never be read as the default shell's"
         );
 
-        // Braces inside comments are prose, not structure. If they were counted, the default
-        // block would end early and this list would be missed.
+        // A regression guard, not a live risk. Nothing here counts braces, so this passes
+        // trivially today; it fails the moment someone reintroduces brace balance as the bound,
+        // because a `}` in prose would end the region before the list.
         const BRACES_IN_COMMENTS: &str = r#"
       devShells = forAllSystems (system: {
           default = pkgs.mkShell {
@@ -1410,12 +1411,13 @@ timeout_secs = 1200
 "#;
         assert!(
             default_devshell_lists_package(BRACES_IN_COMMENTS, "nodejs_22"),
-            "a brace inside a comment is prose and must not end the default shell's block"
+            "a brace inside a comment is prose, and no bound may treat it as structure"
         );
 
-        // Braces inside a STRING are legal Nix and are not structure either. This fixture is why
-        // the region is bounded by the next shell rather than by brace balance: a brace counter
-        // ends the default block at the `}` inside this shellHook and misses the list below it.
+        // The fixture that ruled OUT brace balance, kept as the reason it stays ruled out. A
+        // counter that skips comments but not strings ends the region at the `}` inside this
+        // shellHook and misses the list below it — measured, this flake read as declaring nothing.
+        // Handling it properly needs a Nix string parser; bounding by the next shell needs none.
         const BRACE_IN_STRING: &str = r#"
       devShells = forAllSystems (system: {
           default = pkgs.mkShell {
@@ -1428,20 +1430,20 @@ timeout_secs = 1200
 "#;
         assert!(
             default_devshell_lists_package(BRACE_IN_STRING, "nodejs_22"),
-            "a brace inside a Nix string is not structure and must not end the default shell's \
-             region"
+            "a brace inside a Nix string is legal and is not structure: no bound may end the \
+             default shell's region on it"
         );
 
-        const UNBALANCED: &str = r#"
+        const UNTERMINATED_LIST: &str = r#"
       devShells = forAllSystems (system: {
           default = pkgs.mkShell {
             packages = with pkgs; [
               nodejs_22
 "#;
         assert!(
-            !default_devshell_lists_package(UNBALANCED, "nodejs_22"),
-            "a flake whose braces never balance is unreadable, and an unreadable flake must fail \
-             this guard CLOSED rather than be scanned to the end"
+            !default_devshell_lists_package(UNTERMINATED_LIST, "nodejs_22"),
+            "a package list with no closing bracket is unreadable: the reader must fail CLOSED \
+             rather than treat the rest of the region as list elements"
         );
 
         const NO_DEVSHELL: &str = "{ description = \"no devshell here\"; }";
