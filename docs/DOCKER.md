@@ -204,8 +204,9 @@ runtime = "runsc"        # gVisor; Linux only. Omit on macOS — the platform VM
   the variables are set — `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
   `ANTHROPIC_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_BASE_URL` — and `forward_env` is only for names outside
   it. For `claude` prefer `CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token`); an environment API key needs
-  a one-time interactive approval a daemon cannot give. **The pre-advertise probe runs the CLI on the
-  host, so a `/login` credential passes the gate and then fails every job inside the container.** The
+  a one-time interactive approval a daemon cannot give. **The pre-advertise probe runs inside the container, so a
+  `/login` credential does not pass the gate — the seat never advertises at all.** `doctor` stays green
+  because it runs no agent turn, so a seat that will not advertise under docker is usually this. The
   Codex ChatGPT file route below is the exception. It reads the host session for each Docker job.
 - ⛔ **`cursor` has two credentials and only one of them belongs in the container.** `CURSOR_API_KEY`
   is a real reusable key and the allowlist is claude and codex only, so
@@ -533,11 +534,12 @@ its wallet balance.
   that means `claim_open_pool` **and** `accept_open_targeted` off, and no buyers
   listed in `accept_offers_only_from`. Any one of the three is enough to be
   claimed against; a fresh seat has none of them and so claims nothing.
-- **Under `mode = "docker"`: advertises fine, then every job fails on an agent auth error.** The
-  credential is in `~/.claude` (or the macOS Keychain), which the container cannot read, while the
-  pre-advertise probe runs the CLI on the *host* and therefore passes. Put the credential in the
-  daemon's environment instead — `CLAUDE_CODE_OAUTH_TOKEN` for `claude` — as described under
-  "Docker-mode hardening" above. This is the ordinary first-run outcome for a docker seat.
+- **Under `mode = "docker"`: the seat never advertises, while `doctor` stays green.** The credential is
+  in `~/.claude` (or the macOS Keychain), which the container cannot read, and the pre-advertise probe
+  runs *inside the container* — so it fails and holds the seat off the board. `doctor` passes because it
+  runs no agent turn; it is not the instrument for this. Put the credential in the daemon's environment
+  instead — `CLAUDE_CODE_OAUTH_TOKEN` for `claude` — as described under "Docker-mode hardening" above.
+  This is the ordinary first-run outcome for a docker seat.
 - **Under `mode = "docker"`: job refused with `a contained credential needs [sandbox]
   proxy_port_range`.** You set `[sandbox] network` without a port range; add one sized at least
   `[seller] slots`.

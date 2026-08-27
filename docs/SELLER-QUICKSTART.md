@@ -408,9 +408,11 @@ setup-token`) — an environment API key needs a one-time interactive approval a
 Docker Codex has a separate ChatGPT session route. `[sandbox.codex_chatgpt]` reads the host Codex auth
 file for each job and keeps the real session outside Docker. See the controlled setup below.
 
-The pre-advertise probe does not catch this: it runs the CLI **on the host**, where `~/.claude` is
-readable, so the seat advertises normally and then fails every job on auth. Set the variable where the
-daemon **actually starts** — a systemd `Environment=`, a launchd plist, or the launcher script that
+Whether the pre-advertise probe catches this depends on your sandbox mode, because the probe runs
+wherever jobs run. Under `launcher` or no sandbox it runs the CLI **on the host**, where `~/.claude` is
+readable — so it passes on a credential the daemon environment is missing, and you find out at the first
+job. Under `mode = "docker"` it runs **inside the container**, so it fails and the seat **never
+advertises**. Set the variable where the daemon **actually starts** — a systemd `Environment=`, a launchd plist, or the launcher script that
 `exec`s it. Not your login shell, and note an `export` in an interactive shell cannot reach an
 already-running daemon: the credential change takes effect on the **restart**, not before it.
 
@@ -635,8 +637,10 @@ maxplayer doctor
 ```
 
 **Check your credential before restarting.** A seat that has run on `launcher` may be authenticated only
-through `~/.claude`, which a container cannot read. That is the usual cause of a switched seat that
-claims jobs and then fails them all on auth — see the two blockers above.
+through `~/.claude`, which a container cannot read. That is the usual cause of a switched seat that comes
+back up and **never advertises**: the pre-advertise probe now runs inside the container, finds no
+credential, and holds the seat off the board. `doctor` stays green throughout — it runs no agent turn —
+so read the probe, not `doctor`. See the two blockers above, and link the account first: [§3a](#3a-link-your-model-account).
 
 Then restart the daemon. Two more things to expect on a seat that is already earning: the first job pulls
 the sandbox image unless it is already local (`doctor` warns and hands you the `docker pull` so you can do
