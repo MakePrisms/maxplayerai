@@ -2773,6 +2773,15 @@ mod tests {
     /// and the UTC date it was run by hand. An unrun proof is not a proof. `CAPTURE_SHA256` catches
     /// drift on every ordinary `cargo test`; authenticity is only ever as fresh as the last manual
     /// run recorded in the PR.
+    ///
+    /// RE-CAPTURE WHEN — the obligation `#[ignore]` creates. Moving authenticity out of automation
+    /// makes it an operating duty, and a duty with no clock is not owned by anyone. Run this test,
+    /// by hand, and record the result in the change that causes it:
+    ///
+    /// - the fleet's adapter binary changes version or digest
+    /// - this fixture, [`REDACTED_KEYS`], [`LOAD_BEARING_KEYS`] or the parser's keys change
+    /// - the account's model default moves
+    /// - before any release that republishes the claim this fixture makes
     #[test]
     #[ignore = "spends a real Claude turn; needs a live adapter binary and credentials"]
     fn the_committed_capture_still_matches_the_live_adapter() {
@@ -2783,17 +2792,40 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/claude-agent-acp-0.70.0/capture.mjs"
         );
-        // Unique per run: a fixed name in a shared temp dir lets two hand-runs overwrite each
-        // other's capture, and the loser then compares the winner's bytes while reporting its own
-        // binary. Same class as the fixed-path mis-send this repo's authors have already paid for.
-        let out = std::env::temp_dir().join(format!(
-            "live-acp-capture-{}-{}.json",
+        // The capture is UNREDACTED on disk: the raw init frame carries the workstation's skills,
+        // memory paths, cwd and an IPC socket path. Redaction happens in memory, below.
+        //
+        // So it gets a private directory of its own, per run, removed when the test ends.
+        //
+        // Unique per run because a fixed name in a shared temp dir lets two hand-runs overwrite
+        // each other's capture, and the loser then compares the winner's bytes while reporting its
+        // own binary — the same class as the fixed-path mis-send this repo's authors have already
+        // paid for. But a unique name alone only converts a COLLISION into an ACCUMULATION: one
+        // sensitive file left behind per run, forever. Hence the mode and the cleanup.
+        //
+        // `DirBuilder::mode` applies at creation, so there is no window where the directory exists
+        // world-readable. `CaptureDir` removes it on the way out INCLUDING on panic, which is what
+        // a failing assertion below does. Note the bound: a `panic = "abort"` profile skips Drop,
+        // and then the directory survives the run.
+        struct CaptureDir(std::path::PathBuf);
+        impl Drop for CaptureDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "live-acp-capture-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|since| since.as_nanos())
                 .unwrap_or_default()
         ));
+        std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
+            .create(&dir)
+            .expect("the capture directory must be creatable");
+        let dir = CaptureDir(dir);
+        let out = dir.0.join("capture.json");
         let status = std::process::Command::new("node")
             .arg(client)
             .arg(&bin)
@@ -2801,6 +2833,10 @@ mod tests {
             .status()
             .expect("node must be on PATH to run the capture client");
         assert!(status.success(), "the capture client failed: {status:?}");
+        // The enclosing directory is already 0700; this is for the case where it is not, because
+        // the file is the unredacted frame and one line is cheaper than reasoning about `TMPDIR`.
+        std::fs::set_permissions(&out, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .expect("the capture must be readable only by its owner");
 
         let mut live: Value = serde_json::from_str(
             &std::fs::read_to_string(&out).expect("the live capture must be readable"),
