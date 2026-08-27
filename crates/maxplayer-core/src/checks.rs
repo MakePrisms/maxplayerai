@@ -843,6 +843,100 @@ timeout_secs = 1200
         );
     }
 
+    /// Every path a declared argv points at, normalised across the spellings that reach one
+    /// directory.
+    ///
+    /// #709. A row reaches a Node suite by naming its directory, and there is more than one way to
+    /// write that name: `--prefix web/app`, `--prefix=web/app`, `./web/app`, `web/app/`, or a file
+    /// path underneath it. A reader that knows only the bare argv-position spelling asserts
+    /// coverage only about rows written that way, so `--prefix=web/app` would fail a check whose
+    /// whole purpose is to find it — the same exposure `declared_features` was widened for in
+    /// #737. Normalise first, then ask the membership question once.
+    ///
+    /// Flags are dropped, and an `=`-attached flag contributes its VALUE: that is what makes the
+    /// attached and detached spellings read alike, since the detached form is already its own
+    /// token. Non-path operands (`maxplayer-core`, `wallet`) survive normalisation as harmless
+    /// entries — the question asked of this set is always about one named directory.
+    fn declared_paths(argv: &[String]) -> BTreeSet<String> {
+        argv.iter()
+            .filter_map(|part| {
+                let value = match part.split_once('=') {
+                    Some((flag, value)) if flag.starts_with('-') => value,
+                    _ if part.starts_with('-') => return None,
+                    _ => part.as_str(),
+                };
+                let value = value.strip_prefix("./").unwrap_or(value);
+                let value = value.trim_end_matches('/');
+                (!value.is_empty()).then(|| value.to_owned())
+            })
+            .collect()
+    }
+
+    /// Whether a declared argv runs inside `dir`.
+    ///
+    /// #709. Segment boundaries, not string prefixes: `web/apparel` starts with `web/app` and is
+    /// not inside it. A `starts_with` on the bare name would read a sibling directory as coverage
+    /// and report a suite as run when nothing ran it.
+    fn argv_runs_in(argv: &[String], dir: &str) -> bool {
+        let inside = format!("{dir}/");
+        declared_paths(argv)
+            .iter()
+            .any(|path| path == dir || path.starts_with(&inside))
+    }
+
+    // #709. The normaliser is what the web-suite guard stands on, so it is proven against every
+    // spelling that reaches the directory rather than only against the one this repo declares.
+    // Each row here is a form that actually runs the suite; if any stops being read, a declaration
+    // written that way becomes invisible to the guard and the suite reads as covered by nothing.
+    #[test]
+    fn node_suite_reader_sees_every_spelling_of_one_suite() {
+        fn argv(parts: &[&str]) -> Vec<String> {
+            parts.iter().map(|part| (*part).to_owned()).collect()
+        }
+
+        // Every row reaches `web/app`, so every row must read as reaching it.
+        let reaching: [(&[&str], &str); 7] = [
+            (&["npm", "--prefix", "web/app", "test"], "argv-position prefix"),
+            (&["npm", "--prefix=web/app", "test"], "equals prefix"),
+            (&["npm", "test", "--prefix", "web/app"], "prefix after the command"),
+            (&["npm", "--prefix", "./web/app", "test"], "dot-slash prefix"),
+            (&["npm", "--prefix", "web/app/", "test"], "trailing-slash prefix"),
+            (&["node", "--test", "web/app/test/"], "node directory positional"),
+            (
+                &["node", "--import", "tsx", "--test", "web/app/test/spot.test.ts"],
+                "node file underneath the directory",
+            ),
+        ];
+        for (parts, label) in reaching {
+            assert!(
+                argv_runs_in(&argv(parts), "web/app"),
+                "the {label} spelling runs web/app's suite and must read as such: {parts:?}"
+            );
+        }
+
+        // And the reader must not invent coverage that is not there.
+        assert!(
+            !argv_runs_in(
+                &argv(&["cargo", "test", "-p", "maxplayer-core", "--locked", "--offline"]),
+                "web/app"
+            ),
+            "a cargo row runs no Node suite: that is the whole premise of #709"
+        );
+        assert!(
+            !argv_runs_in(&argv(&["npm", "--prefix", "web/network", "test"]), "web/app"),
+            "the two web suites are different directories and one must never satisfy the other"
+        );
+        assert!(
+            !argv_runs_in(&argv(&["npm", "--prefix", "web/apparel", "test"]), "web/app"),
+            "`web/apparel` is not inside `web/app` — the question is segment boundaries, never a \
+             string prefix"
+        );
+        assert!(
+            !argv_runs_in(&argv(&["npm", "--prefix", "web", "test"]), "web/app"),
+            "the parent directory is not the suite: `web` does not run what is under `web/app`"
+        );
+    }
+
     /// Whether a declared argv is allowed by the cargo-test `-p` rule.
     ///
     /// #753. The rule is cargo feature-unification: a `cargo test` row must name the one package
@@ -957,6 +1051,33 @@ timeout_secs = 1200
                 !has_feature(argv, "live-mints"),
                 "`live-mints` reaches real mints over the network and can never be declared here \
                  (§9.1 runs every command with net denied): {argv:?}"
+            );
+        }
+
+        // #709. This file is the CONTRIBUTION gate — the set a seller's attestation runs from the
+        // pinned base with the network denied — and it is what a delivery is PAID against. It
+        // declared five cargo rows and no Node row, so every test in web/app and web/network ran
+        // zero times under the declared set: a delivery could regress the market terminal and
+        // attest GREEN. CI catches that break on a pull request to main; the gate that pays did
+        // not. Same shape as the #720 wallet gap, and a money defect for the same reason.
+        //
+        // Both suites, not one. They are separate npm packages with separate runners: web/app is
+        // TypeScript run through tsx, web/network is plain ESM with zero dependencies. A guard
+        // that named only one would leave the other exactly as uncovered as before.
+        //
+        // Red-on-revert, measured: drop either row and this fails. Asked through `argv_runs_in`,
+        // which normalises the several spellings that reach one directory — the reader is proven
+        // spelling-by-spelling in `node_suite_reader_sees_every_spelling_of_one_suite`, because a
+        // guard that knows one spelling is blind to the rest.
+        for suite in ["web/app", "web/network"] {
+            assert!(
+                declaration
+                    .commands
+                    .iter()
+                    .any(|argv| argv_runs_in(argv, suite)),
+                "the declared set must run {suite}'s Node suite — without it a delivery can \
+                 regress the web tree and still attest green: {:?}",
+                declaration.commands
             );
         }
     }
