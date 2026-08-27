@@ -247,10 +247,12 @@ runtime = "runsc"        # gVisor; Linux only. Omit on macOS — the platform VM
   `forward_env = ["CURSOR_API_KEY"]` forwards that key into the container for a stranger's job to
   read — which `doctor` flags as a WARN rather than refusing. Never do that. Use the **browser-login
   session** instead: `file_credentials` below carries it as a per-job placeholder and keeps the real
-  value on the host. **That path is now proven end to end from inside a running container — a
-  Docker-contained cursor seat completes, delivers, and settles a real job.** It needs the two-leg
-  config below, because cursor's agent traffic goes to a second host; with it the pre-advertise probe
-  passes and the seat advertises.
+  value on the host. **That path is reported working by the maintainer, measured 2026-08-26 on Cursor
+  Agent `2026.08.25-3e8eec8` (Linux), and not reproduced by us.** Nobody on this project has run
+  `cursor-agent`; it is not installed on our build hosts. Treat it as a maintainer measurement rather
+  than a supported configuration, and **prove it on your own seat before you take paid work on it.** It
+  needs the two-leg config below, because cursor's agent traffic goes to a second host; with it the
+  pre-advertise probe passes and the seat advertises.
 
 - **Omit `image`.** Unset, the binary uses its own version-pinned ref
   `ghcr.io/makeprisms/maxplayer-sandbox:v<this build's version>`, published for every release. `image`
@@ -349,8 +351,12 @@ upstream      = "https://agentn.global.api5.cursor.sh"
 
 On macOS the cursor session lives in the login Keychain, which the daemon cannot read, so the file
 `path` points at does not exist yet. Create it once with `AGENT_CLI_CREDENTIAL_STORE=file cursor-agent
-login`; that writes `~/.cursor/auth.json` with the `accessToken` field this reads. The Keychain login
-stays valid alongside it.
+login`. ⚠ **Then locate the file it wrote; do not type a path from this page.** That location is
+build-dependent — see the `cursor` entry under [Link your model account](#link-your-model-account)
+above: Cursor Agent `2026.08.25-3e8eec8` on Linux wrote `$HOME/.config/cursor/auth.json`, and older
+Cursor documentation names `$HOME/.cursor/auth.json`. Both are real for some build, and we have no
+measurement on macOS at all. Whichever file exists carries the `accessToken` field this reads. The
+Keychain login stays valid alongside it.
 
 `endpoint_args` also accepts a bare string for a client that needs one flag, and the older
 `endpoint_arg = "--endpoint"` spelling still parses, so existing configs keep working. One flag per
@@ -395,12 +401,15 @@ Six things to know before you need them:
   that preface and surfaces **no request at all**, so the symptom is "nothing connected" rather than a
   protocol error. Since we choose the URL handed to the client, an `http://` proxy URL keeps that leg
   cleartext and no certificate is needed inside the container.
-- **The container leg is proven end to end.** From inside a running container the placeholder is carried
-  and substituted on BOTH legs: the control plane authenticates over HTTP/1, and the agent leg connects
-  over h2c to its own host and streams its turn. An earlier build stalled here — the response scrub held
-  the agent leg's keepalives until an idle flush those same keepalives kept resetting — but the scrub
-  now releases each chunk as it arrives, so a long streaming turn flows, and a real job completes,
-  delivers, and settles. Under `launcher` mode this key is inert.
+- **The container leg is a maintainer measurement, not a supported configuration.** Measured 2026-08-26
+  on Cursor Agent `2026.08.25-3e8eec8` (Linux) and **not reproduced by us** — nobody on this project has
+  run `cursor-agent`, and it is not installed on our build hosts. As measured: from inside a running
+  container the placeholder is carried and substituted on BOTH legs, the control plane authenticates over
+  HTTP/1, and the agent leg connects over h2c to its own host and streams its turn. An earlier build
+  stalled here — the response scrub held the agent leg's keepalives until an idle flush those same
+  keepalives kept resetting — but the scrub now releases each chunk as it arrives, so a long streaming
+  turn flows, and the job completed, delivered, and settled. **Prove it on your own seat before you take
+  paid work on it.** Under `launcher` mode this key is inert.
 
 #### The credential proxy listens on every interface — firewall it on a public box
 

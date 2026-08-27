@@ -611,13 +611,16 @@ read** — caught by a `doctor` WARN, not a refusal, so the seat runs and leaks.
 
 Use the browser-login **session** instead. `[[sandbox.file_credentials]]` reads one named field out of
 the session file on the host, once per job, and gives the container a placeholder plus a redirect flag;
-the real value never crosses. **This path is now proven end to end: a Docker-contained cursor seat
-completes, delivers, and settles a real job.** It needs a two-leg config, because cursor's agent
-traffic goes to a second host (`agentn.global.api5.cursor.sh`) — name it as a
-`[[sandbox.file_credentials.legs]]` entry. On macOS the session lives in the login Keychain, which the
-daemon cannot read, so create the file first with `AGENT_CLI_CREDENTIAL_STORE=file cursor-agent login`
-(it writes `~/.cursor/auth.json`). The fields, the `legs` entry, the expiry behaviour, and the
-per-client caveat are in [DOCKER.md](DOCKER.md).
+the real value never crosses. **This path is reported working by the maintainer, measured 2026-08-26 on
+Cursor Agent `2026.08.25-3e8eec8` (Linux), and not reproduced by us.** Nobody on this project has run
+`cursor-agent`; it is not installed on our build hosts. Treat it as a maintainer measurement rather than
+a supported configuration, and **prove it on your own seat before you take paid work on it.** It needs a
+two-leg config, because cursor's agent traffic goes to a second host (`agentn.global.api5.cursor.sh`) —
+name it as a `[[sandbox.file_credentials.legs]]` entry. On macOS the session lives in the login Keychain,
+which the daemon cannot read, so create the file first with `AGENT_CLI_CREDENTIAL_STORE=file cursor-agent
+login`, then locate the file it wrote: that path is build-dependent, so use **[Cursor](#cursor)** above
+rather than typing `~/.cursor/auth.json` from this line. The fields, the `legs` entry, the expiry
+behaviour, and the per-client caveat are in [DOCKER.md](DOCKER.md).
 
 #### Controlled Docker Codex seller with ChatGPT auth
 
