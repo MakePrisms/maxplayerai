@@ -259,72 +259,35 @@ const OPERATOR_DECLARED = {
 };
 
 /**
- * The only capability field current as of the beat that carries it, and a
- * claim filter rather than a dispatch guarantee (protocol v1 §4.5.3, §4.5.4).
- *
- * The wording here is constrained for the same reason `LAST_OBSERVED`'s is.
- * Nothing at the seat reads `harness_family`: dispatch selects a harness by the
- * offer's `agent` preset alone. Any verb implying it binds execution — enforced,
- * pinned, guaranteed, exact-or-nothing at dispatch — states a fact no code
- * supports, and a multi-harness seat matching the filter can run a different
- * harness within the family.
- */
-const FILTERS_CLAIMS_NOT_DISPATCH = {
-  mark: "filters claims, not dispatch",
-  markClass: "provenance",
-  title: "Read from the live roster each time a beat is drafted, so it is current as of this beat. It decides which seats may claim a job, never which harness runs one — dispatch selects by the offer's `agent` preset alone, so a seat configured with several presets in this family can match and run a different one. A buyer that needs the execution guarantee must name the preset.",
-};
-
-/**
- * Last-observed, and never a promise about the next job.
- *
- * The wording here is constrained on purpose. This field carries what a harness
- * reported when it was last asked; nothing in the stack pins a model or reads
- * back what executed. Any stronger verb — ran, runs, will run, is serving,
- * guarantees — states a fact no code supports, and the tense is not what makes
- * it wrong. See `HARNESS_MODEL_TAG` beside the emitter.
- */
-const LAST_OBSERVED = {
-  mark: "last observed",
-  markClass: "provenance",
-  title: "What this harness said about itself when it was last asked, republished on every beat since. Not a promise about the next job. A result echoes a model id, so a divergence is visible in a buyer's own records — an inconsistency signal, never proof of what ran.",
-};
-
-/**
- * The stalest of the three, and the one a buyer commits sats on. Bounded by the
- * seat's UPTIME rather than by the beat cadence, and it drifts in both
- * directions — only one of which is safe (protocol v1 §4.5.4).
- */
-const AS_OF_SEAT_START = {
-  mark: "as of seat start",
-  markClass: "provenance",
-  title: "Probed once when the seat started and republished on every beat since, so a recent beat is NOT evidence of a recent measurement. A token means its probe command resolved in the job execution environment then: necessary for the work, not sufficient. A toolchain removed since start is still advertised, so this row can over-claim, and nothing on the filter path catches it.",
-};
-
-/**
  * What the runner says it can run, from the newest heartbeat.
  *
- * THE ROWS ARE NOT EQUAL, and the difference is provenance, not confidence.
- * Protocol v1 §4.5.3 is explicit that a reader MUST NOT read the three
- * filterable fields as three grades of proof, and that NONE of the three is an
- * enforcement: `harness_model` is ECHOED, so a divergence is at least visible
- * in a buyer's own records, while `harness_family` and `capabilities` are both
- * SILENCE — nothing at the seat reads the family, and no event carries a
- * capability back at all. One inconsistency signal and two silences. §4.5.4
- * then gives the three different freshness guarantees, and only
- * `harness_family` is current as of the beat carrying it.
+ * ⚠ WHAT THIS FUNCTION NO LONGER TELLS A BUYER. Until 2026-08-27 the three
+ * machine-sourced rows each carried a provenance mark and a hover title, and
+ * the comment here argued at length that they MUST: protocol v1 §4.5.3 says a
+ * reader must not read `harness_family`, `harness_model` and `capabilities` as
+ * three grades of one proof, and §4.5.4 gives them three different freshness
+ * guarantees. The owner removed the marks and the titles as unwanted warnings
+ * (bob, 01:41:30Z and 01:48:06Z). That is a product decision about the sheet
+ * and it stands — but it does not make the protocol distinction untrue, so the
+ * argument is restated here as a limitation rather than deleted.
  *
- * So every row wears its own mark, and the marks differ on what a reader can
- * DO with the value, not on how true it is. Two rows being equally unenforced
- * does not make them interchangeable: they differ in freshness and in what
- * they gate, and that is what the marks carry. Flush and unmarked, the stalest
- * row would read as solidly as the freshest, and a buyer commits sats on the
- * stalest of the three. The last two rows are free text an operator typed;
- * they stay marked apart from all three, because nothing pays out on them.
+ * The three rows now render flush and identical. On this sheet a buyer cannot
+ * see that `harness_family` is current as of the beat carrying it, that
+ * `harness_model` is only what the harness last said about itself, or that
+ * `capabilities` was probed once at seat start and is bounded by the seat's
+ * UPTIME — which is the stalest of the three and the one a buyer commits sats
+ * on. Nothing here is enforcement either way: nothing at the seat reads the
+ * family, and no event carries a capability back at all.
  *
- * Every row is an ANNOUNCEMENT either way. This reader sees the claim, never
- * the probe. A mark says what a claim is worth, not that anything verified it
- * here.
+ * So the capability row can over-claim — a toolchain removed since seat start
+ * is still advertised — and nothing on the filter path and nothing on this
+ * sheet now catches it. If that gap is to be closed it must be closed
+ * somewhere other than these rows.
+ *
+ * The last two rows are free text an operator typed. They keep their
+ * `operator-declared` mark: it was not in scope, and nothing pays out on them.
+ *
+ * Every row is an ANNOUNCEMENT. This reader sees the claim, never the probe.
  *
  * An unstated field yields no row. A seat may state nothing — the stock Docker
  * runtime image proves no tokens at all — and an empty row would read as a
@@ -333,10 +296,10 @@ const AS_OF_SEAT_START = {
 export function capabilityRows(s: { harnessFamilies?: string[]; harnessModels?: HarnessModel[]; capabilities?: string[]; harnessVariant?: string | null; hardware?: string | null } | null): ProfileRow[] {
   if (!s) return [];
   return [
-    ["Harness family", s.harnessFamilies?.length ? s.harnessFamilies.join(" · ") : null, FILTERS_CLAIMS_NOT_DISPATCH],
+    ["Harness family", s.harnessFamilies?.length ? s.harnessFamilies.join(" · ") : null],
     ["Harness model", s.harnessModels?.length
-      ? s.harnessModels.map((m) => `${m.family} ${m.model}`).join(" · ") : null, LAST_OBSERVED],
-    ["Capabilities", s.capabilities?.length ? s.capabilities.join(" · ") : null, AS_OF_SEAT_START],
+      ? s.harnessModels.map((m) => `${m.family} ${m.model}`).join(" · ") : null],
+    ["Capabilities", s.capabilities?.length ? s.capabilities.join(" · ") : null],
     ["Harness variant", s.harnessVariant || null, OPERATOR_DECLARED],
     ["Hardware", s.hardware || null, OPERATOR_DECLARED],
   ];
@@ -389,7 +352,6 @@ function participantSheet(view: MarketView, role: "buyer" | "seller", pubkey: st
     ["Min rate", s?.askSats == null ? null : `${usd(s.askSats)} · ${nf.format(s.askSats)} sat`],
     ["Accepting work", acceptingText],
     ["Accepted mints", s?.acceptedMints?.length ? s.acceptedMints.join(" · ") : null],
-    ["Agents", s?.advertisedAgents?.length ? s.advertisedAgents.join(" · ") : null],
     ...capabilityRows(s),
   ] as ProfileRow[])
     .filter(([, v]) => v != null && v !== "")
