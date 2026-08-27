@@ -2924,6 +2924,35 @@ pub fn proven_serving_indices(verdicts: &[HarnessProbeVerdict]) -> Vec<usize> {
         .collect()
 }
 
+/// The operator lines for a pre-advertise probe: one FAILED line per harness that did not prove,
+/// then a serving `n/m` count.
+///
+/// ⛔ THIS EXISTS BECAUSE A PARTIAL FAILURE USED TO NARROW THE ROSTER IN SILENCE. The FAILED lines
+/// used to live inside the `proven_serving_indices(..).is_empty()` branch, so they printed only when
+/// NOTHING proved and the seat refused to boot. A seat with at least one prover booted, dropped the
+/// rest, and advertised the survivors — with no line naming which harnesses dropped, or why. The
+/// roster narrowing is what determines the kind-30340 announcement, so the log was silent about the
+/// thing that changed what the seat advertised (#773).
+///
+/// Pure over the verdicts so it is testable without a relay, a home lock or a boot. The caller emits.
+fn pre_advertise_probe_lines(verdicts: &[HarnessProbeVerdict]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for verdict in verdicts {
+        if let Err((reason, _)) = &verdict.result {
+            let label = verdict.name.as_deref().unwrap_or("<unlabelled>");
+            lines.push(format!(
+                "seller node pre-advertise probe FAILED {label}: {reason}"
+            ));
+        }
+    }
+    let proven = proven_serving_indices(verdicts).len();
+    lines.push(format!(
+        "seller node pre-advertise probe: serving {proven}/{} configured harness(es)",
+        verdicts.len()
+    ));
+    lines
+}
+
 /// Prove-before-advertise: publish discoverability and boot serving ONLY the harnesses that proved
 /// they can deliver.
 ///
@@ -2942,13 +2971,14 @@ pub async fn boot_advertising_only_proven(
     mut home: MaxplayerHome,
     verdicts: Vec<HarnessProbeVerdict>,
 ) -> Result<SellerNodeRunner, NodeError> {
+    // Report every verdict BEFORE the gate, so a seat that boots with a narrowed roster still names
+    // every harness that dropped — the kind-30340 announcement reads that roster. Emitted on every
+    // outcome, not only the all-failed refusal: a mixed probe used to narrow and advertise in
+    // silence (#773). Composition is in `pre_advertise_probe_lines`; the caller emits.
+    for line in pre_advertise_probe_lines(&verdicts) {
+        opline!("{line}");
+    }
     if proven_serving_indices(&verdicts).is_empty() {
-        for verdict in &verdicts {
-            if let Err((reason, _)) = &verdict.result {
-                let label = verdict.name.as_deref().unwrap_or("<unlabelled>");
-                opline!("seller node pre-advertise probe FAILED {label}: {reason}");
-            }
-        }
         return Err(NodeError::NoProvenHarness(format!(
             "none of {} configured harness(es) produced a probe artifact; refusing to advertise \
              (fix the harness/launcher, then restart)",
@@ -13225,6 +13255,120 @@ mod tests {
 
         assert_eq!(state.on_tick(), RearmStep::Wait, "cooling down");
         assert_eq!(state.on_tick(), RearmStep::Attempt, "then attempting again");
+    }
+
+    // ---- #773 pre-advertise probe report -------------------------------------------------------
+    //
+    // Operator lines for the prove-before-advertise probe are composed HERE, not printed, so they
+    // can be asserted on injected verdicts with no relay, no home lock, and no spawn. The call site
+    // in `boot_advertising_only_proven` emits them BEFORE the gate — including the partial-failure
+    // path that used to boot, narrow the roster, and advertise in silence.
+
+    /// Nothing proved: every failing harness is named, then `0/m`.
+    ///
+    /// RED ON REVERT: drop the FAILED-line push from `pre_advertise_probe_lines` and this set
+    /// returns only the serving count.
+    #[test]
+    fn the_pre_advertise_probe_names_every_failure_when_nothing_proved() {
+        let lines = pre_advertise_probe_lines(&[
+            HarnessProbeVerdict {
+                index: 0,
+                name: Some("claude".to_owned()),
+                result: Err(("spawn failed".to_owned(), Fault::Unproven)),
+            },
+            HarnessProbeVerdict {
+                index: 1,
+                name: Some("codex".to_owned()),
+                result: Err(("no artifact".to_owned(), Fault::Unproven)),
+            },
+        ]);
+        assert_eq!(
+            lines,
+            vec![
+                "seller node pre-advertise probe FAILED claude: spawn failed".to_owned(),
+                "seller node pre-advertise probe FAILED codex: no artifact".to_owned(),
+                "seller node pre-advertise probe: serving 0/2 configured harness(es)".to_owned(),
+            ],
+            "an all-failed probe must name every drop and report serving 0/m"
+        );
+    }
+
+    /// THE #773 CASE. At least one harness proves AND at least one fails: the seat will boot and
+    /// advertise a narrowed roster, so the log must still name every drop. The FAILED loop used to
+    /// live inside the all-failed gate, and this mixed set produced no operator line at all.
+    ///
+    /// RED ON REVERT: gate the FAILED-line push on `proven_serving_indices(verdicts).is_empty()` —
+    /// the pre-fix shape — and this mixed set returns only the serving line.
+    #[test]
+    fn the_pre_advertise_probe_names_every_failure_when_some_still_prove() {
+        let lines = pre_advertise_probe_lines(&[
+            HarnessProbeVerdict {
+                index: 0,
+                name: Some("claude".to_owned()),
+                result: Ok(None),
+            },
+            HarnessProbeVerdict {
+                index: 1,
+                name: Some("codex".to_owned()),
+                result: Err(("launcher missing".to_owned(), Fault::Unproven)),
+            },
+        ]);
+        assert_eq!(
+            lines,
+            vec![
+                "seller node pre-advertise probe FAILED codex: launcher missing".to_owned(),
+                "seller node pre-advertise probe: serving 1/2 configured harness(es)".to_owned(),
+            ],
+            "a partial failure must name the drop AND the surviving fraction"
+        );
+    }
+
+    /// Every harness proved: no FAILED line, just the serving count. Without this, a reporter that
+    /// always emitted a FAILED line (or never emitted the count) would still pass the failure tests.
+    ///
+    /// RED ON REVERT: drop the serving-count line from `pre_advertise_probe_lines` and an all-proved
+    /// set returns empty.
+    #[test]
+    fn the_pre_advertise_probe_reports_full_service_when_every_harness_proved() {
+        let lines = pre_advertise_probe_lines(&[
+            HarnessProbeVerdict {
+                index: 0,
+                name: Some("claude".to_owned()),
+                result: Ok(None),
+            },
+            HarnessProbeVerdict {
+                index: 1,
+                name: Some("codex".to_owned()),
+                result: Ok(Some("codex-current".to_owned())),
+            },
+        ]);
+        assert_eq!(
+            lines,
+            vec!["seller node pre-advertise probe: serving 2/2 configured harness(es)".to_owned()],
+            "an all-proved probe must not invent a FAILED line, and must report serving m/m"
+        );
+    }
+
+    /// A verdict whose name is `None` renders as `<unlabelled>` — the same fallback the old
+    /// in-branch print used. A named-only assertion would let that fallback rot.
+    ///
+    /// RED ON REVERT: render `None` names as empty (or skip them) instead of `<unlabelled>` and this
+    /// needle disappears.
+    #[test]
+    fn the_pre_advertise_probe_renders_a_nameless_verdict_as_unlabelled() {
+        let lines = pre_advertise_probe_lines(&[HarnessProbeVerdict {
+            index: 0,
+            name: None,
+            result: Err(("timed out".to_owned(), Fault::Unproven)),
+        }]);
+        assert_eq!(
+            lines,
+            vec![
+                "seller node pre-advertise probe FAILED <unlabelled>: timed out".to_owned(),
+                "seller node pre-advertise probe: serving 0/1 configured harness(es)".to_owned(),
+            ],
+            "a nameless failure must render as <unlabelled>, not as an empty label"
+        );
     }
 
     // ---- #357 prove-before-advertise -----------------------------------------------------------
