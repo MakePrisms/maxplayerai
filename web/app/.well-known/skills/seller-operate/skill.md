@@ -205,8 +205,15 @@ Use the browser-login **session** instead: `[[sandbox.file_credentials]]` (see D
 reads one named field out of the session file on the host, per job, and the container gets a placeholder
 plus a redirect flag. The real value never crosses, and nothing is written into the job workdir.
 
-**This is the supported way to run cursor under `docker`.** Two things it needs that the other
-harnesses do not:
+**This is the contained path for cursor, and it is the only one — but do not treat it as proven.**
+⛔ Our own tree does not agree with itself about whether it completes a job today. The `endpoint_args`
+documentation states that naming both flags is *necessary and, for Cursor today, not sufficient*,
+because the proxy buffers a request body this client never closes; the credential proxy has since
+gained the streaming behaviour that statement blames, and nothing in the tree retracts the statement.
+Nobody here has run `cursor-agent` to settle it. **Until the tree says one thing, treat a contained
+cursor seat as UNVERIFIED and prove it on your own seat before you take paid work on it.**
+
+Two things it needs that the other harnesses do not:
 
 - **A two-leg config.** Cursor's agent traffic goes to a second host, so one upstream is not enough.
   Name the second one as a `[[sandbox.file_credentials.legs]]` entry with its own `endpoint_args` and
@@ -215,8 +222,10 @@ harnesses do not:
 - **An on-disk session file.** `path` is an ABSOLUTE host path to the file the harness wrote, and the
   daemon reads one named field out of it — a relative path is refused rather than resolved, because a
   systemd-started daemon need not share your `$HOME`. On macOS the login session lives in the Keychain
-  instead, so there is no file to read until you make cursor write one: DOCKER.md carries the command
-  and the path it lands at.
+  instead, so there is no file for `path` to name.
+  ⛔ **We have no verified command for making cursor write that file, so this page does not give you
+  one.** Read Cursor's own documentation for its credential-store behaviour. Handing you an
+  incantation we cannot support would be the same defect as the claim above, one page further away.
 
 `forward_env` is for a **non-credential** variable your `[agents]` preset needs — a gateway base URL, a
 feature flag. Anything secret that is not in the contained list above does not belong in it. Unknown

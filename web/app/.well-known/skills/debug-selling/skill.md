@@ -148,12 +148,17 @@ codex only, and the per-job proxy cannot hold `CURSOR_API_KEY`, so **`forward_en
 puts your real reusable key inside the container where a stranger's job reads it.** A `doctor` WARN
 flags that and does not refuse it, so the seat runs and leaks.
 
-The browser-login session has a contained path instead — `[[sandbox.file_credentials]]`, documented in
-DOCKER.md — which keeps the real value on the host and hands the container a per-job placeholder. **That
-path is supported for cursor**, and it needs two things the other harnesses do not: a second
+The browser-login session has a contained path instead — `[[sandbox.file_credentials]]`, whose fields
+are listed in DOCKER.md — which keeps the real value on the host and hands the container a per-job
+placeholder. It needs two things the other harnesses do not: a second
 `[[sandbox.file_credentials.legs]]` entry, because cursor's agent traffic goes to a different host than
 its control plane; and an on-disk session file, because `path` must be an absolute host path and the
-macOS login Keychain is not one — DOCKER.md carries the command that writes the file.
+macOS login Keychain is not one.
+
+⛔ **Two cautions before you build a cursor seat on this.** We have no verified command for making
+cursor write that session file — read Cursor's own documentation, not this page. And our tree does not
+agree with itself on whether the contained path completes a job today, so treat it as unverified until
+you have proven it on your own seat. See *step 3* of **maxplayer-seller-operate**.
 
 Note that the real credential still does not enter the container: a per-job host proxy holds it and
 passes a placeholder plus a base-URL override inward. That is also why `[sandbox] proxy_port_range` is
