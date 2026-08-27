@@ -491,7 +491,14 @@ fn reaping_removes_an_unattached_holder_and_spares_a_busy_one_and_another_seats(
         "another seat's unattached holder was reaped — that is the pre-attach window, and destroying \
          it fails a stranger's job that was about to start; reaped={reaped:?}"
     );
-    assert_eq!(reaped.len(), 1, "exactly one holder was mine and idle; reaped={reaped:?}");
+    assert_eq!(
+        reaped.removed.len(),
+        1,
+        "exactly one holder was mine and idle; reaped={reaped:?}"
+    );
+    // #905: a removal docker refused is now carried back rather than printed and dropped, so against
+    // a real daemon it is an assertion here instead of a line nobody reads.
+    assert!(reaped.failed.is_empty(), "a real reap must not leave holders behind; reaped={reaped:?}");
 }
 
 /// **End to end: a job launched through the seller's own argv builder is contained.**
