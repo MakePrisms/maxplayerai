@@ -564,10 +564,20 @@ pub struct FileCredential {
     /// resolution (`getaddrinfo EAI_AGAIN`) without ever reaching authentication. Every job fails while
     /// the proxy log looks healthy, because nothing about that leg was ever addressed to the proxy.
     ///
-    /// Naming both flags is necessary and, for Cursor today, not sufficient: the redirected agent leg
-    /// reaches the proxy and speaks h2c, and [`crate::credential_proxy`] buffers a request body that
-    /// this client does not close, so the request is never forwarded. Measured on a live contained
-    /// seat. A second flag here fixes the addressing, not that.
+    /// RETRACTED 2026-08-26 — the tree moved under this comment. It was written at `61ee4bc`
+    /// (2026-08-24) and said naming both flags was "not sufficient", because the redirected agent leg
+    /// reached the proxy and spoke h2c while [`crate::credential_proxy`] BUFFERED a request body this
+    /// client never closes, so the request was never forwarded. `0769580` removed that buffering: the
+    /// forward path now streams (`reqwest::Body::wrap_stream(size_bounded(idle_bounded(..)))`), and
+    /// `58008b7` releases the response scrub per chunk rather than per idle. Both are ancestors here.
+    ///
+    /// So naming both flags IS the addressing fix, and a contained cursor seat is no longer blocked on
+    /// this. `a086998` corrected the matching "unsupported" claims in the seller docs.
+    ///
+    /// ⚠ THE SIZE CAP DID NOT GO AWAY WITH THE BUFFER — it changed shape, and reading only the
+    /// removal half of that diff says the opposite. `MAX_REQUEST_BODY_BYTES` is alive and still 32 MiB:
+    /// a declared `content-length` over it is refused 413 BEFORE any forward, and the streamed body is
+    /// bounded by `size_bounded` at the same constant. Two enforcement points, one number.
     ///
     /// Accepts a bare string (one flag) or a list. A bare string is taken **verbatim as a single
     /// flag** and is never split: an element containing whitespace is refused rather than shell-parsed,
@@ -1874,9 +1884,12 @@ fn documented_config_toml(config: &MaxplayerConfig) -> Result<String, HomeError>
 #
 # THE CREDENTIAL DOES NOT CROSS INTO THE CONTAINER. A container inherits no
 # home directory and no macOS Keychain, so a `claude /login` credential is
-# unreachable and every job fails on auth while `doctor` and the pre-advertise
-# probe (which run on the HOST) both pass. Put a token in the DAEMON's own
-# environment - for claude, CLAUDE_CODE_OAUTH_TOKEN from `claude setup-token`.
+# unreachable inside the container. `doctor` still passes - it runs no agent
+# turn - but the pre-advertise probe runs INSIDE the container and FAILS, so the
+# seat never advertises rather than advertising and failing every job. A seat
+# that will not advertise under docker is usually THIS. Put a token in the
+# DAEMON's own environment - for claude, CLAUDE_CODE_OAUTH_TOKEN from
+# `claude setup-token`.
 #
 # Option C - launcher, ONLY for a Linux box that cannot run docker. Weaker: no
 # kernel boundary, no egress containment. Full bwrap example: docs/DOCKER.md
@@ -2429,6 +2442,31 @@ mod tests {
             "must show the Linux gVisor runtime line"
         );
         assert!(rendered.contains("macOS"), "must call out the macOS difference (omit runtime)");
+    }
+
+    #[test]
+    fn the_onboarding_template_does_not_claim_the_probe_runs_on_the_host() {
+        // The template told a docker operator that `doctor` and the pre-advertise probe "run on the
+        // HOST" and therefore both pass while every job fails on auth. The probe half is FALSE:
+        // `capability::probe_capabilities` renders every probe through
+        // `seller_exec::probe_launch_argv`, so under a docker policy the probe launches INSIDE the
+        // container and a missing contained credential FAILS it — the seat never advertises. A
+        // render failure is fatal there rather than a bare-argv fallback, precisely so a capability
+        // is never proven in the wrong environment
+        // (`capability.rs`, and `a_docker_policy_probes_inside_the_container_and_never_bare_on_the_host`).
+        //
+        // `doctor` is the half that really does stay green: it runs no agent turn. Keeping the two
+        // in one sentence taught operators to expect a seat that advertises and then fails every
+        // job, which is the opposite of what a contained seat does.
+        let rendered = documented_config_toml(&MaxplayerConfig::default()).expect("render documented");
+        assert!(
+            !rendered.contains("which run on the HOST"),
+            "the template must not tell a docker operator the pre-advertise probe runs on the host"
+        );
+        assert!(
+            rendered.contains("doctor"),
+            "the template must still name the check that DOES stay green"
+        );
     }
 
     #[test]

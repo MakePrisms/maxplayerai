@@ -1744,17 +1744,24 @@ mod checks {
         };
 
         let mut unresolvable: Vec<String> = Vec::new();
-        let mut inspect: Vec<std::path::PathBuf> = Vec::new();
+        // Each entry carries whether a MISSING directory is a finding. A harness with one known
+        // location must still report an unreadable one; a harness with SEVERAL (cursor) cannot, because
+        // only the operator's actual build decides which of them exists. Warning on the absent one
+        // would be noise on every correctly configured cursor seat.
+        let mut inspect: Vec<(std::path::PathBuf, bool)> = Vec::new();
         for agent in resolved.registry.entries() {
-            match seller_agents::harness_credential_dir(agent, &user_home) {
-                Some(dir) => inspect.push(dir),
-                None => match &agent.name {
+            let dirs = seller_agents::harness_credential_dirs(agent, &user_home);
+            if dirs.is_empty() {
+                match &agent.name {
                     None => unresolvable
                         .push("raw --agent-argv hatch (no preset label)".to_owned()),
                     Some(name) => unresolvable
                         .push(format!("harness {name} (no known credential directory)")),
-                },
+                }
+                continue;
             }
+            let missing_ok = dirs.len() > 1;
+            inspect.extend(dirs.into_iter().map(|dir| (dir, missing_ok)));
         }
         if inspect.is_empty() && unresolvable.is_empty() {
             return Check::warn(
@@ -1792,8 +1799,8 @@ mod checks {
                 None
             };
 
-            for dir in &inspect {
-                if let Some(check) = consider(dir, false, &mut too_open) {
+            for (dir, missing_ok) in &inspect {
+                if let Some(check) = consider(dir, *missing_ok, &mut too_open) {
                     return check;
                 }
                 // settings.json STEERS the harness when present; absence is not a permissions
@@ -1816,7 +1823,7 @@ mod checks {
                     "not group/world-writable: {}",
                     inspect
                         .iter()
-                        .map(|path| path.display().to_string())
+                        .map(|(path, _)| path.display().to_string())
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
