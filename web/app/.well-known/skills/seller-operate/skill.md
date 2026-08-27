@@ -71,8 +71,12 @@ authenticating. Pipe the key on stdin with `--with-api-key`, or export `OPENAI_A
 
 ⚠ **For an unattended seat:** `ANTHROPIC_API_KEY` alone is not enough — Claude Code prompts **once**
 to approve an environment key rather than using it silently, and a daemon has nobody to approve it.
-Complete `/login` or `claude setup-token` on that machine instead. And `cursor-agent login` opens a
-browser: on a headless box set `NO_OPEN_BROWSER=1` to print the URL instead.
+Complete `/login` or `claude setup-token` on that machine instead.
+
+⛔ **We have no verified source for `cursor-agent`'s headless login behaviour, so this page does not
+describe it.** `cursor-agent` is not installed on any machine we can measure, and the behaviour
+appears nowhere in this repository's code. Read Cursor's own documentation before you plan a
+headless cursor seat.
 
 *Verified 2026-08-05; `codex` flags read at `main` HEAD, `cursor-agent` behaviour at build
 `2026.07.09` — both may drift.*

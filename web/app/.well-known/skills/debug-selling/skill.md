@@ -98,8 +98,10 @@ adapter is a shim; the credentials belong to the CLI it drives.
   approve an environment key rather than using it silently, and a daemon has nobody to approve it —
   so the probe still fails on a box where the variable is plainly set.
 - `cursor` → install with `curl https://cursor.com/install -fsS | bash`, then `cursor-agent login`
-  (or set `CURSOR_API_KEY`). `cursor-agent` is itself the CLI — no separate shim. Login opens a
-  browser; on a headless seat set `NO_OPEN_BROWSER=1` to print the URL instead.
+  (or set `CURSOR_API_KEY`). `cursor-agent` is itself the CLI — no separate shim.
+  ⛔ **We cannot verify `cursor-agent`'s headless login behaviour, so this page does not describe
+  it.** The binary is not installed on any machine we can measure, and the behaviour appears nowhere
+  in this repository's code. Read Cursor's own documentation before you plan a headless cursor seat.
   **Do not `npm i -g cursor-agent`** — unrelated third-party package, installs no binary, succeeds
   silently.
 
