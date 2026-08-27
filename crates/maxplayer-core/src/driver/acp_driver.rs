@@ -2077,4 +2077,631 @@ mod tests {
             "the timer's classification must not be flattened into message text"
         );
     }
+
+    // ---------------------------------------------------------------------------------------------
+    // THE CAPTURED WIRE (#916 review, C3/C16).
+    //
+    // Every test above builds its input with `json!`, so all of them pass if the scalars were
+    // invented. That is not a hypothetical: the #896 fixture was ground-truthed by READING this
+    // adapter's source, and it invented a `currentValue` the adapter never sends. Source-reading
+    // cannot falsify an invented scalar.
+    //
+    // The tests below take their load-bearing input from a COMMITTED CAPTURE instead. `CAPTURE_SHA256`
+    // stops the capture being edited into agreement with the code;
+    // `the_committed_capture_still_matches_the_live_adapter` is what proves the adapter ever sent it.
+    // ---------------------------------------------------------------------------------------------
+
+    /// The committed capture. Provenance, redaction and the reproduction recipe live in
+    /// `tests/fixtures/claude-agent-acp-0.70.0/README.md`.
+    const CAPTURE_JSON: &str =
+        include_str!("../../tests/fixtures/claude-agent-acp-0.70.0/session-new-and-init-frame.json");
+
+    /// sha256 of [`CAPTURE_JSON`]. A DRIFT guard and not an authenticity proof — it catches the file
+    /// being quietly changed, and says nothing about whether the adapter ever sent those bytes.
+    const CAPTURE_SHA256: &str =
+        "4dc4c23645f0ddd6b05f65ac34b1e891e36b53046b7b79a91a919535f194a1ec";
+
+    /// The binary the capture came from, by ABSOLUTE PATH. A bare `claude-agent-acp` names the
+    /// reader's `PATH`, not a version: the capturing host carries a SECOND install of this same
+    /// package at `/opt/homebrew/bin/claude-agent-acp`, at 0.64.0.
+    const CAPTURE_BIN: &str = "/Users/forge/forge/npm/bin/claude-agent-acp";
+    const CAPTURE_ADAPTER_VERSION: &str = "0.70.0";
+
+    /// Keys deleted from the capture before committing it: the capturing workstation's environment,
+    /// not adapter wire. Redaction is DELETION of whole keys and never alteration of a value, because
+    /// a deletion cannot fabricate a scalar. The live test applies this same list before comparing,
+    /// which is what keeps the redaction part of the reproducible procedure rather than a one-off
+    /// edit.
+    const REDACTED_KEYS: &[&str] = &[
+        "skills",
+        "slash_commands",
+        "terminal_slash_commands",
+        "memory_paths",
+        "messaging_socket_path",
+        "cwd",
+        "agents",
+        "tools",
+        "stderr",
+    ];
+
+    /// A driver with no child process, for the pure-logic reads. The runtime id is the only thing
+    /// the command contributes here.
+    fn test_driver() -> AcpDriver {
+        AcpDriver::new(
+            AgentCommand::new("claude-agent-acp".into(), Vec::new()),
+            PermissionOutcome::Allow,
+            Duration::from_secs(1),
+        )
+    }
+
+    /// The keys the model read actually depends on.
+    ///
+    /// [`REDACTED_KEYS`] on its own is an ABSENCE gate, and the same list redacts the committed
+    /// fixture AND the live re-capture. So a load-bearing key that ever entered that list would
+    /// disappear from both sides together, every comparison would still pass, and the test would stop
+    /// testing while staying green. This list is the presence half that stops it: every name here
+    /// must be absent from `REDACTED_KEYS` and present in the committed capture.
+    const LOAD_BEARING_KEYS: &[&str] = &[
+        // provenance
+        "bin",
+        "initialize",
+        "agentInfo",
+        "name",
+        "version",
+        // the session-start picker read
+        "sessionNew",
+        "configOptions",
+        "category",
+        "currentValue",
+        "options",
+        "value",
+        // the init-frame read, envelope included
+        "rawSdkNotifications",
+        "method",
+        "params",
+        "message",
+        "type",
+        "subtype",
+        "model",
+    ];
+
+    /// Every object key anywhere in `value`, so presence is checked against the parsed structure
+    /// rather than against the file's spelling.
+    fn all_keys(value: &Value, into: &mut std::collections::BTreeSet<String>) {
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map {
+                    into.insert(key.clone());
+                    all_keys(child, into);
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|item| all_keys(item, into)),
+            _ => {}
+        }
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hex::encode(hasher.finalize())
+    }
+
+    fn capture() -> Value {
+        serde_json::from_str(CAPTURE_JSON).expect("the committed capture parses as JSON")
+    }
+
+    /// The `initialize` RESULT, verbatim from the capture.
+    fn captured_initialize_result() -> Value {
+        capture()["initialize"].clone()
+    }
+
+    /// The `session/new` RESULT, verbatim from the capture.
+    fn captured_session_new_result() -> Value {
+        capture()["sessionNew"].clone()
+    }
+
+    /// The `_claude/sdkMessage` notification, verbatim from the capture — JSON-RPC envelope included,
+    /// because the envelope is part of what the reader has to match.
+    fn captured_init_notification() -> Value {
+        capture()["rawSdkNotifications"][0].clone()
+    }
+
+    /// Delete every [`REDACTED_KEYS`] entry, at any depth. Used on a LIVE capture so it can be
+    /// compared with the committed one.
+    fn redact(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                map.retain(|key, _| !REDACTED_KEYS.contains(&key.as_str()));
+                for child in map.values_mut() {
+                    redact(child);
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(redact),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn the_committed_capture_is_the_file_that_was_measured() {
+        assert_eq!(
+            sha256_hex(CAPTURE_JSON.as_bytes()),
+            CAPTURE_SHA256,
+            "the committed capture changed; re-capture and update the hash, do not edit the file"
+        );
+        let capture = capture();
+        assert_eq!(
+            capture["bin"].as_str(),
+            Some(CAPTURE_BIN),
+            "the capture must name the binary it came from, absolute"
+        );
+        assert_eq!(
+            capture["initialize"]["agentInfo"]["version"].as_str(),
+            Some(CAPTURE_ADAPTER_VERSION),
+            "the capture must carry the adapter's OWN version, not one we assert about it"
+        );
+        // The redaction is verified in-repo, so nobody has to trust that it ran.
+        for key in REDACTED_KEYS {
+            assert!(
+                !CAPTURE_JSON.contains(&format!("\"{key}\"")),
+                "redacted key {key} is still in the committed capture"
+            );
+        }
+    }
+
+    #[test]
+    fn the_redaction_list_cannot_delete_the_thing_under_test() {
+        // The deletion list is applied to BOTH the committed fixture and the live re-capture, so a
+        // load-bearing key inside it would vanish from both and every comparison would still pass.
+        for key in LOAD_BEARING_KEYS {
+            assert!(
+                !REDACTED_KEYS.contains(key),
+                "{key} is load-bearing and must never be redacted"
+            );
+        }
+        let mut present = std::collections::BTreeSet::new();
+        all_keys(&capture(), &mut present);
+        let missing: Vec<_> = LOAD_BEARING_KEYS
+            .iter()
+            .filter(|key| !present.contains(**key))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the committed capture is missing load-bearing keys: {missing:?}"
+        );
+        // Names alone would pass on a key that exists somewhere irrelevant, so require the exact
+        // paths the reads walk to resolve to real values.
+        let capture = capture();
+        for path in [
+            &capture["bin"],
+            &capture["initialize"]["agentInfo"]["name"],
+            &capture["initialize"]["agentInfo"]["version"],
+            &capture["sessionNew"]["configOptions"][0]["category"],
+            &capture["rawSdkNotifications"][0]["method"],
+            &capture["rawSdkNotifications"][0]["params"]["message"]["type"],
+            &capture["rawSdkNotifications"][0]["params"]["message"]["subtype"],
+            &capture["rawSdkNotifications"][0]["params"]["message"]["model"],
+        ] {
+            assert!(
+                path.is_string(),
+                "a load-bearing path resolved to {path:?} instead of a string"
+            );
+        }
+        // POSITIVE CONTROL: the redaction did run, so this is not a fixture nothing was removed from.
+        assert!(
+            !present.contains("skills") && !present.contains("memory_paths"),
+            "POSITIVE CONTROL: the redaction must actually have removed keys"
+        );
+    }
+
+    #[test]
+    fn the_captured_picker_is_the_string_the_field_reported() {
+        // The whole defect in one assertion, driven by real wire: the adapter's model-category
+        // config option really does report `default`, and that string reaches us unchanged. Nothing
+        // here is typed as input — the value comes out of the capture.
+        let result = captured_session_new_result();
+        assert_eq!(
+            result.as_object().map(|object| {
+                let mut keys: Vec<_> = object.keys().map(String::as_str).collect();
+                keys.sort_unstable();
+                keys
+            }),
+            Some(vec!["configOptions", "modes", "sessionId"]),
+            "0.70.0 returns exactly these three keys, so the legacy `models` shape cannot fire"
+        );
+        assert!(
+            result.get("models").is_none(),
+            "POSITIVE CONTROL: if a top-level `models` appeared, the read below would be testing the \
+             legacy shape and would prove nothing about the Claude one"
+        );
+        let model_option = result["configOptions"]
+            .as_array()
+            .expect("configOptions is an array")
+            .iter()
+            .find(|option| option["category"] == json!(MODEL_CONFIG_CATEGORY))
+            .expect("a model-category option");
+        assert_eq!(
+            model_option["currentValue"].as_str(),
+            Some(CLAUDE_PICKER_DEFAULT),
+            "the captured picker value IS the refused alias — this is the field the field reported"
+        );
+        assert_eq!(
+            session_model_from_result(&result),
+            None,
+            "so the session-start read must yield absence, not the alias"
+        );
+    }
+
+    #[test]
+    fn the_captured_init_frame_names_the_concrete_model() {
+        let notification = captured_init_notification();
+        // Assert against the capture's OWN field, so this cannot pass by agreeing with a constant
+        // somebody typed. The literal below then records WHICH model was measured.
+        let on_the_wire = notification["params"]["message"]["model"]
+            .as_str()
+            .expect("the captured frame carries a model");
+        assert_eq!(
+            claude_sdk_init_model(&notification).as_deref(),
+            Some(on_the_wire),
+            "the reader must return the frame's own model field, not a neighbour"
+        );
+        assert_eq!(
+            on_the_wire, "claude-opus-5[1m]",
+            "and this is the id 0.70.0 reported for a `default` picker on the captured account"
+        );
+        assert_ne!(
+            on_the_wire, CLAUDE_PICKER_DEFAULT,
+            "the whole point: the frame carries an identity where the picker carried a preference"
+        );
+    }
+
+    #[test]
+    fn the_captured_initialize_result_is_what_gates_the_opt_in() {
+        assert!(
+            is_claude_agent_acp(&captured_initialize_result()),
+            "the gate must fire on the adapter's real `initialize` result, not only on a hand-built one"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // FAIL-CLOSED (#916 review, C6). The picker is a preference at EVERY value, so no picker value
+    // may be published as an identity on this adapter.
+    // ---------------------------------------------------------------------------------------------
+
+    /// Every value the 0.70.0 picker offers, read out of the committed capture rather than listed
+    /// here — a hand-written list would go stale silently and would not be wire.
+    fn captured_picker_values() -> Vec<String> {
+        captured_session_new_result()["configOptions"]
+            .as_array()
+            .expect("configOptions is an array")
+            .iter()
+            .find(|option| option["category"] == json!(MODEL_CONFIG_CATEGORY))
+            .expect("a model-category option")["options"]
+            .as_array()
+            .expect("the model option has an options array")
+            .iter()
+            .map(|option| {
+                option["value"]
+                    .as_str()
+                    .expect("every picker option has a string value")
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn no_claude_picker_value_is_published_as_a_model() {
+        // C6: refusing only `default` left `sonnet`, `haiku` and `opus[1m]` publishable. Each of
+        // those is a preference too — the same string is a different concrete model on a different
+        // account — so a buyer filtering on it is awarding against ad copy.
+        let values = captured_picker_values();
+        assert!(
+            values.len() >= 4,
+            "POSITIVE CONTROL: the capture must actually offer several picker values, or this test \
+             proves nothing: {values:?}"
+        );
+        assert!(
+            values.iter().any(|value| value != CLAUDE_PICKER_DEFAULT),
+            "POSITIVE CONTROL: at least one value must be something OTHER than the alias the old \
+             code already refused: {values:?}"
+        );
+        for value in values {
+            let mut driver = test_driver();
+            driver.is_claude_adapter = true;
+            driver.session_model = Some(value.clone());
+            assert_eq!(
+                driver.resolved_model(),
+                None,
+                "picker value {value} was published as this run's model"
+            );
+        }
+    }
+
+    #[test]
+    fn the_picker_still_reports_for_every_other_harness() {
+        // Rider 4: codex-acp must not regress. The refusal is scoped to the adapter that has the
+        // preference picker, so a legacy-shape harness reports exactly what it reported before.
+        let mut driver = test_driver();
+        driver.is_claude_adapter = false;
+        driver.session_model = Some("gpt-5.6-terra[medium]".into());
+        assert_eq!(
+            driver.resolved_model().as_deref(),
+            Some("gpt-5.6-terra[medium]"),
+            "narrowing the Claude picker must not touch any other harness"
+        );
+    }
+
+    #[test]
+    fn the_init_frame_outranks_the_picker_on_the_claude_path() {
+        let mut driver = test_driver();
+        driver.is_claude_adapter = true;
+        driver.session_model = Some("sonnet".into());
+        *driver.claude_turn_model.lock().expect("lock") = Some("claude-sonnet-5[1m]".into());
+        assert_eq!(
+            driver.resolved_model().as_deref(),
+            Some("claude-sonnet-5[1m]"),
+            "the turn-resolved id wins; the picker never supplies a fallback here"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // EVERY FAIL-CLOSED BRANCH, EXECUTED (#916 review, C8/C12). One case per branch of
+    // `claude_sdk_init_model`, plus both poisoned-lock branches.
+    // ---------------------------------------------------------------------------------------------
+
+    #[test]
+    fn every_malformed_init_frame_branch_yields_absence() {
+        // Each case names the branch it drives. A branch with no case here is a branch nothing runs.
+        let cases: Vec<(&str, Value)> = vec![
+            ("method absent", json!({"params": {"message": {}}})),
+            ("method not a string", json!({"method": 7, "params": {"message": {}}})),
+            (
+                "method is another notification",
+                json!({"method": "session/update", "params": {"message": {
+                    "type": "system", "subtype": "init", "model": "claude-opus-5[1m]"}}}),
+            ),
+            ("params absent", json!({"method": CLAUDE_SDK_MESSAGE_METHOD})),
+            (
+                "params not an object",
+                json!({"method": CLAUDE_SDK_MESSAGE_METHOD, "params": []}),
+            ),
+            (
+                "message absent",
+                json!({"method": CLAUDE_SDK_MESSAGE_METHOD, "params": {"sessionId": "s"}}),
+            ),
+            (
+                "message not an object",
+                json!({"method": CLAUDE_SDK_MESSAGE_METHOD, "params": {"message": "system"}}),
+            ),
+            (
+                "type absent",
+                json!({"method": CLAUDE_SDK_MESSAGE_METHOD, "params": {"message": {
+                    "subtype": "init", "model": "claude-opus-5[1m]"}}}),
+            ),
+            (
+                "type not a string",
+                json!({"method": CLAUDE_SDK_MESSAGE_METHOD, "params": {"message": {
+                    "type": ["system"], "subtype": "init", "model": "claude-opus-5[1m]"}}}),
+            ),
+            (
+                "type is another frame kind",
+                json!({"method": CLAUDE_SDK_MESSAGE_METHOD, "params": {"message": {
+                    "type": "assistant", "subtype": "init", "model": "claude-opus-5"}}}),
+            ),
+            (
+                "subtype absent",
+                json!({"method": CLAUDE_SDK_MESSAGE_METHOD, "params": {"message": {
+                    "type": "system", "model": "claude-opus-5[1m]"}}}),
+            ),
+            (
+                "subtype not a string",
+                json!({"method": CLAUDE_SDK_MESSAGE_METHOD, "params": {"message": {
+                    "type": "system", "subtype": 1, "model": "claude-opus-5[1m]"}}}),
+            ),
+            (
+                "subtype is another system frame",
+                json!({"method": CLAUDE_SDK_MESSAGE_METHOD, "params": {"message": {
+                    "type": "system", "subtype": "status", "model": "claude-opus-5[1m]"}}}),
+            ),
+            (
+                "model absent",
+                json!({"method": CLAUDE_SDK_MESSAGE_METHOD, "params": {"message": {
+                    "type": "system", "subtype": "init"}}}),
+            ),
+            (
+                "model not a string",
+                json!({"method": CLAUDE_SDK_MESSAGE_METHOD, "params": {"message": {
+                    "type": "system", "subtype": "init", "model": {"id": "claude-opus-5"}}}}),
+            ),
+            (
+                "model blank",
+                json!({"method": CLAUDE_SDK_MESSAGE_METHOD, "params": {"message": {
+                    "type": "system", "subtype": "init", "model": "   "}}}),
+            ),
+            (
+                "model is the refused picker alias",
+                json!({"method": CLAUDE_SDK_MESSAGE_METHOD, "params": {"message": {
+                    "type": "system", "subtype": "init", "model": CLAUDE_PICKER_DEFAULT}}}),
+            ),
+        ];
+        assert_eq!(cases.len(), 17, "keep the branch list and the case list in step");
+        for (branch, notification) in cases {
+            assert_eq!(
+                claude_sdk_init_model(&notification),
+                None,
+                "branch `{branch}` must fail closed to absence, never to a fabricated model"
+            );
+        }
+        // POSITIVE CONTROL: the same reader, on real wire, does produce a model — so the seventeen
+        // absences above are the branches doing their job and not a reader that always returns None.
+        assert!(
+            claude_sdk_init_model(&captured_init_notification()).is_some(),
+            "the reader must still read the captured frame"
+        );
+    }
+
+    #[test]
+    fn a_poisoned_model_lock_reports_absence_and_never_panics() {
+        // C12: `resolved_model`'s `Ok(..)` guard had no executing test. Poison the lock for real.
+        let mut driver = test_driver();
+        driver.is_claude_adapter = true;
+        driver.session_model = Some("sonnet".into());
+        *driver.claude_turn_model.lock().expect("lock") = Some("claude-opus-5[1m]".into());
+        let lock = driver.claude_turn_model.clone();
+        let poisoned = std::panic::catch_unwind(move || {
+            let _guard = lock.lock().expect("lock");
+            panic!("poison the model lock on purpose");
+        });
+        assert!(poisoned.is_err(), "the helper must actually have panicked");
+        assert!(
+            driver.claude_turn_model.is_poisoned(),
+            "POSITIVE CONTROL: the lock must really be poisoned, or the branch below is not reached"
+        );
+        assert_eq!(
+            driver.resolved_model(),
+            None,
+            "a poisoned lock must fail closed to absence, not fall back to the picker alias"
+        );
+    }
+
+    #[test]
+    fn a_poisoned_model_lock_still_routes_the_notification() {
+        // C12: `handle_wire_message`'s capture is best-effort. A poisoned lock must cost the model,
+        // never the update — the notification still has to reach the generic ACP path.
+        let claude_turn_model = Arc::new(Mutex::new(None));
+        let lock = claude_turn_model.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = lock.lock().expect("lock");
+            panic!("poison the model lock on purpose");
+        });
+        assert!(
+            claude_turn_model.is_poisoned(),
+            "POSITIVE CONTROL: the lock must really be poisoned"
+        );
+        let (response_tx, _response_rx) = mpsc::unbounded_channel();
+        let (update_tx, mut update_rx) = mpsc::unbounded_channel();
+        handle_wire_message(
+            &captured_init_notification(),
+            &claude_turn_model,
+            &response_tx,
+            &update_tx,
+            &PermissionOutcome::Deny,
+            &mut |_, _| panic!("a notification must not answer a permission request"),
+        );
+        let update = update_rx.try_recv().expect("the notification must still route");
+        assert!(
+            matches!(update, SessionUpdate::Ext(ExtMethod { ref method, .. })
+                if method == CLAUDE_SDK_MESSAGE_METHOD),
+            "routing must be unchanged by the adapter-private read: {update:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // THE AUTHENTICITY LEG (#916 review, C3). This is the only test that can fail because the
+    // committed capture is fabricated. It spends a real turn, so it is env-gated.
+    // ---------------------------------------------------------------------------------------------
+
+    /// Re-capture from a live adapter and compare the load-bearing fields with the committed file.
+    ///
+    /// Ignored by default: it needs the adapter binary, working credentials, `node`, and one real
+    /// prompt turn. Run it with the binary you want to prove against:
+    ///
+    /// ```text
+    /// LIVE_ACP_CAPTURE_BIN=/Users/forge/forge/npm/bin/claude-agent-acp \
+    ///   cargo test -p maxplayer-core --features acp \
+    ///   the_committed_capture_still_matches_the_live_adapter -- --ignored --nocapture
+    /// ```
+    ///
+    /// Session ids, uuids and token counts differ every run, so this compares the fields the model
+    /// read actually depends on — not the whole file.
+    ///
+    /// ⚠ CI DOES NOT RUN THIS TEST, and cannot. It needs Claude credentials and spends a real turn,
+    /// and this repo's CI is additionally held pending a maintainer click because branches arrive
+    /// from a fork. So this is the only leg that can fail on a fabricated fixture, and it is the leg
+    /// no automated run exercises — which is why the PR that adds it records the command, its output
+    /// and the UTC date it was run by hand. An unrun proof is not a proof. `CAPTURE_SHA256` catches
+    /// drift on every ordinary `cargo test`; authenticity is only ever as fresh as the last manual
+    /// run recorded in the PR.
+    #[test]
+    #[ignore = "spends a real Claude turn; needs a live adapter binary and credentials"]
+    fn the_committed_capture_still_matches_the_live_adapter() {
+        let Ok(bin) = std::env::var("LIVE_ACP_CAPTURE_BIN") else {
+            panic!("set LIVE_ACP_CAPTURE_BIN to the adapter binary to prove against");
+        };
+        let client = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/claude-agent-acp-0.70.0/capture.mjs"
+        );
+        let out = std::env::temp_dir().join("live-acp-capture.json");
+        let status = std::process::Command::new("node")
+            .arg(client)
+            .arg(&bin)
+            .arg(&out)
+            .status()
+            .expect("node must be on PATH to run the capture client");
+        assert!(status.success(), "the capture client failed: {status:?}");
+
+        let mut live: Value = serde_json::from_str(
+            &std::fs::read_to_string(&out).expect("the live capture must be readable"),
+        )
+        .expect("the live capture must parse");
+        redact(&mut live);
+        let committed = capture();
+
+        assert_eq!(
+            live["initialize"]["agentInfo"]["name"],
+            committed["initialize"]["agentInfo"]["name"],
+            "a different adapter answered"
+        );
+        assert_eq!(
+            live["initialize"]["agentInfo"]["version"],
+            committed["initialize"]["agentInfo"]["version"],
+            "adapter version moved; re-capture the fixture rather than loosening this test"
+        );
+        let live_option = live["sessionNew"]["configOptions"]
+            .as_array()
+            .expect("live configOptions")
+            .iter()
+            .find(|option| option["category"] == json!(MODEL_CONFIG_CATEGORY))
+            .expect("a live model-category option")
+            .clone();
+        let committed_option = committed["sessionNew"]["configOptions"]
+            .as_array()
+            .expect("committed configOptions")
+            .iter()
+            .find(|option| option["category"] == json!(MODEL_CONFIG_CATEGORY))
+            .expect("a committed model-category option")
+            .clone();
+        assert_eq!(
+            live_option["currentValue"], committed_option["currentValue"],
+            "the picker value the committed capture claims is not what the adapter sends"
+        );
+        assert_eq!(
+            live_option["options"], committed_option["options"],
+            "the picker vocabulary the committed capture claims is not what the adapter sends"
+        );
+        let live_frame = live["rawSdkNotifications"][0].clone();
+        let committed_frame = committed["rawSdkNotifications"][0].clone();
+        for field in ["method"] {
+            assert_eq!(
+                live_frame[field], committed_frame[field],
+                "the committed capture's `{field}` is not what the adapter sends"
+            );
+        }
+        for field in ["type", "subtype"] {
+            assert_eq!(
+                live_frame["params"]["message"][field], committed_frame["params"]["message"][field],
+                "the committed capture's frame `{field}` is not what the adapter sends"
+            );
+        }
+        // The model itself is account-dependent, so require the SHAPE the capture claims: a
+        // concrete id the reader accepts, and never the picker alias.
+        let live_model = claude_sdk_init_model(&live_frame)
+            .expect("the live init frame must carry a model the reader accepts");
+        assert_ne!(
+            live_model, CLAUDE_PICKER_DEFAULT,
+            "the live adapter published the picker alias as its model"
+        );
+        println!("LIVE bin={bin} model={live_model}");
+    }
 }
