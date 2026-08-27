@@ -74,6 +74,22 @@ const RESULT_PUBLISH_WINDOW_SECS: i64 = 86_400;
 /// error detail — the operator log carries the specifics) but enough that the buyer learns the job
 /// failed instead of waiting on a delivery that will never come.
 const EXEC_FAILURE_FEEDBACK: &str = "seller could not complete the job (execution failed before delivery)";
+/// Buyer-facing reason when the requested harness is not available on this seat, so the job was
+/// never dispatched — a display-only mirror of the `capability_missing` reason_code (§10; the tag
+/// governs). Worded as NEVER STARTED, not as failed: the buyer's useful next move is another seat,
+/// where a retry here would only reproduce the same refusal.
+const CAPABILITY_MISSING_FEEDBACK: &str =
+    "seller could not start the job: the requested harness is not available on this seat";
+/// The reason code the dispatch-refusal arm of `execute_job` emits — a job that reached execution
+/// with no serving harness for the harness its buyer asked for (#821).
+///
+/// ⛔ **Named as a `pub(crate)` const rather than written inline so the BUYER side can assert on the
+/// very value this emitter uses.** That arm is POST-AWARD, so whatever code it emits must be a member
+/// of `buyer::is_releasable_failure_feedback`: a code outside that set leaves the buyer's reservation
+/// held until the deadline reconcile instead of freeing it on the feedback. Nothing related the emit
+/// site to that predicate before, so the label could move out of the releasable set with every test
+/// green — see `the_undispatchable_arms_reason_code_is_releasable`.
+pub(crate) const UNDISPATCHABLE_REASON_CODE: ReasonCode = ReasonCode::CapabilityMissing;
 /// Buyer-facing reason when execution succeeded but the delivery (snapshot/push/publish) failed —
 /// a display-only mirror of the `delivery_failed` reason_code (§10; the tag governs).
 const DELIVERY_FAILURE_FEEDBACK: &str =
@@ -5809,6 +5825,16 @@ impl SellerNodeRunner {
         // this node cannot serve fails the job rather than substituting another harness — the
         // claim gate should already have refused it, and quietly running the wrong agent is the
         // one outcome the registry exists to prevent.
+        //
+        // The reason_code is `capability_missing`, not `execution_failed` (#821): nothing ran here.
+        // `run_agent_job` is below this arm and is never reached, so there is no execution to have
+        // failed — the seat could not START. `execution_failed` reads as *tried and broke*, which
+        // attributes a fault to a run that never happened and points the buyer at a retry, when the
+        // only move that can succeed is a seat that serves this harness.
+        //
+        // ⛔ This is a LABEL, not a guard. It changes nothing about whether the job is paid: under
+        // award-is-payment the sats were committed at award, upstream of this arm. Never read this
+        // code as protecting money (see `ReasonCode::CapabilityMissing`).
         let requested_agent = offer.requested_agent.clone();
         let Some(selected) = self.agents.dispatch(requested_agent.as_deref()) else {
             opline!(
@@ -5816,7 +5842,7 @@ impl SellerNodeRunner {
                  this node (never substituted)",
                 requested_agent.as_deref().unwrap_or("<any>")
             );
-            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None).await;
+            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, UNDISPATCHABLE_REASON_CODE, CAPABILITY_MISSING_FEEDBACK, None).await;
             return;
         };
         let agent_command = selected.agent.argv.clone();
@@ -11460,9 +11486,21 @@ mod tests {
             tag(ReasonCode::ExecutionFailed, "reason_code").as_deref(),
             Some("execution_failed")
         );
+        assert_eq!(
+            tag(ReasonCode::CapabilityMissing, "reason_code").as_deref(),
+            Some("capability_missing")
+        );
         // Coarse status is unchanged (historical `error`) for every code — the tag is the discriminator.
         assert_eq!(tag(ReasonCode::BelowRate, "status").as_deref(), Some("error"));
         assert_eq!(tag(ReasonCode::NoSentinel, "status").as_deref(), Some("error"));
+        // #821 keeps the existing convention deliberately: the §10 refusal re-class is a separate view
+        // change, so `capability_missing` rides `status=error` like every other code. This is also what
+        // discharges #821's buyer-side item without a code change — the claim-list view keys on
+        // `status`, so a code that stays `error` is already handled there.
+        assert_eq!(
+            tag(ReasonCode::CapabilityMissing, "status").as_deref(),
+            Some("error")
+        );
     }
 
     // ── Execute-body delivery contract (invariants 2 & 8), no network ────────────────────────────
