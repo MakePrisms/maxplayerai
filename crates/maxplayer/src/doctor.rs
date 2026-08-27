@@ -1511,10 +1511,8 @@ mod checks {
     /// was "reachable only by buyers it named", which is wrong for a seat that named NOBODY (nothing
     /// reaches it at all) and for one whose every entry is unusable (it admits nobody while the
     /// fence still shuts both surfaces). It also promised that opening either flag turns this
-    /// finding into a FAIL — untrue while a populated allowlist fenced them, which was the very
-    /// state the reachability check then reported as INERT two checks later. #923 deleted both the
-    /// fence and that INERT finding, so the promise is now kept; the sentence was still false when
-    /// it was written.
+    /// finding into a FAIL — untrue while a populated allowlist fences them, which is the very
+    /// state the reachability check reports as INERT two checks later.
     /// ⇒ A LATER WARN DOES NOT MAKE AN EARLIER DIAGNOSIS TRUE. Each state gets its own remedy.
     fn not_stranger_facing_remedy(exposure: SeatExposure) -> String {
         // ⛔ REACHED ONLY WHEN BOTH OPEN ROUTES ARE OFF (#923). `serves_strangers()` is now exactly
