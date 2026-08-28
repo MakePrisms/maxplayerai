@@ -5940,6 +5940,12 @@ impl SellerNodeRunner {
         // the `no_sentinel` refusal so the buyer learns delivery was refused for want of a sentinel
         // (distinct from a crash). The gate, not an unconditional write, is the check.
         let branch = format!("maxplayer/{}", &job_id[..8.min(job_id.len())]);
+        // Single source for the delivery ref. The branch-scoped push token (below) is minted for
+        // THIS refname, and the push refspec `push_branch_with_header` builds is
+        // `refs/heads/{branch}:refs/heads/{branch}` — both derive from `branch`, so the token scope
+        // and the ref actually pushed cannot drift apart. The relay (PR #929) demands the scope be
+        // fully qualified (`refs/heads/…`); a bare branch name is rejected.
+        let push_ref = crate::git_transport::delivery_ref(&branch);
         let message = delivery_message(&offer.task);
         let job_hash = job_hash_for_offer(job_id, &offer.task, offer.amount_sats);
         if let Err(error) = seller_git::snapshot_delivery_at_off_runtime(
@@ -5987,7 +5993,7 @@ impl SellerNodeRunner {
         // stays confined to the actor + the authenticated relay client, never re-read here. A
         // public/anonymous https remote takes no header (auth applies to relay-git remotes only).
         let push_header = if crate::delivery_transport::is_relay_git_locator(&seller.git_remote) {
-            match self.node.signer().http_auth_header(seller.git_remote.clone()).await {
+            match self.node.signer().http_auth_header(seller.git_remote.clone(), Some(push_ref.clone())).await {
                 Ok(Ok(header)) => Some(header),
                 Ok(Err(error)) => {
                     opline!("seller node execute fail job_id={job_id}: push auth sign failed ({error})");

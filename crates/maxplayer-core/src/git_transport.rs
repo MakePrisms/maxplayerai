@@ -212,29 +212,50 @@ pub fn nip98_authorization_header(
 ) -> Result<String, TransportError> {
     let keys = nostr_sdk::Keys::parse(secret_key_hex)
         .map_err(|error| TransportError::Auth(format!("invalid key: {error}")))?;
-    nip98_authorization_header_with_keys(remote_url, &keys)
+    nip98_authorization_header_with_keys(remote_url, &keys, None)
 }
 
 /// Build the NIP-98 `Authorization` header from an already-held [`Keys`](nostr_sdk::Keys) instead of
 /// a raw secret hex. This is the custody-preserving entry point: a caller that keeps its secret
 /// inside a signer actor signs the header THROUGH the actor (which owns the `Keys`) so the secret is
-/// never re-read into a third site. Identical header to [`nip98_authorization_header`].
+/// never re-read into a third site. Identical header to [`nip98_authorization_header`] when
+/// `ref_scope` is `None`.
+///
+/// `ref_scope`: when `Some(refname)`, add one `["ref", "<refname>"]` tag. The relay (PR #929) reads
+/// the first `ref` tag and refuses a push to any other ref, so a token minted for the delivery
+/// branch is worthless if stolen. `refname` must be fully qualified (`refs/heads/…`); the relay
+/// rejects a bare branch name. `None` mints the unscoped header, byte-identical to before.
 pub fn nip98_authorization_header_with_keys(
     remote_url: &str,
     keys: &nostr_sdk::Keys,
+    ref_scope: Option<&str>,
 ) -> Result<String, TransportError> {
     use base64::Engine as _;
     use nostr_sdk::nips::nip98::{HttpData, HttpMethod};
-    use nostr_sdk::prelude::{EventBuilder, Url};
+    use nostr_sdk::prelude::{EventBuilder, Tag, Url};
     use nostr_sdk::JsonUtil;
 
     let url = Url::parse(remote_url)
         .map_err(|error| TransportError::Io(format!("invalid remote url: {error}")))?;
-    let event = EventBuilder::http_auth(HttpData::new(url, HttpMethod::POST))
+    let mut builder = EventBuilder::http_auth(HttpData::new(url, HttpMethod::POST));
+    if let Some(refname) = ref_scope {
+        let tag = Tag::parse(["ref", refname])
+            .map_err(|error| TransportError::Auth(format!("invalid ref scope tag: {error}")))?;
+        builder = builder.tag(tag);
+    }
+    let event = builder
         .sign_with_keys(keys)
         .map_err(|error| TransportError::Auth(format!("nip98 sign failed: {error}")))?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(event.as_json());
     Ok(format!("Nostr {encoded}"))
+}
+
+/// The fully-qualified ref a delivery push writes for `branch`. Both the push refspec
+/// ([`push_branch_with_header`]) and the branch-scoped token scope (the caller in `run.rs`) derive
+/// the ref from THIS one function, so a future edit cannot split the token scope from the ref
+/// actually pushed — the relay demands they match exactly (PR #929).
+pub fn delivery_ref(branch: &str) -> String {
+    format!("refs/heads/{branch}")
 }
 
 /// Resolve the NIP-98 header for a leg: `Some` header only when a key is supplied AND the remote is
@@ -281,7 +302,7 @@ pub fn push_branch_with_header(
         .remote_anonymous(remote_url)
         .map_err(|error| TransportError::Io(format!("anonymous remote: {error}")))?;
 
-    let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+    let refspec = format!("{src}:{dst}", src = delivery_ref(branch), dst = delivery_ref(branch));
     let rejection: std::rc::Rc<RefCell<Option<String>>> = std::rc::Rc::new(RefCell::new(None));
     let mut callbacks = RemoteCallbacks::new();
     {
@@ -647,6 +668,89 @@ mod tests {
         let err = nip98_authorization_header("https://relay.example/git/o/r.git", "not-a-key")
             .expect_err("must reject");
         assert!(matches!(err, TransportError::Auth(_)));
+    }
+
+    // Decode a "Nostr <base64>" header back to its NIP-98 event.
+    fn decode_nip98(header: &str) -> nostr_sdk::Event {
+        use base64::Engine as _;
+        use nostr_sdk::{Event, JsonUtil};
+        let encoded = header.strip_prefix("Nostr ").expect("Nostr scheme");
+        let json = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("base64");
+        Event::from_json(&json).expect("event json")
+    }
+
+    fn ref_tags(event: &nostr_sdk::Event) -> Vec<String> {
+        event
+            .tags
+            .iter()
+            .filter(|t| t.kind() == nostr_sdk::TagKind::custom("ref"))
+            .filter_map(|t| t.content().map(str::to_owned))
+            .collect()
+    }
+
+    #[test]
+    fn nip98_header_scoped_carries_one_ref_tag_and_verifies() {
+        use nostr_sdk::Keys;
+
+        let keys = Keys::generate();
+        let remote = "https://relay.example/git/abcdef/repo.git";
+        let scope = "refs/heads/maxplayer/abc12345";
+        let header = nip98_authorization_header_with_keys(remote, &keys, Some(scope))
+            .expect("build header");
+
+        let event = decode_nip98(&header);
+        // Still a valid NIP-98 token: signature, kind, and the u/method binding are unchanged.
+        event.verify().expect("valid signature");
+        assert_eq!(event.kind.as_u16(), 27235, "NIP-98 kind");
+        let u = event
+            .tags
+            .iter()
+            .find(|t| t.kind() == nostr_sdk::TagKind::custom("u"))
+            .and_then(|t| t.content().map(str::to_owned))
+            .expect("u tag");
+        assert_eq!(u, remote, "u tag still binds the repo-root");
+
+        // Exactly one ref tag, carrying the exact scope. The relay reads the first ref tag; emitting
+        // more than one would be ambiguous.
+        assert_eq!(ref_tags(&event), vec![scope.to_owned()], "one exact ref tag");
+    }
+
+    #[test]
+    fn nip98_header_unscoped_has_no_ref_tag() {
+        use nostr_sdk::Keys;
+
+        let keys = Keys::generate();
+        let remote = "https://relay.example/git/abcdef/repo.git";
+        let header =
+            nip98_authorization_header_with_keys(remote, &keys, None).expect("build header");
+
+        // Backward-compat guard: with no scope the token carries NO ref tag, so an old relay sees
+        // exactly today's event.
+        assert!(ref_tags(&decode_nip98(&header)).is_empty(), "no ref tag when unscoped");
+    }
+
+    #[test]
+    fn delivery_ref_single_sources_scope_and_push() {
+        use nostr_sdk::Keys;
+
+        // The push refspec (push_branch_with_header) and the token scope (run.rs) BOTH call
+        // delivery_ref on the same branch. This test pins delivery_ref's output and proves the
+        // minted token carries exactly that value — so the two cannot drift apart.
+        let branch = "maxplayer/abc12345";
+        let push_ref = delivery_ref(branch);
+        assert_eq!(push_ref, "refs/heads/maxplayer/abc12345", "fully-qualified ref");
+
+        let keys = Keys::generate();
+        let header =
+            nip98_authorization_header_with_keys("https://relay.example/git/o/r.git", &keys, Some(&push_ref))
+                .expect("build header");
+        assert_eq!(
+            ref_tags(&decode_nip98(&header)),
+            vec![push_ref],
+            "the token scope equals the ref the push uses"
+        );
     }
 
     #[test]
