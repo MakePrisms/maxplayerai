@@ -369,9 +369,16 @@ enum SkipReason {
     /// re-surfacing; admitting it only parks an execution slot on work that will not be awarded.
     /// Distinct from [`Self::Lapsed`]: that is the offer's self-declared expiry, this is its age.
     TooOld,
-    /// The seller runs a populated `accept_offers_only_from` allowlist and this offer's author (the
-    /// buyer) is not on it — a hard fence (#482). Named (not silent) so the operator log records the
-    /// declined pubkey; no buyer feedback is emitted (a private seller does not advertise the fence).
+    /// The seller runs a populated `accept_offers_only_from` allowlist, this offer's author (the
+    /// buyer) is not on it, the offer TARGETS this seat, and `accept_open_targeted` is false — so no
+    /// control admits it. Named (not silent) so the operator log records the declined pubkey; no
+    /// buyer feedback is emitted (a private seller does not advertise why it declined a stranger).
+    ///
+    /// ⛔ NOT A FENCE OVER BOTH SURFACES SINCE #923. It used to be emitted for ANY unlisted buyer the
+    /// moment a list existed, targeted or not, ahead of `accept_open_targeted` and the rate gate. It
+    /// is now scoped to the targeted surface with the open route CLOSED: an untargeted offer is
+    /// answered by [`Self::RateGate`] and `claim_open_pool`, and an offer addressed to another seat
+    /// by the rate gate's target mismatch.
     NotAllowlisted,
     /// A buyer this seat has not named targeted it directly, and the seat has not opted in to the
     /// targeted-open surface (`accept_open_targeted = false`, the default).
@@ -2095,13 +2102,20 @@ async fn contribution_result_envelope_tags(
 /// eligibility, then the targeting/rate gate, then the harness the offer asked for.
 /// Pure over (offer, config, registry, buyer, now, offer_created_at).
 ///
-/// Buyer eligibility is TWO clauses over three independent knobs, and no knob is inferred from
-/// another being empty. The allowlist fence (#482) refuses an unlisted buyer whenever the operator
-/// populated a list, on either surface. The targeted-surface opt-in then refuses a buyer the
-/// operator did NOT name when the offer targets this seat and `accept_open_targeted` is false — the
-/// clause that stops an empty allowlist meaning accept-all. The untargeted (open-pool) surface is
-/// left wholly to `claim_open_pool` in the rate gate, so the two open surfaces stay separable.
-/// A populated allowlist wins: while one is set, `accept_open_targeted` cannot re-open the seat.
+/// Buyer eligibility is ONE clause over three ADDITIVE, INDEPENDENT controls (#923), and no control
+/// is inferred from another being empty or populated. On the TARGETED surface admission is the UNION
+/// `buyer_is_named || accept_open_targeted`: `accept_offers_only_from` is an always-admits set of
+/// buyers the operator chose, and `accept_open_targeted` ADDITIONALLY admits a buyer it did not name.
+/// The untargeted (open-pool) surface is left wholly to `claim_open_pool` in the rate gate, so all
+/// three controls stay separately switchable.
+///
+/// ⛔ THE ALLOWLIST IS AN ADMIT-LIST FOR TARGETED WORK, NEVER A VETO OVER THE OPT-IN BESIDE IT. Until
+/// #923 the populated-allowlist fence returned BEFORE the targeted opt-in was consulted, so a
+/// populated list made `accept_open_targeted` INERT on both surfaces: an operator could not keep
+/// trusted buyers while temporarily opening a public route, and the config said one thing while the
+/// seat did another. Restoring that precedence re-breaks #923 — the order is asserted, not left to
+/// reading. Widening admission BEYOND these three controls is a defect, not an improvement: every
+/// clause here is a permission grant an operator cannot take back once a stranger has claimed.
 ///
 /// The harness gate is a CLAIM-time decision, not a delivery-time one: a node that cannot run the
 /// requested harness never parks a claim at all, so the buyer's offer stays visible to a seller
@@ -2134,24 +2148,25 @@ fn classify_offer(
     // the rate/harness gates, so an ineligible buyer's offer is declined outright; the caller names
     // the declined pubkey in the skip log (this pure fn cannot, and stays silent to the buyer).
     let buyer_is_named = seller.accept_offers_only_from.iter().any(|allowed| allowed == buyer_pubkey);
-    // (1) Private-seller fence (#482), UNCHANGED: a POPULATED `accept_offers_only_from` claims ONLY
-    // from a named buyer, on both the targeted and the open-pool surface. `is_empty()` is kept here
-    // deliberately — it is what scopes the fence to operators who set one, and deleting it would
-    // turn an empty list into deny-all by a second route, which is exactly what the separate flag
-    // below exists to avoid.
-    if !seller.accept_offers_only_from.is_empty() && !buyer_is_named {
-        return ClaimDecision::Skip(SkipReason::NotAllowlisted);
-    }
-    // (2) Targeted-surface opt-in: a buyer this seat did not name may target it only with
-    // `accept_open_targeted`. This is the clause that stops an empty allowlist from meaning
-    // accept-all. It is scoped to offers whose `p` tag is THIS seat, so it leaves the untargeted
-    // (open-pool) surface entirely to `claim_open_pool` in the rate gate below — the two open
-    // surfaces are independent knobs, and neither is inferred from the allowlist being empty.
-    if !buyer_is_named
+    // TARGETED surface (#923): admit on the UNION of the two controls that govern it — a buyer the
+    // operator NAMED, or `accept_open_targeted` for one it did not. Neither cancels the other, so
+    // toggling the public route leaves the private fallback intact and vice versa.
+    //
+    // ⛔ SCOPED TO OFFERS WHOSE `p` TAG IS THIS SEAT. That scope is what leaves the untargeted
+    // (open-pool) surface wholly to `claim_open_pool` in the rate gate below — the third, separate
+    // control. An offer targeting ANOTHER seat is refused there, never admitted here.
+    if offer.seller_pubkey.as_deref() == Some(seller_pubkey)
+        && !buyer_is_named
         && !seller.accept_open_targeted
-        && offer.seller_pubkey.as_deref() == Some(seller_pubkey)
     {
-        return ClaimDecision::Skip(SkipReason::OpenTargetedRefused);
+        // TWO refusals over one condition, DELIBERATELY NOT FOLDED: an operator who wrote a list
+        // must be sent to the list, and one who wrote none must be sent to the flag. The same string
+        // would send the second operator hunting a list that does not exist.
+        return ClaimDecision::Skip(if seller.accept_offers_only_from.is_empty() {
+            SkipReason::OpenTargetedRefused
+        } else {
+            SkipReason::NotAllowlisted
+        });
     }
     if rate_gate_allows(offer, seller_pubkey, seller.rate_sats, seller.claim_open_pool).is_err() {
         return ClaimDecision::Skip(SkipReason::RateGate);
@@ -7359,6 +7374,12 @@ mod tests {
         const STRANGER: &str = "dead02"; // ≠ ALLOWED — the real foil, never vacuous-green
         let mut cfg = seller_cfg(2, false);
         cfg.accept_offers_only_from = vec![ALLOWED.to_owned()];
+        // #923: STATED, not inherited. This test is about the FENCE, so the targeted route must be
+        // shut for the fence to be the gate that decides. The fixture forces `accept_open_targeted`
+        // TRUE for reachability, and until #923 a populated allowlist made that flag inert — so this
+        // test used to read as a fence test while silently depending on the precedence bug. Now that
+        // the two controls are additive, leaving it inherited would assert the OPPOSITE of #923.
+        cfg.accept_open_targeted = false;
 
         // Listed buyer ⇒ still claims (same offer an empty allowlist would claim).
         assert_eq!(
@@ -7521,27 +7542,232 @@ mod tests {
         );
     }
 
-    // PRECEDENCE — a populated allowlist WINS over the targeted opt-in, and this test FAILS IF THE
-    // ORDER FLIPS. Run the buyer-eligibility clauses the other way round (targeted opt-in first) and
-    // the stranger below would be admitted, silently dissolving the #482 fence for every operator who
-    // ever sets both. That is the whole reason the order is asserted rather than left to reading.
+    // #923 — THE ALLOWLIST AND THE TARGETED OPT-IN ADMIT ADDITIVELY.
+    //
+    // ⛔ THIS REPLACES `a_populated_allowlist_wins_over_the_targeted_opt_in`, DELIBERATELY. That test
+    // ran on this exact fixture and asserted the OPPOSITE: that the stranger below reports
+    // `NotAllowlisted`, and that `accept_open_targeted` is "set, and deliberately INERT while a list
+    // exists". That assertion IS the defect #923 reports — it locked in a config whose `true` did
+    // nothing, so an operator could not keep trusted buyers while temporarily opening the public
+    // route, and the config file said one thing while the seat did another.
+    //
+    // Its stated fear was that flipping the clause order "silently dissolves the #482 fence". It does
+    // not, and that distinction is the whole of this change: #923 removes the list's VETO over the
+    // flag beside it, never the list's own refusal. The fence survives as the reject leg and is still
+    // asserted — by `allowlist_fences_out_an_unlisted_buyer`, and by every `accept_open_targeted =
+    // false` row of `the_three_admission_controls_are_additive_and_independent` below.
+    //
+    // RED ON REVERT: reinstate the standalone `!seller.accept_offers_only_from.is_empty() &&
+    // !buyer_is_named` early return in `classify_offer` (the pre-#923 clause 1). The stranger then
+    // reports `NotAllowlisted` and the first assertion fails.
     #[test]
-    fn a_populated_allowlist_wins_over_the_targeted_opt_in() {
+    fn the_allowlist_and_the_targeted_opt_in_admit_additively() {
         const ALLOWED: &str = "cafe01";
-        const STRANGER: &str = "dead02";
+        const STRANGER: &str = "dead02"; // ≠ ALLOWED — the foil, so neither leg is vacuous-green
         let mut cfg = seller_cfg(2, false);
         cfg.accept_offers_only_from = vec![ALLOWED.to_owned()];
-        cfg.accept_open_targeted = true; // set, and deliberately INERT while a list exists
+        cfg.accept_open_targeted = true; // set, and now EFFECTIVE alongside the list
 
         assert_eq!(
             classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, STRANGER, NOW, NOW),
-            ClaimDecision::Skip(SkipReason::NotAllowlisted),
-            "the #482 fence must still fence: accept_open_targeted may not reopen a seat that named its buyers"
+            ClaimDecision::Claim { deadline_unix: NOW + 600 },
+            "accept_open_targeted must ADDITIONALLY admit an unnamed targeted buyer — a populated \
+             allowlist may not cancel it (#923)"
         );
         assert_eq!(
             classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, ALLOWED, NOW, NOW),
             ClaimDecision::Claim { deadline_unix: NOW + 600 },
-            "the named buyer is unaffected"
+            "the named buyer keeps its own route in — the private fallback is not traded away"
+        );
+    }
+
+    // THE #923 ADMISSION MATRIX — all eight combinations of the three controls, each probed on BOTH
+    // surfaces from BOTH a named and an unnamed buyer. Thirty-two expectations, transcribed as
+    // literal outcomes from the issue's truth table and NEVER computed from the gate's own predicate:
+    // a table derived from the implementation restates the bug whenever there is one.
+    //
+    // ⛔ A MATRIX, NOT THREE CASES, BECAUSE THE DEFECT WAS A PRECEDENCE BUG. Every control tested
+    // ALONE was already correct before #923 — an allowlist alone fenced, `accept_open_targeted` alone
+    // opened the targeted route, `claim_open_pool` alone claimed the pool. Only the COMBINATION was
+    // wrong. A suite of one-knob-at-a-time tests is fully green on the bug, which is how it shipped.
+    //
+    // ⛔ THIS IS AN ADMISSION CONTROL, SO THE ROWS THAT REFUSE CARRY THE SAME WEIGHT AS THE ROWS THAT
+    // ADMIT. Sixteen of the thirty-two expectations are refusals. A widening that admitted more than
+    // these three controls describe would pass every Claim row here and fail those.
+    //
+    // RED ON REVERT, two independent ways:
+    //  - drop the `offer.seller_pubkey.as_deref() == Some(seller_pubkey) &&` scope from the
+    //    eligibility clause in `classify_offer` ⇒ the (list, targeted-closed, pool-open) untargeted
+    //    rows turn from Claim into a buyer-eligibility refusal.
+    //  - reinstate the pre-#923 `!seller.accept_offers_only_from.is_empty() && !buyer_is_named` early
+    //    return ⇒ every populated-list row with an unnamed buyer turns into NotAllowlisted.
+    #[test]
+    fn the_three_admission_controls_are_additive_and_independent() {
+        const ALLOWED: &str = "cafe01";
+        const STRANGER: &str = "dead02";
+
+        let claim = ClaimDecision::Claim { deadline_unix: NOW + 600 };
+        let shut = ClaimDecision::Skip(SkipReason::OpenTargetedRefused); // no list to edit
+        let fenced = ClaimDecision::Skip(SkipReason::NotAllowlisted); // a list exists, buyer not on it
+        let no_pool = ClaimDecision::Skip(SkipReason::RateGate); // untargeted without claim_open_pool
+
+        // Columns are the four probes in order: named+targeted, stranger+targeted, named+untargeted,
+        // stranger+untargeted. With an EMPTY list nobody is named, so the first two columns of an
+        // empty-list row are identical by construction — that is a property of the fixture, not a
+        // duplicated assertion.
+        let matrix = [
+            (false, false, false, [&shut, &shut, &no_pool, &no_pool],
+             "no list, both routes closed ⇒ no work reaches this seat at all"),
+            (false, true, false, [&claim, &claim, &no_pool, &no_pool],
+             "no list, targeted route open ⇒ any buyer may target; the pool stays shut"),
+            (false, false, true, [&shut, &shut, &claim, &claim],
+             "no list, pool open ⇒ untargeted claims only; targeting still refused"),
+            (false, true, true, [&claim, &claim, &claim, &claim],
+             "no list, both routes open ⇒ both public surfaces serve"),
+            (true, false, false, [&claim, &fenced, &no_pool, &no_pool],
+             "list only ⇒ the named buyer targets and nobody else does (the #482 fence, intact)"),
+            (true, true, false, [&claim, &claim, &no_pool, &no_pool],
+             "list + targeted route ⇒ ADDITIVE: any buyer may target, and the pool is untouched"),
+            (true, false, true, [&claim, &fenced, &claim, &claim],
+             "list + pool ⇒ the pool is INDEPENDENT of the list, and targeting is still fenced"),
+            (true, true, true, [&claim, &claim, &claim, &claim],
+             "list + both routes ⇒ all three admissions serve at once"),
+        ];
+
+        // ⛔ COUNTED, because `zip` TRUNCATES SILENTLY. Add a fifth probe without a fifth expected
+        // outcome and the pair below still runs, still passes, and quietly stops testing the new
+        // probe — a green matrix that covers less than it says. The count is the only thing between
+        // that and a false all-clear, and this is an admission control.
+        let mut checked = 0usize;
+        for (populated, open_targeted, open_pool, expected, what) in matrix {
+            let mut cfg = seller_cfg(2, open_pool);
+            cfg.accept_open_targeted = open_targeted;
+            cfg.accept_offers_only_from =
+                if populated { vec![ALLOWED.to_owned()] } else { Vec::new() };
+
+            let probes = [
+                (ALLOWED, Some(SELLER), "the listed buyer, targeting this seat"),
+                (STRANGER, Some(SELLER), "an unlisted buyer, targeting this seat"),
+                (ALLOWED, None, "the listed buyer's UNTARGETED open-pool offer"),
+                (STRANGER, None, "an unlisted buyer's UNTARGETED open-pool offer"),
+            ];
+            for ((buyer, target, probe), want) in probes.into_iter().zip(expected) {
+                assert_eq!(
+                    &classify_offer(&offer(5, target, NOW + 600), &cfg, &claude_only(), SELLER, buyer, NOW, NOW),
+                    want,
+                    "accept_offers_only_from populated={populated} accept_open_targeted=\
+                     {open_targeted} claim_open_pool={open_pool} — {what}. Probe: {probe}"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(
+            checked, 32,
+            "the matrix must run all 8 control settings x 4 probes — a short count means a row or a \
+             probe stopped being exercised"
+        );
+    }
+
+    // THE THIRD OFFER SHAPE, AND THE ONE THIS CHANGE COULD MOST EASILY HAVE OPENED. #923 narrows the
+    // buyer-eligibility clause to offers whose `p` tag is THIS seat, so an offer targeted at SOMEONE
+    // ELSE now bypasses that clause entirely and is refused only by the rate gate. Nothing in the
+    // suite exercised that shape through `classify_offer` before this test, on any config — so the
+    // narrowing was load-bearing and unproven, which is the pair a security-shaped diff must not
+    // ship. Swept over all eight control settings and both buyers: sixteen refusals, no exceptions.
+    //
+    // ⛔ DISCLOSED REASON CHANGE, NOT A DECISION CHANGE. Before #923 a populated allowlist reported
+    // `NotAllowlisted` for this shape, because the fence ran ahead of everything. It now reports the
+    // rate gate's refusal — which is exactly what a seat with an EMPTY allowlist already reported for
+    // the same offer. The refusal itself is identical either way; all seats now agree on the reason.
+    //
+    // RED ON REVERT: reinstate the pre-#923 `!seller.accept_offers_only_from.is_empty() &&
+    // !buyer_is_named` early return ⇒ the populated-list rows report NotAllowlisted, not RateGate.
+    #[test]
+    fn an_offer_targeted_at_another_seat_is_refused_under_every_control_setting() {
+        const ALLOWED: &str = "cafe01";
+        const STRANGER: &str = "dead02";
+        const OTHER_SEAT: &str = "beef03"; // ≠ SELLER — the offer is addressed elsewhere
+
+        let mut checked = 0usize;
+        for populated in [false, true] {
+            for open_targeted in [false, true] {
+                for open_pool in [false, true] {
+                    let mut cfg = seller_cfg(2, open_pool);
+                    cfg.accept_open_targeted = open_targeted;
+                    cfg.accept_offers_only_from =
+                        if populated { vec![ALLOWED.to_owned()] } else { Vec::new() };
+
+                    for buyer in [ALLOWED, STRANGER] {
+                        assert_eq!(
+                            classify_offer(&offer(5, Some(OTHER_SEAT), NOW + 600), &cfg, &claude_only(), SELLER, buyer, NOW, NOW),
+                            ClaimDecision::Skip(SkipReason::RateGate),
+                            "an offer addressed to another seat must never be claimed \
+                             (list_populated={populated} accept_open_targeted={open_targeted} \
+                             claim_open_pool={open_pool} buyer={buyer}) — opening a route for THIS \
+                             seat may not admit work addressed to a different one"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 16, "the sweep must cover all 8 control settings x 2 buyers");
+    }
+
+    // ROUND TRIP — the operator workflow #923 exists to enable: open a public route, then close it
+    // and be back to allowlist-only targeted work with the list never rewritten. Without this, the
+    // matrix above is satisfied by a gate that reaches the right states but cannot get back.
+    //
+    // ⛔ BOUNDED CLAIM: `classify_offer` is pure over `&SellerConfig`, so this attests the ADMISSION
+    // round trip and the in-memory list, not the config-file writeback. That the writeback preserves
+    // an operator's allowlist across a bare relaunch is a separate surface, already pinned by
+    // `sell_writeback_preserves_operator_accept_offers_only_from` in `crates/maxplayer/src/sell.rs`.
+    //
+    // RED ON REVERT: reinstate the pre-#923 `!seller.accept_offers_only_from.is_empty() &&
+    // !buyer_is_named` early return ⇒ the two flags-open assertions fail before the round trip runs.
+    #[test]
+    fn closing_both_open_routes_restores_allowlist_only_admission_with_the_list_intact() {
+        const ALLOWED: &str = "cafe01";
+        const STRANGER: &str = "dead02";
+        let mut cfg = seller_cfg(2, true); // claim_open_pool = true
+        cfg.accept_open_targeted = true;
+        cfg.accept_offers_only_from = vec![ALLOWED.to_owned()];
+        let list_before = cfg.accept_offers_only_from.clone();
+
+        // Both public routes open: the stranger reaches BOTH surfaces.
+        assert_eq!(
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, STRANGER, NOW, NOW),
+            ClaimDecision::Claim { deadline_unix: NOW + 600 },
+            "with the targeted route open, an unlisted buyer may target the seat"
+        );
+        assert_eq!(
+            classify_offer(&offer(5, None, NOW + 600), &cfg, &claude_only(), SELLER, STRANGER, NOW, NOW),
+            ClaimDecision::Claim { deadline_unix: NOW + 600 },
+            "with the pool open, an unlisted buyer's untargeted offer is claimable"
+        );
+
+        // Close both. Nothing reconstructs buyer identities, and the private fallback is immediate.
+        cfg.accept_open_targeted = false;
+        cfg.claim_open_pool = false;
+        assert_eq!(
+            cfg.accept_offers_only_from, list_before,
+            "toggling an open route must never rewrite or clear the allowlist"
+        );
+        assert_eq!(
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, ALLOWED, NOW, NOW),
+            ClaimDecision::Claim { deadline_unix: NOW + 600 },
+            "the listed buyer is served again the moment the public routes close"
+        );
+        assert_eq!(
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, STRANGER, NOW, NOW),
+            ClaimDecision::Skip(SkipReason::NotAllowlisted),
+            "closing the targeted route must fence the stranger out again"
+        );
+        assert_eq!(
+            classify_offer(&offer(5, None, NOW + 600), &cfg, &claude_only(), SELLER, ALLOWED, NOW, NOW),
+            ClaimDecision::Skip(SkipReason::RateGate),
+            "closing the pool refuses untargeted work even from the listed buyer — the pool is its \
+             own control, not a property of the list"
         );
     }
 

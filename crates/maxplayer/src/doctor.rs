@@ -1330,9 +1330,11 @@ mod checks {
         /// to land here than in any of the first three. `buyer_pubkey_is_reachable` is what counts
         /// this field, so a description that stops at shape under-describes what it counts.
         ///
-        /// ⛔ THESE STILL FENCE. `classify_offer` opens the fence on `is_empty()`, so an entry that
-        /// matches nobody is not a dead letter: it shuts both surfaces and admits no one, which is
-        /// why they are counted separately instead of being dropped as noise.
+        /// ⛔ THESE FENCE NOTHING SINCE #923, AND THAT IS WHY THEY ARE STILL COUNTED. An entry that
+        /// can never match admits nobody, and it no longer shuts anything either — so a list of
+        /// junk degrades to "no buyers named" rather than to deny-all. It is reported because the
+        /// operator believes those entries are a route in and they are not; it is NOT part of the
+        /// stranger-facing answer, which reads the open flags alone.
         pub(super) unusable_buyers: usize,
     }
 
@@ -1353,18 +1355,36 @@ mod checks {
         }
 
         /// True when SOME counterparty the operator never chose can get code onto this box. This —
-        /// not the pool flag — is what raises a containment finding from advisory to blocking.
+        /// not the pool flag, and since #923 not the allowlist either — is what raises a containment
+        /// finding from advisory to BLOCKING.
         ///
-        /// ⛔ A POPULATED ALLOWLIST IS A HARD FENCE ON BOTH SURFACES, SO IT SETTLES THIS QUESTION
-        /// WHATEVER THE FLAGS SAY. `classify_offer` refuses an unnamed buyer with `NotAllowlisted`
-        /// before the targeted clause and before the rate gate that reads `claim_open_pool`, so a
-        /// seat that named buyers is reachable by exactly those buyers — never by a stranger.
-        /// Deriving this from the two flags alone escalated such a seat to stranger-facing across
-        /// engine-floor, containment and home-permission severity, while `check_seat_reachability`
-        /// in this same file already called that config inert-but-safe. Two paths, one config,
-        /// opposite verdicts; the allowlist lives in the type so no caller can reach only one.
+        /// ⛔ DERIVED FROM ONE QUESTION: can a buyer the allowlist does not name be admitted? Since
+        /// #923 the three admission controls are ADDITIVE, so `accept_offers_only_from` admits the
+        /// buyers it lists and vetoes nothing beside it. `accept_open_targeted` admits an unnamed
+        /// buyer on the targeted surface, `claim_open_pool` admits one from the open pool, and each
+        /// fires on its own whatever the list holds. So EITHER open flag makes this seat
+        /// stranger-facing, and a populated allowlist cannot buy that back.
+        ///
+        /// ⛔ THE PRE-#923 FORM WAS `!allowlist_populated() && open_surface_configured()`, AND IT WAS
+        /// CORRECT THEN. The fence really did return `NotAllowlisted` ahead of both open surfaces, so
+        /// a seat that named buyers was reachable by exactly those buyers. #923 deleted that
+        /// precedence and this predicate's premise with it. Left alone it under-reported a genuinely
+        /// stranger-facing seat as advisory across engine-floor, containment and home-permission
+        /// severity — and `doctor` is also the boot readiness gate, so the seat would have booted
+        /// with no containment and no blocking finding.
+        ///
+        /// ⛔ THE ADMISSION RULE IS ENCODED TWICE — here, and in
+        /// `maxplayer_core::seller_node::run::classify_offer` — WITH NOTHING BINDING THEM. That is
+        /// the root defect this predicate keeps paying: one moved, the other did not, and no test
+        /// spanned the two. A single source of truth is NOT reachable from this crate today —
+        /// `classify_offer` is a private fn inside a `wallet`-gated module, and that feature
+        /// structure is #133's to change — so this stays a hand-kept mirror. Change one, change
+        /// the other.
         pub(super) fn serves_strangers(self) -> bool {
-            !self.allowlist_populated() && self.open_surface_configured()
+            // Coincides with `open_surface_configured()` since #923, and that is the finding, not a
+            // redundancy: the gap between "asked for" and "fires" was the allowlist's veto, and the
+            // veto is gone. Kept as its own name because the severity consumers ask THIS question.
+            self.open_surface_configured()
         }
 
         /// Whether an open surface is SET, regardless of whether the allowlist lets it fire. This
@@ -1378,10 +1398,12 @@ mod checks {
         /// How a stranger reaches the seat, for the operator-facing finding. The two surfaces have
         /// different remedies, so a seat exposed only by targeted offers must not be told to turn
         /// off open-pool claiming — a knob it never turned on.
+        /// ⛔ NO `named_buyers` SHORT-CIRCUIT. It used to return "is reachable only by the buyers it
+        /// named" whenever a buyer was listed, which was right while the allowlist fenced both
+        /// surfaces. Since #923 a listed buyer sits ALONGSIDE any open route, so that early return
+        /// would have printed "SERVING STRANGERS UNCONTAINED (this seat is reachable only by the
+        /// buyers it named)" — a sentence that contradicts itself inside one parenthesis.
         fn stranger_surface(self) -> &'static str {
-            if self.named_buyers > 0 {
-                return "is reachable only by the buyers it named";
-            }
             match (self.open_pool, self.open_targeted) {
                 (true, true) => "claims OPEN-POOL jobs and accepts targeted offers from unnamed buyers",
                 (true, false) => "claims OPEN-POOL jobs",
@@ -1408,10 +1430,13 @@ mod checks {
     /// job again. That is the state an already-deployed seller with no allowlist upgrades INTO, since
     /// an empty `accept_offers_only_from` used to mean accept-all on the targeted surface.
     ///
-    /// The second finding is the mirror: a knob that is set and cannot fire. While an allowlist is
-    /// populated it is a hard fence on BOTH surfaces (#482), so an open-surface flag — either one —
-    /// is inert, and an operator who set one believing they had opened the seat is wrong in the
-    /// direction that keeps a seller off the market. Inert-but-safe, so it WARNs rather than fails.
+    /// ⛔ THERE IS NO LONGER A SECOND, INERT-KNOB FINDING, AND ITS REMOVAL IS #923. This check used
+    /// to WARN that an open-surface flag beside a populated allowlist could not fire, because the
+    /// fence returned ahead of both surfaces. The three controls are now additive: the list admits
+    /// the buyers it names and each open flag adds its own public route, so that combination is
+    /// exactly what the operator asked for and there is no inert state left to report. Warning about
+    /// it now would tell an operator their open route is closed while strangers are being admitted
+    /// through it — the most dangerous direction this check can be wrong in.
     ///
     /// ⛔ ADVISORY THROUGHOUT: THIS NEVER BLOCKS BOOT. A seat with no way in sells nothing, which is
     /// a thing to say loudly and not a reason to refuse to start — the documented first run writes
@@ -1432,8 +1457,8 @@ mod checks {
                     REACHABILITY_CHECK,
                     format!(
                         "this seat can claim NOTHING: all {} entr(y/ies) in \
-                         `accept_offers_only_from` are unusable, and a populated allowlist fences \
-                         out everyone else on both surfaces — so no offer can reach this seat at all",
+                         `accept_offers_only_from` are unusable, so the list admits nobody, and \
+                         neither open route is on — so no offer can reach this seat at all",
                         exposure.unusable_buyers
                     ),
                     USABLE_BUYER_ENTRY.to_owned()
@@ -1449,38 +1474,21 @@ mod checks {
                 ROUTES_IN,
             );
         }
-        if exposure.allowlist_populated() && exposure.open_surface_configured() {
-            // Both flags are fenced by a populated allowlist, not just the targeted one: the
-            // `NotAllowlisted` refusal precedes the rate gate that reads `claim_open_pool`.
-            let mut inert = Vec::new();
-            if exposure.open_pool {
-                inert.push("`claim_open_pool`");
-            }
-            if exposure.open_targeted {
-                inert.push("`accept_open_targeted`");
-            }
-            return Check::warn(
-                REACHABILITY_CHECK,
-                format!(
-                    "{} is set but INERT: {} buyer(s) are listed, and a populated allowlist fences \
-                     out everyone else on BOTH surfaces",
-                    inert.join(" and "),
-                    exposure.named_buyers
-                ),
-                "remove the allowlist to actually accept offers from buyers you have not named, or \
-                 drop the open-surface flag to say what this seat really does. As configured, only \
-                 the listed buyers can reach it",
-            );
-        }
+        // #923: state the routes that are IN EFFECT, never a precedence between them. Each clause
+        // below is one admission control that can actually admit somebody, and they compose.
         Check::pass(
             REACHABILITY_CHECK,
-            match exposure.named_buyers {
-                // No usable entry and still reachable ⇒ no allowlist at all, and an open surface
-                // the fence is not shutting.
-                0 => format!("reachable: this seat {}", exposure.stranger_surface()),
-                // A populated allowlist with an open flag set already returned INERT above, so a
-                // named-buyer seat that reaches here has no open surface to report.
-                n => format!("reachable: {n} named buyer(s), and no open surface"),
+            match (exposure.named_buyers, exposure.open_surface_configured()) {
+                // No usable entry, and still reachable ⇒ an open route is carrying the seat.
+                (0, _) => format!("reachable: this seat {}", exposure.stranger_surface()),
+                (n, false) => format!("reachable: {n} named buyer(s), and no open route"),
+                // The additive case. Reported as a PASS with BOTH routes named, because the flag
+                // beside a list is no longer inert — it admits strangers, and saying so is the
+                // whole point of the check.
+                (n, true) => format!(
+                    "reachable: {n} named buyer(s), and additionally this seat {}",
+                    exposure.stranger_surface()
+                ),
             },
         )
     }
@@ -1507,23 +1515,28 @@ mod checks {
     /// state the reachability check reports as INERT two checks later.
     /// ⇒ A LATER WARN DOES NOT MAKE AN EARLIER DIAGNOSIS TRUE. Each state gets its own remedy.
     fn not_stranger_facing_remedy(exposure: SeatExposure) -> String {
+        // ⛔ REACHED ONLY WHEN BOTH OPEN ROUTES ARE OFF (#923). `serves_strangers()` is now exactly
+        // "either open flag is set", so an allowlist no longer softens anything by itself — what
+        // softens this finding is that NO public route is on. Every branch below must say that, and
+        // none may credit the list for it.
         if exposure.named_buyers > 0 {
-            return "advisory because a populated `accept_offers_only_from` fences BOTH surfaces, so \
-                    every job this seat runs comes from a buyer its operator listed. The softening \
-                    is bought by the ALLOWLIST, not by the flags being off: while it stays \
-                    populated, setting `claim_open_pool` or `accept_open_targeted` does not change \
-                    this finding. Emptying it while either flag is on DOES - configure a working \
-                    [sandbox] launcher before that"
+            return "advisory because BOTH open routes are off, so every job this seat runs comes \
+                    from a buyer its operator listed in `accept_offers_only_from`. The softening is \
+                    bought by the routes being CLOSED, never by the list: since #923 the list admits \
+                    the buyers it names and vetoes nothing, so setting `claim_open_pool` or \
+                    `accept_open_targeted` makes this seat stranger-facing and turns this finding \
+                    into a FAIL - with the list still in place. Configure a working [sandbox] \
+                    launcher before you open either route"
                 .to_owned();
         }
         if exposure.allowlist_populated() {
             return "advisory only because nothing can reach this seat at all: every \
-                    `accept_offers_only_from` entry is unusable, and a populated allowlist fences \
-                    out everyone else on both surfaces. This is not a safe steady state - the seat \
-                    sells nothing. Correcting those entries keeps it advisory (it becomes reachable \
-                    by the buyers you named); emptying them while either open surface is on makes it \
-                    stranger-facing and turns this finding into a FAIL. Configure a working \
-                    [sandbox] launcher first"
+                    `accept_offers_only_from` entry is unusable, so the list admits nobody, and \
+                    neither open route is on. This is not a safe steady state - the seat sells \
+                    nothing. Correcting those entries keeps it advisory (it becomes reachable by the \
+                    buyers you named, and by nobody else while both routes stay off); turning on \
+                    either open route makes it stranger-facing and turns this finding into a FAIL, \
+                    whatever the list holds. Configure a working [sandbox] launcher first"
                 .to_owned();
         }
         format!(
@@ -1623,7 +1636,7 @@ mod checks {
                     "this seat {} — arbitrary code from strangers — and {detail}",
                     exposure.stranger_surface()
                 ),
-                "configure a [sandbox] launcher that passes `maxplayer sandbox-probe` — the only one of these that adds containment. Closing ONE open surface while the other stays open does not reduce the exposure, it only silences the surface you closed: to actually narrow who runs code here, list your buyers in `accept_offers_only_from`. `--unsafe-no-sandbox` accepts the exposure deliberately",
+                "configure a [sandbox] launcher that passes `maxplayer sandbox-probe` — the only one of these that adds containment. Closing ONE open surface while the other stays open does not reduce the exposure, it only silences the surface you closed. ⛔ Since #923 listing buyers in `accept_offers_only_from` does NOT narrow who runs code here: the list admits the buyers it names and vetoes nothing, so an open route keeps admitting strangers beside it. To actually narrow who runs code, turn BOTH `accept_open_targeted` and `claim_open_pool` off and let the list carry the seat. `--unsafe-no-sandbox` accepts the exposure deliberately",
             ),
         }
     }
@@ -2056,8 +2069,8 @@ fn build_checks(
         .seller
         .as_ref()
         .map(|seller| {
-            // Usable vs unusable is a REPORTING split and never an admission one: the fence in
-            // `classify_offer` opens on `is_empty()`, so every entry fences whether or not it can
+            // Usable vs unusable is a REPORTING split and never an admission one. Since #923 no
+            // entry fences anybody; an unusable one simply admits nobody, whether or not it can
             // ever match. Counting them apart is what stops a typo reading as a working route.
             let named_buyers = seller
                 .accept_offers_only_from
@@ -2072,10 +2085,10 @@ fn build_checks(
             }
         })
         .unwrap_or(checks::SeatExposure::CLOSED);
-    // Asked of the type, never re-derived from the raw flags here. A populated allowlist is a hard
-    // fence on both surfaces, so a seat that named buyers serves no strangers however its flags
-    // read — and re-deriving `open_pool || open_targeted` at this line is exactly the bug that
-    // escalated such a seat to stranger-facing across the three severity consumers below.
+    // Asked of the type, never re-derived from the raw flags here. Since #923 the answer IS the two
+    // flags — a populated allowlist admits the buyers it names and vetoes nothing — but it stays a
+    // method call so the three severity consumers below cannot drift apart, which is the failure
+    // this line was written for and the one #923 made concrete.
     let serves_strangers = exposure.serves_strangers();
     // Home/wallet perms are verified against the SAME resolved home the rest of the gate inspects.
     let perms_home_root = home.root.clone();
@@ -2695,90 +2708,128 @@ mod tests {
         );
     }
 
-    // ⛔ THE ALLOWLIST IS PART OF THE ANSWER, NOT CONTEXT BESIDE IT. `classify_offer` refuses an
-    // unnamed buyer with `NotAllowlisted` BEFORE the targeted clause and before the rate gate that
-    // reads `claim_open_pool`, so a populated allowlist fences both surfaces and a seat that named
-    // buyers serves no strangers however its flags read. Deriving this from the flags alone is what
-    // escalated such a seat to stranger-facing.
+    // ⛔ THE ALLOWLIST IS NOT PART OF THIS ANSWER ANY MORE (#923), AND THIS TEST IS THE INVERSION OF
+    // THE ONE IT REPLACES. That test asserted `!fenced.serves_strangers()` — that naming a buyer made
+    // a seat stranger-free whatever its flags said — on the premise that `classify_offer` refuses an
+    // unnamed buyer ahead of both open surfaces. #923 deleted that precedence, so the premise is
+    // false and the assertion inverts: a listed buyer sits ALONGSIDE an open route, and the route
+    // still admits strangers.
+    //
+    // This is the direction that matters. The old form under-reported a genuinely stranger-facing
+    // seat as advisory across engine-floor, containment and home-permission severity, and `doctor`
+    // is also the boot readiness gate — so the seat booted uncontained with nothing blocking.
+    //
+    // RED ON REVERT: restore `!self.allowlist_populated() && self.open_surface_configured()` in
+    // `SeatExposure::serves_strangers` — every `listed` assertion below flips to false.
     //
     // One variable: the allowlist. Each flag combination is asserted with it empty and populated,
     // so a predicate that ignored the flags entirely fails the foil rather than reading correct.
     #[test]
-    fn a_populated_allowlist_stops_either_open_flag_from_serving_strangers() {
+    fn either_open_flag_serves_strangers_even_with_a_populated_allowlist() {
         for (open_pool, open_targeted, label) in [
             (true, false, "the open pool"),
             (false, true, "the targeted surface"),
             (true, true, "both surfaces"),
         ] {
-            let unfenced =
+            let no_list =
                 checks::SeatExposure { open_pool, open_targeted, ..checks::SeatExposure::CLOSED };
             assert!(
-                unfenced.serves_strangers(),
-                "FOIL: with no allowlist, {label} must still serve strangers"
+                no_list.serves_strangers(),
+                "CONTROL: with no allowlist, {label} must serve strangers"
             );
-            let fenced = checks::SeatExposure { named_buyers: 1, ..unfenced };
+            let listed = checks::SeatExposure { named_buyers: 1, ..no_list };
             assert!(
-                !fenced.serves_strangers(),
-                "a populated allowlist fences {label}: no stranger can arrive"
+                listed.serves_strangers(),
+                "#923: naming a buyer must NOT un-open {label} — the list admits who it names and \
+                 vetoes nothing, so strangers still arrive through the open route"
             );
         }
     }
 
-    // ⛔ AN ENTRY THAT MATCHES NOBODY STILL FENCES. The fence opens on `is_empty()`, so a list of
-    // malformed entries admits no one AND shuts both surfaces — the seat is reachable by nothing.
-    // Asserted apart from the usable-entry case above because they are opposite outcomes.
+    // ⛔ AN ENTRY THAT MATCHES NOBODY FENCES NOBODY (#923). It admits no one, and since the list no
+    // longer vetoes the flags it also shuts nothing — so a list of junk beside an open route leaves
+    // the route wide open. The test it replaces asserted the opposite on both counts, which was the
+    // most dangerous cell in the old table: an operator with a typo'd allowlist and an open flag was
+    // reported as reachable-by-nobody while strangers were being admitted.
+    //
+    // RED ON REVERT: restore the `!self.allowlist_populated() &&` conjunct in `serves_strangers` —
+    // both assertions below flip.
     #[test]
-    fn an_unusable_allowlist_entry_still_fences_both_surfaces() {
-        let fenced_by_junk = checks::SeatExposure {
+    fn an_unusable_allowlist_entry_fences_nothing() {
+        let junk_and_open = checks::SeatExposure {
             open_pool: true,
             open_targeted: true,
             named_buyers: 0,
             unusable_buyers: 1,
         };
         assert!(
-            !fenced_by_junk.serves_strangers(),
-            "an entry that can never match still closes both surfaces"
+            junk_and_open.serves_strangers(),
+            "an entry that can never match cannot close a surface — both routes are still open"
         );
         assert!(
-            fenced_by_junk.is_unreachable(),
-            "and nothing can reach the seat at all: no entry matches, and the fence shut the flags"
+            !junk_and_open.is_unreachable(),
+            "and the seat IS reachable: the open routes carry it, whatever the junk entry does"
+        );
+        // FOIL: the same junk list with both routes OFF really does reach nobody.
+        let junk_and_closed =
+            checks::SeatExposure { named_buyers: 0, unusable_buyers: 1, ..checks::SeatExposure::CLOSED };
+        assert!(
+            !junk_and_closed.serves_strangers() && junk_and_closed.is_unreachable(),
+            "with no usable entry and no open route, nothing can arrive"
         );
     }
 
     // THE SEVERITY CONSUMERS, WHICH IS WHERE THE BUG WAS ACTUALLY FELT — asserting the derivation
     // alone would leave a caller free to re-derive the old expression and stay green.
+    // ⛔ THE SEVERITY CELL #923 FLIPS, AND THE ONE WORTH THE MOST CARE. This replaces
+    // `an_allowlist_keeps_an_open_flag_advisory_at_the_engine_floor`, which asserted `Status::Warn`
+    // for `{open_pool: true, named_buyers: 1}` — advisory — on the premise that the allowlist fenced
+    // the pool. It does not fence it any more, so that seat genuinely runs strangers' code and the
+    // floor must BLOCK. The old FOIL (same flag, no allowlist) blocked already, so post-#923 the two
+    // agree; the discriminator is now the allowlist-OFF case below, which must stay advisory.
+    //
+    // RED ON REVERT: restore the `!self.allowlist_populated() &&` conjunct in `serves_strangers` —
+    // the first assertion drops back to Warn.
     #[test]
-    fn an_allowlist_keeps_an_open_flag_advisory_at_the_engine_floor() {
+    fn an_open_flag_blocks_at_the_engine_floor_even_with_an_allowlist() {
         use checks::{EngineProbe, EngineVersion};
         let below =
             EngineProbe::Reported(EngineVersion::parse("24.0.9").expect("'24.0.9' must parse"));
-        let open_and_fenced =
+        let open_and_listed =
             checks::SeatExposure { open_pool: true, named_buyers: 1, ..checks::SeatExposure::CLOSED };
         assert_eq!(
-            checks::fold_sandbox_engine_floor(&below, None, open_and_fenced.serves_strangers())
-                .status,
-            Status::Warn,
-            "a seat whose allowlist fences the pool is advisory, not blocking"
-        );
-        // FOIL: the same flag without the allowlist must still block, or this proves nothing.
-        let open_and_unfenced =
-            checks::SeatExposure { open_pool: true, ..checks::SeatExposure::CLOSED };
-        assert_eq!(
-            checks::fold_sandbox_engine_floor(&below, None, open_and_unfenced.serves_strangers())
+            checks::fold_sandbox_engine_floor(&below, None, open_and_listed.serves_strangers())
                 .status,
             Status::Fail,
-            "FOIL: without an allowlist the open pool still blocks"
+            "#923: an open pool admits strangers whatever the list holds, so the floor must BLOCK"
+        );
+        // FOIL: a seat with a list and NO open route is genuinely stranger-free and stays advisory.
+        // Without this, the assertion above is satisfied by a predicate that simply always blocks.
+        let listed_and_closed =
+            checks::SeatExposure { named_buyers: 1, ..checks::SeatExposure::CLOSED };
+        assert_eq!(
+            checks::fold_sandbox_engine_floor(&below, None, listed_and_closed.serves_strangers())
+                .status,
+            Status::Warn,
+            "FOIL: with both routes off the list really is the only way in — advisory, not blocking"
         );
     }
 
     // Containment takes the exposure TYPE rather than a precomputed bool, so it is the consumer that
     // could most easily keep its own derivation. Needs an UNCONTAINED launcher: with a contained one
     // both severities pass and the assertion cannot discriminate.
+    // The containment twin of the engine-floor cell above, and it takes the exposure TYPE rather
+    // than a precomputed bool — so it is the consumer that could most easily keep its own stale
+    // derivation. Needs an UNCONTAINED launcher: with a contained one both severities pass and the
+    // assertion cannot discriminate.
+    //
+    // RED ON REVERT: restore the `!self.allowlist_populated() &&` conjunct in `serves_strangers` —
+    // the open-and-listed seat drops back to Warn while running an unconfined launcher.
     #[cfg(feature = "wallet")]
     #[test]
-    fn an_allowlist_keeps_an_open_flag_advisory_in_containment() {
-        let home = containment_test_home("fenced-open-flag");
-        let fenced = checks::check_sandbox_containment_with_model(
+    fn an_open_flag_blocks_containment_even_with_an_allowlist() {
+        let home = containment_test_home("listed-open-flag");
+        let open_and_listed = checks::check_sandbox_containment_with_model(
             Some(uncontained_probe_launcher()),
             home.clone(),
             checks::SeatExposure { open_pool: true, named_buyers: 1, ..checks::SeatExposure::CLOSED },
@@ -2786,24 +2837,25 @@ mod tests {
             crate::sandbox_probe::ContainmentModel::AllowList,
         );
         assert_eq!(
-            fenced.status,
-            Status::Warn,
-            "an allowlisted seat running an unconfined launcher is advisory:\n{}",
-            fenced.render()
+            open_and_listed.status,
+            Status::Fail,
+            "#923: an open pool beside a list still runs strangers' code, so an unconfined launcher \
+             must BLOCK:\n{}",
+            open_and_listed.render()
         );
-        // FOIL: identical launcher, identical flag, no allowlist — must block.
-        let unfenced = checks::check_sandbox_containment_with_model(
+        // FOIL: identical launcher, same list, BOTH routes off — genuinely stranger-free, advisory.
+        let listed_and_closed = checks::check_sandbox_containment_with_model(
             Some(uncontained_probe_launcher()),
             home.clone(),
-            checks::SeatExposure { open_pool: true, ..checks::SeatExposure::CLOSED },
+            checks::SeatExposure { named_buyers: 1, ..checks::SeatExposure::CLOSED },
             false,
             crate::sandbox_probe::ContainmentModel::AllowList,
         );
         assert_eq!(
-            unfenced.status,
-            Status::Fail,
-            "FOIL: a genuinely stranger-facing seat must still block:\n{}",
-            unfenced.render()
+            listed_and_closed.status,
+            Status::Warn,
+            "FOIL: with both routes off the seat runs only work from buyers it named:\n{}",
+            listed_and_closed.render()
         );
         std::fs::remove_dir_all(home).ok();
     }
@@ -2836,18 +2888,25 @@ mod tests {
         std::fs::remove_dir_all(home).ok();
     }
 
-    /// ⛔ THE JUNK-ONLY STATE, WHICH THE OLD SENTENCE GOT WRONG IN BOTH HALVES: it admits nobody
-    /// (so "reachable only by buyers it named" is false) AND the fence keeps it advisory even with
-    /// both flags on (so "opening either flag turns this into a FAIL" is false too).
+    /// ⛔ THE JUNK-ONLY STATE, AND #923 MOVES IT FROM ADVISORY TO BLOCKING. The old test asserted
+    /// `Status::Warn` here on the premise that a populated list — even a list of typos — shut both
+    /// surfaces. It shuts nothing now, so a seat whose every entry is junk and whose routes are both
+    /// open is fully stranger-facing, and an unconfined launcher on it must FAIL. This was the
+    /// worst cell in the old table: the operator's typo bought them a softened containment verdict.
+    ///
+    /// The advisory-with-junk state still exists and is covered by the FOIL: same junk list, both
+    /// routes off.
+    ///
+    /// RED ON REVERT: restore the `!self.allowlist_populated() &&` conjunct in `serves_strangers` —
+    /// the first status drops back to Warn.
     #[cfg(feature = "wallet")]
     #[test]
-    fn containment_warn_on_a_junk_allowlist_names_the_unusable_entries() {
+    fn containment_blocks_on_a_junk_allowlist_with_both_routes_open() {
         let home = containment_test_home("junk-prose");
         let check = checks::check_sandbox_containment_with_model(
             Some(uncontained_probe_launcher()),
             home.clone(),
-            // Both flags ON, and the fence still shuts them: this is the state the old prose
-            // promised would be a FAIL.
+            // Both routes ON and a list that matches nobody: nothing is fenced, everything arrives.
             checks::SeatExposure {
                 open_pool: true,
                 open_targeted: true,
@@ -2858,23 +2917,51 @@ mod tests {
             crate::sandbox_probe::ContainmentModel::AllowList,
         );
         let rendered = check.render();
-        assert_eq!(check.status, Status::Warn, "both flags on but fenced is still advisory:\n{rendered}");
-        assert!(
-            rendered.contains("entry is unusable"),
-            "the operator must be told the entries are why nothing arrives:\n{rendered}"
+        assert_eq!(
+            check.status, Status::Fail,
+            "#923: a junk list fences nothing, so both open routes make this stranger-facing:\n{rendered}"
         );
         assert!(
             !rendered.contains("reachable only by buyers it named"),
             "an all-unusable allowlist names nobody reachable:\n{rendered}"
         );
+
+        // FOIL: identical junk list, both routes OFF — nothing arrives, so this stays advisory and
+        // must still tell the operator the entries are why.
+        let closed = checks::check_sandbox_containment_with_model(
+            Some(uncontained_probe_launcher()),
+            home.clone(),
+            checks::SeatExposure { named_buyers: 0, unusable_buyers: 2, ..checks::SeatExposure::CLOSED },
+            false,
+            crate::sandbox_probe::ContainmentModel::AllowList,
+        );
+        let closed_rendered = closed.render();
+        assert_eq!(
+            closed.status, Status::Warn,
+            "FOIL: a junk list with both routes off reaches nobody — advisory:\n{closed_rendered}"
+        );
+        assert!(
+            closed_rendered.contains("entry is unusable"),
+            "the operator must be told the entries are why nothing arrives:\n{closed_rendered}"
+        );
         std::fs::remove_dir_all(home).ok();
     }
 
-    /// The FOIL for both above — the one state the old sentence actually described correctly. Without
-    /// it, a remedy that said nothing about allowlists would satisfy the two tests above.
+    /// The FOIL for both above, and #923 REVERSES WHAT IT CREDITS. The old test required the remedy
+    /// to say the softening was "bought by the ALLOWLIST, not by the flags being off" — true while a
+    /// populated list fenced both surfaces. It is now exactly backwards: the list admits the buyers
+    /// it names and vetoes nothing, so what makes this seat stranger-free is that BOTH routes are
+    /// off. Crediting the list would tell an operator they may open a route and stay advisory, which
+    /// is the false permission this whole widening exists to remove.
+    ///
+    /// Still a FOIL for the same reason: without it, a remedy that never mentions why the seat is
+    /// closed would satisfy the two tests above.
+    ///
+    /// RED ON REVERT: restore the `named_buyers > 0` branch of `not_stranger_facing_remedy` to
+    /// crediting the allowlist — the attribution assertion below fails.
     #[cfg(feature = "wallet")]
     #[test]
-    fn containment_warn_on_a_named_seat_credits_the_allowlist_not_the_flags() {
+    fn containment_warn_on_a_named_seat_credits_the_closed_routes_not_the_list() {
         let home = containment_test_home("named-prose");
         let check = checks::check_sandbox_containment_with_model(
             Some(uncontained_probe_launcher()),
@@ -2886,8 +2973,13 @@ mod tests {
         let rendered = check.render();
         assert_eq!(check.status, Status::Warn, "{rendered}");
         assert!(
-            rendered.contains("bought by the ALLOWLIST"),
-            "the softening must be attributed to the allowlist, not to the flags:\n{rendered}"
+            rendered.contains("bought by the routes being CLOSED"),
+            "the softening must be attributed to both open routes being off, never to the list:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("bought by the ALLOWLIST"),
+            "#923: crediting the allowlist tells the operator they can open a route and stay \
+             advisory, which is false:\n{rendered}"
         );
         std::fs::remove_dir_all(home).ok();
     }
@@ -2941,17 +3033,24 @@ mod tests {
         }
     }
 
-    // The INERT combination: a populated allowlist fences both surfaces, so an open-surface flag
-    // does nothing. Safe, so a WARN — but silence here would leave an operator believing they had
-    // opened a seat that is in fact closed to everyone but the names they listed.
+    // ⛔ THE INERT FINDING IS GONE, AND ITS ABSENCE IS THE ASSERTION (#923). This replaces
+    // `seat_reachability_warns_when_an_open_flag_cannot_fire`, which required the detail to contain
+    // "INERT" and name the flag that could not fire. Both open flags fire now, so warning that one
+    // cannot would tell an operator their public route is shut while strangers arrive through it —
+    // and this check's own text is the only thing telling them what their routes are.
     //
-    // BOTH flags are checked: the fence precedes the rate gate as well as the targeted clause, so a
-    // guard written for `accept_open_targeted` alone leaves `claim_open_pool` silently inert.
+    // Asserted as a PASS that names BOTH routes, so the additive state is reported rather than
+    // normalised away. Checked for each flag separately: a rewrite that handled
+    // `accept_open_targeted` and left `claim_open_pool` on the old wording would pass a one-flag
+    // test.
+    //
+    // RED ON REVERT: reinstate the `allowlist_populated() && open_surface_configured()` INERT branch
+    // in `check_seat_reachability` — the status drops to Warn and the detail says INERT.
     #[test]
-    fn seat_reachability_warns_when_an_open_flag_cannot_fire() {
-        for (open_pool, open_targeted, expected_flag) in [
-            (false, true, "`accept_open_targeted`"),
-            (true, false, "`claim_open_pool`"),
+    fn seat_reachability_reports_a_list_and_an_open_route_as_both_in_effect() {
+        for (open_pool, open_targeted, expected_route) in [
+            (false, true, "targeted offers from buyers it has not named"),
+            (true, false, "OPEN-POOL jobs"),
         ] {
             let check = checks::check_seat_reachability(checks::SeatExposure {
                 open_pool,
@@ -2959,10 +3058,16 @@ mod tests {
                 named_buyers: 2,
                 unusable_buyers: 0,
             });
-            assert_eq!(check.status, Status::Warn, "{}", check.render());
+            assert_eq!(check.status, Status::Pass, "{}", check.render());
             assert!(
-                check.detail.contains("INERT") && check.detail.contains(expected_flag),
-                "the operator must be told WHICH flag cannot fire:\n{}",
+                !check.detail.contains("INERT"),
+                "#923: an open route beside a list is not inert, and calling it inert hides live \
+                 stranger admission:\n{}",
+                check.render()
+            );
+            assert!(
+                check.detail.contains("2 named buyer(s)") && check.detail.contains(expected_route),
+                "the operator must be told BOTH routes are in effect:\n{}",
                 check.render()
             );
         }
