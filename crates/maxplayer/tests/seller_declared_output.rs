@@ -99,7 +99,7 @@ fn the_declared_output_type_is_persisted_and_reaches_the_agents_prompt() {
         "the declared output type must be PERSISTED — a resumed job reads its facts from the store"
     );
 
-    let prompt = job_prompt(&resumed, GIT_REMOTE, DEADLINE);
+    let prompt = job_prompt(&resumed, GIT_REMOTE, DEADLINE, None);
     assert!(
         prompt.contains("application/json"),
         "the buyer's declared output type must reach the hired agent's prompt: {prompt}"
@@ -118,8 +118,8 @@ fn the_declared_output_type_is_persisted_and_reaches_the_agents_prompt() {
 /// each prompt must carry its own type and NOT the other's, which a hardcoded line cannot satisfy.
 #[test]
 fn the_prompt_carries_this_offers_own_output_type_and_not_another_offers() {
-    let json = job_prompt(&offer("application/json"), GIT_REMOTE, DEADLINE);
-    let plain = job_prompt(&offer("text/plain"), GIT_REMOTE, DEADLINE);
+    let json = job_prompt(&offer("application/json"), GIT_REMOTE, DEADLINE, None);
+    let plain = job_prompt(&offer("text/plain"), GIT_REMOTE, DEADLINE, None);
 
     assert!(json.contains("application/json"), "{json}");
     assert!(!json.contains("text/plain"), "not the other type: {json}");
@@ -144,13 +144,13 @@ fn the_prompt_carries_this_offers_own_output_type_and_not_another_offers() {
 fn an_offer_with_no_declared_output_type_states_none_and_nothing_is_enforced() {
     let mut none = offer("text/plain");
     none.output = None;
-    let prompt = job_prompt(&none, GIT_REMOTE, DEADLINE);
+    let prompt = job_prompt(&none, GIT_REMOTE, DEADLINE, None);
     assert!(
         !prompt.contains("DECLARED OUTPUT TYPE"),
         "no declared type ⇒ nothing stated: {prompt}"
     );
 
-    let stated = job_prompt(&offer("application/json"), GIT_REMOTE, DEADLINE);
+    let stated = job_prompt(&offer("application/json"), GIT_REMOTE, DEADLINE, None);
     let lower = stated.to_lowercase();
     for banned in ["refuse", "decline", "reject", "must not deliver", "penalt"] {
         assert!(
