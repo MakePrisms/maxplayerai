@@ -43,6 +43,9 @@ enum Command {
     /// confined to this task + the authenticated relay client — the push path never re-reads the key.
     HttpAuthHeader {
         remote_url: String,
+        /// `Some(refname)` scopes the token to one fully-qualified ref (`refs/heads/…`); the relay
+        /// then refuses a push to any other ref. `None` mints the unscoped header.
+        ref_scope: Option<String>,
         reply: oneshot::Sender<Result<String, String>>,
     },
     /// NIP-44/NIP-17 unwrap of a kind-1059 gift-wrap addressed to the seller, decoded to its NUT-18
@@ -182,11 +185,16 @@ impl SignerHandle {
     pub async fn http_auth_header(
         &self,
         remote_url: String,
+        ref_scope: Option<String>,
     ) -> Result<Result<String, String>, SignerActorGone> {
         let (reply, rx) = oneshot::channel();
         self.round_trip(
             "http_auth_header",
-            Command::HttpAuthHeader { remote_url, reply },
+            Command::HttpAuthHeader {
+                remote_url,
+                ref_scope,
+                reply,
+            },
             rx,
         )
         .await
@@ -257,10 +265,17 @@ pub fn spawn(home: &MaxplayerHome) -> Result<SignerHandle, HomeError> {
                         .map_err(|error| error.to_string());
                     let _ = reply.send(result);
                 }
-                Command::HttpAuthHeader { remote_url, reply } => {
-                    let result =
-                        crate::git_transport::nip98_authorization_header_with_keys(&remote_url, &keys)
-                            .map_err(|error| error.to_string());
+                Command::HttpAuthHeader {
+                    remote_url,
+                    ref_scope,
+                    reply,
+                } => {
+                    let result = crate::git_transport::nip98_authorization_header_with_keys(
+                        &remote_url,
+                        &keys,
+                        ref_scope.as_deref(),
+                    )
+                    .map_err(|error| error.to_string());
                     let _ = reply.send(result);
                 }
                 Command::UnwrapPaymentWrap { event, reply } => {
@@ -441,14 +456,45 @@ mod tests {
         let signer = spawn(&home).expect("spawn");
 
         let header = signer
-            .http_auth_header("https://relay.example/git/o/r.git".to_owned())
+            .http_auth_header("https://relay.example/git/o/r.git".to_owned(), None)
             .await
             .expect("actor")
             .expect("header");
         assert!(header.starts_with("Nostr "), "NIP-98 auth scheme: {header}");
         assert!(!header.contains(&secret), "push header must not leak the secret");
+
+        // A `Some(ref)` scope reaches the mint through the actor: the decoded event carries the ref
+        // string, and the scoped header differs from the unscoped one. This is the actor-level guard
+        // that the scope is threaded end to end; git_transport's unit tests check the tag SHAPE.
+        let scoped = signer
+            .http_auth_header(
+                "https://relay.example/git/o/r.git".to_owned(),
+                Some("refs/heads/maxplayer/abc12345".to_owned()),
+            )
+            .await
+            .expect("actor")
+            .expect("header");
+        assert_ne!(scoped, header, "the scope must change the minted token");
+        let json = {
+            use base64::Engine as _;
+            let b64 = scoped.strip_prefix("Nostr ").expect("Nostr scheme");
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .expect("base64");
+            String::from_utf8(bytes).expect("utf8")
+        };
+        assert!(
+            json.contains("refs/heads/maxplayer/abc12345"),
+            "scoped token must carry the ref: {json}"
+        );
+        assert!(!scoped.contains(&secret), "scoped header must not leak the secret");
+
         // A malformed remote url fails cleanly rather than signing garbage.
-        assert!(signer.http_auth_header("not a url".to_owned()).await.expect("actor").is_err());
+        assert!(signer
+            .http_auth_header("not a url".to_owned(), None)
+            .await
+            .expect("actor")
+            .is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 
