@@ -1804,14 +1804,56 @@ fn offer_row(job_id: &str, buyer_pubkey: &str, offer: &ParsedOffer) -> super::st
 /// wallet-gated unit tests do not run under `cargo test -p maxplayer-core` (the `wallet` feature is
 /// off by default there), so a tooth that lives only here is invisible to the repo's declared check
 /// set. See `crates/maxplayer/tests/seller_declared_output.rs`.
-pub fn job_prompt(offer: &super::store::Offer, git_remote: &str, deadline_unix: u64) -> String {
+pub fn job_prompt(
+    offer: &super::store::Offer,
+    git_remote: &str,
+    deadline_unix: u64,
+    memory_section: Option<&str>,
+) -> String {
     compose_agent_prompt(
         &offer.task,
         git_remote,
         deadline_unix,
         offer.output.as_deref(),
-        None,
+        memory_section,
     )
+}
+
+/// The rendered read-on-start memory section for a seller at `home_root`, or `None` when there is
+/// nothing to inject (#828).
+///
+/// This is the impure half of the prompt seam, kept OUT of [`job_prompt`] on purpose. `job_prompt`
+/// stays pure over the stored row — the property its doc above exists to protect — and the one read
+/// that touches the filesystem lives here, where a test can drive it with a real directory.
+///
+/// **It only ever READS.** It must never call `seller_memory::ensure_memory_dir`: that seeds a
+/// NON-EMPTY index (it links `operator-notes.md`), and `memory_enabled` defaults to TRUE, so seeding
+/// from this path would flip every existing seller from inert to injecting on its next job without
+/// any operator writing a word. Creating memory stays an operator act.
+///
+/// **It degrades and never propagates.** `read_on_start_section` REFUSES an index over
+/// [`MAX_MEMORY_INDEX_BYTES`](crate::seller_memory::MAX_MEMORY_INDEX_BYTES) with `InvalidData`, and
+/// an unreadable file is an error too. Neither may fail a job: this is diagnostic/economic context
+/// that never feeds the pay gate, the journal or the receipt bind, so a job that would otherwise
+/// have been delivered and PAID must not die over it. An error is logged and read as "no memory".
+pub fn job_memory_section(
+    home_root: &std::path::Path,
+    config: &crate::home::SellerMemoryConfig,
+) -> Option<String> {
+    if !config.memory_enabled {
+        return None;
+    }
+    let dir = crate::seller_memory::memory_dir(home_root);
+    match crate::seller_memory::read_on_start_section(
+        &dir,
+        config.read_on_start_template_path.as_deref(),
+    ) {
+        Ok(section) => section,
+        Err(error) => {
+            opline!("seller node memory read skipped ({error}); running the job without memory");
+            None
+        }
+    }
 }
 
 /// #591: how a job's delivery workdir is provisioned — a from-scratch empty repo, or a clone of a
@@ -5959,7 +6001,14 @@ impl SellerNodeRunner {
         // deadline has room. The agent edits files in `workdir`; the node owns commit + push. The
         // configured `[sandbox]` policy launches the command (pass-through when absent).
         let deadline = offer.deadline_unix.max(0) as u64;
-        let prompt = job_prompt(&offer, &seller.git_remote, deadline);
+        // #828: operator-authored context (brand guidelines, house style) loads with the job. Inert
+        // for a seller that has never written a MEMORY.md, and it never blocks a job — see
+        // `job_memory_section`.
+        let memory_section = job_memory_section(
+            &self.node.home().root,
+            &self.node.home().config.seller_memory,
+        );
+        let prompt = job_prompt(&offer, &seller.git_remote, deadline, memory_section.as_deref());
         // Resolve the sandbox executor before the run; a misconfigured `[sandbox]` fails the job
         // rather than silently running the agent unsandboxed.
         let sandbox = match SandboxPolicy::from_config(self.node.home().config.sandbox.as_ref()) {
@@ -8626,7 +8675,7 @@ mod tests {
         let resumed = store.offer_row(&job).expect("offer row").expect("offer survives");
 
         // The exact call the execute path makes, over the exact row a resumed job reads.
-        let prompt = job_prompt(&resumed, "https://relay.example/git/abc.git", 2_000_000_000);
+        let prompt = job_prompt(&resumed, "https://relay.example/git/abc.git", 2_000_000_000, None);
         assert!(
             prompt.contains("application/json"),
             "the buyer's declared output type must reach the hired agent: {prompt}"
@@ -8639,7 +8688,7 @@ mod tests {
         // the other job's type.
         let mut other = resumed.clone();
         other.output = Some("text/plain".to_owned());
-        let other_prompt = job_prompt(&other, "https://relay.example/git/abc.git", 2_000_000_000);
+        let other_prompt = job_prompt(&other, "https://relay.example/git/abc.git", 2_000_000_000, None);
         assert!(other_prompt.contains("text/plain"), "{other_prompt}");
         assert!(!other_prompt.contains("application/json"), "{other_prompt}");
         let _ = std::fs::remove_dir_all(&root);

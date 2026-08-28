@@ -18,11 +18,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Sub-directory of `MAXPLAYER_HOME` holding the distilled memory.
 pub const MEMORY_DIR_NAME: &str = "memory";
 /// Upper bound, in bytes, on the `MEMORY.md` index injected into the job prompt (issue #81).
-/// Steady state is ~1–5 KB and the observed worst case ~10 KB; 16 KiB is generous headroom for a
-/// healthy index while still catching runaway growth. An index over this bound is REFUSED at the
-/// injection site — [`read_on_start_section`] returns `InvalidData` instead of inlining it, and
-/// the daemon degrades to running the job without memory (the seam never blocks a job).
-pub const MAX_MEMORY_INDEX_BYTES: usize = 16 * 1024;
+///
+/// Raised from 16 KiB to 64 KiB (#828). The old bound was sized against an AGENT-written index, and
+/// #81 measured that case at ~1–5 KB steady with a ~10 KB worst case. The same file now also has to
+/// hold an OPERATOR's deliberate specialization — brand guidelines, house style — which is written
+/// once rather than accumulated, so it does not grow on its own. A containerized seller has nowhere
+/// else to put it: only this file's CONTENT is inlined into the prompt, while the topic files the
+/// index links sit outside the job's mount namespace and cannot be opened. 64 KiB still clears #81's
+/// worst case by 6.4x, so the runaway guard keeps biting an order of magnitude before genuine
+/// runaway growth.
+///
+/// The cost is prompt tokens on every job, paid by the seller who chose to write the file, so it is
+/// self-limiting. The section is appended LAST, so a larger block never pushes the buyer's task down.
+///
+/// An index over this bound is REFUSED at the injection site — [`read_on_start_section`] returns
+/// `InvalidData` instead of inlining it, and the daemon degrades to running the job without memory
+/// (the seam never blocks a job).
+pub const MAX_MEMORY_INDEX_BYTES: usize = 64 * 1024;
 /// The index file loaded at job start.
 pub const MEMORY_INDEX_FILE: &str = "MEMORY.md";
 /// The always-operator-owned topic file, seeded on first creation.
@@ -159,8 +171,9 @@ pub fn read_on_start_section(
             io::ErrorKind::InvalidData,
             format!(
                 "memory index {} is {} bytes, over the {MAX_MEMORY_INDEX_BYTES}-byte injection \
-                 bound — refusing to inject; trim MEMORY.md (one line per topic, detail in topic \
-                 files)",
+                 bound — refusing to inject; shorten MEMORY.md itself. Moving detail into linked \
+                 topic files only helps a HOST job: under a container policy the linked files are \
+                 outside the job's mount namespace, so this file's own content is all that loads",
                 index_path.display(),
                 index.len()
             ),
