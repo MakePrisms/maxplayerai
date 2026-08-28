@@ -73,6 +73,13 @@ pub struct GitAuth {
     pub pubkey: nostr::PublicKey,
     /// Server-resolved tenant bound from the request Host before auth checks.
     pub tenant: TenantContext,
+    /// Optional single ref this token may write, from a `["ref", <refname>]` tag on the
+    /// signed event. `None` is today's behaviour: the token may write any ref its role and
+    /// the repo's protection rules allow.
+    ///
+    /// The tag is inside the signature, so a holder of a leaked token cannot widen or strip
+    /// it. Read only AFTER signature verification.
+    pub ref_scope: Option<String>,
 }
 
 impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
@@ -229,6 +236,20 @@ async fn authenticate_git(
                 (StatusCode::UNAUTHORIZED, "NIP-98 auth failed").into_response()
             })?;
 
+    // Read the optional ref scope from the token. AFTER signature verification, never
+    // before: the whole value of putting the scope in a tag is that the signature covers it.
+    let ref_scope = serde_json::from_str::<serde_json::Value>(&event_json)
+        .ok()
+        .and_then(|v| {
+            v["tags"]
+                .as_array()?
+                .iter()
+                .find(|t| t[0].as_str() == Some("ref"))?[1]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .filter(|s| !s.is_empty());
+
     // NOTE: NIP-98 event-ID dedup intentionally NOT implemented here.
     // Git's credential protocol reuses one signed token across multiple requests
     // in a session (info_refs GET → upload-pack/receive-pack POST). Rejecting
@@ -267,7 +288,11 @@ async fn authenticate_git(
         }
     }
 
-    Ok(GitAuth { pubkey, tenant })
+    Ok(GitAuth {
+        pubkey,
+        tenant,
+        ref_scope,
+    })
 }
 
 /// Construct the repo-root NIP-98 `u` URL expected for a git HTTP request.
@@ -1011,6 +1036,10 @@ pub async fn receive_pack(
             auth.tenant.community().as_uuid().to_string(),
         ),
         ("BUZZ_PUSHER_PUBKEY", pusher_hex.clone()),
+        // Always set, empty when the token carries no scope. The hook refuses to run if this
+        // is UNSET, so a relay that forgets to pass it fails the push instead of silently
+        // treating a scoped token as unscoped.
+        ("BUZZ_REF_SCOPE", auth.ref_scope.clone().unwrap_or_default()),
         // Override any repo-local core.hooksPath setting; defense in
         // depth even though the hydrated workspace has no inherited
         // config.
