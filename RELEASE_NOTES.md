@@ -1,133 +1,104 @@
-## v0.5.3
+## v0.5.4
 
-A Claude seat reports the model that actually ran the turn, instead of the picker preference it was
-configured with. An operator can reclaim the containment holders a retired seat left behind.
+The three seller admission controls become additive and independent. **This changes what an existing
+seller config means**, so read the upgrade note below before you upgrade a seat.
 
-### What a seat operator gets
+### ⚠ Upgrading: a seller with no allowlist stops claiming targeted work
 
-A seat publishes five capability fields in two classes. The class decides where a field appears and
-what a buyer may do with it. The line between them is provenance: a field is filterable only if the
-seat measured it. `docs/protocol-v1.md` §4.5 defines the split.
+Before this release, an empty `accept_offers_only_from` meant accept-all on the targeted surface.
+After it, that same config admits no one.
 
-**Filterable** — `harness_family`, `harness_model`, `capabilities`. A buyer's award filter reads
-these. They appear on both the kind-30340 announcement and the kind-3402 claim, spelled identically
-on each.
+Admission on the targeted surface is now the union of the two controls that govern it — a buyer you
+named, or `accept_open_targeted` for one you did not. With no buyer named and `accept_open_targeted`
+left at its default of `false`, neither clause admits, and the seat claims nothing.
 
-- `harness_family` — read from live roster state on every beat.
-- `harness_model` — the model id a harness reported when it was last read.
-- `capabilities` — toolchain tokens proven by running a probe at seat start.
+**Nothing about that state is an error.** The config still parses, the node still boots, the relay
+subscription is still live, and the seat still advertises. It simply never claims again. That is the
+part worth naming: the failure is silence, and silence is also what a quiet market looks like.
 
-**Display** — `harness_variant` and `hardware`. You declare these yourself, in a top-level `[seat]`
-config section. They appear on the announcement **only**: a seller must not put them on a claim, and
-a reader must not filter on them. No probe can answer them, and that is the reason for the rule. A
-fork name and a machine description are facts about the operator, not measurements, and a buyer
-commits satoshis at award against a value nothing could contradict.
+Three ways back in, any one of which is enough:
 
-**Restart a seat after you change its toolchain.** `capabilities` is measured once, at seat start,
-and that snapshot is republished for the life of the process. Both directions of drift are real and
-only one is safe. If you add a toolchain to a running seat, the seat under-advertises and loses work
-it could have won. If you remove one, the seat keeps advertising it and can be awarded work it can
-no longer do. Nothing on the wire catches the second case; no event carries a capability back, so no
-buyer message can contradict the advertisement. Issue #891 tracks a bounded re-probe.
+- name a buyer in `accept_offers_only_from`
+- set `accept_open_targeted = true` to take targeted offers from buyers you never named
+- set `claim_open_pool = true` to claim untargeted offers
 
-### What a buyer gets
+**The node tells you.** A seat whose config can claim nothing prints a warning at boot naming all
+three knobs and which of them is off. It is emitted on every boot rather than once, because the
+condition is a standing state of the config and not an event — a seat can be restarted long after the
+upgrade that closed it. The warning also fires for an allowlist whose every entry is unusable, which
+is a list that fences everyone out while looking configured.
 
-`harness_family` decides which seats may claim a job. It does not decide which harness runs one.
-Dispatch selects a harness by the offer's `agent` preset alone, and a seat with several configured
-presets runs its first when no preset is named — so a multi-harness seat can match a family filter
-and execute a different harness within it. A buyer that needs the execution guarantee must name the
-`agent` preset. Requesting a family alone remains valid and unchanged; it narrows who competes.
+**The other direction, if you keep an allowlist.** A seat running a populated
+`accept_offers_only_from` together with `accept_open_targeted = true` used to refuse buyers it had not
+named, because the allowlist silently cancelled the flag. It now accepts them, which is what that
+config always said. If you keep an allowlist and do not want strangers on the targeted surface, check
+that `accept_open_targeted` is `false`.
 
-`harness_model` is a self-report of what was last observed, and it is not a promise. Nothing selects
-or pins a model. The seat states what its harness reported when it was last read, and an arriving job
-opens its own session. Do not read a filter match as a guarantee about execution. Issue #785 carries
-the model-selection work that would make it a commitment.
+### The three admission controls are additive
 
-The advertised model id and the `["model", name]` on a job result come from the same source, so they
-are directly comparable. They are separate reads and can differ without anyone lying.
+`accept_offers_only_from`, `accept_open_targeted` and `claim_open_pool` are now independent. Each
+admits on its own and none cancels another.
 
-An absent field satisfies no named requirement. A seat that declares nothing matches nothing.
+- **`accept_offers_only_from` always admits.** A listed buyer gets in for targeted work whatever the
+  flags say.
+- **`accept_open_targeted` additionally admits** targeted offers from buyers you never named.
+- **`claim_open_pool` owns the untargeted surface** by itself, in the rate gate.
 
-**Award filtering is live.** A job can carry a capability request, and both production award sites —
-the automatic award and the manual one — judge every claim against it through one shared constructor,
-so a request honoured on one path cannot be dropped on the other. A job that names nothing filters
-nothing: omit the request and every claim competes exactly as it did before.
+Previously one fence ran ahead of all of it and applied to both surfaces, so a populated allowlist
+cancelled the other two controls outright. The config file said one thing and the seat did another,
+with no error to say so.
 
-### A Claude seat reports the model that ran the turn
+A refused targeted offer now distinguishes the two cases rather than reporting one string for both.
+An operator who wrote a list is sent to the list; an operator who wrote none is sent to the flag,
+rather than hunting for a list that does not exist.
 
-`harness_model` on a Claude seat used to carry the model picker's own value — `default`, `sonnet`,
-`haiku`, `opus[1m]`. None of those is a model identity. Each is a preference that resolves to a
-different concrete model on a different account, so two seats both advertising `sonnet` can be
-running different models, and a buyer filtering on it is awarding against ad copy.
+The containment readiness gate reads the same rule. "This seat serves strangers" is now exactly
+"either open surface is set", so a seat that has opted in to strangers without a working sandbox
+fails its readiness check rather than passing on a technicality.
 
-A Claude seat now takes its model id from the harness's own session-init frame, which names the
-concrete model — `claude-opus-5[1m]` — before any agent output. That id outranks the configured
-picker value. When no frame arrives the field is absent, and absence is absence: no placeholder and
-no preference stands in for a measurement that was not made. A run that explicitly picked the one
-concrete picker row loses attribution rather than reporting an id nobody observed.
+### An undispatchable job is labelled `capability_missing`
 
-This is scoped to the Claude adapter. Codex reports byte-for-byte what it reported before, and no
-other harness changes.
+A job that reached execution with no serving harness for the harness its buyer asked for was reported
+as `execution_failed`. Nothing had run — the dispatch arm sits above execution and returns before it.
+`execution_failed` reads as *tried and broke*, which attributes a fault to a run that never happened
+and points the buyer at a retry, when the only move that can succeed is finding a seat that serves
+the harness.
 
-### What the runner sheet shows
+The arm is post-award, so the reason code decides money rather than only wording. `capability_missing`
+is a releasable failure, so a buyer's funds are not stranded behind a job no seat could have run.
 
-The Profile section lists the five fields. Harness family, harness model and capabilities render as
-bare label and value pairs. Harness variant and hardware carry an `operator-declared` mark, because
-they are declarations rather than measurements.
+### The contribution gate declares the Node suites
 
-The three filterable rows no longer carry provenance marks. That is a deliberate simplification and
-it costs something worth naming: the sheet no longer shows that `capabilities` is bounded by the
-seat's uptime, so a reader cannot tell from this surface alone that a stale toolchain claim is
-possible. `docs/protocol-v1.md` §4.5.3 and §4.5.4 remain the authority on what the five fields are
-worth, and the three are still not three grades of one proof.
+`.maxplayer/checks.toml` is the set a seller's attestation runs from the pinned base with the network
+denied, and the set a delivery is **paid** against. It declared five cargo rows and no Node rows, so
+every test in `web/app` and `web/network` ran zero times under it. A delivery could regress the market
+terminal and attest green. Pull requests to `main` caught that; the gate that pays did not.
 
-### Freshness
+Both suites are now declared. The default devshell gains Node, because a declared row that cannot
+execute is worse than no row at all.
 
-Of the five fields, only `capabilities` is bounded by seat uptime. `harness_family` is read live on
-each beat, and `harness_model` refreshes from every completed job, including when a harness stops
-reporting one. A recent beat does not mean the capabilities on it were measured recently.
+The guard that keeps those rows in place asserts only what a text reader can actually decide — that
+each declared form appears exactly once — and says so in the assertion. Whether an arbitrary argv runs
+a test suite is not decidable by inspecting its tokens, and two earlier attempts to decide it each
+admitted a new false green.
 
-### Reclaiming what a retired seat left
+### Self-probes stop leaving diagnostics directories
 
-The boot reaper removes only the holders labelled with the booting seat's own key, because on a host
-running several seller daemons ownership is the one thing that makes a removal safe. A seat that
-never boots again therefore never reaps, and its holders survive indefinitely — one container and one
-namespace each.
+Every self-probe stamped the wall clock into its own job id, so each probe minted a fresh diagnostics
+directory, and nothing pruned them. Probes now use remove-only cleanup: the container is still removed
+— an abandoned probe container leaks exactly as an abandoned job container does — and only the
+diagnostics capture is dropped.
 
-No local query can close that gap. "This seat is retired" and "this seat is slow to start" produce
-identical evidence. The operator holds the missing fact, so the operator supplies it:
+A capture that was never attempted is now recorded distinctly from one that failed. With those two
+collapsed, the signal meaning evidence was destroyed fired on every probe and was buried under the
+most frequent event on the node.
 
-```
-maxplayer sandbox-reap --seat <64-hex> [--dry-run]
-```
+**This stops new directories; it does not reclaim old ones.** A seat that has been probing for weeks
+keeps whatever it has already accumulated until someone removes it.
 
-The seat id is evidence, not a convenience: there is no default, no fallback to the local identity,
-and the host-wide flags a person would reach for — `--all`, `--all-seats`, `--every-seat` — are
-refused by name rather than left unrecognised.
+### A partially failing advertising probe no longer narrows the roster in silence
 
-The command also reports what it could not remove. A failed `docker rm` used to be dropped, so a host
-where one holder resisted removal still answered "no reapable containment holders", exit 0 — a false
-statement about the host, on the one line that decides whether the leak is gone. Removed and failed
-are now counted separately.
-
-### doctor names a seat that never linked an account
-
-`maxplayer doctor` checks each harness's credential directory. It treated "missing" as acceptable per
-PATH, so a cursor seat with no credential directory at any known location passed silently: both
-candidates were individually excused. The bound belongs to the harness, not the path. One absent
-candidate says nothing, because only the operator's build decides which of cursor's two locations
-exists — but a harness with none of its locations present is a seat that never linked an account.
-
-The check groups candidates by harness and reports a group that is entirely absent. A real metadata
-error still reads `could not read`; only NotFound folds into the per-harness verdict. The PASS line
-names the paths it actually inspected, rather than claiming a property for a directory that does not
-exist.
-
-### Running Cursor in a container
-
-A Docker-contained Cursor seat needs the two-leg configuration, because Cursor's control plane and
-its agent traffic go to separate hosts. Use the browser-login session through `file_credentials`,
-which keeps the real value on the host and carries a per-job placeholder into the container. Do not
-forward `CURSOR_API_KEY`: it is a real reusable key, and forwarding it puts it inside the container
-for a stranger's job to read. `docs/DOCKER.md` carries the configuration, including the macOS step
-for a session that lives in the Keychain.
+The advertising boot check emitted its failure lines after the gate that acts on them, so a probe
+where some harnesses failed could quietly reduce the advertised roster with nothing in the log saying
+which ones dropped or why. The failure lines now come first. The refusal to advertise a harness
+nothing proved is unchanged.
