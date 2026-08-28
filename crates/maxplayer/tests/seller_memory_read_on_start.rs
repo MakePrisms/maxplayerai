@@ -264,3 +264,47 @@ fn the_read_wire_never_creates_the_memory_directory() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// THE POLICY TOOTH (#828, blocker B1/D5). An index of exactly 65,536 bytes is ACCEPTED and inlined.
+///
+/// **The size is a bare literal on purpose, and that literal is the entire mechanic.** Every other
+/// index size in this suite — and in `seller_memory.rs`'s own tests — is an expression over
+/// `MAX_MEMORY_INDEX_BYTES` (`+ 1`, `- 1`, an exact-at-bound fill). Deriving is right for the
+/// refusal arm, which is about the boundary rather than about where the boundary sits, but it means
+/// every one of those sizes floats with the constant. MEASURED at `c075623`: reverting the constant
+/// to `16 * 1024` left ALL SIXTEEN of them green. The 64 KiB policy had no tooth at all.
+///
+/// **It pins 65,536 without ossifying it.** This is an ACCEPTANCE assertion, not an equality on the
+/// constant: it says an index of this size must be injected, not that the bound equals this number.
+/// A revert to 16 KiB refuses this index and turns the test red. A future raise to 128 KiB leaves it
+/// accepted and the test green — so a correct change is never blocked by a test it would have to
+/// edit in order to be allowed, which is how a pinned tuning value ossifies.
+#[test]
+fn an_index_of_exactly_65536_bytes_is_accepted_and_reaches_the_agent() {
+    // Bare literals, never `MAX_MEMORY_INDEX_BYTES` or an expression over it — see the doc above.
+    const INJECTION_BOUND: usize = 65536;
+    const PREVIOUS_BOUND: usize = 16384;
+
+    let marker = "Acme brand rule: set headings in Söhne and never centre body copy.";
+    let mut index = format!("# Memory\n\n{marker}\n");
+    assert!(index.len() < INJECTION_BOUND);
+    index.push_str(&".".repeat(INJECTION_BOUND - index.len()));
+
+    // Controls on the fixture, so a pass here cannot be an accident of a too-small file.
+    assert_eq!(index.len(), INJECTION_BOUND, "the fixture must be exactly at the bound");
+    assert!(index.len() > PREVIOUS_BOUND, "and it must exceed the bound that shipped before");
+
+    let root = home_with_index("exact-64kib", &index);
+    let section = job_memory_section(&root, &SellerMemoryConfig::default()).expect(
+        "an index of exactly 65,536 bytes must be accepted; if the injection bound is lowered this \
+         is refused and returns None",
+    );
+    let prompt = job_prompt(&offer(), GIT_REMOTE, DEADLINE, Some(section.as_str()));
+
+    assert!(
+        prompt.contains(marker),
+        "the operator's own words must survive a document at the bound"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
