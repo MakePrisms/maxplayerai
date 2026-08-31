@@ -828,9 +828,12 @@ button.chip { cursor: pointer; }
 /* ---------- reduced motion ---------- */
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; }
-  .dot.working, .dot.working i, .sl { animation: none !important; }
-  /* motion gone, meaning kept: a static bright streak still reads as working */
-  .dot.working i:first-child { background: var(--neon); }
+  /* the lamps keep sweeping. lamp-a/b/c animate `background` and nothing else
+     — no transform, no offset, no scale — and a 2.2s cycle on three hairlines
+     4.5px and under is neither vestibular motion nor a 3Hz flash. Suppressing
+     it cost the reader the only cue that tells a working runner from an idle
+     one, so the preference was removing meaning, not movement. */
+  .sl { animation: none !important; }
   .conn[data-state="connecting"] .sl, .conn[data-state="history"] .sl { background: var(--blue); }
   .role, .nav-toggle span { transition: none; }
 }
