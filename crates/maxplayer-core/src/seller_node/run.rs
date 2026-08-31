@@ -6148,11 +6148,16 @@ impl SellerNodeRunner {
         // per-job branches to the same repo, and concurrent git-receive-pack to one repo is what the
         // relay 409s (surfaced as terminal delivery_failed before this). Serializing removes the race;
         // the push oid is stable (invariant 2), so ordering never duplicates a delivery.
+        // Harden the workdir's `.git/config` (a whole-file replacement) BEFORE pushing, so an
+        // `insteadOf` the agent planted cannot redirect the seller's token to a host it chose
+        // (tests/hostile_local_git_config.rs). Safe here: the job container has already exited, so no
+        // agent process is alive to re-plant the redirect between the rewrite and the push. Both run
+        // in one blocking op inside `neutralize_then_push_off_runtime`.
         let commit = match serialized_bounded_push(
             &self.delivery_push_lock,
             DELIVERY_PUSH_TIMEOUT,
             || {
-                seller_git::push_branch_with_header_off_runtime(
+                seller_git::neutralize_then_push_off_runtime(
                     workdir.clone(),
                     seller.git_remote.clone(),
                     branch.clone(),

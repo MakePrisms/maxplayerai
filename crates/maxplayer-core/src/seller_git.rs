@@ -618,6 +618,58 @@ pub async fn push_branch_with_header_off_runtime(
     off_runtime(move || push_branch_with_header(&workdir, &remote_url, &branch, header)).await
 }
 
+/// Overwrite `workdir`'s repo-local git config with a fixed, minimal, redirect-free config, so a push
+/// from `workdir` cannot be hijacked by anything the agent planted in `.git/config`.
+///
+/// A confirmed exploit: under `[sandbox] mode = "docker"` the whole job workdir is bind-mounted into
+/// the container, `.git` included, so the agent can write `.git/config`. libgit2 applies
+/// `url.<other>.insteadOf` from the config of the repo that RUNS an operation (at connect time, for
+/// `remote_anonymous` too). [`crate::git_transport`] empties the global/XDG/system config search paths
+/// (#610), but a repo-LOCAL `.git/config` is not reached through a search path — so a push straight
+/// from the agent's workdir would follow a planted `insteadOf` and send the seller's token to a host
+/// the agent chose.
+///
+/// This closes that: it REPLACES the whole `.git/config` (not a targeted edit), which is what makes it
+/// robust rather than a fragile blocklist. One write strips `url.*.insteadOf`, `url.*.pushInsteadOf`,
+/// any `remote.*.pushurl`, and — because the replacement carries no `[include]`/`[includeIf]` directive
+/// and does not enable `extensions.worktreeConfig` — every SECONDARY config file the agent could have
+/// pointed at. A push needs nothing from the config (explicit URL + refspec), so a minimal file
+/// suffices.
+///
+/// ⚠ Call this only when no agent process can still rewrite the file before the push. On the delivery
+/// path the job container has already exited, so no agent process is alive to re-plant the redirect.
+pub fn neutralize_push_config(workdir: &Path) -> Result<(), SellerGitError> {
+    // repositoryformatversion is the one key git requires to recognise the repo; bare=false for a
+    // working tree. Nothing else — deliberately no `url.*`, no `include`, no worktree-config extension.
+    const MINIMAL_CONFIG: &str = "[core]\n\trepositoryformatversion = 0\n\tbare = false\n";
+    let git_dir = workdir.join(".git");
+    std::fs::write(git_dir.join("config"), MINIMAL_CONFIG)
+        .map_err(|error| SellerGitError::Io(format!("neutralize git config: {error}")))?;
+    // Defense in depth: the config above does not enable worktree config, so git will not read
+    // `config.worktree` — but remove any the agent left, so nothing stale can be reached.
+    let worktree_config = git_dir.join("config.worktree");
+    if worktree_config.exists() {
+        let _ = std::fs::remove_file(&worktree_config);
+    }
+    Ok(())
+}
+
+/// Off-runtime: neutralise `workdir`'s config, THEN push. This is the delivery push — hardening the
+/// config first (a whole-file replacement) means an `insteadOf`/`pushInsteadOf`/`include` the agent
+/// planted cannot redirect the token. Both run in one blocking op, so nothing runs between them.
+pub async fn neutralize_then_push_off_runtime(
+    workdir: PathBuf,
+    remote_url: String,
+    branch: String,
+    header: Option<String>,
+) -> Result<String, SellerGitError> {
+    off_runtime(move || {
+        neutralize_push_config(&workdir)?;
+        push_branch_with_header(&workdir, &remote_url, &branch, header)
+    })
+    .await
+}
+
 /// Run one blocking git operation on a blocking thread. A panic inside libgit2 surfaces as an error
 /// rather than taking the caller down.
 async fn off_runtime<T, F>(operation: F) -> Result<T, SellerGitError>
