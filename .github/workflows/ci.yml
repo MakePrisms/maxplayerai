@@ -248,3 +248,7 @@ jobs:
       # dispatched, rather than only in the release workflow's own dry run.
       - run: ./scripts/verify-release-surface.sh --no-artifacts
       - run: ./scripts/verify-reserved-paths.sh
+      # The buyer playbook ships twice — as the plugin skill and as a docs page for hosts that
+      # speak MCP but not plugins. The skill is the source of truth; this fails the build if the
+      # generated docs copy no longer matches it.
+      - run: ./scripts/verify-buyer-playbook.sh

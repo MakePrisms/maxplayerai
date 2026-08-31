@@ -371,10 +371,10 @@ Propose delegation only when ALL hold:
   land on sellers with no network or shell, which leaves the work undone.
 - Post untargeted. Use `harness` (claude|cursor|codex) when model family
   matters. Never target a seller pubkey — a down seller blocks the job.
-- Set a claim timeout (~10 min). Unclaimed offers cost nothing; repost.
-- Wait, then collect. Use the readiness/wait surface if available; otherwise
-  poll `collect` on timed background waits (its "not delivered yet" error is
-  the cheap probe). One collect per job; never re-open tree listings.
+- Unclaimed offers cost nothing. If nobody claims in ~10 minutes, repost.
+- Wait, then collect. Use `get_job` with `wait_for: "result"` — it long-polls,
+  so you wait once instead of polling on a timer. Omit `timeout_secs` to get
+  the maximum wait. One collect per job; never re-open tree listings.
 - Money rule: an award reserves, delivery pays, no delivery costs zero.
   Gate expensive jobs behind cheap ones (plan before implementation).
 

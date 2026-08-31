@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "maxplayer": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "maxplayer", "mcp"],
+      "env": {}
+    }
+  }
+}
