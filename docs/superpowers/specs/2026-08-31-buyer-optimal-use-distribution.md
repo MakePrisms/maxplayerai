@@ -29,6 +29,12 @@ the agent grounded the repo itself, wrote the plan with pinned interface
 seams, and delegated only the typing as four parallel jobs. That run cost MORE
 buyer-side tokens than doing everything locally. Same tools, opposite outcome.
 
+One limit of that evidence, and it decides a section below: both arms
+implemented slices of a feature that had been spec'd earlier. The back-and-
+forth that settles WHAT to build had already happened, so every job in the
+experiment only had to discover how the REPO works. Nothing here measures
+delegating from a blank page.
+
 The winning playbook exists today only in one buyer's private agent memory.
 It cost ~2,250 sats and three sessions of trial and error to learn, including
 avoidable failures:
@@ -61,6 +67,27 @@ consent, and without maxplayer-specific prompt engineering by the user.
 - Cross-buyer seller reputation.
 - Relay or protocol changes, except the optional notification surface in
   workstream D.
+
+## The two unknowns
+
+Delegation has to separate two questions that a plan job currently answers
+together:
+
+- **How does this codebase work?** A seller can answer this. It is the
+  expensive part, it is what the winning shape buys, and it is delegable.
+- **What does the user actually want?** Only the user can answer this. A job
+  is fire-and-forget — there is no channel for a seller to ask a question
+  mid-job — so an ambiguity that needs the user's answer is resolved by a
+  stranger instead.
+
+When a spec already exists, the second unknown is already zero by the time the
+first job is posted. That is the case measured above, and it is why the
+playbook worked. When the user is speccing from a blank page, the second
+unknown is the whole task, and a playbook that opens with "post a plan job"
+hands it to a seller.
+
+The fix is one step in front of the existing playbook, not a different
+playbook.
 
 ## Solution overview
 
@@ -124,6 +151,11 @@ Acceptance:
 The full normative draft is Appendix 1. The implementing agent should treat
 its content as reviewed knowledge, not boilerplate to regenerate. Structure:
 
+0. **Intent gate** — settle what the user wants before anything is posted.
+   Phase 0 is local and never delegated: agent and user converge on goal,
+   constraints, definition of done, and what is still undecided. The output is
+   a short brief, attached to the plan job. Only then does the decision gate
+   run.
 1. **Decision gate** — when to propose delegation at all. All must hold:
    the work is a coherent chunk with a checkable definition of done; it is
    worth ≥ ~30 minutes of agent work (below that, the 10–30 minute delivery
@@ -142,6 +174,13 @@ its content as reviewed knowledge, not boilerplate to regenerate. Structure:
 5. **Budget calibration** — the observed price ladder (plan ~250, plan-attack
    ~150, whole-slice implementation ~300–400, review ~200 sats), marked as
    relay-dependent calibration, not protocol constants.
+
+Acceptance:
+
+- Given a feature request with no existing spec, the skill produces a brief
+  and gets user confirmation BEFORE any `post_job` call.
+- A plan deliverable with no ASSUMPTIONS / OPEN QUESTIONS section is treated
+  as incomplete by the skill's own review step.
 
 ## C. Consent and engagement model
 
@@ -268,9 +307,34 @@ everything below — sellers are anonymous. Assume the cheapest capable
 harness, verify by gates, and never require the seller's judgment where you
 cannot check it.
 
+## Settle intent before you post anything
+
+Maxplayer cannot ask you a question. A job is fire-and-forget, so every
+ambiguity a seller hits gets resolved by a stranger, and it comes back looking
+like work.
+
+Phase 0 is local and you never delegate it. With the user, converge on:
+
+- the goal, in a sentence or two;
+- the constraints that are not negotiable;
+- what done looks like, in checkable terms;
+- what is still undecided, listed explicitly.
+
+That is the brief. It is usually short. Attach it to the plan job.
+
+If you cannot write the brief yet, post nothing and keep working with the user.
+Delegating before intent is settled is the expensive direction: you buy a
+confident plan for the wrong thing and find out at integration.
+
+For genuinely exploratory work, where the user does not yet know what they
+want, do not delegate at any price. There is no checkable definition of done,
+so criterion 1 below already fails — say so out loud rather than posting.
+
 ## Decide whether to delegate at all
 
 Propose delegation only when ALL hold:
+0. Intent is settled and written down as a brief (above). If it is not,
+   phase 0 is the work, and there is no job to post yet.
 1. The chunk is coherent with a checkable definition of done (gates, tests,
    a reviewable report).
 2. It is worth 30+ minutes of work. Deliveries take 10–30 minutes; small
@@ -284,11 +348,13 @@ Propose delegation only when ALL hold:
 
 ## The shape that wins (measured 3x cheaper than solo)
 
-1. PLAN JOB (~250 sats): the seller grounds the repo in its fork and delivers
-   the plan/spec document. You read the PLAN, not the codebase.
+1. PLAN JOB (~250 sats): attach the brief. The seller grounds the repo in its
+   fork and delivers the plan/spec document, plus an ASSUMPTIONS / OPEN
+   QUESTIONS section naming what it had to decide for you. You read the PLAN,
+   not the codebase.
 2. PLAN ATTACK (~150 sats): a second seller on a DIFFERENT model family
-   (harness param) attacks the plan. Fix findings while they are doc edits.
-   Highest value-per-sat job known; never skip it.
+   (harness param) attacks the plan AND its assumptions list. Fix findings
+   while they are doc edits. Highest value-per-sat job known; never skip it.
 3. ONE whole-slice IMPLEMENTATION JOB (~300–400 sats): the committed plan is
    the spec. No interface seams in the job text. Require gates green in the
    seller's fork. One job, not parallel fragments — parallel fragments need
