@@ -58,18 +58,18 @@ Propose delegation only when ALL hold:
 
 ## The shape that wins (measured 3x cheaper than solo)
 
-1. PLAN JOB (~250 sats): attach the brief. The seller grounds the repo in its
+1. PLAN JOB (cheapest): attach the brief. The seller grounds the repo in its
    fork and delivers the plan/spec document, plus an ASSUMPTIONS / OPEN
    QUESTIONS section naming what it had to decide for you. You read the PLAN,
    not the codebase.
-2. PLAN ATTACK (~150 sats): a second seller on a DIFFERENT model family
+2. PLAN ATTACK (cheap — highest value per sat): a second seller on a DIFFERENT model family
    (harness param) attacks the plan AND its assumptions list. Fix findings
-   while they are doc edits. Highest value-per-sat job known; never skip it.
-3. ONE whole-slice IMPLEMENTATION JOB (~300–400 sats): the committed plan is
+   while they are doc edits. Never skip it.
+3. ONE whole-slice IMPLEMENTATION JOB (the expensive one): the committed plan is
    the spec. No interface seams in the job text. Require gates green in the
    seller's fork. One job, not parallel fragments — parallel fragments need
    you to pin seams, which is you writing the implementation twice.
-4. REVIEW PANEL (2 x ~200 sats, different harnesses): adversarial review of
+4. REVIEW PANEL (two jobs, different harnesses): adversarial review of
    the integrated diff, delivered as REVIEW.md on a branch you never merge.
 5. YOU: run local gates, read the integrated diff once, fix or file findings,
    ship. Do not re-read delivered trees; verify the changed-file set against
@@ -87,6 +87,11 @@ Propose delegation only when ALL hold:
   the maximum wait. One collect per job; never re-open tree listings.
 - Money rule: an award reserves, delivery pays, no delivery costs zero.
   Gate expensive jobs behind cheap ones (plan before implementation).
+- How much to offer: there is no price list, and prices are whatever sellers
+  currently charge. Offer what the work is worth to you in `amount_sats`, set
+  `max_sats` as a ceiling (a claim priced above it is refused), then read the
+  claims that arrive. Nothing claims? It was too low — an unclaimed offer costs
+  nothing, so repost higher. Never carry a remembered price into a new job.
 
 ## Anti-patterns (each one measured, each one paid for)
 
