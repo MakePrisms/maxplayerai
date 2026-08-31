@@ -406,6 +406,98 @@ pub fn buyer_pubkey_is_reachable(entry: &str) -> bool {
         && PublicKey::from_hex(entry).is_ok_and(|key| key.xonly().is_ok())
 }
 
+/// How this seat admits TARGETED offers — those whose `p` tag names this seat.
+///
+/// Three states, because the targeted surface has three and a boolean has two. Admission is the
+/// UNION `buyer_is_named || accept_open_targeted` (`seller_node::run::classify_offer`), so
+/// `accept_open_targeted = false` does NOT mean closed: with buyers named it means closed to
+/// STRANGERS. Collapsing [`Self::Named`] and [`Self::Closed`] onto one `no` is what would tell a
+/// buyer the operator deliberately listed to give up on a seat that would have served it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum TargetedAdmission {
+    /// Any buyer may target this seat: `accept_open_targeted = true`.
+    Open,
+    /// Only buyers this seat named. Never says WHO — the allowlist itself stays off the wire.
+    Named,
+    /// The targeted surface admits nobody.
+    Closed,
+}
+
+impl TargetedAdmission {
+    /// The §4.2 wire value. One spelling, used by the emitter and the reader alike.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Named => "named",
+            Self::Closed => "closed",
+        }
+    }
+
+    /// Read a §4.2 wire value. Unknown text ⇒ `None` — a reader must not guess a policy.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "open" => Some(Self::Open),
+            "named" => Some(Self::Named),
+            "closed" => Some(Self::Closed),
+            _ => None,
+        }
+    }
+}
+
+/// What a seat advertises about WHO it admits, on each of its two surfaces (§4.2).
+///
+/// ⛔ **DERIVED, NEVER CONFIGURED.** There is deliberately no way for an operator to set this: it is
+/// computed from the live [`SellerConfig`] at announce time by [`Self::from_seller_config`]. A
+/// separate field an operator typed would drift from the code that enforces it, and an
+/// advertisement that can disagree with the admission gate is worse than no advertisement — it is a
+/// new lie in the exact place this tag exists to remove one.
+///
+/// ⚠ **IDENTITY ONLY.** This answers *whose* offers are admitted and nothing else. A seat that
+/// admits a buyer still refuses it below `rate`, and still declines when it cannot run the
+/// requested harness. Like `accepting`, it is a statement of intent and not a guarantee — the
+/// authoritative signal that a seat will take a job remains that the seat claims one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct AdmissionPolicy {
+    /// Whether this seat claims UNTARGETED (open-pool) offers: `claim_open_pool`.
+    pub pool: bool,
+    /// Who this seat admits on the targeted surface.
+    pub targeted: TargetedAdmission,
+}
+
+#[cfg(feature = "gateway")]
+impl AdmissionPolicy {
+    /// Derive the advertisement from the config the admission gate itself reads.
+    ///
+    /// ⛔ **`is_empty()` IS NOT THE PREDICATE, AND USING IT WOULD REBUILD THIS BUG INSIDE ITS OWN
+    /// FIX.** `buyer_is_named` is an exact byte compare against a 64-hex wire pubkey, so an entry
+    /// that [`buyer_pubkey_is_reachable`] refuses can never match anybody. A populated list of
+    /// unusable entries therefore admits NOBODY — it degrades to "no buyers named", not to
+    /// deny-all — and an emptiness test would advertise [`TargetedAdmission::Named`] for a seat no
+    /// targeted offer can reach. The same predicate `doctor` counts `named_buyers` with is the one
+    /// used here, so a typo cannot read as a working route in either place.
+    ///
+    /// `accept_open_targeted` is checked FIRST because it is a union arm, not a fallback: when it is
+    /// set, a stranger is admitted whatever the list holds, so the answer is
+    /// [`TargetedAdmission::Open`] and the existence of an allowlist is not disclosed at all.
+    pub fn from_seller_config(seller: &SellerConfig) -> Self {
+        let targeted = if seller.accept_open_targeted {
+            TargetedAdmission::Open
+        } else if seller
+            .accept_offers_only_from
+            .iter()
+            .any(|entry| buyer_pubkey_is_reachable(entry))
+        {
+            TargetedAdmission::Named
+        } else {
+            TargetedAdmission::Closed
+        };
+        Self {
+            pool: seller.claim_open_pool,
+            targeted,
+        }
+    }
+}
+
 /// Executor sandbox config (`[sandbox]` section): which executor the awarded agent command runs
 /// under. Absent ⇒ pass-through — the command runs exactly as configured, byte-identical to no
 /// sandbox. Present ⇒ [`SandboxMode`] selects the executor: `launcher` prepends a launcher argv so
