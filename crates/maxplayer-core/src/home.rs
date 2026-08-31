@@ -406,6 +406,19 @@ pub fn buyer_pubkey_is_reachable(entry: &str) -> bool {
         && PublicKey::from_hex(entry).is_ok_and(|key| key.xonly().is_ok())
 }
 
+/// The §4.2 admission vocabulary — ONE spelling shared by both admission tags.
+///
+/// `admits_pool` carries [`ADMISSION_OPEN`] or [`ADMISSION_CLOSED`]; `admits_targeted` carries
+/// those two plus [`ADMISSION_NAMED`]. The tags describe different-sized state spaces — only the
+/// targeted surface has three states — but they must not describe them in different WORDS. These
+/// constants are what makes that structural instead of remembered: a second spelling cannot be
+/// introduced by editing one emitter, because there is only one place the words live.
+pub const ADMISSION_OPEN: &str = "open";
+/// Only buyers this seat named. Targeted surface only — the pool has no such state.
+pub const ADMISSION_NAMED: &str = "named";
+/// Admits nobody on this surface.
+pub const ADMISSION_CLOSED: &str = "closed";
+
 /// How this seat admits TARGETED offers — those whose `p` tag names this seat.
 ///
 /// Three states, because the targeted surface has three and a boolean has two. Admission is the
@@ -427,18 +440,18 @@ impl TargetedAdmission {
     /// The §4.2 wire value. One spelling, used by the emitter and the reader alike.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Open => "open",
-            Self::Named => "named",
-            Self::Closed => "closed",
+            Self::Open => ADMISSION_OPEN,
+            Self::Named => ADMISSION_NAMED,
+            Self::Closed => ADMISSION_CLOSED,
         }
     }
 
     /// Read a §4.2 wire value. Unknown text ⇒ `None` — a reader must not guess a policy.
     pub fn from_wire(value: &str) -> Option<Self> {
         match value {
-            "open" => Some(Self::Open),
-            "named" => Some(Self::Named),
-            "closed" => Some(Self::Closed),
+            ADMISSION_OPEN => Some(Self::Open),
+            ADMISSION_NAMED => Some(Self::Named),
+            ADMISSION_CLOSED => Some(Self::Closed),
             _ => None,
         }
     }
@@ -459,6 +472,10 @@ impl TargetedAdmission {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct AdmissionPolicy {
     /// Whether this seat claims UNTARGETED (open-pool) offers: `claim_open_pool`.
+    ///
+    /// A `bool` because the pool surface genuinely has two states — it is spelled
+    /// [`ADMISSION_OPEN`] / [`ADMISSION_CLOSED`] on the wire so both admission tags read in one
+    /// vocabulary, not because it has a third.
     pub pool: bool,
     /// Who this seat admits on the targeted surface.
     pub targeted: TargetedAdmission,
