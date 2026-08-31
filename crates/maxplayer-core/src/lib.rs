@@ -27,6 +27,8 @@ pub mod delivery_git;
 #[cfg(feature = "git-delivery")]
 pub mod git_transport;
 #[cfg(feature = "git-delivery")]
+pub mod delivery_orchestrator;
+#[cfg(feature = "git-delivery")]
 mod store_maint;
 #[cfg(feature = "wallet")]
 pub mod doctor;

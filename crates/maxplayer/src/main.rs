@@ -2,6 +2,8 @@ mod accept_cli;
 mod buyer;
 mod cli;
 mod collect_cli;
+// Container-side delivery orchestrator entrypoint (`maxplayer __deliver …`, Track B). INTERNAL.
+mod deliver_cli;
 #[cfg(feature = "wallet")]
 mod daemon;
 mod doctor;
@@ -20,7 +22,7 @@ mod sell;
 #[cfg(feature = "wallet")]
 mod sandbox_probe;
 // The retired-seat holder reaper (#905). `acp`, not `wallet`: it calls `sandbox_netns::reap_orphans`,
-// which needs the docker runner behind that feature — the same gate the boot reaper carries.
+// which needs the docker runner behind that feature â the same gate the boot reaper carries.
 #[cfg(feature = "acp")]
 mod sandbox_reap;
 #[cfg(feature = "stub-pay")]
