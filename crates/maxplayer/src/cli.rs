@@ -50,6 +50,8 @@ where
         Some("accept") => crate::accept_cli::run(&args[2..], out, err),
         Some("collect") => crate::collect_cli::run(&args[2..], out, err),
         Some("doctor") => crate::doctor::run(&args[2..], out, err),
+        // INTERNAL (Track B): container-side delivery orchestrator. Not advertised in usage.
+        Some("__deliver") => crate::deliver_cli::run(&args[2..], out, err),
         // Run BY the boot gate, inside the configured launcher, to report what the launcher let it
         // do. Reachable by hand too: an operator debugging a sandbox wants to run exactly what the
         // gate runs rather than a description of it.
