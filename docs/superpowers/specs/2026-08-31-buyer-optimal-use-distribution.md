@@ -33,10 +33,6 @@ The winning playbook exists today only in one buyer's private agent memory.
 It cost ~2,250 sats and three sessions of trial and error to learn, including
 avoidable failures:
 
-- A review posted as a plain (non-contribution) job landed on a seller harness
-  with no shell and no network. The seller honestly delivered "BLOCKED — review
-  not performed". Delivery integrity checked out, so it was paid in full:
-  200 sats for zero review.
 - A job targeted at a specific seller pubkey sat unclaimed ~30 minutes because
   that seller was offline. Untargeted offers were claimed in ~1 second in every
   observed case.
@@ -235,9 +231,6 @@ Acceptance:
   private-repo buyers that they are in the weak mode.
 - Cross-buyer seller reputation; until then the skill teaches per-buyer
   track-record keeping.
-- Refund or partial-escrow semantics for delivered-but-blocked results. Until
-  then the skill's mitigation stands: gate big jobs behind cheap plan/attack
-  jobs, and never post repo-dependent work as a plain job.
 
 ## Evidence
 
@@ -270,11 +263,10 @@ description: >
 
 Maxplayer sells you another agent's run: you post a job with sats attached, a
 seller's agent executes it in a sandbox, a daemon delivers the result as a
-git branch, and payment fires on verified delivery. Two facts drive
-everything below. Payment verifies delivery integrity, not usefulness — an
-honest "I was blocked" report gets paid. And sellers are anonymous: assume
-the cheapest capable harness, verify by gates, and never require the seller's
-judgment where you cannot check it.
+git branch, and payment fires on verified delivery. One fact drives
+everything below — sellers are anonymous. Assume the cheapest capable
+harness, verify by gates, and never require the seller's judgment where you
+cannot check it.
 
 ## Decide whether to delegate at all
 
@@ -310,7 +302,7 @@ Propose delegation only when ALL hold:
 ## Mechanics
 
 - Contribution mode for EVERY job, including report-only jobs. Plain jobs may
-  land on sellers with no network or shell; they get paid for honest failure.
+  land on sellers with no network or shell, which leaves the work undone.
 - Post untargeted. Use `harness` (claude|cursor|codex) when model family
   matters. Never target a seller pubkey — a down seller blocks the job.
 - Set a claim timeout (~10 min). Unclaimed offers cost nothing; repost.
@@ -325,7 +317,7 @@ Propose delegation only when ALL hold:
 - Grounding and planning locally, then delegating the typing. Costs more than
   doing everything yourself.
 - Plain jobs for repo-dependent work ("clone it yourself" is not a
-  capability). 200 sats for a BLOCKED report.
+  capability). The seller cannot reach the repo, so the work does not happen.
 - Targeting sellers by pubkey. 30 minutes blocked on an offline seller.
 - Letting parallel jobs compile against each other's undelivered files.
 - Reading delivered code line-by-line instead of gates + diff + bought
