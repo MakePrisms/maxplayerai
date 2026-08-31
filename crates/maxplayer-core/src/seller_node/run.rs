@@ -4468,6 +4468,10 @@ impl SellerNodeRunner {
             self.node.home().config.accepted_mints.clone(),
             roster.names.clone(),
             roster.capability(&self.node.home().config.seat),
+            // Derived from the SAME `SellerConfig` `classify_offer` reads, at announce time. An
+            // operator-set field would be a second place to state one fact, and the ad would drift
+            // from the gate that enforces it.
+            crate::home::AdmissionPolicy::from_seller_config(&seller),
         )
         .to_event_draft();
         self.publish_seat_announcement(draft, "heartbeat").await
@@ -4516,6 +4520,7 @@ impl SellerNodeRunner {
             self.node.home().config.accepted_mints.clone(),
             roster.names.clone(),
             roster.capability(&self.node.home().config.seat),
+            crate::home::AdmissionPolicy::from_seller_config(&seller),
         )
         .to_event_draft();
 
@@ -7725,6 +7730,105 @@ mod tests {
             checked, 32,
             "the matrix must run all 8 control settings x 4 probes — a short count means a row or a \
              probe stopped being exercised"
+        );
+    }
+
+    // THE ADVERTISEMENT MUST SAY WHAT THE GATE DOES. This is the anti-drift binding, and it is the
+    // whole reason the advertised value is DERIVED rather than configured.
+    //
+    // ⛔ NOT VACUOUS, AND THE REASON IS STRUCTURAL: `AdmissionPolicy::from_seller_config` (home.rs)
+    // and `classify_offer` (this file) are independent code with no shared helper. This test asserts
+    // they agree. A test that read the advertisement back out of the gate — or that computed the
+    // expected decision from the policy enum — would prove only that one of them equals itself.
+    //
+    // The meaning of each advertised state is transcribed BY HAND below. That transcription is the
+    // spec's promise in code: `open` promises a stranger gets in, `named` promises the listed buyer
+    // gets in and a stranger does not, `closed` promises neither does.
+    //
+    // ⛔ THE ALLOWLIST ENTRIES HERE ARE REAL 64-HEX x-only KEYS, unlike the short fixtures the
+    // matrix above uses. `classify_offer` compares bytes and does not care — but
+    // `from_seller_config` asks `buyer_pubkey_is_reachable`, so a short fixture would derive
+    // `closed` for a list this gate honours and the two would disagree for a reason that is about
+    // the FIXTURE and not about either code path.
+    //
+    // RED ON REVERT: derive `named` from `accept_offers_only_from.is_empty()` instead of from the
+    // reachability predicate ⇒ the all-unusable row advertises `named` while the gate refuses the
+    // stranger AND has nobody to admit, and the `named` arm's first assertion fails.
+    #[test]
+    fn the_advertised_admission_matches_what_classify_offer_decides() {
+        use crate::home::{AdmissionPolicy, TargetedAdmission};
+
+        // A real secp256k1 x-only key (the generator's x), so it is BOTH reachable and matchable.
+        const LISTED: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        // 64 lowercase hex with no curve point: matchable by bytes, reachable by nobody.
+        const UNUSABLE: &str =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const STRANGER: &str = "dead02";
+
+        let allowlists: [&[&str]; 4] = [&[], &[LISTED], &[UNUSABLE], &[UNUSABLE, LISTED]];
+
+        let mut checked = 0usize;
+        for allowlist in allowlists {
+            for open_targeted in [false, true] {
+                for open_pool in [false, true] {
+                    let mut cfg = seller_cfg(2, open_pool);
+                    cfg.accept_open_targeted = open_targeted;
+                    cfg.accept_offers_only_from =
+                        allowlist.iter().map(|entry| (*entry).to_owned()).collect();
+
+                    let policy = AdmissionPolicy::from_seller_config(&cfg);
+
+                    // The promise each advertised state makes, written out rather than derived.
+                    let (listed_gets_in, stranger_gets_in) = match policy.targeted {
+                        TargetedAdmission::Open => (true, true),
+                        TargetedAdmission::Named => (true, false),
+                        TargetedAdmission::Closed => (false, false),
+                    };
+
+                    let admits = |buyer: &str, target: Option<&str>| {
+                        matches!(
+                            classify_offer(
+                                &offer(5, target, NOW + 600),
+                                &cfg,
+                                &claude_only(),
+                                SELLER,
+                                buyer,
+                                NOW,
+                                NOW
+                            ),
+                            ClaimDecision::Claim { .. }
+                        )
+                    };
+
+                    assert_eq!(
+                        admits(LISTED, Some(SELLER)),
+                        listed_gets_in,
+                        "admits_targeted={} promised {listed_gets_in} for the LISTED buyer, but the \
+                         gate disagreed (list={allowlist:?}, open_targeted={open_targeted})",
+                        policy.targeted.as_str()
+                    );
+                    assert_eq!(
+                        admits(STRANGER, Some(SELLER)),
+                        stranger_gets_in,
+                        "admits_targeted={} promised {stranger_gets_in} for a STRANGER, but the \
+                         gate disagreed (list={allowlist:?}, open_targeted={open_targeted})",
+                        policy.targeted.as_str()
+                    );
+                    assert_eq!(
+                        admits(STRANGER, None),
+                        policy.pool,
+                        "admits_pool={} disagreed with the gate on an UNTARGETED offer \
+                         (list={allowlist:?}, claim_open_pool={open_pool})",
+                        if policy.pool { "y" } else { "n" }
+                    );
+                    checked += 3;
+                }
+            }
+        }
+        assert_eq!(
+            checked, 48,
+            "4 allowlists x 2 targeted x 2 pool x 3 probes — a short count means a case stopped \
+             being exercised"
         );
     }
 

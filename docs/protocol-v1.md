@@ -100,6 +100,8 @@ replaces it on every beat. Every fact below is current as of that beat, EXCEPT `
 | `["queue_depth", n]` | 1 | yes | Jobs the seat currently holds in a non-terminal state |
 | `["accepted_mints", url, ...]` | 1 | yes | Every mint the seat accepts payment on |
 | `["agents", id, ...]` | 0..1 | no | Harnesses the seat can run |
+| `["admits_pool", "y"` or `"n"]` | 0..1 | no | Whether the seat claims untargeted (open-pool) offers |
+| `["admits_targeted", "open"`, `"named"` or `"closed"]` | 0..1 | no | Who the seat admits on the targeted surface |
 | `["harness_family", family, ...]` | 0..1 | no | Harness families the seat serves |
 | `["harness_model", family, model]` | 0..N | no | One resolved model, paired to its family |
 | `["capabilities", token, ...]` | 0..1 | no | Capability tokens the seat proved |
@@ -113,6 +115,58 @@ facts spelled differently: a reader that budgets for four will be one short.
 
 `agents` names the harnesses the seat can run. An absent `agents` tag means the seat states no
 harness. It does not mean the seat can run none.
+
+#### Admission
+
+`admits_pool` and `admits_targeted` state WHO the seat admits, one tag per surface. They exist
+because a seat that advertises, beats, and looks healthy can decline every offer a buyer sends, and
+nothing else on the wire says why.
+
+Both are derived from the seat's effective seller configuration at the moment it publishes. A seat
+MUST NOT let an operator state them directly. An advertisement an operator maintains by hand drifts
+from the behaviour it describes, and a tag that can disagree with the seat's own admission decision
+is worse than no tag.
+
+`admits_pool` answers the untargeted surface, and maps to `claim_open_pool`.
+
+`admits_targeted` answers the surface of offers whose `p` tag names this seat. Admission there is
+the union of two independent controls — the buyers the operator named in `accept_offers_only_from`,
+and `accept_open_targeted` for a buyer it did not name — so the surface has three states and not
+two:
+
+| Value | Meaning | Derived from |
+|---|---|---|
+| `open` | Any buyer may target this seat | `accept_open_targeted = true` |
+| `named` | Only buyers this seat named | `accept_open_targeted = false`, and at least one usable entry in `accept_offers_only_from` |
+| `closed` | The targeted surface admits nobody | `accept_open_targeted = false`, and no usable entry |
+
+An entry in `accept_offers_only_from` is usable only if it can match a buyer pubkey as it arrives on
+the wire: 64 lowercase hex characters that are also a valid secp256k1 x-only key. An entry in any
+other form matches nobody, so a seat whose every entry is unusable publishes `closed` and not
+`named`.
+
+A seat publishing `named` states that a list exists. It MUST NOT publish the list. A reader learns
+that it may or may not be on it, which is what lets a buyer the operator chose to serve try the seat
+instead of reading a refusal that does not apply to it.
+
+**Both tags answer identity and nothing else.** A seat that admits a buyer still refuses an offer
+below its `rate`, still refuses one it has already aged out, and still declines when it cannot run
+the requested harness. A reader MUST NOT read `open` as a promise that any offer is claimable.
+
+Like `accepting`, these are the seat's own statement of intent. A reader MUST NOT treat either as a
+guarantee. The authoritative signal that a seat will take a job is that the seat claims one.
+
+**An absent tag means unknown. It does not mean `n`, and it does not mean `closed`.** A seat that
+predates these tags publishes neither, and so does an implementation that has not adopted them. A
+reader that resolved an absent tag to a refusal would stop using every such seat while its
+announcement said nothing to justify that. A reader that cannot determine a seat's policy SHOULD
+behave as it did before these tags existed.
+
+The two tags are read together. A seat that publishes one without the other, or a value outside the
+sets above, states no policy — a reader MUST NOT infer the missing or unrecognised half.
+
+These tags appear on the announcement ONLY. A reader MUST NOT expect them on a kind `3402` claim: a
+claim already demonstrates admission, because the seat sent it.
 
 `queue_depth` is a live count. It returns to `0` when the seat holds no non-terminal job.
 

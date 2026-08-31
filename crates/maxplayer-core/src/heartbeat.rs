@@ -260,6 +260,25 @@ pub const CAPABILITIES_TAG: &str = "capabilities";
 /// verified was requestable.
 pub const CAPABILITY_PARAM: &str = "capability";
 
+/// `["admits_pool", "y"|"n"]` — whether this seat claims UNTARGETED (open-pool) offers.
+///
+/// Two values, because `claim_open_pool` is one flag no other control interacts with. Absent means
+/// UNSTATED, never `n` — see [`crate::home::AdmissionPolicy`] and §4.2.
+pub const ADMITS_POOL_TAG: &str = "admits_pool";
+
+/// `["admits_targeted", "open"|"named"|"closed"]` — who this seat admits on the TARGETED surface.
+///
+/// THREE VALUES, NOT TWO, and that is the whole point of the tag. Targeted admission is the union
+/// `buyer_is_named || accept_open_targeted`, so `accept_open_targeted = false` with buyers named is
+/// closed to STRANGERS and open to the named. A boolean spells that state and genuinely-closed the
+/// same way, which tells a buyer the operator chose to serve that it will be refused.
+///
+/// `named` discloses that a list EXISTS. It never discloses who is on it, and it appears only when
+/// the public route is off — a seat with `accept_open_targeted = true` publishes `open` and says
+/// nothing about its list.
+pub const ADMITS_TARGETED_TAG: &str = "admits_targeted";
+
+
 /// Wire tag carrying operator colour about the machine (#784) — e.g. "mac studio, 64GB". Free text,
 /// single value.
 ///
@@ -448,6 +467,10 @@ pub struct HeartbeatDraft {
     /// The #784 capability advertisement. Default (all-unstated) emits no new tags at all, so a
     /// seat that has not been taught to fill this publishes exactly the §4.2 tag set it always did.
     pub capability: SeatCapability,
+    /// The seat's admission policy (§4.2), or `None` to state nothing. `None` is the default so a
+    /// caller that has no [`crate::home::SellerConfig`] in hand emits the tag set it always did;
+    /// the production publish paths always have one, so a real seat always answers.
+    pub admission: Option<crate::home::AdmissionPolicy>,
 }
 
 impl HeartbeatDraft {
@@ -464,6 +487,7 @@ impl HeartbeatDraft {
             accepted_mints,
             agents: Vec::new(),
             capability: SeatCapability::default(),
+            admission: None,
         }
     }
 
@@ -476,6 +500,12 @@ impl HeartbeatDraft {
     /// Advertise the seat's #784 capability on this heartbeat.
     pub fn with_capability(mut self, capability: SeatCapability) -> Self {
         self.capability = capability;
+        self
+    }
+
+    /// Advertise the seat's admission policy on this heartbeat (§4.2).
+    pub fn with_admission(mut self, admission: crate::home::AdmissionPolicy) -> Self {
+        self.admission = Some(admission);
         self
     }
 
@@ -501,6 +531,9 @@ impl HeartbeatDraft {
         ];
         if let Some(tag) = agent_tag(&self.agents) {
             tags.push(tag);
+        }
+        if let Some(admission) = self.admission.as_ref() {
+            tags.extend(admission_tags(admission));
         }
         tags.extend(self.capability.filterable_tags());
         tags.extend(self.capability.display_tags());
@@ -691,6 +724,40 @@ pub fn hardware_from_tags(tags: &[TagSpec]) -> Option<String> {
     first_tag_value(tags, HARDWARE_TAG).and_then(stated)
 }
 
+/// The `["admits_pool", …]` and `["admits_targeted", …]` tags for a stated admission policy.
+///
+/// BEAT ONLY — never on a kind-3402 claim. A claim already proves admission (the seat claimed), so
+/// the tag would be redundant by construction there, and a tag on a claim reads as filterable,
+/// which §4.5.1 would then have to earn on provenance. This is a §4.2 intent field like
+/// `accepting`, derived from live state and carried by the announcement alone.
+pub fn admission_tags(admission: &crate::home::AdmissionPolicy) -> Vec<TagSpec> {
+    vec![
+        TagSpec::new([ADMITS_POOL_TAG, if admission.pool { "y" } else { "n" }]),
+        TagSpec::new([ADMITS_TARGETED_TAG, admission.targeted.as_str()]),
+    ]
+}
+
+/// Read the admission policy off a seat announcement's tags. `None` ⇒ the seat STATED NOTHING.
+///
+/// ⛔ **ABSENT IS UNKNOWN. IT IS NEVER "NO".** Every seat running today publishes neither tag, so a
+/// reader that resolved absence to a refusal would silently stop using every existing seller. The
+/// same rule §4.2 already states for the roster: an absent `agents` tag means the seat states no
+/// harness, not that it can run none.
+///
+/// BOTH tags are required for a stated policy, and an unparseable value reads as unstated rather
+/// than as a guess. A half-stated policy is not a state this field has, and inventing the missing
+/// half would put a value on the reader's side that no seat ever published.
+pub fn admission_from_tags(tags: &[TagSpec]) -> Option<crate::home::AdmissionPolicy> {
+    let pool = match first_tag_value(tags, ADMITS_POOL_TAG)? {
+        "y" => true,
+        "n" => false,
+        _ => return None,
+    };
+    let targeted =
+        crate::home::TargetedAdmission::from_wire(first_tag_value(tags, ADMITS_TARGETED_TAG)?)?;
+    Some(crate::home::AdmissionPolicy { pool, targeted })
+}
+
 /// `["<name>", value]` for the single-value free-text tags, or `None` when there is nothing honest
 /// to say. Blank and whitespace-only collapse to `None`: an empty tag on the wire would read as a
 /// stated-but-empty value, and these fields have no such state.
@@ -751,6 +818,7 @@ pub fn heartbeat_for_state(
     accepted_mints: Vec<String>,
     agents: Vec<String>,
     capability: SeatCapability,
+    admission: crate::home::AdmissionPolicy,
 ) -> HeartbeatDraft {
     // The capability arrives already derived, from `LiveRoster::Advertisement::capability()` — the
     // ONE route from a roster read to something emittable. Deriving it here instead would make this
@@ -766,6 +834,11 @@ pub fn heartbeat_for_state(
     )
     .with_agents(agents)
     .with_capability(capability)
+    // Taken as a REQUIRED parameter, not an `Option`, for the reason the models argument is: a
+    // caller that could omit it would publish a seat stating no policy, which is indistinguishable
+    // on the wire from a seat too old to have one. Both publish sites hold the `SellerConfig` this
+    // is derived from, so neither has to reach for a default.
+    .with_admission(admission)
 }
 
 /// The seat's **terminal beat** (#747): the ordinary announcement, published one last time with
@@ -803,6 +876,7 @@ pub fn retraction_for_state(
     accepted_mints: Vec<String>,
     agents: Vec<String>,
     capability: SeatCapability,
+    admission: crate::home::AdmissionPolicy,
 ) -> HeartbeatDraft {
     // `anything_serving = false` BY CONSTRUCTION: nothing serves a seat that is leaving the role. It
     // is passed as a literal, not taken as a parameter, so no caller and no in-flight count can make
@@ -814,6 +888,10 @@ pub fn retraction_for_state(
         accepted_mints,
         agents,
         capability,
+        // The policy rides the terminal beat for the same reason the roster does: leaving the
+        // market is not a claim to have changed who this seat would admit. `accepting=n` is the
+        // field that carries "not taking work", and it is passed as a literal above.
+        admission,
     )
 }
 
@@ -833,6 +911,11 @@ pub struct ParsedHeartbeat {
     /// Advertised harnesses, preference order. Empty ⇒ the seller stated none (the tag was
     /// absent) — NOT a claim that it can run nothing.
     pub agents: Vec<String>,
+    /// The seat's admission policy (§4.2), or `None` when the seat stated none.
+    ///
+    /// ⛔ `None` is UNKNOWN, never a refusal. A seat that predates this tag publishes neither half,
+    /// and a reader that treated that as "admits nobody" would drop every seat running today.
+    pub admission: Option<crate::home::AdmissionPolicy>,
     /// The seat's #784 capability advertisement, read back off the same tags the beat emitted.
     /// Every field defaults to unstated, so a beat from a seat that predates #784 parses to a
     /// [`SeatCapability::default`] rather than failing — that is what lets emitters and readers ship
@@ -967,6 +1050,7 @@ pub fn parse_heartbeat(event: &EventDraft) -> Result<ParsedHeartbeat, HeartbeatP
         rate_sats,
         accepted_mints,
         agents: agents_from_tags(&event.tags),
+        admission: admission_from_tags(&event.tags),
         capability: SeatCapability::from_tags(&event.tags),
     })
 }
@@ -1045,6 +1129,221 @@ mod tests {
         let mut names: Vec<&str> = event.tags.iter().filter_map(TagSpec::first).collect();
         names.sort_unstable();
         names
+    }
+
+    /// The admission policy the pre-existing beat tests pass. None of them asserts on it; it exists
+    /// so the emitter's REQUIRED argument stays required rather than being softened to an `Option`
+    /// for the tests' convenience.
+    const TEST_POLICY: crate::home::AdmissionPolicy = crate::home::AdmissionPolicy {
+        pool: false,
+        targeted: crate::home::TargetedAdmission::Closed,
+    };
+
+    /// A 64-hex string that IS a secp256k1 x-only key: the generator's x-coordinate.
+    #[cfg(feature = "gateway")]
+    const USABLE_BUYER: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+    /// 64 lowercase hex characters with NO curve point. Passes every shape rule and matches nobody
+    /// — the case an `is_empty()` derivation would advertise as `named`.
+    #[cfg(feature = "gateway")]
+    const UNUSABLE_BUYER: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[cfg(feature = "gateway")]
+    fn seller_cfg(
+        claim_open_pool: bool,
+        accept_open_targeted: bool,
+        accept_offers_only_from: &[&str],
+    ) -> crate::home::SellerConfig {
+        crate::home::SellerConfig {
+            agent_command: vec!["echo".into()],
+            rate_sats: 1,
+            git_remote: "https://example.invalid/repo.git".into(),
+            job_timeout_secs: None,
+            agents: Vec::new(),
+            claim_open_pool,
+            accept_open_targeted,
+            accept_offers_only_from: accept_offers_only_from
+                .iter()
+                .map(|entry| (*entry).to_owned())
+                .collect(),
+            offer_backfill_secs: 0,
+            contribution_enabled: true,
+            slots: 1,
+            claim_award_timeout_secs: None,
+        }
+    }
+
+    /// Every reachable admission configuration, against the wire values a seat in it must publish.
+    ///
+    /// ⛔ **THE EXPECTED COLUMNS ARE WRITTEN BY HAND AND MUST STAY THAT WAY.** A test that computed
+    /// them from [`crate::home::AdmissionPolicy::from_seller_config`] — or from the same match arms
+    /// in another spelling — would prove only that the code equals itself, and would stay green
+    /// through every renaming of the states it exists to pin. The tell is a computed expected
+    /// value; there is none below.
+    ///
+    /// The allowlist axis has THREE values, not two. `UNUSABLE_BUYER` is the row that separates a
+    /// correct derivation from a plausible one: an `is_empty()` test passes every other row here.
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn admission_advertisement_table() {
+        // (claim_open_pool, accept_open_targeted, allowlist) -> (admits_pool, admits_targeted)
+        let rows: &[(bool, bool, &[&str], &str, &str)] = &[
+            // No allowlist at all.
+            (false, false, &[], "n", "closed"),
+            (false, true, &[], "n", "open"),
+            (true, false, &[], "y", "closed"),
+            (true, true, &[], "y", "open"),
+            // A usable buyer named.
+            (false, false, &[USABLE_BUYER], "n", "named"),
+            (false, true, &[USABLE_BUYER], "n", "open"),
+            (true, false, &[USABLE_BUYER], "y", "named"),
+            (true, true, &[USABLE_BUYER], "y", "open"),
+            // A populated list whose every entry can never match a wire pubkey. Admits NOBODY.
+            (false, false, &[UNUSABLE_BUYER], "n", "closed"),
+            (false, true, &[UNUSABLE_BUYER], "n", "open"),
+            (true, false, &[UNUSABLE_BUYER], "y", "closed"),
+            (true, true, &[UNUSABLE_BUYER], "y", "open"),
+            // Mixed: one unusable entry does not cancel a usable one.
+            (false, false, &[UNUSABLE_BUYER, USABLE_BUYER], "n", "named"),
+        ];
+
+        for (pool, open_targeted, allowlist, want_pool, want_targeted) in rows {
+            let seller = seller_cfg(*pool, *open_targeted, allowlist);
+            let admission = crate::home::AdmissionPolicy::from_seller_config(&seller);
+            let event = draft(true, 0, 5).with_admission(admission).to_event_draft();
+
+            assert_eq!(
+                first_tag_value(&event.tags, ADMITS_POOL_TAG),
+                Some(*want_pool),
+                "admits_pool for (pool={pool}, open_targeted={open_targeted}, list={allowlist:?})"
+            );
+            assert_eq!(
+                first_tag_value(&event.tags, ADMITS_TARGETED_TAG),
+                Some(*want_targeted),
+                "admits_targeted for (pool={pool}, open_targeted={open_targeted}, list={allowlist:?})"
+            );
+        }
+    }
+
+    /// ⛔ An absent tag is UNKNOWN, and a reader must never resolve it to a refusal.
+    ///
+    /// Every seat running today publishes neither half. A reader that read absence as "admits
+    /// nobody" would silently stop using all of them.
+    #[test]
+    fn an_absent_admission_tag_is_unknown_never_no() {
+        let event = draft(true, 0, 5).to_event_draft();
+        assert!(
+            first_tag_value(&event.tags, ADMITS_POOL_TAG).is_none()
+                && first_tag_value(&event.tags, ADMITS_TARGETED_TAG).is_none(),
+            "a draft that states no policy must emit neither tag"
+        );
+
+        let parsed = parse_heartbeat(&event).expect("a beat with no admission tags still parses");
+        assert_eq!(
+            parsed.admission, None,
+            "absent admission tags must read as UNSTATED, never as a refusal"
+        );
+        assert_eq!(admission_from_tags(&event.tags), None);
+    }
+
+    /// The wire spelling of each state, pinned by hand in both directions.
+    #[test]
+    fn admission_wire_values_round_trip() {
+        use crate::home::{AdmissionPolicy, TargetedAdmission};
+
+        let cases: &[(bool, TargetedAdmission, &str, &str)] = &[
+            (true, TargetedAdmission::Open, "y", "open"),
+            (true, TargetedAdmission::Named, "y", "named"),
+            (true, TargetedAdmission::Closed, "y", "closed"),
+            (false, TargetedAdmission::Open, "n", "open"),
+            (false, TargetedAdmission::Named, "n", "named"),
+            (false, TargetedAdmission::Closed, "n", "closed"),
+        ];
+
+        for (pool, targeted, want_pool, want_targeted) in cases {
+            let policy = AdmissionPolicy {
+                pool: *pool,
+                targeted: *targeted,
+            };
+            let event = draft(true, 0, 5).with_admission(policy).to_event_draft();
+            assert_eq!(
+                first_tag_value(&event.tags, ADMITS_POOL_TAG),
+                Some(*want_pool)
+            );
+            assert_eq!(
+                first_tag_value(&event.tags, ADMITS_TARGETED_TAG),
+                Some(*want_targeted)
+            );
+            assert_eq!(
+                parse_heartbeat(&event).expect("parse").admission,
+                Some(policy),
+                "the reader must recover exactly what the emitter stated"
+            );
+        }
+    }
+
+    /// A half-stated or unparseable policy reads as UNSTATED, never as a guessed half.
+    #[test]
+    fn a_partial_or_unknown_admission_policy_is_unstated() {
+        let base = draft(true, 0, 5).to_event_draft();
+
+        let mut only_pool = base.tags.clone();
+        only_pool.push(TagSpec::new([ADMITS_POOL_TAG, "y"]));
+        assert_eq!(
+            admission_from_tags(&only_pool),
+            None,
+            "a stated pool half with no targeted half is not a policy"
+        );
+
+        let mut only_targeted = base.tags.clone();
+        only_targeted.push(TagSpec::new([ADMITS_TARGETED_TAG, "open"]));
+        assert_eq!(admission_from_tags(&only_targeted), None);
+
+        let mut unknown_value = base.tags.clone();
+        unknown_value.push(TagSpec::new([ADMITS_POOL_TAG, "y"]));
+        unknown_value.push(TagSpec::new([ADMITS_TARGETED_TAG, "maybe"]));
+        assert_eq!(
+            admission_from_tags(&unknown_value),
+            None,
+            "an unrecognised value must not be resolved to a state this build invented"
+        );
+    }
+
+    /// Stating a policy adds exactly two tags, and neither is a filterable claim tag.
+    #[test]
+    fn admission_is_beat_only_and_additive() {
+        let stated = draft(true, 0, 5)
+            .with_admission(crate::home::AdmissionPolicy {
+                pool: true,
+                targeted: crate::home::TargetedAdmission::Open,
+            })
+            .to_event_draft();
+        let unstated = draft(true, 0, 5).to_event_draft();
+
+        let before = tag_names(&unstated);
+        let added: Vec<&str> = tag_names(&stated)
+            .into_iter()
+            .filter(|name| !before.contains(name))
+            .collect();
+        assert_eq!(
+            added,
+            vec![ADMITS_POOL_TAG, ADMITS_TARGETED_TAG],
+            "stating a policy must add exactly the two admission tags and nothing else"
+        );
+
+        // A claim carries `SeatCapability::filterable_tags` and nothing else from this module, so
+        // there is no path by which an admission tag reaches a kind-3402 claim.
+        let filterable: Vec<String> = SeatCapability::default()
+            .filterable_tags()
+            .iter()
+            .filter_map(|tag| tag.first().map(str::to_owned))
+            .collect();
+        assert!(
+            !filterable
+                .iter()
+                .any(|name| name == ADMITS_POOL_TAG || name == ADMITS_TARGETED_TAG),
+            "admission tags must never be filterable claim tags"
+        );
     }
 
     #[test]
@@ -1224,7 +1523,7 @@ mod tests {
 
     #[test]
     fn advertises_every_harness_in_preference_order() {
-        let draft = heartbeat_for_state(0, true, 5, mints(), vec!["claude".into(), "codex".into()], cap(&["claude", "codex"]))
+        let draft = heartbeat_for_state(0, true, 5, mints(), vec!["claude".into(), "codex".into()], cap(&["claude", "codex"]), TEST_POLICY)
             .to_event_draft();
         let tag = first_tag(&draft.tags, "agents").expect("agents tag");
         assert_eq!(tag.0, vec!["agents", "claude", "codex"]);
@@ -1238,8 +1537,11 @@ mod tests {
         // A raw `agent_command` seller has no preset label, so it advertises no roster and the tag
         // is omitted rather than emitted empty. It IS serving (hence `true`), which is why an
         // unstated list must never read as dark.
-        let stated_none = heartbeat_for_state(0, true, 5, mints(), Vec::new(), SeatCapability::default()).to_event_draft();
-        assert_eq!(stated_none, draft(true, 0, 5).to_event_draft());
+        let stated_none = heartbeat_for_state(0, true, 5, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY).to_event_draft();
+        assert_eq!(
+            stated_none,
+            draft(true, 0, 5).with_admission(TEST_POLICY).to_event_draft()
+        );
         assert!(
             first_tag(&stated_none.tags, AGENT_TAG).is_none(),
             "an unstated harness list must omit the tag, never emit it empty"
@@ -1249,7 +1551,7 @@ mod tests {
 
     #[test]
     fn accepting_flips_with_in_flight_state() {
-        let idle = heartbeat_for_state(0, true, 5, mints(), Vec::new(), SeatCapability::default());
+        let idle = heartbeat_for_state(0, true, 5, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY);
         assert!(idle.accepting);
         assert_eq!(idle.queue_depth, 0);
         assert_eq!(
@@ -1257,7 +1559,7 @@ mod tests {
             Some("y")
         );
 
-        let busy = heartbeat_for_state(1, true, 5, mints(), Vec::new(), SeatCapability::default());
+        let busy = heartbeat_for_state(1, true, 5, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY);
         assert!(!busy.accepting);
         assert_eq!(busy.queue_depth, 1);
         assert_eq!(
@@ -1279,7 +1581,7 @@ mod tests {
     #[test]
     fn accepting_requires_a_free_slot_and_something_serving() {
         let accepting_of = |in_flight, serving| {
-            let draft = heartbeat_for_state(in_flight, serving, 5, mints(), Vec::new(), SeatCapability::default()).to_event_draft();
+            let draft = heartbeat_for_state(in_flight, serving, 5, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY).to_event_draft();
             (
                 first_tag_value(&draft.tags, "accepting")
                     .expect("accepting tag")
@@ -1310,7 +1612,7 @@ mod tests {
     #[test]
     fn queue_depth_is_the_depth_not_a_busy_flag() {
         for depth in [2_u32, 3, 17] {
-            let draft = heartbeat_for_state(depth, true, 5, mints(), Vec::new(), SeatCapability::default()).to_event_draft();
+            let draft = heartbeat_for_state(depth, true, 5, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY).to_event_draft();
             assert_eq!(
                 first_tag_value(&draft.tags, "queue_depth"),
                 Some(depth.to_string().as_str()),
@@ -1326,7 +1628,7 @@ mod tests {
         // And the boundary that #313 got wrong in the field: nothing in flight ⇒ available, no
         // matter how much this seat has done in the past. The store-side half of this is
         // `a_store_holding_only_terminal_jobs_reports_none_in_flight`.
-        let free = heartbeat_for_state(0, true, 5, mints(), Vec::new(), SeatCapability::default()).to_event_draft();
+        let free = heartbeat_for_state(0, true, 5, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY).to_event_draft();
         assert_eq!(first_tag_value(&free.tags, "accepting"), Some("y"));
         assert_eq!(first_tag_value(&free.tags, "queue_depth"), Some("0"));
     }
@@ -1337,7 +1639,7 @@ mod tests {
     #[test]
     fn the_terminal_beat_is_accepting_n_whatever_the_seat_was_doing() {
         for in_flight in [0_u32, 1, 9] {
-            let event = retraction_for_state(in_flight, 5, mints(), vec!["claude".into()], cap(&["claude"]))
+            let event = retraction_for_state(in_flight, 5, mints(), vec!["claude".into()], cap(&["claude"]), TEST_POLICY)
                 .to_event_draft();
             assert_eq!(
                 first_tag_value(&event.tags, "accepting"),
@@ -1362,8 +1664,8 @@ mod tests {
     /// it, and the directory would go on reading the old one.
     #[test]
     fn the_terminal_beat_replaces_the_live_one_at_the_same_address() {
-        let live = heartbeat_for_state(0, true, 5, mints(), vec!["claude".into()], cap(&["claude"])).to_event_draft();
-        let terminal = retraction_for_state(0, 5, mints(), vec!["claude".into()], cap(&["claude"])).to_event_draft();
+        let live = heartbeat_for_state(0, true, 5, mints(), vec!["claude".into()], cap(&["claude"]), TEST_POLICY).to_event_draft();
+        let terminal = retraction_for_state(0, 5, mints(), vec!["claude".into()], cap(&["claude"]), TEST_POLICY).to_event_draft();
 
         assert_eq!(first_tag_value(&live.tags, "accepting"), Some("y"));
         assert_eq!(terminal.kind, live.kind, "same kind, or it is not a replacement");
@@ -1815,6 +2117,7 @@ mod tests {
                     observed("codex", "gpt-5.6-terra[medium]"),
                 ],
             ),
+                    TEST_POLICY,
         )
         .to_event_draft();
 
@@ -1839,7 +2142,7 @@ mod tests {
     fn a_seat_that_observed_no_model_emits_no_model_tag() {
         // The default state of every seat before a probe has reported anything. Absent means
         // unstated, and nothing else on the beat shifts because of it.
-        let event = heartbeat_for_state(0, true, 5, mints(), vec!["claude".to_owned()], cap(&["claude"]))
+        let event = heartbeat_for_state(0, true, 5, mints(), vec!["claude".to_owned()], cap(&["claude"]), TEST_POLICY)
             .to_event_draft();
         assert!(harness_models_from_tags(&event.tags).is_empty());
         // The POSITIVE CONTROL for the assertion above: the same event still carries the family, so
@@ -2091,6 +2394,7 @@ mod tests {
             mints(),
             vec!["claude".to_owned(), "my-fork".to_owned(), "codex".to_owned()],
             cap(&["claude", "my-fork", "codex"]),
+                    TEST_POLICY,
         )
         .to_event_draft();
         assert_eq!(agents_from_tags(&event.tags), vec!["claude", "my-fork", "codex"]);
