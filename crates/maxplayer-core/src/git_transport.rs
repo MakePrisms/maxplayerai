@@ -212,7 +212,7 @@ pub fn nip98_authorization_header(
 ) -> Result<String, TransportError> {
     let keys = nostr_sdk::Keys::parse(secret_key_hex)
         .map_err(|error| TransportError::Auth(format!("invalid key: {error}")))?;
-    nip98_authorization_header_with_keys(remote_url, &keys, None)
+    nip98_authorization_header_with_keys(remote_url, &keys, None, None)
 }
 
 /// Build the NIP-98 `Authorization` header from an already-held [`Keys`](nostr_sdk::Keys) instead of
@@ -225,10 +225,17 @@ pub fn nip98_authorization_header(
 /// the first `ref` tag and refuses a push to any other ref, so a token minted for the delivery
 /// branch is worthless if stolen. `refname` must be fully qualified (`refs/heads/…`); the relay
 /// rejects a bare branch name. `None` mints the unscoped header, byte-identical to before.
+///
+/// `expiration_unix`: when `Some(ts)`, add a NIP-40 `["expiration", "<ts>"]` tag. This is the
+/// long-lived-token seam (Task B8): the relay's Requirement B (see the relay brief) accepts a SCOPED
+/// token up to its expiry, so ONE token can cover a full container job instead of the ±60 s default.
+/// Only meaningful together with `ref_scope` — an unscoped token keeps the ±60 s window regardless.
+/// `None` adds no expiration tag (today's behaviour). INERT until the relay honours it.
 pub fn nip98_authorization_header_with_keys(
     remote_url: &str,
     keys: &nostr_sdk::Keys,
     ref_scope: Option<&str>,
+    expiration_unix: Option<i64>,
 ) -> Result<String, TransportError> {
     use base64::Engine as _;
     use nostr_sdk::nips::nip98::{HttpData, HttpMethod};
@@ -241,6 +248,11 @@ pub fn nip98_authorization_header_with_keys(
     if let Some(refname) = ref_scope {
         let tag = Tag::parse(["ref", refname])
             .map_err(|error| TransportError::Auth(format!("invalid ref scope tag: {error}")))?;
+        builder = builder.tag(tag);
+    }
+    if let Some(expiry) = expiration_unix {
+        let tag = Tag::parse(["expiration", &expiry.to_string()])
+            .map_err(|error| TransportError::Auth(format!("invalid expiration tag: {error}")))?;
         builder = builder.tag(tag);
     }
     let event = builder
@@ -697,7 +709,7 @@ mod tests {
         let keys = Keys::generate();
         let remote = "https://relay.example/git/abcdef/repo.git";
         let scope = "refs/heads/maxplayer/abc12345";
-        let header = nip98_authorization_header_with_keys(remote, &keys, Some(scope))
+        let header = nip98_authorization_header_with_keys(remote, &keys, Some(scope), None)
             .expect("build header");
 
         let event = decode_nip98(&header);
@@ -724,7 +736,7 @@ mod tests {
         let keys = Keys::generate();
         let remote = "https://relay.example/git/abcdef/repo.git";
         let header =
-            nip98_authorization_header_with_keys(remote, &keys, None).expect("build header");
+            nip98_authorization_header_with_keys(remote, &keys, None, None).expect("build header");
 
         // Backward-compat guard: with no scope the token carries NO ref tag, so an old relay sees
         // exactly today's event.
@@ -744,12 +756,50 @@ mod tests {
 
         let keys = Keys::generate();
         let header =
-            nip98_authorization_header_with_keys("https://relay.example/git/o/r.git", &keys, Some(&push_ref))
+            nip98_authorization_header_with_keys("https://relay.example/git/o/r.git", &keys, Some(&push_ref), None)
                 .expect("build header");
         assert_eq!(
             ref_tags(&decode_nip98(&header)),
             vec![push_ref],
             "the token scope equals the ref the push uses"
+        );
+    }
+
+    fn expiration_tags(event: &nostr_sdk::Event) -> Vec<String> {
+        event
+            .tags
+            .iter()
+            .filter(|t| t.kind() == nostr_sdk::TagKind::custom("expiration"))
+            .filter_map(|t| t.content().map(str::to_owned))
+            .collect()
+    }
+
+    #[test]
+    fn nip98_header_carries_the_expiration_tag_only_when_set() {
+        use nostr_sdk::Keys;
+        let keys = Keys::generate();
+        let remote = "https://relay.example/git/o/r.git";
+        let scope = "refs/heads/maxplayer/abc12345";
+
+        // The long-lived delivery-token shape (Task B8): scoped + a NIP-40 expiration.
+        let long =
+            nip98_authorization_header_with_keys(remote, &keys, Some(scope), Some(1_700_000_060))
+                .expect("build header");
+        let event = decode_nip98(&long);
+        event.verify().expect("valid signature");
+        assert_eq!(
+            expiration_tags(&event),
+            vec!["1700000060".to_owned()],
+            "one expiration tag with the exact unix ts"
+        );
+        assert_eq!(ref_tags(&event), vec![scope.to_owned()], "scope tag unchanged");
+
+        // None ⇒ no expiration tag (today's short-lived token). Backward-compat guard.
+        let short = nip98_authorization_header_with_keys(remote, &keys, Some(scope), None)
+            .expect("build header");
+        assert!(
+            expiration_tags(&decode_nip98(&short)).is_empty(),
+            "no expiration tag when unset"
         );
     }
 

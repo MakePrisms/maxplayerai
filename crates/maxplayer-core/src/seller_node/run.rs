@@ -6127,7 +6127,7 @@ impl SellerNodeRunner {
         // stays confined to the actor + the authenticated relay client, never re-read here. A
         // public/anonymous https remote takes no header (auth applies to relay-git remotes only).
         let push_header = if crate::delivery_transport::is_relay_git_locator(&seller.git_remote) {
-            match self.node.signer().http_auth_header(seller.git_remote.clone(), Some(push_ref.clone())).await {
+            match self.node.signer().http_auth_header(seller.git_remote.clone(), Some(push_ref.clone()), None).await {
                 Ok(Ok(header)) => Some(header),
                 Ok(Err(error)) => {
                     opline!("seller node execute fail job_id={job_id}: push auth sign failed ({error})");
