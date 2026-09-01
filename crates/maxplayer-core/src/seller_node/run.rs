@@ -7819,7 +7819,7 @@ mod tests {
                         policy.pool,
                         "admits_pool={} disagreed with the gate on an UNTARGETED offer \
                          (list={allowlist:?}, claim_open_pool={open_pool})",
-                        if policy.pool { "y" } else { "n" }
+                        if policy.pool { "open" } else { "closed" }
                     );
                     checked += 3;
                 }

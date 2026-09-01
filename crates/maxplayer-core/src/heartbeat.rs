@@ -260,10 +260,12 @@ pub const CAPABILITIES_TAG: &str = "capabilities";
 /// verified was requestable.
 pub const CAPABILITY_PARAM: &str = "capability";
 
-/// `["admits_pool", "y"|"n"]` — whether this seat claims UNTARGETED (open-pool) offers.
+/// `["admits_pool", "open"|"closed"]` — whether this seat claims UNTARGETED (open-pool) offers.
 ///
-/// Two values, because `claim_open_pool` is one flag no other control interacts with. Absent means
-/// UNSTATED, never `n` — see [`crate::home::AdmissionPolicy`] and §4.2.
+/// Two values, because `claim_open_pool` is one flag no other control interacts with. It shares its
+/// vocabulary with [`ADMITS_TARGETED_TAG`] so the two admission tags read alike; the shared words
+/// are [`crate::home::ADMISSION_OPEN`] and [`crate::home::ADMISSION_CLOSED`]. Absent means
+/// UNSTATED, never `closed` — see [`crate::home::AdmissionPolicy`] and §4.2.
 pub const ADMITS_POOL_TAG: &str = "admits_pool";
 
 /// `["admits_targeted", "open"|"named"|"closed"]` — who this seat admits on the TARGETED surface.
@@ -732,7 +734,14 @@ pub fn hardware_from_tags(tags: &[TagSpec]) -> Option<String> {
 /// `accepting`, derived from live state and carried by the announcement alone.
 pub fn admission_tags(admission: &crate::home::AdmissionPolicy) -> Vec<TagSpec> {
     vec![
-        TagSpec::new([ADMITS_POOL_TAG, if admission.pool { "y" } else { "n" }]),
+        TagSpec::new([
+            ADMITS_POOL_TAG,
+            if admission.pool {
+                crate::home::ADMISSION_OPEN
+            } else {
+                crate::home::ADMISSION_CLOSED
+            },
+        ]),
         TagSpec::new([ADMITS_TARGETED_TAG, admission.targeted.as_str()]),
     ]
 }
@@ -749,8 +758,8 @@ pub fn admission_tags(admission: &crate::home::AdmissionPolicy) -> Vec<TagSpec> 
 /// half would put a value on the reader's side that no seat ever published.
 pub fn admission_from_tags(tags: &[TagSpec]) -> Option<crate::home::AdmissionPolicy> {
     let pool = match first_tag_value(tags, ADMITS_POOL_TAG)? {
-        "y" => true,
-        "n" => false,
+        crate::home::ADMISSION_OPEN => true,
+        crate::home::ADMISSION_CLOSED => false,
         _ => return None,
     };
     let targeted =
@@ -1189,22 +1198,22 @@ mod tests {
         // (claim_open_pool, accept_open_targeted, allowlist) -> (admits_pool, admits_targeted)
         let rows: &[(bool, bool, &[&str], &str, &str)] = &[
             // No allowlist at all.
-            (false, false, &[], "n", "closed"),
-            (false, true, &[], "n", "open"),
-            (true, false, &[], "y", "closed"),
-            (true, true, &[], "y", "open"),
+            (false, false, &[], "closed", "closed"),
+            (false, true, &[], "closed", "open"),
+            (true, false, &[], "open", "closed"),
+            (true, true, &[], "open", "open"),
             // A usable buyer named.
-            (false, false, &[USABLE_BUYER], "n", "named"),
-            (false, true, &[USABLE_BUYER], "n", "open"),
-            (true, false, &[USABLE_BUYER], "y", "named"),
-            (true, true, &[USABLE_BUYER], "y", "open"),
+            (false, false, &[USABLE_BUYER], "closed", "named"),
+            (false, true, &[USABLE_BUYER], "closed", "open"),
+            (true, false, &[USABLE_BUYER], "open", "named"),
+            (true, true, &[USABLE_BUYER], "open", "open"),
             // A populated list whose every entry can never match a wire pubkey. Admits NOBODY.
-            (false, false, &[UNUSABLE_BUYER], "n", "closed"),
-            (false, true, &[UNUSABLE_BUYER], "n", "open"),
-            (true, false, &[UNUSABLE_BUYER], "y", "closed"),
-            (true, true, &[UNUSABLE_BUYER], "y", "open"),
+            (false, false, &[UNUSABLE_BUYER], "closed", "closed"),
+            (false, true, &[UNUSABLE_BUYER], "closed", "open"),
+            (true, false, &[UNUSABLE_BUYER], "open", "closed"),
+            (true, true, &[UNUSABLE_BUYER], "open", "open"),
             // Mixed: one unusable entry does not cancel a usable one.
-            (false, false, &[UNUSABLE_BUYER, USABLE_BUYER], "n", "named"),
+            (false, false, &[UNUSABLE_BUYER, USABLE_BUYER], "closed", "named"),
         ];
 
         for (pool, open_targeted, allowlist, want_pool, want_targeted) in rows {
@@ -1252,12 +1261,12 @@ mod tests {
         use crate::home::{AdmissionPolicy, TargetedAdmission};
 
         let cases: &[(bool, TargetedAdmission, &str, &str)] = &[
-            (true, TargetedAdmission::Open, "y", "open"),
-            (true, TargetedAdmission::Named, "y", "named"),
-            (true, TargetedAdmission::Closed, "y", "closed"),
-            (false, TargetedAdmission::Open, "n", "open"),
-            (false, TargetedAdmission::Named, "n", "named"),
-            (false, TargetedAdmission::Closed, "n", "closed"),
+            (true, TargetedAdmission::Open, "open", "open"),
+            (true, TargetedAdmission::Named, "open", "named"),
+            (true, TargetedAdmission::Closed, "open", "closed"),
+            (false, TargetedAdmission::Open, "closed", "open"),
+            (false, TargetedAdmission::Named, "closed", "named"),
+            (false, TargetedAdmission::Closed, "closed", "closed"),
         ];
 
         for (pool, targeted, want_pool, want_targeted) in cases {
@@ -1288,7 +1297,7 @@ mod tests {
         let base = draft(true, 0, 5).to_event_draft();
 
         let mut only_pool = base.tags.clone();
-        only_pool.push(TagSpec::new([ADMITS_POOL_TAG, "y"]));
+        only_pool.push(TagSpec::new([ADMITS_POOL_TAG, "open"]));
         assert_eq!(
             admission_from_tags(&only_pool),
             None,
@@ -1300,13 +1309,29 @@ mod tests {
         assert_eq!(admission_from_tags(&only_targeted), None);
 
         let mut unknown_value = base.tags.clone();
-        unknown_value.push(TagSpec::new([ADMITS_POOL_TAG, "y"]));
+        unknown_value.push(TagSpec::new([ADMITS_POOL_TAG, "open"]));
         unknown_value.push(TagSpec::new([ADMITS_TARGETED_TAG, "maybe"]));
         assert_eq!(
             admission_from_tags(&unknown_value),
             None,
             "an unrecognised value must not be resolved to a state this build invented"
         );
+
+        // NO COMPATIBILITY ALIAS, DELIBERATELY. An earlier draft of this tag spelled the pool
+        // surface `y`/`n`; nothing ever published it, so there is no reader to keep and an alias
+        // would put two spellings on the wire permanently for an empty set. This row is what stops
+        // one being added back as a kindness.
+        for legacy in ["y", "n"] {
+            let mut aliased = base.tags.clone();
+            aliased.push(TagSpec::new([ADMITS_POOL_TAG, legacy]));
+            aliased.push(TagSpec::new([ADMITS_TARGETED_TAG, "open"]));
+            assert_eq!(
+                admission_from_tags(&aliased),
+                None,
+                "`{legacy}` must not be accepted on the pool tag — the wire vocabulary is \
+                 open/named/closed and nothing ever published the old spelling"
+            );
+        }
     }
 
     /// Stating a policy adds exactly two tags, and neither is a filterable claim tag.

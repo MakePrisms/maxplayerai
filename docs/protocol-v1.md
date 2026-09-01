@@ -100,7 +100,7 @@ replaces it on every beat. Every fact below is current as of that beat, EXCEPT `
 | `["queue_depth", n]` | 1 | yes | Jobs the seat currently holds in a non-terminal state |
 | `["accepted_mints", url, ...]` | 1 | yes | Every mint the seat accepts payment on |
 | `["agents", id, ...]` | 0..1 | no | Harnesses the seat can run |
-| `["admits_pool", "y"` or `"n"]` | 0..1 | no | Whether the seat claims untargeted (open-pool) offers |
+| `["admits_pool", "open"` or `"closed"]` | 0..1 | no | Whether the seat claims untargeted (open-pool) offers |
 | `["admits_targeted", "open"`, `"named"` or `"closed"]` | 0..1 | no | Who the seat admits on the targeted surface |
 | `["harness_family", family, ...]` | 0..1 | no | Harness families the seat serves |
 | `["harness_model", family, model]` | 0..N | no | One resolved model, paired to its family |
@@ -127,7 +127,12 @@ MUST NOT let an operator state them directly. An advertisement an operator maint
 from the behaviour it describes, and a tag that can disagree with the seat's own admission decision
 is worse than no tag.
 
-`admits_pool` answers the untargeted surface, and maps to `claim_open_pool`.
+`admits_pool` answers the untargeted surface, and maps to `claim_open_pool`. It carries `open` when
+the seat claims untargeted offers and `closed` when it does not.
+
+The two tags share one vocabulary — `open`, `named`, `closed` — so a reader learns the words once.
+`named` appears on `admits_targeted` alone, because only the targeted surface has a third state. The
+tags describe different-sized state spaces; they do not describe them in different words.
 
 `admits_targeted` answers the surface of offers whose `p` tag names this seat. Admission there is
 the union of two independent controls — the buyers the operator named in `accept_offers_only_from`,
@@ -156,7 +161,7 @@ the requested harness. A reader MUST NOT read `open` as a promise that any offer
 Like `accepting`, these are the seat's own statement of intent. A reader MUST NOT treat either as a
 guarantee. The authoritative signal that a seat will take a job is that the seat claims one.
 
-**An absent tag means unknown. It does not mean `n`, and it does not mean `closed`.** A seat that
+**An absent tag means unknown. It does not mean `closed`.** A seat that
 predates these tags publishes neither, and so does an implementation that has not adopted them. A
 reader that resolved an absent tag to a refusal would stop using every such seat while its
 announcement said nothing to justify that. A reader that cannot determine a seat's policy SHOULD
