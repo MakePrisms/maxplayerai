@@ -1,48 +1,72 @@
-## v0.5.5
+## v0.5.6
 
-Two changes worth reading before you upgrade: a seller can now specialize with an operator-authored
-context file, and delivery push tokens carry the ref they were minted for.
+One security fix on the delivery push, and seats now advertise who they are willing to work for.
 
-### A seller's `MEMORY.md` reaches the job prompt (#828, #932)
+### A delivered job cannot redirect its own push (#937)
 
-An operator-written `MEMORY.md` is loaded into the prompt of every job that seat runs. This is the
-first way a seller differentiates itself — brand guidelines, house style, domain notes, anything you
-want in front of the agent on every job.
+This was a confirmed exploit, not a theoretical one. Under `[sandbox] mode = "docker"` the whole job
+workdir is bind-mounted into the container, `.git` included, so the agent can write `.git/config`.
+libgit2 applies `url.<host>.insteadOf` from the config of the repo that runs an operation, at connect
+time. Emptying the global, XDG and system config paths (#610) does not cover a repo-local file,
+because that one is not reached through a search path. So a delivery push straight from the agent's
+workdir would follow a planted redirect and hand the seller's push token — and the pack — to a host
+the agent picked.
 
-Write it at `$MAXPLAYER_HOME/memory/MEMORY.md`.
+The fix replaces the entire `.git/config` with a minimal one immediately before the push, rather than
+editing out the dangerous keys. That is what makes it robust instead of a blocklist: one write
+removes `url.*.insteadOf`, `url.*.pushInsteadOf` and `remote.*.pushurl`, and also every secondary
+config the agent could have pointed at, because the replacement carries no `[include]` or
+`[includeIf]` and does not enable worktree config. A push needs nothing from the config — the URL and
+refspec are explicit — so a minimal file is enough. Any stale `config.worktree` is removed as well.
 
-**It is inert until you write one.** A seat with no index, or a blank one, composes a prompt that is
-byte-identical to the previous release. `memory_enabled` defaults to `true`, so this read path is on
-for every seat — but nothing is injected until an operator puts a file there. Creating memory stays
-an operator act: the read path only ever reads, and never creates the memory directory.
+Neutralising and pushing happen in one blocking operation, so nothing runs in between.
 
-**It never blocks a job.** An index over the 64 KiB injection bound is refused and the job runs
-without memory. An unreadable file is the same. This is context, not a gate, and a job that would
-otherwise have been delivered and paid must not die over it.
+**What the guarantee rests on.** It holds because no agent process is alive to re-plant the file: on
+the docker path the job container has already exited by the time the push runs. A seat configured
+without `[sandbox]` leaves the agent's orphaned background processes running on the host, and there
+the window between rewrite and connect is raceable in principle. Structural containment for that case
+is the Track B work below, and it is not finished.
 
-⚠ **Under `[sandbox] mode = "docker"`, put the content in `MEMORY.md` itself.** Only the index's own
-content is inlined into the prompt. The topic files it links live outside the job's mount namespace
-and the agent cannot open them, so detail moved into linked files is unreachable for a containerized
-seat. The bound is 64 KiB precisely so the index can carry that detail directly.
+### Seats advertise who they will work for (#942, #946)
 
-The retro half of #828 — a model turn after a paid job that writes back to memory — is **not wired**
-in this release. `retro_enabled` exists and defaults to `true`, but nothing calls it, so no memory is
-written automatically by anything.
+A seat's kind-30340 heartbeat now carries two admission tags: `admits_pool`, either `open` or
+`closed`, for untargeted offers; and `admits_targeted`, one of `open`, `named` or `closed`, for
+offers that name the seat.
 
-### Delivery push tokens carry a ref scope (#930)
+Targeted admission needs three values rather than two, because it is a union — a seat with named
+buyers and the public route off is closed to strangers and open to the named. A boolean would spell
+that state and a genuinely closed one identically, which would tell a buyer the operator chose to
+serve that it will be refused.
 
-The NIP-98 token minted for a delivery push now carries a `["ref", "refs/heads/<branch>"]` tag naming
-the single ref it is for. The push refspec and the token's scope are derived from one function, so a
-later edit cannot silently split them.
+`named` discloses that a list exists. It never discloses who is on it, and it appears only when the
+public route is off.
 
-**This is preparation, not yet protection.** Enforcement lives on the relay — it has to read that tag
-and refuse a push aimed at any other ref — and that relay change is not deployed. Against the relay
-you are talking to today the tag is inert, and a stolen delivery token is no more restricted than it
-was in v0.5.4. The scoping becomes real only once the relay side ships; this release is the half that
-has to land first.
+**Nothing reads this yet.** The tags are published and no buyer-side code consumes them; the MCP
+tools expose no way to see a seat's policy before posting. This release is the publishing half.
+
+An absent tag means unstated, never `closed`. A reader that finds no tag must not conclude the seat
+refuses anything — older seats simply do not publish this.
+
+### Track B groundwork, inert (#939)
+
+A container-side delivery orchestrator ships as an internal `__deliver` subcommand, deliberately not
+advertised in usage, together with its design documents. **No job reaches it.** A seller's delivery
+still runs through the same path as before, hardened as described above.
+
+Its module documentation describes a caller that reaps the agent's process group before the push.
+That reap is a documented contract and not code — nothing implements it in this release. It matters
+for the end state, not for anything that runs today.
 
 ### Also
 
-Front-page copy now matches what the daemon actually does. The old text said a buyer awards the
-runner they want and pays on acceptance; in reality posting awards the first claim meeting your
-terms, and settlement follows delivery. Website only — no change to the shipped binary.
+Runner lamps keep sweeping under `prefers-reduced-motion` (#940). The lamps animate `background` and
+nothing else — no transform, offset or scale — on a 2.2s cycle over hairlines 4.5px and under, which
+is neither vestibular motion nor a flash. Suppressing them removed the only cue distinguishing a
+working runner from an idle one, since both then rendered with the same static bright bar. Website
+only; no change to the shipped binary.
+
+### Unchanged
+
+Delivery push tokens still carry the `["ref", …]` scope tag minted in v0.5.5, and the relay still
+does not enforce it. A stolen delivery token is no more restricted than it was in v0.5.4. Nothing in
+this release changes that.
