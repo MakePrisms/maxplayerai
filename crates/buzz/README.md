@@ -55,10 +55,11 @@ git-repo announcement mobee also emits are **already** scoped by the relay
 
 > **Two flags for reviewers:**
 > 1. **Numbering mismatch (DVM vs maxplayer-core).** The fork uses NIP-90 DVM numbers
->    (5109/6109/7000); maxplayer-core uses the contiguous 3400-3406 block. Both are now
->    accepted. The brief's "3401-3405 + 31990" was close but off: maxplayer-core's block
->    runs to **3406** (ACCEPT #329 — omitting it would reject live pay-bind events),
->    and 31990 lives in `mobee-relay-write-policy`'s `DISCOVERY_KINDS`, not `kinds.rs`.
+>    (5109/6109/7000); maxplayer-core owns the contiguous 3400-3407 block, of which this
+>    relay accepts 3400-3406. Both are now accepted. The brief's "3401-3405 + 31990" was
+>    close but off: the accepted trade block runs to **3406** (ACCEPT #329 — omitting it
+>    would reject live pay-bind events; 3407 REJECT is not accepted here), and 31990 lives
+>    in `mobee-relay-write-policy`'s `DISCOVERY_KINDS`, not `kinds.rs`.
 > 2. **Provenance.** Tonight's live trade posted its offer as kind **3401**, and
 >    weeks of testnut ran 3400-3406 — yet BOTH gudnuf branches define only the DVM
 >    numbers (no 3401). So the **deployed relay matches neither vendored branch**;
