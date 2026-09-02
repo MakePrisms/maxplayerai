@@ -56,8 +56,8 @@ const KIND_MOBEE_JOB_FEEDBACK: u32 = 7000;
 
 // Mobee trade path — the contiguous mobee-owned block 3400-3406, plus the
 // addressable seller heartbeat (30340) and the NIP-89 handler advertisement
-// (31990) that mobee-core writers emit on the wire. Mirrors the authoritative
-// registry in maxplayerai crates/mobee-core/src/kinds.rs (3400 RECEIPT is shared
+// (31990), which historical maxplayer-core writers emitted on the wire. The trade
+// registry mirrors maxplayerai crates/maxplayer-core/src/kinds.rs (3400 RECEIPT is shared
 // with the DVM const above; kind-0 profile and the 30617 git-repo announcement
 // mobee also emits are already scoped by KIND_PROFILE / KIND_GIT_REPO_ANNOUNCEMENT).
 const KIND_MOBEE_TRADE_OFFER: u32 = 3401;
@@ -347,7 +347,7 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         | KIND_MOBEE_JOB_RESULT
         | KIND_MOBEE_JOB_FEEDBACK
         | KIND_MOBEE_JOB_RECEIPT => Ok(Scope::MessagesWrite),
-        // Mobee trade path (mobee-core kind registry): buyer/seller trade events
+        // Mobee trade path (maxplayer-core kind registry): buyer/seller trade events
         // plus the seller liveness heartbeat — authenticated writes by mobee
         // buyers/sellers.
         KIND_MOBEE_TRADE_OFFER
@@ -2802,7 +2802,7 @@ mod tests {
         // The deployed mobee protocol is the contiguous 3400-3406 trade block plus
         // 30340 heartbeat, 31990 NIP-89 discovery, and 10050 NIP-17 DM-relay list.
         // Asserting KIND_MOBEE_TRADE_OFFER (3401) is the load-bearing acceptance
-        // check: 3401 discriminates the mobee-core scheme from the fork's DVM-only
+        // check: 3401 discriminates the maxplayer-core scheme from the fork's DVM-only
         // numbering (3400 is shared by both, so a 3400-only assertion would green
         // over the wrong property).
         for kind in [

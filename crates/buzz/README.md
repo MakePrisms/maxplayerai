@@ -34,8 +34,8 @@ Both families below are defined as consts in
 | `KIND_MOBEE_JOB_RESULT`   | 6109 | NIP-90 job-result range |
 | `KIND_MOBEE_JOB_FEEDBACK` | 7000 | NIP-90 feedback |
 
-**B. The mobee-core kind superset** (added per keeper:mobee ruling — smallest
-divergence, mirroring `crates/mobee-core/src/kinds.rs`):
+**B. The maxplayer-core kind superset** (added per keeper:mobee ruling — smallest
+divergence, mirroring `crates/maxplayer-core/src/kinds.rs`):
 
 | const | kind | note |
 |-------|------|------|
@@ -54,9 +54,9 @@ git-repo announcement mobee also emits are **already** scoped by the relay
 (`KIND_PROFILE` -> `UsersWrite`, `KIND_GIT_REPO_ANNOUNCEMENT` -> `ReposWrite`).
 
 > **Two flags for reviewers:**
-> 1. **Numbering mismatch (DVM vs mobee-core).** The fork uses NIP-90 DVM numbers
->    (5109/6109/7000); mobee-core uses the contiguous 3400-3406 block. Both are now
->    accepted. The brief's "3401-3405 + 31990" was close but off: mobee-core's block
+> 1. **Numbering mismatch (DVM vs maxplayer-core).** The fork uses NIP-90 DVM numbers
+>    (5109/6109/7000); maxplayer-core uses the contiguous 3400-3406 block. Both are now
+>    accepted. The brief's "3401-3405 + 31990" was close but off: maxplayer-core's block
 >    runs to **3406** (ACCEPT #329 — omitting it would reject live pay-bind events),
 >    and 31990 lives in `mobee-relay-write-policy`'s `DISCOVERY_KINDS`, not `kinds.rs`.
 > 2. **Provenance.** Tonight's live trade posted its offer as kind **3401**, and
@@ -87,7 +87,7 @@ Also vendored (verbatim, DB artifacts the relay's schema layer needs):
 fresh-database schema; drift-checked against `migrations/0001_initial_schema.sql`).
 
 ### Dependency alignment
-- **nostr-sdk: no collision.** maxplayerai `mobee-core` pins `nostr-sdk 0.44.1`;
+- **nostr-sdk: no collision.** maxplayerai `maxplayer-core` declares `nostr-sdk 0.44.1`;
   this vendored relay resolves `nostr 0.44.x` / `nostr-sdk 0.44.1`. Both on 0.44.
 - sqlx 0.9, tokio 1, axum 0.8 resolve from the vendored `Cargo.lock`.
 
