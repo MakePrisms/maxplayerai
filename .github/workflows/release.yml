@@ -431,14 +431,13 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           # No NODE_AUTH_TOKEN goes with this — it only points npm at the public registry, which is
           # also where OIDC exchange happens.
           registry-url: https://registry.npmjs.org
 
-      # Pinned to the 11 line: @latest crossed into npm@12, whose engine floor (node >=22) rejects
-      # the node this job runs — and an install-time engine refusal here fails the publish before
-      # any OIDC exchange happens.
+      # Pinned to the 11 line: @latest would silently move the publish onto an npm this release path
+      # has never been proven on.
       # Trusted publishing landed in npm 11.5; the npm bundled with any current setup-node runtime is
       # older than that and would fall back to looking for a token that no longer exists.
       - name: Upgrade npm for trusted publishing
@@ -537,11 +536,12 @@ jobs:
       # here. What gets published is only what the next step writes.
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           registry-url: https://registry.npmjs.org
 
-      # Same pin as the publish job: trusted publishing landed in npm 11.5, and npm@12's engine
-      # floor rejects node 20. A probe on a different npm would exercise a different path.
+      # Same pin as the publish job: trusted publishing landed in npm 11.5, and @latest would drift
+      # off the npm the release path is proven on. A probe on a different npm would exercise a
+      # different path.
       - name: Upgrade npm for trusted publishing
         run: npm install -g npm@11
 
