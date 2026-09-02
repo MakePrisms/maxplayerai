@@ -36,7 +36,7 @@ block/buzz stays meaningful and upstream commits remain scannable/pullable.
 
 3. `crates/buzz-relay/src/handlers/ingest.rs` — two additions, each marked inline
    with a comment:
-   (a) the mobee-core kind superset: `KIND_MOBEE_*` consts plus
+   (a) the kind superset from maxplayer-core (formerly attributed to the Mobee crate): `KIND_MOBEE_*` consts plus
        `required_scope_for_kind` arms — the trade block 3401-3406 and the seller
        heartbeat 30340 -> `MessagesWrite`; the self-describing discovery/config
        kinds (NIP-89 handler 31990, NIP-17 DM-relay list 10050) -> `UsersWrite`
