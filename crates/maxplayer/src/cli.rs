@@ -25,8 +25,10 @@ where
 {
     let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
     match args.get(1).map(String::as_str) {
+        // #818: both arms print the SAME line, built by one function, so the build stamp cannot be
+        // present on the form a release verifier probes and absent on the one a stranger types.
         Some("version" | "--version") if args.len() == 2 => {
-            let _ = writeln!(out, "maxplayer {}", maxplayer_core::version());
+            let _ = writeln!(out, "{}", crate::build_stamp::version_line());
             SUCCESS
         }
         Some("--help") if args.len() == 2 => {
@@ -545,7 +547,14 @@ mod tests {
 
         let (code, out, err) = run_captured(["maxplayer", "version"]);
         assert_eq!(code, 0);
-        assert_eq!(out, format!("maxplayer {}\n", maxplayer_core::version()));
+        assert_eq!(
+            out,
+            format!(
+                "maxplayer {} ({})\n",
+                maxplayer_core::version(),
+                crate::build_stamp::build_commit()
+            )
+        );
         assert!(err.is_empty());
     }
 
@@ -558,7 +567,14 @@ mod tests {
 
         let (code, out, err) = run_captured(["maxplayer", "--version"]);
         assert_eq!(code, 0);
-        assert_eq!(out, format!("maxplayer {}\n", maxplayer_core::version()));
+        assert_eq!(
+            out,
+            format!(
+                "maxplayer {} ({})\n",
+                maxplayer_core::version(),
+                crate::build_stamp::build_commit()
+            )
+        );
         assert!(err.is_empty());
 
         // Trailing arguments are still a usage error, so `--help` cannot swallow a mistyped command.
@@ -566,6 +582,54 @@ mod tests {
         assert_eq!(code, 1);
         assert!(out.is_empty());
         assert!(err.contains("Usage:"));
+    }
+
+    /// #818: the shape of the stamp, read off what the command PRINTS rather than off the accessor
+    /// it prints from — a test that asks `build_commit()` about `build_commit()` would pass on a
+    /// binary whose version arm never reached it.
+    ///
+    /// Two properties, and only the two the issue's acceptance can be held to at build time. The
+    /// stamp is 40 lowercase hex or the literal `unknown`: nothing else, so the class of value #818
+    /// measured (a 40-hex string that resolves to no commit, or the `0000111122223333…` noise beside
+    /// it) cannot be produced by a padded, zeroed or truncated value. And both dispatch arms print
+    /// the SAME line — the arm a release verifier probes and the arm a stranger types are separate
+    /// code, so agreement is a claim that has to be measured, not assumed.
+    ///
+    /// Whether the sha RESOLVES to a commit is not assertable here (a test binary knows nothing
+    /// about the repo it was built from); that half of the acceptance is
+    /// `scripts/verify-release-version.sh`, which holds a release artifact to `git cat-file -t`.
+    #[test]
+    fn version_carries_a_build_stamp_in_both_forms() {
+        let (code, subcommand, _) = run_captured(["maxplayer", "version"]);
+        assert_eq!(code, 0);
+        let (code, flag, _) = run_captured(["maxplayer", "--version"]);
+        assert_eq!(code, 0);
+        assert_eq!(
+            subcommand, flag,
+            "`version` and `--version` printed different lines"
+        );
+
+        let line = subcommand.trim_end_matches('\n');
+        let stamp = line
+            .strip_prefix(&format!("maxplayer {} (", maxplayer_core::version()))
+            .and_then(|rest| rest.strip_suffix(')'))
+            .unwrap_or_else(|| {
+                panic!("`{line}` is not `maxplayer <version> (<stamp>)`");
+            });
+
+        if stamp != "unknown" {
+            assert_eq!(
+                stamp.len(),
+                40,
+                "stamp `{stamp}` is neither `unknown` nor a 40-character sha"
+            );
+            assert!(
+                stamp
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+                "stamp `{stamp}` is not lowercase hex"
+            );
+        }
     }
 
     // ---- #570: `--help` on every subcommand exits 0 with usage on stdout and no side effects ----

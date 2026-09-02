@@ -23,6 +23,14 @@ WORKDIR /src
 # and docs so the build context stays small.
 COPY . .
 
+# #818: `.dockerignore` strips `.git/`, so the build script in this stage has no repository to read
+# and would stamp every image `(unknown)`. The caller is the only one who knows, so it says so:
+#   docker build --build-arg MAXPLAYER_BUILD_COMMIT="$(git rev-parse HEAD)" .
+# `ENV` as well as `ARG` because the value has to reach `cargo` itself, not just this Dockerfile.
+# Left unsupplied the image still builds and prints an honest `(unknown)` — never a made-up sha.
+ARG MAXPLAYER_BUILD_COMMIT=
+ENV MAXPLAYER_BUILD_COMMIT=${MAXPLAYER_BUILD_COMMIT}
+
 # Release build of just the `maxplayer` binary.
 #   acp    — REQUIRED for agent-backed job execution (not in the default set).
 #   wallet — default feature; named explicitly for clarity.
