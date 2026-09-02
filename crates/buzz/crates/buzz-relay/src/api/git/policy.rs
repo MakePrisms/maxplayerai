@@ -64,6 +64,17 @@ pub struct HookCallbackRequest {
     pub pusher_pubkey: String,
     /// Ref updates from git stdin (old_oid, new_oid, ref_name, is_ancestor).
     pub ref_updates: Vec<HookRefUpdate>,
+    /// The single ref this push token is scoped to, or empty for an unscoped token.
+    ///
+    /// Carried from the `["ref", <refname>]` tag on the signed NIP-98 event, through the
+    /// hook env, and HMAC-bound like every other field. Empty means today's behaviour:
+    /// the token may write any ref the role and protection rules allow.
+    ///
+    /// Absent (rather than empty) means the caller predates this field. That is not treated
+    /// as "unscoped" — the HMAC always covers this field, so an omitting caller produces a
+    /// different signature and is rejected at step 2. Skew fails closed by construction.
+    #[serde(default)]
+    pub ref_scope: String,
     /// Unix timestamp when the hook was invoked.
     pub timestamp: u64,
     /// HMAC-SHA256 signature over the canonical payload.
@@ -116,7 +127,7 @@ impl From<Denial> for DenialResponse {
 ///
 /// Format (length-prefixed, `|`-separated, structurally unambiguous):
 /// ```text
-/// len(repo_id):repo_id | repo_owner(64) | community_id(36) | pusher(64) | sorted_refs | timestamp
+/// len(repo_id):repo_id | repo_owner(64) | community_id(36) | pusher(64) | sorted_refs | timestamp | len(ref_scope):ref_scope
 /// ```
 /// where each ref is: `old_oid(40) + new_oid(40) + len(ref_name):ref_name + is_ancestor("1"/"0")`
 ///
@@ -151,6 +162,13 @@ fn compute_hmac(secret: &[u8], req: &HookCallbackRequest) -> Vec<u8> {
     }
     mac.update(b"|");
     mac.update(req.timestamp.to_string().as_bytes());
+    // Ref scope is ALWAYS covered, empty included. A caller that omits the field computes a
+    // different input and fails verification, so an unscoped push can never be forged by
+    // dropping the field.
+    mac.update(b"|");
+    mac.update(req.ref_scope.len().to_string().as_bytes());
+    mac.update(b":");
+    mac.update(req.ref_scope.as_bytes());
 
     mac.finalize().into_bytes().to_vec()
 }
@@ -165,6 +183,18 @@ fn verify_hmac(secret: &[u8], req: &HookCallbackRequest) -> bool {
     // Constant-time comparison.
     use subtle::ConstantTimeEq;
     expected.ct_eq(&provided).into()
+}
+
+/// Structural validation for a full ref name arriving from the hook.
+///
+/// Used for both the reported ref updates and the token's ref scope, so the two can never
+/// drift apart: a scope that would be rejected as a ref name must not be accepted as a scope.
+fn is_valid_ref_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 256
+        && name.starts_with("refs/")
+        && !name.contains("..")
+        && !name.bytes().any(|b| b <= 0x20 || b == 0x7f)
 }
 
 /// `POST /internal/git/policy` — pre-receive hook callback.
@@ -210,12 +240,7 @@ pub async fn hook_policy_check(
         if r.new_oid.len() != 40 || !r.new_oid.chars().all(|c| c.is_ascii_hexdigit()) {
             return (StatusCode::FORBIDDEN, "invalid new_oid").into_response();
         }
-        if r.ref_name.is_empty()
-            || r.ref_name.len() > 256
-            || !r.ref_name.starts_with("refs/")
-            || r.ref_name.contains("..")
-            || r.ref_name.bytes().any(|b| b <= 0x20 || b == 0x7f)
-        {
+        if !is_valid_ref_name(&r.ref_name) {
             return (StatusCode::FORBIDDEN, "invalid ref_name").into_response();
         }
     }
@@ -239,6 +264,48 @@ pub async fn hook_policy_check(
     if req.timestamp.saturating_sub(now) > 5 {
         warn!(repo = %req.repo_id, "hook callback: timestamp too far in future");
         return (StatusCode::FORBIDDEN, "callback timestamp invalid").into_response();
+    }
+
+    // 3b. Enforce the token's ref scope, if it carries one.
+    //
+    // This sits ON TOP of the role and protection-rule checks below, never instead of them:
+    // a scoped token still cannot push where its role may not. Scoping only ever subtracts.
+    //
+    // Exact match, no pattern. A prefix or glob would let a leaked token stomp sibling refs,
+    // which is the whole harm the scope exists to prevent — so `RefPattern` is deliberately
+    // NOT reused here.
+    if !req.ref_scope.is_empty() {
+        if !is_valid_ref_name(&req.ref_scope) {
+            warn!(repo = %req.repo_id, scope = %req.ref_scope, "hook callback: invalid ref scope");
+            return (StatusCode::FORBIDDEN, "invalid ref scope").into_response();
+        }
+        let out_of_scope: Vec<&HookRefUpdate> = req
+            .ref_updates
+            .iter()
+            .filter(|r| r.ref_name != req.ref_scope)
+            .collect();
+        if !out_of_scope.is_empty() {
+            warn!(
+                repo = %req.repo_id,
+                scope = %req.ref_scope,
+                denied = out_of_scope.len(),
+                "hook callback: push outside token ref scope"
+            );
+            let response = HookCallbackResponse {
+                allowed: false,
+                denials: out_of_scope
+                    .into_iter()
+                    .map(|r| DenialResponse {
+                        ref_name: r.ref_name.clone(),
+                        reason: format!(
+                            "push token is scoped to {} and may not write this ref",
+                            req.ref_scope
+                        ),
+                    })
+                    .collect(),
+            };
+            return (StatusCode::FORBIDDEN, Json(response)).into_response();
+        }
     }
 
     // 4. Validate and resolve kind:30617 for this repo.
@@ -423,6 +490,7 @@ pub fn generate_hook_hmac(
     community_id: &str,
     pusher_pubkey: &str,
     ref_updates: &[HookRefUpdate],
+    ref_scope: &str,
     timestamp: u64,
 ) -> String {
     let req = HookCallbackRequest {
@@ -431,6 +499,7 @@ pub fn generate_hook_hmac(
         community_id: community_id.to_string(),
         pusher_pubkey: pusher_pubkey.to_string(),
         ref_updates: ref_updates.to_vec(),
+        ref_scope: ref_scope.to_string(),
         timestamp,
         signature: String::new(), // Not used in computation.
     };
@@ -454,6 +523,7 @@ mod tests {
                 ref_name: "refs/heads/main".to_string(),
                 is_ancestor: true,
             }],
+            ref_scope: String::new(),
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -585,6 +655,7 @@ mod tests {
             &req.community_id,
             &req.pusher_pubkey,
             &req.ref_updates,
+            &req.ref_scope,
             req.timestamp,
         );
         req.signature = sig;
@@ -605,6 +676,10 @@ mod tests {
         let pusher = "cd".repeat(32); // 64 hex chars
         let community_id = uuid::Uuid::from_u128(1).to_string();
         let timestamp: u64 = 1700000000;
+        // Non-empty here on purpose: this test covers the scoped length prefix, while
+        // `bash_hmac_single_ref` covers the empty one. Between them both branches of the
+        // new field are pinned across the bash/Rust boundary.
+        let ref_scope = "refs/heads/maxplayer/contribution/job-1";
 
         // Two refs, intentionally out of sorted order to test sorting.
         let ref_updates = vec![
@@ -630,6 +705,7 @@ mod tests {
             &community_id,
             &pusher,
             &ref_updates,
+            ref_scope,
             timestamp,
         );
 
@@ -645,6 +721,7 @@ BUZZ_COMMUNITY_ID="{community_id}"
 BUZZ_PUSHER_PUBKEY="{pusher}"
 BUZZ_HOOK_SECRET="{secret}"
 TIMESTAMP="{timestamp}"
+BUZZ_REF_SCOPE="{ref_scope}"
 
 # Simulate the HMAC_FILE with two refs (unsorted, like the hook writes them)
 WORK_DIR=$(mktemp -d)
@@ -663,6 +740,8 @@ sort "$HMAC_FILE" | while IFS=' ' read -r ref_name old_oid new_oid is_anc; do
     printf '%s%s%s:%s%s' "$old_oid" "$new_oid" "$REF_LEN" "$ref_name" "$is_anc"
 done > "$HMAC_FILE.concat"
 HMAC_INPUT="${{HMAC_INPUT}}$(cat "$HMAC_FILE.concat")|${{TIMESTAMP}}"
+REF_SCOPE_LEN=${{#BUZZ_REF_SCOPE}}
+HMAC_INPUT="${{HMAC_INPUT}}|${{REF_SCOPE_LEN}}:${{BUZZ_REF_SCOPE}}"
 
 # Compute HMAC-SHA256
 printf '%s' "$HMAC_INPUT" | openssl dgst -sha256 -hmac "$BUZZ_HOOK_SECRET" -hex 2>/dev/null | sed 's/.*= //'
@@ -673,6 +752,7 @@ printf '%s' "$HMAC_INPUT" | openssl dgst -sha256 -hmac "$BUZZ_HOOK_SECRET" -hex 
             pusher = pusher,
             secret = secret,
             timestamp = timestamp,
+            ref_scope = ref_scope,
             old1 = "b".repeat(40),
             new1 = "c".repeat(40),
             old2 = "a".repeat(40),
@@ -724,6 +804,7 @@ printf '%s' "$HMAC_INPUT" | openssl dgst -sha256 -hmac "$BUZZ_HOOK_SECRET" -hex 
             &community_id,
             &pusher,
             &ref_updates,
+            "", // unscoped token — the pre-existing behaviour these tests pin
             timestamp,
         );
 
@@ -741,7 +822,7 @@ sort "$HMAC_FILE" | while IFS=' ' read -r ref_name old_oid new_oid is_anc; do
     REF_LEN=${{#ref_name}}
     printf '%s%s%s:%s%s' "$old_oid" "$new_oid" "$REF_LEN" "$ref_name" "$is_anc"
 done > "$HMAC_FILE.concat"
-HMAC_INPUT="${{HMAC_INPUT}}$(cat "$HMAC_FILE.concat")|{timestamp}"
+HMAC_INPUT="${{HMAC_INPUT}}$(cat "$HMAC_FILE.concat")|{timestamp}|0:"
 printf '%s' "$HMAC_INPUT" | openssl dgst -sha256 -hmac "{secret}" -hex 2>/dev/null | sed 's/.*= //'
 "#,
             old = "1".repeat(40),
@@ -771,5 +852,101 @@ printf '%s' "$HMAC_INPUT" | openssl dgst -sha256 -hmac "{secret}" -hex 2>/dev/nu
             rust_sig, bash_sig,
             "Single-ref HMAC mismatch!\n  Rust: {rust_sig}\n  Bash: {bash_sig}"
         );
+    }
+
+    // ---- Branch-scoped push tokens ------------------------------------------------------
+
+    #[test]
+    fn a_scope_is_validated_as_strictly_as_a_ref_name() {
+        assert!(is_valid_ref_name("refs/heads/maxplayer/contribution/job-1"));
+        assert!(!is_valid_ref_name(""), "empty");
+        assert!(!is_valid_ref_name("heads/main"), "must be fully qualified");
+        assert!(
+            !is_valid_ref_name("refs/heads/../../../etc/passwd"),
+            "traversal must not survive, or a crafted job id redirects the scope"
+        );
+        assert!(!is_valid_ref_name("refs/heads/a b"), "space");
+        assert!(!is_valid_ref_name("refs/heads/a\nb"), "newline");
+        assert!(
+            !is_valid_ref_name(&format!("refs/heads/{}", "a".repeat(300))),
+            "overlong"
+        );
+    }
+
+    #[test]
+    fn hmac_tampered_ref_scope_rejected() {
+        let secret = b"scope-secret";
+        let mut req = make_request();
+        req.ref_scope = "refs/heads/job-1".to_string();
+        sign_request(&mut req, secret);
+        assert!(
+            verify_hmac(secret, &req),
+            "positive control: signs and verifies"
+        );
+
+        req.ref_scope = "refs/heads/job-2".to_string();
+        assert!(
+            !verify_hmac(secret, &req),
+            "widening the scope after signing must break the signature"
+        );
+    }
+
+    #[test]
+    fn stripping_the_scope_does_not_unscope_the_push() {
+        // The failure this pins: drop the field, serde defaults it to empty, and a scoped
+        // push silently becomes unscoped. The HMAC covers the field, so it cannot.
+        let secret = b"scope-secret";
+        let mut req = make_request();
+        req.ref_scope = "refs/heads/job-1".to_string();
+        sign_request(&mut req, secret);
+
+        req.ref_scope = String::new();
+        assert!(
+            !verify_hmac(secret, &req),
+            "an emptied scope must invalidate the signature, never widen the push"
+        );
+    }
+
+    #[test]
+    fn a_signature_in_the_pre_scope_format_is_rejected() {
+        // Independent restatement of the OLD canonical payload — no scope field at all —
+        // exactly as a caller predating this change would sign it. It must NOT verify, so
+        // version skew fails closed rather than silently unscoping.
+        let secret: &[u8] = b"scope-secret";
+        let mut req = make_request();
+        req.ref_scope = String::new();
+
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
+        mac.update(req.repo_id.len().to_string().as_bytes());
+        mac.update(b":");
+        mac.update(req.repo_id.as_bytes());
+        mac.update(b"|");
+        mac.update(req.repo_owner.as_bytes());
+        mac.update(b"|");
+        mac.update(req.community_id.as_bytes());
+        mac.update(b"|");
+        mac.update(req.pusher_pubkey.as_bytes());
+        mac.update(b"|");
+        for r in &req.ref_updates {
+            mac.update(r.old_oid.as_bytes());
+            mac.update(r.new_oid.as_bytes());
+            mac.update(r.ref_name.len().to_string().as_bytes());
+            mac.update(b":");
+            mac.update(r.ref_name.as_bytes());
+            mac.update(if r.is_ancestor { b"1" } else { b"0" });
+        }
+        mac.update(b"|");
+        mac.update(req.timestamp.to_string().as_bytes());
+        req.signature = hex::encode(mac.finalize().into_bytes());
+
+        assert!(
+            !verify_hmac(secret, &req),
+            "a pre-scope signature must be rejected, not accepted as an unscoped push"
+        );
+
+        // Positive control: the same payload signed in the CURRENT format does verify, so
+        // the assertion above is about the format and not about a broken helper.
+        sign_request(&mut req, secret);
+        assert!(verify_hmac(secret, &req));
     }
 }

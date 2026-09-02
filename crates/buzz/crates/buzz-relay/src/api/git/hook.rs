@@ -25,6 +25,8 @@ use tracing::{error, info};
 /// - `BUZZ_REPO_ID` — repo identifier (d-tag)
 /// - `BUZZ_COMMUNITY_ID` — server-resolved community UUID for the git HTTP request
 /// - `BUZZ_PUSHER_PUBKEY` — authenticated pusher's hex pubkey
+/// - `BUZZ_REF_SCOPE` — the single ref the push token is scoped to, or empty when unscoped.
+///   Always set; empty is a value, not an absence.
 ///
 /// Git sets automatically (quarantine):
 /// - `GIT_OBJECT_DIRECTORY` — quarantine object store
@@ -47,6 +49,10 @@ ZERO="0000000000000000000000000000000000000000"
 : "${BUZZ_PUSHER_PUBKEY:?error: BUZZ_PUSHER_PUBKEY not set}"
 : "${BUZZ_HOOK_URL:?error: BUZZ_HOOK_URL not set}"
 : "${BUZZ_HOOK_SECRET:?error: BUZZ_HOOK_SECRET not set}"
+# Ref scope may legitimately be EMPTY (unscoped token), but it must be SET. `?` rather than
+# `:?` is deliberate: an unset variable means the relay failed to pass it, which we refuse,
+# while an empty one is the ordinary unscoped push.
+: "${BUZZ_REF_SCOPE?error: BUZZ_REF_SCOPE not set}"
 
 WORK_DIR=$(mktemp -d) || { echo "error: cannot create temp dir" >&2; exit 1; }
 REFS_FILE="$WORK_DIR/refs"
@@ -111,6 +117,9 @@ if [ -f "$HMAC_FILE" ]; then
     rm -f "$HMAC_FILE.concat"
 fi
 HMAC_INPUT="${HMAC_INPUT}|${TIMESTAMP}"
+# Ref scope, length-prefixed, ALWAYS appended — empty included. Must match Rust's compute_hmac.
+REF_SCOPE_LEN=${#BUZZ_REF_SCOPE}
+HMAC_INPUT="${HMAC_INPUT}|${REF_SCOPE_LEN}:${BUZZ_REF_SCOPE}"
 
 SIGNATURE=$(printf '%s' "$HMAC_INPUT" | openssl dgst -sha256 -hmac "$BUZZ_HOOK_SECRET" -hex 2>/dev/null | sed 's/.*= //')
 if [ -z "$SIGNATURE" ]; then
@@ -122,7 +131,9 @@ fi
 # repo_id is free-form (user-chosen d-tag) — must be escaped for JSON safety.
 # repo_owner, community_id, and pusher_pubkey are validated fixed-shape strings — no escaping needed.
 SAFE_REPO_ID=$(printf '%s' "$BUZZ_REPO_ID" | sed 's/\\/\\\\/g; s/"/\\"/g')
-BODY="{\"repo_id\":\"${SAFE_REPO_ID}\",\"repo_owner\":\"${BUZZ_REPO_OWNER}\",\"community_id\":\"${BUZZ_COMMUNITY_ID}\",\"pusher_pubkey\":\"${BUZZ_PUSHER_PUBKEY}\",\"ref_updates\":[${REFS}],\"timestamp\":${TIMESTAMP},\"signature\":\"${SIGNATURE}\"}"
+# ref_scope comes from a signed token tag, so escape it like repo_id rather than trusting shape.
+SAFE_REF_SCOPE=$(printf '%s' "$BUZZ_REF_SCOPE" | sed 's/\\/\\\\/g; s/"/\\"/g')
+BODY="{\"repo_id\":\"${SAFE_REPO_ID}\",\"repo_owner\":\"${BUZZ_REPO_OWNER}\",\"community_id\":\"${BUZZ_COMMUNITY_ID}\",\"pusher_pubkey\":\"${BUZZ_PUSHER_PUBKEY}\",\"ref_updates\":[${REFS}],\"ref_scope\":\"${SAFE_REF_SCOPE}\",\"timestamp\":${TIMESTAMP},\"signature\":\"${SIGNATURE}\"}"
 
 HTTP_CODE=$(curl --silent --max-time 10 \
     -o "$RESP_FILE" \
@@ -203,5 +214,38 @@ mod tests {
                 "relay runtime image must install {tool}; the git pre-receive hook uses it and fails closed without it"
             );
         }
+    }
+
+    /// The HMAC agreement tests in `policy.rs` run a *transcription* of this script rather
+    /// than the script itself, so they cannot notice if the shipped hook loses a field the
+    /// Rust side still signs. That divergence would deny every push (fail-closed, but a hard
+    /// outage), so pin the three places the ref scope has to appear in the real constant.
+    #[test]
+    fn shipped_hook_carries_the_ref_scope_in_env_hmac_and_body() {
+        for (site, needle) in [
+            // Unset is refused; empty is allowed. `?` not `:?` — the distinction is the guard.
+            (
+                "env guard",
+                r#": "${BUZZ_REF_SCOPE?error: BUZZ_REF_SCOPE not set}""#,
+            ),
+            ("hmac length prefix", "REF_SCOPE_LEN=${#BUZZ_REF_SCOPE}"),
+            (
+                "hmac append",
+                r#"HMAC_INPUT="${HMAC_INPUT}|${REF_SCOPE_LEN}:${BUZZ_REF_SCOPE}""#,
+            ),
+            ("body field", r#"\"ref_scope\":\"${SAFE_REF_SCOPE}\""#),
+        ] {
+            assert!(
+                PRE_RECEIVE_HOOK.contains(needle),
+                "shipped pre-receive hook is missing its {site}: {needle}"
+            );
+        }
+
+        // Negative control: the assertion above can fail. Without this, a `contains` that
+        // always matched would look like four passing checks.
+        assert!(
+            !PRE_RECEIVE_HOOK.contains("BUZZ_REF_SCOPE_THAT_IS_NOT_THERE"),
+            "test setup: containment check must be able to return false"
+        );
     }
 }
