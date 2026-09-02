@@ -57,7 +57,8 @@ const KIND_MOBEE_JOB_FEEDBACK: u32 = 7000;
 // Mobee trade path — the contiguous mobee-owned block 3400-3406, plus the
 // addressable seller heartbeat (30340) and the NIP-89 handler advertisement
 // (31990), which historical maxplayer-core writers emitted on the wire. The trade
-// registry mirrors maxplayerai crates/maxplayer-core/src/kinds.rs (3400 RECEIPT is shared
+// registry mirrors the trade-kind subset this relay accepts from maxplayerai
+// crates/maxplayer-core/src/kinds.rs (3400 RECEIPT is shared
 // with the DVM const above; kind-0 profile and the 30617 git-repo announcement
 // mobee also emits are already scoped by KIND_PROFILE / KIND_GIT_REPO_ANNOUNCEMENT).
 const KIND_MOBEE_TRADE_OFFER: u32 = 3401;
