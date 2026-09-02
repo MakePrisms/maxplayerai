@@ -102,6 +102,7 @@ replaces it on every beat. Every fact below is current as of that beat, EXCEPT `
 | `["agents", id, ...]` | 0..1 | no | Harnesses the seat can run |
 | `["admits_pool", "open"` or `"closed"]` | 0..1 | no | Whether the seat claims untargeted (open-pool) offers |
 | `["admits_targeted", "open"`, `"named"` or `"closed"]` | 0..1 | no | Who the seat admits on the targeted surface |
+| `["issuer_mint", url, cap, outstanding, retired, last_seen]` | 0..1 | no | The seat's own mint and its issuance counters |
 | `["harness_family", family, ...]` | 0..1 | no | Harness families the seat serves |
 | `["harness_model", family, model]` | 0..N | no | One resolved model, paired to its family |
 | `["capabilities", token, ...]` | 0..1 | no | Capability tokens the seat proved |
@@ -172,6 +173,42 @@ sets above, states no policy — a reader MUST NOT infer the missing or unrecogn
 
 These tags appear on the announcement ONLY. A reader MUST NOT expect them on a kind `3402` claim: a
 claim already demonstrates admission, because the seat sent it.
+
+#### Issuer mint
+
+`issuer_mint` states that the seat runs its OWN Cashu mint and issues tokens that are an IOU for its
+own future work. It pays other seats with them. Whoever holds them may later hire this seat and pay
+with them, and the seat retires what comes back. No outside money enters or leaves such a mint.
+
+The unit stays `sat`. One token is one sat of this seat's work at its published `rate`. The mint URL
+is the sole thing that distinguishes this currency from any other `sat` on the wire.
+
+It is one tag with five positional values, every one required when the tag is present:
+
+| Position | Value | Meaning |
+|---|---|---|
+| 1 | `url` | The seat's own mint. MUST also appear in the seat's `accepted_mints` |
+| 2 | `cap` | Ceiling on tokens outstanding that the issuer enforces on its own minting, in sats |
+| 3 | `outstanding` | Minted minus retired, in sats, as of `last_seen` |
+| 4 | `retired` | Tokens the issuer has taken back and burned, in sats, as of `last_seen` |
+| 5 | `last_seen` | Unix seconds at which the counters were read from the mint |
+
+`cap`, `outstanding`, `retired` and `last_seen` are strings of decimal digits and nothing else.
+
+The counters are the issuer's own statement. The seat's signature on the announcement covers them, so
+a reader knows WHO said them, not that they are true. A reader MUST NOT treat them as verified and
+MUST NOT extend credit on them automatically. Accepting an issuer's currency is a manual act: the
+operator of another seat reads this tag and, if it chooses, adds the URL to its own `accepted_mints`.
+Nothing in this protocol derives that decision.
+
+An absent tag means the seat states no issuer mint. A tag with the wrong number of values, a counter
+that is not decimal digits, an empty URL, or a URL that is not in the seat's `accepted_mints` states
+no issuer mint either: a reader MUST read it as unstated and MUST NOT reject the announcement over
+it. A reader that predates this tag ignores it under §2.1 and behaves as it did before.
+
+This tag appears on the announcement ONLY. A reader MUST NOT expect it on a kind `3402` claim. It is
+not an award filter: a buyer pays on a mint the claim's `creq` names, and whether to accept an
+issuer's mint at all was decided by an operator before any offer was sent.
 
 `queue_depth` is a live count. It returns to `0` when the seat holds no non-terminal job.
 
