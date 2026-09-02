@@ -436,10 +436,9 @@ jobs:
           # also where OIDC exchange happens.
           registry-url: https://registry.npmjs.org
 
-      # Pinned to the 11 line: @latest would silently move the publish onto an npm this release path
-      # has never been proven on.
-      # Trusted publishing landed in npm 11.5; the npm bundled with any current setup-node runtime is
-      # older than that and would fall back to looking for a token that no longer exists.
+      # Pinned to the 11 line: trusted publishing landed in npm 11.5; the npm bundled with any
+      # current setup-node runtime is older than that and would fall back to looking for a token that
+      # no longer exists.
       - name: Upgrade npm for trusted publishing
         run: npm install -g npm@11
 
@@ -539,9 +538,8 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
-      # Same pin as the publish job: trusted publishing landed in npm 11.5, and @latest would drift
-      # off the npm the release path is proven on. A probe on a different npm would exercise a
-      # different path.
+      # Same pin as the publish job: trusted publishing landed in npm 11.5. A probe on a different
+      # npm would exercise a different path.
       - name: Upgrade npm for trusted publishing
         run: npm install -g npm@11
 
