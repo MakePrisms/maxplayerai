@@ -44,6 +44,13 @@
             version = "0.1.1";
             src = self;
 
+            # #818: `src = self` is a store copy with no `.git`, so the build script has nothing to
+            # read and would stamp `(unknown)` on every nix-built binary. The flake DOES know the
+            # commit, so hand it over. `dirtyRev` (`<sha>-dirty`) is deliberately passed through
+            # rather than flattened to the clean sha: a binary built from uncommitted work must say
+            # so, and `verify-release-version.sh` refuses it on a release.
+            MAXPLAYER_BUILD_COMMIT = self.rev or self.dirtyRev or "unknown";
+
             # Vendor all dependencies hermetically from the committed
             # Cargo.lock. No network access is needed at build time.
             cargoLock.lockFile = ./Cargo.lock;

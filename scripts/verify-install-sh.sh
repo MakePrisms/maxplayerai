@@ -89,6 +89,26 @@ assert_empty() {
     done
 }
 
+# #818: the artifact prints `maxplayer <version> (<40-hex commit sha>)`, so every leg that asks an
+# installed binary what it is checks the stamp too. A sha is REQUIRED here, not optional: what these
+# legs install is a downloaded GitHub Release asset, and release.yml builds those in a checkout that
+# has a `.git` to read — so `(unknown)` on this path means the release build lost its provenance,
+# which is the state #818 exists to keep out of a deployment.
+#
+# `case`, not a regex: this driver runs under the container's `sh`, and busybox ash has no `[[ =~ ]]`.
+assert_version_line() {
+    _got="$1"
+    _leg="$2"
+    _rest="${_got#"maxplayer $VERSION ("}"
+    [ "$_rest" != "$_got" ] || fail "$_leg reports '$_got', expected 'maxplayer $VERSION (<40-hex commit sha>)'"
+    _stamp="${_rest%")"}"
+    [ "$_stamp" != "$_rest" ] || fail "$_leg reports '$_got', whose build stamp is not closed with ')'"
+    case "$_stamp" in
+        *[!0-9a-f]*) fail "$_leg reports build stamp '$_stamp', which is not a 40-hex commit sha (#818: a stamp that is not a sha identifies no build)" ;;
+    esac
+    [ "${#_stamp}" -eq 40 ] || fail "$_leg reports build stamp '$_stamp' (${#_stamp} characters), expected 40 hex"
+}
+
 count_on_path() {
     n=0
     oldifs="$IFS"
@@ -193,12 +213,12 @@ MAXPLAYER_VERSION="$VERSION" MAXPLAYER_BIN_DIR="$BIN1" sh "$INSTALLER" \
 [ -x "$BIN1/maxplayer" ] || fail "installer reported success but there is no executable at $BIN1/maxplayer"
 
 got="$(maxplayer version)" || fail "maxplayer version exited non-zero"
-[ "$got" = "maxplayer $VERSION" ] || fail "maxplayer version printed '$got', expected 'maxplayer $VERSION'"
+assert_version_line "$got" "maxplayer version"
 ok "maxplayer version -> $got (rc=0)"
 
 # Both dispatch arms, because they are separate code paths in the binary.
 got="$(maxplayer --version)" || fail "maxplayer --version exited non-zero"
-[ "$got" = "maxplayer $VERSION" ] || fail "maxplayer --version printed '$got'"
+assert_version_line "$got" "maxplayer --version"
 ok "maxplayer --version -> $got (rc=0)"
 
 # ── Leg 2 — the installed artifact carries the whole surface ────────────────────────────────────
@@ -249,7 +269,7 @@ MAXPLAYER_VERSION="$VERSION" MAXPLAYER_BIN_DIR="$BIN1" sh "$INSTALLER" \
 after="$(count_on_path)"
 [ "$after" = 1 ] || fail "after two runs there are $after maxplayer executables on PATH, expected 1"
 got="$(maxplayer version)" || fail "maxplayer version exited non-zero after the second run"
-[ "$got" = "maxplayer $VERSION" ] || fail "after the second run, version is '$got'"
+assert_version_line "$got" "the second run's maxplayer version"
 ok "two runs, rc=0 both times, exactly one maxplayer on PATH, still $got"
 
 # ── Legs 4-5b — platform detection ──────────────────────────────────────────────────────────────
@@ -443,7 +463,7 @@ PATH="/shim:$PATH" MAXPLAYER_VERSION="$VERSION" MAXPLAYER_BIN_DIR="$BIN6" \
     || fail "the pass-through shim broke the install, so the tamper legs below would prove nothing. Output: $(cat /legs/shimpass.out)"
 [ -x "$BIN6/maxplayer" ] || fail "pass-through shim: nothing installed"
 got="$("$BIN6/maxplayer" version)"
-[ "$got" = "maxplayer $VERSION" ] || fail "pass-through shim installed something that reports '$got'"
+assert_version_line "$got" "the pass-through shim's installed binary"
 ok "shim pass-through -> rc=0, installed $got"
 
 # ── Legs 7-10 — verification is real ────────────────────────────────────────────────────────────
@@ -496,7 +516,7 @@ BIN_PIPED="$(leg_dir piped)"
 cat "$INSTALLER" | sh -s -- --version "$VERSION" --bin-dir "$BIN_PIPED" >/legs/piped.out 2>&1 \
     || fail "the piped form failed. Output: $(cat /legs/piped.out)"
 got="$("$BIN_PIPED/maxplayer" version)" || fail "the piped install produced a binary that will not run"
-[ "$got" = "maxplayer $VERSION" ] || fail "the piped install produced '$got'"
+assert_version_line "$got" "the piped install's binary"
 ok "cat install.sh | sh -s -- --version $VERSION --bin-dir ... -> $got"
 
 # ── Leg 15 — `--seller` is a no-op, not a refusal and not a different download ──────────────────
@@ -518,7 +538,7 @@ if grep -q 'maxplayer-seller-' /legs/sellerflag.out /legs/sellerflag.err; then
     fail "--seller still constructed a maxplayer-seller-* asset name: $(cat /legs/sellerflag.out /legs/sellerflag.err)"
 fi
 got="$("$BIN_SELLER/maxplayer" version)" || fail "--seller installed a binary that will not run"
-[ "$got" = "maxplayer $VERSION" ] || fail "--seller installed something that reports '$got'"
+assert_version_line "$got" "--seller's installed binary"
 # Same bytes as the plain install, which is the actual claim "no-op" makes.
 cmp -s "$BIN1/maxplayer" "$BIN_SELLER/maxplayer" \
     || fail "--seller installed a DIFFERENT binary than the plain install — the flag is not a no-op"

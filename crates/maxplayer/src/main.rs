@@ -1,4 +1,7 @@
 mod accept_cli;
+// #818: the build-time commit stamp `--version` prints. Compiled on every build — provenance is not
+// a feature, and a deployed binary that cannot say what it was built from is the state #818 measured.
+mod build_stamp;
 mod buyer;
 mod cli;
 mod collect_cli;

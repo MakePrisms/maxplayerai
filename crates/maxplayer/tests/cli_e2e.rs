@@ -105,9 +105,27 @@ fn help_and_version_flags_exit_zero_on_the_real_binary() {
         .output()
         .expect("run maxplayer --version");
     assert_eq!(version.status.code(), Some(0));
-    assert_eq!(
-        String::from_utf8_lossy(&version.stdout),
-        format!("maxplayer {}\n", maxplayer_core::version())
+    // #818: `maxplayer <version> (<stamp>)`. This is the only assertion in the repo that measures
+    // the BUILT ARTIFACT's version line rather than the library path, which makes it the one that
+    // can see a build script that failed to stamp — so it holds the stamp's shape, not merely the
+    // program name. The stamp itself is not compared to a literal: an integration test links the
+    // library, not the binary crate, so it cannot reach `build_stamp::build_commit()`, and the
+    // build script legitimately answers `unknown` where no `.git` and no `MAXPLAYER_BUILD_COMMIT`
+    // exist. 40 lowercase hex or `unknown`, and nothing else — the class #818 measured (a plausible
+    // 40-hex string, or the `0000111122223333…` noise beside it) cannot come from a padded, zeroed
+    // or truncated value. That the sha RESOLVES to a commit is `scripts/verify-release-version.sh`.
+    let reported = String::from_utf8_lossy(&version.stdout);
+    let stamp = reported
+        .strip_prefix(&format!("maxplayer {} (", maxplayer_core::version()))
+        .and_then(|rest| rest.strip_suffix(")\n"))
+        .unwrap_or_else(|| panic!("`{reported}` is not `maxplayer <version> (<stamp>)`"));
+    assert!(
+        stamp == "unknown"
+            || (stamp.len() == 40
+                && stamp
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))),
+        "build stamp `{stamp}` is neither `unknown` nor a 40-character lowercase-hex sha"
     );
 
     let no_args = Command::new(env!("CARGO_BIN_EXE_maxplayer"))
