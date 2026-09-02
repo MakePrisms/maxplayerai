@@ -179,7 +179,7 @@
       # `self` is in scope.
       # One deployable configuration `.#relay`, built from the in-tree vendored `buzz-relay` crate.
       # (There is deliberately NO fork-pin fallback config: the raw gudnuf/buzz fork carries the older
-      # DVM kinds, not the mobee-core set, so it would fail the 3401 verify battery — a path that must
+      # DVM kinds, not the maxplayer-core set, so it would fail the 3401 verify battery — a path that must
       # never be used should not exist in a runbook. If the vendor PR is not ready, deploy NOTHING; the
       # swap waits and strfry keeps serving — the tag never depended on the swap.)
       nixosConfigurations.relay = nixpkgs.lib.nixosSystem {
