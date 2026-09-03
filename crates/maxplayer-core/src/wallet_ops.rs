@@ -506,6 +506,7 @@ pub async fn complete_mint_async(
 ) -> Result<MintOutcome, WalletOpsError> {
     let mint_url = mint_is_allowed(home, &quote.mint_url)?;
     let wallet = open_wallet_async(home, &mint_url).await?;
+    refuse_lightning_op_at_issuer(&wallet, "wallet fund", &mint_url).await?;
     let funded = poll_and_mint(&wallet, &quote.quote_id, quote.amount_sats).await?;
     let balance = wallet
         .total_balance()
@@ -1397,6 +1398,164 @@ mod tests {
         assert!(
             !message.contains(DEFAULT_MINT_URL),
             "MintNotAllowed must NOT name the testnut constant as the default on a minibits home: {message}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A same-process mint stub: answers `GET /v1/info` with `info`, everything else with 404, and
+    /// RECORDS every request path it receives. The recorder is the instrument — what the wallet
+    /// asked the mint is the whole question. No mint process, no money, no network beyond loopback.
+    fn recording_mint_stub(info: &cdk::nuts::MintInfo) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{BufRead, BufReader, Write};
+
+        let body = serde_json::to_string(info).expect("mint info serializes");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub mint");
+        let address = listener.local_addr().expect("stub mint address");
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = BufReader::new(match stream.try_clone() {
+                    Ok(clone) => clone,
+                    Err(_) => continue,
+                });
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                loop {
+                    let mut header = String::new();
+                    match reader.read_line(&mut header) {
+                        Ok(0) => break,
+                        Ok(_) if header == "\r\n" => break,
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+                let path = request_line.split_whitespace().nth(1).unwrap_or("").to_owned();
+                recorder.lock().expect("recorder").push(path.clone());
+                // Match the info route however the client spells its leading slashes (a normalized
+                // mint URL may carry a trailing `/`, giving `//v1/info`).
+                let route = path.trim_start_matches('/');
+                let ok = |json: &str| {
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                         connection: close\r\n\r\n{json}",
+                        json.len()
+                    )
+                };
+                let response = if route == "v1/info" {
+                    ok(&body)
+                } else if route == "v1/keysets" || route == "v1/keys" {
+                    // cdk refreshes keysets alongside the info load; an empty set is a valid answer
+                    // and keeps the stub honest about what it is: an info document, not a mint.
+                    ok(r#"{"keysets":[]}"#)
+                } else {
+                    "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_owned()
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (format!("http://{address}"), seen)
+    }
+
+    /// Check H (§4.2 "Issuer mint"): the fund COMPLETION path is guarded exactly like fund-begin and
+    /// melt. NEGATIVE: at a mint whose NUT-06 lists no bolt11 (Issuer per `class_from_info`),
+    /// `complete_mint_async` returns `WalletOpsError::IssuerMint` and the mint receives NO
+    /// `check_mint_quote` and NO `wallet.mint` request — only the `/v1/info` read the guard makes.
+    /// CONTROL: the identical call against a stub that lists bolt11 (Lightning) goes past the guard
+    /// and the recorder sees the quote lookup, so the negative above is not vacuous.
+    #[tokio::test]
+    async fn completing_a_mint_quote_at_an_issuer_mint_is_refused_before_any_quote_call() {
+        use cdk::nuts::{MintInfo, MintMethodSettings};
+
+        fn is_quote_or_mint_call(path: &str) -> bool {
+            path.contains("/mint/quote/") || path.contains("/mint/bolt11")
+        }
+
+        // Issuer: no bolt11 under NUT-04 or NUT-05.
+        let mut issuer_info = MintInfo::new();
+        issuer_info.nuts.nut04.methods = Vec::new();
+        issuer_info.nuts.nut05.methods = Vec::new();
+        assert_eq!(
+            crate::mint_class::class_from_info(&issuer_info),
+            crate::mint_class::MintClass::Issuer
+        );
+        let (issuer_url, issuer_seen) = recording_mint_stub(&issuer_info);
+
+        let root = temp_home("complete-at-issuer");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap(&root).expect("bootstrap");
+        // The loopback stub is a CONFIGURED mint, so `mint_is_allowed` admits it and the call reaches
+        // the wallet path under test rather than the configured-mint check.
+        home.config.extra_mints.push(issuer_url.clone());
+
+        let quote = MintQuote {
+            mint_url: issuer_url.clone(),
+            invoice: "lnbc1-not-a-real-invoice".to_owned(),
+            quote_id: "quote-at-issuer".to_owned(),
+            amount_sats: 5,
+        };
+        let error = complete_mint_async(&home, &quote)
+            .await
+            .expect_err("completing at an issuer mint must refuse");
+        let seen = issuer_seen.lock().expect("recorder").clone();
+        assert!(
+            matches!(error, WalletOpsError::IssuerMint(_)),
+            "expected IssuerMint, got: {error} (mint saw {seen:?})"
+        );
+        let message = error.to_string();
+        assert!(message.contains("wallet fund refused"), "{message}");
+        assert!(message.contains(crate::mint_class::ISSUER_HOP_REFUSAL), "{message}");
+        assert!(
+            seen.iter().any(|path| path.trim_start_matches('/') == "v1/info"),
+            "the guard must have read the mint's info: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|path| is_quote_or_mint_call(path)),
+            "neither check_mint_quote nor wallet.mint may reach an issuer mint: {seen:?}"
+        );
+
+        // CONTROL: same call, Lightning-class stub. The guard passes and execution goes on into
+        // `poll_and_mint`, where cdk's `check_mint_quote` resolves an id the local store has never
+        // seen WITHOUT a wire call and fails as an ordinary Wallet error — not IssuerMint, and not
+        // a refusal. So the control proves the gate is the CLASS, not the stub: identical call,
+        // identical unknown quote, the only difference is what `/v1/info` said.
+        let mut lightning_info = MintInfo::new();
+        lightning_info.nuts.nut04.methods = vec![MintMethodSettings {
+            method: PaymentMethod::BOLT11,
+            unit: CurrencyUnit::Sat,
+            min_amount: None,
+            max_amount: None,
+            options: None,
+        }];
+        let (lightning_url, lightning_seen) = recording_mint_stub(&lightning_info);
+        home.config.extra_mints.push(lightning_url.clone());
+        let control = complete_mint_async(
+            &home,
+            &MintQuote {
+                mint_url: lightning_url,
+                invoice: "lnbc1-not-a-real-invoice".to_owned(),
+                quote_id: "quote-at-lightning".to_owned(),
+                amount_sats: 5,
+            },
+        )
+        .await
+        .expect_err("an unknown quote id fails inside poll_and_mint");
+        let seen = lightning_seen.lock().expect("recorder").clone();
+        assert!(
+            matches!(control, WalletOpsError::Wallet(_)),
+            "control must fail past the guard, not at it: {control} (mint saw {seen:?})"
+        );
+        let control_message = control.to_string();
+        assert!(
+            !control_message.contains("refused") && !control_message.contains("mint info"),
+            "control must not be a guard refusal or an info failure: {control_message}"
+        );
+        assert!(
+            seen.iter().any(|path| path.trim_start_matches('/') == "v1/info"),
+            "the guard read the control mint's info too: {seen:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
