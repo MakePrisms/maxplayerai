@@ -3684,6 +3684,12 @@ mod tests {
             // Same decision and the same reason: a host ChatGPT session is a containment concern,
             // and reading one here would give the check a second reason to move.
             codex_chatgpt: None,
+            // Off, with its two companion keys unset: where the delivery's git runs is a delivery
+            // concern, and this check asserts the engine-version floor. The host path is the
+            // shipped default, so the check measures the seat as shipped.
+            container_delivery: false,
+            container_delivery_token: None,
+            container_delivery_token_cap_secs: None,
         });
         home.config.relay_url = "not-a-relay-url".into();
         home.config.accepted_mints = Vec::new();

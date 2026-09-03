@@ -540,6 +540,9 @@ fn a_job_launched_through_the_policy_is_contained_and_an_uncontained_one_is_not(
         // for the contained launch to differ from its control.
         file_credentials: Vec::new(),
         codex_chatgpt: None,
+        container_delivery: false,
+        container_delivery_token: None,
+        container_delivery_token_cap_secs: None,
     };
     let policy = SandboxPolicy::from_config(Some(&config)).expect("a docker policy");
     let agent_command: Vec<String> = ["nc", "-w", "2", denied.as_str(), Canary::PORT]

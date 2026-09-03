@@ -200,8 +200,9 @@ impl AgentRunTimeout {
 /// The in-container mount point for the per-job workdir under `docker` mode. The agent works here
 /// (its ACP session cwd), the host workdir is bind-mounted here read-write, and NOTHING ELSE of the
 /// host is mounted — so `$MAXPLAYER_HOME` (wallet/keys/journal) is absent from the container by
-/// construction.
-const CONTAINER_WORKDIR: &str = "/work";
+/// construction. Public because the container-side delivery orchestrator names the same path in the
+/// inputs it hands the container (`delivery_orchestrator`), and one definition keeps the two equal.
+pub const CONTAINER_WORKDIR: &str = "/work";
 
 /// How the awarded agent command is launched. Pass-through and launcher runs stay on the host; a
 /// docker run puts the command inside a container that mounts only the per-job workdir. The launch
@@ -261,6 +262,25 @@ pub struct DockerPolicy {
     /// same reason as `proxy_ports`: the containment path that reads them is the one that builds the
     /// launch, so both come from one config value rather than being written down twice.
     file_credentials: Vec<crate::home::FileCredential>,
+    /// Container-side delivery (Track B), `None` ⇒ the host delivery path. Resolved from
+    /// [`crate::home::SandboxConfig::container_delivery`] and its two companion keys. Carried on the
+    /// policy so the one `[sandbox]` parse decides both the executor and where git runs.
+    container_delivery: Option<ContainerDeliveryPolicy>,
+}
+
+/// The default `[sandbox] container_delivery_token_cap_secs`: 6 hours, the relay brief's default
+/// `SCOPED_TOKEN_MAX_LIFETIME` (`docs/superpowers/briefs/2026-08-31-relay-scoped-token-lifetime.md`).
+pub const DEFAULT_CONTAINER_DELIVERY_TOKEN_CAP_SECS: u64 = 21_600;
+
+/// The resolved container-side delivery settings of a docker seat whose `[sandbox]
+/// container_delivery = true`. Absent from a seat on the host delivery path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContainerDeliveryPolicy {
+    /// How the container obtains its branch-scoped push token.
+    pub token: crate::home::ContainerDeliveryToken,
+    /// The relay's cap on a long-lived scoped token's lifetime, in seconds. The host refuses to mint a
+    /// long-lived token that would outlive it.
+    pub token_cap_secs: u64,
 }
 
 /// The agent-auth environment carried from the daemon into the container.
@@ -360,7 +380,22 @@ impl SandboxPolicy {
             return Ok(Self::passthrough());
         };
         match config.mode {
-            SandboxMode::Launcher => Ok(Self::wrapped(config.launcher.clone())),
+            SandboxMode::Launcher => {
+                // The container-delivery keys name a container that launcher mode never creates. A
+                // seat that sets them under `launcher` has a config that says two different things
+                // about where git runs, so it is refused here rather than read as "host path".
+                if config.container_delivery
+                    || config.container_delivery_token.is_some()
+                    || config.container_delivery_token_cap_secs.is_some()
+                {
+                    return Err(ExecError::Config(
+                        "[sandbox] container_delivery, container_delivery_token and \
+                         container_delivery_token_cap_secs require mode = \"docker\""
+                            .into(),
+                    ));
+                }
+                Ok(Self::wrapped(config.launcher.clone()))
+            }
             SandboxMode::Docker => {
                 let image = config
                     .image
@@ -490,6 +525,19 @@ impl SandboxPolicy {
                         )));
                     }
                 }
+                // A zero cap would refuse every long-lived mint; it is a typo, not a policy, and is
+                // refused at config resolution so the seat does not fail its first job instead.
+                if config.container_delivery_token_cap_secs == Some(0) {
+                    return Err(ExecError::Config(
+                        "[sandbox] container_delivery_token_cap_secs must be greater than zero".into(),
+                    ));
+                }
+                let container_delivery = config.container_delivery.then(|| ContainerDeliveryPolicy {
+                    token: config.container_delivery_token.unwrap_or_default(),
+                    token_cap_secs: config
+                        .container_delivery_token_cap_secs
+                        .unwrap_or(DEFAULT_CONTAINER_DELIVERY_TOKEN_CAP_SECS),
+                });
                 let mut policy = Self::docker(DockerPolicy {
                     image,
                     forward_env: config.forward_env.clone(),
@@ -497,6 +545,7 @@ impl SandboxPolicy {
                     network,
                     proxy_ports,
                     file_credentials: config.file_credentials.clone(),
+                    container_delivery,
                 });
                 policy.codex_chatgpt = config.codex_chatgpt.clone();
                 Ok(policy)
@@ -575,6 +624,15 @@ impl SandboxPolicy {
     pub fn codex_chatgpt(&self) -> Option<&crate::home::CodexChatgptConfig> {
         match &self.kind {
             PolicyKind::Docker(_) => self.codex_chatgpt.as_ref(),
+            PolicyKind::Passthrough | PolicyKind::Launcher(_) => None,
+        }
+    }
+
+    /// The container-side delivery settings, `Some` only for a docker policy whose `[sandbox]
+    /// container_delivery = true`. `None` ⇒ the host delivery path, which is the shipped behaviour.
+    pub fn container_delivery(&self) -> Option<ContainerDeliveryPolicy> {
+        match &self.kind {
+            PolicyKind::Docker(policy) => policy.container_delivery,
             PolicyKind::Passthrough | PolicyKind::Launcher(_) => None,
         }
     }
@@ -3179,6 +3237,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            container_delivery: None,
         });
         let env = vec![("GIT_AUTHOR_NAME".to_string(), "maxplayer-seller-abcd".to_string())];
         let workdir = Path::new("/home/seller/.maxplayer/seller-jobs/job1");
@@ -3244,6 +3303,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            container_delivery: None,
         })
     }
 
@@ -3445,6 +3505,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            container_delivery: None,
         });
 
         // A REAL directory, for the reason `probe_launch_argv` refuses a missing one.
@@ -4133,6 +4194,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            container_delivery: None,
         });
         let launch = policy
             .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
@@ -4173,6 +4235,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            container_delivery: None,
         });
         let launch = policy
             .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
@@ -4228,6 +4291,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            container_delivery: None,
         });
         let launch = policy
             .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
@@ -4773,6 +4837,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            container_delivery: None,
         });
         let launch = default_rt
             .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
@@ -4791,6 +4856,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            container_delivery: None,
         });
         let launch = gvisor
             .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
@@ -4827,6 +4893,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            container_delivery: None,
         });
         let launch = unset
             .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
@@ -4844,6 +4911,7 @@ mod tests {
             network: Some("maxplayer-sbx".into()),
             proxy_ports: None,
             file_credentials: Vec::new(),
+            container_delivery: None,
         });
         let launch = joined
             .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
@@ -5158,6 +5226,150 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    // The container-delivery switch (Track B). Off by default: a docker seat that never names the
+    // key stays on the host delivery path, and the two companion keys take their documented
+    // defaults once the switch is on.
+    #[test]
+    fn container_delivery_is_off_by_default_and_resolves_under_docker() {
+        use crate::home::{ContainerDeliveryToken, SandboxConfig, SandboxMode};
+        let off = SandboxConfig { mode: SandboxMode::Docker, ..Default::default() };
+        let policy = SandboxPolicy::from_config(Some(&off)).expect("docker policy");
+        assert_eq!(policy.container_delivery(), None, "the switch defaults to the host path");
+
+        let on = SandboxConfig {
+            mode: SandboxMode::Docker,
+            container_delivery: true,
+            ..Default::default()
+        };
+        let policy = SandboxPolicy::from_config(Some(&on)).expect("docker policy");
+        assert_eq!(
+            policy.container_delivery(),
+            Some(ContainerDeliveryPolicy {
+                token: ContainerDeliveryToken::FreshAfterAgent,
+                token_cap_secs: DEFAULT_CONTAINER_DELIVERY_TOKEN_CAP_SECS,
+            }),
+            "on ⇒ fresh-after-agent tokens and the 6 h cap"
+        );
+        assert_eq!(DEFAULT_CONTAINER_DELIVERY_TOKEN_CAP_SECS, 6 * 60 * 60);
+
+        let long_lived = SandboxConfig {
+            mode: SandboxMode::Docker,
+            container_delivery: true,
+            container_delivery_token: Some(ContainerDeliveryToken::LongLived),
+            container_delivery_token_cap_secs: Some(3_600),
+            ..Default::default()
+        };
+        let policy = SandboxPolicy::from_config(Some(&long_lived)).expect("docker policy");
+        assert_eq!(
+            policy.container_delivery(),
+            Some(ContainerDeliveryPolicy {
+                token: ContainerDeliveryToken::LongLived,
+                token_cap_secs: 3_600,
+            })
+        );
+
+        // The companion keys without the switch are inert, not an error: an operator may stage
+        // them before flipping the switch.
+        let staged = SandboxConfig {
+            mode: SandboxMode::Docker,
+            container_delivery_token: Some(ContainerDeliveryToken::LongLived),
+            ..Default::default()
+        };
+        let policy = SandboxPolicy::from_config(Some(&staged)).expect("docker policy");
+        assert_eq!(policy.container_delivery(), None);
+
+        // A pass-through policy has no container to deliver from.
+        assert_eq!(SandboxPolicy::passthrough().container_delivery(), None);
+    }
+
+    // The three keys are refused under `launcher` mode — each on its own — because launcher mode
+    // creates no container to move the git steps into.
+    #[test]
+    fn container_delivery_keys_are_refused_outside_docker_mode() {
+        use crate::home::{ContainerDeliveryToken, SandboxConfig, SandboxMode};
+        let cases = [
+            SandboxConfig {
+                mode: SandboxMode::Launcher,
+                container_delivery: true,
+                ..Default::default()
+            },
+            SandboxConfig {
+                mode: SandboxMode::Launcher,
+                container_delivery_token: Some(ContainerDeliveryToken::FreshAfterAgent),
+                ..Default::default()
+            },
+            SandboxConfig {
+                mode: SandboxMode::Launcher,
+                container_delivery_token_cap_secs: Some(60),
+                ..Default::default()
+            },
+        ];
+        for config in cases {
+            let error = SandboxPolicy::from_config(Some(&config))
+                .expect_err("a container-delivery key under launcher mode must be refused");
+            let message = error.to_string();
+            assert!(
+                message.contains("container_delivery") && message.contains("mode = \"docker\""),
+                "the refusal names the keys and the mode they need: {message}"
+            );
+        }
+        // Control: launcher mode with none of the keys resolves as before.
+        SandboxPolicy::from_config(Some(&SandboxConfig {
+            mode: SandboxMode::Launcher,
+            launcher: vec!["env".to_owned()],
+            ..Default::default()
+        }))
+        .expect("launcher mode without the keys is unchanged");
+    }
+
+    // A zero cap is a typo that would refuse every long-lived mint; it is refused at config time.
+    #[test]
+    fn container_delivery_zero_cap_is_refused() {
+        use crate::home::{SandboxConfig, SandboxMode};
+        let error = SandboxPolicy::from_config(Some(&SandboxConfig {
+            mode: SandboxMode::Docker,
+            container_delivery: true,
+            container_delivery_token_cap_secs: Some(0),
+            ..Default::default()
+        }))
+        .expect_err("a zero cap is refused");
+        assert!(error.to_string().contains("container_delivery_token_cap_secs"), "{error}");
+    }
+
+    // The keys parse from the TOML an operator writes, in the documented spelling, and a config
+    // that never names them serialises without them — so a seat on the host path writes back a
+    // `[sandbox]` section byte-identical to before this switch existed.
+    #[test]
+    fn container_delivery_keys_parse_from_toml_and_stay_absent_when_off() {
+        use crate::home::{ContainerDeliveryToken, SandboxConfig, SandboxMode};
+        let parsed: SandboxConfig = toml::from_str(
+            "mode = \"docker\"\n\
+             container_delivery = true\n\
+             container_delivery_token = \"long-lived\"\n\
+             container_delivery_token_cap_secs = 7200\n",
+        )
+        .expect("the documented spelling parses");
+        assert!(parsed.container_delivery);
+        assert_eq!(parsed.container_delivery_token, Some(ContainerDeliveryToken::LongLived));
+        assert_eq!(parsed.container_delivery_token_cap_secs, Some(7_200));
+        let fresh: SandboxConfig =
+            toml::from_str("mode = \"docker\"\ncontainer_delivery_token = \"fresh-after-agent\"\n")
+                .expect("parses");
+        assert_eq!(fresh.container_delivery_token, Some(ContainerDeliveryToken::FreshAfterAgent));
+        assert!(
+            toml::from_str::<SandboxConfig>("mode = \"docker\"\ncontainer_delivery_token = \"forever\"\n")
+                .is_err(),
+            "an unknown token mode is refused, never defaulted"
+        );
+
+        let off = SandboxConfig { mode: SandboxMode::Docker, ..Default::default() };
+        let written = toml::to_string(&off).expect("serialises");
+        assert!(
+            !written.contains("container_delivery"),
+            "an unset switch leaves no trace in the written config: {written}"
+        );
+    }
+
     // from_config threads the runtime through, and a blank string is treated as unset rather than
     // forwarded as an empty `--runtime ` that docker would reject.
     #[test]
@@ -5212,6 +5424,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            container_delivery: None,
         });
         let carried = forwarded_agent_env_from(&docker, daemon_env);
         let names: Vec<&str> = carried.iter().map(|(k, _)| k.as_str()).collect();
@@ -5411,6 +5624,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: vec![cred],
+            container_delivery: None,
         });
         let uncontained =
             uncontained_forwarded_credentials(&policy, |_| Some("set-to-something".to_owned()));
@@ -5599,6 +5813,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            container_delivery: None,
         });
         let carried = forwarded_agent_env_from(&policy, env);
         let names: Vec<&str> = carried.iter().map(|(k, _)| k.as_str()).collect();
@@ -5621,6 +5836,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            container_delivery: None,
         });
         let env = vec![("ANTHROPIC_API_KEY".to_string(), "sk-ant-xxx".to_string())];
         let launch = policy
@@ -5669,6 +5885,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            container_delivery: None,
         });
         let forwarded: Vec<(String, String)> =
             SYNTHETIC_REALS.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
@@ -5699,6 +5916,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            container_delivery: None,
         });
         // All four credentials, an operator var carrying one of the secrets (must be scrubbed too), and
         // both vendor base URLs (the overrides must replace, not append).
@@ -5789,6 +6007,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            container_delivery: None,
         });
         let launch = policy
             .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
@@ -5813,6 +6032,7 @@ mod tests {
                 network: None,
                 proxy_ports: None,
                 file_credentials: Vec::new(),
+                container_delivery: None,
             })
         };
         // Operator forwards an unknown var (set), a known credential (contained), and a blank one.
@@ -5925,6 +6145,7 @@ mod tests {
                 network: None,
                 proxy_ports: None,
                 file_credentials: Vec::new(),
+                container_delivery: None,
             });
         let job = JobLaunch {
             workdir: &workdir,
