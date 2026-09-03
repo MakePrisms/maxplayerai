@@ -851,10 +851,10 @@ async fn bounded<T>(
 
 /// The two mint wallets one hop runs against.
 ///
-/// Both are opened through [`buyer_fund::open_wallet_at_mint_async`], which fences the mint it is
-/// asked for. That is why the hop cannot become a back door around `allow_real_mints`: the fence is
-/// inside the opener, so the TARGET is fenced by the same code that fences the source, without this
-/// module having to remember to do it.
+/// Both are opened through [`buyer_fund::open_wallet_at_mint_async`], which checks the mint URL it
+/// is asked for. WHICH mints may be used is the seat's configured list, applied by the planner that
+/// produced this pairing — the hop adds no mint of its own, so it cannot reach one the plan did
+/// not already name.
 pub(crate) struct CdkHopEffects {
     source: Wallet,
     target: Wallet,

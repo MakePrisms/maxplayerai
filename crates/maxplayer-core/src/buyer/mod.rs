@@ -826,7 +826,6 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
                 offer,
                 max_sats,
                 context.home.config.default_mint(),
-                context.home.config.allow_real_mints,
             );
 
             // Manual award names the claim but applies the SAME hard filters as auto-award —
@@ -1316,7 +1315,6 @@ async fn drive_auto_award(
             offer,
             max_sats,
             context.home.config.default_mint(),
-            context.home.config.allow_real_mints,
         );
 
         // Built AFTER `filters` so the deadline park can name the capability request that refused
@@ -3019,6 +3017,9 @@ async fn status(context: &BuyerContext, id: Value) -> Response {
 
 #[cfg(test)]
 mod tests {
+    /// Test fixture mint host — NOT a default. A mint is just a mint: what makes one usable is membership of
+    /// the home's configured list, which each test sets up explicitly.
+    const FIXTURE_MINT_URL: &str = "https://mint.example/Bitcoin";
     /// Every pre-existing reconcile test runs with the local-clock floor OFF, which is how it
     /// ships. Naming it here means each call site states that rather than leaving it implied.
     const FLOOR_OFF: lifecycle::UnattemptedFloor = lifecycle::UnattemptedFloor {
@@ -5781,7 +5782,7 @@ mod tests {
             &job_id,
             amount,
             "sat",
-            &[crate::home::DEFAULT_MINT_URL.to_string()],
+            &[FIXTURE_MINT_URL.to_string()],
             &seller_hex,
         )
         .expect("creq");

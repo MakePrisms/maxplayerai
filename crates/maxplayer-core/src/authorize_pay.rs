@@ -495,7 +495,7 @@ pub async fn authorize_pay_async(
             let effects = CdkHopEffects::open(
                 home,
                 &source.to_string(),
-                &wallet_open_mint_url(home, &terms),
+                &wallet_open_mint_url(&terms),
             )
             .await?;
             // A pairing already on disk WINS over freshly raised quotes. This attempt may have
@@ -509,7 +509,7 @@ pub async fn authorize_pay_async(
         }
     };
 
-    let wallet = buyer_fund::open_wallet_at_mint_async(home, &wallet_open_mint_url(home, &terms))
+    let wallet = buyer_fund::open_wallet_at_mint_async(home, &wallet_open_mint_url(&terms))
         .await?;
     // Wallet HTTP must run ONLY on the wallet worker, never on this caller runtime. A pre-spawn dust
     // check here ran on the current-thread runtime `collect_blocking` builds (collect.rs), priming a
@@ -756,7 +756,7 @@ pub async fn complete_recovered_locked_async(
     // delivery used that kind, so completion reconstructs byte-identical bytes.
     let delivery_kind = DeliveryKind::Fork;
 
-    let wallet = buyer_fund::open_wallet_at_mint_async(home, &wallet_open_mint_url(home, &terms))
+    let wallet = buyer_fund::open_wallet_at_mint_async(home, &wallet_open_mint_url(&terms))
         .await?;
     let payment_send = NostrPaymentSend::new(home.config.relay_url.clone(), keys);
     let mut effects = CdkPaymentEffects::spawn(
@@ -813,13 +813,13 @@ fn contribution_policy(home: &MaxplayerHome) -> crate::contribution::ContentPoli
 /// buyer flips its config default to B, bind the wallet to B while the attempt id + send target A —
 /// the budget is appended, then the send refuses on mint mismatch and strands the reservation.
 /// Taking the mint from the sealed terms keeps the wallet, the attempt id, and the send all on one
-/// mint. `home` is passed so the already-fenced invariant is asserted at this seam (the realized
-/// mint was fenced while planning; `open_wallet_at_mint_async` re-checks, redundant-safe).
-pub(crate) fn wallet_open_mint_url(home: &MaxplayerHome, terms: &PaymentTerms) -> String {
+/// mint. The sealed mint was already checked while planning; `open_wallet_at_mint_async` re-checks
+/// its shape, redundant-safe.
+pub(crate) fn wallet_open_mint_url(terms: &PaymentTerms) -> String {
     let mint_url = terms.mint.to_string();
     debug_assert!(
-        crate::home::mint_allowed(&mint_url, home.config.allow_real_mints),
-        "frozen realized mint must already be fenced before wallet open"
+        crate::home::mint_url_supported(&mint_url),
+        "frozen realized mint must be a usable mint URL before wallet open"
     );
     mint_url
 }
@@ -926,11 +926,7 @@ fn derive_payment(
         .map_err(|error| AuthorizePayError::Input(format!("seller_pubkey: {error}")))?;
     let seller_p2pk = cashu_compressed_from_nostr(&seller_nostr)?;
     let buyer_selected_mint = realized_mint.unwrap_or_else(|| home.config.default_mint());
-    let plan = crate::crossmint::plan_payment(
-        buyer_selected_mint,
-        accepted_mints,
-        home.config.allow_real_mints,
-    )?;
+    let plan = crate::crossmint::plan_payment(buyer_selected_mint, accepted_mints)?;
     let terms = PaymentTerms::new(
         plan.realized_mint().clone(),
         Amount::from(amount_sats),
@@ -1187,24 +1183,27 @@ fn publish_receipt_event(
 
 #[cfg(test)]
 mod tests {
+    /// Test fixture mint host — NOT a default. A mint is just a mint: what makes one usable is membership of
+    /// the home's configured list, which each test sets up explicitly.
+    const FIXTURE_MINT_URL: &str = "https://mint.example/Bitcoin";
     use super::*;
     use cashu::MintUrl;
 
     use crate::budget::BudgetGate;
-    use crate::home::{self, DEFAULT_MINT_URL};
+    use crate::home::{self};
 
-    // A real (non-testnut) mint — admissible ONLY when `allow_real_mints` is true.
+    // A second mint fixture, distinct from FIXTURE_MINT_URL.
     const REAL_MINT: &str = "https://minibits.example";
 
     // Empty creq list → pay from the buyer's configured mint (config-driven).
     // Default flag (false): the configured testnut/dev mint plans a direct payment.
     #[test]
     fn pay_plan_empty_creq_uses_configured_mint() {
-        let plan = crate::crossmint::plan_payment(DEFAULT_MINT_URL, &[], false).unwrap();
+        let plan = crate::crossmint::plan_payment(FIXTURE_MINT_URL, &[]).unwrap();
         assert!(!plan.is_hop());
         assert_eq!(
             plan.realized_mint(),
-            &MintUrl::from_str(DEFAULT_MINT_URL).unwrap()
+            &MintUrl::from_str(FIXTURE_MINT_URL).unwrap()
         );
     }
 
@@ -1212,34 +1211,30 @@ mod tests {
     #[test]
     fn pay_plan_is_direct_when_configured_mint_is_listed() {
         let plan = crate::crossmint::plan_payment(
-            DEFAULT_MINT_URL,
+            FIXTURE_MINT_URL,
             &[
                 "https://other.example".to_string(),
-                DEFAULT_MINT_URL.to_string(),
+                FIXTURE_MINT_URL.to_string(),
             ],
-            false,
         )
         .unwrap();
         assert!(!plan.is_hop(), "overlap must not hop");
         assert_eq!(
             plan.realized_mint(),
-            &MintUrl::from_str(DEFAULT_MINT_URL).unwrap()
+            &MintUrl::from_str(FIXTURE_MINT_URL).unwrap()
         );
     }
 
     // The boundary, half one. A configured mint outside the creq list used to be the end of the
     // road for this claim; it is now a hop to a mint the seller does accept.
     //
-    // `allow_real_mints` is on because it has to be: with the flag off the fence admits exactly one
-    // mint (the testnut default), so a buyer and a seller can never be at two DIFFERENT admissible
-    // mints and a hop is structurally unreachable in the default posture. The flag is what makes
-    // two distinct admissible mints possible at all.
+    // Two DIFFERENT mints is the whole shape of a hop, and nothing gates that any more: the seller
+    // lists what it accepts, the buyer sits somewhere else, and the hop reaches across.
     #[test]
     fn pay_plan_hops_when_the_configured_mint_is_not_listed_but_the_target_is_admissible() {
         let plan = crate::crossmint::plan_payment(
             "https://buyer-only.example",
-            &[DEFAULT_MINT_URL.to_string()],
-            true,
+            &[FIXTURE_MINT_URL.to_string()],
         )
         .unwrap();
         assert!(plan.is_hop(), "no overlap must plan a hop, not refuse");
@@ -1249,72 +1244,49 @@ mod tests {
         );
         assert_eq!(
             plan.realized_mint(),
-            &MintUrl::from_str(DEFAULT_MINT_URL).unwrap()
+            &MintUrl::from_str(FIXTURE_MINT_URL).unwrap()
         );
     }
 
-    // The same no-overlap shape under the DEFAULT posture refuses, because the buyer's own mint is
-    // not admissible there — the fence stops it before a target is even considered. Together with
-    // the two tests around it this pins the whole boundary: a hop needs the operator's opt-in AND an
-    // admissible landing, and the fence refuses first when either is missing.
+    // NEGATIVE, one-mint form: a buyer mint that is not a mint URL at all refuses before a target
+    // is even considered — the only thing left to refuse on.
     #[test]
-    fn pay_plan_refuses_a_no_overlap_hop_under_the_default_posture() {
-        let error = crate::crossmint::plan_payment(
-            "https://buyer-only.example",
-            &[DEFAULT_MINT_URL.to_string()],
-            false,
-        )
-        .unwrap_err();
+    fn pay_plan_refuses_a_buyer_mint_that_is_not_a_mint_url() {
+        let error = crate::crossmint::plan_payment("not-a-url", &[FIXTURE_MINT_URL.to_string()])
+            .unwrap_err();
         assert!(
-            error.to_string().contains("real-mint fence"),
+            error.to_string().contains("not a usable mint URL"),
             "got: {error}"
         );
     }
 
-    // The boundary, half two. No overlap AND no admissible landing still refuses fail-closed — the
-    // target fence is the refusal that now covers what the old membership check covered. This pair
-    // pins exactly where "hop" ends and "refuse" begins.
+    // The boundary: no overlap and no landing that is a mint URL still refuses fail-closed.
     #[test]
-    fn pay_plan_refuses_when_no_overlap_and_no_accepted_mint_is_admissible() {
-        let error =
-            crate::crossmint::plan_payment(DEFAULT_MINT_URL, &[REAL_MINT.to_string()], false)
-                .unwrap_err();
+    fn pay_plan_refuses_when_no_overlap_and_no_accepted_mint_is_usable() {
+        let error = crate::crossmint::plan_payment(FIXTURE_MINT_URL, &["ftp://nope.example".to_string()])
+            .unwrap_err();
         assert!(matches!(error, AuthorizePayError::Input(_)));
         let rendered = error.to_string();
-        assert!(rendered.contains("real-mint fence"), "got: {rendered}");
-        assert!(
-            rendered.contains("nowhere permitted to land"),
-            "got: {rendered}"
-        );
+        assert!(rendered.contains("nowhere to land"), "got: {rendered}");
     }
 
-    // Real-mint switch: a buyer configured at a real mint X is REFUSED by the fence when the
-    // operator sets `allow_real_mints = false` (opt-out; since #378 the default is true)...
+    // A mint is just a mint: any mint the creq lists is payable, with no second switch to flip.
+    // The seller's own accepted list is what decided it, and it is the creq's contents.
     #[test]
-    fn pay_plan_real_mint_refused_when_flag_false() {
-        let error =
-            crate::crossmint::plan_payment(REAL_MINT, &[REAL_MINT.to_string()], false).unwrap_err();
-        assert!(matches!(error, AuthorizePayError::Input(_)));
-        assert!(error.to_string().contains("real-mint fence"));
-    }
-
-    // ...and ADMITTED (pays at X when the creq lists X) once the operator opts in with the flag.
-    #[test]
-    fn pay_plan_real_mint_admitted_when_flag_true() {
+    fn pay_plan_pays_at_any_mint_the_creq_lists() {
         let plan =
-            crate::crossmint::plan_payment(REAL_MINT, &[REAL_MINT.to_string()], true).unwrap();
+            crate::crossmint::plan_payment(REAL_MINT, &[REAL_MINT.to_string()]).unwrap();
         assert!(!plan.is_hop());
         assert_eq!(plan.realized_mint(), &MintUrl::from_str(REAL_MINT).unwrap());
 
-        // With the flag on, a creq that lists a DIFFERENT admissible mint is now reachable by hop
-        // rather than refused for non-membership.
+        // A creq that lists a DIFFERENT mint is reachable by hop, not refused for non-membership.
         let hopped =
-            crate::crossmint::plan_payment(REAL_MINT, &[DEFAULT_MINT_URL.to_string()], true)
+            crate::crossmint::plan_payment(REAL_MINT, &[FIXTURE_MINT_URL.to_string()])
                 .unwrap();
         assert!(hopped.is_hop());
         assert_eq!(
             hopped.realized_mint(),
-            &MintUrl::from_str(DEFAULT_MINT_URL).unwrap()
+            &MintUrl::from_str(FIXTURE_MINT_URL).unwrap()
         );
     }
 
@@ -1570,11 +1542,11 @@ mod tests {
     }
 
     // The replacement invariant, at the pay entry point. `mint_unreachable_pay` no longer refuses a
-    // buyer that cannot settle at the seller's mint — the hop does, or the fence does. This pins the
-    // fence half END TO END: a hop with nowhere admissible to land refuses through the real pay
-    // path, burns zero budget, and leaves no pairing on disk for a later run to resume.
+    // buyer that cannot settle at the seller's mint — the hop does. This pins that half END TO END:
+    // a hop with nowhere USABLE to land refuses through the real pay path, burns zero budget, and
+    // leaves no pairing on disk for a later run to resume.
     #[test]
-    fn authorize_pay_refuses_an_inadmissible_hop_with_zero_spend_and_no_pairing() {
+    fn authorize_pay_refuses_an_unusable_hop_with_zero_spend_and_no_pairing() {
         let root = std::env::temp_dir().join(format!(
             "maxplayer-authorize-pay-hop-fence-{}-{}",
             std::process::id(),
@@ -1584,14 +1556,7 @@ mod tests {
                 .as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        let mut home = home::bootstrap(&root).expect("home");
-        // Issue #378 made allow_real_mints default TRUE; force the fenced posture this test needs so
-        // the seller's real mint stays inadmissible and the hop has nowhere to land.
-        home.config.allow_real_mints = false;
-        assert!(
-            !home.config.allow_real_mints,
-            "fenced posture (allow_real_mints = false) is what makes this refuse"
-        );
+        let home = home::bootstrap(&root).expect("home");
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         let request = AuthorizePayRequest {
             job_id: "job-hop-fence".into(),
@@ -1606,19 +1571,19 @@ mod tests {
             commit_oid: "aa".repeat(20),
             seller_signature: String::new(),
             creq_hash: None,
-            // The buyer sits on the one fenced mint; the seller accepts only an unfenced one, so
-            // there is nowhere the hop is permitted to land.
-            accepted_mints: vec![REAL_MINT.to_string()],
-            realized_mint: Some(DEFAULT_MINT_URL.to_string()),
+            // The seller's creq lists only something this wallet cannot speak to, so the hop has
+            // nowhere to land. (`ftp://` parses as a URL, so the refusal here is the mint-shape
+            // rule, not a parse error.)
+            accepted_mints: vec!["ftp://not-a-mint.example".to_string()],
+            realized_mint: Some(FIXTURE_MINT_URL.to_string()),
             contribution: None,
         };
         let error = authorize_pay_blocking(&home, &mut gate, request)
             .expect_err("an inadmissible hop target must refuse");
         let message = error.to_string();
-        assert!(message.contains("real-mint fence"), "unexpected: {message}");
         assert!(
-            message.contains("nowhere permitted to land"),
-            "the refusal must say the hop had no permitted target: {message}"
+            message.contains("nowhere to land"),
+            "the refusal must say the hop had no target: {message}"
         );
         assert_eq!(gate.spent(), 0, "a refused hop must not burn budget");
         assert!(
@@ -1805,7 +1770,7 @@ mod tests {
             )
         };
         let default_mint =
-            receipt_preimage_for(&key_at(DEFAULT_MINT_URL), &buyer, &seller, DeliveryKind::Fork);
+            receipt_preimage_for(&key_at(FIXTURE_MINT_URL), &buyer, &seller, DeliveryKind::Fork);
         let other_mint = receipt_preimage_for(
             &key_at("https://other-accepted.testnut.example"),
             &buyer,
@@ -1828,9 +1793,8 @@ mod tests {
     // The control asserts the pre-CC legacy (unsealed) path DIVERGES — exactly the double-pay vector.
     #[test]
     fn sealed_realized_mint_stabilizes_attempt_id_across_config_default_change() {
-        // Two distinct admissible paying mints, both in the seller's accepted set. `allow_real_mints`
-        // is on so two DIFFERENT mints can both pass the fence (with it off only DEFAULT_MINT_URL
-        // does, and there'd be no second admissible mint to shift to).
+        // Two distinct paying mints, both in the seller's accepted set — the config default can
+        // therefore shift between them, which is exactly what the seal has to survive.
         let m1 = "https://mint-a.example";
         let m2 = "https://mint-b.example";
         let accepted = vec![m1.to_string(), m2.to_string()];
@@ -1859,7 +1823,7 @@ mod tests {
         // a legacy bind (`None`) falls back to the live config default.
         let select = |sealed: Option<&str>, config_default: &str| {
             let chosen = sealed.unwrap_or(config_default);
-            crate::crossmint::plan_payment(chosen, &accepted, true)
+            crate::crossmint::plan_payment(chosen, &accepted)
                 .expect("plans")
                 .realized_mint()
                 .clone()
@@ -1905,7 +1869,7 @@ mod tests {
         let seller_nostr = NostrPublicKey::parse(&hex).expect("seller nostr");
         let seller_p2pk = cashu_compressed_from_nostr(&seller_nostr).expect("p2pk");
         let terms = PaymentTerms::new(
-            MintUrl::from_str(DEFAULT_MINT_URL).expect("mint"),
+            MintUrl::from_str(FIXTURE_MINT_URL).expect("mint"),
             Amount::from(amount_sats),
             CurrencyUnit::Sat,
             seller_nostr,
@@ -2027,7 +1991,7 @@ mod tests {
             commit_oid: oid.clone(),
             seller_signature: forged_sig,
             creq_hash: Some(creq_hash.clone()),
-            accepted_mints: vec![DEFAULT_MINT_URL.to_string()],
+            accepted_mints: vec![FIXTURE_MINT_URL.to_string()],
             realized_mint: None,
             contribution: None,
         };

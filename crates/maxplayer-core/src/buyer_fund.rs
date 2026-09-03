@@ -1,7 +1,8 @@
 //! Buyer wallet setup for packaged `~/.maxplayer`: open the CDK wallet at a mint, derive its seed from
 //! the nostr secret, and read its balance. The wallet opens at the configured mint
 //! ([`crate::home::MaxplayerConfig::default_mint`]) or at an explicit realized mint
-//! ([`open_wallet_at_mint_async`]); the real-mint fence gates non-testnut mints.
+//! ([`open_wallet_at_mint_async`]). Which mints this seat may use is its configured list; the open
+//! path only checks the URL is a usable mint URL.
 //!
 //! Funding a wallet (mint quote → surface the bolt11 invoice → wait for payment → mint) lives in
 //! [`crate::wallet_ops`]: `begin_mint_async` returns the invoice up front and `complete_mint_async`
@@ -22,7 +23,9 @@ pub enum FundError {
     Home(HomeError),
     Wallet(String),
     /// The configured mint is not permitted under the real-mint fence (issue #49): a real mint with
-    /// `allow_real_mints == false`. Fail-closed before opening/quoting the wallet.
+    /// The mint URL is not a well-formed `http://` / `https://` mint URL. Fail-closed before
+    /// opening/quoting the wallet. Mint POLICY is not decided here: the seat's configured list is
+    /// the only gate, and it is applied by the callers that own a config.
     MintNotAllowed { mint_url: String },
 }
 
@@ -33,7 +36,7 @@ impl std::fmt::Display for FundError {
             Self::Wallet(message) => write!(formatter, "wallet fund error: {message}"),
             Self::MintNotAllowed { mint_url } => write!(
                 formatter,
-                "mint {mint_url} not allowed (allow_real_mints is off; set MAXPLAYER_ALLOW_REAL_MINTS to opt in)"
+                "mint {mint_url} is not a usable mint URL (expected http:// or https:// with a host)"
             ),
         }
     }
@@ -86,11 +89,11 @@ pub async fn open_wallet_at_mint_async(
     home: &MaxplayerHome,
     mint_url: &str,
 ) -> Result<Wallet, FundError> {
-    // Real-mint fence (issue #49): fail closed BEFORE opening/quoting if this mint is a real mint
-    // and the operator has not opted in (`allow_real_mints == false`), the same gate the
-    // send/melt/receive paths enforce. Callers may have already fenced the realized mint; this
-    // re-checks so the helper is safe on its own.
-    if !home::mint_allowed(mint_url, home.config.allow_real_mints) {
+    // Shape check only: refuse a string that could never be a mint before opening/quoting a
+    // wallet at it. WHICH mints this seat may use is decided by its configured list, in the callers
+    // that own the config (`wallet_ops::mint_is_allowed`, the creq accepted set) — there is no
+    // second policy gate here.
+    if !home::mint_url_supported(mint_url) {
         return Err(FundError::MintNotAllowed {
             mint_url: mint_url.to_owned(),
         });
@@ -153,16 +156,15 @@ mod tests {
         assert_eq!(a.len(), 64);
     }
 
-    // The wallet opens at the CONFIGURED mint, not a compile-time pin — a buyer
-    // configured at a non-default mint spends from that mint (no `MintPinned` refusal). A real
-    // (non-testnut) mint requires the operator opt-in (`allow_real_mints`; see the real-mint fence).
+    // The wallet opens at the CONFIGURED mint, not a compile-time pin — a buyer configured at a
+    // non-default mint spends from that mint (no `MintPinned` refusal). A mint is just a mint: what
+    // decides is the seat's configured list, which this test sets.
     #[test]
     fn wallet_opens_at_the_configured_mint() {
         let root = temp_home("cfg-mint");
         let _ = std::fs::remove_dir_all(&root);
         let mut home = bootstrap(&root).expect("bootstrap");
         home.config.accepted_mints = vec!["https://minibits.example".into()];
-        home.config.allow_real_mints = true;
         let wallet = open_wallet_blocking(&home).expect("open at configured mint");
         assert_eq!(wallet.mint_url.to_string(), "https://minibits.example");
         let _ = std::fs::remove_dir_all(&root);
@@ -179,12 +181,11 @@ mod tests {
         let mut home = bootstrap(&root).expect("bootstrap");
         // accepted[0] (== default) is the seller default; accepted[1] is the realized mint.
         home.config.accepted_mints = vec![
-            "https://default-testnut.example".into(),
-            "https://realized-testnut.example".into(),
+            "https://default-mint.example".into(),
+            "https://realized-mint.example".into(),
         ];
-        home.config.allow_real_mints = true;
-        assert_eq!(home.config.default_mint(), "https://default-testnut.example");
-        let realized = "https://realized-testnut.example";
+        assert_eq!(home.config.default_mint(), "https://default-mint.example");
+        let realized = "https://realized-mint.example";
         let wallet = open_wallet_at_mint_async(&home, realized)
             .await
             .expect("open at realized mint");
@@ -193,21 +194,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // Finding T(2): opening the buyer wallet fails closed on a non-allowlisted REAL mint when
-    // allow_real_mints=false — BEFORE any network open/quote — the same fence send/melt/receive
-    // enforce. With the opt-in it opens (covered by `wallet_opens_at_the_configured_mint`).
+    // Finding T(2), one-mint form: the wallet open fails closed BEFORE any network open/quote on a
+    // string that is not a usable mint URL, and opens on either scheme when it is. There is no
+    // real/test mint distinction left to fence on — `http://` is admitted deliberately, because a
+    // seat's own sidecar mint runs on loopback.
     #[test]
-    fn open_wallet_refuses_real_mint_when_disallowed() {
-        let root = temp_home("open-real-mint-fence");
+    fn open_wallet_refuses_a_url_that_is_not_a_mint_and_admits_both_schemes() {
+        let root = temp_home("open-mint-url-shape");
         let _ = std::fs::remove_dir_all(&root);
         let mut home = bootstrap(&root).expect("bootstrap");
-        home.config.accepted_mints = vec!["https://real-mint.example/".into()];
-        home.config.allow_real_mints = false;
-        let err = open_wallet_blocking(&home).expect_err("real mint must refuse under allow_real_mints=false");
-        assert!(
-            matches!(&err, FundError::MintNotAllowed { mint_url } if mint_url == "https://real-mint.example/"),
-            "expected MintNotAllowed, got {err:?}"
-        );
+
+        for bad in ["not-a-url", "ftp://mint.example", "https://", ""] {
+            home.config.accepted_mints = vec![bad.to_owned()];
+            let err = open_wallet_blocking(&home)
+                .expect_err("a string that is not a mint URL must refuse before any network touch");
+            assert!(
+                matches!(&err, FundError::MintNotAllowed { mint_url } if mint_url == bad),
+                "expected MintNotAllowed for {bad:?}, got {err:?}"
+            );
+        }
+
+        for good in ["https://real-mint.example/", "http://127.0.0.1:3338"] {
+            home.config.accepted_mints = vec![good.to_owned()];
+            let wallet = open_wallet_blocking(&home)
+                .unwrap_or_else(|error| panic!("a configured {good} must open: {error:?}"));
+            assert_eq!(wallet.mint_url.to_string(), good.trim_end_matches('/'));
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -227,8 +239,8 @@ mod tests {
 
     #[test]
     fn default_config_mint_is_the_shipped_minibits_default() {
-        // Issue #378 flipped the shipped default mint from testnut to a REAL minibits mint (paired
-        // with allow_real_mints = true). A fresh config's default mint is that minibits mint.
+        // Issue #378 flipped the shipped default mint to a minibits mint. A fresh config's default
+        // mint is that minibits mint.
         assert_eq!(
             MaxplayerConfig::default().default_mint(),
             crate::home::DEFAULT_MINIBITS_MINT_URL

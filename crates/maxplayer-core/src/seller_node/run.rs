@@ -6442,7 +6442,7 @@ impl SellerNodeRunner {
     /// Settle one gift-wrapped payment: decode it (through the signer actor — the NIP-44 decrypt
     /// needs the seller key, which never leaves the actor), authenticate the buyer by the seal,
     /// enforce the money-safety guards (seal sender == bound buyer, realized mint ∈ the STORED
-    /// claim-time creq per Fix Q, `allow_real_mints` fence), then — in the invariant-3 order — write
+    /// claim-time creq per Fix Q), then — in the invariant-3 order — write
     /// the intent breadcrumb BEFORE swapping at the mint, classify the swap FAIL-CLOSED (never infer
     /// collection from the breadcrumb), and only then record the receipt (deduped by the wrap id, so
     /// a replayed wrap credits the job at most once). Every refusal is logged with a named reason.
@@ -6533,14 +6533,6 @@ impl SellerNodeRunner {
         if !request.mints.contains(&payload_mint) {
             opline!(
                 "seller node wrap event={event_id}: realized mint {mint_str} outside the stored creq's accepted mints for job {job_id} — refused"
-            );
-            return;
-        }
-        // Real-mint fence: a real mint can never settle unless the operator opted in.
-        if !crate::home::mint_allowed(&mint_str, self.node.home().config.allow_real_mints) {
-            opline!(
-                "seller node wrap event={event_id}: mint {mint_str} not allowed (allow_real_mints={}) for job {job_id} — refused",
-                self.node.home().config.allow_real_mints
             );
             return;
         }

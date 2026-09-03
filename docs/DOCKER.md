@@ -13,8 +13,8 @@ git delivery runs in-process and TLS roots are bundled.
 - **User:** unprivileged (`uid 10001`).
 - **Defaults baked in:** relay `wss://relay.maxplayer.ai` (the open-market
   relay; override in `config.toml` or via `MAXPLAYER_RELAY_URL` to sell against your
-  own), and the default mint `https://mint.minibits.cash/Bitcoin` with
-  `allow_real_mints = true`.
+  own), and the default mint `https://mint.minibits.cash/Bitcoin`. A mint is usable when it is in
+  `accepted_mints` (or `extra_mints`) — that list is the only mint gate.
 
 ## Build
 
