@@ -285,7 +285,7 @@ pub const ADMITS_TARGETED_TAG: &str = "admits_targeted";
 /// `sat`: one token is one sat of the issuer's work at its published `rate`, and the mint URL is the
 /// sole thing that distinguishes this currency from any other `sat` on the wire.
 ///
-/// ONE tag, FIVE positional values, all required when the tag is present — see [`IssuerMintAd`] for
+/// ONE tag, FOUR positional values, all required when the tag is present — see [`IssuerMintAd`] for
 /// what each one means. Absent means the seat states no issuer mint. Malformed reads as UNSTATED,
 /// never as a rejection: an optional tag must not be able to take a working seat off the market.
 ///
