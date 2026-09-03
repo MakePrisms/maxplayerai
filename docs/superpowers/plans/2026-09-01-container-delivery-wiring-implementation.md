@@ -1,29 +1,42 @@
 # Container-delivery wiring — implementation spec (the go-live work)
 
-> **Status: BLOCKED, not started.** This is the durable spec for the wiring that moves git delivery
-> into the sandbox container. It exists so the plan is not lost while the blockers clear. Do NOT build
-> it until the gates below are met — most of it is not validatable without a live relay + a real
-> container.
+> **Status: BUILT, behind a switch that defaults to off.** The wiring is on branch
+> `feat/container-delivery-golive`, behind `[sandbox] container_delivery`. This document is the design
+> reference for the wiring that moves git delivery into the sandbox container. The code follows the
+> sections below. The sections "Live validation record" and "Follow-ups" record the status on
+> 2026-09-03.
 >
-> **Gates (all required):**
-> 1. Relay: #929 (scope enforcement) merged + deployed, plus the longer-life-for-scoped-tokens change
->    (Requirement B in `2026-08-31-relay-scoped-token-lifetime.md`), **canary-verified**.
-> 2. A running sandbox container to validate the host wiring + the driver relocation.
-> 3. Security review confirming C3/C4/C6 + metering-at-proxy in the wiring code.
+> **Gates:**
+> 1. Relay — **partly met.** Requirement A (#929, ref-scope enforcement) is deployed, and the canary
+>    verified it on 2026-09-03. Requirement B (long life for scoped tokens, the brief
+>    `2026-08-31-relay-scoped-token-lifetime.md`) is not deployed, and no code in this repo writes it.
+>    Therefore the `fresh-after-agent` token mode is the mode in use. The `long-lived` mode waits.
+> 2. Container — **met.** The container path delivered one from-scratch job on 2026-09-03, and the
+>    buyer paid for it. The host path (`container_delivery = false`) delivered one job on the same seat
+>    with no regression.
+> 3. Security review of C3/C4/C6 and B10 — **open.**
 
 ## Where this fits
 
-| PR | State | What it did |
+| PR / commit | State | What it did |
 |----|-------|-------------|
 | #937 | merged | interim host fix: `seller_git::neutralize_push_config` + neutralise-then-push on the host. Closes the exploit today. |
 | #930 | merged | Track A: the `["ref", …]` scope tag on the delivery token. |
 | #939 | merged | the orchestrator building blocks (`delivery_orchestrator`, `__deliver` CLI) — INERT; nothing invokes them. |
-| #949 | draft/blocked | Task B8: the `expiration_unix` mint seam for the long-lived token. INERT. |
-| **this spec** | — | how the inert pieces get wired so git actually runs in the container. |
+| #949 (`51e6587`) | on this branch | Task B8: the `expiration_unix` mint seam for the long-lived token. The `long-lived` token mode uses it. |
+| #950 (`cb26141`) | on this branch | this spec. |
+| `15b6e7b` | on this branch | Task B7: the sandbox image carries the `maxplayer` binary. The image build context is the repo root. |
+| `b090bd3` | on this branch | the relay canary test, `crates/maxplayer-core/tests/relay_canary.rs`. It is `#[ignore]`; a person runs it against a live relay. |
+| `92a4c80` | on this branch | the `[sandbox]` switch: `container_delivery`, `container_delivery_token`, `container_delivery_token_cap_secs`. Default off. |
+| `e00be26` | on this branch | Task B9: the ACP agent runs inside the delivery container. The host no longer drives ACP. |
+| `008e464` | on this branch | Task B2: the host launches one container, hands off the token in one of two modes, and reads back the OID. C3/C4/C6 land here. |
+| `1258772` | on this branch | docs for the switch: `SELLER-QUICKSTART.md` section 3c and `DOCKER.md`. |
 
-**Today git is 100% host-side.** Only the agent runs in the container. Clone (`init_*_workdir`),
-commit (`snapshot_delivery_at`), and push (`neutralize_then_push_off_runtime`) all run on the host in
-`SellerNodeRunner::execute_job` (`run.rs`). The wiring below moves them into the container.
+**With the switch off (the default), git is 100% host-side.** Only the agent runs in the container.
+Clone (`init_*_workdir`), commit (`snapshot_delivery_at`), and push (`neutralize_then_push_off_runtime`)
+all run on the host in `SellerNodeRunner::execute_job` (`run.rs:6299`). **With the switch on,**
+`execute_job` calls `deliver_via_container` (`run.rs:6473`), and the wiring below runs them in the
+container.
 
 ---
 
@@ -138,11 +151,46 @@ push reuses it via `delivery_orchestrator::push_delivery`.
 - The **relay canary** (mint a scoped token, push a different ref, expect 403) proves the scope is
   enforced before long-lived tokens are trusted.
 
+## Live validation record (2026-09-03)
+
+Seat: macOS, Docker 29.1.3, the cursor harness, a real minibits mint, 2 sats per job. The tester owned
+both the buyer and the seller, and built the sandbox image from this branch. Relay: `relay.maxplayer.ai`.
+Canary test: `crates/maxplayer-core/tests/relay_canary.rs`.
+
+| Check | Verdict | Evidence |
+|---|---|---|
+| Relay canary, Requirement A (ref scope) | **enforced** | The relay refused the push to a ref outside the token's scope: `pre-receive hook declined`. The push to the scoped ref succeeded. The cleanup left no canary ref. |
+| Relay canary, Requirement B (long life for scoped tokens) | **not deployed** | A scoped token with `created_at` 300 s in the past and a future `expiration` tag got HTTP 401, the same as an aged unscoped token. |
+| Container path, from-scratch job `c034b574` | **delivered and paid** | `container_delivery = true`, token mode `fresh-after-agent`. The seller claimed the job. One container ran the agent and every git step. Gated commit `271bb5bc`. The host handed over the fresh token after the agent exited. Container outcome `Delivered`. The seller published the result; the buyer accepted and paid. The host log shows no host-side clone, snapshot, or push line. The host removed the exchange directory after the job. About 50 s from award to delivered. |
+| Host path, job `2f91deb9` | **delivered and paid** | `container_delivery = false`. The log shows `seller push path=inprocess ... ok`. Commit `af52117`. No regression. |
+| Contribution job | **not tested** | — |
+| `long-lived` token mode | **not tested** | Blocked on relay Requirement B. |
+
+## Follow-ups (not done)
+
+- Task B10: meter usage at the credential proxy.
+- Remove the interim host push (the #937 path) once the switch is the default.
+- Relay Requirement B. Write it in the vendored relay (`crates/buzz/crates/buzz-auth/src/nip98.rs`
+  has a flat ±60 s check). Deploy it. Re-run the canary. Then allow
+  `container_delivery_token = "long-lived"`.
+- An orchestrator progress ping, so the host can base liveness on more than "container alive".
+- Container-mode gaps: an authenticated fetch of a relay-git contribution base, and the `checks.toml`
+  environment provisioning of a contribution base.
+- Push serialization across concurrent jobs (the relay answers 409).
+- A doctor check that the image carries `/usr/local/bin/maxplayer` when the switch is on.
+- The container's stderr capture (`seller-diagnostics/<job>/logs.txt`) was empty for the
+  container-path job. The orchestrator should log its phases to stderr.
+- The sandbox image CI workflow builds arm64 under QEMU, and a Rust release build there is very slow.
+  Proposal: one native runner per arch.
+- A live test of a contribution job.
+
 ## Code anchors
 
 - Host delivery path: `crates/maxplayer-core/src/seller_node/run.rs` — `execute_job` (provision →
   `run_agent_with_retry` → `snapshot_delivery_at` → `neutralize_then_push_off_runtime`).
-- Orchestrator (inert, #939): `crates/maxplayer-core/src/delivery_orchestrator.rs`
+- Container delivery path (B2): `crates/maxplayer-core/src/seller_node/run.rs` — `deliver_via_container`,
+  `classify_container_outcome`, `fail_container_delivery`, `container_exchange_dir`.
+- Orchestrator (#939, wired by B9 and B2): `crates/maxplayer-core/src/delivery_orchestrator.rs`
   (`run_phase1`, `push_delivery`, `run_phase1_entry`, `spawn_agent_child`, `Phase1Inputs`).
 - CLI entrypoint: `crates/maxplayer/src/deliver_cli.rs` (`maxplayer __deliver`).
 - Token mint seam (B8, #949): `git_transport::nip98_authorization_header_with_keys(…, expiration_unix)`
