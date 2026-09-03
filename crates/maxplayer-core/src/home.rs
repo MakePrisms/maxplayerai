@@ -1462,30 +1462,61 @@ fn default_per_job_budget_sats() -> u64 {
 /// predicate only rejects a string that could never be a mint at all. Full URL validity is
 /// re-checked downstream (`MintUrl::from_str` / `Wallet::new`).
 ///
-/// `http://` is admitted deliberately: a seat's own sidecar mint runs on loopback, and an
-/// https-only shape rule would make the operator's own list unusable.
+/// `http://` is admitted deliberately: a seat's own sidecar mint runs on loopback — including IPv6
+/// loopback, `http://[::1]:3338` — and an https-only shape rule would make the operator's own list
+/// unusable.
+///
+/// This validator is deliberately hand-rolled rather than delegated to a general URL parser: a
+/// browser-compatibility parser is the wrong instrument for an admission whitelist. `url::Url` reads
+/// `http:///x` as the host `x` (WHATWG special schemes skip repeated slashes), which would ADMIT a
+/// string this predicate exists to refuse.
 pub fn mint_url_supported(mint_url: &str) -> bool {
-    // Split the authority off properly rather than calling "host" everything after the scheme: the
-    // authority ends at the first `/`, `?` or `#`, and a userinfo prefix (`user@host`) is not the
-    // host. Then require a non-empty HOST — not merely a non-empty tail — so `http:///path`,
-    // `http://:8080` and `http:// ` are refused instead of waved through.
+    // 1. Only the two schemes this wallet speaks.
     let Some(rest) = mint_url
         .strip_prefix("https://")
         .or_else(|| mint_url.strip_prefix("http://"))
     else {
         return false;
     };
+    // 2. The authority ends at the first `/`, `?` or `#` — so `http:///x` has an EMPTY authority,
+    //    not the host `x`.
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    // `user@host` and `host:port` both keep the host in the middle; an empty host on either side of
-    // those separators is the malformed case this predicate exists to catch.
-    let after_userinfo = authority.rsplit('@').next().unwrap_or("");
-    let host = match after_userinfo.rsplit_once(':') {
-        // A trailing `:port` is only a port when what follows it is digits; otherwise the colon
-        // belongs to the host text (an IPv6 literal keeps its brackets and is handled below).
-        Some((head, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => head,
-        Some((head, "")) => head,
-        _ => after_userinfo,
+    // 3. Userinfo is not the host: keep only what follows the last `@`.
+    let host_part = authority.rsplit('@').next().unwrap_or("");
+    let host = if let Some(after_open) = host_part.strip_prefix('[') {
+        // 4. A bracketed IPv6 literal: it must close, the literal must be non-empty, and what
+        //    follows the bracket is either nothing or a `:` and an all-digit port.
+        let Some((literal, after_close)) = after_open.split_once(']') else {
+            return false;
+        };
+        let port_ok = match after_close.strip_prefix(':') {
+            Some(port) => !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()),
+            None => after_close.is_empty(),
+        };
+        if !port_ok {
+            return false;
+        }
+        literal
+    } else {
+        // 5. An unbracketed host carries no brackets at all, and at most one `:` — which must be
+        //    followed by an all-digit port. `mint.example:abc` and `:8080` are refused here.
+        if host_part.contains('[') || host_part.contains(']') {
+            return false;
+        }
+        match host_part.split_once(':') {
+            Some((head, port)) => {
+                let port_ok = !port.is_empty()
+                    && port.chars().all(|c| c.is_ascii_digit())
+                    && !port.contains(':');
+                if !port_ok {
+                    return false;
+                }
+                head
+            }
+            None => host_part,
+        }
     };
+    // 6. Whatever survived must actually be a host.
     !host.is_empty() && !host.chars().any(|c| c.is_whitespace())
 }
 
@@ -2215,7 +2246,6 @@ fn write_new_key(path: &Path) -> Result<(), HomeError> {
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -2640,8 +2670,9 @@ mod tests {
     }
 
     /// D: the predicate must implement its own contract — scheme ∈ {http, https} AND a non-empty
-    /// HOST — not merely "the tail after the scheme is non-empty". Each malformed case the old
-    /// tail-check waved through is named here.
+    /// HOST — not merely "the tail after the scheme is non-empty". Each malformed case an authority
+    /// tail-check waved through is named here, including the two that survived the first attempt at
+    /// this fix: a non-numeric port and an unterminated IPv6 literal.
     #[test]
     fn mint_url_supported_requires_a_scheme_and_a_real_host() {
         // ADMITTED. `http://` is deliberate and load-bearing: a seat's own sidecar mint runs on
@@ -2654,6 +2685,9 @@ mod tests {
             "https://mint.example:8443/Bitcoin",
             "https://user@mint.example/Bitcoin",
             "https://mint.example/Bitcoin?x=1#frag",
+            // A seat's own sidecar mint may sit on IPv6 loopback, with or without a port.
+            "http://[::1]:3338",
+            "https://[::1]",
         ] {
             assert!(mint_url_supported(good), "must admit {good}");
         }
@@ -2672,6 +2706,9 @@ mod tests {
             ("userinfo, then port only", "https://user@:8443"),
             ("empty tail", "https://"),
             ("empty tail, http", "http://"),
+            // The two an authority tail-check waved through, which is why the host is parsed now.
+            ("non-numeric port", "https://mint.example:abc"),
+            ("unterminated IPv6 literal", "https://[::1"),
         ];
         for (name, bad) in cases {
             assert!(!mint_url_supported(bad), "must refuse {name}: {bad:?}");
