@@ -502,7 +502,9 @@ fn run_push(workdir: &Path, remote: &str, branch: &str, header: String) -> (Push
         base_delay: Duration::ZERO,
         max_delay: Duration::ZERO,
     };
-    match push_delivery(workdir, remote, branch, Some(header), &policy) {
+    // The canary measures the relay's answer only. The C6 oid guard (`expected_oid`) has its own
+    // unit tests in `delivery_orchestrator`; `None` keeps this probe about the relay.
+    match push_delivery(workdir, remote, branch, Some(header), &policy, None) {
         Ok(oid) => (PushOutcome::Accepted, format!("accepted oid={oid}")),
         Err(error) => {
             let text = clean(&error.to_string(), 300);
