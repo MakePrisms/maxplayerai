@@ -41,6 +41,11 @@ pub enum WalletOpsError {
     /// than a hardcoded constant — on a real-minibits home the constant would be a false-default
     /// lie (#579).
     MintPinnedDefault { mint_url: String },
+    /// A Lightning operation (`wallet fund`, `wallet melt`) aimed at an ISSUER mint — a mint whose
+    /// info lists no bolt11 method (§4.2 "Issuer mint"). There is no Lightning there to mint from or
+    /// melt to; the message carries the plain reason. Issuance at a seat's own mint is a different
+    /// path (stage 3), never this one.
+    IssuerMint(String),
     Wallet(String),
 }
 
@@ -58,6 +63,7 @@ impl std::fmt::Display for WalletOpsError {
                  Set MAXPLAYER_ALLOW_REAL_MINTS=true (or allow_real_mints in config.toml) to opt in, \
                  or use --mint {DEFAULT_MINT_URL} for dev/play-money"
             ),
+            Self::IssuerMint(reason) => write!(formatter, "{reason}"),
             Self::MintPinnedDefault { mint_url } => write!(
                 formatter,
                 "cannot remove the default mint ({mint_url}); only extra_mints are removable"
@@ -439,6 +445,29 @@ pub async fn balances_async(home: &MaxplayerHome) -> Result<Vec<MintBalance>, Wa
     Ok(rows)
 }
 
+/// Refuse a Lightning operation at an ISSUER mint (§4.2 "Issuer mint") BEFORE any quote is raised.
+///
+/// The class comes from the mint's own NUT-06 info, read through the wallet's cached info load —
+/// the same document the quote call would consult next, so this adds no new dependency and a mint
+/// that cannot answer fails the operation exactly as the quote would have. `Ok(())` for a Lightning
+/// mint.
+async fn refuse_lightning_op_at_issuer(
+    wallet: &Wallet,
+    op: &str,
+    mint_url: &str,
+) -> Result<(), WalletOpsError> {
+    let info = wallet
+        .load_mint_info()
+        .await
+        .map_err(|error| WalletOpsError::Wallet(format!("{op}: mint info: {error}")))?;
+    crate::mint_class::refuse_lightning_at_issuer(
+        op,
+        mint_url,
+        crate::mint_class::class_from_info(&info),
+    )
+    .map_err(WalletOpsError::IssuerMint)
+}
+
 /// Create a mint quote and return the bolt11 **before** any poll/wait.
 pub async fn begin_mint_async(
     home: &MaxplayerHome,
@@ -450,6 +479,7 @@ pub async fn begin_mint_async(
     }
     let mint_url = resolve_mint(home, mint_override)?;
     let wallet = open_wallet_async(home, &mint_url).await?;
+    refuse_lightning_op_at_issuer(&wallet, "wallet fund", &mint_url).await?;
     let amount = Amount::from(amount_sats);
     let quote = wallet
         .mint_quote(PaymentMethod::BOLT11, Some(amount), None, None)
@@ -748,6 +778,7 @@ pub async fn melt_async(
         return Err(WalletOpsError::RealMintDisallowed { mint_url });
     }
     let wallet = open_wallet_async(home, &mint_url).await?;
+    refuse_lightning_op_at_issuer(&wallet, "wallet melt", &mint_url).await?;
     let quote = wallet
         .melt_quote(PaymentMethod::BOLT11, bolt11, None, None)
         .await

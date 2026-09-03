@@ -43,6 +43,7 @@ use cdk::wallet::Wallet;
 use crate::buyer_fund;
 use crate::crossmint::{HopCost, HopJournal};
 use crate::home::MaxplayerHome;
+use crate::mint_class::{ISSUER_HOP_REFUSAL, MintClass, class_from_info};
 use crate::payment_wallet::{MINT_TOUCH_TIMEOUT, is_mint_unreachable};
 
 /// What the source mint says about the melt leg.
@@ -187,11 +188,27 @@ pub enum HopError {
         /// Amount the target mint actually issued.
         minted: u64,
     },
+    /// One leg of the hop is an ISSUER mint (§4.2 "Issuer mint") — a mint whose info lists no
+    /// bolt11 method. It has no Lightning to melt to or mint from, so the hop refuses before either
+    /// leg is touched. Planning already refuses such a hop; this is the executor's own check, so
+    /// that no journal, no caller, and no stale plan can put a Lightning leg on an issuer mint.
+    IssuerMint {
+        /// Which leg: `source` or `target`.
+        leg: &'static str,
+        /// The issuer mint.
+        mint: String,
+    },
 }
 
 impl fmt::Display for HopError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::IssuerMint { leg, mint } => write!(
+                formatter,
+                "cross-mint hop refused: {ISSUER_HOP_REFUSAL}. The {leg} mint {mint} is an issuer \
+                 mint with no Lightning; its tokens are only good for hiring the seat that issued \
+                 them, so nothing can be melted out of it or minted into it over Lightning"
+            ),
             Self::Journal(detail) => write!(formatter, "cross-mint hop journal: {detail}"),
             Self::Mint(detail) => write!(formatter, "cross-mint hop: {detail}"),
             Self::MintUnreachable { label, detail } => write!(
@@ -296,6 +313,14 @@ impl std::error::Error for HopError {}
 /// that pays the melt and then dies before the mint reproduces the exact strand the journal exists to
 /// survive, which no amount of testing against a live mint pair could produce on demand.
 pub(crate) trait HopEffects {
+    /// The class of the (source, target) mints, from what each mint says about itself (its NUT-06
+    /// info). Asked FIRST, before any leg: an issuer mint on either side refuses the hop with no
+    /// melt and no mint quote touched. Knowledge, not a reachability gate: a mint that does not
+    /// answer is UNKNOWN and reads as `Lightning` (the fail-safe `mint_class::probe_issuer_mints`
+    /// uses), so the leg that follows refuses it with the reachability label an operator already
+    /// knows. A fake answers `Lightning` for both unless a test says otherwise.
+    fn mint_classes(&mut self) -> Result<(MintClass, MintClass), HopError>;
+
     /// Ask the SOURCE mint what became of the melt. Asking is also cdk's recovery trigger — a melt
     /// interrupted mid-saga resumes on this call rather than needing a separate sweep.
     fn melt_leg(&mut self, melt_quote_id: &str) -> Result<MeltLeg, HopError>;
@@ -639,6 +664,23 @@ pub(crate) fn run_hop<S: HopJournalStore, E: HopEffects>(
         });
     }
 
+    // Class gate, before the Planned record and before either leg: a hop has no business on an
+    // issuer mint in either direction (§4.2 "Issuer mint"). The planner already refuses one; this
+    // is the executor refusing on its own evidence — what the mints say about themselves — so no
+    // caller, journal, or stale plan can put a Lightning leg on a mint that has none.
+    let (source_class, target_class) = effects.mint_classes()?;
+    for (leg, class, mint) in [
+        ("source", source_class, &journal.source_mint),
+        ("target", target_class, &journal.target_mint),
+    ] {
+        if class == MintClass::Issuer {
+            return Err(HopError::IssuerMint {
+                leg,
+                mint: mint.clone(),
+            });
+        }
+    }
+
     let pairing = match planned_of(&records) {
         None => {
             store.append_sync(&HopRecord::Planned(journal.clone()))?;
@@ -906,6 +948,18 @@ impl CdkHopEffects {
                     .into(),
             ));
         }
+        // No quote is raised at an issuer mint, on either side (§4.2 "Issuer mint"). Asked of the
+        // mints themselves, before the first quote, so a plan that reached here by any route still
+        // cannot put a Lightning leg on a mint that has none. A mint that does not answer is
+        // unknown, not refused here: the quote below refuses it with its own reachability label.
+        for (leg, wallet) in [("source", &self.source), ("target", &self.target)] {
+            if Self::class_of(wallet).await == MintClass::Issuer {
+                return Err(HopError::IssuerMint {
+                    leg,
+                    mint: wallet.mint_url.to_string(),
+                });
+            }
+        }
         let mint_quote = bounded(
             "target mint quote",
             MINT_TOUCH_TIMEOUT,
@@ -1022,7 +1076,31 @@ fn mint_quote_id(id: &impl fmt::Display) -> String {
     id.to_string()
 }
 
+impl CdkHopEffects {
+    /// The class of one leg's mint from its own NUT-06 info (the wallet's cached load, bounded).
+    ///
+    /// Knowledge, not a gate: a mint that does not answer within [`MINT_TOUCH_TIMEOUT`], or answers
+    /// malformed, is UNKNOWN and reads as `Lightning` — the same fail-safe as
+    /// [`crate::mint_class::probe_issuer_mints`]. Only a mint that ANSWERS "no bolt11" is an issuer
+    /// mint here; an unreachable one is refused by the quote that follows, under the reachability
+    /// label (`target mint quote`, …) an operator already knows how to read.
+    async fn class_of(wallet: &Wallet) -> MintClass {
+        match tokio::time::timeout(MINT_TOUCH_TIMEOUT, wallet.load_mint_info()).await {
+            Ok(Ok(info)) => class_from_info(&info),
+            Ok(Err(_)) | Err(_) => MintClass::Lightning,
+        }
+    }
+}
+
 impl HopEffects for CdkHopEffects {
+    fn mint_classes(&mut self) -> Result<(MintClass, MintClass), HopError> {
+        let source = self.source.clone();
+        let target = self.target.clone();
+        block_on_leg("mint classes", async move {
+            (Self::class_of(&source).await, Self::class_of(&target).await)
+        })
+    }
+
     fn melt_leg(&mut self, melt_quote_id: &str) -> Result<MeltLeg, HopError> {
         let wallet = self.source.clone();
         let quote_id = melt_quote_id.to_owned();
@@ -1294,6 +1372,9 @@ mod tests {
         fail_all_melts: bool,
         /// Actual Lightning fee the melt effect reports as paid (#186 reconciliation input).
         melt_fee: u64,
+        /// What each mint says it is (§4.2 "Issuer mint"). Lightning unless a test says otherwise.
+        source_class: MintClass,
+        target_class: MintClass,
         /// Shared with the journal so a test can assert write-before-effect order.
         ops: Rc<RefCell<Vec<String>>>,
     }
@@ -1315,6 +1396,12 @@ mod tests {
     }
 
     impl HopEffects for FakeMints {
+        fn mint_classes(&mut self) -> Result<(MintClass, MintClass), HopError> {
+            let world = self.world.borrow();
+            world.ops.borrow_mut().push("classes".to_owned());
+            Ok((world.source_class, world.target_class))
+        }
+
         fn melt_leg(&mut self, _melt_quote_id: &str) -> Result<MeltLeg, HopError> {
             self.world
                 .borrow()
@@ -1717,10 +1804,59 @@ mod tests {
 
     // The send that follows hands the seller exactly the offer amount, so a short issue is refused
     // here rather than carried into the send path.
+    /// NEGATIVE: an issuer mint on either leg refuses BEFORE anything is journalled or touched — no
+    /// Planned record, no melt, no mint quote. The executor asks the mints what they are and stops
+    /// there. Two Lightning mints on the same journal proceed exactly as before.
+    #[test]
+    fn an_issuer_mint_on_either_leg_refuses_before_any_leg_is_touched() {
+        for (leg, source_class, target_class) in [
+            ("target", MintClass::Lightning, MintClass::Issuer),
+            ("source", MintClass::Issuer, MintClass::Lightning),
+            ("source", MintClass::Issuer, MintClass::Issuer),
+        ] {
+            let world = MintWorld::shared();
+            world.borrow_mut().source_class = source_class;
+            world.borrow_mut().target_class = target_class;
+            let store = MemJournal::default();
+            let mut effects = FakeMints {
+                world: Rc::clone(&world),
+            };
+            let error = run_hop(&store, &mut effects, &journal("attempt-1"))
+                .expect_err("an issuer leg must refuse");
+            match &error {
+                HopError::IssuerMint { leg: got, .. } => assert_eq!(*got, leg),
+                other => panic!("expected IssuerMint, got {other}"),
+            }
+            assert!(error.to_string().contains(ISSUER_HOP_REFUSAL), "{error}");
+            let ops = world.borrow().ops.borrow().clone();
+            assert_eq!(
+                ops,
+                vec!["classes".to_owned()],
+                "only the class question may have run ({leg} issuer): {ops:?}"
+            );
+            assert!(
+                store.replay("attempt-1").expect("replays").is_empty(),
+                "no Planned record may be written for a refused hop"
+            );
+        }
+
+        let world = MintWorld::shared();
+        let store = MemJournal::default();
+        let mut effects = FakeMints {
+            world: Rc::clone(&world),
+        };
+        let settled =
+            run_hop(&store, &mut effects, &journal("attempt-1")).expect("two Lightning mints hop");
+        assert_eq!(settled.minted_sats, 100);
+    }
+
     #[test]
     fn issuing_less_than_the_pinned_delivery_amount_refuses() {
         struct ShortMint;
         impl HopEffects for ShortMint {
+            fn mint_classes(&mut self) -> Result<(MintClass, MintClass), HopError> {
+                Ok((MintClass::Lightning, MintClass::Lightning))
+            }
             fn melt_leg(&mut self, _: &str) -> Result<MeltLeg, HopError> {
                 Ok(MeltLeg::Unpaid)
             }
