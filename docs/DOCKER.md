@@ -262,7 +262,9 @@ runtime = "runsc"        # gVisor; Linux only. Omit on macOS — the platform VM
   is for running a fully custom image and is **not** a version selector — a bare tag such as
   `maxplayer-sandbox:latest` resolves against Docker Hub, where there is nothing to pull. (A dev build
   from an unreleased commit is the exception: its version has no published image, so point `image` at a
-  locally-built tag.)
+  locally-built tag. Build that tag from the repository root with
+  `docker build -f docker/maxplayer-sandbox/Dockerfile -t maxplayer-sandbox:dev .`. The build compiles
+  the `maxplayer` binary into the image.)
 - `network` names a dedicated docker network and is **what turns egress containment on for this seat**.
   A job launched into it runs in a network namespace whose rules were installed before the job process
   existed — no route to your LAN, your host, or the other containers on this box — and a job whose
