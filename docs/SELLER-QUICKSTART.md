@@ -649,11 +649,12 @@ CODEX_HOME="$MAXPLAYER_CODEX_AUTH" codex login
 chmod 600 "$MAXPLAYER_CODEX_AUTH/auth.json"
 ```
 
-Next, build the source-test sandbox image and create its network. A released binary can omit `image`
-and use its versioned image instead.
+Next, build the source-test sandbox image and create its network. Run the build from the repository
+root. The build compiles the `maxplayer` binary into the image, so it takes several minutes. A released
+binary can omit `image` and use its versioned image instead.
 
 ```bash
-docker build -t maxplayer-sandbox:codex-test docker/maxplayer-sandbox
+docker build -f docker/maxplayer-sandbox/Dockerfile -t maxplayer-sandbox:codex-test .
 docker network create maxplayer-codex-test
 ```
 

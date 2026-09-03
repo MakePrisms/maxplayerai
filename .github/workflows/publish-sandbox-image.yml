@@ -1,7 +1,9 @@
 name: Publish sandbox image
 
 # Builds `docker/maxplayer-sandbox/Dockerfile` and pushes it to GHCR so sellers PULL the sandbox image
-# instead of building it from a repo checkout (docs/SANDBOXING.md §4, issue #792 phase 1).
+# instead of building it from a repo checkout (docs/SANDBOXING.md §4, issue #792 phase 1). The build
+# context is the REPO ROOT: the Dockerfile's builder stage compiles the `maxplayer` binary from the
+# workspace (Track B, `maxplayer __deliver`), so the crate sources must be in the context.
 #
 # This workflow ONLY publishes. It changes no runtime behaviour: the shipped config sample still offers
 # `image = "maxplayer-sandbox:latest"`, `doctor` is unchanged, and a seller who does nothing keeps
@@ -127,10 +129,17 @@ jobs:
             netfilter_tags="${netfilter_tags},${REGISTRY}/${NETFILTER_IMAGE_NAME}:latest"
           fi
 
+          # The commit the checkout above resolved, for the binary's `--version` stamp (#818). The
+          # Dockerfile's builder stage has no .git to read (.dockerignore strips it), so the caller
+          # states the commit. After the checkout, `git rev-parse HEAD` is the released ref in all
+          # three trigger shapes.
+          commit="$(git rev-parse HEAD)"
+
           echo "version=$version"               >> "$GITHUB_OUTPUT"
           echo "tags=$tags"                     >> "$GITHUB_OUTPUT"
           echo "netfilter_tags=$netfilter_tags" >> "$GITHUB_OUTPUT"
-          echo "Building $version (prerelease=$prerelease)"
+          echo "commit=$commit"                 >> "$GITHUB_OUTPUT"
+          echo "Building $version (prerelease=$prerelease) from commit $commit"
           echo "Tags: $tags"
           echo "Netfilter tags: $netfilter_tags"
 
@@ -149,11 +158,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The context is the repo root and the Dockerfile is named explicitly: the builder stage compiles
+      # the `maxplayer` binary from the workspace. NOTE: the arm64 half of this step runs a full Rust
+      # release build under QEMU, which is many times slower than a native build. The cargo cache
+      # mounts in the Dockerfile are not layers, so `type=gha` does not carry them between runs.
       - name: Build and push
         id: build
         uses: docker/build-push-action@v5
         with:
-          context: docker/maxplayer-sandbox
+          context: .
+          file: docker/maxplayer-sandbox/Dockerfile
+          build-args: |
+            MAXPLAYER_BUILD_COMMIT=${{ steps.meta.outputs.commit }}
           push: true
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}

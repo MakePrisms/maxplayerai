@@ -1,13 +1,20 @@
+# syntax=docker/dockerfile:1
+#
 # The sandbox image the seller runs an awarded job inside (`[sandbox] mode = "docker"`).
 #
 # It carries only what a job legitimately needs: the node runtime, the ACP agent adapters the
 # harness presets launch (claude/codex), git for the delivery commit, CA certificates so the
-# adapter's HTTPS calls (model API, relay, git host) validate, and nix so a nix-flake-provisioned job
-# has a provisioner. The seller mounts the per-job workdir at /work and runs the container as the
-# seller's uid; NOTHING else of the host is present, so the wallet/keys/journal under
-# $MAXPLAYER_HOME cannot be read from here.
+# adapter's HTTPS calls (model API, relay, git host) validate, nix so a nix-flake-provisioned job
+# has a provisioner, and the `maxplayer` binary itself. The binary is the container-side delivery
+# orchestrator (`maxplayer __deliver`, Track B). The seller mounts the per-job workdir at /work and
+# runs the container as the seller's uid; NOTHING else of the host is present, so the
+# wallet/keys/journal under $MAXPLAYER_HOME cannot be read from here.
 #
-# Build:  docker build -t maxplayer-sandbox:latest docker/maxplayer-sandbox
+# Build from the REPO ROOT. The builder stage compiles the crate, so the context must hold the
+# workspace. The root .dockerignore keeps target/, .git/ and web/ out of the context:
+#   docker build -f docker/maxplayer-sandbox/Dockerfile -t maxplayer-sandbox:latest .
+# Add `--build-arg MAXPLAYER_BUILD_COMMIT="$(git rev-parse HEAD)"` to stamp the binary with its
+# commit. Without it, `maxplayer --version` prints an honest `(unknown)` (#818).
 
 # nix arrives as a copied store rather than through the installer: the installer wants root and sets
 # up a daemon, and the job container has neither — it runs as a host uid with `--cap-drop ALL` and
@@ -22,6 +29,34 @@ RUN set -eux; \
     nix --extra-experimental-features nix-command \
         copy --no-check-sigs --to "local?root=/nixroot" "$pkg"; \
     ln -s "$pkg/bin" /nixroot/nix/nixbin
+
+# The `maxplayer` binary, compiled from this checkout. The build context is the repo root, so the
+# workspace is visible here. The features mirror the top-level Dockerfile and ci.yml:
+#   acp    — the seller surface (agent execution). Not in the default set.
+#   wallet — the wallet and in-process git delivery. `__deliver` refuses to run without it.
+# `--locked` holds the build to Cargo.lock, so the image carries the dependency set the commit names.
+#
+# Two cache mounts keep the cargo registry and the target dir warm across rebuilds. The target cache
+# id carries TARGETARCH on purpose: a multi-platform build runs this stage once per platform, and two
+# cargo builds that share one target dir overwrite each other's `release/maxplayer`. A cache mount is
+# not a layer, so a registry cache (`type=gha`) does not carry it between CI runs.
+FROM rust:1-bookworm AS builder
+WORKDIR /src
+COPY . .
+# #818: .dockerignore strips .git/, so build.rs has no HEAD to read. The caller states the commit
+# (`--build-arg MAXPLAYER_BUILD_COMMIT=...`). ENV as well as ARG, because the value must reach the
+# build script that cargo runs, not only this Dockerfile. Unsupplied, the stamp is `(unknown)`.
+ARG MAXPLAYER_BUILD_COMMIT=
+ENV MAXPLAYER_BUILD_COMMIT=${MAXPLAYER_BUILD_COMMIT}
+ARG TARGETARCH
+# `install -m 0755` sets the mode the final stage needs: the job uid is a host uid with no passwd
+# entry there, so the binary must be executable by everyone. `strip` drops the debug symbols.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=maxplayer-target-${TARGETARCH},target=/src/target \
+    set -eu; \
+    cargo build --release -p maxplayer --features acp,wallet --locked; \
+    install -m 0755 /src/target/release/maxplayer /usr/local/bin/maxplayer; \
+    strip /usr/local/bin/maxplayer
 
 FROM node:22-bookworm-slim
 
@@ -166,6 +201,15 @@ RUN set -eux; \
         links=$((links + 1)); \
     done; \
     [ "$links" -ge 1 ]
+
+# The `maxplayer` binary from the builder stage: the container-side delivery orchestrator
+# (`maxplayer __deliver <phase1|phase2> <inputs.json>`, Track B). With the Track B wiring, the seller
+# daemon runs it as the container's command, so clone, gate, commit and push happen INSIDE the
+# container. The host never opens a git repository the job agent could write. The binary holds no
+# secret: the host passes the per-job inputs at `docker run`. Mode 0755, so the job uid — a host uid
+# with no passwd entry here — can execute it. ENTRYPOINT and CMD stay unchanged: the host passes the
+# full command.
+COPY --from=builder --chmod=0755 /usr/local/bin/maxplayer /usr/local/bin/maxplayer
 
 # HOME is a CONTAINER-ONLY path, deliberately NOT the mounted workdir.
 #
