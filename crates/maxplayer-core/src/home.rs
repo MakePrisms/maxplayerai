@@ -2215,6 +2215,7 @@ fn write_new_key(path: &Path) -> Result<(), HomeError> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -2638,7 +2639,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// D: the predicate must implement its own contract — scheme ∈ {http, https} AND a non-empty
     /// HOST — not merely "the tail after the scheme is non-empty". Each malformed case the old
     /// tail-check waved through is named here.
@@ -2683,6 +2683,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn shipped_defaults_are_real_money_and_usable() {
         // The whole default posture in one place. Load-bearing: the shipped default mint IS this
         // config's own configured mint, so the one mint gate — membership of the configured list —
