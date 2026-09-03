@@ -442,6 +442,25 @@ The port was never a control.
 default-denying inbound, or a cloud security group that exposes nothing but the ports you chose, both
 satisfy this. Sellers on a home NAT or a private network are already covered by the absence of a route.
 
+#### Container-side delivery (opt-in)
+
+`container_delivery = true` moves the git steps of a delivery into the job container. One container
+then runs the agent, the clone, the completion gate, the commit, and the push. The host runs no git
+for the job and reads back only the commit id. The switch needs `mode = "docker"` and a sandbox image
+that carries the `maxplayer` binary at `/usr/local/bin/maxplayer`.
+
+```toml
+[sandbox]
+mode = "docker"
+container_delivery = true
+# container_delivery_token = "fresh-after-agent"   # default; or "long-lived"
+# container_delivery_token_cap_secs = 21600        # "long-lived" only
+```
+
+The default token mode mints a 60-second branch-scoped push token after the agent has exited, so it
+works with the relay as deployed today. See `SELLER-QUICKSTART.md`, section 3c, "Container-side
+delivery", for the token modes, the log lines to watch, and the known limits.
+
 ### Working example: bubblewrap inside the container
 
 Install `bubblewrap` in your image (e.g. `apk add bubblewrap` / `apt-get install bubblewrap`), then add
