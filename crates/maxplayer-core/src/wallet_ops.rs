@@ -22,7 +22,7 @@ use cdk::Amount;
 use cdk_sqlite::wallet::WalletSqliteDatabase;
 
 use crate::buyer_fund::seed_from_secret_hex;
-use crate::home::{self, HomeError, MaxplayerHome, LEGACY_TESTNUT_MINT_URL};
+use crate::home::{self, HomeError, MaxplayerHome};
 
 #[derive(Debug)]
 pub enum WalletOpsError {
@@ -336,38 +336,6 @@ async fn open_balance_store(home: &MaxplayerHome) -> Result<WalletSqliteDatabase
         .map_err(|error| WalletOpsError::Wallet(error.to_string()))
 }
 
-fn is_autopay_mint(mint_url: &str) -> bool {
-    normalize_mint_url(mint_url)
-        .ok()
-        .as_deref()
-        == Some(LEGACY_TESTNUT_MINT_URL)
-}
-
-/// Money class a mint moves, derived purely from the mint URL. The historical dev mint
-/// ([`LEGACY_TESTNUT_MINT_URL`]) FakeWallet-auto-pays its own invoices — play money — while every other
-/// mint invoices for real sats. Internal: it gates the #445 fail-closed refusal of silently
-/// auto-funding play money and drives a play-money marker on dev rows. Ordinary mints carry no
-/// money-class label in user output — a mint is a mint, identified by its URL (#577).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MoneyType {
-    /// A real mint — its invoices move real sats.
-    Real,
-    /// The historical dev mint — auto-pays its own invoices with fake sats.
-    Play,
-}
-
-impl MoneyType {
-    /// Classify a mint URL. A URL that does not normalize is treated as [`Self::Real`] — the
-    /// fail-safe direction, so an unrecognized mint is never mislabeled play money.
-    pub fn of_mint(mint_url: &str) -> Self {
-        if is_autopay_mint(mint_url) {
-            Self::Play
-        } else {
-            Self::Real
-        }
-    }
-}
-
 /// Balance per configured or wallet-database-discovered mint. The sqlite store is shared across
 /// every mint, and proofs legally land at mints outside the configured set (seller redemption at
 /// `accepted_mints[1..]`, cross-mint hop residue) — so the read enumerates the DB truth (proof
@@ -584,24 +552,19 @@ pub async fn complete_mint_by_id_async(
 
 /// Flexible/repeatable mint-fund (no `already_funded` hard-block).
 ///
-/// A mint that FakeWallet-auto-pays its own invoices ([`LEGACY_TESTNUT_MINT_URL`]) goes begin →
-/// complete; every other mint returns [`MintFlow::NeedsPayment`] with the bolt11 already surfaced
-/// (caller pays, then [`complete_mint_async`]).
+/// Always returns [`MintFlow::NeedsPayment`] with the bolt11 already surfaced: the caller pays the
+/// invoice, then calls [`complete_mint_async`]. No mint is special-cased — a mint that settles its
+/// own invoices does so on its own, and the caller sees the same two steps either way.
 pub async fn mint_async(
     home: &MaxplayerHome,
     amount_sats: u64,
     mint_override: Option<&str>,
 ) -> Result<MintFlow, WalletOpsError> {
     let quote = begin_mint_async(home, amount_sats, mint_override).await?;
-    if is_autopay_mint(&quote.mint_url) {
-        Ok(MintFlow::Funded(complete_mint_async(home, &quote).await?))
-    } else {
-        Ok(MintFlow::NeedsPayment(quote))
-    }
+    Ok(MintFlow::NeedsPayment(quote))
 }
 
-/// Create a bolt11 invoice; an auto-paying mint mints once it settles. Other mints return
-/// [`MintFlow::NeedsPayment`] (invoice before any wait).
+/// Create a bolt11 invoice and return it before any wait ([`MintFlow::NeedsPayment`]).
 pub async fn invoice_async(
     home: &MaxplayerHome,
     amount_sats: u64,

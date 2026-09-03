@@ -70,12 +70,6 @@ pub const DEFAULT_RELAY_URL: &str = "wss://relay.maxplayer.ai";
 /// fallback every product default reads. A mint is just a mint — the seat's configured list is the
 /// only thing that decides whether it may be used (owner ruling, 2 Sep 2026).
 pub const DEFAULT_MINIBITS_MINT_URL: &str = "https://mint.minibits.cash/Bitcoin";
-/// The historical dev mint. **Never a default and never seeded**: nothing in the product writes it
-/// into a config, and no code path prefers it. It survives under this name only so the two places
-/// that must still recognise the host by sight can say which host they mean — the money-class
-/// check in [`crate::wallet_ops`] (held pending a ruling) and this module's own migration prose.
-/// If you are looking for "the default mint", it is the seat's `accepted_mints` list.
-pub const LEGACY_TESTNUT_MINT_URL: &str = "https://testnut.cashudevkit.org";
 /// Dead mint host — bootstrap migrates a config.toml carrying it onto
 /// [`DEFAULT_MINIBITS_MINT_URL`]. Removal only: nothing writes this host.
 pub const DEAD_TESTNUT_MINT_HOST: &str = "testnut.cashu.space";
