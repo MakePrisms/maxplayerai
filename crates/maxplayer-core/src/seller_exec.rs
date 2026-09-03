@@ -2284,7 +2284,7 @@ fn codex_chatgpt_session_for_command(
 /// Run the awarded agent under the ACP driver: one session in `workdir`, seeded with `prompt`, with
 /// the delivery `identity`'s git env, bounded by `timeout` (the unified job timeout). The agent
 /// command is launched through `policy` — directly under a pass-through policy, or inside the
-/// policy's launcher.
+/// policy's launcher. The agent child inherits this process's environment (the host behaviour).
 #[cfg(feature = "acp")]
 pub async fn run_agent_job(
     agent_command: &[String],
@@ -2293,6 +2293,26 @@ pub async fn run_agent_job(
     workdir: &Path,
     identity: &DeliveryAgentIdentity,
     timeout: AgentRunTimeout,
+) -> Result<AgentRunReport, ExecError> {
+    run_agent_job_with_env(agent_command, policy, prompt, workdir, identity, timeout, None).await
+}
+
+/// [`run_agent_job`] with an explicit agent environment. `agent_env = Some(pairs)` spawns the agent
+/// child with EXACTLY `pairs` as its environment (nothing inherited); `None` inherits, as
+/// [`run_agent_job`] does. The container-side delivery orchestrator passes the allowlist it computed
+/// (`delivery_orchestrator::agent_env_allowlist`), so the agent never sees the push token, the
+/// `job_hash`, or the inputs path — C4 of the container-delivery review. Under a docker policy the
+/// container's own `-e` pairs are what the agent sees, so callers pass `None` there.
+#[cfg(feature = "acp")]
+#[allow(clippy::too_many_arguments)]
+pub async fn run_agent_job_with_env(
+    agent_command: &[String],
+    policy: &SandboxPolicy,
+    prompt: &str,
+    workdir: &Path,
+    identity: &DeliveryAgentIdentity,
+    timeout: AgentRunTimeout,
+    agent_env: Option<Vec<(String, String)>>,
 ) -> Result<AgentRunReport, ExecError> {
     use crate::driver::{AcpDriver, AgentCommand, ContentBlock, PromptTurn, SessionConfig};
     use crate::engine::{run_job, RunParams};
@@ -2429,8 +2449,12 @@ pub async fn run_agent_job(
     let launch = policy.launch(&effective_command, &job)?;
     // The ACP idle/response timeout IS the unified job timeout — never a hardcoded 300s that could
     // override or conflict with `--job-timeout-secs`.
+    let mut agent = AgentCommand::new(launch.program, launch.args);
+    if let Some(env) = agent_env {
+        agent = agent.with_env(env);
+    }
     let mut driver = AcpDriver::new(
-        AgentCommand::new(launch.program, launch.args),
+        agent,
         crate::driver::PermissionOutcome::Allow,
         timeout.duration(),
     );
@@ -3103,6 +3127,21 @@ pub async fn run_agent_job(
     _workdir: &Path,
     _identity: &DeliveryAgentIdentity,
     _timeout: AgentRunTimeout,
+) -> Result<AgentRunReport, ExecError> {
+    Err(ExecError::AcpRequired)
+}
+
+/// Without the `acp` feature there is no agent runtime — fail closed with the rebuild hint.
+#[cfg(not(feature = "acp"))]
+#[allow(clippy::too_many_arguments)]
+pub async fn run_agent_job_with_env(
+    _agent_command: &[String],
+    _policy: &SandboxPolicy,
+    _prompt: &str,
+    _workdir: &Path,
+    _identity: &DeliveryAgentIdentity,
+    _timeout: AgentRunTimeout,
+    _agent_env: Option<Vec<(String, String)>>,
 ) -> Result<AgentRunReport, ExecError> {
     Err(ExecError::AcpRequired)
 }

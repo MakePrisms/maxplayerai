@@ -26,11 +26,27 @@ use crate::driver::{
 pub struct AgentCommand {
     program: String,
     args: Vec<String>,
+    /// The agent child's WHOLE environment, when set. `None` (the default) inherits this process's
+    /// environment, which is what a host launch has always done. `Some(pairs)` clears the inherited
+    /// environment and sets exactly `pairs` — the container-side orchestrator uses it so the agent
+    /// receives an allowlist and nothing else (the push token, `job_hash` and the inputs path never
+    /// reach the agent's environment, even by accident).
+    env: Option<Vec<(String, String)>>,
 }
 
 impl AgentCommand {
     pub fn new(program: String, args: Vec<String>) -> Self {
-        Self { program, args }
+        Self {
+            program,
+            args,
+            env: None,
+        }
+    }
+
+    /// Spawn the agent with exactly `env` as its environment (nothing inherited). See the field.
+    pub fn with_env(mut self, env: Vec<(String, String)>) -> Self {
+        self.env = Some(env);
+        self
     }
 
     fn runtime_id(&self) -> RuntimeId {
@@ -105,6 +121,11 @@ impl AcpDriver {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+        // An explicit environment REPLACES the inherited one; a host launch (`None`) is unchanged.
+        if let Some(env) = &self.command.env {
+            command.env_clear();
+            command.envs(env.iter().map(|(key, value)| (key.as_str(), value.as_str())));
+        }
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;

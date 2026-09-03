@@ -27,7 +27,7 @@ pub struct Readiness {
 /// `amount` is the exact string as reported by the harness (kept as text so it is
 /// byte-exact and never zero/float-mangled); `basis` ∈ {harness-reported-usd,
 /// harness-reported-notional}. Unit is locked to USD.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UsageCost {
     pub amount: String,
     pub basis: String,
@@ -39,7 +39,7 @@ pub struct UsageCost {
 /// the harness did not report is `None` and is NEVER zero-filled downstream. `total_tokens`
 /// is intentionally NOT stored — it is DERIVED (`input + output + reasoning`) at tag-emission
 /// so a partial capture can never masquerade as a complete total.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UsageMetadata {
     pub model: Option<String>,
     /// Non-cached input tokens.

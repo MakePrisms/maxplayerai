@@ -3,15 +3,17 @@
 //! entrypoint so clone/gate/commit/push happen INSIDE the container, and the host never opens a git
 //! repository the job agent could write.
 //!
-//! - `phase1`: provision the workdir, run the agent as a child (inheriting the container's stdin/
-//!   stdout so the host keeps driving ACP), gate + sentinel + commit, and write the delivery oid. No
-//!   push credential is present. The inputs file is deleted before the agent runs, so `job_hash` lives
-//!   only in memory (B-2).
-//! - `phase2`: harden the workdir's git config (whole-file replacement, so a planted `insteadOf`
-//!   cannot redirect the push) and push it with the host-minted, branch-scoped token, retrying
-//!   transient/conflict failures. No agent runs here, so the token never coexists with job code.
+//! - `phase1`: the ONE-container delivery. Reads and DELETES the inputs file (C3), provisions the
+//!   workdir, DRIVES the ACP agent itself (Task B9: no nested docker, an explicit environment
+//!   allowlist), gates + sentinels + commits, reaps every other process, obtains the branch-scoped
+//!   push token per the inputs' token source, pushes with the gated oid as the expected oid (C6), and
+//!   writes the oid and an outcome file for the host. Exit 0 only when the push succeeded.
+//! - `phase2`: the older push-only leg (harden the config, push with a host-minted token). Kept for
+//!   the split-container shape; the seller daemon does not launch it.
 //!
 //! The heavy lifting lives in [`maxplayer_core::delivery_orchestrator`]; this is only the argv shim.
+//! `phase1` builds its own current-thread Tokio runtime inside the core entry, because this CLI is
+//! synchronous.
 
 use std::io::Write;
 
