@@ -78,7 +78,7 @@ pub struct AwardFilters<'a> {
 /// stronger test.
 ///
 /// Everything filterable comes from the OFFER; only the money context is passed in, because the
-/// buyer's mint and its real-mint policy are properties of the buyer rather than of the job.
+/// buyer's own paying mint is a property of the buyer rather than of the job.
 pub fn award_filters_for_offer<'a>(
     offer: &'a OfferView,
     max_sats: u64,

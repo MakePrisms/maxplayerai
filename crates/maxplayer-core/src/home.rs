@@ -1465,10 +1465,28 @@ fn default_per_job_budget_sats() -> u64 {
 /// `http://` is admitted deliberately: a seat's own sidecar mint runs on loopback, and an
 /// https-only shape rule would make the operator's own list unusable.
 pub fn mint_url_supported(mint_url: &str) -> bool {
-    let host = mint_url
+    // Split the authority off properly rather than calling "host" everything after the scheme: the
+    // authority ends at the first `/`, `?` or `#`, and a userinfo prefix (`user@host`) is not the
+    // host. Then require a non-empty HOST — not merely a non-empty tail — so `http:///path`,
+    // `http://:8080` and `http:// ` are refused instead of waved through.
+    let Some(rest) = mint_url
         .strip_prefix("https://")
-        .or_else(|| mint_url.strip_prefix("http://"));
-    host.is_some_and(|host| !host.is_empty())
+        .or_else(|| mint_url.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // `user@host` and `host:port` both keep the host in the middle; an empty host on either side of
+    // those separators is the malformed case this predicate exists to catch.
+    let after_userinfo = authority.rsplit('@').next().unwrap_or("");
+    let host = match after_userinfo.rsplit_once(':') {
+        // A trailing `:port` is only a port when what follows it is digits; otherwise the colon
+        // belongs to the host text (an IPv6 literal keeps its brackets and is handled below).
+        Some((head, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => head,
+        Some((head, "")) => head,
+        _ => after_userinfo,
+    };
+    !host.is_empty() && !host.chars().any(|c| c.is_whitespace())
 }
 
 impl MaxplayerConfig {
@@ -2621,6 +2639,50 @@ mod tests {
     }
 
     #[test]
+    /// D: the predicate must implement its own contract — scheme ∈ {http, https} AND a non-empty
+    /// HOST — not merely "the tail after the scheme is non-empty". Each malformed case the old
+    /// tail-check waved through is named here.
+    #[test]
+    fn mint_url_supported_requires_a_scheme_and_a_real_host() {
+        // ADMITTED. `http://` is deliberate and load-bearing: a seat's own sidecar mint runs on
+        // loopback, so an https-only rule would make the operator's own list unusable.
+        for good in [
+            "http://127.0.0.1:3338",
+            "http://localhost",
+            "https://mint.example",
+            "https://mint.example/Bitcoin",
+            "https://mint.example:8443/Bitcoin",
+            "https://user@mint.example/Bitcoin",
+            "https://mint.example/Bitcoin?x=1#frag",
+        ] {
+            assert!(mint_url_supported(good), "must admit {good}");
+        }
+
+        // REFUSED — malformed non-empty tails, the class the old predicate accepted.
+        let cases = [
+            ("path only, no host", "http:///x"),
+            ("path only, root", "http:///"),
+            ("whitespace-only tail", "http:// "),
+            ("whitespace-only tail, several", "https://   "),
+            ("port only, no host", "http://:8080"),
+            ("port only, then path", "http://:8080/Bitcoin"),
+            ("embedded space in host", "https://mint .example"),
+            ("leading space before host", "https:// mint.example"),
+            ("userinfo but no host", "https://user@"),
+            ("userinfo, then port only", "https://user@:8443"),
+            ("empty tail", "https://"),
+            ("empty tail, http", "http://"),
+        ];
+        for (name, bad) in cases {
+            assert!(!mint_url_supported(bad), "must refuse {name}: {bad:?}");
+        }
+
+        // REFUSED — not a scheme this wallet speaks, or no scheme at all.
+        for bad in ["ftp://mint.example", "mint.example", "//mint.example", "", "   "] {
+            assert!(!mint_url_supported(bad), "must refuse {bad:?}");
+        }
+    }
+
     fn shipped_defaults_are_real_money_and_usable() {
         // The whole default posture in one place. Load-bearing: the shipped default mint IS this
         // config's own configured mint, so the one mint gate — membership of the configured list —

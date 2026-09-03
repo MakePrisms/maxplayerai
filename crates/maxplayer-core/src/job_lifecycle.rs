@@ -369,7 +369,7 @@ pub struct AcceptedBind {
     pub accepted_mints: Vec<String>,
     /// The buyer's FUNDING (source) mint for this job — the mint whose proofs are spent — SELECTED and
     /// frozen at accept from the buyer's then-configured default (or a pre-funded cross-mint balance),
-    /// validated against `accepted_mints` + the real-mint fence. The pay path derives the paying mint
+    /// validated against `accepted_mints`. The pay path derives the paying mint
     /// from THIS on every attempt — including retries — so a config-default change between attempts can
     /// never shift the mint and mint a second [`crate::payment::AttemptId`] (double-pay). On a
     /// cross-mint hop this is the SOURCE the buyer melts, NOT the mint the seller is paid in (that is
@@ -1324,7 +1324,7 @@ pub async fn accept_claim_async(
         verify_accepted_claim_creq(claim.creq.as_deref(), &request.job_id, offer.amount_sats)?;
 
     // FREEZE the buyer's paying mint at accept from its then-configured default, validated by
-    // planning the payment against the accepted set + the real-mint fence. Sealing the SELECTION
+    // planning the payment against the accepted set. Sealing the SELECTION
     // here — not just the accepted SET (finding V) — is what makes the pay-path attempt id stable
     // across retries: a config-default change after accept can no longer shift the mint into a
     // different attempt id and mint a second payment for one job (double-pay). A buyer with no

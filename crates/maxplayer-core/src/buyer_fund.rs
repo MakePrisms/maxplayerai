@@ -22,7 +22,6 @@ use crate::home::{self, HomeError, MaxplayerHome};
 pub enum FundError {
     Home(HomeError),
     Wallet(String),
-    /// The configured mint is not permitted under the real-mint fence (issue #49): a real mint with
     /// The mint URL is not a well-formed `http://` / `https://` mint URL. Fail-closed before
     /// opening/quoting the wallet. Mint POLICY is not decided here: the seat's configured list is
     /// the only gate, and it is applied by the callers that own a config.

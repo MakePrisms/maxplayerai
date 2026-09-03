@@ -1187,7 +1187,7 @@ mod tests {
     }
 
     /// Seed a home whose configured default is an ORDINARY mint — the shape every test that is
-    /// about output grammar rather than the held play-money class wants.
+    /// about output grammar wants.
     #[cfg(feature = "wallet")]
     fn seed_fixture_default_home(root: &std::path::Path) {
         let mut home = home::bootstrap(root).expect("bootstrap seed home");

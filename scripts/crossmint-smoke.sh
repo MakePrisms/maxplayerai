@@ -232,7 +232,7 @@ agent and never by a retry."
 # VAR=x maxplayer_at ...` cannot work — env execs a binary and would never see the function. Exporting
 # also means the mint lists and the cap apply to every invocation in the stage, not just the ones a
 # caller remembered to prefix.
-arm_real_mints() {
+arm_mint_lists() {
     export MAXPLAYER_ACCEPTED_MINTS="$SOURCE_MINT"
     export MAXPLAYER_EXTRA_MINTS="$TARGET_MINT"
     # The exposure cap as a RUNTIME gate rather than a matter of discipline: the budget gate
@@ -247,7 +247,7 @@ arm_real_mints() {
 # `status=needs_payment` branch is exercised — the branch no test mint can produce.
 fund() {
     require_auth
-    arm_real_mints
+    arm_mint_lists
     local home="$RUN_DIR/probe"
     rule "FUND — raise a ${FUND_SATS} sat mint quote at the SOURCE (${SOURCE_MINT})"
     ensure_home "$home"
@@ -274,7 +274,7 @@ If it auto-funded instead, it is a TEST mint and this is not the real-sats path.
 
 fund_complete() { # <quote_id>
     require_auth
-    arm_real_mints
+    arm_mint_lists
     local home="$RUN_DIR/probe" quote_id="${1:-}"
     [ -n "$quote_id" ] || die "usage: $0 --fund-complete <quote_id>"
     rule "FUND-COMPLETE — issue the ecash at the source"
@@ -294,7 +294,7 @@ the mint and recoverable — re-run this exact command. Do not re-pay the invoic
 # ── Stage A: routing + fee probe ────────────────────────────────────────────────────────────────
 stage_a() {
     require_auth
-    arm_real_mints
+    arm_mint_lists
     local home="$RUN_DIR/probe"
     rule "STAGE A — routing + fee probe: ${PROBE_SATS} sats ${SOURCE_MINT} -> ${TARGET_MINT}"
     ensure_home "$home"

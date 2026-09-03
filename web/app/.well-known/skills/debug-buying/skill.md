@@ -194,10 +194,9 @@ the seller's advertised `accepted_mints`.
 ## Symptom: a claim is on a mint I cannot pay (mint mismatch)
 
 Your wallet settles at specific mints. When a seller's mint differs from yours, the buyer
-does **not** immediately give up: if real mints are allowed it tries a **cross-mint
-Lightning hop** to land the payment on a mint the seller accepts. A mismatch only blocks
-the trade when there is **no permitted route** — most often because you have pinned
-yourself to test-only mints.
+does **not** immediately give up: it tries a **cross-mint Lightning hop** to land the
+payment on a mint the seller accepts. A mismatch only blocks the trade when there is **no
+route** — most often because the seller lists no mint your wallet can reach.
 
 **Check:**
 - your side: `maxplayer buyer status` → `wallet.mint`, and `maxplayer wallet mints` for

@@ -75,7 +75,7 @@ pub struct AuthorizePayRequest {
     pub accepted_mints: Vec<String>,
     /// The realized paying mint the buyer SELECTED for this job, sealed into the accept-bind at
     /// accept time and threaded here. When `Some`, the pay path derives the realized mint from THIS
-    /// (still enforcing accepted-set membership + the real-mint fence) instead of the live config
+    /// (still enforcing accepted-set membership) instead of the live config
     /// default, so the attempt id is stable across retries even if the buyer's config default
     /// changes between attempts (double-pay fence). `None` only for a legacy bind that predates the
     /// sealed field — the pay path then falls back to the live config default.
@@ -893,12 +893,12 @@ struct DerivedPayment {
 /// identity inputs. This is the ONE derivation both [`authorize_pay_async`] and
 /// [`complete_recovered_locked_async`] call, so both compute the IDENTICAL attempt id for the same
 /// job — a re-derivation drift would target a different journal file and could double-pay. Pure
-/// beyond reading the home config's default mint + real-mint policy.
+/// beyond reading the home config's default mint.
 ///
 /// The realized mint is chosen from the seller's `creq` `m` list via the SELECTION frozen into the
 /// accept-bind (`realized_mint`), not the live config default — so a config-default change between
 /// attempts cannot shift the mint and mint a second attempt id. `plan_payment` still enforces
-/// accepted-set membership + the real-mint fence over that selection, and plans a cross-mint hop
+/// accepted-set membership over that selection, and plans a cross-mint hop
 /// when the selected mint is NOT in the seller's accepted set — a membership test over the mint
 /// URLs that reads no wallet balances; a legacy bind (no sealed mint) falls back to the live default.
 #[allow(clippy::too_many_arguments)]
