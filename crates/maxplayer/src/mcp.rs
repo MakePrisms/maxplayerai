@@ -429,8 +429,7 @@ fn with_prereq_hint(tool: &str, error: String) -> String {
     let lower = error.to_lowercase();
     let funds_prereq = lower.contains("no balance at any accepted mint")
         || lower.contains("insufficient")
-        || lower.contains("mint_unreachable")
-        || lower.contains("real-mint fence");
+        || lower.contains("mint_unreachable");
     if funds_prereq {
         format!(
             "{error} — {tool} prerequisite: fund your wallet with `maxplayer wallet setup` or \
