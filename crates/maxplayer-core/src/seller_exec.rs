@@ -663,6 +663,20 @@ impl SandboxPolicy {
         agent_command: &[String],
         job: &JobLaunch<'_>,
     ) -> Result<AgentLaunch, ExecError> {
+        self.launch_with_mounts(agent_command, job, &[])
+    }
+
+    /// [`Self::launch`] with extra read-write bind mounts for a docker launch: `(host_dir,
+    /// container_path)` pairs added after the workdir mount. A host executor has no mount namespace
+    /// to add to and ignores them. The container-delivery launch mounts its per-job exchange
+    /// directory this way; the agent launch adds nothing — so ONE argv builder still serves both, and
+    /// the only difference between the two launches is the command and this list.
+    pub fn launch_with_mounts(
+        &self,
+        agent_command: &[String],
+        job: &JobLaunch<'_>,
+        extra_mounts: &[(PathBuf, String)],
+    ) -> Result<AgentLaunch, ExecError> {
         if agent_command.is_empty() {
             return Err(ExecError::Config("agent_command empty".into()));
         }
@@ -695,7 +709,7 @@ impl SandboxPolicy {
                         )));
                     }
                 }
-                let argv = policy.run_argv(agent_command, job);
+                let argv = policy.run_argv(agent_command, job, extra_mounts);
                 // The ACP session runs at the in-container mount point, not the host path.
                 return Ok(split_argv(argv, PathBuf::from(CONTAINER_WORKDIR)));
             }
@@ -736,7 +750,16 @@ impl DockerPolicy {
     /// runs against a userspace kernel, not the host one; a Mac seat leaves it unset (the platform VM
     /// is the boundary there). The named runtime must be registered with the daemon, or the run fails
     /// at spawn — a fail-closed the seller boot doctor is meant to catch first.
-    fn run_argv(&self, agent_command: &[String], job: &JobLaunch<'_>) -> Vec<String> {
+    ///
+    /// `extra_mounts` — further read-write bind mounts, `(host_dir, container_path)`, after the
+    /// workdir. Empty for the agent launch. The container-delivery launch passes its exchange
+    /// directory, which lives OUTSIDE the workdir so the deliverable never contains it.
+    fn run_argv(
+        &self,
+        agent_command: &[String],
+        job: &JobLaunch<'_>,
+        extra_mounts: &[(PathBuf, String)],
+    ) -> Vec<String> {
         let mut argv: Vec<String> = vec!["docker".into(), "run".into(), "-i".into()];
         // Runtime first, so it is unambiguously a `docker run` flag and not read as the image.
         if let Some(runtime) = &self.runtime {
@@ -788,6 +811,10 @@ impl DockerPolicy {
             "-w".into(),
             CONTAINER_WORKDIR.into(),
         ]);
+        for (host_dir, container_path) in extra_mounts {
+            argv.push("-v".into());
+            argv.push(format!("{}:{container_path}", host_dir.display()));
+        }
         // Egress containment (#797): join the namespace a holder container already owns, where the
         // rendered policy is in force BEFORE this process exists — the rules are not applied to the
         // job, the job is started into them. `crate::sandbox_netns` establishes that; `None` here
@@ -1345,7 +1372,7 @@ impl Drop for ProbeWorkdir {
 /// attributed instead of merely noticed. Sanitised to what docker accepts in a container name
 /// (`[a-zA-Z0-9][a-zA-Z0-9_.-]*`), and never empty: a workdir with no usable final component would
 /// otherwise produce a name docker rejects at the moment containment is being established.
-fn job_id_of(workdir: &Path) -> String {
+pub(crate) fn job_id_of(workdir: &Path) -> String {
     let raw = workdir.file_name().and_then(|name| name.to_str()).unwrap_or_default();
     let cleaned: String = raw
         .chars()
@@ -2319,6 +2346,124 @@ pub async fn run_agent_job_with_env(
     use crate::event::JobId;
     use crate::log::EventLog;
 
+    let prepared = prepare_launch(agent_command, policy, workdir, identity, timeout.duration()).await?;
+    let job = JobLaunch {
+        workdir,
+        env: &prepared.env,
+        uid: prepared.uid,
+        gid: prepared.gid,
+        netns: prepared.holder_name.as_deref(),
+    };
+    let launch = policy.launch(&prepared.effective_command, &job)?;
+    // The ACP idle/response timeout IS the unified job timeout — never a hardcoded 300s that could
+    // override or conflict with `--job-timeout-secs`.
+    let mut agent = AgentCommand::new(launch.program, launch.args);
+    if let Some(env) = agent_env {
+        agent = agent.with_env(env);
+    }
+    let mut driver = AcpDriver::new(
+        agent,
+        crate::driver::PermissionOutcome::Allow,
+        timeout.duration(),
+    );
+    let log_path = workdir.join(crate::seller_git::SELLER_RUN_LOG);
+    let mut log = EventLog::open(&log_path).map_err(|error| ExecError::Agent(error.to_string()))?;
+    let params = RunParams {
+        session_config: SessionConfig {
+            cwd: launch.cwd,
+            mcp_servers: Vec::new(),
+            env: identity.git_env(),
+        },
+        prompt: PromptTurn {
+            input: vec![ContentBlock::Text {
+                text: prompt.to_owned(),
+            }],
+        },
+    };
+    // The agent's own account of the turn, kept from the sink that was already called for every
+    // update. A turn can complete having done nothing and say WHY in its last message — a blocked
+    // host, an exhausted plan — and that text was previously dropped here, leaving the caller to
+    // guess a cause from the turn's shape alone.
+    let mut capture = crate::engine::AgentMessageCapture::default();
+    // The job container is addressable by a name derived from the job, so adopt the guard BEFORE the
+    // run: from here on every exit — return, `?`, panic, runtime shutdown — has something that will
+    // remove it. Only a docker policy has a container at all; a host executor has nothing to guard.
+    let mut container = policy
+        .docker_image()
+        .map(|_| JobContainer::adopt(job_container_name(&job_id_of(workdir))));
+    let outcome = run_job(
+        &mut driver,
+        &mut log,
+        &JobId(format!("seller-{}", short_hash(prompt))),
+        params,
+        &mut |event| capture.observe(event),
+    )
+    .await;
+    // ⛔ The cleanup sits HERE, above the `?`, and moving it below would restore the bug. A timeout or
+    // an agent failure returns `Err`, and the error exit is precisely the one that leaves a container
+    // running — `AcpDriver::shutdown` kills the `docker run` CLIENT, so `--rm` never fires. A cleanup
+    // placed after `map_err(…)?` would therefore run on every exit EXCEPT the ones that need it.
+    if let Some(container) = container.take() {
+        // An awarded job's diagnostics are worth keeping; a self-probe's are not worth a directory
+        // per run in a tree nothing prunes. `cleanup_policy` carries the full reasoning, and the
+        // removal — the leak this path exists to close — happens either way.
+        cleanup_job_container(
+            container,
+            workdir,
+            log_path.clone(),
+            prepared.forwarded_secrets.clone(),
+            cleanup_policy(timeout),
+        )
+        .await;
+    }
+    let outcome = outcome.map_err(|error| classify_run_error(error, timeout))?;
+    match outcome.terminal {
+        crate::event::JobExecutionStatus::Completed => Ok(AgentRunReport {
+            usage: outcome.usage,
+            last_agent_message: capture.into_last_message(),
+        }),
+        other => Err(ExecError::Agent(format!("agent terminal {other:?}"))),
+    }
+}
+
+/// The host-side preparation of one job launch under `policy`: the delivery-identity env, the
+/// forwarded agent-auth allowlist, egress containment (#797) and credential containment (#647) when
+/// the policy is docker — everything [`run_agent_job`] did before it built the argv, as ONE value
+/// whose guards live for the run. Both the agent launch ([`run_agent_job_with_env`]) and the
+/// container-delivery launch (`seller_node::run`) call this, so a docker seat's containment is
+/// decided in one place whichever command runs inside the container.
+///
+/// Field order is drop order: the proxy goes first, then the namespace — the namespace has to
+/// outlive the job that ran in it.
+#[cfg_attr(not(feature = "acp"), allow(dead_code))]
+pub(crate) struct PreparedLaunch {
+    /// The container environment (`-e` pairs under docker): the delivery identity plus the contained
+    /// or forwarded agent auth. Placeholders and base URLs, never a real contained credential.
+    pub env: Vec<(String, String)>,
+    /// The argv actually spawned: `agent_command` plus any containment redirect flags.
+    pub effective_command: Vec<String>,
+    /// The real credential values this run forwards, for the capture redactor's exact-value pass.
+    /// ⛔ Never printed, formatted into an error, or written anywhere but through [`redact`].
+    pub forwarded_secrets: Vec<String>,
+    pub uid: u32,
+    pub gid: u32,
+    /// The netns holder's container name when egress containment is in force.
+    pub holder_name: Option<String>,
+    _proxy: Option<crate::credential_proxy::RunningProxy>,
+    _containment: Option<crate::sandbox_netns::Containment>,
+}
+
+/// Prepare a launch (see [`PreparedLaunch`]). `job_lifetime` bounds the contained credentials'
+/// placeholders and the host ChatGPT session read; the agent launch passes its unified job timeout,
+/// the container-delivery launch adds its push margin.
+#[cfg(feature = "acp")]
+pub(crate) async fn prepare_launch(
+    agent_command: &[String],
+    policy: &SandboxPolicy,
+    workdir: &Path,
+    identity: &DeliveryAgentIdentity,
+    job_lifetime: Duration,
+) -> Result<PreparedLaunch, ExecError> {
     // Run the container/process as the seller's own uid/gid so a docker bind-mount's output is owned
     // by the seller and the delivery snapshot can read it. Ignored by the host executors.
     //
@@ -2328,7 +2473,7 @@ pub async fn run_agent_job_with_env(
     // Read and validate the host session before any docker holder or job container starts. The
     // session reader binds no refresh token and requires the token to outlive this job.
     let codex_chatgpt_session =
-        codex_chatgpt_session_for_command(policy, agent_command, timeout.duration())?;
+        codex_chatgpt_session_for_command(policy, agent_command, job_lifetime)?;
     // The argv actually spawned. Identical to `agent_command` unless containment adds a redirect flag
     // for a file-sourced credential, whose proxy URL is not known until the proxy is bound.
     let mut effective_command = agent_command.to_vec();
@@ -2397,7 +2542,7 @@ pub async fn run_agent_job_with_env(
     // for the run (dropping `_proxy` at fn end revokes the placeholder). If containment is required
     // but cannot be established, the job FAILS — there is no fallback to putting the real credential
     // in the container.
-    let _proxy;
+    let mut _proxy: Option<crate::credential_proxy::RunningProxy> = None;
     if policy.docker_image().is_some() {
         // A namespace-contained job reaches the proxy at the measured address, not at the docker
         // alias: `--add-host` and `--network=container:…` are mutually exclusive, so the alias would
@@ -2410,7 +2555,7 @@ pub async fn run_agent_job_with_env(
             &forwarded,
             policy.file_credentials(),
             codex_chatgpt_session,
-            timeout.duration(),
+            job_lifetime,
             policy.proxy_ports(),
             proxy_host,
         )
@@ -2439,154 +2584,117 @@ pub async fn run_agent_job_with_env(
     } else {
         env.extend(forwarded);
     }
-    let job = JobLaunch {
-        workdir,
-        env: &env,
+    Ok(PreparedLaunch {
+        env,
+        effective_command,
+        forwarded_secrets,
         uid,
         gid,
-        netns: holder.as_ref().map(|(name, _)| name.as_str()),
-    };
-    let launch = policy.launch(&effective_command, &job)?;
-    // The ACP idle/response timeout IS the unified job timeout — never a hardcoded 300s that could
-    // override or conflict with `--job-timeout-secs`.
-    let mut agent = AgentCommand::new(launch.program, launch.args);
-    if let Some(env) = agent_env {
-        agent = agent.with_env(env);
-    }
-    let mut driver = AcpDriver::new(
-        agent,
-        crate::driver::PermissionOutcome::Allow,
-        timeout.duration(),
-    );
-    let log_path = workdir.join(crate::seller_git::SELLER_RUN_LOG);
-    let mut log = EventLog::open(&log_path).map_err(|error| ExecError::Agent(error.to_string()))?;
-    let params = RunParams {
-        session_config: SessionConfig {
-            cwd: launch.cwd,
-            mcp_servers: Vec::new(),
-            env: identity.git_env(),
-        },
-        prompt: PromptTurn {
-            input: vec![ContentBlock::Text {
-                text: prompt.to_owned(),
-            }],
-        },
-    };
-    // The agent's own account of the turn, kept from the sink that was already called for every
-    // update. A turn can complete having done nothing and say WHY in its last message — a blocked
-    // host, an exhausted plan — and that text was previously dropped here, leaving the caller to
-    // guess a cause from the turn's shape alone.
-    let mut capture = crate::engine::AgentMessageCapture::default();
-    // The job container is addressable by a name derived from the job, so adopt the guard BEFORE the
-    // run: from here on every exit — return, `?`, panic, runtime shutdown — has something that will
-    // remove it. Only a docker policy has a container at all; a host executor has nothing to guard.
-    let mut container = policy
-        .docker_image()
-        .map(|_| JobContainer::adopt(job_container_name(&job_id_of(workdir))));
-    let outcome = run_job(
-        &mut driver,
-        &mut log,
-        &JobId(format!("seller-{}", short_hash(prompt))),
-        params,
-        &mut |event| capture.observe(event),
-    )
-    .await;
-    // ⛔ The cleanup sits HERE, above the `?`, and moving it below would restore the bug. A timeout or
-    // an agent failure returns `Err`, and the error exit is precisely the one that leaves a container
-    // running — `AcpDriver::shutdown` kills the `docker run` CLIENT, so `--rm` never fires. A cleanup
-    // placed after `map_err(…)?` would therefore run on every exit EXCEPT the ones that need it.
-    if let Some(mut container) = container.take() {
-        let name = container.name().to_owned();
-        let destination = job_diagnostics_dir(workdir);
-        let event_log = log_path.clone();
-        let secrets = forwarded_secrets;
-        // Owned: `spawn_blocking` needs `'static`, and this is only ever used in a message.
-        let workdir_shown = workdir.display().to_string();
-        // An awarded job's diagnostics are worth keeping; a self-probe's are not worth a directory
-        // per run in a tree nothing prunes. `cleanup_policy` carries the full reasoning, and the
-        // removal — the leak this path exists to close — happens either way.
-        let cleanup = cleanup_policy(timeout);
-        // Off the runtime, for the reason `AcpDriver::shutdown` gives for its own blocking work: the
-        // seller node runs every awarded job as a `spawn_local` task on ONE LocalSet thread, so
-        // blocking docker calls here would stall every sibling job for the duration.
-        let reported = tokio::task::spawn_blocking(move || match (cleanup, destination) {
-            (CleanupPolicy::RemoveOnly, _) => {
-                remove_only(&mut RealDockerCli, &name, CAPTURE_SKIPPED_PROBE)
-            }
-            (CleanupPolicy::CaptureThenRemove, Some(dir)) => {
-                capture_then_remove(&mut RealDockerCli, &name, &dir, Some(&event_log), &secrets)
-            }
-            // The workdir is not one `job_workdir` built, so there is nowhere derivable to put the
-            // evidence. Still remove the container — a leak would also block the next attempt on this
-            // job id — but say plainly that nothing was captured rather than reporting a clean exit.
-            // A FAILURE and not a policy skip: this job was owed diagnostics and did not get them.
-            (CleanupPolicy::CaptureThenRemove, None) => CleanupReport {
-                capture: CaptureOutcome::Failed(format!(
-                    "no diagnostics directory derivable from the workdir {workdir_shown}"
-                )),
-                removal: RealDockerCli.run(&force_remove_argv(&name)).map(|_| ()),
-            },
-        })
-        .await;
-        // The explicit path ran, so `Drop` must not also fire its fallback and report a
-        // `capture_skipped` that did not happen. `settle` records that it RAN, not that it SUCCEEDED —
-        // the two legs below carry the outcome.
-        container.settle();
-        match reported {
-            // Reported as two independent facts. A single verdict would collapse "evidence saved, the
-            // container is still there" and "container gone, evidence lost" — opposite problems.
-            Ok(report) => {
-                match &report.capture {
-                    CaptureOutcome::Written(dir) => eprintln!(
-                        "sandbox: job_capture=ok container={} dir={}",
-                        container.name(),
-                        dir.display()
-                    ),
-                    // Emitted rather than stayed silent about: a run with no diagnostics and no line
-                    // explaining why is the ambiguity `CAPTURE_SKIPPED_MARKER` exists to remove, and
-                    // a deliberate skip needs the same treatment as a fallback's.
-                    CaptureOutcome::SkippedByPolicy(reason) => eprintln!(
-                        "sandbox: {reason} container={}",
-                        container.name()
-                    ),
-                    CaptureOutcome::Failed(error) => eprintln!(
-                        "sandbox: job_capture=failed container={} error={error}",
-                        container.name()
-                    ),
-                }
-                match &report.removal {
-                    Ok(()) => {
-                        eprintln!("sandbox: job_cleanup=ok container={}", container.name())
-                    }
-                    Err(error) => eprintln!(
-                        "sandbox: job_cleanup=failed container={} error={error}",
-                        container.name()
-                    ),
-                }
-                if report.evidence_lost() {
-                    eprintln!(
-                        "sandbox: job_capture=evidence_lost container={} — the container was removed \
-                         and its diagnostics were not saved",
-                        container.name()
-                    );
-                }
-            }
-            // The blocking task itself died, so neither leg has an answer and the container's state is
-            // unknown. Saying so is the point: an unreported orphan is the failure mode this work
-            // exists to remove.
-            Err(error) => eprintln!(
-                "sandbox: job_cleanup=unknown container={} error=cleanup task panicked: {error}",
-                container.name()
-            ),
+        holder_name: holder.map(|(name, _)| name),
+        _proxy,
+        _containment,
+    })
+}
+
+/// Without the `acp` feature there is no containment path to prepare — fail closed.
+#[cfg(not(feature = "acp"))]
+pub(crate) async fn prepare_launch(
+    _agent_command: &[String],
+    _policy: &SandboxPolicy,
+    _workdir: &Path,
+    _identity: &DeliveryAgentIdentity,
+    _job_lifetime: Duration,
+) -> Result<PreparedLaunch, ExecError> {
+    Err(ExecError::AcpRequired)
+}
+
+/// Capture the job container's diagnostics, then remove it, and report both — the tail every docker
+/// launch shares ([`run_agent_job_with_env`] and the container-delivery launch in
+/// `seller_node::run`). `container` is settled here, so its `Drop` fallback stays quiet. `event_log`
+/// is the run's maxplayer event log to copy into the bundle; `secrets` feeds the redactor.
+pub(crate) async fn cleanup_job_container(
+    mut container: JobContainer,
+    workdir: &Path,
+    event_log: PathBuf,
+    secrets: Vec<String>,
+    cleanup: CleanupPolicy,
+) {
+    let name = container.name().to_owned();
+    let destination = job_diagnostics_dir(workdir);
+    // Owned: `spawn_blocking` needs `'static`, and this is only ever used in a message.
+    let workdir_shown = workdir.display().to_string();
+    // Off the runtime, for the reason `AcpDriver::shutdown` gives for its own blocking work: the
+    // seller node runs every awarded job as a `spawn_local` task on ONE LocalSet thread, so
+    // blocking docker calls here would stall every sibling job for the duration.
+    let reported = tokio::task::spawn_blocking(move || match (cleanup, destination) {
+        (CleanupPolicy::RemoveOnly, _) => {
+            remove_only(&mut RealDockerCli, &name, CAPTURE_SKIPPED_PROBE)
         }
-    }
-    let outcome = outcome.map_err(|error| classify_run_error(error, timeout))?;
-    match outcome.terminal {
-        crate::event::JobExecutionStatus::Completed => Ok(AgentRunReport {
-            usage: outcome.usage,
-            last_agent_message: capture.into_last_message(),
-        }),
-        other => Err(ExecError::Agent(format!("agent terminal {other:?}"))),
+        (CleanupPolicy::CaptureThenRemove, Some(dir)) => {
+            capture_then_remove(&mut RealDockerCli, &name, &dir, Some(&event_log), &secrets)
+        }
+        // The workdir is not one `job_workdir` built, so there is nowhere derivable to put the
+        // evidence. Still remove the container — a leak would also block the next attempt on this
+        // job id — but say plainly that nothing was captured rather than reporting a clean exit.
+        // A FAILURE and not a policy skip: this job was owed diagnostics and did not get them.
+        (CleanupPolicy::CaptureThenRemove, None) => CleanupReport {
+            capture: CaptureOutcome::Failed(format!(
+                "no diagnostics directory derivable from the workdir {workdir_shown}"
+            )),
+            removal: RealDockerCli.run(&force_remove_argv(&name)).map(|_| ()),
+        },
+    })
+    .await;
+    // The explicit path ran, so `Drop` must not also fire its fallback and report a
+    // `capture_skipped` that did not happen. `settle` records that it RAN, not that it SUCCEEDED —
+    // the two legs below carry the outcome.
+    container.settle();
+    match reported {
+        // Reported as two independent facts. A single verdict would collapse "evidence saved, the
+        // container is still there" and "container gone, evidence lost" — opposite problems.
+        Ok(report) => {
+            match &report.capture {
+                CaptureOutcome::Written(dir) => eprintln!(
+                    "sandbox: job_capture=ok container={} dir={}",
+                    container.name(),
+                    dir.display()
+                ),
+                // Emitted rather than stayed silent about: a run with no diagnostics and no line
+                // explaining why is the ambiguity `CAPTURE_SKIPPED_MARKER` exists to remove, and
+                // a deliberate skip needs the same treatment as a fallback's.
+                CaptureOutcome::SkippedByPolicy(reason) => eprintln!(
+                    "sandbox: {reason} container={}",
+                    container.name()
+                ),
+                CaptureOutcome::Failed(error) => eprintln!(
+                    "sandbox: job_capture=failed container={} error={error}",
+                    container.name()
+                ),
+            }
+            match &report.removal {
+                Ok(()) => {
+                    eprintln!("sandbox: job_cleanup=ok container={}", container.name())
+                }
+                Err(error) => eprintln!(
+                    "sandbox: job_cleanup=failed container={} error={error}",
+                    container.name()
+                ),
+            }
+            if report.evidence_lost() {
+                eprintln!(
+                    "sandbox: job_capture=evidence_lost container={} — the container was removed \
+                     and its diagnostics were not saved",
+                    container.name()
+                );
+            }
+        }
+        // The blocking task itself died, so neither leg has an answer and the container's state is
+        // unknown. Saying so is the point: an unreported orphan is the failure mode this work
+        // exists to remove.
+        Err(error) => eprintln!(
+            "sandbox: job_cleanup=unknown container={} error=cleanup task panicked: {error}",
+            container.name()
+        ),
     }
 }
 

@@ -415,6 +415,9 @@ fn deliver_in_container(
     // touch the workdir: reap whatever the agent left behind BEFORE the marker invites a token in
     // and BEFORE the push reads the branch (C6's threat is exactly a survivor re-pointing it).
     reap_other_processes()?;
+    // The agent could write into the exchange mount while it lived (same uid). Now that nothing else
+    // runs, discard anything it planted there, so every file the host reads from here on is ours.
+    remove_planted_exchange_files(&inputs.out_dir);
     write_agent_done_marker(&inputs.out_dir, &inputs.handoff_nonce, &output.delivery_oid)?;
 
     let header = match &inputs.push_token {
@@ -858,11 +861,38 @@ impl Phase1Outcome {
     }
 }
 
-/// Write the outcome file (container side).
+/// Write the outcome file (container side). Replaces any file already there: this is written on
+/// every exit, including exits before the reap, and the orchestrator's account must win over
+/// anything a job process planted under the same name.
 pub fn write_outcome(out_dir: &Path, outcome: &Phase1Outcome) -> Result<(), OrchestratorError> {
     let json = serde_json::to_string(outcome)
         .map_err(|error| OrchestratorError::Io(format!("encode outcome: {error}")))?;
-    write_file_atomically(&out_dir.join(OUTCOME_FILE), &json, None)
+    let path = out_dir.join(OUTCOME_FILE);
+    let _ = std::fs::remove_file(&path);
+    write_file_atomically(&path, &json, None)
+}
+
+/// Remove every hand-off file a job process could have planted in the exchange directory while it
+/// lived — a fake marker, a fake token, a fake oid or outcome, and their temp siblings. Called after
+/// the reap, when nothing but the orchestrator runs, so what the orchestrator writes next is the only
+/// copy. Best effort: a file that cannot be removed makes the following write refuse, which fails
+/// the delivery closed rather than silently.
+fn remove_planted_exchange_files(out_dir: &Path) {
+    for name in [AGENT_DONE_MARKER, PUSH_TOKEN_FILE, DELIVERY_OID_FILE, OUTCOME_FILE] {
+        for candidate in [out_dir.join(name), out_dir.join(format!("{name}.tmp"))] {
+            match std::fs::remove_file(&candidate) {
+                Ok(()) => eprintln!(
+                    "sandbox orchestrator: removed a planted file {} before the hand-off",
+                    candidate.display()
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => eprintln!(
+                    "sandbox orchestrator: could not remove {}: {error}",
+                    candidate.display()
+                ),
+            }
+        }
+    }
 }
 
 /// Read the outcome file (host side). `Ok(None)` when the container never wrote one.
@@ -1673,6 +1703,40 @@ mod tests {
         assert_eq!(outcome.status, Phase1Status::PushFailed, "{}", outcome.detail);
         assert!(!outcome.detail.contains("fresh-header"), "no token in the outcome");
         assert_eq!(marker.nonce, NONCE);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // Files a job process planted in the exchange directory (a forged marker, a fake token, a fake
+    // outcome) are discarded after the reap: the marker the host reads is the orchestrator's, and the
+    // fake token never reaches the push.
+    #[test]
+    fn entry_discards_files_the_agent_planted_in_the_exchange_dir() {
+        let root = fresh_root("entry-planted");
+        let inputs = inputs_for(&root, PushTokenSource::FreshAfterAgent { wait_secs: 1 });
+        let inputs_path = root.join("io").join(PHASE1_INPUTS_FILE);
+        write_phase1_inputs(&inputs_path, &inputs).expect("write inputs");
+        let io = root.join("io");
+        let err = run_phase1_entry_with(&inputs_path, |_inputs, workdir| {
+            // The "agent" plants a forged marker with a guessed nonce, a fake token and a fake outcome.
+            fs::write(io.join(AGENT_DONE_MARKER), format!("{{\"nonce\":\"{NONCE}\",\"expected_oid\":\"{}\"}}", "0".repeat(40))).expect("plant");
+            fs::write(io.join(PUSH_TOKEN_FILE), "Nostr planted").expect("plant");
+            fs::write(io.join(OUTCOME_FILE), "{\"status\":\"delivered\"}").expect("plant");
+            fs::write(workdir.join("answer.txt"), "output\n")
+                .map_err(|e| OrchestratorError::Io(e.to_string()))?;
+            Ok(AgentOutcome::default())
+        })
+        .expect_err("no real token arrives");
+        // The planted token was discarded, so the wait timed out rather than pushing with it.
+        assert!(matches!(err, OrchestratorError::TokenUnavailable(_)), "{err}");
+        // The marker on disk is the orchestrator's: it names the real gated commit, not the planted oid.
+        let marker = read_agent_done_marker(&io, NONCE).expect("valid").expect("present");
+        assert_ne!(marker.expected_oid, "0".repeat(40));
+        let repo = git2::Repository::open(root.join("work")).expect("open");
+        let tip = repo.refname_to_id("refs/heads/maxplayer/abc12345").expect("tip").to_string();
+        assert_eq!(marker.expected_oid, tip);
+        // The outcome is the orchestrator's account, not the planted "delivered".
+        let outcome = read_outcome(&io).expect("parses").expect("present");
+        assert_eq!(outcome.status, Phase1Status::TokenUnavailable);
         let _ = fs::remove_dir_all(&root);
     }
 
