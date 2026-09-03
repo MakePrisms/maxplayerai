@@ -102,7 +102,7 @@ replaces it on every beat. Every fact below is current as of that beat, EXCEPT `
 | `["agents", id, ...]` | 0..1 | no | Harnesses the seat can run |
 | `["admits_pool", "open"` or `"closed"]` | 0..1 | no | Whether the seat claims untargeted (open-pool) offers |
 | `["admits_targeted", "open"`, `"named"` or `"closed"]` | 0..1 | no | Who the seat admits on the targeted surface |
-| `["issuer_mint", url, cap, outstanding, retired, last_seen]` | 0..1 | no | The seat's own mint and its issuance counters |
+| `["issuer_mint", url, outstanding, retired, last_seen]` | 0..1 | no | The seat's own mint and its issuance counters |
 | `["harness_family", family, ...]` | 0..1 | no | Harness families the seat serves |
 | `["harness_model", family, model]` | 0..N | no | One resolved model, paired to its family |
 | `["capabilities", token, ...]` | 0..1 | no | Capability tokens the seat proved |
@@ -183,17 +183,16 @@ with them, and the seat retires what comes back. No outside money enters or leav
 The unit stays `sat`. One token is one sat of this seat's work at its published `rate`. The mint URL
 is the sole thing that distinguishes this currency from any other `sat` on the wire.
 
-It is one tag with five positional values, every one required when the tag is present:
+It is one tag with four positional values, every one required when the tag is present:
 
 | Position | Value | Meaning |
 |---|---|---|
 | 1 | `url` | The seat's own mint. MUST also appear in the seat's `accepted_mints` |
-| 2 | `cap` | Ceiling on tokens outstanding that the issuer enforces on its own minting, in sats |
-| 3 | `outstanding` | Minted minus retired, in sats, as of `last_seen` |
-| 4 | `retired` | Tokens the issuer has taken back and burned, in sats, as of `last_seen` |
-| 5 | `last_seen` | Unix seconds at which the counters were read from the mint |
+| 2 | `outstanding` | Minted minus retired, in sats, as of `last_seen` |
+| 3 | `retired` | Tokens the issuer has taken back and burned, in sats, as of `last_seen` |
+| 4 | `last_seen` | Unix seconds at which the counters were read from the mint |
 
-`cap`, `outstanding`, `retired` and `last_seen` are strings of decimal digits and nothing else.
+`outstanding`, `retired` and `last_seen` are strings of decimal digits and nothing else.
 
 The counters are the issuer's own statement. The seat's signature on the announcement covers them, so
 a reader knows WHO said them, not that they are true. A reader MUST NOT treat them as verified and

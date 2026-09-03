@@ -280,7 +280,7 @@ pub const ADMITS_POOL_TAG: &str = "admits_pool";
 /// nothing about its list.
 pub const ADMITS_TARGETED_TAG: &str = "admits_targeted";
 
-/// `["issuer_mint", url, cap, outstanding, retired, last_seen]` — the seat runs its OWN Cashu mint
+/// `["issuer_mint", url, outstanding, retired, last_seen]` — the seat runs its OWN Cashu mint
 /// and issues tokens that are an IOU for its own future work (§4.2 "Issuer mint"). The unit stays
 /// `sat`: one token is one sat of the issuer's work at its published `rate`, and the mint URL is the
 /// sole thing that distinguishes this currency from any other `sat` on the wire.
@@ -306,8 +306,6 @@ pub struct IssuerMintAd {
     /// The seat's own mint URL. MUST also appear in `accepted_mints`: a seat announcing a currency
     /// it will not itself take back is not announcing an issuer mint, and the reader treats it so.
     pub mint_url: String,
-    /// Ceiling on tokens OUTSTANDING the issuer enforces on its own minting, in sats.
-    pub cap_sats: u64,
     /// Minted minus retired, in sats, as of `last_seen`.
     pub outstanding_sats: u64,
     /// Tokens the issuer has taken back and burned, in sats, as of `last_seen`.
@@ -317,13 +315,12 @@ pub struct IssuerMintAd {
 }
 
 impl IssuerMintAd {
-    /// The wire tag: `["issuer_mint", url, cap, outstanding, retired, last_seen]`, counters as
-    /// plain decimal digit strings.
+    /// The wire tag: `["issuer_mint", url, outstanding, retired, last_seen]`, counters as plain
+    /// decimal digit strings.
     pub fn to_tag(&self) -> TagSpec {
         TagSpec(vec![
             ISSUER_MINT_TAG.to_owned(),
             self.mint_url.clone(),
-            self.cap_sats.to_string(),
             self.outstanding_sats.to_string(),
             self.retired_sats.to_string(),
             self.last_seen.to_string(),
@@ -340,7 +337,7 @@ impl IssuerMintAd {
     /// [`admission_from_tags`] applies to a half-stated policy.
     pub fn from_tags(tags: &[TagSpec], accepted_mints: &[String]) -> Option<Self> {
         let tag = first_tag(tags, ISSUER_MINT_TAG)?;
-        let [_, url, cap, outstanding, retired, last_seen] = tag.0.as_slice() else {
+        let [_, url, outstanding, retired, last_seen] = tag.0.as_slice() else {
             return None;
         };
         if url.is_empty() || !accepted_mints.contains(url) {
@@ -348,7 +345,6 @@ impl IssuerMintAd {
         }
         Some(Self {
             mint_url: url.clone(),
-            cap_sats: decimal_sats(cap)?,
             outstanding_sats: decimal_sats(outstanding)?,
             retired_sats: decimal_sats(retired)?,
             last_seen: decimal_sats(last_seen)?,
@@ -1482,14 +1478,13 @@ mod tests {
     fn issuer() -> IssuerMintAd {
         IssuerMintAd {
             mint_url: mints()[0].clone(),
-            cap_sats: 100_000,
             outstanding_sats: 2_500,
             retired_sats: 750,
             last_seen: 1_788_390_000,
         }
     }
 
-    /// The wire shape, pinned by hand in both directions: one tag, five positional values, counters
+    /// The wire shape, pinned by hand in both directions: one tag, four positional values, counters
     /// as plain decimal digits.
     #[test]
     fn issuer_mint_wire_shape_round_trips() {
@@ -1502,7 +1497,6 @@ mod tests {
             vec![
                 "issuer_mint",
                 "https://testnut.example/Bitcoin",
-                "100000",
                 "2500",
                 "750",
                 "1788390000",
@@ -1619,11 +1613,11 @@ mod tests {
 
         let mut short = good.clone();
         short.pop();
-        cases.push(("four values".to_owned(), short));
+        cases.push(("three values".to_owned(), short));
 
         let mut long = good.clone();
         long.push("extra".to_owned());
-        cases.push(("six values".to_owned(), long));
+        cases.push(("five values".to_owned(), long));
 
         cases.push(("bare tag".to_owned(), vec![ISSUER_MINT_TAG.to_owned()]));
 
@@ -1635,12 +1629,7 @@ mod tests {
         unlisted[1] = "https://elsewhere.example/Bitcoin".to_owned();
         cases.push(("url not in accepted_mints".to_owned(), unlisted));
 
-        for (index, field) in [
-            (2, "cap"),
-            (3, "outstanding"),
-            (4, "retired"),
-            (5, "last_seen"),
-        ] {
+        for (index, field) in [(2, "outstanding"), (3, "retired"), (4, "last_seen")] {
             for bad in [
                 "",
                 "-1",
