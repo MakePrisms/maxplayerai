@@ -531,10 +531,14 @@ max_outputs = 1000
 ///   [`fs::symlink_metadata`], which does not follow links — `metadata` would report the target's
 ///   type and let a link through. A symlink is refused even when its target is a fine `0600` file,
 ///   because the seat cannot promise the mode of a path it does not own.
-/// - On Unix an over-broad mode is narrowed to `0600` in place. Only the mode changes:
-///   [`fs::set_permissions`] does not open the file for writing and no byte is read or rewritten.
-///   A mode already at or tighter than `0600` (`0400`, say) is left alone — the fix is for
-///   permissions that are too broad, not for an operator who chose to be stricter.
+/// - On Unix a mode carrying any bit outside owner read+write is narrowed to `0600` in place —
+///   the special bits `0o7000` (setuid, setgid, sticky) as well as the `0o177` below owner rw.
+///   Only the mode changes: [`fs::set_permissions`] does not open the file for writing and no
+///   byte is read or rewritten. A mode already at or tighter than `0600` (`0400`, say) is left
+///   alone — the fix is for permissions that are too broad, not for an operator who chose to be
+///   stricter. The first cut of this check masked the read with `0o7777` and then tested `0o177`,
+///   so a seed at `04600` scored 0 and kept its setuid bit; that is why the mask below is spelled
+///   out and why the regressions assert against `0o7777`, never `0o777`.
 ///
 /// ⛔ The phrase is written and never returned, never printed, never logged and never put in an
 /// error message — including the errors this validation adds, which name the path and the file
@@ -560,11 +564,19 @@ fn ensure_seed(path: &Path) -> Result<bool, IssuerError> {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                // 0o177 is every bit BEYOND owner read+write: owner-execute, and all of group and
-                // other. Non-zero means the file is readable, writable or executable by someone
-                // this seat does not answer for.
+                // DISALLOWED is every bit a seat-owned seed may not carry: 0o7000 the special
+                // bits (setuid, setgid, sticky) and 0o177 everything below owner read+write
+                // (owner-execute, and all of group and other). `0o600` is the one mode with
+                // neither, so `mode & DISALLOWED != 0` is exactly "not 0600 or tighter".
+                //
+                // The special bits are in the mask because they are read out of it: `mode` below
+                // is taken with `& 0o7777`, so a seed at `04600` yields 0o4600, and a mask of
+                // 0o177 alone would score that 0 and leave the setuid bit standing on a file
+                // holding a mint seed. Masking the read down to 0o777 instead would hide the bit
+                // rather than clear it — the check must see what set_permissions will overwrite.
+                const DISALLOWED: u32 = 0o7000 | 0o177;
                 let mode = metadata.permissions().mode() & 0o7777;
-                if mode & 0o177 != 0 {
+                if mode & DISALLOWED != 0 {
                     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(
                         |error| {
                             IssuerError::Io(format!(
@@ -980,6 +992,11 @@ mod tests {
     /// judge a file it did not create. This starts from a `0644` file some earlier hand left and
     /// asserts the two halves separately — the bytes are IDENTICAL (a seed is money-shaped state;
     /// rewriting it is losing it) and the mode ends at `0600`.
+    ///
+    /// Every mode assertion here masks `0o7777`, never `0o777`. A `0o777` mask cannot witness the
+    /// special bits at all: it scores `04600` as `0600` and calls a setuid seed narrowed. That is
+    /// the exact hole the first cut of this test left open, and
+    /// [`an_existing_setuid_seed_has_its_special_bits_cleared`] is the case that walks through it.
     #[cfg(unix)]
     #[test]
     fn an_existing_over_readable_seed_is_narrowed_to_0600_without_touching_its_bytes() {
@@ -996,7 +1013,7 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("make it too broad");
         let before = fs::metadata(&path).expect("planted metadata");
         let mtime_before = before.modified().expect("planted mtime");
-        assert_eq!(before.permissions().mode() & 0o777, 0o644, "precondition");
+        assert_eq!(before.permissions().mode() & 0o7777, 0o644, "precondition");
 
         let report = init(&mut home, &InitOptions::default()).expect("init over a planted seed");
         assert!(!report.seed_created, "an existing seed is KEPT, never regenerated");
@@ -1008,10 +1025,75 @@ mod tests {
         );
         let after = fs::metadata(&path).expect("metadata after init");
         assert_eq!(
-            after.permissions().mode() & 0o777,
+            after.permissions().mode() & 0o7777,
             0o600,
             "mode after init was {:04o}, not 0600",
-            after.permissions().mode() & 0o777
+            after.permissions().mode() & 0o7777
+        );
+        assert_eq!(
+            after.modified().expect("mtime after"),
+            mtime_before,
+            "the file's contents were touched, not just its mode"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A REGULAR seed carrying a special bit is narrowed too — `04600` must not survive `init`.
+    ///
+    /// This is the class the first cut of the check could not see. It masked the read with
+    /// `0o7777` and then tested `mode & 0o177`, and `0o4600 & 0o177 == 0`, so the branch was
+    /// skipped and the setuid bit stood on a file holding a mint seed. The sibling regression
+    /// could not catch it either, because it asserted `mode & 0o777 == 0o600` and
+    /// `0o4600 & 0o777 == 0o600` passes. Both mistakes are the same mistake — a mask narrower
+    /// than the value being judged — so this test asserts `0o7777` end to end.
+    ///
+    /// `04600` is a regular file, not a special one: `symlink_metadata().file_type().is_file()`
+    /// is true for it, so it reaches the mode branch rather than the refusal branch. Setuid on a
+    /// non-executable data file grants nothing by itself; it is cleared because a seat that
+    /// promises "0600" must not leave a bit it never inspected on money-shaped state.
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_setuid_seed_has_its_special_bits_cleared() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("seed-setuid");
+        let mut home = home_at(&root);
+        let path = seed_path(&home);
+
+        let planted = b"planted seed bytes, not a mnemonic\n";
+        fs::write(&path, planted).expect("plant a seed");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o4600)).expect("plant setuid 04600");
+        let before = fs::metadata(&path).expect("planted metadata");
+        let mtime_before = before.modified().expect("planted mtime");
+        assert_eq!(
+            before.permissions().mode() & 0o7777,
+            0o4600,
+            "precondition: the plant must really carry the setuid bit"
+        );
+        assert!(
+            before.file_type().is_file(),
+            "precondition: 04600 is a REGULAR file, so it reaches the mode branch"
+        );
+        // The trap, asserted so it can never be re-introduced silently: under the old 0o177 mask
+        // this mode scores zero, and under a 0o777 assertion it reads as already-correct.
+        assert_eq!(0o4600 & 0o177, 0, "the old mask really was blind to this");
+        assert_eq!(0o4600 & 0o777, 0o600, "the old assertion really did pass this");
+
+        let report = init(&mut home, &InitOptions::default()).expect("init over a setuid seed");
+        assert!(!report.seed_created, "an existing seed is KEPT, never regenerated");
+
+        assert_eq!(
+            fs::read(&path).expect("seed still readable"),
+            planted,
+            "the seed bytes changed — set_permissions must not rewrite the file"
+        );
+        let after = fs::metadata(&path).expect("metadata after init");
+        assert_eq!(
+            after.permissions().mode() & 0o7777,
+            0o600,
+            "mode after init was {:04o}, not 0600 — the special bits survived",
+            after.permissions().mode() & 0o7777
         );
         assert_eq!(
             after.modified().expect("mtime after"),
