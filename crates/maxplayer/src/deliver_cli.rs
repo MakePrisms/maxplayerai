@@ -1,4 +1,4 @@
-//! `maxplayer __deliver <phase1|phase2> <inputs.json>` — the container-side delivery orchestrator
+//! `maxplayer __deliver phase1 <inputs.json>` — the container-side delivery orchestrator
 //! (Track B). INTERNAL, not a user surface: the seller daemon runs this as the sandbox image
 //! entrypoint so clone/gate/commit/push happen INSIDE the container, and the host never opens a git
 //! repository the job agent could write.
@@ -8,8 +8,6 @@
 //!   allowlist), gates + sentinels + commits, reaps every other process, obtains the branch-scoped
 //!   push token per the inputs' token source, pushes with the gated oid as the expected oid (C6), and
 //!   writes the oid and an outcome file for the host. Exit 0 only when the push succeeded.
-//! - `phase2`: the older push-only leg (harden the config, push with a host-minted token). Kept for
-//!   the split-container shape; the seller daemon does not launch it.
 //!
 //! The heavy lifting lives in [`maxplayer_core::delivery_orchestrator`]; this is only the argv shim.
 //! `phase1` builds its own current-thread Tokio runtime inside the core entry, because this CLI is
@@ -22,7 +20,10 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     #[cfg(not(feature = "wallet"))]
     {
         let _ = (args, out);
-        let _ = writeln!(err, "__deliver requires a wallet build (git-delivery is absent)");
+        let _ = writeln!(
+            err,
+            "__deliver requires a wallet build (git-delivery is absent)"
+        );
         return 2;
     }
     #[cfg(feature = "wallet")]
@@ -45,18 +46,8 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
                     RUNTIME_ERROR
                 }
             },
-            (Some("phase2"), Some(path)) => match orch::run_phase2_entry(path) {
-                Ok(oid) => {
-                    let _ = writeln!(out, "{oid}");
-                    SUCCESS
-                }
-                Err(error) => {
-                    let _ = writeln!(err, "__deliver phase2 failed: {error}");
-                    RUNTIME_ERROR
-                }
-            },
             _ => {
-                let _ = writeln!(err, "usage: maxplayer __deliver <phase1|phase2> <inputs.json>");
+                let _ = writeln!(err, "usage: maxplayer __deliver phase1 <inputs.json>");
                 USAGE_ERROR
             }
         }

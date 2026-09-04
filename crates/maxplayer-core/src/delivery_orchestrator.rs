@@ -306,23 +306,10 @@ pub struct Phase1Inputs {
     pub handoff_nonce: String,
 }
 
-/// Everything the phase-2 (push-only) container needs. No agent runs in phase 2, so the scoped token
-/// never coexists with a job agent. The token is a full NIP-98 `Authorization` header, or `None` for
-/// a public/anonymous https remote.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct Phase2Inputs {
-    /// The committed repo to push from — phase 1's workdir, on the shared volume. Its delivery branch
-    /// points at the gated commit.
-    pub repo_dir: PathBuf,
-    pub relay_url: String,
-    pub delivery_branch: String,
-    pub header: Option<String>,
-    pub out_dir: PathBuf,
-}
-
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, OrchestratorError> {
-    let raw = std::fs::read_to_string(path)
-        .map_err(|error| OrchestratorError::Io(format!("read inputs {}: {error}", path.display())))?;
+    let raw = std::fs::read_to_string(path).map_err(|error| {
+        OrchestratorError::Io(format!("read inputs {}: {error}", path.display()))
+    })?;
     serde_json::from_str(&raw)
         .map_err(|error| OrchestratorError::Io(format!("parse inputs {}: {error}", path.display())))
 }
@@ -335,14 +322,6 @@ pub fn write_phase1_inputs(path: &Path, inputs: &Phase1Inputs) -> Result<(), Orc
     let json = serde_json::to_string(inputs)
         .map_err(|error| OrchestratorError::Io(format!("encode phase1 inputs: {error}")))?;
     write_secret_file(path, &json)
-}
-
-/// Serialise `inputs` to `path` as JSON (phase 2).
-pub fn write_phase2_inputs(path: &Path, inputs: &Phase2Inputs) -> Result<(), OrchestratorError> {
-    let json = serde_json::to_string(inputs)
-        .map_err(|error| OrchestratorError::Io(format!("encode phase2 inputs: {error}")))?;
-    std::fs::write(path, json)
-        .map_err(|error| OrchestratorError::Io(format!("write phase2 inputs: {error}")))
 }
 
 /// The container orchestrator entrypoint (`maxplayer __deliver phase1 <inputs>`), driving the real
@@ -423,9 +402,10 @@ fn deliver_in_container(
     let header = match &inputs.push_token {
         PushTokenSource::None => None,
         PushTokenSource::LongLived { header } => Some(header.clone()),
-        PushTokenSource::FreshAfterAgent { wait_secs } => {
-            Some(await_push_token(&inputs.out_dir, Duration::from_secs(*wait_secs))?)
-        }
+        PushTokenSource::FreshAfterAgent { wait_secs } => Some(await_push_token(
+            &inputs.out_dir,
+            Duration::from_secs(*wait_secs),
+        )?),
     };
     let pushed = push_delivery(
         &output.delivery_repo_dir,
@@ -463,13 +443,18 @@ fn delete_inputs_fail_closed(path: &Path) -> Result<(), OrchestratorError> {
 /// because `maxplayer __deliver` is a synchronous CLI. The agent's environment is the allowlist from
 /// [`agent_env_allowlist`], never this process's whole environment (C4).
 #[cfg(feature = "wallet")]
-fn drive_acp_agent(inputs: &Phase1Inputs, workdir: &Path) -> Result<AgentOutcome, OrchestratorError> {
+fn drive_acp_agent(
+    inputs: &Phase1Inputs,
+    workdir: &Path,
+) -> Result<AgentOutcome, OrchestratorError> {
     use crate::seller_exec::{
-        run_agent_job_with_env, run_agent_with_retry, unified_job_timeout, AgentRunTimeout,
-        ExecError, SandboxPolicy,
+        AgentRunTimeout, ExecError, SandboxPolicy, run_agent_job_with_env, run_agent_with_retry,
+        unified_job_timeout,
     };
     let identity = DeliveryAgentIdentity::for_seller(&inputs.seller_pubkey_hex);
-    let env = agent_env_allowlist(&inputs.agent_env_names, &identity, |key| std::env::var(key).ok());
+    let env = agent_env_allowlist(&inputs.agent_env_names, &identity, |key| {
+        std::env::var(key).ok()
+    });
     let policy = SandboxPolicy::passthrough();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -511,23 +496,6 @@ fn unix_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-/// Phase-2 container entrypoint. Reads `inputs_path` and pushes the committed repo (phase 1's
-/// workdir) with the scoped token, retrying transient/conflict failures. No agent runs here, so the
-/// token never coexists with job code. Writes the pushed oid to the OID file as confirmation.
-pub fn run_phase2_entry(inputs_path: &Path) -> Result<String, OrchestratorError> {
-    let inputs = read_json::<Phase2Inputs>(inputs_path)?;
-    let oid = push_delivery(
-        &inputs.repo_dir,
-        &inputs.relay_url,
-        &inputs.delivery_branch,
-        inputs.header,
-        &PushRetryPolicy::default(),
-        None,
-    )?;
-    write_delivery_oid(&inputs.out_dir, &oid)?;
-    Ok(oid)
 }
 
 /// Retry policy for the delivery push. Exponential backoff with full jitter, bounded by an attempt
@@ -611,7 +579,7 @@ pub fn push_with_retry(
                 return Err(OrchestratorError::PushExhausted {
                     attempts: attempt,
                     last: error.to_string(),
-                })
+                });
             }
         }
     }
@@ -673,12 +641,7 @@ pub fn push_delivery(
     let pushed = push_with_retry(
         policy,
         |_attempt| {
-            git_transport::push_branch_with_header(
-                repo_dir,
-                relay_url,
-                branch,
-                header.clone(),
-            )
+            git_transport::push_branch_with_header(repo_dir, relay_url, branch, header.clone())
         },
         default_is_retryable,
         |wait| std::thread::sleep(wait),
@@ -701,7 +664,9 @@ fn local_branch_tip(repo_dir: &Path, branch: &str) -> Result<String, Orchestrato
         .map_err(|error| OrchestratorError::Io(format!("open delivery repo: {error}")))?;
     repo.refname_to_id(&git_transport::delivery_ref(branch))
         .map(|oid| oid.to_string())
-        .map_err(|error| OrchestratorError::Io(format!("resolve delivery branch {branch}: {error}")))
+        .map_err(|error| {
+            OrchestratorError::Io(format!("resolve delivery branch {branch}: {error}"))
+        })
 }
 
 /// Off-runtime [`push_delivery`]: neutralise `workdir`'s config and push from it, on a blocking
@@ -719,14 +684,20 @@ pub async fn push_delivery_off_runtime(
     expected_oid: Option<String>,
 ) -> Result<String, OrchestratorError> {
     tokio::task::spawn_blocking(move || {
-        push_delivery(&workdir, &remote_url, &branch, header, &policy, expected_oid.as_deref())
+        push_delivery(
+            &workdir,
+            &remote_url,
+            &branch,
+            header,
+            &policy,
+            expected_oid.as_deref(),
+        )
     })
     .await
     .map_err(|error| {
         OrchestratorError::Io(format!("blocking delivery task did not complete: {error}"))
     })?
 }
-
 
 // ─── The host↔container exchange contract ─────────────────────────────────────────────────────────
 
@@ -878,7 +849,12 @@ pub fn write_outcome(out_dir: &Path, outcome: &Phase1Outcome) -> Result<(), Orch
 /// copy. Best effort: a file that cannot be removed makes the following write refuse, which fails
 /// the delivery closed rather than silently.
 fn remove_planted_exchange_files(out_dir: &Path) {
-    for name in [AGENT_DONE_MARKER, PUSH_TOKEN_FILE, DELIVERY_OID_FILE, OUTCOME_FILE] {
+    for name in [
+        AGENT_DONE_MARKER,
+        PUSH_TOKEN_FILE,
+        DELIVERY_OID_FILE,
+        OUTCOME_FILE,
+    ] {
         for candidate in [out_dir.join(name), out_dir.join(format!("{name}.tmp"))] {
             match std::fs::remove_file(&candidate) {
                 Ok(()) => eprintln!(
@@ -949,18 +925,22 @@ pub fn read_agent_done_marker(
             return Err(OrchestratorError::Io(format!(
                 "read marker {}: {error}",
                 path.display()
-            )))
+            )));
         }
     };
     let marker: AgentDoneMarker = serde_json::from_str(&raw).map_err(|error| {
-        OrchestratorError::Tampered(format!("marker does not parse ({error}); not minting a token"))
+        OrchestratorError::Tampered(format!(
+            "marker does not parse ({error}); not minting a token"
+        ))
     })?;
     if marker.nonce != expected_nonce {
         return Err(OrchestratorError::Tampered(
             "marker nonce mismatch — a job process may have forged it; not minting a token".into(),
         ));
     }
-    if marker.expected_oid.len() != 40 || !marker.expected_oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if marker.expected_oid.len() != 40
+        || !marker.expected_oid.bytes().all(|b| b.is_ascii_hexdigit())
+    {
         return Err(OrchestratorError::Tampered(format!(
             "marker expected_oid is not a 40-char hex oid: {:?}",
             marker.expected_oid
@@ -981,8 +961,9 @@ fn await_push_token(out_dir: &Path, wait: Duration) -> Result<String, Orchestrat
             wait.as_secs()
         )));
     }
-    let raw = std::fs::read_to_string(&path)
-        .map_err(|error| OrchestratorError::TokenUnavailable(format!("read token file: {error}")))?;
+    let raw = std::fs::read_to_string(&path).map_err(|error| {
+        OrchestratorError::TokenUnavailable(format!("read token file: {error}"))
+    })?;
     if let Err(error) = std::fs::remove_file(&path) {
         eprintln!("sandbox orchestrator: could not delete the consumed token file: {error}");
     }
@@ -1115,7 +1096,10 @@ pub fn agent_env_allowlist(
 pub fn create_exchange_dir(dir: &Path) -> Result<(), OrchestratorError> {
     if dir.symlink_metadata().is_ok() {
         std::fs::remove_dir_all(dir).map_err(|error| {
-            OrchestratorError::Io(format!("remove stale exchange dir {}: {error}", dir.display()))
+            OrchestratorError::Io(format!(
+                "remove stale exchange dir {}: {error}",
+                dir.display()
+            ))
         })?;
     }
     std::fs::create_dir_all(dir).map_err(|error| {
@@ -1178,7 +1162,10 @@ fn write_file_atomically(
     })();
     if let Err(error) = result {
         let _ = std::fs::remove_file(&tmp);
-        return Err(OrchestratorError::Io(format!("write {}: {error}", path.display())));
+        return Err(OrchestratorError::Io(format!(
+            "write {}: {error}",
+            path.display()
+        )));
     }
     Ok(())
 }
@@ -1267,7 +1254,11 @@ fn other_live_pids() -> Result<Vec<u32>, OrchestratorError> {
         .map_err(|error| OrchestratorError::Io(format!("list /proc: {error}")))?;
     let mut live = Vec::new();
     for entry in entries.flatten() {
-        let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
             continue;
         };
         if pid == 1 || pid == me {
@@ -1298,8 +1289,11 @@ mod tests {
 
     // Build an agent workdir repo with one committed base, one agent-written file, and a delivery
     // commit produced by the real gate. Returns (tempdir root, agent_workdir, branch, delivery_oid).
-    fn agent_repo_with_delivery(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, String, String) {
-        let root = std::env::temp_dir().join(format!("maxplayer-orch-{tag}-{}", std::process::id()));
+    fn agent_repo_with_delivery(
+        tag: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf, String, String) {
+        let root =
+            std::env::temp_dir().join(format!("maxplayer-orch-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let workdir = root.join("agent");
         fs::create_dir_all(&workdir).expect("mkdir workdir");
@@ -1317,9 +1311,12 @@ mod tests {
             let mut index = repo.index().expect("index");
             index.add_path(Path::new("README.md")).expect("add");
             index.write().expect("write index");
-            let tree = repo.find_tree(index.write_tree().expect("tree")).expect("find tree");
-            let sig = git2::Signature::new("base", "base@example.invalid", &git2::Time::new(DATE, 0))
-                .expect("sig");
+            let tree = repo
+                .find_tree(index.write_tree().expect("tree"))
+                .expect("find tree");
+            let sig =
+                git2::Signature::new("base", "base@example.invalid", &git2::Time::new(DATE, 0))
+                    .expect("sig");
             repo.commit(Some("HEAD"), &sig, &sig, "base", &tree, &[])
                 .expect("commit")
                 .to_string()
@@ -1365,7 +1362,10 @@ mod tests {
             prompt: "do the task".to_owned(),
             deadline_unix: 4_000_000_000,
             max_agent_attempts: 3,
-            agent_env_names: vec!["ANTHROPIC_API_KEY".to_owned(), "ANTHROPIC_BASE_URL".to_owned()],
+            agent_env_names: vec![
+                "ANTHROPIC_API_KEY".to_owned(),
+                "ANTHROPIC_BASE_URL".to_owned(),
+            ],
             relay_url: "ext::sh -c evil".to_owned(),
             push_token,
             handoff_nonce: NONCE.to_owned(),
@@ -1373,7 +1373,8 @@ mod tests {
     }
 
     fn fresh_root(tag: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("maxplayer-orch-{tag}-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("maxplayer-orch-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("io")).expect("mkdir io");
         root
@@ -1393,16 +1394,26 @@ mod tests {
         assert_eq!(backoff_delay(&policy, 5), Duration::from_secs(4));
         assert_eq!(backoff_delay(&policy, 6), Duration::from_secs(8));
         assert_eq!(backoff_delay(&policy, 7), Duration::from_secs(8), "capped");
-        assert_eq!(backoff_delay(&policy, 99), Duration::from_secs(8), "no overflow, capped");
+        assert_eq!(
+            backoff_delay(&policy, 99),
+            Duration::from_secs(8),
+            "no overflow, capped"
+        );
     }
 
     // Retryable classification: transient/conflict retry, permission/allowlist do not.
     #[test]
     fn retryable_classification() {
         assert!(default_is_retryable(&TransportError::Io("connect".into())));
-        assert!(default_is_retryable(&TransportError::Rejected("receive-pack busy".into())));
-        assert!(!default_is_retryable(&TransportError::Auth("403 ref scope".into())));
-        assert!(!default_is_retryable(&TransportError::Transport("ext:: banned".into())));
+        assert!(default_is_retryable(&TransportError::Rejected(
+            "receive-pack busy".into()
+        )));
+        assert!(!default_is_retryable(&TransportError::Auth(
+            "403 ref scope".into()
+        )));
+        assert!(!default_is_retryable(&TransportError::Transport(
+            "ext:: banned".into()
+        )));
     }
 
     // A retryable failure then a success returns the oid and sleeps exactly once.
@@ -1428,7 +1439,11 @@ mod tests {
         .expect("succeeds on retry");
         assert_eq!(out, "deadbeef");
         assert_eq!(*calls.borrow(), 2, "one retry");
-        assert_eq!(sleeps.borrow().as_slice(), &[Duration::from_millis(500)], "one backoff wait");
+        assert_eq!(
+            sleeps.borrow().as_slice(),
+            &[Duration::from_millis(500)],
+            "one backoff wait"
+        );
     }
 
     // A non-retryable failure stops immediately, no sleep, no further attempt.
@@ -1448,7 +1463,10 @@ mod tests {
             |d| d,
         )
         .expect_err("permission is terminal");
-        assert!(matches!(err, OrchestratorError::PushExhausted { attempts: 1, .. }), "got {err}");
+        assert!(
+            matches!(err, OrchestratorError::PushExhausted { attempts: 1, .. }),
+            "got {err}"
+        );
         assert_eq!(*calls.borrow(), 1, "no retry on permission");
         assert!(!*slept.borrow(), "no backoff before giving up");
     }
@@ -1473,7 +1491,10 @@ mod tests {
             |d| d,
         )
         .expect_err("exhausts");
-        assert!(matches!(err, OrchestratorError::PushExhausted { attempts: 3, .. }), "got {err}");
+        assert!(
+            matches!(err, OrchestratorError::PushExhausted { attempts: 3, .. }),
+            "got {err}"
+        );
         assert_eq!(*calls.borrow(), 3, "exactly max_attempts tries");
     }
 
@@ -1514,12 +1535,21 @@ mod tests {
             .refname_to_id(&git_transport::delivery_ref(branch))
             .expect("tip")
             .to_string();
-        assert_eq!(tip, result.delivery_oid, "reported oid is the committed workdir tip");
-        assert_eq!(result.delivery_repo_dir, workdir, "phase 2 pushes from the workdir");
+        assert_eq!(
+            tip, result.delivery_oid,
+            "reported oid is the committed workdir tip"
+        );
+        assert_eq!(
+            result.delivery_repo_dir, workdir,
+            "phase 2 pushes from the workdir"
+        );
 
         // The OID file the host reads round-trips.
         write_delivery_oid(&out, &result.delivery_oid).expect("write oid");
-        assert_eq!(read_delivery_oid(&out).expect("read oid"), result.delivery_oid);
+        assert_eq!(
+            read_delivery_oid(&out).expect("read oid"),
+            result.delivery_oid
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1527,7 +1557,8 @@ mod tests {
     // and no commit — the quota-dead case, unchanged by relocation.
     #[test]
     fn run_phase1_gate_refuses_when_the_agent_wrote_nothing() {
-        let root = std::env::temp_dir().join(format!("maxplayer-orch-p1empty-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("maxplayer-orch-p1empty-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let workdir = root.join("agent");
         fs::create_dir_all(&workdir).expect("mkdir workdir");
@@ -1545,7 +1576,10 @@ mod tests {
         )
         .expect_err("empty tree must be refused");
         assert!(
-            matches!(err, OrchestratorError::Gate(SellerGitError::NoExecutionObserved(_))),
+            matches!(
+                err,
+                OrchestratorError::Gate(SellerGitError::NoExecutionObserved(_))
+            ),
             "got {err}"
         );
         let _ = fs::remove_dir_all(&root);
@@ -1584,10 +1618,16 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "the inputs file is owner-only from its first byte");
+            assert_eq!(
+                mode, 0o600,
+                "the inputs file is owner-only from its first byte"
+            );
         }
         // Refuses to overwrite: a file already there is stale or planted.
-        assert!(write_phase1_inputs(&path, &inputs).is_err(), "no silent overwrite");
+        assert!(
+            write_phase1_inputs(&path, &inputs).is_err(),
+            "no silent overwrite"
+        );
         // The token source serialises under a tagged `mode`, in the documented spelling.
         let json = serde_json::to_string(&PushTokenSource::FreshAfterAgent { wait_secs: 120 })
             .expect("encode");
@@ -1615,7 +1655,10 @@ mod tests {
         let result = run_phase1_entry_with(&inputs_path, |inputs, workdir| {
             *saw_inputs_at_agent_time.borrow_mut() =
                 Some(root.join("io").join(PHASE1_INPUTS_FILE).exists());
-            assert_eq!(workdir, inputs.workdir, "the agent runs in the provisioned workdir");
+            assert_eq!(
+                workdir, inputs.workdir,
+                "the agent runs in the provisioned workdir"
+            );
             fs::write(workdir.join("answer.txt"), "entry agent output\n")
                 .map_err(|e| OrchestratorError::Io(e.to_string()))?;
             Ok(AgentOutcome {
@@ -1632,7 +1675,10 @@ mod tests {
 
         // The push was attempted and refused (allowlist), so the run is not delivered…
         let err = result.expect_err("the refused remote fails the push");
-        assert!(matches!(err, OrchestratorError::PushExhausted { attempts: 1, .. }), "{err}");
+        assert!(
+            matches!(err, OrchestratorError::PushExhausted { attempts: 1, .. }),
+            "{err}"
+        );
         // …but the gate ran: the marker names the gated commit and echoes the nonce.
         let marker = read_agent_done_marker(&root.join("io"), NONCE)
             .expect("marker parses")
@@ -1642,13 +1688,21 @@ mod tests {
             .refname_to_id("refs/heads/maxplayer/abc12345")
             .expect("tip")
             .to_string();
-        assert_eq!(marker.expected_oid, tip, "the marker names the gated commit");
+        assert_eq!(
+            marker.expected_oid, tip,
+            "the marker names the gated commit"
+        );
         // The outcome file classifies the failure and carries the agent's report, no oid.
-        let outcome = read_outcome(&root.join("io")).expect("outcome parses").expect("written");
+        let outcome = read_outcome(&root.join("io"))
+            .expect("outcome parses")
+            .expect("written");
         assert_eq!(outcome.status, Phase1Status::PushFailed);
         assert_eq!(outcome.delivery_oid, None);
         assert_eq!(
-            outcome.agent.as_ref().and_then(|a| a.last_agent_message.as_deref()),
+            outcome
+                .agent
+                .as_ref()
+                .and_then(|a| a.last_agent_message.as_deref()),
             Some("done")
         );
         assert!(
@@ -1656,7 +1710,10 @@ mod tests {
             "the outcome never carries the token: {}",
             outcome.detail
         );
-        assert!(!root.join("io").join(PUSH_TOKEN_FILE).exists(), "no token file in this mode");
+        assert!(
+            !root.join("io").join(PUSH_TOKEN_FILE).exists(),
+            "no token file in this mode"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1675,33 +1732,56 @@ mod tests {
         let host = std::thread::spawn(move || {
             let marker_path = io.join(AGENT_DONE_MARKER);
             assert!(
-                wait_for_file(&marker_path, Duration::from_secs(10), Duration::from_millis(10)),
+                wait_for_file(
+                    &marker_path,
+                    Duration::from_secs(10),
+                    Duration::from_millis(10)
+                ),
                 "the marker must appear"
             );
-            let marker = read_agent_done_marker(&io, NONCE).expect("valid").expect("present");
+            let marker = read_agent_done_marker(&io, NONCE)
+                .expect("valid")
+                .expect("present");
             write_secret_file(&io.join(PUSH_TOKEN_FILE), "Nostr fresh-header\n").expect("token");
             marker
         });
 
         let agent_ran_before_marker = RefCell::new(false);
         let result = run_phase1_entry_with(&inputs_path, |_inputs, workdir| {
-            *agent_ran_before_marker.borrow_mut() = !root.join("io").join(AGENT_DONE_MARKER).exists();
+            *agent_ran_before_marker.borrow_mut() =
+                !root.join("io").join(AGENT_DONE_MARKER).exists();
             fs::write(workdir.join("answer.txt"), "fresh agent output\n")
                 .map_err(|e| OrchestratorError::Io(e.to_string()))?;
             Ok(AgentOutcome::default())
         });
         let marker = host.join().expect("host thread");
-        assert!(agent_ran_before_marker.into_inner(), "the marker is written after the agent");
+        assert!(
+            agent_ran_before_marker.into_inner(),
+            "the marker is written after the agent"
+        );
         // The token reached the push (which then failed on the refused remote), and was consumed.
         let err = result.expect_err("refused remote");
-        assert!(matches!(err, OrchestratorError::PushExhausted { .. }), "{err}");
+        assert!(
+            matches!(err, OrchestratorError::PushExhausted { .. }),
+            "{err}"
+        );
         assert!(
             !root.join("io").join(PUSH_TOKEN_FILE).exists(),
             "the consumed token file is deleted"
         );
-        let outcome = read_outcome(&root.join("io")).expect("parses").expect("written");
-        assert_eq!(outcome.status, Phase1Status::PushFailed, "{}", outcome.detail);
-        assert!(!outcome.detail.contains("fresh-header"), "no token in the outcome");
+        let outcome = read_outcome(&root.join("io"))
+            .expect("parses")
+            .expect("written");
+        assert_eq!(
+            outcome.status,
+            Phase1Status::PushFailed,
+            "{}",
+            outcome.detail
+        );
+        assert!(
+            !outcome.detail.contains("fresh-header"),
+            "no token in the outcome"
+        );
         assert_eq!(marker.nonce, NONCE);
         let _ = fs::remove_dir_all(&root);
     }
@@ -1718,7 +1798,14 @@ mod tests {
         let io = root.join("io");
         let err = run_phase1_entry_with(&inputs_path, |_inputs, workdir| {
             // The "agent" plants a forged marker with a guessed nonce, a fake token and a fake outcome.
-            fs::write(io.join(AGENT_DONE_MARKER), format!("{{\"nonce\":\"{NONCE}\",\"expected_oid\":\"{}\"}}", "0".repeat(40))).expect("plant");
+            fs::write(
+                io.join(AGENT_DONE_MARKER),
+                format!(
+                    "{{\"nonce\":\"{NONCE}\",\"expected_oid\":\"{}\"}}",
+                    "0".repeat(40)
+                ),
+            )
+            .expect("plant");
             fs::write(io.join(PUSH_TOKEN_FILE), "Nostr planted").expect("plant");
             fs::write(io.join(OUTCOME_FILE), "{\"status\":\"delivered\"}").expect("plant");
             fs::write(workdir.join("answer.txt"), "output\n")
@@ -1727,12 +1814,20 @@ mod tests {
         })
         .expect_err("no real token arrives");
         // The planted token was discarded, so the wait timed out rather than pushing with it.
-        assert!(matches!(err, OrchestratorError::TokenUnavailable(_)), "{err}");
+        assert!(
+            matches!(err, OrchestratorError::TokenUnavailable(_)),
+            "{err}"
+        );
         // The marker on disk is the orchestrator's: it names the real gated commit, not the planted oid.
-        let marker = read_agent_done_marker(&io, NONCE).expect("valid").expect("present");
+        let marker = read_agent_done_marker(&io, NONCE)
+            .expect("valid")
+            .expect("present");
         assert_ne!(marker.expected_oid, "0".repeat(40));
         let repo = git2::Repository::open(root.join("work")).expect("open");
-        let tip = repo.refname_to_id("refs/heads/maxplayer/abc12345").expect("tip").to_string();
+        let tip = repo
+            .refname_to_id("refs/heads/maxplayer/abc12345")
+            .expect("tip")
+            .to_string();
         assert_eq!(marker.expected_oid, tip);
         // The outcome is the orchestrator's account, not the planted "delivered".
         let outcome = read_outcome(&io).expect("parses").expect("present");
@@ -1755,9 +1850,17 @@ mod tests {
             Ok(AgentOutcome::default())
         })
         .expect_err("no token ⇒ no push");
-        assert!(matches!(err, OrchestratorError::TokenUnavailable(_)), "{err}");
-        assert!(started.elapsed() < Duration::from_secs(8), "the wait is bounded");
-        let outcome = read_outcome(&root.join("io")).expect("parses").expect("written");
+        assert!(
+            matches!(err, OrchestratorError::TokenUnavailable(_)),
+            "{err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "the wait is bounded"
+        );
+        let outcome = read_outcome(&root.join("io"))
+            .expect("parses")
+            .expect("written");
         assert_eq!(outcome.status, Phase1Status::TokenUnavailable);
         let _ = fs::remove_dir_all(&root);
     }
@@ -1787,7 +1890,10 @@ mod tests {
         })
         .expect_err("an undeletable inputs file refuses the run");
         assert!(matches!(err, OrchestratorError::Io(_)), "{err}");
-        assert!(err.to_string().contains("refusing to start the agent"), "{err}");
+        assert!(
+            err.to_string().contains("refusing to start the agent"),
+            "{err}"
+        );
         assert!(!agent_ran.into_inner(), "C3: the agent must not run");
 
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).expect("chmod back");
@@ -1802,14 +1908,26 @@ mod tests {
         let inputs = inputs_for(&root, PushTokenSource::None);
         let inputs_path = root.join("io").join(PHASE1_INPUTS_FILE);
         write_phase1_inputs(&inputs_path, &inputs).expect("write inputs");
-        let err = run_phase1_entry_with(&inputs_path, |_inputs, _workdir| Ok(AgentOutcome::default()))
+        let err =
+            run_phase1_entry_with(
+                &inputs_path,
+                |_inputs, _workdir| Ok(AgentOutcome::default()),
+            )
             .expect_err("empty tree");
         assert!(
-            matches!(err, OrchestratorError::Gate(SellerGitError::NoExecutionObserved(_))),
+            matches!(
+                err,
+                OrchestratorError::Gate(SellerGitError::NoExecutionObserved(_))
+            ),
             "{err}"
         );
-        assert!(!root.join("io").join(AGENT_DONE_MARKER).exists(), "no marker without a commit");
-        let outcome = read_outcome(&root.join("io")).expect("parses").expect("written");
+        assert!(
+            !root.join("io").join(AGENT_DONE_MARKER).exists(),
+            "no marker without a commit"
+        );
+        let outcome = read_outcome(&root.join("io"))
+            .expect("parses")
+            .expect("written");
         assert_eq!(outcome.status, Phase1Status::NoSentinel);
         let _ = fs::remove_dir_all(&root);
     }
@@ -1823,14 +1941,20 @@ mod tests {
             let repo = git2::Repository::open(&workdir).expect("open");
             let sig = git2::Signature::new("x", "x@example.invalid", &git2::Time::new(DATE, 0))
                 .expect("sig");
-            let gated_commit =
-                repo.find_commit(git2::Oid::from_str(&gated).expect("oid")).expect("commit");
+            let gated_commit = repo
+                .find_commit(git2::Oid::from_str(&gated).expect("oid"))
+                .expect("commit");
             let tree = gated_commit.tree().expect("tree");
             let other = repo
                 .commit(None, &sig, &sig, "re-pointed", &tree, &[&gated_commit])
                 .expect("commit");
-            repo.reference(&git_transport::delivery_ref(&branch), other, true, "re-point")
-                .expect("re-point");
+            repo.reference(
+                &git_transport::delivery_ref(&branch),
+                other,
+                true,
+                "re-point",
+            )
+            .expect("re-point");
         }
 
         let err = push_delivery(
@@ -1845,17 +1969,35 @@ mod tests {
         assert!(matches!(err, OrchestratorError::Tampered(_)), "{err}");
         // The config was NOT yet neutralised — nothing ran past the check.
         let config = fs::read_to_string(workdir.join(".git").join("config")).expect("config");
-        assert!(config.contains("user.name") || config.contains("[user]"), "untouched: {config}");
+        assert!(
+            config.contains("user.name") || config.contains("[user]"),
+            "untouched: {config}"
+        );
         // Control: with the branch back on the gated commit the check passes and the push proceeds
         // to the transport, which the refused remote then stops.
         let repo = git2::Repository::open(&workdir).expect("open");
         let gated_oid = git2::Oid::from_str(&gated).expect("oid");
-        repo.reference(&git_transport::delivery_ref(&branch), gated_oid, true, "restore")
-            .expect("restore");
+        repo.reference(
+            &git_transport::delivery_ref(&branch),
+            gated_oid,
+            true,
+            "restore",
+        )
+        .expect("restore");
         drop(repo);
-        let err = push_delivery(&workdir, "ext::sh -c evil", &branch, None, &PushRetryPolicy::default(), Some(&gated))
-            .expect_err("refused remote");
-        assert!(matches!(err, OrchestratorError::PushExhausted { .. }), "{err}");
+        let err = push_delivery(
+            &workdir,
+            "ext::sh -c evil",
+            &branch,
+            None,
+            &PushRetryPolicy::default(),
+            Some(&gated),
+        )
+        .expect_err("refused remote");
+        assert!(
+            matches!(err, OrchestratorError::PushExhausted { .. }),
+            "{err}"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1865,22 +2007,39 @@ mod tests {
     fn marker_round_trips_and_rejects_a_forgery() {
         let root = fresh_root("marker");
         let io = root.join("io");
-        assert_eq!(read_agent_done_marker(&io, NONCE).expect("absent is fine"), None);
+        assert_eq!(
+            read_agent_done_marker(&io, NONCE).expect("absent is fine"),
+            None
+        );
         write_agent_done_marker(&io, NONCE, &"c".repeat(40)).expect("write");
-        let marker = read_agent_done_marker(&io, NONCE).expect("valid").expect("present");
+        let marker = read_agent_done_marker(&io, NONCE)
+            .expect("valid")
+            .expect("present");
         assert_eq!(marker.expected_oid, "c".repeat(40));
         assert!(
-            matches!(read_agent_done_marker(&io, "other-nonce"), Err(OrchestratorError::Tampered(_))),
+            matches!(
+                read_agent_done_marker(&io, "other-nonce"),
+                Err(OrchestratorError::Tampered(_))
+            ),
             "wrong nonce is tamper evidence"
         );
-        assert!(write_agent_done_marker(&io, NONCE, &"c".repeat(40)).is_err(), "no overwrite");
+        assert!(
+            write_agent_done_marker(&io, NONCE, &"c".repeat(40)).is_err(),
+            "no overwrite"
+        );
 
         fs::remove_file(io.join(AGENT_DONE_MARKER)).expect("rm");
         fs::write(io.join(AGENT_DONE_MARKER), "not json").expect("plant");
-        assert!(matches!(read_agent_done_marker(&io, NONCE), Err(OrchestratorError::Tampered(_))));
+        assert!(matches!(
+            read_agent_done_marker(&io, NONCE),
+            Err(OrchestratorError::Tampered(_))
+        ));
         fs::remove_file(io.join(AGENT_DONE_MARKER)).expect("rm");
         write_agent_done_marker(&io, NONCE, "short").expect("write");
-        assert!(matches!(read_agent_done_marker(&io, NONCE), Err(OrchestratorError::Tampered(_))));
+        assert!(matches!(
+            read_agent_done_marker(&io, NONCE),
+            Err(OrchestratorError::Tampered(_))
+        ));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1894,7 +2053,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(60));
             fs::write(writer_target, "x").expect("write");
         });
-        assert!(wait_for_file(&late, Duration::from_secs(5), Duration::from_millis(5)));
+        assert!(wait_for_file(
+            &late,
+            Duration::from_secs(5),
+            Duration::from_millis(5)
+        ));
         writer.join().expect("writer");
         let started = std::time::Instant::now();
         assert!(!wait_for_file(
@@ -1903,7 +2066,10 @@ mod tests {
             Duration::from_millis(10)
         ));
         let waited = started.elapsed();
-        assert!(waited >= Duration::from_millis(120) && waited < Duration::from_secs(2), "{waited:?}");
+        assert!(
+            waited >= Duration::from_millis(120) && waited < Duration::from_secs(2),
+            "{waited:?}"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1913,15 +2079,25 @@ mod tests {
         let now = 1_000_000;
         // Deadline one hour out: lifetime = 3600 + margin, under a 6 h cap.
         let expiry = long_lived_expiration(now + 3_600, now, 21_600).expect("under cap");
-        assert_eq!(expiry, (now + 3_600 + PUSH_MARGIN_SECS) as i64, "expiry = deadline + margin");
+        assert_eq!(
+            expiry,
+            (now + 3_600 + PUSH_MARGIN_SECS) as i64,
+            "expiry = deadline + margin"
+        );
         // Deadline exactly at cap minus margin fits; one second more does not.
         long_lived_expiration(now + 21_600 - PUSH_MARGIN_SECS, now, 21_600).expect("fits exactly");
         let err = long_lived_expiration(now + 21_600 - PUSH_MARGIN_SECS + 1, now, 21_600)
             .expect_err("over cap");
-        assert!(matches!(err, OrchestratorError::TokenUnavailable(_)), "{err}");
+        assert!(
+            matches!(err, OrchestratorError::TokenUnavailable(_)),
+            "{err}"
+        );
         let message = err.to_string();
         assert!(message.contains("relay cap of 21600s"), "{message}");
-        assert!(message.contains("fresh-after-agent"), "names the way out: {message}");
+        assert!(
+            message.contains("fresh-after-agent"),
+            "names the way out: {message}"
+        );
     }
 
     // C4: the agent's environment is the baseline + the host-named variables + the git identity,
@@ -1952,13 +2128,27 @@ mod tests {
         assert!(keys.contains(&"PATH") && keys.contains(&"HOME"));
         assert!(keys.contains(&"ANTHROPIC_API_KEY") && keys.contains(&"ANTHROPIC_BASE_URL"));
         assert!(keys.contains(&"CURSOR_AUTH_TOKEN"));
-        for poison in ["MAXPLAYER_PUSH_TOKEN", "MAXPLAYER_JOB_HASH", "MAXPLAYER_INPUTS"] {
-            assert!(!keys.contains(&poison), "{poison} must not reach the agent: {keys:?}");
+        for poison in [
+            "MAXPLAYER_PUSH_TOKEN",
+            "MAXPLAYER_JOB_HASH",
+            "MAXPLAYER_INPUTS",
+        ] {
+            assert!(
+                !keys.contains(&poison),
+                "{poison} must not reach the agent: {keys:?}"
+            );
         }
-        let values = env.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>().join("\n");
+        let values = env
+            .iter()
+            .map(|(_, v)| v.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(!values.contains("Nostr secret") && !values.contains(JOB_HASH));
         // The delivery identity wins over a same-named host value.
-        let author = env.iter().find(|(k, _)| k == "GIT_AUTHOR_NAME").expect("identity env");
+        let author = env
+            .iter()
+            .find(|(k, _)| k == "GIT_AUTHOR_NAME")
+            .expect("identity env");
         assert_eq!(author.1, identity.name);
         assert!(env.iter().any(|(k, _)| k == "GIT_COMMITTER_EMAIL"));
         // Unset names are absent, never an empty pair.
@@ -2001,27 +2191,47 @@ mod tests {
         let classify = |error: OrchestratorError| {
             Phase1Outcome::from_result(&Err(error), None, Duration::ZERO).status
         };
-        assert_eq!(classify(OrchestratorError::Agent("x".into())), Phase1Status::AgentFailed);
-        assert_eq!(classify(OrchestratorError::DeadlineExceeded), Phase1Status::DeadlineExceeded);
+        assert_eq!(
+            classify(OrchestratorError::Agent("x".into())),
+            Phase1Status::AgentFailed
+        );
+        assert_eq!(
+            classify(OrchestratorError::DeadlineExceeded),
+            Phase1Status::DeadlineExceeded
+        );
         assert_eq!(
             classify(OrchestratorError::AgentUnavailable("x".into())),
             Phase1Status::AgentUnavailable
         );
         assert_eq!(
-            classify(OrchestratorError::Gate(SellerGitError::NoExecutionObserved("x".into()))),
+            classify(OrchestratorError::Gate(
+                SellerGitError::NoExecutionObserved("x".into())
+            )),
             Phase1Status::NoSentinel
         );
         assert_eq!(
             classify(OrchestratorError::Gate(SellerGitError::Io("x".into()))),
             Phase1Status::SnapshotFailed
         );
-        assert_eq!(classify(OrchestratorError::TokenUnavailable("x".into())), Phase1Status::TokenUnavailable);
         assert_eq!(
-            classify(OrchestratorError::PushExhausted { attempts: 1, last: "x".into() }),
+            classify(OrchestratorError::TokenUnavailable("x".into())),
+            Phase1Status::TokenUnavailable
+        );
+        assert_eq!(
+            classify(OrchestratorError::PushExhausted {
+                attempts: 1,
+                last: "x".into()
+            }),
             Phase1Status::PushFailed
         );
-        assert_eq!(classify(OrchestratorError::Tampered("x".into())), Phase1Status::Tampered);
-        assert_eq!(classify(OrchestratorError::Io("x".into())), Phase1Status::Aborted);
+        assert_eq!(
+            classify(OrchestratorError::Tampered("x".into())),
+            Phase1Status::Tampered
+        );
+        assert_eq!(
+            classify(OrchestratorError::Io("x".into())),
+            Phase1Status::Aborted
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -2035,39 +2245,27 @@ mod tests {
         fs::create_dir_all(&dir).expect("mkdir");
         fs::write(dir.join(PUSH_TOKEN_FILE), "stale").expect("stale token");
         create_exchange_dir(&dir).expect("create");
-        assert!(!dir.join(PUSH_TOKEN_FILE).exists(), "stale contents are gone");
+        assert!(
+            !dir.join(PUSH_TOKEN_FILE).exists(),
+            "stale contents are gone"
+        );
         let mode = fs::metadata(&dir).expect("stat").permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
         write_secret_file(&dir.join(PUSH_TOKEN_FILE), "Nostr x").expect("token");
-        let mode = fs::metadata(dir.join(PUSH_TOKEN_FILE)).expect("stat").permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "the token file is owner-only from its first byte");
-        assert!(!dir.join(format!("{PUSH_TOKEN_FILE}.tmp")).exists(), "no temp file left behind");
+        let mode = fs::metadata(dir.join(PUSH_TOKEN_FILE))
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the token file is owner-only from its first byte"
+        );
+        assert!(
+            !dir.join(format!("{PUSH_TOKEN_FILE}.tmp")).exists(),
+            "no temp file left behind"
+        );
         let _ = fs::remove_dir_all(&root);
-    }
-
-    // The phase-2 entrypoint fails closed (never panics) when the remote is not allowlisted — the
-    // parse + push wiring is exercised without a live relay.
-    #[test]
-    fn run_phase2_entry_fails_closed_on_a_bad_remote() {
-        let root = std::env::temp_dir().join(format!("maxplayer-orch-entry2-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let out = root.join("out");
-        fs::create_dir_all(&out).expect("mkdir out");
-        // A committed repo (the workdir, as phase 1 leaves it) so the push has something to send.
-        let (agent_root, workdir, branch, _oid) = agent_repo_with_delivery("entry2");
-
-        let inputs = Phase2Inputs {
-            repo_dir: workdir,
-            relay_url: "ext::sh -c evil".to_owned(), // not allowlisted
-            delivery_branch: branch,
-            header: None,
-            out_dir: out,
-        };
-        let path = root.join("in2.json");
-        write_phase2_inputs(&path, &inputs).expect("write");
-        assert!(run_phase2_entry(&path).is_err(), "a non-allowlisted remote must fail closed");
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&agent_root);
     }
 
     // The OID file fails closed on a truncated / garbage value, so it can never become a published
@@ -2079,7 +2277,11 @@ mod tests {
         fs::create_dir_all(&root).expect("mkdir");
         fs::write(root.join(DELIVERY_OID_FILE), "not-an-oid\n").expect("write");
         assert!(read_delivery_oid(&root).is_err(), "non-hex is refused");
-        fs::write(root.join(DELIVERY_OID_FILE), format!("{}\n", "a".repeat(40))).expect("write");
+        fs::write(
+            root.join(DELIVERY_OID_FILE),
+            format!("{}\n", "a".repeat(40)),
+        )
+        .expect("write");
         assert_eq!(read_delivery_oid(&root).expect("valid"), "a".repeat(40));
         let _ = fs::remove_dir_all(&root);
     }

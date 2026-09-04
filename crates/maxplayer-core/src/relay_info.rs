@@ -67,13 +67,19 @@ impl fmt::Display for ScopedTokenSupport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Advertised(secs) => {
-                write!(formatter, "{SCOPED_TOKEN_CAP_FIELD}={secs} (relay honours the expiration tag)")
+                write!(
+                    formatter,
+                    "{SCOPED_TOKEN_CAP_FIELD}={secs} (relay honours the expiration tag)"
+                )
             }
             Self::Absent => write!(
                 formatter,
                 "no {SCOPED_TOKEN_CAP_FIELD} in the relay's NIP-11 limitation object"
             ),
-            Self::Unknown(reason) => write!(formatter, "could not read the relay's NIP-11 document: {reason}"),
+            Self::Unknown(reason) => write!(
+                formatter,
+                "could not read the relay's NIP-11 document: {reason}"
+            ),
         }
     }
 }
@@ -97,7 +103,7 @@ pub fn nip11_origin(url: &str) -> Result<String, String> {
         other => {
             return Err(format!(
                 "relay url scheme {other:?} carries no NIP-11 document (expected ws, wss, http or https)"
-            ))
+            ));
         }
     };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
@@ -241,7 +247,10 @@ impl LongLivedVerdict {
 
 /// Fold a relay's answer and the seat's configured cap into the boot verdict. Pure — the caller owns
 /// the fetch, so every arm is testable with no network.
-pub fn long_lived_verdict(support: &ScopedTokenSupport, configured_cap_secs: u64) -> LongLivedVerdict {
+pub fn long_lived_verdict(
+    support: &ScopedTokenSupport,
+    configured_cap_secs: u64,
+) -> LongLivedVerdict {
     match support {
         ScopedTokenSupport::Advertised(advertised) if *advertised >= configured_cap_secs => {
             LongLivedVerdict::Supported {
@@ -259,10 +268,23 @@ pub fn long_lived_verdict(support: &ScopedTokenSupport, configured_cap_secs: u64
 
 /// GET the NIP-11 document at `origin` and read the scoped-token cap out of it.
 ///
-/// ONE request, no redirects followed by us beyond reqwest's default, and every failure — DNS, TLS,
-/// timeout, a non-200 status, a body that is not the document — comes back as
+/// ONE request to `origin` and NO redirects. Every failure — DNS, TLS, timeout, any non-200 status
+/// including a 3xx, a body that is not the document — comes back as
 /// [`ScopedTokenSupport::Unknown`]. The caller decides what an unknown answer means; for
 /// `long-lived` it means refuse.
+///
+/// # Why redirects are refused
+///
+/// This answer decides whether the seat may mint a token that stays valid for hours. It is only
+/// worth anything if it came from the SAME origin the push goes to. A followed redirect breaks
+/// exactly that: `origin` could answer `302 Location: https://elsewhere.example`, and a document
+/// there advertising `scoped_token_max_lifetime_secs` would pass this gate while the real git relay
+/// honours no such thing. The seat would then mint long-lived tokens and meet HTTP 401 at push
+/// time, at the end of a paid run — the failure this gate exists to prevent.
+///
+/// A redirect is not expected here: NIP-11 is served at the relay's own origin. So refusing one
+/// costs nothing, and a relay that does redirect reads as `Unknown`, which fails closed in
+/// `long-lived` mode instead of trusting a stranger's answer.
 ///
 /// Gated on `git-delivery` because that is the feature that carries `reqwest` (and it is implied by
 /// `wallet`, which both callers — the seller boot gate and the doctor row — already require).
@@ -274,6 +296,9 @@ pub async fn fetch_scoped_token_support(
     let client = match reqwest::Client::builder()
         .connect_timeout(timeout)
         .timeout(timeout)
+        // No redirects: see the note above. reqwest's DEFAULT follows up to 10, which would let
+        // another host answer for this one, so this is not a default worth inheriting.
+        .redirect(reqwest::redirect::Policy::none())
         // Mirrors the push leg's own switch (`git_transport`): a self-signed test relay whose push
         // this seat already trusts must not be refused only on the NIP-11 read.
         .danger_accept_invalid_certs(std::env::var_os("GIT_SSL_NO_VERIFY").is_some())
@@ -292,13 +317,28 @@ pub async fn fetch_scoped_token_support(
         Err(error) => return ScopedTokenSupport::Unknown(format!("GET {origin} failed: {error}")),
     };
     let status = response.status();
+    // A redirect reaches here as a 3xx, because the client follows none. Name it, so an operator
+    // reading the doctor row learns the relay redirected rather than that it "answered HTTP 302".
+    if status.is_redirection() {
+        return ScopedTokenSupport::Unknown(format!(
+            "GET {origin} answered HTTP {} with a redirect; the NIP-11 answer must come from the \
+             same origin as the push, so it is not followed",
+            status.as_u16()
+        ));
+    }
     if !status.is_success() {
-        return ScopedTokenSupport::Unknown(format!("GET {origin} answered HTTP {}", status.as_u16()));
+        return ScopedTokenSupport::Unknown(format!(
+            "GET {origin} answered HTTP {}",
+            status.as_u16()
+        ));
     }
     // Declared length first, then the stream itself, and BOTH are checked. A declared over-cap
     // length is refused before a byte is read; a relay that declares nothing (or lies) is stopped by
     // the accumulating cap below, so the boot gate can never be made to buffer an unbounded body.
-    if response.content_length().is_some_and(|len| len > NIP11_MAX_BYTES as u64) {
+    if response
+        .content_length()
+        .is_some_and(|len| len > NIP11_MAX_BYTES as u64)
+    {
         return ScopedTokenSupport::Unknown(format!(
             "GET {origin} declared {} bytes, more than the {NIP11_MAX_BYTES}-byte NIP-11 limit",
             response.content_length().unwrap_or_default()
@@ -318,13 +358,15 @@ pub async fn fetch_scoped_token_support(
             }
             Ok(None) => break,
             Err(error) => {
-                return ScopedTokenSupport::Unknown(format!("GET {origin} body: {error}"))
+                return ScopedTokenSupport::Unknown(format!("GET {origin} body: {error}"));
             }
         }
     }
     match std::str::from_utf8(&body) {
         Ok(text) => parse_scoped_token_cap(text),
-        Err(error) => ScopedTokenSupport::Unknown(format!("GET {origin} body is not UTF-8: {error}")),
+        Err(error) => {
+            ScopedTokenSupport::Unknown(format!("GET {origin} body is not UTF-8: {error}"))
+        }
     }
 }
 
@@ -339,17 +381,26 @@ mod tests {
 
     #[test]
     fn origin_maps_websocket_schemes_and_drops_the_path() {
-        assert_eq!(nip11_origin("wss://relay.example").expect("wss"), "https://relay.example/");
+        assert_eq!(
+            nip11_origin("wss://relay.example").expect("wss"),
+            "https://relay.example/"
+        );
         assert_eq!(
             nip11_origin("wss://relay.example:7777/").expect("port"),
             "https://relay.example:7777/"
         );
-        assert_eq!(nip11_origin("ws://127.0.0.1:8080").expect("ws"), "http://127.0.0.1:8080/");
+        assert_eq!(
+            nip11_origin("ws://127.0.0.1:8080").expect("ws"),
+            "http://127.0.0.1:8080/"
+        );
         assert_eq!(
             nip11_origin("https://relay.example/git/abc/m0123.git").expect("relay-git remote"),
             "https://relay.example/"
         );
-        assert_eq!(nip11_origin("WSS://Relay.Example").expect("case"), "https://Relay.Example/");
+        assert_eq!(
+            nip11_origin("WSS://Relay.Example").expect("case"),
+            "https://Relay.Example/"
+        );
     }
 
     #[test]
@@ -366,8 +417,11 @@ mod tests {
     #[test]
     fn authority_prefers_the_relay_git_remote_over_the_event_relay() {
         assert_eq!(
-            scoped_token_authority("wss://events.example", "https://git.example/git/abc/m0123.git")
-                .expect("relay-git remote wins"),
+            scoped_token_authority(
+                "wss://events.example",
+                "https://git.example/git/abc/m0123.git"
+            )
+            .expect("relay-git remote wins"),
             "https://git.example/"
         );
         // A plain https remote takes no scoped token at all, so the event relay is the only origin
@@ -382,7 +436,10 @@ mod tests {
     #[test]
     fn parse_reads_the_advertised_cap() {
         let document = r#"{"name":"r","limitation":{"auth_required":true,"scoped_token_max_lifetime_secs":21600}}"#;
-        assert_eq!(parse_scoped_token_cap(document), ScopedTokenSupport::Advertised(21_600));
+        assert_eq!(
+            parse_scoped_token_cap(document),
+            ScopedTokenSupport::Advertised(21_600)
+        );
         assert_eq!(
             parse_scoped_token_cap(document).advertised_secs(),
             Some(21_600)
@@ -424,7 +481,9 @@ mod tests {
         ));
         assert!(
             matches!(
-                parse_scoped_token_cap(r#"{"limitation":{"scoped_token_max_lifetime_secs":"21600"}}"#),
+                parse_scoped_token_cap(
+                    r#"{"limitation":{"scoped_token_max_lifetime_secs":"21600"}}"#
+                ),
                 ScopedTokenSupport::Unknown(_)
             ),
             "a string is not a lifetime"
@@ -449,7 +508,9 @@ mod tests {
     fn verdict_accepts_a_cap_at_or_above_the_configured_one() {
         assert_eq!(
             long_lived_verdict(&ScopedTokenSupport::Advertised(CAP), CAP),
-            LongLivedVerdict::Supported { advertised_secs: CAP }
+            LongLivedVerdict::Supported {
+                advertised_secs: CAP
+            }
         );
         assert_eq!(
             long_lived_verdict(&ScopedTokenSupport::Advertised(CAP + 1), CAP),
@@ -457,9 +518,11 @@ mod tests {
                 advertised_secs: CAP + 1
             }
         );
-        assert!(long_lived_verdict(&ScopedTokenSupport::Advertised(CAP), CAP)
-            .refusal()
-            .is_none());
+        assert!(
+            long_lived_verdict(&ScopedTokenSupport::Advertised(CAP), CAP)
+                .refusal()
+                .is_none()
+        );
     }
 
     #[test]
@@ -484,14 +547,98 @@ mod tests {
         assert!(matches!(unknown, LongLivedVerdict::Unknown(_)));
 
         for verdict in [absent, small, unknown] {
-            let refusal = verdict.refusal().expect("every non-supported verdict refuses");
-            assert!(refusal.contains("long-lived"), "names the refused mode: {refusal}");
+            let refusal = verdict
+                .refusal()
+                .expect("every non-supported verdict refuses");
+            assert!(
+                refusal.contains("long-lived"),
+                "names the refused mode: {refusal}"
+            );
             assert!(
                 refusal.contains("fresh-after-agent"),
                 "names the mode that works: {refusal}"
             );
-            assert!(refusal.contains("relay_canary"), "names the canary: {refusal}");
+            assert!(
+                refusal.contains("relay_canary"),
+                "names the canary: {refusal}"
+            );
         }
+    }
+
+    /// A one-shot HTTP server on loopback. Answers the FIRST connection with `response`, then stops.
+    /// std sockets on a thread, so no tokio net feature is needed for the listener itself.
+    #[cfg(feature = "git-delivery")]
+    fn one_shot_http(response: String) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let origin = format!("http://{}", listener.local_addr().expect("addr"));
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut scratch = [0_u8; 2048];
+                let _ = stream.read(&mut scratch);
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (origin, handle)
+    }
+
+    /// The NIP-11 answer must come from the SAME origin as the push, so a redirect is refused
+    /// instead of followed.
+    ///
+    /// The redirect here points at a second server whose document DOES advertise the cap. So this
+    /// test is its own red-prove: if the client ever follows redirects again, the first case stops
+    /// being `Unknown` and becomes `Advertised`, and the assertion fails. The second case is the
+    /// control — the same document, served directly, is read as `Advertised` — which proves the
+    /// refusal is about the redirect and not about a broken harness.
+    #[cfg(feature = "git-delivery")]
+    #[test]
+    fn a_redirect_is_refused_and_never_answers_for_another_origin() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let timeout = std::time::Duration::from_secs(5);
+        let document =
+            format!(r#"{{"name":"elsewhere","limitation":{{"{SCOPED_TOKEN_CAP_FIELD}":21600}}}}"#);
+        let body = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/nostr+json\r\nContent-Length: {}\r\n\r\n{}",
+            document.len(),
+            document
+        );
+
+        // The origin a follower would land on, serving a document that WOULD satisfy the gate.
+        let (elsewhere, elsewhere_thread) = one_shot_http(body.clone());
+        let (redirector, redirector_thread) = one_shot_http(format!(
+            "HTTP/1.1 302 Found\r\nLocation: {elsewhere}/\r\nContent-Length: 0\r\n\r\n"
+        ));
+
+        let redirected = runtime.block_on(fetch_scoped_token_support(&redirector, timeout));
+        match &redirected {
+            ScopedTokenSupport::Unknown(reason) => assert!(
+                reason.contains("redirect"),
+                "the reason must name the redirect, so an operator can act on it: {reason}"
+            ),
+            other => panic!(
+                "a redirect must NOT answer for another origin, got {other:?} —                  the client is following redirects again"
+            ),
+        }
+
+        // Control: the very same document, served without a redirect, IS accepted.
+        let (direct, direct_thread) = one_shot_http(body);
+        let served = runtime.block_on(fetch_scoped_token_support(&direct, timeout));
+        assert_eq!(
+            served,
+            ScopedTokenSupport::Advertised(21_600),
+            "control: the same document served directly must be read as advertised"
+        );
+
+        let _ = redirector_thread.join();
+        let _ = direct_thread.join();
+        // The redirect was never followed, so nothing connected to `elsewhere`; its accept() is
+        // still blocked. Connect once so the thread can finish rather than leak.
+        let _ = std::net::TcpStream::connect(elsewhere.trim_start_matches("http://"));
+        let _ = elsewhere_thread.join();
     }
 
     #[test]
@@ -500,6 +647,9 @@ mod tests {
             .refusal()
             .expect("refuse");
         assert!(refusal.contains("600"), "advertised cap: {refusal}");
-        assert!(refusal.contains(&CAP.to_string()), "configured cap: {refusal}");
+        assert!(
+            refusal.contains(&CAP.to_string()),
+            "configured cap: {refusal}"
+        );
     }
 }
