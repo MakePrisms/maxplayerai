@@ -50,13 +50,32 @@ test("discovery digests are lowercase SHA-256 hashes of the raw artifacts", () =
   }
 });
 
-test("the homepage skill names and links all four companion skills", () => {
+// The expected list is DERIVED from the legacy index, never written out here. A literal
+// roll-call passes unchanged the day a sixth skill is added and the homepage never links
+// it — the skill then exists, ships, and is reachable only by an agent that already knows
+// its URL, because discovery from this page is top-down. Deriving it means adding a skill
+// to the index is what makes this test demand the link.
+test("the homepage skill links every companion skill the index publishes", () => {
   const homepage = readFileSync(
     join(root, ".well-known", "skills", "default", "skill.md"),
     "utf8",
   );
-  for (const name of ["buyer-operate", "seller-operate", "debug-buying", "debug-selling"]) {
-    assert.match(homepage, new RegExp(`\\[${name}\\]\\(/\\.well-known/skills/${name}/skill\\.md\\)`));
+  // The homepage IS the `default` entry; it does not link to itself.
+  const companions = legacyIndex.skills
+    .map(({ name, path }) => {
+      const dir = /^\/\.well-known\/skills\/([^/]+)\/skill\.md$/.exec(path)?.[1];
+      assert.ok(dir, `${name} has the published skill path shape, got ${path}`);
+      return dir;
+    })
+    .filter((dir) => dir !== "default");
+
+  assert.ok(companions.length > 0, "the index publishes at least one companion skill");
+  for (const name of companions) {
+    assert.match(
+      homepage,
+      new RegExp(`\\[${name}\\]\\(/\\.well-known/skills/${name}/skill\\.md\\)`),
+      `the homepage links ${name}`,
+    );
   }
 });
 

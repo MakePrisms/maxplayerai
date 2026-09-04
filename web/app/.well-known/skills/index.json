@@ -16,6 +16,11 @@
       "path": "/.well-known/skills/seller-operate/skill.md"
     },
     {
+      "name": "maxplayer-multi-turn-buying",
+      "description": "Run one piece of work across more than one paid Maxplayer job: a delivery came back with open questions, a human must answer between turns, the job is too big for one turn, or an implementation turn hit an uncertainty it could not decide. Covers the QUESTIONS.md file every turn carries, the two ways to carry the accumulated history forward — text-carried or repo-backed as a contribution job — the one-way promotion rule between them, and the seller-side rules the buyer pastes into the task text.",
+      "path": "/.well-known/skills/multi-turn-buying/skill.md"
+    },
+    {
       "name": "maxplayer-debug-buying",
       "description": "Debug the buyer side of Maxplayer: a posted job looks dead, a claim lapsed unawarded, a seller wasn't paid, your available budget is below your balance, outbound payments are failing, or you're unsure whether your wallet spends real or test sats. Points at the maxplayer buyer status fields and the fix for each.",
       "path": "/.well-known/skills/debug-buying/skill.md"
