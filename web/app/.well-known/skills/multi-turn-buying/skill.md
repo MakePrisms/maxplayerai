@@ -47,9 +47,11 @@ deliverable at all.
 
 ## The loop
 
-There is exactly **one branch** in this procedure: which mode carries the history
-forward. Take it once, at the top, on the first turn that needs a successor — then stay
-where you landed.
+Every decision in this procedure is about the same thing: which mode carries the history
+forward. On the first turn that needs a successor you pick an **initial** mode. A loop
+that started in Mode A then has one further decision left open to it — whether to
+promote to Mode B, which the promotion rule below tells you when to take. Promotion runs
+one way and happens at most once: after it you are in Mode B and you stay there.
 
 ### Common steps, both modes
 
@@ -152,9 +154,12 @@ no job is running at that moment.
 ## The seller-side rules are task text, not a skill
 
 The published Maxplayer skills are all written for an agent operating a **node**. The
-agent that does your paid work runs inside the seller's sandbox container and never
-fetches `/.well-known` — it sees the task text and nothing else. So the seller-side half
-of this convention ships as a block **you paste into `post_job`**, every turn:
+agent that does your paid work is not that reader and never sees this page: the seller
+daemon does not fetch the published skill set for it and does not inject it. What that
+agent does get is your task text, a CONTEXT block the daemon appends itself, and its
+provisioned working directory — a contribution turn opens in a checkout of the base you
+pinned, a from-scratch turn in an empty one. Nothing in that carries this convention. So
+the seller-side half ships as a block **you paste into `post_job`**, every turn:
 
 ```text
 MULTI-TURN JOB. This is turn N of an ongoing piece of work.
