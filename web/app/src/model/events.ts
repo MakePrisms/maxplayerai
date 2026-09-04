@@ -247,11 +247,13 @@ export function param(event: RawEvent, name: string): string | null {
 /**
  * THE free-lane predicate: this offer settles with no payment.
  *
- * Read from the offer's own tags — `["param","payment","none"]` — because that
- * is the buyer's structured statement of it. A zero amount corroborates but
- * never decides: an offer with NO amount tag is a different thing (the price
- * was not stated), and one such offer exists on the live market, so a reader
- * that inferred "free" from a missing or zero price would misfile it.
+ * Both halves are required, per `docs/specs/free-job-lane.md` §1.3: a free
+ * offer carries `["param","payment","none"]` AND its (still-required) amount
+ * tag reads exactly `["amount","0","sat"]` — the mode tag is what makes that
+ * zero mean "no payment leg" rather than "a payment of zero". Fails CLOSED on
+ * anything else: no amount tag (the price was not stated — one such offer
+ * exists on the live market), a nonzero amount, or a zero with no mode tag.
+ * A malformed free offer is not free; it is a priced offer we cannot settle.
  *
  * What it changes downstream: a free job's ACCEPT is its last event — no
  * RECEIPT can ever follow because there is nothing to settle — so a delivered-and-
@@ -260,7 +262,11 @@ export function param(event: RawEvent, name: string): string | null {
  * nothing and counted nothing.
  */
 export function settlesWithoutPayment(event: RawEvent): boolean {
-  return param(event, "payment") === "none";
+  if (param(event, "payment") !== "none") return false;
+  const amount = tagsNamed(event, "amount")[0];
+  if (!amount || amount[2] !== "sat") return false;
+  const value = Number.parseFloat(amount[1] ?? "");
+  return Number.isFinite(value) && value === 0;
 }
 
 /**

@@ -47,6 +47,13 @@ const unpricedOffer = (created_at: number): RawEvent =>
   ev(OFFER, BUYER, created_at, [["t", "maxplayer"], ["i", "price unstated"], ["param", "deadline", String(created_at + 3600)]]);
 const zeroWithoutTag = (created_at: number): RawEvent =>
   ev(OFFER, BUYER, created_at, [["t", "maxplayer"], ["i", "zero, but nobody said free"], ["amount", "0", "sat"]]);
+// The two malformed shapes the classifier must fail CLOSED on (free-job-lane.md
+// §1.3: the amount tag "is unchanged and stays required", and payment=none is
+// what makes ITS zero mean "no payment leg"). Either half alone is not free.
+const noneWithoutAmount = (created_at: number): RawEvent =>
+  ev(OFFER, BUYER, created_at, [["t", "maxplayer"], ["i", "says free, states no amount"], ["param", "payment", "none"]]);
+const noneWithNonzeroAmount = (created_at: number): RawEvent =>
+  ev(OFFER, BUYER, created_at, [["t", "maxplayer"], ["i", "says free, prices 500"], ["amount", "500", "sat"], ["param", "payment", "none"]]);
 
 const claim = (o: RawEvent, at: number): RawEvent => ev(CLAIM, SELLER, at, [["t", "maxplayer"], ["e", o.id, "", "root"]]);
 const award = (o: RawEvent, at: number): RawEvent => ev(AWARD, BUYER, at, [["t", "maxplayer"], ["e", o.id, "", "root"], ["p", SELLER]]);
@@ -56,14 +63,30 @@ const accept = (o: RawEvent, at: number): RawEvent => ev(ACCEPT, BUYER, at, [["t
 /** offer → claim → award → result → accept. The last event of a free job. */
 const lifecycle = (o: RawEvent): RawEvent[] => [o, claim(o, T0 + 1), award(o, T0 + 2), result(o, T0 + 3), accept(o, T0 + 4)];
 
-test("the predicate reads `param payment=none` — a zero or missing amount never decides it", () => {
-  assert.equal(settlesWithoutPayment(freeOffer(T0)), true, "payment=none is free");
+test("free requires BOTH `param payment=none` AND `amount 0 sat` — either half alone is not free", () => {
+  assert.equal(settlesWithoutPayment(freeOffer(T0)), true, "payment=none with amount 0 sat is free");
   assert.equal(settlesWithoutPayment(paidOffer(T0)), false);
   assert.equal(settlesWithoutPayment(unpricedOffer(T0)), false, "no amount tag at all is NOT silently free");
   assert.equal(settlesWithoutPayment(zeroWithoutTag(T0)), false, "a zero amount alone is not the test");
   assert.equal(events.parseEvent(freeOffer(T0))?.free, true, "parsed once, at the edge");
   assert.equal(events.parseEvent(unpricedOffer(T0))?.free, false);
   assert.equal(buildTrades(lifecycle(freeOffer(T0)))[0]!.free, true, "the trade join carries it");
+});
+
+test("control: `payment=none` with NO amount tag is NOT free — predicate, parsed offer, trade join", () => {
+  const o = noneWithoutAmount(T0);
+  assert.equal(settlesWithoutPayment(o), false, "the mode tag alone does not make an offer free");
+  assert.equal(events.parseEvent(o)?.free, false, "parseEvent().free fails closed");
+  assert.equal(buildTrades(lifecycle(o))[0]!.free, false, "buildTrades()[0].free fails closed");
+  assert.equal(buyerBoard(lifecycle(o), NOW)[0]!.unpaidDeliveries, 1, "so its delivery is still an open question");
+});
+
+test("control: `payment=none` with a NONZERO amount is NOT free — predicate, parsed offer, trade join", () => {
+  const o = noneWithNonzeroAmount(T0);
+  assert.equal(settlesWithoutPayment(o), false, "a priced offer is not free whatever its mode tag says");
+  assert.equal(events.parseEvent(o)?.free, false, "parseEvent().free fails closed");
+  assert.equal(buildTrades(lifecycle(o))[0]!.free, false, "buildTrades()[0].free fails closed");
+  assert.equal(buyerBoard(lifecycle(o), NOW)[0]!.unpaidDeliveries, 1, "so its delivery is still an open question");
 });
 
 test("a free job that reached ACCEPT is complete and settled: zero unpaid deliveries, zero active jobs, no payment wording", () => {
