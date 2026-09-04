@@ -368,6 +368,8 @@ ol .row:hover .pos.up i, ol .row:focus-visible .pos.up i { background: #0a0a0b; 
 .sats { color: var(--neon); font-weight: 700; }
 .person { color: var(--ink); font-weight: 500; }
 .self { color: var(--warn); font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; }
+/* A free job: settles with no payment. Muted, not money-coloured — there is no price to draw the eye to. */
+.free { color: var(--muted); font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; }
 .unknown { color: var(--muted); font-style: italic; }
 .empty { padding: 18px 12px; color: var(--faint); font-size: 11.5px; }
 

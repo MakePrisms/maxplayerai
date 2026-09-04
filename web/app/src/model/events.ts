@@ -49,6 +49,8 @@ export interface ParsedEvent {
   buyer?: string;
   seller?: string;
   selfTrade?: boolean;
+  /** Offer only: it settles with no payment — see `settlesWithoutPayment`. */
+  free?: boolean;
   amount?: number | null;
   targetSeller?: string | null;
   description?: string;
@@ -243,6 +245,25 @@ export function param(event: RawEvent, name: string): string | null {
 }
 
 /**
+ * THE free-lane predicate: this offer settles with no payment.
+ *
+ * Read from the offer's own tags — `["param","payment","none"]` — because that
+ * is the buyer's structured statement of it. A zero amount corroborates but
+ * never decides: an offer with NO amount tag is a different thing (the price
+ * was not stated), and one such offer exists on the live market, so a reader
+ * that inferred "free" from a missing or zero price would misfile it.
+ *
+ * What it changes downstream: a free job's ACCEPT is its last event — no 3400
+ * can ever follow because there is nothing to settle — so a delivered-and-
+ * accepted free job is COMPLETE, not a delivery awaiting money. It must not be
+ * counted as unpaid, and it must not be counted as paid either: it paid
+ * nothing and counted nothing.
+ */
+export function settlesWithoutPayment(event: RawEvent): boolean {
+  return param(event, "payment") === "none";
+}
+
+/**
  * protocol-v1 §7.1: `reason_code` names the class. The vocabulary is
  * extensible, so a reader that meets an unknown code MUST fall back to
  * `status` and MUST NOT treat the event as malformed.
@@ -344,6 +365,7 @@ function parseEventUncached(event: RawEvent): ParsedEvent | null {
                // A buyer commissioning its own seller marks the offer
                // ["t","self-trade"]. A structured predicate, not prose.
                selfTrade: tagsNamed(event, "t").some((t) => t[1] === SELF_TRADE_TAG),
+               free: settlesWithoutPayment(event),
                amount: firstNumber(event, "amount", "rate", "price", "sats"),
                targetSeller: firstTag(event, "p"),
                // The job itself is the `i` (input) tag. Offer content is empty
