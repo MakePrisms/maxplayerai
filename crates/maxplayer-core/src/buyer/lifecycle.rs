@@ -42,6 +42,12 @@ pub struct AwardFilters<'a> {
     pub buyer_mint: &'a str,
     /// Whether real (non-testnut) mints are permitted; gates the mint-compat check.
     pub allow_real_mints: bool,
+    /// The issuer mints the buyer knows of at award time (§4.2 "Issuer mint"): its OWN, from config.
+    /// A seller's issuer mint is not known here — the award filter reads the claim and never probes
+    /// a mint — so a claim listing only such a mint passes this filter as a Lightning hop and is
+    /// refused at accept, where the class is learned and sealed. Fail-safe: the filter never admits
+    /// a claim the accept gate would not. A reference, so the filters stay `Copy`.
+    pub issuer_mints: &'a crate::mint_class::IssuerMints,
     /// The harness the OFFER asked for, read back from the relay (never from award params — the
     /// signed offer is the authority for what the job requested). `None` ⇒ no preference and every
     /// claim passes this filter unchanged.
@@ -86,12 +92,14 @@ pub fn award_filters_for_offer<'a>(
     max_sats: u64,
     buyer_mint: &'a str,
     allow_real_mints: bool,
+    issuer_mints: &'a crate::mint_class::IssuerMints,
 ) -> AwardFilters<'a> {
     AwardFilters {
         offer_amount_sats: offer.amount_sats,
         max_sats,
         buyer_mint,
         allow_real_mints,
+        issuer_mints,
         requested_agent: offer.requested_agent.as_deref(),
         requested_harness_family: offer.requested_harness_family.as_deref(),
         requested_model: offer.requested_model.as_deref(),
@@ -409,6 +417,7 @@ pub fn unsatisfiable_capability_request(
         offer_amount_sats: 0,
         max_sats: 0,
         buyer_mint: "",
+        issuer_mints: &crate::mint_class::NO_ISSUER_MINTS,
         allow_real_mints: false,
         requested_agent,
         requested_harness_family,
@@ -608,7 +617,13 @@ fn claim_is_payable(job_id: &str, creq: Option<&str>, filters: &AwardFilters) ->
     // fence admits. This is the SAME planning the pay path performs, so a claim that passes here is
     // one the buyer can actually pay, by whichever of those two routes.
     let listed: Vec<String> = request.mints.iter().map(|mint| mint.to_string()).collect();
-    plan_payment(filters.buyer_mint, &listed, filters.allow_real_mints).is_ok()
+    plan_payment(
+        filters.buyer_mint,
+        &listed,
+        filters.allow_real_mints,
+        filters.issuer_mints,
+    )
+    .is_ok()
 }
 
 /// What [`award_with_reservation`] may do about a job, decided BEFORE any reserve, sign, or send.
@@ -1610,6 +1625,7 @@ mod tests {
             max_sats,
             buyer_mint: DEFAULT_MINT_URL,
             allow_real_mints: false,
+            issuer_mints: &crate::mint_class::NO_ISSUER_MINTS,
             requested_agent: None,
             requested_harness_family: None,
             requested_model: None,
@@ -3955,7 +3971,13 @@ mod tests {
     /// predicate, and the fix in both cases is to call the real thing rather than to test the copy
     /// harder.
     fn filters_from_offer<'a>(offer: &'a OfferView, max_sats: u64) -> AwardFilters<'a> {
-        award_filters_for_offer(offer, max_sats, DEFAULT_MINT_URL, false)
+        award_filters_for_offer(
+            offer,
+            max_sats,
+            DEFAULT_MINT_URL,
+            false,
+            &crate::mint_class::NO_ISSUER_MINTS,
+        )
     }
 
     // THE ACCEPTANCE TEST FOR #897, both axes through BOTH selection entry points.

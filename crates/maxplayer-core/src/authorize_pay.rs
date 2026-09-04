@@ -73,6 +73,12 @@ pub struct AuthorizePayRequest {
     /// a claim with no `creq` — the buyer then pays from the pinned default mint.
     #[allow(clippy::struct_field_names)]
     pub accepted_mints: Vec<String>,
+    /// The issuer mints SEALED into the accept-bind (§4.2 "Issuer mint"), each with WHO said it:
+    /// the buyer's own (config), any accepted mint classified from its info at accept, and the
+    /// seller's own declaration off its announcement. The class-aware fence and the hop refusal
+    /// read this seal; the pay path never probes a mint's class itself, so the plan re-derived here
+    /// is the plan that was accepted. Empty ⇒ none known (a legacy bind, or Lightning mints only).
+    pub issuer_mints: Vec<crate::mint_class::IssuerMintSeal>,
     /// The realized paying mint the buyer SELECTED for this job, sealed into the accept-bind at
     /// accept time and threaded here. When `Some`, the pay path derives the realized mint from THIS
     /// (still enforcing accepted-set membership + the real-mint fence) instead of the live config
@@ -146,6 +152,8 @@ pub struct CompleteLockedRequest {
     pub seller_signature: String,
     pub creq_hash: Option<String>,
     pub accepted_mints: Vec<String>,
+    /// Sealed issuer-mint knowledge, as on [`AuthorizePayRequest::issuer_mints`].
+    pub issuer_mints: Vec<crate::mint_class::IssuerMintSeal>,
     pub realized_mint: Option<String>,
 }
 
@@ -317,6 +325,7 @@ pub async fn authorize_pay_async(
         key,
         seller_nostr,
         plan,
+        issuers,
     } = derive_payment(
         home,
         &request.job_id,
@@ -326,6 +335,7 @@ pub async fn authorize_pay_async(
         &request.seller_pubkey,
         request.amount_sats,
         &request.accepted_mints,
+        &request.issuer_mints,
         request.realized_mint.as_deref(),
         request.creq_hash.clone(),
     )?;
@@ -492,10 +502,13 @@ pub async fn authorize_pay_async(
         None => None,
         Some(source) => {
             let store = FsHopJournal::new(crossmint_hop::hop_journal_dir(home));
+            // The hop executor's class gate reads the SEAL too — the same `issuers` the plan was
+            // derived from — so it can never learn a class from a mint.
             let effects = CdkHopEffects::open(
                 home,
                 &source.to_string(),
-                &wallet_open_mint_url(home, &terms),
+                &wallet_open_mint_url(home, &terms, &issuers),
+                &issuers,
             )
             .await?;
             // A pairing already on disk WINS over freshly raised quotes. This attempt may have
@@ -509,8 +522,12 @@ pub async fn authorize_pay_async(
         }
     };
 
-    let wallet = buyer_fund::open_wallet_at_mint_async(home, &wallet_open_mint_url(home, &terms))
-        .await?;
+    let wallet = buyer_fund::open_wallet_at_mint_admitted_async(
+        home,
+        &wallet_open_mint_url(home, &terms, &issuers),
+        &issuers,
+    )
+    .await?;
     // Wallet HTTP must run ONLY on the wallet worker, never on this caller runtime. A pre-spawn dust
     // check here ran on the current-thread runtime `collect_blocking` builds (collect.rs), priming a
     // reqwest pooled connection whose IO driver task lived on the caller; the worker then blocked that
@@ -724,6 +741,7 @@ pub async fn complete_recovered_locked_async(
         key,
         seller_nostr,
         plan: _,
+        issuers,
     } = derive_payment(
         home,
         &request.job_id,
@@ -733,6 +751,7 @@ pub async fn complete_recovered_locked_async(
         &request.seller_pubkey,
         request.amount_sats,
         &request.accepted_mints,
+        &request.issuer_mints,
         request.realized_mint.as_deref(),
         request.creq_hash.clone(),
     )?;
@@ -756,7 +775,11 @@ pub async fn complete_recovered_locked_async(
     // delivery used that kind, so completion reconstructs byte-identical bytes.
     let delivery_kind = DeliveryKind::Fork;
 
-    let wallet = buyer_fund::open_wallet_at_mint_async(home, &wallet_open_mint_url(home, &terms))
+    let wallet = buyer_fund::open_wallet_at_mint_admitted_async(
+        home,
+        &wallet_open_mint_url(home, &terms, &issuers),
+        &issuers,
+    )
         .await?;
     let payment_send = NostrPaymentSend::new(home.config.relay_url.clone(), keys);
     let mut effects = CdkPaymentEffects::spawn(
@@ -814,11 +837,18 @@ fn contribution_policy(home: &MaxplayerHome) -> crate::contribution::ContentPoli
 /// the budget is appended, then the send refuses on mint mismatch and strands the reservation.
 /// Taking the mint from the sealed terms keeps the wallet, the attempt id, and the send all on one
 /// mint. `home` is passed so the already-fenced invariant is asserted at this seam (the realized
-/// mint was fenced while planning; `open_wallet_at_mint_async` re-checks, redundant-safe).
-pub(crate) fn wallet_open_mint_url(home: &MaxplayerHome, terms: &PaymentTerms) -> String {
+/// mint was fenced while planning; `open_wallet_at_mint_admitted_async` re-checks, redundant-safe).
+/// `issuers` is the SEALED issuer-mint knowledge the plan was made with: a realized issuer mint
+/// passes the fence by class, and the assertion here has to know that or it would fire on every
+/// payment made in a seat's own currency.
+pub(crate) fn wallet_open_mint_url(
+    home: &MaxplayerHome,
+    terms: &PaymentTerms,
+    issuers: &crate::mint_class::IssuerMints,
+) -> String {
     let mint_url = terms.mint.to_string();
     debug_assert!(
-        crate::home::mint_allowed(&mint_url, home.config.allow_real_mints),
+        crate::mint_class::mint_admitted(&mint_url, home.config.allow_real_mints, issuers),
         "frozen realized mint must already be fenced before wallet open"
     );
     mint_url
@@ -887,6 +917,9 @@ struct DerivedPayment {
     /// do not re-parse it.
     seller_nostr: NostrPublicKey,
     plan: crate::crossmint::PayPlan,
+    /// The sealed issuer-mint knowledge the plan was made with, handed on so the wallet-open fence
+    /// judges the realized mint by the same class the planner did.
+    issuers: crate::mint_class::IssuerMints,
 }
 
 /// Derive the stable [`PaymentTerms`] + [`PaymentKey`] (and thus the attempt id) from a trade's
@@ -911,6 +944,7 @@ fn derive_payment(
     seller_pubkey: &str,
     amount_sats: u64,
     accepted_mints: &[String],
+    issuer_mints: &[crate::mint_class::IssuerMintSeal],
     realized_mint: Option<&str>,
     creq_hash: Option<String>,
 ) -> Result<DerivedPayment, AuthorizePayError> {
@@ -926,10 +960,14 @@ fn derive_payment(
         .map_err(|error| AuthorizePayError::Input(format!("seller_pubkey: {error}")))?;
     let seller_p2pk = cashu_compressed_from_nostr(&seller_nostr)?;
     let buyer_selected_mint = realized_mint.unwrap_or_else(|| home.config.default_mint());
+    // The issuer-mint knowledge is the SEAL, and only the seal: no live config, no probe. A pay-time
+    // re-derivation that consulted anything else could plan a different payment than was accepted.
+    let issuers = crate::mint_class::IssuerMints::from_seal(issuer_mints);
     let plan = crate::crossmint::plan_payment(
         buyer_selected_mint,
         accepted_mints,
         home.config.allow_real_mints,
+        &issuers,
     )?;
     let terms = PaymentTerms::new(
         plan.realized_mint().clone(),
@@ -951,6 +989,7 @@ fn derive_payment(
         key,
         seller_nostr,
         plan,
+        issuers,
     })
 }
 
@@ -1188,6 +1227,7 @@ fn publish_receipt_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mint_class::IssuerMints;
     use cashu::MintUrl;
 
     use crate::budget::BudgetGate;
@@ -1200,7 +1240,7 @@ mod tests {
     // Default flag (false): the configured testnut/dev mint plans a direct payment.
     #[test]
     fn pay_plan_empty_creq_uses_configured_mint() {
-        let plan = crate::crossmint::plan_payment(DEFAULT_MINT_URL, &[], false).unwrap();
+        let plan = crate::crossmint::plan_payment(DEFAULT_MINT_URL, &[], false, &IssuerMints::none()).unwrap();
         assert!(!plan.is_hop());
         assert_eq!(
             plan.realized_mint(),
@@ -1218,6 +1258,7 @@ mod tests {
                 DEFAULT_MINT_URL.to_string(),
             ],
             false,
+            &IssuerMints::none(),
         )
         .unwrap();
         assert!(!plan.is_hop(), "overlap must not hop");
@@ -1240,6 +1281,7 @@ mod tests {
             "https://buyer-only.example",
             &[DEFAULT_MINT_URL.to_string()],
             true,
+            &IssuerMints::none(),
         )
         .unwrap();
         assert!(plan.is_hop(), "no overlap must plan a hop, not refuse");
@@ -1263,6 +1305,7 @@ mod tests {
             "https://buyer-only.example",
             &[DEFAULT_MINT_URL.to_string()],
             false,
+            &IssuerMints::none(),
         )
         .unwrap_err();
         assert!(
@@ -1277,7 +1320,7 @@ mod tests {
     #[test]
     fn pay_plan_refuses_when_no_overlap_and_no_accepted_mint_is_admissible() {
         let error =
-            crate::crossmint::plan_payment(DEFAULT_MINT_URL, &[REAL_MINT.to_string()], false)
+            crate::crossmint::plan_payment(DEFAULT_MINT_URL, &[REAL_MINT.to_string()], false, &IssuerMints::none())
                 .unwrap_err();
         assert!(matches!(error, AuthorizePayError::Input(_)));
         let rendered = error.to_string();
@@ -1293,7 +1336,7 @@ mod tests {
     #[test]
     fn pay_plan_real_mint_refused_when_flag_false() {
         let error =
-            crate::crossmint::plan_payment(REAL_MINT, &[REAL_MINT.to_string()], false).unwrap_err();
+            crate::crossmint::plan_payment(REAL_MINT, &[REAL_MINT.to_string()], false, &IssuerMints::none()).unwrap_err();
         assert!(matches!(error, AuthorizePayError::Input(_)));
         assert!(error.to_string().contains("real-mint fence"));
     }
@@ -1302,14 +1345,14 @@ mod tests {
     #[test]
     fn pay_plan_real_mint_admitted_when_flag_true() {
         let plan =
-            crate::crossmint::plan_payment(REAL_MINT, &[REAL_MINT.to_string()], true).unwrap();
+            crate::crossmint::plan_payment(REAL_MINT, &[REAL_MINT.to_string()], true, &IssuerMints::none()).unwrap();
         assert!(!plan.is_hop());
         assert_eq!(plan.realized_mint(), &MintUrl::from_str(REAL_MINT).unwrap());
 
         // With the flag on, a creq that lists a DIFFERENT admissible mint is now reachable by hop
         // rather than refused for non-membership.
         let hopped =
-            crate::crossmint::plan_payment(REAL_MINT, &[DEFAULT_MINT_URL.to_string()], true)
+            crate::crossmint::plan_payment(REAL_MINT, &[DEFAULT_MINT_URL.to_string()], true, &IssuerMints::none())
                 .unwrap();
         assert!(hopped.is_hop());
         assert_eq!(
@@ -1490,6 +1533,7 @@ mod tests {
             seller_signature: String::new(),
             creq_hash: None,
             accepted_mints: Vec::new(),
+            issuer_mints: Vec::new(),
             realized_mint: None,
             contribution: None,
         };
@@ -1609,6 +1653,7 @@ mod tests {
             // The buyer sits on the one fenced mint; the seller accepts only an unfenced one, so
             // there is nowhere the hop is permitted to land.
             accepted_mints: vec![REAL_MINT.to_string()],
+            issuer_mints: Vec::new(),
             realized_mint: Some(DEFAULT_MINT_URL.to_string()),
             contribution: None,
         };
@@ -1655,6 +1700,7 @@ mod tests {
             seller_signature: String::new(),
             creq_hash: None,
             accepted_mints: Vec::new(),
+            issuer_mints: Vec::new(),
             realized_mint: None,
             contribution: None,
         };
@@ -1699,6 +1745,7 @@ mod tests {
             seller_signature: String::new(),
             creq_hash: None,
             accepted_mints: Vec::new(),
+            issuer_mints: Vec::new(),
             realized_mint: None,
             contribution: None,
         };
@@ -1746,6 +1793,7 @@ mod tests {
             seller_signature: valid_sig,
             creq_hash: None,
             accepted_mints: Vec::new(),
+            issuer_mints: Vec::new(),
             realized_mint: None,
             contribution: None,
         };
@@ -1859,7 +1907,7 @@ mod tests {
         // a legacy bind (`None`) falls back to the live config default.
         let select = |sealed: Option<&str>, config_default: &str| {
             let chosen = sealed.unwrap_or(config_default);
-            crate::crossmint::plan_payment(chosen, &accepted, true)
+            crate::crossmint::plan_payment(chosen, &accepted, true, &IssuerMints::none())
                 .expect("plans")
                 .realized_mint()
                 .clone()
@@ -1971,6 +2019,7 @@ mod tests {
             seller_signature: forged_sig,
             creq_hash: None,
             accepted_mints: Vec::new(),
+            issuer_mints: Vec::new(),
             realized_mint: None,
             contribution: None,
         };
@@ -2028,6 +2077,7 @@ mod tests {
             seller_signature: forged_sig,
             creq_hash: Some(creq_hash.clone()),
             accepted_mints: vec![DEFAULT_MINT_URL.to_string()],
+            issuer_mints: Vec::new(),
             realized_mint: None,
             contribution: None,
         };
@@ -2101,6 +2151,7 @@ mod tests {
             seller_signature: sig_over_2,
             creq_hash: None,
             accepted_mints: Vec::new(),
+            issuer_mints: Vec::new(),
             realized_mint: None,
             contribution: None,
         };
@@ -2132,6 +2183,7 @@ mod tests {
             seller_signature: sig_over_aa,
             creq_hash: None,
             accepted_mints: Vec::new(),
+            issuer_mints: Vec::new(),
             realized_mint: None,
             contribution: None,
         };

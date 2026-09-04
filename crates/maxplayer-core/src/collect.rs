@@ -406,6 +406,7 @@ mod tests {
             seller_signature: String::new(),
             creq_hash: None,
             accepted_mints: Vec::new(),
+            issuer_mints: Vec::new(),
             funding_mint: None,
             delivery_mint: None,
             agent_used: None,

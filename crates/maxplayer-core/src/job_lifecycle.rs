@@ -367,6 +367,16 @@ pub struct AcceptedBind {
     /// the buyer pay path chooses the realized mint from it. Empty for a claim with no `creq`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accepted_mints: Vec<String>,
+    /// The ISSUER MINTS this accept knew of when it planned the payment (§4.2 "Issuer mint"), each
+    /// with WHO said it ([`crate::mint_class::IssuerMarker`]): the buyer's own (from config), every
+    /// entry of `accepted_mints` whose NUT-06 info listed no bolt11 method at accept time, and the
+    /// mint the seller DECLARED on its own kind-30340 announcement. SEALED so the pay path
+    /// re-derives the identical plan — the class-aware fence and the hop refusal read this list,
+    /// never a fresh probe or a fresh relay read, so a mint (or a seller) that changes its answer
+    /// later can neither shift nor unblock a sealed decision. Empty ⇒ none known (every bind written
+    /// before this field, and every trade among Lightning mints).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issuer_mints: Vec<crate::mint_class::IssuerMintSeal>,
     /// The buyer's FUNDING (source) mint for this job — the mint whose proofs are spent — SELECTED and
     /// frozen at accept from the buyer's then-configured default (or a pre-funded cross-mint balance),
     /// validated against `accepted_mints` + the real-mint fence. The pay path derives the paying mint
@@ -1341,6 +1351,18 @@ pub async fn accept_claim_async(
     // fee); fall back to the configured default. Balances are a local sqlite read (no network). The
     // CHOICE is sealed below and re-derived at pay, so it stays deterministic — a later balance or
     // config-default change can never shift a sealed mint (the pays-once attempt-id invariant).
+    //
+    // Which mints are ISSUER mints (§4.2 "Issuer mint") is DECLARED, gathered HERE and sealed with
+    // the selection, marker by marker: the buyer's own from config, and the mint the seller
+    // DECLARED on its announcement (one bounded relay read; the seller's word refuses a hop but
+    // never widens the fence — `mint_class` docs). No mint is asked what it is: a class is stated
+    // by an operator or it does not exist. The class-aware fence and the hop refusal are then
+    // re-derived at pay from the seal — never from a fresh read.
+    let declared_issuer_mint =
+        fetch_seller_issuer_mint_async(home, &keys, &claim.seller_pubkey, timeout).await;
+    let issuers = crate::mint_class::IssuerMints::none()
+        .with_own(home.config.issuer_mint())
+        .with_declared(declared_issuer_mint.as_deref());
     let source_seed = match crate::wallet_ops::balances_async(home).await {
         Ok(balances) => crate::crossmint::select_source_mint(
             home.config.default_mint(),
@@ -1348,6 +1370,8 @@ pub async fn accept_claim_async(
             home.config.allow_real_mints,
             &balances,
             offer.amount_sats,
+            home.config.issuer_mint(),
+            &issuers,
         ),
         // Best-effort: a balance-read failure falls back to today's behavior (the default mint)
         // rather than blocking an otherwise-plannable payment. Logged, never silent.
@@ -1364,9 +1388,11 @@ pub async fn accept_claim_async(
         &source_seed,
         &accepted_mints,
         home.config.allow_real_mints,
+        &issuers,
     )
     .map_err(|error| JobLifecycleError::Input(error.to_string()))?;
     let (funding_mint, delivery_mint) = seal_bind_mints(&plan);
+    let issuer_mints = issuers.seal();
 
     let buyer_pubkey = keys.public_key().to_hex();
     // ACCEPT is its own kind: this is the pay-bind, not the selection — `prepare_award_async` owns
@@ -1405,6 +1431,9 @@ pub async fn accept_claim_async(
         creq_hash: claim.creq.as_deref().map(crate::gateway::creq_hash_hex),
         // The creq's accepted-mint list (validated + parsed above, fail-closed).
         accepted_mints,
+        // The issuer mints known when the plan above was made — sealed so pay re-derives, not
+        // re-probes.
+        issuer_mints,
         // The FUNDING (source) mint SELECTED for this job, frozen above. Sealing the choice makes the
         // pay-path attempt id stable across retries. On a hop this is the source, NOT the delivery mint.
         funding_mint: Some(funding_mint),
@@ -1843,6 +1872,9 @@ pub fn authorize_request_from_bind(
         // Thread the creq's accepted-mint list so the buyer chooses the realized
         // mint. Empty ⇒ a claim with no creq (pay from the pinned default mint).
         accepted_mints: bind.accepted_mints.clone(),
+        // Thread the SEALED issuer-mint knowledge so the class-aware fence and the hop refusal are
+        // re-derived from the bind, never re-probed at pay.
+        issuer_mints: bind.issuer_mints.clone(),
         // Thread the SEALED funding-mint selection so the pay path derives the paying mint from the
         // bind, not the live config default — stable attempt id across retries. `None` ⇒ legacy bind.
         realized_mint: bind.funding_mint.clone(),
@@ -1902,6 +1934,9 @@ pub fn fill_explicit_request_from_bind(
     // caller-supplied value. The seller cosig does not pin the realized mint (the preimage binds
     // only creq_hash), so a caller list must never be trusted to select the paying mint.
     request.accepted_mints = bind.accepted_mints.clone();
+    // Same seal for the issuer-mint knowledge: a caller must not be able to widen the fence or
+    // reclassify a hop leg by naming a mint an issuer.
+    request.issuer_mints = bind.issuer_mints.clone();
     // Finding CC: same seal for the funding-mint SELECTION — derived SOLELY from the sealed bind,
     // overwriting any caller value. A caller must not be able to pick the paying mint (which would
     // shift the attempt id); the frozen selection makes retries dedup.
@@ -2876,6 +2911,74 @@ fn select_result<'a>(
         })
 }
 
+/// Read the mint a seller DECLARES its own issuer mint on its kind-30340 announcement (§4.2
+/// "Issuer mint"), or `None` when it declares none.
+///
+/// Resolved by `(author, kind, d)` — never by event id — because the announcement is addressable
+/// and superseded in place ([`crate::heartbeat::ParsedHeartbeat::key`]). The newest stored beat is
+/// the seat's current statement; the stage-1 reader rule (URL must be in the seat's own
+/// `accepted_mints`, else unstated) is applied by [`crate::heartbeat::parse_heartbeat`].
+///
+/// Best-effort and FAIL-SAFE toward the behaviour that existed before the class did: a relay that
+/// cannot be reached or refuses the read, a seat with no announcement, a beat this reader cannot
+/// parse, and a beat with no tag all read as "declared none". Never an error — the tag is optional
+/// (§2.1) and an unreadable optional tag must not block an accept — and never a widening: a
+/// declaration only ever makes the planner REFUSE a hop it would otherwise plan. Logged when the
+/// read itself fails, so a silent relay is a visible fact rather than a quiet `None`.
+pub(crate) async fn fetch_seller_issuer_mint_async(
+    home: &MaxplayerHome,
+    keys: &nostr_sdk::Keys,
+    seller_pubkey: &str,
+    timeout: Duration,
+) -> Option<String> {
+    use nostr_sdk::pool::relay::ReqExitPolicy;
+    use nostr_sdk::prelude::{Client, Filter, Kind, PublicKey};
+
+    let seller = PublicKey::from_hex(seller_pubkey).ok()?;
+    let client = Client::new(keys.clone());
+    client.automatic_authentication(true);
+    if let Err(error) = client.add_relay(&home.config.relay_url).await {
+        crate::opline!("accept: seller announcement read skipped (add relay: {error})");
+        return None;
+    }
+    client.connect().await;
+    let read = async {
+        let relay = client.relay(&home.config.relay_url).await.ok()?;
+        relay.wait_for_connection(RELAY_CONNECT_WAIT).await;
+        let filter = Filter::new()
+            .author(seller)
+            .kind(Kind::Custom(crate::heartbeat::SELLER_HEARTBEAT_KIND))
+            .identifier(crate::heartbeat::SELLER_HEARTBEAT_D)
+            .hashtag(gateway::MAXPLAYER_TAG)
+            .limit(1);
+        // Single-relay read, `ExitOnEOSE`: a refused REQ surfaces as `Err` (logged below) instead
+        // of being swallowed into an empty set by the pool — same discipline as the job view.
+        match relay
+            .fetch_events(filter, timeout, ReqExitPolicy::ExitOnEOSE)
+            .await
+        {
+            Ok(events) => Some(events),
+            Err(error) => {
+                crate::opline!(
+                    "accept: seller announcement read failed for {seller_pubkey} ({error}); \
+                     treating the seller as declaring no issuer mint"
+                );
+                None
+            }
+        }
+    }
+    .await;
+    client.disconnect().await;
+    let events = read?;
+    // The newest beat is the seat's current word; a relay serving more than one (replaceable
+    // events should not, but a reader must not depend on that) is resolved the way NIP-01 does.
+    let newest = events.into_iter().max_by_key(|event| event.created_at)?;
+    crate::heartbeat::parse_heartbeat(&event_to_draft(&newest))
+        .ok()?
+        .issuer_mint
+        .map(|ad| ad.mint_url)
+}
+
 /// Convert a relay event into an [`EventDraft`] (tag/content only — no secrets).
 pub fn event_to_draft(event: &nostr_sdk::Event) -> EventDraft {
     let tags = event
@@ -2951,6 +3054,7 @@ fn result_attribution(tags: &[TagSpec]) -> (Option<String>, Option<String>) {
 mod tests {
     use super::*;
     use crate::home;
+    use crate::mint_class::IssuerMints;
 
     // #602: offer-ABSENCE is certified from the offer read ALONE. The bug was
     // `read_confirmed = offer || feedback || result || probe`, which let a non-empty claims (or
@@ -3032,6 +3136,7 @@ mod tests {
             seller_signature: "ab".repeat(32),
             creq_hash: None,
             accepted_mints: Vec::new(),
+            issuer_mints: Vec::new(),
             funding_mint: None,
             delivery_mint: None,
             agent_used: None,
@@ -3071,6 +3176,7 @@ mod tests {
             seller_signature: "ab".repeat(32),
             creq_hash: None,
             accepted_mints: Vec::new(),
+            issuer_mints: Vec::new(),
             funding_mint: None,
             delivery_mint: None,
             agent_used: None,
@@ -3159,6 +3265,7 @@ mod tests {
             seller_signature: valid_sig.clone(),
             creq_hash: None,
             accepted_mints: Vec::new(),
+            issuer_mints: Vec::new(),
             funding_mint: None,
             delivery_mint: None,
             agent_used: None,
@@ -3211,6 +3318,7 @@ mod tests {
             seller_signature: "dd".repeat(64),
             creq_hash: Some("2ad9b34cbf8c".to_string()),
             accepted_mints: vec!["https://mint.minibits.cash/Bitcoin".into()],
+            issuer_mints: Vec::new(),
             funding_mint: None,
             delivery_mint: None,
             agent_used: None,
@@ -3238,6 +3346,7 @@ mod tests {
             seller_signature: String::new(),
             creq_hash: None,
             accepted_mints: Vec::new(),
+            issuer_mints: Vec::new(),
             realized_mint: None,
             contribution: None,
         };
@@ -3269,6 +3378,7 @@ mod tests {
             seller_signature: "dd".repeat(64),
             creq_hash: Some("2ad9b34cbf8c".to_string()),
             accepted_mints: vec!["https://mint.minibits.cash/Bitcoin".into()],
+            issuer_mints: Vec::new(),
             funding_mint: None,
             delivery_mint: None,
             agent_used: None,
@@ -3290,6 +3400,7 @@ mod tests {
             seller_signature: String::new(),
             creq_hash: None,
             accepted_mints: Vec::new(),
+            issuer_mints: Vec::new(),
             realized_mint: None,
             contribution: None,
         };
@@ -3320,6 +3431,7 @@ mod tests {
             seller_signature: "dd".repeat(64),
             creq_hash: Some("2ad9b34c".repeat(8)),
             accepted_mints: vec!["https://mint.minibits.cash/Bitcoin".into()],
+            issuer_mints: Vec::new(),
             funding_mint: None,
             delivery_mint: None,
             agent_used: None,
@@ -3344,6 +3456,7 @@ mod tests {
             seller_signature: bind.seller_signature.clone(),
             creq_hash: bind.creq_hash.clone(),
             accepted_mints: bind.accepted_mints.clone(),
+            issuer_mints: Vec::new(),
             realized_mint: None,
             contribution: None,
         };
@@ -3383,6 +3496,7 @@ mod tests {
             accepted_mints: vec![bound_mint.clone()],
             // The funding-mint SELECTION is sealed in the bind (finding CC). Buyer funds at a mint in
             // the accepted set ⇒ direct payment ⇒ delivery mint equals the funding mint.
+            issuer_mints: Vec::new(),
             funding_mint: Some(bound_mint.clone()),
             delivery_mint: Some(bound_mint.clone()),
             agent_used: None,
@@ -3405,6 +3519,7 @@ mod tests {
             // Caller substitutes a mint OUTSIDE the bound set — for BOTH the accepted set and the
             // realized-mint selection.
             accepted_mints: vec![attacker_mint.clone()],
+            issuer_mints: Vec::new(),
             realized_mint: Some(attacker_mint.clone()),
             contribution: None,
         };
@@ -3489,6 +3604,7 @@ mod tests {
             accepted_mints: vec![mint_a.to_string(), mint_b.to_string()],
             // Funding sealed at accept from the buyer's then-configured default (A); A is in the
             // accepted set ⇒ direct payment ⇒ delivery equals funding.
+            issuer_mints: Vec::new(),
             funding_mint: Some(mint_a.to_string()),
             delivery_mint: Some(mint_a.to_string()),
             agent_used: None,
@@ -3512,7 +3628,7 @@ mod tests {
         // wallet-open seam consumes).
         let attempt_for = |config_default: &str| -> (String, MintUrl, PaymentTerms) {
             let selected = request.realized_mint.as_deref().unwrap_or(config_default);
-            let mint = plan_payment(selected, &request.accepted_mints, true)
+            let mint = plan_payment(selected, &request.accepted_mints, true, &IssuerMints::none())
                 .expect("plan payment")
                 .realized_mint()
                 .clone();
@@ -3556,7 +3672,7 @@ mod tests {
         // the live default flips this observed mint B↔A (red-on-revert).
         let opened = crate::buyer_fund::open_wallet_at_mint_async(
             &home,
-            &wallet_open_mint_url(&home, &retry_terms),
+            &wallet_open_mint_url(&home, &retry_terms, &IssuerMints::none()),
         )
         .await
         .expect("open pay wallet");
@@ -3601,6 +3717,19 @@ mod tests {
             seller_signature: "ab".repeat(32),
             creq_hash: None,
             accepted_mints: Vec::new(),
+            // One sealed issuer mint per marker (§4.2 "Issuer mint"), so the round-trip covers the
+            // marker, not just the URL — a seal that came back as bare URLs would let a seller's
+            // declaration widen the fence at pay.
+            issuer_mints: vec![
+                crate::mint_class::IssuerMintSeal {
+                    url: "http://127.0.0.1:3338".into(),
+                    marker: crate::mint_class::IssuerMarker::Own,
+                },
+                crate::mint_class::IssuerMintSeal {
+                    url: "https://declared.example".into(),
+                    marker: crate::mint_class::IssuerMarker::Declared,
+                },
+            ],
             // Distinct funding/delivery — a cross-mint bind — so the round-trip covers BOTH fields
             // (#495), not just their absence, and pins that the `realized_mint` alias does not clobber
             // the funding write on the way back out.
@@ -3635,6 +3764,9 @@ mod tests {
         assert_eq!(bind.funding_mint, None, "missing field defaults to None (legacy)");
         assert_eq!(bind.delivery_mint, None, "missing field defaults to None (legacy)");
         assert_eq!(bind.accepted_mints, vec!["https://mint.example".to_string()]);
+        // §4.2 "Issuer mint": a bind written before the seal existed knows no issuer mint, so the
+        // pay path fences and hop-plans it exactly as it did then.
+        assert!(bind.issuer_mints.is_empty(), "missing seal defaults to none known (legacy)");
 
         // #495 rename alias: a bind written BEFORE the rename carries a `realized_mint` key holding the
         // funding selection. The `alias = "realized_mint"` must load it into `funding_mint` (same
@@ -3695,7 +3827,7 @@ mod tests {
         let source = "https://a.example";
         let target = "https://b.example";
         // Buyer funded at `source`; seller accepts only `target` ⇒ no overlap ⇒ a hop.
-        let plan = crate::crossmint::plan_payment(source, &[target.to_string()], true)
+        let plan = crate::crossmint::plan_payment(source, &[target.to_string()], true, &IssuerMints::none())
             .expect("cross-mint plan");
         assert!(plan.is_hop(), "distinct source/target must plan a hop");
         let (funding, delivery) = seal_bind_mints(&plan);
@@ -3705,7 +3837,7 @@ mod tests {
 
         // Sibling direct-payment case: the same mint on both sides ⇒ delivery equals funding (no hop),
         // which is precisely why the mis-report was invisible on same-mint jobs.
-        let direct = crate::crossmint::plan_payment(source, &[source.to_string()], true)
+        let direct = crate::crossmint::plan_payment(source, &[source.to_string()], true, &IssuerMints::none())
             .expect("direct plan");
         assert!(!direct.is_hop(), "buyer mint in the accepted set is a direct payment");
         let (funding_direct, delivery_direct) = seal_bind_mints(&direct);
@@ -3806,6 +3938,7 @@ mod tests {
             seller_signature: "ab".repeat(32),
             creq_hash: None,
             accepted_mints: Vec::new(),
+            issuer_mints: Vec::new(),
             funding_mint: None,
             delivery_mint: None,
             agent_used: None,
@@ -3875,6 +4008,7 @@ mod tests {
             seller_signature: "ab".repeat(32),
             creq_hash: None,
             accepted_mints: Vec::new(),
+            issuer_mints: Vec::new(),
             funding_mint: None,
             delivery_mint: None,
             agent_used: None,
@@ -3965,6 +4099,7 @@ mod tests {
             seller_signature: "ab".repeat(32),
             creq_hash: None,
             accepted_mints: Vec::new(),
+            issuer_mints: Vec::new(),
             funding_mint: None,
             delivery_mint: None,
             agent_used: None,
@@ -4010,6 +4145,7 @@ mod tests {
             seller_signature: "ab".repeat(32),
             creq_hash: None,
             accepted_mints: Vec::new(),
+            issuer_mints: Vec::new(),
             funding_mint: None,
             delivery_mint: None,
             agent_used: None,
@@ -4051,6 +4187,7 @@ mod tests {
             seller_signature: "ab".repeat(32),
             creq_hash: None,
             accepted_mints: Vec::new(),
+            issuer_mints: Vec::new(),
             funding_mint: None,
             delivery_mint: None,
             agent_used: None,
@@ -4527,6 +4664,96 @@ mod tests {
         )
         .expect_err("seller required");
         assert!(err.to_string().contains("seller_pubkey"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// §4.2 "Issuer mint": the buyer reads a seller's declaration off the seller's OWN kind-30340
+    /// announcement — resolved by (author, kind, d) — through a real relay round trip. Three seats
+    /// on one relay: one declares its mint, one declares none, one declares a mint it does not list
+    /// in its own `accepted_mints` (the stage-1 reader rule reads that as unstated). Only the first
+    /// yields a URL; the buyer is a separate identity, as in production. A seat with no beat at all
+    /// is the fourth row.
+    ///
+    /// ⛔ A bare `LocalRelay`, deliberately NOT the `post_job_async` fixture — that path resolves a
+    /// fee floor at the home's real mint under `live-mints`; this one touches no mint at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sellers_issuer_mint_declaration_is_read_off_its_own_announcement() {
+        use crate::heartbeat::{HeartbeatDraft, IssuerMintAd};
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_sdk::prelude::{Client, Keys};
+
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let (root, mut home) = temp_job_home("read-declared-issuer");
+        home.config.relay_url = relay.url().await.to_string();
+
+        let sidecar = "http://10.0.0.7:3338";
+        let lightning = "https://testnut.example/Bitcoin";
+        let ad = |url: &str| IssuerMintAd {
+            mint_url: url.to_owned(),
+            outstanding_sats: 0,
+            retired_sats: 0,
+            last_seen: 1_788_390_000,
+        };
+        let declaring = Keys::generate();
+        let silent = Keys::generate();
+        let unlisted = Keys::generate();
+        let absent = Keys::generate();
+        let beats = [
+            (
+                &declaring,
+                HeartbeatDraft::new(true, 0, 5, vec![lightning.to_owned(), sidecar.to_owned()])
+                    .with_issuer_mint(ad(sidecar)),
+            ),
+            (&silent, HeartbeatDraft::new(true, 0, 5, vec![lightning.to_owned()])),
+            (
+                &unlisted,
+                HeartbeatDraft::new(true, 0, 5, vec![lightning.to_owned()])
+                    .with_issuer_mint(ad(sidecar)),
+            ),
+        ];
+        for (seat, beat) in beats {
+            let client = Client::new(seat.clone());
+            client.add_relay(&home.config.relay_url).await.expect("add relay");
+            client.connect().await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let event = crate::gateway::nostr::event_builder(&beat.to_event_draft())
+                .expect("event builder")
+                .sign_with_keys(seat)
+                .expect("sign");
+            client.send_event(&event).await.expect("publish the announcement");
+            client.disconnect().await;
+        }
+
+        let buyer = buyer_keys(&home).expect("buyer keys");
+        let timeout = Duration::from_secs(5);
+        let read = |seat: &Keys| {
+            let seller_hex = seat.public_key().to_hex();
+            let (home, buyer) = (&home, &buyer);
+            async move { fetch_seller_issuer_mint_async(home, buyer, &seller_hex, timeout).await }
+        };
+        assert_eq!(
+            read(&declaring).await.as_deref(),
+            Some(sidecar),
+            "the declared, listed mint is read off the wire"
+        );
+        assert_eq!(read(&silent).await, None, "a seat that states none declares none");
+        assert_eq!(
+            read(&unlisted).await,
+            None,
+            "a declared mint the seat does not list is unstated (stage-1 reader rule)"
+        );
+        assert_eq!(read(&absent).await, None, "no announcement at all is none");
+        assert_eq!(
+            fetch_seller_issuer_mint_async(&home, &buyer, "not-a-pubkey", timeout).await,
+            None,
+            "an unparseable seller key is none, never a panic"
+        );
+
+        // What the seal makes of it: the declaration refuses, and admits nothing.
+        let issuers = crate::mint_class::IssuerMints::none()
+            .with_declared(read(&declaring).await.as_deref());
+        assert!(issuers.contains(sidecar) && !issuers.admits(sidecar));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -5072,6 +5299,7 @@ mod tests {
             seller_signature: "ab".repeat(32),
             creq_hash: None,
             accepted_mints: Vec::new(),
+            issuer_mints: Vec::new(),
             funding_mint: None,
             delivery_mint: None,
             agent_used: None,

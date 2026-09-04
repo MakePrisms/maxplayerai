@@ -20,6 +20,8 @@ pub mod contribution;
 pub mod crossmint;
 #[cfg(all(feature = "wallet", feature = "gateway"))]
 pub mod crossmint_hop;
+#[cfg(all(feature = "wallet", feature = "gateway"))]
+pub mod mint_class;
 pub mod delivery;
 pub mod delivery_sentinel;
 #[cfg(feature = "git-delivery")]

@@ -1314,6 +1314,14 @@ pub struct MaxplayerConfig {
     /// fields with separate meanings and are never merged or repurposed for one another.
     #[serde(default = "default_accepted_mints")]
     pub accepted_mints: Vec<String>,
+    /// The mint this seat itself RUNS and issues its own currency from (`docs/protocol-v1.md` §4.2
+    /// "Issuer mint") — the stage-3 sidecar's URL. `None` ⇒ this seat issues no currency, which is
+    /// every seat today. When set: it is the one mint the real-mint fence admits without the
+    /// real-money switch (it carries no sats), the buyer side pays from it wherever a seller lists
+    /// it, and the seat's kind-30340 announcement carries it with live counters (stage 3). Nothing
+    /// reads it as a spendable Lightning balance — an issuer mint has no Lightning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer_mint: Option<String>,
     /// Per-job spend cap (sats) — the standing spend bound on the money path. Absent ⇒ the built-in
     /// [`DEFAULT_PER_JOB_BUDGET_SATS`]. Issue #378 removed the rolling/total cap: the durable
     /// `spent.jsonl` ledger still records every spend (audit + retry-idempotency), but this per-job cap
@@ -1496,6 +1504,15 @@ impl MaxplayerConfig {
             .map(String::as_str)
             .unwrap_or(DEFAULT_MINT_URL)
     }
+
+    /// The seat's OWN issuer mint (§4.2 "Issuer mint"), or `None` when it runs none. Blank and
+    /// whitespace-only read as `None`: an empty URL is not a mint this seat runs.
+    pub fn issuer_mint(&self) -> Option<&str> {
+        self.issuer_mint
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+    }
 }
 
 impl Default for MaxplayerConfig {
@@ -1503,6 +1520,7 @@ impl Default for MaxplayerConfig {
         Self {
             relay_url: DEFAULT_RELAY_URL.to_owned(),
             accepted_mints: default_accepted_mints(),
+            issuer_mint: None,
             per_job_budget_sats: DEFAULT_PER_JOB_BUDGET_SATS,
             extra_mints: Vec::new(),
             allow_real_mints: true,
