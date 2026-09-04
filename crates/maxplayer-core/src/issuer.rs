@@ -1157,11 +1157,15 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            // 0o7777, not 0o777: a file-mode assertion masks the WHOLE mode word, so the
+            // special bits are witnessed rather than discarded. This seed is created fresh by
+            // `init` above, so no special bit can be present and the two masks cannot disagree
+            // here — which is exactly why it had to be changed by hand rather than caught.
             let mode = fs::metadata(&report.seed_path)
                 .expect("seed metadata")
                 .permissions()
                 .mode()
-                & 0o777;
+                & 0o7777;
             assert_eq!(mode, 0o600, "seed mode {mode:#o}");
         }
         let phrase = fs::read_to_string(&report.seed_path).expect("seed");
