@@ -805,11 +805,26 @@ impl Config {
         // `expiration` tag, so raising it cannot lengthen an unscoped token's life.
         // An explicit value that does not parse STOPS startup. It must never fall back to the
         // default: an operator who types `300 ` or `six hours` means to NARROW this security
-        // limit, and a silent fallback would widen it to 6 hours instead. Only an absent
-        // variable selects the default.
+        // limit, and a silent fallback would widen it to 6 hours instead.
+        //
+        // ONLY `NotPresent` selects the default. `NotUnicode` means the variable IS set, to
+        // bytes that are not UTF-8, so it must be refused for the same reason: it is an
+        // explicit value the operator wrote, and defaulting on it would widen the cap. A
+        // catch-all `Err(_)` arm covers both and reintroduces exactly the bug this rule
+        // exists to prevent, so match the variants by name and let a new variant break the
+        // build rather than pass silently.
         let scoped_token_max_lifetime_secs: u64 =
             match std::env::var("BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS") {
-                Err(_) => buzz_auth::DEFAULT_SCOPED_TOKEN_MAX_LIFETIME_SECS,
+                Err(std::env::VarError::NotPresent) => {
+                    buzz_auth::DEFAULT_SCOPED_TOKEN_MAX_LIFETIME_SECS
+                }
+                Err(std::env::VarError::NotUnicode(raw)) => {
+                    return Err(ConfigError::InvalidValue(format!(
+                        "BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS is set to bytes that are not \
+                         UTF-8 ({raw:?}); it must be a whole number of seconds (0 disables \
+                         the relaxation)"
+                    )));
+                }
                 Ok(raw) => raw.parse().map_err(|_| {
                     ConfigError::InvalidValue(format!(
                         "BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS must be a whole number of seconds \
@@ -1105,6 +1120,19 @@ mod tests {
             junk.push((raw, Config::from_env().is_err()));
         }
 
+        // Bytes that are not UTF-8. `std::env::var` reports these as `VarError::NotUnicode`,
+        // NOT as `NotPresent`: the variable IS set. A catch-all `Err(_)` arm would default
+        // here and widen the cap to 6 hours, which is the same hole as a silent parse
+        // fallback. Unix only — Windows environment values are UTF-16 and reach this by
+        // another route.
+        #[cfg(unix)]
+        let not_unicode_refused = {
+            use std::os::unix::ffi::OsStrExt;
+            let raw = std::ffi::OsStr::from_bytes(&[0x32, 0x31, 0x36, 0x30, 0x30, 0xff]);
+            std::env::set_var("BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS", raw);
+            Config::from_env().is_err()
+        };
+
         if let Some(value) = previous {
             std::env::set_var("BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS", value);
         } else {
@@ -1119,6 +1147,12 @@ mod tests {
                 "an explicit `{raw}` must stop startup, never widen the cap to the default"
             );
         }
+        #[cfg(unix)]
+        assert!(
+            not_unicode_refused,
+            "a value set to non-UTF-8 bytes is PRESENT, so it must stop startup; \
+             defaulting on VarError::NotUnicode widens the cap to 6 hours"
+        );
     }
 
     #[test]
