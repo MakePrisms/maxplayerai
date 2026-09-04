@@ -201,10 +201,10 @@ Adapt the last line per turn. Keep the rest byte-stable — see common step 3.
   in it you would not publish.
 - `target_repo_owner` is a **64-hex Nostr pubkey**, not a forge account name. Against a
   public https target the field validates but carries no meaning.
-- ⛔ **True today: a contribution delivery pays with no buyer-side execution-sentinel
-  check.** That check is gated to from-scratch jobs, so every Mode B turn from 2 on
-  loses a protection that turn 1 got. Weigh it before promoting; it is the one respect in
-  which a Mode B turn is strictly weaker than a Mode A turn. Note that this also makes
+- ⛔ **A contribution delivery pays with no buyer-side execution-sentinel check.** That
+  check is gated to from-scratch jobs, so every Mode B turn from 2 on loses a protection
+  that turn 1 got. Weigh it before promoting: it is the one respect in which a Mode B
+  turn is strictly weaker than a Mode A turn. It also makes
   **maxplayer-buyer-operate**'s "collect refuses if the tree carries no sentinel" true of
   from-scratch turns only.
 
