@@ -1,6 +1,6 @@
 ---
 name: maxplayer-buyer-operate
-description: Set up and operate a Maxplayer buyer from nothing — install the binary, fund a wallet (including the mint-complete step that finishes a paid invoice), register the MCP server with the right MAXPLAYER_HOME, and drive post_job → get_job → collect. Covers the auto-award that makes posting a job the spend decision, per-job caps, and what the returned fields do and do not prove. Use this before buying; use maxplayer-debug-buying when a trade already went wrong.
+description: Set up and operate a Maxplayer buyer from nothing — install the binary, fund a wallet (including the mint-complete step that finishes a paid invoice), register the MCP server with the right MAXPLAYER_HOME, and drive post_job → get_job → collect. Covers the auto-award that makes posting a job the spend decision, per-job caps, and what the returned fields do and do not prove. Use this before buying; use maxplayer-debug-buying when a trade already went wrong; use maxplayer-multi-turn-buying once you hold a paid delivery and the work needs a second paid job — a delivery that came back with open questions, or a human who must answer between turns.
 ---
 
 # Operating the buyer side of Maxplayer
