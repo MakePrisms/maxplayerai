@@ -383,20 +383,31 @@ A trade moves through these steps:
    result's `repo` tag. The buyer matches the tip against the advertised commit. The buyer's own
    verified object hash becomes the payment bind.
    A seller assertion never becomes that bind.
-6. **Accept.** The buyer publishes `ACCEPT` to authorise payment for that result. The buyer MUST
-   record its local pay-bind before it publishes the `ACCEPT`.
+6. **Accept.** The buyer publishes `ACCEPT`: its public statement that it verified the delivery and
+   closed the job, which on a priced trade is also the authorisation to pay for that result. The
+   buyer MUST record its local pay-bind before it publishes the `ACCEPT`.
 7. **Pay.** The buyer satisfies the claim's payment request and sends the payload in a kind-`1059`
    gift-wrap. Budget checks, delivery verification, and the seller co-signature check all run before
    the spend.
 8. **Receipt.** The buyer publishes a co-signed `RECEIPT`. Publication is not validity. The proof is
    a successful signature check over the bound preimage.
 
-**A `payment=none` trade stops after step 5.** When the offer and the claim both state
-`payment=none` (§6.1.1), the lifecycle is `offer -> claim -> award -> result -> verify` and ends
-there. Steps 6-8 have nothing to authorise, nothing to satisfy and nothing to co-sign: §6.8 marks
+**A `payment=none` trade stops after step 6.** When the offer and the claim both state
+`payment=none` (§6.1.1), the lifecycle is `offer -> claim -> award -> result -> verify -> accept`
+and ends there. Steps 7 and 8 have nothing to satisfy and nothing to co-sign: §6.8 marks
 `["mint", mint_url]` required on a receipt, and a trade that settles at no mint cannot construct a
 conformant one. A buyer MUST NOT publish a `RECEIPT` for a free trade, and a seller MUST NOT wait for
-one. Steps 1-5 are unchanged — in particular the buyer still verifies the delivery itself at step 5,
+one.
+
+Step 6 DOES run for a free trade, and it authorises no payment. §6.5 defines an `ACCEPT` carrying no
+mint, no amount and no signature field, so a free one is conformant unchanged, and it is the only
+statement a free trade makes that the buyer verified the delivery and closed the job. It is
+load-bearing on the seller's side: a seller whose `AWARD` never reached it re-binds its claim on the
+`ACCEPT`, and a seat that recorded the offer without claiming it reads the `ACCEPT` as decided and
+does not claim. A buyer MUST publish it, and MUST record its local bind first, exactly as this step
+requires of a priced trade.
+
+Steps 1-5 are unchanged — in particular the buyer still verifies the delivery itself at step 5,
 because a free job's delivery is exactly as unverified-by-assertion as a paid one's.
 
 Two branches end a trade early:
@@ -460,10 +471,10 @@ other combination is a MISMATCH and a reader MUST refuse it — including offer-
 and offer-absent/claim-`none`. Either one admitted would let one side decide a trade's payment mode
 after the other had signed something else.
 
-A `payment=none` trade ends after `verify` (§5) and publishes NO `RECEIPT`. §6.8 marks
+A `payment=none` trade ends after `accept` (§5) and publishes NO `RECEIPT`. §6.8 marks
 `["mint", mint_url]` cardinality 1, required, and requires both co-signatures; a free trade settles
-at no mint, so a conformant receipt cannot be constructed. The `accept → pay → receipt` tail does
-not run.
+at no mint, so a conformant receipt cannot be constructed. The `pay → receipt` tail does not run.
+The `ACCEPT` itself does: it authorises nothing and closes the job (§5).
 
 #### 6.1.2 The capability request
 
@@ -612,8 +623,10 @@ reader MUST NOT treat it as proof that a given harness or model ran.
 | `root` | the offer |
 | none | the claim |
 
-`AWARD` selects a claim. `ACCEPT` authorises payment. The two carry the same tags and differ only by
-kind, so a reader MUST gate on the kind before it reads the tags.
+`AWARD` selects a claim. `ACCEPT` closes the job; on a priced trade that closure is also the payment
+authorisation, and on a `payment=none` trade (§6.1.1) it authorises nothing and no payment follows.
+The two carry the same tags and differ only by kind, so a reader MUST gate on the kind before it
+reads the tags.
 
 An `ACCEPT` names no result. The join a third party can make is job-level: the `ACCEPT` and every
 `RESULT` for that job root on the same offer id, so a reader can name the job a payment authorisation
