@@ -640,7 +640,11 @@ pub async fn authorize_pay_async(
 /// (the `job_id`, the seller's workdir label the buyer already knows) is removed before matching so a
 /// token reachable only through a path echo cannot count. `Ok(false)` = read fine, no job-bound
 /// sentinel present (missing or replayed); `Err` = the tree could not be read (the caller fails closed).
-fn delivery_tree_carries_sentinel(
+///
+/// `pub(crate)` because the FREE collect path ([`crate::collect`]) runs this SAME check: a free
+/// delivery is verified on exactly the evidence a paid one is, minus the payment. It reads a git
+/// store and touches no wallet, budget, or mint, so a wallet-less buyer can run it.
+pub(crate) fn delivery_tree_carries_sentinel(
     store: &Path,
     store_ref: &str,
     commit_hex: &str,
@@ -690,7 +694,11 @@ fn delivery_tree_carries_sentinel(
 /// `no_sentinel`) from a buyer-side verify error, so reputation does not misattribute the latter to
 /// the seller. Best-effort: a journal write that itself fails is logged, never converted into a spend
 /// — the refusal already stands on the returned error.
-fn journal_sentinel_refusal(home: &MaxplayerHome, job_id: &str, commit_oid: &str, class: &str) {
+///
+/// `pub(crate)` for the same reason as [`delivery_tree_carries_sentinel`]: a FREE collect's sentinel
+/// refusal must land in the SAME artifact a priced one does, or §17 would see free jobs as a blind
+/// spot where a seller can deliver unexecuted work without a record.
+pub(crate) fn journal_sentinel_refusal(home: &MaxplayerHome, job_id: &str, commit_oid: &str, class: &str) {
     let dir = home.root.join("sentinel-refusals");
     if let Err(error) = std::fs::create_dir_all(&dir) {
         eprintln!("authorize_pay: sentinel-refusal journal dir failed (continuing): {error}");

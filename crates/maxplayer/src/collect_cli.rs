@@ -52,9 +52,11 @@ fn usage(err: &mut dyn Write) {
          \x20 maxplayer collect <job_id> [--out <folder>] [--home <path>]\n\
          \n\
          Accepts the delivered claim if no bind exists yet, verifies the delivery integrity\n\
-         (delivered branch must tip at the accepted commit), pays the seller through the sealed\n\
-         money path, then materializes the files under <home>/results/<job_id>. Idempotent:\n\
-         re-collecting an already-paid job re-materializes without a second payment.\n\
+         (delivered branch must tip at the accepted commit), settles under the payment mode the\n\
+         offer and the claim agreed on, then materializes the files under <home>/results/<job_id>.\n\
+         A priced job (payment=sat) pays the seller through the sealed money path; a free job\n\
+         (payment=none) pays nothing and opens no wallet. Idempotent: re-collecting\n\
+         re-materializes without a second payment.\n\
          Exit codes: 0 success, 1 usage error, 2 runtime error"
     );
 }

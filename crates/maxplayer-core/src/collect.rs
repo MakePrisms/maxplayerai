@@ -23,14 +23,29 @@
 //!
 //! Idempotent by attempt id: re-collecting an already-paid job loads the existing bind, reconciles
 //! the payment without a second spend, and re-materializes the files.
+//!
+//! # Two modes
+//!
+//! Step 2/3 above is the ONE place `payment=none` (§1.1) diverges. `collect_async` branches on
+//! `bind.payment_mode` — the mode the buyer-signed offer and the seller-signed claim AGREED on,
+//! frozen at accept — and a free bind runs [`collect_free`] instead of the money path: the same
+//! tip-match and the same §19 execution-sentinel check, then materialize and record, with no
+//! `authorize_pay`, no [`BudgetGate`] append, no wallet open and no mint contact. The paid path is
+//! untouched.
+//!
+//! That branch is not an optimisation, it is a REQUIREMENT of shipping a free post surface:
+//! `authorize_pay_async` refuses a free bind at its entry, so a buyer able to post a free job
+//! without this branch could post one it could never collect. The branch and the post-surface
+//! `payment` parameter therefore land in one commit.
 
 use std::path::{Path, PathBuf};
 
 use crate::authorize_pay::{self, AuthorizePayError, AuthorizePayOutcome};
 use crate::budget::BudgetGate;
+use crate::delivery::{CommitOid, DeliveryVerifier, GitDelivery};
 use crate::delivery_git::PayPathDeliveryVerifier;
-use crate::home::MaxplayerHome;
-use crate::job_lifecycle::{self, JobLifecycleError};
+use crate::home::{self, MaxplayerHome};
+use crate::job_lifecycle::{self, AcceptedBind, JobLifecycleError};
 
 /// Inputs for [`collect_async`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,10 +57,49 @@ pub struct CollectRequest {
     pub out: Option<String>,
 }
 
-/// Successful collect outcome: the pay result plus the materialized delivery.
+/// What a collect SETTLED — the one place the two payment modes differ in the outcome.
+///
+/// A variant rather than an `Option<AuthorizePayOutcome>`: `Free` is a positive statement that this
+/// trade had no payment leg, and it is named `Free` (never `None`) so no call site has to read
+/// `CollectPayment::None` next to an `Option::None` and keep the two apart — the same reason
+/// [`crate::gateway::PaymentMode::is_free`] exists.
+#[derive(Clone, Debug)]
+pub enum CollectPayment {
+    /// `payment=sat`: the sealed money path ran and returned this outcome.
+    Sat(AuthorizePayOutcome),
+    /// `payment=none`: there was nothing to pay. No `authorize_pay`, no [`BudgetGate`] append, no
+    /// wallet open, no mint contact — the delivery was still tip-matched + sentinel-checked before
+    /// its files were materialized.
+    Free,
+}
+
+impl CollectPayment {
+    /// What the seller received: the paid amount, or `0` for a free trade.
+    pub fn amount_sats(&self) -> u64 {
+        match self {
+            Self::Sat(outcome) => outcome.amount_sats,
+            Self::Free => 0,
+        }
+    }
+
+    /// Whether this collect settled a FREE trade.
+    pub fn is_free(&self) -> bool {
+        matches!(self, Self::Free)
+    }
+
+    /// The pay outcome when one exists; `None` for a free trade.
+    pub fn paid(&self) -> Option<&AuthorizePayOutcome> {
+        match self {
+            Self::Sat(outcome) => Some(outcome),
+            Self::Free => None,
+        }
+    }
+}
+
+/// Successful collect outcome: what settled plus the materialized delivery.
 #[derive(Clone, Debug)]
 pub struct CollectOutcome {
-    pub pay: AuthorizePayOutcome,
+    pub pay: CollectPayment,
     pub commit_oid: String,
     /// Absolute path the delivery files were checked out to.
     pub path: String,
@@ -64,6 +118,11 @@ pub enum CollectError {
     Input(String),
     Lifecycle(JobLifecycleError),
     Pay(AuthorizePayError),
+    /// A FREE collect's delivery verification refused — the tip-match or the §19 execution
+    /// sentinel. The paid path's equivalent refusals arrive as [`CollectError::Pay`] because they
+    /// run inside `authorize_pay`; a free job never enters that function, so its verification
+    /// refusals need a class of their own rather than a borrowed pay error that names no payment.
+    Integrity(String),
     Materialize(String),
 }
 
@@ -73,6 +132,7 @@ impl std::fmt::Display for CollectError {
             Self::Input(message) => write!(formatter, "collect: {message}"),
             Self::Lifecycle(error) => write!(formatter, "collect: {error}"),
             Self::Pay(error) => write!(formatter, "collect: {error}"),
+            Self::Integrity(message) => write!(formatter, "collect integrity: {message}"),
             Self::Materialize(message) => write!(formatter, "collect materialize: {message}"),
         }
     }
@@ -108,9 +168,31 @@ pub async fn collect_async(
     let dest = results_dest(home, &request.job_id, request.out.as_deref())
         .map_err(CollectError::Input)?;
 
-    // 2/3. Verify integrity + pay through the sealed money path. The tip-match commitment is the oid
-    // the buyer accepted; the machine tip-match runs inside authorize_pay before any spend.
-    // Idempotent by attempt id: a re-collect reconciles without a second spend.
+    // 2/3. THE MODE BRANCH. `bind.payment_mode` is the agreement of the buyer-signed OFFER and the
+    // seller-signed CLAIM, decided and frozen at accept by `verify_free_accept` — never re-derived
+    // here, never inferred from `amount_sats == 0`, and never caller input. A free trade has no
+    // payment leg to run, so it takes the branch below; every priced trade goes through the sealed
+    // money path exactly as before.
+    //
+    // ⛔ ORDERING (Bob, 2026-09-04): this branch and the post-surface `payment` parameter are ONE
+    // commit. `authorize_pay_async` refuses a free bind at its entry (§2.5), so a shipped surface
+    // that could post a free job WITHOUT this branch would produce jobs that are postable and
+    // uncollectable. Nothing on this branch may reintroduce that window.
+    if bind.payment_mode.is_free() {
+        let files = collect_free(home, &bind, &dest)?;
+        return Ok(CollectOutcome {
+            pay: CollectPayment::Free,
+            commit_oid: bind.commit_oid,
+            path: dest.display().to_string(),
+            files,
+            agent_used: bind.agent_used,
+            model_used: bind.model_used,
+        });
+    }
+
+    // The PAID path, unchanged. The tip-match commitment is the oid the buyer accepted; the machine
+    // tip-match runs inside authorize_pay before any spend. Idempotent by attempt id: a re-collect
+    // reconciles without a second spend.
     let pay_request = job_lifecycle::authorize_request_from_bind(
         &bind,
         bind.amount_sats,
@@ -129,7 +211,7 @@ pub async fn collect_async(
         .map_err(CollectError::Materialize)?;
 
     Ok(CollectOutcome {
-        pay,
+        pay: CollectPayment::Sat(pay),
         commit_oid: bind.commit_oid,
         path: dest.display().to_string(),
         files,
@@ -153,6 +235,165 @@ pub fn collect_blocking(
         .build()
         .map_err(|error| CollectError::Input(format!("collect runtime: {error}")))?;
     runtime.block_on(collect_async(home, gate, request))
+}
+
+/// The FREE collect path (`payment=none`): verify the delivery exactly as hard as the paid path
+/// does, materialize it, and record the collect. No payment leg exists, so none is run.
+///
+/// What this deliberately does NOT do — the list is the point of the function:
+///
+///   * no [`authorize_pay`](crate::authorize_pay) (it refuses a free bind at its entry, §2.5),
+///   * no [`BudgetGate`] append or read — a free collect cannot move the spend total,
+///   * no wallet open, no mint contact, no `plan_payment`. A buyer holding zero bitcoin, with no
+///     wallet and no mint configured, must reach the delivered files, and every one of those calls
+///     is a place a wallet-less buyer would have been refused.
+///
+/// What it DOES do, both of them borrowed from the paid path so a free delivery is never
+/// materialized on weaker evidence than a paid one:
+///
+///   1. **The tip-match** — the same fetch + compare `authorize_pay` runs through
+///      [`crate::payment::verify_pay_path_delivery`]: the delivered branch must tip at the
+///      `commit_oid` the buyer accepted. The comparison is against the BIND, never the seller's
+///      echo. This is also what fetches the delivery into the buyer store, so it is what makes the
+///      materialize below possible at all.
+///   2. **The §19 execution sentinel** (from-scratch jobs) — the delivered tree must carry THIS
+///      job's sentinel, evidence the buyer reads itself rather than seller testimony. A refusal is
+///      journalled through the same `sentinel-refusals` artifact the pay path writes, so §17
+///      reputation sees a free job's refusal identically to a priced one's.
+///
+/// The receipt co-signature tooth is NOT run here, and cannot be: that tooth verifies the seller's
+/// signature over the payment RECEIPT preimage (mint, amount, unit, attempt id), which does not
+/// exist for a trade with no payment. The seller's co-signature over the delivered RESULT is
+/// verified at accept, which has already run by the time we are here.
+fn collect_free(
+    home: &MaxplayerHome,
+    bind: &AcceptedBind,
+    dest: &Path,
+) -> Result<Vec<String>, CollectError> {
+    let commit_oid = CommitOid::parse(bind.commit_oid.clone())
+        .map_err(|error| CollectError::Integrity(format!("accepted commit_oid: {error}")))?;
+    let delivery = GitDelivery::new(bind.repo.clone(), bind.branch.clone(), commit_oid)
+        .map_err(|error| CollectError::Integrity(format!("accepted delivery: {error}")))?;
+
+    // Buyer secret signs NIP-98 for the relay-git READ, exactly as the pay path's verifier does.
+    // This is a delivery fetch, not a money operation: no wallet, no mint, no proofs.
+    let secret_hex = home::read_secret_key_hex(home)
+        .map_err(|error| CollectError::Integrity(format!("buyer key: {error}")))?;
+    let store = delivery_store_path(home);
+    let mut verifier = PayPathDeliveryVerifier::new(store.clone(), Some(secret_hex));
+
+    // 1. THE TIP-MATCH. Same verifier, same allowlist, same fetch, same compare as the paid path —
+    // only the payment that would have followed it is absent.
+    let verified = verifier
+        .verify(&delivery)
+        .map_err(|error| CollectError::Integrity(format!("delivery verify refused: {error}")))?;
+    if verified.commit_oid().as_str() != bind.commit_oid {
+        return Err(CollectError::Integrity(format!(
+            "verified delivery commit {} does not match the accepted commit_oid {} (buyer \
+             tip-match required; refuse mismatch)",
+            verified.commit_oid().as_str(),
+            bind.commit_oid
+        )));
+    }
+
+    // 2. THE §19 SENTINEL. Contribution deliveries are gated by the contribution content path and
+    // are not served free yet, so — as on the paid path — the sentinel check is from-scratch only.
+    // `bind.contribution == None` iff the offer was from-scratch (accept is fail-closed).
+    let store_ref = PayPathDeliveryVerifier::store_ref_for(&bind.commit_oid);
+    if bind.contribution.is_none() {
+        match authorize_pay::delivery_tree_carries_sentinel(
+            verifier.repository(),
+            &store_ref,
+            &bind.commit_oid,
+            &bind.job_hash,
+            &bind.job_id,
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                authorize_pay::journal_sentinel_refusal(
+                    home,
+                    &bind.job_id,
+                    &bind.commit_oid,
+                    "missing_or_replayed",
+                );
+                return Err(CollectError::Integrity(format!(
+                    "delivery {} carries no execution sentinel bound to job {} (§19); refusing \
+                     no_sentinel and materializing nothing",
+                    bind.commit_oid, bind.job_id
+                )));
+            }
+            Err(reason) => {
+                authorize_pay::journal_sentinel_refusal(
+                    home,
+                    &bind.job_id,
+                    &bind.commit_oid,
+                    "verify_error",
+                );
+                return Err(CollectError::Integrity(format!(
+                    "delivery {} sentinel could not be verified ({reason}); fail-closed, \
+                     materializing nothing",
+                    bind.commit_oid
+                )));
+            }
+        }
+    }
+
+    // 3. Materialize — the SAME read-only checkout the paid path performs, reached only after both
+    // verifications above passed.
+    let files = materialize_delivery(&store, &store_ref, &bind.commit_oid, dest)
+        .map_err(CollectError::Materialize)?;
+
+    // 4. Record the collect. A free job produces no payment-journal entry (there is no payment to
+    // journal), so without this a completed free trade would leave the buyer no durable local
+    // artifact at all — and §7.0 is that the record is the artifact, never the silence. Written
+    // ONLY on the free path: the paid path's durable record is its payment journal, and adding a
+    // second one there would change paid behaviour.
+    write_free_collect_record(home, bind, dest, &files)?;
+    Ok(files)
+}
+
+/// Where a FREE collect's durable buyer-side record lives: `<home>/collects/<job_id>.json`.
+pub fn free_collect_record_path(home: &MaxplayerHome, job_id: &str) -> PathBuf {
+    home.root.join("collects").join(format!("{job_id}.json"))
+}
+
+/// Write the free collect record, `payment = "none"` — the buyer-side fact that this job completed
+/// with no payment leg. WRITE-ONCE: a re-collect re-materializes the files (idempotent) and leaves
+/// the first record's `collected_at` standing, so the record dates the collect rather than the last
+/// re-read of it.
+fn write_free_collect_record(
+    home: &MaxplayerHome,
+    bind: &AcceptedBind,
+    dest: &Path,
+    files: &[String],
+) -> Result<(), CollectError> {
+    let path = free_collect_record_path(home, &bind.job_id);
+    if path.exists() {
+        return Ok(());
+    }
+    let dir = path
+        .parent()
+        .ok_or_else(|| CollectError::Materialize("collect record has no parent dir".to_owned()))?;
+    std::fs::create_dir_all(dir)
+        .map_err(|error| CollectError::Materialize(format!("collect record dir: {error}")))?;
+    let record = serde_json::json!({
+        "job_id": bind.job_id,
+        "claim_id": bind.claim_id,
+        "result_id": bind.result_id,
+        "seller_pubkey": bind.seller_pubkey,
+        "commit_oid": bind.commit_oid,
+        // The fact this record exists to state. Mirrors the seller store's `deliveries.payment`.
+        "payment": crate::gateway::PaymentMode::None.as_wire(),
+        "amount_sats": 0,
+        "path": dest.display().to_string(),
+        "files": files,
+        "collected_at": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0),
+    });
+    std::fs::write(&path, format!("{record}\n"))
+        .map_err(|error| CollectError::Materialize(format!("collect record write: {error}")))
 }
 
 /// The buyer store: the local bare repository the pay path retains verified delivery objects in.
