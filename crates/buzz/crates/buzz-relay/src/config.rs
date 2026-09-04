@@ -276,8 +276,13 @@ pub struct Config {
     /// enforce a scope it cannot parse, so a token whose holder asked for one branch must
     /// not become a token that may write any branch.
     ///
-    /// Set via `BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS`. Zero disables the relaxation and
-    /// puts every token back on the ±60 s window.
+    /// Set via `BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS`. Zero disables the relaxation and puts
+    /// every token back on the ±60 s window — the exact rule from before this feature, and
+    /// the rollback switch.
+    ///
+    /// An explicit value that is not a whole number of seconds STOPS startup. It never falls
+    /// back to the default: an operator who mistypes a NARROWER limit must not receive the
+    /// wider default instead. Only an absent variable selects the default.
     pub scoped_token_max_lifetime_secs: u64,
 
     /// Descriptor key identifier accepted in kind:30350 `exec` tags.
@@ -798,11 +803,20 @@ impl Config {
         // 6 hours by default. See the `scoped_token_max_lifetime_secs` field doc: this
         // only ever applies to a token that carries BOTH a valid ref scope and an
         // `expiration` tag, so raising it cannot lengthen an unscoped token's life.
+        // An explicit value that does not parse STOPS startup. It must never fall back to the
+        // default: an operator who types `300 ` or `six hours` means to NARROW this security
+        // limit, and a silent fallback would widen it to 6 hours instead. Only an absent
+        // variable selects the default.
         let scoped_token_max_lifetime_secs: u64 =
-            std::env::var("BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(buzz_auth::DEFAULT_SCOPED_TOKEN_MAX_LIFETIME_SECS);
+            match std::env::var("BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS") {
+                Err(_) => buzz_auth::DEFAULT_SCOPED_TOKEN_MAX_LIFETIME_SECS,
+                Ok(raw) => raw.parse().map_err(|_| {
+                    ConfigError::InvalidValue(format!(
+                        "BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS must be a whole number of seconds \
+                         (0 disables the relaxation); got `{raw}`"
+                    ))
+                })?,
+            };
         let push_executor_key_id =
             std::env::var("BUZZ_PUSH_EXECUTOR_KEY_ID").unwrap_or_else(|_| "relay-v1".to_string());
         if push_executor_key_id.is_empty() || push_executor_key_id.len() > 64 {
@@ -1082,10 +1096,14 @@ mod tests {
             .expect("config")
             .scoped_token_max_lifetime_secs;
 
-        std::env::set_var("BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS", "six hours");
-        let junk = Config::from_env()
-            .expect("config")
-            .scoped_token_max_lifetime_secs;
+        // A malformed explicit value must STOP startup. A fallback to the default would turn
+        // an operator's typo into a WIDER limit than the one they typed. Each of these is a
+        // plausible typo, and a trailing space is the easiest one to make.
+        let mut junk = Vec::new();
+        for raw in ["six hours", "300 ", "", "-1", "21600s", "6h", "1e3"] {
+            std::env::set_var("BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS", raw);
+            junk.push((raw, Config::from_env().is_err()));
+        }
 
         if let Some(value) = previous {
             std::env::set_var("BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS", value);
@@ -1095,11 +1113,12 @@ mod tests {
 
         assert_eq!(raised, 43_200);
         assert_eq!(off, 0, "zero must switch the relaxation off, not fall back");
-        assert_eq!(
-            junk,
-            buzz_auth::DEFAULT_SCOPED_TOKEN_MAX_LIFETIME_SECS,
-            "an unparsable value must fall back to the default"
-        );
+        for (raw, refused) in junk {
+            assert!(
+                refused,
+                "an explicit `{raw}` must stop startup, never widen the cap to the default"
+            );
+        }
     }
 
     #[test]

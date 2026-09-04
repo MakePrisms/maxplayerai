@@ -180,7 +180,10 @@ in
         more is REJECTED outright, not shortened, so raising the deadline without raising this value
         breaks delivery at push time. The effective value is advertised in the relay's NIP-11
         `limitation` object as `scoped_token_max_lifetime_secs`, which is how a client checks the cap
-        before it mints. 0 switches the relaxation off and puts every token back on ±60 s.
+        before it mints. 0 switches the relaxation off and puts every token back on ±60 s — the
+        exact rule from before this feature, so 0 is the rollback switch. The relay REFUSES to
+        start on a value that is not a whole number of seconds; it never falls back to the
+        default, because a mistyped narrower limit must not become the wider default.
       '';
     };
 

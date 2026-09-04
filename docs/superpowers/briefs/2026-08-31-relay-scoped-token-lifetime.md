@@ -180,7 +180,12 @@ Branch `feat/relay-scoped-token-lifetime`. Requirement A stays as PR #929 merged
   `BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS`, default **21600** seconds (6 hours).
 - NixOS option `services.maxplayer.relay.scopedTokenMaxLifetimeSecs` in `nix/relay.nix`
   wires the same env var.
-- `0` switches the relaxation off and puts every token back on ±60 s.
+- `0` switches the relaxation off and puts every token back on ±60 s. A cap of 0 selects the
+  strict policy itself, so it is the exact rule from before this change and nothing else.
+  This is the rollback switch.
+- An explicit env value that is not a whole number of seconds STOPS startup. It never falls
+  back to the default, because a mistyped narrower limit must not become the wider default.
+  Only an absent variable selects the default.
 - A token that asks for more than the cap is rejected outright, not shortened. Raise the
   cap before you raise the job deadline.
 

@@ -73,7 +73,18 @@ impl Nip98Freshness {
 
     /// Grant a scoped token that carries a NIP-40 `expiration` tag a life of up to
     /// `cap_secs` seconds. Unscoped tokens keep the ±60 s window.
+    ///
+    /// `cap_secs == 0` returns [`STRICT`](Self::STRICT) itself, so a zero cap is the exact
+    /// historical rule and nothing more. This is the operator's rollback switch: a cap of 0
+    /// must behave as though this feature never shipped. `Some(0)` would not do that — it
+    /// keeps a token with an `expiration` tag on the scoped path, where an unparseable
+    /// tag, an `expiration` that equals `created_at`, or a malformed `ref` tag all refuse a
+    /// request that the ±60 s window accepts. Those refusals are safe, but they are not a
+    /// rollback.
     pub const fn with_scoped_lifetime_cap(cap_secs: u64) -> Self {
+        if cap_secs == 0 {
+            return Self::STRICT;
+        }
         Self {
             scoped_token_max_lifetime_secs: Some(cap_secs),
         }
@@ -906,6 +917,72 @@ mod tests {
             Nip98Freshness::with_scoped_lifetime_cap(99).scoped_lifetime_cap(),
             Some(99)
         );
+    }
+
+    /// A zero cap is the operator's rollback switch, so it must be STRICT itself and not a
+    /// third behaviour. `Some(0)` used to keep a token that carries an `expiration` tag on
+    /// the scoped path, where three inputs are refused that the ±60 s window accepts: an
+    /// `expiration` equal to `created_at` once the token ages, an unparseable `expiration`,
+    /// and a malformed `ref` tag. Each case below is fresh and unremarkable under STRICT, so
+    /// each one fails if a zero cap ever stops meaning "off".
+    #[test]
+    fn a_zero_cap_is_exactly_strict_for_a_scoped_token_with_an_expiration() {
+        let keys = Keys::generate();
+        let now = Timestamp::now().as_secs();
+        let off = Nip98Freshness::with_scoped_lifetime_cap(0);
+
+        assert_eq!(
+            off,
+            Nip98Freshness::STRICT,
+            "a zero cap IS the strict policy"
+        );
+        assert_eq!(off.scoped_lifetime_cap(), None, "no cap is in force");
+
+        // 30 s old, `expiration` == `created_at`: inside the window, and the scoped path
+        // would call it expired.
+        let stale_expiry = make_event_with_tags(
+            &keys,
+            now - 30,
+            &[["ref", SCOPE], ["expiration", &(now - 30).to_string()]],
+        );
+        // An `expiration` the scoped path cannot parse. STRICT never reads the tag.
+        let junk_expiry =
+            make_event_with_tags(&keys, now, &[["ref", SCOPE], ["expiration", "tomorrow"]]);
+        // A `ref` tag the scoped path refuses. STRICT never reads it, and the push path
+        // enforces nothing from an unscoped token.
+        let bad_scope = make_event_with_tags(
+            &keys,
+            now,
+            &[
+                ["ref", "refs/heads/../../etc/passwd"],
+                ["expiration", &(now + 3600).to_string()],
+            ],
+        );
+
+        for (json, case) in [
+            (&stale_expiry, "expiration equal to created_at"),
+            (&junk_expiry, "unparseable expiration"),
+            (&bad_scope, "malformed ref tag"),
+        ] {
+            let capped = verify_nip98_event_with_policy(json, TEST_URL, TEST_METHOD, None, off);
+            let strict = verify_nip98_event_with_policy(
+                json,
+                TEST_URL,
+                TEST_METHOD,
+                None,
+                Nip98Freshness::STRICT,
+            );
+            assert!(
+                strict.is_ok(),
+                "control: STRICT must accept the {case} case; got {:?}",
+                strict.err()
+            );
+            assert!(
+                capped.is_ok(),
+                "a zero cap must accept the {case} case exactly as STRICT does; got {:?}",
+                capped.err()
+            );
+        }
     }
 
     #[test]
