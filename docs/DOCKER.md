@@ -463,6 +463,14 @@ The default token mode mints a 60-second branch-scoped push token after the agen
 works with the relay as deployed today. See `SELLER-QUICKSTART.md`, section 3c, "Container-side
 delivery", for the token modes, the log lines to watch, and the known limits.
 
+`container_delivery_token = "long-lived"` needs a relay that advertises
+`scoped_token_max_lifetime_secs` in its NIP-11 `limitation` object. The seat reads that field at boot
+and REFUSES to start when it is absent, when it is smaller than `container_delivery_token_cap_secs`,
+or when the relay cannot be read. The `relay token policy` row of `maxplayer doctor` reports the
+same answer. **As of 2026-09-03 the deployed relay does not honor the `expiration` tag of a scoped
+token, so `long-lived` does not work there.** Keep the default. To prove what a relay does, run the
+canary test (`crates/maxplayer-core/tests/relay_canary.rs`). `SELLER-QUICKSTART.md` gives the command.
+
 ### Working example: bubblewrap inside the container
 
 Install `bubblewrap` in your image (e.g. `apk add bubblewrap` / `apt-get install bubblewrap`), then add

@@ -756,6 +756,41 @@ The token mode selects when the host mints the branch-scoped push token:
   (relay Requirement B). The host refuses to start the job when the token lifetime exceeds
   `container_delivery_token_cap_secs`.
 
+##### `long-lived` needs a relay that advertises support
+
+**As of 2026-09-03 the deployed relay does NOT honor the `expiration` tag.** The relay refuses a
+scoped token older than 60 seconds with HTTP 401, even when the token carries a future `expiration`.
+Use `fresh-after-agent` on that relay.
+
+A relay that does honor the tag advertises the cap it applies in its NIP-11 `limitation` object, as
+`scoped_token_max_lifetime_secs`. The seat reads that field before it advertises:
+
+- The seat REFUSES to boot in `long-lived` mode when the field is absent, when its value is smaller
+  than `container_delivery_token_cap_secs`, or when the relay cannot be read at all. The refusal names
+  the mode and tells you to use `fresh-after-agent`.
+- `fresh-after-agent` reads nothing over the network. It depends on no relay feature, so no relay
+  answer can block a boot in that mode.
+
+The refusal happens at boot, and never in the middle of a paid job. Before this gate, a config flip
+to `long-lived` caused an HTTP 401 on the push. The push is the last step of a job, and it runs after
+the agent ran and after the buyer paid.
+
+The `relay token policy` row of `maxplayer doctor` reports the same answer. The row is information
+under `fresh-after-agent`, and it FAILs under `long-lived`. Turn `container_delivery = true` on
+first. With the switch off, the row reads the config only and asks no relay.
+
+To measure a relay yourself, run the canary test. It pushes with the production push path and prints
+what the relay did with a scoped token that carries an `expiration` tag:
+
+```bash
+MAXPLAYER_CANARY_KEY_FILE=/path/to/key \
+MAXPLAYER_CANARY_REMOTE=https://<relay>/git/<owner>/<repo> \
+  cargo test -p maxplayer-core --features git-delivery --test relay_canary -- --ignored --nocapture
+```
+
+The last line reads `CANARY VERDICT A=<...> B=<...>`. `B=deployed` means the relay honors the
+`expiration` tag; `B=not-deployed` means `long-lived` cannot work there.
+
 Watch these lines in the seller log for one job:
 
 ```text
