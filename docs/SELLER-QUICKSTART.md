@@ -649,11 +649,12 @@ CODEX_HOME="$MAXPLAYER_CODEX_AUTH" codex login
 chmod 600 "$MAXPLAYER_CODEX_AUTH/auth.json"
 ```
 
-Next, build the source-test sandbox image and create its network. A released binary can omit `image`
-and use its versioned image instead.
+Next, build the source-test sandbox image and create its network. Run the build from the repository
+root. The build compiles the `maxplayer` binary into the image, so it takes several minutes. A released
+binary can omit `image` and use its versioned image instead.
 
 ```bash
-docker build -t maxplayer-sandbox:codex-test docker/maxplayer-sandbox
+docker build -f docker/maxplayer-sandbox/Dockerfile -t maxplayer-sandbox:codex-test .
 docker network create maxplayer-codex-test
 ```
 
@@ -721,6 +722,101 @@ hardening flags every docker job gets and `SANDBOXING.md` for the architecture.
 
 An existing seat on `launcher` is never moved by an upgrade — see *Moving an existing seat from
 `launcher` to `docker`* at the end of this section.
+
+#### Container-side delivery (opt-in, experimental)
+
+By default the seller host runs the git steps of a delivery. The host clones the base, the container
+runs the agent, and the host commits and pushes. With `container_delivery = true`, ONE sandbox
+container runs the agent and every git step: clone, completion gate, commit, and push. The host runs
+no git for the job. It writes the job inputs into a per-job directory, starts the container, hands
+over a push token, and reads back the commit id. Then it publishes the result as before.
+
+```toml
+[sandbox]
+mode = "docker"
+container_delivery = true
+# container_delivery_token = "fresh-after-agent"   # default; the other value is "long-lived"
+# container_delivery_token_cap_secs = 21600        # "long-lived" only; the relay's cap, 6 h
+```
+
+Requirements:
+
+- `mode = "docker"`. The seller refuses the three keys under `launcher` mode.
+- A sandbox image that contains the `maxplayer` binary at `/usr/local/bin/maxplayer`. A custom image
+  must add it.
+- A relay that enforces the branch scope on push tokens (PR #929).
+
+The token mode selects when the host mints the branch-scoped push token:
+
+- `fresh-after-agent` (the default). The container reports that the agent has exited and the delivery
+  commit is gated. The host then mints a 60-second token and writes it into the per-job directory. The
+  container reads the token and pushes. This mode works with the relay as deployed today.
+- `long-lived`. The host mints one token before the container starts. The token expires at the job
+  deadline plus 5 minutes. The relay must accept the token's `expiration` tag for scoped tokens
+  (relay Requirement B). The host refuses to start the job when the token lifetime exceeds
+  `container_delivery_token_cap_secs`.
+
+##### `long-lived` needs a relay that advertises support
+
+**As of 2026-09-03 the deployed relay does NOT honor the `expiration` tag.** The relay refuses a
+scoped token older than 60 seconds with HTTP 401, even when the token carries a future `expiration`.
+Use `fresh-after-agent` on that relay.
+
+A relay that does honor the tag advertises the cap it applies in its NIP-11 `limitation` object, as
+`scoped_token_max_lifetime_secs`. The seat reads that field before it advertises:
+
+- The seat REFUSES to boot in `long-lived` mode when the field is absent, when its value is smaller
+  than `container_delivery_token_cap_secs`, or when the relay cannot be read at all. The refusal names
+  the mode and tells you to use `fresh-after-agent`.
+- `fresh-after-agent` reads nothing over the network. It depends on no relay feature, so no relay
+  answer can block a boot in that mode.
+
+The refusal happens at boot, and never in the middle of a paid job. Before this gate, a config flip
+to `long-lived` caused an HTTP 401 on the push. The push is the last step of a job, and it runs after
+the agent ran and after the buyer paid.
+
+The `relay token policy` row of `maxplayer doctor` reports the same answer. The row is information
+under `fresh-after-agent`, and it FAILs under `long-lived`. Turn `container_delivery = true` on
+first. With the switch off, the row reads the config only and asks no relay.
+
+To measure a relay yourself, run the canary test. It pushes with the production push path and prints
+what the relay did with a scoped token that carries an `expiration` tag:
+
+```bash
+MAXPLAYER_CANARY_KEY_FILE=/path/to/key \
+MAXPLAYER_CANARY_REMOTE=https://<relay>/git/<owner>/<repo> \
+  cargo test -p maxplayer-core --features git-delivery --test relay_canary -- --ignored --nocapture
+```
+
+The last line reads `CANARY VERDICT A=<...> B=<...>`. `B=deployed` means the relay honors the
+`expiration` tag; `B=not-deployed` means `long-lived` cannot work there.
+
+Watch these lines in the seller log for one job:
+
+```text
+seller node execute job_id=… : container delivery started container=maxplayer-job-… token=FreshAfterAgent
+seller node execute job_id=… : agent done in container, gated commit=<oid>
+seller node execute job_id=… : fresh push token handed to the container
+seller node execute job_id=… : container outcome status=Delivered exit=exit status: 0 detail=
+seller node delivered job_id=… commit=<oid> agent=… result enqueued
+```
+
+The per-job directory is `$MAXPLAYER_HOME/seller-delivery/<job_id>`. The host creates it with mode
+`0700`, writes the inputs file and the token file with mode `0600`, and removes the directory when the
+job ends. The container's diagnostics land in `seller-diagnostics/<job_id>` as for every docker job.
+
+Known limits of this mode:
+
+- Every process inside the container runs as one uid. A process the agent leaves behind can read every
+  file the orchestrator can read. The orchestrator therefore deletes the inputs file before it starts
+  the agent, kills every other process before it requests the token, and reads the token only after
+  that. The token can push only the seller's own delivery branch, so a leaked token cannot reach any
+  other ref.
+- The container clones a contribution base without a credential. A base repository that requires an
+  authenticated fetch is not supported in this mode.
+- The `checks.toml` environment provisioning step of a contribution base does not run in this mode.
+- The usage and model metadata on the result come from the container's report. Metering at the
+  credential proxy is a follow-up.
 
 ### `launcher` mode — only if this box cannot run docker
 

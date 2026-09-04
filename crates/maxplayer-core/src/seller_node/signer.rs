@@ -46,6 +46,9 @@ enum Command {
         /// `Some(refname)` scopes the token to one fully-qualified ref (`refs/heads/…`); the relay
         /// then refuses a push to any other ref. `None` mints the unscoped header.
         ref_scope: Option<String>,
+        /// `Some(ts)` adds a NIP-40 `expiration` tag so a SCOPED token may outlive the ±60 s default
+        /// (Task B8; inert until the relay honours it). `None` = today's short-lived token.
+        expiration_unix: Option<i64>,
         reply: oneshot::Sender<Result<String, String>>,
     },
     /// NIP-44/NIP-17 unwrap of a kind-1059 gift-wrap addressed to the seller, decoded to its NUT-18
@@ -186,6 +189,7 @@ impl SignerHandle {
         &self,
         remote_url: String,
         ref_scope: Option<String>,
+        expiration_unix: Option<i64>,
     ) -> Result<Result<String, String>, SignerActorGone> {
         let (reply, rx) = oneshot::channel();
         self.round_trip(
@@ -193,6 +197,7 @@ impl SignerHandle {
             Command::HttpAuthHeader {
                 remote_url,
                 ref_scope,
+                expiration_unix,
                 reply,
             },
             rx,
@@ -268,12 +273,14 @@ pub fn spawn(home: &MaxplayerHome) -> Result<SignerHandle, HomeError> {
                 Command::HttpAuthHeader {
                     remote_url,
                     ref_scope,
+                    expiration_unix,
                     reply,
                 } => {
                     let result = crate::git_transport::nip98_authorization_header_with_keys(
                         &remote_url,
                         &keys,
                         ref_scope.as_deref(),
+                        expiration_unix,
                     )
                     .map_err(|error| error.to_string());
                     let _ = reply.send(result);
@@ -456,7 +463,7 @@ mod tests {
         let signer = spawn(&home).expect("spawn");
 
         let header = signer
-            .http_auth_header("https://relay.example/git/o/r.git".to_owned(), None)
+            .http_auth_header("https://relay.example/git/o/r.git".to_owned(), None, None)
             .await
             .expect("actor")
             .expect("header");
@@ -470,6 +477,7 @@ mod tests {
             .http_auth_header(
                 "https://relay.example/git/o/r.git".to_owned(),
                 Some("refs/heads/maxplayer/abc12345".to_owned()),
+                None,
             )
             .await
             .expect("actor")
@@ -491,7 +499,7 @@ mod tests {
 
         // A malformed remote url fails cleanly rather than signing garbage.
         assert!(signer
-            .http_auth_header("not a url".to_owned(), None)
+            .http_auth_header("not a url".to_owned(), None, None)
             .await
             .expect("actor")
             .is_err());

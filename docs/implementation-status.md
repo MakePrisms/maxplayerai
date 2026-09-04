@@ -22,6 +22,15 @@ matches the spec.
 |---|---|---|---|
 | §8.1 | An implementation MUST assert a parent count of one in contribution mode, and zero in greenfield mode. | No production path asserts it. The buyer verifies descent and tip-match instead — `delivery_git.rs:254`, `delivery_git.rs:308`, `delivery.rs:93`. The only `parent_count()` assertions are tests — `seller_git.rs:952`, `seller_git.rs:1049`, both inside the `#[cfg(test)]` module that opens at `seller_git.rs:804`. | — |
 
+Container-side delivery exists behind `[sandbox] container_delivery`, default `false` (`home.rs:644`).
+When the switch is on, `execute_job` calls `deliver_via_container` (`seller_node/run.rs:6062`), and one
+container runs the agent and every git step. When it is off, the #937 host path runs unchanged. On
+2026-09-03 one live from-scratch job passed through the container path (`fresh-after-agent` token
+mode) and the buyer paid. The relay canary (`tests/relay_canary.rs`) showed that day that the relay
+enforces the token's ref scope but does not yet honor its `expiration` tag. Open: Task B10 (meter usage
+at the credential proxy), removal of the interim host push, and relay Requirement B (the `expiration`
+tag), on which the `long-lived` token mode waits. The line numbers are from commit `519a4d0`.
+
 ## Verification checks and rejection
 
 The checks declaration and environment-provisioning path is wired into contribution jobs. Running

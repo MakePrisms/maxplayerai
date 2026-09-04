@@ -272,6 +272,7 @@ mod checks {
 
     use maxplayer_core::doctor::{self, RelayProbe};
     use maxplayer_core::home::DEFAULT_MINIBITS_MINT_URL;
+    use maxplayer_core::relay_info::{self, ScopedTokenSupport};
     use maxplayer_core::home::{AgentPresetConfig, SandboxConfig, SellerConfig, TelemetryConfig};
     use maxplayer_core::seller_exec::SandboxPolicy;
 
@@ -284,10 +285,16 @@ mod checks {
 
     const RELAY_TIMEOUT: Duration = Duration::from_secs(15);
     const MINT_TIMEOUT: Duration = Duration::from_secs(10);
+    /// One small JSON document from a host the seat already talks to; a longer wait would only make
+    /// a doctor run slower on a relay that is not answering anyway.
+    const NIP11_TIMEOUT: Duration = Duration::from_secs(10);
 
     const CREDENTIAL_HELPER_CHECK: &str = "credential helper";
     const KEY_CHECK: &str = "seller key";
     const RELAY_CHECK: &str = "relay reachability";
+    /// Named apart from RELAY_CHECK: that one says the relay answers and authenticates, this one says
+    /// what the relay's NIP-11 document promises about a branch-scoped push token's lifetime.
+    const RELAY_TOKEN_POLICY_CHECK: &str = "relay token policy";
     const MINT_CHECK: &str = "mint reachability";
     const AGENT_CHECK: &str = "agent preset";
     const TELEMETRY_CHECK: &str = "telemetry";
@@ -481,6 +488,140 @@ mod checks {
                 format!("{relay_url}: {error}"),
                 "check relay_url in config.toml and network/relay availability",
             ),
+        }
+    }
+
+    /// What the relay says about the lifetime of a branch-scoped push token, and what that means for
+    /// the two `[sandbox] container_delivery_token` modes.
+    ///
+    /// INFORMATION under `fresh-after-agent`, a GATE under `long-lived`. The split is deliberate.
+    /// `fresh-after-agent` mints a fresh 60 s token after the agent exits and depends on no
+    /// relay feature, so its row can never block a boot. `long-lived` mints one token up front with a
+    /// NIP-40 `expiration` tag, which only works on a relay that honours that tag for a scoped token
+    /// (relay Requirement B) — and a relay that does not answers HTTP 401 on the PUSH, the last step
+    /// of a paid job. So that mode FAILs here when the relay does not advertise the field, advertises
+    /// a smaller cap than this seat is configured for, or cannot be read at all.
+    ///
+    /// Costs ONE HTTP GET, and only when `[sandbox] container_delivery = true`. A seat on the shipped
+    /// default (container delivery off) is answered from config alone, so neither `maxplayer doctor`
+    /// nor the boot gate gains a network read for a feature that is switched off.
+    pub(super) fn check_relay_token_policy(
+        relay_url: String,
+        git_remote: Option<String>,
+        sandbox: Option<SandboxConfig>,
+    ) -> Check {
+        check_relay_token_policy_in(relay_url, git_remote, sandbox, |origin| {
+            match build_runtime() {
+                Ok(runtime) => runtime.block_on(relay_info::fetch_scoped_token_support(
+                    origin,
+                    NIP11_TIMEOUT,
+                )),
+                Err(error) => ScopedTokenSupport::Unknown(error),
+            }
+        })
+    }
+
+    /// [`check_relay_token_policy`] over an injected NIP-11 read, so every arm — including the
+    /// unreachable-relay one — is testable with no network.
+    pub(super) fn check_relay_token_policy_in(
+        relay_url: String,
+        git_remote: Option<String>,
+        sandbox: Option<SandboxConfig>,
+        probe: impl Fn(&str) -> ScopedTokenSupport,
+    ) -> Check {
+        use maxplayer_core::home::ContainerDeliveryToken;
+
+        let policy = match SandboxPolicy::from_config(sandbox.as_ref()) {
+            Ok(policy) => policy,
+            // An unresolvable [sandbox] is already FAILed by the launcher check; do not double-report.
+            Err(_) => return Check::pass(RELAY_TOKEN_POLICY_CHECK, "no resolvable docker executor"),
+        };
+        let Some(delivery) = policy.container_delivery() else {
+            return Check::pass(
+                RELAY_TOKEN_POLICY_CHECK,
+                "[sandbox] container_delivery is off, so the host runs the git steps and no scoped \
+                 push token is minted — the relay's token policy does not apply (not asked)",
+            );
+        };
+        let long_lived = delivery.token == ContainerDeliveryToken::LongLived;
+        let Some(git_remote) = git_remote else {
+            return Check::pass(
+                RELAY_TOKEN_POLICY_CHECK,
+                "no [seller] git_remote to push to, so there is no push token to ask about",
+            );
+        };
+        // A public/anonymous https remote takes no NIP-98 header at all, so no scoped token exists
+        // whose lifetime a relay could cap. Reported, never failed: nothing is wrong with the seat.
+        if !maxplayer_core::delivery_transport::is_relay_git_locator(&git_remote) {
+            return Check::pass(
+                RELAY_TOKEN_POLICY_CHECK,
+                format!(
+                    "the [seller] git remote is not relay-git, so the container pushes with no \
+                     scoped token — container_delivery_token = {:?} has no effect on this seat",
+                    delivery.token
+                ),
+            );
+        }
+        let support = match relay_info::scoped_token_authority(&relay_url, &git_remote) {
+            Ok(origin) => probe(&origin),
+            Err(error) => ScopedTokenSupport::Unknown(error),
+        };
+        // `fresh-after-agent`: report the answer and what it would mean, and PASS whatever it is.
+        if !long_lived {
+            return Check::pass(
+                RELAY_TOKEN_POLICY_CHECK,
+                match &support {
+                    ScopedTokenSupport::Advertised(secs) => format!(
+                        "relay advertises {}={secs} s — `fresh-after-agent` (in use) works, and \
+                         `long-lived` is available up to {secs} s",
+                        relay_info::SCOPED_TOKEN_CAP_FIELD
+                    ),
+                    ScopedTokenSupport::Absent => format!(
+                        "relay advertises no {} — `fresh-after-agent` (in use) works, it needs no \
+                         relay feature; `long-lived` needs that field and would be refused at boot",
+                        relay_info::SCOPED_TOKEN_CAP_FIELD
+                    ),
+                    ScopedTokenSupport::Unknown(reason) => format!(
+                        "relay token policy unknown ({reason}) — `fresh-after-agent` (in use) works \
+                         either way; `long-lived` needs {} and would be refused at boot",
+                        relay_info::SCOPED_TOKEN_CAP_FIELD
+                    ),
+                },
+            );
+        }
+        // `long-lived`: the same verdict the seller boot gate refuses on, one run earlier.
+        let verdict = relay_info::long_lived_verdict(&support, delivery.token_cap_secs);
+        match verdict.measured() {
+            None => Check::pass(
+                RELAY_TOKEN_POLICY_CHECK,
+                format!(
+                    "relay advertises {}={} s, at or above this seat's \
+                     container_delivery_token_cap_secs={} s — `long-lived` (in use) is usable, and \
+                     `fresh-after-agent` works too",
+                    relay_info::SCOPED_TOKEN_CAP_FIELD,
+                    support.advertised_secs().unwrap_or_default(),
+                    delivery.token_cap_secs
+                ),
+            ),
+            Some(measured) => {
+                let detail = format!(
+                    "[sandbox] container_delivery_token = \"long-lived\" is configured, but \
+                     {measured} — every job would fail on the PUSH, after the agent ran and the \
+                     buyer paid"
+                );
+                // An UNREADABLE relay is a live-dependency blip the boot gate may re-run, exactly as
+                // the relay-reachability row treats one. An ABSENT or too-small cap is the relay
+                // telling us what it does: a re-run returns the same answer, so refuse at once.
+                if matches!(verdict, relay_info::LongLivedVerdict::Unknown(_)) {
+                    Check::fail_transient(
+                        RELAY_TOKEN_POLICY_CHECK,
+                        detail,
+                        relay_info::LongLivedVerdict::FIX,
+                    )
+                } else {
+                    Check::fail(RELAY_TOKEN_POLICY_CHECK, detail, relay_info::LongLivedVerdict::FIX)
+                }
+            }
         }
     }
 
@@ -2040,6 +2181,14 @@ fn build_checks(
     unsafe_no_sandbox: bool,
 ) -> Vec<Box<dyn FnOnce() -> Check>> {
     let relay_url = home.config.relay_url.clone();
+    let relay_url_for_token_policy = home.config.relay_url.clone();
+    // The delivery remote is what a scoped push token is checked against, so the token-policy row
+    // reads it rather than re-deriving one.
+    let git_remote_for_token_policy = home
+        .config
+        .seller
+        .as_ref()
+        .map(|seller| seller.git_remote.clone());
     let secret = maxplayer_core::home::read_secret_key_hex(home).ok();
     let key_present = maxplayer_core::home::key_file_present(home);
     // The key file of the RESOLVED home, so the key check names what it read (#216/#265).
@@ -2059,6 +2208,7 @@ fn build_checks(
     let sandbox_for_image = sandbox.clone();
     let sandbox_for_engine = sandbox.clone();
     let sandbox_for_egress = sandbox.clone();
+    let sandbox_for_token_policy = sandbox.clone();
     // The probe runs in the seat's OWN home, because that is where a launcher's config points.
     let home_root = home.root.clone();
     // Reaching this box with stranger-written code is what the containment gate is about, and there
@@ -2103,6 +2253,16 @@ fn build_checks(
     checks.push(Box::new(checks::check_credential_helper));
     checks.push(Box::new(move || checks::check_seller_key(&key_path, key_present)));
     checks.push(Box::new(move || checks::check_relay(relay_url, secret)));
+    // What the relay promises about a branch-scoped push token's lifetime. Information under the
+    // default `fresh-after-agent` token mode, a boot-blocking gate under `long-lived` — and answered
+    // from config alone (no HTTP GET) on a seat with `[sandbox] container_delivery` off.
+    checks.push(Box::new(move || {
+        checks::check_relay_token_policy(
+            relay_url_for_token_policy,
+            git_remote_for_token_policy,
+            sandbox_for_token_policy,
+        )
+    }));
     // One aggregate mint check across the accept-policy: "can I settle anywhere?".
     checks.push(Box::new(move || checks::check_mints(accepted_mints)));
     let agent_host = maxplayer_core::agent_presets::AdapterHost::for_sandbox(sandbox.as_ref());
@@ -2448,6 +2608,197 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+
+    // ---- Relay token policy: information under `fresh-after-agent`, a gate under `long-lived` ----
+    //
+    // The mode an operator flips is `[sandbox] container_delivery_token`, and the failure it used to
+    // buy was an HTTP 401 on the PUSH — after the agent ran and the buyer paid. These rows move that
+    // answer to a doctor run. Every case injects the NIP-11 read, so none of them touches a network.
+
+    #[cfg(feature = "wallet")]
+    const TOKEN_POLICY_RELAY: &str = "wss://relay.example";
+    #[cfg(feature = "wallet")]
+    const TOKEN_POLICY_REMOTE: &str = "https://relay.example/git/abc/m0123.git";
+    /// The shipped `container_delivery_token_cap_secs` default (6 h).
+    #[cfg(feature = "wallet")]
+    const TOKEN_POLICY_CAP: u64 = 21_600;
+
+    /// A docker seat with container delivery on, in the named token mode.
+    #[cfg(feature = "wallet")]
+    fn token_mode_sandbox(
+        token: Option<maxplayer_core::home::ContainerDeliveryToken>,
+    ) -> Option<maxplayer_core::home::SandboxConfig> {
+        use maxplayer_core::home::{SandboxConfig, SandboxMode};
+        Some(SandboxConfig {
+            mode: SandboxMode::Docker,
+            image: Some("maxplayer/sandbox:test".into()),
+            container_delivery: true,
+            container_delivery_token: token,
+            ..Default::default()
+        })
+    }
+
+    /// Container delivery OFF (the shipped default) must be answered from config alone. The probe
+    /// panics, so a version that asked the relay anyway goes red here.
+    ///
+    /// RED ON REVERT: fetch before the `container_delivery` branch and this test panics.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn relay_token_policy_asks_nothing_when_container_delivery_is_off() {
+        let check = checks::check_relay_token_policy_in(
+            TOKEN_POLICY_RELAY.into(),
+            Some(TOKEN_POLICY_REMOTE.into()),
+            None,
+            |_| panic!("a seat with container delivery off must not read the relay's NIP-11 document"),
+        );
+        assert_eq!(check.status, Status::Pass);
+        assert!(check.detail.contains("container_delivery is off"), "{}", check.detail);
+    }
+
+    /// `fresh-after-agent` PASSes whatever the relay says — it needs no relay feature — and the row
+    /// still reports the answer plus what it means for the other mode.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn relay_token_policy_is_information_in_fresh_after_agent_mode() {
+        use maxplayer_core::relay_info::ScopedTokenSupport;
+
+        for support in [
+            ScopedTokenSupport::Advertised(TOKEN_POLICY_CAP),
+            ScopedTokenSupport::Absent,
+            ScopedTokenSupport::Unknown("connection refused".into()),
+        ] {
+            let check = checks::check_relay_token_policy_in(
+                TOKEN_POLICY_RELAY.into(),
+                Some(TOKEN_POLICY_REMOTE.into()),
+                token_mode_sandbox(None), // None ⇒ the default, `fresh-after-agent`
+                |_| support.clone(),
+            );
+            assert_eq!(
+                check.status,
+                Status::Pass,
+                "fresh-after-agent must never block on the relay's answer: {}",
+                check.detail
+            );
+            assert!(
+                check.detail.contains("fresh-after-agent"),
+                "names the mode in use: {}",
+                check.detail
+            );
+            assert!(
+                check.detail.contains("long-lived"),
+                "and what the answer means for the other mode: {}",
+                check.detail
+            );
+        }
+    }
+
+    /// `long-lived` against a relay that advertises nothing is exactly the surprise this row exists
+    /// to remove: FAIL, with the working mode named in the fix.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn relay_token_policy_fails_in_long_lived_mode_when_the_field_is_missing() {
+        use maxplayer_core::home::ContainerDeliveryToken;
+        use maxplayer_core::relay_info::ScopedTokenSupport;
+
+        let check = checks::check_relay_token_policy_in(
+            TOKEN_POLICY_RELAY.into(),
+            Some(TOKEN_POLICY_REMOTE.into()),
+            token_mode_sandbox(Some(ContainerDeliveryToken::LongLived)),
+            |_| ScopedTokenSupport::Absent,
+        );
+        assert_eq!(check.status, Status::Fail, "{}", check.detail);
+        assert!(check.detail.contains("long-lived"), "{}", check.detail);
+        assert!(
+            check.detail.contains("scoped_token_max_lifetime_secs"),
+            "names the missing field: {}",
+            check.detail
+        );
+        let rendered = check.render();
+        assert!(
+            rendered.contains("fresh-after-agent"),
+            "the fix names the mode that works: {rendered}"
+        );
+    }
+
+    /// A relay that advertises LESS than this seat is configured for prints both numbers, so the
+    /// operator can fix either side.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn relay_token_policy_fails_when_the_advertised_cap_is_smaller_than_the_configured_one() {
+        use maxplayer_core::home::ContainerDeliveryToken;
+        use maxplayer_core::relay_info::ScopedTokenSupport;
+
+        let check = checks::check_relay_token_policy_in(
+            TOKEN_POLICY_RELAY.into(),
+            Some(TOKEN_POLICY_REMOTE.into()),
+            token_mode_sandbox(Some(ContainerDeliveryToken::LongLived)),
+            |_| ScopedTokenSupport::Advertised(600),
+        );
+        assert_eq!(check.status, Status::Fail, "{}", check.detail);
+        assert!(check.detail.contains("600"), "advertised: {}", check.detail);
+        assert!(
+            check.detail.contains(&TOKEN_POLICY_CAP.to_string()),
+            "configured: {}",
+            check.detail
+        );
+    }
+
+    /// An unreachable relay is UNKNOWN, and unknown FAILs in `long-lived`: nothing proves the relay
+    /// honours the expiration tag, so the row must not read silence as support.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn relay_token_policy_fails_in_long_lived_mode_when_the_relay_cannot_be_read() {
+        use maxplayer_core::home::ContainerDeliveryToken;
+        use maxplayer_core::relay_info::ScopedTokenSupport;
+
+        let check = checks::check_relay_token_policy_in(
+            TOKEN_POLICY_RELAY.into(),
+            Some(TOKEN_POLICY_REMOTE.into()),
+            token_mode_sandbox(Some(ContainerDeliveryToken::LongLived)),
+            |_| ScopedTokenSupport::Unknown("dns error".into()),
+        );
+        assert_eq!(check.status, Status::Fail, "{}", check.detail);
+        assert!(check.detail.contains("dns error"), "{}", check.detail);
+    }
+
+    /// The healthy `long-lived` case: a relay that advertises a cap at or above the seat's own.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn relay_token_policy_passes_in_long_lived_mode_when_the_relay_advertises_enough() {
+        use maxplayer_core::home::ContainerDeliveryToken;
+        use maxplayer_core::relay_info::ScopedTokenSupport;
+
+        let check = checks::check_relay_token_policy_in(
+            TOKEN_POLICY_RELAY.into(),
+            Some(TOKEN_POLICY_REMOTE.into()),
+            token_mode_sandbox(Some(ContainerDeliveryToken::LongLived)),
+            |_| ScopedTokenSupport::Advertised(TOKEN_POLICY_CAP),
+        );
+        assert_eq!(check.status, Status::Pass, "{}", check.detail);
+        assert!(
+            check.detail.contains(&TOKEN_POLICY_CAP.to_string()),
+            "{}",
+            check.detail
+        );
+    }
+
+    /// A BYO https remote takes no NIP-98 header, so no scoped token exists to cap. Reported, never
+    /// failed, and asked of no relay.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn relay_token_policy_is_inert_on_a_remote_that_takes_no_scoped_token() {
+        use maxplayer_core::home::ContainerDeliveryToken;
+
+        let check = checks::check_relay_token_policy_in(
+            TOKEN_POLICY_RELAY.into(),
+            Some("https://github.com/owner/repo.git".into()),
+            token_mode_sandbox(Some(ContainerDeliveryToken::LongLived)),
+            |_| panic!("a remote that takes no scoped token must not read the relay's document"),
+        );
+        assert_eq!(check.status, Status::Pass, "{}", check.detail);
+        assert!(check.detail.contains("not relay-git"), "{}", check.detail);
     }
 
     // ---- Issue #357: the sandbox launcher must resolve before the seat advertises ----
@@ -3684,6 +4035,12 @@ mod tests {
             // Same decision and the same reason: a host ChatGPT session is a containment concern,
             // and reading one here would give the check a second reason to move.
             codex_chatgpt: None,
+            // Off, with its two companion keys unset: where the delivery's git runs is a delivery
+            // concern, and this check asserts the engine-version floor. The host path is the
+            // shipped default, so the check measures the seat as shipped.
+            container_delivery: false,
+            container_delivery_token: None,
+            container_delivery_token_cap_secs: None,
         });
         home.config.relay_url = "not-a-relay-url".into();
         home.config.accepted_mints = Vec::new();
@@ -3693,6 +4050,47 @@ mod tests {
             results.iter().any(|check| check.name == "sandbox engine floor"),
             "build_checks must run the sandbox engine floor check; got: {:?}",
             results.iter().map(Check::render).collect::<Vec<_>>()
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+
+    // RED-PROVE (wiring): the relay token-policy row must sit in the ONE registry that both
+    // `maxplayer doctor` and the seller boot gate run — drop the `check_relay_token_policy` push
+    // from `build_checks` and this goes red. The seat has `container_delivery` off, so the row is
+    // answered from config alone and this test reads no network.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn relay_token_policy_check_is_wired_into_the_boot_gate() {
+        let tmp = std::env::temp_dir().join(format!(
+            "maxplayer-doctor-token-policy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut home = resolve_doctor_home(Some(tmp.clone())).expect("bootstrap the home");
+        home.config.sandbox = None;
+        home.config.relay_url = "not-a-relay-url".into();
+        home.config.accepted_mints = Vec::new();
+
+        let results = run_checks(build_checks(&home, false));
+        let row = results
+            .iter()
+            .find(|check| check.name == "relay token policy")
+            .unwrap_or_else(|| {
+                panic!(
+                    "build_checks must run the relay token policy check; got: {:?}",
+                    results.iter().map(Check::render).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            row.status,
+            Status::Pass,
+            "a seat with container delivery off must never fail this row: {}",
+            row.detail
         );
 
         std::fs::remove_dir_all(&tmp).ok();

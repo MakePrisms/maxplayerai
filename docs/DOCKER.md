@@ -262,7 +262,9 @@ runtime = "runsc"        # gVisor; Linux only. Omit on macOS — the platform VM
   is for running a fully custom image and is **not** a version selector — a bare tag such as
   `maxplayer-sandbox:latest` resolves against Docker Hub, where there is nothing to pull. (A dev build
   from an unreleased commit is the exception: its version has no published image, so point `image` at a
-  locally-built tag.)
+  locally-built tag. Build that tag from the repository root with
+  `docker build -f docker/maxplayer-sandbox/Dockerfile -t maxplayer-sandbox:dev .`. The build compiles
+  the `maxplayer` binary into the image.)
 - `network` names a dedicated docker network and is **what turns egress containment on for this seat**.
   A job launched into it runs in a network namespace whose rules were installed before the job process
   existed — no route to your LAN, your host, or the other containers on this box — and a job whose
@@ -441,6 +443,33 @@ The port was never a control.
 `proxy_port_range` (and to the ephemeral high ports if you have not configured one).** A host firewall
 default-denying inbound, or a cloud security group that exposes nothing but the ports you chose, both
 satisfy this. Sellers on a home NAT or a private network are already covered by the absence of a route.
+
+#### Container-side delivery (opt-in)
+
+`container_delivery = true` moves the git steps of a delivery into the job container. One container
+then runs the agent, the clone, the completion gate, the commit, and the push. The host runs no git
+for the job and reads back only the commit id. The switch needs `mode = "docker"` and a sandbox image
+that carries the `maxplayer` binary at `/usr/local/bin/maxplayer`.
+
+```toml
+[sandbox]
+mode = "docker"
+container_delivery = true
+# container_delivery_token = "fresh-after-agent"   # default; or "long-lived"
+# container_delivery_token_cap_secs = 21600        # "long-lived" only
+```
+
+The default token mode mints a 60-second branch-scoped push token after the agent has exited, so it
+works with the relay as deployed today. See `SELLER-QUICKSTART.md`, section 3c, "Container-side
+delivery", for the token modes, the log lines to watch, and the known limits.
+
+`container_delivery_token = "long-lived"` needs a relay that advertises
+`scoped_token_max_lifetime_secs` in its NIP-11 `limitation` object. The seat reads that field at boot
+and REFUSES to start when it is absent, when it is smaller than `container_delivery_token_cap_secs`,
+or when the relay cannot be read. The `relay token policy` row of `maxplayer doctor` reports the
+same answer. **As of 2026-09-03 the deployed relay does not honor the `expiration` tag of a scoped
+token, so `long-lived` does not work there.** Keep the default. To prove what a relay does, run the
+canary test (`crates/maxplayer-core/tests/relay_canary.rs`). `SELLER-QUICKSTART.md` gives the command.
 
 ### Working example: bubblewrap inside the container
 

@@ -648,6 +648,48 @@ pub struct SandboxConfig {
     /// remains unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_chatgpt: Option<CodexChatgptConfig>,
+    /// `docker` mode: run the job's git delivery INSIDE the sandbox container (Track B).
+    ///
+    /// `false` (the default) keeps the host path: the host clones the base, the container runs the
+    /// agent, and the host commits and pushes. `true` moves the clone, the completion gate, the commit
+    /// and the push into ONE container, so the host never opens a git repository the job agent could
+    /// write. The host then reads back only the commit oid and publishes it.
+    ///
+    /// Refused under `launcher` mode: there is no container to move the git steps into.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub container_delivery: bool,
+    /// `docker` mode, with `container_delivery = true`: how the container obtains the branch-scoped
+    /// push token. Omitted ⇒ [`ContainerDeliveryToken::FreshAfterAgent`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_delivery_token: Option<ContainerDeliveryToken>,
+    /// `docker` mode, with `container_delivery_token = "long-lived"`: the relay's cap on a scoped
+    /// token's lifetime, in seconds. The host REFUSES to mint a token whose `deadline + push margin`
+    /// exceeds this cap, so a job that the relay would refuse at push time fails at launch instead.
+    /// Omitted ⇒ [`crate::seller_exec::DEFAULT_CONTAINER_DELIVERY_TOKEN_CAP_SECS`] (6 hours, the
+    /// relay brief's default). Must be greater than zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_delivery_token_cap_secs: Option<u64>,
+}
+
+/// How a container-side delivery obtains its branch-scoped push token (`[sandbox]
+/// container_delivery_token`).
+///
+/// The token is a NIP-98 `Authorization` header the host signs. It is scoped to the ONE delivery
+/// ref, so a leaked token can push nothing but the seller's own delivery branch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContainerDeliveryToken {
+    /// The host mints a FRESH 60-second token only after the container reports that the agent has
+    /// exited and the delivery commit is gated. The container waits for the token file, reads it, and
+    /// pushes. Works with a relay that enforces the standard ±60 s token age. The default.
+    #[default]
+    FreshAfterAgent,
+    /// The host mints ONE token before the container starts, with a NIP-40 `expiration` of
+    /// `deadline + push margin`. The container deletes the inputs file before the agent runs and
+    /// pushes from memory at the end. Requires a relay that honours `expiration` for scoped tokens
+    /// (relay Requirement B); refused at mint when the lifetime exceeds
+    /// `container_delivery_token_cap_secs`.
+    LongLived,
 }
 
 /// Host ChatGPT session source for a contained Docker Codex run.

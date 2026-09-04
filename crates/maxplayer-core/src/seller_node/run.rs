@@ -46,9 +46,10 @@ use crate::relay_auth::{self, AuthWait};
 use crate::seller::rate_gate_allows;
 use crate::seller_agents::AgentRegistry;
 use crate::seller_exec::{
-    compose_agent_prompt, delivery_message, job_workdir, run_agent_job, run_agent_with_retry,
-    seller_delivery_kind, seller_exec_metadata, unified_job_timeout, AgentRunTimeout, ExecError,
-    SandboxPolicy,
+    cleanup_job_container, compose_agent_prompt, delivery_message, job_container_name, job_id_of,
+    job_workdir, prepare_launch, run_agent_job, run_agent_with_retry, seller_delivery_kind,
+    seller_exec_metadata, unified_job_timeout, AgentRunTimeout, CleanupPolicy, ExecError,
+    JobContainer, JobLaunch, SandboxPolicy, CONTAINER_WORKDIR,
 };
 use crate::seller_roster::{ExecutionFailure, Fault, LiveRoster, MissingCapability, Unavailable};
 use crate::seller_git::{self, DeliveryAgentIdentity};
@@ -2395,6 +2396,203 @@ fn harness_fault_for(error: &ExecError) -> Option<ExecutionFailure> {
     }
 }
 
+/// What a container-delivered job hands back to `execute_job`: the pushed commit, the branch it is
+/// on, and the agent's report for the seller-claimed exec-metadata block.
+struct ContainerDelivery {
+    commit: String,
+    branch: String,
+    usage: Option<crate::driver::UsageMetadata>,
+    last_agent_message: Option<String>,
+    wall_time_ms: u64,
+}
+
+/// Why a container delivery failed, shaped for the feedback and harness attribution the host path
+/// emits for the equivalent failure (see `fail_container_delivery`). Details never carry a token.
+#[derive(Debug)]
+enum ContainerDeliveryFailure {
+    /// Before any agent ran, or an unclassified I/O failure: config, exchange dir, inputs,
+    /// containment, launch. `execution_failed`, no harness fault.
+    Setup(String),
+    /// The agent run failed inside the container; the `ExecError` shape drives `harness_fault_for`.
+    Agent(ExecError),
+    /// The gate saw no execution. `no_sentinel`, harness unproven.
+    NoSentinel(String),
+    /// The snapshot failed otherwise. `execution_failed`, harness unproven.
+    Snapshot(String),
+    /// Token refused or absent, push failed, oid unreadable, tamper evidence. `delivery_failed`.
+    Delivery(String),
+    /// The container outlived its bound and was killed. `execution_failed`, deadline fault.
+    Timeout(String),
+}
+
+/// The host-owned exchange directory for `job_id`: `$MAXPLAYER_HOME/seller-delivery/<job_id>`.
+/// Beside, never inside, the job workdir (`seller-jobs/<job_id>`), which is the agent-writable
+/// mount. It holds the inputs file and, in the fresh-after-agent mode, the token file — both mode
+/// `0600` in a `0700` directory. Only this seller uid on the host, and the container's processes
+/// (which run as the same uid), can read it; the inputs are deleted before the agent exists.
+fn container_exchange_dir(home_root: &std::path::Path, job_id: &str) -> std::path::PathBuf {
+    home_root.join("seller-delivery").join(job_id)
+}
+
+/// A fresh 32-byte random nonce as hex, for the agent-done marker hand-off.
+fn random_nonce_hex() -> Result<String, String> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(|error| format!("nonce entropy unavailable: {error}"))?;
+    Ok(hex::encode(bytes))
+}
+
+#[cfg(test)]
+mod container_delivery_tests {
+    use super::*;
+
+    // The exchange directory is a sibling tree of the job workdirs (`seller-jobs/<job_id>`, per
+    // `seller_exec::job_workdir`), never inside one.
+    #[test]
+    fn exchange_dir_is_outside_the_job_workdir() {
+        let root = std::path::Path::new("/home/s/.maxplayer");
+        let io = container_exchange_dir(root, "abc123");
+        let workdir = root.join("seller-jobs").join("abc123");
+        assert_eq!(io, std::path::PathBuf::from("/home/s/.maxplayer/seller-delivery/abc123"));
+        assert!(!io.starts_with(&workdir), "the exchange dir must not be under the mount");
+        assert!(!workdir.starts_with(&io));
+    }
+
+    // The nonce is 32 random bytes as hex, and differs per call.
+    #[test]
+    fn nonce_is_64_hex_chars_and_fresh() {
+        let a = random_nonce_hex().expect("entropy");
+        let b = random_nonce_hex().expect("entropy");
+        assert_eq!(a.len(), 64);
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
+
+    use crate::home::ContainerDeliveryToken;
+    use crate::relay_info::{long_lived_verdict, ScopedTokenSupport};
+    use crate::seller_exec::{
+        ContainerDeliveryPolicy, DEFAULT_CONTAINER_DELIVERY_TOKEN_CAP_SECS as DEFAULT_CAP,
+    };
+
+    const RELAY_GIT_REMOTE: &str = "https://relay.example/git/abc/m0123.git";
+
+    fn policy(token: ContainerDeliveryToken) -> Option<ContainerDeliveryPolicy> {
+        Some(ContainerDeliveryPolicy {
+            token,
+            token_cap_secs: DEFAULT_CAP,
+        })
+    }
+
+    /// The shipped default reads NOTHING over the network. A gate that probed here would add an HTTP
+    /// GET to every seller boot for a feature that is off.
+    #[test]
+    fn container_delivery_off_reads_no_relay_document() {
+        assert_eq!(
+            container_delivery_token_gate("wss://relay.example", RELAY_GIT_REMOTE, None)
+                .expect("gate"),
+            TokenModeGate::Skip(None)
+        );
+    }
+
+    /// `fresh-after-agent` needs no relay feature, so it must never be blocked — and must never even
+    /// ask. RED ON REVERT: probe in both modes and this returns `Probe`.
+    #[test]
+    fn fresh_after_agent_reads_no_relay_document() {
+        assert_eq!(
+            container_delivery_token_gate(
+                "wss://relay.example",
+                RELAY_GIT_REMOTE,
+                policy(ContainerDeliveryToken::FreshAfterAgent),
+            )
+            .expect("gate"),
+            TokenModeGate::Skip(None)
+        );
+    }
+
+    /// `long-lived` asks the server that CHECKS the token — the relay-git remote's own origin — and
+    /// carries the seat's configured cap into the comparison.
+    #[test]
+    fn long_lived_probes_the_relay_git_origin_with_the_configured_cap() {
+        assert_eq!(
+            container_delivery_token_gate(
+                "wss://events.example",
+                RELAY_GIT_REMOTE,
+                policy(ContainerDeliveryToken::LongLived),
+            )
+            .expect("gate"),
+            TokenModeGate::Probe {
+                origin: "https://relay.example/".to_owned(),
+                cap_secs: DEFAULT_CAP,
+            }
+        );
+    }
+
+    /// A plain https remote takes no NIP-98 header, so there is no scoped token to gate. Inert, and
+    /// said out loud rather than passed in silence.
+    #[test]
+    fn long_lived_on_a_byo_https_remote_is_inert_and_says_so() {
+        let gate = container_delivery_token_gate(
+            "wss://relay.example",
+            "https://github.com/owner/repo.git",
+            policy(ContainerDeliveryToken::LongLived),
+        )
+        .expect("gate");
+        let TokenModeGate::Skip(Some(line)) = gate else {
+            panic!("a byo remote must skip with an operator line, got {gate:?}");
+        };
+        assert!(line.contains("long-lived"), "names the mode: {line}");
+        assert!(line.contains("no scoped token"), "says why it is inert: {line}");
+    }
+
+    /// The authority is the server that CHECKS the token, so an unusable event-relay url cannot
+    /// change the answer when the seat pushes to relay-git.
+    #[test]
+    fn the_relay_git_remote_outranks_the_event_relay_url() {
+        assert_eq!(
+            container_delivery_token_gate(
+                "not-even-a-url",
+                RELAY_GIT_REMOTE,
+                policy(ContainerDeliveryToken::LongLived),
+            )
+            .expect("gate"),
+            TokenModeGate::Probe {
+                origin: "https://relay.example/".to_owned(),
+                cap_secs: DEFAULT_CAP,
+            }
+        );
+    }
+
+    /// The refusal an operator actually sees for a relay that does not implement Requirement B: it
+    /// names the mode, names the working mode, and renders through `NodeError`.
+    #[test]
+    fn the_boot_refusal_names_the_mode_and_the_way_forward() {
+        let refusal = long_lived_verdict(&ScopedTokenSupport::Absent, DEFAULT_CAP)
+            .refusal()
+            .expect("an absent field refuses");
+        let rendered =
+            NodeError::ContainerDeliveryToken(format!("https://relay.example/ — {refusal}"))
+                .to_string();
+        assert!(
+            rendered.starts_with("seller node container-delivery token mode refused:"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("long-lived"), "{rendered}");
+        assert!(rendered.contains("fresh-after-agent"), "{rendered}");
+        assert!(rendered.contains("scoped_token_max_lifetime_secs"), "{rendered}");
+    }
+
+    /// An unreachable relay is UNKNOWN, and unknown refuses in `long-lived`. Fail closed: nothing
+    /// proves the relay honours the expiration tag, so the seat must not mint one.
+    #[test]
+    fn an_unreachable_relay_refuses_in_long_lived_mode() {
+        let verdict = long_lived_verdict(
+            &ScopedTokenSupport::Unknown("connection refused".to_owned()),
+            DEFAULT_CAP,
+        );
+        assert!(!verdict.is_supported());
+        assert!(verdict.refusal().is_some());
+    }
+}
+
 /// How long a harness self-probe turn may take. Deliberately short: the probe asks for one tiny file,
 /// so a harness that cannot manage that inside this window is not one to hand a paid job to either.
 ///
@@ -2956,6 +3154,125 @@ async fn probe_one_harness(
     ))
 }
 
+/// How long the boot gate waits for the relay's NIP-11 document. Short on purpose: the answer is one
+/// small JSON document from a host the seat already talks to, and the gate stands between the
+/// operator and a seat that will refuse either way.
+const RELAY_TOKEN_POLICY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What the boot gate must do about `[sandbox] container_delivery_token`, decided from config alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TokenModeGate {
+    /// Nothing to prove, and NO network read: container delivery is off, the mode is
+    /// `fresh-after-agent` (which needs no relay feature), or the seat pushes to a remote that takes
+    /// no scoped token at all. Carries an operator line when the reason is worth saying out loud.
+    Skip(Option<String>),
+    /// `long-lived`: read the NIP-11 document at `origin` and refuse to boot unless the relay
+    /// advertises a scoped-token cap of at least `cap_secs`.
+    Probe { origin: String, cap_secs: u64 },
+}
+
+/// The pure half of the `long-lived` boot gate: which relay to ask, and whether to ask at all.
+///
+/// Separated from the fetch so every branch — including "do not touch the network" — is testable
+/// with no relay and no home. `delivery` is [`SandboxPolicy::container_delivery`].
+fn container_delivery_token_gate(
+    relay_url: &str,
+    git_remote: &str,
+    delivery: Option<crate::seller_exec::ContainerDeliveryPolicy>,
+) -> Result<TokenModeGate, NodeError> {
+    use crate::home::ContainerDeliveryToken;
+
+    // Container delivery off (the shipped default) ⇒ the host delivery path, nothing to ask.
+    let Some(delivery) = delivery else {
+        return Ok(TokenModeGate::Skip(None));
+    };
+    // `fresh-after-agent` mints a 60 s token AFTER the agent exits and works with the relay as
+    // deployed today. It depends on no relay feature, so this mode reads NOTHING over the network.
+    if delivery.token != ContainerDeliveryToken::LongLived {
+        return Ok(TokenModeGate::Skip(None));
+    }
+    // A public/anonymous https remote takes no NIP-98 header at all (`deliver_via_container` sets
+    // `PushTokenSource::None` for it), so there is no scoped token whose lifetime could matter. Said
+    // out loud: an operator who set `long-lived` must learn that the setting does nothing here.
+    if !crate::delivery_transport::is_relay_git_locator(git_remote) {
+        return Ok(TokenModeGate::Skip(Some(
+            "seller node: [sandbox] container_delivery_token = \"long-lived\" has no effect on this \
+             seat — its git remote is not relay-git, so the container pushes with no scoped token"
+                .to_owned(),
+        )));
+    }
+    let origin = crate::relay_info::scoped_token_authority(relay_url, git_remote).map_err(|error| {
+        NodeError::ContainerDeliveryToken(format!(
+            "[sandbox] container_delivery_token = \"long-lived\" needs a relay whose NIP-11 document \
+             can be read, and this seat's relay url cannot be turned into one ({error})"
+        ))
+    })?;
+    Ok(TokenModeGate::Probe {
+        origin,
+        cap_secs: delivery.token_cap_secs,
+    })
+}
+
+/// Refuse to boot a `long-lived` container-delivery seat whose relay does not advertise that it
+/// honours a scoped token's NIP-40 `expiration` tag (relay Requirement B).
+///
+/// ⛔ WHY THIS RUNS BEFORE THE FIRST HARNESS. Without it the seat learns the answer as an HTTP 401 on
+/// the PUSH — the last step of a paid job, after the agent ran and the buyer already committed the
+/// sats at award. Measured on the deployed relay on 2026-09-03 (`tests/relay_canary.rs`): the ref
+/// scope is enforced, the expiration tag is NOT honoured. So a config flip to `long-lived` against
+/// today's relay fails every job at its most expensive moment, and it must fail at boot instead.
+///
+/// This is a SECOND gate, not a replacement: `long_lived_expiration` still refuses an over-cap token
+/// at mint time. This one moves the same refusal earlier and adds the relay's own answer to it.
+///
+/// Fails CLOSED. An absent field, a cap smaller than the seat's own, an unreachable relay and an
+/// unreadable document all refuse. `fresh-after-agent` reads nothing and can never be blocked here.
+///
+/// `maxplayer doctor` reports the same answer in its `relay token policy` row, and `--skip-doctor`
+/// bypasses that row. It does NOT bypass this one: the doctor row exists so an operator can see the
+/// answer before flipping the switch, and this gate exists so the flip cannot ship a seat that fails
+/// every job on its push.
+async fn gate_container_delivery_token_mode(
+    home: &MaxplayerHome,
+    sandbox: &SandboxPolicy,
+) -> Result<(), NodeError> {
+    // No `[seller]` block means no delivery remote to push to; `boot_agent_registry` above is what
+    // refuses that seat. A second refusal here would only hide that message.
+    let Some(seller) = home.config.seller.as_ref() else {
+        return Ok(());
+    };
+    let gate = container_delivery_token_gate(
+        &home.config.relay_url,
+        &seller.git_remote,
+        sandbox.container_delivery(),
+    )?;
+    let (origin, cap_secs) = match gate {
+        TokenModeGate::Skip(line) => {
+            if let Some(line) = line {
+                opline!("{line}");
+            }
+            return Ok(());
+        }
+        TokenModeGate::Probe { origin, cap_secs } => (origin, cap_secs),
+    };
+    let support =
+        crate::relay_info::fetch_scoped_token_support(&origin, RELAY_TOKEN_POLICY_TIMEOUT).await;
+    let verdict = crate::relay_info::long_lived_verdict(&support, cap_secs);
+    match verdict.refusal() {
+        Some(refusal) => Err(NodeError::ContainerDeliveryToken(format!(
+            "{origin} — {refusal}"
+        ))),
+        None => {
+            opline!(
+                "seller node: relay {origin} advertises {} — [sandbox] container_delivery_token = \
+                 \"long-lived\" is usable on this seat (configured cap {cap_secs} s)",
+                support
+            );
+            Ok(())
+        }
+    }
+}
+
 /// Probe EVERY configured harness before anything goes on the wire.
 ///
 /// Local compute only — no sats, no mint, no award ([`probe_one_harness`] runs the harness in a
@@ -2973,6 +3290,10 @@ pub async fn probe_configured_harnesses(
     // under a pass-through fallback would prove a harness the awarded job will never run under.
     let sandbox = SandboxPolicy::from_config(home.config.sandbox.as_ref())
         .map_err(|error| NodeError::Sandbox(error.to_string()))?;
+    // Track B, `long-lived` token mode only: prove the relay honours a scoped token's expiration tag
+    // BEFORE any harness runs, or refuse to boot. Reads nothing over the network in the default
+    // `fresh-after-agent` mode. See `gate_container_delivery_token_mode`.
+    gate_container_delivery_token_mode(home, &sandbox).await?;
     // #647 credential-containment scope (P2): every KNOWN model-credential variable is contained by
     // the proxy. What can still cross RAW is an operator-added `[sandbox] forward_env` variable the
     // daemon cannot recognize — it may be a credential, and the daemon has no way to know. Say so
@@ -6034,230 +6355,293 @@ impl SellerNodeRunner {
         let seller_pubkey = self.seller_pubkey.to_hex();
         let identity = DeliveryAgentIdentity::for_seller(&seller_pubkey);
         let workdir = job_workdir(self.node.home(), job_id);
-        // #591: provision the delivery workdir from the job's STORED contribution pin. The pin was
-        // written at claim (pin ≤ offer ≤ claim), so it is present on BOTH the fresh-award and the
-        // restart/resume path — the same durable-facts re-read the rest of execute_job relies on. A
-        // recorded pin ⇒ clone the pinned base at base_oid (the fork tip the agent extends); no pin ⇒
-        // the empty-workdir default (a from-scratch job, unchanged). A pin read error is fatal here
-        // rather than a silent degrade to an empty workdir: no fund risk either way (buyer verify is
-        // fail-closed pre-pay), but a loud fail is recoverable whereas an empty-workdir mis-delivery
-        // hides the fault. Routing lives in `provision_delivery_workdir` so the real read→plan→init
-        // path is unit-testable.
-        let base_oid = match provision_delivery_workdir(
-            self.node.store(),
-            self.node.home(),
-            job_id,
-            workdir.clone(),
-            identity.clone(),
-        )
-        .await
-        {
-            Ok(base_oid) => base_oid,
-            Err(DeliveryWorkdirError::Refused(refusal)) => {
-                let (reason_code, reason_detail) = env_provision::refusal_feedback(&refusal);
-                opline!(
-                    "seller node execute fail job_id={job_id}: environment provisioning refused ({refusal:?})"
-                );
-                self.fail_job_with_feedback(
-                    job_id,
-                    &offer.buyer_pubkey,
-                    reason_code,
-                    EXEC_FAILURE_FEEDBACK,
-                    Some(reason_detail),
-                )
-                .await;
-                return;
-            }
-            Err(error) => {
-                opline!("seller node execute fail job_id={job_id}: workdir init failed ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None).await;
-                return;
-            }
-        };
-
-        // Run the agent under the job's remaining deadline, retrying a transient error while the
-        // deadline has room. The agent edits files in `workdir`; the node owns commit + push. The
-        // configured `[sandbox]` policy launches the command (pass-through when absent).
-        let deadline = offer.deadline_unix.max(0) as u64;
-        // #828: operator-authored context (brand guidelines, house style) loads with the job. Inert
-        // for a seller that has never written a MEMORY.md, and it never blocks a job — see
-        // `job_memory_section`.
-        let memory_section = job_memory_section(
-            &self.node.home().root,
-            &self.node.home().config.seller_memory,
-        );
-        let prompt = job_prompt(&offer, &seller.git_remote, deadline, memory_section.as_deref());
-        // Resolve the sandbox executor before the run; a misconfigured `[sandbox]` fails the job
-        // rather than silently running the agent unsandboxed.
-        let sandbox = match SandboxPolicy::from_config(self.node.home().config.sandbox.as_ref()) {
-            Ok(sandbox) => sandbox,
-            Err(error) => {
-                opline!("seller node execute fail job_id={job_id}: sandbox config invalid ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None).await;
-                return;
-            }
-        };
-        let run_started = std::time::Instant::now();
-        let run_result = run_agent_with_retry(
-            deadline,
-            MAX_AGENT_ATTEMPTS,
-            || now_unix() as u64,
-            |_attempt| {
-                let job_timeout = unified_job_timeout(deadline, now_unix() as u64);
-                run_agent_job(
-                    &agent_command,
-                    &sandbox,
-                    &prompt,
-                    &workdir,
-                    &identity,
-                    AgentRunTimeout::JobDeadline(job_timeout),
-                )
-            },
-        )
-        .await;
-        let wall_time_ms = run_started.elapsed().as_millis() as u64;
-        let report = match run_result {
-            Ok(report) => report,
-            Err(error) => {
-                opline!("seller node execute fail job_id={job_id}: agent run failed ({error})");
-                self.drop_harness(harness, harness_fault_for(&error));
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None).await;
-                return;
-            }
-        };
-        // The agent's own account of the run, on the REAL job path and not only the probe: it was
-        // discarded here too, so a job that delivered nothing left the operator the same guess the
-        // probe used to. Logged whenever the agent said anything — one line per job, and it is the
-        // line that names a blocked host or an exhausted plan.
-        if let Some(quoted) = quoted_agent_message(report.last_agent_message.as_deref()) {
-            opline!("seller node execute job_id={job_id} agent last message: {quoted}");
-        }
-        let usage = report.usage;
-        // Refresh the advertised model from THIS run (#784). The boot probe answers for the moment
-        // the node started; an operator can re-point a harness at a different default while it runs,
-        // and an advertisement that sits behind the last restart is a claim the seat no longer keeps.
-        // A real run is the freshest evidence available, and it costs nothing to read here.
-        //
-        // A `None` observation CLEARS rather than preserves, which is the roster's documented
-        // contract: a harness that stops reporting a model must stop advertising one, or the last
-        // value it ever gave outlives the truth. That is the drift this field exists to bound.
-        self.agents
-            .record_model(harness, usage.as_ref().and_then(|u| u.model.clone()));
-
-        // Snapshot the agent's final workdir tree into ONE delivery commit at the stored author date.
-        // §19: the snapshot writes the execution sentinel into the delivered tree, seeded from this
-        // job's job_hash (replay-resistant; the buyer holds the same value on its accept-bind). When
-        // the node observed no genuine execution — the quota-dead case, an empty / base-identical tree
-        // — the snapshot refuses `NoExecutionObserved` and writes no sentinel, which is mapped here to
-        // the `no_sentinel` refusal so the buyer learns delivery was refused for want of a sentinel
-        // (distinct from a crash). The gate, not an unconditional write, is the check.
-        let branch = format!("maxplayer/{}", &job_id[..8.min(job_id.len())]);
-        // Single source for the delivery ref. The branch-scoped push token (below) is minted for
-        // THIS refname, and the push refspec `push_branch_with_header` builds is
-        // `refs/heads/{branch}:refs/heads/{branch}` — both derive from `branch`, so the token scope
-        // and the ref actually pushed cannot drift apart. The relay (PR #929) demands the scope be
-        // fully qualified (`refs/heads/…`); a bare branch name is rejected.
-        let push_ref = crate::git_transport::delivery_ref(&branch);
-        let message = delivery_message(&offer.task);
-        let job_hash = job_hash_for_offer(job_id, &offer.task, offer.amount_sats);
-        if let Err(error) = seller_git::snapshot_delivery_at_off_runtime(
-            workdir.clone(),
-            identity.clone(),
-            // #616: parent the delivery commit on the base the workdir was provisioned at. A
-            // contribution (Some(base_oid)) then descends from base_oid by construction; the buyer's
-            // descendant gate refuses a commit that doesn't. From-scratch (None) stays a root commit.
-            base_oid,
-            branch.clone(),
-            message,
-            author_date,
-            job_hash,
-        )
-        .await
-        {
-            // Harness-attributable: the agent returned success having left nothing to deliver. This
-            // is the site that fires on a quota-dead harness — its turn "completes", so the agent-run
-            // arm above sees no error at all — which is why the trigger cannot live at one site.
-            self.drop_harness(
-                harness,
-                Some(ExecutionFailure::Harness(Fault::Unproven)),
+        // Track B — container-side delivery, behind `[sandbox] container_delivery`. When it is on, ONE
+        // sandbox container runs the agent AND every git step (clone, gate, commit, push), and this
+        // host runs no git and drives no ACP for the job: it launches the container, hands it a
+        // branch-scoped push token, and reads back the pushed oid. When it is off, the host path
+        // below runs exactly as before. The raw flag is read here — before any provisioning — because
+        // the host path's own `SandboxPolicy::from_config` below must keep its place and its failure
+        // ordering; a `container_delivery = true` under `launcher` mode reads as off here and is then
+        // refused by that same parse (and by the boot gate) as an invalid `[sandbox]`.
+        let container_delivery = self
+            .node
+            .home()
+            .config
+            .sandbox
+            .as_ref()
+            .is_some_and(|sandbox| {
+                sandbox.mode == crate::home::SandboxMode::Docker && sandbox.container_delivery
+            });
+        let (commit, branch, usage, wall_time_ms) = if container_delivery {
+            let deadline = offer.deadline_unix.max(0) as u64;
+            let memory_section = job_memory_section(
+                &self.node.home().root,
+                &self.node.home().config.seller_memory,
             );
-            let (reason_code, feedback) = match error {
-                seller_git::SellerGitError::NoExecutionObserved(_) => {
-                    opline!(
-                        "seller node execute fail job_id={job_id}: delivery refused no_sentinel — {error}"
+            let prompt = job_prompt(&offer, &seller.git_remote, deadline, memory_section.as_deref());
+            match self
+                .deliver_via_container(
+                    job_id,
+                    &offer,
+                    &seller,
+                    &identity,
+                    &workdir,
+                    &agent_command,
+                    &prompt,
+                    deadline,
+                    author_date,
+                )
+                .await
+            {
+                Ok(delivered) => {
+                    if let Some(quoted) = quoted_agent_message(delivered.last_agent_message.as_deref()) {
+                        opline!("seller node execute job_id={job_id} agent last message: {quoted}");
+                    }
+                    // The container reported the model (#784), the same way the host driver did.
+                    self.agents.record_model(
+                        harness,
+                        delivered.usage.as_ref().and_then(|u| u.model.clone()),
                     );
-                    (ReasonCode::NoSentinel, NO_SENTINEL_FEEDBACK)
+                    (
+                        delivered.commit,
+                        delivered.branch,
+                        delivered.usage,
+                        delivered.wall_time_ms,
+                    )
                 }
-                _ => {
-                    opline!(
-                        "seller node execute fail job_id={job_id}: delivery snapshot failed ({error})"
-                    );
-                    (ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK)
-                }
-            };
-            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, reason_code, feedback, None)
-                .await;
-            return;
-        }
-
-        // Push under the seller's NIP-98 auth. The push authorization is signed THROUGH the signer
-        // actor (which owns the seller key), so the push path is NOT a third custody site — the key
-        // stays confined to the actor + the authenticated relay client, never re-read here. A
-        // public/anonymous https remote takes no header (auth applies to relay-git remotes only).
-        let push_header = if crate::delivery_transport::is_relay_git_locator(&seller.git_remote) {
-            match self.node.signer().http_auth_header(seller.git_remote.clone(), Some(push_ref.clone())).await {
-                Ok(Ok(header)) => Some(header),
-                Ok(Err(error)) => {
-                    opline!("seller node execute fail job_id={job_id}: push auth sign failed ({error})");
-                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
-                    return;
-                }
-                Err(error) => {
-                    opline!("seller node execute fail job_id={job_id}: signer actor gone ({error})");
-                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+                Err(failure) => {
+                    self.fail_container_delivery(job_id, &offer.buyer_pubkey, harness, failure)
+                        .await;
                     return;
                 }
             }
         } else {
-            None
-        };
-        // #562: serialize the delivery push to this seat's ONE delivery remote, bounded so a hung
-        // push frees the lock instead of starving every later delivery. Concurrent awarded jobs push
-        // per-job branches to the same repo, and concurrent git-receive-pack to one repo is what the
-        // relay 409s (surfaced as terminal delivery_failed before this). Serializing removes the race;
-        // the push oid is stable (invariant 2), so ordering never duplicates a delivery.
-        // Harden the workdir's `.git/config` (a whole-file replacement) BEFORE pushing, so an
-        // `insteadOf` the agent planted cannot redirect the seller's token to a host it chose
-        // (tests/hostile_local_git_config.rs). Safe here: the job container has already exited, so no
-        // agent process is alive to re-plant the redirect between the rewrite and the push. Both run
-        // in one blocking op inside `neutralize_then_push_off_runtime`.
-        let commit = match serialized_bounded_push(
-            &self.delivery_push_lock,
-            DELIVERY_PUSH_TIMEOUT,
-            || {
-                seller_git::neutralize_then_push_off_runtime(
-                    workdir.clone(),
-                    seller.git_remote.clone(),
-                    branch.clone(),
-                    push_header,
-                )
-            },
-        )
-        .await
-        {
-            Ok(oid) => oid,
-            Err(DeliveryPushErr::Push(error)) => {
-                opline!("seller node execute fail job_id={job_id}: git push failed ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+            // #591: provision the delivery workdir from the job's STORED contribution pin. The pin was
+            // written at claim (pin ≤ offer ≤ claim), so it is present on BOTH the fresh-award and the
+            // restart/resume path — the same durable-facts re-read the rest of execute_job relies on. A
+            // recorded pin ⇒ clone the pinned base at base_oid (the fork tip the agent extends); no pin ⇒
+            // the empty-workdir default (a from-scratch job, unchanged). A pin read error is fatal here
+            // rather than a silent degrade to an empty workdir: no fund risk either way (buyer verify is
+            // fail-closed pre-pay), but a loud fail is recoverable whereas an empty-workdir mis-delivery
+            // hides the fault. Routing lives in `provision_delivery_workdir` so the real read→plan→init
+            // path is unit-testable.
+            let base_oid = match provision_delivery_workdir(
+                self.node.store(),
+                self.node.home(),
+                job_id,
+                workdir.clone(),
+                identity.clone(),
+            )
+            .await
+            {
+                Ok(base_oid) => base_oid,
+                Err(DeliveryWorkdirError::Refused(refusal)) => {
+                    let (reason_code, reason_detail) = env_provision::refusal_feedback(&refusal);
+                    opline!(
+                        "seller node execute fail job_id={job_id}: environment provisioning refused ({refusal:?})"
+                    );
+                    self.fail_job_with_feedback(
+                        job_id,
+                        &offer.buyer_pubkey,
+                        reason_code,
+                        EXEC_FAILURE_FEEDBACK,
+                        Some(reason_detail),
+                    )
+                    .await;
+                    return;
+                }
+                Err(error) => {
+                    opline!("seller node execute fail job_id={job_id}: workdir init failed ({error})");
+                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None).await;
+                    return;
+                }
+            };
+
+            // Run the agent under the job's remaining deadline, retrying a transient error while the
+            // deadline has room. The agent edits files in `workdir`; the node owns commit + push. The
+            // configured `[sandbox]` policy launches the command (pass-through when absent).
+            let deadline = offer.deadline_unix.max(0) as u64;
+            // #828: operator-authored context (brand guidelines, house style) loads with the job. Inert
+            // for a seller that has never written a MEMORY.md, and it never blocks a job — see
+            // `job_memory_section`.
+            let memory_section = job_memory_section(
+                &self.node.home().root,
+                &self.node.home().config.seller_memory,
+            );
+            let prompt = job_prompt(&offer, &seller.git_remote, deadline, memory_section.as_deref());
+            // Resolve the sandbox executor before the run; a misconfigured `[sandbox]` fails the job
+            // rather than silently running the agent unsandboxed.
+            let sandbox = match SandboxPolicy::from_config(self.node.home().config.sandbox.as_ref()) {
+                Ok(sandbox) => sandbox,
+                Err(error) => {
+                    opline!("seller node execute fail job_id={job_id}: sandbox config invalid ({error})");
+                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None).await;
+                    return;
+                }
+            };
+            let run_started = std::time::Instant::now();
+            let run_result = run_agent_with_retry(
+                deadline,
+                MAX_AGENT_ATTEMPTS,
+                || now_unix() as u64,
+                |_attempt| {
+                    let job_timeout = unified_job_timeout(deadline, now_unix() as u64);
+                    run_agent_job(
+                        &agent_command,
+                        &sandbox,
+                        &prompt,
+                        &workdir,
+                        &identity,
+                        AgentRunTimeout::JobDeadline(job_timeout),
+                    )
+                },
+            )
+            .await;
+            let wall_time_ms = run_started.elapsed().as_millis() as u64;
+            let report = match run_result {
+                Ok(report) => report,
+                Err(error) => {
+                    opline!("seller node execute fail job_id={job_id}: agent run failed ({error})");
+                    self.drop_harness(harness, harness_fault_for(&error));
+                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None).await;
+                    return;
+                }
+            };
+            // The agent's own account of the run, on the REAL job path and not only the probe: it was
+            // discarded here too, so a job that delivered nothing left the operator the same guess the
+            // probe used to. Logged whenever the agent said anything — one line per job, and it is the
+            // line that names a blocked host or an exhausted plan.
+            if let Some(quoted) = quoted_agent_message(report.last_agent_message.as_deref()) {
+                opline!("seller node execute job_id={job_id} agent last message: {quoted}");
+            }
+            let usage = report.usage;
+            // Refresh the advertised model from THIS run (#784). The boot probe answers for the moment
+            // the node started; an operator can re-point a harness at a different default while it runs,
+            // and an advertisement that sits behind the last restart is a claim the seat no longer keeps.
+            // A real run is the freshest evidence available, and it costs nothing to read here.
+            //
+            // A `None` observation CLEARS rather than preserves, which is the roster's documented
+            // contract: a harness that stops reporting a model must stop advertising one, or the last
+            // value it ever gave outlives the truth. That is the drift this field exists to bound.
+            self.agents
+                .record_model(harness, usage.as_ref().and_then(|u| u.model.clone()));
+
+            // Snapshot the agent's final workdir tree into ONE delivery commit at the stored author date.
+            // §19: the snapshot writes the execution sentinel into the delivered tree, seeded from this
+            // job's job_hash (replay-resistant; the buyer holds the same value on its accept-bind). When
+            // the node observed no genuine execution — the quota-dead case, an empty / base-identical tree
+            // — the snapshot refuses `NoExecutionObserved` and writes no sentinel, which is mapped here to
+            // the `no_sentinel` refusal so the buyer learns delivery was refused for want of a sentinel
+            // (distinct from a crash). The gate, not an unconditional write, is the check.
+            let branch = format!("maxplayer/{}", &job_id[..8.min(job_id.len())]);
+            // Single source for the delivery ref. The branch-scoped push token (below) is minted for
+            // THIS refname, and the push refspec `push_branch_with_header` builds is
+            // `refs/heads/{branch}:refs/heads/{branch}` — both derive from `branch`, so the token scope
+            // and the ref actually pushed cannot drift apart. The relay (PR #929) demands the scope be
+            // fully qualified (`refs/heads/…`); a bare branch name is rejected.
+            let push_ref = crate::git_transport::delivery_ref(&branch);
+            let message = delivery_message(&offer.task);
+            let job_hash = job_hash_for_offer(job_id, &offer.task, offer.amount_sats);
+            if let Err(error) = seller_git::snapshot_delivery_at_off_runtime(
+                workdir.clone(),
+                identity.clone(),
+                // #616: parent the delivery commit on the base the workdir was provisioned at. A
+                // contribution (Some(base_oid)) then descends from base_oid by construction; the buyer's
+                // descendant gate refuses a commit that doesn't. From-scratch (None) stays a root commit.
+                base_oid,
+                branch.clone(),
+                message,
+                author_date,
+                job_hash,
+            )
+            .await
+            {
+                // Harness-attributable: the agent returned success having left nothing to deliver. This
+                // is the site that fires on a quota-dead harness — its turn "completes", so the agent-run
+                // arm above sees no error at all — which is why the trigger cannot live at one site.
+                self.drop_harness(
+                    harness,
+                    Some(ExecutionFailure::Harness(Fault::Unproven)),
+                );
+                let (reason_code, feedback) = match error {
+                    seller_git::SellerGitError::NoExecutionObserved(_) => {
+                        opline!(
+                            "seller node execute fail job_id={job_id}: delivery refused no_sentinel — {error}"
+                        );
+                        (ReasonCode::NoSentinel, NO_SENTINEL_FEEDBACK)
+                    }
+                    _ => {
+                        opline!(
+                            "seller node execute fail job_id={job_id}: delivery snapshot failed ({error})"
+                        );
+                        (ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK)
+                    }
+                };
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, reason_code, feedback, None)
+                    .await;
                 return;
             }
-            Err(DeliveryPushErr::TimedOut(secs)) => {
-                // Timeout lands in the SAME delivery_failed handling (lead 37896 — no new state); the
-                // lock is already released, so later deliveries are not starved behind this one.
-                opline!("seller node execute fail job_id={job_id}: git push exceeded {secs}s (delivery-push lock released; treated as delivery_failed)");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
-                return;
-            }
+
+            // Push under the seller's NIP-98 auth. The push authorization is signed THROUGH the signer
+            // actor (which owns the seller key), so the push path is NOT a third custody site — the key
+            // stays confined to the actor + the authenticated relay client, never re-read here. A
+            // public/anonymous https remote takes no header (auth applies to relay-git remotes only).
+            let push_header = if crate::delivery_transport::is_relay_git_locator(&seller.git_remote) {
+                match self.node.signer().http_auth_header(seller.git_remote.clone(), Some(push_ref.clone()), None).await {
+                    Ok(Ok(header)) => Some(header),
+                    Ok(Err(error)) => {
+                        opline!("seller node execute fail job_id={job_id}: push auth sign failed ({error})");
+                        self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+                        return;
+                    }
+                    Err(error) => {
+                        opline!("seller node execute fail job_id={job_id}: signer actor gone ({error})");
+                        self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            // #562: serialize the delivery push to this seat's ONE delivery remote, bounded so a hung
+            // push frees the lock instead of starving every later delivery. Concurrent awarded jobs push
+            // per-job branches to the same repo, and concurrent git-receive-pack to one repo is what the
+            // relay 409s (surfaced as terminal delivery_failed before this). Serializing removes the race;
+            // the push oid is stable (invariant 2), so ordering never duplicates a delivery.
+            // Harden the workdir's `.git/config` (a whole-file replacement) BEFORE pushing, so an
+            // `insteadOf` the agent planted cannot redirect the seller's token to a host it chose
+            // (tests/hostile_local_git_config.rs). Safe here: the job container has already exited, so no
+            // agent process is alive to re-plant the redirect between the rewrite and the push. Both run
+            // in one blocking op inside `neutralize_then_push_off_runtime`.
+            let commit = match serialized_bounded_push(
+                &self.delivery_push_lock,
+                DELIVERY_PUSH_TIMEOUT,
+                || {
+                    seller_git::neutralize_then_push_off_runtime(
+                        workdir.clone(),
+                        seller.git_remote.clone(),
+                        branch.clone(),
+                        push_header,
+                    )
+                },
+            )
+            .await
+            {
+                Ok(oid) => oid,
+                Err(DeliveryPushErr::Push(error)) => {
+                    opline!("seller node execute fail job_id={job_id}: git push failed ({error})");
+                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+                    return;
+                }
+                Err(DeliveryPushErr::TimedOut(secs)) => {
+                    // Timeout lands in the SAME delivery_failed handling (lead 37896 — no new state); the
+                    // lock is already released, so later deliveries are not starved behind this one.
+                    opline!("seller node execute fail job_id={job_id}: git push exceeded {secs}s (delivery-push lock released; treated as delivery_failed)");
+                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+                    return;
+                }
+            };
+            (commit, branch, usage, wall_time_ms)
         };
 
         // #552: arm the durable pushed-delivery marker IMMEDIATELY after the push (arm-state-after-
@@ -6387,6 +6771,412 @@ impl SellerNodeRunner {
             }
         }
         self.drain().await;
+    }
+
+    /// Task B2: deliver `job_id` through ONE sandbox container that runs the agent AND all git. The
+    /// host runs no git here — it computes the delivery facts, prepares containment exactly as the
+    /// agent launch does, writes the orchestrator's inputs (mode `0600`, in a host-owned exchange
+    /// directory outside the workdir), launches `maxplayer __deliver phase1`, keeps the container
+    /// alive-checked, hands off the push token per `[sandbox] container_delivery_token`, and reads back
+    /// the pushed oid plus the orchestrator's outcome. Publishing, co-signing and settlement stay in
+    /// `execute_job`, unchanged.
+    ///
+    /// Token hand-off (who can read the token, and when):
+    /// - `fresh-after-agent`: this host mints a fresh 60 s scoped token only after the container's
+    ///   `agent-done` marker — which carries a nonce only the orchestrator learned from the deleted
+    ///   inputs file — has been verified, and writes it `0600` into the exchange directory. By then
+    ///   the agent and every other process in the container are dead.
+    /// - `long-lived`: this host mints once, before launch, with `expiration = deadline + margin`,
+    ///   refusing when that exceeds `container_delivery_token_cap_secs`; the token rides in the inputs
+    ///   file the orchestrator deletes before the agent exists.
+    /// Either way the token is scoped to `refs/heads/<delivery branch>`, so a leak pushes nothing
+    /// but the seller's own delivery branch.
+    ///
+    /// Liveness is "container alive": the `docker run` client is polled once a second, and the
+    /// container is killed past `deadline + PUSH_MARGIN_SECS + CONTAINER_EXIT_GRACE_SECS`.
+    #[allow(clippy::too_many_arguments)]
+    async fn deliver_via_container(
+        &self,
+        job_id: &str,
+        offer: &super::store::Offer,
+        seller: &home::SellerConfig,
+        identity: &DeliveryAgentIdentity,
+        workdir: &std::path::Path,
+        agent_command: &[String],
+        prompt: &str,
+        deadline: u64,
+        author_date: i64,
+    ) -> Result<ContainerDelivery, ContainerDeliveryFailure> {
+        use crate::delivery_orchestrator as orch;
+        use crate::home::ContainerDeliveryToken;
+        use ContainerDeliveryFailure as Fail;
+
+        let sandbox = SandboxPolicy::from_config(self.node.home().config.sandbox.as_ref())
+            .map_err(|error| Fail::Setup(format!("sandbox config invalid ({error})")))?;
+        let Some(delivery_policy) = sandbox.container_delivery() else {
+            return Err(Fail::Setup("container delivery is not enabled for this seat".into()));
+        };
+
+        // The delivery facts, exactly as the host path computes them. The base is PLANNED from the
+        // stored pin, not provisioned: the clone runs inside the container (`run_phase1`).
+        let branch = format!("maxplayer/{}", &job_id[..8.min(job_id.len())]);
+        let push_ref = crate::git_transport::delivery_ref(&branch);
+        let message = delivery_message(&offer.task);
+        let job_hash = job_hash_for_offer(job_id, &offer.task, offer.amount_sats);
+        let pin = self
+            .node
+            .store()
+            .contribution_pin(job_id)
+            .map_err(|error| Fail::Setup(format!("contribution pin read failed ({error})")))?;
+        let base = match plan_delivery_workdir(pin, job_id) {
+            DeliveryWorkdirPlan::Empty => None,
+            DeliveryWorkdirPlan::ContributionClone {
+                clone_url,
+                base_branch,
+                base_oid,
+                ..
+            } => Some(orch::Phase1BaseOwned {
+                clone_url,
+                branch: base_branch,
+                oid: base_oid,
+            }),
+        };
+
+        // The bind sources must exist before docker sees them: a missing source is created
+        // root-owned and the container's uid cannot write it. The workdir is EMPTY here — no git.
+        std::fs::create_dir_all(workdir)
+            .map_err(|error| Fail::Setup(format!("create workdir {}: {error}", workdir.display())))?;
+        let io_dir = container_exchange_dir(&self.node.home().root, job_id);
+        orch::create_exchange_dir(&io_dir).map_err(|error| Fail::Setup(error.to_string()))?;
+
+        // Containment (#797) and the credential proxy (#647), exactly as the agent launch prepares
+        // them. The proxy is a host process; the container reaches it over the network. The
+        // placeholders must outlive the push, hence the margin on the lifetime.
+        let job_lifetime = unified_job_timeout(deadline, now_unix().max(0) as u64)
+            + Duration::from_secs(orch::PUSH_MARGIN_SECS);
+        let prepared = prepare_launch(agent_command, &sandbox, workdir, identity, job_lifetime)
+            .await
+            .map_err(|error| Fail::Setup(format!("container launch preparation failed ({error})")))?;
+
+        // The push token source. A public/anonymous https remote takes no header (as on the host).
+        let push_token = if !crate::delivery_transport::is_relay_git_locator(&seller.git_remote) {
+            orch::PushTokenSource::None
+        } else {
+            match delivery_policy.token {
+                ContainerDeliveryToken::FreshAfterAgent => orch::PushTokenSource::FreshAfterAgent {
+                    wait_secs: orch::FRESH_TOKEN_WAIT_SECS,
+                },
+                ContainerDeliveryToken::LongLived => {
+                    // §7(b): refuse an over-cap token HERE, not at push time.
+                    let expiry = orch::long_lived_expiration(
+                        deadline,
+                        now_unix().max(0) as u64,
+                        delivery_policy.token_cap_secs,
+                    )
+                    .map_err(|error| Fail::Delivery(error.to_string()))?;
+                    let header = self
+                        .mint_push_header(&seller.git_remote, &push_ref, Some(expiry))
+                        .await?;
+                    orch::PushTokenSource::LongLived { header }
+                }
+            }
+        };
+        let nonce = random_nonce_hex().map_err(Fail::Setup)?;
+        let fresh_mode = matches!(push_token, orch::PushTokenSource::FreshAfterAgent { .. });
+
+        let inputs = orch::Phase1Inputs {
+            job_hash,
+            seller_pubkey_hex: identity.seller_pubkey_hex().to_owned(),
+            base,
+            delivery_branch: branch.clone(),
+            message,
+            author_date_unix: author_date,
+            agent_argv: prepared.effective_command.clone(),
+            workdir: std::path::PathBuf::from(CONTAINER_WORKDIR),
+            out_dir: std::path::PathBuf::from(orch::CONTAINER_EXCHANGE_DIR),
+            prompt: prompt.to_owned(),
+            deadline_unix: deadline,
+            max_agent_attempts: MAX_AGENT_ATTEMPTS,
+            // C4: names only. The orchestrator hands the agent these (values from the container
+            // environment), the runtime baseline, and the git identity — nothing else.
+            agent_env_names: prepared.env.iter().map(|(key, _)| key.clone()).collect(),
+            relay_url: seller.git_remote.clone(),
+            push_token,
+            handoff_nonce: nonce.clone(),
+        };
+        orch::write_phase1_inputs(&io_dir.join(orch::PHASE1_INPUTS_FILE), &inputs)
+            .map_err(|error| Fail::Setup(error.to_string()))?;
+
+        // ONE container, the orchestrator as its command, through the SAME argv builder as the agent
+        // launch (mounts, uid, network, cap-drop, init) plus the exchange directory.
+        let orchestrator = vec![
+            orch::CONTAINER_ORCHESTRATOR_BIN.to_owned(),
+            "__deliver".to_owned(),
+            "phase1".to_owned(),
+            format!("{}/{}", orch::CONTAINER_EXCHANGE_DIR, orch::PHASE1_INPUTS_FILE),
+        ];
+        let job = JobLaunch {
+            workdir,
+            env: &prepared.env,
+            uid: prepared.uid,
+            gid: prepared.gid,
+            netns: prepared.holder_name.as_deref(),
+        };
+        let launch = sandbox
+            .launch_with_mounts(
+                &orchestrator,
+                &job,
+                &[(io_dir.clone(), orch::CONTAINER_EXCHANGE_DIR.to_owned())],
+            )
+            .map_err(|error| Fail::Setup(format!("container argv: {error}")))?;
+        // Adopted BEFORE the spawn: `docker run` can fail after creating the container.
+        let container = JobContainer::adopt(job_container_name(&job_id_of(workdir)));
+        let started = Instant::now();
+        let mut child = std::process::Command::new(&launch.program)
+            .args(&launch.args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .map_err(|error| Fail::Setup(format!("spawn {}: {error}", launch.program)))?;
+        opline!(
+            "seller node execute job_id={job_id}: container delivery started container={} token={:?}",
+            container.name(),
+            delivery_policy.token
+        );
+
+        // Liveness + hand-off loop. "Alive" is the `docker run` client still running; the marker is
+        // the orchestrator's word that the agent is dead and the commit is gated.
+        let hard_deadline = deadline
+            .saturating_add(orch::PUSH_MARGIN_SECS)
+            .saturating_add(orch::CONTAINER_EXIT_GRACE_SECS);
+        let mut marker: Option<orch::AgentDoneMarker> = None;
+        let mut last_alive_line = Instant::now();
+        let exit: Result<std::process::ExitStatus, Fail> = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => {}
+                Err(error) => break Err(Fail::Setup(format!("wait on container: {error}"))),
+            }
+            if marker.is_none() {
+                match orch::read_agent_done_marker(&io_dir, &nonce) {
+                    Ok(None) => {}
+                    Ok(Some(seen)) => {
+                        opline!(
+                            "seller node execute job_id={job_id}: agent done in container, gated commit={}",
+                            seen.expected_oid
+                        );
+                        if fresh_mode {
+                            // The agent is dead. Mint the 60 s scoped token NOW and hand it over,
+                            // owner-only, atomically.
+                            let header = match self
+                                .mint_push_header(&seller.git_remote, &push_ref, None)
+                                .await
+                            {
+                                Ok(header) => header,
+                                Err(failure) => break Err(failure),
+                            };
+                            if let Err(error) =
+                                orch::write_secret_file(&io_dir.join(orch::PUSH_TOKEN_FILE), &header)
+                            {
+                                break Err(Fail::Delivery(format!("token hand-off: {error}")));
+                            }
+                            opline!("seller node execute job_id={job_id}: fresh push token handed to the container");
+                        }
+                        marker = Some(seen);
+                    }
+                    // A forged or malformed marker: no token, no delivery.
+                    Err(error) => break Err(Fail::Delivery(error.to_string())),
+                }
+            }
+            if now_unix().max(0) as u64 > hard_deadline {
+                break Err(Fail::Timeout(format!(
+                    "container still running {}s past the job deadline; killed",
+                    orch::PUSH_MARGIN_SECS + orch::CONTAINER_EXIT_GRACE_SECS
+                )));
+            }
+            if last_alive_line.elapsed() >= Duration::from_secs(300) {
+                opline!(
+                    "seller node execute job_id={job_id}: container alive, {}s elapsed",
+                    started.elapsed().as_secs()
+                );
+                last_alive_line = Instant::now();
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        };
+        if exit.is_err() {
+            // Kill the `docker run` CLIENT and reap it; the container itself is removed below by name.
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        // Evidence first, then remove — the same tail as the agent launch.
+        cleanup_job_container(
+            container,
+            workdir,
+            workdir.join(seller_git::SELLER_RUN_LOG),
+            prepared.forwarded_secrets.clone(),
+            CleanupPolicy::CaptureThenRemove,
+        )
+        .await;
+        // The container exited between two polls: the marker may not have been read yet.
+        if marker.is_none()
+            && let Ok(Some(seen)) = orch::read_agent_done_marker(&io_dir, &nonce)
+        {
+            marker = Some(seen);
+        }
+
+        let result = match exit {
+            Ok(status) => {
+                self.classify_container_outcome(job_id, &io_dir, status, marker.as_ref(), &branch, started)
+            }
+            Err(failure) => Err(failure),
+        };
+        // The exchange directory may still hold an unconsumed token file (a container that died
+        // between the hand-off and the read). Remove the whole directory; the token was 60 s anyway.
+        if let Err(error) = std::fs::remove_dir_all(&io_dir) {
+            opline!(
+                "seller node execute job_id={job_id}: could not remove the exchange dir {} ({error})",
+                io_dir.display()
+            );
+        }
+        // `prepared` — the proxy and the namespace — lives to here on purpose.
+        drop(prepared);
+        result
+    }
+
+    /// Read the orchestrator's outcome and oid after the container exited, and map them onto the
+    /// host's own outcome shape. Fails closed on a missing outcome, a missing marker, an oid that
+    /// differs from the gated one, or a "delivered" claim with a non-zero exit.
+    fn classify_container_outcome(
+        &self,
+        job_id: &str,
+        io_dir: &std::path::Path,
+        status: std::process::ExitStatus,
+        marker: Option<&crate::delivery_orchestrator::AgentDoneMarker>,
+        branch: &str,
+        started: Instant,
+    ) -> Result<ContainerDelivery, ContainerDeliveryFailure> {
+        use crate::delivery_orchestrator as orch;
+        use ContainerDeliveryFailure as Fail;
+        let outcome = orch::read_outcome(io_dir).map_err(|error| Fail::Delivery(error.to_string()))?;
+        let Some(outcome) = outcome else {
+            return Err(Fail::Setup(format!(
+                "container exited with {status} and wrote no outcome file"
+            )));
+        };
+        opline!(
+            "seller node execute job_id={job_id}: container outcome status={:?} exit={status} detail={}",
+            outcome.status,
+            outcome.detail
+        );
+        let detail = outcome.detail;
+        match outcome.status {
+            orch::Phase1Status::Delivered => {
+                let commit = orch::read_delivery_oid(io_dir)
+                    .map_err(|error| Fail::Delivery(error.to_string()))?;
+                let Some(marker) = marker else {
+                    return Err(Fail::Delivery("delivered without an agent-done marker".into()));
+                };
+                if marker.expected_oid != commit {
+                    return Err(Fail::Delivery(format!(
+                        "pushed oid {commit} differs from the gated oid {} in the marker",
+                        marker.expected_oid
+                    )));
+                }
+                if !status.success() {
+                    return Err(Fail::Delivery(format!(
+                        "outcome says delivered but the container exited with {status}"
+                    )));
+                }
+                let agent = outcome.agent.unwrap_or_default();
+                Ok(ContainerDelivery {
+                    commit,
+                    branch: branch.to_owned(),
+                    usage: agent.usage,
+                    last_agent_message: agent.last_agent_message,
+                    wall_time_ms: started.elapsed().as_millis() as u64,
+                })
+            }
+            orch::Phase1Status::ProvisionFailed | orch::Phase1Status::Aborted => {
+                Err(Fail::Setup(detail))
+            }
+            orch::Phase1Status::AgentFailed => Err(Fail::Agent(ExecError::Agent(detail))),
+            orch::Phase1Status::AgentUnavailable => Err(Fail::Agent(ExecError::Config(detail))),
+            orch::Phase1Status::DeadlineExceeded => Err(Fail::Agent(ExecError::DeadlineExceeded)),
+            orch::Phase1Status::NoSentinel => Err(Fail::NoSentinel(detail)),
+            orch::Phase1Status::SnapshotFailed => Err(Fail::Snapshot(detail)),
+            orch::Phase1Status::TokenUnavailable
+            | orch::Phase1Status::PushFailed
+            | orch::Phase1Status::Tampered => Err(Fail::Delivery(detail)),
+        }
+    }
+
+    /// Mint the branch-scoped NIP-98 push header through the signer actor (the seller key never
+    /// leaves it). `expiration_unix` is `Some` only for a long-lived token. The header is returned to
+    /// the caller for the hand-off and is never logged.
+    async fn mint_push_header(
+        &self,
+        remote: &str,
+        push_ref: &str,
+        expiration_unix: Option<i64>,
+    ) -> Result<String, ContainerDeliveryFailure> {
+        match self
+            .node
+            .signer()
+            .http_auth_header(remote.to_owned(), Some(push_ref.to_owned()), expiration_unix)
+            .await
+        {
+            Ok(Ok(header)) => Ok(header),
+            Ok(Err(error)) => Err(ContainerDeliveryFailure::Delivery(format!(
+                "push auth sign failed ({error})"
+            ))),
+            Err(error) => Err(ContainerDeliveryFailure::Delivery(format!(
+                "signer actor gone ({error})"
+            ))),
+        }
+    }
+
+    /// Fail a container-delivered job with the SAME feedback reason codes and harness attribution the
+    /// host path emits for the equivalent failure, so a buyer cannot tell the two paths apart.
+    async fn fail_container_delivery(
+        &self,
+        job_id: &str,
+        buyer_pubkey: &str,
+        harness: usize,
+        failure: ContainerDeliveryFailure,
+    ) {
+        use ContainerDeliveryFailure as Fail;
+        let (reason_code, feedback) = match failure {
+            Fail::Setup(detail) => {
+                opline!("seller node execute fail job_id={job_id}: container delivery setup failed ({detail})");
+                (ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK)
+            }
+            Fail::Agent(error) => {
+                opline!("seller node execute fail job_id={job_id}: agent run failed in container ({error})");
+                self.drop_harness(harness, harness_fault_for(&error));
+                (ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK)
+            }
+            Fail::NoSentinel(detail) => {
+                opline!("seller node execute fail job_id={job_id}: delivery refused no_sentinel — {detail}");
+                self.drop_harness(harness, Some(ExecutionFailure::Harness(Fault::Unproven)));
+                (ReasonCode::NoSentinel, NO_SENTINEL_FEEDBACK)
+            }
+            Fail::Snapshot(detail) => {
+                opline!("seller node execute fail job_id={job_id}: delivery snapshot failed in container ({detail})");
+                self.drop_harness(harness, Some(ExecutionFailure::Harness(Fault::Unproven)));
+                (ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK)
+            }
+            Fail::Delivery(detail) => {
+                opline!("seller node execute fail job_id={job_id}: container delivery failed ({detail})");
+                (ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK)
+            }
+            Fail::Timeout(detail) => {
+                opline!("seller node execute fail job_id={job_id}: container delivery timed out ({detail})");
+                self.drop_harness(harness, Some(ExecutionFailure::DeadlineExceeded));
+                (ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK)
+            }
+        };
+        self.fail_job_with_feedback(job_id, buyer_pubkey, reason_code, feedback, None).await;
     }
 
     /// Complete an interrupted delivery from its journaled pushed commit (#552), WITHOUT re-running

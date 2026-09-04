@@ -110,6 +110,14 @@ required-features = ["git-delivery"]
 name = "no_system_git"
 required-features = ["git-delivery"]
 
+# Relay canary: a manual `#[ignore]`d test against a live relay-git server. It shows two facts with
+# evidence. Fact A: a scoped push token cannot write another ref. Fact B: the relay accepts, or
+# refuses, a scoped token older than 60 s that carries an expiration tag. Run it with
+# `--ignored --nocapture` and the two MAXPLAYER_CANARY_* variables; see the file header.
+[[test]]
+name = "relay_canary"
+required-features = ["git-delivery"]
+
 [dev-dependencies]
 async-trait = "0.1.89"
 cdk-sqlite = "=0.17.2"

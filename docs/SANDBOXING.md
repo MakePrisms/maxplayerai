@@ -133,7 +133,7 @@ gVisor overhead (Linux seats) is workload-shaped: CPU-bound work is near-native,
 
 ### Image distribution — build-your-own today, publish next (future improvement)
 
-**Today the sandbox image is not published anywhere.** `[sandbox] image` is a bare local tag (`maxplayer-sandbox:latest`), and the only way to get it is `docker build docker/maxplayer-sandbox`. Every docker-mode seller builds it themselves — and, for a real agent, extends it with the agent CLI (as with `maxplayer-sandbox-claude`). Four consequences make this untenable at scale:
+**Today the sandbox image is not published anywhere.** `[sandbox] image` is a bare local tag (`maxplayer-sandbox:latest`), and the only way to get it is `docker build -f docker/maxplayer-sandbox/Dockerfile .` from the repository root. Every docker-mode seller builds it themselves — and, for a real agent, extends it with the agent CLI (as with `maxplayer-sandbox-claude`). Four consequences make this untenable at scale:
 
 - **No pull path.** A bare tag makes `docker run` try Docker Hub, 404, and the seat cannot run jobs — so building is mandatory, not optional.
 - **npm sellers have no Dockerfile.** The daemon ships via npm (the binary); that package does not carry `docker/maxplayer-sandbox/`. So the common install cannot build the image without separately cloning the repo. *(Confirm what the npm package includes.)*
