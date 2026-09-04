@@ -1322,6 +1322,16 @@ pub struct MaxplayerConfig {
     /// reads it as a spendable Lightning balance — an issuer mint has no Lightning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issuer_mint: Option<String>,
+    /// Where this seat's ISSUER MINT SEED lives — the BIP39 mnemonic `cdk-mintd` derives its signing
+    /// keys from (`docs/protocol-v1.md` §4.2, stage 3a). Absent ⇒ `<home>/mint-seed`, beside the seat
+    /// `key`.
+    ///
+    /// It is a PATH and never the phrase: the seed reaches the mint by `--seed-file`, never through
+    /// this file and never through the mint's own config, so nothing that prints a config can print
+    /// a seed. The path is named here so an operator can move the file to a volume of their choosing
+    /// without the sidecar and the seat disagreeing about where it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mint_seed_path: Option<String>,
     /// Per-job spend cap (sats) — the standing spend bound on the money path. Absent ⇒ the built-in
     /// [`DEFAULT_PER_JOB_BUDGET_SATS`]. Issue #378 removed the rolling/total cap: the durable
     /// `spent.jsonl` ledger still records every spend (audit + retry-idempotency), but this per-job cap
@@ -1513,6 +1523,16 @@ impl MaxplayerConfig {
             .map(str::trim)
             .filter(|url| !url.is_empty())
     }
+
+    /// The configured issuer-mint seed PATH, or `None` for the default (`<home>/mint-seed`). Blank
+    /// and whitespace-only read as `None`, the same way [`Self::issuer_mint`] does: an empty path is
+    /// not a location.
+    pub fn mint_seed_path(&self) -> Option<&str> {
+        self.mint_seed_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+    }
 }
 
 impl Default for MaxplayerConfig {
@@ -1521,6 +1541,7 @@ impl Default for MaxplayerConfig {
             relay_url: DEFAULT_RELAY_URL.to_owned(),
             accepted_mints: default_accepted_mints(),
             issuer_mint: None,
+            mint_seed_path: None,
             per_job_budget_sats: DEFAULT_PER_JOB_BUDGET_SATS,
             extra_mints: Vec::new(),
             allow_real_mints: true,

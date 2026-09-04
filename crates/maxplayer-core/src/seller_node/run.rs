@@ -4472,6 +4472,12 @@ impl SellerNodeRunner {
             // operator-set field would be a second place to state one fact, and the ad would drift
             // from the gate that enforces it.
             crate::home::AdmissionPolicy::from_seller_config(&seller),
+            // §4.2 counters, read from the MINT this tick — `last_seen` is the instant of the read.
+            // TOTAL by construction: a seat that runs no issuer mint, a sidecar that is down, a
+            // sqlite that will not open, a counter that will not parse and a URL missing from
+            // `accepted_mints` all answer `None`, and this beat publishes without the tag. Nothing
+            // here can fail the publish or take the seat off the market.
+            crate::issuer::advertisement(self.node.home()).await,
         )
         .to_event_draft();
         self.publish_seat_announcement(draft, "heartbeat").await
@@ -4521,6 +4527,11 @@ impl SellerNodeRunner {
             roster.names.clone(),
             roster.capability(&self.node.home().config.seat),
             crate::home::AdmissionPolicy::from_seller_config(&seller),
+            // Read once more on the way out rather than dropped: this beat REPLACES the seat's
+            // standing announcement, so omitting the tag would make the seat's permanent public
+            // word about its own outstanding currency "states nothing" while that currency is still
+            // in somebody's wallet.
+            crate::issuer::advertisement(self.node.home()).await,
         )
         .to_event_draft();
 

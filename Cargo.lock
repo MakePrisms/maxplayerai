@@ -2583,6 +2583,7 @@ version = "0.5.6"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "bip39",
  "bytes",
  "cashu",
  "cdk",

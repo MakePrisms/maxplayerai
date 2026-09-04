@@ -11,6 +11,7 @@ mod deliver_cli;
 mod daemon;
 mod doctor;
 mod exec;
+mod issuer_cli;
 mod mcp;
 mod profile_cli;
 // The `sell` surface is the seller advertise path: it publishes the kind-0 identity and boots the

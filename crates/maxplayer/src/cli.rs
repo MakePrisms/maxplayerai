@@ -52,6 +52,11 @@ where
         Some("accept") => crate::accept_cli::run(&args[2..], out, err),
         Some("collect") => crate::collect_cli::run(&args[2..], out, err),
         Some("doctor") => crate::doctor::run(&args[2..], out, err),
+        // §4.2 "Issuer mint": this seat's OWN mint — wizard, counters, issue and retire. Ungated at
+        // dispatch like `doctor`, and it answers a sole `--help` from its own usage at the top of
+        // its `run` (issue #570); on a build without `wallet` each verb says so rather than
+        // vanishing, because a subcommand that silently is not there reads as a typo.
+        Some("issuer") => crate::issuer_cli::run(&args[2..], out, err),
         // INTERNAL (Track B): container-side delivery orchestrator. Not advertised in usage.
         Some("__deliver") => crate::deliver_cli::run(&args[2..], out, err),
         // Run BY the boot gate, inside the configured launcher, to report what the launcher let it
@@ -324,7 +329,7 @@ fn usage(err: &mut dyn Write) -> i32 {
 fn write_usage(out: &mut dyn Write) {
     let _ = write!(
         out,
-        "Usage:\n  maxplayer [--help | --version]\n  maxplayer version\n  maxplayer mcp\n  maxplayer buyer     # persistent per-home daemon (exclusive lock, unix-socket RPC); `maxplayer buyer status` = thin client\n  maxplayer doctor   # seller environment self-check (git, credential helper, relay, mint, agent)\n  maxplayer wallet <setup|balance|mint|mint-complete|send|receive|melt|invoice|mints|reconcile> ...\n  maxplayer profile set [--name <name>] [--about <about>]   # publish kind-0 identity\n  maxplayer whoami [--home <dir>]   # print this seat's public identity (hex pubkey, npub, resolved home)\n"
+        "Usage:\n  maxplayer [--help | --version]\n  maxplayer version\n  maxplayer mcp\n  maxplayer buyer     # persistent per-home daemon (exclusive lock, unix-socket RPC); `maxplayer buyer status` = thin client\n  maxplayer doctor   # seller environment self-check (git, credential helper, relay, mint, agent)\n  maxplayer issuer <init|status|issue|retire> ...   # this seat's OWN mint (§4.2): stand up the sidecar, read its counters, issue and retire\n  maxplayer wallet <setup|balance|mint|mint-complete|send|receive|melt|invoice|mints|reconcile> ...\n  maxplayer profile set [--name <name>] [--about <about>]   # publish kind-0 identity\n  maxplayer whoami [--home <dir>]   # print this seat's public identity (hex pubkey, npub, resolved home)\n"
     );
     #[cfg(feature = "stub-pay")]
     let _ = write!(

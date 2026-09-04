@@ -924,6 +924,7 @@ pub fn heartbeat_for_state(
     agents: Vec<String>,
     capability: SeatCapability,
     admission: crate::home::AdmissionPolicy,
+    issuer_mint: Option<IssuerMintAd>,
 ) -> HeartbeatDraft {
     // The capability arrives already derived, from `LiveRoster::Advertisement::capability()` — the
     // ONE route from a roster read to something emittable. Deriving it here instead would make this
@@ -931,7 +932,7 @@ pub fn heartbeat_for_state(
     // that can drift; the fields are observed STATE (models, probed capabilities) that cannot be
     // recomputed from the `agents` list anyway. Callers pass names and capability from the same
     // single locked snapshot, so they cannot describe different rosters.
-    HeartbeatDraft::new(
+    let mut draft = HeartbeatDraft::new(
         in_flight == 0 && anything_serving,
         in_flight,
         rate_sats,
@@ -943,7 +944,21 @@ pub fn heartbeat_for_state(
     // caller that could omit it would publish a seat stating no policy, which is indistinguishable
     // on the wire from a seat too old to have one. Both publish sites hold the `SellerConfig` this
     // is derived from, so neither has to reach for a default.
-    .with_admission(admission)
+    .with_admission(admission);
+    // REQUIRED for the same reason as `admission`, and the `Option` here is the STATED value rather
+    // than a defaulted one: `None` means "this seat runs no issuer mint", which is a fact the caller
+    // knows and this function cannot derive. A defaulted parameter would let a publish site that
+    // simply forgot emit a seat whose silence about its own currency is indistinguishable from a
+    // seat too old to speak — the exact failure mode #313 shipped.
+    //
+    // The caller is `crate::issuer::advertisement`, which is TOTAL: a sidecar that is down, a sqlite
+    // that will not open, a counter that will not parse and a URL outside `accepted_mints` all yield
+    // `None`, so the beat still publishes and the seat stays on the market (see the rule stated at
+    // `ISSUER_MINT_TAG` above: an optional tag must never take a working seat off the market).
+    if let Some(ad) = issuer_mint {
+        draft = draft.with_issuer_mint(ad);
+    }
+    draft
 }
 
 /// The seat's **terminal beat** (#747): the ordinary announcement, published one last time with
@@ -982,6 +997,7 @@ pub fn retraction_for_state(
     agents: Vec<String>,
     capability: SeatCapability,
     admission: crate::home::AdmissionPolicy,
+    issuer_mint: Option<IssuerMintAd>,
 ) -> HeartbeatDraft {
     // `anything_serving = false` BY CONSTRUCTION: nothing serves a seat that is leaving the role. It
     // is passed as a literal, not taken as a parameter, so no caller and no in-flight count can make
@@ -997,6 +1013,12 @@ pub fn retraction_for_state(
         // market is not a claim to have changed who this seat would admit. `accepting=n` is the
         // field that carries "not taking work", and it is passed as a literal above.
         admission,
+        // So does the issuer advertisement, and for a sharper reason: the terminal beat REPLACES the
+        // seat's standing announcement in place (kind-30340 is addressable), so dropping the tag
+        // here would leave the seat's last public word about its own outstanding currency as
+        // "states nothing" — while the tokens it issued are still out there in somebody's wallet.
+        // A seat leaving the market still owes what it issued.
+        issuer_mint,
     )
 }
 
@@ -1846,9 +1868,101 @@ mod tests {
         );
     }
 
+    /// The producer, both ways, read back off the EVENT rather than off the draft.
+    ///
+    /// `heartbeat_for_state` takes the advertisement as a REQUIRED parameter, so a publish site
+    /// cannot forget it — this pins the two answers that parameter can carry, and that the `None`
+    /// one is a beat the market still sees.
+    #[test]
+    fn the_beat_carries_the_issuer_advertisement_it_was_given_and_omits_it_when_given_none() {
+        let stated = heartbeat_for_state(
+            0,
+            true,
+            5,
+            mints(),
+            vec!["claude".into()],
+            cap(&["claude"]),
+            TEST_POLICY,
+            Some(issuer()),
+        )
+        .to_event_draft();
+        let tag = first_tag(&stated.tags, ISSUER_MINT_TAG).expect("issuer_mint tag");
+        assert_eq!(
+            tag.0,
+            vec![
+                ISSUER_MINT_TAG.to_owned(),
+                mints()[0].clone(),
+                "2500".to_owned(),
+                "750".to_owned(),
+                "1788390000".to_owned(),
+            ]
+        );
+        assert_eq!(
+            IssuerMintAd::from_tags(&stated.tags, &mints()),
+            Some(issuer()),
+            "a reader gets back exactly what the seat stated"
+        );
+
+        let silent = heartbeat_for_state(
+            0,
+            true,
+            5,
+            mints(),
+            vec!["claude".into()],
+            cap(&["claude"]),
+            TEST_POLICY,
+            None,
+        )
+        .to_event_draft();
+        assert!(
+            first_tag(&silent.tags, ISSUER_MINT_TAG).is_none(),
+            "None states nothing and emits no tag"
+        );
+        assert_eq!(IssuerMintAd::from_tags(&silent.tags, &mints()), None);
+        // ...and the seat is still on the market. This is the §6 rule: an optional tag must never
+        // take a working seat off it.
+        let parsed = parse_heartbeat(&silent).expect("a seat with no issuer mint still parses");
+        assert!(parsed.accepting, "silence about a mint is not silence");
+        assert_eq!(parsed.issuer_mint, None);
+        // Every OTHER tag is identical, so the advertisement is purely additive.
+        let strip = |draft: &EventDraft| -> Vec<TagSpec> {
+            draft
+                .tags
+                .iter()
+                .filter(|tag| tag.first() != Some(ISSUER_MINT_TAG))
+                .cloned()
+                .collect()
+        };
+        assert_eq!(strip(&stated), strip(&silent));
+    }
+
+    /// A seat LEAVING the market still owes what it issued. The terminal beat replaces the seat's
+    /// standing announcement in place, so dropping the tag here would make the seat's permanent
+    /// public word about its own outstanding currency "states nothing".
+    #[test]
+    fn a_terminal_beat_still_states_what_the_seat_issued() {
+        let terminal = retraction_for_state(
+            0,
+            5,
+            mints(),
+            vec!["claude".into()],
+            cap(&["claude"]),
+            TEST_POLICY,
+            Some(issuer()),
+        )
+        .to_event_draft();
+        assert_eq!(
+            IssuerMintAd::from_tags(&terminal.tags, &mints()),
+            Some(issuer())
+        );
+        let parsed = parse_heartbeat(&terminal).expect("terminal beat parses");
+        assert!(!parsed.accepting, "a terminal beat is still accepting=n");
+        assert_eq!(parsed.issuer_mint, Some(issuer()));
+    }
+
     #[test]
     fn advertises_every_harness_in_preference_order() {
-        let draft = heartbeat_for_state(0, true, 5, mints(), vec!["claude".into(), "codex".into()], cap(&["claude", "codex"]), TEST_POLICY)
+        let draft = heartbeat_for_state(0, true, 5, mints(), vec!["claude".into(), "codex".into()], cap(&["claude", "codex"]), TEST_POLICY, None)
             .to_event_draft();
         let tag = first_tag(&draft.tags, "agents").expect("agents tag");
         assert_eq!(tag.0, vec!["agents", "claude", "codex"]);
@@ -1862,7 +1976,7 @@ mod tests {
         // A raw `agent_command` seller has no preset label, so it advertises no roster and the tag
         // is omitted rather than emitted empty. It IS serving (hence `true`), which is why an
         // unstated list must never read as dark.
-        let stated_none = heartbeat_for_state(0, true, 5, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY).to_event_draft();
+        let stated_none = heartbeat_for_state(0, true, 5, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY, None).to_event_draft();
         assert_eq!(
             stated_none,
             draft(true, 0, 5).with_admission(TEST_POLICY).to_event_draft()
@@ -1876,7 +1990,7 @@ mod tests {
 
     #[test]
     fn accepting_flips_with_in_flight_state() {
-        let idle = heartbeat_for_state(0, true, 5, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY);
+        let idle = heartbeat_for_state(0, true, 5, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY, None);
         assert!(idle.accepting);
         assert_eq!(idle.queue_depth, 0);
         assert_eq!(
@@ -1884,7 +1998,7 @@ mod tests {
             Some("y")
         );
 
-        let busy = heartbeat_for_state(1, true, 5, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY);
+        let busy = heartbeat_for_state(1, true, 5, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY, None);
         assert!(!busy.accepting);
         assert_eq!(busy.queue_depth, 1);
         assert_eq!(
@@ -1906,7 +2020,7 @@ mod tests {
     #[test]
     fn accepting_requires_a_free_slot_and_something_serving() {
         let accepting_of = |in_flight, serving| {
-            let draft = heartbeat_for_state(in_flight, serving, 5, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY).to_event_draft();
+            let draft = heartbeat_for_state(in_flight, serving, 5, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY, None).to_event_draft();
             (
                 first_tag_value(&draft.tags, "accepting")
                     .expect("accepting tag")
@@ -1937,7 +2051,7 @@ mod tests {
     #[test]
     fn queue_depth_is_the_depth_not_a_busy_flag() {
         for depth in [2_u32, 3, 17] {
-            let draft = heartbeat_for_state(depth, true, 5, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY).to_event_draft();
+            let draft = heartbeat_for_state(depth, true, 5, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY, None).to_event_draft();
             assert_eq!(
                 first_tag_value(&draft.tags, "queue_depth"),
                 Some(depth.to_string().as_str()),
@@ -1953,7 +2067,7 @@ mod tests {
         // And the boundary that #313 got wrong in the field: nothing in flight ⇒ available, no
         // matter how much this seat has done in the past. The store-side half of this is
         // `a_store_holding_only_terminal_jobs_reports_none_in_flight`.
-        let free = heartbeat_for_state(0, true, 5, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY).to_event_draft();
+        let free = heartbeat_for_state(0, true, 5, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY, None).to_event_draft();
         assert_eq!(first_tag_value(&free.tags, "accepting"), Some("y"));
         assert_eq!(first_tag_value(&free.tags, "queue_depth"), Some("0"));
     }
@@ -1964,7 +2078,7 @@ mod tests {
     #[test]
     fn the_terminal_beat_is_accepting_n_whatever_the_seat_was_doing() {
         for in_flight in [0_u32, 1, 9] {
-            let event = retraction_for_state(in_flight, 5, mints(), vec!["claude".into()], cap(&["claude"]), TEST_POLICY)
+            let event = retraction_for_state(in_flight, 5, mints(), vec!["claude".into()], cap(&["claude"]), TEST_POLICY, None)
                 .to_event_draft();
             assert_eq!(
                 first_tag_value(&event.tags, "accepting"),
@@ -1989,8 +2103,8 @@ mod tests {
     /// it, and the directory would go on reading the old one.
     #[test]
     fn the_terminal_beat_replaces_the_live_one_at_the_same_address() {
-        let live = heartbeat_for_state(0, true, 5, mints(), vec!["claude".into()], cap(&["claude"]), TEST_POLICY).to_event_draft();
-        let terminal = retraction_for_state(0, 5, mints(), vec!["claude".into()], cap(&["claude"]), TEST_POLICY).to_event_draft();
+        let live = heartbeat_for_state(0, true, 5, mints(), vec!["claude".into()], cap(&["claude"]), TEST_POLICY, None).to_event_draft();
+        let terminal = retraction_for_state(0, 5, mints(), vec!["claude".into()], cap(&["claude"]), TEST_POLICY, None).to_event_draft();
 
         assert_eq!(first_tag_value(&live.tags, "accepting"), Some("y"));
         assert_eq!(terminal.kind, live.kind, "same kind, or it is not a replacement");
@@ -2443,6 +2557,7 @@ mod tests {
                 ],
             ),
                     TEST_POLICY,
+            None,
         )
         .to_event_draft();
 
@@ -2467,7 +2582,7 @@ mod tests {
     fn a_seat_that_observed_no_model_emits_no_model_tag() {
         // The default state of every seat before a probe has reported anything. Absent means
         // unstated, and nothing else on the beat shifts because of it.
-        let event = heartbeat_for_state(0, true, 5, mints(), vec!["claude".to_owned()], cap(&["claude"]), TEST_POLICY)
+        let event = heartbeat_for_state(0, true, 5, mints(), vec!["claude".to_owned()], cap(&["claude"]), TEST_POLICY, None)
             .to_event_draft();
         assert!(harness_models_from_tags(&event.tags).is_empty());
         // The POSITIVE CONTROL for the assertion above: the same event still carries the family, so
@@ -2720,6 +2835,7 @@ mod tests {
             vec!["claude".to_owned(), "my-fork".to_owned(), "codex".to_owned()],
             cap(&["claude", "my-fork", "codex"]),
                     TEST_POLICY,
+            None,
         )
         .to_event_draft();
         assert_eq!(agents_from_tags(&event.tags), vec!["claude", "my-fork", "codex"]);
