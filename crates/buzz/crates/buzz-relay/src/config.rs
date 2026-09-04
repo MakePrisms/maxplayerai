@@ -257,6 +257,28 @@ pub struct Config {
     /// HMAC secret for git pre-receive hook callbacks.
     /// Used to authenticate internal policy endpoint requests.
     pub git_hook_hmac_secret: String,
+    /// Longest life, in seconds, granted to a NIP-98 git push token that is scoped to a
+    /// single ref AND carries a NIP-40 `expiration` tag. Default: 21600 (6 hours).
+    ///
+    /// A seller mints one push token on the host before a sandboxed job starts, then
+    /// pushes with it minutes later, so the ±60 s window cannot serve that push. The ref
+    /// scope is what makes the longer life safe: the token may write one branch of one
+    /// repo, and the pre-receive hook enforces that. Unscoped tokens keep the ±60 s
+    /// window whatever this value says.
+    ///
+    /// Raise it above the longest job deadline the marketplace allows; a token that asks
+    /// for more than this is rejected outright, not shortened. The effective value is
+    /// advertised in the NIP-11 `limitation` object as `scoped_token_max_lifetime_secs`,
+    /// so a client can refuse an over-cap token at mint time.
+    ///
+    /// While this is non-zero the git legs also REFUSE a `ref` tag that is not a valid
+    /// ref name, rather than reading it as an absent scope: the push path will not
+    /// enforce a scope it cannot parse, so a token whose holder asked for one branch must
+    /// not become a token that may write any branch.
+    ///
+    /// Set via `BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS`. Zero disables the relaxation and
+    /// puts every token back on the ±60 s window.
+    pub scoped_token_max_lifetime_secs: u64,
 
     /// Descriptor key identifier accepted in kind:30350 `exec` tags.
     pub push_executor_key_id: String,
@@ -773,6 +795,14 @@ impl Config {
                 let secret: [u8; 32] = rand::random();
                 hex::encode(secret)
             });
+        // 6 hours by default. See the `scoped_token_max_lifetime_secs` field doc: this
+        // only ever applies to a token that carries BOTH a valid ref scope and an
+        // `expiration` tag, so raising it cannot lengthen an unscoped token's life.
+        let scoped_token_max_lifetime_secs: u64 =
+            std::env::var("BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(buzz_auth::DEFAULT_SCOPED_TOKEN_MAX_LIFETIME_SECS);
         let push_executor_key_id =
             std::env::var("BUZZ_PUSH_EXECUTOR_KEY_ID").unwrap_or_else(|_| "relay-v1".to_string());
         if push_executor_key_id.is_empty() || push_executor_key_id.len() > 64 {
@@ -947,6 +977,7 @@ impl Config {
             git_max_repos_per_pubkey,
             git_max_concurrent_ops,
             git_hook_hmac_secret,
+            scoped_token_max_lifetime_secs,
             push_executor_key_id,
             push_gateway_delivery_url,
             push_gateway_timeout,
@@ -1022,6 +1053,52 @@ mod tests {
         assert!(
             config.huddle_audio_available,
             "huddle_audio_available should default to true so single-pod (N=1) keeps today's huddle behavior"
+        );
+        assert_eq!(
+            config.scoped_token_max_lifetime_secs,
+            buzz_auth::DEFAULT_SCOPED_TOKEN_MAX_LIFETIME_SECS,
+            "the scoped push-token cap should default to 6 hours"
+        );
+        assert_eq!(
+            config.scoped_token_max_lifetime_secs, 21_600,
+            "the default is 6 hours; the marketplace's longest job deadline must fit inside it"
+        );
+    }
+
+    #[test]
+    fn scoped_token_max_lifetime_env_override_and_invalid_fallback() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous = std::env::var_os("BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS");
+
+        std::env::set_var("BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS", "43200");
+        let raised = Config::from_env()
+            .expect("config")
+            .scoped_token_max_lifetime_secs;
+
+        // Zero is a real value, not a typo: it switches the relaxation off and puts every
+        // token back on the ±60 s window.
+        std::env::set_var("BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS", "0");
+        let off = Config::from_env()
+            .expect("config")
+            .scoped_token_max_lifetime_secs;
+
+        std::env::set_var("BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS", "six hours");
+        let junk = Config::from_env()
+            .expect("config")
+            .scoped_token_max_lifetime_secs;
+
+        if let Some(value) = previous {
+            std::env::set_var("BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS", value);
+        } else {
+            std::env::remove_var("BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS");
+        }
+
+        assert_eq!(raised, 43_200);
+        assert_eq!(off, 0, "zero must switch the relaxation off, not fall back");
+        assert_eq!(
+            junk,
+            buzz_auth::DEFAULT_SCOPED_TOKEN_MAX_LIFETIME_SECS,
+            "an unparsable value must fall back to the default"
         );
     }
 
