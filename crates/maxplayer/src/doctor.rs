@@ -1648,8 +1648,8 @@ mod checks {
     /// open AFTER bootstrap (an external chmod, a restored backup, a pre-#473 seat that never
     /// re-bootstrapped) rather than trusting the enforcement to be the only guard.
     ///
-    /// Access-exposure is orthogonal to transaction value — testnut vs real changes nothing about who
-    /// can read the key — so this never consults the mint. A too-open dir is a WARN for a seat only its
+    /// Access-exposure is orthogonal to transaction value — which mint a seat uses changes nothing
+    /// about who can read the key — so this never consults the mint. A too-open dir is a WARN for a seat only its
     /// named buyers can reach (single-user boxes are common, and there the exposure is nil) and a FAIL
     /// for one strangers can reach, whose higher exposure warrants the stricter posture. A no-op PASS
     /// where there is no POSIX mode to read (non-unix): the `too_open` list simply stays empty.

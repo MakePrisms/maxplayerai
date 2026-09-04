@@ -40,8 +40,6 @@ pub struct AwardFilters<'a> {
     /// The buyer's own paying mint (config default). A claim whose `creq` lists no mint the buyer
     /// can settle at is skipped — the #126 mandatory guard: never auto-award what we cannot pay.
     pub buyer_mint: &'a str,
-    /// Whether real (non-testnut) mints are permitted; gates the mint-compat check.
-    pub allow_real_mints: bool,
     /// The harness the OFFER asked for, read back from the relay (never from award params — the
     /// signed offer is the authority for what the job requested). `None` ⇒ no preference and every
     /// claim passes this filter unchanged.
@@ -80,18 +78,16 @@ pub struct AwardFilters<'a> {
 /// stronger test.
 ///
 /// Everything filterable comes from the OFFER; only the money context is passed in, because the
-/// buyer's mint and its real-mint policy are properties of the buyer rather than of the job.
+/// buyer's own paying mint is a property of the buyer rather than of the job.
 pub fn award_filters_for_offer<'a>(
     offer: &'a OfferView,
     max_sats: u64,
     buyer_mint: &'a str,
-    allow_real_mints: bool,
 ) -> AwardFilters<'a> {
     AwardFilters {
         offer_amount_sats: offer.amount_sats,
         max_sats,
         buyer_mint,
-        allow_real_mints,
         requested_agent: offer.requested_agent.as_deref(),
         requested_harness_family: offer.requested_harness_family.as_deref(),
         requested_model: offer.requested_model.as_deref(),
@@ -409,7 +405,6 @@ pub fn unsatisfiable_capability_request(
         offer_amount_sats: 0,
         max_sats: 0,
         buyer_mint: "",
-        allow_real_mints: false,
         requested_agent,
         requested_harness_family,
         requested_model,
@@ -608,7 +603,7 @@ fn claim_is_payable(job_id: &str, creq: Option<&str>, filters: &AwardFilters) ->
     // fence admits. This is the SAME planning the pay path performs, so a claim that passes here is
     // one the buyer can actually pay, by whichever of those two routes.
     let listed: Vec<String> = request.mints.iter().map(|mint| mint.to_string()).collect();
-    plan_payment(filters.buyer_mint, &listed, filters.allow_real_mints).is_ok()
+    plan_payment(filters.buyer_mint, &listed).is_ok()
 }
 
 /// What [`award_with_reservation`] may do about a job, decided BEFORE any reserve, sign, or send.
@@ -1521,10 +1516,13 @@ pub fn apply_unattempted_floor(
 
 #[cfg(test)]
 mod tests {
+    /// Test fixture mint host — NOT a default. A mint is just a mint: what makes one usable is membership of
+    /// the home's configured list, which each test sets up explicitly.
+    const FIXTURE_MINT_URL: &str = "https://mint.example/Bitcoin";
     use super::*;
     use crate::budget::BudgetGate;
     use crate::gateway::creq::build_seller_creq;
-    use crate::home::{self, DEFAULT_MINT_URL};
+    use crate::home::{self};
     use crate::job_lifecycle::{ClaimView, OfferView, RelayedAward};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -1608,8 +1606,7 @@ mod tests {
         AwardFilters {
             offer_amount_sats: offer_amount,
             max_sats,
-            buyer_mint: DEFAULT_MINT_URL,
-            allow_real_mints: false,
+            buyer_mint: FIXTURE_MINT_URL,
             requested_agent: None,
             requested_harness_family: None,
             requested_model: None,
@@ -1621,7 +1618,7 @@ mod tests {
     #[test]
     fn select_picks_live_payable_claim() {
         let job = "a".repeat(64);
-        let view = view_with(&job, 10, vec![claim(&job, true, 10, &[DEFAULT_MINT_URL.into()])]);
+        let view = view_with(&job, 10, vec![claim(&job, true, 10, &[FIXTURE_MINT_URL.into()])]);
         let selected = select_awardable_claim(&view, &filters(10, 100));
         assert_eq!(selected.as_deref(), Some("c".repeat(64).as_str()));
     }
@@ -1634,9 +1631,9 @@ mod tests {
     #[test]
     fn a_job_requesting_a_harness_is_never_awarded_to_a_claim_without_it() {
         let job = "a".repeat(64);
-        let mut codex_only = claim(&job, true, 10, &[DEFAULT_MINT_URL.into()]);
+        let mut codex_only = claim(&job, true, 10, &[FIXTURE_MINT_URL.into()]);
         codex_only.agents = vec!["codex".to_owned()];
-        let mut silent = claim(&job, true, 10, &[DEFAULT_MINT_URL.into()]);
+        let mut silent = claim(&job, true, 10, &[FIXTURE_MINT_URL.into()]);
         silent.claim_id = "d".repeat(64);
         let view = view_with(&job, 10, vec![codex_only, silent]);
 
@@ -1685,7 +1682,7 @@ mod tests {
     #[test]
     fn every_award_entry_point_applies_the_capability_predicate() {
         let job = "a".repeat(64);
-        let mut named = claim(&job, true, 10, &[DEFAULT_MINT_URL.into()]);
+        let mut named = claim(&job, true, 10, &[FIXTURE_MINT_URL.into()]);
         named.capability = crate::heartbeat::SeatCapability {
             harness_families: vec!["codex".to_owned()],
             models: vec![crate::heartbeat::HarnessModel {
@@ -1771,7 +1768,7 @@ mod tests {
     #[test]
     fn no_harness_request_awards_exactly_as_before() {
         let job = "a".repeat(64);
-        let view = view_with(&job, 10, vec![claim(&job, true, 10, &[DEFAULT_MINT_URL.into()])]);
+        let view = view_with(&job, 10, vec![claim(&job, true, 10, &[FIXTURE_MINT_URL.into()])]);
         let unfiltered = filters(10, 100);
         assert!(unfiltered.requested_agent.is_none());
         assert_eq!(
@@ -1791,29 +1788,43 @@ mod tests {
     #[test]
     fn select_skips_non_live_claim() {
         let job = "a".repeat(64);
-        let view = view_with(&job, 10, vec![claim(&job, false, 10, &[DEFAULT_MINT_URL.into()])]);
+        let view = view_with(&job, 10, vec![claim(&job, false, 10, &[FIXTURE_MINT_URL.into()])]);
         assert_eq!(select_awardable_claim(&view, &filters(10, 100)), None);
     }
 
-    // Mint compatibility is a HARD filter: a live claim quoting only a mint the buyer cannot pay
-    // from is skipped — the buyer must never auto-award a claim it cannot settle.
+    // Mint compatibility is a HARD filter: a live claim the buyer cannot plan a payment to is
+    // skipped — the buyer must never auto-award a claim it cannot settle. A seller mint the buyer
+    // does not hold is NOT such a claim (the buyer hops to it); a creq that lists nothing this
+    // wallet can speak to is.
     #[test]
     fn select_skips_claim_with_no_payable_mint() {
         let job = "a".repeat(64);
-        // The seller lists only a foreign testnut mint; the buyer's default mint is not among it.
         let view = view_with(
             &job,
             10,
-            vec![claim(&job, true, 10, &["https://foreign.testnut.example".into()])],
+            vec![claim(&job, true, 10, &["ftp://not-a-mint.example".into()])],
         );
         assert_eq!(select_awardable_claim(&view, &filters(10, 100)), None);
+    }
+
+    // The other half: a seller mint the buyer simply does not hold IS payable — a hop reaches it.
+    // Together these pin where "payable" ends now that a mint is just a mint.
+    #[test]
+    fn select_takes_a_claim_at_a_mint_the_buyer_does_not_hold() {
+        let job = "a".repeat(64);
+        let view = view_with(
+            &job,
+            10,
+            vec![claim(&job, true, 10, &["https://foreign-mint.example".into()])],
+        );
+        assert!(select_awardable_claim(&view, &filters(10, 100)).is_some());
     }
 
     // Over the buyer's ceiling: an offer amount above max_sats yields no selection.
     #[test]
     fn select_skips_when_offer_over_max_sats() {
         let job = "a".repeat(64);
-        let view = view_with(&job, 50, vec![claim(&job, true, 50, &[DEFAULT_MINT_URL.into()])]);
+        let view = view_with(&job, 50, vec![claim(&job, true, 50, &[FIXTURE_MINT_URL.into()])]);
         assert_eq!(select_awardable_claim(&view, &filters(50, 40)), None);
     }
 
@@ -1822,7 +1833,7 @@ mod tests {
     #[test]
     fn select_skips_claim_priced_off_the_offer() {
         let job = "a".repeat(64);
-        let view = view_with(&job, 10, vec![claim(&job, true, 11, &[DEFAULT_MINT_URL.into()])]);
+        let view = view_with(&job, 10, vec![claim(&job, true, 11, &[FIXTURE_MINT_URL.into()])]);
         assert_eq!(select_awardable_claim(&view, &filters(10, 100)), None);
     }
 
@@ -1832,7 +1843,7 @@ mod tests {
     fn named_claim_awardable_accepts_live_payable_within_max() {
         let job = "a".repeat(64);
         let claim_id = "c".repeat(64);
-        let view = view_with(&job, 10, vec![claim(&job, true, 10, &[DEFAULT_MINT_URL.into()])]);
+        let view = view_with(&job, 10, vec![claim(&job, true, 10, &[FIXTURE_MINT_URL.into()])]);
         assert_eq!(named_claim_awardable(&view, &claim_id, &filters(10, 100)), Ok(()));
     }
 
@@ -1842,7 +1853,7 @@ mod tests {
     fn named_claim_over_max_sats_refused() {
         let job = "a".repeat(64);
         let claim_id = "c".repeat(64);
-        let view = view_with(&job, 50, vec![claim(&job, true, 50, &[DEFAULT_MINT_URL.into()])]);
+        let view = view_with(&job, 50, vec![claim(&job, true, 50, &[FIXTURE_MINT_URL.into()])]);
         assert_eq!(
             named_claim_awardable(&view, &claim_id, &filters(50, 40)),
             Err(NamedAwardRefused::OverMax { offer_amount_sats: 50, max_sats: 40 })
@@ -1853,7 +1864,7 @@ mod tests {
     #[test]
     fn named_claim_not_found_refused() {
         let job = "a".repeat(64);
-        let view = view_with(&job, 10, vec![claim(&job, true, 10, &[DEFAULT_MINT_URL.into()])]);
+        let view = view_with(&job, 10, vec![claim(&job, true, 10, &[FIXTURE_MINT_URL.into()])]);
         let missing = "d".repeat(64);
         assert_eq!(
             named_claim_awardable(&view, &missing, &filters(10, 100)),
@@ -1866,7 +1877,7 @@ mod tests {
     fn named_claim_not_live_refused() {
         let job = "a".repeat(64);
         let claim_id = "c".repeat(64);
-        let view = view_with(&job, 10, vec![claim(&job, false, 10, &[DEFAULT_MINT_URL.into()])]);
+        let view = view_with(&job, 10, vec![claim(&job, false, 10, &[FIXTURE_MINT_URL.into()])]);
         assert_eq!(
             named_claim_awardable(&view, &claim_id, &filters(10, 100)),
             Err(NamedAwardRefused::NotLive { claim_id })
@@ -1882,7 +1893,7 @@ mod tests {
         let view = view_with(
             &job,
             10,
-            vec![claim(&job, true, 10, &["https://foreign.testnut.example".into()])],
+            vec![claim(&job, true, 10, &["ftp://not-a-mint.example".into()])],
         );
         assert_eq!(
             named_claim_awardable(&view, &claim_id, &filters(10, 100)),
@@ -3872,7 +3883,7 @@ mod tests {
     fn a_foreign_offer_naming_a_bogus_family_is_refused_on_both_paths_and_parks_blaming_the_request()
     {
         let job = "a".repeat(64);
-        let mints = vec![DEFAULT_MINT_URL.to_owned()];
+        let mints = vec![FIXTURE_MINT_URL.to_owned()];
         let claim_id = "c".repeat(64);
 
         // A claim that is payable, live, and advertises exactly the bogus family requested. Every
@@ -3955,7 +3966,7 @@ mod tests {
     /// predicate, and the fix in both cases is to call the real thing rather than to test the copy
     /// harder.
     fn filters_from_offer<'a>(offer: &'a OfferView, max_sats: u64) -> AwardFilters<'a> {
-        award_filters_for_offer(offer, max_sats, DEFAULT_MINT_URL, false)
+        award_filters_for_offer(offer, max_sats, FIXTURE_MINT_URL)
     }
 
     // THE ACCEPTANCE TEST FOR #897, both axes through BOTH selection entry points.
@@ -3970,7 +3981,7 @@ mod tests {
     #[test]
     fn an_offer_sourced_request_refuses_a_non_matching_claim_on_both_paths() {
         let job = "a".repeat(64);
-        let mints = vec![DEFAULT_MINT_URL.to_owned()];
+        let mints = vec![FIXTURE_MINT_URL.to_owned()];
         let claim_id = "c".repeat(64);
         let mut payable = claim(&job, true, 10, &mints);
         payable.capability = seat(&["codex"], &[], &["rust"]);
@@ -4226,7 +4237,7 @@ mod tests {
     #[test]
     fn a_request_matching_no_claim_parks_with_an_actionable_reason() {
         let job = "a".repeat(64);
-        let mints = vec![DEFAULT_MINT_URL.to_owned()];
+        let mints = vec![FIXTURE_MINT_URL.to_owned()];
         let mut payable = claim(&job, true, 10, &mints);
         payable.capability = seat(&["codex"], &[], &[]);
 
@@ -4267,7 +4278,7 @@ mod tests {
     #[test]
     fn a_foreign_model_only_offer_is_refused_at_award_and_parks_saying_why() {
         let job = "a".repeat(64);
-        let mints = vec![DEFAULT_MINT_URL.to_owned()];
+        let mints = vec![FIXTURE_MINT_URL.to_owned()];
         let claim_id = "c".repeat(64);
         // A seat that genuinely advertises the model, under a family. Even this claim must be refused:
         // the defect is in the REQUEST, and a claim-blaming refusal would send an operator to fix a
@@ -4313,7 +4324,7 @@ mod tests {
     #[test]
     fn the_park_reason_declines_to_blame_capability_when_it_was_not_the_obstacle() {
         let job = "a".repeat(64);
-        let mints = vec![DEFAULT_MINT_URL.to_owned()];
+        let mints = vec![FIXTURE_MINT_URL.to_owned()];
         let mut matching = claim(&job, true, 10, &mints);
         matching.capability = seat(&["codex"], &[], &[]);
 
@@ -4365,7 +4376,7 @@ mod tests {
     #[test]
     fn the_capability_clause_survives_the_real_deadline_demotion() {
         let job = "a".repeat(64);
-        let mints = vec![DEFAULT_MINT_URL.to_owned()];
+        let mints = vec![FIXTURE_MINT_URL.to_owned()];
         let deadline = 1_000_u64;
 
         let park_row_for = |capability: crate::heartbeat::SeatCapability, requested| {
@@ -4550,7 +4561,7 @@ mod tests {
     #[test]
     fn select_awardable_claim_consults_the_capability_predicate() {
         let job = "a".repeat(64);
-        let mints = vec![DEFAULT_MINT_URL.to_owned()];
+        let mints = vec![FIXTURE_MINT_URL.to_owned()];
         let mut payable = claim(&job, true, 10, &mints);
         payable.capability = seat(&["codex"], &[], &[]);
         let view = view_with(&job, 10, vec![payable]);

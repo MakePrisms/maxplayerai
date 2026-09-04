@@ -413,9 +413,9 @@ async fn collect_passes_the_sentinel_gate_for_a_valid_delivery() {
 // (`gate.spent()==charged`, and a journal is written) before the preflight ever runs, so every ZERO
 // assertion below flips and this test goes RED. That is the exact budget leak Option A closes.
 //
-// `allow_real_mints=true` is ISOLATED to this test home so the pay path will resolve + open the wallet
-// at the (dead) real mint; 127.0.0.1:1 refuses the connect, so NO real mint is contacted and no money
-// can move. The cosig is unaffected — the `ReceiptPreimage` binds no mint
+// The dead mint is SEALED into this test's bind and accepted set, so the pay path resolves + opens
+// the wallet at it; 127.0.0.1:1 refuses the connect, so NO mint is contacted and no money can move.
+// The cosig is unaffected — the `ReceiptPreimage` binds no mint
 // (`receipt_preimage_digest_is_independent_of_realized_mint`, authorize_pay.rs).
 #[tokio::test(flavor = "current_thread")]
 async fn collect_refuses_dead_mint_at_preflight_before_the_budget_reserve() {
@@ -441,11 +441,7 @@ async fn collect_refuses_dead_mint_at_preflight_before_the_budget_reserve() {
 
     let root = temp("home-deadmint");
     let _ = fs::remove_dir_all(&root);
-    let mut home = home::bootstrap(&root).expect("home");
-    // Real-mint opt-in ISOLATED to this test home: lets `plan_payment` + `open_wallet_at_mint_async`
-    // resolve/open the wallet at the (dead) real mint so the preflight is actually exercised. The mint
-    // is connection-refused loopback, so this opts in to no real money.
-    home.config.allow_real_mints = true;
+    let home = home::bootstrap(&root).expect("home");
     let secret_hex = home::read_secret_key_hex(&home).expect("secret");
     let pubkey_hex = home::public_key_hex(&home).expect("pubkey");
 

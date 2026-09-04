@@ -221,17 +221,18 @@ authorized. This is real money: it is authorized by a human naming those three v
 agent and never by a retry."
 }
 
-# Config is supplied ENTIRELY by environment. Measured: env overrides are never persisted — a home
-# booted with MAXPLAYER_ALLOW_REAL_MINTS=true still has `allow_real_mints = false` in its config.toml.
-# So the real-mint fence is process-scoped and evaporates on exit. There is no fence to restore and
-# no EXIT trap that could fail to restore it.
+# Config is supplied ENTIRELY by environment. Measured: env overrides are never persisted, so the
+# mint lists below are process-scoped and evaporate on exit. There is nothing to restore and no EXIT
+# trap that could fail to restore it.
+#
+# A mint is usable when it is on the seat's configured list, and not otherwise — that list is what
+# these variables set.
 #
 # These are EXPORTED rather than prefixed onto each call: maxplayer_at is a shell function, and `env
 # VAR=x maxplayer_at ...` cannot work — env execs a binary and would never see the function. Exporting
-# also means the fence and the cap apply to every invocation in the stage, not just the ones a
+# also means the mint lists and the cap apply to every invocation in the stage, not just the ones a
 # caller remembered to prefix.
-arm_real_mints() {
-    export MAXPLAYER_ALLOW_REAL_MINTS=true
+arm_mint_lists() {
     export MAXPLAYER_ACCEPTED_MINTS="$SOURCE_MINT"
     export MAXPLAYER_EXTRA_MINTS="$TARGET_MINT"
     # The exposure cap as a RUNTIME gate rather than a matter of discipline: the budget gate
@@ -246,7 +247,7 @@ arm_real_mints() {
 # `status=needs_payment` branch is exercised — the branch no test mint can produce.
 fund() {
     require_auth
-    arm_real_mints
+    arm_mint_lists
     local home="$RUN_DIR/probe"
     rule "FUND — raise a ${FUND_SATS} sat mint quote at the SOURCE (${SOURCE_MINT})"
     ensure_home "$home"
@@ -273,7 +274,7 @@ If it auto-funded instead, it is a TEST mint and this is not the real-sats path.
 
 fund_complete() { # <quote_id>
     require_auth
-    arm_real_mints
+    arm_mint_lists
     local home="$RUN_DIR/probe" quote_id="${1:-}"
     [ -n "$quote_id" ] || die "usage: $0 --fund-complete <quote_id>"
     rule "FUND-COMPLETE — issue the ecash at the source"
@@ -293,7 +294,7 @@ the mint and recoverable — re-run this exact command. Do not re-pay the invoic
 # ── Stage A: routing + fee probe ────────────────────────────────────────────────────────────────
 stage_a() {
     require_auth
-    arm_real_mints
+    arm_mint_lists
     local home="$RUN_DIR/probe"
     rule "STAGE A — routing + fee probe: ${PROBE_SATS} sats ${SOURCE_MINT} -> ${TARGET_MINT}"
     ensure_home "$home"
@@ -346,7 +347,7 @@ unpaid. STOP HERE and report. Do not run mint-complete."
 ${TARGET_MINT} failed for quote ${quote_id}. The money left the source and is not yet ecash at the
 target. It is RECOVERABLE and no sats are lost — re-run exactly:
 
-  MAXPLAYER_HOME=${home} MAXPLAYER_ALLOW_REAL_MINTS=true MAXPLAYER_ACCEPTED_MINTS=${SOURCE_MINT} \\
+  MAXPLAYER_HOME=${home} MAXPLAYER_ACCEPTED_MINTS=${SOURCE_MINT} \\
   MAXPLAYER_EXTRA_MINTS=${TARGET_MINT} ${MAXPLAYER} wallet mint-complete ${quote_id} \\
   --amount ${PROBE_SATS} --mint ${TARGET_MINT} --home ${home}
 

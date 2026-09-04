@@ -16,7 +16,8 @@ use std::path::PathBuf;
 
 use maxplayer_core::delivery_transport::is_relay_git_locator;
 use maxplayer_core::home::{
-    self, MaxplayerHome, SellerConfig, DEFAULT_MINT_URL, DEFAULT_RATE_SATS, DEFAULT_RELAY_URL,
+    self, MaxplayerHome, SellerConfig, DEFAULT_MINIBITS_MINT_URL, DEFAULT_RATE_SATS,
+    DEFAULT_RELAY_URL,
 };
 use maxplayer_core::profile::{self, SetProfileRequest};
 
@@ -135,7 +136,7 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
                 config.relay_url = DEFAULT_RELAY_URL.to_owned();
             }
             if needs_mints {
-                config.accepted_mints = vec![DEFAULT_MINT_URL.to_owned()];
+                config.accepted_mints = vec![DEFAULT_MINIBITS_MINT_URL.to_owned()];
             }
         })
         .map_err(|error| {

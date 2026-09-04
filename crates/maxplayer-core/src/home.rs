@@ -34,7 +34,6 @@
 //! | `accepted_mints` (list) | `MAXPLAYER_ACCEPTED_MINTS=a,b` |
 //! | `per_job_budget_sats` | `MAXPLAYER_PER_JOB_BUDGET_SATS` |
 //! | `extra_mints` (list) | `MAXPLAYER_EXTRA_MINTS=a,b` |
-//! | `allow_real_mints` | `MAXPLAYER_ALLOW_REAL_MINTS` |
 //! | `profile.name` | `MAXPLAYER_PROFILE__NAME` |
 //! | `seller.rate_sats` | `MAXPLAYER_SELLER__RATE_SATS` |
 //! | `seller.agent_command` (list) | `MAXPLAYER_SELLER__AGENT_COMMAND=claude,--flag` |
@@ -67,13 +66,12 @@ use serde::{Deserialize, Serialize};
 
 /// Open-market relay — the maxplayer launch relay.
 pub const DEFAULT_RELAY_URL: &str = "wss://relay.maxplayer.ai";
-/// Standing CDK test mint — its bolt11 invoices auto-settle, so it moves no real money. Kept as the
-/// testnut/dev allow-list anchor: `mint_allowed` admits exactly this when `allow_real_mints` is false.
-pub const DEFAULT_MINT_URL: &str = "https://testnut.cashudevkit.org";
-/// Shipped default seller mint (issue #378): a REAL minibits mint. Fresh configs accept real sats here
-/// by default — paired with `allow_real_mints = true`, without which the fence would refuse this mint.
+/// Shipped default mint: the seat's first `accepted_mints` entry on a fresh config, and the
+/// fallback every product default reads. A mint is just a mint — the seat's configured list is the
+/// only thing that decides whether it may be used (owner ruling, 2 Sep 2026).
 pub const DEFAULT_MINIBITS_MINT_URL: &str = "https://mint.minibits.cash/Bitcoin";
-/// Dead testnut host — bootstrap migrates config.toml away from this.
+/// Dead mint host — bootstrap migrates a config.toml carrying it onto
+/// [`DEFAULT_MINIBITS_MINT_URL`]. Removal only: nothing writes this host.
 pub const DEAD_TESTNUT_MINT_HOST: &str = "testnut.cashu.space";
 /// Empty-market per-job spend fallback (sats): the cap applied when no market-rate signal exists.
 /// Market-rate derivation is a follow-up (#378); until then every fresh config ships this cap.
@@ -1307,7 +1305,11 @@ pub struct MaxplayerConfig {
     pub relay_url: String,
     /// Seller-side accept policy: the mints this seller will accept payment at. The first
     /// entry is the mint the seller advertises first and also the buyer-side wallet default
-    /// mint (read via [`MaxplayerConfig::default_mint`]). Defaults to `[DEFAULT_MINT_URL]`.
+    /// mint (read via [`MaxplayerConfig::default_mint`]). Defaults to
+    /// `[DEFAULT_MINIBITS_MINT_URL]`.
+    ///
+    /// This list IS the mint policy. There is no second gate: a mint is usable by this seat when
+    /// it is on this list (or in `extra_mints` for the buyer wallet), and not otherwise.
     ///
     /// NOTE: distinct from `extra_mints`. `accepted_mints` is the SELLER accept-policy list;
     /// `extra_mints` is the BUYER wallet's *additional allowed* mints. They are separate
@@ -1325,15 +1327,6 @@ pub struct MaxplayerConfig {
     /// never invents spendable credit by itself.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_mints: Vec<String>,
-    /// REAL-MONEY SWITCH (issue #49). When `true` (issue #378 made this the DEFAULT, because the
-    /// shipped `accepted_mints` default is a real minibits mint) the seller `accepted_mints` boot fence
-    /// and the buyer pay-path mint resolution admit any well-formed `https://` mint URL — real sats
-    /// move. When `false` (explicit opt-OUT) only the testnut/dev allow-list ([`DEFAULT_MINT_URL`]) is
-    /// admitted; a real mint is refused fail-closed. It flips ONLY the allow-list check; every other
-    /// money gate (creq membership, redeem guard token==payload mint, dust guard, per-job budget cap,
-    /// co-signatures) is unchanged — the per-job cap is the standing spend bound on the real path.
-    #[serde(default = "default_allow_real_mints")]
-    pub allow_real_mints: bool,
     /// Optional `[profile] name / about`. Skipped when absent so fresh homes stay unnamed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<ProfileConfig>,
@@ -1442,10 +1435,9 @@ pub struct ContributionPolicyConfig {
     pub max_diff_bytes: Option<u64>,
 }
 
-/// Serde/default seed for [`MaxplayerConfig::accepted_mints`] (issue #378): a single REAL minibits mint.
-/// A fresh config accepts real sats here by default — which is why [`MaxplayerConfig::default`] also flips
-/// `allow_real_mints` true, without which `mint_allowed` would refuse this very default. Mint VARIETY
-/// (multiple real mints) lives in the market-mode loop, not the shipped default pool.
+/// Serde/default seed for [`MaxplayerConfig::accepted_mints`] (issue #378): a single minibits mint.
+/// A fresh config accepts sats there by default. Mint VARIETY (multiple mints) lives in the
+/// market-mode loop, not the shipped default pool.
 fn default_accepted_mints() -> Vec<String> {
     vec![DEFAULT_MINIBITS_MINT_URL.to_owned()]
 }
@@ -1460,41 +1452,84 @@ fn default_per_job_budget_sats() -> u64 {
     DEFAULT_PER_JOB_BUDGET_SATS
 }
 
-/// Serde default for [`MaxplayerConfig::allow_real_mints`] — `true` (issue #378). The shipped
-/// `accepted_mints` default is a real mint, so the fence must admit it; `false` here would make the
-/// default config refuse its own default mint. Set `allow_real_mints = false` to force testnut-only.
-fn default_allow_real_mints() -> bool {
-    true
-}
-
-/// The single real-mint fence predicate (issue #49), shared by the seller `accepted_mints` boot
-/// check and the buyer pay-path mint resolution so both sides gate on the SAME rule.
+/// Whether a mint URL is WELL FORMED enough to be configured: `http://` or `https://` with a
+/// non-empty host.
 ///
-/// - `allow_real_mints == false` (default safety posture): only the testnut/dev allow-list — today
-///   that is exactly [`DEFAULT_MINT_URL`].
-/// - `allow_real_mints == true` (operator opt-in real-money switch): any well-formed `https://`
-///   mint URL. Full URL validity is re-checked downstream (`MintUrl::from_str` / `Wallet::new`);
-///   this predicate only decides the POLICY (the testnut/dev allow-list vs any-https).
-pub fn mint_allowed(mint_url: &str, allow_real_mints: bool) -> bool {
-    if allow_real_mints {
-        mint_url
-            .strip_prefix("https://")
-            .is_some_and(|host| !host.is_empty())
+/// This is a SHAPE rule, not a policy. There is no real-mint/test-mint distinction anywhere — "the
+/// concept of real mint doesn't make sense, it's just a mint; the seller chooses what mint to
+/// accept or not" (owner ruling, 2 Sep 2026). The ONE policy gate on a mint is membership of this
+/// seat's configured list (`accepted_mints`, plus `extra_mints` for the buyer wallet); this
+/// predicate only rejects a string that could never be a mint at all. Full URL validity is
+/// re-checked downstream (`MintUrl::from_str` / `Wallet::new`).
+///
+/// `http://` is admitted deliberately: a seat's own sidecar mint runs on loopback — including IPv6
+/// loopback, `http://[::1]:3338` — and an https-only shape rule would make the operator's own list
+/// unusable.
+///
+/// This validator is deliberately hand-rolled rather than delegated to a general URL parser: a
+/// browser-compatibility parser is the wrong instrument for an admission whitelist. `url::Url` reads
+/// `http:///x` as the host `x` (WHATWG special schemes skip repeated slashes), which would ADMIT a
+/// string this predicate exists to refuse.
+pub fn mint_url_supported(mint_url: &str) -> bool {
+    // 1. Only the two schemes this wallet speaks.
+    let Some(rest) = mint_url
+        .strip_prefix("https://")
+        .or_else(|| mint_url.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    // 2. The authority ends at the first `/`, `?` or `#` — so `http:///x` has an EMPTY authority,
+    //    not the host `x`.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // 3. Userinfo is not the host: keep only what follows the last `@`.
+    let host_part = authority.rsplit('@').next().unwrap_or("");
+    let host = if let Some(after_open) = host_part.strip_prefix('[') {
+        // 4. A bracketed IPv6 literal: it must close, the literal must be non-empty, and what
+        //    follows the bracket is either nothing or a `:` and an all-digit port.
+        let Some((literal, after_close)) = after_open.split_once(']') else {
+            return false;
+        };
+        let port_ok = match after_close.strip_prefix(':') {
+            Some(port) => !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()),
+            None => after_close.is_empty(),
+        };
+        if !port_ok {
+            return false;
+        }
+        literal
     } else {
-        mint_url == DEFAULT_MINT_URL
-    }
+        // 5. An unbracketed host carries no brackets at all, and at most one `:` — which must be
+        //    followed by an all-digit port. `mint.example:abc` and `:8080` are refused here.
+        if host_part.contains('[') || host_part.contains(']') {
+            return false;
+        }
+        match host_part.split_once(':') {
+            Some((head, port)) => {
+                let port_ok = !port.is_empty()
+                    && port.chars().all(|c| c.is_ascii_digit())
+                    && !port.contains(':');
+                if !port_ok {
+                    return false;
+                }
+                head
+            }
+            None => host_part,
+        }
+    };
+    // 6. Whatever survived must actually be a host.
+    !host.is_empty() && !host.chars().any(|c| c.is_whitespace())
 }
 
 impl MaxplayerConfig {
-    /// Buyer-side default mint: the first accepted mint. Falls back to [`DEFAULT_MINT_URL`]
-    /// only if the list is empty (boot validation refuses an empty list for sellers). Buyer
-    /// wallet ops read a single default mint through this accessor; the seller accept policy
-    /// is the full `accepted_mints` list.
+    /// Buyer-side default mint: the first accepted mint. Falls back to
+    /// [`DEFAULT_MINIBITS_MINT_URL`] only if the list is empty (boot validation refuses an empty
+    /// list for sellers). Buyer wallet ops read a single default mint through this accessor; the
+    /// seller accept policy is the full `accepted_mints` list.
     pub fn default_mint(&self) -> &str {
         self.accepted_mints
             .first()
             .map(String::as_str)
-            .unwrap_or(DEFAULT_MINT_URL)
+            .unwrap_or(DEFAULT_MINIBITS_MINT_URL)
     }
 }
 
@@ -1505,7 +1540,6 @@ impl Default for MaxplayerConfig {
             accepted_mints: default_accepted_mints(),
             per_job_budget_sats: DEFAULT_PER_JOB_BUDGET_SATS,
             extra_mints: Vec::new(),
-            allow_real_mints: true,
             profile: None,
             seller: None,
             buzz: None,
@@ -1583,7 +1617,7 @@ pub fn is_initialized(root: impl AsRef<Path>) -> bool {
 /// Ensure `root` exists with config, key (`0600`), and `wallet/` dir.
 ///
 /// Idempotent: existing config/key are left in place except dead-mint migration
-/// (`testnut.cashu.space` → [`DEFAULT_MINT_URL`]). The persisted `config.toml` is the file layer;
+/// ([`DEAD_TESTNUT_MINT_HOST`] → [`DEFAULT_MINIBITS_MINT_URL`]). The persisted `config.toml` is the file layer;
 /// the returned [`MaxplayerHome::config`] additionally carries the `MAXPLAYER_*` environment overlay (see
 /// the module docs). Never returns the secret key.
 pub fn bootstrap(root: impl AsRef<Path>) -> Result<MaxplayerHome, HomeError> {
@@ -1634,13 +1668,14 @@ pub fn bootstrap(root: impl AsRef<Path>) -> Result<MaxplayerHome, HomeError> {
     })
 }
 
-/// Rewrite dead `.cashu.space` testnut hosts to [`DEFAULT_MINT_URL`] across every
-/// `accepted_mints` entry. Returns true when any entry changed.
+/// Rewrite the dead `.cashu.space` host to [`DEFAULT_MINIBITS_MINT_URL`] across every
+/// `accepted_mints` entry. Returns true when any entry changed. This migration only ever REMOVES
+/// the dead host; nothing in the product writes it back.
 pub fn migrate_dead_mint_url(config: &mut MaxplayerConfig) -> bool {
     let mut changed = false;
     for mint in &mut config.accepted_mints {
         if mint.to_ascii_lowercase().contains(DEAD_TESTNUT_MINT_HOST) {
-            *mint = DEFAULT_MINT_URL.to_owned();
+            *mint = DEFAULT_MINIBITS_MINT_URL.to_owned();
             changed = true;
         }
     }
@@ -1680,6 +1715,18 @@ fn fold_legacy_mint_url(table: &mut toml::Table) {
 ///   (the per-entry `slots` knob was dead weight — refused above 1 — so nothing is lost).
 fn fold_removed_config_fields(table: &mut toml::Table) {
     table.remove("total_budget_sats");
+    // The real-mint switch is gone: a mint is just a mint, and the seat's configured list is the
+    // only gate (owner ruling, 2 Sep 2026). An operator upgrading with `allow_real_mints = …` in
+    // their config.toml must keep booting, so the key is dropped here — BEFORE the
+    // `deny_unknown_fields` parse that would otherwise refuse it — and the drop is announced once
+    // so it is never a silent policy change.
+    if table.remove("allow_real_mints").is_some() {
+        crate::opline!(
+            "config.toml: `allow_real_mints` is no longer a setting and was ignored — a mint is \
+             usable when it is in `accepted_mints` (or `extra_mints`), and not otherwise. Remove \
+             the line to silence this."
+        );
+    }
 
     let Some(seller) = table.get_mut("seller").and_then(toml::Value::as_table_mut) else {
         return;
@@ -1787,6 +1834,10 @@ const RESERVED_ENV_VARS: &[&str] = &[
     "MAXPLAYER_ACP_SMOKE",
     "MAXPLAYER_ACP_SMOKE_CMD",
     "MAXPLAYER_EVALS_SNAPSHOT_DIR",
+    // RETIRED config field, kept reserved so an operator (or a script) that still exports it keeps
+    // booting instead of being refused by the fail-closed unknown-`MAXPLAYER_*` rule. It sets
+    // nothing: the seat's configured mint list is the only mint gate.
+    "MAXPLAYER_ALLOW_REAL_MINTS",
 ];
 
 /// [`MaxplayerConfig`] fields whose env value is a comma-separated list. The env source must be told
@@ -1928,8 +1979,8 @@ fn documented_config_toml(config: &MaxplayerConfig) -> Result<String, HomeError>
             "accepted_mints",
             &[
                 "Mints this seller accepts; the first is also the buyer wallet's default mint.",
-                "⚠ THE SHIPPED DEFAULT IS A REAL MINT (minibits) — a fresh node moves REAL sats.",
-                "For testnut/dev only, set a test mint here AND allow_real_mints = false below.",
+                "⚠ A fresh node ships a real mint (minibits) and moves REAL sats.",
+                "This list is the ONLY mint gate — a mint not on it is refused, one on it is used.",
             ],
         ),
         (
@@ -1937,13 +1988,6 @@ fn documented_config_toml(config: &MaxplayerConfig) -> Result<String, HomeError>
             &[
                 "Per-job spend cap (sats): the standing bound on every job posted or paid. There is",
                 "no total cap — the spent.jsonl ledger records every spend for audit. Raise with care.",
-            ],
-        ),
-        (
-            "allow_real_mints",
-            &[
-                "Real-money switch — TRUE by default so the fence admits the real default mint above.",
-                "Set false to force testnut/dev-only (any real mint is then refused fail-closed).",
             ],
         ),
     ];
@@ -2533,15 +2577,23 @@ mod tests {
         };
         write_config(&config_path, &stale).expect("write stale");
         let home = bootstrap(&root).expect("bootstrap migrates");
-        assert_eq!(home.config.accepted_mints, vec![DEFAULT_MINT_URL.to_owned()]);
+        // The migration REMOVES the dead host and lands on the shipped default; it never writes a
+        // test mint back in.
+        assert_eq!(
+            home.config.accepted_mints,
+            vec![DEFAULT_MINIBITS_MINT_URL.to_owned()]
+        );
         let reloaded = load_config(&config_path).expect("reload");
-        assert_eq!(reloaded.accepted_mints, vec![DEFAULT_MINT_URL.to_owned()]);
+        assert_eq!(
+            reloaded.accepted_mints,
+            vec![DEFAULT_MINIBITS_MINT_URL.to_owned()]
+        );
     }
 
     #[test]
     fn accepted_mints_default() {
-        // Issue #378: a config that names no mint yields the shipped default — a single REAL minibits
-        // mint (paired with allow_real_mints = true; see `default_allow_real_mints`).
+        // Issue #378: a config that names no mint yields the shipped default — a single minibits
+        // mint. That list is the mint policy; there is no second switch beside it.
         let config: MaxplayerConfig = toml::from_str(
             "relay_url = 'r'\nper_job_budget_sats = 1\n",
         )
@@ -2617,19 +2669,73 @@ mod tests {
         );
     }
 
+    /// D: the predicate must implement its own contract — scheme ∈ {http, https} AND a non-empty
+    /// HOST — not merely "the tail after the scheme is non-empty". Each malformed case an authority
+    /// tail-check waved through is named here, including the two that survived the first attempt at
+    /// this fix: a non-numeric port and an unterminated IPv6 literal.
     #[test]
-    fn shipped_defaults_are_real_money_and_the_fence_admits_them() {
-        // #378 flipped fresh nodes real-money-capable. The whole default posture in one place; the
-        // load-bearing part is that mint_allowed ADMITS the shipped default mint (it would REFUSE it
-        // if allow_real_mints had stayed false, or if the mint reverted to testnut).
+    fn mint_url_supported_requires_a_scheme_and_a_real_host() {
+        // ADMITTED. `http://` is deliberate and load-bearing: a seat's own sidecar mint runs on
+        // loopback, so an https-only rule would make the operator's own list unusable.
+        for good in [
+            "http://127.0.0.1:3338",
+            "http://localhost",
+            "https://mint.example",
+            "https://mint.example/Bitcoin",
+            "https://mint.example:8443/Bitcoin",
+            "https://user@mint.example/Bitcoin",
+            "https://mint.example/Bitcoin?x=1#frag",
+            // A seat's own sidecar mint may sit on IPv6 loopback, with or without a port.
+            "http://[::1]:3338",
+            "https://[::1]",
+        ] {
+            assert!(mint_url_supported(good), "must admit {good}");
+        }
+
+        // REFUSED — malformed non-empty tails, the class the old predicate accepted.
+        let cases = [
+            ("path only, no host", "http:///x"),
+            ("path only, root", "http:///"),
+            ("whitespace-only tail", "http:// "),
+            ("whitespace-only tail, several", "https://   "),
+            ("port only, no host", "http://:8080"),
+            ("port only, then path", "http://:8080/Bitcoin"),
+            ("embedded space in host", "https://mint .example"),
+            ("leading space before host", "https:// mint.example"),
+            ("userinfo but no host", "https://user@"),
+            ("userinfo, then port only", "https://user@:8443"),
+            ("empty tail", "https://"),
+            ("empty tail, http", "http://"),
+            // The two an authority tail-check waved through, which is why the host is parsed now.
+            ("non-numeric port", "https://mint.example:abc"),
+            ("unterminated IPv6 literal", "https://[::1"),
+        ];
+        for (name, bad) in cases {
+            assert!(!mint_url_supported(bad), "must refuse {name}: {bad:?}");
+        }
+
+        // REFUSED — not a scheme this wallet speaks, or no scheme at all.
+        for bad in ["ftp://mint.example", "mint.example", "//mint.example", "", "   "] {
+            assert!(!mint_url_supported(bad), "must refuse {bad:?}");
+        }
+    }
+
+    #[test]
+    fn shipped_defaults_are_real_money_and_usable() {
+        // The whole default posture in one place. Load-bearing: the shipped default mint IS this
+        // config's own configured mint, so the one mint gate — membership of the configured list —
+        // admits it. Breaks if the default mint and the default list ever diverge.
         let d = MaxplayerConfig::default();
         assert_eq!(d.accepted_mints, vec![DEFAULT_MINIBITS_MINT_URL.to_owned()]);
-        assert!(d.allow_real_mints, "fresh nodes are real-money-capable by default");
         assert_eq!(d.per_job_budget_sats, 30_000);
         assert_eq!(default_slots(), 3, "seller default concurrency");
         assert!(
-            mint_allowed(d.default_mint(), d.allow_real_mints),
-            "the fence must admit the shipped default mint (breaks if either default reverts)"
+            d.accepted_mints.iter().any(|mint| mint == d.default_mint()),
+            "the shipped default mint must be on the shipped configured list"
+        );
+        assert!(
+            mint_url_supported(d.default_mint()),
+            "the shipped default mint must be a usable mint URL"
         );
     }
 
@@ -2838,7 +2944,7 @@ mod tests {
         .expect("file layer");
         // Sanity: defaults<file already merged by the file parse.
         assert_eq!(file.relay_url, "wss://from-file"); // file over default
-        assert!(file.allow_real_mints); // default stands (file did not set it)
+        assert_eq!(file.per_job_budget_sats, 50); // file over default
 
         let resolved = apply_env_layer(
             &file,
@@ -2856,7 +2962,11 @@ mod tests {
             resolved.accepted_mints,
             vec!["https://env-a".to_owned(), "https://env-b".to_owned()]
         ); // env list over file list
-        assert!(resolved.allow_real_mints); // untouched default survives
+        assert_eq!(
+            resolved.extra_mints,
+            Vec::<String>::new(),
+            "an untouched default survives both layers"
+        );
     }
 
     #[test]

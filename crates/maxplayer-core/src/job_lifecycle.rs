@@ -369,7 +369,7 @@ pub struct AcceptedBind {
     pub accepted_mints: Vec<String>,
     /// The buyer's FUNDING (source) mint for this job — the mint whose proofs are spent — SELECTED and
     /// frozen at accept from the buyer's then-configured default (or a pre-funded cross-mint balance),
-    /// validated against `accepted_mints` + the real-mint fence. The pay path derives the paying mint
+    /// validated against `accepted_mints`. The pay path derives the paying mint
     /// from THIS on every attempt — including retries — so a config-default change between attempts can
     /// never shift the mint and mint a second [`crate::payment::AttemptId`] (double-pay). On a
     /// cross-mint hop this is the SOURCE the buyer melts, NOT the mint the seller is paid in (that is
@@ -1324,7 +1324,7 @@ pub async fn accept_claim_async(
         verify_accepted_claim_creq(claim.creq.as_deref(), &request.job_id, offer.amount_sats)?;
 
     // FREEZE the buyer's paying mint at accept from its then-configured default, validated by
-    // planning the payment against the accepted set + the real-mint fence. Sealing the SELECTION
+    // planning the payment against the accepted set. Sealing the SELECTION
     // here — not just the accepted SET (finding V) — is what makes the pay-path attempt id stable
     // across retries: a config-default change after accept can no longer shift the mint into a
     // different attempt id and mint a second payment for one job (double-pay). A buyer with no
@@ -1345,7 +1345,6 @@ pub async fn accept_claim_async(
         Ok(balances) => crate::crossmint::select_source_mint(
             home.config.default_mint(),
             &accepted_mints,
-            home.config.allow_real_mints,
             &balances,
             offer.amount_sats,
         ),
@@ -1360,12 +1359,8 @@ pub async fn accept_claim_async(
     // the pay path spends from (frozen for attempt-id stability), and the DELIVERY mint the seller is
     // realized at (reporting only — the pay path re-derives it and never reads the stored value). On a
     // direct payment the two are equal; on a hop the delivery mint is the target, not the source.
-    let plan = crate::crossmint::plan_payment(
-        &source_seed,
-        &accepted_mints,
-        home.config.allow_real_mints,
-    )
-    .map_err(|error| JobLifecycleError::Input(error.to_string()))?;
+    let plan = crate::crossmint::plan_payment(&source_seed, &accepted_mints)
+        .map_err(|error| JobLifecycleError::Input(error.to_string()))?;
     let (funding_mint, delivery_mint) = seal_bind_mints(&plan);
 
     let buyer_pubkey = keys.public_key().to_hex();
@@ -3448,7 +3443,7 @@ mod tests {
         use std::str::FromStr;
 
         // A and B are BOTH in the accepted set; A is the buyer's default at accept, B the flipped
-        // default on retry. `allow_real_mints` is on so two distinct mints both pass the fence.
+        // default on retry.
         let mint_a = "https://mint-a.example";
         let mint_b = "https://mint-b.example";
 
@@ -3465,7 +3460,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let mut home = home::bootstrap(&root).expect("home");
         home.config.accepted_mints = vec![mint_b.to_string()]; // default_mint() = B
-        home.config.allow_real_mints = true;
         assert_eq!(home.config.default_mint(), mint_b, "live config default is B (flipped)");
 
         let seller_nostr = nostr_sdk::Keys::generate().public_key();
@@ -3512,7 +3506,7 @@ mod tests {
         // wallet-open seam consumes).
         let attempt_for = |config_default: &str| -> (String, MintUrl, PaymentTerms) {
             let selected = request.realized_mint.as_deref().unwrap_or(config_default);
-            let mint = plan_payment(selected, &request.accepted_mints, true)
+            let mint = plan_payment(selected, &request.accepted_mints)
                 .expect("plan payment")
                 .realized_mint()
                 .clone();
@@ -3556,7 +3550,7 @@ mod tests {
         // the live default flips this observed mint B↔A (red-on-revert).
         let opened = crate::buyer_fund::open_wallet_at_mint_async(
             &home,
-            &wallet_open_mint_url(&home, &retry_terms),
+            &wallet_open_mint_url(&retry_terms),
         )
         .await
         .expect("open pay wallet");
@@ -3695,7 +3689,7 @@ mod tests {
         let source = "https://a.example";
         let target = "https://b.example";
         // Buyer funded at `source`; seller accepts only `target` ⇒ no overlap ⇒ a hop.
-        let plan = crate::crossmint::plan_payment(source, &[target.to_string()], true)
+        let plan = crate::crossmint::plan_payment(source, &[target.to_string()])
             .expect("cross-mint plan");
         assert!(plan.is_hop(), "distinct source/target must plan a hop");
         let (funding, delivery) = seal_bind_mints(&plan);
@@ -3705,7 +3699,7 @@ mod tests {
 
         // Sibling direct-payment case: the same mint on both sides ⇒ delivery equals funding (no hop),
         // which is precisely why the mis-report was invisible on same-mint jobs.
-        let direct = crate::crossmint::plan_payment(source, &[source.to_string()], true)
+        let direct = crate::crossmint::plan_payment(source, &[source.to_string()])
             .expect("direct plan");
         assert!(!direct.is_hop(), "buyer mint in the accepted set is a direct payment");
         let (funding_direct, delivery_direct) = seal_bind_mints(&direct);

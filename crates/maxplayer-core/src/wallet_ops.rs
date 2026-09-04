@@ -3,9 +3,9 @@
 //! quote and returns the bolt11 invoice up front, then [`complete_mint_async`] mints once it is
 //! paid. ([`crate::buyer_fund`] covers wallet open, seed derivation, and balance read.)
 //!
-//! **Funding assumption:** only the pinned testnut host ([`DEFAULT_MINT_URL`])
-//! FakeWallet-auto-pays mint quotes. For other configured mints, [`begin_mint_async`]
-//! returns the bolt11 and callers must pay it, then [`complete_mint_async`].
+//! **Funding assumption:** a mint invoices, and someone pays that invoice. [`begin_mint_async`]
+//! returns the bolt11 and the caller pays it, then calls [`complete_mint_async`]. No mint is
+//! special-cased: a mint is a mint, and the seat's configured list decides which ones it uses.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
@@ -22,20 +22,16 @@ use cdk::Amount;
 use cdk_sqlite::wallet::WalletSqliteDatabase;
 
 use crate::buyer_fund::seed_from_secret_hex;
-use crate::home::{self, HomeError, MaxplayerHome, DEFAULT_MINT_URL};
+use crate::home::{self, HomeError, MaxplayerHome};
 
 #[derive(Debug)]
 pub enum WalletOpsError {
     Home(HomeError),
     /// The mint is not in this home's configured set (`accepted_mints`/`extra_mints`) — a
     /// MEMBERSHIP miss, cleared by `maxplayer wallet mints add`. `default_mint` carries the home's
-    /// ACTUAL default (`config.default_mint()`) so the Display names it rather than the pinned
-    /// testnut constant — on a real-minibits home the latter is a money-relevant lie (#506).
+    /// ACTUAL default (`config.default_mint()`) so the Display names the mint this home really
+    /// pins rather than a constant (#506). This is the ONLY mint policy gate there is.
     MintNotAllowed { mint_url: String, default_mint: String },
-    /// The mint IS configured but is a real mint refused by the real-mint fence (issue #49):
-    /// `allow_real_mints` is off. A POLICY block — `mints add` cannot clear it, so it must NOT
-    /// borrow [`Self::MintNotAllowed`]'s remedy; the control is `MAXPLAYER_ALLOW_REAL_MINTS` (#465).
-    RealMintDisallowed { mint_url: String },
     /// `remove_mint` refuses to remove the home's pinned default mint. `mint_url` carries that
     /// actual default (`config.default_mint()`) so the message names the real pinned mint rather
     /// than a hardcoded constant — on a real-minibits home the constant would be a false-default
@@ -51,12 +47,6 @@ impl std::fmt::Display for WalletOpsError {
             Self::MintNotAllowed { mint_url, default_mint } => write!(
                 formatter,
                 "mint {mint_url} is not configured; add it with `maxplayer wallet mints add` (default stays {default_mint})"
-            ),
-            Self::RealMintDisallowed { mint_url } => write!(
-                formatter,
-                "mint {mint_url} not allowed: allow_real_mints is off (only {DEFAULT_MINT_URL} is permitted). \
-                 Set MAXPLAYER_ALLOW_REAL_MINTS=true (or allow_real_mints in config.toml) to opt in, \
-                 or use --mint {DEFAULT_MINT_URL} for dev/play-money"
             ),
             Self::MintPinnedDefault { mint_url } => write!(
                 formatter,
@@ -181,37 +171,6 @@ pub fn normalize_mint_url(raw: &str) -> Result<String, WalletOpsError> {
     Ok(parsed.to_string())
 }
 
-fn is_autopay_mint(mint_url: &str) -> bool {
-    normalize_mint_url(mint_url)
-        .ok()
-        .as_deref()
-        == Some(DEFAULT_MINT_URL)
-}
-
-/// Money class a mint moves, derived purely from the mint URL. The pinned testnut host
-/// ([`DEFAULT_MINT_URL`]) FakeWallet-auto-pays its own invoices — play money — while every other
-/// mint invoices for real sats. Internal: it gates the #445 fail-closed refusal of silently
-/// auto-funding play money and drives a play-money marker on dev rows. Ordinary mints carry no
-/// money-class label in user output — a mint is a mint, identified by its URL (#577).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MoneyType {
-    /// A real mint — its invoices move real sats.
-    Real,
-    /// The testnut dev/play mint — auto-pays its own invoices with fake sats.
-    Play,
-}
-
-impl MoneyType {
-    /// Classify a mint URL. A URL that does not normalize is treated as [`Self::Real`] — the
-    /// fail-safe direction, so an unrecognized mint is never mislabeled play money.
-    pub fn of_mint(mint_url: &str) -> Self {
-        if is_autopay_mint(mint_url) {
-            Self::Play
-        } else {
-            Self::Real
-        }
-    }
-}
 
 /// Configured mints: default `mint_url` first, then opt-in `extra_mints` (deduped).
 pub fn configured_mints(home: &MaxplayerHome) -> Result<Vec<String>, WalletOpsError> {
@@ -593,24 +552,19 @@ pub async fn complete_mint_by_id_async(
 
 /// Flexible/repeatable mint-fund (no `already_funded` hard-block).
 ///
-/// Testnut ([`DEFAULT_MINT_URL`]) FakeWallet-auto-pays: begin → complete.
-/// Other configured mints return [`MintFlow::NeedsPayment`] with bolt11 already
-/// surfaced (caller pays, then [`complete_mint_async`]).
+/// Always returns [`MintFlow::NeedsPayment`] with the bolt11 already surfaced: the caller pays the
+/// invoice, then calls [`complete_mint_async`]. No mint is special-cased — a mint that settles its
+/// own invoices does so on its own, and the caller sees the same two steps either way.
 pub async fn mint_async(
     home: &MaxplayerHome,
     amount_sats: u64,
     mint_override: Option<&str>,
 ) -> Result<MintFlow, WalletOpsError> {
     let quote = begin_mint_async(home, amount_sats, mint_override).await?;
-    if is_autopay_mint(&quote.mint_url) {
-        Ok(MintFlow::Funded(complete_mint_async(home, &quote).await?))
-    } else {
-        Ok(MintFlow::NeedsPayment(quote))
-    }
+    Ok(MintFlow::NeedsPayment(quote))
 }
 
-/// Create a bolt11 invoice; on testnut, mint once FakeWallet auto-pays.
-/// Non-autopay mints return [`MintFlow::NeedsPayment`] (invoice before any wait).
+/// Create a bolt11 invoice and return it before any wait ([`MintFlow::NeedsPayment`]).
 pub async fn invoice_async(
     home: &MaxplayerHome,
     amount_sats: u64,
@@ -629,12 +583,6 @@ pub async fn send_async(
         return Err(WalletOpsError::Wallet("amount must be > 0".into()));
     }
     let mint_url = resolve_mint(home, mint_override)?;
-    // Fail closed against the real-mint gate before opening the wallet. Operator sends are a
-    // deliberate action OUTSIDE the job-pay budget gate (BudgetGate is deliberately not wired in
-    // here — owner decision pending), but they must still honor `allow_real_mints`.
-    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
-        return Err(WalletOpsError::RealMintDisallowed { mint_url });
-    }
     let wallet = open_wallet_async(home, &mint_url).await?;
     let before = wallet
         .total_balance()
@@ -687,14 +635,8 @@ pub async fn receive_async(
         .mint_url()
         .map_err(|error| WalletOpsError::Wallet(error.to_string()))?
         .to_string();
+    // The token's own mint must be in this home's CONFIGURED list — the one and only mint gate.
     let mint_url = mint_is_allowed(home, &mint_url)?;
-    // Real-mint fence (issue #49): `mint_is_allowed` only checks the mint is in the CONFIGURED list;
-    // this additionally fails closed on a real mint unless the operator opted in, the same gate
-    // send/melt enforce. Without it a real mint left in the configured list would redeem while
-    // `allow_real_mints == false`.
-    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
-        return Err(WalletOpsError::RealMintDisallowed { mint_url });
-    }
     let wallet = open_wallet_async(home, &mint_url).await?;
     let before = wallet
         .total_balance()
@@ -741,12 +683,6 @@ pub async fn melt_async(
         return Err(WalletOpsError::Wallet("bolt11 invoice is empty".into()));
     }
     let mint_url = resolve_mint(home, mint_override)?;
-    // Fail closed against the real-mint gate before opening the wallet. Operator melts are a
-    // deliberate action OUTSIDE the job-pay budget gate (BudgetGate is deliberately not wired in
-    // here — owner decision pending), but they must still honor `allow_real_mints`.
-    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
-        return Err(WalletOpsError::RealMintDisallowed { mint_url });
-    }
     let wallet = open_wallet_async(home, &mint_url).await?;
     let quote = wallet
         .melt_quote(PaymentMethod::BOLT11, bolt11, None, None)
@@ -962,6 +898,9 @@ pub fn invoice_blocking(
 
 #[cfg(test)]
 mod tests {
+    /// Test fixture mint host — NOT a default. A mint is just a mint: what makes one usable is membership of
+    /// the home's configured list, which each test sets up explicitly.
+    const FIXTURE_MINT_URL: &str = "https://mint.example/Bitcoin";
     use super::*;
     use crate::home::bootstrap;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1084,9 +1023,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // #579: MintPinnedDefault's message hardcoded the testnut DEFAULT_MINT_URL, so on a
-    // real-minibits-default home `wallet mints remove <minibits>` errored "cannot remove the default
-    // mint (https://testnut.cashudevkit.org)" — naming testnut as the default when the mint actually
+    // #579: MintPinnedDefault's message hardcoded one mint constant, so on a minibits-default home
+    // `wallet mints remove <minibits>` errored "cannot remove the default mint (<that constant>)" —
+    // naming the wrong mint as the default when the mint actually
     // pinned is minibits (config.default_mint()). Display-only lie; the guard pins correctly. This
     // pins the message to the ACTUAL default. Reverting the Display fix REDS this.
     #[test]
@@ -1098,7 +1037,7 @@ mod tests {
         // The shipped default is the real minibits mint, distinct from the testnut constant — so a
         // message naming testnut here is provably wrong, not a coincidental match.
         assert_eq!(default, crate::home::DEFAULT_MINIBITS_MINT_URL);
-        assert_ne!(default, crate::home::DEFAULT_MINT_URL);
+        assert_ne!(default, FIXTURE_MINT_URL);
 
         let message = remove_mint(&mut home, crate::home::DEFAULT_MINIBITS_MINT_URL)
             .expect_err("removing the pinned default must error")
@@ -1108,7 +1047,7 @@ mod tests {
             "message must name the real pinned default ({default}): {message}"
         );
         assert!(
-            !message.contains(crate::home::DEFAULT_MINT_URL),
+            !message.contains(FIXTURE_MINT_URL),
             "message must not name the testnut constant as the default: {message}"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -1136,23 +1075,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // Finding T(3): the standalone receive path fails closed on a non-allowlisted REAL mint when
-    // allow_real_mints=false — even though the mint IS in the configured list (so `mint_is_allowed`
-    // passes) — the same real-mint fence send/melt enforce. Reached before any wallet open, so it
-    // holds offline.
+    // Finding T(3), one-mint form: the standalone receive path gates on the CONFIGURED LIST and on
+    // nothing else — a token whose own mint this home has not configured is refused before any
+    // wallet open (so it holds offline), and the same token at a configured mint gets past that gate.
     #[tokio::test(flavor = "current_thread")]
-    async fn receive_refuses_real_mint_when_disallowed() {
+    async fn receive_refuses_a_token_from_an_unconfigured_mint() {
         use std::str::FromStr;
 
         use cashu::secret::Secret;
         use cashu::{Amount, CurrencyUnit, Id, MintUrl, Proof, SecretKey, Token};
 
-        let real_mint = "https://real-mint.example/";
-        let root = temp_home("receive-real-mint-fence");
+        let foreign_mint = "https://not-configured.example/";
+        let root = temp_home("receive-unconfigured-mint");
         let _ = std::fs::remove_dir_all(&root);
         let mut home = bootstrap(&root).expect("bootstrap");
-        home.config.accepted_mints = vec![real_mint.into()];
-        home.config.allow_real_mints = false;
+        home.config.accepted_mints = vec!["https://configured.example/".into()];
 
         let proof = Proof::new(
             Amount::from(5),
@@ -1161,7 +1098,7 @@ mod tests {
             SecretKey::generate().public_key(),
         );
         let token = Token::new(
-            MintUrl::from_str(real_mint).expect("mint url"),
+            MintUrl::from_str(foreign_mint).expect("mint url"),
             vec![proof],
             None,
             CurrencyUnit::Sat,
@@ -1169,54 +1106,65 @@ mod tests {
 
         let err = receive_async(&home, &token.to_string())
             .await
-            .expect_err("real mint must refuse under allow_real_mints=false");
+            .expect_err("a token from an unconfigured mint must refuse");
         assert!(
-            matches!(&err, WalletOpsError::RealMintDisallowed { mint_url } if mint_url.contains("real-mint.example")),
-            "expected RealMintDisallowed (policy fence, not a membership miss), got {err:?}"
+            matches!(&err, WalletOpsError::MintNotAllowed { mint_url, .. } if mint_url.contains("not-configured.example")),
+            "expected MintNotAllowed (the one mint gate), got {err:?}"
         );
-        // #465: the policy refusal must name the ACTUAL control and never the membership remedy —
-        // `mints add` cannot clear an allow_real_mints=false fence.
+        // The refusal names the remedy that actually clears it — there is no other control left.
         let message = err.to_string();
         assert!(
-            message.contains("MAXPLAYER_ALLOW_REAL_MINTS"),
-            "policy refusal must name the real control (MAXPLAYER_ALLOW_REAL_MINTS), got: {message}"
+            message.contains("mints add"),
+            "the membership refusal must name `mints add`, got: {message}"
         );
         assert!(
-            !message.contains("mints add"),
-            "policy refusal must NOT borrow the membership `mints add` remedy, got: {message}"
+            !message.to_ascii_lowercase().contains("allow_real_mints"),
+            "no real-mint switch exists any more, got: {message}"
+        );
+
+        // Configure that same mint and the membership gate no longer refuses: the call now fails
+        // later, at the (unreachable) mint, which is what proves the gate was the only thing in the
+        // way.
+        home.config.extra_mints = vec![foreign_mint.to_owned()];
+        let err = receive_async(&home, &token.to_string())
+            .await
+            .expect_err("the example mint is unreachable, so the receive still fails");
+        assert!(
+            matches!(&err, WalletOpsError::Wallet(_)),
+            "a configured mint must get past the membership gate, got {err:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // #500: a funding op must persist ONLY its own change, never the in-memory, env-widened real-mint
-    // fence. `save_config` writes the FILE-only view (re-reads config.toml, edits that), so an
-    // `allow_real_mints = true` that exists only because MAXPLAYER_ALLOW_REAL_MINTS opened it in-process
-    // can never leak to disk. The write-back class was fixed by #84 (fix/save-config-env-promotion);
-    // this pins the FENCE field on the FUNDING path — which the scalar-only, direct-save
-    // `save_does_not_persist_env_override_values` (home.rs) did not cover.
+    // #500: a funding op must persist ONLY its own change, never an in-memory value that exists
+    // just because an env override set it. `save_config` writes the FILE-only view (re-reads
+    // config.toml, edits that), so a `MAXPLAYER_*` value can never leak to disk. The write-back
+    // class was fixed by #84 (fix/save-config-env-promotion); this pins it on the FUNDING path —
+    // which the scalar-only, direct-save `save_does_not_persist_env_override_values` (home.rs) did
+    // not cover.
     #[test]
-    fn funding_op_never_writes_back_the_env_widened_real_mint_fence() {
-        let root = temp_home("500-funding-no-gate-writeback");
+    fn funding_op_never_writes_back_an_env_only_value() {
+        let root = temp_home("500-funding-no-env-writeback");
         let _ = std::fs::remove_dir_all(&root);
         let mut home = bootstrap(&root).expect("bootstrap");
 
-        // Durable fence CLOSED on disk — the operator's explicit opt-out.
-        home::save_config(&mut home, |config| config.allow_real_mints = false)
-            .expect("seed the fence closed on disk");
-
-        // Simulate the daemon launcher's MAXPLAYER_ALLOW_REAL_MINTS=true: the env overlay opens the
-        // fence IN-MEMORY only (`home.config`), while config.toml on disk stays false.
-        home.config.allow_real_mints = true;
+        // Durable relay on disk — the operator's explicit setting.
+        home::save_config(&mut home, |config| {
+            config.relay_url = "wss://on-disk.example".to_owned()
+        })
+        .expect("seed the relay on disk");
+        // Simulate an env overlay (MAXPLAYER_RELAY_URL): in-memory only, config.toml unchanged.
+        home.config.relay_url = "wss://from-env.example".to_owned();
 
         // A funding op (adds an extra mint) — persists through `save_config`.
-        let added = add_mint(&mut home, "https://real-mint.example/").expect("add an extra mint");
+        let added = add_mint(&mut home, "https://extra-mint.example/").expect("add an extra mint");
 
         let raw = std::fs::read_to_string(root.join("config.toml")).expect("read config.toml");
         let on_disk = home::parse_config_toml(&raw).expect("parse config.toml");
-        // The durable fence is untouched: the env-widened in-memory value did NOT leak to disk...
-        assert!(
-            !on_disk.allow_real_mints,
-            "a funding op must not write the env-widened real-mint fence back to disk (#500); config.toml = {raw}"
+        // The durable value is untouched: the env-only in-memory value did NOT leak to disk...
+        assert_eq!(
+            on_disk.relay_url, "wss://on-disk.example",
+            "a funding op must not write an env-only value back to disk (#500); config.toml = {raw}"
         );
         // ...while the funding op's OWN change DID persist.
         assert!(
@@ -1312,42 +1260,62 @@ mod tests {
 
     #[test]
     fn normalize_mint_url_trims_and_strips_trailing_slash() {
-        let normalized =
-            normalize_mint_url(" https://testnut.cashudevkit.org/ ").expect("normalize");
-        assert_eq!(normalized, DEFAULT_MINT_URL);
+        let normalized = normalize_mint_url(&format!(" {FIXTURE_MINT_URL}/ ")).expect("normalize");
+        assert_eq!(normalized, FIXTURE_MINT_URL);
         let err = normalize_mint_url("   ").expect_err("empty");
         assert!(matches!(err, WalletOpsError::Wallet(_)));
     }
 
-    // #506/#577 money class: `of_mint` classifies PURELY from the mint URL — the testnut play mint is
-    // Play, every other mint (including the shipped minibits default) is Real. The classification is
-    // internal: it gates the #445 refusal and the play-money marker, never a surfaced money-class label.
+    // #577, one-mint form: a mint is a mint. NEGATIVE — no money class survives anywhere on this
+    // path: `mint_is_allowed` answers membership of the configured list and nothing else, for the
+    // shipped default and for any other mint alike, over either scheme.
     #[test]
-    fn of_mint_classifies_testnut_play_and_others_real() {
-        assert_eq!(MoneyType::of_mint(DEFAULT_MINT_URL), MoneyType::Play);
-        // Trailing slash / surrounding whitespace still classify as the testnut mint (normalized).
-        assert_eq!(
-            MoneyType::of_mint(" https://testnut.cashudevkit.org/ "),
-            MoneyType::Play
-        );
-        assert_eq!(
-            MoneyType::of_mint(crate::home::DEFAULT_MINIBITS_MINT_URL),
-            MoneyType::Real
-        );
-        assert_eq!(
-            MoneyType::of_mint("https://real-mint.example"),
-            MoneyType::Real
-        );
-        // Fail-safe: an unparseable URL is never classified play money.
-        assert_eq!(MoneyType::of_mint("not a url"), MoneyType::Real);
+    fn membership_of_the_configured_list_is_the_only_mint_gate() {
+        let root = temp_home("one-mint-gate");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap(&root).expect("bootstrap");
+
+        // The shipped default is admitted because it is CONFIGURED, not because of what it is.
+        let default_mint = home.config.default_mint().to_owned();
+        assert_eq!(default_mint, crate::home::DEFAULT_MINIBITS_MINT_URL);
+        assert!(mint_is_allowed(&home, &default_mint).is_ok());
+
+        // Not on the list ⇒ refused, whatever the mint looks like.
+        for outsider in [
+            "https://some-other-mint.example",
+            "http://127.0.0.1:3338",
+            "https://testnut.cashudevkit.org",
+        ] {
+            assert!(
+                matches!(
+                    mint_is_allowed(&home, outsider),
+                    Err(WalletOpsError::MintNotAllowed { .. })
+                ),
+                "an unconfigured mint must refuse: {outsider}"
+            );
+        }
+
+        // On the list ⇒ admitted, over EITHER scheme (http is deliberate: a seat's own sidecar mint
+        // runs on loopback).
+        home.config.extra_mints = vec![
+            "https://some-other-mint.example".to_owned(),
+            "http://127.0.0.1:3338".to_owned(),
+        ];
+        for insider in ["https://some-other-mint.example", "http://127.0.0.1:3338"] {
+            assert!(
+                mint_is_allowed(&home, insider).is_ok(),
+                "a configured mint must be admitted: {insider}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // #506-A: `MintNotAllowed` must name the home's ACTUAL default (`config.default_mint()`), never
-    // the pinned testnut constant. On the shipped real-minibits default home, "(default stays
-    // testnut)" was a money-relevant lie (`wallet mints list` correctly shows minibits as default).
-    // Red-on-revert: interpolating DEFAULT_MINT_URL again names testnut on a minibits home.
+    // a compile-time constant. On the shipped minibits-default home, naming any other mint as "the
+    // default" was a money-relevant lie (`wallet mints list` correctly shows minibits as default).
+    // Red-on-revert: interpolating a fixture constant again names the wrong mint on a minibits home.
     #[test]
-    fn mint_not_allowed_names_home_default_not_testnut_constant() {
+    fn mint_not_allowed_names_home_default_not_a_constant() {
         let root = temp_home("506a-default-name");
         let _ = std::fs::remove_dir_all(&root);
         let home = bootstrap(&root).expect("bootstrap");
@@ -1364,7 +1332,7 @@ mod tests {
             "MintNotAllowed must name the home's real default: {message}"
         );
         assert!(
-            !message.contains(DEFAULT_MINT_URL),
+            !message.contains(FIXTURE_MINT_URL),
             "MintNotAllowed must NOT name the testnut constant as the default on a minibits home: {message}"
         );
         let _ = std::fs::remove_dir_all(&root);

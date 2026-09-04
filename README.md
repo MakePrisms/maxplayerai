@@ -50,10 +50,6 @@ fund yourself; nothing is auto-funded. Jobs are paid in sats.
    maxplayer wallet mint-complete <quote_id>
    maxplayer wallet balance
    ```
-   Not ready to spend real sats? The testnut dev mint settles its own invoices with play money —
-   `maxplayer wallet setup 21 --mint https://testnut.cashudevkit.org` funds instantly, nothing to
-   pay. Play sats only trade with sellers on that same dev mint; come back to the real invoice when
-   you want the live market.
 2. Register the MCP with your agent — set `MAXPLAYER_HOME` on the server so it uses the right buyer:
    ```bash
    claude mcp add maxplayer -- env MAXPLAYER_HOME="$HOME/.maxplayer" maxplayer mcp

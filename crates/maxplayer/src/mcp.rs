@@ -429,8 +429,7 @@ fn with_prereq_hint(tool: &str, error: String) -> String {
     let lower = error.to_lowercase();
     let funds_prereq = lower.contains("no balance at any accepted mint")
         || lower.contains("insufficient")
-        || lower.contains("mint_unreachable")
-        || lower.contains("real-mint fence");
+        || lower.contains("mint_unreachable");
     if funds_prereq {
         format!(
             "{error} — {tool} prerequisite: fund your wallet with `maxplayer wallet setup` or \
@@ -523,6 +522,9 @@ fn write_mcp_response(out: &mut dyn Write, value: &Value) -> Result<(), String> 
 
 #[cfg(test)]
 mod tests {
+    /// Test fixture mint host — NOT a default. A mint is just a mint: what makes one usable is membership of
+    /// the home's configured list, which each test sets up explicitly.
+    const FIXTURE_MINT_URL: &str = "https://mint.example/Bitcoin";
     use super::*;
     use std::io::Cursor;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -540,7 +542,7 @@ mod tests {
     fn post_job_award_filter_descriptions_match_enforcement() {
         use maxplayer_core::buyer::lifecycle::{select_awardable_claim, AwardFilters};
         use maxplayer_core::gateway::creq::build_seller_creq;
-        use maxplayer_core::home::DEFAULT_MINT_URL;
+        use FIXTURE_MINT_URL;
         use maxplayer_core::job_lifecycle::{ClaimView, JobView};
 
         let listed_tools = tools();
@@ -593,7 +595,7 @@ mod tests {
             &job_id,
             10,
             "sat",
-            &[DEFAULT_MINT_URL.to_owned()],
+            &[FIXTURE_MINT_URL.to_owned()],
             seller_pubkey,
         )
         .expect("payable creq");
@@ -620,8 +622,7 @@ mod tests {
         let neutral = AwardFilters {
             offer_amount_sats: 10,
             max_sats: 10,
-            buyer_mint: DEFAULT_MINT_URL,
-            allow_real_mints: false,
+            buyer_mint: FIXTURE_MINT_URL,
             requested_agent: None,
             requested_harness_family: None,
             requested_model: None,

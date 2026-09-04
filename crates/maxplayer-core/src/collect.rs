@@ -254,6 +254,9 @@ pub fn materialize_delivery(
 
 #[cfg(test)]
 mod tests {
+    /// Test fixture mint host — NOT a default. A mint is just a mint: what makes one usable is membership of
+    /// the home's configured list, which each test sets up explicitly.
+    const FIXTURE_MINT_URL: &str = "https://mint.example/Bitcoin";
     use super::*;
     use crate::home;
     use crate::job_lifecycle::AcceptedBind;
@@ -539,7 +542,7 @@ mod tests {
             &offer_id,
             amount,
             "sat",
-            &[crate::home::DEFAULT_MINT_URL.to_string()],
+            &[FIXTURE_MINT_URL.to_string()],
             &seller_hex,
         )
         .expect("creq");

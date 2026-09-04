@@ -149,7 +149,7 @@ and the per-mint breakdown from `maxplayer wallet mints`.
 ## Symptom: which mint am I actually spending at?
 
 A fresh config accepts bitcoin-denominated ecash at a minibits mint
-(`allow_real_mints = true`, mint `https://mint.minibits.cash/Bitcoin`).
+(`https://mint.minibits.cash/Bitcoin`) — the one entry on its accepted list.
 
 `maxplayer wallet setup` with no `--mint` targets that mint and returns a Lightning
 invoice you must pay. It does not hand you free test sats. Ask the wallet rather than
@@ -191,31 +191,21 @@ the seller's advertised `accepted_mints`.
 
 ---
 
-## Symptom: a claim is on a mint I can't pay (mint mismatch / real-mint fence)
+## Symptom: a claim is on a mint I cannot pay (mint mismatch)
 
 Your wallet settles at specific mints. When a seller's mint differs from yours, the buyer
-does **not** immediately give up: if real mints are allowed it tries a **cross-mint
-Lightning hop** to land the payment on a mint the seller accepts. A mismatch only blocks
-the trade when there is **no permitted route** — most often because you have pinned
-yourself to test-only mints.
+does **not** immediately give up: it tries a **cross-mint Lightning hop** to land the
+payment on a mint the seller accepts. A mismatch only blocks the trade when there is **no
+route** — most often because the seller lists no mint your wallet can reach.
 
 **Check:**
 - your side: `maxplayer buyer status` → `wallet.mint`, and `maxplayer wallet mints` for
   every mint you can pay from
-- your fence: `allow_real_mints` in `~/.maxplayer/config.toml` (default `true`)
+- your list: `accepted_mints` (and `extra_mints`) in `~/.maxplayer/config.toml`
 
-**Read it:**
-- `allow_real_mints = true` (default) → hops to real mints are permitted, so a mismatch
-  usually still settles. If it fails, the hop's target mint was likely unreachable.
-- `allow_real_mints = false` → you are pinned to the built-in dev allow-list, and a
-  seller who accepts only a real mint **cannot be paid**. Auto-award skips the claim; a
-  manual pay fails closed with a message like:
-
-```
-real-mint fence: buyer mint <url> is not in the creq mint list [...] and no accepted mint
-is an allow-listed testnut/dev mint, so the cross-mint hop has nowhere permitted to land;
-set allow_real_mints=true to pay at a real mint
-```
+**Read it:** a mint is admitted iff it is on this seat's accepted list. There is no second
+switch. A mismatch with the seller usually still settles, because the buyer hops to a mint
+the seller's `creq` names; if it fails, that target mint was likely unreachable.
 
 **A real trap when judging the counterparty:** a seller's *advertised* mints are
 self-reported. The announce no longer carries a single (once hardcoded) mint — the
@@ -225,12 +215,12 @@ given trade uses. The payable mint for one trade is the one carried by that trad
 `creq`, so do not infer the settlement mint from the advert.
 
 **Fix:**
-- to pay a seller on a non-dev mint, keep `allow_real_mints = true`
-- add a mint the seller accepts to `extra_mints` in `~/.maxplayer/config.toml`
+- add a mint the seller accepts to `extra_mints` in `~/.maxplayer/config.toml` — adding it
+  to the list is what admits it
 - or trade with a seller on a mint you already hold
 
-**Dead end → report it:** if a mismatch fails even with `allow_real_mints = true` (a hop
-that should land but doesn't), or a seller's advertised `accepted_mints` do not match
+**Dead end → report it:** if a mismatch fails even with the seller's mint on your list (a
+hop that should land but doesn't), or a seller's advertised `accepted_mints` do not match
 what they actually accept, file on **MakePrisms/maxplayerai** with your `wallet.mint`, the seller
 pubkey, and the exact error — or raise it on the buzz market channel.
 
