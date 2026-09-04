@@ -329,6 +329,7 @@ mod tests {
 
     fn seller_with(agents: Vec<String>) -> SellerConfig {
         SellerConfig {
+            takes_no_payment: false,
             agent_command: vec!["fallback-bin".into()],
             rate_sats: 5,
             git_remote: "https://example.invalid/repo".into(),

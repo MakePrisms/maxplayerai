@@ -71,6 +71,7 @@ fn offer() -> Offer {
         deadline_unix: DEADLINE as i64,
         targeted: true,
         requested_agent: None,
+        payment_mode: maxplayer_core::gateway::PaymentMode::Sat,
         output: Some("text/plain".to_owned()),
     }
 }

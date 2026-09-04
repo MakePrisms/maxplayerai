@@ -99,6 +99,7 @@ replaces it on every beat. Every fact below is current as of that beat, EXCEPT `
 | `["accepting", "y"` or `"n"]` | 1 | yes | Whether the seat intends to take new work |
 | `["queue_depth", n]` | 1 | yes | Jobs the seat currently holds in a non-terminal state |
 | `["accepted_mints", url, ...]` | 1 | yes | Every mint the seat accepts payment on |
+| `["takes_payment","none"]` | 0..1 | no | The seat takes NO payment. Absent is UNSTATED, never `"no"` |
 | `["agents", id, ...]` | 0..1 | no | Harnesses the seat can run |
 | `["admits_pool", "open"` or `"closed"]` | 0..1 | no | Whether the seat claims untargeted (open-pool) offers |
 | `["admits_targeted", "open"`, `"named"` or `"closed"]` | 0..1 | no | Who the seat admits on the targeted surface |
@@ -112,6 +113,18 @@ The last five are the seat's capability. Section 4.5 defines them. They are five
 facts spelled differently: a reader that budgets for four will be one short.
 
 `accepted_mints` carries one or more mint URLs. A buyer can pay a seat only on a mint in this list.
+This holds for a `takes_payment=none` seat too: a seat that publishes no mints does not parse, so a
+seat that takes nothing still names a mint it will never be paid at.
+
+`takes_payment` states that the seat takes no payment at all. It carries exactly one value, `none`,
+and it is emitted only by a seat that takes nothing. An ABSENT tag is UNSTATED and MUST NOT be read
+as `"takes payment: yes"` — the same rule the admission pair states for its own absence. It is
+derived from the seat's effective seller configuration, like `admits_pool` and `admits_targeted`,
+and a seat MUST NOT let an operator state it directly.
+
+`rate` is NOT this statement and a reader MUST NOT substitute it. `rate` is the lowest price the
+seat accepts, so a seat at `rate 0` is saying it will take any amount INCLUDING nothing — which is
+not the same as saying it takes nothing, and a buyer holding no bitcoin cannot act on the first.
 
 `agents` names the harnesses the seat can run. An absent `agents` tag means the seat states no
 harness. It does not mean the seat can run none.
@@ -290,7 +303,7 @@ protocol:
 
 A reader MUST NOT read these as grades of proof. NONE of the three is an enforcement: one is an
 inconsistency signal and two are silence. The only part of an offer that binds what executes is the
-`agent` preset, which is why §6.1.1 requires a model request to name one.
+`agent` preset, which is why §6.1.2 requires a model request to name one.
 
 #### 4.5.4 Freshness
 
@@ -378,6 +391,14 @@ A trade moves through these steps:
 8. **Receipt.** The buyer publishes a co-signed `RECEIPT`. Publication is not validity. The proof is
    a successful signature check over the bound preimage.
 
+**A `payment=none` trade stops after step 5.** When the offer and the claim both state
+`payment=none` (§6.1.1), the lifecycle is `offer -> claim -> award -> result -> verify` and ends
+there. Steps 6-8 have nothing to authorise, nothing to satisfy and nothing to co-sign: §6.8 marks
+`["mint", mint_url]` required on a receipt, and a trade that settles at no mint cannot construct a
+conformant one. A buyer MUST NOT publish a `RECEIPT` for a free trade, and a seller MUST NOT wait for
+one. Steps 1-5 are unchanged — in particular the buyer still verifies the delivery itself at step 5,
+because a free job's delivery is exactly as unverified-by-assertion as a paid one's.
+
 Two branches end a trade early:
 
 - **Reject.** A deterministic verification failure ends in `REJECT`. Section 10 defines it.
@@ -405,6 +426,7 @@ reject a lifecycle event that lacks it.
 | `["param","harness_family", family]` | 0..1 | no | Requires one harness family; must agree with `agent` |
 | `["param","harness_model", model]` | 0..1 | no | Requires one model; needs `agent` |
 | `["param","capability", token, ...]` | 0..1 | no | Requires every listed capability token |
+| `["param","payment","none"]` | 0..1 | no | This job has NO payment leg. Absent means `sat` |
 | `["delivery","git"]` | 0..1 | no | Delivery binding mode |
 | `["repo", locator]` | 0..1 | no | Bound delivery remote |
 | `["branch", name]` | 0..1 | no | Bound delivery branch |
@@ -412,7 +434,38 @@ reject a lifecycle event that lacks it.
 The `delivery`, `repo`, and `branch` tags bind delivery as one group. If the offer uses any of them,
 it MUST carry all three. A reader MUST reject a partial group.
 
-#### 6.1.1 The capability request
+#### 6.1.1 The payment mode
+
+`["param","payment","none"]` states that the job settles with NO payment at all. It carries exactly
+one value, `none`, and an ABSENT tag means `sat` — a priced job.
+
+That default is normative and it is the fail-closed direction. Every offer on the wire carried no
+such tag before this existed, so a stripped, dropped, or pre-upgrade tag reads as PAID, which the
+money rules of §11 already refuse to run for free. The opposite default would let a tag-dropping
+relay or an older signer turn a paid job into a free one. It is also why this ships as a tag rather
+than a new major: §2.3 requires an additive fact to ship as a tag, and a v1 reader that never learns
+this one keeps parsing free events and refuses to act on them.
+
+A reader MUST NOT INFER the mode. Not from `amount == 0`, not from a seat's `rate`, and not from a
+claim carrying no `creq`. The mode is read from one tag on each side, and both sides must agree.
+
+The `amount` tag is unchanged and stays cardinality 1, required: a free offer still carries
+`["amount","0","sat"]`. `payment=none` is what makes that `0` mean "no payment leg exists" rather
+than "a payment of zero", which §11 rule 6 forbids. A free offer whose amount is not `0` is a
+contradiction and a reader MUST refuse it.
+
+**The both-ends rule.** A trade is free only when the buyer-signed OFFER carries
+`["param","payment","none"]` AND the seller-signed CLAIM carries `["payment","none"]` (§6.2). Every
+other combination is a MISMATCH and a reader MUST refuse it — including offer-`none`/claim-absent
+and offer-absent/claim-`none`. Either one admitted would let one side decide a trade's payment mode
+after the other had signed something else.
+
+A `payment=none` trade ends after `verify` (§5) and publishes NO `RECEIPT`. §6.8 marks
+`["mint", mint_url]` cardinality 1, required, and requires both co-signatures; a free trade settles
+at no mint, so a conformant receipt cannot be constructed. The `accept → pay → receipt` tail does
+not run.
+
+#### 6.1.2 The capability request
 
 The three `harness_family` / `harness_model` / `capability` params are the offer's CAPABILITY REQUEST.
 They name what a seat must advertise to be awarded this job, and they are matched against the
@@ -474,7 +527,8 @@ on an unfalsifiable claim.
 | `["status","processing"]` | 1 | yes | Claim state |
 | `["e", offer_id, "", "root"]` | 1 | yes | Root offer id |
 | `["p", buyer_pubkey]` | 1 | yes | Intended buyer |
-| `["creq", creqA...]` | 1 | yes | Seller-authored NUT-18 payment request |
+| `["creq", creqA...]` | 0..1 | yes* | Seller-authored NUT-18 payment request. Required unless the claim states `payment=none` |
+| `["payment","none"]` | 0..1 | no | This claim takes NO payment. Absent means `sat` |
 | `["t","maxplayer"]` | 1 | yes | Namespace |
 | `["v","1"]` | 1 | yes | Protocol major |
 | `["p", seller_pubkey]` | 0..1 | no | Seller mirror |
@@ -488,6 +542,15 @@ are absent from a claim by rule, not by omission. Section 4.5 defines the split 
 it. A buyer decides an award on the claim, so a capability a buyer filters on MUST appear here.
 
 The `creq` carries the accepted mints, the amount, the unit, and a NIP-17 transport to the seller.
+
+A claim states EXACTLY ONE of `creq` and `payment=none`, never both and never neither. A claim
+carrying `payment=none` MUST NOT carry a `creq`: a zero-amount payment request reads as an invoice
+to every reader that does not know the payment tag, which is the exact ambiguity the tag exists to
+remove. A claim carrying both, or neither, MUST be refused.
+
+`payment` is absent on a priced claim, and its absence means `sat` — the same fail-closed default
+§6.1.1 states for the offer. A buyer MUST refuse a claim whose payment mode disagrees with the mode
+its own signed offer stated (the both-ends rule, §6.1.1).
 
 ### 6.3 Award, kind `3405`
 
@@ -795,6 +858,12 @@ events, provisioning failures, posture mismatches, and I/O failures all retry in
    MUST check the seller's pre-pay signature before spending.
 5. **Capped.** Every payment passes the buyer's per-job and total budget limits.
 6. **Fee floor.** An amount at or below the mint fee is dust, and a buyer MUST refuse it.
+7. **No payment leg, no payment path.** A `payment=none` trade (§6.1.1) has no amount to check
+   against any of the rules above, and a buyer MUST NOT enter the payment path for one. Rule 6 is
+   NOT relaxed to admit `amount = 0`: a free trade is not a payment of zero, and weakening the dust
+   floor would weaken it for every priced job in the market. Rules 1, 3 and 4 apply to a free trade
+   unchanged — work still follows the award, the buyer still verifies its own delivery, and a result
+   whose author is not the claim's seller is still refused.
 
 ## 12. Reserved Paths
 

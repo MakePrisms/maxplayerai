@@ -137,6 +137,7 @@ async fn collect_refuses_pay_when_delivered_tip_differs_from_bound_oid() {
     // lands at the tip-match. buyer == seller == the home key.
     let job_id = "a".repeat(64);
     let mut bind = AcceptedBind {
+        payment_mode: maxplayer_core::gateway::PaymentMode::Sat,
         job_id: job_id.clone(),
         claim_id: "c".repeat(64),
         result_id: "d".repeat(64),
@@ -256,6 +257,7 @@ fn from_scratch_bind(
     job_hash: &str,
 ) -> AcceptedBind {
     AcceptedBind {
+        payment_mode: maxplayer_core::gateway::PaymentMode::Sat,
         job_id: job_id.to_owned(),
         claim_id: "c".repeat(64),
         result_id: "d".repeat(64),

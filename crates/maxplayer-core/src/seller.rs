@@ -71,18 +71,39 @@ pub fn require_seller_config(home: &MaxplayerHome) -> Result<&SellerConfig, Sell
         ));
     }
     // rate_sats: 0 is allowed (accept any amount ≥ 0) but field must be present (serde).
+    //
+    // §2.1 CONFIG COUPLING, DELIBERATE. `takes_no_payment = true` is valid only with
+    // `rate_sats = 0`. The pair "advertises free, floors at 21 sat" describes a seat NO buyer can
+    // satisfy in either mode — a free offer is refused by the price floor, a priced one by the
+    // free-lane gate — so the seat would publish an advertisement its own admission contradicts.
+    // Refused at config-read because that is the only place the operator can fix it.
+    if seller.takes_no_payment && seller.rate_sats != 0 {
+        return Err(SellerError::Config(format!(
+            "[seller] takes_no_payment = true requires rate_sats = 0 (found {}): a seat that \
+             advertises free work but floors at a price can satisfy no buyer in either mode",
+            seller.rate_sats
+        )));
+    }
     Ok(seller)
 }
 
-/// Claim-floor: targeted-to-self AND `offer.amount ≥ rate_sats`.
+/// Claim-floor: targeted-to-self AND (per §2.1) the offer's PAYMENT MODE is one this seat serves —
+/// a `payment=none` offer only when `takes_no_payment`, a priced offer only at `amount ≥ rate_sats`.
 ///
 /// Untargeted/open offers refuse by default. Pass `claim_open_pool = true` (explicit
 /// seller opt-in) to allow untargeted offers that still clear the rate floor.
+///
+/// ⛔ THE TWO MODES ARE JUDGED BY DIFFERENT GATES, AND NEITHER SUBSTITUTES FOR THE OTHER. A seat at
+/// `rate_sats = 0` already clears the price floor for an `amount = 0` offer — the floor is `<`, not
+/// `<=` — so WITHOUT the mode refusal below a free offer would be admitted by any zero-rate seat
+/// that never opted in. `rate 0` means "any amount ≥ 0"; it is not a statement that the seat takes
+/// nothing, and reading it as one is exactly the inference §2.0 forbids.
 pub fn rate_gate_allows(
     offer: &ParsedOffer,
     seller_pubkey: &str,
     rate_sats: u64,
     claim_open_pool: bool,
+    takes_no_payment: bool,
 ) -> Result<(), SellerError> {
     match offer.seller_pubkey.as_deref() {
         None if claim_open_pool => {}
@@ -97,6 +118,19 @@ pub fn rate_gate_allows(
             )));
         }
         Some(_) => {}
+    }
+    if offer.payment_mode.is_free() {
+        if !takes_no_payment {
+            return Err(SellerError::Policy(
+                "free offer (payment=none) refused (set [seller] takes_no_payment=true to opt in)"
+                    .into(),
+            ));
+        }
+        // The price floor is NOT consulted for a free offer: there is no price. `takes_no_payment`
+        // already implies `rate_sats == 0` (`require_seller_config`), so this arm and the floor
+        // below can never disagree — they are separated so the refusal an operator reads names the
+        // knob that governs their case.
+        return Ok(());
     }
     if offer.amount < rate_sats {
         return Err(SellerError::Policy(format!(
@@ -733,6 +767,7 @@ mod tests {
 
     fn offer(amount: u64, seller: Option<&str>) -> ParsedOffer {
         ParsedOffer {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             task: "task".into(),
             output: "text/plain".into(),
             amount,
@@ -797,12 +832,12 @@ mod tests {
     #[test]
     fn rate_gate_floor_allows_above_rate_refuses_below_and_untargeted() {
         let seller = "aa".repeat(32);
-        rate_gate_allows(&offer(5, Some(&seller)), &seller, 3, false).expect("above floor");
-        rate_gate_allows(&offer(3, Some(&seller)), &seller, 3, false).expect("equal floor");
-        assert!(rate_gate_allows(&offer(2, Some(&seller)), &seller, 3, false).is_err());
-        assert!(rate_gate_allows(&offer(9, None), &seller, 1, false).is_err());
-        rate_gate_allows(&offer(9, None), &seller, 1, true).expect("open-pool opt-in");
-        assert!(rate_gate_allows(&offer(0, None), &seller, 1, true).is_err());
+        rate_gate_allows(&offer(5, Some(&seller)), &seller, 3, false, false).expect("above floor");
+        rate_gate_allows(&offer(3, Some(&seller)), &seller, 3, false, false).expect("equal floor");
+        assert!(rate_gate_allows(&offer(2, Some(&seller)), &seller, 3, false, false).is_err());
+        assert!(rate_gate_allows(&offer(9, None), &seller, 1, false, false).is_err());
+        rate_gate_allows(&offer(9, None), &seller, 1, true, false).expect("open-pool opt-in");
+        assert!(rate_gate_allows(&offer(0, None), &seller, 1, true, false).is_err());
     }
 
     #[test]
@@ -963,6 +998,7 @@ offer_backfill_secs = {backfill}
         let mut home = home::bootstrap(&root).expect("bootstrap");
         home::save_config(&mut home, |config| {
             config.seller = Some(SellerConfig {
+                takes_no_payment: false,
                 agent_command: vec!["echo".into()],
                 rate_sats: 1,
                 git_remote: "https://example.invalid/repo.git".into(),
@@ -1388,3 +1424,137 @@ offer_backfill_secs = {backfill}
         assert_eq!(normalized.public_key().to_bytes()[0], 0x02);
     }
 }
+
+#[cfg(test)]
+mod free_lane_tests {
+    use super::*;
+    use crate::gateway::PaymentMode;
+
+    fn offer(amount: u64, mode: PaymentMode, seller: Option<&str>) -> ParsedOffer {
+        ParsedOffer {
+            payment_mode: mode,
+            task: "task".into(),
+            output: "text/plain".into(),
+            amount,
+            unit: "sat".into(),
+            deadline_unix: 2_000_000_000,
+            seller_pubkey: seller.map(str::to_owned),
+            requested_agent: None,
+            requested_harness_family: None,
+            requested_model: None,
+            required_capabilities: Vec::new(),
+        }
+    }
+
+    /// PROPERTY 1, SELLER SIDE (§2.1) — a `payment=none` offer is admitted ONLY by a seat that
+    /// opted in, and the price floor is not a substitute for that opt-in.
+    ///
+    /// The third assertion is the tooth. A seat at `rate_sats = 0` ALREADY clears the price floor
+    /// for an `amount = 0` offer — the floor is `<`, not `<=` — so without the mode refusal every
+    /// zero-rate seat in the market would silently start working for free the moment the first free
+    /// offer appeared. Deleting the `takes_no_payment` arm turns this leg red and nothing else.
+    #[test]
+    fn a_free_offer_is_admitted_only_by_a_seat_that_opted_in_never_by_a_zero_rate_one() {
+        let seller = "aa".repeat(32);
+
+        rate_gate_allows(&offer(0, PaymentMode::None, Some(&seller)), &seller, 0, false, true)
+            .expect("an opted-in seat admits a free offer");
+
+        let refused = rate_gate_allows(&offer(0, PaymentMode::None, Some(&seller)), &seller, 0, false, false)
+            .expect_err("a seat that never opted in must refuse a free offer");
+        assert!(
+            refused.to_string().contains("takes_no_payment"),
+            "the refusal must name the knob the operator has to set: {refused}"
+        );
+
+        // A PAID offer is judged by the price floor exactly as before, in both directions, and the
+        // opt-in does not soften it — `takes_no_payment` implies `rate_sats = 0`, so there is no
+        // floor left to soften, and the paid arm is reached unchanged.
+        rate_gate_allows(&offer(5, PaymentMode::Sat, Some(&seller)), &seller, 3, false, false)
+            .expect("a priced offer above the floor still clears it");
+        assert!(
+            rate_gate_allows(&offer(2, PaymentMode::Sat, Some(&seller)), &seller, 3, false, false).is_err(),
+            "a priced offer below the floor is still refused — the free lane does not touch this"
+        );
+    }
+
+    /// The targeting gate runs BEFORE the payment gate, in both modes: a free offer addressed to
+    /// another seat is refused for targeting, not admitted because it is free.
+    #[test]
+    fn a_free_offer_still_passes_through_the_targeting_gate_first() {
+        let seller = "aa".repeat(32);
+        let elsewhere = "bb".repeat(32);
+        assert!(
+            rate_gate_allows(&offer(0, PaymentMode::None, Some(&elsewhere)), &seller, 0, true, true).is_err(),
+            "a free offer targeting ANOTHER seat is refused; free-ness is not a targeting override"
+        );
+        assert!(
+            rate_gate_allows(&offer(0, PaymentMode::None, None), &seller, 0, false, true).is_err(),
+            "an untargeted free offer still needs claim_open_pool — admission is the only control \
+             a free seat has left, so it must not be bypassed by the mode"
+        );
+        rate_gate_allows(&offer(0, PaymentMode::None, None), &seller, 0, true, true)
+            .expect("untargeted + open-pool + opted-in is the one admitting combination");
+    }
+
+    /// §2.1 CONFIG COUPLING — `takes_no_payment = true` with a non-zero `rate_sats` is refused at
+    /// config read. That pair describes a seat no buyer can satisfy in EITHER mode.
+    #[test]
+    fn takes_no_payment_requires_rate_zero() {
+        fn seller(rate_sats: u64, takes_no_payment: bool) -> SellerConfig {
+            SellerConfig {
+                takes_no_payment,
+                agent_command: vec!["echo".into()],
+                rate_sats,
+                git_remote: "https://example.invalid/repo.git".into(),
+                job_timeout_secs: None,
+                agents: Vec::new(),
+                claim_open_pool: false,
+                accept_open_targeted: false,
+                accept_offers_only_from: Vec::new(),
+                offer_backfill_secs: 0,
+                contribution_enabled: true,
+                slots: 1,
+                claim_award_timeout_secs: None,
+            }
+        }
+
+        // Asserted through the real reader, so the refusal is the one an operator actually meets.
+        let root = std::env::temp_dir().join(format!(
+            "maxplayer-free-lane-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap");
+
+        crate::home::save_config(&mut home, |config| {
+            config.seller = Some(seller(21, true));
+        })
+        .expect("save");
+        let err = require_seller_config(&home).expect_err("free + priced floor must be refused");
+        assert!(
+            err.to_string().contains("rate_sats = 0"),
+            "the refusal must tell the operator what to change: {err}"
+        );
+
+        crate::home::save_config(&mut home, |config| {
+            config.seller = Some(seller(0, true));
+        })
+        .expect("save");
+        require_seller_config(&home).expect("free + rate 0 is the valid pair");
+
+        // And the pair the whole market already runs is untouched.
+        crate::home::save_config(&mut home, |config| {
+            config.seller = Some(seller(21, false));
+        })
+        .expect("save");
+        require_seller_config(&home).expect("a priced seat is unaffected by the coupling");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+

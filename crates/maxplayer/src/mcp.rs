@@ -610,6 +610,7 @@ mod tests {
                 creq: Some(creq),
                 agents: vec!["codex".to_owned()],
                 capability: maxplayer_core::heartbeat::SeatCapability::default(),
+                payment_mode: maxplayer_core::gateway::PaymentMode::Sat,
             }],
             results: Vec::new(),
             live_claim_id: None,
@@ -626,6 +627,7 @@ mod tests {
             requested_harness_family: None,
             requested_model: None,
             required_capabilities: &[],
+            payment_mode: maxplayer_core::gateway::PaymentMode::Sat,
         };
 
         // CONTROL FIRST: this claim IS awardable with no request. Every refusal below is meaningless

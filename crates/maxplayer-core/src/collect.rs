@@ -392,6 +392,7 @@ mod tests {
     // Helper: a from-scratch accept-bind pinning `commit_oid` (used by refuse-path tests).
     fn bind_for(job_id: &str, seller_hex: &str, commit_oid: &str) -> AcceptedBind {
         AcceptedBind {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: job_id.to_owned(),
             claim_id: "c".repeat(64),
             result_id: "d".repeat(64),
@@ -543,7 +544,7 @@ mod tests {
             &seller_hex,
         )
         .expect("creq");
-        let claim_draft = crate::gateway::claim_draft(&offer_id, &buyer_hex, &seller_hex, &creq, &[], &Default::default());
+        let claim_draft = crate::gateway::claim_draft(&offer_id, &buyer_hex, &seller_hex, crate::gateway::ClaimPayment::Sat(&creq), &[], &Default::default());
         let claim_id = publish(&seller, &claim_draft).await.to_hex();
 
         // The buyer AWARDS the seller's claim (kind-3405). collect resolves the delivery against this

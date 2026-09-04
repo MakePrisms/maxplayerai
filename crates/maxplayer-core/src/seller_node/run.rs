@@ -397,6 +397,16 @@ enum SkipReason {
     RateGate,
     /// The offer asked for a harness this node does not run.
     AgentUnavailable,
+    /// §2.1: the offer states `payment=none` and this seat has not opted in to free work
+    /// (`[seller] takes_no_payment = false`, the default).
+    ///
+    /// DELIBERATELY NOT FOLDED INTO [`Self::RateGate`], for the reason [`Self::OpenTargetedRefused`]
+    /// is not folded into [`Self::NotAllowlisted`]: they answer different operator questions and
+    /// point at different knobs. `RateGate` means "this offer did not clear your price"; this means
+    /// "this offer names no price at all and you have not said you work for free". A seat at
+    /// `rate_sats = 0` clears the price floor for an `amount = 0` offer, so folding them would also
+    /// let the operator read a free refusal as a pricing one and go adjust a rate that is already 0.
+    FreeNotOffered,
     /// Every execution slot is busy — the node is fully loaded and does not claim (reserve-at-claim
     /// back-pressure; a loaded node is invisible to the market by simply not claiming). Emitted by
     /// [`SellerNodeRunner::on_offer`], never by the pure [`classify_offer`], because it depends on
@@ -434,6 +444,10 @@ impl SkipReason {
             }
             Self::RateGate => "rate-gate refused (untargeted without opt-in / below rate)",
             Self::AgentUnavailable => "requested agent harness not available on this node",
+            Self::FreeNotOffered => {
+                "free offer (payment=none) and this seat does not work for free (set [seller] \
+                 takes_no_payment=true, which also requires rate_sats=0, to opt in)"
+            }
             Self::SlotsBusy => "all execution slots busy (node fully loaded; not claiming)",
             Self::Settled => "offer already settled (co-signed receipt seen; terminal, never claimed)",
             Self::TakenElsewhere => {
@@ -800,6 +814,11 @@ fn already_handled_skip_line(job_id: &str, state: Option<super::store::JobState>
 /// cannot break the buyer/seller cosignature (audit N-4 / invariant 8). The specific realized mint is
 /// deliberately NOT in the preimage (the seller signs at delivery, before the buyer picks a mint); the
 /// accepted-mint SET is bound via this creq hash, so buyer/seller cosigs agree for ANY accepted mint.
+///
+/// `stored_creq = None` ⇒ a FREE job (§2.2): there are no payment terms to bind, so `creq_hash` is
+/// `None` — the SAME value the buyer's accept-bind records for a claim carrying no creq. Hashing a
+/// sentinel here instead would make the two sides sign different preimages for a trade that, by
+/// §3.4, never publishes a receipt at all — a silent disagreement nothing would ever surface.
 #[allow(clippy::too_many_arguments)]
 fn delivery_receipt_preimage(
     job_id: &str,
@@ -809,7 +828,7 @@ fn delivery_receipt_preimage(
     seller_pubkey: &str,
     commit_oid: &str,
     delivery_kind: &str,
-    stored_creq: &str,
+    stored_creq: Option<&str>,
 ) -> ReceiptPreimage {
     ReceiptPreimage {
         job_hash: job_hash_for_offer(job_id, task, amount),
@@ -821,7 +840,20 @@ fn delivery_receipt_preimage(
         delivery_integrity_hash: commit_oid.to_owned(),
         delivery_kind: delivery_kind.to_owned(),
         exec_metadata_commitment: EXEC_METADATA_COMMITMENT_EMPTY.to_owned(),
-        creq_hash: Some(gateway::creq_hash_hex(stored_creq)),
+        creq_hash: stored_creq.map(gateway::creq_hash_hex),
+    }
+}
+
+/// The claim-time creq's PAYMENT TERMS, separating a free claim from a priced one.
+///
+/// `SellerStore::job_creq` answers three states in one `Option` (see its doc): `None` = no claim,
+/// `Some("")` = a FREE claim, `Some(creq)` = a priced one. Every caller that wants TERMS rather than
+/// "did we claim" goes through here, so the empty-string sentinel is read in exactly one place.
+fn creq_terms(stored_creq: &str) -> Option<&str> {
+    if stored_creq.is_empty() {
+        None
+    } else {
+        Some(stored_creq)
     }
 }
 
@@ -1789,6 +1821,10 @@ fn offer_row(job_id: &str, buyer_pubkey: &str, offer: &ParsedOffer) -> super::st
         // offer without it), so it is always `Some` here. It becomes `None` only for a row written
         // before the column existed.
         output: Some(offer.output.clone()),
+        // §1.1, journaled for the same reason as the two fields above: the delivery record this
+        // job eventually writes must state the mode the OFFER was posted under, and execution can
+        // be a restart away from here.
+        payment_mode: offer.payment_mode,
     }
 }
 
@@ -2210,7 +2246,26 @@ fn classify_offer(
             SkipReason::NotAllowlisted
         });
     }
-    if rate_gate_allows(offer, seller_pubkey, seller.rate_sats, seller.claim_open_pool).is_err() {
+    // §2.1 — the payment-mode gate, checked BEFORE the rate gate so the operator gets the refusal
+    // that names their knob. `rate_gate_allows` refuses the same offer for the same reason; this
+    // arm exists only to keep "you have not opted in to free work" distinguishable from "this offer
+    // did not clear your price", which is not a distinction a single `is_err()` can carry.
+    //
+    // ⛔ NOTE WHAT IS *NOT* HERE: no check of `offer.amount`, no check of `seller.rate_sats`. Mode
+    // is read from the offer's tag and nothing else (§2.0). A zero-rate seat that never opted in
+    // refuses a free offer here even though the price floor would have admitted it.
+    if offer.payment_mode.is_free() && !seller.takes_no_payment {
+        return ClaimDecision::Skip(SkipReason::FreeNotOffered);
+    }
+    if rate_gate_allows(
+        offer,
+        seller_pubkey,
+        seller.rate_sats,
+        seller.claim_open_pool,
+        seller.takes_no_payment,
+    )
+    .is_err()
+    {
         return ClaimDecision::Skip(SkipReason::RateGate);
     }
     if !agents.serves(offer.requested_agent.as_deref()) {
@@ -3451,6 +3506,7 @@ impl SellerNodeRunner {
             let offer = ParsedOffer {
                 task: row.task.clone(),
                 output: String::new(),
+                payment_mode: row.payment_mode,
                 amount: row.amount_sats,
                 unit: row.unit.clone(),
                 deadline_unix: row.deadline_unix as u64,
@@ -4465,6 +4521,9 @@ impl SellerNodeRunner {
             in_flight,
             roster.serving,
             seller.rate_sats,
+            // §4.1 — derived from the SAME `SellerConfig` `classify_offer` reads, in the same call,
+            // for the same reason the admission policy below is: the ad cannot drift from its gate.
+            seller.takes_no_payment,
             self.node.home().config.accepted_mints.clone(),
             roster.names.clone(),
             roster.capability(&self.node.home().config.seat),
@@ -4517,6 +4576,7 @@ impl SellerNodeRunner {
         let draft = crate::heartbeat::retraction_for_state(
             self.live_in_flight("retraction"),
             seller.rate_sats,
+            seller.takes_no_payment,
             self.node.home().config.accepted_mints.clone(),
             roster.names.clone(),
             roster.capability(&self.node.home().config.seat),
@@ -4966,17 +5026,25 @@ impl SellerNodeRunner {
             return;
         }
 
-        let creq = match gateway::creq::build_seller_creq(
-            job_id,
-            offer.amount,
-            &offer.unit,
-            &self.node.home().config.accepted_mints,
-            seller_pubkey,
-        ) {
-            Ok(creq) => creq,
-            Err(error) => {
-                opline!("seller node offer skip id={job_id}: creq build failed ({error})");
-                return;
+        // §2.2 — in FREE mode NO creq is built and none is emitted. `build_seller_creq` would
+        // happily encode `amount = 0`, but every consumer of that request is a payment gate that
+        // refuses zero (§2.4, §2.5), so a zero creq would put an unpayable invoice on the wire that
+        // reads as an invoice to every un-upgraded buyer — the exact ambiguity the mode tag removes.
+        let creq = if offer.payment_mode.is_free() {
+            None
+        } else {
+            match gateway::creq::build_seller_creq(
+                job_id,
+                offer.amount,
+                &offer.unit,
+                &self.node.home().config.accepted_mints,
+                seller_pubkey,
+            ) {
+                Ok(creq) => Some(creq),
+                Err(error) => {
+                    opline!("seller node offer skip id={job_id}: creq build failed ({error})");
+                    return;
+                }
             }
         };
         // The claim advertises what this node can run, so the buyer's award filter can hold it to
@@ -4992,7 +5060,12 @@ impl SellerNodeRunner {
             job_id,
             buyer_pubkey,
             seller_pubkey,
-            &creq,
+            // Exactly one of the two payment statements, chosen by the OFFER's mode — never both
+            // and never neither (§2.2). A free claim carries `["payment","none"]` and no creq.
+            match creq.as_deref() {
+                Some(creq) => gateway::ClaimPayment::Sat(&creq),
+                None => gateway::ClaimPayment::None,
+            },
             &roster.names,
             // The claim holds the declared colour and emits none of it: `claim_draft` asks only for
             // the filterable tags. Passing it is not a leak, and passing a stub here instead would
@@ -5022,7 +5095,7 @@ impl SellerNodeRunner {
         match self.node.store().claim_and_enqueue(
             job_id,
             job_id,
-            &creq,
+            creq.as_deref(),
             &claim,
             now,
             now + CLAIM_PUBLISH_WINDOW_SECS,
@@ -6212,7 +6285,7 @@ impl SellerNodeRunner {
             &seller_pubkey,
             &commit,
             delivery_kind.as_str(),
-            &stored_creq,
+            creq_terms(&stored_creq),
         );
         let seller_sig = match self.node.signer().sign_receipt_hash(preimage.digest_hex()).await {
             Ok(Ok(sig)) => sig,
@@ -6278,6 +6351,10 @@ impl SellerNodeRunner {
         match self.node.store().deliver_and_enqueue(
             job_id,
             &commit,
+            // §3.2 — the mode the JOB was posted under, read off the journaled offer row, not
+            // inferred from the amount. `offer` came from the store precisely because execution can
+            // be a restart away from the claim.
+            offer.payment_mode,
             &draft,
             now,
             now + RESULT_PUBLISH_WINDOW_SECS,
@@ -6364,7 +6441,7 @@ impl SellerNodeRunner {
             &seller_pubkey,
             commit,
             delivery_kind.as_str(),
-            &stored_creq,
+            creq_terms(&stored_creq),
         );
         let seller_sig = match self.node.signer().sign_receipt_hash(preimage.digest_hex()).await {
             Ok(Ok(sig)) => sig,
@@ -6419,6 +6496,7 @@ impl SellerNodeRunner {
         match self.node.store().deliver_and_enqueue(
             job_id,
             commit,
+            offer.payment_mode,
             &draft,
             now,
             now + RESULT_PUBLISH_WINDOW_SECS,
@@ -6552,6 +6630,10 @@ impl SellerNodeRunner {
         let parsed_offer = ParsedOffer {
             task: offer.task.clone(),
             output: String::new(),
+            // The redeem guard runs only for a PRICED job — a free trade has no payment to redeem —
+            // but the mode is carried from the stored row rather than assumed, so a free job that
+            // somehow reached here is judged as free, not as paid.
+            payment_mode: offer.payment_mode,
             amount: offer.amount_sats,
             unit: offer.unit.clone(),
             deadline_unix: offer.deadline_unix.max(0) as u64,
@@ -7347,6 +7429,7 @@ mod tests {
     /// behavioural twin `default_seat_refuses_a_targeted_offer_from_an_unnamed_buyer`.
     fn seller_cfg(rate_sats: u64, claim_open_pool: bool) -> crate::home::SellerConfig {
         crate::home::SellerConfig {
+            takes_no_payment: false,
             agent_command: vec!["claude".to_owned()],
             rate_sats,
             git_remote: "https://example.invalid/repo.git".to_owned(),
@@ -7374,6 +7457,7 @@ mod tests {
 
     fn offer(amount: u64, targeted_to: Option<&str>, deadline_unix: u64) -> ParsedOffer {
         ParsedOffer {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             task: "do the thing".to_owned(),
             output: String::new(),
             amount,
@@ -8431,6 +8515,110 @@ mod tests {
         );
     }
 
+    // ── FREE JOB LANE (§2.1) ───────────────────────────────────────────────────────────────────
+
+    fn free_offer(targeted_to: Option<&str>) -> ParsedOffer {
+        ParsedOffer {
+            payment_mode: crate::gateway::PaymentMode::None,
+            ..offer(0, targeted_to, NOW + 600)
+        }
+    }
+
+    fn free_seat(claim_open_pool: bool) -> crate::home::SellerConfig {
+        crate::home::SellerConfig {
+            takes_no_payment: true,
+            ..seller_cfg(0, claim_open_pool)
+        }
+    }
+
+    /// §2.1 — a `payment=none` offer reaches a seat that opted in, and NOTHING ELSE admits it.
+    ///
+    /// The middle case is the one with teeth: a seat at `rate_sats = 0` that never set
+    /// `takes_no_payment` clears the price floor for an `amount = 0` offer (the floor is `<`, not
+    /// `<=`), so without the mode gate every zero-rate seat in the market would start working for
+    /// free the moment the first free offer appeared. Delete the `FreeNotOffered` arm and only this
+    /// leg turns red.
+    #[test]
+    fn a_free_offer_is_claimed_only_by_a_seat_that_opted_in() {
+        assert_eq!(
+            classify_offer(&free_offer(Some(SELLER)), &free_seat(false), &claude_only(), SELLER, BUYER, NOW, NOW),
+            ClaimDecision::Claim { deadline_unix: NOW + 600 },
+            "an opted-in seat claims a free offer"
+        );
+        assert_eq!(
+            classify_offer(&free_offer(Some(SELLER)), &seller_cfg(0, false), &claude_only(), SELLER, BUYER, NOW, NOW),
+            ClaimDecision::Skip(SkipReason::FreeNotOffered),
+            "a ZERO-RATE seat that never opted in must still refuse — rate 0 means 'any amount >= 0', \
+             not 'I take nothing'"
+        );
+        assert_eq!(
+            classify_offer(&free_offer(Some(SELLER)), &seller_cfg(21, false), &claude_only(), SELLER, BUYER, NOW, NOW),
+            ClaimDecision::Skip(SkipReason::FreeNotOffered),
+            "a priced seat refuses a free offer, and the reason names the free knob rather than the rate"
+        );
+    }
+
+    /// The free refusal is its OWN operator string, distinct from the rate gate's.
+    ///
+    /// They answer different questions and point at different knobs: `RateGate` means "this offer
+    /// did not clear your price", and `FreeNotOffered` means "this offer names no price at all and
+    /// you have not said you work for free". One string covering both would send an operator to
+    /// adjust a `rate_sats` that is already 0.
+    #[test]
+    fn free_not_offered_is_not_folded_into_the_rate_gate() {
+        assert_ne!(
+            SkipReason::FreeNotOffered.reason(),
+            SkipReason::RateGate.reason(),
+            "the two refusals must not collapse to one operator string"
+        );
+        assert!(
+            SkipReason::FreeNotOffered.reason().contains("takes_no_payment"),
+            "the free refusal must name the knob that fixes it: {}",
+            SkipReason::FreeNotOffered.reason()
+        );
+    }
+
+    /// The earlier gates still run FIRST for a free offer: a lapsed deadline, a foreign target and
+    /// the open-pool opt-in are all judged before the payment mode is.
+    ///
+    /// Free-ness is not an admission override — §6 names admission as the ONLY control an operator
+    /// has left once the price floor is set aside.
+    #[test]
+    fn a_free_offer_does_not_bypass_the_admission_gates() {
+        let lapsed = ParsedOffer { deadline_unix: NOW - 1, ..free_offer(Some(SELLER)) };
+        assert_eq!(
+            classify_offer(&lapsed, &free_seat(false), &claude_only(), SELLER, BUYER, NOW, NOW),
+            ClaimDecision::Skip(SkipReason::Lapsed)
+        );
+        assert_eq!(
+            classify_offer(&free_offer(Some("cc")), &free_seat(true), &claude_only(), SELLER, BUYER, NOW, NOW),
+            ClaimDecision::Skip(SkipReason::RateGate),
+            "a free offer addressed to ANOTHER seat is refused by targeting, inside the rate gate"
+        );
+        assert_eq!(
+            classify_offer(&free_offer(None), &free_seat(false), &claude_only(), SELLER, BUYER, NOW, NOW),
+            ClaimDecision::Skip(SkipReason::RateGate),
+            "an untargeted free offer still needs claim_open_pool"
+        );
+        assert_eq!(
+            classify_offer(&free_offer(None), &free_seat(true), &claude_only(), SELLER, BUYER, NOW, NOW),
+            ClaimDecision::Claim { deadline_unix: NOW + 600 }
+        );
+    }
+
+    /// A PRICED offer is judged exactly as it always was by a free seat — the mode gate fires only
+    /// on the mode. Without this leg the gate above would also pass an implementation that refused
+    /// everything a free seat was offered.
+    #[test]
+    fn a_free_seat_still_judges_a_priced_offer_by_the_price_floor() {
+        assert_eq!(
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &free_seat(false), &claude_only(), SELLER, BUYER, NOW, NOW),
+            ClaimDecision::Claim { deadline_unix: NOW + 600 },
+            "a free seat floors at 0, so a priced offer clears it — it is a seat that takes no \
+             payment, not one that refuses money it is handed"
+        );
+    }
+
     // Untargeted offers are refused unless open-pool is opted in; with it, they claim.
     #[test]
     fn untargeted_needs_open_pool_opt_in() {
@@ -8832,6 +9020,7 @@ mod tests {
             store
                 .record_offer(
                     &Offer {
+                        payment_mode: crate::gateway::PaymentMode::Sat,
                         offer_id: job.clone(),
                         buyer_pubkey: buyer.clone(),
                         amount_sats: 21,
@@ -8845,9 +9034,9 @@ mod tests {
                     1,
                 )
                 .expect("record offer");
-            let draft = claim_draft(&job, &buyer, &seller, &creq, &["codex".to_owned()], &Default::default());
+            let draft = claim_draft(&job, &buyer, &seller, crate::gateway::ClaimPayment::Sat(&creq), &["codex".to_owned()], &Default::default());
             store
-                .claim_and_enqueue(&job, &job, &creq, &draft, 1, 9_999_999_999, 1)
+                .claim_and_enqueue(&job, &job, Some(&creq), &draft, 1, 9_999_999_999, 1)
                 .expect("claim");
         }
 
@@ -11081,6 +11270,7 @@ mod tests {
         store
             .record_offer(
                 &crate::seller_node::store::Offer {
+                    payment_mode: crate::gateway::PaymentMode::Sat,
                     offer_id: job_id.to_owned(),
                     buyer_pubkey: buyer_hex.to_owned(),
                     amount_sats: 100,
@@ -11094,9 +11284,9 @@ mod tests {
                 now,
             )
             .expect("record offer");
-        let draft = claim_draft(job_id, buyer_hex, &"s".repeat(64), "creq", &[], &Default::default());
+        let draft = claim_draft(job_id, buyer_hex, &"s".repeat(64), crate::gateway::ClaimPayment::Sat("creq"), &[], &Default::default());
         store
-            .claim_and_enqueue(job_id, job_id, "creq", &draft, now, now + 3_600, now)
+            .claim_and_enqueue(job_id, job_id, Some("creq"), &draft, now, now + 3_600, now)
             .expect("claim");
         store
             .record_award(&"a".repeat(64), job_id, buyer_hex, now)
@@ -11420,12 +11610,13 @@ mod tests {
             "nothing delivered yet"
         );
 
-        let draft = claim_draft(&job, &buyer, &seller, &creq, &[], &Default::default());
+        let draft = claim_draft(&job, &buyer, &seller, crate::gateway::ClaimPayment::Sat(&creq), &[], &Default::default());
         let delivered_at = 6_000;
         assert!(store
             .deliver_and_enqueue(
                 &job,
                 &"c".repeat(40),
+                crate::gateway::PaymentMode::Sat,
                 &draft,
                 delivered_at,
                 delivered_at + RESULT_PUBLISH_WINDOW_SECS,
@@ -11687,11 +11878,11 @@ mod tests {
         let job = "a".repeat(64);
         let buyer = "b".repeat(64);
         let (store, root) = store_with_awarded_job(&creq, &job, &buyer, 4242);
-        let draft = claim_draft(&job, &buyer, &seller, &creq, &[], &Default::default());
+        let draft = claim_draft(&job, &buyer, &seller, crate::gateway::ClaimPayment::Sat(&creq), &[], &Default::default());
 
         // Deliver ⇒ state Delivered ⇒ NOT re-execute-eligible (the guard early-returns).
         assert!(store
-            .deliver_and_enqueue(&job, &"c".repeat(40), &draft, 5000, 5000 + RESULT_PUBLISH_WINDOW_SECS, 5000)
+            .deliver_and_enqueue(&job, &"c".repeat(40), crate::gateway::PaymentMode::Sat, &draft, 5000, 5000 + RESULT_PUBLISH_WINDOW_SECS, 5000)
             .expect("deliver"));
         assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Delivered));
         assert!(
@@ -11738,7 +11929,7 @@ mod tests {
         let buyer = "b".repeat(64);
         // The helper journals award event A (`w`×64) — that is execution #1's award.
         let (store, root) = store_with_awarded_job(&creq, &job, &buyer, 4242);
-        let draft = claim_draft(&job, &buyer, &seller, &creq, &[], &Default::default());
+        let draft = claim_draft(&job, &buyer, &seller, crate::gateway::ClaimPayment::Sat(&creq), &[], &Default::default());
 
         // Execution #1 finished and published ⇒ Delivered.
         assert!(
@@ -11746,6 +11937,7 @@ mod tests {
                 .deliver_and_enqueue(
                     &job,
                     &"c".repeat(40),
+                    crate::gateway::PaymentMode::Sat,
                     &draft,
                     5000,
                     5000 + RESULT_PUBLISH_WINDOW_SECS,
@@ -12093,6 +12285,7 @@ mod tests {
         store
             .record_offer(
                 &Offer {
+                    payment_mode: crate::gateway::PaymentMode::Sat,
                     offer_id: job.to_owned(),
                     buyer_pubkey: buyer.to_owned(),
                     amount_sats: 21,
@@ -12106,9 +12299,9 @@ mod tests {
                 1,
             )
             .expect("record offer");
-        let draft = claim_draft(job, buyer, &"s".repeat(64), creq, &[], &Default::default());
+        let draft = claim_draft(job, buyer, &"s".repeat(64), crate::gateway::ClaimPayment::Sat(&creq), &[], &Default::default());
         store
-            .claim_and_enqueue(job, job, creq, &draft, 1, 9_999_999_999, 1)
+            .claim_and_enqueue(job, job, Some(creq), &draft, 1, 9_999_999_999, 1)
             .expect("claim");
         store
             .record_award(&"w".repeat(64), job, buyer, award_time)
@@ -12130,6 +12323,7 @@ mod tests {
         store
             .record_offer(
                 &Offer {
+                    payment_mode: crate::gateway::PaymentMode::Sat,
                     offer_id: job.to_owned(),
                     buyer_pubkey: buyer.to_owned(),
                     amount_sats: 21,
@@ -12143,9 +12337,9 @@ mod tests {
                 1,
             )
             .expect("record offer");
-        let draft = claim_draft(job, buyer, &"s".repeat(64), "creqL", &[], &Default::default());
+        let draft = claim_draft(job, buyer, &"s".repeat(64), crate::gateway::ClaimPayment::Sat("creqL"), &[], &Default::default());
         store
-            .claim_and_enqueue(job, job, "creqL", &draft, 1, 9_999_999_999, 1)
+            .claim_and_enqueue(job, job, Some("creqL"), &draft, 1, 9_999_999_999, 1)
             .expect("claim");
         store
             .record_award(&"w".repeat(64), job, buyer, 2)
@@ -12246,6 +12440,7 @@ mod tests {
                 store
                     .record_offer(
                         &Offer {
+                            payment_mode: crate::gateway::PaymentMode::Sat,
                             offer_id: job.to_owned(),
                             buyer_pubkey: buyer.clone(),
                             amount_sats: 21,
@@ -12260,9 +12455,9 @@ mod tests {
                     )
                     .expect("record offer");
                 // A per-job draft (distinct event id) — claim_and_enqueue dedups on `claim:{job}`.
-                let draft = claim_draft(job, &buyer, &seller, creq, &[], &Default::default());
+                let draft = claim_draft(job, &buyer, &seller, crate::gateway::ClaimPayment::Sat(&creq), &[], &Default::default());
                 store
-                    .claim_and_enqueue(job, job, creq, &draft, 1, 9_999_999_999, 1)
+                    .claim_and_enqueue(job, job, Some(creq), &draft, 1, 9_999_999_999, 1)
                     .expect("claim");
                 store.record_award(award, job, &buyer, 2).expect("award");
             };
@@ -12273,9 +12468,9 @@ mod tests {
             seed(&pushed_lapsed, lapsed, &format!("{}4", "w".repeat(63)));
             store.mark_pushed(&pushed_lapsed, "commitX", 3).expect("mark pushed (lapsed)");
             seed(&delivered, live, &format!("{}5", "w".repeat(63)));
-            let ddraft = claim_draft(&delivered, &buyer, &seller, creq, &[], &Default::default());
+            let ddraft = claim_draft(&delivered, &buyer, &seller, crate::gateway::ClaimPayment::Sat(&creq), &[], &Default::default());
             store
-                .deliver_and_enqueue(&delivered, &"c".repeat(40), &ddraft, 4, 4 + RESULT_PUBLISH_WINDOW_SECS, 4)
+                .deliver_and_enqueue(&delivered, &"c".repeat(40), crate::gateway::PaymentMode::Sat, &ddraft, 4, 4 + RESULT_PUBLISH_WINDOW_SECS, 4)
                 .expect("deliver");
             // #563: a live-deadline row a PRIOR resume relay-derived as settled elsewhere. The durable
             // marker must survive the restart and short-circuit the next resume to SkipTerminal WITHOUT
@@ -12375,7 +12570,7 @@ mod tests {
             &seller,
             &"c".repeat(40),
             "fork",
-            &stored,
+            creq_terms(&stored),
         );
         assert_eq!(
             preimage.creq_hash,
@@ -12453,17 +12648,17 @@ mod tests {
         )
         .expect("creq");
         let (store, root) = store_with_awarded_job(&creq, &job, &buyer, author_date);
-        let draft = claim_draft(&job, &buyer, &seller, &creq, &[], &Default::default());
+        let draft = claim_draft(&job, &buyer, &seller, crate::gateway::ClaimPayment::Sat(&creq), &[], &Default::default());
         let now = 5000;
         assert!(
             store
-                .deliver_and_enqueue(&job, &commit_first, &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now)
+                .deliver_and_enqueue(&job, &commit_first, crate::gateway::PaymentMode::Sat, &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now)
                 .expect("deliver"),
             "first delivery journals + enqueues the result"
         );
         assert!(
             !store
-                .deliver_and_enqueue(&job, &commit_resume, &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now)
+                .deliver_and_enqueue(&job, &commit_resume, crate::gateway::PaymentMode::Sat, &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now)
                 .expect("re-deliver"),
             "resume adopts the existing tip: a second delivery re-enqueues nothing"
         );
@@ -12707,17 +12902,17 @@ mod tests {
         );
 
         // Re-execution delivers exactly once: deliver_and_enqueue is idempotent on the job.
-        let draft = claim_draft(&job, &buyer, &seller, &creq, &[], &Default::default());
+        let draft = claim_draft(&job, &buyer, &seller, crate::gateway::ClaimPayment::Sat(&creq), &[], &Default::default());
         let now = 5000;
         assert!(
             store
-                .deliver_and_enqueue(&job, &"c".repeat(40), &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now)
+                .deliver_and_enqueue(&job, &"c".repeat(40), crate::gateway::PaymentMode::Sat, &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now)
                 .expect("deliver"),
             "first (resumed) delivery lands"
         );
         assert!(
             !store
-                .deliver_and_enqueue(&job, &"c".repeat(40), &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now)
+                .deliver_and_enqueue(&job, &"c".repeat(40), crate::gateway::PaymentMode::Sat, &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now)
                 .expect("re-deliver"),
             "a resumed re-execution delivers at most once"
         );

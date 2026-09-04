@@ -24,7 +24,19 @@ use crate::checks::EnvKind;
 use crate::gateway::EventDraft;
 
 /// Current on-disk schema version.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
+
+/// Resolve a nullable `payment` column into a [`crate::gateway::PaymentMode`].
+///
+/// NULL ⇒ [`crate::gateway::PaymentMode::Sat`] — a row written before the column existed, and every
+/// such row was a priced job. An unrecognized value resolves the same way, fail-closed: a store this
+/// binary cannot read a mode out of is read as PAID, never as free.
+fn payment_mode_from_column(stored: Option<String>) -> crate::gateway::PaymentMode {
+    match stored.as_deref().map(str::trim) {
+        Some(crate::gateway::PAYMENT_NONE) => crate::gateway::PaymentMode::None,
+        _ => crate::gateway::PaymentMode::Sat,
+    }
+}
 
 /// A cloneable handle to the node-owned SQLite state.
 #[derive(Clone)]
@@ -74,6 +86,13 @@ pub struct Offer {
     /// the claim, and the resumed job composes its agent prompt from this row. Unpersisted, the buyer's
     /// declared type would be gone for that job permanently.
     pub output: Option<String>,
+    /// How this offer settles (§1.1), read off its `["param","payment", …]` tag at ingest.
+    ///
+    /// Journaled for the SAME reason as `requested_agent` and `output` above: execution can be a
+    /// RESTART away from the claim, and the delivery row records the mode the job settled under. A
+    /// row written before this column existed reads NULL ⇒ [`crate::gateway::PaymentMode::Sat`],
+    /// which is correct by construction — every job recorded then was priced.
+    pub payment_mode: crate::gateway::PaymentMode,
 }
 
 /// #591: the target + base a SERVED contribution job clones into its delivery workdir. The buyer's
@@ -255,7 +274,16 @@ impl SellerStore {
                  -- #686: the buyer's declared output type (the offer's `output` tag — a MIME / output
                  -- type). Mandatory on ingest, so this binary always writes it; NULL ⇒ an offer
                  -- recorded before this column existed, which states no output type to the agent.
-                 output          TEXT
+                 output          TEXT,
+                 -- The offer's PAYMENT MODE (spec 1.1): 'none' for a free job, 'sat' otherwise.
+                 -- NULL => 'sat', which is what an offer recorded before this column existed reads
+                 -- as: the same fail-closed direction the wire default takes.
+                 --
+                 -- Journaled for the SAME reason requested_agent and output are: execution can be a
+                 -- RESTART away from the claim, and the delivery row below records the mode this
+                 -- offer settled under. Unpersisted, a resumed free job would write its delivery as
+                 -- paid.
+                 payment         TEXT
              );
              -- Claims the node parked. `state` is the claim's own lifecycle; `awarded` marks the
              -- one the buyer selected, `released` the ones it stepped back from.
@@ -269,6 +297,13 @@ impl SellerStore {
                  -- config change between claim and delivery cannot break the buyer/seller cosig), and
                  -- the restart redeem-guard settles against the mints IT lists (Fix Q — original terms,
                  -- not current config).
+                 --
+                 -- EMPTY STRING => a FREE claim (spec 2.2): this seat claimed the job and authored
+                 -- NO creq, because a free trade has no payment terms. It is NOT null, and that is
+                 -- load-bearing: the presence of this ROW is how job_creq answers whether we claimed
+                 -- the job at all (#814/#626), so a free claim must be present-and-empty rather than
+                 -- absent. Widening the column to NULL would need a table rebuild, which migrate's
+                 -- additive-only contract forbids on a live money store.
                  creq            TEXT NOT NULL,
                  created_at_unix INTEGER NOT NULL,
                  updated_at_unix INTEGER NOT NULL
@@ -311,7 +346,17 @@ impl SellerStore {
              CREATE TABLE IF NOT EXISTS deliveries (
                  job_id          TEXT PRIMARY KEY,
                  result_ref      TEXT NOT NULL,
-                 delivered_at_unix INTEGER NOT NULL
+                 delivered_at_unix INTEGER NOT NULL,
+                 -- Spec 3.2: how this job settled. 'none' => a FREE job: a free job still writes
+                 -- the delivery record, with the payment recorded as none. 'sat' => a priced job.
+                 -- NULL => a legacy row, which every reader resolves to 'sat'.
+                 --
+                 -- A free job's terminal jobs.state stays 'delivered' and never advances to 'paid':
+                 -- widening the CHECK above needs a table rebuild, which migrate's additive-only
+                 -- contract forbids on a live money store. THIS COLUMN is the fact that says the job
+                 -- will never advance further. Operator tooling that reads delivered-but-not-paid as
+                 -- ARREARS must read this column before it reports.
+                 payment         TEXT
              );
              -- Collected receipts. `receipt_id` is UNIQUE — the dedup that stops a replayed
              -- payment from crediting the same job twice.
@@ -412,6 +457,16 @@ impl SellerStore {
         if !Self::column_exists(conn, "offers", "output")? {
             conn.execute_batch("ALTER TABLE offers ADD COLUMN output TEXT;")?;
         }
+        // §3.2 — the payment mode, on both the offer it was stated on and the delivery it settled
+        // under. A store from a pre-free-lane binary reads NULL for its existing rows, which every
+        // reader resolves to 'sat': those jobs were all priced, so the default is not a guess.
+        // Additive + idempotent, exactly like the columns above; nothing is rewritten or dropped.
+        if !Self::column_exists(conn, "offers", "payment")? {
+            conn.execute_batch("ALTER TABLE offers ADD COLUMN payment TEXT;")?;
+        }
+        if !Self::column_exists(conn, "deliveries", "payment")? {
+            conn.execute_batch("ALTER TABLE deliveries ADD COLUMN payment TEXT;")?;
+        }
         Ok(())
     }
 
@@ -452,8 +507,8 @@ impl SellerStore {
         let changed = conn.execute(
             "INSERT OR IGNORE INTO offers
                  (offer_id, buyer_pubkey, amount_sats, unit, task, deadline_unix, targeted, created_at_unix,
-                  requested_agent, output)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                  requested_agent, output, payment)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 offer.offer_id,
                 offer.buyer_pubkey,
@@ -465,6 +520,7 @@ impl SellerStore {
                 now_unix,
                 offer.requested_agent,
                 offer.output,
+                offer.payment_mode.as_wire(),
             ],
         )?;
         Ok(changed == 1)
@@ -499,7 +555,7 @@ impl SellerStore {
         let row = conn
             .query_row(
                 "SELECT offer_id, buyer_pubkey, amount_sats, unit, task, deadline_unix, targeted,
-                        requested_agent, output
+                        requested_agent, output, payment
                  FROM offers WHERE offer_id = ?1",
                 [offer_id],
                 |row| {
@@ -513,6 +569,9 @@ impl SellerStore {
                         targeted: row.get::<_, i64>(6)? != 0,
                         requested_agent: row.get(7)?,
                         output: row.get(8)?,
+                        // NULL ⇒ `Sat`. Resolved HERE rather than left to the caller so no reader
+                        // of this row can accidentally treat "column absent" as a third state.
+                        payment_mode: payment_mode_from_column(row.get::<_, Option<String>>(9)?),
                     })
                 },
             )
@@ -649,7 +708,9 @@ impl SellerStore {
         &self,
         job_id: &str,
         offer_id: &str,
-        creq: &str,
+        // `None` ⇒ a FREE claim (§2.2), journaled as the empty string so the row still exists and
+        // `job_creq` still answers "yes, we claimed this".
+        creq: Option<&str>,
         draft: &EventDraft,
         created_at_unix: i64,
         expires_at_unix: i64,
@@ -664,7 +725,7 @@ impl SellerStore {
         tx.execute(
             "INSERT INTO claims (job_id, offer_id, state, creq, created_at_unix, updated_at_unix)
              VALUES (?1, ?2, 'claimed', ?3, ?4, ?4)",
-            params![job_id, offer_id, creq, now_unix],
+            params![job_id, offer_id, creq.unwrap_or(""), now_unix],
         )?;
         enqueue_event(
             &tx,
@@ -706,7 +767,7 @@ impl SellerStore {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT offer_id, buyer_pubkey, amount_sats, unit, task, deadline_unix, targeted,
-                    requested_agent, output
+                    requested_agent, output, payment
              FROM offers
              WHERE deadline_unix > ?1
                AND offer_id NOT IN (SELECT job_id FROM claims)",
@@ -722,6 +783,7 @@ impl SellerStore {
                 targeted: row.get::<_, i64>(6)? != 0,
                 requested_agent: row.get(7)?,
                 output: row.get(8)?,
+                payment_mode: payment_mode_from_column(row.get::<_, Option<String>>(9)?),
             })
         })?;
         let mut offers = Vec::new();
@@ -912,6 +974,7 @@ impl SellerStore {
         &self,
         job_id: &str,
         result_ref: &str,
+        payment_mode: crate::gateway::PaymentMode,
         draft: &EventDraft,
         created_at_unix: i64,
         expires_at_unix: i64,
@@ -931,9 +994,14 @@ impl SellerStore {
             tx.commit()?;
             return Ok(false);
         }
+        // §3.2 — ruling 3's record, with the payment stated explicitly rather than inferred from
+        // the absence of a receipt. A free job's row is written here and never advances past
+        // `state = 'delivered'` below; `collect_receipt` is the only writer of `'paid'` and no
+        // kind-1059 wrap ever arrives for a free job.
         tx.execute(
-            "INSERT INTO deliveries (job_id, result_ref, delivered_at_unix) VALUES (?1, ?2, ?3)",
-            params![job_id, result_ref, now_unix],
+            "INSERT INTO deliveries (job_id, result_ref, delivered_at_unix, payment)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![job_id, result_ref, now_unix, payment_mode.as_wire()],
         )?;
         tx.execute(
             "UPDATE jobs SET state = 'delivered', updated_at_unix = ?2 WHERE job_id = ?1",
@@ -1301,6 +1369,12 @@ impl SellerStore {
     /// the receipt preimage and the restart redeem-guard reads its mints, so a config change between
     /// claim and delivery can never alter the cosigned terms or the settlement mint set. `None` when
     /// the node never parked a claim for this job.
+    /// The claim-time creq journaled for a job.
+    ///
+    /// ⛔ THREE STATES, NOT TWO. `None` ⇒ this node holds NO claim for the job — the discriminator
+    /// #814/#626 rest on. `Some("")` ⇒ a claim exists and it is FREE (§2.2), which carries no
+    /// payment terms. `Some(creq)` ⇒ a priced claim. A caller asking "did we claim this" wants
+    /// `is_some()`; a caller wanting the payment TERMS must also reject the empty string.
     pub fn job_creq(&self, job_id: &str) -> Result<Option<String>, StoreError> {
         let conn = self.lock()?;
         let creq: Option<String> = conn
@@ -1495,9 +1569,9 @@ mod tests {
         );
 
         // release_claim: only a still-`claimed` row releases; an awarded one reports 0.
-        let draft = crate::gateway::claim_draft("job-c", &"b".repeat(64), &"s".repeat(64), "creq", &[], &Default::default());
+        let draft = crate::gateway::claim_draft("job-c", &"b".repeat(64), &"s".repeat(64), crate::gateway::ClaimPayment::Sat("creq"), &[], &Default::default());
         store
-            .claim_and_enqueue("job-c", "job-c", "creq", &draft, 1, 9_999_999_999, 1)
+            .claim_and_enqueue("job-c", "job-c", Some("creq"), &draft, 1, 9_999_999_999, 1)
             .expect("claim");
         assert_eq!(store.release_claim("job-c", 6).expect("release"), 1, "a parked claim releases");
         assert_eq!(
@@ -1603,6 +1677,7 @@ mod tests {
 
     fn sample_offer(id: &str) -> Offer {
         Offer {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             offer_id: id.to_owned(),
             buyer_pubkey: "b".repeat(64),
             amount_sats: 100,
@@ -1970,7 +2045,7 @@ mod tests {
         let offer = "o".repeat(64);
         assert_eq!(
             store
-                .claim_and_enqueue(&job, &offer, "creqA", &claim(), 500, 999, 1)
+                .claim_and_enqueue(&job, &offer, Some("creqA"), &claim(), 500, 999, 1)
                 .expect("claim"),
             Claimed::New
         );
@@ -2007,13 +2082,13 @@ mod tests {
         let job = "j".repeat(64);
         let offer = "o".repeat(64);
         assert_eq!(
-            store.claim_and_enqueue(&job, &offer, "creqA", &claim(), 1, 999, 1).expect("first"),
+            store.claim_and_enqueue(&job, &offer, Some("creqA"), &claim(), 1, 999, 1).expect("first"),
             Claimed::New
         );
         // A replay carrying a DIFFERENT creq is a no-op: neither the outbox nor the journaled
         // claim-time creq is overwritten. The first creq — the one that was on the wire — stands.
         assert_eq!(
-            store.claim_and_enqueue(&job, &offer, "creqB", &claim(), 1, 999, 2).expect("replay"),
+            store.claim_and_enqueue(&job, &offer, Some("creqB"), &claim(), 1, 999, 2).expect("replay"),
             Claimed::Idempotent
         );
         assert_eq!(store.pending_outbox(3).expect("pending").len(), 1, "no second enqueue");
@@ -2045,7 +2120,7 @@ mod tests {
         let job = "j".repeat(64);
         let offer = "o".repeat(64);
         let buyer = "b".repeat(64);
-        store.claim_and_enqueue(&job, &offer, "creqA", &claim(), 1, 999, 1).expect("claim");
+        store.claim_and_enqueue(&job, &offer, Some("creqA"), &claim(), 1, 999, 1).expect("claim");
 
         // The LATER award is inserted FIRST — see the note above.
         store.record_award(&"z".repeat(64), &job, &buyer, 900).expect("later award");
@@ -2091,7 +2166,7 @@ mod tests {
         // (2) awarded and live, but WE HOLD THE CLAIM — ours, never suppressed.
         offer_at(&"2".repeat(64), 10_000);
         store
-            .claim_and_enqueue(&"2".repeat(64), &"2".repeat(64), "creq", &claim(), 1, 999, 1)
+            .claim_and_enqueue(&"2".repeat(64), &"2".repeat(64), Some("creq"), &claim(), 1, 999, 1)
             .expect("claim 2");
         store.record_award(&"w2".repeat(32), &"2".repeat(64), &buyer, 2).expect("award 2");
         // (3) recorded and unclaimed, but NO award — nothing decided it.
@@ -2124,7 +2199,7 @@ mod tests {
         let offer = "o".repeat(64);
         let award = "w".repeat(64);
         let buyer = "b".repeat(64);
-        store.claim_and_enqueue(&job, &offer, "creqA", &claim(), 1, 999, 1).expect("claim");
+        store.claim_and_enqueue(&job, &offer, Some("creqA"), &claim(), 1, 999, 1).expect("claim");
 
         assert_eq!(
             store.record_award(&award, &job, &buyer, 2).expect("award"),
@@ -2159,17 +2234,17 @@ mod tests {
         let job = "j".repeat(64);
         let offer = "o".repeat(64);
         let buyer = "b".repeat(64);
-        store.claim_and_enqueue(&job, &offer, "creqA", &claim(), 1, 999, 1).expect("claim");
+        store.claim_and_enqueue(&job, &offer, Some("creqA"), &claim(), 1, 999, 1).expect("claim");
         store.record_award(&"w".repeat(64), &job, &buyer, 2).expect("award");
         store.mark_executing(&job, 3).expect("exec");
 
         assert!(store
-            .deliver_and_enqueue(&job, "ref-1", &result(), 4, 999, 5)
+            .deliver_and_enqueue(&job, "ref-1", crate::gateway::PaymentMode::Sat, &result(), 4, 999, 5)
             .expect("deliver"));
         assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Delivered));
         // Replay: no second delivery, no second result enqueue.
         assert!(!store
-            .deliver_and_enqueue(&job, "ref-1", &result(), 4, 999, 6)
+            .deliver_and_enqueue(&job, "ref-1", crate::gateway::PaymentMode::Sat, &result(), 4, 999, 6)
             .expect("replay"));
         assert_eq!(
             store.outbox_row(&format!("result:{job}")).expect("row").expect("exists").0,
@@ -2185,7 +2260,7 @@ mod tests {
         let job = "j".repeat(64);
         let offer = "o".repeat(64);
         let receipt = "r".repeat(64);
-        store.claim_and_enqueue(&job, &offer, "creqA", &claim(), 1, 999, 1).expect("claim");
+        store.claim_and_enqueue(&job, &offer, Some("creqA"), &claim(), 1, 999, 1).expect("claim");
         store.record_award(&"w".repeat(64), &job, &"b".repeat(64), 2).expect("award");
 
         assert_eq!(
@@ -2205,7 +2280,7 @@ mod tests {
     fn expire_outbox_stops_the_publisher_from_sending() {
         let (store, path) = fresh_store("expire");
         let job = "j".repeat(64);
-        store.claim_and_enqueue(&job, &"o".repeat(64), "creqA", &claim(), 1, 100, 1).expect("claim");
+        store.claim_and_enqueue(&job, &"o".repeat(64), Some("creqA"), &claim(), 1, 100, 1).expect("claim");
         // now=200 is past expires_at=100.
         assert_eq!(store.expire_outbox(200).expect("expire"), 1);
         assert!(store.pending_outbox(200).expect("pending").is_empty());
@@ -2216,3 +2291,194 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+#[cfg(test)]
+mod free_lane_tests {
+    use super::*;
+    use crate::gateway::PaymentMode;
+    use rusqlite::Connection;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_db(label: &str) -> std::path::PathBuf {
+        let id = NEXT.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!(
+            "maxplayer-free-lane-store-{label}-{}-{id}.sqlite",
+            std::process::id()
+        ))
+    }
+
+    fn wire_draft(kind: u16) -> EventDraft {
+        EventDraft::new(kind, vec![crate::gateway::TagSpec::new(["t", "maxplayer"])], "")
+    }
+
+    fn offer_row(job: &str, mode: PaymentMode) -> Offer {
+        Offer {
+            offer_id: job.to_owned(),
+            buyer_pubkey: "b".repeat(64),
+            amount_sats: if mode.is_free() { 0 } else { 21 },
+            unit: "sat".to_owned(),
+            task: "t".to_owned(),
+            deadline_unix: 2_000_000_000,
+            targeted: true,
+            requested_agent: None,
+            output: Some("text/plain".to_owned()),
+            payment_mode: mode,
+        }
+    }
+
+    fn payment_column(path: &std::path::Path, table: &str, job: &str) -> Option<String> {
+        let conn = Connection::open(path).expect("reopen raw");
+        conn.query_row(
+            &format!("SELECT payment FROM {table} WHERE {} = ?1", if table == "offers" { "offer_id" } else { "job_id" }),
+            [job],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .expect("read payment column")
+    }
+
+    /// §3.2 — RULING 3's RECORD. A free job still writes a delivery row, and that row says `none`.
+    ///
+    /// Both modes are asserted from the same store, because "writes 'none'" alone would pass a
+    /// writer that wrote `none` for everything — which would mis-report every priced delivery in
+    /// the market as unpaid-forever.
+    #[test]
+    fn a_free_delivery_records_payment_none_and_a_priced_one_records_sat() {
+        let path = temp_db("delivery-payment");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+
+        for (job, mode, expected) in [("free-job", PaymentMode::None, "none"), ("paid-job", PaymentMode::Sat, "sat")] {
+            store.record_offer(&offer_row(job, mode), 1).expect("record offer");
+            store
+                .claim_and_enqueue(job, job, if mode.is_free() { None } else { Some("creqA") }, &wire_draft(crate::gateway::JOB_CLAIM_KIND), 1, 9_999, 1)
+                .expect("claim");
+            store
+                .record_award(&format!("award-{job}"), job, &"b".repeat(64), 2)
+                .expect("award");
+            assert!(
+                store
+                    .deliver_and_enqueue(job, "ref", mode, &wire_draft(crate::gateway::JOB_RESULT_KIND), 3, 9_999, 3)
+                    .expect("deliver"),
+                "the delivery row must be written for BOTH modes — ruling 3"
+            );
+            assert_eq!(
+                payment_column(&path, "deliveries", job).as_deref(),
+                Some(expected),
+                "{job} delivery row payment column"
+            );
+        }
+
+        // A free job's terminal state stays 'delivered' — it never advances to 'paid', and the
+        // deliveries.payment column is the fact that says so.
+        assert_eq!(store.job_state("free-job").expect("state"), Some(JobState::Delivered));
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The offer's mode is JOURNALED, so a delivery that happens a RESTART after the claim still
+    /// records the mode the job was posted under.
+    ///
+    /// Without the persisted column a resumed free job would read its offer back as `Sat` — the
+    /// fail-closed default — and write its delivery as PAID, which is the one row an operator's
+    /// arrears tooling reads.
+    #[test]
+    fn the_offers_payment_mode_survives_a_restart() {
+        let path = temp_db("offer-mode-restart");
+        let _ = std::fs::remove_file(&path);
+        {
+            let store = SellerStore::open(&path).expect("open");
+            store.record_offer(&offer_row("free-job", PaymentMode::None), 1).expect("record");
+            store.record_offer(&offer_row("paid-job", PaymentMode::Sat), 1).expect("record");
+        }
+        let store = SellerStore::open(&path).expect("reopen — the process died and came back");
+        assert_eq!(
+            store.offer_row("free-job").expect("read").expect("row").payment_mode,
+            PaymentMode::None
+        );
+        assert_eq!(
+            store.offer_row("paid-job").expect("read").expect("row").payment_mode,
+            PaymentMode::Sat
+        );
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The v6→v7 migration is ADDITIVE, IDEMPOTENT and RE-ENTRANT on a live store, and it does not
+    /// touch the `jobs.state` CHECK.
+    ///
+    /// The pre-existing money-path rows are read back after the migration, so a migration that
+    /// rewrote or dropped a row fails here rather than in production. The second open proves
+    /// re-entrance: `column_exists` must make the ALTERs no-ops, not errors.
+    #[test]
+    fn a_v6_store_migrates_to_v7_additively_and_re_entrantly() {
+        let path = temp_db("v6-to-v7");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).expect("create v6 store");
+            conn.execute_batch(
+                "CREATE TABLE seller_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO seller_meta VALUES ('schema_version', '6');
+                 CREATE TABLE offers (
+                     offer_id TEXT PRIMARY KEY, buyer_pubkey TEXT NOT NULL,
+                     amount_sats INTEGER NOT NULL CHECK (amount_sats >= 0), unit TEXT NOT NULL,
+                     task TEXT NOT NULL, deadline_unix INTEGER NOT NULL, targeted INTEGER NOT NULL,
+                     created_at_unix INTEGER NOT NULL, requested_agent TEXT, output TEXT
+                 );
+                 INSERT INTO offers VALUES ('legacy-job','bb','21','sat','t',2000000000,1,1,NULL,'text/plain');
+                 CREATE TABLE deliveries (
+                     job_id TEXT PRIMARY KEY, result_ref TEXT NOT NULL, delivered_at_unix INTEGER NOT NULL
+                 );
+                 INSERT INTO deliveries VALUES ('legacy-job','legacy-ref',7);",
+            )
+            .expect("v6 schema");
+        }
+
+        let store = SellerStore::open(&path).expect("a v6 store opens clean under v7");
+        assert_eq!(store.health().expect("health").schema_version, SCHEMA_VERSION);
+        assert_eq!(SCHEMA_VERSION, 7, "the free lane's schema version");
+
+        // The legacy rows SURVIVE and read as PAID — correct by construction, because every job
+        // recorded before this column existed was priced.
+        let legacy = store.offer_row("legacy-job").expect("read").expect("the v6 offer survives");
+        assert_eq!(legacy.amount_sats, 21, "the pre-existing money-path row is untouched");
+        assert_eq!(
+            legacy.payment_mode,
+            PaymentMode::Sat,
+            "a NULL payment column resolves to PAID, never to a third state"
+        );
+        assert_eq!(
+            payment_column(&path, "deliveries", "legacy-job"),
+            None,
+            "the migration ADDS a nullable column; it does not backfill or rewrite a live row"
+        );
+
+        // RE-ENTRANT: opening again neither errors nor double-adds.
+        drop(store);
+        let store = SellerStore::open(&path).expect("second open is a no-op");
+        assert_eq!(store.health().expect("health").schema_version, SCHEMA_VERSION);
+        let again = store.offer_row("legacy-job").expect("read").expect("row");
+        assert_eq!(again.amount_sats, 21);
+        drop(store);
+
+        // §3.2 — the `jobs.state` CHECK is UNTOUCHED: 'settled_free' was rejected as a terminal
+        // state precisely because widening this constraint needs a table rebuild, which migrate's
+        // additive-only contract forbids on a live money store.
+        let conn = Connection::open(&path).expect("reopen raw");
+        let ddl: String = conn
+            .query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs'", [], |row| row.get(0))
+            .expect("jobs DDL");
+        assert!(
+            ddl.contains("CHECK (state IN ('awarded','executing','delivered','paid','failed'))"),
+            "the jobs.state CHECK must be byte-unchanged by the free lane: {ddl}"
+        );
+        assert!(
+            !ddl.contains("settled_free"),
+            "no new terminal state was added — deliveries.payment carries the fact instead: {ddl}"
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
