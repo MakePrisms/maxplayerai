@@ -253,8 +253,8 @@ export function param(event: RawEvent, name: string): string | null {
  * was not stated), and one such offer exists on the live market, so a reader
  * that inferred "free" from a missing or zero price would misfile it.
  *
- * What it changes downstream: a free job's ACCEPT is its last event — no 3400
- * can ever follow because there is nothing to settle — so a delivered-and-
+ * What it changes downstream: a free job's ACCEPT is its last event — no
+ * RECEIPT can ever follow because there is nothing to settle — so a delivered-and-
  * accepted free job is COMPLETE, not a delivery awaiting money. It must not be
  * counted as unpaid, and it must not be counted as paid either: it paid
  * nothing and counted nothing.
