@@ -774,6 +774,7 @@ mod tests {
 
     fn wiring_seller(rate_sats: u64) -> home::SellerConfig {
         home::SellerConfig {
+            takes_no_payment: false,
             agent_command: vec!["claude".into()],
             rate_sats,
             git_remote: "https://example.invalid/repo.git".into(),

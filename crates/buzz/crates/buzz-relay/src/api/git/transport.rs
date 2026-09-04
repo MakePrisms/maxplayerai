@@ -73,12 +73,16 @@ pub struct GitAuth {
     pub pubkey: nostr::PublicKey,
     /// Server-resolved tenant bound from the request Host before auth checks.
     pub tenant: TenantContext,
-    /// Optional single ref this token may write, from a `["ref", <refname>]` tag on the
-    /// signed event. `None` is today's behaviour: the token may write any ref its role and
-    /// the repo's protection rules allow.
+    /// Optional single ref this token may write, from the FIRST `["ref", <refname>]` tag
+    /// on the signed event. `None` is today's behaviour: the token may write any ref its
+    /// role and the repo's protection rules allow.
     ///
     /// The tag is inside the signature, so a holder of a leaked token cannot widen or strip
     /// it. Read only AFTER signature verification.
+    ///
+    /// This value comes back from NIP-98 verification, which is also what decided the
+    /// token's freshness. The scope that bought the longer life and the scope the push
+    /// path enforces are therefore one value, read once (brief §7(c)).
     pub ref_scope: Option<String>,
 }
 
@@ -119,10 +123,17 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitReadAuth {
 /// Shared NIP-98 authentication for all git smart-HTTP routes.
 ///
 /// ALWAYS verifies the NIP-98 `Authorization: Nostr` token (base64 decode,
-/// host-bound `u`-tag URL match against the server-resolved tenant, ±60s
-/// timestamp window). `require_membership` gates ONLY the relay-membership
-/// (NIP-43) check: git READ routes pass `false` when `config.git_public_read`
-/// is enabled; every other caller passes `true`.
+/// host-bound `u`-tag URL match against the server-resolved tenant, freshness).
+/// `require_membership` gates ONLY the relay-membership (NIP-43) check: git READ
+/// routes pass `false` when `config.git_public_read` is enabled; every other
+/// caller passes `true`.
+///
+/// Freshness: unscoped tokens keep the ±60 s window. A token scoped to one ref
+/// that also carries a NIP-40 `expiration` tag may live until that expiration,
+/// up to `config.scoped_token_max_lifetime_secs`. Both legs of a push get the
+/// same rule because both legs land here — the `info/refs` GET arrives through
+/// [`GitReadAuth`] and the service POST through [`GitAuth`], and neither one
+/// chooses its own policy (brief §7(a)).
 async fn authenticate_git(
     parts: &mut axum::http::request::Parts,
     state: &Arc<AppState>,
@@ -197,7 +208,8 @@ async fn authenticate_git(
     // level without protocol changes. The token is repo-scoped, not service-scoped.
     //
     // Security is still provided by:
-    // - ±60s timestamp window (limits replay)
+    // - the freshness window (limits replay): ±60s for an unscoped token, and for a
+    //   scoped one its own capped `expiration` tag
     // - HTTPS in production (prevents token theft)
     // - Pre-receive hook for push authorization (role + protection rules)
     // - Endpoint routing (clone/push are different HTTP paths)
@@ -208,8 +220,8 @@ async fn authenticate_git(
     // then reuses the token for POST (pack data). Method binding can't work here.
     //
     // Security is provided by: service-binding in the URL (clone vs push scoped),
-    // ±60s timestamp, and the pre-receive hook for push authorization.
-    // We pass the method from the event itself so verify_nip98_event always accepts.
+    // the freshness window, and the pre-receive hook for push authorization.
+    // We pass the method from the event itself so verification always accepts it.
     let event_method = serde_json::from_str::<serde_json::Value>(&event_json)
         .ok()
         .and_then(|v| {
@@ -225,37 +237,38 @@ async fn authenticate_git(
     // SECURITY: method intentionally not verified for git routes. The tautological
     // check (event.method == event.method) is deliberate — see comment block above.
     // Git's credential protocol signs once with GET and reuses for POST. The URL tag
-    // provides the real security boundary (±60s timestamp + URL lock + HTTPS).
+    // provides the real security boundary (freshness + URL lock + HTTPS).
 
     // body=None: can't buffer streaming pack data to verify payload hash.
-    // Token is time-bounded (±60s) and URL-locked — acceptable trade-off.
-    let pubkey =
-        buzz_auth::nip98::verify_nip98_event(&event_json, &expected_url, &event_method, None)
-            .map_err(|e| {
-                warn!(error = %e, "git NIP-98 auth failed");
-                (StatusCode::UNAUTHORIZED, "NIP-98 auth failed").into_response()
-            })?;
-
-    // Read the optional ref scope from the token. AFTER signature verification, never
-    // before: the whole value of putting the scope in a tag is that the signature covers it.
-    let ref_scope = serde_json::from_str::<serde_json::Value>(&event_json)
-        .ok()
-        .and_then(|v| {
-            v["tags"]
-                .as_array()?
-                .iter()
-                .find(|t| t[0].as_str() == Some("ref"))?[1]
-                .as_str()
-                .map(str::to_owned)
-        })
-        .filter(|s| !s.is_empty());
+    // Token is time-bounded and URL-locked — acceptable trade-off.
+    //
+    // The ref scope comes back from verification rather than a second scan of the event.
+    // That is deliberate: verification reads the FIRST `ref` tag once, uses it to decide
+    // how long this token may live, and hands the same value back for the push path to
+    // enforce. A second scan could pick a different tag, and an event with two `ref` tags
+    // would then buy its life under one ref and be enforced under another (brief §7(c)).
+    let buzz_auth::Nip98Auth { pubkey, ref_scope } = buzz_auth::verify_nip98_event_with_policy(
+        &event_json,
+        &expected_url,
+        &event_method,
+        None,
+        buzz_auth::Nip98Freshness::with_scoped_lifetime_cap(
+            state.config.scoped_token_max_lifetime_secs,
+        ),
+    )
+    .map_err(|e| {
+        warn!(error = %e, "git NIP-98 auth failed");
+        (StatusCode::UNAUTHORIZED, "NIP-98 auth failed").into_response()
+    })?;
 
     // NOTE: NIP-98 event-ID dedup intentionally NOT implemented here.
     // Git's credential protocol reuses one signed token across multiple requests
     // in a session (info_refs GET → upload-pack/receive-pack POST). Rejecting
     // replayed event IDs would break normal clone/push operations.
-    // The ±60s timestamp window + URL scoping + HTTPS transport provide sufficient
-    // replay protection for v1. Per-request signing requires protocol changes.
+    // The freshness window + URL scoping + HTTPS transport provide sufficient replay
+    // protection for v1. Per-request signing requires protocol changes. A scoped token
+    // trades a wider replay window for a ref scope the push path enforces: a replay can
+    // only reach the one branch the token names, on the one repo its `u` tag names.
 
     // Relay membership gate (NIP-43). Skipped ONLY for public git READ
     // routes when `config.git_public_read` is enabled (see `GitReadAuth`);
@@ -1790,6 +1803,134 @@ mod track_c_tests {
             .sign_with_keys(keys)
             .expect("sign NIP-98 event");
         serde_json::to_string(&event).expect("serialize")
+    }
+
+    /// Sign a scoped delivery token: a `ref` tag, an `expiration` tag, and a
+    /// `created_at` the caller chooses.
+    fn scoped_delivery_token(
+        keys: &Keys,
+        url: &str,
+        scope: &str,
+        created_at: u64,
+        expiration: u64,
+    ) -> String {
+        let tags = vec![
+            Tag::parse(["u", url]).expect("u tag"),
+            Tag::parse(["method", "GET"]).expect("method tag"),
+            Tag::parse(["ref", scope]).expect("ref tag"),
+            Tag::parse(["expiration", &expiration.to_string()]).expect("expiration tag"),
+        ];
+        let event = EventBuilder::new(Kind::HttpAuth, "")
+            .tags(tags)
+            .custom_created_at(nostr::Timestamp::from(created_at))
+            .sign_with_keys(keys)
+            .expect("sign NIP-98 event");
+        serde_json::to_string(&event).expect("serialize")
+    }
+
+    /// §7(a): ONE token serves both legs of a push — the `info/refs` GET and the service
+    /// POST — so both legs must apply the same age rule. `authenticate_git` is the single
+    /// place that picks the policy, and both extractors route through it, so the two legs
+    /// cannot diverge. This test drives the same token through the URL of each leg.
+    #[test]
+    fn both_legs_of_a_push_accept_the_same_scoped_token() {
+        let keys = Keys::generate();
+        let scope = "refs/heads/maxplayer/contribution/job-1";
+        let now = nostr::Timestamp::now().as_secs();
+        let created_at = now - 600; // minutes old: the whole point of the relaxation
+        let tenant_a = tenant("host-a.example", 1);
+        let repo_root = "https://host-a.example/git/alice/repo";
+        let token = scoped_delivery_token(&keys, repo_root, scope, created_at, created_at + 3600);
+        let policy = buzz_auth::Nip98Freshness::with_scoped_lifetime_cap(
+            buzz_auth::DEFAULT_SCOPED_TOKEN_MAX_LIFETIME_SECS,
+        );
+
+        for (leg, path) in [
+            (
+                "info/refs GET",
+                "/git/alice/repo/info/refs?service=git-receive-pack",
+            ),
+            ("receive-pack POST", "/git/alice/repo/git-receive-pack"),
+        ] {
+            let expected_url = git_expected_url("wss://host-a.example", &tenant_a, path)
+                .expect("recognized git endpoint");
+            let auth = buzz_auth::verify_nip98_event_with_policy(
+                &token,
+                &expected_url,
+                "GET",
+                None,
+                policy,
+            )
+            .unwrap_or_else(|e| panic!("{leg} must accept the scoped token, got {e}"));
+            assert_eq!(auth.pubkey, keys.public_key());
+            assert_eq!(
+                auth.ref_scope.as_deref(),
+                Some(scope),
+                "{leg} must carry the scope forward for the push path to enforce"
+            );
+        }
+
+        // Same token, strict policy: rejected. That is the proof the acceptance above
+        // comes from the relaxation and not from a wide clock tolerance.
+        let expected_url = git_expected_url(
+            "wss://host-a.example",
+            &tenant_a,
+            "/git/alice/repo/git-receive-pack",
+        )
+        .expect("recognized git endpoint");
+        assert!(
+            buzz_auth::verify_nip98_event(&token, &expected_url, "GET", None).is_err(),
+            "a 10-minute-old token must fail the ±60s window"
+        );
+    }
+
+    /// The longer scoped lifetime is a git-transport concession, granted because the
+    /// pre-receive hook enforces the scope. No other NIP-98 caller may opt in: an
+    /// unscoped long-lived token would be a push-anywhere credential, and a non-git
+    /// caller has no scope to bound it. Guard the whole crate, not just today's callers.
+    #[test]
+    fn only_the_git_transport_opts_into_the_longer_scoped_lifetime() {
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let allowed = src_root.join("api").join("git").join("transport.rs");
+
+        let mut opted_in: Vec<String> = Vec::new();
+        let mut stack = vec![src_root.clone()];
+        let mut files_scanned = 0usize;
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                files_scanned += 1;
+                let text = std::fs::read_to_string(&path).expect("read source file");
+                if text.contains("verify_nip98_event_with_policy") && path != allowed {
+                    opted_in.push(path.display().to_string());
+                }
+            }
+        }
+
+        assert!(
+            files_scanned > 1,
+            "test setup: the source walk found nothing"
+        );
+        assert!(
+            opted_in.is_empty(),
+            "these files call the policy-taking NIP-98 entry point; every non-git caller \
+             must stay on verify_nip98_event (±60s): {opted_in:?}"
+        );
+
+        // Negative control: the one allowed file really does opt in, so an empty list
+        // above cannot come from a broken search.
+        let transport = std::fs::read_to_string(&allowed).expect("read transport.rs");
+        assert!(
+            transport.contains("verify_nip98_event_with_policy"),
+            "test setup: transport.rs must be the file that opts in"
+        );
     }
 
     fn pkt(payload: &[u8]) -> Vec<u8> {

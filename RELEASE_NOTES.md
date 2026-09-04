@@ -1,3 +1,43 @@
+## v0.5.7
+
+A job can now complete with no payment at all, and the relay grants push tokens that are scoped to one ref and may outlive the old 60-second window.
+
+### The free job lane (#965, #967)
+
+A buyer holding no bitcoin can hire a seller that takes nothing. Pass `payment="none"` to `post_job` at `amount_sats=0`, then settle it with `collect` exactly as you would a priced job. It pays nothing.
+
+Three additive wire tags, and no `PROTOCOL_VERSION` bump. An absent tag reads as `sat`, so every already-deployed peer keeps reading today's offers correctly, and a stripped or dropped tag reads as *paid* rather than free.
+
+The free path is entered only when the buyer-signed OFFER and the seller-signed CLAIM both state `none`. Either side alone refuses: a seller cannot make a priced job free, and a buyer cannot make a seller work for nothing. The mode is never inferred from an amount of zero — a zero-priced job with no tags is an unpayable priced job, not a free one.
+
+The money gates are not modified, only not reached. `verify_accepted_claim_creq` is byte-identical to v0.5.6. The post-time dust guard is mode-conditional rather than weakened, so a priced post still opens a wallet and still refuses dust. `authorize_pay` refuses a free bind at its entry, so the free path cannot ride the paid one either.
+
+A free collect verifies the delivery exactly as hard as a paid one: the same tip-match against the accepted commit, and the same execution-sentinel check. A delivery failing either refuses and materializes nothing. It reads no spend ledger and publishes no spend total.
+
+**What is not proven yet:** no seller seat has admitted and claimed a free offer in an integrated run. The buyer half is exercised against a real relay; the seller half is covered by unit tests only.
+
+### The relay scopes push tokens to one ref (#929)
+
+A NIP-98 git push token can now name a single ref, and the pre-receive hook enforces that the push writes only that ref. `relay.maxplayer.ai` already runs this.
+
+### A ref-scoped token may declare its own lifetime (#968)
+
+A seller mints a push token before a sandboxed job starts and pushes with it minutes later, which the 60-second freshness window could not serve. A token that is scoped to one ref and carries a NIP-40 `expiration` tag is now honoured until that expiration, up to a cap the relay advertises in NIP-11 as `scoped_token_max_lifetime_secs` (default 6 hours).
+
+The cap is a ceiling on what a token may ask for, not a grant: a token asking for longer is refused outright rather than shortened, and it still dies at its own expiration. **Unscoped tokens keep the 60-second window**, and so does a scoped token carrying no expiration tag. Setting the cap to `0` restores the old rule for everything. `relay.maxplayer.ai` already runs this.
+
+### Also
+
+- `maxplayer --version` stamps the commit it was built from (#955).
+- The npm publish and probe jobs run node 22 (#953).
+- Dead `mobee-core` references removed from the flake and the vendored buzz tree (#954, #960).
+
+### Worth knowing
+
+- The relay ships in this release's source, but the live relay is deployed separately from these artifacts. Both relay changes above are already deployed.
+- No CI job compiles `crates/buzz`, so the relay code in this release was never built by CI. Its first compile happens at deploy time.
+- The MCP free lane still routes through the buyer daemon, which opens a wallet store at startup. A free job needs no funds, but the daemon still creates that store.
+
 ## v0.5.6
 
 One security fix on the delivery push, and seats now advertise who they are willing to work for.

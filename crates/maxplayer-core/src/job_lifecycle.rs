@@ -22,7 +22,8 @@ use sha2::{Digest, Sha256};
 
 use crate::gateway::{
     self, accept_draft, award_draft, parse_git_result_delivery, parse_offer, EventDraft, OfferDraft,
-    TagSpec, JOB_AWARD_KIND, JOB_CLAIM_KIND, JOB_FEEDBACK_KIND, JOB_OFFER_KIND, JOB_RESULT_KIND,
+    PaymentMode, TagSpec, JOB_AWARD_KIND, JOB_CLAIM_KIND, JOB_FEEDBACK_KIND, JOB_OFFER_KIND,
+    JOB_RESULT_KIND,
 };
 use crate::home::{self, HomeError, MaxplayerHome};
 #[cfg(feature = "wallet")]
@@ -93,6 +94,13 @@ pub struct PostJobRequest {
     /// [`crate::capability::CAPABILITIES`]; the posting path refuses the request otherwise, before
     /// any event is signed.
     pub required_capabilities: Vec<String>,
+    /// How this job settles (§1.1). [`PaymentMode::Sat`] — the default — is a priced job and every
+    /// money gate runs as it always did.
+    ///
+    /// [`PaymentMode::None`] posts a FREE job: `amount_sats` must be `0` (refused otherwise), no
+    /// wallet is opened, no mint is contacted, and no dust guard runs. This is the ONLY thing that
+    /// makes a zero-bitcoin buyer able to post at all — see [`post_job_async`].
+    pub payment_mode: PaymentMode,
 }
 
 /// Job class of a posted offer. Making this an enum (rather than an all-or-nothing cluster of
@@ -252,6 +260,11 @@ pub struct OfferView {
     /// every claim passes this filter unchanged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_capabilities: Vec<String>,
+    /// How this job settles (`["param","payment", …]`, §1.1). Read from the SIGNED OFFER, for the
+    /// same reason `requested_agent` is: the statement a buyer is held to must be the one it
+    /// published, not one supplied at award or accept time. Absent ⇒ [`PaymentMode::Sat`].
+    #[serde(default)]
+    pub payment_mode: PaymentMode,
 }
 
 /// Serializable view of a well-formed contribution offer's pins.
@@ -305,6 +318,14 @@ pub struct ClaimView {
     /// or it stays green against a parser that reads nothing at all.
     #[serde(default, skip_serializing_if = "crate::heartbeat::SeatCapability::is_unstated")]
     pub capability: crate::heartbeat::SeatCapability,
+    /// What this claim says about payment (`["payment", …]`, §1.1). Absent ⇒
+    /// [`PaymentMode::Sat`].
+    ///
+    /// ⚠ This is the SELLER's half of the both-ends rule and it is a statement in its own right —
+    /// NOT derivable from `creq` being `None`. A priced claim that simply carries no creq is
+    /// unpayable, not free, and the award filter refuses it for a different reason.
+    #[serde(default)]
+    pub payment_mode: PaymentMode,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -404,6 +425,14 @@ pub struct AcceptedBind {
     /// from-scratch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contribution: Option<AcceptedContribution>,
+    /// How this trade settles (§2.4), sealed at accept from the BOTH-ENDS agreement of the buyer's
+    /// signed offer and the seller's published claim.
+    ///
+    /// ⛔ [`PaymentMode::None`] means there is nothing to pay, and `authorize_pay_async` REFUSES
+    /// such a bind at entry (§2.5). A legacy bind written before this field existed deserializes to
+    /// [`PaymentMode::Sat`] and behaves byte-identically to before.
+    #[serde(default)]
+    pub payment_mode: PaymentMode,
 }
 
 /// Contribution binds captured in the accept-bind. `target_*` / `base_*` come from the
@@ -585,12 +614,37 @@ pub async fn post_job_async(
     // cap from the SAME config the budget gate uses (`home.config.per_job_budget_sats`).
     assert_amount_within_budget_cap(request.amount_sats, home.config.per_job_budget_sats)?;
 
+    // §2.6 — THE POST GATE, MADE MODE-CONDITIONAL. It is the load-bearing change of the free lane.
+    //
+    // A FREE post is a contradiction unless it is priced at zero, so that is refused first and
+    // unconditionally — before the relay, before the wallet, before anything is signed. The refusal
+    // is here rather than at the seller because a free offer with a price is malformed at the
+    // source, and the buyer is the one that can fix it.
+    if request.payment_mode.is_free() && request.amount_sats != 0 {
+        return Err(JobLifecycleError::Input(format!(
+            "post_job refused: payment=none requires amount_sats = 0 (got {}); a free offer with a \
+             price is a contradiction and must not reach the relay",
+            request.amount_sats
+        )));
+    }
     // Dust guard: live keyset N=1 floor, fail-closed (no hardcoded fee=1). Bounded
     // and mint-unreachable-aware: a dead mint degrades to the cached
     // keyset fee floor, and only refuses (fast, `mint_unreachable`) when no fee can
     // be read at all — posting needs no funds, so it must not hang on a dead mint.
+    //
+    // ⛔ SKIPPED ENTIRELY IN FREE MODE, AND THAT IS THE WHOLE POINT. Measured at the anchor commit,
+    // this block is why a `payment=none` offer at `amount = 0` COULD NOT BE POSTED AT ALL:
+    // `require_fee_safe_amount_for_post` reaches `require_amount_covers_fee(0, fee)` and `0 <= fee`
+    // for EVERY fee including zero, so the post was refused before the offer draft was ever built.
+    // `open_wallet_async` separately requires a mint URL clearing the real-mint fence and a wallet
+    // sqlite store. Both are payment machinery; a trade with no payment leg must not run either.
+    //
+    // ⛔ NOTHING INSIDE IS RELAXED. The dust rule (§11.6) is unchanged for every priced job — a
+    // `Sat` post still opens a wallet and still refuses dust. Weakening the guard to admit
+    // `amount = 0` would have loosened it for the whole market, which is precisely the failure mode
+    // the rejected 1-sat convention was itself an attempt to route around.
     #[cfg(feature = "wallet")]
-    {
+    if !request.payment_mode.is_free() {
         let wallet = buyer_fund::open_wallet_async(home)
             .await
             .map_err(|error| JobLifecycleError::Input(error.to_string()))?;
@@ -692,6 +746,7 @@ fn build_offer_draft(
             })?,
         )
     }
+    .with_payment_mode(request.payment_mode)
     .requesting_agent(request.requested_agent.as_deref())
     .requiring_capability(
         request.requested_harness_family.as_deref(),
@@ -1317,9 +1372,68 @@ pub async fn accept_claim_async(
     // the echo. From-scratch offers (no `job-class=contribution`) leave `contribution = None`.
     let contribution = resolve_accepted_contribution(offer, result, &commit_oid)?;
 
+    // §2.4 — the accept-side both-ends check, and the branch that decides whether ANY payment
+    // machinery runs for this job. `payment_mode` is the agreement of two signed statements, and
+    // `verify_free_accept` refuses every mixed combination.
+    let payment_mode = verify_free_accept(offer, claim)?;
+
     // Fail-closed STRICT verification of the accepted claim's seller-authored creq: creq is
     // REQUIRED and its payment-terms (payment_id, amount, unit, mints) are verified field by
     // field before the bind is written (see [`verify_accepted_claim_creq`]).
+    //
+    // ⛔ NOT CALLED IN FREE MODE, and its six refusals are NOT modified. They are §11.6 in code and
+    // stay exactly as they were for every priced job; a free job simply never presents payment
+    // terms to them. The same is true of `plan_payment` below — the SECOND mint requirement on this
+    // path, distinct from the award-path one — which is what a wallet-less buyer could not satisfy.
+    if payment_mode.is_free() {
+        let buyer_pubkey = keys.public_key().to_hex();
+        let draft = accept_draft(
+            &request.job_id,
+            &request.claim_id,
+            &buyer_pubkey,
+            &claim.seller_pubkey,
+        );
+        // The bind records what a free trade actually is: no amount, no creq, no mints, no funding
+        // or delivery mint, and the mode that makes `authorize_pay` refuse it (§2.5).
+        let mut bind = AcceptedBind {
+            job_id: request.job_id.clone(),
+            claim_id: request.claim_id.clone(),
+            result_id: result.result_id.clone(),
+            seller_pubkey: claim.seller_pubkey.clone(),
+            commit_oid,
+            repo,
+            branch,
+            job_hash,
+            amount_sats: 0,
+            accept_event_id: String::new(),
+            accepted_at: 0,
+            seller_signature,
+            creq_hash: None,
+            accepted_mints: Vec::new(),
+            funding_mint: None,
+            delivery_mint: None,
+            agent_used: result.harness.clone(),
+            model_used: result.model.clone(),
+            contribution,
+            payment_mode,
+        };
+        // SAME durability ordering as the paid path below: bind first, publish second, finalize
+        // third — a crash between publish and bind-write must never leave a public accepted state
+        // with no local bind.
+        write_accepted_bind(home, &bind)?;
+        let accept_event_id = publish_draft_async(home, &keys, &draft).await?;
+        bind.accept_event_id = accept_event_id.clone();
+        bind.accepted_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        write_accepted_bind(home, &bind)?;
+        return Ok(AcceptClaimOutcome {
+            accept_event_id,
+            bind,
+        });
+    }
+
     let accepted_mints =
         verify_accepted_claim_creq(claim.creq.as_deref(), &request.job_id, offer.amount_sats)?;
 
@@ -1417,6 +1531,8 @@ pub async fn accept_claim_async(
         agent_used: result.harness.clone(),
         model_used: result.model.clone(),
         contribution,
+        // Reached only through the `Sat` branch above, so this is a fact rather than a default.
+        payment_mode,
     };
     write_accepted_bind(home, &bind)?;
 
@@ -1586,6 +1702,60 @@ pub(crate) fn awarded_delivery_pending(
 ///
 /// The recorded binds (`target_*`, `base_*`) come from the OFFER; the fork is the result's
 /// repo/branch; `store_ref` is derived from the fork-tip `commit_oid`.
+/// Resolve the trade's payment mode at accept, refusing every combination that is not a clean
+/// agreement (§2.0, §2.4).
+///
+/// Returns the agreed mode, or refuses. There are exactly four combinations and only two of them
+/// are trades:
+///
+/// | offer states | claim states | verdict |
+/// |---|---|---|
+/// | `sat` (or absent) | `sat` (or absent) | PAID — the creq gates below run unchanged |
+/// | `none` | `none` | FREE — and `offer.amount_sats` must be `0` |
+/// | `none` | absent/`sat` | **REFUSED** — the seller never agreed to work for nothing |
+/// | absent/`sat` | `none` | **REFUSED** — the seller cannot make a priced job free unilaterally |
+///
+/// ⛔ THE TWO MIXED ROWS ARE THE POINT. Either one, admitted, would let ONE side decide a trade's
+/// payment mode after the other had signed something else. Both refusals are stated here, in one
+/// function, rather than falling out of a later gate's failure — a refusal that happens by accident
+/// is a refusal that can be removed by accident.
+///
+/// ⛔ NOTHING HERE READS AN AMOUNT TO DECIDE A MODE. `amount_sats == 0` is REQUIRED of a free trade
+/// and is never evidence for one: a priced offer at zero is refused by the dust rule at post, and a
+/// free offer at a price was refused at post too (§2.6).
+fn verify_free_accept(offer: &OfferView, claim: &ClaimView) -> Result<PaymentMode, JobLifecycleError> {
+    match (offer.payment_mode, claim.payment_mode) {
+        (PaymentMode::Sat, PaymentMode::Sat) => Ok(PaymentMode::Sat),
+        (PaymentMode::None, PaymentMode::None) => {
+            if claim.creq.is_some() {
+                return Err(JobLifecycleError::Input(
+                    "accepted claim states payment=none but also carries a creq — refused (a free \
+                     claim authors no payment request)"
+                        .into(),
+                ));
+            }
+            if offer.amount_sats != 0 {
+                return Err(JobLifecycleError::Input(format!(
+                    "free trade (payment=none) but the offer's signed amount is {} sat, not 0 — \
+                     refused",
+                    offer.amount_sats
+                )));
+            }
+            Ok(PaymentMode::None)
+        }
+        (PaymentMode::None, PaymentMode::Sat) => Err(JobLifecycleError::Input(
+            "offer states payment=none but the accepted claim does not — refused (both ends must \
+             state the same mode; the seller never agreed to work for nothing)"
+                .into(),
+        )),
+        (PaymentMode::Sat, PaymentMode::None) => Err(JobLifecycleError::Input(
+            "accepted claim states payment=none but the buyer's signed offer does not — refused \
+             (both ends must state the same mode; a seller cannot make a priced job free)"
+                .into(),
+        )),
+    }
+}
+
 /// Fail-closed STRICT verification of the accepted claim's seller-authored NUT-18 `creq`,
 /// mirroring the seller-side field-by-field creq rebind. The buyer must not accept-then-pay a claim whose payment
 /// terms it did not fully verify, so before the accept-bind is written this requires:
@@ -1857,6 +2027,9 @@ pub fn authorize_request_from_bind(
                 tuple_signature: c.tuple_signature.clone(),
             }
         }),
+        // Thread the sealed mode so the §2.5 entry guard can refuse a free bind. A legacy bind
+        // deserializes to `Sat` and reaches the pay path exactly as it always did.
+        payment_mode: bind.payment_mode,
     })
 }
 
@@ -2533,6 +2706,8 @@ fn claim_view_from_tags(
         creq: first_tag_value(tags, "creq").map(str::to_owned),
         agents: crate::heartbeat::agents_from_tags(tags),
         capability: crate::heartbeat::SeatCapability::from_tags(tags),
+        // Read from the claim's OWN tag, never from `creq.is_none()` above (§2.0).
+        payment_mode: PaymentMode::from_claim_tags(tags),
     }
 }
 
@@ -2696,6 +2871,9 @@ pub(crate) async fn fetch_job_view_async(
                 .as_ref()
                 .map(|p| p.required_capabilities.clone())
                 .unwrap_or_default(),
+            // An offer that failed to parse reads as PAID — the same fail-closed direction as an
+            // offer that parsed and stated nothing.
+            payment_mode: parsed.as_ref().map(|p| p.payment_mode).unwrap_or_default(),
         }
     });
 
@@ -3018,6 +3196,7 @@ mod tests {
     #[test]
     fn authorize_from_bind_refuses_amount_drift() {
         let bind = AcceptedBind {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "aa".repeat(32),
             claim_id: "bb".repeat(32),
             result_id: "cc".repeat(32),
@@ -3057,6 +3236,7 @@ mod tests {
     #[test]
     fn single_settlement_refuses_different_result_and_is_idempotent_on_same() {
         let existing = AcceptedBind {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "aa".repeat(32),
             claim_id: "bb".repeat(32),
             result_id: "res-A".into(),
@@ -3145,6 +3325,7 @@ mod tests {
             require_seller_signature(&Some("ab".repeat(64))).expect("valid non-empty sig accepted");
         assert_eq!(valid_sig, "ab".repeat(64));
         let bind = AcceptedBind {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: job_id.clone(),
             claim_id: "bb".repeat(32),
             result_id: "res-valid".into(),
@@ -3197,6 +3378,7 @@ mod tests {
     #[test]
     fn explicit_and_bind_forms_build_identical_request() {
         let bind = AcceptedBind {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "2a195bece5f6".into(),
             claim_id: "0a8bbc5284e8".into(),
             result_id: "058886d7b19e".into(),
@@ -3225,6 +3407,7 @@ mod tests {
         // The explicit request as mcp.rs builds it, with a job_hash that DIVERGES from the bind
         // (the real-trade failure) and creq_hash/accepted_mints/seller_signature left for the fill.
         let mut explicit = crate::authorize_pay::AuthorizePayRequest {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: bind.job_id.clone(),
             result_id: bind.result_id.clone(),
             job_class: crate::authorize_pay::JobClass::FromScratch,
@@ -3255,6 +3438,7 @@ mod tests {
     #[test]
     fn explicit_form_seals_repo_and_branch_from_bind() {
         let bind = AcceptedBind {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "2a195bece5f6".into(),
             claim_id: "0a8bbc5284e8".into(),
             result_id: "058886d7b19e".into(),
@@ -3276,6 +3460,7 @@ mod tests {
             contribution: None,
         };
         let mut explicit = crate::authorize_pay::AuthorizePayRequest {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: bind.job_id.clone(),
             result_id: bind.result_id.clone(),
             job_class: crate::authorize_pay::JobClass::FromScratch,
@@ -3306,6 +3491,7 @@ mod tests {
     #[test]
     fn byte_equal_explicit_matches_bind_request() {
         let bind = AcceptedBind {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "2a195bece5f6".into(),
             claim_id: "0a8bbc5284e8".into(),
             result_id: "058886d7b19e".into(),
@@ -3331,6 +3517,7 @@ mod tests {
 
         // Explicit form with EVERY field byte-equal to the bind (the incident's inputs).
         let mut explicit = crate::authorize_pay::AuthorizePayRequest {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: bind.job_id.clone(),
             result_id: bind.result_id.clone(),
             job_class: crate::authorize_pay::JobClass::FromScratch,
@@ -3367,6 +3554,7 @@ mod tests {
         let bound_mint = "https://mint.minibits.cash/Bitcoin".to_string();
         let attacker_mint = "https://evil.example/attacker".to_string();
         let bind = AcceptedBind {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "aa".repeat(32),
             claim_id: "bb".repeat(32),
             result_id: "cc".repeat(32),
@@ -3390,6 +3578,7 @@ mod tests {
             contribution: None,
         };
         let mut explicit = crate::authorize_pay::AuthorizePayRequest {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: bind.job_id.clone(),
             result_id: bind.result_id.clone(),
             job_class: crate::authorize_pay::JobClass::FromScratch,
@@ -3473,6 +3662,7 @@ mod tests {
             CashuPublicKey::from_str(&format!("02{}", seller_nostr.to_hex())).expect("p2pk");
 
         let bind = AcceptedBind {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "job-cc".into(),
             claim_id: "bb".repeat(32),
             result_id: "res-cc".into(),
@@ -3587,6 +3777,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let home = home::bootstrap(&root).expect("home");
         let bind = AcceptedBind {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "aa".repeat(32),
             claim_id: "bb".repeat(32),
             result_id: "cc".repeat(32),
@@ -3791,6 +3982,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let home = home::bootstrap(&root).expect("home");
         let mut bind = AcceptedBind {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "aa".repeat(32),
             claim_id: "bb".repeat(32),
             result_id: "cc".repeat(32),
@@ -3861,6 +4053,7 @@ mod tests {
         let job_id = "aa".repeat(32);
 
         let bind_for = |result_id: &str| AcceptedBind {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: job_id.clone(),
             claim_id: "bb".repeat(32),
             result_id: result_id.to_owned(),
@@ -3950,6 +4143,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let home = home::bootstrap(&root).expect("home");
         let mut bind = AcceptedBind {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "aa".repeat(32),
             claim_id: "bb".repeat(32),
             result_id: "cc".repeat(32),
@@ -3996,6 +4190,7 @@ mod tests {
     #[test]
     fn authorize_from_bind_requires_buyer_tip_match_hash() {
         let bind = AcceptedBind {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "aa".repeat(32),
             claim_id: "bb".repeat(32),
             result_id: "cc".repeat(32),
@@ -4037,6 +4232,7 @@ mod tests {
     #[test]
     fn assert_authorize_matches_bind_refuses_seller_mismatch() {
         let bind = AcceptedBind {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "aa".repeat(32),
             claim_id: "bb".repeat(32),
             result_id: "cc".repeat(32),
@@ -4149,7 +4345,7 @@ mod tests {
             "offer-id",
             "buyer-pubkey",
             "seller-pubkey",
-            "creqA-test",
+            crate::gateway::ClaimPayment::Sat("creqA-test"),
             &["claude".to_owned()],
             &capability,
         );
@@ -4180,7 +4376,7 @@ mod tests {
             "offer-id",
             "buyer-pubkey",
             "seller-pubkey",
-            "creqA-test",
+            crate::gateway::ClaimPayment::Sat("creqA-test"),
             &[],
             &Default::default(),
         );
@@ -4213,6 +4409,7 @@ mod tests {
     // the winning claim + its seller. These drive the resolver purely, no relay.
     fn claim_with(claim_id: &str, seller: &str, status: &str, live: bool) -> ClaimView {
         ClaimView {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             claim_id: claim_id.to_owned(),
             created_at: 100,
             seller_pubkey: seller.to_owned(),
@@ -4350,6 +4547,7 @@ mod tests {
 
     fn claim_view(claim_id: &str, created_at: u64, status: &str) -> ClaimView {
         ClaimView {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             claim_id: claim_id.to_owned(),
             created_at,
             seller_pubkey: SELLER_HEX.to_owned(),
@@ -4510,6 +4708,7 @@ mod tests {
         let err = post_job(
             &home,
             PostJobRequest {
+                payment_mode: crate::gateway::PaymentMode::Sat,
                 task: "t".into(),
                 output: "text/plain".into(),
                 amount_sats: 1,
@@ -4701,6 +4900,7 @@ mod tests {
         let posted = post_job_async(
             &home,
             PostJobRequest {
+                payment_mode: crate::gateway::PaymentMode::Sat,
                 task: "wake on arrival".into(),
                 output: "text/plain".into(),
                 amount_sats: 2,
@@ -4794,6 +4994,7 @@ mod tests {
         let posted = post_job_async(
             &home,
             PostJobRequest {
+                payment_mode: crate::gateway::PaymentMode::Sat,
                 task: "test display-name opt-in".into(),
                 output: "text/plain".into(),
                 amount_sats: 2,
@@ -4856,6 +5057,7 @@ mod tests {
         let err = post_job(
             &home,
             PostJobRequest {
+                payment_mode: crate::gateway::PaymentMode::Sat,
                 task: "t".into(),
                 output: "text/plain".into(),
                 amount_sats: 1,
@@ -4938,6 +5140,7 @@ mod tests {
     // ── Accept-path: contribution resolution (echo-equality + fail-closed) ─────
     fn offer_view_contribution(owner: &str, url: &str, base_branch: &str, base_oid: &str) -> OfferView {
         OfferView {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             event_id: "of".repeat(16),
             created_at: 1,
             author_pubkey: "aa".repeat(32),
@@ -5058,6 +5261,7 @@ mod tests {
     #[test]
     fn authorize_request_from_bind_threads_contribution() {
         let mut bind = AcceptedBind {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "aa".repeat(32),
             claim_id: "bb".repeat(32),
             result_id: "cc".repeat(32),
@@ -5146,6 +5350,7 @@ mod tests {
         accepts: Option<Vec<String>>,
     ) -> PostJobRequest {
         PostJobRequest {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             task: "t".into(),
             output: "text/plain".into(),
             amount_sats: 1,
@@ -5219,6 +5424,7 @@ mod tests {
         capabilities: &[&str],
     ) -> PostJobRequest {
         PostJobRequest {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             task: "t".into(),
             output: "text/plain".into(),
             amount_sats: 3,
@@ -5378,6 +5584,7 @@ mod tests {
     fn post_job_from_scratch_emits_byte_identical_tags() {
         // No contribution params ⇒ Ok(None) ⇒ built tags are byte-identical to the bare offer.
         let request = PostJobRequest {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             task: "t".into(),
             output: "text/plain".into(),
             amount_sats: 3,
@@ -5585,6 +5792,7 @@ mod tests {
         let err = post_job_async(
             &home,
             PostJobRequest {
+                payment_mode: crate::gateway::PaymentMode::Sat,
                 task: "t".into(),
                 output: "text/plain".into(),
                 amount_sats: 40,
@@ -5978,3 +6186,281 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod free_lane_tests {
+    use super::*;
+
+    const SELLER: &str = "aa1e5f8c9d3b6a2f4e7c1d0b8a5f3e2c1d0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f";
+    const JOB: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+    fn offer_view(amount: u64, mode: PaymentMode) -> OfferView {
+        OfferView {
+            payment_mode: mode,
+            event_id: JOB.to_owned(),
+            created_at: 0,
+            author_pubkey: "b".repeat(64),
+            author_display_name: None,
+            task: "t".into(),
+            output: "text/plain".into(),
+            amount_sats: amount,
+            deadline_unix: 1_900_000_000,
+            seller_pubkey: Some(SELLER.to_owned()),
+            seller_display_name: None,
+            targeted: true,
+            repo: None,
+            branch: None,
+            job_class: None,
+            contribution: None,
+            requested_agent: None,
+            requested_harness_family: None,
+            requested_model: None,
+            required_capabilities: Vec::new(),
+        }
+    }
+
+    fn claim_view(mode: PaymentMode, creq: Option<&str>) -> ClaimView {
+        ClaimView {
+            payment_mode: mode,
+            capability: crate::heartbeat::SeatCapability::default(),
+            claim_id: "c".repeat(64),
+            created_at: 1,
+            seller_pubkey: SELLER.to_owned(),
+            display_name: None,
+            status: "processing".into(),
+            live: true,
+            creq: creq.map(str::to_owned),
+            agents: Vec::new(),
+        }
+    }
+
+    fn temp_job_home(label: &str) -> (std::path::PathBuf, crate::home::MaxplayerHome) {
+        let root = std::env::temp_dir().join(format!(
+            "maxplayer-free-lane-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+        (root, home)
+    }
+
+    fn post_request(amount_sats: u64, payment_mode: PaymentMode) -> PostJobRequest {
+        PostJobRequest {
+            payment_mode,
+            task: "t".into(),
+            output: "text/plain".into(),
+            amount_sats,
+            seller_pubkey: Some(SELLER.to_owned()),
+            untargeted: false,
+            deadline_unix: Some(2_000_000_000),
+            repo: None,
+            branch: None,
+            job: JobKind::FromScratch,
+            requested_agent: None,
+            requested_harness_family: None,
+            requested_model: None,
+            required_capabilities: Vec::new(),
+        }
+    }
+
+    /// PROPERTY 1 + 2, AT THE ACCEPT (§2.4) — all four mode combinations, and the two mixed rows
+    /// refuse.
+    ///
+    /// This is where "a paid job can never take the free accept path" is decided: reaching the free
+    /// branch requires BOTH signed statements to say `none`, so a paid job cannot arrive there by
+    /// any single-sided route.
+    #[test]
+    fn the_accept_resolves_the_mode_from_both_signed_statements_and_refuses_every_mix() {
+        assert_eq!(
+            verify_free_accept(&offer_view(21, PaymentMode::Sat), &claim_view(PaymentMode::Sat, Some("creqAtest")))
+                .expect("paid/paid is a trade"),
+            PaymentMode::Sat
+        );
+        assert_eq!(
+            verify_free_accept(&offer_view(0, PaymentMode::None), &claim_view(PaymentMode::None, None))
+                .expect("free/free is a trade"),
+            PaymentMode::None
+        );
+
+        let offer_only = verify_free_accept(
+            &offer_view(0, PaymentMode::None),
+            &claim_view(PaymentMode::Sat, Some("creqAtest")),
+        )
+        .expect_err("offer=none / claim=absent must refuse");
+        assert!(
+            offer_only.to_string().contains("the accepted claim does not"),
+            "the refusal must say WHICH end disagreed: {offer_only}"
+        );
+
+        let claim_only = verify_free_accept(
+            &offer_view(21, PaymentMode::Sat),
+            &claim_view(PaymentMode::None, None),
+        )
+        .expect_err("offer=absent / claim=none must refuse");
+        assert!(
+            claim_only.to_string().contains("the buyer's signed offer does not"),
+            "the refusal must say WHICH end disagreed: {claim_only}"
+        );
+    }
+
+    /// §2.4 — the free branch's own two conditions. A free trade whose claim carries a creq, or
+    /// whose signed offer is not priced at zero, is refused rather than normalized.
+    #[test]
+    fn a_free_accept_requires_no_creq_and_a_zero_signed_amount() {
+        let with_creq = verify_free_accept(
+            &offer_view(0, PaymentMode::None),
+            &claim_view(PaymentMode::None, Some("creqAtest")),
+        )
+        .expect_err("a free claim carrying a creq must refuse");
+        assert!(with_creq.to_string().contains("also carries a creq"), "{with_creq}");
+
+        let priced = verify_free_accept(
+            &offer_view(21, PaymentMode::None),
+            &claim_view(PaymentMode::None, None),
+        )
+        .expect_err("a free trade at a non-zero signed amount must refuse");
+        assert!(priced.to_string().contains("not 0"), "{priced}");
+    }
+
+    /// PROPERTY 4 — THE POST GATE IS MODE-CONDITIONAL, NOT DELETED.
+    ///
+    /// Two legs, and the second is the one that keeps the first honest.
+    ///
+    /// LEG 1 (behavioural): a `none` post at a non-zero price is refused before anything is signed.
+    ///
+    /// LEG 2 (structural): the wallet-open + dust-guard block still EXISTS and is guarded by the
+    /// mode, rather than having been deleted or weakened. It is asserted against the function's own
+    /// source because the alternative — actually opening a wallet — needs a live mint, and a test
+    /// that cannot run offline is a test that stops guarding this. The detector carries a positive
+    /// control against a synthetic body that IS bad, so a matcher that found nothing would fail
+    /// loudly instead of passing while inspecting nothing.
+    #[test]
+    fn the_post_gate_is_mode_conditional_and_the_dust_guard_is_still_there() {
+        // LEG 1.
+        let request = post_request(21, PaymentMode::None);
+        let error = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let (root, home) = temp_job_home("free-post-priced");
+                let outcome = post_job_async(&home, request).await;
+                let _ = std::fs::remove_dir_all(&root);
+                outcome
+            })
+            .expect_err("payment=none at a non-zero amount must be refused");
+        assert!(
+            error.to_string().contains("payment=none requires amount_sats = 0"),
+            "unexpected refusal: {error}"
+        );
+
+        // LEG 2.
+        fn post_body(source: &str) -> &str {
+            let body = source
+                .split_once("pub async fn post_job_async(")
+                .expect("post_job_async declaration")
+                .1;
+            body.split_once("\nfn now_unix_secs()").expect("end of post_job_async").0
+        }
+
+        let planted = post_body(
+            "pub async fn post_job_async(\n    #[cfg(feature = \"wallet\")]\n    {\n        open_wallet_async(home)\n    }\nfn now_unix_secs()",
+        );
+        assert!(
+            planted.contains("open_wallet_async") && !planted.contains("is_free()"),
+            "control: the detector must be able to SEE an unguarded wallet open, else its verdict \
+             on the real body means nothing"
+        );
+
+        let body = post_body(include_str!("job_lifecycle.rs"));
+        assert!(
+            body.contains("open_wallet_async(home)"),
+            "the wallet open must still EXIST — a priced post opens a wallet exactly as before; \
+             deleting it would make every priced job skip the dust rule"
+        );
+        assert!(
+            body.contains("require_fee_safe_amount_for_post"),
+            "the dust guard must still EXIST for priced posts (§11.6 is not weakened for anyone)"
+        );
+        assert!(
+            body.contains("if !request.payment_mode.is_free() {"),
+            "…and it must be GUARDED BY THE MODE. Without this guard a free post reaches \
+             require_amount_covers_fee(0, fee), where 0 <= fee for EVERY fee including zero, and \
+             ruling 2 is unreachable: no zero-bitcoin buyer can post at all"
+        );
+    }
+
+    /// §1.1 — the mode reaches the WIRE from the post request, and a priced post emits no tag.
+    #[test]
+    fn the_posted_offer_draft_carries_the_requested_mode() {
+        let free = build_offer_draft(&post_request(0, PaymentMode::None), 2_000_000_000, None)
+            .expect("free draft builds");
+        assert_eq!(
+            parse_offer(&free).expect("parses").payment_mode,
+            PaymentMode::None,
+            "the mode the caller asked for must reach the signed offer"
+        );
+
+        let priced = build_offer_draft(&post_request(21, PaymentMode::Sat), 2_000_000_000, None)
+            .expect("priced draft builds");
+        assert_eq!(parse_offer(&priced).expect("parses").payment_mode, PaymentMode::Sat);
+        assert!(
+            !priced.tags.iter().any(|tag| {
+                tag.first() == Some("param")
+                    && tag.0.get(1).map(String::as_str) == Some(crate::gateway::PAYMENT_PARAM)
+            }),
+            "a priced post stays byte-identical to one made before the free lane: {:?}",
+            priced.tags
+        );
+    }
+
+    /// §1.1 read-back on the claim view: the buyer recovers the seller's statement from the claim's
+    /// own tag, and a claim that states nothing reads as PAID.
+    #[test]
+    fn the_claim_view_reads_the_sellers_payment_statement_off_the_tag() {
+        let free = crate::gateway::claim_draft(
+            JOB,
+            &"b".repeat(64),
+            SELLER,
+            crate::gateway::ClaimPayment::None,
+            &[],
+            &Default::default(),
+        );
+        let view = claim_view_from_tags(
+            "c".repeat(64),
+            1,
+            SELLER.to_owned(),
+            "processing".to_owned(),
+            &free.tags,
+        );
+        assert_eq!(view.payment_mode, PaymentMode::None);
+        assert_eq!(view.creq, None, "a free claim carries no creq");
+
+        let priced = crate::gateway::claim_draft(
+            JOB,
+            &"b".repeat(64),
+            SELLER,
+            crate::gateway::ClaimPayment::Sat("creqAtest"),
+            &[],
+            &Default::default(),
+        );
+        let view = claim_view_from_tags(
+            "c".repeat(64),
+            1,
+            SELLER.to_owned(),
+            "processing".to_owned(),
+            &priced.tags,
+        );
+        assert_eq!(
+            view.payment_mode,
+            PaymentMode::Sat,
+            "a claim stating nothing is PAID — the fail-closed default on the seller's side too"
+        );
+        assert_eq!(view.creq.as_deref(), Some("creqAtest"));
+    }
+}
+

@@ -257,6 +257,33 @@ pub struct Config {
     /// HMAC secret for git pre-receive hook callbacks.
     /// Used to authenticate internal policy endpoint requests.
     pub git_hook_hmac_secret: String,
+    /// Longest life, in seconds, granted to a NIP-98 git push token that is scoped to a
+    /// single ref AND carries a NIP-40 `expiration` tag. Default: 21600 (6 hours).
+    ///
+    /// A seller mints one push token on the host before a sandboxed job starts, then
+    /// pushes with it minutes later, so the ±60 s window cannot serve that push. The ref
+    /// scope is what makes the longer life safe: the token may write one branch of one
+    /// repo, and the pre-receive hook enforces that. Unscoped tokens keep the ±60 s
+    /// window whatever this value says.
+    ///
+    /// Raise it above the longest job deadline the marketplace allows; a token that asks
+    /// for more than this is rejected outright, not shortened. The effective value is
+    /// advertised in the NIP-11 `limitation` object as `scoped_token_max_lifetime_secs`,
+    /// so a client can refuse an over-cap token at mint time.
+    ///
+    /// While this is non-zero the git legs also REFUSE a `ref` tag that is not a valid
+    /// ref name, rather than reading it as an absent scope: the push path will not
+    /// enforce a scope it cannot parse, so a token whose holder asked for one branch must
+    /// not become a token that may write any branch.
+    ///
+    /// Set via `BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS`. Zero disables the relaxation and puts
+    /// every token back on the ±60 s window — the exact rule from before this feature, and
+    /// the rollback switch.
+    ///
+    /// An explicit value that is not a whole number of seconds STOPS startup. It never falls
+    /// back to the default: an operator who mistypes a NARROWER limit must not receive the
+    /// wider default instead. Only an absent variable selects the default.
+    pub scoped_token_max_lifetime_secs: u64,
 
     /// Descriptor key identifier accepted in kind:30350 `exec` tags.
     pub push_executor_key_id: String,
@@ -773,6 +800,38 @@ impl Config {
                 let secret: [u8; 32] = rand::random();
                 hex::encode(secret)
             });
+        // 6 hours by default. See the `scoped_token_max_lifetime_secs` field doc: this
+        // only ever applies to a token that carries BOTH a valid ref scope and an
+        // `expiration` tag, so raising it cannot lengthen an unscoped token's life.
+        // An explicit value that does not parse STOPS startup. It must never fall back to the
+        // default: an operator who types `300 ` or `six hours` means to NARROW this security
+        // limit, and a silent fallback would widen it to 6 hours instead.
+        //
+        // ONLY `NotPresent` selects the default. `NotUnicode` means the variable IS set, to
+        // bytes that are not UTF-8, so it must be refused for the same reason: it is an
+        // explicit value the operator wrote, and defaulting on it would widen the cap. A
+        // catch-all `Err(_)` arm covers both and reintroduces exactly the bug this rule
+        // exists to prevent, so match the variants by name and let a new variant break the
+        // build rather than pass silently.
+        let scoped_token_max_lifetime_secs: u64 =
+            match std::env::var("BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS") {
+                Err(std::env::VarError::NotPresent) => {
+                    buzz_auth::DEFAULT_SCOPED_TOKEN_MAX_LIFETIME_SECS
+                }
+                Err(std::env::VarError::NotUnicode(raw)) => {
+                    return Err(ConfigError::InvalidValue(format!(
+                        "BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS is set to bytes that are not \
+                         UTF-8 ({raw:?}); it must be a whole number of seconds (0 disables \
+                         the relaxation)"
+                    )));
+                }
+                Ok(raw) => raw.parse().map_err(|_| {
+                    ConfigError::InvalidValue(format!(
+                        "BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS must be a whole number of seconds \
+                         (0 disables the relaxation); got `{raw}`"
+                    ))
+                })?,
+            };
         let push_executor_key_id =
             std::env::var("BUZZ_PUSH_EXECUTOR_KEY_ID").unwrap_or_else(|_| "relay-v1".to_string());
         if push_executor_key_id.is_empty() || push_executor_key_id.len() > 64 {
@@ -947,6 +1006,7 @@ impl Config {
             git_max_repos_per_pubkey,
             git_max_concurrent_ops,
             git_hook_hmac_secret,
+            scoped_token_max_lifetime_secs,
             push_executor_key_id,
             push_gateway_delivery_url,
             push_gateway_timeout,
@@ -1022,6 +1082,76 @@ mod tests {
         assert!(
             config.huddle_audio_available,
             "huddle_audio_available should default to true so single-pod (N=1) keeps today's huddle behavior"
+        );
+        assert_eq!(
+            config.scoped_token_max_lifetime_secs,
+            buzz_auth::DEFAULT_SCOPED_TOKEN_MAX_LIFETIME_SECS,
+            "the scoped push-token cap should default to 6 hours"
+        );
+        assert_eq!(
+            config.scoped_token_max_lifetime_secs, 21_600,
+            "the default is 6 hours; the marketplace's longest job deadline must fit inside it"
+        );
+    }
+
+    #[test]
+    fn scoped_token_max_lifetime_env_override_and_invalid_fallback() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous = std::env::var_os("BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS");
+
+        std::env::set_var("BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS", "43200");
+        let raised = Config::from_env()
+            .expect("config")
+            .scoped_token_max_lifetime_secs;
+
+        // Zero is a real value, not a typo: it switches the relaxation off and puts every
+        // token back on the ±60 s window.
+        std::env::set_var("BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS", "0");
+        let off = Config::from_env()
+            .expect("config")
+            .scoped_token_max_lifetime_secs;
+
+        // A malformed explicit value must STOP startup. A fallback to the default would turn
+        // an operator's typo into a WIDER limit than the one they typed. Each of these is a
+        // plausible typo, and a trailing space is the easiest one to make.
+        let mut junk = Vec::new();
+        for raw in ["six hours", "300 ", "", "-1", "21600s", "6h", "1e3"] {
+            std::env::set_var("BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS", raw);
+            junk.push((raw, Config::from_env().is_err()));
+        }
+
+        // Bytes that are not UTF-8. `std::env::var` reports these as `VarError::NotUnicode`,
+        // NOT as `NotPresent`: the variable IS set. A catch-all `Err(_)` arm would default
+        // here and widen the cap to 6 hours, which is the same hole as a silent parse
+        // fallback. Unix only — Windows environment values are UTF-16 and reach this by
+        // another route.
+        #[cfg(unix)]
+        let not_unicode_refused = {
+            use std::os::unix::ffi::OsStrExt;
+            let raw = std::ffi::OsStr::from_bytes(&[0x32, 0x31, 0x36, 0x30, 0x30, 0xff]);
+            std::env::set_var("BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS", raw);
+            Config::from_env().is_err()
+        };
+
+        if let Some(value) = previous {
+            std::env::set_var("BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS", value);
+        } else {
+            std::env::remove_var("BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS");
+        }
+
+        assert_eq!(raised, 43_200);
+        assert_eq!(off, 0, "zero must switch the relaxation off, not fall back");
+        for (raw, refused) in junk {
+            assert!(
+                refused,
+                "an explicit `{raw}` must stop startup, never widen the cap to the default"
+            );
+        }
+        #[cfg(unix)]
+        assert!(
+            not_unicode_refused,
+            "a value set to non-UTF-8 bytes is PRESENT, so it must stop startup; \
+             defaulting on VarError::NotUnicode widens the cap to 6 hours"
         );
     }
 

@@ -63,6 +63,7 @@ let
     BUZZ_REQUIRE_AUTH_TOKEN = lib.boolToString cfg.requireAuthToken;
     BUZZ_REQUIRE_RELAY_MEMBERSHIP = lib.boolToString cfg.requireRelayMembership;
     BUZZ_OPEN_READ = lib.boolToString cfg.openRead;
+    BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS = toString cfg.scopedTokenMaxLifetimeSecs;
   }
   // lib.optionalAttrs (cfg.ownerPubkey != null) { RELAY_OWNER_PUBKEY = cfg.ownerPubkey; };
 in
@@ -159,6 +160,30 @@ in
         public marketplace whose events are meant to be readable by anyone without an account. Wires
         BUZZ_OPEN_READ (config.rs treats only "true"/"1" as on). READ-only: writes stay gated by
         requireRelayMembership / NIP-42; this opens the read path only.
+      '';
+    };
+
+    scopedTokenMaxLifetimeSecs = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 21600; # 6 hours — the buzz-relay default (buzz_auth::DEFAULT_SCOPED_TOKEN_MAX_LIFETIME_SECS).
+      description = ''
+        Longest life, in seconds, the relay grants a NIP-98 git push token that is scoped to ONE ref
+        and carries a NIP-40 `expiration` tag. Wires BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS.
+
+        A seller mints one push token on the host BEFORE a sandboxed job starts and pushes with it at
+        the end, minutes later, so the relay's ±60 s freshness window cannot serve that push. The ref
+        scope is what makes the longer life safe: the token may write one branch of one repo, and the
+        pre-receive hook enforces that exactly. UNSCOPED tokens keep the ±60 s window whatever this
+        value says.
+
+        Keep it at or above the longest job deadline the marketplace allows. A token that asks for
+        more is REJECTED outright, not shortened, so raising the deadline without raising this value
+        breaks delivery at push time. The effective value is advertised in the relay's NIP-11
+        `limitation` object as `scoped_token_max_lifetime_secs`, which is how a client checks the cap
+        before it mints. 0 switches the relaxation off and puts every token back on ±60 s — the
+        exact rule from before this feature, so 0 is the rollback switch. The relay REFUSES to
+        start on a value that is not a whole number of seconds; it never falls back to the
+        default, because a mistyped narrower limit must not become the wider default.
       '';
     };
 

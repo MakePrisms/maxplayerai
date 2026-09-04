@@ -59,6 +59,14 @@ pub const HEARTBEAT_STALL_MISSED_INTERVALS_ENV: &str = "MAXPLAYER_HEARTBEAT_STAL
 /// Wire tag listing every mint the seat accepts payment on (§4.2). Multi-value, order preserved.
 pub const ACCEPTED_MINTS_TAG: &str = "accepted_mints";
 
+/// Wire tag stating that this seat TAKES NO PAYMENT (§4.1): `["takes_payment","none"]`, emitted
+/// only when the seat's `[seller] takes_no_payment` is set.
+///
+/// ⛔ ABSENT IS UNSTATED. IT IS NEVER "NO". A seat that predates this tag publishes nothing here,
+/// and a reader resolving that to "takes payment: yes" would be right today while asserting a fact
+/// no seat published — the same rule the admission pair already states for its own absence.
+pub const TAKES_PAYMENT_TAG: &str = "takes_payment";
+
 /// Wire tag naming the harness FAMILIES this seat serves (#784) — the enum-bound, filterable axis.
 /// Multi-value like [`crate::seller_agents::AGENT_TAG`], because a seat may serve several harnesses.
 /// Values come from [`crate::agent_presets::harness_family_for_preset`] and are therefore always in
@@ -459,6 +467,13 @@ pub struct HeartbeatDraft {
     pub queue_depth: u32,
     /// The seller's advertised rate (sats).
     pub rate_sats: u64,
+    /// Does this seat take NO payment at all (§4.1)? `false` — the default — emits no tag, so a
+    /// priced seat's beat is byte-identical to one published before the free lane existed.
+    ///
+    /// DERIVED from `[seller] takes_no_payment`, never operator-set on the beat, for the reason
+    /// `admission` is derived: an operator-set field would be a second place to state one fact and
+    /// the ad would drift from the gate that enforces it.
+    pub takes_no_payment: bool,
     /// Every mint this seat accepts payment on, in config order. §4.2 requires at least one: a
     /// buyer can pay this seat only on a mint in this list, so a seat stating none is unpayable.
     pub accepted_mints: Vec<String>,
@@ -486,11 +501,18 @@ impl HeartbeatDraft {
             accepting,
             queue_depth,
             rate_sats,
+            takes_no_payment: false,
             accepted_mints,
             agents: Vec::new(),
             capability: SeatCapability::default(),
             admission: None,
         }
+    }
+
+    /// Advertise that this seat takes no payment (§4.1).
+    pub fn with_takes_no_payment(mut self, takes_no_payment: bool) -> Self {
+        self.takes_no_payment = takes_no_payment;
+        self
     }
 
     /// Advertise `agents` (preference order) on this heartbeat.
@@ -531,6 +553,14 @@ impl HeartbeatDraft {
             TagSpec::new(["queue_depth", &queue_depth]),
             multi_value_tag(ACCEPTED_MINTS_TAG, &self.accepted_mints),
         ];
+        // §4.1 — stated next to `rate`, and only when true. `false` emits nothing, which reads as
+        // UNSTATED rather than "no" (see [`TAKES_PAYMENT_TAG`]).
+        if self.takes_no_payment {
+            tags.push(TagSpec::new([
+                TAKES_PAYMENT_TAG,
+                crate::gateway::PAYMENT_NONE,
+            ]));
+        }
         if let Some(tag) = agent_tag(&self.agents) {
             tags.push(tag);
         }
@@ -767,6 +797,15 @@ pub fn admission_from_tags(tags: &[TagSpec]) -> Option<crate::home::AdmissionPol
     Some(crate::home::AdmissionPolicy { pool, targeted })
 }
 
+/// Read the §4.1 seat advertisement: `true` only for a literal `["takes_payment","none"]`.
+///
+/// Anything else — absent, blank, or a value this build does not know — reads `false`, i.e.
+/// UNSTATED. That is the fail-closed direction: a buyer that cannot confirm a seat takes nothing
+/// simply does not post a free offer to it.
+pub fn takes_no_payment_from_tags(tags: &[TagSpec]) -> bool {
+    first_tag_value(tags, TAKES_PAYMENT_TAG).map(str::trim) == Some(crate::gateway::PAYMENT_NONE)
+}
+
 /// `["<name>", value]` for the single-value free-text tags, or `None` when there is nothing honest
 /// to say. Blank and whitespace-only collapse to `None`: an empty tag on the wire would read as a
 /// stated-but-empty value, and these fields have no such state.
@@ -824,6 +863,7 @@ pub fn heartbeat_for_state(
     in_flight: u32,
     anything_serving: bool,
     rate_sats: u64,
+    takes_no_payment: bool,
     accepted_mints: Vec<String>,
     agents: Vec<String>,
     capability: SeatCapability,
@@ -841,6 +881,9 @@ pub fn heartbeat_for_state(
         rate_sats,
         accepted_mints,
     )
+    // §4.1 — derived from the SAME `SellerConfig` the admission gate reads, in the same call, so
+    // the advertisement cannot lie about the gate that enforces it.
+    .with_takes_no_payment(takes_no_payment)
     .with_agents(agents)
     .with_capability(capability)
     // Taken as a REQUIRED parameter, not an `Option`, for the reason the models argument is: a
@@ -882,6 +925,7 @@ pub fn heartbeat_for_state(
 pub fn retraction_for_state(
     in_flight: u32,
     rate_sats: u64,
+    takes_no_payment: bool,
     accepted_mints: Vec<String>,
     agents: Vec<String>,
     capability: SeatCapability,
@@ -894,6 +938,9 @@ pub fn retraction_for_state(
         in_flight,
         false,
         rate_sats,
+        // The seat's payment stance rides the terminal beat for the same reason the roster does:
+        // leaving the market is not a claim to have started taking payment.
+        takes_no_payment,
         accepted_mints,
         agents,
         capability,
@@ -914,8 +961,17 @@ pub struct ParsedHeartbeat {
     pub accepting: bool,
     pub queue_depth: u32,
     pub rate_sats: u64,
+    /// Does this seat state that it takes NO payment (§4.1)? `false` ⇒ the seat stated nothing,
+    /// which is UNSTATED and never a claim that it does take payment.
+    ///
+    /// ⚠ Do NOT substitute `rate_sats == 0` for this. `rate` is a `u64` floor with no distinguished
+    /// zero and §4.2 defines it as "lowest price the seat accepts": a seat at `rate 0` says "I will
+    /// take any amount, including nothing", which a buyer holding zero sats cannot act on.
+    #[serde(default)]
+    pub takes_no_payment: bool,
     /// Every mint this seat accepts payment on. Never empty — [`parse_heartbeat`] rejects a seat
-    /// that states none.
+    /// that states none, INCLUDING a free one (§4.3): relaxing that would make a genuinely
+    /// unpayable priced seat parseable, so a free seat still names a mint it will never be paid at.
     pub accepted_mints: Vec<String>,
     /// Advertised harnesses, preference order. Empty ⇒ the seller stated none (the tag was
     /// absent) — NOT a claim that it can run nothing.
@@ -1057,6 +1113,9 @@ pub fn parse_heartbeat(event: &EventDraft) -> Result<ParsedHeartbeat, HeartbeatP
         accepting,
         queue_depth,
         rate_sats,
+        // §4.1. Absent ⇒ false ⇒ UNSTATED. Read AFTER the `v` check above and the
+        // `MissingAcceptedMints` check below, neither of which the free lane touches.
+        takes_no_payment: takes_no_payment_from_tags(&event.tags),
         accepted_mints,
         agents: agents_from_tags(&event.tags),
         admission: admission_from_tags(&event.tags),
@@ -1164,6 +1223,7 @@ mod tests {
         accept_offers_only_from: &[&str],
     ) -> crate::home::SellerConfig {
         crate::home::SellerConfig {
+            takes_no_payment: false,
             agent_command: vec!["echo".into()],
             rate_sats: 1,
             git_remote: "https://example.invalid/repo.git".into(),
@@ -1548,7 +1608,7 @@ mod tests {
 
     #[test]
     fn advertises_every_harness_in_preference_order() {
-        let draft = heartbeat_for_state(0, true, 5, mints(), vec!["claude".into(), "codex".into()], cap(&["claude", "codex"]), TEST_POLICY)
+        let draft = heartbeat_for_state(0, true, 5, false, mints(), vec!["claude".into(), "codex".into()], cap(&["claude", "codex"]), TEST_POLICY)
             .to_event_draft();
         let tag = first_tag(&draft.tags, "agents").expect("agents tag");
         assert_eq!(tag.0, vec!["agents", "claude", "codex"]);
@@ -1562,7 +1622,7 @@ mod tests {
         // A raw `agent_command` seller has no preset label, so it advertises no roster and the tag
         // is omitted rather than emitted empty. It IS serving (hence `true`), which is why an
         // unstated list must never read as dark.
-        let stated_none = heartbeat_for_state(0, true, 5, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY).to_event_draft();
+        let stated_none = heartbeat_for_state(0, true, 5, false, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY).to_event_draft();
         assert_eq!(
             stated_none,
             draft(true, 0, 5).with_admission(TEST_POLICY).to_event_draft()
@@ -1576,7 +1636,7 @@ mod tests {
 
     #[test]
     fn accepting_flips_with_in_flight_state() {
-        let idle = heartbeat_for_state(0, true, 5, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY);
+        let idle = heartbeat_for_state(0, true, 5, false, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY);
         assert!(idle.accepting);
         assert_eq!(idle.queue_depth, 0);
         assert_eq!(
@@ -1584,7 +1644,7 @@ mod tests {
             Some("y")
         );
 
-        let busy = heartbeat_for_state(1, true, 5, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY);
+        let busy = heartbeat_for_state(1, true, 5, false, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY);
         assert!(!busy.accepting);
         assert_eq!(busy.queue_depth, 1);
         assert_eq!(
@@ -1606,7 +1666,7 @@ mod tests {
     #[test]
     fn accepting_requires_a_free_slot_and_something_serving() {
         let accepting_of = |in_flight, serving| {
-            let draft = heartbeat_for_state(in_flight, serving, 5, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY).to_event_draft();
+            let draft = heartbeat_for_state(in_flight, serving, 5, false, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY).to_event_draft();
             (
                 first_tag_value(&draft.tags, "accepting")
                     .expect("accepting tag")
@@ -1637,7 +1697,7 @@ mod tests {
     #[test]
     fn queue_depth_is_the_depth_not_a_busy_flag() {
         for depth in [2_u32, 3, 17] {
-            let draft = heartbeat_for_state(depth, true, 5, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY).to_event_draft();
+            let draft = heartbeat_for_state(depth, true, 5, false, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY).to_event_draft();
             assert_eq!(
                 first_tag_value(&draft.tags, "queue_depth"),
                 Some(depth.to_string().as_str()),
@@ -1653,7 +1713,7 @@ mod tests {
         // And the boundary that #313 got wrong in the field: nothing in flight ⇒ available, no
         // matter how much this seat has done in the past. The store-side half of this is
         // `a_store_holding_only_terminal_jobs_reports_none_in_flight`.
-        let free = heartbeat_for_state(0, true, 5, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY).to_event_draft();
+        let free = heartbeat_for_state(0, true, 5, false, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY).to_event_draft();
         assert_eq!(first_tag_value(&free.tags, "accepting"), Some("y"));
         assert_eq!(first_tag_value(&free.tags, "queue_depth"), Some("0"));
     }
@@ -1664,7 +1724,7 @@ mod tests {
     #[test]
     fn the_terminal_beat_is_accepting_n_whatever_the_seat_was_doing() {
         for in_flight in [0_u32, 1, 9] {
-            let event = retraction_for_state(in_flight, 5, mints(), vec!["claude".into()], cap(&["claude"]), TEST_POLICY)
+            let event = retraction_for_state(in_flight, 5, false, mints(), vec!["claude".into()], cap(&["claude"]), TEST_POLICY)
                 .to_event_draft();
             assert_eq!(
                 first_tag_value(&event.tags, "accepting"),
@@ -1689,8 +1749,8 @@ mod tests {
     /// it, and the directory would go on reading the old one.
     #[test]
     fn the_terminal_beat_replaces_the_live_one_at_the_same_address() {
-        let live = heartbeat_for_state(0, true, 5, mints(), vec!["claude".into()], cap(&["claude"]), TEST_POLICY).to_event_draft();
-        let terminal = retraction_for_state(0, 5, mints(), vec!["claude".into()], cap(&["claude"]), TEST_POLICY).to_event_draft();
+        let live = heartbeat_for_state(0, true, 5, false, mints(), vec!["claude".into()], cap(&["claude"]), TEST_POLICY).to_event_draft();
+        let terminal = retraction_for_state(0, 5, false, mints(), vec!["claude".into()], cap(&["claude"]), TEST_POLICY).to_event_draft();
 
         assert_eq!(first_tag_value(&live.tags, "accepting"), Some("y"));
         assert_eq!(terminal.kind, live.kind, "same kind, or it is not a replacement");
@@ -2133,6 +2193,7 @@ mod tests {
             0,
             true,
             5,
+            false,
             mints(),
             vec!["claude".to_owned(), "codex".to_owned()],
             SeatCapability::from_roster(
@@ -2167,7 +2228,7 @@ mod tests {
     fn a_seat_that_observed_no_model_emits_no_model_tag() {
         // The default state of every seat before a probe has reported anything. Absent means
         // unstated, and nothing else on the beat shifts because of it.
-        let event = heartbeat_for_state(0, true, 5, mints(), vec!["claude".to_owned()], cap(&["claude"]), TEST_POLICY)
+        let event = heartbeat_for_state(0, true, 5, false, mints(), vec!["claude".to_owned()], cap(&["claude"]), TEST_POLICY)
             .to_event_draft();
         assert!(harness_models_from_tags(&event.tags).is_empty());
         // The POSITIVE CONTROL for the assertion above: the same event still carries the family, so
@@ -2302,7 +2363,7 @@ mod tests {
             "offer-id",
             "buyer-pubkey",
             "seller-pubkey",
-            "creqA-test",
+            crate::gateway::ClaimPayment::Sat("creqA-test"),
             &["claude".to_owned()],
             &capability,
         );
@@ -2339,7 +2400,7 @@ mod tests {
             "offer-id",
             "buyer-pubkey",
             "seller-pubkey",
-            "creqA-test",
+            crate::gateway::ClaimPayment::Sat("creqA-test"),
             &[],
             &capability,
         );
@@ -2416,6 +2477,7 @@ mod tests {
             0,
             true,
             5,
+            false,
             mints(),
             vec!["claude".to_owned(), "my-fork".to_owned(), "codex".to_owned()],
             cap(&["claude", "my-fork", "codex"]),
@@ -2429,4 +2491,80 @@ mod tests {
             "my-fork has no spec family and must contribute none"
         );
     }
+}
+
+#[cfg(test)]
+mod free_lane_tests {
+    use super::*;
+
+    fn mints() -> Vec<String> {
+        vec!["https://testnut.example/Bitcoin".to_owned()]
+    }
+
+    const fn policy() -> crate::home::AdmissionPolicy {
+        crate::home::AdmissionPolicy {
+            pool: false,
+            targeted: crate::home::TargetedAdmission::Closed,
+        }
+    }
+
+    /// PROPERTY 3, SEAT SIDE — `["takes_payment","none"]` is emitted ONLY by a seat that opted in,
+    /// and its ABSENCE reads as UNSTATED rather than as "this seat takes payment".
+    ///
+    /// The third leg is the one that matters and is easy to omit: a seat at `rate 0` that never set
+    /// `takes_no_payment` must NOT advertise free work. `rate` is a floor meaning "any amount ≥ 0",
+    /// which is not the same statement as "I take nothing", and a buyer holding zero sats cannot act
+    /// on the first.
+    #[test]
+    fn only_an_opted_in_seat_advertises_takes_payment_none_and_rate_zero_is_not_that_statement() {
+        let free = heartbeat_for_state(0, true, 0, true, mints(), Vec::new(), SeatCapability::default(), policy())
+            .to_event_draft();
+        assert!(
+            free.tags.contains(&TagSpec::new([TAKES_PAYMENT_TAG, crate::gateway::PAYMENT_NONE])),
+            "an opted-in seat must publish the tag: {:?}",
+            free.tags
+        );
+        assert!(takes_no_payment_from_tags(&free.tags));
+
+        let priced = heartbeat_for_state(0, true, 21, false, mints(), Vec::new(), SeatCapability::default(), policy())
+            .to_event_draft();
+        assert!(
+            !priced.tags.iter().any(|tag| tag.first() == Some(TAKES_PAYMENT_TAG)),
+            "a priced seat must emit NO tag — its beat stays byte-identical to a pre-free-lane one: {:?}",
+            priced.tags
+        );
+        assert!(
+            !takes_no_payment_from_tags(&priced.tags),
+            "absent is UNSTATED, and a reader must not resolve it to a claim the seat never made"
+        );
+
+        // THE DISCRIMINATOR: rate 0 alone is not the advertisement.
+        let zero_rate_silent =
+            heartbeat_for_state(0, true, 0, false, mints(), Vec::new(), SeatCapability::default(), policy())
+                .to_event_draft();
+        assert!(
+            !takes_no_payment_from_tags(&zero_rate_silent.tags),
+            "rate_sats = 0 means 'any amount >= 0'; it must NEVER be read as 'takes no payment'"
+        );
+    }
+
+    /// The advertisement survives the beat round trip, and §4.3's mint requirement is NOT relaxed
+    /// for a free seat: a seat publishing no mints is unparseable to every buyer, free or paid.
+    #[test]
+    fn a_free_seat_round_trips_and_still_must_publish_a_mint() {
+        let draft = heartbeat_for_state(0, true, 0, true, mints(), Vec::new(), SeatCapability::default(), policy())
+            .to_event_draft();
+        let parsed = parse_heartbeat(&draft).expect("a free beat parses");
+        assert!(parsed.takes_no_payment, "the buyer must recover the seat's free advertisement");
+        assert_eq!(parsed.rate_sats, 0);
+
+        let mut mintless = draft.clone();
+        mintless.tags.retain(|tag| tag.first() != Some(ACCEPTED_MINTS_TAG));
+        assert!(
+            matches!(parse_heartbeat(&mintless), Err(HeartbeatParseError::MissingAcceptedMints)),
+            "MissingAcceptedMints is NOT relaxed for a free seat — relaxing it would make a \
+             genuinely unpayable PRICED seat parseable, a market-visible regression"
+        );
+    }
+
 }

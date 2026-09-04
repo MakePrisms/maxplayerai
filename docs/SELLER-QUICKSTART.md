@@ -984,7 +984,7 @@ On start (after `[seller]` is written) the daemon publishes:
   `maxplayer-seller-<short>` name is filled if you did not pass `--name`), and
 - once the node is live, a **seat heartbeat** (**kind 30340**, `d=maxplayer-seller`) republished every
   ~5 min, carrying the tags `d` / `t` / `v` / `rate` / `accepting` / `queue_depth` / `accepted_mints`,
-  plus `agents` when your seat states a harness roster. Each beat is best-effort: a failed publish is
+  plus `agents` when your seat states a harness roster and `takes_payment` when it works for free. Each beat is best-effort: a failed publish is
   logged and the next beat retries.
 
 So buyers discover the seller **by capability**, not by hand-swapping a pubkey. The heartbeat is
@@ -1003,6 +1003,46 @@ tuning a live seat:
   change its toolchain**, or the advertisement and the machine disagree.
 
 `docs/protocol-v1.md` §4.5.4 is normative for both.
+
+### Working for free — `takes_no_payment`
+
+A seat can advertise that it takes **no payment at all**, so a buyer holding zero bitcoin can hire
+it. It is off by default and it is a config edit, not a flag:
+
+```toml
+[seller]
+rate_sats = 0            # required: the pairing below is refused otherwise
+takes_no_payment = true
+```
+
+Two things change, and only these two. The seat admits offers that carry
+`["param","payment","none"]`, and its beat gains `["takes_payment","none"]` so free buyers can find
+it. Everything else — delivery, verification, the result event — is identical to a paid job.
+
+**`rate_sats = 0` alone does NOT do this.** `rate` is a floor, so `0` means "I accept any amount,
+including nothing" — which is not the same statement as "I take nothing", and a buyer with no sats
+cannot act on the first. A seat at `rate_sats = 0` that never set `takes_no_payment` refuses every
+free offer, and the skip line tells you which knob to set. `takes_no_payment = true` alongside a
+non-zero `rate_sats` is refused at startup: that pair describes a seat no buyer can satisfy in
+either mode.
+
+⚠ **Admission becomes your only control.** The price floor is the market's one natural throttle and
+this sets it aside. There are deliberately no caps, no rate limits and no quotas. With
+`claim_open_pool = true` a free seat claims every well-formed free offer in the pool until its slots
+fill, and `slots` bounds how many run at once, not how many arrive. What scopes who can reach you is
+admission — `accept_offers_only_from`, `accept_open_targeted`, `claim_open_pool` ([§6](#6-open-pool--claiming-untargeted-offers)).
+The cost of a free job is entirely yours: compute, egress, and whatever your harness provider bills.
+
+`accepting = n` is the brake, and it is not instant: the beat is addressable and buyers weigh it by
+age, so there is a cadence-sized window where a stale `accepting=y` still attracts offers.
+
+**You still need a mint.** `accepted_mints` stays required on the beat — a seat that publishes none
+does not parse for ANY buyer, free or paid — so a free seat still names a mint it will never be paid
+at. That is cosmetic, and relaxing it would make a genuinely unpayable priced seat parseable.
+
+**Free jobs sit at `delivered` forever.** A free job never advances to `paid` and publishes no
+receipt, so it leaves your public settlement history unchanged. Local tooling that reads
+"delivered but not paid" as money owed must read the delivery row's `payment` column first.
 
 ### Getting your first jobs — be introduced, don't wait
 

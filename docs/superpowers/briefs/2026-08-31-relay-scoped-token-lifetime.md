@@ -138,3 +138,74 @@ deployed commit.
 stream, so the per-job roster model refresh loses its source and container-reported usage/model is
 spoofable by the job. Since metering already moves to the proxy, have the proxy also record the model
 from the API traffic and feed the roster from that — tamper-resistant by the same argument.
+
+---
+
+## 8. Implementation (Requirement B)
+
+Branch `feat/relay-scoped-token-lifetime`. Requirement A stays as PR #929 merged it.
+
+### What shipped
+
+- `crates/buzz/crates/buzz-auth/src/nip98.rs` — a new entry point
+  `verify_nip98_event_with_policy(event_json, url, method, body, freshness)`. It returns
+  `Nip98Auth { pubkey, ref_scope }`. `Nip98Freshness::STRICT` keeps the ±60 s window.
+  `Nip98Freshness::with_scoped_lifetime_cap(cap)` grants the longer life.
+  `verify_nip98_event` is now a thin wrapper that passes `STRICT`, so every caller
+  outside the git transport keeps today's behaviour.
+- The rule, in order: a future-dated token is always rejected (`created_at <= now + 60`).
+  A token that is scoped AND carries an `expiration` tag is judged by that expiration
+  alone: reject when `expiration - created_at > cap`, reject when `now > expiration`,
+  accept otherwise. Every other token gets the ±60 s window. A scoped token with no
+  `expiration` tag therefore buys nothing (fail closed).
+- One deliberate tightening, also fail closed: on the git legs a `ref` tag that is not a
+  valid ref name is now REFUSED (401), not treated as an absent scope. The push path
+  refuses to enforce a scope it cannot parse, so honouring such a token would hand a
+  wider credential to a client that asked for a narrower one. Non-git callers keep
+  ignoring the tag, because `STRICT` never reads it.
+- `is_valid_ref_name` moved from `api/git/policy.rs` to `buzz-auth`. One definition now
+  decides whether a token counts as scoped and whether the push path will enforce the
+  scope, so the two cannot drift.
+- `crates/buzz/crates/buzz-relay/src/api/git/transport.rs` — `authenticate_git` passes
+  the cap and takes `ref_scope` from the return value. The second scan of the event JSON
+  is gone. §7(c) holds by construction: one read of the FIRST `ref` tag, and the value
+  the freshness rule used is the value the hook enforces.
+- §7(a) holds by construction too. Both legs land in `authenticate_git` — the
+  `info/refs` GET through `GitReadAuth` and the service POST through `GitAuth` — and
+  neither extractor chooses its own policy.
+
+### The cap
+
+- Config field `Config::scoped_token_max_lifetime_secs`, env var
+  `BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS`, default **21600** seconds (6 hours).
+- NixOS option `services.maxplayer.relay.scopedTokenMaxLifetimeSecs` in `nix/relay.nix`
+  wires the same env var.
+- `0` switches the relaxation off and puts every token back on ±60 s. A cap of 0 selects the
+  strict policy itself, so it is the exact rule from before this change and nothing else.
+  This is the rollback switch.
+- An explicit env value that is not a whole number of seconds STOPS startup. It never falls
+  back to the default, because a mistyped narrower limit must not become the wider default.
+  Only an absent variable selects the default.
+- A token that asks for more than the cap is rejected outright, not shortened. Raise the
+  cap before you raise the job deadline.
+
+### NIP-11
+
+The `limitation` object carries `scoped_token_max_lifetime_secs` (`nip11.rs`,
+`RelayLimitation`). The field holds the enforced value and is omitted when the cap is 0.
+This is how a client meets §7(b): it reads the cap and refuses an over-cap token at mint
+time.
+
+### Not implemented here
+
+- §7(b) is a client change; the relay half is the advertised cap above.
+- §7(d) (the per-seat canary) is a seat-side leg and is out of scope for this branch.
+
+### Deployment is still open
+
+Do not treat this as deployed. The relay runs from a separate host repository, and the
+NIP-11 document identifies the software only by `software` and `version`. `version` is
+the `buzz-relay` crate version (`0.2.0` in this tree), which does not name a commit. Per
+§6, `relay.maxplayer.ai` reports `software: https://github.com/block/buzz` and
+`version: 0.2.0`, so the running commit cannot be read from this repository. Confirm the
+deployed build by another route before the seller client switches to long-lived tokens.
