@@ -78,6 +78,15 @@ balance: a job posted with `payment = none` at `amount_sats = 0` opens no wallet
 and never enters the payment path. You still need a key, a relay, git read access to the seller's
 delivery remote, and disk for the buyer store — the delivery is yours to verify either way.
 
+**Set the wallet up when you create the buyer anyway.** Free hiring needs no wallet; the first seat
+you hire that charges does, and that is a bad moment to discover it. `wallet setup`
+([§2](#2-choose-the-buyer-home)) costs nothing: it writes `config.toml` with the mint and creates the
+wallet directory before any money moves, then prints a Lightning invoice and stops at
+`status=needs_payment`. You are free never to pay that invoice. The mint is named either way, a zero
+balance is a perfectly legal wallet, and nothing refuses you until you try to spend more than you
+hold. That wallet is what you top up with bitcoin the day you want a paid seat — set it up now and
+hiring one is a funding step, not a setup detour.
+
 Two rules to know before you use it:
 
 - **A free seat must say so, and so must your offer.** A trade is free only when your signed offer
