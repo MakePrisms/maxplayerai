@@ -25,6 +25,7 @@ use crate::job_lifecycle::{
 
 use super::reservations::{Converted, JobDisposition, ReservationState, ReserveRefused};
 use super::store::{AttemptState, AwardAttempt, AwardRecord, BeginAttempt, BuyerStore, StoreError};
+use crate::gateway::PaymentMode;
 
 /// Hard filters an awardable claim must pass (issue #126). Grounded in the wire the offer/claim
 /// actually carry: the offer's signed `amount_sats` is the fixed price, the seller's claim `creq`
@@ -62,6 +63,15 @@ pub struct AwardFilters<'a> {
     /// Capability tokens the offer requires (#784). Empty ⇒ no requirement. Every token is validated
     /// against [`crate::capability::CAPABILITIES`] before any claim is judged.
     pub required_capabilities: &'a [String],
+    /// The mode the buyer's SIGNED OFFER stated (§2.0). Read from the offer like every other
+    /// filterable axis here, never supplied at award time — the request a buyer is held to must be
+    /// the one it published.
+    ///
+    /// This is one half of the both-ends rule: it decides WHICH arm of
+    /// [`claim_is_settleable`] judges a claim, and that arm then requires the seller's CLAIM to
+    /// state the same thing. Absent on the wire ⇒ [`PaymentMode::Sat`], so an old-format offer is
+    /// judged as PAID.
+    pub payment_mode: PaymentMode,
 }
 
 /// Build the award filters for a job from its SIGNED OFFER — the ONE constructor both award paths
@@ -96,6 +106,7 @@ pub fn award_filters_for_offer<'a>(
         requested_harness_family: offer.requested_harness_family.as_deref(),
         requested_model: offer.requested_model.as_deref(),
         required_capabilities: &offer.required_capabilities,
+        payment_mode: offer.payment_mode,
     }
 }
 
@@ -112,7 +123,7 @@ pub fn select_awardable_claim(view: &JobView, filters: &AwardFilters) -> Option<
             claim.live
                 && claim_serves_requested_agent(&claim.agents, filters.requested_agent)
                 && claim_meets_capability_request(&claim.capability, filters).is_ok()
-                && claim_is_payable(&view.job_id, claim.creq.as_deref(), filters)
+                && claim_is_settleable(claim.payment_mode, &view.job_id, claim.creq.as_deref(), filters)
         })
         .map(|claim| claim.claim_id.clone())
 }
@@ -410,6 +421,8 @@ pub fn unsatisfiable_capability_request(
         max_sats: 0,
         buyer_mint: "",
         allow_real_mints: false,
+        // Placeholder, like the money fields above: this helper consults only the request axes.
+        payment_mode: PaymentMode::Sat,
         requested_agent,
         requested_harness_family,
         requested_model,
@@ -576,15 +589,49 @@ pub fn named_claim_awardable(
     if let Err(refusal) = claim_meets_capability_request(&claim.capability, filters) {
         return Err(NamedAwardRefused::Capability { claim_id: claim_id.to_owned(), refusal });
     }
-    if !claim_is_payable(&view.job_id, claim.creq.as_deref(), filters) {
+    if !claim_is_settleable(claim.payment_mode, &view.job_id, claim.creq.as_deref(), filters) {
         return Err(NamedAwardRefused::Unpayable { claim_id: claim_id.to_owned() });
     }
     Ok(())
 }
 
-/// True when a claim's `creq` is present, well-formed, priced at the offer amount within the
-/// budget ceiling, denominated in sats for this job, and quotes a mint the buyer can pay from.
-fn claim_is_payable(job_id: &str, creq: Option<&str>, filters: &AwardFilters) -> bool {
+/// Whether this claim can be SETTLED under the offer's payment mode — the both-ends check (§2.0,
+/// §2.3), and the buyer's first refusal of a mixed-mode trade.
+///
+/// The free path is entered only when the buyer's signed OFFER says `none` AND the seller's
+/// published CLAIM says `none`. Both mixed combinations refuse: offer-none/claim-absent falls into
+/// the `None` arm and fails its first condition; offer-absent/claim-none falls into the `Sat` arm
+/// and fails the explicit refusal at its head.
+///
+/// ⛔ MODE IS NEVER INFERRED HERE. `amount == 0` alone reaches the `Sat` arm and is refused there
+/// (no creq, or a creq the accept gate would reject); a missing `creq` alone is not free, it is an
+/// unpayable priced claim. `offer_amount_sats == 0` is a REQUIREMENT of the free arm, never a
+/// discriminator for it — a free offer at a non-zero price is a contradiction, and the post gate
+/// (§2.6) refuses to publish one.
+///
+/// ⛔ `plan_payment` — the ONLY mint-touching call on this path — is reached solely through the
+/// `Sat` arm. Nothing in the `None` arm reads `buyer_mint`, `allow_real_mints`, or any wallet state.
+/// That is what makes a zero-bitcoin buyer able to award at all.
+///
+/// The `Sat` arm's body is today's `claim_is_payable`, unchanged: a claim's `creq` present,
+/// well-formed, priced at the offer amount within the budget ceiling, denominated in sats for this
+/// job, and quoting a mint the buyer can pay from.
+fn claim_is_settleable(
+    claim_mode: PaymentMode,
+    job_id: &str,
+    creq: Option<&str>,
+    filters: &AwardFilters,
+) -> bool {
+    if filters.payment_mode.is_free() {
+        // FREE arm — three conditions, ALL required, none of them about money.
+        return claim_mode.is_free() && creq.is_none() && filters.offer_amount_sats == 0;
+    }
+    // PAID arm. A claim that states `payment=none` against a priced offer is refused BEFORE the
+    // creq checks: the seller and the buyer disagree about what kind of trade this is, and no
+    // amount of well-formed payment terms makes that agreement exist.
+    if claim_mode.is_free() {
+        return false;
+    }
     let Some(creq) = creq else { return false };
     let Ok(request) = crate::gateway::creq::parse_creq(creq) else {
         return false;
@@ -1548,6 +1595,7 @@ mod tests {
 
     fn offer_view(job_id: &str, amount: u64) -> OfferView {
         OfferView {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             event_id: job_id.to_owned(),
             created_at: 0,
             author_pubkey: "b".repeat(64),
@@ -1576,6 +1624,7 @@ mod tests {
     fn claim(job_id: &str, live: bool, creq_amount: u64, mints: &[String]) -> ClaimView {
         let creq = build_seller_creq(job_id, creq_amount, "sat", mints, SELLER_HEX).expect("creq");
         ClaimView {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             // The UNSTATED capability — a seat advertising nothing. Set explicitly because `ClaimView`
             // has no `Default` derive and must not gain one: a default `SandboxConfig` is a meaningful
             // object, but a default `ClaimView` is a claim that never existed.
@@ -1606,6 +1655,7 @@ mod tests {
 
     fn filters<'a>(offer_amount: u64, max_sats: u64) -> AwardFilters<'a> {
         AwardFilters {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             offer_amount_sats: offer_amount,
             max_sats,
             buyer_mint: DEFAULT_MINT_URL,
@@ -4570,3 +4620,209 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod free_lane_tests {
+    use super::*;
+    use crate::gateway::creq::build_seller_creq;
+    use crate::job_lifecycle::{ClaimView, JobView, OfferView};
+
+    const SELLER: &str = "aa1e5f8c9d3b6a2f4e7c1d0b8a5f3e2c1d0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f";
+    /// The buyer's own default mint, so the PAID legs below exercise the real mint-compat plan
+    /// rather than a fixture the fence would reject for an unrelated reason.
+    const MINT: &str = crate::home::DEFAULT_MINT_URL;
+    const JOB: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+    fn offer_view(amount: u64, mode: PaymentMode) -> OfferView {
+        OfferView {
+            payment_mode: mode,
+            event_id: JOB.to_owned(),
+            created_at: 0,
+            author_pubkey: "b".repeat(64),
+            author_display_name: None,
+            task: "t".into(),
+            output: "text/plain".into(),
+            amount_sats: amount,
+            deadline_unix: 1_900_000_000,
+            seller_pubkey: Some(SELLER.to_owned()),
+            seller_display_name: None,
+            targeted: true,
+            repo: None,
+            branch: None,
+            job_class: None,
+            contribution: None,
+            requested_agent: None,
+            requested_harness_family: None,
+            requested_model: None,
+            required_capabilities: Vec::new(),
+        }
+    }
+
+    fn claim_view(mode: PaymentMode, creq: Option<String>) -> ClaimView {
+        ClaimView {
+            payment_mode: mode,
+            capability: crate::heartbeat::SeatCapability::default(),
+            claim_id: "c".repeat(64),
+            created_at: 1,
+            seller_pubkey: SELLER.to_owned(),
+            display_name: None,
+            status: "processing".into(),
+            live: true,
+            creq,
+            agents: Vec::new(),
+        }
+    }
+
+    fn view(offer: OfferView, claim: ClaimView) -> JobView {
+        JobView {
+            job_id: JOB.to_owned(),
+            offer: Some(offer),
+            claims: vec![claim],
+            results: Vec::new(),
+            live_claim_id: None,
+            accepted: None,
+            pending: false,
+            read_confirmed: true,
+        }
+    }
+
+    /// A buyer with NO wallet context at all: empty mint string, real mints forbidden. Any code
+    /// path that reached `plan_payment` with these would refuse, so a free award that succeeds here
+    /// has provably not touched one.
+    fn walletless_filters(offer: &OfferView) -> AwardFilters<'_> {
+        award_filters_for_offer(offer, 0, "", false)
+    }
+
+    /// PROPERTY 1 — THE BOTH-ENDS RULE, at the award. All four combinations, in one test so no
+    /// combination can be dropped by deleting a test nobody notices.
+    ///
+    /// The two mixed rows are the whole point: each is one side unilaterally deciding a trade's
+    /// payment mode after the other signed something else.
+    #[test]
+    fn a_free_award_needs_both_ends_and_every_mixed_combination_refuses() {
+        let creq = build_seller_creq(JOB, 0, "sat", &[MINT.to_owned()], SELLER).expect("creq");
+
+        // FREE / FREE — the one awarding combination, and it awards with NO wallet, NO mint, NO
+        // balance and no real-mint permission.
+        let offer = offer_view(0, PaymentMode::None);
+        let awarded = select_awardable_claim(
+            &view(offer.clone(), claim_view(PaymentMode::None, None)),
+            &walletless_filters(&offer),
+        );
+        assert_eq!(
+            awarded.as_deref(),
+            Some("c".repeat(64).as_str()),
+            "a free offer and a free claim must award — with an empty buyer mint and real mints \
+             forbidden, which proves plan_payment was never reached"
+        );
+
+        // MIXED — offer says none, claim says nothing.
+        assert_eq!(
+            select_awardable_claim(
+                &view(offer.clone(), claim_view(PaymentMode::Sat, Some(creq.clone()))),
+                &walletless_filters(&offer)
+            ),
+            None,
+            "offer=none / claim=absent must REFUSE: the seller never agreed to work for nothing"
+        );
+
+        // MIXED — offer says nothing, claim says none.
+        let priced = offer_view(21, PaymentMode::Sat);
+        assert_eq!(
+            select_awardable_claim(
+                &view(priced.clone(), claim_view(PaymentMode::None, None)),
+                &award_filters_for_offer(&priced, 21, MINT, false)
+            ),
+            None,
+            "offer=absent / claim=none must REFUSE: a seller cannot make a priced job free"
+        );
+
+        // PAID / PAID — unchanged, and still judged by the money gates.
+        let paid_creq = build_seller_creq(JOB, 21, "sat", &[MINT.to_owned()], SELLER).expect("creq");
+        assert_eq!(
+            select_awardable_claim(
+                &view(priced.clone(), claim_view(PaymentMode::Sat, Some(paid_creq))),
+                &award_filters_for_offer(&priced, 21, MINT, false)
+            )
+            .as_deref(),
+            Some("c".repeat(64).as_str()),
+            "the paid path is byte-unchanged by the free lane"
+        );
+    }
+
+    /// PROPERTY 1 — MODE IS NEVER INFERRED, at the award.
+    ///
+    /// A zero-priced offer that states nothing is PAID, and a claim carrying no creq is UNPAYABLE
+    /// rather than free. Both are refused, and neither is allowed to slip into the free arm by
+    /// looking like it.
+    #[test]
+    fn a_silent_zero_amount_job_is_never_run_free() {
+        let silent_zero = offer_view(0, PaymentMode::Sat);
+        assert_eq!(
+            select_awardable_claim(
+                &view(silent_zero.clone(), claim_view(PaymentMode::Sat, None)),
+                &walletless_filters(&silent_zero)
+            ),
+            None,
+            "amount 0 + no creq + no tags is an unpayable PRICED job, never a free one — this is \
+             §6's single largest correctness risk and the reason mode is read only from the tag"
+        );
+
+        // And a free offer whose amount is NOT zero cannot be awarded either: the free arm requires
+        // `offer_amount_sats == 0` as a CONDITION, never as a discriminator.
+        let contradictory = offer_view(21, PaymentMode::None);
+        assert_eq!(
+            select_awardable_claim(
+                &view(contradictory.clone(), claim_view(PaymentMode::None, None)),
+                &walletless_filters(&contradictory)
+            ),
+            None,
+            "payment=none at a non-zero price is a contradiction and must not award"
+        );
+    }
+
+    /// §2.3 — a free claim that ALSO carries a creq is refused. The seller cannot make a mixed
+    /// claim acceptable by emitting both statements.
+    #[test]
+    fn a_free_claim_carrying_a_creq_is_refused() {
+        let creq = build_seller_creq(JOB, 0, "sat", &[MINT.to_owned()], SELLER).expect("creq");
+        let offer = offer_view(0, PaymentMode::None);
+        assert_eq!(
+            select_awardable_claim(
+                &view(offer.clone(), claim_view(PaymentMode::None, Some(creq))),
+                &walletless_filters(&offer)
+            ),
+            None,
+            "both statements at once is not a stronger claim, it is a refused one"
+        );
+    }
+
+    /// The MANUAL award path applies the identical filters — the property
+    /// `named_claim_awardable`'s own doc binds ("a filter skipped here is a filter that never runs
+    /// at all"). Asserted for the free lane specifically, because naming a claim must select WHICH
+    /// claim is judged and never WHETHER it is.
+    #[test]
+    fn the_manual_award_path_applies_the_free_lane_filters_too() {
+        let claim_id = "c".repeat(64);
+        let offer = offer_view(0, PaymentMode::None);
+
+        named_claim_awardable(
+            &view(offer.clone(), claim_view(PaymentMode::None, None)),
+            &claim_id,
+            &walletless_filters(&offer),
+        )
+        .expect("free/free is awardable by name too");
+
+        let refused = named_claim_awardable(
+            &view(offer.clone(), claim_view(PaymentMode::Sat, None)),
+            &claim_id,
+            &walletless_filters(&offer),
+        )
+        .expect_err("a mixed pair must refuse on the manual path as well");
+        assert!(
+            matches!(refused, NamedAwardRefused::Unpayable { .. }),
+            "unexpected refusal: {refused:?}"
+        );
+    }
+}
+

@@ -85,6 +85,10 @@ pub struct AuthorizePayRequest {
     /// descendant + content) + the authorship tuple seam run pre-pay, all against these
     /// buyer-controlled binds.
     pub contribution: Option<ContributionPayBinds>,
+    /// How this trade settles, threaded from the accept-bind (§2.5).
+    /// [`crate::gateway::PaymentMode::None`] is REFUSED at the entry of [`authorize_pay_async`]:
+    /// there is nothing to pay.
+    pub payment_mode: crate::gateway::PaymentMode,
 }
 
 /// Buyer-controlled contribution binds threaded from the signed offer / accept-bind into the pay
@@ -280,6 +284,24 @@ pub async fn authorize_pay_async(
     // Both job_id and explicit forms: buyer tip-match hash is required and must
     // equal the seller-advertised commit_oid. Never derive/default the hash from the
     // claim/result oid — caller must supply it; mismatch refuses.
+    // §2.5 — A FREE BIND HAS NOTHING TO PAY, SO IT NEVER ENTERS THIS FUNCTION.
+    //
+    // Defence in depth, not the primary control: §2.4 never writes a payable bind for a free job.
+    // Its job is to make the claim "a paid job cannot ride the free path" SYMMETRIC — the free path
+    // cannot ride the paid path either. First refusal in the function, ahead of every other input
+    // check, because none of the checks below have any meaning for a trade with no payment leg.
+    //
+    // ⛔ The zero-refusals downstream (`require_amount_covers_fee`'s `amount <= fee`, which refuses
+    // `0` even when the fee is `0`, and `require_realized_locked_token`'s zero-value token check)
+    // are UNTOUCHED by the free lane. They are §11.6 in code: relaxing either to admit
+    // `amount = 0` would weaken the dust rule for every priced job in the market. They are not
+    // reached by a free job; they are not softened for one.
+    if request.payment_mode.is_free() {
+        return Err(AuthorizePayError::Input(format!(
+            "job {} is a free trade (payment=none): there is nothing to pay — refused",
+            request.job_id
+        )));
+    }
     if request.delivery_integrity_hash.trim().is_empty() {
         return Err(AuthorizePayError::Input(
             "delivery_integrity_hash is required (buyer tip-match); never auto-filled from claim/result oid".into(),
@@ -1476,6 +1498,7 @@ mod tests {
         let home = home::bootstrap(&root).expect("home");
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         let request = AuthorizePayRequest {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "job-d2-empty".into(),
             result_id: "result-d2".into(),
             job_class: JobClass::FromScratch,
@@ -1594,6 +1617,7 @@ mod tests {
         );
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         let request = AuthorizePayRequest {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "job-hop-fence".into(),
             result_id: "result-hop-fence".into(),
             job_class: JobClass::FromScratch,
@@ -1642,6 +1666,7 @@ mod tests {
         let home = home::bootstrap(&root).expect("home");
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         let request = AuthorizePayRequest {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "job-d2".into(),
             result_id: "result-d2".into(),
             job_class: JobClass::FromScratch,
@@ -1686,6 +1711,7 @@ mod tests {
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         let oid = "aa".repeat(20);
         let request = AuthorizePayRequest {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "job-jc".into(),
             result_id: "result-jc".into(),
             job_class: JobClass::Contribution,
@@ -1733,6 +1759,7 @@ mod tests {
             &prepay_preimage(&home, "job-ext", "result-ext", &"bb".repeat(32), &"aa".repeat(20), 2),
         );
         let request = AuthorizePayRequest {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "job-ext".into(),
             result_id: "result-ext".into(),
             job_class: JobClass::FromScratch,
@@ -1958,6 +1985,7 @@ mod tests {
             .sign_schnorr(&Message::from_digest(preimage.digest_bytes()))
             .to_string();
         let request = AuthorizePayRequest {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "job-forged".into(),
             result_id: "result-forged".into(),
             job_class: JobClass::FromScratch,
@@ -2015,6 +2043,7 @@ mod tests {
             .sign_schnorr(&Message::from_digest(preimage.digest_bytes()))
             .to_string();
         let request = AuthorizePayRequest {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "job-diag".into(),
             result_id: "result-diag".into(),
             job_class: JobClass::FromScratch,
@@ -2088,6 +2117,7 @@ mod tests {
         );
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         let tampered_amount = AuthorizePayRequest {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "job-tamper".into(),
             result_id: "result-tamper".into(),
             job_class: JobClass::FromScratch,
@@ -2119,6 +2149,7 @@ mod tests {
         );
         let mut gate2 = BudgetGate::from_home(&home).expect("gate");
         let tampered_delivery = AuthorizePayRequest {
+            payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "job-tamper2".into(),
             result_id: "result-tamper2".into(),
             job_class: JobClass::FromScratch,
@@ -2299,3 +2330,124 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod free_lane_tests {
+    use super::*;
+    use crate::gateway::PaymentMode;
+
+    /// Same pattern as the sibling module's helper: a current-thread runtime, so the sync `#[test]`
+    /// cases drive the async authorize path directly.
+    fn authorize_pay_blocking(
+        home: &MaxplayerHome,
+        gate: &mut BudgetGate,
+        request: AuthorizePayRequest,
+    ) -> Result<AuthorizePayOutcome, AuthorizePayError> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime")
+            .block_on(authorize_pay_async(home, gate, request))
+    }
+
+    fn temp_home(label: &str) -> (std::path::PathBuf, MaxplayerHome) {
+        let root = std::env::temp_dir().join(format!(
+            "maxplayer-free-lane-pay-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+        (root, home)
+    }
+
+    /// PROPERTY 2, SECOND HALF (§2.5) — A FREE JOB NEVER REACHES THE PAY LEG.
+    ///
+    /// The request is otherwise fully well-formed: a matching tip-match hash, a real commit oid, a
+    /// job hash. It refuses on the MODE alone, first, ahead of every other input check — which is
+    /// what makes "a paid job cannot ride the free path" symmetric: the free path cannot ride the
+    /// paid path either.
+    ///
+    /// And the budget gate must be untouched by the refusal: a trade with nothing to pay must not
+    /// burn a satoshi of the buyer's per-job ceiling on its way to being refused.
+    #[test]
+    fn authorize_pay_refuses_a_free_bind_at_entry_and_burns_no_budget() {
+        let (root, home) = temp_home("refuses-free");
+        let mut gate = BudgetGate::from_home(&home).expect("gate");
+        let commit = "ab".repeat(20);
+        let request = AuthorizePayRequest {
+            payment_mode: PaymentMode::None,
+            job_id: "free-job".into(),
+            result_id: "free-result".into(),
+            job_class: JobClass::FromScratch,
+            // Deliberately VALID: the refusal below must be about the mode, not about a defect that
+            // any request would trip over.
+            delivery_integrity_hash: commit.clone(),
+            job_hash: "bb".repeat(32),
+            seller_pubkey: home::public_key_hex(&home).expect("pubkey"),
+            amount_sats: 0,
+            repo: "https://github.com/bitcoin/bips.git".into(),
+            branch: "master".into(),
+            commit_oid: commit,
+            seller_signature: "cc".repeat(32),
+            creq_hash: None,
+            accepted_mints: Vec::new(),
+            realized_mint: None,
+            contribution: None,
+        };
+        let err = authorize_pay_blocking(&home, &mut gate, request).expect_err("a free bind must refuse");
+        let message = err.to_string();
+        assert!(
+            message.contains("free trade") && message.contains("nothing to pay"),
+            "the refusal must be about the MODE, not about some other defect: {message}"
+        );
+        assert_eq!(gate.spent(), 0, "a refused free bind must not burn budget");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The mode guard is a REFUSAL on the free mode, not a blanket one: an otherwise-identical
+    /// `Sat` request gets PAST it and is judged by the checks that have always followed.
+    ///
+    /// Without this leg the test above would also pass a guard that refused every request — which
+    /// would "prove" the property while breaking every paid job in the market.
+    #[test]
+    fn the_same_request_in_sat_mode_gets_past_the_mode_guard() {
+        let (root, home) = temp_home("sat-passes");
+        let mut gate = BudgetGate::from_home(&home).expect("gate");
+        let request = AuthorizePayRequest {
+            payment_mode: PaymentMode::Sat,
+            job_id: "paid-job".into(),
+            result_id: "paid-result".into(),
+            job_class: JobClass::FromScratch,
+            // Empty ⇒ the NEXT check refuses. That is the point: we assert which refusal we get.
+            delivery_integrity_hash: String::new(),
+            job_hash: "bb".repeat(32),
+            seller_pubkey: home::public_key_hex(&home).expect("pubkey"),
+            amount_sats: 21,
+            repo: "https://github.com/bitcoin/bips.git".into(),
+            branch: "master".into(),
+            commit_oid: "ab".repeat(20),
+            seller_signature: "cc".repeat(32),
+            creq_hash: None,
+            accepted_mints: Vec::new(),
+            realized_mint: None,
+            contribution: None,
+        };
+        let message = authorize_pay_blocking(&home, &mut gate, request)
+            .expect_err("still refuses, but for the pre-existing reason")
+            .to_string();
+        assert!(
+            message.contains("delivery_integrity_hash is required"),
+            "a Sat request must reach the checks that always ran; got: {message}"
+        );
+        assert!(
+            !message.contains("nothing to pay"),
+            "the mode guard must not fire for a priced job: {message}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+

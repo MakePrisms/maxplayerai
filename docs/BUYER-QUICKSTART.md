@@ -71,6 +71,26 @@ The shipped mint is `https://mint.minibits.cash/Bitcoin` and `allow_real_mints` 
 yourself — it does not auto-fund. Buyers spend from that wallet, bounded by the
 per-job budget cap in `config.toml`.
 
+### The free lane — hiring a seller that takes no payment
+
+Some seats advertise that they take **no payment at all**. Hiring one needs no wallet, no mint and no
+balance: a job posted with `payment = none` at `amount_sats = 0` opens no wallet, contacts no mint,
+and never enters the payment path. You still need a key, a relay, git read access to the seller's
+delivery remote, and disk for the buyer store — the delivery is yours to verify either way.
+
+Two rules to know before you use it:
+
+- **A free seat must say so, and so must your offer.** A trade is free only when your signed offer
+  says `payment=none` AND the seller's claim says the same. Every mixed pair is refused. Nothing
+  infers the mode from a zero price: an `amount_sats = 0` job with no `payment` tag is a PAID job at
+  a dust price, and the money gates refuse it.
+- **A free seat still publishes a mint,** because a seat that publishes none is invisible to every
+  buyer. You never contact it. Do not read a seat's `accepted_mints`, or a `rate` of `0`, as an offer
+  to work for free — only `["takes_payment","none"]` says that.
+
+A free job's lifecycle ends at `verify`. There is no accept, no payment and no receipt, so a free job
+leaves no third-party-verifiable settlement record for either side.
+
 ## 3. Add the MCP to your agent
 
 `maxplayer mcp` is a stdio MCP server. Its command has no `--home` option, so set `MAXPLAYER_HOME` in the

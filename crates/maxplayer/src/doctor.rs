@@ -3829,6 +3829,7 @@ mod tests {
         let seller = SellerConfig {
             agent_command: vec![existing.to_string_lossy().into_owned()],
             rate_sats: 5,
+            takes_no_payment: false,
             git_remote: "https://example.invalid/repo".into(),
             job_timeout_secs: None,
             agents: Vec::new(), // empty ⇒ boot uses fallback_registry (agent_command VERBATIM)
@@ -3876,6 +3877,7 @@ mod tests {
         let seller = SellerConfig {
             agent_command: vec![existing.to_string_lossy().into_owned()],
             rate_sats: 5,
+            takes_no_payment: false,
             git_remote: "https://example.invalid/repo".into(),
             job_timeout_secs: None,
             agents: Vec::new(),
@@ -3928,6 +3930,7 @@ mod tests {
         let seller = SellerConfig {
             agent_command: vec!["ignored-when-agents-listed".to_owned()],
             rate_sats: 5,
+            takes_no_payment: false,
             git_remote: "https://example.invalid/repo".into(),
             job_timeout_secs: None,
             agents: vec!["ghostxyz-not-a-preset".to_owned()],
@@ -4049,6 +4052,7 @@ mod tests {
         maxplayer_core::home::SellerConfig {
             agent_command,
             rate_sats: 5,
+            takes_no_payment: false,
             git_remote: "https://example.invalid/repo".into(),
             job_timeout_secs: None,
             agents,

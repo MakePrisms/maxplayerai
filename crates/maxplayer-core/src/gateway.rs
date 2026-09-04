@@ -9,6 +9,120 @@ pub const MAXPLAYER_TAG: &str = "maxplayer";
 // matches maxplayer's own events.
 pub const PROTOCOL_VERSION: &str = "1";
 
+/// The offer's payment-mode PARAMETER name: `["param", "payment", "none"]` (§1.1). The offer states
+/// it as a `param` because that is where the offer's request family already lives.
+pub const PAYMENT_PARAM: &str = "payment";
+/// The claim's payment-mode TAG name: `["payment", "none"]` (§1.1). The claim states it as a bare
+/// filterable tag because the buyer's award filter reads the CLAIM, and §6.2 admits only filterable
+/// tags there.
+pub const PAYMENT_TAG: &str = "payment";
+/// The one spelling of "this trade has no payment leg", on every surface.
+pub const PAYMENT_NONE: &str = "none";
+
+/// How a job settles. **One enum, two spellings of the same word, three surfaces** (§1.1): the
+/// offer's `["param","payment","none"]`, the claim's `["payment","none"]`, and the seat's
+/// `["takes_payment","none"]`.
+///
+/// ⛔ **ABSENT ON THE WIRE ⇒ [`PaymentMode::Sat`], and that direction is load-bearing.** Every event
+/// on the wire today carries no such tag, so a stripped, dropped or pre-upgrade tag reads as *paid*
+/// — the status quo, which the money gates already refuse to run for free. The opposite default
+/// would let a tag-dropping relay or an older signer silently turn a paid job into a free one. It is
+/// also why the free lane ships with NO `PROTOCOL_VERSION` bump: a v1 reader that never learns the
+/// tag keeps parsing free events and refuses to act on them, which is the behaviour we want from an
+/// un-upgraded peer.
+///
+/// ⛔ **Mode is NEVER inferred.** Not from `amount == 0`, not from `rate_sats == 0`, not from a
+/// missing `creq`. Every buyer has a default mint resolved for it whether it meant to or not
+/// (`MaxplayerConfig::default_mint`), and `rate 0` means "any amount ≥ 0" rather than "I take
+/// nothing" — so each of those would read a mode nobody published. It is read from one tag on each
+/// side, and the **both-ends rule** (§2.0) requires the buyer-signed OFFER and the seller-signed
+/// CLAIM to agree before the free path is entered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PaymentMode {
+    /// A priced job: the seller quotes a NUT-18 `creq` and the buyer pays it. The default in every
+    /// direction — on the wire, in serde, and for a reader that does not understand the tag.
+    #[default]
+    Sat,
+    /// A free job: no payment leg exists at all. This is NOT "a payment of zero" — §11.6's dust rule
+    /// stays intact precisely because a free job never presents an amount to it.
+    None,
+}
+
+impl PaymentMode {
+    /// The wire word for this mode. Only [`PaymentMode::None`] is ever EMITTED; `Sat` is stated by
+    /// absence, so an unmodified offer stays byte-identical to one posted before this existed.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Sat => "sat",
+            Self::None => PAYMENT_NONE,
+        }
+    }
+
+    /// Whether this is the FREE mode. Named rather than compared inline so no call site has to write
+    /// `== PaymentMode::None` next to an `Option::None` and hope the reader keeps them apart.
+    pub fn is_free(self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    /// Read the mode off an OFFER's tags: `["param", "payment", "none"]`. Anything else — absent,
+    /// blank, or an unrecognized value — is [`PaymentMode::Sat`], fail-closed.
+    pub fn from_offer_tags(tags: &[TagSpec]) -> Self {
+        Self::from_wire(param_value(tags, PAYMENT_PARAM))
+    }
+
+    /// Read the mode off a CLAIM's tags: `["payment", "none"]`. Same fail-closed default.
+    pub fn from_claim_tags(tags: &[TagSpec]) -> Self {
+        Self::from_wire(first_tag_value(tags, PAYMENT_TAG))
+    }
+
+    fn from_wire(stated: Option<&str>) -> Self {
+        match stated.map(str::trim) {
+            Some(PAYMENT_NONE) => Self::None,
+            _ => Self::Sat,
+        }
+    }
+}
+
+impl fmt::Display for PaymentMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_wire())
+    }
+}
+
+/// What a CLAIM says about payment, as ONE argument so the two statements cannot both be made and
+/// cannot both be omitted (§2.2).
+///
+/// A type rather than a `(Option<&str>, PaymentMode)` pair on purpose: a free claim carrying a
+/// `creq`, or a priced claim carrying none, is refused by the buyer at §2.3 — so an emitter able to
+/// express either shape could only produce claims nobody will award. Here neither shape exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaimPayment<'a> {
+    /// A priced claim: carries the seller-authored NUT-18 request as `["creq", …]` and NO
+    /// `["payment", …]` tag (absent ⇒ `sat`).
+    Sat(&'a str),
+    /// A free claim: carries `["payment","none"]` and NO `creq`. Encoding a zero-amount `creq`
+    /// instead would put an unpayable invoice on the wire that reads as an invoice to every
+    /// un-upgraded buyer — the exact ambiguity the mode tag exists to remove.
+    None,
+}
+
+impl<'a> ClaimPayment<'a> {
+    pub fn mode(self) -> PaymentMode {
+        match self {
+            Self::Sat(_) => PaymentMode::Sat,
+            Self::None => PaymentMode::None,
+        }
+    }
+
+    pub fn creq(self) -> Option<&'a str> {
+        match self {
+            Self::Sat(creq) => Some(creq),
+            Self::None => None,
+        }
+    }
+}
+
 // All kind NUMBERS live in `crate::kinds` (the one registry); re-exported here so the historical
 // `gateway::JOB_*_KIND` paths keep resolving.
 pub use crate::kinds::{
@@ -90,6 +204,9 @@ pub struct OfferDraft {
     /// requirement, and no tag is emitted, so an offer that requires nothing stays byte-identical to
     /// one posted before capability requests existed.
     pub required_capabilities: Vec<String>,
+    /// How this job settles (§1.1). [`PaymentMode::Sat`] — the default — emits NO tag at all, so a
+    /// priced offer stays byte-identical to one built before the free lane existed.
+    pub payment_mode: PaymentMode,
 }
 
 impl OfferDraft {
@@ -110,6 +227,7 @@ impl OfferDraft {
             requested_harness_family: None,
             requested_model: None,
             required_capabilities: Vec::new(),
+            payment_mode: PaymentMode::Sat,
         }
     }
 
@@ -129,7 +247,15 @@ impl OfferDraft {
             requested_harness_family: None,
             requested_model: None,
             required_capabilities: Vec::new(),
+            payment_mode: PaymentMode::Sat,
         }
+    }
+
+    /// State how this job settles (§1.1). Defaults to [`PaymentMode::Sat`], which emits no tag —
+    /// so the free lane is opt-in per offer on the WIRE, not only in a predicate.
+    pub fn with_payment_mode(mut self, payment_mode: PaymentMode) -> Self {
+        self.payment_mode = payment_mode;
+        self
     }
 
     /// Request a specific harness for this job. A canonicalised-away value (`any`, blank) records
@@ -228,6 +354,12 @@ impl OfferDraft {
             values.extend(self.required_capabilities.iter().cloned());
             tags.push(TagSpec(values));
         }
+        // §1.1 — the payment-mode param, emitted ONLY for the free mode. `Sat` states itself by
+        // absence, for the same reason the #897 capability request does above: a priced offer stays
+        // byte-identical to one posted before this existed, so the free lane is opt-in on the wire.
+        if self.payment_mode.is_free() {
+            tags.push(TagSpec::new(["param", PAYMENT_PARAM, PAYMENT_NONE]));
+        }
         if let Some(seller_pubkey) = &self.seller_pubkey {
             tags.push(TagSpec::new(["p", seller_pubkey]));
         }
@@ -256,6 +388,11 @@ pub struct ParsedOffer {
     pub requested_model: Option<String>,
     /// Capability tokens this job requires (#897). Empty ⇒ no requirement.
     pub required_capabilities: Vec<String>,
+    /// How this job settles (§1.1), read from `["param","payment", …]`. Absent ⇒
+    /// [`PaymentMode::Sat`] — an old-format offer is still read as PAID, which is the fail-closed
+    /// direction and the reason there is no version bump.
+    #[serde(default)]
+    pub payment_mode: PaymentMode,
 }
 
 impl ParsedOffer {
@@ -461,6 +598,11 @@ pub fn parse_offer(event: &EventDraft) -> Result<ParsedOffer, OfferParseError> {
             crate::heartbeat::HARNESS_MODEL_PARAM,
         )),
         required_capabilities: param_values(&event.tags, crate::heartbeat::CAPABILITY_PARAM),
+        // §1.1. Absent ⇒ `Sat`, so every offer already on the wire keeps parsing as PAID. The
+        // `amount` tag above is deliberately untouched: a free offer still carries
+        // `["amount","0","sat"]`, and `payment=none` is what makes that `0` mean "no payment leg
+        // exists" rather than "a payment of zero" (which §11.6 forbids).
+        payment_mode: PaymentMode::from_offer_tags(&event.tags),
     })
 }
 
@@ -572,6 +714,9 @@ pub fn parse_bound_git_delivery(
 /// the invoice. Build `creq` with [`creq::build_seller_creq`]; buyers read it back with
 /// [`creq::parse_creq`].
 ///
+/// A FREE claim ([`ClaimPayment::None`], §2.2) carries `["payment","none"]` and no `creq` at all —
+/// the two are mutually exclusive by the type, so this cannot emit both or neither.
+///
 /// The offer `e` tag is marked `root`, so an observer holding only public tags can join the claim
 /// to its offer without guessing at `e`-tag position.
 ///
@@ -592,7 +737,7 @@ pub fn claim_draft(
     offer_id: &str,
     buyer_pubkey: &str,
     seller_pubkey: &str,
-    creq: &str,
+    payment: ClaimPayment<'_>,
     agents: &[String],
     capability: &crate::heartbeat::SeatCapability,
 ) -> EventDraft {
@@ -600,8 +745,14 @@ pub fn claim_draft(
         TagSpec::new(["e", offer_id, "", "root"]),
         TagSpec::new(["p", buyer_pubkey]),
         TagSpec::new(["p", seller_pubkey]),
-        TagSpec::new(["creq", creq]),
     ];
+    // §2.2 — EXACTLY ONE of the two statements, never both and never neither. `ClaimPayment` is what
+    // makes that structural: there is no way to hand this function a free claim with a `creq`, or a
+    // priced claim without one, so the shape the buyer's award filter refuses cannot be built here.
+    match payment {
+        ClaimPayment::Sat(creq) => tags.push(TagSpec::new(["creq", creq])),
+        ClaimPayment::None => tags.push(TagSpec::new([PAYMENT_TAG, PAYMENT_NONE])),
+    }
     if let Some(tag) = crate::heartbeat::agent_tag(agents) {
         tags.push(tag);
     }
@@ -1318,7 +1469,7 @@ mod tests {
             "job-1",
             "buyer",
             "seller",
-            "creqAtest",
+            crate::gateway::ClaimPayment::Sat("creqAtest"),
             &["claude".to_owned(), "codex".to_owned()],
             &Default::default(),
         );
@@ -1333,7 +1484,7 @@ mod tests {
             vec!["claude", "codex"]
         );
 
-        let silent = claim_draft("job-1", "buyer", "seller", "creqAtest", &[], &Default::default());
+        let silent = claim_draft("job-1", "buyer", "seller", crate::gateway::ClaimPayment::Sat("creqAtest"), &[], &Default::default());
         assert!(silent.tags.iter().all(|tag| tag.first() != Some("agents")));
         assert!(crate::heartbeat::agents_from_tags(&silent.tags).is_empty());
     }
@@ -1404,6 +1555,7 @@ mod tests {
         assert_eq!(
             parse_offer(&draft).expect("parse offer"),
             ParsedOffer {
+                payment_mode: crate::gateway::PaymentMode::Sat,
                 task: "summarize".into(),
                 output: "application/json".into(),
                 amount: 3,
@@ -1482,7 +1634,7 @@ mod tests {
         // The claim (processing) is its own claim kind, and the buyer-authored award
         // is the award kind — each distinct from the seller's feedback kind.
         assert_eq!(
-            claim_draft("offer", BUYER, SELLER, "creqAtest", &[], &Default::default()),
+            claim_draft("offer", BUYER, SELLER, crate::gateway::ClaimPayment::Sat("creqAtest"), &[], &Default::default()),
             EventDraft::new(
                 JOB_CLAIM_KIND,
                 vec![
@@ -1525,7 +1677,7 @@ mod tests {
         );
         // A non-award event yields no selection.
         assert_eq!(
-            parse_award(&claim_draft("offer", BUYER, SELLER, "creqAtest", &[], &Default::default())),
+            parse_award(&claim_draft("offer", BUYER, SELLER, crate::gateway::ClaimPayment::Sat("creqAtest"), &[], &Default::default())),
             None
         );
     }
@@ -1544,7 +1696,7 @@ mod tests {
         // new one against. A new lifecycle builder needs a row added by hand.
         const OFFER: &str = "offer";
         let lifecycle = [
-            ("claim", claim_draft(OFFER, BUYER, SELLER, "creqAtest", &[], &Default::default())),
+            ("claim", claim_draft(OFFER, BUYER, SELLER, crate::gateway::ClaimPayment::Sat("creqAtest"), &[], &Default::default())),
             ("award", award_draft(OFFER, "claim", BUYER, SELLER)),
             ("accept", accept_draft(OFFER, "claim", BUYER, SELLER)),
             (
@@ -1877,7 +2029,7 @@ mod creq_tests {
             build_seller_creq("job-1", 21, "sat", &[MINT_A.to_string()], &seller).expect("build creq");
         assert!(creq.starts_with("creqA"), "creq must start with creqA: {creq}");
 
-        let draft = claim_draft("job-1", "buyer-pubkey", &seller, &creq, &[], &Default::default());
+        let draft = claim_draft("job-1", "buyer-pubkey", &seller, crate::gateway::ClaimPayment::Sat(&creq), &[], &Default::default());
         let creq_tag = draft
             .tags
             .iter()
@@ -1931,7 +2083,7 @@ mod creq_tests {
         let seller = seller_hex();
         let creq =
             build_seller_creq("job-7", 5, "sat", &[MINT_A.to_string()], &seller).expect("build creq");
-        let draft = claim_draft("job-7", "buyer", &seller, &creq, &[], &Default::default());
+        let draft = claim_draft("job-7", "buyer", &seller, crate::gateway::ClaimPayment::Sat(&creq), &[], &Default::default());
         let tag: &TagSpec = draft
             .tags
             .iter()
@@ -1940,5 +2092,149 @@ mod creq_tests {
         let request = parse_creq(tag.value().unwrap()).expect("parse creq off claim");
         assert_eq!(request.amount, Some(Amount::from(5)));
         assert_eq!(request.mints, vec![MintUrl::from_str(MINT_A).unwrap()]);
+    }
+}
+
+#[cfg(test)]
+mod free_lane_tests {
+    use super::*;
+    // ————————————————————————————————————————————————————————————————————————————————————————
+    // FREE JOB LANE (`payment = none`) — the WIRE half of the both-ends rule.
+    // ————————————————————————————————————————————————————————————————————————————————————————
+
+    fn free_offer_draft() -> OfferDraft {
+        OfferDraft::new("t", "text/plain", 0, 2_000_000_000, &"s".repeat(64))
+            .with_payment_mode(PaymentMode::None)
+    }
+
+    /// PROPERTY 3 — ABSENT TAGS DEFAULT TO `Sat`, and this is the fail-closed direction that
+    /// removes the need for a `PROTOCOL_VERSION` bump.
+    ///
+    /// Both legs are here on purpose. The positive leg alone would pass a reader that answered
+    /// `None` to everything; the negative leg alone would pass a reader that answered `Sat` to
+    /// everything — which is exactly the "reads nothing at all" failure the free lane cannot
+    /// tolerate, because reading nothing looks identical to reading the safe default.
+    #[test]
+    fn an_offer_with_no_payment_tag_is_read_as_paid_and_one_that_states_none_is_read_as_free() {
+        let old_format = OfferDraft::new("t", "text/plain", 0, 2_000_000_000, &"s".repeat(64));
+        let old_draft = old_format.to_event_draft();
+        assert!(
+            !old_draft
+                .tags
+                .iter()
+                .any(|tag| tag.first() == Some("param") && tag.0.get(1).map(String::as_str) == Some(PAYMENT_PARAM)),
+            "a priced offer must emit NO payment tag — that byte-identity is what makes the free \
+             lane opt-in on the wire rather than only in a predicate: {:?}",
+            old_draft.tags
+        );
+        assert_eq!(
+            parse_offer(&old_draft).expect("old-format offer parses").payment_mode,
+            PaymentMode::Sat,
+            "an offer carrying no payment tag — every offer on the wire today — must read as PAID"
+        );
+
+        let free_draft = free_offer_draft().to_event_draft();
+        assert!(
+            free_draft.tags.contains(&TagSpec::new(["param", PAYMENT_PARAM, PAYMENT_NONE])),
+            "a free offer must state it as a param: {:?}",
+            free_draft.tags
+        );
+        assert_eq!(
+            parse_offer(&free_draft).expect("free offer parses").payment_mode,
+            PaymentMode::None,
+            "the free mode must survive the round trip, or the tag is decoration"
+        );
+    }
+
+    /// PROPERTY 1 — MODE IS NEVER INFERRED. Not from `amount == 0`, not from a missing `creq`,
+    /// not from an unrecognized value.
+    ///
+    /// The first case is the one §6 names as the single largest correctness risk: a zero-amount
+    /// offer that states nothing is a PAID offer priced at dust, and the money gates refuse it.
+    /// A reader that inferred free-ness from the amount would run it for nothing.
+    #[test]
+    fn payment_mode_is_read_only_from_the_tag_and_never_inferred_from_an_amount() {
+        let zero_but_silent =
+            OfferDraft::new("t", "text/plain", 0, 2_000_000_000, &"s".repeat(64)).to_event_draft();
+        assert_eq!(
+            parse_offer(&zero_but_silent).expect("parses").payment_mode,
+            PaymentMode::Sat,
+            "amount 0 with no payment tag is a PAID offer at a dust price, never a free one"
+        );
+
+        // An unrecognized value is not a third state: it reads as PAID, fail-closed.
+        let mut junk = free_offer_draft().to_event_draft();
+        for tag in &mut junk.tags {
+            if tag.0.get(1).map(String::as_str) == Some(PAYMENT_PARAM) {
+                tag.0[2] = "gratis".to_owned();
+            }
+        }
+        assert_eq!(
+            parse_offer(&junk).expect("parses").payment_mode,
+            PaymentMode::Sat,
+            "a payment value this build does not know must read as PAID, never as free"
+        );
+
+        // A claim with no payment tag reads paid, whether or not it carries a creq. Absence of a
+        // creq is an UNPAYABLE claim, not a free one — a different refusal for a different reason.
+        let priced = claim_draft("job", "buyer", "seller", ClaimPayment::Sat("creqAtest"), &[], &Default::default());
+        assert_eq!(PaymentMode::from_claim_tags(&priced.tags), PaymentMode::Sat);
+        let creqless = EventDraft::new(JOB_CLAIM_KIND, vec![TagSpec::new(["p", "buyer"])], "");
+        assert_eq!(
+            PaymentMode::from_claim_tags(&creqless.tags),
+            PaymentMode::Sat,
+            "a claim with neither a creq nor a payment tag is unpayable, not free"
+        );
+    }
+
+    /// §2.2 — a claim states EXACTLY ONE of `creq` and `payment=none`. Never both, never neither.
+    ///
+    /// Asserted as a count over the two tag names rather than as two independent presence checks:
+    /// the failure this guards is "a free claim that also carries an invoice", and two presence
+    /// checks written separately can both be satisfied by an emitter that emits both.
+    #[test]
+    fn a_claim_carries_a_creq_xor_a_payment_none_tag_and_never_both() {
+        for (label, payment, expected_creq, expected_free) in [
+            ("priced", ClaimPayment::Sat("creqAtest"), 1, 0),
+            ("free", ClaimPayment::None, 0, 1),
+        ] {
+            let draft = claim_draft("job", "buyer", "seller", payment, &[], &Default::default());
+            let creqs = draft.tags.iter().filter(|t| t.first() == Some("creq")).count();
+            let frees = draft
+                .tags
+                .iter()
+                .filter(|t| t.first() == Some(PAYMENT_TAG) && t.0.get(1).map(String::as_str) == Some(PAYMENT_NONE))
+                .count();
+            assert_eq!(creqs, expected_creq, "{label} claim creq tag count: {:?}", draft.tags);
+            assert_eq!(frees, expected_free, "{label} claim payment=none tag count: {:?}", draft.tags);
+            assert_eq!(
+                creqs + frees,
+                1,
+                "{label} claim must make EXACTLY ONE payment statement: {:?}",
+                draft.tags
+            );
+        }
+    }
+
+    /// §1.3 — the `amount` tag is UNCHANGED and stays required. A free offer still carries
+    /// `["amount","0","sat"]`, which `parse_offer` has always accepted (no lower bound).
+    ///
+    /// This is why §11.6's dust rule never had to be weakened: `payment=none` is what makes that
+    /// `0` mean "no payment leg exists" rather than "a payment of zero".
+    #[test]
+    fn a_free_offer_still_carries_the_required_amount_tag_at_zero() {
+        let draft = free_offer_draft().to_event_draft();
+        assert!(
+            draft.tags.contains(&TagSpec::new(["amount", "0", "sat"])),
+            "the amount tag is cardinality-1 required and the free lane does not touch it: {:?}",
+            draft.tags
+        );
+        let parsed = parse_offer(&draft).expect("parses");
+        assert_eq!(parsed.amount, 0);
+        assert_eq!(parsed.unit, "sat");
+
+        // And the version is untouched: a free offer speaks v1, so a v1 reader parses it.
+        assert!(draft.tags.contains(&TagSpec::new(["v", PROTOCOL_VERSION])));
+        assert_eq!(PROTOCOL_VERSION, "1", "the free lane ships with NO wire version bump");
     }
 }

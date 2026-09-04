@@ -193,6 +193,22 @@ pub struct SellerConfig {
     #[serde(deserialize_with = "deserialize_agent_command_argv")]
     pub agent_command: Vec<String>,
     pub rate_sats: u64,
+    /// This seat TAKES NO PAYMENT (§2.1, §4.1). Default **false**. Opting in does two things and
+    /// only these two: it lets the seat admit a `payment=none` offer, and it puts
+    /// `["takes_payment","none"]` on the seat's kind-30340 beat so a buyer holding zero bitcoin can
+    /// find it.
+    ///
+    /// ⛔ ONLY VALID WITH `rate_sats = 0` — [`crate::seller::require_seller_config`] refuses the
+    /// other pair. `rate_sats = 0` alone does NOT mean this: it means "any amount ≥ 0", which is not
+    /// the same statement as "I take nothing", and a buyer with no sats cannot act on the first.
+    ///
+    /// ⚠ ADMISSION BECOMES THE ONLY CONTROL LEFT. The price floor is the market's one natural
+    /// throttle and this sets it aside, so with `claim_open_pool = true` the seat will claim every
+    /// well-formed free offer in the pool until its slots fill. `accept_offers_only_from`,
+    /// `accept_open_targeted` and `claim_open_pool` are what scope who may reach it; `slots` bounds
+    /// concurrency, not volume. There are deliberately no caps, rate limits or quotas (§6).
+    #[serde(default)]
+    pub takes_no_payment: bool,
     pub git_remote: String,
     /// Job deadline override (seconds). Default: offer `deadline_unix`, else ~600s.
     #[serde(default, skip_serializing_if = "Option::is_none")]

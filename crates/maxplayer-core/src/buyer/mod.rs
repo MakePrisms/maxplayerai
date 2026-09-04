@@ -513,6 +513,10 @@ async fn post_job(context: &Arc<BuyerContext>, id: Value, params: Value) -> Resp
         // offer says, and the award filter reads only the offer.
         requested_model: model.clone(),
         required_capabilities: params.capabilities.unwrap_or_default(),
+        // The daemon's post surface posts PRICED jobs. The free lane is reached through the
+        // library's `PostJobRequest` directly; wiring an RPC parameter for it is a separate change,
+        // and defaulting to `Sat` here keeps every existing caller byte-identical on the wire.
+        payment_mode: crate::gateway::PaymentMode::Sat,
     };
     match job_lifecycle::post_job_async(&context.home, request).await {
         Ok(outcome) => {
@@ -5110,6 +5114,7 @@ mod tests {
 
         fn claim_with(status: &str, seller_pubkey: String) -> job_lifecycle::ClaimView {
             job_lifecycle::ClaimView {
+                payment_mode: crate::gateway::PaymentMode::Sat,
                 // The UNSTATED capability — a seat advertising nothing. Set explicitly because `ClaimView`
                 // has no `Default` derive and must not gain one: a default `SandboxConfig` is a meaningful
                 // object, but a default `ClaimView` is a claim that never existed.
@@ -5166,6 +5171,7 @@ mod tests {
                 results: vec![result(Some("d".repeat(40)))],
                 live_claim_id: None,
                 accepted: Some(job_lifecycle::AcceptedBind {
+                    payment_mode: crate::gateway::PaymentMode::Sat,
                     job_id: "a".repeat(64),
                     claim_id: "c".repeat(64),
                     result_id: "r".repeat(64),
@@ -5204,6 +5210,7 @@ mod tests {
                 results: vec![result(Some("d".repeat(40)))],
                 live_claim_id: None,
                 accepted: Some(job_lifecycle::AcceptedBind {
+                    payment_mode: crate::gateway::PaymentMode::Sat,
                     job_id: "a".repeat(64),
                     claim_id: "b".repeat(64),
                     result_id: "q".repeat(64),
@@ -5785,7 +5792,7 @@ mod tests {
             &seller_hex,
         )
         .expect("creq");
-        let claim_draft = crate::gateway::claim_draft(&job_id, &buyer_hex, &seller_hex, &creq, &[], &crate::heartbeat::SeatCapability::default());
+        let claim_draft = crate::gateway::claim_draft(&job_id, &buyer_hex, &seller_hex, crate::gateway::ClaimPayment::Sat(&creq), &[], &crate::heartbeat::SeatCapability::default());
         let claim_id = publish(&seller, &claim_draft).await.to_hex();
 
         // The buyer AWARDED this claim on the relay (kind-3405) — collect resolves the delivery

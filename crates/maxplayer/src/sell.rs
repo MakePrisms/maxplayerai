@@ -501,6 +501,12 @@ fn ensure_seller_config(
         agents,
         claim_open_pool,
         accept_open_targeted,
+        // Free-lane opt-in (spec §2.1/§4.1): carried from an existing config so a relaunch never
+        // clobbers it (#369-class), defaulting to false on a fresh config. There is deliberately no
+        // CLI flag — `takes_no_payment` is only valid with `rate_sats = 0` and hands the operator's
+        // only remaining control to admission, so it is an edit an operator makes deliberately in
+        // `[seller]`, not one a wizard can set in passing.
+        takes_no_payment: existing.as_ref().map(|s| s.takes_no_payment).unwrap_or(false),
         // Buyer allowlist (#482): carried from an existing config so a relaunch never clobbers an
         // operator's private-seller fence (#369-class); a fresh config defaults empty, which now
         // means "no buyer named" rather than accept-all — reachability is decided by the two
@@ -1031,6 +1037,7 @@ mod tests {
             config.seller = Some(SellerConfig {
                 agent_command: vec!["claude".to_owned()],
                 rate_sats: 5,
+                takes_no_payment: false,
                 git_remote: "https://example.invalid/seller.git".to_owned(),
                 job_timeout_secs: None,
                 agents: vec!["claude".to_owned(), "codex".to_owned()],
@@ -1084,6 +1091,7 @@ mod tests {
             config.seller = Some(SellerConfig {
                 agent_command: vec!["claude".to_owned()],
                 rate_sats: 5,
+                takes_no_payment: false,
                 git_remote: "https://example.invalid/seller.git".to_owned(),
                 job_timeout_secs: None,
                 agents: vec!["claude".to_owned()],
@@ -1144,6 +1152,7 @@ mod tests {
             config.seller = Some(SellerConfig {
                 agent_command: vec!["claude".to_owned()],
                 rate_sats: 5,
+                takes_no_payment: false,
                 git_remote: "https://example.invalid/seller.git".to_owned(),
                 job_timeout_secs: None,
                 agents: vec!["claude".to_owned()],
@@ -1199,6 +1208,7 @@ mod tests {
             config.seller = Some(SellerConfig {
                 agent_command: vec!["claude".to_owned()],
                 rate_sats: 5,
+                takes_no_payment: false,
                 git_remote: "https://example.invalid/seller.git".to_owned(),
                 job_timeout_secs: None,
                 agents: vec!["claude".to_owned()],
@@ -1277,6 +1287,7 @@ mod tests {
             config.seller = Some(SellerConfig {
                 agent_command: vec!["claude".to_owned()],
                 rate_sats: 5,
+                takes_no_payment: false,
                 git_remote: "https://example.invalid/seller.git".to_owned(),
                 job_timeout_secs: None,
                 agents: Vec::new(),
