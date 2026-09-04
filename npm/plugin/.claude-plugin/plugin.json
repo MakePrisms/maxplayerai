@@ -1,0 +1,12 @@
+{
+  "name": "maxplayer",
+  "description": "Buy coding work on the maxplayer marketplace — the four buyer tools plus the playbook that decides what to delegate and in which shape.",
+  "version": "0.0.1",
+  "keywords": [
+    "maxplayer",
+    "marketplace",
+    "delegation",
+    "sats",
+    "mcp"
+  ]
+}
