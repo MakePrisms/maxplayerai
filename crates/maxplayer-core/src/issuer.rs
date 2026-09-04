@@ -519,13 +519,69 @@ max_outputs = 1000
     )
 }
 
-/// Generate a fresh BIP39 mnemonic and write it `0600`, or KEEP an existing one.
+/// Generate a fresh BIP39 mnemonic and write it `0600`, or KEEP an existing one — after checking
+/// that what is already there deserves to be kept.
+///
+/// An existing path is VALIDATED, never trusted. `0600` on the file this function creates says
+/// nothing about a file some earlier hand left behind, and the earlier version of this function
+/// took `path.exists()` as the whole answer: a `0644` seed, or a symlink pointing at a file the
+/// operator never meant to be a seed, was adopted silently. So:
+///
+/// - Anything that is not a regular file is REFUSED, symlink included. The check uses
+///   [`fs::symlink_metadata`], which does not follow links — `metadata` would report the target's
+///   type and let a link through. A symlink is refused even when its target is a fine `0600` file,
+///   because the seat cannot promise the mode of a path it does not own.
+/// - On Unix an over-broad mode is narrowed to `0600` in place. Only the mode changes:
+///   [`fs::set_permissions`] does not open the file for writing and no byte is read or rewritten.
+///   A mode already at or tighter than `0600` (`0400`, say) is left alone — the fix is for
+///   permissions that are too broad, not for an operator who chose to be stricter.
 ///
 /// ⛔ The phrase is written and never returned, never printed, never logged and never put in an
-/// error message. The only reader is `cdk-mintd`, through `--seed-file`.
+/// error message — including the errors this validation adds, which name the path and the file
+/// type and never open the file.
 fn ensure_seed(path: &Path) -> Result<bool, IssuerError> {
-    if path.exists() {
-        return Ok(false);
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if !file_type.is_file() {
+                let kind = if file_type.is_symlink() {
+                    "a symlink"
+                } else if file_type.is_dir() {
+                    "a directory"
+                } else {
+                    "not a regular file"
+                };
+                return Err(IssuerError::Io(format!(
+                    "{}: the mint seed path is {kind}; refusing to adopt it as this seat's seed. \
+                     Move it aside and re-run, or point the seat at a different home.",
+                    path.display(),
+                )));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                // 0o177 is every bit BEYOND owner read+write: owner-execute, and all of group and
+                // other. Non-zero means the file is readable, writable or executable by someone
+                // this seat does not answer for.
+                let mode = metadata.permissions().mode() & 0o7777;
+                if mode & 0o177 != 0 {
+                    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(
+                        |error| {
+                            IssuerError::Io(format!(
+                                "{}: found mode {mode:04o} on an existing mint seed and could not \
+                                 narrow it to 0600: {error}",
+                                path.display(),
+                            ))
+                        },
+                    )?;
+                }
+            }
+            return Ok(false);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(IssuerError::Io(format!("{}: {error}", path.display())));
+        }
     }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -914,6 +970,99 @@ mod tests {
                 .count(),
             1
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A seed that was ALREADY on disk, and already too readable, is narrowed — not rewritten.
+    ///
+    /// `init_keeps_an_existing_seed_and_is_idempotent` cannot catch this: its "existing" seed is
+    /// the one the first `init` wrote, which was born `0600`, so the keep path is never asked to
+    /// judge a file it did not create. This starts from a `0644` file some earlier hand left and
+    /// asserts the two halves separately — the bytes are IDENTICAL (a seed is money-shaped state;
+    /// rewriting it is losing it) and the mode ends at `0600`.
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_over_readable_seed_is_narrowed_to_0600_without_touching_its_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("seed-mode");
+        let mut home = home_at(&root);
+        let path = seed_path(&home);
+
+        // Not a real mnemonic on purpose: this test must never depend on, or produce, a usable
+        // seed. What is under test is custody of the bytes, whatever they are.
+        let planted = b"planted seed bytes, not a mnemonic\n";
+        fs::write(&path, planted).expect("plant a seed");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("make it too broad");
+        let before = fs::metadata(&path).expect("planted metadata");
+        let mtime_before = before.modified().expect("planted mtime");
+        assert_eq!(before.permissions().mode() & 0o777, 0o644, "precondition");
+
+        let report = init(&mut home, &InitOptions::default()).expect("init over a planted seed");
+        assert!(!report.seed_created, "an existing seed is KEPT, never regenerated");
+
+        assert_eq!(
+            fs::read(&path).expect("seed still readable"),
+            planted,
+            "the seed bytes changed — set_permissions must not rewrite the file"
+        );
+        let after = fs::metadata(&path).expect("metadata after init");
+        assert_eq!(
+            after.permissions().mode() & 0o777,
+            0o600,
+            "mode after init was {:04o}, not 0600",
+            after.permissions().mode() & 0o777
+        );
+        assert_eq!(
+            after.modified().expect("mtime after"),
+            mtime_before,
+            "the file's contents were touched, not just its mode"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A seed PATH that is not a regular file is refused by name, and nothing is written through it.
+    ///
+    /// A symlink is refused even though its target here is a perfectly good `0600` file: the seat
+    /// cannot promise the mode, or the identity, of a path it does not own. `symlink_metadata` is
+    /// what makes this reachable — plain `metadata` would report the target and let the link pass.
+    #[cfg(unix)]
+    #[test]
+    fn a_seed_path_that_is_not_a_regular_file_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("seed-type");
+        let mut home = home_at(&root);
+        let path = seed_path(&home);
+
+        let target = root.join("elsewhere");
+        fs::write(&target, b"target bytes\n").expect("write link target");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).expect("0600 target");
+        std::os::unix::fs::symlink(&target, &path).expect("symlink into the seed path");
+
+        let refusal = init(&mut home, &InitOptions::default()).expect_err("a symlink is refused");
+        let text = refusal.to_string();
+        assert!(text.contains("symlink"), "the refusal must name what it found: {text}");
+        assert!(
+            text.contains(&path.display().to_string()),
+            "the refusal must name the path: {text}"
+        );
+        assert_eq!(
+            fs::read(&target).expect("target still readable"),
+            b"target bytes\n",
+            "the refusal wrote through the link"
+        );
+
+        // And a directory in the same place is refused too, by a different branch.
+        fs::remove_file(&path).expect("remove the symlink");
+        fs::create_dir(&path).expect("plant a directory");
+        let refusal = init(&mut home, &InitOptions::default()).expect_err("a directory is refused");
+        assert!(
+            refusal.to_string().contains("directory"),
+            "{refusal}"
+        );
+
         let _ = fs::remove_dir_all(&root);
     }
 
