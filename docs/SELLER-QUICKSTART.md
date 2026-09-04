@@ -1060,7 +1060,9 @@ On a typical keyset the fee is **1 sat** for small amounts:
 
 The product charges a platform fee on each payment you collect. **The rate is set by the product,
 in the binary, and you cannot change it** — there is no config key, no environment variable and no
-flag for it. **Its current value is zero.**
+flag for it. **The rate is 10%.** This stage only records what that comes to: **there is no way to
+pay it yet**, because no payout destination exists in the product, so the figure in your journal is
+not a bill that is due.
 
 On every collection the daemon computes the fee **on the net amount the mint actually hands you**
 (after the mint's own input fee described above), rounds it **down** to whole sats — a payment too
@@ -1070,7 +1072,8 @@ The `seller node collect ok` log line carries `fee_sats=` and `fee_bps=` for eve
 
 **This stage records the fee and pays nobody.** No sats leave your wallet on account of it: there is
 no fee recipient in this version, and no payout, transfer or remittance of the recorded amount exists
-anywhere in the binary. With the rate at zero, every receipt records a fee of `0`.
+anywhere in the binary. A 100-sat net receive, for example, records `fee_bps = 1000, fee_sats = 10`
+and moves nothing.
 
 ---
 

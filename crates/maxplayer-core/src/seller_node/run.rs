@@ -12889,12 +12889,11 @@ mod tests {
     // redeem has classified `Finalize` — `platform_fee_at_collect` on the NET amount, then
     // `collect_receipt` with the result — against a real store, with no relay or mint.
     //
-    // Two things are proved. (1) The seam's rate IS `PLATFORM_FEE_BPS` and its sats are what the
-    // parameterised `fee_sats` gives for that rate — checked by identity, not by literal, so the test
-    // follows the constant when a human names the number. (2) The same path at a nonzero rate — the
-    // parameterised function into the same `collect_receipt` — journals a nonzero fee and reads it
-    // back per job and in total, so a seam that dropped or zeroed the rate would fail here rather
-    // than hide behind the shipped `0`. What this does NOT drive: the wallet swap itself.
+    // Two things are proved. (1) The seam's rate IS `PLATFORM_FEE_BPS` — asserted directly as 1000
+    // bp (10%) — and a 100-sat NET receive journals the 10 sats that follow, per job and in total; a
+    // seam that dropped or zeroed the rate fails here. (2) The same path through the parameterised
+    // function at a different rate (2%) journals 2 sats, so the store carries whatever rate was in
+    // force, not a baked-in number. What this does NOT drive: the wallet swap itself.
     #[test]
     fn a_collected_job_records_the_platform_fee_constant_and_the_sats_it_implies() {
         use crate::platform_fee::{PLATFORM_FEE_BPS, fee_sats};
@@ -12912,22 +12911,22 @@ mod tests {
         let job = "a".repeat(64);
         let buyer = "b".repeat(64);
 
-        // (1) The seam reads the constant. A 100-sat NET receive is journaled with `fee_bps` equal to
-        // `PLATFORM_FEE_BPS` and `fee_sats` equal to what that rate implies — today both are 0.
+        // (1) The seam reads the constant: 10% (1000 bp). A 100-sat NET receive is journaled with
+        // `fee_bps = 1000` and `fee_sats = 10`.
         let (seam_bps, seam_sats) = platform_fee_at_collect(100);
         assert_eq!(
             seam_bps, PLATFORM_FEE_BPS,
             "the seam's rate is the constant"
         );
         assert_eq!(
+            (seam_bps, seam_sats),
+            (1000, 10),
+            "stage 1 ships at 10%: 100 sats net owes 10 sats, recorded and not remitted"
+        );
+        assert_eq!(
             seam_sats,
             fee_sats(100, PLATFORM_FEE_BPS),
             "the seam's sats follow from the constant through the parameterised function"
-        );
-        assert_eq!(
-            (seam_bps, seam_sats),
-            (0, 0),
-            "stage 1 ships at zero: it accrues nothing and pays nobody"
         );
         let (store, root) = store_with_awarded_job(&creq, &job, &buyer, 4242);
         assert_eq!(
@@ -12937,14 +12936,14 @@ mod tests {
             Collected::New
         );
         let accrued = store.accrued_fees().expect("read-out");
-        assert_eq!(accrued.total_fee_sats, fee_sats(100, PLATFORM_FEE_BPS));
+        assert_eq!(accrued.total_fee_sats, 10, "10% of 100 sats, accrued");
         assert_eq!(
             accrued.by_job,
             vec![JobFeeAccrual {
                 job_id: job.clone(),
                 amount_sats: 100,
-                fee_bps: PLATFORM_FEE_BPS,
-                fee_sats: fee_sats(100, PLATFORM_FEE_BPS),
+                fee_bps: 1000,
+                fee_sats: 10,
                 received_at_unix: 5000
             }]
         );
@@ -12954,9 +12953,9 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
 
-        // (2) The same fee path at a nonzero rate: 2% (200 bp) of a 100-sat NET receive is 2 sats,
-        // journaled in the receipt row and read back. This is what would fail if the seam ignored
-        // its rate, because the shipped 0 can never distinguish "used the constant" from "hardcoded".
+        // (2) The same fee path at a different rate: 2% (200 bp) of a 100-sat NET receive is 2 sats,
+        // journaled in the receipt row and read back — the store records the rate in force, whatever
+        // it is, so a later change to the constant leaves old rows telling the truth.
         let nonzero_bps = 200;
         let nonzero_sats = fee_sats(100, nonzero_bps);
         assert_eq!(nonzero_sats, 2);

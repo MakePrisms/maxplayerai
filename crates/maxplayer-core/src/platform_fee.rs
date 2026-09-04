@@ -28,21 +28,16 @@
 /// - The rate in force is journaled beside every receipt (`receipts.fee_bps`), so a store that
 ///   outlives a change to this number still says what each collection owed.
 ///
-/// **Currently `0`**: no rate has been named, and a nonzero constant in a released binary would
-/// accrue a fee against sellers while this stage still pays nobody. It takes its real value in the
-/// same change that ships remittance, or earlier if a human names the number.
-pub const PLATFORM_FEE_BPS: u32 = 0;
+/// **Currently `1000` — ten percent.** Stage 1 accrues and records what this rate comes to on each
+/// collection; it pays nobody, because no payout destination exists in the product yet. The rows
+/// this stage writes are a journal, not a bill.
+pub const PLATFORM_FEE_BPS: u32 = 1000;
 
 /// Basis points in one hundred percent — the ceiling on any rate.
 pub const BPS_PER_WHOLE: u32 = 10_000;
 
 // The rate can never exceed the whole payment. Checked at compile time so a bad edit to the constant
-// fails the build, not a seller. At the shipped `0` the comparison is trivially true, which is the
-// point: the check is for the day the number changes.
-#[allow(
-    clippy::absurd_extreme_comparisons,
-    reason = "a guard on a constant that is currently 0; it earns its keep when the rate is set"
-)]
+// fails the build, not a seller.
 const _: () = assert!(
     PLATFORM_FEE_BPS <= BPS_PER_WHOLE,
     "PLATFORM_FEE_BPS must not exceed 10_000 (100%)"
@@ -125,10 +120,11 @@ mod tests {
     // ---- the constant ----
 
     #[test]
-    fn the_shipped_rate_is_zero_and_within_the_whole() {
-        // Stage 1 accrues and pays nobody; the rate stays 0 until a human names it. The `<= 10_000`
-        // bound is enforced at compile time by the `const _` assertion in the module body.
-        assert_eq!(PLATFORM_FEE_BPS, 0);
-        assert_eq!(fee_sats(u64::MAX, PLATFORM_FEE_BPS), 0);
+    fn the_shipped_rate_is_ten_percent_and_within_the_whole() {
+        // Stage 1 accrues at 10% and pays nobody. The `<= 10_000` bound is enforced at compile time
+        // by the `const _` assertion in the module body.
+        assert_eq!(PLATFORM_FEE_BPS, 1000);
+        assert_eq!(fee_sats(100, PLATFORM_FEE_BPS), 10);
+        assert_eq!(fee_sats(9, PLATFORM_FEE_BPS), 0);
     }
 }
