@@ -2411,6 +2411,131 @@ mod container_delivery_tests {
         assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b);
     }
+
+    use crate::home::ContainerDeliveryToken;
+    use crate::relay_info::{long_lived_verdict, ScopedTokenSupport};
+    use crate::seller_exec::{
+        ContainerDeliveryPolicy, DEFAULT_CONTAINER_DELIVERY_TOKEN_CAP_SECS as DEFAULT_CAP,
+    };
+
+    const RELAY_GIT_REMOTE: &str = "https://relay.example/git/abc/m0123.git";
+
+    fn policy(token: ContainerDeliveryToken) -> Option<ContainerDeliveryPolicy> {
+        Some(ContainerDeliveryPolicy {
+            token,
+            token_cap_secs: DEFAULT_CAP,
+        })
+    }
+
+    /// The shipped default reads NOTHING over the network. A gate that probed here would add an HTTP
+    /// GET to every seller boot for a feature that is off.
+    #[test]
+    fn container_delivery_off_reads_no_relay_document() {
+        assert_eq!(
+            container_delivery_token_gate("wss://relay.example", RELAY_GIT_REMOTE, None)
+                .expect("gate"),
+            TokenModeGate::Skip(None)
+        );
+    }
+
+    /// `fresh-after-agent` needs no relay feature, so it must never be blocked — and must never even
+    /// ask. RED ON REVERT: probe in both modes and this returns `Probe`.
+    #[test]
+    fn fresh_after_agent_reads_no_relay_document() {
+        assert_eq!(
+            container_delivery_token_gate(
+                "wss://relay.example",
+                RELAY_GIT_REMOTE,
+                policy(ContainerDeliveryToken::FreshAfterAgent),
+            )
+            .expect("gate"),
+            TokenModeGate::Skip(None)
+        );
+    }
+
+    /// `long-lived` asks the server that CHECKS the token — the relay-git remote's own origin — and
+    /// carries the seat's configured cap into the comparison.
+    #[test]
+    fn long_lived_probes_the_relay_git_origin_with_the_configured_cap() {
+        assert_eq!(
+            container_delivery_token_gate(
+                "wss://events.example",
+                RELAY_GIT_REMOTE,
+                policy(ContainerDeliveryToken::LongLived),
+            )
+            .expect("gate"),
+            TokenModeGate::Probe {
+                origin: "https://relay.example/".to_owned(),
+                cap_secs: DEFAULT_CAP,
+            }
+        );
+    }
+
+    /// A plain https remote takes no NIP-98 header, so there is no scoped token to gate. Inert, and
+    /// said out loud rather than passed in silence.
+    #[test]
+    fn long_lived_on_a_byo_https_remote_is_inert_and_says_so() {
+        let gate = container_delivery_token_gate(
+            "wss://relay.example",
+            "https://github.com/owner/repo.git",
+            policy(ContainerDeliveryToken::LongLived),
+        )
+        .expect("gate");
+        let TokenModeGate::Skip(Some(line)) = gate else {
+            panic!("a byo remote must skip with an operator line, got {gate:?}");
+        };
+        assert!(line.contains("long-lived"), "names the mode: {line}");
+        assert!(line.contains("no scoped token"), "says why it is inert: {line}");
+    }
+
+    /// The authority is the server that CHECKS the token, so an unusable event-relay url cannot
+    /// change the answer when the seat pushes to relay-git.
+    #[test]
+    fn the_relay_git_remote_outranks_the_event_relay_url() {
+        assert_eq!(
+            container_delivery_token_gate(
+                "not-even-a-url",
+                RELAY_GIT_REMOTE,
+                policy(ContainerDeliveryToken::LongLived),
+            )
+            .expect("gate"),
+            TokenModeGate::Probe {
+                origin: "https://relay.example/".to_owned(),
+                cap_secs: DEFAULT_CAP,
+            }
+        );
+    }
+
+    /// The refusal an operator actually sees for a relay that does not implement Requirement B: it
+    /// names the mode, names the working mode, and renders through `NodeError`.
+    #[test]
+    fn the_boot_refusal_names_the_mode_and_the_way_forward() {
+        let refusal = long_lived_verdict(&ScopedTokenSupport::Absent, DEFAULT_CAP)
+            .refusal()
+            .expect("an absent field refuses");
+        let rendered =
+            NodeError::ContainerDeliveryToken(format!("https://relay.example/ — {refusal}"))
+                .to_string();
+        assert!(
+            rendered.starts_with("seller node container-delivery token mode refused:"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("long-lived"), "{rendered}");
+        assert!(rendered.contains("fresh-after-agent"), "{rendered}");
+        assert!(rendered.contains("scoped_token_max_lifetime_secs"), "{rendered}");
+    }
+
+    /// An unreachable relay is UNKNOWN, and unknown refuses in `long-lived`. Fail closed: nothing
+    /// proves the relay honours the expiration tag, so the seat must not mint one.
+    #[test]
+    fn an_unreachable_relay_refuses_in_long_lived_mode() {
+        let verdict = long_lived_verdict(
+            &ScopedTokenSupport::Unknown("connection refused".to_owned()),
+            DEFAULT_CAP,
+        );
+        assert!(!verdict.is_supported());
+        assert!(verdict.refusal().is_some());
+    }
 }
 
 /// How long a harness self-probe turn may take. Deliberately short: the probe asks for one tiny file,
@@ -2974,6 +3099,125 @@ async fn probe_one_harness(
     ))
 }
 
+/// How long the boot gate waits for the relay's NIP-11 document. Short on purpose: the answer is one
+/// small JSON document from a host the seat already talks to, and the gate stands between the
+/// operator and a seat that will refuse either way.
+const RELAY_TOKEN_POLICY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What the boot gate must do about `[sandbox] container_delivery_token`, decided from config alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TokenModeGate {
+    /// Nothing to prove, and NO network read: container delivery is off, the mode is
+    /// `fresh-after-agent` (which needs no relay feature), or the seat pushes to a remote that takes
+    /// no scoped token at all. Carries an operator line when the reason is worth saying out loud.
+    Skip(Option<String>),
+    /// `long-lived`: read the NIP-11 document at `origin` and refuse to boot unless the relay
+    /// advertises a scoped-token cap of at least `cap_secs`.
+    Probe { origin: String, cap_secs: u64 },
+}
+
+/// The pure half of the `long-lived` boot gate: which relay to ask, and whether to ask at all.
+///
+/// Separated from the fetch so every branch — including "do not touch the network" — is testable
+/// with no relay and no home. `delivery` is [`SandboxPolicy::container_delivery`].
+fn container_delivery_token_gate(
+    relay_url: &str,
+    git_remote: &str,
+    delivery: Option<crate::seller_exec::ContainerDeliveryPolicy>,
+) -> Result<TokenModeGate, NodeError> {
+    use crate::home::ContainerDeliveryToken;
+
+    // Container delivery off (the shipped default) ⇒ the host delivery path, nothing to ask.
+    let Some(delivery) = delivery else {
+        return Ok(TokenModeGate::Skip(None));
+    };
+    // `fresh-after-agent` mints a 60 s token AFTER the agent exits and works with the relay as
+    // deployed today. It depends on no relay feature, so this mode reads NOTHING over the network.
+    if delivery.token != ContainerDeliveryToken::LongLived {
+        return Ok(TokenModeGate::Skip(None));
+    }
+    // A public/anonymous https remote takes no NIP-98 header at all (`deliver_via_container` sets
+    // `PushTokenSource::None` for it), so there is no scoped token whose lifetime could matter. Said
+    // out loud: an operator who set `long-lived` must learn that the setting does nothing here.
+    if !crate::delivery_transport::is_relay_git_locator(git_remote) {
+        return Ok(TokenModeGate::Skip(Some(
+            "seller node: [sandbox] container_delivery_token = \"long-lived\" has no effect on this \
+             seat — its git remote is not relay-git, so the container pushes with no scoped token"
+                .to_owned(),
+        )));
+    }
+    let origin = crate::relay_info::scoped_token_authority(relay_url, git_remote).map_err(|error| {
+        NodeError::ContainerDeliveryToken(format!(
+            "[sandbox] container_delivery_token = \"long-lived\" needs a relay whose NIP-11 document \
+             can be read, and this seat's relay url cannot be turned into one ({error})"
+        ))
+    })?;
+    Ok(TokenModeGate::Probe {
+        origin,
+        cap_secs: delivery.token_cap_secs,
+    })
+}
+
+/// Refuse to boot a `long-lived` container-delivery seat whose relay does not advertise that it
+/// honours a scoped token's NIP-40 `expiration` tag (relay Requirement B).
+///
+/// ⛔ WHY THIS RUNS BEFORE THE FIRST HARNESS. Without it the seat learns the answer as an HTTP 401 on
+/// the PUSH — the last step of a paid job, after the agent ran and the buyer already committed the
+/// sats at award. Measured on the deployed relay on 2026-09-03 (`tests/relay_canary.rs`): the ref
+/// scope is enforced, the expiration tag is NOT honoured. So a config flip to `long-lived` against
+/// today's relay fails every job at its most expensive moment, and it must fail at boot instead.
+///
+/// This is a SECOND gate, not a replacement: `long_lived_expiration` still refuses an over-cap token
+/// at mint time. This one moves the same refusal earlier and adds the relay's own answer to it.
+///
+/// Fails CLOSED. An absent field, a cap smaller than the seat's own, an unreachable relay and an
+/// unreadable document all refuse. `fresh-after-agent` reads nothing and can never be blocked here.
+///
+/// `maxplayer doctor` reports the same answer in its `relay token policy` row, and `--skip-doctor`
+/// bypasses that row. It does NOT bypass this one: the doctor row exists so an operator can see the
+/// answer before flipping the switch, and this gate exists so the flip cannot ship a seat that fails
+/// every job on its push.
+async fn gate_container_delivery_token_mode(
+    home: &MaxplayerHome,
+    sandbox: &SandboxPolicy,
+) -> Result<(), NodeError> {
+    // No `[seller]` block means no delivery remote to push to; `boot_agent_registry` above is what
+    // refuses that seat. A second refusal here would only hide that message.
+    let Some(seller) = home.config.seller.as_ref() else {
+        return Ok(());
+    };
+    let gate = container_delivery_token_gate(
+        &home.config.relay_url,
+        &seller.git_remote,
+        sandbox.container_delivery(),
+    )?;
+    let (origin, cap_secs) = match gate {
+        TokenModeGate::Skip(line) => {
+            if let Some(line) = line {
+                opline!("{line}");
+            }
+            return Ok(());
+        }
+        TokenModeGate::Probe { origin, cap_secs } => (origin, cap_secs),
+    };
+    let support =
+        crate::relay_info::fetch_scoped_token_support(&origin, RELAY_TOKEN_POLICY_TIMEOUT).await;
+    let verdict = crate::relay_info::long_lived_verdict(&support, cap_secs);
+    match verdict.refusal() {
+        Some(refusal) => Err(NodeError::ContainerDeliveryToken(format!(
+            "{origin} — {refusal}"
+        ))),
+        None => {
+            opline!(
+                "seller node: relay {origin} advertises {} — [sandbox] container_delivery_token = \
+                 \"long-lived\" is usable on this seat (configured cap {cap_secs} s)",
+                support
+            );
+            Ok(())
+        }
+    }
+}
+
 /// Probe EVERY configured harness before anything goes on the wire.
 ///
 /// Local compute only — no sats, no mint, no award ([`probe_one_harness`] runs the harness in a
@@ -2991,6 +3235,10 @@ pub async fn probe_configured_harnesses(
     // under a pass-through fallback would prove a harness the awarded job will never run under.
     let sandbox = SandboxPolicy::from_config(home.config.sandbox.as_ref())
         .map_err(|error| NodeError::Sandbox(error.to_string()))?;
+    // Track B, `long-lived` token mode only: prove the relay honours a scoped token's expiration tag
+    // BEFORE any harness runs, or refuse to boot. Reads nothing over the network in the default
+    // `fresh-after-agent` mode. See `gate_container_delivery_token_mode`.
+    gate_container_delivery_token_mode(home, &sandbox).await?;
     // #647 credential-containment scope (P2): every KNOWN model-credential variable is contained by
     // the proxy. What can still cross RAW is an operator-added `[sandbox] forward_env` variable the
     // daemon cannot recognize — it may be a credential, and the daemon has no way to know. Say so

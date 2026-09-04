@@ -67,6 +67,12 @@ pub enum NodeError {
     /// image). Boot refuses rather than fall back to running the agent unsandboxed: a seat
     /// configured to contain strangers' code must not silently serve without containment.
     Sandbox(String),
+    /// `[sandbox] container_delivery_token = "long-lived"` is configured, and the relay does not
+    /// advertise that it honours the NIP-40 `expiration` tag of a branch-scoped push token (relay
+    /// Requirement B). Boot refuses rather than let the seat learn the answer as an HTTP 401 on the
+    /// PUSH — the last step of a paid job, after the agent ran and the buyer already paid. The
+    /// default `fresh-after-agent` mode never raises this.
+    ContainerDeliveryToken(String),
 }
 
 impl std::fmt::Display for NodeError {
@@ -83,6 +89,9 @@ impl std::fmt::Display for NodeError {
             }
             Self::Sandbox(message) => {
                 write!(formatter, "seller node sandbox config error: {message}")
+            }
+            Self::ContainerDeliveryToken(message) => {
+                write!(formatter, "seller node container-delivery token mode refused: {message}")
             }
         }
     }

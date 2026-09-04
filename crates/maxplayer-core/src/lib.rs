@@ -69,6 +69,13 @@ pub mod receipt;
 /// receipt-publish both use it).
 #[cfg(feature = "gateway")]
 pub mod relay_auth;
+/// The relay's advertised scoped-token policy (NIP-11), and the boot verdict for `[sandbox]
+/// container_delivery_token = "long-lived"`.
+///
+/// UNGATED on purpose, like [`sandbox_net`] below: the decision "may this seat mint a long-lived
+/// push token" is a safety verdict, so it is compiled and tested on every feature set. Only the one
+/// HTTP GET inside it needs `git-delivery`, which is the feature that carries `reqwest`.
+pub mod relay_info;
 pub mod runtime_guard;
 /// Host-side network containment for a docker job (#797): which destinations a job may reach, and
 /// the `iptables` rules that enforce it on the two chains container traffic actually splits across.
