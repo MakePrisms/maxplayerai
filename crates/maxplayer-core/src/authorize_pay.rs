@@ -502,10 +502,13 @@ pub async fn authorize_pay_async(
         None => None,
         Some(source) => {
             let store = FsHopJournal::new(crossmint_hop::hop_journal_dir(home));
+            // The hop executor's class gate reads the SEAL too — the same `issuers` the plan was
+            // derived from — so it can never learn a class from a mint.
             let effects = CdkHopEffects::open(
                 home,
                 &source.to_string(),
                 &wallet_open_mint_url(home, &terms, &issuers),
+                &issuers,
             )
             .await?;
             // A pairing already on disk WINS over freshly raised quotes. This attempt may have

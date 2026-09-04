@@ -582,8 +582,10 @@ mod tests {
     /// Another seat's issuer mint, reachable on a LAN. Also not https.
     const SELLER_ISSUER: &str = "http://10.0.0.7:3338";
 
+    /// Issuer mints under the ADMITTING marker — declared by this seat's own config (`Own`).
     fn issuers(urls: &[&str]) -> IssuerMints {
-        IssuerMints::from_urls(urls)
+        urls.iter()
+            .fold(IssuerMints::none(), |known, url| known.with_own(Some(url)))
     }
 
     /// A DIRECT payment at a known issuer mint passes the fence with the real-money switch OFF and

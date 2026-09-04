@@ -1352,21 +1352,17 @@ pub async fn accept_claim_async(
     // CHOICE is sealed below and re-derived at pay, so it stays deterministic — a later balance or
     // config-default change can never shift a sealed mint (the pays-once attempt-id invariant).
     //
-    // Which of the seller's mints are ISSUER mints (§4.2 "Issuer mint") is learned HERE and sealed
-    // with the selection, marker by marker: any accepted mint whose info lists no bolt11 method (a
-    // bounded GET /v1/info per mint, no wallet, no money), the buyer's own from config, and the
-    // mint the seller DECLARED on its announcement (one bounded relay read; the seller's word
-    // refuses a hop but never widens the fence — `mint_class` docs). The class-aware fence and the
-    // hop refusal are then re-derived at pay from the seal — never from a fresh probe or read.
+    // Which mints are ISSUER mints (§4.2 "Issuer mint") is DECLARED, gathered HERE and sealed with
+    // the selection, marker by marker: the buyer's own from config, and the mint the seller
+    // DECLARED on its announcement (one bounded relay read; the seller's word refuses a hop but
+    // never widens the fence — `mint_class` docs). No mint is asked what it is: a class is stated
+    // by an operator or it does not exist. The class-aware fence and the hop refusal are then
+    // re-derived at pay from the seal — never from a fresh read.
     let declared_issuer_mint =
         fetch_seller_issuer_mint_async(home, &keys, &claim.seller_pubkey, timeout).await;
-    let issuers = crate::mint_class::probe_issuer_mints(
-        &accepted_mints,
-        crate::payment_wallet::MINT_TOUCH_TIMEOUT,
-    )
-    .await
-    .with_own(home.config.issuer_mint())
-    .with_declared(declared_issuer_mint.as_deref());
+    let issuers = crate::mint_class::IssuerMints::none()
+        .with_own(home.config.issuer_mint())
+        .with_declared(declared_issuer_mint.as_deref());
     let source_seed = match crate::wallet_ops::balances_async(home).await {
         Ok(balances) => crate::crossmint::select_source_mint(
             home.config.default_mint(),
@@ -3728,10 +3724,6 @@ mod tests {
                 crate::mint_class::IssuerMintSeal {
                     url: "http://127.0.0.1:3338".into(),
                     marker: crate::mint_class::IssuerMarker::Own,
-                },
-                crate::mint_class::IssuerMintSeal {
-                    url: "https://info.example".into(),
-                    marker: crate::mint_class::IssuerMarker::Info,
                 },
                 crate::mint_class::IssuerMintSeal {
                     url: "https://declared.example".into(),

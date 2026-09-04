@@ -14,36 +14,31 @@
 //!   hop INTO one cannot land and a hop OUT of one cannot leave. The plain reason a buyer reads is
 //!   [`ISSUER_HOP_REFUSAL`]: it holds none of this seller's currency, and Lightning cannot buy any.
 //!
-//! How a mint is KNOWN to be an issuer mint — the two markers the design names, and nothing else.
-//! Each is recorded with WHO said it ([`IssuerMarker`]), because the two rules above do not trust
-//! the two markers equally:
+//! How a mint is KNOWN to be an issuer mint — it is DECLARED by an operator, and never inferred
+//! from the mint itself. Each declaration is recorded with WHO said it ([`IssuerMarker`]), because
+//! the two rules above do not trust the two sources equally:
 //!
-//! 1. **The ad tag.** A seat that runs one advertises it on its own kind-30340 announcement
-//!    ([`crate::heartbeat::ISSUER_MINT_TAG`]). Read two ways:
-//!    - The seat's OWN mint comes from config ([`crate::home::MaxplayerConfig::issuer_mint`]) —
-//!      the source the tag is published from — and is [`IssuerMarker::Own`]. The operator stated
-//!      it; it admits and it refuses.
-//!    - A SELLER's declaration is read off the seller's announcement at accept and is
-//!      [`IssuerMarker::Declared`]. It REFUSES the hop (the seller's word can only make the buyer
-//!      more careful) but does NOT widen the fence: a seller's signed tag must not be able to open
-//!      the buyer's real-mint fence to any mint the seller cares to name — a real mint the buyer
-//!      holds sats at, declared "issuer" by a stranger, would otherwise become spendable with the
-//!      real-money switch off.
-//! 2. **The mint's own info.** A mint whose NUT-06 document lists no `bolt11` method under NUT-04
-//!    (mint) or NUT-05 (melt) has no Lightning. [`class_from_info`] is that test, recorded as
-//!    [`IssuerMarker::Info`]: the mint itself says it holds no Lightning route, so it admits and it
-//!    refuses. It is how a buyer classifies a seller's mint at accept, where the classification is
-//!    sealed into the bind so the pay path re-derives rather than re-decides.
+//! 1. **This seat's own config** ([`crate::home::MaxplayerConfig::issuer_mint`]) — the source its
+//!    kind-30340 `issuer_mint` tag ([`crate::heartbeat::ISSUER_MINT_TAG`]) is published from — is
+//!    [`IssuerMarker::Own`]. The operator stated it; it admits and it refuses.
+//! 2. **A counterparty's advertisement.** A SELLER's declaration is read off the seller's
+//!    announcement at accept and is [`IssuerMarker::Declared`]. It REFUSES the hop (the seller's
+//!    word can only make the buyer more careful) but does NOT widen the fence: a seller's signed
+//!    tag must not be able to open the buyer's real-mint fence to any mint the seller cares to
+//!    name — a real mint the buyer holds sats at, declared "issuer" by a stranger, would otherwise
+//!    become spendable with the real-money switch off.
+//!
+//! What a mint says about ITSELF (its NUT-06 `/v1/info` document) is not a source: no production
+//! path reads a mint's info to obtain its class. Whatever is known is sealed into the accept-bind
+//! ([`IssuerMintSeal`]) so the pay path re-derives rather than re-decides.
 //!
 //! Absence of every marker is UNKNOWN, and unknown reads as Lightning: the fence and the hop then
 //! behave exactly as they did before this class existed.
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
-use std::time::Duration;
 
 use cdk::mint_url::MintUrl;
-use cdk::nuts::{MintInfo, PaymentMethod};
 use serde::{Deserialize, Serialize};
 
 use crate::home;
@@ -63,15 +58,18 @@ pub enum MintClass {
     Issuer,
 }
 
-/// WHO said a mint is an issuer mint. Every marker refuses the Lightning hop; only the markers
-/// this seat can stand behind widen its real-mint fence (see the module docs).
+/// WHO declared a mint an issuer mint. Every marker refuses the Lightning hop; only the marker
+/// this seat can stand behind — its own config — widens its real-mint fence (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IssuerMarker {
     /// Another seat's kind-30340 `issuer_mint` tag, read at accept. Refuses; does not admit.
+    ///
+    /// Also what a seal written under the retired `info` marker (a class once inferred from the
+    /// mint's own NUT-06 document) reads back as: an old bind still loads, the hop it refused it
+    /// still refuses, and a class nobody declared never widens the fence.
+    #[serde(alias = "info")]
     Declared,
-    /// The mint's own NUT-06 info lists no bolt11 method. Refuses and admits.
-    Info,
     /// This seat's own issuer mint, from its config. Refuses and admits.
     Own,
 }
@@ -79,7 +77,7 @@ pub enum IssuerMarker {
 impl IssuerMarker {
     /// Whether this marker is one the seat may widen its OWN real-mint fence on.
     fn admits(self) -> bool {
-        matches!(self, Self::Info | Self::Own)
+        matches!(self, Self::Own)
     }
 }
 
@@ -89,33 +87,6 @@ impl IssuerMarker {
 pub struct IssuerMintSeal {
     pub url: String,
     pub marker: IssuerMarker,
-}
-
-/// Classify a mint from its NUT-06 info: `Issuer` iff neither NUT-04 (mint) nor NUT-05 (melt)
-/// lists a `bolt11` method.
-///
-/// Both tables are consulted because a hop needs Lightning on BOTH sides of a mint — a mint that
-/// could be paid by Lightning but not pay out (or the reverse) is not a hop leg either, but that
-/// is a different defect; the class here is "has no Lightning at all", which is what an issuer
-/// mint run with no Lightning backend reports.
-pub fn class_from_info(info: &MintInfo) -> MintClass {
-    let mints_bolt11 = info
-        .nuts
-        .nut04
-        .methods
-        .iter()
-        .any(|method| method.method == PaymentMethod::BOLT11);
-    let melts_bolt11 = info
-        .nuts
-        .nut05
-        .methods
-        .iter()
-        .any(|method| method.method == PaymentMethod::BOLT11);
-    if mints_bolt11 || melts_bolt11 {
-        MintClass::Lightning
-    } else {
-        MintClass::Issuer
-    }
 }
 
 /// The issuer mints known for ONE payment decision, each with its marker. Built once, passed by
@@ -143,19 +114,6 @@ impl IssuerMints {
     /// existed.
     pub fn none() -> Self {
         Self::default()
-    }
-
-    /// Issuer mints classified from their own info ([`IssuerMarker::Info`]) — a probe's result.
-    pub fn from_urls<I, S>(urls: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        let mut known = Self::default();
-        for url in urls {
-            known.insert(url.as_ref(), IssuerMarker::Info);
-        }
-        known
     }
 
     /// Rebuild from a sealed bind's list, marker by marker. The pay path's ONLY constructor.
@@ -250,9 +208,8 @@ impl IssuerMints {
 /// unconditionally; every other mint answers to [`home::mint_allowed`] exactly as before.
 ///
 /// This is the ONE place the class widens the fence, and it widens it only for a mint the seat
-/// itself can stand behind — its own (from config) or one the mint's own info classified (sealed at
-/// accept). A mint a seller merely declared, and a mint nobody classified, are fenced as they
-/// always were.
+/// itself can stand behind — its own, from its config (sealed at accept). A mint a seller merely
+/// declared, and a mint nobody declared, are fenced as they always were.
 pub fn mint_admitted(mint_url: &str, allow_real_mints: bool, issuers: &IssuerMints) -> bool {
     issuers.admits(mint_url) || home::mint_allowed(mint_url, allow_real_mints)
 }
@@ -274,114 +231,13 @@ pub fn refuse_lightning_at_issuer(
     }
 }
 
-/// Ask each of `mint_urls` for its NUT-06 info and return those that classify as issuer mints
-/// ([`IssuerMarker::Info`]).
-///
-/// Best-effort and FAIL-SAFE in the direction that matters: a mint that does not answer within
-/// `timeout`, answers malformed, or does not parse as a URL is NOT classified — it stays Lightning
-/// class (unknown), so it is fenced and hop-planned exactly as before. Nothing here moves money or
-/// opens a wallet; it is the same GET `/v1/info` the doctor's reachability probe makes.
-///
-/// Called at accept, where the result is sealed into the bind. It is never called on the pay path:
-/// the pay path re-derives from the seal, so a mint that changes its answer later cannot shift a
-/// sealed decision.
-pub async fn probe_issuer_mints(mint_urls: &[String], timeout: Duration) -> IssuerMints {
-    use cdk::wallet::{HttpClient, MintConnector};
-
-    let mut known = IssuerMints::none();
-    for raw in mint_urls {
-        let Ok(url) = MintUrl::from_str(raw.trim()) else {
-            continue;
-        };
-        let client = HttpClient::new(url.clone(), None);
-        let info = match tokio::time::timeout(timeout, client.get_mint_info()).await {
-            Ok(Ok(info)) => info,
-            // Unreachable or malformed: unknown, therefore Lightning. Never a refusal here — the
-            // fence and the hop executor are the gates; this is only knowledge.
-            Ok(Err(_)) | Err(_) => continue,
-        };
-        if class_from_info(&info) == MintClass::Issuer {
-            known.insert(&url.to_string(), IssuerMarker::Info);
-        }
-    }
-    known
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cdk::nuts::{CurrencyUnit, MeltMethodSettings, MintMethodSettings};
-
-    fn bolt11_mint_method() -> MintMethodSettings {
-        MintMethodSettings {
-            method: PaymentMethod::BOLT11,
-            unit: CurrencyUnit::Sat,
-            min_amount: None,
-            max_amount: None,
-            options: None,
-        }
-    }
-
-    fn bolt11_melt_method() -> MeltMethodSettings {
-        MeltMethodSettings {
-            method: PaymentMethod::BOLT11,
-            unit: CurrencyUnit::Sat,
-            min_amount: None,
-            max_amount: None,
-            options: None,
-        }
-    }
-
-    fn custom_melt_method(name: &str) -> MeltMethodSettings {
-        MeltMethodSettings {
-            method: PaymentMethod::Custom(name.to_owned()),
-            unit: CurrencyUnit::Sat,
-            min_amount: None,
-            max_amount: None,
-            options: None,
-        }
-    }
-
-    /// A stock Lightning mint lists bolt11 under both NUT-04 and NUT-05.
-    fn lightning_info() -> MintInfo {
-        let mut info = MintInfo::new();
-        info.nuts.nut04.methods = vec![bolt11_mint_method()];
-        info.nuts.nut05.methods = vec![bolt11_melt_method()];
-        info
-    }
-
-    /// An issuer mint run with no Lightning backend: no bolt11 anywhere. It may still list a
-    /// custom melt method (the stage-3 "retire" path) — that is not Lightning.
-    fn issuer_info() -> MintInfo {
-        let mut info = MintInfo::new();
-        info.nuts.nut04.methods = Vec::new();
-        info.nuts.nut05.methods = vec![custom_melt_method("retire")];
-        info
-    }
-
-    #[test]
-    fn a_mint_listing_no_bolt11_method_is_an_issuer_mint() {
-        assert_eq!(class_from_info(&issuer_info()), MintClass::Issuer);
-        assert_eq!(class_from_info(&MintInfo::new()), MintClass::Issuer);
-        assert_eq!(class_from_info(&lightning_info()), MintClass::Lightning);
-    }
-
-    /// Lightning on EITHER side is enough to be Lightning class: the class is "no Lightning at
-    /// all", not "cannot serve as a hop leg".
-    #[test]
-    fn bolt11_on_either_table_reads_as_lightning() {
-        let mut mint_only = MintInfo::new();
-        mint_only.nuts.nut04.methods = vec![bolt11_mint_method()];
-        assert_eq!(class_from_info(&mint_only), MintClass::Lightning);
-
-        let mut melt_only = MintInfo::new();
-        melt_only.nuts.nut05.methods = vec![bolt11_melt_method()];
-        assert_eq!(class_from_info(&melt_only), MintClass::Lightning);
-    }
 
     #[test]
     fn issuer_mints_normalize_and_compare_like_the_planner() {
-        let known = IssuerMints::from_urls(["https://Issuer.example/Bitcoin/"]);
+        let known = IssuerMints::none().with_own(Some("https://Issuer.example/Bitcoin/"));
         assert!(known.contains("https://issuer.example/Bitcoin"));
         assert!(known.contains("https://issuer.example/Bitcoin/"));
         assert!(!known.contains("https://other.example/Bitcoin"));
@@ -422,11 +278,12 @@ mod tests {
         );
     }
 
-    /// The three markers all REFUSE (every one is an issuer mint to the hop), but only the two the
-    /// seat can stand behind — its own config, the mint's own info — ADMIT. A seller's declaration
-    /// is knowledge for the hop and nothing for the fence.
+    /// Both markers REFUSE (each is an issuer mint to the hop), but only the one the seat can stand
+    /// behind — its own config — ADMITS. A seller's declaration is knowledge for the hop and
+    /// nothing for the fence. Each half on its own.
     #[test]
-    fn every_marker_refuses_but_only_own_and_info_admit() {
+    fn every_marker_refuses_but_only_own_admits() {
+        // Ad-declared: refuses, does not admit.
         let declared = IssuerMints::none().with_declared(Some("https://issuer.example"));
         assert!(declared.contains("https://issuer.example"));
         assert!(!declared.admits("https://issuer.example"));
@@ -434,12 +291,16 @@ mod tests {
             declared.marker_of("https://issuer.example"),
             Some(IssuerMarker::Declared)
         );
+        assert!(!IssuerMarker::Declared.admits());
 
-        let info = IssuerMints::from_urls(["https://issuer.example"]);
-        assert!(info.contains("https://issuer.example") && info.admits("https://issuer.example"));
-
+        // Config-declared: refuses and admits.
         let own = IssuerMints::none().with_own(Some("https://issuer.example"));
         assert!(own.contains("https://issuer.example") && own.admits("https://issuer.example"));
+        assert_eq!(
+            own.marker_of("https://issuer.example"),
+            Some(IssuerMarker::Own)
+        );
+        assert!(IssuerMarker::Own.admits());
 
         // Unknown: neither.
         assert!(!IssuerMints::none().contains("https://issuer.example"));
@@ -447,14 +308,15 @@ mod tests {
     }
 
     /// One URL, two markers: the admitting one stands whichever order they arrive in. A seller's
-    /// declaration can never downgrade what the seat itself knows.
+    /// declaration can never downgrade what the seat itself stated.
     #[test]
     fn a_declaration_never_downgrades_an_admitting_marker() {
-        let info_then_declared = IssuerMints::from_urls(["https://issuer.example"])
+        let own_then_declared = IssuerMints::none()
+            .with_own(Some("https://issuer.example"))
             .with_declared(Some("https://issuer.example/"));
         assert_eq!(
-            info_then_declared.marker_of("https://issuer.example"),
-            Some(IssuerMarker::Info)
+            own_then_declared.marker_of("https://issuer.example"),
+            Some(IssuerMarker::Own)
         );
         let declared_then_own = IssuerMints::none()
             .with_declared(Some("https://issuer.example"))
@@ -474,35 +336,70 @@ mod tests {
     /// JSON shape is stable, because it lives in every accept-bind on disk.
     #[test]
     fn the_seal_round_trips_with_its_markers() {
-        let known = IssuerMints::from_urls(["https://info.example"])
+        let known = IssuerMints::none()
             .with_own(Some("http://127.0.0.1:3338"))
             .with_declared(Some("https://declared.example"));
         let seal = known.seal();
-        assert_eq!(seal.len(), 3);
+        assert_eq!(seal.len(), 2);
         assert_eq!(IssuerMints::from_seal(&seal), known);
 
         let json = serde_json::to_string(&seal).expect("serializes");
         assert!(json.contains(r#""marker":"declared""#), "{json}");
         assert!(json.contains(r#""marker":"own""#), "{json}");
-        assert!(json.contains(r#""marker":"info""#), "{json}");
+        assert!(!json.contains(r#""marker":"info""#), "{json}");
         let back: Vec<IssuerMintSeal> = serde_json::from_str(&json).expect("deserializes");
         assert_eq!(IssuerMints::from_seal(&back), known);
         // Rebuilt, the fence and the hop answer as they did at accept.
         let rebuilt = IssuerMints::from_seal(&back);
-        assert!(rebuilt.admits("https://info.example") && rebuilt.admits("http://127.0.0.1:3338"));
+        assert!(rebuilt.admits("http://127.0.0.1:3338"));
         assert!(
             rebuilt.contains("https://declared.example")
                 && !rebuilt.admits("https://declared.example")
         );
     }
 
-    /// The fence: an issuer mint passes regardless of `allow_real_mints` and of scheme; every other
-    /// mint answers to the unchanged `home::mint_allowed`.
+    /// A seal written BEFORE the class became declaration-only carried a third marker, `info` (a
+    /// class inferred from the mint's own NUT-06 document). Such a bind must still load: the entry
+    /// reads back as a declaration — the hop still refuses it — and it admits nothing, because no
+    /// operator ever stated it. It is written back as `declared`, never as `info`.
+    #[test]
+    fn a_legacy_info_seal_still_reads_as_a_declaration_and_admits_nothing() {
+        let legacy = r#"[
+            {"url":"https://info.example","marker":"info"},
+            {"url":"http://127.0.0.1:3338","marker":"own"},
+            {"url":"https://declared.example","marker":"declared"}
+        ]"#;
+        let seal: Vec<IssuerMintSeal> = serde_json::from_str(legacy).expect("a legacy seal loads");
+        assert_eq!(seal.len(), 3);
+        assert_eq!(seal[0].marker, IssuerMarker::Declared);
+        assert_eq!(seal[1].marker, IssuerMarker::Own);
+        assert_eq!(seal[2].marker, IssuerMarker::Declared);
+
+        let rebuilt = IssuerMints::from_seal(&seal);
+        assert_eq!(rebuilt.class_of("https://info.example"), MintClass::Issuer);
+        assert!(
+            !rebuilt.admits("https://info.example"),
+            "a class nobody declared never widens the fence"
+        );
+        assert!(!mint_admitted("https://info.example", false, &rebuilt));
+        assert!(rebuilt.admits("http://127.0.0.1:3338"));
+
+        let rewritten = serde_json::to_string(&rebuilt.seal()).expect("serializes");
+        assert!(!rewritten.contains(r#""marker":"info""#), "{rewritten}");
+        assert!(rewritten.contains(r#""marker":"declared""#), "{rewritten}");
+        assert!(
+            serde_json::from_str::<IssuerMarker>(r#""sniffed""#).is_err(),
+            "only the named markers read"
+        );
+    }
+
+    /// The fence: an issuer mint this seat declared passes regardless of `allow_real_mints` and of
+    /// scheme; every other mint answers to the unchanged `home::mint_allowed`.
     #[test]
     fn the_fence_admits_a_known_issuer_mint_and_nothing_else_new() {
         let sidecar = "http://127.0.0.1:3338";
         let real = "https://mint.minibits.cash/Bitcoin";
-        let known = IssuerMints::from_urls([sidecar]);
+        let known = IssuerMints::none().with_own(Some(sidecar));
 
         // Issuer: admitted with the fence closed, and over plain http.
         assert!(mint_admitted(sidecar, false, &known));
@@ -517,9 +414,38 @@ mod tests {
         assert!(mint_admitted(home::DEFAULT_MINT_URL, false, &known));
     }
 
+    /// NEGATIVE: a mint nobody declared is fenced EXACTLY as `home::mint_allowed` fences it, for
+    /// every URL and either switch setting — including a mint that is unreachable, one that is
+    /// malformed, and one that would answer "no bolt11" if asked. None of that can matter, because
+    /// nothing asks: the class comes from a declaration or it does not exist.
+    #[test]
+    fn an_undeclared_mint_is_fenced_exactly_as_before_whatever_it_is() {
+        let nobody = IssuerMints::none();
+        let candidates = [
+            "https://mint.minibits.cash/Bitcoin",
+            home::DEFAULT_MINT_URL,
+            "http://127.0.0.1:1",            // nothing listens here
+            "http://10.255.255.1:3338",      // unroutable
+            "https://no-such-host.invalid/", // does not resolve
+            "::not-a-url::",                 // malformed
+            "",
+        ];
+        for url in candidates {
+            for allow in [false, true] {
+                assert_eq!(
+                    mint_admitted(url, allow, &nobody),
+                    home::mint_allowed(url, allow),
+                    "undeclared {url:?} with allow_real_mints={allow}"
+                );
+            }
+            assert_eq!(nobody.class_of(url), MintClass::Lightning, "{url:?}");
+            assert_eq!(nobody.marker_of(url), None, "{url:?}");
+        }
+    }
+
     /// NEGATIVE: a seller DECLARING a mint its issuer mint opens nothing. A real mint so declared is
     /// fenced exactly as an undeclared one — the switch alone decides — and the seller's sidecar so
-    /// declared stays fenced too, until the mint's own info (or this seat's config) says otherwise.
+    /// declared stays fenced too, unless this seat's own config names it.
     #[test]
     fn a_sellers_declaration_does_not_widen_the_fence() {
         let real = "https://mint.minibits.cash/Bitcoin";
@@ -538,7 +464,7 @@ mod tests {
         assert!(!mint_admitted(sidecar, false, &declared));
         assert!(
             !mint_admitted(sidecar, true, &declared),
-            "http is not https; declaration is not info"
+            "http is not https; a seller's declaration is not this seat's"
         );
     }
 

@@ -445,27 +445,21 @@ pub async fn balances_async(home: &MaxplayerHome) -> Result<Vec<MintBalance>, Wa
     Ok(rows)
 }
 
-/// Refuse a Lightning operation at an ISSUER mint (§4.2 "Issuer mint") BEFORE any quote is raised.
+/// Refuse a Lightning operation at an ISSUER mint (§4.2 "Issuer mint") BEFORE the wallet is opened
+/// or any quote is raised.
 ///
-/// The class comes from the mint's own NUT-06 info, read through the wallet's cached info load —
-/// the same document the quote call would consult next, so this adds no new dependency and a mint
-/// that cannot answer fails the operation exactly as the quote would have. `Ok(())` for a Lightning
-/// mint.
-async fn refuse_lightning_op_at_issuer(
-    wallet: &Wallet,
+/// The class is DECLARED, never read off the mint: an operator `wallet fund`/`wallet melt` runs
+/// with no accept-bind in hand, so the one declaration this seat can stand behind is its own
+/// config (`issuer_mint`). A mint the config does not name is Lightning class and proceeds as it
+/// always did; nothing here touches the network. `Ok(())` for a Lightning mint.
+fn refuse_lightning_op_at_issuer(
+    home: &MaxplayerHome,
     op: &str,
     mint_url: &str,
 ) -> Result<(), WalletOpsError> {
-    let info = wallet
-        .load_mint_info()
-        .await
-        .map_err(|error| WalletOpsError::Wallet(format!("{op}: mint info: {error}")))?;
-    crate::mint_class::refuse_lightning_at_issuer(
-        op,
-        mint_url,
-        crate::mint_class::class_from_info(&info),
-    )
-    .map_err(WalletOpsError::IssuerMint)
+    let issuers = crate::mint_class::IssuerMints::none().with_own(home.config.issuer_mint());
+    crate::mint_class::refuse_lightning_at_issuer(op, mint_url, issuers.class_of(mint_url))
+        .map_err(WalletOpsError::IssuerMint)
 }
 
 /// Create a mint quote and return the bolt11 **before** any poll/wait.
@@ -478,8 +472,8 @@ pub async fn begin_mint_async(
         return Err(WalletOpsError::Wallet("amount must be > 0".into()));
     }
     let mint_url = resolve_mint(home, mint_override)?;
+    refuse_lightning_op_at_issuer(home, "wallet fund", &mint_url)?;
     let wallet = open_wallet_async(home, &mint_url).await?;
-    refuse_lightning_op_at_issuer(&wallet, "wallet fund", &mint_url).await?;
     let amount = Amount::from(amount_sats);
     let quote = wallet
         .mint_quote(PaymentMethod::BOLT11, Some(amount), None, None)
@@ -505,8 +499,8 @@ pub async fn complete_mint_async(
     quote: &MintQuote,
 ) -> Result<MintOutcome, WalletOpsError> {
     let mint_url = mint_is_allowed(home, &quote.mint_url)?;
+    refuse_lightning_op_at_issuer(home, "wallet fund", &mint_url)?;
     let wallet = open_wallet_async(home, &mint_url).await?;
-    refuse_lightning_op_at_issuer(&wallet, "wallet fund", &mint_url).await?;
     let funded = poll_and_mint(&wallet, &quote.quote_id, quote.amount_sats).await?;
     let balance = wallet
         .total_balance()
@@ -778,8 +772,8 @@ pub async fn melt_async(
     if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
         return Err(WalletOpsError::RealMintDisallowed { mint_url });
     }
+    refuse_lightning_op_at_issuer(home, "wallet melt", &mint_url)?;
     let wallet = open_wallet_async(home, &mint_url).await?;
-    refuse_lightning_op_at_issuer(&wallet, "wallet melt", &mint_url).await?;
     let quote = wallet
         .melt_quote(PaymentMethod::BOLT11, bolt11, None, None)
         .await
@@ -1460,12 +1454,16 @@ mod tests {
         (format!("http://{address}"), seen)
     }
 
-    /// Check H (§4.2 "Issuer mint"): the fund COMPLETION path is guarded exactly like fund-begin and
-    /// melt. NEGATIVE: at a mint whose NUT-06 lists no bolt11 (Issuer per `class_from_info`),
-    /// `complete_mint_async` returns `WalletOpsError::IssuerMint` and the mint receives NO
-    /// `check_mint_quote` and NO `wallet.mint` request — only the `/v1/info` read the guard makes.
-    /// CONTROL: the identical call against a stub that lists bolt11 (Lightning) goes past the guard
-    /// and the recorder sees the quote lookup, so the negative above is not vacuous.
+    /// Check H (§4.2 "Issuer mint"): fund-begin and fund-completion are guarded by the DECLARED
+    /// class — this seat's own `issuer_mint` config — and the guard runs before the wallet opens.
+    /// NEGATIVE: at the declared mint, `begin_mint_async` and `complete_mint_async` return
+    /// `WalletOpsError::IssuerMint` and the mint receives NO request at all — no quote, no mint,
+    /// and not even `/v1/info`, because nothing asks a mint what it is. The stub would answer as a
+    /// LIGHTNING mint (bolt11 under NUT-04) if it were asked, so a class read off the wire would
+    /// have let the call through: the declaration is what refuses it.
+    /// CONTROL: the identical completion against an UNDECLARED stub goes past the guard and into
+    /// `poll_and_mint`, where cdk fails an unknown quote id as an ordinary Wallet error — not
+    /// IssuerMint, not a refusal — so the negative above is not vacuous.
     #[tokio::test]
     async fn completing_a_mint_quote_at_an_issuer_mint_is_refused_before_any_quote_call() {
         use cdk::nuts::{MintInfo, MintMethodSettings};
@@ -1473,24 +1471,36 @@ mod tests {
         fn is_quote_or_mint_call(path: &str) -> bool {
             path.contains("/mint/quote/") || path.contains("/mint/bolt11")
         }
+        fn lightning_info() -> MintInfo {
+            let mut info = MintInfo::new();
+            info.nuts.nut04.methods = vec![MintMethodSettings {
+                method: PaymentMethod::BOLT11,
+                unit: CurrencyUnit::Sat,
+                min_amount: None,
+                max_amount: None,
+                options: None,
+            }];
+            info
+        }
 
-        // Issuer: no bolt11 under NUT-04 or NUT-05.
-        let mut issuer_info = MintInfo::new();
-        issuer_info.nuts.nut04.methods = Vec::new();
-        issuer_info.nuts.nut05.methods = Vec::new();
-        assert_eq!(
-            crate::mint_class::class_from_info(&issuer_info),
-            crate::mint_class::MintClass::Issuer
-        );
-        let (issuer_url, issuer_seen) = recording_mint_stub(&issuer_info);
+        let (issuer_url, issuer_seen) = recording_mint_stub(&lightning_info());
 
         let root = temp_home("complete-at-issuer");
         let _ = std::fs::remove_dir_all(&root);
         let mut home = bootstrap(&root).expect("bootstrap");
-        // The loopback stub is a CONFIGURED mint, so `mint_is_allowed` admits it and the call reaches
-        // the wallet path under test rather than the configured-mint check.
+        // The loopback stub is a CONFIGURED mint, so `mint_is_allowed`/`resolve_mint` admit it and
+        // the call reaches the guard under test rather than the configured-mint check; and it is
+        // this seat's DECLARED issuer mint, which is the whole of what the guard reads.
         home.config.extra_mints.push(issuer_url.clone());
+        home.config.issuer_mint = Some(issuer_url.clone());
 
+        let begin = begin_mint_async(&home, 5, Some(&issuer_url))
+            .await
+            .expect_err("funding at a declared issuer mint must refuse");
+        assert!(
+            matches!(begin, WalletOpsError::IssuerMint(_)),
+            "expected IssuerMint from begin, got: {begin}"
+        );
         let quote = MintQuote {
             mint_url: issuer_url.clone(),
             invoice: "lnbc1-not-a-real-invoice".to_owned(),
@@ -1499,7 +1509,7 @@ mod tests {
         };
         let error = complete_mint_async(&home, &quote)
             .await
-            .expect_err("completing at an issuer mint must refuse");
+            .expect_err("completing at a declared issuer mint must refuse");
         let seen = issuer_seen.lock().expect("recorder").clone();
         assert!(
             matches!(error, WalletOpsError::IssuerMint(_)),
@@ -1507,30 +1517,23 @@ mod tests {
         );
         let message = error.to_string();
         assert!(message.contains("wallet fund refused"), "{message}");
+        assert!(message.contains(&issuer_url), "{message}");
         assert!(message.contains(crate::mint_class::ISSUER_HOP_REFUSAL), "{message}");
         assert!(
-            seen.iter().any(|path| path.trim_start_matches('/') == "v1/info"),
-            "the guard must have read the mint's info: {seen:?}"
+            seen.is_empty(),
+            "a declared issuer mint is asked NOTHING — not a quote, not its info: {seen:?}"
         );
         assert!(
             !seen.iter().any(|path| is_quote_or_mint_call(path)),
             "neither check_mint_quote nor wallet.mint may reach an issuer mint: {seen:?}"
         );
 
-        // CONTROL: same call, Lightning-class stub. The guard passes and execution goes on into
-        // `poll_and_mint`, where cdk's `check_mint_quote` resolves an id the local store has never
-        // seen WITHOUT a wire call and fails as an ordinary Wallet error — not IssuerMint, and not
-        // a refusal. So the control proves the gate is the CLASS, not the stub: identical call,
-        // identical unknown quote, the only difference is what `/v1/info` said.
-        let mut lightning_info = MintInfo::new();
-        lightning_info.nuts.nut04.methods = vec![MintMethodSettings {
-            method: PaymentMethod::BOLT11,
-            unit: CurrencyUnit::Sat,
-            min_amount: None,
-            max_amount: None,
-            options: None,
-        }];
-        let (lightning_url, lightning_seen) = recording_mint_stub(&lightning_info);
+        // CONTROL: same call, same kind of stub, NOT declared. The guard passes and execution goes
+        // on into `poll_and_mint`, where cdk's `check_mint_quote` resolves an id the local store has
+        // never seen WITHOUT a wire call and fails as an ordinary Wallet error — not IssuerMint,
+        // and not a refusal. Identical call, identical unknown quote, identical info document: the
+        // only difference is the declaration.
+        let (lightning_url, _lightning_seen) = recording_mint_stub(&lightning_info());
         home.config.extra_mints.push(lightning_url.clone());
         let control = complete_mint_async(
             &home,
@@ -1543,20 +1546,14 @@ mod tests {
         )
         .await
         .expect_err("an unknown quote id fails inside poll_and_mint");
-        let seen = lightning_seen.lock().expect("recorder").clone();
         assert!(
             matches!(control, WalletOpsError::Wallet(_)),
-            "control must fail past the guard, not at it: {control} (mint saw {seen:?})"
+            "control must fail past the guard, not at it: {control}"
         );
         let control_message = control.to_string();
         assert!(
-            !control_message.contains("refused") && !control_message.contains("mint info"),
-            "control must not be a guard refusal or an info failure: {control_message}"
+            !control_message.contains("refused"),
+            "control must not be a guard refusal: {control_message}"
         );
-        assert!(
-            seen.iter().any(|path| path.trim_start_matches('/') == "v1/info"),
-            "the guard read the control mint's info too: {seen:?}"
-        );
-        let _ = std::fs::remove_dir_all(&root);
     }
 }
