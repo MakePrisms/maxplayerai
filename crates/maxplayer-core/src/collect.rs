@@ -145,9 +145,15 @@ impl std::error::Error for CollectError {}
 /// On an integrity mismatch (the delivered branch does not tip at the accepted `commit_oid`), the
 /// composed [`authorize_pay`](crate::authorize_pay::authorize_pay_async) refuses BEFORE the budget
 /// gate — so this returns [`CollectError::Pay`] with ZERO spend and no files are materialized.
+///
+/// `gate` is OPTIONAL, and the `Option` is the free lane's contract stated in the type: a free
+/// collect runs no payment leg, so it needs no budget gate, so a caller must not be made to open
+/// the durable spend ledger in order to reach one. `None` is what a free caller passes. The paid
+/// arm below refuses LOUDLY on `None` rather than substituting an in-memory gate, so a future edit
+/// that routed a spend onto the free path fails red instead of quietly charging an empty ledger.
 pub async fn collect_async(
     home: &MaxplayerHome,
-    gate: &mut BudgetGate,
+    gate: Option<&mut BudgetGate>,
     request: CollectRequest,
 ) -> Result<CollectOutcome, CollectError> {
     // 1. Load the buyer's accept-bind — the delivered commit + pay terms it recorded at accept.
@@ -199,6 +205,13 @@ pub async fn collect_async(
         bind.commit_oid.clone(),
     )
     .map_err(CollectError::Lifecycle)?;
+    // A priced collect REQUIRES the durable gate. Refuse rather than fabricate one: an in-memory
+    // substitute would read `spent = 0` and append nowhere, which is a spend with no ledger.
+    let gate = gate.ok_or_else(|| {
+        CollectError::Input(
+            "a priced collect requires the durable budget gate; none was supplied".to_owned(),
+        )
+    })?;
     let pay = authorize_pay::authorize_pay_async(home, gate, pay_request)
         .await
         .map_err(CollectError::Pay)?;
@@ -225,7 +238,7 @@ pub async fn collect_async(
 /// Blocking wrapper over [`collect_async`] for the CLI (builds a current-thread runtime).
 pub fn collect_blocking(
     home: &MaxplayerHome,
-    gate: &mut BudgetGate,
+    gate: Option<&mut BudgetGate>,
     request: CollectRequest,
 ) -> Result<CollectOutcome, CollectError> {
     crate::runtime_guard::refuse_nested_block_on("collect_blocking")
@@ -549,7 +562,7 @@ mod tests {
 
         let error = collect_async(
             &home,
-            &mut gate,
+            Some(&mut gate),
             CollectRequest {
                 job_id: "a".repeat(64),
                 out: None,
@@ -689,7 +702,7 @@ mod tests {
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         let error = collect_async(
             &home,
-            &mut gate,
+            Some(&mut gate),
             CollectRequest {
                 job_id: bind.job_id.clone(),
                 out: None,
@@ -812,7 +825,7 @@ mod tests {
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         let error = collect_async(
             &home,
-            &mut gate,
+            Some(&mut gate),
             CollectRequest {
                 job_id: offer_id.clone(),
                 out: None,

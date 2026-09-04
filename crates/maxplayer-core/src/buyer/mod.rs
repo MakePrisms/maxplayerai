@@ -1092,7 +1092,8 @@ impl std::fmt::Display for SettleJobError {
     }
 }
 
-/// The daemon's ONE path to the spend gate: money lock → budget gate → pay-then-flip.
+/// The daemon's ONE path to the spend gate: money lock → resolve the bind → budget gate (PAID ARM
+/// ONLY) → pay-then-flip.
 ///
 /// Both the `collect` RPC and the delivery watcher call this and nothing else. That is deliberate:
 /// it makes "can the watcher reach around a money gate?" answerable by construction instead of by
@@ -1111,8 +1112,37 @@ async fn settle_job(
     // Serialize with award + other collects: at most one wallet-melting op in flight daemon-wide.
     let _guard = context.money_lock.lock().await;
 
-    let mut gate =
-        BudgetGate::from_home(&context.home).map_err(|error| SettleJobError::Gate(error.to_string()))?;
+    // #967 ground B — LEARN THE MODE BEFORE OPENING THE MONEY SUBSYSTEM. `BudgetGate::from_home`
+    // is a genuine durable read (it folds `spent.jsonl` and the legacy total), so constructing it
+    // unconditionally put the spend ledger on the critical path of a FREE collect: a buyer holding
+    // no bitcoin — the exact buyer the free lane exists to serve — had its free collect aborted by
+    // the money subsystem whenever that ledger was unreadable or malformed.
+    //
+    // The mode is `bind.payment_mode`, the sealed agreement of the signed offer and the signed
+    // claim. Resolving the bind HERE — load, and when none exists run the SAME
+    // `accept_for_collect_async` that `collect_async` would have run — is what lets the ledger stay
+    // shut on the free arm. It is one accept, not two: `collect_async` re-loads this now-persisted
+    // bind and never re-accepts. And it moves no ordering `settle_after_pay` guarantees, because
+    // that function runs nothing before its pay closure. Errors are mapped to the same variant the
+    // in-closure accept produced, so the wire code and operator line are unchanged.
+    let bind = match job_lifecycle::load_accepted_bind(&context.home, job_id) {
+        Ok(Some(bind)) => bind,
+        Ok(None) => job_lifecycle::accept_for_collect_async(&context.home, job_id)
+            .await
+            .map_err(|error| SettleJobError::Pay(collect::CollectError::Lifecycle(error)))?,
+        Err(error) => return Err(SettleJobError::Pay(collect::CollectError::Lifecycle(error))),
+    };
+
+    // The free arm opens NO gate — not a swallowed one, not an in-memory stand-in: none. The paid
+    // arm still fails loudly on an unreadable ledger, which is the behaviour a spend requires.
+    let mut gate = if bind.payment_mode.is_free() {
+        None
+    } else {
+        Some(
+            BudgetGate::from_home(&context.home)
+                .map_err(|error| SettleJobError::Gate(error.to_string()))?,
+        )
+    };
     let request = CollectRequest {
         job_id: job_id.to_owned(),
         out,
@@ -1123,7 +1153,7 @@ async fn settle_job(
         &context.store,
         job_id,
         now_unix(),
-        || collect::collect_async(&context.home, &mut gate, request),
+        || collect::collect_async(&context.home, gate.as_mut(), request),
         // A free collect settles `0`, which flips a zero reservation and moves no ledger total —
         // the same arithmetic the award already reserved for a zero-amount offer.
         |outcome| outcome.pay.amount_sats(),
@@ -1210,13 +1240,23 @@ fn settled_payment_line(pay: &collect::CollectPayment) -> String {
 
 /// The `pay` object of the `collect` response.
 ///
-/// ONE shape for both modes — the same four keys, so a paid collect's response bytes are exactly
-/// what they were before the free lane existed and no consumer has to learn a second shape. A free
-/// collect says so in the values it cannot fake: `state = "none"` and a null `attempt_id`, because
-/// no payment state machine ran and no attempt id was ever derived. `spent_total_sats` is a fresh
-/// DURABLE read of the buyer's budget total — a free collect never appended to it, and reporting the
-/// standing total is more use to a caller than a zero that would read as "you have spent nothing".
-fn collect_pay_response(context: &BuyerContext, pay: &collect::CollectPayment) -> Value {
+/// A paid collect's response bytes are exactly what they were before the free lane existed — the
+/// same four keys, read off the pay outcome. A free collect says what it is in the values it cannot
+/// fake: `state = "none"` and a null `attempt_id`, because no payment state machine ran and no
+/// attempt id was ever derived.
+///
+/// **`spent_total_sats` is ABSENT on a free collect (#967 ground B).** It used to be a fresh
+/// `BudgetGate::from_home` — a durable read of the spend ledger on the free path, publishing the
+/// buyer's lifetime spend total on a response for a trade that moved no money. The green e2e that
+/// read `spent_total_sats: 0` was success-shaped: zero only because that run's ledger happened to be
+/// zero. Emitting a constant instead would be worse than absence — `0` on a buyer with prior spend
+/// is a false statement about their money — so the key is omitted, and its absence is the honest
+/// report that no spend total was read. `undefined`/`None` is what a consumer sees; see the
+/// `a_free_collect_response_carries_no_spend_total` test for the asserted shape.
+///
+/// The function takes no [`BuyerContext`] on purpose: with no home in hand it CANNOT reopen the
+/// ledger, so the property is structural rather than a rule someone has to remember.
+fn collect_pay_response(pay: &collect::CollectPayment) -> Value {
     match pay {
         collect::CollectPayment::Sat(outcome) => json!({
             "state": format!("{:?}", outcome.state),
@@ -1228,9 +1268,6 @@ fn collect_pay_response(context: &BuyerContext, pay: &collect::CollectPayment) -
             "state": crate::gateway::PaymentMode::None.as_wire(),
             "attempt_id": Value::Null,
             "amount_sats": 0,
-            "spent_total_sats": BudgetGate::from_home(&context.home)
-                .map(|gate| gate.spent())
-                .unwrap_or(0),
         }),
     }
 }
@@ -1245,7 +1282,7 @@ async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
         Ok(outcome) => Response::ok(
             id,
             json!({
-                "pay": collect_pay_response(context, &outcome.pay),
+                "pay": collect_pay_response(&outcome.pay),
                 "commit_oid": outcome.commit_oid,
                 "path": outcome.path,
                 "files": outcome.files,
@@ -6411,5 +6448,59 @@ mod tests {
         assert_eq!(paid.amount_sats(), 21);
         assert_eq!(collect::CollectPayment::Free.amount_sats(), 0);
         assert!(collect::CollectPayment::Free.paid().is_none());
+    }
+
+    /// #967 ground B, site 2 — RED-PROVE of the wire shape. The free arm of the collect response
+    /// must carry NO `spent_total_sats`. It used to carry a fresh `BudgetGate::from_home` read:
+    /// a durable read of the spend ledger on a path that moved no money, publishing the buyer's
+    /// lifetime spend total on a FREE collect's response. The old e2e read `0` there and looked
+    /// green only because that run's ledger was empty; a buyer with prior spend got a real total.
+    ///
+    /// Emitting a constant `0` instead would be a WORSE failure than absence — a false statement
+    /// about someone's money rather than a missing one — so the key is absent, and the absence is
+    /// the honest report that nothing was read. The paid arm is unchanged and still carries all
+    /// four keys, off the pay outcome, never off a fresh ledger read.
+    ///
+    /// The structural half of the guard is the signature: `collect_pay_response` takes no
+    /// `BuyerContext`, so it has no home to open a ledger from. If someone re-adds the key here
+    /// they must first re-add the parameter, which this test cannot stop but the reviewer will see.
+    #[test]
+    fn a_free_collect_response_carries_no_spend_total() {
+        let free = collect_pay_response(&collect::CollectPayment::Free);
+        let free = free.as_object().expect("the pay response is an object");
+
+        assert!(
+            !free.contains_key("spent_total_sats"),
+            "a FREE collect must publish no spend total — the key is absent, not zero: {free:?}"
+        );
+        // `serde_json::Map` is a `BTreeMap` here, so `keys()` comes out sorted — the assertion is
+        // on the SET of keys, which is what "no fourth key" means.
+        assert_eq!(
+            free.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["amount_sats", "attempt_id", "state"],
+            "the free shape is exactly these three keys — no fourth"
+        );
+        assert_eq!(free["state"], "none");
+        assert_eq!(free["attempt_id"], Value::Null);
+        assert_eq!(free["amount_sats"], 0);
+
+        // The PAID control: same builder, all four keys, and the total comes off the pay outcome.
+        let state: crate::payment::PaymentState =
+            serde_json::from_value(json!({ "state": "intent", "attempt_id": "attempt" }))
+                .expect("payment state");
+        let paid = collect_pay_response(&collect::CollectPayment::Sat(
+            crate::authorize_pay::AuthorizePayOutcome {
+                state,
+                attempt_id: "attempt".to_owned(),
+                amount_sats: 21,
+                charged_sats: 21,
+                spent_total_sats: 9_999,
+            },
+        ));
+        assert_eq!(
+            paid["spent_total_sats"], 9_999,
+            "a PAID collect still reports the total, and reports the one the pay path returned"
+        );
+        assert_eq!(paid["amount_sats"], 21);
     }
 }

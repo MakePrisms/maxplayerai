@@ -171,7 +171,7 @@ async fn collect_refuses_pay_when_delivered_tip_differs_from_bound_oid() {
     let mut gate = BudgetGate::from_home(&home).expect("gate");
     let error = collect_async(
         &home,
-        &mut gate,
+        Some(&mut gate),
         CollectRequest { job_id: job_id.clone(), out: None },
     )
     .await
@@ -316,7 +316,7 @@ async fn collect_over_delivery(
     write_bind(&home, &bind);
 
     let mut gate = BudgetGate::from_home(&home).expect("gate");
-    let result = collect_async(&home, &mut gate, CollectRequest { job_id, out: None }).await;
+    let result = collect_async(&home, Some(&mut gate), CollectRequest { job_id, out: None }).await;
 
     drop(server);
     let _ = fs::remove_dir_all(&upstream);
@@ -491,7 +491,7 @@ async fn a_free_collect_settles_without_authorize_pay_and_a_paid_one_still_enter
     );
 
     let mut gate = BudgetGate::from_home(&home).expect("gate");
-    let outcome = collect_async(&home, &mut gate, CollectRequest { job_id: job_id.clone(), out: None })
+    let outcome = collect_async(&home, Some(&mut gate), CollectRequest { job_id: job_id.clone(), out: None })
         .await
         .expect("a free collect must SUCCEED — authorize_pay would have refused this bind at entry");
 
@@ -546,7 +546,7 @@ async fn a_free_collect_settles_without_authorize_pay_and_a_paid_one_still_enter
 
     // RE-COLLECT is idempotent: it re-materializes and leaves the first record's timestamp standing.
     let first_collected_at = record["collected_at"].clone();
-    let again = collect_async(&home, &mut gate, CollectRequest { job_id: job_id.clone(), out: None })
+    let again = collect_async(&home, Some(&mut gate), CollectRequest { job_id: job_id.clone(), out: None })
         .await
         .expect("re-collecting a free job must succeed");
     assert_eq!(again.files, outcome.files, "a re-collect materializes the same files");
@@ -581,7 +581,7 @@ async fn a_free_collect_settles_without_authorize_pay_and_a_paid_one_still_enter
     let mut paid_gate = BudgetGate::from_home(&paid_home).expect("paid gate");
     let error = collect_async(
         &paid_home,
-        &mut paid_gate,
+        Some(&mut paid_gate),
         CollectRequest { job_id: job_id.clone(), out: None },
     )
     .await
@@ -633,7 +633,7 @@ async fn a_free_collect_refuses_a_wrong_tip_and_materializes_nothing() {
     let mut gate = BudgetGate::from_home(&home).expect("gate");
     let error = collect_async(
         &home,
-        &mut gate,
+        Some(&mut gate),
         CollectRequest { job_id: job_id.clone(), out: None },
     )
     .await
@@ -696,7 +696,7 @@ async fn a_free_collect_refuses_a_delivery_with_no_execution_sentinel() {
     let mut gate = BudgetGate::from_home(&home).expect("gate");
     let error = collect_async(
         &home,
-        &mut gate,
+        Some(&mut gate),
         CollectRequest { job_id: job_id.clone(), out: None },
     )
     .await
@@ -794,7 +794,7 @@ async fn collect_refuses_dead_mint_at_preflight_before_the_budget_reserve() {
     let mut gate = BudgetGate::from_home(&home).expect("gate");
     let started = std::time::Instant::now();
     let result =
-        collect_async(&home, &mut gate, CollectRequest { job_id: job_id.clone(), out: None }).await;
+        collect_async(&home, Some(&mut gate), CollectRequest { job_id: job_id.clone(), out: None }).await;
     let elapsed = started.elapsed();
 
     drop(server);
