@@ -186,9 +186,10 @@ test("the since-hint is used only when the cached store is known complete", () =
   const complete = harness({ sinceHint: T0 + 500, storeComplete: true });
   complete.source.start();
   complete.latest().onopen!();
-  assert.equal(
-    complete.latest().reqs[0]!.filter.since,
-    T0 + 501,
-    "a proven-complete store still gets the cheap forward read",
-  );
+  const since = complete.latest().reqs[0]!.filter.since as number;
+  assert.ok(Number.isFinite(since), "a proven-complete store still gets the cheap forward read");
+  // Not `hint + 1`: an event stamped in the hint's own second may still be on
+  // its way to the relay. The exact trailing distance is pinned in
+  // lamp-recovery.test.ts; here only the direction matters.
+  assert.ok(since <= T0 + 500, `the forward read must not start above the hint (asked since ${since})`);
 });

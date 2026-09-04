@@ -6,7 +6,8 @@
  * hint when the store already holds the past), then keeps itself current in
  * one of two ways:
  *
- *   poll   — one `since: newest+1` REQ per tick, closed on its own EOSE.
+ *   poll   — one `since: newest − overlap` REQ per tick, closed on its own
+ *            EOSE (the overlap is POLL_OVERLAP_SECONDS in config.ts).
  *            MEASURED 7/28 on the production relay: it answers stored-event
  *            queries anonymously but never streams post-EOSE (NIP-42 AUTH
  *            gates the live feed), so a long-lived REQ sits there looking
@@ -17,6 +18,7 @@
  *
  * The socket is injectable so the whole lifecycle is testable without a network.
  */
+import { POLL_OVERLAP_SECONDS } from "../config.js";
 import { MAXPLAYER_TAG, MAXPLAYER_TAGGED_KINDS, UNTAGGED_KINDS } from "../model/kinds.js";
 import type { RawEvent } from "../model/events.js";
 import type { MarketSource, SourceCallbacks, SourceState, Transport } from "./source.js";
@@ -99,6 +101,13 @@ export interface RelaySourceOptions {
    * itself. Default false: re-walk unless completeness was actually proven.
    */
   storeComplete?: boolean;
+  /**
+   * Where the oldest job the store still holds open began (see
+   * source/recovery.ts). The boot's first forward walk starts from here when
+   * it is below the since-hint, so a terminal event this browser once missed
+   * is asked for again. Cleared once a walk completes; never used per tick.
+   */
+  recoveryFloor?: number | null;
   openSocket?: (url: string) => WebSocket;
   now?: () => number;
   setTimer?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
@@ -111,6 +120,7 @@ export function createRelaySource(
     transport,
     sinceHint = null,
     storeComplete = false,
+    recoveryFloor = null,
     openSocket = (u) => new WebSocket(u),
     now = () => Math.floor(Date.now() / 1000),
     setTimer = (fn, ms) => setTimeout(fn, ms),
@@ -184,13 +194,23 @@ export function createRelaySource(
     requestHistory();
   }
 
-  /** One incremental ask. A quiet market costs an empty round trip. */
+  /**
+   * The floor of a forward ask: the mark, less the overlap. `since` is
+   * inclusive and the mark only moves forward, so asking from `mark + 1` was
+   * the natural economy — and it lost every event stamped in the mark's own
+   * second that the relay had not yet returned, and every event a slow
+   * publisher clock stamped below it. The overlap re-fetches a short tail
+   * each ask; the cache drops what it already holds by id.
+   */
+  function forwardSince(mark: number): number {
+    return mark - POLL_OVERLAP_SECONDS;
+  }
+
+  /** One incremental ask. A quiet market costs a short re-delivered tail. */
   function pollOnce() {
     if (stopped) return;
     activeSub = `p${++subCounter}`;
-    // +1 so an ingested event is not re-fetched every tick; `since` is
-    // inclusive and this cursor only moves forward.
-    send(["REQ", activeSub, ...liveFilters(newestSeen == null ? now() : newestSeen + 1)]);
+    send(["REQ", activeSub, ...liveFilters(newestSeen == null ? now() : forwardSince(newestSeen))]);
   }
 
   function schedulePoll() {
@@ -217,6 +237,10 @@ export function createRelaySource(
       historyComplete = true;
       cursors.clear();
       drained.clear();
+      // A finished walk has re-read everything down to the recovery floor;
+      // the miss it existed for is either healed or was never on the relay.
+      // Dropping it here is the bound: one walk per boot, never per tick.
+      recoveryFloor = null;
     } else {
       console.warn(`[relay] history stopped at the ${MAX_PAGES}-page backstop; the store is not known complete`);
     }
@@ -226,7 +250,7 @@ export function createRelaySource(
       // One subscription, left open: the relay pushes every new event as it
       // lands. No timers at all in this mode.
       liveSub = `s${++subCounter}`;
-      send(["REQ", liveSub, ...liveFilters(newestSeen == null ? now() : newestSeen + 1)]);
+      send(["REQ", liveSub, ...liveFilters(newestSeen == null ? now() : forwardSince(newestSeen))]);
     } else {
       pollOnce();
       schedulePoll();
@@ -326,7 +350,12 @@ export function createRelaySource(
     // resume each stream from its own recorded cursor — reconnecting mid-read
     // must not step over history it has never seen.
     const forward = historyComplete && newestSeen != null;
-    streams = historyStreams(forward ? newestSeen! + 1 : null);
+    // A forward walk reaches down to the oldest job the store still holds
+    // open (when that is older than the mark), so a terminal event this
+    // browser lost is asked for again — then trails by the same overlap every
+    // live ask uses. The mark itself is untouched.
+    const floor = forward ? Math.min(newestSeen!, recoveryFloor ?? newestSeen!) : null;
+    streams = historyStreams(floor == null ? null : forwardSince(floor));
     streamIndex = forward ? 0 : streams.findIndex((s) => !drained.has(s.name));
     if (streamIndex < 0) streamIndex = streams.length;
     oldestSeen = forward ? null : cursors.get(streams[streamIndex]?.name ?? "") ?? null;

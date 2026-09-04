@@ -15,6 +15,7 @@ import { RELAY_URL, SNAPSHOT_TIMEOUT_MS, SNAPSHOT_URL, TRANSPORT } from "./confi
 import { createEngine } from "./market/engine.js";
 import { DEFAULT_WINDOW, WINDOWS } from "./market/participants.js";
 import { createRelaySource } from "./source/relay.js";
+import { recoveryFloor } from "./source/recovery.js";
 import { createEventDb } from "./store/db.js";
 import { loadSnapshot } from "./store/snapshot.js";
 import type { RawEvent } from "./model/events.js";
@@ -166,6 +167,11 @@ async function boot(): Promise<void> {
       sinceHint: engine.cache.newest,
       // The hint may only be trusted if a previous walk actually finished.
       storeComplete: await db.historyComplete(),
+      // A job this store still shows open may be done on the relay — its
+      // terminal event fell below the hint once and was never asked for
+      // again. Reach the first walk back to where that job began, so this
+      // browser heals itself on reload instead of flashing forever.
+      recoveryFloor: recoveryFloor(engine.cache.all(), now()),
     },
     {
       onEvent: (event) => ingest(event, true),
