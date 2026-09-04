@@ -413,7 +413,9 @@ excluded by citation above, and D is not called an announce anywhere in the tree
 **No RECEIPT is published for a free job**, in either answer. §6.8's table marks `["mint", mint_url]`
 cardinality 1, required, and requires both co-signatures; a free trade settles at no mint, so a
 conformant receipt cannot be constructed. The free lifecycle terminates at `offer → claim → award →
-result → verify` and stops — the `accept → pay → receipt` tail of §5 does not run.
+result → verify → accept` and stops — the `pay → receipt` tail of §5 does not run. (Corrected
+2026-09-04: this sentence originally ended the free lifecycle at `verify`, which contradicts §2.4
+above — §2.4 keeps the ACCEPT publish on the free path, and §2.4 is what shipped.)
 
 ---
 
