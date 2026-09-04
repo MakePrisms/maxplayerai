@@ -280,6 +280,86 @@ pub const ADMITS_POOL_TAG: &str = "admits_pool";
 /// nothing about its list.
 pub const ADMITS_TARGETED_TAG: &str = "admits_targeted";
 
+/// `["issuer_mint", url, outstanding, retired, last_seen]` — the seat runs its OWN Cashu mint
+/// and issues tokens that are an IOU for its own future work (§4.2 "Issuer mint"). The unit stays
+/// `sat`: one token is one sat of the issuer's work at its published `rate`, and the mint URL is the
+/// sole thing that distinguishes this currency from any other `sat` on the wire.
+///
+/// ONE tag, FOUR positional values, all required when the tag is present — see [`IssuerMintAd`] for
+/// what each one means. Absent means the seat states no issuer mint. Malformed reads as UNSTATED,
+/// never as a rejection: an optional tag must not be able to take a working seat off the market.
+///
+/// BEAT ONLY — never on a kind-3402 claim. It is not an award filter: a buyer pays on the mint the
+/// claim's `creq` names, and whether to accept an issuer's currency at all is a decision the
+/// operator of the OTHER seat makes by hand, by adding this URL to its own `accepted_mints`,
+/// before any offer is sent. Nothing in the protocol derives that decision from these values.
+pub const ISSUER_MINT_TAG: &str = "issuer_mint";
+
+/// The seat's issuer-mint advertisement (§4.2 "Issuer mint"), read off or written to
+/// [`ISSUER_MINT_TAG`].
+///
+/// The counters are the ISSUER's own statement. The seat's signature on the beat covers them, so a
+/// reader knows WHO said them — not that they are true. They exist for the operator of another seat
+/// to read before extending credit; no code path acts on them automatically.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct IssuerMintAd {
+    /// The seat's own mint URL. MUST also appear in `accepted_mints`: a seat announcing a currency
+    /// it will not itself take back is not announcing an issuer mint, and the reader treats it so.
+    pub mint_url: String,
+    /// Minted minus retired, in sats, as of `last_seen`.
+    pub outstanding_sats: u64,
+    /// Tokens the issuer has taken back and burned, in sats, as of `last_seen`.
+    pub retired_sats: u64,
+    /// Unix seconds at which the counters were read from the mint.
+    pub last_seen: u64,
+}
+
+impl IssuerMintAd {
+    /// The wire tag: `["issuer_mint", url, outstanding, retired, last_seen]`, counters as plain
+    /// decimal digit strings.
+    pub fn to_tag(&self) -> TagSpec {
+        TagSpec(vec![
+            ISSUER_MINT_TAG.to_owned(),
+            self.mint_url.clone(),
+            self.outstanding_sats.to_string(),
+            self.retired_sats.to_string(),
+            self.last_seen.to_string(),
+        ])
+    }
+
+    /// Read the issuer-mint advertisement off a seat announcement's tags. `None` ⇒ the seat STATED
+    /// NOTHING.
+    ///
+    /// Absent is unstated. So is every malformed shape — wrong arity, a counter that is not plain
+    /// decimal digits, an empty URL, or a URL the seat does not list in `accepted_mints`. None of
+    /// those is an error: this tag is optional, and a reader that dropped a payable seat over an
+    /// optional tag it could not read would be stricter than §2.1 lets it be. The same rule
+    /// [`admission_from_tags`] applies to a half-stated policy.
+    pub fn from_tags(tags: &[TagSpec], accepted_mints: &[String]) -> Option<Self> {
+        let tag = first_tag(tags, ISSUER_MINT_TAG)?;
+        let [_, url, outstanding, retired, last_seen] = tag.0.as_slice() else {
+            return None;
+        };
+        if url.is_empty() || !accepted_mints.contains(url) {
+            return None;
+        }
+        Some(Self {
+            mint_url: url.clone(),
+            outstanding_sats: decimal_sats(outstanding)?,
+            retired_sats: decimal_sats(retired)?,
+            last_seen: decimal_sats(last_seen)?,
+        })
+    }
+}
+
+/// A counter on the wire is plain ASCII decimal digits and nothing else. `str::parse::<u64>` also
+/// takes a leading `+`, which would put two spellings of one number on the wire; this pins one.
+fn decimal_sats(raw: &str) -> Option<u64> {
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    raw.parse().ok()
+}
 
 /// Wire tag carrying operator colour about the machine (#784) — e.g. "mac studio, 64GB". Free text,
 /// single value.
@@ -473,6 +553,10 @@ pub struct HeartbeatDraft {
     /// caller that has no [`crate::home::SellerConfig`] in hand emits the tag set it always did;
     /// the production publish paths always have one, so a real seat always answers.
     pub admission: Option<crate::home::AdmissionPolicy>,
+    /// The seat's issuer-mint advertisement (§4.2 "Issuer mint"), or `None` to state none. `None`
+    /// is the default and emits no tag: a seat that runs no mint of its own publishes exactly the
+    /// tag set it always did.
+    pub issuer_mint: Option<IssuerMintAd>,
 }
 
 impl HeartbeatDraft {
@@ -490,6 +574,7 @@ impl HeartbeatDraft {
             agents: Vec::new(),
             capability: SeatCapability::default(),
             admission: None,
+            issuer_mint: None,
         }
     }
 
@@ -511,9 +596,17 @@ impl HeartbeatDraft {
         self
     }
 
+    /// Advertise the seat's own issuer mint and its issuance counters on this heartbeat (§4.2
+    /// "Issuer mint").
+    pub fn with_issuer_mint(mut self, issuer_mint: IssuerMintAd) -> Self {
+        self.issuer_mint = Some(issuer_mint);
+        self
+    }
+
     /// The §4.2 tag set, in the order the spec table lists it: `d`, `t`, `v`, `rate`, `accepting`,
-    /// `queue_depth`, `accepted_mints`, and `agents` when the seat states a roster — followed by the
-    /// #784 capability tags, filterable first then display-only.
+    /// `queue_depth`, `accepted_mints`, `agents` when the seat states a roster, the admission tags
+    /// when it states a policy, `issuer_mint` when it runs one — followed by the #784 capability
+    /// tags, filterable first then display-only.
     ///
     /// The beat emits BOTH capability sets; a claim emits only the filterable one. Both take them
     /// from [`SeatCapability`], so the two events cannot spell a shared field differently.
@@ -536,6 +629,9 @@ impl HeartbeatDraft {
         }
         if let Some(admission) = self.admission.as_ref() {
             tags.extend(admission_tags(admission));
+        }
+        if let Some(issuer_mint) = self.issuer_mint.as_ref() {
+            tags.push(issuer_mint.to_tag());
         }
         tags.extend(self.capability.filterable_tags());
         tags.extend(self.capability.display_tags());
@@ -925,6 +1021,10 @@ pub struct ParsedHeartbeat {
     /// ⛔ `None` is UNKNOWN, never a refusal. A seat that predates this tag publishes neither half,
     /// and a reader that treated that as "admits nobody" would drop every seat running today.
     pub admission: Option<crate::home::AdmissionPolicy>,
+    /// The seat's issuer-mint advertisement (§4.2 "Issuer mint"), or `None` when the seat stated
+    /// none — absent OR unreadable. Never a rejection: the tag is optional, and the counters are the
+    /// issuer's own unverified statement for an operator to read, not a value any code acts on.
+    pub issuer_mint: Option<IssuerMintAd>,
     /// The seat's #784 capability advertisement, read back off the same tags the beat emitted.
     /// Every field defaults to unstated, so a beat from a seat that predates #784 parses to a
     /// [`SeatCapability::default`] rather than failing — that is what lets emitters and readers ship
@@ -1057,10 +1157,11 @@ pub fn parse_heartbeat(event: &EventDraft) -> Result<ParsedHeartbeat, HeartbeatP
         accepting,
         queue_depth,
         rate_sats,
-        accepted_mints,
         agents: agents_from_tags(&event.tags),
         admission: admission_from_tags(&event.tags),
+        issuer_mint: IssuerMintAd::from_tags(&event.tags, &accepted_mints),
         capability: SeatCapability::from_tags(&event.tags),
+        accepted_mints,
     })
 }
 
@@ -1368,6 +1469,205 @@ mod tests {
                 .iter()
                 .any(|name| name == ADMITS_POOL_TAG || name == ADMITS_TARGETED_TAG),
             "admission tags must never be filterable claim tags"
+        );
+    }
+
+    // ---- issuer_mint (§4.2 "Issuer mint") ----
+
+    /// An issuer whose mint is the one `mints()` lists, so the URL cross-check passes.
+    fn issuer() -> IssuerMintAd {
+        IssuerMintAd {
+            mint_url: mints()[0].clone(),
+            outstanding_sats: 2_500,
+            retired_sats: 750,
+            last_seen: 1_788_390_000,
+        }
+    }
+
+    /// The wire shape, pinned by hand in both directions: one tag, four positional values, counters
+    /// as plain decimal digits.
+    #[test]
+    fn issuer_mint_wire_shape_round_trips() {
+        let event = draft(true, 0, 5)
+            .with_issuer_mint(issuer())
+            .to_event_draft();
+        let tag = first_tag(&event.tags, ISSUER_MINT_TAG).expect("issuer_mint tag");
+        assert_eq!(
+            tag.0,
+            vec![
+                "issuer_mint",
+                "https://testnut.example/Bitcoin",
+                "2500",
+                "750",
+                "1788390000",
+            ]
+        );
+        let parsed = parse_heartbeat(&event).expect("round-trip");
+        assert_eq!(parsed.issuer_mint, Some(issuer()));
+        assert_eq!(
+            IssuerMintAd::from_tags(&event.tags, &mints()),
+            Some(issuer())
+        );
+
+        // The URL may sit anywhere in `accepted_mints`, not only first: a seat that lists a shared
+        // mint ahead of its own currency still states an issuer mint.
+        let two = vec![
+            "https://shared.example/Bitcoin".to_owned(),
+            mints()[0].clone(),
+        ];
+        let second = HeartbeatDraft::new(true, 0, 5, two)
+            .with_issuer_mint(issuer())
+            .to_event_draft();
+        assert_eq!(
+            parse_heartbeat(&second).expect("parses").issuer_mint,
+            Some(issuer())
+        );
+    }
+
+    /// Absent is UNSTATED, and a seat stating none emits nothing new — the tag set it always did.
+    #[test]
+    fn an_absent_issuer_mint_tag_is_unstated_and_adds_nothing() {
+        let event = draft(true, 0, 5).to_event_draft();
+        assert!(
+            first_tag(&event.tags, ISSUER_MINT_TAG).is_none(),
+            "a draft that states no issuer mint must emit no tag"
+        );
+        let parsed = parse_heartbeat(&event).expect("a beat with no issuer_mint tag still parses");
+        assert_eq!(parsed.issuer_mint, None);
+        assert_eq!(IssuerMintAd::from_tags(&event.tags, &mints()), None);
+    }
+
+    /// Stating an issuer mint adds exactly ONE tag, leaves every other tag byte-identical, and
+    /// changes nothing a reader that predates the tag can see. That last clause is the "old reader
+    /// ignores it" proof: an old reader is this reader minus the field, and §2.1 has it skip a tag
+    /// it does not recognise — so its whole view is `parsed_with` with the new field blanked, which
+    /// must equal what it reads off a beat that never carried the tag.
+    #[test]
+    fn issuer_mint_is_additive_beat_only_and_invisible_to_an_old_reader() {
+        let without = draft(true, 2, 5)
+            .with_agents(vec!["claude".into()])
+            .with_admission(TEST_POLICY)
+            .to_event_draft();
+        let with = draft(true, 2, 5)
+            .with_agents(vec!["claude".into()])
+            .with_admission(TEST_POLICY)
+            .with_issuer_mint(issuer())
+            .to_event_draft();
+
+        let before = tag_names(&without);
+        let added: Vec<&str> = tag_names(&with)
+            .into_iter()
+            .filter(|name| !before.contains(name))
+            .collect();
+        assert_eq!(
+            added,
+            vec![ISSUER_MINT_TAG],
+            "stating an issuer mint must add exactly one tag and nothing else"
+        );
+
+        // Every tag an old reader knows is byte-identical, in the same order.
+        let known: Vec<&Vec<String>> = with
+            .tags
+            .iter()
+            .filter(|tag| tag.first() != Some(ISSUER_MINT_TAG))
+            .map(|tag| &tag.0)
+            .collect();
+        let original: Vec<&Vec<String>> = without.tags.iter().map(|tag| &tag.0).collect();
+        assert_eq!(known, original);
+
+        // The old reader's view: identical in every field it has.
+        let mut parsed_with = parse_heartbeat(&with).expect("parses with the tag");
+        let parsed_without = parse_heartbeat(&without).expect("parses without the tag");
+        assert_eq!(parsed_with.issuer_mint, Some(issuer()));
+        parsed_with.issuer_mint = None;
+        assert_eq!(
+            parsed_with, parsed_without,
+            "a reader that ignores issuer_mint must see exactly the beat it always saw"
+        );
+
+        // And the converse §2.1 property on THIS reader: a tag it does not know, sitting beside
+        // the one it does, changes nothing.
+        let mut with_stranger = with.clone();
+        with_stranger
+            .tags
+            .push(TagSpec::new(["issuer_mint_v2", "https://x.example", "1"]));
+        let parsed_stranger = parse_heartbeat(&with_stranger).expect("an unknown tag is ignored");
+        assert_eq!(parsed_stranger, parse_heartbeat(&with).expect("parses"));
+
+        // Beat only: the claim carries `SeatCapability::filterable_tags` and nothing else from
+        // this module, so there is no path by which the tag reaches a kind-3402 claim.
+        assert!(
+            SeatCapability::default()
+                .filterable_tags()
+                .iter()
+                .all(|tag| tag.first() != Some(ISSUER_MINT_TAG)),
+            "issuer_mint must never be a filterable claim tag"
+        );
+    }
+
+    /// Every malformed shape is UNSTATED — never a rejection of the beat, never a guessed value.
+    #[test]
+    fn a_malformed_issuer_mint_tag_is_unstated_never_a_rejection() {
+        let good = issuer().to_tag().0;
+        let mut cases: Vec<(String, Vec<String>)> = Vec::new();
+
+        let mut short = good.clone();
+        short.pop();
+        cases.push(("three values".to_owned(), short));
+
+        let mut long = good.clone();
+        long.push("extra".to_owned());
+        cases.push(("five values".to_owned(), long));
+
+        cases.push(("bare tag".to_owned(), vec![ISSUER_MINT_TAG.to_owned()]));
+
+        let mut empty_url = good.clone();
+        empty_url[1] = String::new();
+        cases.push(("empty url".to_owned(), empty_url));
+
+        let mut unlisted = good.clone();
+        unlisted[1] = "https://elsewhere.example/Bitcoin".to_owned();
+        cases.push(("url not in accepted_mints".to_owned(), unlisted));
+
+        for (index, field) in [(2, "outstanding"), (3, "retired"), (4, "last_seen")] {
+            for bad in [
+                "",
+                "-1",
+                "+5",
+                "1.5",
+                "1e3",
+                "abc",
+                " 5",
+                "5 ",
+                "99999999999999999999",
+            ] {
+                let mut case = good.clone();
+                case[index] = bad.to_owned();
+                cases.push((format!("{field}={bad:?}"), case));
+            }
+        }
+
+        for (label, tag) in cases {
+            let mut event = draft(true, 0, 5).to_event_draft();
+            event.tags.push(TagSpec(tag.clone()));
+            let parsed = parse_heartbeat(&event).unwrap_or_else(|err| {
+                panic!("{label}: an optional tag must never reject the beat, got {err}")
+            });
+            assert_eq!(
+                parsed.issuer_mint, None,
+                "{label}: {tag:?} must read as unstated, not as a value this reader invented"
+            );
+            // The rest of the beat is untouched by the bad tag.
+            assert_eq!(parsed.accepted_mints, mints());
+            assert_eq!(parsed.rate_sats, 5);
+        }
+
+        // The well-formed tag, for contrast, on the same fixture.
+        let mut event = draft(true, 0, 5).to_event_draft();
+        event.tags.push(TagSpec(good));
+        assert_eq!(
+            parse_heartbeat(&event).expect("parses").issuer_mint,
+            Some(issuer())
         );
     }
 
