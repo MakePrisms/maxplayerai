@@ -112,6 +112,28 @@ tag and content <= 128 KB. The remainder of #397's write-policy is folded as
 native code by market-orch — this vendor does **not** add a namespace/`t`-tag
 predicate; the kind allowlist is the scoping.
 
+### Branch-scoped push tokens and their lifetime
+Two changes serve the maxplayer seller delivery push (see `NOTICE` item 4):
+
+1. **Scope (PR #929).** A NIP-98 push token may carry one `["ref", "<refname>"]` tag.
+   The pre-receive policy endpoint denies the push (403) unless every ref update
+   matches that name exactly — no glob, no prefix. A token with no `ref` tag behaves
+   as before.
+2. **Lifetime.** A SCOPED token that also carries a NIP-40 `["expiration", <unix>]`
+   tag is accepted while `now <= expiration`, up to a cap. UNSCOPED tokens keep the
+   ±60 s NIP-98 window, always. The cap is
+   `BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS` (default 21600 s = 6 h; the NixOS option is
+   `services.maxplayer.relay.scopedTokenMaxLifetimeSecs`), and the relay advertises the
+   effective value in its NIP-11 `limitation` object as
+   `scoped_token_max_lifetime_secs`.
+
+The seller mints one token on the host before a sandboxed job starts and pushes with
+it minutes later, so the ±60 s window cannot serve that push. The scope is what makes
+the longer life safe: a leaked scoped token can only write one branch of one repo.
+Ship the two together — a long-lived UNSCOPED token would be a push-anywhere
+credential. Work order:
+`docs/superpowers/briefs/2026-08-31-relay-scoped-token-lifetime.md`.
+
 ## Building
 
 The relay's `sqlx 0.9` requires **rustc >= 1.94**. The maxplayerai nix devShell
