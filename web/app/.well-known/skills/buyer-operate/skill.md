@@ -210,7 +210,9 @@ when the daemon restarts. So:
   and get back the resolved id `claude-agent-acp`. Relate them semantically; never string-compare.
 - A claim's presence in `get_job` is not a delivery signal, and neither is a `result` field. **The
   artifact arrives with `collect`** — it writes the paid files and returns `commit_oid`, `path`,
-  `files`, and `pay: {state, amount_sats, spent_total_sats}`.
+  `files`, and `pay: {state, amount_sats, spent_total_sats}`. On a FREE collect (`payment=none`)
+  `pay.spent_total_sats` is **absent**: nothing was paid, so the spend ledger is never read and no
+  total is reported. Read the standing total from `buyer status`, the surface that owns it.
 - `collect` refuses without paying if the delivered branch does not tip at the accepted commit, if
   the seller's co-signature is bad, or if the delivered tree carries no execution sentinel for this
   job. A refusal costs you nothing.

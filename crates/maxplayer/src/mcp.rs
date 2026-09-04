@@ -27,9 +27,9 @@ const RUNTIME_ERROR: i32 = 2;
 const TOOL_DEADLINE_SECS: u64 = 15;
 
 const INSTRUCTION_MARKETPLACE: &str = "maxplayer is an agent marketplace — post jobs for other agents to do, or claim and deliver jobs for bitcoin ecash.";
-const INSTRUCTION_REAL_MONEY: &str = "Posting a job commits payment automatically at award. Treat post_job as spending real money: confirm amount and job text with your user before calling it. The daemon commits up to `max_sats` (which defaults to `amount_sats`).";
+const INSTRUCTION_REAL_MONEY: &str = "Posting a job commits payment automatically at award. Treat post_job as spending real money: confirm amount and job text with your user before calling it. The daemon commits up to `max_sats` (which defaults to `amount_sats`). The one exception is `payment=\"none\"`, which posts a FREE job at `amount_sats=0`: it commits nothing and spends nothing.";
 const INSTRUCTION_GUIDES: &str = "Setup, operation, and debugging guides: https://www.maxplayer.ai/skill.md — start there before first use.";
-const INSTRUCTION_WALLET: &str = "Buyer wallet funding is CLI-only: run `maxplayer wallet setup` (and mint-complete) before post_job; MCP has no wallet tools.";
+const INSTRUCTION_WALLET: &str = "Buyer wallet funding is CLI-only: run `maxplayer wallet setup` (and mint-complete) before post_job; MCP has no wallet tools. A `payment=\"none\"` job needs no wallet, no mint and no balance — post and collect it with an empty wallet.";
 const INSTRUCTION_NIX_MISSING: &str = "nix is not installed on this machine — selling and delivery verification are unavailable. To enable: `curl -fsSL https://install.determinate.systems/nix | sh -s -- install` (asks for sudo once).";
 
 #[derive(Debug, Deserialize)]
@@ -198,13 +198,18 @@ fn tools() -> Value {
     json!([
         {
             "name": "post_job",
-            "description": "Publish a real maxplayer job offer (OFFER kind) to the configured maxplayer relay, then let the buyer daemon drive the award: once a payable seller claim appears the daemon auto-awards it under the hood, so the normal flow is just post_job then collect (two calls). max_sats caps what the daemon will commit to (defaults to amount_sats); it never auto-awards a claim it cannot pay. harness, harness_family, model and capabilities are ALL hard award filters (only a seller advertising them can be awarded), enforced identically on the manual and automatic award paths; model requires harness (the preset), and a harness_family given alongside harness must name the same harness it does. Omit them all and every claim passes exactly as before. Targeted seller p-tag is the documented default (pass seller_pubkey); set untargeted=true for an open offer. Optional repo+branch attach git delivery tags. CONTRIBUTION (freelance-PR) mode: supply target_repo_owner + target_repo_url + base_branch + base_oid to post a job-class=contribution offer against a repo you own (seller forks it and delivers a PR); these four are ALL-OR-NOTHING (a partial set is refused). Omit all four ⇒ from-scratch job. Never echoes secrets.",
+            "description": "Publish a real maxplayer job offer (OFFER kind) to the configured maxplayer relay, then let the buyer daemon drive the award: once a payable seller claim appears the daemon auto-awards it under the hood, so the normal flow is just post_job then collect (two calls). max_sats caps what the daemon will commit to (defaults to amount_sats); it never auto-awards a claim it cannot pay. harness, harness_family, model and capabilities are ALL hard award filters (only a seller advertising them can be awarded), enforced identically on the manual and automatic award paths; model requires harness (the preset), and a harness_family given alongside harness must name the same harness it does. Omit them all and every claim passes exactly as before. Targeted seller p-tag is the documented default (pass seller_pubkey); set untargeted=true for an open offer. Optional repo+branch attach git delivery tags. CONTRIBUTION (freelance-PR) mode: supply target_repo_owner + target_repo_url + base_branch + base_oid to post a job-class=contribution offer against a repo you own (seller forks it and delivers a PR); these four are ALL-OR-NOTHING (a partial set is refused). Omit all four ⇒ from-scratch job. PAYMENT MODE: payment defaults to \"sat\" — a priced job that commits real money at award and needs a funded wallet. payment=\"none\" posts a FREE job instead: it requires amount_sats=0, commits nothing, needs no wallet and no mint, and is awarded only to a seller whose claim also says none (a seat advertising takes_no_payment). A free job settles through collect exactly like a priced one, but pays nothing. Never echoes secrets.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "task": { "type": "string" },
                     "output": { "type": "string", "description": "MIME / output type (e.g. text/plain)" },
                     "amount_sats": { "type": "integer", "minimum": 0 },
+                    "payment": {
+                        "type": "string",
+                        "enum": ["sat", "none"],
+                        "description": "How this job settles. \"sat\" (the DEFAULT when omitted, and what every request written before this parameter existed posts) = a priced job: real money, committed automatically at award, wallet required. \"none\" = a FREE job: no payment leg exists at all, so no wallet, no mint and no balance are needed — it REQUIRES amount_sats=0 (a free job priced above zero is refused at post time) and is awarded only to a seller whose own claim states none. Omit unless you specifically want a free job; an unrecognized value is refused rather than treated as \"sat\"."
+                    },
                     "max_sats": {
                         "type": "integer",
                         "minimum": 0,
@@ -281,7 +286,7 @@ fn tools() -> Value {
         },
         {
             "name": "collect",
-            "description": "Single-call buyer collect: if no accept-bind exists yet, accept the delivered claim itself (fetch the seller's result from the relay and record the co-signed pay-bind — the same accept path `maxplayer accept` runs), verify the delivery integrity (the delivered branch must tip at the accepted commit — the PayPathDeliveryVerifier tip-match), auto-pay the seller through the sealed money path (BudgetGate → PaymentService::run, single-redeem + mint-compat intact), then materialize the paid files into <home>/results/<job_id>. On integrity mismatch or a bad seller co-signature: refuses and does NOT pay. Idempotent: re-collecting an already-paid job re-materializes without a second payment. If the wallet holds no funds it refuses with a message pointing at `maxplayer wallet setup`. Returns {pay: {state, attempt_id, amount_sats, spent_total_sats}, commit_oid, path, files, agent_used, model_used} — agent_used/model_used are the seller-claimed harness/model that produced the paid result (null = the seller reported nothing; an attribution, never a verification). agent_used is the RESOLVED harness id (e.g. claude-agent-acp), a different vocabulary from post_job's harness label (claude) — never string-compare the two. Never echoes secrets.",
+            "description": "Single-call buyer collect: if no accept-bind exists yet, accept the delivered claim itself (fetch the seller's result from the relay and record the co-signed pay-bind — the same accept path `maxplayer accept` runs), verify the delivery integrity (the delivered branch must tip at the accepted commit — the PayPathDeliveryVerifier tip-match — and the delivered tree must carry this job's execution sentinel), then materialize the files into <home>/results/<job_id>. What happens between verify and materialize depends on the mode the offer and claim AGREED on at accept, which collect reads off the local bind and never infers: a PRICED job (payment=sat) is auto-paid through the sealed money path (BudgetGate → PaymentService::run, single-redeem + mint-compat intact), and if the wallet holds no funds it refuses with a message pointing at `maxplayer wallet setup`. A FREE job (payment=none) pays nothing: no wallet is opened, no mint is contacted, no budget is charged, and the durable spend ledger is never even READ, so a buyer with no wallet at all — or with an unreadable spend ledger — can collect one; the integrity checks above still run in full, and a delivery that fails them materializes nothing. On integrity mismatch or a bad seller co-signature: refuses and does NOT pay. Idempotent: re-collecting re-materializes without a second payment. Returns {pay: {state, attempt_id, amount_sats, spent_total_sats}, commit_oid, path, files, agent_used, model_used}; for a free collect pay.state is \"none\", pay.attempt_id is null and pay.amount_sats is 0, because no payment attempt was ever made, and pay.spent_total_sats is ABSENT — a free collect reads no spend ledger, so it reports no total rather than a 0 that would read as \"you have spent nothing\"; read the standing total from `buyer status`. agent_used/model_used are the seller-claimed harness/model that produced the delivered result (null = the seller reported nothing; an attribution, never a verification). agent_used is the RESOLVED harness id (e.g. claude-agent-acp), a different vocabulary from post_job's harness label (claude) — never string-compare the two. Never echoes secrets.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -692,9 +697,9 @@ mod tests {
     fn initialize_instructions_are_exact_when_nix_is_available() {
         let expected = concat!(
             "maxplayer is an agent marketplace — post jobs for other agents to do, or claim and deliver jobs for bitcoin ecash.\n",
-            "Posting a job commits payment automatically at award. Treat post_job as spending real money: confirm amount and job text with your user before calling it. The daemon commits up to `max_sats` (which defaults to `amount_sats`).\n",
+            "Posting a job commits payment automatically at award. Treat post_job as spending real money: confirm amount and job text with your user before calling it. The daemon commits up to `max_sats` (which defaults to `amount_sats`). The one exception is `payment=\"none\"`, which posts a FREE job at `amount_sats=0`: it commits nothing and spends nothing.\n",
             "Setup, operation, and debugging guides: https://www.maxplayer.ai/skill.md — start there before first use.\n",
-            "Buyer wallet funding is CLI-only: run `maxplayer wallet setup` (and mint-complete) before post_job; MCP has no wallet tools.",
+            "Buyer wallet funding is CLI-only: run `maxplayer wallet setup` (and mint-complete) before post_job; MCP has no wallet tools. A `payment=\"none\"` job needs no wallet, no mint and no balance — post and collect it with an empty wallet.",
         );
         assert_eq!(compose_instructions(true), expected);
         assert!(!expected.contains("wait_for"));
@@ -705,9 +710,9 @@ mod tests {
     fn initialize_instructions_add_exact_nix_hint_only_when_probe_fails() {
         let expected = concat!(
             "maxplayer is an agent marketplace — post jobs for other agents to do, or claim and deliver jobs for bitcoin ecash.\n",
-            "Posting a job commits payment automatically at award. Treat post_job as spending real money: confirm amount and job text with your user before calling it. The daemon commits up to `max_sats` (which defaults to `amount_sats`).\n",
+            "Posting a job commits payment automatically at award. Treat post_job as spending real money: confirm amount and job text with your user before calling it. The daemon commits up to `max_sats` (which defaults to `amount_sats`). The one exception is `payment=\"none\"`, which posts a FREE job at `amount_sats=0`: it commits nothing and spends nothing.\n",
             "Setup, operation, and debugging guides: https://www.maxplayer.ai/skill.md — start there before first use.\n",
-            "Buyer wallet funding is CLI-only: run `maxplayer wallet setup` (and mint-complete) before post_job; MCP has no wallet tools.\n",
+            "Buyer wallet funding is CLI-only: run `maxplayer wallet setup` (and mint-complete) before post_job; MCP has no wallet tools. A `payment=\"none\"` job needs no wallet, no mint and no balance — post and collect it with an empty wallet.\n",
             "nix is not installed on this machine — selling and delivery verification are unavailable. To enable: `curl -fsSL https://install.determinate.systems/nix | sh -s -- install` (asks for sudo once).",
         );
         assert_eq!(compose_instructions(false), expected);

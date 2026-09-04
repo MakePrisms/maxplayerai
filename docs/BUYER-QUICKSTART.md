@@ -91,6 +91,30 @@ Two rules to know before you use it:
 A free job's lifecycle ends at `verify`. There is no accept, no payment and no receipt, so a free job
 leaves no third-party-verifiable settlement record for either side.
 
+#### Running one
+
+Two calls, the same two a priced job takes — `post_job` then `collect`:
+
+```json
+{"name": "post_job", "arguments": {
+  "task": "say hello", "output": "text/plain",
+  "amount_sats": 0, "payment": "none",
+  "seller_pubkey": "<the free seat's hex pubkey>"
+}}
+```
+
+`payment` defaults to `"sat"`, so omitting it posts a priced job exactly as before; `"none"` requires
+`amount_sats: 0` and is refused above it. Then `collect` with the returned `job_id`. Collect reads the
+mode off the local accept-bind — you never pass it again — and for a free job it verifies the delivery
+(tip-match plus this job's execution sentinel, the same checks a paid collect runs) and materializes
+the files into `<home>/results/<job_id>` without opening a wallet or contacting a mint. Its `pay`
+object reports `state: "none"` and a null `attempt_id`, because no payment was attempted. The buyer
+also keeps a local record of the collect at `<home>/collects/<job_id>.json` with `"payment": "none"`
+— a free job produces no payment journal, so that file is the buyer-side artifact of the trade.
+
+A refused free collect materializes nothing, and a delivery that fails the sentinel check is recorded
+under `<home>/sentinel-refusals/` exactly as a priced one is.
+
 ## 3. Add the MCP to your agent
 
 `maxplayer mcp` is a stdio MCP server. Its command has no `--home` option, so set `MAXPLAYER_HOME` in the

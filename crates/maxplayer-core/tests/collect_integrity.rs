@@ -171,7 +171,7 @@ async fn collect_refuses_pay_when_delivered_tip_differs_from_bound_oid() {
     let mut gate = BudgetGate::from_home(&home).expect("gate");
     let error = collect_async(
         &home,
-        &mut gate,
+        Some(&mut gate),
         CollectRequest { job_id: job_id.clone(), out: None },
     )
     .await
@@ -316,7 +316,7 @@ async fn collect_over_delivery(
     write_bind(&home, &bind);
 
     let mut gate = BudgetGate::from_home(&home).expect("gate");
-    let result = collect_async(&home, &mut gate, CollectRequest { job_id, out: None }).await;
+    let result = collect_async(&home, Some(&mut gate), CollectRequest { job_id, out: None }).await;
 
     drop(server);
     let _ = fs::remove_dir_all(&upstream);
@@ -392,6 +392,336 @@ async fn collect_passes_the_sentinel_gate_for_a_valid_delivery() {
     let _ = fs::remove_dir_all(&root);
 }
 
+// ── FREE JOB LANE (`payment = none`) — collect's mode branch, over the SAME real HTTPS fetch ─────
+//
+// The gap Bob named (2026-09-04): `collect_async` used to load-or-create the bind and then call
+// `authorize_pay_async` with NO mode branch, and `authorize_pay_async` REFUSES a free bind at its
+// entry (§2.5). So the moment a shipped surface could post a free job, collect would break. These
+// tests are the executable form of that ruling — they are red on the pre-branch collect and on any
+// revert of it, and the paid control proves the same fixture still reaches the money path when the
+// bind is priced.
+//
+// Every one of them runs on a home whose WALLET STORE DOES NOT EXIST. That is the load-bearing
+// assertion: a free collect that opened a wallet would create `wallet/cdk-wallet.sqlite`, and the
+// buyer this lane exists for (zero bitcoin, no mint) has none.
+
+/// The buyer's CDK wallet store. Its ABSENCE is what proves a free collect opened no wallet.
+fn wallet_store(home: &maxplayer_core::home::MaxplayerHome) -> PathBuf {
+    home.wallet_dir.join("cdk-wallet.sqlite")
+}
+
+/// A FREE accept-bind (`payment=none`): zero amount, no creq hash, no mints, no funding or delivery
+/// mint — exactly the shape `accept_claim`'s free arm writes (job_lifecycle.rs §2.4). `commit_oid`
+/// is whatever the caller pins, so the tip-match can be made to pass or fail.
+fn free_bind(
+    job_id: &str,
+    seller_hex: &str,
+    commit_oid: &str,
+    repo_url: &str,
+    job_hash: &str,
+) -> AcceptedBind {
+    AcceptedBind {
+        payment_mode: maxplayer_core::gateway::PaymentMode::None,
+        job_id: job_id.to_owned(),
+        claim_id: "c".repeat(64),
+        result_id: "d".repeat(64),
+        seller_pubkey: seller_hex.to_owned(),
+        commit_oid: commit_oid.to_owned(),
+        repo: repo_url.to_owned(),
+        branch: "main".into(),
+        job_hash: job_hash.to_owned(),
+        amount_sats: 0,
+        accept_event_id: "f".repeat(64),
+        accepted_at: 1,
+        // A free bind still carries the seller's signed-result signature (accept records it), but
+        // NOTHING on the free path verifies a RECEIPT cosig — there is no receipt for a trade with
+        // no payment. Left empty here to prove the free path does not secretly need one: if collect
+        // ever routed a free bind through `authorize_pay`, the cosig tooth would refuse on this.
+        seller_signature: String::new(),
+        creq_hash: None,
+        accepted_mints: Vec::new(),
+        funding_mint: None,
+        delivery_mint: None,
+        agent_used: Some("claude-agent-acp".to_owned()),
+        model_used: None,
+        contribution: None,
+    }
+}
+
+// TEST 1 — A FREE COLLECT NEVER CALLS `authorize_pay`, WITH A PAID CONTROL THAT DOES.
+//
+// The proof is not a mock: `authorize_pay_async`'s FIRST statement refuses a free bind ("is a free
+// trade (payment=none): there is nothing to pay"), ahead of every other check. So a free collect
+// that SUCCEEDS is a free collect that never entered the function — there is no path through it
+// that returns Ok for this bind. Belt and braces, the run must also leave no payment journal, no
+// wallet store, and a zero spend total.
+//
+// The PAID CONTROL is the same fixture, the same delivered tip, the same sentinel — only the bind
+// says `sat`. It must FAIL inside `authorize_pay` (there is no wallet or mint here), which is what
+// makes the free result meaningful: the delivery is collectable either way, and the mode is the only
+// thing that decides whether money machinery runs.
+#[tokio::test(flavor = "current_thread")]
+async fn a_free_collect_settles_without_authorize_pay_and_a_paid_one_still_enters_it() {
+    init_test_env();
+    let job_hash = "2b".repeat(32);
+    let manifest = maxplayer_core::delivery_sentinel::render_manifest(
+        &job_hash,
+        maxplayer_core::delivery_sentinel::DeliveryMode::FromScratch,
+        1,
+        12,
+    );
+    let (upstream, tip_oid) = make_upstream_delivery("free-ok", Some(&manifest));
+    let mount = format!("/git/{}/repo.git", "56".repeat(32));
+    let server = GitHttpAuthServer::spawn(&upstream, &mount);
+    let repo_url = server.repo_url();
+
+    // ── FREE ──────────────────────────────────────────────────────────────────────────────────
+    let root = temp("home-free-ok");
+    let _ = fs::remove_dir_all(&root);
+    let home = home::bootstrap(&root).expect("home");
+    let pubkey_hex = home::public_key_hex(&home).expect("pubkey");
+    let job_id = "a".repeat(64);
+    let bind = free_bind(&job_id, &pubkey_hex, &tip_oid, &repo_url, &job_hash);
+    write_bind(&home, &bind);
+
+    // The negative gate, BEFORE: this buyer has no wallet store at all.
+    assert!(
+        !wallet_store(&home).exists(),
+        "the free lane's buyer starts with NO wallet store"
+    );
+
+    let mut gate = BudgetGate::from_home(&home).expect("gate");
+    let outcome = collect_async(&home, Some(&mut gate), CollectRequest { job_id: job_id.clone(), out: None })
+        .await
+        .expect("a free collect must SUCCEED — authorize_pay would have refused this bind at entry");
+
+    assert!(
+        outcome.pay.is_free(),
+        "the outcome must state the trade had no payment leg"
+    );
+    assert_eq!(outcome.pay.amount_sats(), 0, "a free trade pays nothing");
+    assert!(outcome.pay.paid().is_none(), "there is no pay outcome to report");
+    assert_eq!(outcome.commit_oid, tip_oid, "the delivered tip is what was collected");
+    assert!(
+        outcome.files.contains(&"README.md".to_string()),
+        "the delivered files must be materialized: {:?}",
+        outcome.files
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("results").join(&job_id).join("README.md")).expect("readme"),
+        "delivered\n",
+        "the materialized file must be the delivered content, read back off disk"
+    );
+
+    // The negative gate, AFTER: still no wallet store. A run that quietly created one would have
+    // opened a wallet, which is the thing this lane exists to avoid.
+    assert!(
+        !wallet_store(&home).exists(),
+        "a free collect must NOT open a wallet — no wallet store may appear"
+    );
+    assert_eq!(gate.spent(), 0, "a free collect must not move the spend total");
+    assert_eq!(
+        BudgetGate::from_home(&home).expect("reload").spent(),
+        0,
+        "durable spent must stay 0 — no BudgetGate append happened"
+    );
+    assert!(
+        !root.join("payment-journal").exists(),
+        "a free collect writes no payment journal: there is no payment to journal"
+    );
+
+    // The buyer-side collect record — the artifact, never the silence (§7.0). A free job produces
+    // no payment-journal entry, so without this a completed free trade would leave no local trace.
+    let record_path = maxplayer_core::collect::free_collect_record_path(&home, &job_id);
+    let record: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&record_path).expect("collect record"))
+            .expect("collect record json");
+    assert_eq!(
+        record["payment"], "none",
+        "the buyer-side collect record must state payment=none: {record}"
+    );
+    assert_eq!(record["amount_sats"], 0);
+    assert_eq!(record["commit_oid"], tip_oid);
+    assert_eq!(record["job_id"], job_id);
+
+    // RE-COLLECT is idempotent: it re-materializes and leaves the first record's timestamp standing.
+    let first_collected_at = record["collected_at"].clone();
+    let again = collect_async(&home, Some(&mut gate), CollectRequest { job_id: job_id.clone(), out: None })
+        .await
+        .expect("re-collecting a free job must succeed");
+    assert_eq!(again.files, outcome.files, "a re-collect materializes the same files");
+    assert!(again.pay.is_free());
+    let reread: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&record_path).expect("collect record")).expect("json");
+    assert_eq!(
+        reread["collected_at"], first_collected_at,
+        "the record dates the collect, not the last re-read of it"
+    );
+    assert_eq!(gate.spent(), 0, "a re-collect of a free job still spends nothing");
+
+    // ── PAID CONTROL — same delivery, same sentinel, only the mode differs ────────────────────
+    let paid_root = temp("home-free-ok-paid-control");
+    let _ = fs::remove_dir_all(&paid_root);
+    let mut paid_home = home::bootstrap(&paid_root).expect("paid home");
+    // Seal the LOOPBACK dead mint (TCP-refused, never contacted) as this bind's funding mint and
+    // accepted set, exactly as `collect_refuses_dead_mint_at_preflight_before_the_budget_reserve`
+    // does. Without it the pay path resolves the default mint and queries it over the REAL network,
+    // which would make this control slow and dependent on someone else's uptime; with it the
+    // refusal is local, instant, and still lands inside `authorize_pay`, which is all the control
+    // claims. Opting in to real mints here opts in to no real money.
+    paid_home.config.allow_real_mints = true;
+    let paid_secret = home::read_secret_key_hex(&paid_home).expect("secret");
+    let paid_pubkey = home::public_key_hex(&paid_home).expect("pubkey");
+    let mut paid = from_scratch_bind(&job_id, &paid_pubkey, &tip_oid, &repo_url, &job_hash);
+    paid.funding_mint = Some("https://127.0.0.1:1".to_owned());
+    paid.accepted_mints = vec!["https://127.0.0.1:1".to_owned()];
+    paid.seller_signature = seller_cosig(&paid_secret, &paid_pubkey, &paid);
+    write_bind(&paid_home, &paid);
+
+    let mut paid_gate = BudgetGate::from_home(&paid_home).expect("paid gate");
+    let error = collect_async(
+        &paid_home,
+        Some(&mut paid_gate),
+        CollectRequest { job_id: job_id.clone(), out: None },
+    )
+    .await
+    .expect_err("a PRICED bind must still enter the money path (and refuse here — no funds)");
+    assert!(
+        matches!(error, CollectError::Pay(_)),
+        "the paid control must refuse INSIDE authorize_pay, proving the mode is what branched: {error}"
+    );
+    assert!(
+        !error.to_string().contains("free trade"),
+        "the paid control must not hit the free-bind entry refusal: {error}"
+    );
+
+    drop(server);
+    let _ = fs::remove_dir_all(&upstream);
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&paid_root);
+}
+
+// TEST 4 — A FREE COLLECT WITH A WRONG TIP REFUSES AND MATERIALIZES NOTHING.
+//
+// The free path's verification is not weaker than the paid path's: it runs the SAME tip-match, and
+// the accepted `commit_oid` — never the seller's echo — is the commitment. Here the bind pins the
+// base commit while the served branch tips at a later one, so the fetch succeeds and the COMPARE is
+// what refuses. Nothing may be materialized, and (being free) nothing may be spent or journalled.
+//
+// Red-on-revert: drop the tip-match from the free branch and this test materializes a delivery the
+// buyer never accepted.
+#[tokio::test(flavor = "current_thread")]
+async fn a_free_collect_refuses_a_wrong_tip_and_materializes_nothing() {
+    init_test_env();
+    let (upstream, tip_oid, base_oid) = make_upstream("free-wrongtip-upstream");
+    assert_ne!(tip_oid, base_oid, "the fixture must offer two distinct commits");
+
+    let mount = format!("/git/{}/repo.git", "78".repeat(32));
+    let server = GitHttpAuthServer::spawn(&upstream, &mount);
+    let repo_url = server.repo_url();
+
+    let root = temp("home-free-wrongtip");
+    let _ = fs::remove_dir_all(&root);
+    let home = home::bootstrap(&root).expect("home");
+    let pubkey_hex = home::public_key_hex(&home).expect("pubkey");
+
+    let job_id = "a".repeat(64);
+    // Pin the BASE oid: the delivered branch tips elsewhere, so the tip-match must refuse.
+    let bind = free_bind(&job_id, &pubkey_hex, &base_oid, &repo_url, &"3c".repeat(32));
+    write_bind(&home, &bind);
+
+    let mut gate = BudgetGate::from_home(&home).expect("gate");
+    let error = collect_async(
+        &home,
+        Some(&mut gate),
+        CollectRequest { job_id: job_id.clone(), out: None },
+    )
+    .await
+    .expect_err("a free collect whose delivered tip differs from the accepted oid must refuse");
+
+    assert!(
+        matches!(error, CollectError::Integrity(_)),
+        "a free collect's refusal is an integrity refusal, not a pay refusal (no payment exists to \
+         refuse): {error}"
+    );
+    assert!(
+        error.to_string().contains("does not match advertised")
+            || error.to_string().contains("tip-match"),
+        "the refusal must name the tip-match, got: {error}"
+    );
+    assert!(
+        !root.join("results").join(&job_id).exists(),
+        "a free collect must materialize NO files when the tip-match refuses"
+    );
+    assert!(
+        !maxplayer_core::collect::free_collect_record_path(&home, &job_id).exists(),
+        "no collect record may be written for a collect that refused"
+    );
+    assert_eq!(gate.spent(), 0, "a free refusal spends nothing (nothing was ever payable)");
+    assert!(!root.join("payment-journal").exists(), "no payment journal on a free refusal");
+    assert!(
+        !wallet_store(&home).exists(),
+        "a refused free collect must not have opened a wallet either"
+    );
+
+    drop(server);
+    let _ = fs::remove_dir_all(&upstream);
+    let _ = fs::remove_dir_all(&root);
+}
+
+// TEST 4b — the §19 execution sentinel is enforced on the FREE path too.
+//
+// Beyond the brief's four properties, and stated so it can be ruled on: the free branch runs the
+// same execution-sentinel check the paid path does. A free delivery carrying no job-bound sentinel
+// materializes NOTHING and journals the refusal into the same `sentinel-refusals` artifact §17
+// reads — otherwise free jobs would be the one lane where a seller can deliver unexecuted work with
+// no record of the refusal.
+#[tokio::test(flavor = "current_thread")]
+async fn a_free_collect_refuses_a_delivery_with_no_execution_sentinel() {
+    init_test_env();
+    let (upstream, tip_oid) = make_upstream_delivery("free-nosentinel", None);
+    let mount = format!("/git/{}/repo.git", "9a".repeat(32));
+    let server = GitHttpAuthServer::spawn(&upstream, &mount);
+    let repo_url = server.repo_url();
+
+    let root = temp("home-free-nosentinel");
+    let _ = fs::remove_dir_all(&root);
+    let home = home::bootstrap(&root).expect("home");
+    let pubkey_hex = home::public_key_hex(&home).expect("pubkey");
+
+    let job_id = "a".repeat(64);
+    let bind = free_bind(&job_id, &pubkey_hex, &tip_oid, &repo_url, &"4d".repeat(32));
+    write_bind(&home, &bind);
+
+    let mut gate = BudgetGate::from_home(&home).expect("gate");
+    let error = collect_async(
+        &home,
+        Some(&mut gate),
+        CollectRequest { job_id: job_id.clone(), out: None },
+    )
+    .await
+    .expect_err("a sentinel-less free delivery must refuse");
+
+    assert!(matches!(error, CollectError::Integrity(_)), "must be an integrity refusal: {error}");
+    assert!(
+        error.to_string().contains("no execution sentinel"),
+        "the refusal must name the sentinel, got: {error}"
+    );
+    assert!(
+        !root.join("results").join(&job_id).exists(),
+        "no files may be materialized on a sentinel refusal"
+    );
+    assert!(
+        root.join("sentinel-refusals").exists(),
+        "a FREE sentinel refusal lands in the same §17 artifact a priced one does"
+    );
+    assert_eq!(gate.spent(), 0);
+
+    drop(server);
+    let _ = fs::remove_dir_all(&upstream);
+    let _ = fs::remove_dir_all(&root);
+}
+
 // ── #387 preflight-before-reserve ORDER gate — a dead mint burns ZERO budget, over the REAL path ───
 //
 // The see-saw (2eda85d → ef7a49e): the cross-runtime deadlock fix unparked the hang but LEAKED budget
@@ -464,7 +794,7 @@ async fn collect_refuses_dead_mint_at_preflight_before_the_budget_reserve() {
     let mut gate = BudgetGate::from_home(&home).expect("gate");
     let started = std::time::Instant::now();
     let result =
-        collect_async(&home, &mut gate, CollectRequest { job_id: job_id.clone(), out: None }).await;
+        collect_async(&home, Some(&mut gate), CollectRequest { job_id: job_id.clone(), out: None }).await;
     let elapsed = started.elapsed();
 
     drop(server);
