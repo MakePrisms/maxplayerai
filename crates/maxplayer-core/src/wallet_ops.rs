@@ -41,6 +41,11 @@ pub enum WalletOpsError {
     /// than a hardcoded constant — on a real-minibits home the constant would be a false-default
     /// lie (#579).
     MintPinnedDefault { mint_url: String },
+    /// A Lightning operation (`wallet fund`, `wallet melt`) aimed at an ISSUER mint — a mint whose
+    /// info lists no bolt11 method (§4.2 "Issuer mint"). There is no Lightning there to mint from or
+    /// melt to; the message carries the plain reason. Issuance at a seat's own mint is a different
+    /// path (stage 3), never this one.
+    IssuerMint(String),
     Wallet(String),
 }
 
@@ -58,6 +63,7 @@ impl std::fmt::Display for WalletOpsError {
                  Set MAXPLAYER_ALLOW_REAL_MINTS=true (or allow_real_mints in config.toml) to opt in, \
                  or use --mint {DEFAULT_MINT_URL} for dev/play-money"
             ),
+            Self::IssuerMint(reason) => write!(formatter, "{reason}"),
             Self::MintPinnedDefault { mint_url } => write!(
                 formatter,
                 "cannot remove the default mint ({mint_url}); only extra_mints are removable"
@@ -439,6 +445,23 @@ pub async fn balances_async(home: &MaxplayerHome) -> Result<Vec<MintBalance>, Wa
     Ok(rows)
 }
 
+/// Refuse a Lightning operation at an ISSUER mint (§4.2 "Issuer mint") BEFORE the wallet is opened
+/// or any quote is raised.
+///
+/// The class is DECLARED, never read off the mint: an operator `wallet fund`/`wallet melt` runs
+/// with no accept-bind in hand, so the one declaration this seat can stand behind is its own
+/// config (`issuer_mint`). A mint the config does not name is Lightning class and proceeds as it
+/// always did; nothing here touches the network. `Ok(())` for a Lightning mint.
+fn refuse_lightning_op_at_issuer(
+    home: &MaxplayerHome,
+    op: &str,
+    mint_url: &str,
+) -> Result<(), WalletOpsError> {
+    let issuers = crate::mint_class::IssuerMints::none().with_own(home.config.issuer_mint());
+    crate::mint_class::refuse_lightning_at_issuer(op, mint_url, issuers.class_of(mint_url))
+        .map_err(WalletOpsError::IssuerMint)
+}
+
 /// Create a mint quote and return the bolt11 **before** any poll/wait.
 pub async fn begin_mint_async(
     home: &MaxplayerHome,
@@ -449,6 +472,7 @@ pub async fn begin_mint_async(
         return Err(WalletOpsError::Wallet("amount must be > 0".into()));
     }
     let mint_url = resolve_mint(home, mint_override)?;
+    refuse_lightning_op_at_issuer(home, "wallet fund", &mint_url)?;
     let wallet = open_wallet_async(home, &mint_url).await?;
     let amount = Amount::from(amount_sats);
     let quote = wallet
@@ -475,6 +499,7 @@ pub async fn complete_mint_async(
     quote: &MintQuote,
 ) -> Result<MintOutcome, WalletOpsError> {
     let mint_url = mint_is_allowed(home, &quote.mint_url)?;
+    refuse_lightning_op_at_issuer(home, "wallet fund", &mint_url)?;
     let wallet = open_wallet_async(home, &mint_url).await?;
     let funded = poll_and_mint(&wallet, &quote.quote_id, quote.amount_sats).await?;
     let balance = wallet
@@ -632,7 +657,19 @@ pub async fn send_async(
     // Fail closed against the real-mint gate before opening the wallet. Operator sends are a
     // deliberate action OUTSIDE the job-pay budget gate (BudgetGate is deliberately not wired in
     // here — owner decision pending), but they must still honor `allow_real_mints`.
-    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+    //
+    // CLASS-AWARE (stage 3a): the seat's OWN issuer mint passes, because a seat that cannot send its
+    // own currency cannot issue one — and an issuer mint carries no sats, so the fence this widens
+    // was never guarding anything at that URL. `issuers` is built exactly as
+    // `refuse_lightning_op_at_issuer` builds it, from this seat's config alone, so ONLY the
+    // `Own` marker admits: a mint a counterparty merely DECLARED is `Declared`, and
+    // `IssuerMints::admits` answers false for it — a seller's signed tag can never open this seat's
+    // real-mint fence to a mint the seller cares to name.
+    if !crate::mint_class::mint_admitted(
+        &mint_url,
+        home.config.allow_real_mints,
+        &crate::mint_class::IssuerMints::none().with_own(home.config.issuer_mint()),
+    ) {
         return Err(WalletOpsError::RealMintDisallowed { mint_url });
     }
     let wallet = open_wallet_async(home, &mint_url).await?;
@@ -692,7 +729,15 @@ pub async fn receive_async(
     // this additionally fails closed on a real mint unless the operator opted in, the same gate
     // send/melt enforce. Without it a real mint left in the configured list would redeem while
     // `allow_real_mints == false`.
-    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+    //
+    // CLASS-AWARE (stage 3a), the mirror of `send_async`: the seat must be able to take its OWN
+    // currency back in, or it could issue tokens it can never hold. Built from this seat's config
+    // alone, so only the `Own` marker admits and a counterparty's declaration widens nothing.
+    if !crate::mint_class::mint_admitted(
+        &mint_url,
+        home.config.allow_real_mints,
+        &crate::mint_class::IssuerMints::none().with_own(home.config.issuer_mint()),
+    ) {
         return Err(WalletOpsError::RealMintDisallowed { mint_url });
     }
     let wallet = open_wallet_async(home, &mint_url).await?;
@@ -747,6 +792,7 @@ pub async fn melt_async(
     if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
         return Err(WalletOpsError::RealMintDisallowed { mint_url });
     }
+    refuse_lightning_op_at_issuer(home, "wallet melt", &mint_url)?;
     let wallet = open_wallet_async(home, &mint_url).await?;
     let quote = wallet
         .melt_quote(PaymentMethod::BOLT11, bolt11, None, None)
@@ -1368,5 +1414,323 @@ mod tests {
             "MintNotAllowed must NOT name the testnut constant as the default on a minibits home: {message}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A same-process mint stub: answers `GET /v1/info` with `info`, everything else with 404, and
+    /// RECORDS every request path it receives. The recorder is the instrument — what the wallet
+    /// asked the mint is the whole question. No mint process, no money, no network beyond loopback.
+    fn recording_mint_stub(info: &cdk::nuts::MintInfo) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{BufRead, BufReader, Write};
+
+        let body = serde_json::to_string(info).expect("mint info serializes");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub mint");
+        let address = listener.local_addr().expect("stub mint address");
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = BufReader::new(match stream.try_clone() {
+                    Ok(clone) => clone,
+                    Err(_) => continue,
+                });
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                loop {
+                    let mut header = String::new();
+                    match reader.read_line(&mut header) {
+                        Ok(0) => break,
+                        Ok(_) if header == "\r\n" => break,
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+                let path = request_line.split_whitespace().nth(1).unwrap_or("").to_owned();
+                recorder.lock().expect("recorder").push(path.clone());
+                // Match the info route however the client spells its leading slashes (a normalized
+                // mint URL may carry a trailing `/`, giving `//v1/info`).
+                let route = path.trim_start_matches('/');
+                let ok = |json: &str| {
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                         connection: close\r\n\r\n{json}",
+                        json.len()
+                    )
+                };
+                let response = if route == "v1/info" {
+                    ok(&body)
+                } else if route == "v1/keysets" || route == "v1/keys" {
+                    // cdk refreshes keysets alongside the info load; an empty set is a valid answer
+                    // and keeps the stub honest about what it is: an info document, not a mint.
+                    ok(r#"{"keysets":[]}"#)
+                } else {
+                    "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_owned()
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (format!("http://{address}"), seen)
+    }
+
+    /// Check H (§4.2 "Issuer mint"): fund-begin and fund-completion are guarded by the DECLARED
+    /// class — this seat's own `issuer_mint` config — and the guard runs before the wallet opens.
+    /// NEGATIVE: at the declared mint, `begin_mint_async` and `complete_mint_async` return
+    /// `WalletOpsError::IssuerMint` and the mint receives NO request at all — no quote, no mint,
+    /// and not even `/v1/info`, because nothing asks a mint what it is. The stub would answer as a
+    /// LIGHTNING mint (bolt11 under NUT-04) if it were asked, so a class read off the wire would
+    /// have let the call through: the declaration is what refuses it.
+    /// CONTROL: the identical completion against an UNDECLARED stub goes past the guard and into
+    /// `poll_and_mint`, where cdk fails an unknown quote id as an ordinary Wallet error — not
+    /// IssuerMint, not a refusal — so the negative above is not vacuous.
+    #[tokio::test]
+    async fn completing_a_mint_quote_at_an_issuer_mint_is_refused_before_any_quote_call() {
+        use cdk::nuts::{MintInfo, MintMethodSettings};
+
+        fn is_quote_or_mint_call(path: &str) -> bool {
+            path.contains("/mint/quote/") || path.contains("/mint/bolt11")
+        }
+        fn lightning_info() -> MintInfo {
+            let mut info = MintInfo::new();
+            info.nuts.nut04.methods = vec![MintMethodSettings {
+                method: PaymentMethod::BOLT11,
+                unit: CurrencyUnit::Sat,
+                min_amount: None,
+                max_amount: None,
+                options: None,
+            }];
+            info
+        }
+
+        let (issuer_url, issuer_seen) = recording_mint_stub(&lightning_info());
+
+        let root = temp_home("complete-at-issuer");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap(&root).expect("bootstrap");
+        // The loopback stub is a CONFIGURED mint, so `mint_is_allowed`/`resolve_mint` admit it and
+        // the call reaches the guard under test rather than the configured-mint check; and it is
+        // this seat's DECLARED issuer mint, which is the whole of what the guard reads.
+        home.config.extra_mints.push(issuer_url.clone());
+        home.config.issuer_mint = Some(issuer_url.clone());
+
+        let begin = begin_mint_async(&home, 5, Some(&issuer_url))
+            .await
+            .expect_err("funding at a declared issuer mint must refuse");
+        assert!(
+            matches!(begin, WalletOpsError::IssuerMint(_)),
+            "expected IssuerMint from begin, got: {begin}"
+        );
+        let quote = MintQuote {
+            mint_url: issuer_url.clone(),
+            invoice: "lnbc1-not-a-real-invoice".to_owned(),
+            quote_id: "quote-at-issuer".to_owned(),
+            amount_sats: 5,
+        };
+        let error = complete_mint_async(&home, &quote)
+            .await
+            .expect_err("completing at a declared issuer mint must refuse");
+        let seen = issuer_seen.lock().expect("recorder").clone();
+        assert!(
+            matches!(error, WalletOpsError::IssuerMint(_)),
+            "expected IssuerMint, got: {error} (mint saw {seen:?})"
+        );
+        let message = error.to_string();
+        assert!(message.contains("wallet fund refused"), "{message}");
+        assert!(message.contains(&issuer_url), "{message}");
+        assert!(message.contains(crate::mint_class::ISSUER_HOP_REFUSAL), "{message}");
+        assert!(
+            seen.is_empty(),
+            "a declared issuer mint is asked NOTHING — not a quote, not its info: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|path| is_quote_or_mint_call(path)),
+            "neither check_mint_quote nor wallet.mint may reach an issuer mint: {seen:?}"
+        );
+
+        // CONTROL: same call, same kind of stub, NOT declared. The guard passes and execution goes
+        // on into `poll_and_mint`, where cdk's `check_mint_quote` resolves an id the local store has
+        // never seen WITHOUT a wire call and fails as an ordinary Wallet error — not IssuerMint,
+        // and not a refusal. Identical call, identical unknown quote, identical info document: the
+        // only difference is the declaration.
+        let (lightning_url, _lightning_seen) = recording_mint_stub(&lightning_info());
+        home.config.extra_mints.push(lightning_url.clone());
+        let control = complete_mint_async(
+            &home,
+            &MintQuote {
+                mint_url: lightning_url,
+                invoice: "lnbc1-not-a-real-invoice".to_owned(),
+                quote_id: "quote-at-lightning".to_owned(),
+                amount_sats: 5,
+            },
+        )
+        .await
+        .expect_err("an unknown quote id fails inside poll_and_mint");
+        assert!(
+            matches!(control, WalletOpsError::Wallet(_)),
+            "control must fail past the guard, not at it: {control}"
+        );
+        let control_message = control.to_string();
+        assert!(
+            !control_message.contains("refused"),
+            "control must not be a guard refusal: {control_message}"
+        );
+    }
+
+    /// Stage 3a (§7): the seat's own wallet ops ADMIT the seat's OWN issuer mint, and nothing else
+    /// new. Two sites only — `send_async` and `receive_async` — and each is proved with its own
+    /// control, because "the fence passed" is only meaningful beside an otherwise identical mint it
+    /// still refuses.
+    ///
+    /// `allow_real_mints = false` throughout, so `home::mint_allowed` refuses EVERY loopback
+    /// `http://` URL here. The only thing that can let one through is the seat's own declaration.
+    ///
+    /// NEGATIVE, and it is the load-bearing half: the SAME URL, configured and reachable but NOT
+    /// declared this seat's issuer mint, is still `RealMintDisallowed`. And a URL a COUNTERPARTY
+    /// declared is not this seat's declaration — `IssuerMints::none().with_own(...)` is built from
+    /// config alone, so a `Declared` marker never reaches this predicate at all.
+    #[tokio::test]
+    async fn send_and_receive_admit_this_seats_own_issuer_mint_and_nothing_else_new() {
+        use cdk::nuts::{Id, MintInfo, Proof, PublicKey};
+        use cdk::secret::Secret;
+
+        fn token_at(mint_url: &str) -> String {
+            let keyset = Id::from_str("009a1f293253e41e").expect("a keyset id");
+            let blinded = PublicKey::from_hex(
+                "02194603ffa36356f4a56b7df9371fc3192472351453ec7398b8da8117e7c3e104",
+            )
+            .expect("a public key");
+            let proof = Proof::new(Amount::from(1), keyset, Secret::generate(), blinded);
+            Token::new(
+                MintUrl::from_str(mint_url).expect("a mint url"),
+                vec![proof],
+                None,
+                CurrencyUnit::Sat,
+            )
+            .to_string()
+        }
+
+        let (issuer_url, _issuer_seen) = recording_mint_stub(&MintInfo::new());
+        let (other_url, _other_seen) = recording_mint_stub(&MintInfo::new());
+
+        let root = temp_home("send-receive-at-issuer");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap(&root).expect("bootstrap");
+        // Both stubs are CONFIGURED, so `mint_is_allowed` admits both and the difference the test
+        // measures is the class fence alone. The real-money switch is OFF, so `home::mint_allowed`
+        // refuses both on its own.
+        home.config.extra_mints.push(issuer_url.clone());
+        home.config.extra_mints.push(other_url.clone());
+        home.config.allow_real_mints = false;
+        assert!(!home::mint_allowed(&issuer_url, false));
+        assert!(!home::mint_allowed(&other_url, false));
+
+        // ── CONTROL, before any declaration exists: BOTH are refused by the real-mint fence. ─────
+        for url in [&issuer_url, &other_url] {
+            let refused = send_async(&home, 5, Some(url))
+                .await
+                .expect_err("an undeclared http mint is fenced");
+            assert!(
+                matches!(refused, WalletOpsError::RealMintDisallowed { .. }),
+                "expected RealMintDisallowed at {url}, got: {refused}"
+            );
+            let refused = receive_async(&home, &token_at(url))
+                .await
+                .expect_err("an undeclared http mint is fenced");
+            assert!(
+                matches!(refused, WalletOpsError::RealMintDisallowed { .. }),
+                "expected RealMintDisallowed at {url}, got: {refused}"
+            );
+        }
+
+        // ── Declare ONE of them this seat's own issuer mint. Nothing else changes. ───────────────
+        home.config.issuer_mint = Some(issuer_url.clone());
+
+        // send: past the fence, and on into the wallet, where an empty balance stops it as an
+        // ordinary Wallet error — not a refusal.
+        let sent = send_async(&home, 5, Some(&issuer_url))
+            .await
+            .expect_err("nothing has been issued yet, so there is nothing to send");
+        assert!(
+            matches!(sent, WalletOpsError::Wallet(_)),
+            "the seat's own issuer mint must pass the fence, got: {sent}"
+        );
+        assert!(
+            sent.to_string().contains("insufficient funds"),
+            "it failed past the fence, on balance: {sent}"
+        );
+
+        // receive: past the fence too. It then fails at the mint (the stub is not a mint), which is
+        // exactly what "past the fence" looks like from here.
+        let received = receive_async(&home, &token_at(&issuer_url))
+            .await
+            .expect_err("the stub cannot honour a fabricated proof");
+        assert!(
+            matches!(received, WalletOpsError::Wallet(_)),
+            "the seat's own issuer mint must pass the fence, got: {received}"
+        );
+
+        // ── NEGATIVE: the OTHER stub — same scheme, same host, same config list — is still fenced.
+        let refused = send_async(&home, 5, Some(&other_url))
+            .await
+            .expect_err("a mint this seat did not declare stays fenced");
+        assert!(
+            matches!(refused, WalletOpsError::RealMintDisallowed { .. }),
+            "expected RealMintDisallowed at {other_url}, got: {refused}"
+        );
+        let refused = receive_async(&home, &token_at(&other_url))
+            .await
+            .expect_err("a mint this seat did not declare stays fenced");
+        assert!(
+            matches!(refused, WalletOpsError::RealMintDisallowed { .. }),
+            "expected RealMintDisallowed at {other_url}, got: {refused}"
+        );
+
+        // ── NEGATIVE: a COUNTERPARTY's declaration cannot reach this predicate. The fence is built
+        // from `home.config.issuer_mint()` alone, so a `Declared` marker is not even constructible
+        // here — and if one were, `IssuerMints::admits` answers false for it.
+        let declared_by_someone_else =
+            crate::mint_class::IssuerMints::none().with_declared(Some(other_url.as_str()));
+        assert!(!declared_by_someone_else.admits(&other_url));
+        assert!(!crate::mint_class::mint_admitted(
+            &other_url,
+            false,
+            &declared_by_someone_else
+        ));
+
+        // ── And `wallet melt` STILL REFUSES at the seat's own issuer mint. ──────────────────────
+        //
+        // Stage 3a deliberately did NOT make this site class-aware: melting is paying a Lightning
+        // invoice, and an issuer mint has no Lightning, so there is nothing here for the class to
+        // widen. Both guards above it are still in place and the call cannot reach a mint.
+        //
+        // ⚠ WHICH guard answers is worth stating, because it is not the one stage 2's message
+        // suggests. The class-blind real-mint fence runs FIRST, and `home::mint_allowed` refuses
+        // every `http://` URL under either setting of `allow_real_mints` (it admits only `https://`,
+        // or the dev allow-list). So for a LOOPBACK issuer mint — the normal case, and the only one
+        // the wizard writes — melt refuses as `RealMintDisallowed` and the issuer-specific message
+        // at `refuse_lightning_op_at_issuer` is never reached. The refusal stands; only its wording
+        // differs. An `https://` issuer mint would get the issuer message instead.
+        for allow_real_mints in [false, true] {
+            home.config.allow_real_mints = allow_real_mints;
+            let melt = melt_async(&home, "lnbc1-not-a-real-invoice", Some(&issuer_url))
+                .await
+                .expect_err("melting at an issuer mint stays refused");
+            assert!(
+                matches!(melt, WalletOpsError::RealMintDisallowed { .. }),
+                "with allow_real_mints={allow_real_mints}, melt at a loopback issuer mint is \
+                 refused by the class-blind fence first, got: {melt}"
+            );
+        }
+        home.config.allow_real_mints = false;
+        // The issuer-specific refusal is still WIRED — it is what answers once the URL gets past
+        // the real-mint fence, which only an `https://` mint does.
+        assert_eq!(
+            refuse_lightning_op_at_issuer(&home, "wallet melt", &issuer_url)
+                .expect_err("still refuses")
+                .to_string()
+                .contains("wallet melt refused"),
+            true
+        );
     }
 }

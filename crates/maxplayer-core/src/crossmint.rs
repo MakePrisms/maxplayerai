@@ -16,7 +16,7 @@ use std::str::FromStr;
 use cdk::mint_url::MintUrl;
 
 use crate::authorize_pay::AuthorizePayError;
-use crate::home;
+use crate::mint_class::{ISSUER_HOP_REFUSAL, IssuerMints, mint_admitted};
 
 /// How the buyer reaches a mint the seller accepts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,16 +87,24 @@ impl PayPlan {
 /// source: a hop ends with the buyer holding ecash at the target, so an unfenced target would let a
 /// real-sats mint in through the back door while `allow_real_mints` is off.
 ///
+/// The fence is class-aware ([`mint_admitted`]): a mint `issuers` names is admitted whatever the
+/// real-money switch says, because it carries no sats. The hop is class-aware in the other
+/// direction: an issuer mint has no Lightning, so a hop can neither leave one nor land on one.
+/// A DIRECT payment at an issuer mint is fine — that is the buyer spending currency it already holds
+/// (the seller's, or its own where the seller lists it) — and is the only way such a mint is paid.
+///
 /// Target selection is the FIRST admissible entry of `accepted_mints` — the seller's list order is
 /// their preference. It must stay deterministic: the attempt id is derived from the realized mint, so
 /// a retry that re-derived a different target would compute a different attempt id and defeat
-/// pays-once.
+/// pays-once. `issuers` is part of that determinism: the accept path seals what it knew into the
+/// bind and the pay path passes the seal back in, never a fresh classification.
 pub fn plan_payment(
     buyer_selected_mint: &str,
     accepted_mints: &[String],
     allow_real_mints: bool,
+    issuers: &IssuerMints,
 ) -> Result<PayPlan, AuthorizePayError> {
-    if !home::mint_allowed(buyer_selected_mint, allow_real_mints) {
+    if !mint_admitted(buyer_selected_mint, allow_real_mints, issuers) {
         return Err(AuthorizePayError::Input(format!(
             "real-mint fence: buyer mint {buyer_selected_mint} is not an allow-listed testnut/dev \
              mint; set allow_real_mints=true to pay at a real mint"
@@ -120,12 +128,26 @@ pub fn plan_payment(
         return Ok(PayPlan::Direct { mint: buyer_mint });
     }
 
-    // No overlap. Hop to the first accepted mint that the fence admits; refuse fail-closed if none
+    // No overlap, so reaching the seller means a Lightning hop — which an issuer mint cannot be a
+    // leg of, on either side. OUT: the buyer's selected mint is an issuer mint; its tokens do not
+    // melt to Lightning, they only hire their issuer. Refused before any target is even considered.
+    if issuers.contains(buyer_selected_mint) {
+        return Err(AuthorizePayError::Input(format!(
+            "cross-mint hop refused: {ISSUER_HOP_REFUSAL}. The buyer's mint {buyer_mint} is an \
+             issuer mint with no Lightning, so nothing can be melted out of it to reach the seller's \
+             mints {accepted_mints:?}; its tokens are only good for hiring the seat that issued them"
+        )));
+    }
+
+    // IN: an accepted mint that is an issuer mint cannot be hopped INTO — Lightning cannot buy the
+    // seller's currency; only holding it already can pay there (the Direct row above). Skip every
+    // such entry, then hop to the first remaining mint the fence admits; refuse fail-closed if none
     // does, rather than hopping to a mint we are not permitted to hold ecash at.
     let target = accepted_mints
         .iter()
         .zip(listed)
-        .find(|(raw, _)| home::mint_allowed(raw, allow_real_mints))
+        .filter(|(raw, _)| !issuers.contains(raw))
+        .find(|(raw, _)| mint_admitted(raw, allow_real_mints, issuers))
         .map(|(_, parsed)| parsed);
 
     match target {
@@ -133,6 +155,14 @@ pub fn plan_payment(
             source: buyer_mint,
             target,
         }),
+        None if accepted_mints.iter().any(|raw| issuers.contains(raw)) => {
+            Err(AuthorizePayError::Input(format!(
+                "cross-mint hop refused: {ISSUER_HOP_REFUSAL}. The seller accepts issuer-mint \
+                 currency {accepted_mints:?} that has no Lightning route, so a hop from \
+                 {buyer_mint} cannot land there; only tokens the buyer already holds at the \
+                 issuer's mint can pay this seller"
+            )))
+        }
         None => Err(AuthorizePayError::Input(format!(
             "real-mint fence: buyer mint {buyer_mint} is not in the creq mint list \
              {accepted_mints:?} and no accepted mint is an allow-listed testnut/dev mint, so the \
@@ -147,10 +177,18 @@ pub fn plan_payment(
 /// the default (which would drain the default and pay a melt fee). Falls back to the configured
 /// default — today's behavior — when no held, accepted, fence-admissible mint covers the amount.
 ///
-/// Deterministic preference: the FIRST entry of the seller's `accepted_mints`, in the seller's list
-/// order, that (1) passes the real-mint fence and (2) shows a balance `>= amount_sats`. Returning an
-/// accepted mint makes [`plan_payment`] plan a DIRECT payment from it (no hop); the seller's order is
-/// their stated preference and keeps the choice stable across retries.
+/// FIRST preference, ahead of any balance: the buyer's OWN issuer mint (`own_mint`), when the seller
+/// lists it. A seat pays in its own currency wherever that currency is taken — that is what the
+/// currency is for — and it needs no balance to do so: the issuer mints at will from its own mint
+/// (stage 3), and the pay path refuses fail-closed at the sealed mint if it cannot. `own_mint` is compared by
+/// normalized URL, and an `own_mint` the seller does not list changes nothing.
+///
+/// Then the deterministic balance preference: the FIRST entry of the seller's `accepted_mints`, in
+/// the seller's list order, that (1) passes the class-aware real-mint fence and (2) shows a balance
+/// `>= amount_sats`. A seller's issuer mint the buyer holds a balance at qualifies here like any
+/// other — bearer tokens are spent by whoever holds them. Returning an accepted mint makes
+/// [`plan_payment`] plan a DIRECT payment from it (no hop); the seller's order is their stated
+/// preference and keeps the choice stable across retries.
 ///
 /// Balance-awareness is ADVISORY and applied ONCE, here at accept. The result is sealed into the
 /// accept-bind and re-derived (not re-decided) at pay, so a later balance or config-default change
@@ -163,12 +201,21 @@ pub(crate) fn select_source_mint(
     allow_real_mints: bool,
     balances: &[crate::wallet_ops::MintBalance],
     amount_sats: u64,
+    own_mint: Option<&str>,
+    issuers: &IssuerMints,
 ) -> String {
+    if let Some(own) = own_mint.and_then(|own| MintUrl::from_str(own).ok())
+        && let Some(listed) = accepted_mints
+            .iter()
+            .find(|accepted| MintUrl::from_str(accepted).map(|url| url == own).unwrap_or(false))
+    {
+        return listed.clone();
+    }
     accepted_mints
         .iter()
         .find(|accepted| {
             let mint = accepted.as_str();
-            home::mint_allowed(mint, allow_real_mints) && holds_at_least(balances, mint, amount_sats)
+            mint_admitted(mint, allow_real_mints, issuers) && holds_at_least(balances, mint, amount_sats)
         })
         .cloned()
         .unwrap_or_else(|| config_default.to_owned())
@@ -295,7 +342,7 @@ mod tests {
     // and then coincidentally produced the right amount would still be a bug.
     #[test]
     fn buyer_mint_in_accepted_set_pays_direct_without_hopping() {
-        let plan = plan_payment(DEFAULT_MINT_URL, &[DEFAULT_MINT_URL.to_owned()], false)
+        let plan = plan_payment(DEFAULT_MINT_URL, &[DEFAULT_MINT_URL.to_owned()], false, &IssuerMints::none())
             .expect("an accepted, fenced buyer mint plans");
         assert_eq!(
             plan,
@@ -316,7 +363,7 @@ mod tests {
             "https://b.example".to_owned(),
             "https://a.example".to_owned(),
         ];
-        let plan = plan_payment("https://a.example", &accepted, true).expect("listed mint plans");
+        let plan = plan_payment("https://a.example", &accepted, true, &IssuerMints::none()).expect("listed mint plans");
         assert!(!plan.is_hop(), "a listed buyer mint never hops");
         assert_eq!(plan.realized_mint(), &mint("https://a.example"));
     }
@@ -325,7 +372,7 @@ mod tests {
     fn no_overlap_plans_a_hop_from_the_buyer_mint_to_an_accepted_mint() {
         let accepted = vec!["https://seller.example".to_owned()];
         let plan =
-            plan_payment("https://buyer.example", &accepted, true).expect("a hop is plannable");
+            plan_payment("https://buyer.example", &accepted, true, &IssuerMints::none()).expect("a hop is plannable");
         assert_eq!(
             plan,
             PayPlan::Hop {
@@ -350,10 +397,10 @@ mod tests {
             "https://first.example".to_owned(),
             "https://second.example".to_owned(),
         ];
-        let planned = plan_payment("https://buyer.example", &accepted, true).expect("plans");
+        let planned = plan_payment("https://buyer.example", &accepted, true, &IssuerMints::none()).expect("plans");
         let sealed = planned.source_mint().to_string();
 
-        let replanned = plan_payment(&sealed, &accepted, true).expect("the sealed source re-plans");
+        let replanned = plan_payment(&sealed, &accepted, true, &IssuerMints::none()).expect("the sealed source re-plans");
         assert_eq!(replanned, planned, "the seal must re-derive the same plan");
         assert!(replanned.is_hop(), "re-planning must not collapse the hop");
         assert_eq!(replanned.realized_mint(), planned.realized_mint());
@@ -362,7 +409,7 @@ mod tests {
     // The direct path's seal is unchanged: the buyer's own mint, which is also what it realizes at.
     #[test]
     fn the_direct_path_seals_the_mint_it_realizes_at() {
-        let plan = plan_payment(DEFAULT_MINT_URL, &[DEFAULT_MINT_URL.to_owned()], false)
+        let plan = plan_payment(DEFAULT_MINT_URL, &[DEFAULT_MINT_URL.to_owned()], false, &IssuerMints::none())
             .expect("direct plans");
         assert_eq!(plan.source_mint(), plan.realized_mint());
         assert_eq!(plan.source_mint(), &mint(DEFAULT_MINT_URL));
@@ -377,9 +424,9 @@ mod tests {
             "https://second.example".to_owned(),
             "https://third.example".to_owned(),
         ];
-        let first = plan_payment("https://buyer.example", &accepted, true).expect("plans");
+        let first = plan_payment("https://buyer.example", &accepted, true, &IssuerMints::none()).expect("plans");
         for _ in 0..5 {
-            let again = plan_payment("https://buyer.example", &accepted, true).expect("plans");
+            let again = plan_payment("https://buyer.example", &accepted, true, &IssuerMints::none()).expect("plans");
             assert_eq!(
                 again, first,
                 "target selection must not vary between attempts"
@@ -390,7 +437,7 @@ mod tests {
 
     #[test]
     fn empty_accepted_set_pays_direct_at_the_buyer_mint() {
-        let plan = plan_payment(DEFAULT_MINT_URL, &[], false).expect("legacy bind plans");
+        let plan = plan_payment(DEFAULT_MINT_URL, &[], false, &IssuerMints::none()).expect("legacy bind plans");
         assert_eq!(
             plan,
             PayPlan::Direct {
@@ -403,7 +450,7 @@ mod tests {
     #[test]
     fn unfenced_buyer_mint_is_refused_before_planning_a_hop() {
         let accepted = vec![DEFAULT_MINT_URL.to_owned()];
-        let error = plan_payment("https://real-mint.example", &accepted, false)
+        let error = plan_payment("https://real-mint.example", &accepted, false, &IssuerMints::none())
             .expect_err("an unfenced buyer mint must refuse");
         let rendered = error.to_string();
         assert!(
@@ -418,7 +465,7 @@ mod tests {
     fn hop_refuses_when_no_accepted_mint_passes_the_fence() {
         // Buyer sits on the one fenced mint; the seller accepts only an unfenced real mint.
         let accepted = vec!["https://real-mint.example".to_owned()];
-        let error = plan_payment(DEFAULT_MINT_URL, &accepted, false)
+        let error = plan_payment(DEFAULT_MINT_URL, &accepted, false, &IssuerMints::none())
             .expect_err("an unfenced hop target must refuse");
         let rendered = error.to_string();
         assert!(
@@ -436,7 +483,7 @@ mod tests {
     #[test]
     fn hop_to_a_real_mint_plans_once_the_operator_opts_in() {
         let accepted = vec!["https://real-mint.example".to_owned()];
-        let plan = plan_payment(DEFAULT_MINT_URL, &accepted, true)
+        let plan = plan_payment(DEFAULT_MINT_URL, &accepted, true, &IssuerMints::none())
             .expect("opted-in real mint is a permitted hop target");
         assert_eq!(
             plan,
@@ -523,9 +570,266 @@ mod tests {
             "http://not-https.example".to_owned(),
             DEFAULT_MINT_URL.to_owned(),
         ];
-        let plan = plan_payment("https://buyer.example", &accepted, true)
+        let plan = plan_payment("https://buyer.example", &accepted, true, &IssuerMints::none())
             .expect("a later admissible entry is usable");
         assert_eq!(plan.realized_mint(), &mint(DEFAULT_MINT_URL));
+    }
+
+    // ---- issuer mints (§4.2 "Issuer mint"): the fence admits, the hop refuses, own mint first ----
+
+    /// The buyer's own sidecar mint — plain http on loopback, the normal case.
+    const SIDECAR: &str = "http://127.0.0.1:3338";
+    /// Another seat's issuer mint, reachable on a LAN. Also not https.
+    const SELLER_ISSUER: &str = "http://10.0.0.7:3338";
+
+    /// Issuer mints under the ADMITTING marker — declared by this seat's own config (`Own`).
+    fn issuers(urls: &[&str]) -> IssuerMints {
+        urls.iter()
+            .fold(IssuerMints::none(), |known, url| known.with_own(Some(url)))
+    }
+
+    /// A DIRECT payment at a known issuer mint passes the fence with the real-money switch OFF and
+    /// over plain http: it moves no sats. The same URL nobody classified is fenced exactly as before.
+    #[test]
+    fn a_direct_payment_at_a_known_issuer_mint_passes_the_fence() {
+        let accepted = vec![SELLER_ISSUER.to_owned(), DEFAULT_MINT_URL.to_owned()];
+        let plan = plan_payment(SELLER_ISSUER, &accepted, false, &issuers(&[SELLER_ISSUER]))
+            .expect("direct in the seller's currency");
+        assert_eq!(
+            plan,
+            PayPlan::Direct {
+                mint: mint(SELLER_ISSUER)
+            }
+        );
+        for allow in [false, true] {
+            let refused = plan_payment(SELLER_ISSUER, &accepted, allow, &IssuerMints::none())
+                .expect_err("unclassified http mint is fenced as before");
+            assert!(refused.to_string().contains("real-mint fence"), "{refused}");
+        }
+    }
+
+    /// A hop INTO an issuer mint refuses with the plain reason; an issuer entry is never a hop
+    /// target, whatever its position in the seller's list.
+    #[test]
+    fn a_hop_into_an_issuer_mint_is_refused_with_the_plain_reason() {
+        // The seller accepts only its own currency; the buyer sits at a Lightning mint. No landing.
+        let error = plan_payment(
+            DEFAULT_MINT_URL,
+            &[SELLER_ISSUER.to_owned()],
+            true,
+            &issuers(&[SELLER_ISSUER]),
+        )
+        .expect_err("no Lightning route into an issuer mint");
+        let text = error.to_string();
+        assert!(text.contains(ISSUER_HOP_REFUSAL), "{text}");
+        assert!(text.contains(SELLER_ISSUER), "{text}");
+
+        // The seller lists its issuer mint FIRST and a Lightning mint after: the issuer entry is
+        // skipped and the hop lands on the Lightning mint.
+        let buyer = "https://buyer-only.example";
+        let plan = plan_payment(
+            buyer,
+            &[SELLER_ISSUER.to_owned(), DEFAULT_MINT_URL.to_owned()],
+            true,
+            &issuers(&[SELLER_ISSUER]),
+        )
+        .expect("hops past the issuer entry");
+        assert_eq!(
+            plan,
+            PayPlan::Hop {
+                source: mint(buyer),
+                target: mint(DEFAULT_MINT_URL),
+            }
+        );
+
+        // The class is what does it, not the scheme: an https issuer mint that the fence ALONE
+        // would admit as a target is still never one once classified.
+        let https_issuer = "https://issuer.example/Bitcoin";
+        let accepted = vec![https_issuer.to_owned(), DEFAULT_MINT_URL.to_owned()];
+        let unclassified = plan_payment(buyer, &accepted, true, &IssuerMints::none()).unwrap();
+        assert_eq!(
+            unclassified.realized_mint(),
+            &mint(https_issuer),
+            "unclassified, the fence alone admits it as a hop target"
+        );
+        let classified = plan_payment(buyer, &accepted, true, &issuers(&[https_issuer])).unwrap();
+        assert_eq!(
+            classified.realized_mint(),
+            &mint(DEFAULT_MINT_URL),
+            "classified, it is never a hop target"
+        );
+    }
+
+    /// A hop OUT of an issuer mint refuses: the buyer's own currency does not melt to Lightning. A
+    /// seller that LISTS that mint is paid directly, as ever.
+    #[test]
+    fn a_hop_out_of_an_issuer_mint_is_refused_with_the_plain_reason() {
+        let error = plan_payment(
+            SIDECAR,
+            &[DEFAULT_MINT_URL.to_owned()],
+            true,
+            &issuers(&[SIDECAR]),
+        )
+        .expect_err("nothing melts out of an issuer mint");
+        let text = error.to_string();
+        assert!(text.contains(ISSUER_HOP_REFUSAL), "{text}");
+        assert!(text.contains("melted out"), "{text}");
+
+        let plan = plan_payment(
+            SIDECAR,
+            &[DEFAULT_MINT_URL.to_owned(), SIDECAR.to_owned()],
+            false,
+            &issuers(&[SIDECAR]),
+        )
+        .expect("the seller takes the buyer's currency: direct");
+        assert_eq!(plan, PayPlan::Direct { mint: mint(SIDECAR) });
+    }
+
+    /// NEGATIVE, exhaustively over a small world: no plan this module can produce puts a known
+    /// issuer mint on either leg of a hop, for any source, any two-entry accepted list, and either
+    /// setting of the real-money switch.
+    #[test]
+    fn no_plan_ever_puts_an_issuer_mint_on_a_hop_leg() {
+        let lightning = ["https://a.example", "https://b.example", DEFAULT_MINT_URL];
+        let issuer_urls = [SIDECAR, SELLER_ISSUER, "https://issuer.example"];
+        let known = issuers(&issuer_urls);
+        let mut world: Vec<&str> = lightning.to_vec();
+        world.extend(issuer_urls);
+
+        let mut hops = 0;
+        for source in &world {
+            for first in &world {
+                for second in &world {
+                    for allow in [false, true] {
+                        let accepted = vec![first.to_string(), second.to_string()];
+                        if let Ok(PayPlan::Hop { source, target }) =
+                            plan_payment(source, &accepted, allow, &known)
+                        {
+                            hops += 1;
+                            assert!(
+                                !known.contains(&source.to_string()),
+                                "planned a hop OUT of issuer mint {source} (accepted {accepted:?})"
+                            );
+                            assert!(
+                                !known.contains(&target.to_string()),
+                                "planned a hop INTO issuer mint {target} (accepted {accepted:?})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(hops > 0, "the world must contain some legitimate hops for this to prove anything");
+    }
+
+    /// `select_source_mint` puts the buyer's OWN mint first when the seller lists it, balance or no
+    /// balance; otherwise it behaves as before. A seller's issuer mint the buyer holds tokens at is a
+    /// valid direct source (bearer) once classified — and fenced as before when not.
+    #[test]
+    fn source_selection_prefers_the_buyers_own_mint_when_the_seller_lists_it() {
+        let listed_with_slash = "http://127.0.0.1:3338/";
+        let accepted = vec![DEFAULT_MINT_URL.to_owned(), listed_with_slash.to_owned()];
+        let rich_default = [balance(DEFAULT_MINT_URL, 10_000)];
+        let known = issuers(&[SIDECAR]);
+
+        // Own mint listed (spelled with a trailing slash — normalized compare) beats a funded default,
+        // and the SELLER's spelling is what is returned, so the plan matches the creq list.
+        assert_eq!(
+            select_source_mint(DEFAULT_MINT_URL, &accepted, true, &rich_default, 100, Some(SIDECAR), &known),
+            listed_with_slash
+        );
+        // Own mint not listed: unchanged behaviour.
+        assert_eq!(
+            select_source_mint(DEFAULT_MINT_URL, &[DEFAULT_MINT_URL.to_owned()], true, &rich_default, 100, Some(SIDECAR), &known),
+            DEFAULT_MINT_URL
+        );
+        // No own mint stated: unchanged behaviour.
+        assert_eq!(
+            select_source_mint(DEFAULT_MINT_URL, &accepted, true, &rich_default, 100, None, &IssuerMints::none()),
+            DEFAULT_MINT_URL
+        );
+        // A seller's issuer mint the buyer HOLDS tokens at: direct source, switch off, plain http.
+        let held = [balance(SELLER_ISSUER, 500)];
+        assert_eq!(
+            select_source_mint(DEFAULT_MINT_URL, &[SELLER_ISSUER.to_owned()], false, &held, 100, None, &issuers(&[SELLER_ISSUER])),
+            SELLER_ISSUER
+        );
+        // ...and not without the class: the fence refuses the http URL as before.
+        assert_eq!(
+            select_source_mint(DEFAULT_MINT_URL, &[SELLER_ISSUER.to_owned()], false, &held, 100, None, &IssuerMints::none()),
+            DEFAULT_MINT_URL
+        );
+    }
+
+    /// A mint the SELLER declared its issuer mint (its kind-30340 tag, read at accept) is an issuer
+    /// mint to the hop — never a leg, in either direction — but NOT to the fence: a seller's word
+    /// widens nothing. So a declared https mint is skipped as a hop target where the fence alone
+    /// would have landed there; a direct payment at a declared REAL mint still answers to the
+    /// real-money switch exactly as before; and a declared sidecar is fenced until the mint's own
+    /// info (or this seat's config) says otherwise.
+    #[test]
+    fn a_sellers_declared_issuer_mint_refuses_the_hop_but_widens_nothing() {
+        let declared_https = "https://issuer.example/Bitcoin";
+        let declared_real = "https://mint.minibits.cash/Bitcoin";
+        let buyer = "https://buyer-only.example";
+
+        // Hop INTO a declared mint: refused with the plain reason when it is the only entry...
+        let error = plan_payment(
+            buyer,
+            &[declared_https.to_owned()],
+            true,
+            &IssuerMints::none().with_declared(Some(declared_https)),
+        )
+        .expect_err("no hop into a declared issuer mint");
+        assert!(error.to_string().contains(ISSUER_HOP_REFUSAL), "{error}");
+        // ...and skipped when a Lightning mint follows it, where unclassified it would have landed.
+        let accepted = vec![declared_https.to_owned(), DEFAULT_MINT_URL.to_owned()];
+        let unclassified = plan_payment(buyer, &accepted, true, &IssuerMints::none()).unwrap();
+        assert_eq!(unclassified.realized_mint(), &mint(declared_https));
+        let declared = plan_payment(
+            buyer,
+            &accepted,
+            true,
+            &IssuerMints::none().with_declared(Some(declared_https)),
+        )
+        .unwrap();
+        assert_eq!(declared.realized_mint(), &mint(DEFAULT_MINT_URL));
+
+        // Hop OUT of a declared mint: refused. (The seller declaring the BUYER's mint is odd but
+        // costs nothing to refuse — the buyer would only ever hop out of it over Lightning.)
+        let error = plan_payment(
+            declared_https,
+            &[DEFAULT_MINT_URL.to_owned()],
+            true,
+            &IssuerMints::none().with_declared(Some(declared_https)),
+        )
+        .expect_err("nothing melts out of a declared issuer mint");
+        assert!(error.to_string().contains(ISSUER_HOP_REFUSAL), "{error}");
+
+        // NEGATIVE — the fence: a declared REAL mint the buyer sits at is fenced with the switch off
+        // and admitted with it on, exactly as an undeclared one. The declaration changed nothing.
+        let declared_only = IssuerMints::none().with_declared(Some(declared_real));
+        let refused = plan_payment(declared_real, &[declared_real.to_owned()], false, &declared_only)
+            .expect_err("declared or not, a real mint answers to the switch");
+        assert!(refused.to_string().contains("real-mint fence"), "{refused}");
+        assert_eq!(
+            plan_payment(declared_real, &[declared_real.to_owned()], true, &declared_only).unwrap(),
+            PayPlan::Direct {
+                mint: mint(declared_real)
+            }
+        );
+        // A declared plain-http sidecar is still fenced, both switch settings — until it is
+        // classified by its own info or by this seat's config, which the Info/Own rows above cover.
+        for allow in [false, true] {
+            let refused = plan_payment(
+                SELLER_ISSUER,
+                &[SELLER_ISSUER.to_owned()],
+                allow,
+                &IssuerMints::none().with_declared(Some(SELLER_ISSUER)),
+            )
+            .expect_err("a declaration does not open the fence");
+            assert!(refused.to_string().contains("real-mint fence"), "{refused}");
+        }
     }
 
     // ---- select_source_mint: balance-aware source selection at accept (#497 behavior B) ----
@@ -551,13 +855,13 @@ mod tests {
         let balances = vec![balance(minibits, 5_000), balance(cuba, 5_000)];
 
         // Control — the default seed hops to reach cuba (the ⑤ waste).
-        let control = plan_payment(minibits, &accepted, true).expect("control plans");
+        let control = plan_payment(minibits, &accepted, true, &IssuerMints::none()).expect("control plans");
         assert!(control.is_hop(), "control: the default-seeded plan hops minibits->cuba");
 
         // Balance-aware — cuba is selected and plan_payment pays direct from it.
-        let seed = select_source_mint(minibits, &accepted, true, &balances, 100);
+        let seed = select_source_mint(minibits, &accepted, true, &balances, 100, None, &IssuerMints::none());
         assert_eq!(seed, cuba, "the held, accepted mint is chosen as the source");
-        let plan = plan_payment(&seed, &accepted, true).expect("balance-aware plan");
+        let plan = plan_payment(&seed, &accepted, true, &IssuerMints::none()).expect("balance-aware plan");
         assert!(!plan.is_hop(), "direct from the held mint — no hop, no melt fee");
         assert_eq!(plan.realized_mint(), &mint(cuba));
     }
@@ -571,13 +875,13 @@ mod tests {
         let accepted = vec![cuba.to_owned()];
 
         let thin = vec![balance(cuba, 99)];
-        assert_eq!(select_source_mint(minibits, &accepted, true, &thin, 100), minibits);
+        assert_eq!(select_source_mint(minibits, &accepted, true, &thin, 100, None, &IssuerMints::none()), minibits);
 
         let elsewhere = vec![balance(minibits, 10_000)];
-        assert_eq!(select_source_mint(minibits, &accepted, true, &elsewhere, 100), minibits);
+        assert_eq!(select_source_mint(minibits, &accepted, true, &elsewhere, 100, None, &IssuerMints::none()), minibits);
 
         // Legacy: an empty accepted set has nothing to prefer; the default stands.
-        assert_eq!(select_source_mint(minibits, &[], true, &elsewhere, 100), minibits);
+        assert_eq!(select_source_mint(minibits, &[], true, &elsewhere, 100, None, &IssuerMints::none()), minibits);
     }
 
     // #266 guard: the widened balance read surfaces DB-discovered, unconfigured mints for DISPLAY,
@@ -592,7 +896,7 @@ mod tests {
         discovered.configured = false;
 
         assert_eq!(
-            select_source_mint(default_mint, &accepted, true, &[discovered], 100),
+            select_source_mint(default_mint, &accepted, true, &[discovered], 100, None, &IssuerMints::none()),
             default_mint,
             "DB discovery widens display only; it must not change the sealed funding mint"
         );
@@ -606,12 +910,12 @@ mod tests {
         let accepted = vec![real.to_owned()];
         let balances = vec![balance(real, 10_000)];
         assert_eq!(
-            select_source_mint(DEFAULT_MINT_URL, &accepted, false, &balances, 100),
+            select_source_mint(DEFAULT_MINT_URL, &accepted, false, &balances, 100, None, &IssuerMints::none()),
             DEFAULT_MINT_URL,
             "fence off: a covered real mint is not admissible, fall back to the default"
         );
         assert_eq!(
-            select_source_mint(DEFAULT_MINT_URL, &accepted, true, &balances, 100),
+            select_source_mint(DEFAULT_MINT_URL, &accepted, true, &balances, 100, None, &IssuerMints::none()),
             real,
             "fence on: the covered real mint is now selectable"
         );
@@ -627,11 +931,11 @@ mod tests {
         let b = "https://b.example";
         let balances = vec![balance(a, 5_000), balance(b, 5_000)];
         assert_eq!(
-            select_source_mint(default_mint, &[a.to_owned(), b.to_owned()], true, &balances, 100),
+            select_source_mint(default_mint, &[a.to_owned(), b.to_owned()], true, &balances, 100, None, &IssuerMints::none()),
             a
         );
         assert_eq!(
-            select_source_mint(default_mint, &[b.to_owned(), a.to_owned()], true, &balances, 100),
+            select_source_mint(default_mint, &[b.to_owned(), a.to_owned()], true, &balances, 100, None, &IssuerMints::none()),
             b
         );
     }
@@ -646,12 +950,12 @@ mod tests {
         let cuba = "https://cuba.example";
         let accepted = vec![cuba.to_owned()];
         // cuba is covered at accept and gets sealed.
-        let sealed = select_source_mint(minibits, &accepted, true, &[balance(cuba, 5_000)], 100);
+        let sealed = select_source_mint(minibits, &accepted, true, &[balance(cuba, 5_000)], 100, None, &IssuerMints::none());
         assert_eq!(sealed, cuba);
         // At pay, re-derivation uses ONLY the sealed mint + accepted set — no balance input — so the
         // plan is sourced at the sealed cuba regardless of where funds now sit. A drained cuba then
         // fails the wallet's coverage check (the existing fail-closed guard), never a re-select.
-        let pay_plan = plan_payment(&sealed, &accepted, true).expect("re-derives from the seal");
+        let pay_plan = plan_payment(&sealed, &accepted, true, &IssuerMints::none()).expect("re-derives from the seal");
         assert_eq!(pay_plan.source_mint(), &mint(cuba), "pay honors the sealed source");
         assert!(!pay_plan.is_hop());
     }

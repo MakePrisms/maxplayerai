@@ -622,6 +622,7 @@ mod tests {
             max_sats: 10,
             buyer_mint: DEFAULT_MINT_URL,
             allow_real_mints: false,
+            issuer_mints: &maxplayer_core::mint_class::NO_ISSUER_MINTS,
             requested_agent: None,
             requested_harness_family: None,
             requested_model: None,

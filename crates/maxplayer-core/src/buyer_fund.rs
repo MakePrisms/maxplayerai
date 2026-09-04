@@ -86,11 +86,24 @@ pub async fn open_wallet_at_mint_async(
     home: &MaxplayerHome,
     mint_url: &str,
 ) -> Result<Wallet, FundError> {
+    open_wallet_at_mint_admitted_async(home, mint_url, &crate::mint_class::IssuerMints::none()).await
+}
+
+/// [`open_wallet_at_mint_async`] with the caller's SEALED issuer-mint knowledge (§4.2 "Issuer
+/// mint"): a mint `issuers` names passes the fence by class — it carries no sats — so a payment
+/// made in a seat's own currency can open its wallet there whatever `allow_real_mints` says and
+/// whatever scheme the sidecar's URL has. Every other mint is fenced exactly as before. The pay path
+/// passes the bind's seal; nothing else may widen the fence.
+pub async fn open_wallet_at_mint_admitted_async(
+    home: &MaxplayerHome,
+    mint_url: &str,
+    issuers: &crate::mint_class::IssuerMints,
+) -> Result<Wallet, FundError> {
     // Real-mint fence (issue #49): fail closed BEFORE opening/quoting if this mint is a real mint
     // and the operator has not opted in (`allow_real_mints == false`), the same gate the
     // send/melt/receive paths enforce. Callers may have already fenced the realized mint; this
     // re-checks so the helper is safe on its own.
-    if !home::mint_allowed(mint_url, home.config.allow_real_mints) {
+    if !crate::mint_class::mint_admitted(mint_url, home.config.allow_real_mints, issuers) {
         return Err(FundError::MintNotAllowed {
             mint_url: mint_url.to_owned(),
         });

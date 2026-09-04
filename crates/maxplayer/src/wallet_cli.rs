@@ -699,6 +699,8 @@ fn parse_complete_locked(
         seller_signature: required(seller_signature, "--seller-signature")?,
         creq_hash,
         accepted_mints,
+        // The sealed bind overrides this on the locked path; a caller never names an issuer mint.
+        issuer_mints: Vec::new(),
         realized_mint,
     };
     Ok((home, request))

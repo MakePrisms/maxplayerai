@@ -822,11 +822,14 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
             // every other filter come from the SIGNED OFFER, never from award params, so the request
             // cannot be changed after the fact. Sharing the constructor is what makes "both paths
             // filter identically" structural instead of a convention someone has to keep noticing.
+            let issuer_mints =
+                crate::mint_class::IssuerMints::none().with_own(context.home.config.issuer_mint());
             let filters = lifecycle::award_filters_for_offer(
                 offer,
                 max_sats,
                 context.home.config.default_mint(),
                 context.home.config.allow_real_mints,
+                &issuer_mints,
             );
 
             // Manual award names the claim but applies the SAME hard filters as auto-award —
@@ -1312,11 +1315,14 @@ async fn drive_auto_award(
         // THE SAME constructor the manual award path uses, so the two cannot apply different filters.
         // Both selection entry points then consult `claim_meets_capability_request`:
         // `select_awardable_claim` here, `named_claim_awardable` on the manual path.
+        let issuer_mints =
+            crate::mint_class::IssuerMints::none().with_own(context.home.config.issuer_mint());
         let filters = lifecycle::award_filters_for_offer(
             offer,
             max_sats,
             context.home.config.default_mint(),
             context.home.config.allow_real_mints,
+            &issuer_mints,
         );
 
         // Built AFTER `filters` so the deadline park can name the capability request that refused
@@ -5180,6 +5186,7 @@ mod tests {
                     seller_signature: String::new(),
                     creq_hash: None,
                     accepted_mints: vec![],
+                    issuer_mints: Vec::new(),
                     funding_mint: None,
                     delivery_mint: None,
                     agent_used: None,
@@ -5218,6 +5225,7 @@ mod tests {
                     seller_signature: String::new(),
                     creq_hash: None,
                     accepted_mints: vec![],
+                    issuer_mints: Vec::new(),
                     funding_mint: None,
                     delivery_mint: None,
                     agent_used: None,

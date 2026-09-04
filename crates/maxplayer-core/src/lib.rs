@@ -20,6 +20,8 @@ pub mod contribution;
 pub mod crossmint;
 #[cfg(all(feature = "wallet", feature = "gateway"))]
 pub mod crossmint_hop;
+#[cfg(all(feature = "wallet", feature = "gateway"))]
+pub mod mint_class;
 pub mod delivery;
 pub mod delivery_sentinel;
 #[cfg(feature = "git-delivery")]
@@ -43,6 +45,11 @@ pub mod format;
 pub mod gateway;
 pub mod heartbeat;
 pub mod home;
+// The seat's own issuer mint (§4.2) — the stage-3a sidecar's wizard, counters and burn path.
+// `wallet`-gated: the counters read the mint's sqlite (rusqlite) and the burn drives the cdk
+// wallet, both of which live behind that feature.
+#[cfg(feature = "wallet")]
+pub mod issuer;
 pub mod kinds;
 pub mod log;
 // Ungated on purpose: the CLI's MCP tool table reads the long-poll cap from here on a build with
