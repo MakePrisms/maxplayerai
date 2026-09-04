@@ -1441,6 +1441,22 @@ fn classify_redeem_outcome(
     }
 }
 
+/// The platform fee (stage 1) owed on one collected payment: the product-set rate
+/// ([`crate::platform_fee::PLATFORM_FEE_BPS`]) applied to `amount_received`, the NET the mint handed
+/// over. This is the ONE place the constant is read; the arithmetic stays in the parameterised
+/// [`crate::platform_fee::fee_sats`]. Returns the rate in force and the sats it comes to, rounded
+/// down, so the caller journals both beside the receipt.
+///
+/// Called only after the redeem classified `Finalize`; nothing is computed or recorded for a payment
+/// that did not land. Accrued, never remitted: this returns numbers for the journal and moves no sat.
+fn platform_fee_at_collect(amount_received: u64) -> (u32, u64) {
+    let fee_bps = crate::platform_fee::PLATFORM_FEE_BPS;
+    (
+        fee_bps,
+        crate::platform_fee::fee_sats(amount_received, fee_bps),
+    )
+}
+
 /// The seal-sender guard: a payment settles a job ONLY when the authenticated NIP-17 seal sender is
 /// the bound offer buyer (the pubkey folded into the seller-signed receipt preimage). A third party
 /// can never pay-once and close someone else's job.
@@ -6718,17 +6734,24 @@ impl SellerNodeRunner {
                 return;
             }
         };
+        // Platform fee (stage 1): computed only NOW — after the redeem classified `Finalize` — on the
+        // NET the mint handed over, at the product-set rate, and journaled in the receipt write
+        // below. Accrued, never remitted: nothing here or downstream moves a sat on its account.
+        let (fee_bps, fee_sats) = platform_fee_at_collect(amount_received);
         opline!(
-            "seller node collect ok: job_id={job_id} amount_received={amount_received} expected={expected} mint={mint_str}"
+            "seller node collect ok: job_id={job_id} amount_received={amount_received} expected={expected} mint={mint_str} fee_sats={fee_sats} fee_bps={fee_bps}"
         );
 
         // Record the receipt AFTER the money landed (invariant 3 order) — deduped on the wrap id, so a
-        // replayed wrap marks the job paid at most once.
-        match self
-            .node
-            .store()
-            .collect_receipt(&event_id, &job_id, amount_received, now_unix())
-        {
+        // replayed wrap marks the job paid at most once. The fee rides in the same row.
+        match self.node.store().collect_receipt(
+            &event_id,
+            &job_id,
+            amount_received,
+            fee_bps,
+            fee_sats,
+            now_unix(),
+        ) {
             Ok(super::store::Collected::New) => {
                 // `event_id` is the kind-1059 payment gift-wrap — the id this collection is
                 // journaled and deduped under. It is NOT the co-signed kind-3400 receipt (the buyer
@@ -11631,7 +11654,7 @@ mod tests {
 
         // The payment lands ⇒ no longer unsettled, and the receipt time becomes the cursor.
         store
-            .collect_receipt(&"d".repeat(64), &job, 21, 10_000)
+            .collect_receipt(&"d".repeat(64), &job, 21, 0, 0, 10_000)
             .expect("collect");
         assert_eq!(store.last_receipt_unix().expect("receipts"), Some(10_000));
         assert_eq!(
@@ -11892,7 +11915,9 @@ mod tests {
 
         // Pay ⇒ state Paid ⇒ likewise not re-execute-eligible (terminal never clobbered).
         assert_eq!(
-            store.collect_receipt(&"e".repeat(64), &job, 21, 6000).expect("collect"),
+            store
+                .collect_receipt(&"e".repeat(64), &job, 21, 0, 0, 6000)
+                .expect("collect"),
             Collected::New
         );
         assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Paid));
@@ -12843,15 +12868,117 @@ mod tests {
         let wrap_id = "e".repeat(64);
         assert!(!store.has_receipt(&job).expect("read"), "not paid before collect");
         assert_eq!(
-            store.collect_receipt(&wrap_id, &job, 21, 5000).expect("collect"),
+            store.collect_receipt(&wrap_id, &job, 21, 0, 0, 5000).expect("collect"),
             crate::seller_node::store::Collected::New
         );
         assert_eq!(
-            store.collect_receipt(&wrap_id, &job, 21, 5001).expect("replay"),
+            store
+                .collect_receipt(&wrap_id, &job, 21, 0, 0, 5001)
+                .expect("replay"),
             crate::seller_node::store::Collected::Duplicate,
             "a replayed wrap id never credits the job twice"
         );
-        assert!(store.has_receipt(&job).expect("read"), "paid after the first collect");
+        assert!(
+            store.has_receipt(&job).expect("read"),
+            "paid after the first collect"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Platform fee (stage 1) at the collect seam. Drives the two calls `on_gift_wrap` makes once the
+    // redeem has classified `Finalize` — `platform_fee_at_collect` on the NET amount, then
+    // `collect_receipt` with the result — against a real store, with no relay or mint.
+    //
+    // Two things are proved. (1) The seam's rate IS `PLATFORM_FEE_BPS` and its sats are what the
+    // parameterised `fee_sats` gives for that rate — checked by identity, not by literal, so the test
+    // follows the constant when a human names the number. (2) The same path at a nonzero rate — the
+    // parameterised function into the same `collect_receipt` — journals a nonzero fee and reads it
+    // back per job and in total, so a seam that dropped or zeroed the rate would fail here rather
+    // than hide behind the shipped `0`. What this does NOT drive: the wallet swap itself.
+    #[test]
+    fn a_collected_job_records_the_platform_fee_constant_and_the_sats_it_implies() {
+        use crate::platform_fee::{PLATFORM_FEE_BPS, fee_sats};
+        use crate::seller_node::store::{Collected, JobFeeAccrual};
+
+        let seller = nostr_sdk::prelude::Keys::generate().public_key().to_hex();
+        let creq = gateway::creq::build_seller_creq(
+            &"a".repeat(64),
+            100,
+            "sat",
+            &["https://testnut.cashudevkit.org".to_owned()],
+            &seller,
+        )
+        .expect("creq");
+        let job = "a".repeat(64);
+        let buyer = "b".repeat(64);
+
+        // (1) The seam reads the constant. A 100-sat NET receive is journaled with `fee_bps` equal to
+        // `PLATFORM_FEE_BPS` and `fee_sats` equal to what that rate implies — today both are 0.
+        let (seam_bps, seam_sats) = platform_fee_at_collect(100);
+        assert_eq!(
+            seam_bps, PLATFORM_FEE_BPS,
+            "the seam's rate is the constant"
+        );
+        assert_eq!(
+            seam_sats,
+            fee_sats(100, PLATFORM_FEE_BPS),
+            "the seam's sats follow from the constant through the parameterised function"
+        );
+        assert_eq!(
+            (seam_bps, seam_sats),
+            (0, 0),
+            "stage 1 ships at zero: it accrues nothing and pays nobody"
+        );
+        let (store, root) = store_with_awarded_job(&creq, &job, &buyer, 4242);
+        assert_eq!(
+            store
+                .collect_receipt(&"e".repeat(64), &job, 100, seam_bps, seam_sats, 5000)
+                .expect("collect"),
+            Collected::New
+        );
+        let accrued = store.accrued_fees().expect("read-out");
+        assert_eq!(accrued.total_fee_sats, fee_sats(100, PLATFORM_FEE_BPS));
+        assert_eq!(
+            accrued.by_job,
+            vec![JobFeeAccrual {
+                job_id: job.clone(),
+                amount_sats: 100,
+                fee_bps: PLATFORM_FEE_BPS,
+                fee_sats: fee_sats(100, PLATFORM_FEE_BPS),
+                received_at_unix: 5000
+            }]
+        );
+        assert!(
+            store.has_receipt(&job).expect("read"),
+            "the receipt still marks the job paid"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        // (2) The same fee path at a nonzero rate: 2% (200 bp) of a 100-sat NET receive is 2 sats,
+        // journaled in the receipt row and read back. This is what would fail if the seam ignored
+        // its rate, because the shipped 0 can never distinguish "used the constant" from "hardcoded".
+        let nonzero_bps = 200;
+        let nonzero_sats = fee_sats(100, nonzero_bps);
+        assert_eq!(nonzero_sats, 2);
+        let (store, root) = store_with_awarded_job(&creq, &job, &buyer, 4242);
+        assert_eq!(
+            store
+                .collect_receipt(&"f".repeat(64), &job, 100, nonzero_bps, nonzero_sats, 5000)
+                .expect("collect"),
+            Collected::New
+        );
+        let accrued = store.accrued_fees().expect("read-out");
+        assert_eq!(accrued.total_fee_sats, 2, "a nonzero rate accrues");
+        assert_eq!(
+            accrued.by_job,
+            vec![JobFeeAccrual {
+                job_id: job.clone(),
+                amount_sats: 100,
+                fee_bps: 200,
+                fee_sats: 2,
+                received_at_unix: 5000
+            }]
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

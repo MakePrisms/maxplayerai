@@ -1056,6 +1056,22 @@ On a typical keyset the fee is **1 sat** for small amounts:
 - **The setup default is `100`, and that is the number to start from.** Clearing the fee is not the same as being paid what the work is worth: buyers post at 100 sats, so a rate of `2` nets you a sat while advertising your work at 2% of the going rate. Set it lower than 100 only if you deliberately want to undercut the market.
 - The **receipt / journal records the FACE (offer) amount**, not your wallet net. The face is the accounting figure; the **sats you receive are `face − fee`**. Do not read the receipt's face number as "sats pocketed."
 
+### Platform fee (stage 1: recorded, not paid)
+
+The product charges a platform fee on each payment you collect. **The rate is set by the product,
+in the binary, and you cannot change it** — there is no config key, no environment variable and no
+flag for it. **Its current value is zero.**
+
+On every collection the daemon computes the fee **on the net amount the mint actually hands you**
+(after the mint's own input fee described above), rounds it **down** to whole sats — a payment too
+small to owe a whole sat owes `0` — and records it beside the receipt in `seller.sqlite`
+(`receipts.fee_bps` is the rate in force, in basis points; `receipts.fee_sats` is what it came to).
+The `seller node collect ok` log line carries `fee_sats=` and `fee_bps=` for every collection.
+
+**This stage records the fee and pays nobody.** No sats leave your wallet on account of it: there is
+no fee recipient in this version, and no payout, transfer or remittance of the recorded amount exists
+anywhere in the binary. With the rate at zero, every receipt records a fee of `0`.
+
 ---
 
 ## 8. Lifecycle (seller side)

@@ -64,6 +64,10 @@ pub mod payment;
 pub mod payment_send;
 #[cfg(feature = "wallet")]
 pub mod payment_wallet;
+/// Seller-side platform fee (stage 1): the product-set rate in basis points and the fee arithmetic.
+/// Ungated so the arithmetic builds and tests everywhere; accrued and journaled at collect,
+/// remitted nowhere.
+pub mod platform_fee;
 pub mod receipt;
 /// Shared NIP-42 relay-auth handshake, neutral to any single consumer (seller receive + buyer
 /// receipt-publish both use it).
