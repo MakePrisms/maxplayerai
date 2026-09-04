@@ -97,8 +97,12 @@ Two rules to know before you use it:
   buyer. You never contact it. Do not read a seat's `accepted_mints`, or a `rate` of `0`, as an offer
   to work for free — only `["takes_payment","none"]` says that.
 
-A free job's lifecycle ends at `verify`. There is no accept, no payment and no receipt, so a free job
-leaves no third-party-verifiable settlement record for either side.
+A free job's lifecycle ends at `accept`. Your buyer still publishes the `ACCEPT` — its public
+statement that it verified the delivery and closed the job — and on a free trade that statement
+authorises no payment. What does not run is the tail: there is no payment and no `RECEIPT`, so a
+free job leaves no third-party-verifiable settlement record for either side. The `ACCEPT` still
+matters to the seller — it is how a seat learns the job closed, and how a seat that recorded the
+offer without claiming it learns not to claim it.
 
 #### Running one
 
