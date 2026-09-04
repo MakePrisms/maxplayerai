@@ -85,6 +85,15 @@ pub struct RelayLimitation {
     /// NIP-ER: maximum allowed `not_before` horizon in seconds from now.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_not_before_delta: Option<u64>,
+    /// Longest life this relay grants a NIP-98 git push token that is scoped to a single
+    /// ref and carries a NIP-40 `expiration` tag, in seconds.
+    ///
+    /// A client reads this to decide whether a long-lived scoped token is safe to mint,
+    /// and to refuse an over-cap token at mint time rather than meeting a 403 in the
+    /// middle of a delivery. Omitted when the relay grants no relaxation at all, which a
+    /// client must read as "unscoped rules only: ±60 s".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scoped_token_max_lifetime_secs: Option<u64>,
 }
 
 /// Canonical `RelayLimitation` advertised by this relay.
@@ -93,7 +102,10 @@ pub struct RelayLimitation {
 /// unconditionally reject connections that are not in
 /// `AuthState::Authenticated`. This is independent of the REST API token
 /// toggle (`config.require_auth_token`).
-fn relay_limitation(max_message_length: usize) -> RelayLimitation {
+fn relay_limitation(
+    max_message_length: usize,
+    scoped_token_max_lifetime_secs: u64,
+) -> RelayLimitation {
     let max_not_before_delta: u64 = std::env::var("SPROUT_MAX_NOT_BEFORE_DELTA")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -111,6 +123,10 @@ fn relay_limitation(max_message_length: usize) -> RelayLimitation {
         restricted_writes: true,
         due_delivery_mode: Some("push".to_string()),
         max_not_before_delta: Some(max_not_before_delta),
+        // Zero means the relay grants no relaxation, so advertise nothing rather than a
+        // cap of 0 — a client reading `0` could mistake it for "no limit".
+        scoped_token_max_lifetime_secs: (scoped_token_max_lifetime_secs > 0)
+            .then_some(scoped_token_max_lifetime_secs),
     }
 }
 
@@ -128,6 +144,11 @@ impl RelayInfo {
     /// [`workspace_icon_for_host`]) — a host-scoped scalar, pre-fetched by
     /// the caller so `build` itself stays static-input.
     ///
+    /// `scoped_token_max_lifetime_secs` is the cap this relay enforces on a ref-scoped
+    /// NIP-98 push token, advertised in `limitation` under the same name. Pass
+    /// `config.scoped_token_max_lifetime_secs` so the advertised value is the enforced
+    /// one; `0` advertises nothing.
+    ///
     /// `advertise_nip43` controls whether NIP-43 (relay membership) is added
     /// to `supported_nips`. Set `true` only when the relay actually emits and
     /// gates on NIP-43 events — i.e. has a stable key AND enforces
@@ -139,6 +160,7 @@ impl RelayInfo {
         advertise_nip43: bool,
         max_message_length: usize,
         pairing_relay_url: Option<&str>,
+        scoped_token_max_lifetime_secs: u64,
     ) -> Self {
         debug_assert!(
             !advertise_nip43 || relay_self.is_some(),
@@ -161,7 +183,10 @@ impl RelayInfo {
             push: None,
             software: "https://github.com/block/buzz".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
-            limitation: Some(relay_limitation(max_message_length)),
+            limitation: Some(relay_limitation(
+                max_message_length,
+                scoped_token_max_lifetime_secs,
+            )),
             pairing_relay_url: pairing_relay_url.map(str::to_string),
             relay_self: relay_self.map(|s| s.to_string()),
         }
@@ -241,6 +266,7 @@ pub(crate) async fn nip11_document(state: &crate::state::AppState, raw_host: &st
         advertise_nip43,
         state.config.max_frame_bytes,
         state.config.pairing_relay_url.as_deref(),
+        state.config.scoped_token_max_lifetime_secs,
     );
     let tenant_host = if state.config.push_gateway_delivery_url.is_some() {
         crate::tenant::bind_community(&state.db, raw_host)
@@ -325,6 +351,10 @@ pub(crate) fn nip11_facts(state: &crate::state::AppState) -> (Option<String>, bo
 /// hard build break, the same way a deny-lint would. If you must change this
 /// signature, you are changing the conformance contract: update the conformance
 /// doc and prove the new input is host-scoped, not unscoped, first.
+///
+/// The trailing `u64` is the scoped-token lifetime cap. It is a deployment-global scalar
+/// from `Config`, the same class of input as `max_message_length`, so it carries no
+/// per-community state and cannot become an enumeration oracle.
 #[allow(clippy::type_complexity)]
 const _RELAY_INFO_BUILD_STATIC_INPUT_FENCE: fn(
     Option<&str>,
@@ -332,11 +362,16 @@ const _RELAY_INFO_BUILD_STATIC_INPUT_FENCE: fn(
     bool,
     usize,
     Option<&str>,
+    u64,
 ) -> RelayInfo = RelayInfo::build;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cap a test relay advertises. Deliberately NOT the production default, so a
+    /// test that asserts the advertised value cannot pass by coincidence.
+    const TEST_CAP: u64 = 12_345;
 
     #[test]
     fn push_descriptor_is_gated_by_gateway_configuration_and_tenant_binding() {
@@ -386,7 +421,7 @@ mod tests {
 
     #[test]
     fn build_advertises_buzz_repository_url() {
-        let info = RelayInfo::build(None, None, false, DEFAULT_MAX_FRAME_BYTES, None);
+        let info = RelayInfo::build(None, None, false, DEFAULT_MAX_FRAME_BYTES, None, TEST_CAP);
         assert_eq!(info.software, "https://github.com/block/buzz");
     }
 
@@ -398,6 +433,7 @@ mod tests {
             false,
             DEFAULT_MAX_FRAME_BYTES,
             Some("wss://pairing.buzz.xyz"),
+            TEST_CAP,
         );
         let json = serde_json::to_value(&info).expect("serialize");
         assert_eq!(
@@ -406,7 +442,7 @@ mod tests {
             Some("wss://pairing.buzz.xyz")
         );
 
-        let info = RelayInfo::build(None, None, false, DEFAULT_MAX_FRAME_BYTES, None);
+        let info = RelayInfo::build(None, None, false, DEFAULT_MAX_FRAME_BYTES, None, TEST_CAP);
         let json = serde_json::to_value(&info).expect("serialize");
         assert!(json.get("pairing_relay_url").is_none());
     }
@@ -422,6 +458,7 @@ mod tests {
             false,
             DEFAULT_MAX_FRAME_BYTES,
             None,
+            TEST_CAP,
         );
         assert_eq!(
             info.icon.as_deref(),
@@ -434,7 +471,7 @@ mod tests {
         );
 
         for icon in [None, Some("")] {
-            let info = RelayInfo::build(None, icon, false, DEFAULT_MAX_FRAME_BYTES, None);
+            let info = RelayInfo::build(None, icon, false, DEFAULT_MAX_FRAME_BYTES, None, TEST_CAP);
             assert!(info.icon.is_none());
             let json = serde_json::to_value(&info).expect("serialize");
             assert!(
@@ -449,14 +486,80 @@ mod tests {
         // REQ, EVENT, and COUNT all unconditionally require
         // `AuthState::Authenticated` (see `crates/buzz-relay/src/handlers/`),
         // so the NIP-11 doc must advertise it.
-        assert!(relay_limitation(DEFAULT_MAX_FRAME_BYTES).auth_required);
+        assert!(relay_limitation(DEFAULT_MAX_FRAME_BYTES, TEST_CAP).auth_required);
     }
 
     #[test]
     fn max_message_length_uses_configured_frame_limit() {
-        let info = RelayInfo::build(None, None, false, 262_144, None);
+        let info = RelayInfo::build(None, None, false, 262_144, None, TEST_CAP);
         let limitation = info.limitation.expect("limitation");
         assert_eq!(limitation.max_message_length, Some(262_144));
+    }
+
+    /// The client half reads this field by name to decide whether a long-lived scoped
+    /// push token is safe to mint, so the SPELLING is part of the contract. Assert it in
+    /// the serialized JSON, not only on the struct.
+    #[test]
+    fn the_scoped_token_cap_is_advertised_in_the_limitation() {
+        let info = RelayInfo::build(None, None, false, DEFAULT_MAX_FRAME_BYTES, None, TEST_CAP);
+        assert_eq!(
+            info.limitation
+                .as_ref()
+                .expect("limitation")
+                .scoped_token_max_lifetime_secs,
+            Some(TEST_CAP)
+        );
+
+        let json = serde_json::to_value(&info).expect("serialize");
+        assert_eq!(
+            json["limitation"]["scoped_token_max_lifetime_secs"]
+                .as_u64()
+                .expect("scoped_token_max_lifetime_secs must be served as a number"),
+            TEST_CAP,
+            "NIP-11 must advertise the ENFORCED cap under exactly this field name"
+        );
+    }
+
+    /// A relay that grants no relaxation omits the field, so a client cannot read a `0`
+    /// as "no limit". The document is otherwise unchanged.
+    #[test]
+    fn a_zero_cap_advertises_no_scoped_lifetime() {
+        let info = RelayInfo::build(None, None, false, DEFAULT_MAX_FRAME_BYTES, None, 0);
+        assert_eq!(
+            info.limitation
+                .as_ref()
+                .expect("limitation")
+                .scoped_token_max_lifetime_secs,
+            None
+        );
+        let json = serde_json::to_value(&info).expect("serialize");
+        assert!(
+            json["limitation"]
+                .get("scoped_token_max_lifetime_secs")
+                .is_none(),
+            "a zero cap must omit the field entirely"
+        );
+    }
+
+    /// The production default is 6 hours, which covers the longest job the marketplace
+    /// allows. `buzz_auth` owns the number; the relay must not carry a second copy.
+    #[test]
+    fn the_default_advertised_cap_is_six_hours() {
+        assert_eq!(buzz_auth::DEFAULT_SCOPED_TOKEN_MAX_LIFETIME_SECS, 21_600);
+        let info = RelayInfo::build(
+            None,
+            None,
+            false,
+            DEFAULT_MAX_FRAME_BYTES,
+            None,
+            buzz_auth::DEFAULT_SCOPED_TOKEN_MAX_LIFETIME_SECS,
+        );
+        assert_eq!(
+            info.limitation
+                .expect("limitation")
+                .scoped_token_max_lifetime_secs,
+            Some(21_600)
+        );
     }
 
     #[test]
@@ -485,7 +588,7 @@ mod tests {
     /// Open relay, ephemeral key — both `self` and NIP-43 are absent.
     #[test]
     fn build_open_relay_ephemeral_key_omits_self_and_nip43() {
-        let info = RelayInfo::build(None, None, false, DEFAULT_MAX_FRAME_BYTES, None);
+        let info = RelayInfo::build(None, None, false, DEFAULT_MAX_FRAME_BYTES, None, TEST_CAP);
         assert!(info.relay_self.is_none());
         assert!(!info.supported_nips.contains(&NIP_RELAY_MEMBERSHIP));
     }
@@ -498,7 +601,14 @@ mod tests {
     #[test]
     fn build_open_relay_stable_key_advertises_self_but_not_nip43() {
         let pk = "0000000000000000000000000000000000000000000000000000000000000001";
-        let info = RelayInfo::build(Some(pk), None, false, DEFAULT_MAX_FRAME_BYTES, None);
+        let info = RelayInfo::build(
+            Some(pk),
+            None,
+            false,
+            DEFAULT_MAX_FRAME_BYTES,
+            None,
+            TEST_CAP,
+        );
         assert_eq!(info.relay_self.as_deref(), Some(pk));
         assert!(!info.supported_nips.contains(&NIP_RELAY_MEMBERSHIP));
     }
@@ -507,7 +617,14 @@ mod tests {
     #[test]
     fn build_membership_relay_advertises_self_and_nip43() {
         let pk = "0000000000000000000000000000000000000000000000000000000000000001";
-        let info = RelayInfo::build(Some(pk), None, true, DEFAULT_MAX_FRAME_BYTES, None);
+        let info = RelayInfo::build(
+            Some(pk),
+            None,
+            true,
+            DEFAULT_MAX_FRAME_BYTES,
+            None,
+            TEST_CAP,
+        );
         assert_eq!(info.relay_self.as_deref(), Some(pk));
         assert!(info.supported_nips.contains(&NIP_RELAY_MEMBERSHIP));
     }
@@ -518,6 +635,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "advertise_nip43=true requires relay_self=Some")]
     fn build_nip43_without_self_panics_in_debug() {
-        let _ = RelayInfo::build(None, None, true, DEFAULT_MAX_FRAME_BYTES, None);
+        let _ = RelayInfo::build(None, None, true, DEFAULT_MAX_FRAME_BYTES, None, TEST_CAP);
     }
 }

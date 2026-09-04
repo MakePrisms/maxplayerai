@@ -19,7 +19,7 @@ changed the files").
 MODIFICATIONS relative to the upstream branch above
 ---------------------------------------------------
 Every file under `crates/buzz/` is a byte-verbatim copy of the upstream source
-EXCEPT the three changes below. The layout mirrors the upstream repo root (its
+EXCEPT the four changes below. The layout mirrors the upstream repo root (its
 `crates/`, `migrations/`, `Dockerfile`, `LICENSE`) so `git diff` against
 block/buzz stays meaningful and upstream commits remain scannable/pullable.
 
@@ -45,6 +45,28 @@ block/buzz stays meaningful and upstream commits remain scannable/pullable.
    (b) the MakePrisms/maxplayerai #397 payment/DoS bound on NIP-17 events: the
        gift wrap (1059) and the DM-relay list (10050) are capped at 128 KB of
        content, and the gift wrap must additionally carry at least one `p` tag.
+
+4. Git push tokens — the maxplayerai seller delivery path. A seller delivers a hired
+   job as a git push to the relay, authenticated with a NIP-98 (kind:27235) bearer
+   token. Two additions serve that path, each marked inline with a comment:
+   (a) `crates/buzz-relay/src/api/git/{transport.rs,hook.rs,policy.rs}` (PR #929) — a
+       push token MAY carry one `["ref", "<refname>"]` tag naming the single ref it may
+       write. `transport.rs` reads the FIRST such tag after signature verification, the
+       pre-receive hook carries it in its environment, its length-prefixed HMAC input,
+       and its callback body, and the policy endpoint denies the push (403) when any ref
+       update is not an EXACT match. A token with no `ref` tag keeps today's behaviour.
+   (b) `crates/buzz-auth/src/nip98.rs` plus `crates/buzz-relay/src/{config.rs,nip11.rs}`
+       and the transport call site — a scope-conditional freshness rule.
+       `verify_nip98_event_with_policy` grants a scoped token that also carries a NIP-40
+       `["expiration", <unix>]` tag a life up to
+       `BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS` (default 21600 s = 6 h), and rejects one
+       that asks for more. `verify_nip98_event` keeps the ±60 s window, so every caller
+       outside the git transport is unchanged. The effective cap is advertised in the
+       NIP-11 `limitation` object as `scoped_token_max_lifetime_secs`. The ref-name
+       validator moved from `policy.rs` to `buzz-auth` so one definition serves both the
+       freshness rule and the push-time enforcement. While the cap is non-zero the git
+       legs also refuse a `ref` tag that is not a valid ref name rather than reading it
+       as an absent scope.
    No other source (`.rs`) files were modified.
 
 Vendored (the 12-crate relay build closure): buzz-relay, buzz-core,

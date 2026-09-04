@@ -41,6 +41,7 @@ use tracing::{error, warn};
 
 use uuid::Uuid;
 
+use buzz_auth::is_valid_ref_name;
 use buzz_core::channel::MemberRole;
 use buzz_core::git_perms::{evaluate_push, parse_protection_tags, Denial, RefUpdate, UpdateKind};
 use buzz_db::EventQuery;
@@ -185,16 +186,16 @@ fn verify_hmac(secret: &[u8], req: &HookCallbackRequest) -> bool {
     expected.ct_eq(&provided).into()
 }
 
-/// Structural validation for a full ref name arriving from the hook.
+/// The ref updates in this push that the token's scope does not cover.
 ///
-/// Used for both the reported ref updates and the token's ref scope, so the two can never
-/// drift apart: a scope that would be rejected as a ref name must not be accepted as a scope.
-fn is_valid_ref_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 256
-        && name.starts_with("refs/")
-        && !name.contains("..")
-        && !name.bytes().any(|b| b <= 0x20 || b == 0x7f)
+/// Exact match, no pattern. A prefix or glob would let a leaked token stomp sibling refs,
+/// which is the whole harm the scope exists to prevent — so `RefPattern` is deliberately
+/// NOT reused here. An empty `scope` means the token is unscoped and covers everything.
+fn refs_outside_scope<'a>(scope: &str, updates: &'a [HookRefUpdate]) -> Vec<&'a HookRefUpdate> {
+    if scope.is_empty() {
+        return Vec::new();
+    }
+    updates.iter().filter(|r| r.ref_name != scope).collect()
 }
 
 /// `POST /internal/git/policy` — pre-receive hook callback.
@@ -271,19 +272,15 @@ pub async fn hook_policy_check(
     // This sits ON TOP of the role and protection-rule checks below, never instead of them:
     // a scoped token still cannot push where its role may not. Scoping only ever subtracts.
     //
-    // Exact match, no pattern. A prefix or glob would let a leaked token stomp sibling refs,
-    // which is the whole harm the scope exists to prevent — so `RefPattern` is deliberately
-    // NOT reused here.
+    // The scope arrives from the signed NIP-98 token, and it is the SAME value that
+    // decided how long that token was allowed to live (brief §7(c)): the transport reads
+    // the first `ref` tag once and passes it here through the hook environment.
     if !req.ref_scope.is_empty() {
         if !is_valid_ref_name(&req.ref_scope) {
             warn!(repo = %req.repo_id, scope = %req.ref_scope, "hook callback: invalid ref scope");
             return (StatusCode::FORBIDDEN, "invalid ref scope").into_response();
         }
-        let out_of_scope: Vec<&HookRefUpdate> = req
-            .ref_updates
-            .iter()
-            .filter(|r| r.ref_name != req.ref_scope)
-            .collect();
+        let out_of_scope = refs_outside_scope(&req.ref_scope, &req.ref_updates);
         if !out_of_scope.is_empty() {
             warn!(
                 repo = %req.repo_id,
@@ -855,6 +852,61 @@ printf '%s' "$HMAC_INPUT" | openssl dgst -sha256 -hmac "{secret}" -hex 2>/dev/nu
     }
 
     // ---- Branch-scoped push tokens ------------------------------------------------------
+
+    /// A scoped token that pushes any other ref is denied, and the reason names the
+    /// scope. This is the Requirement A regression the longer lifetime rests on: a
+    /// long-lived token is only safe because this stays true.
+    #[test]
+    fn a_scoped_token_may_write_only_its_own_ref() {
+        let scope = "refs/heads/maxplayer/contribution/job-1";
+        let in_scope = HookRefUpdate {
+            old_oid: "0".repeat(40),
+            new_oid: "a".repeat(40),
+            ref_name: scope.to_string(),
+            is_ancestor: false,
+        };
+        let mut sibling = in_scope.clone();
+        sibling.ref_name = "refs/heads/maxplayer/contribution/job-2".to_string();
+        let mut main = in_scope.clone();
+        main.ref_name = "refs/heads/main".to_string();
+        // A prefix of the scope must not pass either — the match is exact, not a glob.
+        let mut prefix = in_scope.clone();
+        prefix.ref_name = "refs/heads/maxplayer/contribution/job-1x".to_string();
+
+        assert!(
+            refs_outside_scope(scope, std::slice::from_ref(&in_scope)).is_empty(),
+            "the scoped ref itself must be allowed"
+        );
+        for other in [&sibling, &main, &prefix] {
+            let denied = refs_outside_scope(scope, std::slice::from_ref(other));
+            assert_eq!(
+                denied.len(),
+                1,
+                "ref {} must be denied under scope {scope}",
+                other.ref_name
+            );
+        }
+
+        // A push that mixes the scoped ref with another denies only the other one, and
+        // the handler denies the whole push because the list is non-empty.
+        let mixed = [in_scope, sibling.clone()];
+        let denied = refs_outside_scope(scope, &mixed);
+        assert_eq!(denied.len(), 1);
+        assert_eq!(denied[0].ref_name, sibling.ref_name);
+    }
+
+    /// An empty scope is the unscoped token: every ref passes, exactly as before
+    /// Requirement A.
+    #[test]
+    fn an_unscoped_token_is_not_narrowed_by_the_scope_check() {
+        let update = HookRefUpdate {
+            old_oid: "0".repeat(40),
+            new_oid: "a".repeat(40),
+            ref_name: "refs/heads/anything".to_string(),
+            is_ancestor: false,
+        };
+        assert!(refs_outside_scope("", &[update]).is_empty());
+    }
 
     #[test]
     fn a_scope_is_validated_as_strictly_as_a_ref_name() {
