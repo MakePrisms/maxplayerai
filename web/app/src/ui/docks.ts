@@ -173,7 +173,7 @@ const statBlock = (pairs: [string, string, string?][]): string =>
 
 const fieldLabel = (name: string): string => ({
   d: "Seat", t: "Namespace", v: "Protocol version", rate: "Rate (sats)",
-  accepting: "Accepting work", queue_depth: "Queue depth",
+  accepting: "Serving", queue_depth: "Jobs in flight",
   accepted_mints: "Accepted mints", agents: "Agents",
   model: "Model", models: "Models", hardware: "Hardware",
 } as Record<string, string>)[name] || String(name).replaceAll("_", " ").replace(/\b\w/g, (c) => c.toUpperCase());
@@ -335,22 +335,35 @@ function participantSheet(view: MarketView, role: "buyer" | "seller", pubkey: st
   }
   const parts = [`<h3>${dot}<span>${isSeller ? "Runner" : "Racer"} ${title}</span></h3>`];
 
-  /* Profile: identity plus what the participant advertises. "Accepting work:
-     No" is a published value and stays; an absent advertisement does not. */
+  /* Profile: identity plus what the participant advertises. "Status: Not
+     serving" is a published value and stays; an absent advertisement does not. */
   const kind0 = view.profiles.get(pubkey);
   const about = kind0?.about ?? s?.about ?? b?.about;
   const accepting = s?.accepting;
   // The wire value is "y"/"n" (measured on the live relay 8/13 — 20 of 21
   // heartbeats say "y"). Accept the long forms too; an unknown value shows
   // raw rather than being silently misread as a refusal.
-  const acceptingText = accepting == null ? null
-    : ["y", "yes", "true", "1"].includes(String(accepting).toLowerCase()) ? "Yes"
-    : ["n", "no", "false", "0"].includes(String(accepting).toLowerCase()) ? "No"
+  const acceptingFlag = accepting == null ? null
+    : ["y", "yes", "true", "1"].includes(String(accepting).toLowerCase()) ? true
+    : ["n", "no", "false", "0"].includes(String(accepting).toLowerCase()) ? false
+    : null;
+  // `accepting=y` means the seat is alive and serving, NOT that it has a free
+  // slot (protocol-v1 §4.2): a seat holding one job of three still says "y".
+  // So the row is not "Accepting work: Yes/No" — that read as "has room". It
+  // renders `accepting` and `queue_depth` together: serving plus the load it
+  // is carrying. A seat that is actually full shows it by not claiming.
+  const depth = s?.queueDepth;
+  const loadText = depth == null ? null
+    : depth === 0 ? "idle"
+    : `${nf.format(depth)} job${depth === 1 ? "" : "s"} in flight`;
+  const statusText = accepting == null ? null
+    : acceptingFlag === true ? (loadText ? `Serving · ${loadText}` : "Serving")
+    : acceptingFlag === false ? (depth ? `Not serving · ${loadText}` : "Not serving")
     : String(accepting);
   const profileRowsHtml = ([
     ["About", about ? String(about) : null],
     ["Min rate", s?.askSats == null ? null : `${usd(s.askSats)} · ${nf.format(s.askSats)} sat`],
-    ["Accepting work", acceptingText],
+    ["Status", statusText],
     ["Accepted mints", s?.acceptedMints?.length ? s.acceptedMints.join(" · ") : null],
     ...capabilityRows(s),
   ] as ProfileRow[])

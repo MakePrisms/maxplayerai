@@ -836,10 +836,13 @@ fn tag_values(tags: &[TagSpec], name: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Build the heartbeat for a seller's live state. `accepting` is `y` only when the seat has a free
-/// slot AND something is actually serving: a busy seller is not taking new work, and neither is a
-/// seat that has dropped every harness. `agents` is what the live roster advertises. This is the
-/// single mapping the daemon loop uses, factored out so the flip is unit-testable without a relay.
+/// Build the heartbeat for a seller's live state. `accepting` is `y` exactly when something is
+/// actually serving, at ANY in-flight depth; a seat that has dropped every harness publishes `n`.
+/// It does NOT mean "has a free execution slot": a seat holding one job of its three slots is
+/// still open to offers, and a seat that is genuinely full declines at claim time
+/// (`SlotGate::try_reserve` ⇒ `Reserve::Full`) rather than by a tag. `agents` is what the live
+/// roster advertises. This is the single mapping the daemon loop uses, factored out so the flip
+/// is unit-testable without a relay.
 ///
 /// ⚠ **`in_flight` is a COUNT, and the type is load-bearing.** This parameter was a `bool`, which
 /// destroyed the count at the signature — the `queue_depth` on the wire could then only ever be 0 or
@@ -875,12 +878,12 @@ pub fn heartbeat_for_state(
     // that can drift; the fields are observed STATE (models, probed capabilities) that cannot be
     // recomputed from the `agents` list anyway. Callers pass names and capability from the same
     // single locked snapshot, so they cannot describe different rosters.
-    HeartbeatDraft::new(
-        in_flight == 0 && anything_serving,
-        in_flight,
-        rate_sats,
-        accepted_mints,
-    )
+    // `accepting` is "alive and serving", NOT "has a free slot". `in_flight` deliberately plays no
+    // part: with `[seller] slots` defaulting to 3, gating on `in_flight == 0` published `n` from
+    // the first job onward while two slots stood free, and said nothing `queue_depth` did not.
+    // Capacity is enforced where it is known — `SlotGate::try_reserve` at claim time — and a full
+    // seat signals fullness by not claiming. `queue_depth` stays the live count, unchanged.
+    HeartbeatDraft::new(anything_serving, in_flight, rate_sats, accepted_mints)
     // §4.1 — derived from the SAME `SellerConfig` the admission gate reads, in the same call, so
     // the advertisement cannot lie about the gate that enforces it.
     .with_takes_no_payment(takes_no_payment)
@@ -1634,8 +1637,10 @@ mod tests {
         assert!(parse_heartbeat(&stated_none).expect("parse").agents.is_empty());
     }
 
+    /// A busy seat stays open. `accepting` does not flip on in-flight state; `queue_depth` is what
+    /// carries the load, so the pair says "serving, holding one" rather than "closed".
     #[test]
-    fn accepting_flips_with_in_flight_state() {
+    fn accepting_stays_y_while_busy_and_queue_depth_carries_the_load() {
         let idle = heartbeat_for_state(0, true, 5, false, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY);
         assert!(idle.accepting);
         assert_eq!(idle.queue_depth, 0);
@@ -1645,11 +1650,14 @@ mod tests {
         );
 
         let busy = heartbeat_for_state(1, true, 5, false, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY);
-        assert!(!busy.accepting);
+        assert!(
+            busy.accepting,
+            "one job held of three slots is not a closed seat"
+        );
         assert_eq!(busy.queue_depth, 1);
         assert_eq!(
             first_tag_value(&busy.to_event_draft().tags, "accepting"),
-            Some("n")
+            Some("y")
         );
         assert_eq!(
             first_tag_value(&busy.to_event_draft().tags, "queue_depth"),
@@ -1657,14 +1665,16 @@ mod tests {
         );
     }
 
-    /// The whole point of the change: an idle seat with nothing serving is NOT accepting.
+    /// `accepting` means alive and serving — NOT "has a free execution slot". Something serving ⇒
+    /// `y` at any depth; nothing serving ⇒ `n` at any depth (the dark-seat rule, which predates
+    /// this table and stays).
     ///
     /// Written as the full truth table so every row is pinned, not just the one that motivated the
-    /// change. Transposing the two arguments no longer even compiles — `in_flight` is a `u32` and
+    /// change. Transposing the two arguments does not even compile — `in_flight` is a `u32` and
     /// `anything_serving` a `bool` — which is a stronger guard than the assertion below; the table
-    /// stays because it pins the four OUTPUTS, which the types cannot.
+    /// stays because it pins the OUTPUTS, which the types cannot.
     #[test]
-    fn accepting_requires_a_free_slot_and_something_serving() {
+    fn accepting_means_serving_not_a_free_slot() {
         let accepting_of = |in_flight, serving| {
             let draft = heartbeat_for_state(in_flight, serving, 5, false, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY).to_event_draft();
             (
@@ -1678,15 +1688,31 @@ mod tests {
         };
 
         assert_eq!(accepting_of(0, true), ("y".into(), "0".into()), "idle + serving");
-        assert_eq!(accepting_of(1, true), ("n".into(), "1".into()), "busy");
-        // The row this change adds. Before it, a fully dark seat published `y` and kept drawing work
-        // it could only decline.
+        assert_eq!(
+            accepting_of(1, true),
+            ("y".into(), "1".into()),
+            "busy + serving stays open"
+        );
+        // At or above the default slot count (`home::default_slots` = 3). This row is deliberate,
+        // not an oversight: the tag does not know the slot count, and a seat that is actually full
+        // signals it by not claiming (`SlotGate::try_reserve` ⇒ `Reserve::Full`), not by a tag.
+        assert_eq!(
+            accepting_of(3, true),
+            ("y".into(), "3".into()),
+            "at capacity, still serving"
+        );
+        assert_eq!(
+            accepting_of(4, true),
+            ("y".into(), "4".into()),
+            "above capacity, still serving"
+        );
+        // Dark rows: a seat with nothing serving publishes `n` whatever it holds. Before the dark
+        // rule, a fully dark seat published `y` and kept drawing work it could only decline.
         assert_eq!(accepting_of(0, false), ("n".into(), "0".into()), "idle + dark");
         assert_eq!(accepting_of(1, false), ("n".into(), "1".into()), "busy + dark");
 
-        // And dark is DISTINGUISHABLE from busy, which the pair could not express before: both say
-        // "not taking work", and `queue_depth` says which reason.
-        assert_ne!(accepting_of(0, false), accepting_of(1, true));
+        // Busy and dark are DISTINGUISHABLE, now by `accepting` itself rather than by depth.
+        assert_ne!(accepting_of(1, true), accepting_of(1, false));
     }
 
     /// `queue_depth` must carry the DEPTH, not a busy flag.
@@ -1703,10 +1729,12 @@ mod tests {
                 Some(depth.to_string().as_str()),
                 "queue_depth must publish the count itself, not a 0/1 cast of it"
             );
+            // Depth is load, not closure: 3 and 17 are at/above the default slot count and the seat
+            // still says `y`. Fullness is enforced at claim time, never announced by this tag.
             assert_eq!(
                 first_tag_value(&draft.tags, "accepting"),
-                Some("n"),
-                "any non-zero depth means the seat is occupied"
+                Some("y"),
+                "a serving seat is accepting at any depth; depth is not a busy flag either"
             );
         }
 
