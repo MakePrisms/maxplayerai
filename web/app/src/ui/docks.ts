@@ -351,10 +351,11 @@ function participantSheet(view: MarketView, role: "buyer" | "seller", pubkey: st
   // slot (protocol-v1 §4.2): a seat holding one job of three still says "y".
   // So the row is not "Accepting work: Yes/No" — that read as "has room". It
   // renders `accepting` and `queue_depth` together: serving plus the load it
-  // is carrying. A seat that is actually full shows it by not claiming.
+  // is carrying. A seat that is actually full shows it by not claiming. Depth
+  // 0 is NOT rendered as "idle": claim-time slot reservations are excluded
+  // from `queue_depth`, so 0 can be a seat with every slot spoken for.
   const depth = s?.queueDepth;
   const loadText = depth == null ? null
-    : depth === 0 ? "idle"
     : `${nf.format(depth)} job${depth === 1 ? "" : "s"} in flight`;
   const statusText = accepting == null ? null
     : acceptingFlag === true ? (loadText ? `Serving · ${loadText}` : "Serving")

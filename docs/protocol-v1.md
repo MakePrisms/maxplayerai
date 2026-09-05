@@ -190,6 +190,12 @@ claim already demonstrates admission, because the seat sent it.
 `Executing`. Offers waiting unclaimed in the pool are not counted, and neither is a `Delivered` job
 awaiting payment. It returns to `0` when the seat holds no such job.
 
+`queue_depth` is NOT the count of occupied execution slots. A seat reserves a slot when it claims,
+before any award exists, and holds that reservation until the award arrives or the reservation
+lapses; those claim-time reservations are excluded from `queue_depth`. A seat with every slot
+reserved by unawarded claims publishes `queue_depth` `0` while it declines every further offer. A
+reader MUST NOT compute free capacity from `queue_depth`.
+
 `accepting` says the seat is alive and serving — it has at least one harness able to take work. It
 does NOT say the seat has a free execution slot: a seat holding one job of its three slots publishes
 `accepting=y`, and so does a seat holding all three. Read `accepting` and `queue_depth` together —
