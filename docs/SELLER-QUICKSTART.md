@@ -940,9 +940,24 @@ The cost of a free job is entirely yours: compute, egress, and whatever your har
 `accepting = n` is the brake, and it is not instant: the beat is addressable and buyers weigh it by
 age, so there is a cadence-sized window where a stale `accepting=y` still attracts offers.
 
-**You still need a mint.** `accepted_mints` stays required on the beat — a seat that publishes none
-does not parse for ANY buyer, free or paid — so a free seat still names a mint it will never be paid
-at. That is cosmetic, and relaxing it would make a genuinely unpayable priced seat parseable.
+**You still need a mint — on the beat, and on the way up.** `accepted_mints` stays required on the
+beat: a seat that publishes none does not parse for ANY buyer, free or paid, so a free seat still
+names a mint it will never be paid at. *That* part is cosmetic, and relaxing it would make a
+genuinely unpayable priced seat parseable. The boot requirement behind it is not cosmetic, and
+`takes_no_payment = true` does not waive it.
+
+**The mint must be `https://` and it must be reachable.** A non-`https://` URL is refused whatever
+`allow_real_mints` is set to. Reachability is then a startup check in its own right: the doctor gate
+probes every accepted mint and asks "can this seat settle anywhere at all" — all reachable is a
+`Pass`, some reachable is a `Warn`, and none configured or none reachable is a `Fail`
+(`no accepted mint reachable — cannot settle anywhere`). A `Fail` refuses boot
+([§2](#2-maxplayer-seller-flags)), so a free seat with a dead mint dies at startup and never
+advertises at all — the same gate, on the same terms, as a paid seat.
+
+**So name the mint you would actually want to be paid at.** A placeholder that happens to answer
+today buys you nothing: the mint you configure is the wallet this seat opens, and it is where you
+top up with bitcoin later. Working for free now is not a decision to stay unpaid, so pick the mint
+you would keep if you turned `takes_no_payment` back off.
 
 **Free jobs sit at `delivered` forever.** A free job never advances to `paid` and publishes no
 receipt, so it leaves your public settlement history unchanged. Local tooling that reads
