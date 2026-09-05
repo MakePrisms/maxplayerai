@@ -54,6 +54,9 @@ const noneWithoutAmount = (created_at: number): RawEvent =>
   ev(OFFER, BUYER, created_at, [["t", "maxplayer"], ["i", "says free, states no amount"], ["param", "payment", "none"]]);
 const noneWithNonzeroAmount = (created_at: number): RawEvent =>
   ev(OFFER, BUYER, created_at, [["t", "maxplayer"], ["i", "says free, prices 500"], ["amount", "500", "sat"], ["param", "payment", "none"]]);
+/** `payment=none` with an amount string the protocol reader would reject. */
+const noneWithAmountString = (created_at: number, amount: string): RawEvent =>
+  ev(OFFER, BUYER, created_at, [["t", "maxplayer"], ["i", `says free, amount ${JSON.stringify(amount)}`], ["amount", amount, "sat"], ["param", "payment", "none"]]);
 
 const claim = (o: RawEvent, at: number): RawEvent => ev(CLAIM, SELLER, at, [["t", "maxplayer"], ["e", o.id, "", "root"]]);
 const award = (o: RawEvent, at: number): RawEvent => ev(AWARD, BUYER, at, [["t", "maxplayer"], ["e", o.id, "", "root"], ["p", SELLER]]);
@@ -87,6 +90,26 @@ test("control: `payment=none` with a NONZERO amount is NOT free — predicate, p
   assert.equal(events.parseEvent(o)?.free, false, "parseEvent().free fails closed");
   assert.equal(buildTrades(lifecycle(o))[0]!.free, false, "buildTrades()[0].free fails closed");
   assert.equal(buyerBoard(lifecycle(o), NOW)[0]!.unpaidDeliveries, 1, "so its delivery is still an open question");
+});
+
+test("control: `payment=none` with `amount 0junk sat` is NOT free — a numeric prefix is not a number", () => {
+  // `parseFloat("0junk")` is 0. The protocol reader (`parse_offer`,
+  // crates/maxplayer-core/src/gateway.rs) parses the amount as a whole-string
+  // u64 and rejects this offer outright; the site must not call it free.
+  const o = noneWithAmountString(T0, "0junk");
+  assert.equal(settlesWithoutPayment(o), false, "a malformed amount string is not zero");
+  assert.equal(events.parseEvent(o)?.free, false, "parseEvent().free fails closed");
+  assert.equal(buildTrades(lifecycle(o))[0]!.free, false, "buildTrades()[0].free fails closed");
+  assert.equal(buyerBoard(lifecycle(o), NOW)[0]!.unpaidDeliveries, 1, "so its delivery is still an open question");
+});
+
+test("the amount half is parsed whole-string by the protocol reader's unsigned-integer rule (`^\\+?[0-9]+$`)", () => {
+  for (const ok of ["0", "00", "+0"]) {
+    assert.equal(settlesWithoutPayment(noneWithAmountString(T0, ok)), true, `${JSON.stringify(ok)} is zero`);
+  }
+  for (const bad of [" 0", "0.0", "0e0", "-0", "0x0", ""]) {
+    assert.equal(settlesWithoutPayment(noneWithAmountString(T0, bad)), false, `${JSON.stringify(bad)} is not accepted as zero`);
+  }
 });
 
 test("a free job that reached ACCEPT is complete and settled: zero unpaid deliveries, zero active jobs, no payment wording", () => {

@@ -255,6 +255,13 @@ export function param(event: RawEvent, name: string): string | null {
  * exists on the live market), a nonzero amount, or a zero with no mode tag.
  * A malformed free offer is not free; it is a priced offer we cannot settle.
  *
+ * The amount is parsed WHOLE-STRING by the protocol reader's rule — `parse_offer`
+ * in `crates/maxplayer-core/src/gateway.rs` reads it as a `u64`, so an optional
+ * `+` then ASCII digits, nothing else. Not `parseFloat`/`parseInt`/`Number`:
+ * those accept a numeric prefix, whitespace, exponents, hex and signs, so
+ * `"0junk"` read as zero here while the buyer's own tool rejected the offer.
+ * Two readers, one line.
+ *
  * What it changes downstream: a free job's ACCEPT is its last event — no
  * RECEIPT can ever follow because there is nothing to settle — so a delivered-and-
  * accepted free job is COMPLETE, not a delivery awaiting money. It must not be
@@ -265,8 +272,8 @@ export function settlesWithoutPayment(event: RawEvent): boolean {
   if (param(event, "payment") !== "none") return false;
   const amount = tagsNamed(event, "amount")[0];
   if (!amount || amount[2] !== "sat") return false;
-  const value = Number.parseFloat(amount[1] ?? "");
-  return Number.isFinite(value) && value === 0;
+  const digits = /^\+?([0-9]+)$/.exec(amount[1] ?? "");
+  return digits != null && BigInt(digits[1]!) === 0n;
 }
 
 /**
