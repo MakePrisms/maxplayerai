@@ -96,8 +96,8 @@ replaces it on every beat. Every fact below is current as of that beat, EXCEPT `
 | `["t","maxplayer"]` | 1 | yes | Namespace |
 | `["v","1"]` | 1 | yes | Protocol major |
 | `["rate", sats]` | 1 | yes | Lowest price the seat accepts, in satoshis |
-| `["accepting", "y"` or `"n"]` | 1 | yes | Whether the seat intends to take new work |
-| `["queue_depth", n]` | 1 | yes | Jobs the seat currently holds in a non-terminal state |
+| `["accepting", "y"` or `"n"]` | 1 | yes | The seat is alive and serving. NOT a free-slot signal |
+| `["queue_depth", n]` | 1 | yes | Jobs the seat holds in `Awarded` or `Executing` — its live load |
 | `["accepted_mints", url, ...]` | 1 | yes | Every mint the seat accepts payment on |
 | `["takes_payment","none"]` | 0..1 | no | The seat takes NO payment. Absent is UNSTATED, never `"no"` |
 | `["agents", id, ...]` | 0..1 | no | Harnesses the seat can run |
@@ -186,7 +186,23 @@ sets above, states no policy — a reader MUST NOT infer the missing or unrecogn
 These tags appear on the announcement ONLY. A reader MUST NOT expect them on a kind `3402` claim: a
 claim already demonstrates admission, because the seat sent it.
 
-`queue_depth` is a live count. It returns to `0` when the seat holds no non-terminal job.
+`queue_depth` is a live count of the jobs occupying an execution slot: those in `Awarded` or
+`Executing`. Offers waiting unclaimed in the pool are not counted, and neither is a `Delivered` job
+awaiting payment. It returns to `0` when the seat holds no such job.
+
+`queue_depth` is NOT the count of occupied execution slots. A seat reserves a slot when it claims,
+before any award exists, and holds that reservation until the award arrives or the reservation
+lapses; those claim-time reservations are excluded from `queue_depth`. A seat with every slot
+reserved by unawarded claims publishes `queue_depth` `0` while it declines every further offer. A
+reader MUST NOT compute free capacity from `queue_depth`.
+
+`accepting` says the seat is alive and serving — it has at least one harness able to take work. It
+does NOT say the seat has a free execution slot: a seat holding one job of its three slots publishes
+`accepting=y`, and so does a seat holding all three. Read `accepting` and `queue_depth` together —
+`y` with a depth is "open, carrying that much load"; `n` is "not serving", whatever the depth.
+
+A seat at capacity signals fullness by not claiming, not by a tag. Capacity is enforced at claim
+time, on the seat, and no announcement field carries the slot count.
 
 `accepting` is the seat's own statement of intent. A reader MUST NOT treat it as a guarantee. The
 authoritative signal that a seat will take a job is that the seat claims one.
