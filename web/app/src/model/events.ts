@@ -49,6 +49,8 @@ export interface ParsedEvent {
   buyer?: string;
   seller?: string;
   selfTrade?: boolean;
+  /** Offer only: it settles with no payment — see `settlesWithoutPayment`. */
+  free?: boolean;
   amount?: number | null;
   targetSeller?: string | null;
   description?: string;
@@ -243,6 +245,38 @@ export function param(event: RawEvent, name: string): string | null {
 }
 
 /**
+ * THE free-lane predicate: this offer settles with no payment.
+ *
+ * Both halves are required, per `docs/specs/free-job-lane.md` §1.3: a free
+ * offer carries `["param","payment","none"]` AND its (still-required) amount
+ * tag reads exactly `["amount","0","sat"]` — the mode tag is what makes that
+ * zero mean "no payment leg" rather than "a payment of zero". Fails CLOSED on
+ * anything else: no amount tag (the price was not stated — one such offer
+ * exists on the live market), a nonzero amount, or a zero with no mode tag.
+ * A malformed free offer is not free; it is a priced offer we cannot settle.
+ *
+ * The amount is parsed WHOLE-STRING by the protocol reader's rule — `parse_offer`
+ * in `crates/maxplayer-core/src/gateway.rs` reads it as a `u64`, so an optional
+ * `+` then ASCII digits, nothing else. Not `parseFloat`/`parseInt`/`Number`:
+ * those accept a numeric prefix, whitespace, exponents, hex and signs, so
+ * `"0junk"` read as zero here while the buyer's own tool rejected the offer.
+ * Two readers, one line.
+ *
+ * What it changes downstream: a free job's ACCEPT is its last event — no
+ * RECEIPT can ever follow because there is nothing to settle — so a delivered-and-
+ * accepted free job is COMPLETE, not a delivery awaiting money. It must not be
+ * counted as unpaid, and it must not be counted as paid either: it paid
+ * nothing and counted nothing.
+ */
+export function settlesWithoutPayment(event: RawEvent): boolean {
+  if (param(event, "payment") !== "none") return false;
+  const amount = tagsNamed(event, "amount")[0];
+  if (!amount || amount[2] !== "sat") return false;
+  const digits = /^\+?([0-9]+)$/.exec(amount[1] ?? "");
+  return digits != null && BigInt(digits[1]!) === 0n;
+}
+
+/**
  * protocol-v1 §7.1: `reason_code` names the class. The vocabulary is
  * extensible, so a reader that meets an unknown code MUST fall back to
  * `status` and MUST NOT treat the event as malformed.
@@ -344,6 +378,7 @@ function parseEventUncached(event: RawEvent): ParsedEvent | null {
                // A buyer commissioning its own seller marks the offer
                // ["t","self-trade"]. A structured predicate, not prose.
                selfTrade: tagsNamed(event, "t").some((t) => t[1] === SELF_TRADE_TAG),
+               free: settlesWithoutPayment(event),
                amount: firstNumber(event, "amount", "rate", "price", "sats"),
                targetSeller: firstTag(event, "p"),
                // The job itself is the `i` (input) tag. Offer content is empty

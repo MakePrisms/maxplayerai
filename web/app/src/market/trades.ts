@@ -44,6 +44,12 @@ export interface Trade {
   /** Runners that published a result for this trade. */
   deliveredBy: string[];
   selfTrade: boolean;
+  /**
+   * The offer settles with no payment (`settlesWithoutPayment`). Its ACCEPT is
+   * the last event there will ever be: no receipt is owed, so "delivered with
+   * no receipt" is completion here, not an open question.
+   */
+  free: boolean;
   at: Partial<Record<Stage, number>>;
 }
 
@@ -104,7 +110,7 @@ function buildTradesUncached(events: (RawEvent | ParsedEvent)[]): Trade[] {
     if (!t) {
       t = { offerId, buyer: null, seller: null, sellerConflict: false, offerAmount: null,
             receiptAmount: null, declineReason: null,
-            claimants: [], releasedBy: [], deliveredBy: [], selfTrade: false, at: {} };
+            claimants: [], releasedBy: [], deliveredBy: [], selfTrade: false, free: false, at: {} };
       trades.set(offerId, t);
       signals.set(offerId, { authenticated: new Set(), delivered: null, deliveredAt: Infinity,
                              claimed: null, claimedAt: Infinity });
@@ -145,6 +151,7 @@ function buildTradesUncached(events: (RawEvent | ParsedEvent)[]): Trade[] {
     if (e.stage === "result" && e.seller && !t.deliveredBy.includes(e.seller)) t.deliveredBy.push(e.seller);
     if (e.stage === "offer" && e.amount != null) t.offerAmount = e.amount;
     if (e.stage === "offer" && e.selfTrade) t.selfTrade = true;
+    if (e.stage === "offer" && e.free) t.free = true;
     // A floor, like the stamp above is an earliest: several receipts can name
     // one trade, they arrive in relay order, and a plain assignment would let
     // whichever paged last decide the figure.

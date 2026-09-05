@@ -284,9 +284,11 @@ export function buyerBoard(events: RawEvent[], now: number, activeEvents: RawEve
       r.receipted += 1;
       r.satsPaid += t.receiptAmount || 0;
       r.lastSeen = Math.max(r.lastSeen, t.at.receipt);
-    } else if (t.at.result != null) {
+    } else if (t.at.result != null && !t.free) {
       // Delivered with no receipt published. Not proof of non-payment —
-      // surfaced as an open question, never as a debt.
+      // surfaced as an open question, never as a debt. A FREE job is not that
+      // question: it can never publish a receipt, so its delivery is complete
+      // and settled the moment it is accepted — it is neither unpaid nor paid.
       r.unpaidDeliveries += 1;
     }
     if (t.offerAmount != null) r.prices.push(t.offerAmount);

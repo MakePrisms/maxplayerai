@@ -63,7 +63,9 @@ export function feedLine(view: MarketView, e: ParsedEvent): string {
   switch (e.stage) {
     // The job itself is the most interesting thing on the board. Price after
     // it, not before.
-    case "offer": return `${who} · ${e.selfTrade ? '<span class="self" title="The racer operates the runner being paid — real work, but not market demand">self</span> ' : ""}${e.description ? esc(e.description) : "posted a job"}${e.amount != null ? ` · <span class="sats">${usd(e.amount)}</span>` : ""}`;
+    // A free job is named, not priced: "$0.00" would read as a price of zero,
+    // and the point is that no payment is part of this job at all.
+    case "offer": return `${who} · ${e.selfTrade ? '<span class="self" title="The racer operates the runner being paid — real work, but not market demand">self</span> ' : ""}${e.free ? '<span class="free" title="A free job: it settles with no payment, so no receipt will ever follow its accept">free</span> ' : ""}${e.description ? esc(e.description) : "posted a job"}${e.amount != null && !e.free ? ` · <span class="sats">${usd(e.amount)}</span>` : ""}`;
     case "claim": { const from = counterparty(view, e, "buyer"); return `${who} claimed a job${from ? ` from ${from}` : ""}`; }
     // "awarded the job", not "awarded a claim" — the claim is the mechanism,
     // the job is what the reader understands changed hands.

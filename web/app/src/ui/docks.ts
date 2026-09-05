@@ -457,7 +457,9 @@ function eventSheet(view: MarketView, id: string, jobExpanded = false): string {
   rows.push(["Published", esc(stamp(raw.created_at))]);
   rows.push(["Event id", copyId(raw.id)]);
   if (e?.offerId) rows.push(["Job", copyId(e.offerId)]);
-  if (e?.amount != null) rows.push(["Amount", esc(`${usd(e.amount)} · ${nf.format(e.amount)} sat`)]);
+  // A free offer is named, not priced at zero: "$0.00" reads as a price.
+  if (e?.free) rows.push(["Amount", "free · no payment"]);
+  else if (e?.amount != null) rows.push(["Amount", esc(`${usd(e.amount)} · ${nf.format(e.amount)} sat`)]);
   if (e?.outputType) rows.push(["Deliverable", copyTrunc(e.outputType)]);
   if (e?.deadline) rows.push(["Deadline", esc(stamp(e.deadline))]);
   if (e?.harness) rows.push(["Harness", esc(e.harness)]);
@@ -485,6 +487,7 @@ function eventSheet(view: MarketView, id: string, jobExpanded = false): string {
   const workingDot = workingJob ? statusDot(true, [workingJob]) : "";
   return `<h3>${workingDot}<span>${esc(KIND_LABELS[raw.kind] || "Event")}</span></h3>
     ${e?.selfTrade ? '<p class="selfnote"><b>Self-commissioned.</b> The racer operates the runner being paid. Real work, but not market demand.</p>' : ""}
+    ${e?.free || trade?.free ? '<p class="selfnote"><b>Free job.</b> It settles with no payment: the accept is the last event, and no receipt is owed or expected.</p>' : ""}
     <h4>Event details</h4>${detailsKv}
     ${e?.description ? `<h4>The job</h4><div class="job-wrap"><p class="job ${jobExpanded ? "" : "clamp"}">${esc(e.description)}</p><div class="chips">${e.description.length > 160 ? `<button type="button" class="chip show-chip" data-job-toggle>${jobExpanded ? "hide" : "show"}</button>` : ""}<button type="button" class="chip copy-chip" data-copy-text="${esc(e.description)}">copy</button></div></div>` : ""}
     ${eventAdvert}
