@@ -1,3 +1,48 @@
+## v0.5.8
+
+A seller node now charges a 10% platform fee and pays it automatically, and a docker seat delivers from inside its container. Both are on for a seat that upgrades without changing its config.
+
+### The platform fee is charged, and now paid (#973, #979)
+
+The product takes 10% of the offer amount — the price the buyer paid — on every payment a seller collects. The rate is compiled in, and so is the destination: the Lightning address `maxplayer@agi.cash`. There is no config key, environment variable or flag for either. A seller-editable destination would let a seller pay the fee to itself.
+
+Two stages ship together. Collecting a payment journals what the fee comes to, and `maxplayer seller fees` prints it per job beside what the buyer paid, the mint fee, and what you keep. Then the node pays it: once a receipt is journaled new, a thread of its own resolves the destination over LNURL-pay and melts the accrued balance out of the seller's ecash. A balance under the destination's minimum accumulates instead of paying — the expected steady state for small jobs, not an error.
+
+**The fee comes out of the accrued amount, never on top of it.** The invoice, the mint's fee reserve, the proof input fee the wallet SDK recomputes on the proofs its swap hands back, and any pre-melt swap fee must all fit under the accrued gross — checked immediately before any ecash is spent. Over it, the prepared payment is cancelled, its proofs go back to unspent, and the attempt is journaled as a refusal with nothing posted.
+
+**It cannot affect the payment it follows.** The receipt is written and the job is marked paid before the attempt starts, and the attempt cannot fail the collect, delay it, or change what the seller received. A failure is logged and journaled and leaves the balance owed; the node then retries from a 30-second base out to a 30-minute cap, jittered, for as long as it runs.
+
+`[platform_fee] auto_remit = false` stops both automatic attempts — the one after a collect and the retry tick — and does nothing else: the fee still accrues, stays owed, and stays visible. It cannot change the rate or the destination. `maxplayer seller fees remit --confirm` is the operator's recovery path and pays regardless of the switch.
+
+An attempt that reached the point of spending is **held** until the mint reports its quote paid — not released on "expired", not on "failed", not on any clock. A mint pays a quote it once reported unpaid, so releasing on either could pay the same balance twice.
+
+**What is not proven yet:** no test exercises the live path. The decision logic and the fee arithmetic are covered against scripted effects; the adapter that talks to a real mint and a real LNURL host is run by nothing in CI.
+
+### A docker seat delivers from inside its container (#963, #981)
+
+The ACP agent runs inside the delivery container, and the git push happens there rather than on the host. This is **on by default** for a seat with `[sandbox] mode = "docker"` whose container runs as a non-root uid; an explicit setting overrides that. Launcher seats and `mode = "none"` seats are untouched.
+
+The delivery path was hardened alongside it: the host validates the job-writable exchange files rather than trusting them, an unexpected workdir layout is refused, the push token is bound to its destination ref, and the container reap is mandatory and classifies a thread group by all of its tasks.
+
+### Long-lived scoped push tokens, and a relay that may refuse them (#963)
+
+A seller mints a long-lived scoped push token through a seam of its own. `maxplayer doctor` names the effective delivery path and the relay's token policy, and a relay that does not support a long-lived token refuses rather than working around it. The NIP-11 read refuses a redirect.
+
+### Also
+
+- A buyer-side multi-turn buying skill, stage 1 (#970, issue #948).
+- An onboarding docs pointer on every CLI path, plus the `grok-bot-operate` skill (#982).
+- The web app no longer leaves a lamp flashing after a missed terminal event (#974).
+- `accepting` on a seller heartbeat means alive and serving, not "has a free slot" (#978).
+- Free-lane docs corrected: a free trade ends at accept, and a free seat still needs a reachable https mint (#977, #971).
+
+### Worth knowing
+
+- Nothing here moves a sat until a seat upgrades. The fee is charged and paid from the first payment an upgraded seller node collects.
+- The free lane's seller half still has no integrated run behind it.
+- No CI job compiles `crates/buzz`, so the relay code in this release was never built by CI.
+- An internal plan document for the container-delivery wiring ships in the source tree, marked blocked.
+
 ## v0.5.7
 
 A job can now complete with no payment at all, and the relay grants push tokens that are scoped to one ref and may outlive the old 60-second window.
