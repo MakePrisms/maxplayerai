@@ -24,6 +24,7 @@ pub mod client;
 pub mod config;
 pub mod http;
 pub mod proto;
+pub mod safeio;
 pub mod validate;
 
 use std::fmt;

@@ -67,15 +67,33 @@ impl fmt::Display for Reject {
     }
 }
 
-/// A call that passed validation: a fixed subcommand and a fully-formed argv tail. Nothing here
-/// is interpreted again downstream — no shell, no string splitting, no template expansion.
+/// A call that passed validation: a fixed subcommand and one argument per declared parameter, in
+/// spec order. Nothing here is interpreted again downstream — no shell, no string splitting, no
+/// template expansion.
+///
+/// Note what a file argument carries: a **job-relative path**, not a canonicalized absolute
+/// string. Validation deliberately does not resolve a file path, because a path resolved here and
+/// opened later is the check/use race this whole module used to have (advisor F2). The holder
+/// resolves and opens each file itself, once, following no symlink — see [`crate::safeio`].
 #[derive(Clone, Debug)]
 pub struct ValidatedCall {
     pub operation: String,
     pub subcommand: String,
-    pub argv_tail: Vec<String>,
-    pub output_paths: Vec<PathBuf>,
+    pub args: Vec<CallArg>,
     pub max_output_bytes: usize,
+}
+
+/// One validated argument. The holder turns each into exactly one flag plus one operand; a file
+/// operand is resolved race-safely at that point, never here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CallArg {
+    /// Literal data (text or an enum choice). Safe to place in argv as-is.
+    Literal { flag: String, value: String },
+    /// A file the job supplies. Carries the job-relative path; the holder opens it no-follow.
+    Input { flag: String, rel: PathBuf },
+    /// A file the holder will create for the job. Carries the job-relative path; the holder
+    /// creates it no-follow.
+    Output { flag: String, rel: PathBuf },
 }
 
 /// Characters refused in literal text. The holder never invokes a shell, so this is defence in
@@ -86,11 +104,18 @@ const REFUSED: &[char] = &[
     '\n', '\r', '\0',
 ];
 
+/// Validate a call against the seller's operation list. This checks **grammar and confinement by
+/// name only**: it never touches the filesystem, so it cannot canonicalize a path that is then
+/// re-opened later. File arguments come back as job-relative paths for the holder to open
+/// race-safely; see [`ValidatedCall`] and [`crate::safeio`].
+///
+/// `job_root` is accepted for signature stability and future use but is deliberately not resolved
+/// here — resolving it, and the operands under it, is the holder's job at consumption time.
 pub fn validate_call(
     cfg: &SellerToolConfig,
     operation: &str,
     params: &BTreeMap<String, serde_json::Value>,
-    job_root: &Path,
+    _job_root: &Path,
 ) -> Result<ValidatedCall, Reject> {
     let spec = cfg
         .operation(operation)
@@ -104,49 +129,42 @@ pub fn validate_call(
         }
     }
 
-    let root = job_root.canonicalize().map_err(|_| Reject::BadJobRoot)?;
+    let mut args = Vec::new();
 
-    let mut argv_tail = Vec::new();
-    let mut output_paths = Vec::new();
-
-    // Iterate the *spec*, not the input: argv order is fixed by configuration.
+    // Iterate the *spec*, not the input: argument order is fixed by configuration.
     for p in &spec.params {
         let raw = params
             .get(&p.name)
             .ok_or_else(|| Reject::MissingParam { op: operation.to_string(), param: p.name.clone() })?;
         let value = raw.as_str().ok_or_else(|| Reject::NotAString { param: p.name.clone() })?;
 
-        let rendered = match &p.kind {
+        let arg = match &p.kind {
             ParamKind::Text { max_len } => {
                 check_text(&p.name, value, *max_len)?;
-                value.to_string()
+                CallArg::Literal { flag: p.flag.clone(), value: value.to_string() }
             }
             ParamKind::Choice { choices } => {
                 if !choices.iter().any(|c| c == value) {
                     return Err(Reject::NotAChoice { param: p.name.clone() });
                 }
-                value.to_string()
+                CallArg::Literal { flag: p.flag.clone(), value: value.to_string() }
             }
             ParamKind::JobInputFile => {
-                let path = resolve_job_path(&root, value, &p.name, true)?;
-                path.to_string_lossy().into_owned()
+                let rel = check_rel_path(value, &p.name)?;
+                CallArg::Input { flag: p.flag.clone(), rel }
             }
             ParamKind::JobOutputFile => {
-                let path = resolve_job_path(&root, value, &p.name, false)?;
-                output_paths.push(path.clone());
-                path.to_string_lossy().into_owned()
+                let rel = check_rel_path(value, &p.name)?;
+                CallArg::Output { flag: p.flag.clone(), rel }
             }
         };
-
-        argv_tail.push(p.flag.clone());
-        argv_tail.push(rendered);
+        args.push(arg);
     }
 
     Ok(ValidatedCall {
         operation: spec.name.clone(),
         subcommand: spec.subcommand.clone(),
-        argv_tail,
-        output_paths,
+        args,
         max_output_bytes: spec.max_output_bytes,
     })
 }
@@ -167,16 +185,14 @@ fn check_text(param: &str, value: &str, max_len: usize) -> Result<(), Reject> {
     Ok(())
 }
 
-/// Resolve `raw` inside the already-canonicalized `root`.
+/// Check that `raw` is a well-formed **job-relative** path, without touching the filesystem.
 ///
-/// `must_exist` distinguishes an input (must be there now) from an output (the holder will
-/// create it). Both are confined the same way.
-pub fn resolve_job_path(
-    root: &Path,
-    raw: &str,
-    param: &str,
-    must_exist: bool,
-) -> Result<PathBuf, Reject> {
+/// This is confinement by name: it refuses an empty path, control characters, an absolute path,
+/// and any `.`/`..` component before any `open` happens. What it deliberately does **not** do is
+/// resolve the path, stat it, or test it for a symlink — doing that here and opening it later is
+/// the check/use race (advisor F2). Existence, regular-file-ness and symlink refusal are decided
+/// at open time by [`crate::safeio`], on the descriptor that is actually used.
+pub fn check_rel_path(raw: &str, param: &str) -> Result<PathBuf, Reject> {
     if raw.is_empty() {
         return Err(Reject::EmptyPath { param: param.to_string() });
     }
@@ -188,45 +204,14 @@ pub fn resolve_job_path(
     if rel.is_absolute() {
         return Err(Reject::AbsolutePath { param: param.to_string() });
     }
-    // Only ordinary names. This is what refuses `../other-job/secret` before any filesystem
-    // call happens, and it is intentionally stricter than "no `..` after normalization".
+    // Only ordinary names. This refuses `../other-job/secret` by grammar, independent of what the
+    // filesystem currently looks like, and is intentionally stricter than "no `..` after
+    // normalization".
     for c in rel.components() {
         match c {
             Component::Normal(_) => {}
             _ => return Err(Reject::NonNormalComponent { param: param.to_string() }),
         }
     }
-
-    let joined = root.join(rel);
-
-    // A symlink is refused whether or not its target is legal: the check and the later use
-    // would otherwise be two different questions.
-    if let Ok(md) = std::fs::symlink_metadata(&joined) {
-        if md.file_type().is_symlink() {
-            return Err(Reject::SymlinkedPath { param: param.to_string() });
-        }
-    }
-
-    if must_exist {
-        let real = joined.canonicalize().map_err(|_| Reject::MissingInput { param: param.to_string() })?;
-        if !real.starts_with(root) {
-            return Err(Reject::EscapesJobDir { param: param.to_string() });
-        }
-        if !real.is_file() {
-            return Err(Reject::NotARegularFile { param: param.to_string() });
-        }
-        Ok(real)
-    } else {
-        let parent = joined.parent().ok_or_else(|| Reject::EmptyPath { param: param.to_string() })?;
-        let real_parent = parent
-            .canonicalize()
-            .map_err(|_| Reject::OutputParentMissing { param: param.to_string() })?;
-        if !real_parent.starts_with(root) {
-            return Err(Reject::EscapesJobDir { param: param.to_string() });
-        }
-        let name = joined
-            .file_name()
-            .ok_or_else(|| Reject::EmptyPath { param: param.to_string() })?;
-        Ok(real_parent.join(name))
-    }
+    Ok(rel.to_path_buf())
 }

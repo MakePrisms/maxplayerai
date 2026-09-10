@@ -16,6 +16,12 @@ description = "Seller-level tool holder: keeps a third-party tool logged in for 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# libc is the one dependency beyond serde, and it earns the exception to the audit-surface rule
+# above: race-safe, no-follow directory traversal (openat with O_NOFOLLOW|O_DIRECTORY) is not
+# expressible in std, and the string-canonicalize alternative is exactly the check/use race the
+# holder must not have (advisor F2). It is used only in src/safeio.rs. libc has no transitive
+# dependencies, so it adds one crate, not a tree.
+libc = "0.2"
 
 [[bin]]
 name = "vendor-service"

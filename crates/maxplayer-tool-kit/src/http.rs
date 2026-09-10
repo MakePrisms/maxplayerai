@@ -37,7 +37,7 @@ pub fn read_request<R: Read>(stream: R) -> std::io::Result<Option<Request>> {
     if reader.read_line(&mut line)? == 0 {
         return Ok(None);
     }
-    let mut parts = line.trim_end().split_whitespace();
+    let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_string();
     let path = parts.next().unwrap_or_default().to_string();
     if method.is_empty() || path.is_empty() {

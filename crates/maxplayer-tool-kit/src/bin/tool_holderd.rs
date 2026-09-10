@@ -19,11 +19,12 @@
 
 use maxplayer_tool_kit::config::{ParamKind, SellerToolConfig};
 use maxplayer_tool_kit::proto::{self, RpcRequest, RpcResponse};
-use maxplayer_tool_kit::validate::validate_call;
+use maxplayer_tool_kit::safeio;
+use maxplayer_tool_kit::validate::{validate_call, CallArg};
 use maxplayer_tool_kit::Health;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -51,8 +52,68 @@ struct Holder {
     resumed_existing_session: bool,
     enrollments_this_process: AtomicU64,
     calls_served: AtomicU64,
+    /// Monotonic sequence for per-call staging directory names, so two concurrent calls of one
+    /// job never collide on a staging path.
+    staging_seq: AtomicU64,
     started_at: SystemTime,
     jobs: Mutex<BTreeMap<String, JobSlot>>,
+}
+
+/// The seller's tool never reads or writes a path a job can influence. Instead the holder copies
+/// each input into this holder-private directory, runs the tool against it, and publishes outputs
+/// from it. The directory is 0700, lives under the holder runtime (never mounted into a job
+/// container), and is removed when this guard drops — on success, on rejection, or on error.
+struct Staging {
+    dir: PathBuf,
+}
+
+impl Staging {
+    fn create(runtime: &Path, job_id: &str, seq: u64) -> std::io::Result<Self> {
+        let parent = runtime.join("staging");
+        std::fs::create_dir_all(&parent)?;
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))?;
+        let dir = parent.join(format!("{job_id}-{seq}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir)?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        Ok(Staging { dir })
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.dir.join(name)
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Largest input the holder will stage for one call. It matches the fake vendor's HTTP body cap,
+/// so a larger input would be refused downstream anyway; refusing it here keeps the holder from
+/// copying an unbounded file first.
+const MAX_INPUT_BYTES: u64 = 1 << 20;
+
+/// Copy an opened input descriptor into a staged file, refusing anything over the ingest bound.
+/// The source is the descriptor `safeio::open_input` returned, so these are exactly the bytes that
+/// were opened no-follow — not a re-read of a name that could have changed.
+fn stage_input(src: &mut std::fs::File, dest: &Path, max: u64) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(dest)
+        .map_err(|e| format!("cannot stage input: {e}"))?;
+    // Read one byte past the ceiling so an at-the-limit file is accepted and an over-limit one is
+    // caught without reading it all.
+    let copied = std::io::copy(&mut src.take(max + 1), &mut out).map_err(|e| format!("cannot stage input: {e}"))?;
+    if copied > max {
+        return Err(format!("input exceeds the {max}-byte ingest bound"));
+    }
+    Ok(())
 }
 
 fn main() {
@@ -121,6 +182,7 @@ fn main() {
         resumed_existing_session: already,
         enrollments_this_process: AtomicU64::new(enrolments),
         calls_served: AtomicU64::new(0),
+        staging_seq: AtomicU64::new(0),
         started_at: SystemTime::now(),
         jobs: Mutex::new(BTreeMap::new()),
     });
@@ -129,7 +191,7 @@ fn main() {
     holder.probe_health();
 
     let control_path = runtime.join("holder.sock");
-    let control = bind_private(&control_path).unwrap_or_else(|e| fatal(&format!("{e}")));
+    let control = bind_private(&control_path).unwrap_or_else(|e| fatal(&e));
     println!("tool-holderd: control endpoint {}", control_path.display());
     println!(
         "tool-holderd: offering {:?} with {} operation(s), available while this process runs",
@@ -323,16 +385,66 @@ impl Holder {
             Err(reject) => return RpcResponse::err(id, proto::CODE_REJECTED, reject.to_string()),
         };
 
-        // Fixed program, fixed subcommand, validated operands, cleared environment, cwd pinned
-        // to this job's directory. No shell anywhere on this path.
+        // Consume the call race-safely. The whole point of F2: the CLI never touches a path the
+        // job can influence. The holder opens each input itself, following no symlink, copies it
+        // into a holder-private staging directory the job cannot reach, and gives the CLI only
+        // staged paths. Output is produced in staging and published back with an equally
+        // no-follow create. A `Staging` guard removes the directory on every exit path.
+        let seq = self.staging_seq.fetch_add(1, Ordering::SeqCst);
+        let staging = match Staging::create(&self.runtime, job_id, seq) {
+            Ok(s) => s,
+            Err(e) => return RpcResponse::err(id, proto::CODE_INTERNAL, format!("staging: {e}")),
+        };
+
+        let mut argv: Vec<String> = Vec::new();
+        // (staged output path, job-relative destination) pairs, published only after the CLI
+        // succeeds and only through a no-follow create.
+        let mut pending_outputs: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let mut out_idx = 0usize;
+        let mut in_idx = 0usize;
+
+        for arg in &call.args {
+            match arg {
+                CallArg::Literal { flag, value } => {
+                    argv.push(flag.clone());
+                    argv.push(value.clone());
+                }
+                CallArg::Input { flag, rel } => {
+                    // Open the real input no-follow, then stage its bytes. A symlink or a
+                    // swapped parent is refused here, on the descriptor that is actually read.
+                    let mut src = match safeio::open_input(&root, rel, "input") {
+                        Ok(f) => f,
+                        Err(reject) => return RpcResponse::err(id, proto::CODE_REJECTED, reject.to_string()),
+                    };
+                    let staged = staging.path(&format!("in-{in_idx}"));
+                    in_idx += 1;
+                    if let Err(e) = stage_input(&mut src, &staged, MAX_INPUT_BYTES) {
+                        return RpcResponse::err(id, proto::CODE_REJECTED, e);
+                    }
+                    argv.push(flag.clone());
+                    argv.push(staged.to_string_lossy().into_owned());
+                }
+                CallArg::Output { flag, rel } => {
+                    let staged = staging.path(&format!("out-{out_idx}"));
+                    out_idx += 1;
+                    argv.push(flag.clone());
+                    argv.push(staged.to_string_lossy().into_owned());
+                    pending_outputs.push((staged, rel.clone()));
+                }
+            }
+        }
+
+        // Fixed program, fixed subcommand, staged operands, cleared environment, cwd pinned to the
+        // holder-private staging directory. No shell anywhere on this path, and no job-writable
+        // path in the child's argv or cwd.
         let out = Command::new(&self.vendor_cli)
             .arg(&call.subcommand)
-            .args(&call.argv_tail)
+            .args(&argv)
             .env_clear()
             .env("VENDOR_CLI_HOME", &self.vendor_home)
             .env("VENDOR_CLI_BASE_URL", &self.vendor_base_url)
             .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-            .current_dir(&root)
+            .current_dir(&staging.dir)
             .stdin(Stdio::null())
             .output();
 
@@ -353,35 +465,39 @@ impl Holder {
             return RpcResponse::err(id, proto::CODE_TOOL_FAILED, format!("tool failed: {msg}"));
         }
 
-        // Enforce the seller's output ceiling on the holder side. A ceiling nobody enforces is
-        // a comment.
-        for p in &call.output_paths {
-            if let Ok(md) = std::fs::metadata(p) {
-                if md.len() as usize > call.max_output_bytes {
-                    let _ = std::fs::remove_file(p);
-                    return RpcResponse::err(
-                        id,
-                        proto::CODE_TOOL_FAILED,
-                        format!("output exceeded the configured ceiling of {} bytes; removed", call.max_output_bytes),
-                    );
-                }
+        // Publish each staged output back into the job directory. The ceiling is enforced on the
+        // staged file, before anything is written into the job's directory, so an oversized
+        // result never lands there at all. The destination is created no-follow, so a symlink a
+        // job planted at the output name is refused rather than written through.
+        let mut outputs: Vec<Value> = Vec::new();
+        for (staged, rel) in &pending_outputs {
+            let bytes = std::fs::metadata(staged).map(|m| m.len()).unwrap_or(0);
+            if bytes as usize > call.max_output_bytes {
+                return RpcResponse::err(
+                    id,
+                    proto::CODE_TOOL_FAILED,
+                    format!("output exceeded the configured ceiling of {} bytes; not published", call.max_output_bytes),
+                );
             }
+            let data = match std::fs::read(staged) {
+                Ok(d) => d,
+                Err(e) => return RpcResponse::err(id, proto::CODE_INTERNAL, format!("read staged output: {e}")),
+            };
+            let mut dest = match safeio::create_output(&root, rel, "output") {
+                Ok(f) => f,
+                Err(reject) => return RpcResponse::err(id, proto::CODE_REJECTED, reject.to_string()),
+            };
+            if let Err(e) = dest.write_all(&data) {
+                return RpcResponse::err(id, proto::CODE_INTERNAL, format!("write output: {e}"));
+            }
+            // Report the path relative to the job's own root: the job has no business learning the
+            // holder's filesystem layout.
+            outputs.push(json!({"path": rel, "bytes": bytes}));
         }
 
         self.calls_served.fetch_add(1, Ordering::SeqCst);
         self.set_health(Health::Healthy);
         let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let outputs: Vec<Value> = call
-            .output_paths
-            .iter()
-            .map(|p| {
-                let bytes = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-                // Report the path relative to the job's own root: the job has no business
-                // learning the holder's filesystem layout.
-                let rel = p.strip_prefix(&root).unwrap_or(p);
-                json!({"path": rel, "bytes": bytes})
-            })
-            .collect();
 
         RpcResponse::ok(
             id,

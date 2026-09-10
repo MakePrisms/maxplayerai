@@ -9,7 +9,8 @@ mod common;
 
 use common::Fixture;
 use maxplayer_tool_kit::config::SellerToolConfig;
-use maxplayer_tool_kit::validate::{validate_call, Reject};
+use maxplayer_tool_kit::safeio;
+use maxplayer_tool_kit::validate::{validate_call, CallArg, Reject};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -87,8 +88,7 @@ fn valid_params() -> BTreeMap<String, Value> {
 
 fn reject(job: &JobDir, op: &str, p: BTreeMap<String, Value>) -> Reject {
     validate_call(&grammar_config(), op, &p, &job.root)
-        .err()
-        .expect("this call must be refused")
+        .expect_err("this call must be refused")
 }
 
 #[test]
@@ -98,14 +98,25 @@ fn the_valid_call_is_accepted() {
     let call = validate_call(&grammar_config(), "transform-file", &valid_params(), &job.root)
         .expect("the valid call must be accepted");
     assert_eq!(call.subcommand, "transform");
-    // argv is built from the spec order, flags paired with values, nothing shell-interpreted.
-    assert_eq!(call.argv_tail[0], "--in");
-    assert_eq!(call.argv_tail[2], "--out");
-    assert_eq!(call.argv_tail[4], "--mode");
-    assert_eq!(call.argv_tail[5], "upper");
-    assert_eq!(call.argv_tail[6], "--label");
-    assert_eq!(call.argv_tail[7], "ok-label");
-    assert!(Path::new(&call.argv_tail[1]).starts_with(job.root.canonicalize().unwrap()));
+    // Arguments are built from the spec order: one per declared parameter, each carrying its
+    // flag, and a file argument carries the job-RELATIVE path — never a canonicalized absolute
+    // string, because resolving it here and opening it later is the F2 race.
+    assert_eq!(
+        call.args,
+        vec![
+            CallArg::Input { flag: "--in".into(), rel: PathBuf::from("input.txt") },
+            CallArg::Output { flag: "--out".into(), rel: PathBuf::from("out.txt") },
+            CallArg::Literal { flag: "--mode".into(), value: "upper".into() },
+            CallArg::Literal { flag: "--label".into(), value: "ok-label".into() },
+        ]
+    );
+    // No component of a file argument escaped the job by grammar; the descriptor-level guarantee
+    // is Part A-2's job.
+    for arg in &call.args {
+        if let CallArg::Input { rel, .. } | CallArg::Output { rel, .. } = arg {
+            assert!(rel.is_relative(), "a file argument must stay job-relative");
+        }
+    }
 }
 
 #[test]
@@ -212,27 +223,43 @@ fn a_dotdot_escape_into_another_job_is_refused() {
     assert!(matches!(reject(&job, "transform-file", p), Reject::NonNormalComponent { .. }));
 }
 
+// ---------------------------------------------------------------------------
+// Part A-2 — race-safe consumption (advisor F2).
+//
+// These used to assert that `validate_call` refused a symlink, a missing file and so on. It no
+// longer does, on purpose: a path resolved at validation and re-opened later is the check/use
+// race F2 is about. Refusal now happens where the file is actually consumed — the holder's
+// no-follow open — so that is where these test it. `validate_call` accepts the ordinary NAME;
+// `safeio` refuses what the name resolves to.
+// ---------------------------------------------------------------------------
+
+fn open_input_err(job: &JobDir, rel: &str) -> Reject {
+    safeio::open_input(&job.root, Path::new(rel), "input")
+        .expect_err("this input must be refused")
+}
+
+fn create_output_err(job: &JobDir, rel: &str) -> Reject {
+    safeio::create_output(&job.root, Path::new(rel), "output")
+        .expect_err("this output must be refused")
+}
+
 #[test]
-fn a_symlink_is_refused() {
+fn a_symlinked_input_is_refused() {
     let job = JobDir::new("symlink");
     std::os::unix::fs::symlink(job.other.join("secret.txt"), job.root.join("link.txt")).unwrap();
-    let mut p = valid_params();
-    p.insert("input".into(), json!("link.txt"));
-    assert!(matches!(reject(&job, "transform-file", p), Reject::SymlinkedPath { .. }));
+    assert!(matches!(open_input_err(&job, "link.txt"), Reject::SymlinkedPath { .. }));
 }
 
 /// The case a string-prefix check would pass: the final component is an ordinary file, but a
-/// *parent* component is a symlink out of the job directory.
+/// *parent* component is a symlink out of the job directory. The no-follow walk catches it.
 #[test]
 fn a_symlinked_parent_directory_is_refused() {
     let job = JobDir::new("symlink-parent");
     std::os::unix::fs::symlink(&job.other, job.root.join("sub")).unwrap();
-    let mut p = valid_params();
-    p.insert("input".into(), json!("sub/secret.txt"));
-    let err = reject(&job, "transform-file", p);
+    let err = open_input_err(&job, "sub/secret.txt");
     assert!(
         matches!(err, Reject::EscapesJobDir { .. }),
-        "a symlinked parent must be caught by resolution, got {err:?}"
+        "a symlinked parent must be caught by the no-follow walk, got {err:?}"
     );
 }
 
@@ -240,34 +267,73 @@ fn a_symlinked_parent_directory_is_refused() {
 fn a_symlinked_parent_is_refused_for_outputs_too() {
     let job = JobDir::new("symlink-parent-out");
     std::os::unix::fs::symlink(&job.other, job.root.join("sub")).unwrap();
-    let mut p = valid_params();
-    p.insert("output".into(), json!("sub/planted.txt"));
-    assert!(matches!(reject(&job, "transform-file", p), Reject::EscapesJobDir { .. }));
+    assert!(matches!(create_output_err(&job, "sub/planted.txt"), Reject::EscapesJobDir { .. }));
 }
 
 #[test]
 fn a_missing_input_is_refused() {
     let job = JobDir::new("missing-input");
-    let mut p = valid_params();
-    p.insert("input".into(), json!("nope.txt"));
-    assert!(matches!(reject(&job, "transform-file", p), Reject::MissingInput { .. }));
+    assert!(matches!(open_input_err(&job, "nope.txt"), Reject::MissingInput { .. }));
 }
 
 #[test]
 fn a_directory_is_not_an_input_file() {
     let job = JobDir::new("dir-input");
     std::fs::create_dir_all(job.root.join("adir")).unwrap();
-    let mut p = valid_params();
-    p.insert("input".into(), json!("adir"));
-    assert!(matches!(reject(&job, "transform-file", p), Reject::NotARegularFile { .. }));
+    assert!(matches!(open_input_err(&job, "adir"), Reject::NotARegularFile { .. }));
 }
 
 #[test]
 fn an_output_in_a_missing_directory_is_refused() {
     let job = JobDir::new("out-parent");
-    let mut p = valid_params();
-    p.insert("output".into(), json!("nodir/out.txt"));
-    assert!(matches!(reject(&job, "transform-file", p), Reject::OutputParentMissing { .. }));
+    assert!(matches!(create_output_err(&job, "nodir/out.txt"), Reject::OutputParentMissing { .. }));
+}
+
+/// The check/use boundary, made explicit and shown not to be a boundary at all: `validate_call`
+/// accepts the ordinary names (the "check"), a symlink is then planted where each file will be
+/// consumed (the "swap"), and the holder's no-follow open/create refuses both (the "use").
+/// Crucially, the outside file the symlinks point at is neither read through nor truncated
+/// through — the property F2 requires.
+#[test]
+fn a_swap_between_validation_and_use_reads_and_writes_nothing_outside() {
+    let job = JobDir::new("f2-boundary");
+    let outside = job.other.join("outside.txt");
+    std::fs::write(&outside, "OUTSIDE SENTINEL").unwrap();
+
+    // The check: grammar accepts input.txt and out.txt as ordinary relative names.
+    let call = validate_call(&grammar_config(), "transform-file", &valid_params(), &job.root)
+        .expect("grammar accepts ordinary names");
+
+    // The swap: point both names out of the job directory.
+    std::fs::remove_file(job.root.join("input.txt")).ok();
+    std::os::unix::fs::symlink(&outside, job.root.join("input.txt")).unwrap();
+    std::os::unix::fs::symlink(&outside, job.root.join("out.txt")).unwrap();
+
+    // The use: every file argument is resolved through safeio, and every one is refused.
+    let mut checked_input = false;
+    let mut checked_output = false;
+    for arg in &call.args {
+        match arg {
+            CallArg::Input { rel, .. } => {
+                checked_input = true;
+                assert!(matches!(
+                    safeio::open_input(&job.root, rel, "input"),
+                    Err(Reject::SymlinkedPath { .. })
+                ));
+            }
+            CallArg::Output { rel, .. } => {
+                checked_output = true;
+                assert!(matches!(
+                    safeio::create_output(&job.root, rel, "output"),
+                    Err(Reject::SymlinkedPath { .. })
+                ));
+            }
+            CallArg::Literal { .. } => {}
+        }
+    }
+    assert!(checked_input && checked_output, "both a file input and output must have been exercised");
+    // Not read through, and not truncated through.
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "OUTSIDE SENTINEL");
 }
 
 #[test]
@@ -483,4 +549,58 @@ fn an_unknown_method_is_refused() {
     fx.make_job("job-a");
     let err = fx.job_call("job-a", "tools/exfiltrate", json!({})).expect_err("unknown method");
     assert!(err.contains("[-32601]"), "unexpected error: {err}");
+}
+
+/// F2 at the live endpoint, input side. Job B swaps its own input name for a symlink into job A.
+/// The holder refuses it at consumption, job A's file is not read, nothing reaches the vendor,
+/// and a legitimate call still succeeds afterward.
+#[test]
+fn a_planted_input_symlink_is_refused_at_the_live_endpoint() {
+    let fx = Fixture::start();
+    let a = fx.make_job("job-a");
+    std::fs::write(a.join("secret.txt"), "job A private").unwrap();
+    let b = fx.make_job("job-b");
+    std::os::unix::fs::symlink(a.join("secret.txt"), b.join("input.txt")).unwrap();
+
+    let mut mcp = fx.mcp_session("job-b");
+    mcp.initialize();
+    let res = mcp.request(
+        "tools/call",
+        json!({"name": "transform-file", "arguments": {"input": "input.txt", "output": "out.txt", "mode": "upper"}}),
+    );
+    assert_eq!(res["error"]["code"], json!(1003), "a symlinked input must be refused: {res}");
+    assert!(!b.join("out.txt").exists(), "no output should have been produced");
+    assert_eq!(fx.vendor_stats()["transform_count"], json!(0), "nothing should have reached the vendor");
+
+    // A real file in job B still works, so the refusal was specific to the swap.
+    std::fs::write(b.join("real.txt"), "job b own").unwrap();
+    let ok = mcp.request(
+        "tools/call",
+        json!({"name": "transform-file", "arguments": {"input": "real.txt", "output": "out.txt", "mode": "upper"}}),
+    );
+    assert_eq!(ok["result"]["isError"], json!(false), "the legitimate call must still work: {ok}");
+    assert_eq!(std::fs::read_to_string(b.join("out.txt")).unwrap(), "JOB B OWN");
+}
+
+/// F2 at the live endpoint, output side. Job B aims its output at job A's file through a symlink
+/// named `out.txt`. The holder produces the transform in private staging, then refuses to publish
+/// through the symlink, so job A's file is left exactly as it was.
+#[test]
+fn a_planted_output_symlink_does_not_write_outside_the_job() {
+    let fx = Fixture::start();
+    let a = fx.make_job("job-a");
+    std::fs::write(a.join("target.txt"), "A ORIGINAL").unwrap();
+    let b = fx.make_job("job-b");
+    std::fs::write(b.join("input.txt"), "payload").unwrap();
+    std::os::unix::fs::symlink(a.join("target.txt"), b.join("out.txt")).unwrap();
+
+    let mut mcp = fx.mcp_session("job-b");
+    mcp.initialize();
+    let res = mcp.request(
+        "tools/call",
+        json!({"name": "transform-file", "arguments": {"input": "input.txt", "output": "out.txt", "mode": "upper"}}),
+    );
+    assert_eq!(res["error"]["code"], json!(1003), "a symlinked output must be refused: {res}");
+    // Job A's file is untouched: not truncated, not overwritten.
+    assert_eq!(std::fs::read_to_string(a.join("target.txt")).unwrap(), "A ORIGINAL");
 }
