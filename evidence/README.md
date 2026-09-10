@@ -4,6 +4,30 @@ Each subdirectory is one complete execution of `crates/maxplayer-tool-kit/docker
 named by its UTC start time. A bundle holds per-step verdicts (`results.txt`), both MCP
 transcripts, holder and vendor logs, vendor counter snapshots, and a `manifest.json`.
 
+## Current bundle: `20260910T110320Z` (post-repair)
+
+This is the current bundle. It is a run of the repaired demo: **39 checks, 0 failures**. It
+demonstrates the F1, F2, and F3 repairs end to end.
+
+- **F1**: `credential_absent_from_job_container` is 0, and the negative control
+  `secret_scanner_detects_planted_credential` is 1. The scan runs host-side, and the control
+  proves the scanner can detect the secret when it is present.
+- **F2**: the container transforms run through the holder's private staging path. A cross-job
+  path is refused with code 1003.
+- **F3**: the lifecycle proof re-attaches the job, then proves call, loss, and restore on a live
+  endpoint. The tool list is compared in full across both jobs and the seller control view.
+
+Read `20260910T110320Z/CAVEAT.md` first. The image for this run was built offline from
+`rust:1-bookworm`, not from the pinned digests, because the Docker buildkit resolver was wedged.
+This bundle stands for the F1, F2, and F3 mechanism. The digest-pinned build (F4) must be re-run
+once Docker registry resolution works again.
+
+## Superseded bundles: `20260909T220053Z` and `20260909T220105Z` (pre-repair)
+
+These two bundles are **superseded**. Do not cite them. The pre-repair demo produced them, so the
+old, invalid F1 credential check and the old F3 lifecycle probe are in them. They are kept, not
+deleted, because a superseded record is preserved rather than removed.
+
 Every bundle here is `mechanism_only`. The vendor and the CLI were both written for this
 contract and therefore cannot falsify it: these runs establish that the holder mechanism
 behaves as specified, not that any third-party tool has been accepted.
