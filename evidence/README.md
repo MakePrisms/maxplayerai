@@ -4,10 +4,11 @@ Each subdirectory is one complete execution of `crates/maxplayer-tool-kit/docker
 named by its UTC start time. A bundle holds per-step verdicts (`results.txt`), both MCP
 transcripts, holder and vendor logs, vendor counter snapshots, and a `manifest.json`.
 
-## Current bundle: `20260910T110320Z` (post-repair)
+## Current bundle: `20260910T125544Z` (post-repair, digest-pinned)
 
-This is the current bundle. It is a run of the repaired demo: **39 checks, 0 failures**. It
-demonstrates the F1, F2, and F3 repairs end to end.
+This is the current bundle. It is a run of the repaired demo against the digest-pinned image from
+`crates/maxplayer-tool-kit/docker/Dockerfile`: **39 checks, 0 failures**. It demonstrates the F1,
+F2, F3, and F4 repairs end to end, with no caveat.
 
 - **F1**: `credential_absent_from_job_container` is 0, and the negative control
   `secret_scanner_detects_planted_credential` is 1. The scan runs host-side, and the control
@@ -16,11 +17,9 @@ demonstrates the F1, F2, and F3 repairs end to end.
   path is refused with code 1003.
 - **F3**: the lifecycle proof re-attaches the job, then proves call, loss, and restore on a live
   endpoint. The tool list is compared in full across both jobs and the seller control view.
-
-Read `20260910T110320Z/CAVEAT.md` first. The image for this run was built offline from
-`rust:1-bookworm`, not from the pinned digests, because the Docker buildkit resolver was wedged.
-This bundle stands for the F1, F2, and F3 mechanism. The digest-pinned build (F4) must be re-run
-once Docker registry resolution works again.
+- **F4**: `manifest.json` `build` records the exact pinned base-image digests, the built image
+  id, and a clean committed source tree. `source_tree_dirty` is false and the recorded base
+  digest matches the Dockerfile pin.
 
 ## Superseded bundles: `20260909T220053Z` and `20260909T220105Z` (pre-repair)
 

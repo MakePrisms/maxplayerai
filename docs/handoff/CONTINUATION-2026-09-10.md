@@ -137,9 +137,12 @@ separate stage. A fake CLI and a fake vendor cannot satisfy it.
 
 ## 8. Demo re-run status
 
-The demo re-run **passed: 39 checks, 0 failures**. The new bundle is `evidence/20260910T110320Z/`.
-Every F1, F2, and F3 check passed. The independent vendor counters confirm one enrolment plus one
-re-enrolment (two logins), five transforms, and one auth failure from the revoke test.
+The demo re-run **passed: 39 checks, 0 failures**, against the digest-pinned image from
+`docker/Dockerfile`. The bundle is `evidence/20260910T125544Z/`. Every F1, F2, F3, and F4 check
+passed. The independent vendor counters confirm one enrolment plus one re-enrolment (two logins),
+five transforms, and one auth failure from the revoke test. The build receipt shows a clean
+committed source tree, the pinned base-image digests matching the Dockerfile, and the built image
+id.
 
 Running the demo also found and fixed two latent bugs in the F1 section of `docker/demo.sh`, both
 from the earlier WIP commit that had never run:
@@ -149,13 +152,9 @@ from the earlier WIP commit that had never run:
   `set -o pipefail`. The fix separates a clean no-match from a real scanner error, so a scanner
   error still fails the check instead of reading as a false absence.
 
-One caveat, recorded in `evidence/20260910T110320Z/CAVEAT.md`. The image for this run was built
-offline from `rust:1-bookworm`, not from the pinned digests, because the Docker buildkit resolver
-on this machine hung on the pinned base-image metadata. The host and the Docker VM both reached
-docker.io fast, and the pull rate limit was not reached, so this was a wedged buildkit state that a
-Docker Desktop restart would clear. The restart was not done, because it would stop other running
-containers. This bundle stands for the F1, F2, and F3 mechanism. Re-run the demo against the
-digest-pinned `docker/Dockerfile` once registry resolution works, to re-earn the F4 claim.
+Note on the environment: the pinned build first hung on the Docker buildkit resolver, and a
+graceful `docker desktop restart` cleared it. An earlier offline-built bundle stood in while the
+resolver was wedged; it is retired now that the pinned build succeeds.
 
 ## 9. Browser-based authentication — not supported for now
 

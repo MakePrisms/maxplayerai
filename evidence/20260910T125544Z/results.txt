@@ -1,6 +1,6 @@
-run-id: 20260910T110320Z
-image:  maxplayer-tool-kit:demo-offline
-vendor observable from host at http://127.0.0.1:55002
+run-id: 20260910T125544Z
+image:  maxplayer-tool-kit:demo
+vendor observable from host at http://127.0.0.1:55000
 PASS  vendor_login_count_before_holder                     0
 PASS  holder_healthy_at_start                              contains "healthy": true
 PASS  vendor_login_count_after_enrolment                   1
@@ -42,4 +42,4 @@ PASS  job_b_output_restored                                RESTORED PAYLOAD
 PASS  vendor_login_count_after_restore                     2
 
 checks passed: 39   failed: 0
-evidence: /Users/pmilic/Projects/Agicash/maxplayerai/evidence/20260910T110320Z
+evidence: /Users/pmilic/Projects/Agicash/maxplayerai/evidence/20260910T125544Z

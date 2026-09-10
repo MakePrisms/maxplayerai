@@ -1,21 +1,21 @@
 {
-  "run_id": "20260910T110320Z",
-  "image": "maxplayer-tool-kit:demo-offline",
+  "run_id": "20260910T125544Z",
+  "image": "maxplayer-tool-kit:demo",
   "platform": "linux/arm64",
   "docker_server_version": "29.1.3",
-  "generated_utc": "2026-09-10T11:03:27Z",
+  "generated_utc": "2026-09-10T12:55:52Z",
 
   "build": {
-  "source_commit": "a0cc31d2a025290c2b2a31f2ccedf70e00c9436e",
-  "crate_tree_object": "811bf410df38ad0ddc960b275e935c8d07ffec61",
-  "source_tree_dirty": true,
+  "source_commit": "722ce47ca34416b5b6c48b79e380574ac11fad68",
+  "crate_tree_object": "712b151bbb87dc96e7df350458fd0ef13c233329",
+  "source_tree_dirty": false,
   "cargo_lock_sha256": "a97bb94d9e4f1df72c693733531ca34d23d78e1a989b7d32fd21d5cb69f4e0d4",
   "dockerfile_sha256": "f2c5e0727efb836b4d5059678176897d29db203089f05ab75e4b8181be60fa1a",
   "build_base_image": "rust@sha256:ebd900bae66fd508b466cef82d64a83a5fb34682e4c8b2797a42908bddc95a57",
   "runtime_base_image": "debian@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171",
-  "built_image_id": "sha256:0ce75f21d318847bd6e1399abeacfbe8175ee9a5aa764fe159f2397a6ec13374",
+  "built_image_id": "sha256:c4a743f4c067973a5c855cf53f324a652e48da0c460909c61abd8d270e033a11",
   "built_image_repo_digests": [
-    "maxplayer-tool-kit@sha256:0ce75f21d318847bd6e1399abeacfbe8175ee9a5aa764fe159f2397a6ec13374"
+    "maxplayer-tool-kit@sha256:c4a743f4c067973a5c855cf53f324a652e48da0c460909c61abd8d270e033a11"
   ]
 },
   "raw_capture_sha256": {
@@ -26,7 +26,7 @@
   "job-b-mcp.jsonl": "6e6ee306991673323c816cbb5af209ddf6f239fec1b5fbe467562b047e2841fb",
   "job-b-pre-stop.jsonl": "94faca964c37ef91064f27f6830e1fc9dc781a91efd5ad167835280cac4ae98d",
   "job-b-restored.jsonl": "6d4c867e87583b1bb16338f6e62a4571bfab2ce898968e96fcbedeffac3049e8",
-  "results.txt": "3682034b8271e37a95e78f00548520ac850822acec876dfe7ebbe66c9b9ca2be"
+  "results.txt": "70009b28f11d899652f205b143e31870cfb13d1649d631921d382fbe67704a44"
 },
 
   "mechanism_only": true,
