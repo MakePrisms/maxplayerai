@@ -59,6 +59,7 @@ this contract to be reported, not a silent amendment.
 | 06 | [Paper walk B — tenant-aware HTTP API (contrast)](06-walk-b-tenant-aware-http.md) | §6 stage 0 |
 | 07 | [Test entrypoints and evidence layout](07-test-entrypoints-and-evidence.md) | §5, §6 |
 | 08 | [Named gaps, unsupported and deferred cases](08-gaps-and-unsupported.md) | §6 stage 0 output |
+| 09 | [Production integration plan](09-production-integration.md) | post-review, later stage |
 
 ## Scope fence
 

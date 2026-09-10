@@ -102,6 +102,11 @@ old F3 lifecycle probe. A fresh demo run writes a new bundle with the F1, F3, an
 
 ## 7. Production integration plan (still owed)
 
+A detailed, code-grounded version of this plan is in
+[`../specs/seller-tool-onboarding/09-production-integration.md`](../specs/seller-tool-onboarding/09-production-integration.md).
+It carries the exact insertion points, code sketches, the feature gate, the test plan, and the open
+decisions. The summary below stays here.
+
 Nothing in this branch is wired into the product. The prototype runs beside it. Do not wire the
 `mcp_servers` vector alone: a bridge with no mounted socket and no supervised holder breaks job
 execution. Land the parts together.
