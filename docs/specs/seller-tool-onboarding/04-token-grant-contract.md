@@ -38,10 +38,17 @@
 >
 > **Implementation status, stated precisely.** `crates/maxplayer-tool-kit` implements the
 > per-seller enrolment lifecycle, and its persistence and re-enrolment behaviour is exercised
-> by tests. Two claims that appeared here earlier are corrected: file confinement is **not**
-> yet safe against a buyer replacing a checked path between validation and use (advisor F2), and
-> the container evidence for credential absence and for the stop/restore lifecycle is **under
-> repair** (advisor F1, F3) and must not be cited as established.
+> by tests. The advisor findings against the executable prototype are now addressed:
+> - **F2 (file confinement) is fixed.** The holder no longer re-opens a checked path string. It
+>   resolves each job file itself, following no symlink on any component, copies an input into a
+>   private staging directory, and publishes an output with a no-follow create. See
+>   `src/safeio.rs` and `src/bin/tool_holderd.rs`. Deterministic and live replacement controls in
+>   `tests/negative_controls.rs` assert that a symlink planted after validation is refused and the
+>   outside file is neither read nor written.
+> - **F1 (credential absence) and F3 (stop/restore lifecycle)** are repaired in
+>   `docker/demo.sh`: the credential scan runs host-side with a functioning negative control, and
+>   the lifecycle proof re-attaches a job after each restart and proves call → loss → restore on a
+>   live endpoint. The pre-repair evidence bundles remain superseded and must not be cited.
 
 Paper artifact. **PROPOSED** throughout. Anchored in plan v3 §4, and revised against the
 stage-0 verdict findings F1, F2 and F6.
