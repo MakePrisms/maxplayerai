@@ -28,10 +28,15 @@ EV="$REPO_ROOT/evidence/$RUN_ID"
 # Host scratch lives outside the repository: nothing credential-shaped can be committed by
 # accident, and it is removed on exit.
 HOSTDIR="$HOME/.mtk-demo/$RUN_ID"
+# Host-side scratch for the credential-absence scan (advisor F1). It holds captured job-container
+# archives and the extracted trees the scanner reads. It lives under HOSTDIR so the EXIT trap
+# removes it, and it never enters a container.
+RUN_TMP="$HOSTDIR/scan"
 
 mkdir -p "$EV"
 mkdir -p "$HOSTDIR"
 chmod 700 "$HOSTDIR"
+mkdir -p "$RUN_TMP"
 
 SUFFIX="$$"
 NET="mtk-net-$SUFFIX"
@@ -211,8 +216,12 @@ docker run --rm --network none -v "$VOL_SOCK_A:/run/holder" -v "$VOL_WORK_A:/wor
 # nothing but its own two mounts. A capture failure aborts rather than reporting a clean scan.
 capture_job_fs() {
   _cap_sock="$1"; _cap_work="$2"; _cap_out="$3"
+  # Exclude Unix sockets: the job's own socket lives under run/holder, and `tar` returns a
+  # non-zero "socket ignored" status for it. A socket carries no file content, so it is not a
+  # place a credential could be read from; skipping it removes a false capture failure while a
+  # genuine failure (an unreadable directory, an empty archive) still aborts below.
   if ! docker run --rm --network none -v "$_cap_sock:/run/holder" -v "$_cap_work:/work" "$IMAGE" \
-      tar -cf - -C / work run/holder etc/maxplayer usr/local/bin > "$_cap_out" 2>"$_cap_out.err"; then
+      tar --exclude='*.sock' -cf - -C / work run/holder etc/maxplayer usr/local/bin > "$_cap_out" 2>"$_cap_out.err"; then
     echo "FATAL: filesystem capture failed; see $(basename "$_cap_out").err" >&2
     return 1
   fi
@@ -228,8 +237,23 @@ scan_capture_for_secret() {
   if ! tar -xf "$_scan_tar" -C "$_scan_dir" 2>/dev/null; then
     echo "SCAN_ERROR"; return 0
   fi
-  # -a treats every file as text so binaries are searched too, not skipped.
-  LC_ALL=C grep -r -a -F -l -- "$SECRET" "$_scan_dir" 2>/dev/null | wc -l | tr -d ' '
+  # -a treats every file as text so binaries are searched too, not skipped. grep's exit status is
+  # load-bearing here: 0 means it found the secret, 1 means a clean no-match, and >=2 means a real
+  # scanner error. A no-match is the EXPECTED absence result, so it must not be read as a failure
+  # under `set -o pipefail`; a real error must not be read as "0 hits", which would manufacture a
+  # false absence (the F1 anti-pattern). So the three cases are separated explicitly.
+  set +e
+  _hits="$(LC_ALL=C grep -r -a -F -l -- "$SECRET" "$_scan_dir" 2>/dev/null)"
+  _rc=$?
+  set -e
+  if [ "$_rc" -gt 1 ]; then
+    echo "SCAN_ERROR"; return 0
+  fi
+  if [ -z "$_hits" ]; then
+    echo 0
+  else
+    printf '%s\n' "$_hits" | wc -l | tr -d ' '
+  fi
 }
 
 capture_job_fs "$VOL_SOCK_A" "$VOL_WORK_A" "$EV/job-a-fs.tar" || exit 1
@@ -285,10 +309,26 @@ mcp_drive "$VOL_SOCK_B" "$VOL_WORK_B" "$EV/job-b-mcp.jsonl" \
 check_contains "job_b_mcp_call_ok" '"isError":false' "$(cat "$EV/job-b-mcp.jsonl")"
 check "job_b_output" "daolyap boj dnoces" "$(docker run --rm -v "$VOL_WORK_B:/work" "$IMAGE" cat /work/out.txt)"
 
-# Same offering seen by both jobs.
-A_TOOLS="$(grep -o '"tools":\[[^]]*\]' "$EV/job-a-mcp.jsonl" | head -1)"
-B_TOOLS="$(grep -o '"tools":\[[^]]*\]' "$EV/job-b-mcp.jsonl" | head -1)"
-check "operation_list_identical_for_both_jobs" "$A_TOOLS" "$B_TOOLS"
+# Same offering seen by both jobs — the WHOLE tool list, compared as parsed JSON.
+#
+# What this replaces (advisor F3). The previous version compared `grep -o '"tools":\[[^]]*\]'`,
+# a regex that stops at the first ']' — which falls inside the schema's `enum`, so it compared a
+# prefix of the list and never saw the operation schema at all. Here jq parses the full response,
+# sorts object keys (-S) for a canonical form, and the entire tool array is compared: any
+# difference anywhere in the schema is caught, not just up to the first bracket. The seller's own
+# control view is compared too, so "seller-level offering" is checked against all three surfaces.
+tools_of_jsonl() { jq -cS 'select(.result and .result.tools) | .result.tools' "$1" | head -1; }
+A_TOOLS="$(tools_of_jsonl "$EV/job-a-mcp.jsonl")"
+B_TOOLS="$(tools_of_jsonl "$EV/job-b-mcp.jsonl")"
+hctl tools > "$EV/holder-tools-control.json"
+CTL_TOOLS="$(jq -cS '.tools' "$EV/holder-tools-control.json")"
+
+A_LEN="$(printf '%s' "$A_TOOLS" | jq 'length' 2>/dev/null || echo 0)"
+check "operation_list_nonempty"                   "true"           "$([ "${A_LEN:-0}" -ge 1 ] && echo true || echo false)"
+check "operation_list_identical_for_both_jobs"    "$A_TOOLS"       "$B_TOOLS"
+check "operation_list_matches_seller_control_view" "$A_TOOLS"      "$CTL_TOOLS"
+check "operation_present_transform_file"          "transform-file" "$(printf '%s' "$A_TOOLS" | jq -r '.[] | select(.name=="transform-file") | .name')"
+check "operation_schema_is_closed"                "false"          "$(printf '%s' "$A_TOOLS" | jq -r '.[0].inputSchema.additionalProperties')"
 
 stats > "$EV/stats-02-after-two-jobs.json"
 S="$(stats)"
@@ -297,7 +337,13 @@ check "vendor_login_count_after_two_jobs" "1" "$(field "$S" login_count)"
 check "vendor_auth_failures_after_two_jobs" "0" "$(field "$S" auth_failures)"
 
 # ---------------------------------------------------------------------------
-# Restart: the persisted session is reused, not re-established.
+# Restart: the persisted session is reused, not re-established — and the tool still serves a
+# LIVE job afterwards.
+#
+# A restart drops the holder's in-memory attachments (it comes back with a control socket and an
+# empty jobs map). That is exactly why job B must be RE-ATTACHED here before it can be called
+# again. Doing so, and proving a live call on the fresh endpoint, is what lets the later stop
+# below be a proof about the tool rather than about an endpoint that was already gone (advisor F3).
 # ---------------------------------------------------------------------------
 docker restart "$HOLDER" >/dev/null
 for _ in $(seq 1 60); do
@@ -308,6 +354,15 @@ hctl status > "$EV/holder-status-03-after-restart.json"
 check_contains "restart_resumed_existing_session" '"resumed_existing_session": true' "$(cat "$EV/holder-status-03-after-restart.json")"
 check_contains "restart_enrollments_this_process_zero" '"enrollments_this_process": 0' "$(cat "$EV/holder-status-03-after-restart.json")"
 check "vendor_login_count_after_restart" "1" "$(field "$(stats)" login_count)"
+
+# Re-establish job B's addressing and prove a live call on the persisted session (no new login).
+hctl attach --job-id job-b --job-root /srv/jobs/job-b > "$EV/attach-job-b-after-restart.json"
+docker exec "$HOLDER" sh -c 'printf "post restart payload" > /srv/jobs/job-b/input.txt'
+mcp_drive "$VOL_SOCK_B" "$VOL_WORK_B" "$EV/job-b-after-restart.jsonl" \
+  '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"transform-file","arguments":{"input":"input.txt","output":"out.txt","mode":"upper"}}}'
+check_contains "restart_live_call_ok" '"isError":false' "$(cat "$EV/job-b-after-restart.jsonl")"
+check "job_b_output_after_restart" "POST RESTART PAYLOAD" "$(docker run --rm -v "$VOL_WORK_B:/work" "$IMAGE" cat /work/out.txt)"
+check "vendor_login_count_after_restart_call" "1" "$(field "$(stats)" login_count)"
 
 # ---------------------------------------------------------------------------
 # Vendor-side revocation must become visible seller state, then recover.
@@ -326,12 +381,22 @@ check_contains "reenrolment_restores_health" '"healthy"' "$(cat "$EV/holder-reen
 check "vendor_login_count_after_reenrolment" "2" "$(field "$(stats)" login_count)"
 
 # ---------------------------------------------------------------------------
-# Availability follows the daemon.
+# Availability follows the daemon: call -> loss -> restore, all on a LIVE attachment.
+#
+# Job B is attached and was just used, so the endpoint is genuinely live here. We prove one
+# successful call on it immediately before the stop, prove that the SAME endpoint fails after the
+# stop, then start the daemon, re-attach, and prove success again without a new login. A
+# still-serving endpoint would make the "unavailable" check fail — which is the point.
 # ---------------------------------------------------------------------------
+docker exec "$HOLDER" sh -c 'printf "pre stop payload" > /srv/jobs/job-b/input.txt'
+mcp_drive "$VOL_SOCK_B" "$VOL_WORK_B" "$EV/job-b-pre-stop.jsonl" \
+  '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"transform-file","arguments":{"input":"input.txt","output":"out.txt","mode":"upper"}}}'
+check_contains "live_endpoint_ok_before_stop" '"isError":false' "$(cat "$EV/job-b-pre-stop.jsonl")"
+
 docker stop "$HOLDER" >/dev/null
 set +e
 mcp_drive "$VOL_SOCK_B" "$VOL_WORK_B" "$EV/job-b-after-stop.jsonl" \
-  '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+  '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"transform-file","arguments":{"input":"input.txt","output":"out2.txt","mode":"upper"}}}'
 set -e
 check_contains "tool_unavailable_once_daemon_stops" "holder endpoint unavailable" "$(cat "$EV/job-b-after-stop.jsonl")"
 
@@ -341,7 +406,64 @@ for _ in $(seq 1 60); do
   sleep 0.25
 done
 check "vendor_login_count_after_daemon_restart" "2" "$(field "$(stats)" login_count)"
+
+# Restore: re-attach and prove the same job works again on the resumed session, no new login.
+hctl attach --job-id job-b --job-root /srv/jobs/job-b > "$EV/attach-job-b-after-daemon-start.json"
+docker exec "$HOLDER" sh -c 'printf "restored payload" > /srv/jobs/job-b/input.txt'
+mcp_drive "$VOL_SOCK_B" "$VOL_WORK_B" "$EV/job-b-restored.jsonl" \
+  '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"transform-file","arguments":{"input":"input.txt","output":"out.txt","mode":"upper"}}}'
+check_contains "call_restored_after_daemon_restart" '"isError":false' "$(cat "$EV/job-b-restored.jsonl")"
+check "job_b_output_restored" "RESTORED PAYLOAD" "$(docker run --rm -v "$VOL_WORK_B:/work" "$IMAGE" cat /work/out.txt)"
+check "vendor_login_count_after_restore" "2" "$(field "$(stats)" login_count)"
 stats > "$EV/stats-06-final.json"
+
+# ---------------------------------------------------------------------------
+# Source-to-build receipt (advisor F4).
+#
+# The old manifest recorded the image TAG, which is mutable and does not identify what was built.
+# This binds the run to: the source commit and the crate's own git tree object (source identity
+# independent of the rest of the repo), the lockfile and Dockerfile hashes, the two base-image
+# digests the Dockerfile pins, and the ACTUAL built image id. A reader can therefore check that
+# the image tested was built from this exact source, not merely from a tag that happened to point
+# somewhere on the day.
+# ---------------------------------------------------------------------------
+sha256() { shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'; }
+
+BUILT_IMAGE_ID="$(docker inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null || echo unknown)"
+BUILT_REPO_DIGESTS="$(docker inspect --format '{{json .RepoDigests}}' "$IMAGE" 2>/dev/null || echo '[]')"
+SRC_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+CRATE_TREE="$(git -C "$REPO_ROOT" rev-parse 'HEAD:crates/maxplayer-tool-kit' 2>/dev/null || echo unknown)"
+if [ -n "$(git -C "$REPO_ROOT" status --porcelain -- crates/maxplayer-tool-kit 2>/dev/null)" ]; then
+  SRC_DIRTY=true
+else
+  SRC_DIRTY=false
+fi
+LOCK_SHA="$(sha256 "$SCRIPT_DIR/../Cargo.lock")"
+DOCKERFILE_SHA="$(sha256 "$SCRIPT_DIR/Dockerfile")"
+BUILD_BASE="$(grep -oE 'rust@sha256:[0-9a-f]+' "$SCRIPT_DIR/Dockerfile" | head -1)"
+RUNTIME_BASE="$(grep -oE 'debian@sha256:[0-9a-f]+' "$SCRIPT_DIR/Dockerfile" | head -1)"
+
+BUILD_RECEIPT="$(jq -n \
+  --arg src_commit "$SRC_COMMIT" \
+  --arg crate_tree "$CRATE_TREE" \
+  --argjson src_dirty "$SRC_DIRTY" \
+  --arg cargo_lock_sha256 "$LOCK_SHA" \
+  --arg dockerfile_sha256 "$DOCKERFILE_SHA" \
+  --arg build_base "$BUILD_BASE" \
+  --arg runtime_base "$RUNTIME_BASE" \
+  --arg built_image_id "$BUILT_IMAGE_ID" \
+  --argjson built_repo_digests "$BUILT_REPO_DIGESTS" \
+  '{source_commit:$src_commit, crate_tree_object:$crate_tree, source_tree_dirty:$src_dirty,
+    cargo_lock_sha256:$cargo_lock_sha256, dockerfile_sha256:$dockerfile_sha256,
+    build_base_image:$build_base, runtime_base_image:$runtime_base,
+    built_image_id:$built_image_id, built_image_repo_digests:$built_repo_digests}')"
+
+# Hash every raw capture so the manifest fixes the exact bytes of the transcripts it summarises.
+CAPTURE_HASHES="{}"
+for f in "$EV"/*.jsonl "$EV"/results.txt; do
+  [ -e "$f" ] || continue
+  CAPTURE_HASHES="$(printf '%s' "$CAPTURE_HASHES" | jq --arg k "$(basename "$f")" --arg v "$(sha256 "$f")" '. + {($k): $v}')"
+done
 
 # ---------------------------------------------------------------------------
 # Evidence manifest.
@@ -354,6 +476,9 @@ cat > "$EV/manifest.json" <<JSON
   "platform": "$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}' 2>/dev/null)",
   "docker_server_version": "$(docker version --format '{{.Server.Version}}' 2>/dev/null)",
   "generated_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+
+  "build": $BUILD_RECEIPT,
+  "raw_capture_sha256": $CAPTURE_HASHES,
 
   "mechanism_only": true,
   "what_this_proves": "That the holder mechanism behaves as specified against a fake vendor and a CLI written for it.",
