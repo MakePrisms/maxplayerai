@@ -99,4 +99,7 @@ These items are not part of onboarding a tool with this kit.
 - Production wiring into `seller_exec.rs`. The prototype runs beside the product, not inside it.
 - A per-job grant, an award gate, or a marketplace state change. These are withdrawn.
 - A TLS transport. This kit ships `http://` only.
-- Browser-based authentication. No ruling for it has arrived. Treat it as undecided.
+- Browser-based authentication. Not supported for now. It fits the holder model only when the
+  vendor login persists and the holder can refresh it without a browser. A vendor with
+  short-lived, non-refreshable tokens would force a per-job re-login, which the enroll-once model
+  cannot hold.

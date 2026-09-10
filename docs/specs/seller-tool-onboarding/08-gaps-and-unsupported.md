@@ -80,7 +80,10 @@ different results and must never collapse into two** (plan v3 §2).
 
 5. Rung 3 (key-swap proxy) and rung 5 (host executor) templates.
 6. HTTP transport profiles, pending C-1…C-5 and their own acceptance run.
-7. Browser support, including profile mutation and isolation.
+7. Browser support, including profile mutation and isolation. Browser-based **authentication** is
+   not supported for now (Petar, 2026-09-10): it fits the enroll-once holder model only when the
+   vendor login persists and the holder can refresh it without a browser. A short-lived,
+   non-refreshable login would force a per-job re-login, which the enroll-once model cannot hold.
 8. Deriving the allowed operation/resource set from offer text.
 9. Manual work as a fallback route, pending a product decision.
 10. Platform-hosted credential custody; seller hosting is the initial scope.

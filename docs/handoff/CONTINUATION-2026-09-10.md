@@ -152,7 +152,19 @@ Docker Desktop restart would clear. The restart was not done, because it would s
 containers. This bundle stands for the F1, F2, and F3 mechanism. Re-run the demo against the
 digest-pinned `docker/Dockerfile` once registry resolution works, to re-earn the F4 claim.
 
-## 9. Undecided, held for Petar
+## 9. Browser-based authentication — not supported for now
 
-Browser-based authentication was named as a routing decision, but no ruling text arrived. Treat it
-as undecided. Do not read silence as a decision either way.
+Petar's decision, 2026-09-10: do not support browser-based authentication for now.
+
+The reason, stated plainly:
+- The holder model works when a login persists. You authenticate one time on the host, the holder
+  holds the session for the daemon's life, and a refresh happens outside a job.
+- A browser login fits that model only when the vendor issues a session the holder can renew
+  without a browser. A refresh token is the usual form.
+- Some vendors issue only short-lived tokens with no non-interactive refresh. That kind forces a
+  person at a browser again and again, which the enroll-once model cannot hold.
+- We cannot tell which kind a vendor is until we integrate one. So the safe choice is to not
+  support a browser login now.
+
+This becomes supportable when a specific vendor offers a browser login with a refreshable session.
+The holder already accommodates that case; no redesign is needed.
