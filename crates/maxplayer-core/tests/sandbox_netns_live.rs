@@ -1652,7 +1652,17 @@ fn integrated_leg(
     port: &str,
     before_payload: impl FnOnce(&str),
 ) -> Result<PayloadOutcome, String> {
-    let config = gate_config(network);
+    integrated_leg_with(gate_config(network), ip, port, before_payload)
+}
+
+/// [`integrated_leg`], for a leg that needs a `[sandbox]` section other than the default one — a
+/// configured pinhole, or a named runtime. The path through production is identical.
+fn integrated_leg_with(
+    config: maxplayer_core::home::SandboxConfig,
+    ip: &str,
+    port: &str,
+    before_payload: impl FnOnce(&str),
+) -> Result<PayloadOutcome, String> {
     let policy = maxplayer_core::seller_exec::SandboxPolicy::from_config(Some(&config))
         .expect("a docker policy");
     let workdir = std::env::temp_dir().join(owned_name("workdir"));
