@@ -42,3 +42,18 @@ path = "src/bin/holderctl.rs"
 [[bin]]
 name = "tool-mcp-bridge"
 path = "src/bin/tool_mcp_bridge.rs"
+
+# Proxy-swap route demo (synthetic). vendor-mcp and swap-proxy are test doubles, like
+# vendor-service. mcp-http-bridge is the real new piece: the stdio-to-HTTP transport shim a job
+# container would run to reach a vendor-hosted MCP through the credential proxy.
+[[bin]]
+name = "vendor-mcp"
+path = "src/bin/vendor_mcp.rs"
+
+[[bin]]
+name = "swap-proxy"
+path = "src/bin/swap_proxy.rs"
+
+[[bin]]
+name = "mcp-http-bridge"
+path = "src/bin/mcp_http_bridge.rs"
