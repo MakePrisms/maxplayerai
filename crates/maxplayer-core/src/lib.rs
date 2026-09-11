@@ -113,6 +113,14 @@ mod sandbox_egress_live;
 /// `wallet`-only, so a default-features test run cannot execute a line of them — the policy is the
 /// part that decides what a stranger's job can reach, and it is compiled and tested on every build
 /// rather than only on the money-path one.
+/// The same policy, on the interface the packets actually leave by.
+///
+/// `sandbox_net`'s rules live on the host kernel's `OUTPUT` chain, which a gVisor payload never
+/// traverses: it runs its own netstack and hands finished packets to the namespace's veth. This
+/// module translates the very same rendered policy into `tc`/`flower` filters on that veth, so the
+/// containment stops depending on which runtime the job was launched under. Ungated for the same
+/// reason as the renderer it derives from.
+pub mod sandbox_iface;
 pub mod sandbox_net;
 /// Putting `sandbox_net`'s policy in force: the holder container that owns the job's network
 /// namespace, and the sidecar that installs the rules into it before the job exists. Unconditional
