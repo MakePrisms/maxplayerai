@@ -84,30 +84,36 @@ IMAGE=maxplayer-tool-kit:demo ./docker/demo.sh
 The demo writes evidence to `evidence/<UTC-timestamp>/`. The `manifest.json` carries a
 source-to-build receipt and the built image id.
 
-## Rung 3 — Key-swap proxy (template deferred; mechanism exists)
+## Rung 3 — Key-swap proxy (deferred; not self-serve today)
 
 Use this for an authenticated HTTP API or a vendor-hosted MCP server whose auth is a header value.
 The job holds a placeholder; the credential proxy (`#647`) swaps the real credential in at egress.
-The mechanism ships for the model credential; the seller-tool template is deferred, so today this is
-manual setup.
 
-Configure it.
+**Status: recognized, template deferred.** The low-level swap mechanism ships for the model
+credential, but the reviewed seller-tool template — the profile, the checker, the credential-custody
+handling, the transport, and the acceptance tests — is not built. So a seller cannot onboard this
+route by configuration today, and a run of it must never be reported as onboarded. This is a
+platform build item, not a seller task. Do not improvise per-seller custody; that is the unreviewed
+path the design refuses. If the tool also genuinely fits rung 4, offer that instead, but never as a
+silent downgrade.
 
-1. Add a credential entry (the `FileCredential` shape in `home.rs`): the file `path` and `field`
-   for the real token, the `env` placeholder the container gets, the one `upstream` host, and the
+What a rung-3 template must wire, for the platform to build (this is the design, not a seller
+recipe):
+
+1. A credential entry (the `FileCredential` shape in `home.rs`): the file `path` and `field` for the
+   real token, the `env` placeholder the container gets, the one `upstream` host, and the
    `endpoint_args` that point the client at the proxy.
-2. Add the vendor host to the job's egress allowlist, or the request dies at name resolution.
-3. Confirm the token is a header value. The proxy substitutes in header values only, never the body
-   or the path.
-4. **Answer the scope question.** Is the credential already scoped to the job's resources?
-   - Yes → the proxy swap alone is safe.
-   - No → the credential is broad, so add a trusted operation filter that is the job's only path to
-     the vendor. Do not put the filter inside the job container; the job holds the placeholder and
-     can skip it. A trusted filter that holds the credential and exposes only safe operations is the
-     rung 4 holder shape, for a remote tool.
-5. For a remote MCP, remember the transport gap: `McpServer` is `{name, command}`, stdio only. A
-   remote HTTPS MCP needs a stdio-to-HTTP shim in the container pointed at the proxy, or driver-side
-   HTTP MCP support.
+2. The vendor host on the job's egress allowlist, or the request dies at name resolution.
+3. Header-only auth: the proxy substitutes in header values only, never the body or the path.
+4. The scope fork. Is the credential already scoped to the job's resources? If yes, the proxy swap
+   alone is safe. If no, a trusted operation filter that is the job's only path to the vendor — never
+   an in-container filter, which the job can skip because it holds the placeholder. That trusted
+   filter is the rung 4 holder shape, for a remote tool.
+5. The transport: `McpServer` is `{name, command}`, stdio only, so a remote HTTPS MCP needs a
+   stdio-to-HTTP shim in the container pointed at the proxy, or driver-side HTTP MCP support.
+
+Until that template exists, the honest outcome at this leaf is "recognized shape, template
+deferred".
 
 ## Rung 2 — Direct vendor token (guidance only; deliver through the proxy)
 
@@ -119,6 +125,11 @@ placeholder in the container, the real token swapped in at egress. The proxy mak
 worthless outside the life of the job, so job-close-binding is ensured for you. Inject a real token
 into the container only when the proxy cannot mediate the traffic (non-header auth, a signing
 protocol, or a client that will not route through the proxy), and record the residual leak risk.
+
+Be honest about what is available today. The proxy delivery above is the rung 3 path, and rung 3 is
+deferred. So the only self-serve option for a token tool today is the weaker one: the real token in
+the container, with the eligibility gate above and the residual leak recorded. State that plainly
+rather than implying the proxy delivery is ready.
 
 ## Rung 1 — Public (guidance only)
 

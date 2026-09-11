@@ -88,6 +88,25 @@ job-close-binding is ensured out of band. This is why a rung 2 case, in practice
 rung 3. Bare rung 2 (a real token in the container) survives only where the proxy cannot mediate the
 traffic: non-header auth, a signing protocol, or a client that will not route through the proxy.
 
+## What a leaf does when it has no template
+
+A route without a shipped template is not one behavior. It is two, and they must not be confused.
+
+- **Manual setup (rungs 1, 2).** The route works; only the automation is missing. So the tree does
+  real work: it confirms the route, runs the eligibility gate (rung 2's four predicates, each with
+  evidence), gives the concrete known-safe steps, and reports the outcome as "manual setup", never
+  as "onboarded". A human operator does a bounded, known-safe wiring.
+- **Deferred (rungs 3, 5, browser).** The tree recognizes the route, returns "recognized shape,
+  template deferred", and stops. It does not hand the route to the seller to improvise, and it does
+  not silently drop to a weaker route that has a template. The missing template is reviewed platform
+  machinery — the profile, the custody handling, the checker, the acceptance tests — and that review
+  is meant to happen one time, on the template, so every seller then fills only a manifest. A seller
+  hand-rolling their own custody is the unreviewed, per-seller path the design refuses. So a deferred
+  route is a platform build item, not a seller task.
+
+At a deferred leaf the useful outputs are: name what the template must build; offer a shipping route
+only if the tool genuinely fits one; or escalate to the platform to build the template.
+
 ## Dead ends, named
 
 - A credential store that cannot separate its auth writes from job state — unsupported
