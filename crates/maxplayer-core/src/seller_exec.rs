@@ -2740,6 +2740,47 @@ pub(crate) async fn prepare_launch(
     })
 }
 
+/// Run the **production** preparation and launch construction for one job, hand the resulting argv
+/// to `run_payload`, and tear everything down afterwards.
+///
+/// This is the entrypoint the live containment gate goes through, and it exists because the
+/// alternative failed review: a gate that creates its own holder and installs its own plan proves
+/// those filters *can* be installed while saying nothing about whether a real job is launched with
+/// them. Here the same [`prepare_launch`] a seat calls establishes containment, the same
+/// [`SandboxPolicy::launch`] builds the argv, and `netns` is wired from `holder_name` exactly as
+/// [`run_agent_job_with_env`] wires it — one code path, exercised rather than re-implemented.
+///
+/// `run_payload` receives the argv to execute and the holder name, and its return value is passed
+/// back. The containment guard lives across the call and is dropped **after** it returns, so a
+/// caller that measures cleanup can compare what it saw during the call with what survives after.
+///
+/// `#[doc(hidden)]`: this is reachable so an integration test can exercise the real path, not an
+/// interface for callers. Production code calls `run_agent_job*`.
+#[cfg(feature = "acp")]
+#[doc(hidden)]
+pub async fn with_prepared_launch<R>(
+    agent_command: &[String],
+    policy: &SandboxPolicy,
+    workdir: &Path,
+    identity: &DeliveryAgentIdentity,
+    job_lifetime: Duration,
+    run_payload: impl FnOnce(&AgentLaunch, Option<&str>) -> R,
+) -> Result<R, ExecError> {
+    let prepared = prepare_launch(agent_command, policy, workdir, identity, job_lifetime).await?;
+    let job = JobLaunch {
+        workdir,
+        env: &prepared.env,
+        uid: prepared.uid,
+        gid: prepared.gid,
+        netns: prepared.holder_name.as_deref(),
+    };
+    let launch = policy.launch(&prepared.effective_command, &job)?;
+    let outcome = run_payload(&launch, prepared.holder_name.as_deref());
+    // `prepared` drops here: proxy first, then the namespace, in the declared field order.
+    drop(prepared);
+    Ok(outcome)
+}
+
 /// Without the `acp` feature there is no containment path to prepare — fail closed.
 #[cfg(not(feature = "acp"))]
 pub(crate) async fn prepare_launch(

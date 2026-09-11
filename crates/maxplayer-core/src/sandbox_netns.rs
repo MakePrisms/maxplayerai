@@ -64,20 +64,85 @@ pub const HOLDER_LABEL: &str = "ai.maxplayer.netns-holder";
 /// this whole module chooses whenever it has to choose.
 pub const HOLDER_SEAT_LABEL: &str = "ai.maxplayer.netns-holder-seat";
 
+/// How long any one `docker` invocation in this module may take before it is killed. A create or a
+/// sidecar that never returns would otherwise hold the launch open indefinitely, and an unbounded
+/// wait is the state in which cancellation leaves work nobody owns.
+pub const DOCKER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// A running holder container, and the guarantee that it goes away.
 ///
-/// Constructed the instant the container exists, so that every `?` after that point tears it down on
-/// the way out — the holder is a resource with a lifetime, not a step in a procedure.
+/// Constructed **before** the container does, so that every `?` — and every cancellation — after
+/// that point tears it down on the way out. The holder is a resource with a lifetime, not a step in
+/// a procedure.
+///
+/// The guard also owns the **temporary containers joined to the namespace**. A sidecar is a joiner:
+/// while it lives the namespace cannot go away, so removing the holder while an applier or a
+/// readback is still running leaves the namespace pinned by a process nobody is tracking. Every
+/// sidecar is therefore named, registered here for its lifetime, and force-removed before the holder
+/// is.
 #[derive(Debug)]
 pub struct NetnsHolder {
     name: String,
+    sidecars: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl NetnsHolder {
-    /// Adopt an already-created container as the holder. Private on purpose: a `NetnsHolder` that
-    /// does not correspond to a running container would promise a teardown it cannot perform.
+    /// Adopt a container name as the holder, whether or not the container exists yet.
+    ///
+    /// Private on purpose. Adoption happens **before** the create command is issued: the create is
+    /// an await, an await is a cancellation point, and a cancelled create can still complete inside
+    /// the blocking pool after the future is gone. Adopting afterwards left exactly that container
+    /// with no guard — running, joined to nothing, and invisible to this process.
     fn adopt(name: String) -> Self {
-        Self { name }
+        Self { name, sidecars: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())) }
+    }
+
+    /// Register a sidecar container name for the duration of one command.
+    fn watch_sidecar(&self, name: String) -> SidecarGuard {
+        if let Ok(mut names) = self.sidecars.lock() {
+            names.push(name.clone());
+        }
+        SidecarGuard { name, registry: std::sync::Arc::clone(&self.sidecars) }
+    }
+
+    /// Whether a failed `docker rm` says "there was nothing here" rather than "I could not do it".
+    ///
+    /// The only benign failure. Because the holder is adopted **before** its create is issued, a run
+    /// cancelled in that window tears down a container that never existed, and docker rightly
+    /// objects. Every other message is a container this process could not remove — a leak, which the
+    /// caller reports as a leak. An empty stderr is not benign: a removal that failed without saying
+    /// why is the one case where assuming success would be a silent orphan.
+    fn force_remove_stderr_is_benign(stderr: &str) -> bool {
+        stderr.contains("No such container")
+    }
+
+    /// Force-remove one container by name, bounded, and say what actually happened.
+    ///
+    /// `Ok(())` means docker reported the removal, or reported that there was nothing to remove.
+    fn force_remove(name: &str) -> Result<(), String> {
+        let outcome = std::process::Command::new("docker")
+            .args(["rm", "--force", "--volumes", name])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output();
+        match outcome {
+            Ok(done) if done.status.success() => Ok(()),
+            Ok(done) => {
+                let stderr = String::from_utf8_lossy(&done.stderr).trim().to_owned();
+                // Removing something that was never created is the expected path when a create was
+                // cancelled before it started, and it is not a cleanup failure.
+                if Self::force_remove_stderr_is_benign(&stderr) {
+                    Ok(())
+                } else {
+                    Err(if stderr.is_empty() {
+                        "docker rm failed and said nothing".to_owned()
+                    } else {
+                        stderr
+                    })
+                }
+            }
+            Err(error) => Err(format!("could not run docker rm: {error}")),
+        }
     }
 
     /// The container name, for `docker` commands that address it directly.
@@ -100,32 +165,61 @@ impl NetnsHolder {
     }
 }
 
+/// One sidecar's registration, dropped when its command finishes however it finishes.
+///
+/// On a normal return the container is already gone (`--rm`) and this only deregisters. On
+/// cancellation the future is dropped mid-command, the name stays with the holder, and the holder's
+/// own `Drop` force-removes it — which is the case that used to leave a joiner pinning a namespace
+/// whose holder had just been removed.
+#[derive(Debug)]
+struct SidecarGuard {
+    name: String,
+    registry: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl Drop for SidecarGuard {
+    fn drop(&mut self) {
+        if let Ok(mut names) = self.registry.lock() {
+            names.retain(|name| name != &self.name);
+        }
+    }
+}
+
 impl Drop for NetnsHolder {
-    /// Destroy the holder, **synchronously**.
+    /// Destroy the holder, **synchronously**, and everything joined to it first.
     ///
     /// Deliberately a blocking `std::process::Command` and not a spawned task: a task spawned from
     /// `Drop` can be discarded when the runtime shuts down, and runtime shutdown is exactly the path a
     /// panicking or aborted job takes. A leaked holder is a container pinned to a namespace nothing
     /// will ever clean up, so the ~100 ms block is the cheaper end of that trade.
     ///
-    /// Failure is logged, never propagated: `Drop` cannot return, and the reaper in
-    /// [`reap_orphans`] is the backstop for the case where this did not work.
+    /// **Sidecars go first.** A joiner still running when the holder is removed keeps the namespace
+    /// alive, and is precisely what a cancelled applier or readback leaves behind. Only names this
+    /// run registered are removed; nothing is matched by pattern, so a sibling job's containers are
+    /// never in scope.
+    ///
+    /// Failure is reported, never propagated and never implied away: `Drop` cannot return, so each
+    /// failure is printed as a failure — "could not remove", not "destroyed" — and
+    /// [`reap_orphans`] is the backstop. A cleanup that failed is a leak that is now on the record.
     fn drop(&mut self) {
-        let outcome = std::process::Command::new("docker")
-            .args(["rm", "--force", "--volumes", &self.name])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .output();
-        match outcome {
-            Ok(done) if done.status.success() => {}
-            Ok(done) => eprintln!(
-                "sandbox: could not remove netns holder {}: {}",
-                self.name,
-                String::from_utf8_lossy(&done.stderr).trim()
-            ),
-            Err(error) => {
-                eprintln!("sandbox: could not run docker rm for netns holder {}: {error}", self.name)
+        let joiners: Vec<String> =
+            self.sidecars.lock().map(|names| names.clone()).unwrap_or_default();
+        for joiner in joiners {
+            if let Err(error) = Self::force_remove(&joiner) {
+                eprintln!(
+                    "sandbox: could not remove sidecar {joiner} joined to netns holder {}: {error} \
+                     — the namespace may still be pinned by it",
+                    self.name
+                );
             }
+        }
+        match Self::force_remove(&self.name) {
+            Ok(()) => {}
+            Err(error) => eprintln!(
+                "sandbox: could not remove netns holder {}: {error} — this holder is LEAKED, not \
+                 destroyed; the boot reaper is the only remaining backstop",
+                self.name
+            ),
         }
     }
 }
@@ -567,11 +661,27 @@ pub async fn reap_orphans(seat: &str) -> Result<ReapReport, String> {
 /// default build to enable three calls that happen once per job.
 #[cfg(feature = "acp")]
 async fn run_docker(argv: Vec<String>, stdin: Option<String>) -> Result<(String, String), String> {
+    run_bounded(argv, stdin, DOCKER_DEADLINE).await
+}
+
+/// Run an argv to completion with a **wall-clock bound**, optionally feeding `stdin`.
+///
+/// The bound is the cancellation ownership this module was missing. A `docker` client that never
+/// returns holds the launch open for as long as it likes, and while it is blocked in the pool the
+/// future above it can be cancelled — leaving a command nobody is waiting for and a container nobody
+/// is tracking. Past the deadline the child is killed and the caller gets a failure that names the
+/// deadline rather than a hang that names nothing.
+#[cfg(feature = "acp")]
+async fn run_bounded(
+    argv: Vec<String>,
+    stdin: Option<String>,
+    deadline: std::time::Duration,
+) -> Result<(String, String), String> {
     tokio::task::spawn_blocking(move || {
-        use std::io::Write;
+        use std::io::{Read, Write};
         use std::process::{Command, Stdio};
 
-        let (program, args) = argv.split_first().expect("a docker argv is never empty");
+        let (program, args) = argv.split_first().expect("an argv is never empty");
         let mut child = Command::new(program)
             .args(args)
             .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
@@ -590,9 +700,35 @@ async fn run_docker(argv: Vec<String>, stdin: Option<String>) -> Result<(String,
             // job's launch hangs instead of failing.
             drop(child.stdin.take());
         }
-        let done = child
-            .wait_with_output()
-            .map_err(|error| format!("could not wait for `{program}`: {error}"))?;
+
+        // Poll rather than `wait_with_output`, so the deadline is enforceable at all.
+        let started = std::time::Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(error) => return Err(format!("could not wait for `{program}`: {error}")),
+            }
+            if started.elapsed() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "`{program}` did not finish within {}s and was killed — a command with no bound \
+                     is a launch that can hang and a container nobody is waiting for",
+                    deadline.as_secs()
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        if let Some(mut pipe) = child.stdout.take() {
+            let _ = pipe.read_to_end(&mut stdout);
+        }
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_end(&mut stderr);
+        }
+        let done = std::process::Output { status, stdout, stderr };
         let stdout = String::from_utf8_lossy(&done.stdout).trim().to_owned();
         let stderr = String::from_utf8_lossy(&done.stderr).trim().to_owned();
         match done.status.code() {
@@ -605,6 +741,53 @@ async fn run_docker(argv: Vec<String>, stdin: Option<String>) -> Result<(String,
     })
     .await
     .map_err(|error| format!("docker task panicked: {error}"))?
+}
+
+/// A unique name for one temporary container joined to `holder`'s namespace.
+///
+/// Unique per process and per call, so nothing here can address — or remove — a container belonging
+/// to another run.
+pub fn sidecar_name(holder: &str, verb: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!("{holder}-{verb}-{}-{serial}", std::process::id())
+}
+
+/// Give a `docker run` argv an explicit container name.
+///
+/// An unnamed sidecar cannot be cleaned up after a cancellation: docker assigns it a random name
+/// this process never learns, so the one container capable of pinning the namespace open is the one
+/// container nothing can address.
+pub fn with_container_name(mut argv: Vec<String>, name: &str) -> Result<Vec<String>, String> {
+    match argv.get(1).map(String::as_str) {
+        Some("run") => {
+            argv.splice(2..2, ["--name".to_owned(), name.to_owned()]);
+            Ok(argv)
+        }
+        other => Err(format!(
+            "refusing to name {other:?} as a container: this is not a `docker run` argv, and naming \
+             the wrong command would register a cleanup target that does not exist"
+        )),
+    }
+}
+
+/// Run one sidecar joined to the holder's namespace: named, registered for its lifetime, bounded.
+#[cfg(feature = "acp")]
+async fn run_sidecar(
+    holder: &NetnsHolder,
+    verb: &str,
+    argv: Vec<String>,
+    stdin: Option<String>,
+) -> Result<(String, String), String> {
+    let name = sidecar_name(holder.name(), verb);
+    let argv = with_container_name(argv, &name)?;
+    // Registered BEFORE the command starts: a cancellation between these two lines must still leave
+    // a cleanup target behind, and registering afterwards would not.
+    let registration = holder.watch_sidecar(name);
+    let outcome = run_docker(argv, stdin).await;
+    drop(registration);
+    outcome
 }
 
 /// Establish containment for one job: measure the proxy address, create the namespace holder, install
@@ -643,12 +826,14 @@ pub async fn establish(
     })?;
 
     let name = holder_name(job_id);
+    // Adopted BEFORE the create is issued, not after it returns. `run_docker` awaits, an await is a
+    // cancellation point, and the blocking create can complete after the future above it is gone:
+    // adopting afterwards left exactly that container running with no guard and no record. The guard
+    // costs one `docker rm` that reports "No such container" when the create never happened.
+    let holder = NetnsHolder::adopt(name.clone());
     run_docker(holder_argv(&name, network, holder_image, uid, gid, job_id, seat), None)
         .await
         .map_err(|error| format!("could not start the netns holder {name} — {error}"))?;
-    // From here on the container exists, so every early return must tear it down. Adopting it into
-    // the guard immediately is what makes that automatic rather than remembered.
-    let holder = NetnsHolder::adopt(name);
 
     // The resolvers arrive from the caller rather than being discovered here, and that is the one
     // property that keeps the job's `/etc/resolv.conf` and this policy in agreement: the caller
@@ -661,9 +846,10 @@ pub async fn establish(
         dns_resolvers,
     };
     let (plan, expected) = plan_stdin(&policy);
-    let (applied, _) = run_docker(sidecar_argv(&holder, sidecar_image), Some(plan))
-        .await
-        .map_err(|error| format!("containment was not installed — {error}"))?;
+    let (applied, _) =
+        run_sidecar(&holder, "iptables", sidecar_argv(&holder, sidecar_image), Some(plan))
+            .await
+            .map_err(|error| format!("containment was not installed — {error}"))?;
 
     // The count cross-check. A truncated stdin applies cleanly and exits 0, so no exit code reveals
     // it; only comparing the sidecar's own total against what was rendered does.
@@ -684,11 +870,16 @@ pub async fn establish(
     // Both families are checked, and a v6 failure is as fatal as a v4 one: an unfiltered address family
     // is the cheapest bypass there is.
     for family in [Family::V4, Family::V6] {
-        let (readback, _) = run_docker(readback_argv(holder.name(), sidecar_image, family), None)
-            .await
-            .map_err(|error| {
-                format!("could not read {} rules back from the namespace — {error}", family.binary())
-            })?;
+        let (readback, _) = run_sidecar(
+            &holder,
+            "iptables-readback",
+            readback_argv(holder.name(), sidecar_image, family),
+            None,
+        )
+        .await
+        .map_err(|error| {
+            format!("could not read {} rules back from the namespace — {error}", family.binary())
+        })?;
         policy.verify_readback(family, &readback).map_err(|error| {
             format!("containment did not verify after installation — {error}")
         })?;
@@ -712,7 +903,9 @@ pub async fn establish(
     let iface = crate::sandbox_iface::IfacePlan::derive(&dev, &policy)
         .map_err(|error| format!("the egress filter plan for {dev} could not be rendered — {error}"))?;
     let (iface_plan, iface_expected) = crate::sandbox_iface::plan_stdin(&iface);
-    let (iface_applied, _) = run_docker(
+    let (iface_applied, _) = run_sidecar(
+        &holder,
+        "iface",
         crate::sandbox_iface::iface_sidecar_argv(holder.name(), sidecar_image),
         Some(iface_plan),
     )
@@ -743,7 +936,9 @@ pub async fn establish(
     // still the installer's own account of its work. `verify_readback` checks presence, order, both
     // families, the exceptions' width and that no drop carries a protocol match — the TCP-only drop
     // is the bug this closes, not the fix.
-    let (iface_readback, _) = run_docker(
+    let (iface_readback, _) = run_sidecar(
+        &holder,
+        "iface-readback",
         crate::sandbox_iface::filter_readback_argv(holder.name(), sidecar_image, &dev),
         None,
     )
@@ -768,13 +963,18 @@ pub async fn establish(
 /// fails the launch here instead of installing drops on something shared.
 #[cfg(feature = "acp")]
 async fn egress_device(holder: &NetnsHolder, sidecar_image: &str) -> Result<String, String> {
-    let (links, _) =
-        run_docker(crate::sandbox_iface::link_probe_argv(holder.name(), sidecar_image), None)
-            .await
-            .map_err(|error| {
-                format!("could not enumerate the links in the job's namespace — {error}")
-            })?;
-    let link = crate::sandbox_iface::select_egress_link(&crate::sandbox_iface::parse_links(&links))
+    let (links, _) = run_sidecar(
+        holder,
+        "link-probe",
+        crate::sandbox_iface::link_probe_argv(holder.name(), sidecar_image),
+        None,
+    )
+    .await
+    .map_err(|error| format!("could not enumerate the links in the job's namespace — {error}"))?;
+    let parsed = crate::sandbox_iface::parse_links(&links).map_err(|error| {
+        format!("the job's namespace listed a link this build cannot read — {error}")
+    })?;
+    let link = crate::sandbox_iface::select_egress_link(&parsed)
         .map_err(|error| format!("the job's egress interface could not be identified — {error}"))?;
     Ok(link.name)
 }
@@ -1091,5 +1291,121 @@ mod tests {
         let accepts: Vec<&str> = stdin.lines().filter(|l| l.contains("ACCEPT")).collect();
         assert_eq!(accepts.len(), 1, "exactly one pinhole: {accepts:?}");
         assert!(accepts[0].contains(&measured), "the pinhole must name the measured host: {accepts:?}");
+    }
+
+    // ── Cancellation custody (F4) ─────────────────────────────────────────────────────────────
+    //
+    // A cancelled establish must leave nothing running that this process cannot name. These tests
+    // check the three properties that make that true without a daemon: the sidecar is addressable,
+    // its name is unique to this run, and the holder tracks it for exactly as long as it is alive.
+
+    /// Every container joined to the namespace is named by us. An unnamed sidecar gets a random name
+    /// this process never learns, so a cancellation mid-command leaves the one container capable of
+    /// pinning the namespace open as the one container nothing can address.
+    #[test]
+    fn every_sidecar_is_named_so_a_cancelled_one_can_still_be_removed() {
+        let holder = NetnsHolder::adopt("maxplayer-netns-abc".into());
+        let name = sidecar_name(holder.name(), "iface");
+        for argv in [
+            sidecar_argv(&holder, "netfilter"),
+            readback_argv(holder.name(), "netfilter", Family::V4),
+            crate::sandbox_iface::iface_sidecar_argv(holder.name(), "netfilter"),
+            crate::sandbox_iface::filter_readback_argv(holder.name(), "netfilter", "eth0"),
+            crate::sandbox_iface::link_probe_argv(holder.name(), "netfilter"),
+        ] {
+            let named = with_container_name(argv, &name).expect("a docker run argv");
+            assert!(
+                named.windows(2).any(|w| w == ["--name", name.as_str()]),
+                "an unnamed joiner cannot be cleaned up: {named:?}"
+            );
+            // The name goes to the docker client, before the image and its command: appended at the
+            // end it would become an argument to the sidecar instead of a flag to `run`.
+            let at = named.iter().position(|a| a == "--name").expect("named");
+            let image = named.iter().position(|a| a == "netfilter").expect("the image");
+            assert!(at < image, "--name must precede the image: {named:?}");
+        }
+    }
+
+    /// The name must be unique per call. A deterministic sidecar name is a name two concurrent jobs
+    /// share, and cleaning up "the" sidecar would then remove a sibling's live container.
+    #[test]
+    fn sidecar_names_are_unique_per_call_so_cleanup_cannot_hit_a_sibling() {
+        let first = sidecar_name("maxplayer-netns-abc", "iface");
+        let second = sidecar_name("maxplayer-netns-abc", "iface");
+        assert_ne!(first, second, "two joiners of the same holder must not share a name");
+        // Each is still attributable to its holder and its purpose, which is what makes an orphan
+        // readable to an operator rather than merely unique.
+        for name in [&first, &second] {
+            assert!(name.starts_with("maxplayer-netns-abc-iface-"), "{name}");
+        }
+        // Different holders never collide either.
+        assert_ne!(
+            sidecar_name("maxplayer-netns-abc", "iface"),
+            sidecar_name("maxplayer-netns-def", "iface")
+        );
+    }
+
+    /// Naming is refused rather than misapplied. Splicing `--name` into something that is not a
+    /// `docker run` would register a cleanup target that does not exist, and a cleanup target that
+    /// does not exist reports success for a container still running.
+    #[test]
+    fn naming_a_non_run_argv_is_refused() {
+        let err = with_container_name(list_all_containers_argv(), "x")
+            .expect_err("`docker ps` takes no --name");
+        assert!(err.contains("not a `docker run` argv"), "{err}");
+        assert!(with_container_name(network_modes_argv(&["a".into()]), "x").is_err());
+        // The positive control, so the refusal is not simply "always refuse".
+        let holder = NetnsHolder::adopt("h".into());
+        assert!(with_container_name(sidecar_argv(&holder, "img"), "x").is_ok());
+    }
+
+    /// A joiner is tracked for exactly its command's lifetime: registered before it starts (a
+    /// cancellation between registration and start must still leave a cleanup target) and dropped
+    /// when it finishes, so a completed sidecar is not removed twice or reported as an orphan.
+    #[test]
+    fn a_joiner_is_tracked_while_it_runs_and_forgotten_when_it_finishes() {
+        let holder = NetnsHolder::adopt("maxplayer-netns-abc".into());
+        let tracked = |holder: &NetnsHolder| -> Vec<String> {
+            holder.sidecars.lock().expect("registry").clone()
+        };
+        assert!(tracked(&holder).is_empty(), "nothing is joined before anything runs");
+
+        let first = holder.watch_sidecar(sidecar_name(holder.name(), "iface"));
+        let second = holder.watch_sidecar(sidecar_name(holder.name(), "iface-readback"));
+        assert_eq!(tracked(&holder).len(), 2, "both live joiners are cleanup targets");
+
+        // Finishing one deregisters only that one: the other is still running and still owned.
+        let second_name = second.name.clone();
+        drop(second);
+        assert_eq!(tracked(&holder), vec![first.name.clone()], "{second_name} must be forgotten");
+
+        drop(first);
+        assert!(tracked(&holder).is_empty(), "a finished joiner is not an orphan");
+    }
+
+    /// Cleanup reports what happened. "No such container" after a cancelled create is the expected
+    /// path and not a failure; anything else is a leak, and must be reported as one rather than
+    /// swallowed into a teardown that claims to have destroyed the namespace.
+    #[test]
+    fn removing_something_that_was_never_created_is_not_a_cleanup_failure() {
+        // The holder is adopted before the create is issued precisely so this case exists.
+        let name = holder_name("a-job-whose-create-was-cancelled");
+        assert!(name.starts_with("maxplayer-netns-"), "{name}");
+        // No daemon is touched here; the classification under test is the string one, and it is the
+        // only place a "nothing to remove" result is allowed to pass as success.
+        assert!(
+            NetnsHolder::force_remove_stderr_is_benign("Error: No such container: x"),
+            "a container that never existed is not a leak"
+        );
+        for real in [
+            "Error response from daemon: cannot remove a running container",
+            "permission denied while trying to connect to the Docker daemon socket",
+            "",
+        ] {
+            assert!(
+                !NetnsHolder::force_remove_stderr_is_benign(real),
+                "a failed removal must be reported as a leak, not as a teardown: {real:?}"
+            );
+        }
     }
 }

@@ -80,6 +80,75 @@ fn docker(args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
     )
 }
 
+// ── Fixture ownership ─────────────────────────────────────────────────────────────────────────
+//
+// Every resource these tests create is unique to this run and carries a label saying so, and
+// nothing is ever removed unless that label is read back off it first.
+//
+// The rule exists because the alternative was in this file: fixtures named deterministically
+// (`mx-runsc-net`, `mx-reap-idle`, …) and a `docker rm --force` of those names at setup, to clear
+// whatever a previous run had left. That start-by-deleting step is indistinguishable from deleting
+// somebody else's container — a concurrent run of this same suite, or an operator's box where the
+// name happens to be taken — and it destroys the evidence of the leak it is papering over. A unique
+// name needs no pre-delete, and an ownership check makes teardown provably ours.
+
+/// The label every fixture resource carries, with this run's token as its value.
+const FIXTURE_OWNER_LABEL: &str = "ai.maxplayer.live-fixture-owner";
+
+/// This run's ownership token: pid plus process start-unique nanoseconds, so two concurrent runs on
+/// one host — and a rerun after a crash — never share it.
+fn owner_token() -> &'static str {
+    static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TOKEN.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64 + d.as_secs().wrapping_mul(1_000_000_000))
+            .unwrap_or(0);
+        format!("{}-{nanos:x}", std::process::id())
+    })
+}
+
+/// A resource name this run owns and nothing else can be using.
+fn owned_name(kind: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!("mx-live-{kind}-{}-{}", owner_token(), NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// The `--label` argument that stamps this run's ownership.
+fn owner_label() -> String {
+    format!("{FIXTURE_OWNER_LABEL}={}", owner_token())
+}
+
+/// Whether a resource carries **this run's** ownership token. Read off the daemon, never assumed
+/// from the name: the name is what a collision would reproduce, the label is what it would not.
+fn owned_by_this_run(kind: &str, name: &str) -> bool {
+    let format = format!("{{{{index .{} \"{FIXTURE_OWNER_LABEL}\"}}}}", match kind {
+        "network" => "Labels",
+        _ => "Config.Labels",
+    });
+    let args: Vec<&str> = match kind {
+        "network" => vec!["network", "inspect", "--format", &format, name],
+        _ => vec!["inspect", "--format", &format, name],
+    };
+    let (ok, out, _) = docker(&args, None);
+    ok && out.trim() == owner_token()
+}
+
+/// Remove a container this run created, and only if it still says it is ours.
+fn remove_owned_container(name: &str) {
+    if owned_by_this_run("container", name) {
+        docker(&["rm", "--force", "--volumes", name], None);
+    }
+}
+
+/// Remove a network this run created, and only if it still says it is ours.
+fn remove_owned_network(name: &str) {
+    if owned_by_this_run("network", name) {
+        docker(&["network", "rm", name], None);
+    }
+}
+
 /// A namespace holder plus the network it sits on, torn down on drop however the test exits.
 struct Fixture {
     network: String,
@@ -88,9 +157,11 @@ struct Fixture {
 
 impl Fixture {
     fn new(tag: &str) -> Self {
-        let network = format!("mx-live-net-{tag}");
-        let holder = format!("mx-live-holder-{tag}");
-        let (ok, _, err) = docker(&["network", "create", &network], None);
+        let network = owned_name(&format!("net-{tag}"));
+        let holder = owned_name(&format!("holder-{tag}"));
+        // No pre-delete: the names above did not exist a microsecond ago, so there is nothing of
+        // anyone's to clear, and a create that fails is a real failure rather than a stale leftover.
+        let (ok, _, err) = docker(&["network", "create", "--label", &owner_label(), &network], None);
         assert!(ok, "could not create the test network: {err}");
         let (ok, _, err) = docker(
             &[
@@ -98,6 +169,8 @@ impl Fixture {
                 "--detach",
                 "--name",
                 &holder,
+                "--label",
+                &owner_label(),
                 "--network",
                 &network,
                 "--read-only",
@@ -149,8 +222,8 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        docker(&["rm", "--force", "--volumes", &self.holder], None);
-        docker(&["network", "rm", &self.network], None);
+        remove_owned_container(&self.holder);
+        remove_owned_network(&self.network);
     }
 }
 
@@ -419,15 +492,17 @@ fn reaping_removes_an_unattached_holder_and_spares_a_busy_one_and_another_seats(
     // Two synthetic seats. `MINE` boots and reaps; `FOREIGN` is a co-tenant that must be left alone.
     const MINE: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const FOREIGN: &str = "2222222222222222222222222222222222222222222222222222222222222222";
-    let idle = "mx-reap-idle";
-    let busy = "mx-reap-busy";
-    let job = "mx-reap-job";
+    // Unique per run, and stamped as ours. The seats below are synthetic, so no OTHER run of this
+    // suite can be reaping them; that is exactly why these names must not be the same two runs
+    // apart, and why nothing is force-removed here before it is created.
+    let idle = owned_name("reap-idle");
+    let busy = owned_name("reap-busy");
+    let job = owned_name("reap-job");
     // Deliberately unattached, like a holder in its pre-attach window: the co-tenant case that the
     // host-wide reaper destroyed and attachment state cannot distinguish.
-    let foreign = "mx-reap-cotenant";
-    for name in [idle, busy, job, foreign] {
-        docker(&["rm", "--force", "--volumes", name], None);
-    }
+    let foreign = owned_name("reap-cotenant");
+    let (idle, busy, job, foreign) =
+        (idle.as_str(), busy.as_str(), job.as_str(), foreign.as_str());
 
     // Three holders carrying the real label — two mine, one another seat's — and a job joined to
     // exactly one of mine.
@@ -438,6 +513,8 @@ fn reaping_removes_an_unattached_holder_and_spares_a_busy_one_and_another_seats(
                 "--detach",
                 "--name",
                 name,
+                "--label",
+                &owner_label(),
                 "--label",
                 &format!("{}=jobfor-{name}", maxplayer_core::sandbox_netns::HOLDER_LABEL),
                 "--label",
@@ -457,6 +534,8 @@ fn reaping_removes_an_unattached_holder_and_spares_a_busy_one_and_another_seats(
             "--detach",
             "--name",
             job,
+            "--label",
+            &owner_label(),
             "--network",
             &format!("container:{busy}"),
             "--entrypoint",
@@ -481,9 +560,10 @@ fn reaping_removes_an_unattached_holder_and_spares_a_busy_one_and_another_seats(
     let busy_survived = still_there(busy);
     let foreign_survived = still_there(foreign);
 
-    // Clean up before asserting, so a failure does not leak containers.
+    // Clean up before asserting, so a failure does not leak containers. `idle` is expected to be
+    // gone already — the reaper removed it — and the ownership check simply finds nothing to do.
     for name in [idle, busy, job, foreign] {
-        docker(&["rm", "--force", "--volumes", name], None);
+        remove_owned_container(name);
     }
 
     assert!(!idle_survived, "my own unattached holder should have been reaped; reaped={reaped:?}");
@@ -685,21 +765,21 @@ impl Canary {
     const OTHER_PORT: &'static str = "9998";
 
     fn new(allowed_subnet: &str, denied_subnet: &str) -> Self {
-        let allowed_net = "mx-canary-allowed".to_owned();
-        let denied_net = "mx-canary-denied".to_owned();
-        // Setup can panic before the guard exists, which leaks whatever was created first. Clearing
-        // our own names up front makes a rerun idempotent instead of failing on the previous run's
-        // debris. Nothing here can touch a name we did not create.
-        for name in ["mx-canary-listener-allowed", "mx-canary-listener-denied", "mx-live-holder-canary"] {
-            docker(&["rm", "--force", "--volumes", name], None);
-        }
-        for net in [&allowed_net, &denied_net, &"mx-live-net-canary".to_owned()] {
-            docker(&["network", "rm", net], None);
-        }
+        // Unique per run and stamped as ours, so setup creates and never clears.
+        //
+        // These names used to be fixed, with a `docker rm --force` of each at the top to make a
+        // rerun idempotent over the previous run's debris. "Nothing here can touch a name we did not
+        // create" was wrong twice: a second concurrent run of this suite creates exactly these
+        // names, and on any host an operator may already hold one. Deleting first also destroys the
+        // leak it was hiding, so a fixture that leaks on panic now stays visible and attributable to
+        // the run that leaked it.
+        let allowed_net = owned_name("canary-allowed");
+        let denied_net = owned_name("canary-denied");
 
         let fixture = Fixture::new("canary");
         for (net, subnet) in [(&allowed_net, allowed_subnet), (&denied_net, denied_subnet)] {
-            let (ok, _, err) = docker(&["network", "create", "--subnet", subnet, net], None);
+            let (ok, _, err) =
+                docker(&["network", "create", "--label", &owner_label(), "--subnet", subnet, net], None);
             assert!(
                 ok,
                 "could not create {net} on {subnet}: {err}\n\
@@ -708,8 +788,8 @@ impl Canary {
             );
         }
 
-        let allowed_listener = "mx-canary-listener-allowed".to_owned();
-        let denied_listener = "mx-canary-listener-denied".to_owned();
+        let allowed_listener = owned_name("canary-listener-allowed");
+        let denied_listener = owned_name("canary-listener-denied");
         let mut ips = Vec::new();
         for (name, net) in [(&allowed_listener, &allowed_net), (&denied_listener, &denied_net)] {
             // Two ports, because the pinhole test needs one address that is reachable on one port and
@@ -720,6 +800,8 @@ impl Canary {
                     "--detach",
                     "--name",
                     name,
+                    "--label",
+                    &owner_label(),
                     "--network",
                     net,
                     "--entrypoint",
@@ -802,12 +884,12 @@ impl Drop for Canary {
         // A network cannot be removed while a container is attached, and the holder is attached to
         // both. `Fixture`'s Drop runs after this one, so the holder has to go first here — its own
         // removal then finds nothing, which is harmless.
-        docker(&["rm", "--force", "--volumes", &self.fixture.holder], None);
+        remove_owned_container(&self.fixture.holder);
         for name in [&self.allowed_listener, &self.denied_listener] {
-            docker(&["rm", "--force", "--volumes", name], None);
+            remove_owned_container(name);
         }
         for net in [&self.allowed_net, &self.denied_net] {
-            docker(&["network", "rm", net], None);
+            remove_owned_network(net);
         }
     }
 }
@@ -817,8 +899,9 @@ impl Drop for Canary {
 #[test]
 #[ignore = "needs docker and the netfilter image"]
 fn establish_contains_a_namespace_and_tears_it_down_on_drop() {
-    let network = "mx-live-net-establish";
-    let (ok, _, err) = docker(&["network", "create", network], None);
+    let network = owned_name("net-establish");
+    let network = network.as_str();
+    let (ok, _, err) = docker(&["network", "create", "--label", &owner_label(), network], None);
     assert!(ok, "could not create the test network: {err}");
 
     let runtime = tokio::runtime::Runtime::new().expect("a runtime");
@@ -855,14 +938,14 @@ fn establish_contains_a_namespace_and_tears_it_down_on_drop() {
             name
         }
         Err(error) => {
-            docker(&["network", "rm", network], None);
+            remove_owned_network(network);
             panic!("establish failed: {error}");
         }
     };
 
     // The guard's Drop is synchronous, so by here the holder must be gone.
     let (_, listed, _) = docker(&["ps", "--all", "--quiet", "--filter", &format!("name={holder_name}")], None);
-    docker(&["network", "rm", network], None);
+    remove_owned_network(network);
     assert!(
         listed.is_empty(),
         "dropping the containment must remove the holder, but {holder_name} is still listed"
@@ -918,7 +1001,12 @@ fn run_argv(argv: &[String], stdin: Option<&str>) -> (bool, String, String) {
 fn egress_dev(holder: &str) -> String {
     let (ok, stdout, err) = run_argv(&link_probe_argv(holder, &netfilter_image()), None);
     assert!(ok, "could not enumerate the namespace's links: {err}");
-    select_egress_link(&parse_links(&stdout))
+    // `parse_links` refuses a record it cannot read rather than skipping it, so an unreadable line
+    // fails the test here instead of silently shrinking the list the selector then judges.
+    let links = parse_links(&stdout).unwrap_or_else(|error| {
+        panic!("the namespace's link list could not be read: {error}\n{stdout}")
+    });
+    select_egress_link(&links)
         .expect("a job holder's namespace has exactly one non-loopback link")
         .name
 }
@@ -936,9 +1024,9 @@ fn iface_readback(holder: &str, dev: &str) -> String {
 #[test]
 #[ignore = "needs docker and the netfilter image"]
 fn establish_filters_the_veth_the_packets_actually_leave_by() {
-    let network = "mx-live-net-iface";
-    docker(&["network", "rm", network], None);
-    let (ok, _, err) = docker(&["network", "create", network], None);
+    let network = owned_name("net-iface");
+    let network = network.as_str();
+    let (ok, _, err) = docker(&["network", "create", "--label", &owner_label(), network], None);
     assert!(ok, "could not create the test network: {err}");
 
     let runtime = tokio::runtime::Runtime::new().expect("a runtime");
@@ -958,7 +1046,7 @@ fn establish_filters_the_veth_the_packets_actually_leave_by() {
     let containment = match outcome {
         Ok(containment) => containment,
         Err(error) => {
-            docker(&["network", "rm", network], None);
+            remove_owned_network(network);
             panic!("establish failed: {error}");
         }
     };
@@ -995,7 +1083,7 @@ fn establish_filters_the_veth_the_packets_actually_leave_by() {
     drop(containment);
     let (_, listed, _) =
         docker(&["ps", "--all", "--quiet", "--filter", &format!("name={holder_name}")], None);
-    docker(&["network", "rm", network], None);
+    remove_owned_network(network);
     assert!(listed.is_empty(), "the holder {holder_name} outlived its containment");
 }
 
@@ -1176,13 +1264,21 @@ impl RunscNet {
     const DENIED_IP: &'static str = "198.18.7.2";
 
     fn new() -> Self {
-        let network = "mx-runsc-net".to_owned();
-        let listener = "mx-runsc-listener".to_owned();
-        docker(&["rm", "--force", "--volumes", &listener], None);
-        docker(&["network", "rm", &network], None);
-        let (ok, _, err) =
-            docker(&["network", "create", "--subnet", "203.0.113.0/24", &network], None);
-        assert!(ok, "could not create {network}: {err}");
+        // Unique per run and stamped as ours. The fixed `mx-runsc-net` / `mx-runsc-listener` pair
+        // this replaces was force-removed at setup to clear a prior run, which is the same command
+        // whether the name is a leftover of ours or a resource somebody else owns.
+        let network = owned_name("runsc-net");
+        let listener = owned_name("runsc-listener");
+        let (ok, _, err) = docker(
+            &["network", "create", "--label", &owner_label(), "--subnet", "203.0.113.0/24", &network],
+            None,
+        );
+        assert!(
+            ok,
+            "could not create {network}: {err}\n\
+             If this says the pool overlaps, another network on this host already holds \
+             203.0.113.0/24 — pick a free prefix rather than deleting whatever holds it."
+        );
 
         // One process, both addresses: `nc -l` binds every local address, so a refusal can never be
         // "that one was not listening".
@@ -1192,6 +1288,8 @@ impl RunscNet {
                 "--detach",
                 "--name",
                 &listener,
+                "--label",
+                &owner_label(),
                 "--network",
                 &network,
                 "--cap-add",
@@ -1249,8 +1347,8 @@ impl RunscNet {
 
 impl Drop for RunscNet {
     fn drop(&mut self) {
-        docker(&["rm", "--force", "--volumes", &self.listener], None);
-        docker(&["network", "rm", &self.network], None);
+        remove_owned_container(&self.listener);
+        remove_owned_network(&self.network);
     }
 }
 
@@ -1265,14 +1363,15 @@ struct Payload {
 
 impl Payload {
     fn new(net: &RunscNet, tag: &str) -> Self {
-        let holder = format!("mx-live-payload-{tag}");
-        docker(&["rm", "--force", "--volumes", &holder], None);
+        let holder = owned_name(&format!("payload-{tag}"));
         let (ok, _, err) = docker(
             &[
                 "run",
                 "--detach",
                 "--name",
                 &holder,
+                "--label",
+                &owner_label(),
                 "--network",
                 &net.network,
                 "--read-only",
@@ -1379,6 +1478,482 @@ impl Payload {
 
 impl Drop for Payload {
     fn drop(&mut self) {
-        docker(&["rm", "--force", "--volumes", &self.holder], None);
+        remove_owned_container(&self.holder);
     }
+}
+
+// =================================================================================================
+// The integrated launch matrix
+// =================================================================================================
+//
+// Everything above this line prepares a namespace by hand and then joins something to it. That
+// proves these filters CAN be installed; it does not prove a real job is launched with them, and a
+// gate that installs its own plan would stay green if `prepare_launch` stopped calling `establish`
+// altogether.
+//
+// So this section goes through `seller_exec::with_prepared_launch`: the production `prepare_launch`
+// establishes containment, the production `SandboxPolicy::launch` builds the argv, `netns` is wired
+// from `holder_name` exactly as `run_agent_job_with_env` wires it, and the argv is executed
+// verbatim. The separate OUTPUT-only reproduction above is kept deliberately — it is the baseline
+// arm, and it must not be folded into this one.
+//
+// **The oracle.** A refusal and a launch that never happened are the same exit code, and reading
+// docker's status alone lets a broken image, a missing mount or an OOM be scored as containment.
+// Every payload here therefore prints a start marker before it tries anything and a result marker
+// carrying the connection's own exit code, and the outcome is read from those markers. A payload
+// that did not print the start marker is `NeverStarted` and is never counted as a denial.
+
+/// Printed by the payload before it attempts anything, so "the job ran" is observable separately
+/// from "the job's connection failed".
+const STARTED_MARKER: &str = "MX-PAYLOAD-STARTED";
+
+/// Printed after the connection attempt, carrying `nc`'s own exit code.
+const RESULT_MARKER: &str = "MX-CONNECT-RC=";
+
+/// What a payload actually did. The distinction between the last two variants is the whole point:
+/// only `Refused` is evidence of containment.
+#[derive(Debug, PartialEq, Eq)]
+enum PayloadOutcome {
+    /// The payload's own process never reached its first statement. A docker, image, mount or
+    /// runtime failure — never containment evidence, in either direction.
+    NeverStarted,
+    /// The payload ran and its connection succeeded.
+    Connected,
+    /// The payload ran and its connection was refused or timed out.
+    Refused,
+}
+
+/// The agent command for one connection attempt, bracketed by markers.
+///
+/// `sh -c` rather than `nc` directly, because the markers have to come from the payload's own
+/// process: a wrapper outside the container would print "started" for a container that never did.
+fn payload_command(ip: &str, port: &str) -> Vec<String> {
+    vec![
+        "sh".to_owned(),
+        "-c".to_owned(),
+        format!("echo {STARTED_MARKER}; nc -w 4 {ip} {port} </dev/null >/dev/null 2>&1; echo {RESULT_MARKER}$?"),
+    ]
+}
+
+/// Classify a payload's own output. Docker's exit status is deliberately not consulted.
+fn classify_payload(stdout: &str, stderr: &str) -> PayloadOutcome {
+    let combined = format!("{stdout}\n{stderr}");
+    if !combined.contains(STARTED_MARKER) {
+        return PayloadOutcome::NeverStarted;
+    }
+    match combined
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(RESULT_MARKER))
+        .and_then(|code| code.trim().parse::<i32>().ok())
+    {
+        Some(0) => PayloadOutcome::Connected,
+        Some(_) => PayloadOutcome::Refused,
+        // Started, but never reported a result: killed mid-attempt. Not a denial.
+        None => PayloadOutcome::NeverStarted,
+    }
+}
+
+/// Execute a production-built `AgentLaunch` verbatim and read the payload's own markers back.
+fn run_launch_attributably(launch: &maxplayer_core::seller_exec::AgentLaunch) -> PayloadOutcome {
+    let out = Command::new(&launch.program)
+        .args(&launch.args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("the launch program must be runnable");
+    classify_payload(
+        &String::from_utf8_lossy(&out.stdout),
+        &String::from_utf8_lossy(&out.stderr),
+    )
+}
+
+/// The seat identity the gate launches as. Synthetic, and distinct from the reaper test's seats so a
+/// concurrent reap cannot touch this run's holders.
+fn gate_identity() -> maxplayer_core::seller_git::DeliveryAgentIdentity {
+    maxplayer_core::seller_git::DeliveryAgentIdentity::for_seller(
+        "5555555555555555555555555555555555555555555555555555555555555555",
+    )
+}
+
+/// The `[sandbox]` section an operator writes, resolved through the same call a booting seat makes.
+fn gate_config(network: &str) -> maxplayer_core::home::SandboxConfig {
+    maxplayer_core::home::SandboxConfig {
+        mode: maxplayer_core::home::SandboxMode::Docker,
+        launcher: Vec::new(),
+        // Carries `sh` and `nc`, and declares no entrypoint, so the agent command is the payload.
+        image: Some(holder_image()),
+        forward_env: Vec::new(),
+        runtime: None,
+        network: Some(network.to_owned()),
+        // No pinhole: this matrix measures denial and allowance, and a proxy range would add a
+        // second reason for a leg to differ from its control. The pinhole has its own coverage.
+        proxy_port_range: None,
+        file_credentials: Vec::new(),
+        codex_chatgpt: None,
+        container_delivery: None,
+        container_delivery_token: None,
+        container_delivery_token_cap_secs: None,
+    }
+}
+
+/// Production `prepare_launch` hardcodes [`DEFAULT_NETFILTER_IMAGE`] — it does NOT read
+/// `MAXPLAYER_NETFILTER_IMAGE`, which only the hand-built fixtures above use. So an integrated run
+/// measures whatever is tagged as that image on this host.
+///
+/// This asserts it exists, and says what to do about it, because the alternative is the failure this
+/// whole change is about: a gate reporting containment from an image that has no `tc` in it.
+fn require_default_netfilter_image() {
+    let image = maxplayer_core::sandbox_netns::DEFAULT_NETFILTER_IMAGE;
+    let (ok, _, err) = docker(&["image", "inspect", "--format", "{{.Id}}", image], None);
+    assert!(
+        ok,
+        "the integrated gate goes through production `prepare_launch`, which hardcodes {image} and \
+         ignores MAXPLAYER_NETFILTER_IMAGE. Tag the locally built sidecar as that image before \
+         running this gate:\n  docker build -t {image} docker/maxplayer-netfilter\nThe published \
+         v0.5.8 image does NOT contain tc, so an integrated run against it is expected to refuse \
+         every launch rather than contain anything.\ndocker said: {err}"
+    );
+}
+
+/// Make `ip` reachable on-link inside the holder's namespace, so a later refusal is the filters and
+/// not the absence of a route. Run after preparation, which is the only moment the namespace exists
+/// and the payload has not started.
+fn route_on_link(holder: &str, ip: &str) {
+    let (ok, _, err) = docker(
+        &[
+            "run",
+            "--rm",
+            "--network",
+            &format!("container:{holder}"),
+            "--cap-drop",
+            "ALL",
+            "--cap-add",
+            "NET_ADMIN",
+            "--entrypoint",
+            "ip",
+            &netfilter_image(),
+            "route",
+            "add",
+            &format!("{ip}/32"),
+            "dev",
+            "eth0",
+        ],
+        None,
+    );
+    assert!(ok, "could not make {ip} routable inside {holder}: {err}");
+}
+
+/// Run one integrated leg: production preparation, production launch argv, attributable payload.
+///
+/// `before_payload` runs inside the prepared namespace after containment is installed and before the
+/// payload starts — the window a route injection has to use.
+fn integrated_leg(
+    network: &str,
+    ip: &str,
+    port: &str,
+    before_payload: impl FnOnce(&str),
+) -> Result<PayloadOutcome, String> {
+    let config = gate_config(network);
+    let policy = maxplayer_core::seller_exec::SandboxPolicy::from_config(Some(&config))
+        .expect("a docker policy");
+    let workdir = std::env::temp_dir().join(owned_name("workdir"));
+    std::fs::create_dir_all(&workdir).expect("a workdir");
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    let outcome = runtime.block_on(maxplayer_core::seller_exec::with_prepared_launch(
+        &payload_command(ip, port),
+        &policy,
+        &workdir,
+        &gate_identity(),
+        std::time::Duration::from_secs(120),
+        |launch, holder| {
+            let holder = holder.expect(
+                "a docker policy with a configured network must establish containment — a `None` \
+                 holder here means the job would run uncontained",
+            );
+            assert!(
+                launch.args.iter().any(|arg| arg == &format!("container:{holder}")),
+                "the production launch must join the holder's namespace: {:?}",
+                launch.args
+            );
+            before_payload(holder);
+            run_launch_attributably(launch)
+        },
+    ));
+    let _ = std::fs::remove_dir_all(&workdir);
+    outcome.map_err(|error| error.to_string())
+}
+
+/// **The integrated gate.** One preparation path, three ordered legs, each scored from the payload's
+/// own markers.
+///
+/// The allowed leg is not a formality: a filter set that denies everything would pass the denied leg
+/// and is not containment. The outside control is the discriminator for the denied leg — from
+/// outside the namespace the policy does not apply, so a success there proves the listener was alive
+/// and the refusal inside was the rules.
+#[test]
+#[ignore = "needs docker and the production-tagged netfilter image"]
+fn a_job_prepared_and_launched_by_production_is_contained_on_its_veth() {
+    require_default_netfilter_image();
+    let net = RunscNet::new();
+
+    // CONTROL, outside every namespace: both destinations answer.
+    assert!(
+        net.reachable_from_outside(RunscNet::DENIED_IP),
+        "control: {} must answer from outside, or the denied leg below proves nothing",
+        RunscNet::DENIED_IP
+    );
+    assert!(
+        net.reachable_from_outside(&net.allowed_ip),
+        "control: {} must answer from outside",
+        net.allowed_ip
+    );
+
+    // LEG 1 — a destination the shipped policy denies, through the production launch path.
+    let denied = integrated_leg(&net.network, RunscNet::DENIED_IP, Canary::PORT, |holder| {
+        route_on_link(holder, RunscNet::DENIED_IP)
+    })
+    .expect("preparation must succeed");
+    assert_eq!(
+        denied,
+        PayloadOutcome::Refused,
+        "a job prepared and launched by production reached the denied {} \
+         (NeverStarted here would mean the payload never ran, which is not containment either)",
+        RunscNet::DENIED_IP
+    );
+
+    // LEG 2 — the allowed destination, same path, same image, same user.
+    let allowed = integrated_leg(&net.network, &net.allowed_ip, Canary::PORT, |_| {})
+        .expect("preparation must succeed");
+    assert_eq!(
+        allowed,
+        PayloadOutcome::Connected,
+        "positive control: the allowed {} must stay reachable through the production launch path — \
+         a policy that denies everything is not containment",
+        net.allowed_ip
+    );
+
+    // LEG 3 — a neighbouring port on the SAME allowed address. The policy's denials are not
+    // port-scoped, so the allowed address stays allowed; what this leg rules out is a filter that
+    // happened to match on one port number.
+    let other_port = integrated_leg(&net.network, &net.allowed_ip, Canary::OTHER_PORT, |_| {})
+        .expect("preparation must succeed");
+    assert_ne!(
+        other_port,
+        PayloadOutcome::NeverStarted,
+        "the neighbouring-port leg never started, so it scored nothing"
+    );
+}
+
+/// **The oracle's own red-prove.** A payload that cannot start must not be scored as a denial.
+///
+/// Without this the matrix above would pass with every leg broken: a bad image, a missing mount or a
+/// runtime failure exits non-zero exactly like a refused connection, and round 1's oracle — docker's
+/// status alone — could not tell them apart.
+#[test]
+#[ignore = "needs docker and the production-tagged netfilter image"]
+fn a_payload_that_never_ran_is_not_scored_as_a_denial() {
+    // The classifier first, on captured shapes, so the rule is stated independently of any daemon.
+    assert_eq!(
+        classify_payload("", "docker: Error response from daemon: no such image"),
+        PayloadOutcome::NeverStarted,
+        "a docker failure must never be read as containment"
+    );
+    assert_eq!(
+        classify_payload(&format!("{STARTED_MARKER}\n{RESULT_MARKER}1\n"), ""),
+        PayloadOutcome::Refused
+    );
+    assert_eq!(
+        classify_payload(&format!("{STARTED_MARKER}\n{RESULT_MARKER}0\n"), ""),
+        PayloadOutcome::Connected
+    );
+    assert_eq!(
+        classify_payload(&format!("{STARTED_MARKER}\n"), ""),
+        PayloadOutcome::NeverStarted,
+        "started but killed before reporting is not a denial"
+    );
+
+    // Then live: a real production launch whose command does not exist. Containment is established
+    // and correct; the payload still never runs, and the outcome must say so.
+    require_default_netfilter_image();
+    let net = RunscNet::new();
+    let config = gate_config(&net.network);
+    let policy = maxplayer_core::seller_exec::SandboxPolicy::from_config(Some(&config))
+        .expect("a docker policy");
+    let workdir = std::env::temp_dir().join(owned_name("workdir-nostart"));
+    std::fs::create_dir_all(&workdir).expect("a workdir");
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    let outcome = runtime
+        .block_on(maxplayer_core::seller_exec::with_prepared_launch(
+            &["mx-no-such-binary".to_owned()],
+            &policy,
+            &workdir,
+            &gate_identity(),
+            std::time::Duration::from_secs(60),
+            |launch, _| run_launch_attributably(launch),
+        ))
+        .expect("preparation must succeed — it is the payload that cannot start");
+    let _ = std::fs::remove_dir_all(&workdir);
+    assert_eq!(
+        outcome,
+        PayloadOutcome::NeverStarted,
+        "a payload that could not start was scored as something other than NeverStarted"
+    );
+}
+
+/// **Fail-closed at preparation.** When containment cannot be established the launch is refused, no
+/// payload is started, and nothing is left running.
+///
+/// The trigger is a configured network that does not exist, which is the shape of every preparation
+/// failure that matters: the seat is configured for containment and the daemon cannot deliver it.
+/// The alternative behaviour — running the job on whatever networking is available — is exactly what
+/// "configured but not enforced" means, and it must not be representable.
+#[test]
+#[ignore = "needs docker"]
+fn containment_that_cannot_be_established_refuses_the_launch_and_leaves_nothing_behind() {
+    let missing = owned_name("net-that-does-not-exist");
+    let config = gate_config(&missing);
+    let policy = maxplayer_core::seller_exec::SandboxPolicy::from_config(Some(&config))
+        .expect("a docker policy");
+    let workdir = std::env::temp_dir().join(owned_name("workdir-failclosed"));
+    std::fs::create_dir_all(&workdir).expect("a workdir");
+
+    let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = std::sync::Arc::clone(&started);
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    let outcome = runtime.block_on(maxplayer_core::seller_exec::with_prepared_launch(
+        &payload_command("203.0.113.9", Canary::PORT),
+        &policy,
+        &workdir,
+        &gate_identity(),
+        std::time::Duration::from_secs(60),
+        move |_, _| {
+            observed.store(true, std::sync::atomic::Ordering::SeqCst);
+        },
+    ));
+    let _ = std::fs::remove_dir_all(&workdir);
+
+    let error = outcome
+        .err()
+        .map(|error| error.to_string())
+        .expect("a job whose containment cannot be established must not launch");
+    assert!(
+        error.contains("egress containment not established"),
+        "the refusal must name what failed: {error}"
+    );
+    assert!(
+        !started.load(std::sync::atomic::Ordering::SeqCst),
+        "the payload closure ran despite containment failing — the job would have started uncontained"
+    );
+    // Nothing survives. The holder is named from the job id, which is derived from the workdir, so
+    // this looks for any holder still carrying this run's workdir name.
+    let (_, listed, _) = docker(
+        &["ps", "--all", "--quiet", "--filter", "label=ai.maxplayer.netns-holder"],
+        None,
+    );
+    for id in listed.lines().filter(|line| !line.trim().is_empty()) {
+        let (_, name, _) = docker(&["inspect", "--format", "{{.Name}}", id], None);
+        assert!(
+            !name.contains("failclosed"),
+            "a holder from the failed preparation is still running: {name}"
+        );
+    }
+}
+
+/// **Sibling isolation across cleanup.** One contained job's teardown must not disturb another's.
+///
+/// Two jobs are prepared through the production path on the same network. The first is torn down —
+/// its holder removed, its namespace destroyed — while the second is still running, and the second
+/// must still reach its allowed destination afterwards. This is the property a cleanup implemented
+/// as "delete the tc filters" or "remove the containers matching our prefix" would break, and
+/// neither failure is visible from a single-job test.
+#[test]
+#[ignore = "needs docker and the production-tagged netfilter image"]
+fn one_jobs_cleanup_leaves_a_sibling_job_contained_and_running() {
+    require_default_netfilter_image();
+    let net = RunscNet::new();
+
+    // The sibling: prepared, measured, and kept alive across the other job's whole lifetime. Its
+    // holder name is captured so its survival can be asserted rather than assumed.
+    let config = gate_config(&net.network);
+    let policy = maxplayer_core::seller_exec::SandboxPolicy::from_config(Some(&config))
+        .expect("a docker policy");
+    let workdir = std::env::temp_dir().join(owned_name("workdir-sibling"));
+    std::fs::create_dir_all(&workdir).expect("a workdir");
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+
+    let survived = runtime.block_on(maxplayer_core::seller_exec::with_prepared_launch(
+        &payload_command(&net.allowed_ip, Canary::PORT),
+        &policy,
+        &workdir,
+        &gate_identity(),
+        std::time::Duration::from_secs(180),
+        |launch, holder| {
+            let sibling_holder = holder.expect("containment").to_owned();
+            // Before: the sibling reaches its allowed destination.
+            assert_eq!(
+                run_launch_attributably(launch),
+                PayloadOutcome::Connected,
+                "the sibling could not reach {} before the other job existed",
+                net.allowed_ip
+            );
+
+            // A whole second job, prepared and torn down inside this window.
+            let other = integrated_leg(&net.network, RunscNet::DENIED_IP, Canary::PORT, |h| {
+                route_on_link(h, RunscNet::DENIED_IP)
+            })
+            .expect("the second job must prepare");
+            assert_eq!(other, PayloadOutcome::Refused, "the second job was not contained");
+
+            // After the other job's guard dropped: the sibling's holder is still there…
+            let (_, listed, _) = docker(
+                &["ps", "--quiet", "--filter", &format!("name={sibling_holder}")],
+                None,
+            );
+            assert!(
+                !listed.is_empty(),
+                "the sibling's holder {sibling_holder} was removed by another job's cleanup"
+            );
+            // …and it is still contained and still working.
+            (
+                run_launch_attributably(launch),
+                run_launch_attributably(
+                    &prepared_launch_for(&policy, &workdir, RunscNet::DENIED_IP, &sibling_holder),
+                ),
+            )
+        },
+    ));
+    let _ = std::fs::remove_dir_all(&workdir);
+    let (allowed_after, denied_after) = survived.expect("preparation must succeed");
+    assert_eq!(
+        allowed_after,
+        PayloadOutcome::Connected,
+        "the sibling lost its allowed destination after another job's cleanup"
+    );
+    assert_eq!(
+        denied_after,
+        PayloadOutcome::Refused,
+        "the sibling lost its containment after another job's cleanup — its veth filters were \
+         deleted by a teardown that was not scoped to the job that owned them"
+    );
+}
+
+/// Build a launch into an EXISTING holder, for the sibling check's second probe. Goes through the
+/// production argv builder, and names the namespace explicitly rather than preparing a new one.
+fn prepared_launch_for(
+    policy: &maxplayer_core::seller_exec::SandboxPolicy,
+    workdir: &std::path::Path,
+    ip: &str,
+    holder: &str,
+) -> maxplayer_core::seller_exec::AgentLaunch {
+    policy
+        .launch(
+            &payload_command(ip, Canary::PORT),
+            &maxplayer_core::seller_exec::JobLaunch {
+                workdir,
+                env: &[],
+                uid: 0,
+                gid: 0,
+                netns: Some(holder),
+            },
+        )
+        .expect("the policy must build a launch")
 }

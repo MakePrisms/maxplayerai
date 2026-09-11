@@ -287,39 +287,62 @@ pub fn link_probe_argv(holder_name: &str, image: &str) -> Vec<String> {
 }
 
 /// Parse `ip -details -oneline link show` output.
-pub fn parse_links(stdout: &str) -> Vec<Link> {
-    stdout
-        .lines()
-        .filter_map(|line| {
-            // `<index>: <name>[@peer]: <FLAGS> mtu … \    link/<type> … [kind] …`
-            let mut head = line.splitn(3, ": ");
-            let index: u32 = head.next()?.trim().parse().ok()?;
-            let name_field = head.next()?.trim();
-            let rest = head.next().unwrap_or_default();
-            let (name, peer_index) = match name_field.split_once('@') {
-                Some((name, peer)) => (
-                    name.to_owned(),
-                    peer.strip_prefix("if").and_then(|digits| digits.parse().ok()),
-                ),
-                None => (name_field.to_owned(), None),
-            };
-            let tokens: Vec<&str> = rest.split_whitespace().collect();
-            Some(Link {
-                index,
-                name,
-                peer_index,
-                kind: LINK_KINDS
-                    .iter()
-                    .find(|kind| tokens.contains(kind))
-                    .map(|kind| (*kind).to_owned()),
-                loopback: tokens.iter().any(|token| *token == "link/loopback"),
-                up: rest
-                    .split_once('>')
-                    .map(|(flags, _)| flags.contains(",UP") || flags.contains("<UP"))
-                    .unwrap_or(false),
-            })
-        })
-        .collect()
+///
+/// **A nonempty line that does not parse is a refusal, not a skip.** Silently dropping unparsable
+/// records let a namespace holding `lo`, a veth and one malformed third record present itself as the
+/// two-link shape [`select_egress_link`] accepts — the discarded record is exactly the link that
+/// would have forced a refusal.
+pub fn parse_links(stdout: &str) -> Result<Vec<Link>, String> {
+    let mut links = Vec::new();
+    for (number, line) in stdout.lines().enumerate() {
+        let at = number + 1;
+        if line.trim().is_empty() {
+            continue;
+        }
+        // `<index>: <name>[@peer]: <FLAGS> mtu … \    link/<type> … [kind] …`
+        let mut head = line.splitn(3, ": ");
+        let index: u32 = head
+            .next()
+            .and_then(|field| field.trim().parse().ok())
+            .ok_or(format!("line {at}: link record names no ifindex: {line:?}"))?;
+        let name_field = head
+            .next()
+            .ok_or(format!("line {at}: link record names no interface: {line:?}"))?
+            .trim();
+        if name_field.is_empty() {
+            return Err(format!("line {at}: link record has an empty interface name: {line:?}"));
+        }
+        let rest = head.next().unwrap_or_default();
+        let (name, peer_index) = match name_field.split_once('@') {
+            Some((name, peer)) => (
+                name.to_owned(),
+                peer.strip_prefix("if").and_then(|digits| digits.parse().ok()),
+            ),
+            None => (name_field.to_owned(), None),
+        };
+        let tokens: Vec<&str> = rest.split_whitespace().collect();
+        if !tokens.iter().any(|token| token.starts_with("link/")) {
+            return Err(format!(
+                "line {at}: link record for {name:?} names no link type: {line:?} — an unreadable \
+                 record is refused, because the link it hides is the one that would force a refusal"
+            ));
+        }
+        links.push(Link {
+            index,
+            name,
+            peer_index,
+            kind: LINK_KINDS
+                .iter()
+                .find(|kind| tokens.contains(kind))
+                .map(|kind| (*kind).to_owned()),
+            loopback: tokens.iter().any(|token| *token == "link/loopback"),
+            up: rest
+                .split_once('>')
+                .map(|(flags, _)| flags.contains(",UP") || flags.contains("<UP"))
+                .unwrap_or(false),
+        });
+    }
+    Ok(links)
 }
 
 /// The link kinds `-details` may print that this module needs to recognise. A kind it does not know
@@ -405,6 +428,15 @@ pub fn tc_protocol(family: Family) -> &'static str {
     }
 }
 
+/// What `flower` prints back for the ethertype it matched. `tc` takes `protocol ip` on the command
+/// line and lists `eth_type ipv4`, so readback compares this spelling rather than [`tc_protocol`].
+pub fn tc_eth_type(family: Family) -> &'static str {
+    match family {
+        Family::V4 => "ipv4",
+        Family::V6 => "ipv6",
+    }
+}
+
 /// iptables spells a port range `49200:49299`; `tc` flower spells it `49200-49299`.
 fn to_tc_port_range(dport: &str) -> String {
     dport.replace(':', "-")
@@ -448,6 +480,7 @@ mod tests {
                 "filter protocol {protocol} pref {} flower chain 0 handle 0x1 \n",
                 filter.pref
             ));
+            out.push_str(&format!("  eth_type {}\n", tc_eth_type(filter.family)));
             if let Some(proto) = &filter.ip_proto {
                 out.push_str(&format!("  ip_proto {proto}\n"));
             }
@@ -455,6 +488,7 @@ mod tests {
             if let Some(port) = &filter.dst_port {
                 out.push_str(&format!("  dst_port {port}\n"));
             }
+            out.push_str("  skip_hw\n");
             out.push_str("  not_in_hw\n");
             out.push_str(&format!("\taction order 1: gact action {}\n", filter.action));
             out.push_str("\t random type none pass val 0\n");
@@ -643,18 +677,125 @@ filter protocol ipv6 pref 111 flower chain 0 handle 0x1
 	Action statistics:
 	Sent 168 bytes 4 pkt (dropped 4, overlimits 0 requeues 0) 
 ";
-        let parsed = parse_filters(CAPTURE);
+        let parsed = parse_filters(CAPTURE).expect("real tc output must parse");
         assert_eq!(parsed.len(), 2, "the handle-less header lines are not filters: {parsed:#?}");
         assert_eq!(parsed[0].protocol, "ip");
         assert_eq!(parsed[0].pref, 102);
-        assert_eq!(parsed[0].dst_ip.as_deref(), Some("172.17.0.1"));
-        assert_eq!(parsed[0].ip_proto.as_deref(), Some("tcp"));
-        assert_eq!(parsed[0].dst_port.as_deref(), Some("49200-49299"));
-        assert_eq!(parsed[0].action.as_deref(), Some("pass"));
+        assert_eq!(parsed[0].chain, ACTIVE_CHAIN);
+        assert_eq!(parsed[0].handle, "0x1");
+        assert_eq!(parsed[0].key("dst_ip"), Some("172.17.0.1"));
+        assert_eq!(parsed[0].key("ip_proto"), Some("tcp"));
+        assert_eq!(parsed[0].key("dst_port"), Some("49200-49299"));
+        assert_eq!(parsed[0].key("eth_type"), Some("ipv4"));
+        assert_eq!(parsed[0].actions, vec!["pass".to_owned()]);
         assert_eq!(parsed[1].protocol, "ipv6");
-        assert_eq!(parsed[1].dst_ip.as_deref(), Some("fc00::/7"));
-        assert_eq!(parsed[1].ip_proto, None);
-        assert_eq!(parsed[1].action.as_deref(), Some("drop"));
+        assert_eq!(parsed[1].key("dst_ip"), Some("fc00::/7"));
+        assert_eq!(parsed[1].key("ip_proto"), None);
+        assert_eq!(parsed[1].actions, vec!["drop".to_owned()]);
+        // Complete accounting: every key the capture prints is retained, none invented.
+        assert_eq!(
+            parsed[1].keys.iter().map(|(key, _)| key.as_str()).collect::<Vec<_>>(),
+            vec!["eth_type", "dst_ip"]
+        );
+    }
+
+    /// F1: the substitutions that survive a *lossy* readback untouched. Every one of these is a
+    /// valid rule `tc` would accept and list, agreeing on protocol, pref, destination, ip_proto,
+    /// port and terminal action — every field the old projection compared — while being a
+    /// different filter. Both families, because a check applied to one is a bypass in the other.
+    #[test]
+    fn a_rule_that_differs_only_in_what_the_old_parser_discarded_is_refused() {
+        let plan = plan();
+        let faithful = as_tc_output(&plan);
+
+        // 1. A NARROWER DENY: the same destination drop, restricted to one source. Traffic from
+        //    every other source misses it, and nothing the old parser read has changed.
+        for (family, src) in
+            [("v4", "  src_ip 192.0.2.123\n"), ("v6", "  src_ip 2001:db8::123\n")]
+        {
+            let anchor = if family == "v4" { "  dst_ip 10.0.0.0/8\n" } else { "  dst_ip fc00::/7\n" };
+            assert!(faithful.contains(anchor), "fixture anchor {anchor:?} missing");
+            let narrowed = faithful.replace(anchor, &format!("{anchor}{src}"));
+            let refused = plan
+                .verify_readback(&narrowed)
+                .expect_err("a source-restricted deny must not verify as the full deny");
+            assert!(refused.contains("src_ip"), "{family}: {refused}");
+        }
+
+        // 2. AN INACTIVE CHAIN: installed, listed, never consulted on the egress path.
+        for family in ["ip", "ipv6"] {
+            let parked = faithful.replace(
+                &format!("filter protocol {family} pref"),
+                &format!("filter protocol {family} PREF_MARKER"),
+            );
+            let parked = parked.replace("PREF_MARKER", "pref");
+            let parked = parked
+                .lines()
+                .map(|line| {
+                    if line.trim_start().starts_with(&format!("filter protocol {family} ")) {
+                        line.replace("chain 0", "chain 7")
+                    } else {
+                        line.to_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let refused = plan
+                .verify_readback(&parked)
+                .expect_err("a filter in an unreferenced chain must not verify");
+            assert!(refused.contains("chain"), "{family}: {refused}");
+        }
+
+        // 3. A SECOND ACTION after the terminal one — the old parser kept only the last verb it saw.
+        let two_actions = faithful.replacen(
+            "action order 1: gact action drop",
+            "action order 1: gact action pass\n\taction order 2: gact action drop",
+            1,
+        );
+        let refused = plan
+            .verify_readback(&two_actions)
+            .expect_err("two actions on one filter must not verify");
+        assert!(refused.contains("actions") || refused.contains("action"), "{refused}");
+
+        // 4. A DUPLICATE key, where the second silently overwrote the first.
+        let duplicated = faithful.replace(
+            "  dst_ip 10.0.0.0/8\n",
+            "  dst_ip 0.0.0.0/0\n  dst_ip 10.0.0.0/8\n",
+        );
+        let refused =
+            plan.verify_readback(&duplicated).expect_err("a duplicated match key must not verify");
+        assert!(refused.contains("twice"), "{refused}");
+
+        // 5. A DIFFERENT CLASSIFIER matching by different rules under the same header fields.
+        let u32_classifier = faithful.replace("flower", "u32");
+        let refused = plan
+            .verify_readback(&u32_classifier)
+            .expect_err("a non-flower classifier must not verify");
+        assert!(refused.contains("classifier"), "{refused}");
+
+        // 6. TRUNCATION: the listing stops after a header, before the rule it describes.
+        let cut = format!("{}\nfilter protocol ip pref 140 flower chain 0\n", faithful.trim_end());
+        let refused = plan.verify_readback(&cut).expect_err("a truncated listing must not verify");
+        assert!(refused.contains("truncated") || refused.contains("filters"), "{refused}");
+
+        // 7. An unknown predicate that is not a known bypass — refused because it is unread, not
+        //    because this module happens to know what it does.
+        let unknown = faithful.replace("  dst_ip fc00::/7\n", "  dst_ip fc00::/7\n  tcp_flags 0x2\n");
+        let refused =
+            plan.verify_readback(&unknown).expect_err("an unknown predicate must not verify");
+        assert!(refused.contains("unknown match key"), "{refused}");
+
+        // A verifier that refused everything would pass all seven. The real shape still verifies.
+        plan.verify_readback(&faithful).expect("the faithful readback must still verify");
+    }
+
+    /// `skip_sw` means the software path never evaluates the rule: listed, and inert.
+    #[test]
+    fn a_filter_the_software_path_never_evaluates_is_refused() {
+        let plan = plan();
+        let inert = as_tc_output(&plan).replace("  skip_hw\n", "  skip_sw\n");
+        let refused = plan.verify_readback(&inert).expect_err("skip_sw must not verify");
+        assert!(refused.contains("skip_sw"), "{refused}");
     }
 
     #[test]
@@ -746,9 +887,15 @@ filter protocol ipv6 pref 111 flower chain 0 handle 0x1
 108: veth9a1b@if107: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue master docker0 state UP mode DEFAULT group default \\    link/ether 9a:1b:2c:3d:4e:5f brd ff:ff:ff:ff:ff:ff link-netnsid 1 promiscuity 1 veth 
 ";
 
+    /// Fixture links that are expected to be readable. A fixture that stopped parsing would
+    /// otherwise turn every identity test below into a vacuous refusal.
+    fn links_of(text: &str) -> Vec<Link> {
+        parse_links(text).expect("fixture link records must parse")
+    }
+
     #[test]
     fn the_job_veth_is_selected_inside_the_holders_namespace() {
-        let links = parse_links(HOLDER_LINKS);
+        let links = links_of(HOLDER_LINKS);
         assert_eq!(links.len(), 2, "{links:#?}");
         let chosen = select_egress_link(&links).expect("the holder's veth must be selectable");
         assert_eq!(chosen.name, "eth0");
@@ -761,15 +908,32 @@ filter protocol ipv6 pref 111 flower chain 0 handle 0x1
     /// rather than picking whichever interface sorted first.
     #[test]
     fn the_hosts_own_namespace_is_refused() {
-        let refused = select_egress_link(&parse_links(HOST_LINKS)).expect_err("must refuse");
+        let refused = select_egress_link(&links_of(HOST_LINKS)).expect_err("must refuse");
         assert!(refused.contains("bridge") || refused.contains("host"), "{refused}");
+    }
+
+    /// F1: a link record that does not parse is refused, not skipped. Skipping it let a namespace
+    /// holding `lo`, a veth and one unreadable third link present the exact two-link shape
+    /// [`select_egress_link`] accepts — and the discarded record is the one that would have forced
+    /// the refusal.
+    #[test]
+    fn an_unreadable_link_record_is_refused_rather_than_skipped() {
+        let with_garbage = format!("{HOLDER_LINKS}109: eth1@if110: <BROADCAST,UP> mtu 1500 \n");
+        let refused = parse_links(&with_garbage)
+            .expect_err("a record with no link type must not be silently dropped");
+        assert!(refused.contains("link type"), "{refused}");
+
+        assert!(parse_links("not a link record at all\n").is_err());
+        assert!(parse_links("7: : <UP> \\    link/ether 02:42 veth \n").is_err(), "empty name");
+        // The honest capture still parses, so this is not a parser that refuses everything.
+        assert_eq!(links_of(HOLDER_LINKS).len(), 2);
     }
 
     #[test]
     fn every_ambiguous_or_wrong_shaped_namespace_is_refused() {
         assert!(select_egress_link(&[]).is_err(), "no links at all");
         assert!(
-            select_egress_link(&parse_links(
+            select_egress_link(&links_of(
                 "107: eth0@if108: <BROADCAST,UP> mtu 1500 \\    link/ether 02:42 veth \n"
             ))
             .is_err(),
@@ -780,15 +944,15 @@ filter protocol ipv6 pref 111 flower chain 0 handle 0x1
             "{HOLDER_LINKS}109: eth1@if110: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 \\    \
              link/ether 02:42:ac:11:00:03 veth \n"
         );
-        let ambiguous = select_egress_link(&parse_links(&two_veths)).expect_err("must refuse");
+        let ambiguous = select_egress_link(&links_of(&two_veths)).expect_err("must refuse");
         assert!(ambiguous.contains("exactly one"), "{ambiguous}");
 
         let not_a_veth = HOLDER_LINKS.replace(" veth numtxqueues", " numtxqueues");
-        let refused = select_egress_link(&parse_links(&not_a_veth)).expect_err("must refuse");
+        let refused = select_egress_link(&links_of(&not_a_veth)).expect_err("must refuse");
         assert!(refused.contains("veth"), "{refused}");
 
         let down = HOLDER_LINKS.replace("<BROADCAST,MULTICAST,UP,LOWER_UP>", "<BROADCAST,MULTICAST>");
-        let refused = select_egress_link(&parse_links(&down)).expect_err("must refuse");
+        let refused = select_egress_link(&links_of(&down)).expect_err("must refuse");
         assert!(refused.contains("down"), "{refused}");
     }
 
@@ -948,63 +1112,319 @@ pub fn filter_readback_argv(holder_name: &str, image: &str, dev: &str) -> Vec<St
     .collect()
 }
 
-/// One filter as `tc filter show` prints it.
+/// The only chain reached from the `clsact` egress hook by default. A filter parked in any other
+/// chain is installed, listed, and never consulted — it looks exactly like containment and is none.
+pub const ACTIVE_CHAIN: u32 = 0;
+
+/// The classifier this module installs, and the only one readback will bless.
+pub const CLASSIFIER: &str = "flower";
+
+/// The match keys a rendered filter may carry. **This list is the security boundary**: any other
+/// predicate — `src_ip` above all — narrows what the rule matches while leaving every field this
+/// module compares untouched, so an unknown key is refused rather than ignored.
+const KNOWN_KEYS: &[&str] = &["eth_type", "dst_ip", "ip_proto", "dst_port"];
+
+/// Valueless tokens `tc` prints that say nothing about what the rule matches. `skip_sw` is
+/// deliberately absent: it means the software path never evaluates the rule, so a filter carrying it
+/// is listed and inert exactly like one in an unreferenced chain.
+const KNOWN_FLAGS: &[&str] = &["not_in_hw", "in_hw", "skip_hw"];
+
+/// One filter as `tc filter show` prints it, with **every token accounted for**.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReadbackFilter {
     /// `ip` or `ipv6`.
     pub protocol: String,
     pub pref: u16,
-    pub dst_ip: Option<String>,
-    pub ip_proto: Option<String>,
-    pub dst_port: Option<String>,
-    /// The gact verb: `pass`, `drop`, …
-    pub action: Option<String>,
+    /// The chain the filter sits in. Only [`ACTIVE_CHAIN`] is on the egress path.
+    pub chain: u32,
+    pub handle: String,
+    /// Match keys in printed order, every one of them — not a chosen projection.
+    pub keys: Vec<(String, String)>,
+    /// The `gact` verbs, in printed order. More than one is a refusal, not a last-one-wins.
+    pub actions: Vec<String>,
 }
 
-/// Parse `tc filter show dev <dev> egress` output, in kernel order.
+impl ReadbackFilter {
+    /// The value of one match key, if the filter carries it.
+    pub fn key(&self, name: &str) -> Option<&str> {
+        self.keys.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str())
+    }
+
+    fn describe(&self) -> String {
+        let keys: Vec<String> =
+            self.keys.iter().map(|(key, value)| format!("{key} {value}")).collect();
+        format!(
+            "protocol {} pref {} chain {} handle {} [{}] actions {:?}",
+            self.protocol,
+            self.pref,
+            self.chain,
+            self.handle,
+            keys.join(", "),
+            self.actions
+        )
+    }
+}
+
+/// Parse `tc filter show dev <dev> egress` output strictly, in kernel order.
+///
+/// **Every token is consumed or the parse fails.** The previous version of this function recorded a
+/// chosen projection — protocol, pref, destination, ip_proto, port, last action — and silently
+/// dropped the rest, which let a rule that was narrower (`src_ip` added), parked off the egress path
+/// (`chain 7`), or carrying a second action compare equal to the rule that was meant to be there.
+/// A comparison cannot recover information the parser discarded, so nothing is discarded.
 ///
 /// `tc` prints a bare `filter protocol … pref … flower chain 0` header line per priority **and** a
 /// second line carrying `handle`, followed by the match keys. Only the handle-bearing block is a
 /// filter; counting the header too would double every total and make a namespace holding half the
-/// plan look complete.
-pub fn parse_filters(stdout: &str) -> Vec<ReadbackFilter> {
+/// plan look complete. The header must be followed by its handle line: a header alone is truncation.
+pub fn parse_filters(stdout: &str) -> Result<Vec<ReadbackFilter>, String> {
     let mut filters: Vec<ReadbackFilter> = Vec::new();
-    for line in stdout.lines() {
+    let mut pending_header: Option<(String, u16, u32)> = None;
+
+    for (number, line) in stdout.lines().enumerate() {
+        let at = number + 1;
         let trimmed = line.trim();
-        let fields: Vec<&str> = trimmed.split_whitespace().collect();
-        if trimmed.starts_with("filter ") {
-            if !fields.contains(&"handle") {
-                continue;
-            }
-            let protocol = value_after(&fields, "protocol").unwrap_or_default().to_owned();
-            let pref = value_after(&fields, "pref")
-                .and_then(|text| text.parse().ok())
-                .unwrap_or(u16::MAX);
-            filters.push(ReadbackFilter { protocol, pref, ..ReadbackFilter::default() });
+        if trimmed.is_empty() {
             continue;
         }
-        let Some(current) = filters.last_mut() else { continue };
-        if let Some(value) = value_after(&fields, "dst_ip") {
-            current.dst_ip = Some(value.to_owned());
-        }
-        if let Some(value) = value_after(&fields, "ip_proto") {
-            current.ip_proto = Some(value.to_owned());
-        }
-        if let Some(value) = value_after(&fields, "dst_port") {
-            current.dst_port = Some(value.to_owned());
-        }
-        // `action order 1: gact action pass`
-        if fields.first() == Some(&"action") && fields.contains(&"gact") {
-            if let Some(verb) = fields.last() {
-                current.action = Some((*verb).to_owned());
+        let fields: Vec<&str> = trimmed.split_whitespace().collect();
+
+        if fields[0] == "filter" {
+            let header = parse_filter_header(&fields, at)?;
+            match header.handle.clone() {
+                None => {
+                    if pending_header.is_some() {
+                        return Err(format!(
+                            "line {at}: a second bare filter header arrived before the first one's \
+                             handle line — the listing is truncated or interleaved"
+                        ));
+                    }
+                    pending_header = Some((header.protocol, header.pref, header.chain));
+                }
+                Some(handle) => {
+                    if let Some((protocol, pref, chain)) = pending_header.take() {
+                        if protocol != header.protocol
+                            || pref != header.pref
+                            || chain != header.chain
+                        {
+                            return Err(format!(
+                                "line {at}: the handle line (protocol {} pref {} chain {}) does not \
+                                 match the header it follows (protocol {protocol} pref {pref} chain \
+                                 {chain})",
+                                header.protocol, header.pref, header.chain
+                            ));
+                        }
+                    }
+                    filters.push(ReadbackFilter {
+                        protocol: header.protocol,
+                        pref: header.pref,
+                        chain: header.chain,
+                        handle,
+                        keys: Vec::new(),
+                        actions: Vec::new(),
+                    });
+                }
             }
+            continue;
+        }
+
+        let Some(current) = filters.last_mut() else {
+            return Err(format!(
+                "line {at}: {trimmed:?} appears before any filter header — this is not the output \
+                 of `tc filter show` on an egress hook"
+            ));
+        };
+
+        if fields[0] == "action" {
+            parse_action_line(current, &fields, at)?;
+            continue;
+        }
+        if is_action_detail(&fields) || is_counter_line(&fields) {
+            parse_action_detail(current, &fields, at)?;
+            continue;
+        }
+        parse_key_line(current, &fields, at)?;
+    }
+
+    if let Some((protocol, pref, _)) = pending_header {
+        return Err(format!(
+            "the listing ends on a bare header (protocol {protocol} pref {pref}) with no handle line \
+             — truncated output is not a verified namespace"
+        ));
+    }
+    for filter in &filters {
+        if filter.actions.is_empty() {
+            return Err(format!(
+                "filter {} carries no action — a classifier that matches and does nothing is not \
+                 containment, and a listing that ends mid-filter is truncation",
+                filter.describe()
+            ));
         }
     }
-    filters
+    Ok(filters)
 }
 
-fn value_after<'a>(fields: &[&'a str], key: &str) -> Option<&'a str> {
-    fields.iter().position(|field| *field == key).and_then(|at| fields.get(at + 1)).copied()
+struct FilterHeader {
+    protocol: String,
+    pref: u16,
+    chain: u32,
+    handle: Option<String>,
+}
+
+/// `filter protocol ip pref 100 flower chain 0 [handle 0x1]`, and nothing else.
+fn parse_filter_header(fields: &[&str], at: usize) -> Result<FilterHeader, String> {
+    let want = |index: usize, keyword: &str| -> Result<(), String> {
+        match fields.get(index) {
+            Some(field) if *field == keyword => Ok(()),
+            other => Err(format!(
+                "line {at}: expected {keyword:?} at position {index} of a filter header, found \
+                 {other:?}"
+            )),
+        }
+    };
+    want(1, "protocol")?;
+    want(3, "pref")?;
+    want(6, "chain")?;
+
+    let protocol = (*fields.get(2).ok_or(format!("line {at}: filter header names no protocol"))?)
+        .to_owned();
+    let pref: u16 = fields
+        .get(4)
+        .ok_or(format!("line {at}: filter header names no pref"))?
+        .parse()
+        .map_err(|_| format!("line {at}: {:?} is not a pref", fields[4]))?;
+    let kind = *fields.get(5).ok_or(format!("line {at}: filter header names no classifier"))?;
+    if kind != CLASSIFIER {
+        return Err(format!(
+            "line {at}: classifier is {kind:?}, expected {CLASSIFIER:?} — a different classifier \
+             matches by different rules, whatever the listing looks like"
+        ));
+    }
+    let chain: u32 = fields
+        .get(7)
+        .ok_or(format!("line {at}: filter header names no chain"))?
+        .parse()
+        .map_err(|_| format!("line {at}: {:?} is not a chain number", fields[7]))?;
+
+    let handle = match fields.len() {
+        8 => None,
+        10 if fields[8] == "handle" => Some(fields[9].to_owned()),
+        _ => {
+            return Err(format!(
+                "line {at}: unexpected trailing tokens in a filter header: {:?}",
+                &fields[8.min(fields.len())..]
+            ))
+        }
+    };
+    Ok(FilterHeader { protocol, pref, chain, handle })
+}
+
+/// `action order 1: gact action drop`
+fn parse_action_line(
+    filter: &mut ReadbackFilter,
+    fields: &[&str],
+    at: usize,
+) -> Result<(), String> {
+    if fields.get(1) != Some(&"order") {
+        return Err(format!("line {at}: malformed action line {fields:?}"));
+    }
+    let order: usize = fields
+        .get(2)
+        .and_then(|field| field.trim_end_matches(':').parse().ok())
+        .ok_or(format!("line {at}: action line names no order"))?;
+    if order != filter.actions.len() + 1 {
+        return Err(format!(
+            "line {at}: action order {order} arrived after {} action(s) — the listing is out of \
+             order or a line is missing",
+            filter.actions.len()
+        ));
+    }
+    let kind = *fields.get(3).ok_or(format!("line {at}: action line names no kind"))?;
+    if kind != "gact" {
+        return Err(format!(
+            "line {at}: action kind is {kind:?}, expected \"gact\" — this module renders nothing \
+             else, and an unrecognised action can do anything at all"
+        ));
+    }
+    if fields.get(4) != Some(&"action") {
+        return Err(format!("line {at}: malformed gact action line {fields:?}"));
+    }
+    let verb = *fields.get(5).ok_or(format!("line {at}: gact names no verb"))?;
+    if fields.len() > 6 {
+        return Err(format!("line {at}: unexpected trailing tokens after the verb: {:?}", &fields[6..]));
+    }
+    filter.actions.push(verb.to_owned());
+    Ok(())
+}
+
+fn is_action_detail(fields: &[&str]) -> bool {
+    matches!(fields[0], "random" | "index")
+}
+
+/// The counter block `tc` prints under an action in the captured real output. Packet and byte
+/// counts carry no match semantics, so they are consumed rather than refused — but only these
+/// spellings, so an unrecognised line is still a refusal.
+fn is_counter_line(fields: &[&str]) -> bool {
+    matches!(fields[0], "Sent" | "backlog")
+        || (fields[0] == "Action" && fields.get(1) == Some(&"statistics:"))
+}
+
+/// The lines `tc` prints under an action. `random type none` is the only randomness accepted: any
+/// other spelling is a rule that drops a *fraction* of what it claims to drop.
+fn parse_action_detail(
+    filter: &ReadbackFilter,
+    fields: &[&str],
+    at: usize,
+) -> Result<(), String> {
+    if fields[0] == "random" && fields.get(1..3) != Some(&["type", "none"][..]) {
+        return Err(format!(
+            "line {at}: filter {} carries a randomised action ({fields:?}) — a probabilistic drop \
+             passes traffic it claims to stop",
+            filter.describe()
+        ));
+    }
+    Ok(())
+}
+
+/// Match keys and hardware flags. Unknown predicates and duplicates are refusals.
+fn parse_key_line(
+    filter: &mut ReadbackFilter,
+    fields: &[&str],
+    at: usize,
+) -> Result<(), String> {
+    let mut index = 0;
+    while index < fields.len() {
+        let token = fields[index];
+        if KNOWN_FLAGS.contains(&token) {
+            index += 1;
+            continue;
+        }
+        if token == "in_hw_count" {
+            index += 2;
+            continue;
+        }
+        if !KNOWN_KEYS.contains(&token) {
+            return Err(format!(
+                "line {at}: unknown match key or token {token:?} on filter {} — an unrecognised \
+                 predicate narrows what the rule matches while every compared field stays equal, \
+                 so it is refused rather than ignored",
+                filter.describe()
+            ));
+        }
+        let value = *fields.get(index + 1).ok_or(format!(
+            "line {at}: match key {token:?} has no value — truncated output is not a verified \
+             namespace"
+        ))?;
+        if filter.keys.iter().any(|(key, _)| key == token) {
+            return Err(format!(
+                "line {at}: match key {token:?} appears twice on one filter — a duplicate silently \
+                 overwrote the first value in the old parser"
+            ));
+        }
+        filter.keys.push((token.to_owned(), value.to_owned()));
+        index += 2;
+    }
+    Ok(())
 }
 
 /// `tc` prints a single address without its prefix length; the policy spells one with it.
@@ -1031,8 +1451,13 @@ impl IfacePlan {
     ///   a TCP-only drop passes the very fixture that found it.
     /// * **both families are filtered** — an unfiltered address family is the cheapest bypass there
     ///   is.
+    /// * **the classifier, the chain and the exact set of match keys** — checked by the parser and
+    ///   again here. A rule that is `flower` on the active chain with exactly the rendered keys is
+    ///   the rule that was asked for; a rule that merely agrees on the fields an older parser chose
+    ///   to read can be narrower (`src_ip`), parked off the egress path (`chain 7`), or carry a
+    ///   second action, and every one of those reads as a pass.
     pub fn verify_readback(&self, stdout: &str) -> Result<(), String> {
-        let live = parse_filters(stdout);
+        let live = parse_filters(stdout)?;
         if live.len() != self.filters.len() {
             return Err(format!(
                 "the namespace holds {} egress filters, expected {} — {:?}",
@@ -1050,30 +1475,60 @@ impl IfacePlan {
                     got.protocol, got.pref, want.pref, want.why
                 ));
             }
-            if got.dst_ip.as_deref().map(normalise_prefix) != Some(normalise_prefix(&want.dst)) {
+            if got.chain != ACTIVE_CHAIN {
                 return Err(format!(
-                    "filter {at} (pref {}) matches destination {:?}, expected {} — {}",
-                    want.pref, got.dst_ip, want.dst, want.why
+                    "filter {at} (pref {}, {}) sits in chain {}, not the active chain \
+                     {ACTIVE_CHAIN} — a filter in an unreferenced chain is listed, is never \
+                     consulted on egress, and looks exactly like containment",
+                    want.pref, want.dst, got.chain
                 ));
             }
-            if got.action.as_deref() != Some(want.action) {
+            if got.actions.len() != 1 {
+                return Err(format!(
+                    "filter {at} (pref {}, {}) carries {} actions {:?}, expected exactly one — a \
+                     second action runs after the first and can undo it",
+                    want.pref,
+                    want.dst,
+                    got.actions.len(),
+                    got.actions
+                ));
+            }
+            if got.actions[0] != want.action {
                 return Err(format!(
                     "filter {at} (pref {}, {}) has action {:?}, expected {}",
-                    want.pref, want.dst, got.action, want.action
+                    want.pref, want.dst, got.actions[0], want.action
                 ));
             }
-            if got.ip_proto != want.ip_proto {
-                return Err(format!(
-                    "filter {at} (pref {}, {}) matches ip_proto {:?}, expected {:?} — a drop that \
-                     names a protocol leaves every other protocol reachable",
-                    want.pref, want.dst, got.ip_proto, want.ip_proto
-                ));
+
+            // The whole key set, compared as a set. Anything the render did not ask for is a
+            // different rule, whatever the fields an older parser happened to read.
+            let mut expected: Vec<(&str, String)> =
+                vec![("eth_type", tc_eth_type(want.family).to_owned())];
+            expected.push(("dst_ip", normalise_prefix(&want.dst).to_owned()));
+            if let Some(proto) = want.ip_proto.as_deref() {
+                expected.push(("ip_proto", proto.to_owned()));
             }
-            if got.dst_port.as_deref() != want.dst_port.as_deref() {
+            if let Some(port) = want.dst_port.as_deref() {
+                expected.push(("dst_port", port.to_owned()));
+            }
+            let mut seen: Vec<(&str, String)> = got
+                .keys
+                .iter()
+                .map(|(key, value)| {
+                    let value = if key == "dst_ip" {
+                        normalise_prefix(value).to_owned()
+                    } else {
+                        value.clone()
+                    };
+                    (key.as_str(), value)
+                })
+                .collect();
+            expected.sort();
+            seen.sort();
+            if seen != expected {
                 return Err(format!(
-                    "filter {at} (pref {}, {}) matches dst_port {:?}, expected {:?} — a widened \
-                     pinhole is an egress hole",
-                    want.pref, want.dst, got.dst_port, want.dst_port
+                    "filter {at} (pref {}, {}) matches on {:?}, expected exactly {:?} — {}",
+                    want.pref, want.dst, seen, expected, want.why
                 ));
             }
         }
@@ -1089,10 +1544,10 @@ impl IfacePlan {
                     Family::V4
                 },
                 pref: filter.pref,
-                dst: filter.dst_ip.clone().unwrap_or_default(),
-                ip_proto: filter.ip_proto.clone(),
-                dst_port: filter.dst_port.clone(),
-                action: match filter.action.as_deref() {
+                dst: filter.key("dst_ip").unwrap_or_default().to_owned(),
+                ip_proto: filter.key("ip_proto").map(str::to_owned),
+                dst_port: filter.key("dst_port").map(str::to_owned),
+                action: match filter.actions.first().map(String::as_str) {
                     Some("pass") => "pass",
                     _ => "drop",
                 },
@@ -1101,7 +1556,8 @@ impl IfacePlan {
             .collect();
         no_shadowed_exception(&live_filters)?;
         if live.iter().any(|filter| {
-            filter.action.as_deref() == Some("drop") && filter.ip_proto.is_some()
+            filter.actions.first().map(String::as_str) == Some("drop")
+                && filter.key("ip_proto").is_some()
         }) {
             return Err(
                 "a live drop filter carries an ip_proto match — the containment this closes is \
@@ -1112,7 +1568,8 @@ impl IfacePlan {
         for family in [Family::V4, Family::V6] {
             let protocol = tc_protocol(family);
             if !live.iter().any(|filter| {
-                filter.protocol == protocol && filter.action.as_deref() == Some("drop")
+                filter.protocol == protocol
+                    && filter.actions.first().map(String::as_str) == Some("drop")
             }) {
                 return Err(format!(
                     "the namespace holds no {protocol} drop filter — an unfiltered address family is \
