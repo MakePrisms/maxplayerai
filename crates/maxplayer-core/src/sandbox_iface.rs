@@ -770,6 +770,40 @@ filter protocol ipv6 pref 111 flower chain 0 handle 0x1
             .verify_readback(&parked)
             .expect_err("a real capture with one filter parked in chain 7 must be refused");
         assert!(refused.contains("chain"), "{refused}");
+
+        // F1, strict token accounting: the lines this parser *skips* are the ones worth hiding in.
+        // Statistics lines and action bookkeeping carry nothing that is compared, so each is read to
+        // the end and refused on anything unrecognised rather than skipped wholesale.
+        let hidden: &[(&str, &str, &str)] = &[
+            (
+                "a match key smuggled onto a statistics line",
+                "Sent 168 bytes 4 pkt (dropped 4, overlimits 0 requeues 0) ",
+                "Sent 168 bytes 4 pkt (dropped 4, overlimits 0 requeues 0) dst_ip 0.0.0.0/0",
+            ),
+            (
+                "an unread token on the action bookkeeping line",
+                " index 2 ref 1 bind 1 installed 2 sec used 0 sec",
+                " index 2 ref 1 bind 1 installed 2 sec used 0 sec goto chain 9",
+            ),
+            (
+                "a probability restored under a `random type none` prefix",
+                " random type none pass val 0\n\t index 2",
+                " random type none pass val 7\n\t index 2",
+            ),
+            (
+                "a non-numeric hardware count, whose value this parser steps over",
+                "  skip_hw\n\tnot_in_hw\n\taction order 1: gact action drop",
+                "  skip_hw in_hw_count dst_ip\n\tnot_in_hw\n\taction order 1: gact action drop",
+            ),
+        ];
+        for (what, from, to) in hidden {
+            let mutated = captured_text.replace(from, to);
+            assert_ne!(&mutated, &captured_text, "{what}: the mutation did not apply");
+            let refused = captured
+                .verify_readback(&mutated)
+                .expect_err(&format!("{what} must not verify"));
+            assert!(!refused.is_empty(), "{what}: {refused}");
+        }
     }
 
     /// Rewrite only the lines that belong to a filter of `protocol`, leaving the other family's
@@ -1248,6 +1282,10 @@ const KNOWN_KEYS: &[&str] = &["eth_type", "dst_ip", "ip_proto", "dst_port"];
 /// is listed and inert exactly like one in an unreferenced chain.
 const KNOWN_FLAGS: &[&str] = &["not_in_hw", "in_hw", "skip_hw"];
 
+/// The `gact` verbs this module renders, and the only ones a readback may name. `tc` reprints the
+/// verb inside the `random type none <verb> val 0` detail line, so the same list gates both places.
+const GACT_VERBS: &[&str] = &["pass", "drop"];
+
 /// One filter as `tc filter show` prints it, with **every token accounted for**.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReadbackFilter {
@@ -1358,7 +1396,11 @@ pub fn parse_filters(stdout: &str) -> Result<Vec<ReadbackFilter>, String> {
             parse_action_line(current, &fields, at)?;
             continue;
         }
-        if is_action_detail(&fields) || is_counter_line(&fields) {
+        if is_counter_line(&fields) {
+            check_counter_line(current, &fields, at)?;
+            continue;
+        }
+        if is_action_detail(&fields) {
             parse_action_detail(current, &fields, at)?;
             continue;
         }
@@ -1488,19 +1530,90 @@ fn is_counter_line(fields: &[&str]) -> bool {
         || (fields[0] == "Action" && fields.get(1) == Some(&"statistics:"))
 }
 
-/// The lines `tc` prints under an action. `random type none` is the only randomness accepted: any
-/// other spelling is a rule that drops a *fraction* of what it claims to drop.
+/// Tokens that may only ever appear where this parser reads semantics: on a header, an action line
+/// or a match-key line. Finding one inside a statistics line means the line is not the statistics
+/// line it looks like.
+const SEMANTIC_TOKENS: &[&str] =
+    &["filter", "flower", "action", "gact", "chain", "handle", "pref", "protocol"];
+
+/// A statistics line carries counts, and counts carry nothing this module compares. It is consumed
+/// rather than parsed field by field — the numbers differ on every run — but it is first checked to
+/// contain no token that could carry match or action semantics, so "consumed" cannot become a place
+/// to hide a predicate.
+fn check_counter_line(
+    filter: &ReadbackFilter,
+    fields: &[&str],
+    at: usize,
+) -> Result<(), String> {
+    if let Some(token) =
+        fields.iter().find(|token| SEMANTIC_TOKENS.contains(token) || KNOWN_KEYS.contains(token))
+    {
+        return Err(format!(
+            "line {at}: filter {} has {token:?} inside what is otherwise a statistics line \
+             ({fields:?}) — statistics are skipped, so a predicate hidden in one would be skipped \
+             with them",
+            filter.describe()
+        ));
+    }
+    Ok(())
+}
+
+/// The lines `tc` prints under an action, token by token.
+///
+/// `random type none` is the only randomness accepted: any other spelling is a rule that drops a
+/// *fraction* of what it claims to drop. The `index` line is bookkeeping — install order, reference
+/// counts, age — but it is still read to the end, because "the rest of this line is bookkeeping" is
+/// exactly the assumption an added token would hide behind.
 fn parse_action_detail(
     filter: &ReadbackFilter,
     fields: &[&str],
     at: usize,
 ) -> Result<(), String> {
-    if fields[0] == "random" && fields.get(1..3) != Some(&["type", "none"][..]) {
-        return Err(format!(
-            "line {at}: filter {} carries a randomised action ({fields:?}) — a probabilistic drop \
-             passes traffic it claims to stop",
+    let unexpected = |what: &str| {
+        Err(format!(
+            "line {at}: filter {} carries an action detail this parser does not read ({what} in \
+             {fields:?}) — an unread token is an unchecked token",
             filter.describe()
-        ));
+        ))
+    };
+
+    if fields[0] == "random" {
+        if fields.get(1..3) != Some(&["type", "none"][..]) {
+            return Err(format!(
+                "line {at}: filter {} carries a randomised action ({fields:?}) — a probabilistic \
+                 drop passes traffic it claims to stop",
+                filter.describe()
+            ));
+        }
+        // `random type none pass val 0` is what iproute2 prints for a non-random gact; nothing
+        // else is accepted after `none`.
+        return match &fields[3..] {
+            [] => Ok(()),
+            [verb, "val", value] if GACT_VERBS.contains(verb) && *value == "0" => Ok(()),
+            rest => unexpected(&format!("{rest:?}")),
+        };
+    }
+
+    // `index 1 ref 1 bind 1 installed 2 sec used 2 sec [firstused 2 sec]`
+    let mut index = 1;
+    if !fields.get(index).is_some_and(|value| value.parse::<u64>().is_ok()) {
+        return unexpected("a non-numeric action index");
+    }
+    index += 1;
+    while index < fields.len() {
+        let token = fields[index];
+        let value = fields.get(index + 1);
+        let numeric = value.is_some_and(|value| value.parse::<u64>().is_ok());
+        match token {
+            "ref" | "bind" if numeric => index += 2,
+            "installed" | "used" | "firstused" | "expires" if numeric => {
+                index += 2;
+                if fields.get(index) == Some(&"sec") {
+                    index += 1;
+                }
+            }
+            _ => return unexpected(&format!("{token:?}")),
+        }
     }
     Ok(())
 }
@@ -1519,6 +1632,15 @@ fn parse_key_line(
             continue;
         }
         if token == "in_hw_count" {
+            let count = fields.get(index + 1).ok_or(format!(
+                "line {at}: in_hw_count has no value — truncated output is not a verified namespace"
+            ))?;
+            if count.parse::<u64>().is_err() {
+                return Err(format!(
+                    "line {at}: in_hw_count is {count:?}, not a count — this parser skips the \
+                     value, so anything may be hiding in it"
+                ));
+            }
             index += 2;
             continue;
         }
