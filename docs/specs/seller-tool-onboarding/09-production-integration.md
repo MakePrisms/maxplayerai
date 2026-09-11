@@ -32,19 +32,29 @@ as today.
   holder by the socket. So a job needs no network for the tool, and its egress posture does not
   change.
 
-## Step 1 — supervise the holder with the seller daemon
+## Step 1 — supervise the holder container with the seller daemon
 
-Site: `SellerNode::boot_with_lock` (`run.rs:3991`); the shutdown seam in `shutdown.rs`.
+The holder runs in its OWN persistent, isolated container. The route is literally "MCP in a
+persistent isolated container". There is ONE holder container per seller, long-lived for the
+daemon's life — not one per job, and not a process on the seller's everyday host. The credential and
+the vendor CLI live inside that container, off the host. The demo already runs it this way
+(`docker run -d --name <holder> … tool-holderd`).
+
+Site: `SellerNode::boot_with_lock` (`run.rs:3991`); the shutdown seam in `shutdown.rs`. This mirrors
+the sidecar-container supervision the codebase already has (`NetnsHolder`, `JobContainer` in
+`seller_exec.rs`).
 
 Do these steps.
 
 1. Read the held-tool config (step 2). If a seat declares no held tool, skip the rest.
-2. Start `tool-holderd` as a child of the daemon, after the config load and before the dispatch
-   loop. Point it at the holder state directory, the runtime directory, the seller-tool config, and
-   the credential file.
+2. Launch the holder container at boot, before the dispatch loop: `docker run -d` the tool image
+   running `tool-holderd`, with the credential file, the state volume, and the runtime volume
+   mounted. Name it deterministically from the seller id, the way job containers are named from the
+   job id.
 3. Wait for the control socket, then probe health. Enrolment happens one time here.
-4. Hold the child and the control-socket path on the node struct, so the daemon owns the lifetime.
-5. On shutdown, send `holder/shutdown` on the control socket, then reap the child.
+4. Hold the container handle and the control-socket path on the node struct, so the daemon owns the
+   lifetime. Use a guard whose `Drop` stops the container, like `JobContainer`.
+5. On shutdown, send `holder/shutdown` on the control socket, then stop and remove the container.
 
 Sketch:
 
@@ -56,11 +66,14 @@ struct SellerNode {
 }
 
 struct HeldTool {
-    child: std::process::Child,     // the tool-holderd process
-    control_socket: PathBuf,        // <runtime>/holder.sock
-    runtime: PathBuf,               // <runtime>, parent of jobs/<id>/job.sock
+    container: HolderContainer,     // stops the holder container on Drop, by name, like JobContainer
+    control_socket: PathBuf,        // reached over a mounted socket, or a host-gateway port
+    runtime: PathBuf,               // the runtime volume, parent of jobs/<id>/job.sock
 }
 ```
+
+The seller daemon reaches the holder's control socket over the shared runtime volume, and each job
+container mounts only its own per-job socket from that same volume (step 3).
 
 Decide the fail posture. Recommendation: if the holder cannot enrol at boot, log the seat as
 unhealthy for the tool, but still boot. A job that calls the tool then sees an unhealthy endpoint.

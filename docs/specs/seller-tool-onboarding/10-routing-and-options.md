@@ -69,6 +69,26 @@ shape). The only genuinely new component is the transport shim.
   a real-vendor acceptance run. The scope fork still holds: a broad credential needs a trusted
   operation filter, which is the Holder shape for a remote tool.
 
+### First acceptance vendor: GitHub (chosen, 2026-09-11)
+
+GitHub is the first real vendor for the Proxy swap acceptance run. It fits the criteria: a
+fine-grained Personal Access Token is header-borne (`Authorization: Bearer`), static, and scopable
+to one repository with read-only permissions, so no operation filter is needed; and GitHub hosts a
+remote MCP server.
+
+The acceptance run, when an environment with a real token is available (it cannot run in this
+sandbox):
+
+1. Mint a fine-grained PAT, read-only, scoped to one throwaway repository.
+2. Register it as a `FileCredential` on `#647`, with `upstream` set to GitHub's MCP host. Confirm the
+   current MCP endpoint, transport, and auth header from GitHub's MCP docs at setup.
+3. Add that host to the job's egress allowlist.
+4. Run `mcp-http-bridge` in the job, pointed at the proxy.
+5. Drive an MCP `tools/call` (a read, such as listing issues or reading a file) and confirm: it
+   succeeds through the swapped PAT; the job never holds the PAT; and a bypass placeholder fails.
+
+The read-only scope and the throwaway repository keep the run safe and free.
+
 ## The decision tree
 
 Route to the route the tool's constraints select. Never silently pick a weaker route because its
