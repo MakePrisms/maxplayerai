@@ -1408,4 +1408,59 @@ mod tests {
             );
         }
     }
+
+    /// F4: **the bound itself, exercised.** Every other cancellation test in this module inspects
+    /// argv or drives `Drop` by hand; none of them ever let a command run long enough to be
+    /// stopped, so the deadline that owns cancellation was asserted only by reading it.
+    ///
+    /// `sleep 30` under a one-second bound needs no daemon and no docker: the property is that a
+    /// command which does not finish is **killed** and the caller gets a failure naming the
+    /// deadline — not a hang, and not a success. The elapsed-time assertion is the real one; an
+    /// implementation that returned the right error after waiting out the full thirty seconds would
+    /// satisfy the string check and still be the bug.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_command_that_outlives_its_deadline_is_killed_and_says_so() {
+        let started = std::time::Instant::now();
+        let outcome = run_bounded(
+            vec!["sleep".to_owned(), "30".to_owned()],
+            None,
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        let error = outcome.expect_err("a command past its deadline must not report success");
+        assert!(
+            error.contains("did not finish within 1s"),
+            "the failure must name the deadline it broke: {error}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the bound returned after {elapsed:?} — a deadline that is only reported once the \
+             command finishes on its own is not a bound at all"
+        );
+    }
+
+    /// F4: a program that cannot be started fails **by name**, immediately.
+    ///
+    /// The path that matters is the one where docker is absent or unexecutable: that must surface as
+    /// a named failure rather than as a deadline timeout thirty seconds later, and it must never be
+    /// confused with a container that was created.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_program_that_cannot_be_started_fails_by_name() {
+        let missing = "maxplayer-no-such-program-exists";
+        let error = run_bounded(
+            vec![missing.to_owned()],
+            None,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect_err("a program that cannot be run must not report success");
+        assert!(
+            error.contains("could not run") && error.contains(missing),
+            "the failure must name the program it could not run: {error}"
+        );
+    }
 }
