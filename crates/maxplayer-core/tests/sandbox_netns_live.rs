@@ -30,6 +30,10 @@
 
 use std::process::Command;
 
+use maxplayer_core::sandbox_iface::{
+    filter_readback_argv, iface_sidecar_argv, link_probe_argv, parse_links, select_egress_link,
+    IfacePlan,
+};
 use maxplayer_core::sandbox_net::{Family, NetPolicy, PortRange};
 use maxplayer_core::sandbox_netns::{plan_stdin, readback_argv};
 
@@ -862,5 +866,297 @@ fn establish_contains_a_namespace_and_tears_it_down_on_drop() {
     assert!(
         listed.is_empty(),
         "dropping the containment must remove the holder, but {holder_name} is still listed"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The interface layer: the filters on the veth the packets actually leave by
+// ---------------------------------------------------------------------------------------------
+
+/// The container runtime whose payloads do **not** traverse the host's `OUTPUT` chain, named by the
+/// operator rather than guessed. Required, like [`netfilter_image`]: a default of `runsc` would let
+/// this test quietly measure `runc` on a host without gVisor and report the leak as closed by rules
+/// that never had to stop anything.
+fn runsc_runtime() -> String {
+    std::env::var("MAXPLAYER_RUNSC_RUNTIME").expect(
+        "set MAXPLAYER_RUNSC_RUNTIME (e.g. `runsc`) — the whole point of this test is the runtime \
+         that bypasses the OUTPUT chain, so it refuses to guess which one that is",
+    )
+}
+
+/// Connect from a container started under an explicit `--runtime`.
+fn connect_under(runtime: &str, network: &str, ip: &str, port: &str) -> bool {
+    let (ok, _, _) = docker(
+        &[
+            "run",
+            "--rm",
+            "--runtime",
+            runtime,
+            "--network",
+            network,
+            "--entrypoint",
+            "nc",
+            &netfilter_image(),
+            "-w",
+            "2",
+            ip,
+            port,
+        ],
+        None,
+    );
+    ok
+}
+
+/// Run a daemon-built argv verbatim. Every helper below goes through this rather than assembling its
+/// own docker command, so what the tests exercise is the argv the product ships.
+fn run_argv(argv: &[String], stdin: Option<&str>) -> (bool, String, String) {
+    let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
+    docker(&args, stdin)
+}
+
+/// The job's egress link, measured inside the namespace through the daemon's own probe argv.
+fn egress_dev(holder: &str) -> String {
+    let (ok, stdout, err) = run_argv(&link_probe_argv(holder, &netfilter_image()), None);
+    assert!(ok, "could not enumerate the namespace's links: {err}");
+    select_egress_link(&parse_links(&stdout))
+        .expect("a job holder's namespace has exactly one non-loopback link")
+        .name
+}
+
+fn iface_readback(holder: &str, dev: &str) -> String {
+    let (ok, stdout, err) = run_argv(&filter_readback_argv(holder, &netfilter_image(), dev), None);
+    assert!(ok, "reading the egress filters back from {dev} failed: {err}");
+    stdout
+}
+
+/// `establish` installs the egress filters too, and the kernel is asked — not the return value.
+///
+/// The interface leg is inside `establish` rather than beside it deliberately: a test-only installer
+/// would prove that these filters *can* be installed while every real job launched without them.
+#[test]
+#[ignore = "needs docker and the netfilter image"]
+fn establish_filters_the_veth_the_packets_actually_leave_by() {
+    let network = "mx-live-net-iface";
+    docker(&["network", "rm", network], None);
+    let (ok, _, err) = docker(&["network", "create", network], None);
+    assert!(ok, "could not create the test network: {err}");
+
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    let outcome = runtime.block_on(maxplayer_core::sandbox_netns::establish(
+        network,
+        &holder_image(),
+        &netfilter_image(),
+        "host.docker.internal",
+        "live-iface",
+        "4444444444444444444444444444444444444444444444444444444444444444",
+        1000,
+        1000,
+        Some(PortRange::new(49200, 49299).expect("valid range")),
+        true,
+    ));
+
+    let containment = match outcome {
+        Ok(containment) => containment,
+        Err(error) => {
+            docker(&["network", "rm", network], None);
+            panic!("establish failed: {error}");
+        }
+    };
+
+    // The device it filtered is a measured veth, not loopback and not a name anybody assumed.
+    assert_ne!(containment.egress_dev, "lo", "establish filtered loopback, not the job's egress link");
+    assert!(!containment.egress_dev.is_empty(), "establish named no egress device at all");
+
+    // The plan the daemon must have installed, re-derived from the address IT measured, and checked
+    // against what the kernel in that namespace actually holds.
+    let policy = NetPolicy {
+        gateway: containment.proxy_host.clone(),
+        proxy_ports: Some(PortRange::new(49200, 49299).expect("valid range")),
+        log_connections: true,
+    };
+    let plan = IfacePlan::derive(&containment.egress_dev, &policy).expect("the plan renders");
+    let readback = iface_readback(containment.holder.name(), &containment.egress_dev);
+    assert_eq!(
+        plan.verify_readback(&readback),
+        Ok(()),
+        "the namespace establish() blessed does not hold the egress filters:\n{readback}"
+    );
+    // Both families present as drops, stated here as well as inside the verifier: an unfiltered
+    // address family is the cheapest bypass there is, and this assert fails by name if the verifier
+    // is ever loosened.
+    for protocol in ["ip", "ipv6"] {
+        assert!(
+            readback.lines().any(|line| line.contains(protocol)),
+            "no {protocol} filter in the live readback:\n{readback}"
+        );
+    }
+
+    let holder_name = containment.holder.name().to_owned();
+    drop(containment);
+    let (_, listed, _) =
+        docker(&["ps", "--all", "--quiet", "--filter", &format!("name={holder_name}")], None);
+    docker(&["network", "rm", network], None);
+    assert!(listed.is_empty(), "the holder {holder_name} outlived its containment");
+}
+
+/// The red-prove for the egress readback: remove ONE filter from a live namespace and the verifier
+/// must refuse it.
+///
+/// Without this the verifier could `Ok(())` unconditionally and every other test here would still be
+/// green — the failure mode that makes a readback worthless is the readback that cannot fail.
+#[test]
+#[ignore = "needs docker and the netfilter image"]
+fn a_namespace_missing_one_egress_filter_is_refused() {
+    let fixture = Fixture::new("iface-missing");
+    let policy = policy("172.17.0.1");
+    let dev = egress_dev(&fixture.holder);
+    let plan = IfacePlan::derive(&dev, &policy).expect("the plan renders");
+    let (expected_stdin, expected) = maxplayer_core::sandbox_iface::plan_stdin(&plan);
+
+    let (ok, applied, err) =
+        run_argv(&iface_sidecar_argv(&fixture.holder, &netfilter_image()), Some(&expected_stdin));
+    assert!(ok, "the interface applier refused the plan: {err}");
+    assert_eq!(applied.parse::<usize>().expect("a count"), expected, "every step must reach the kernel");
+    assert_eq!(
+        plan.verify_readback(&iface_readback(&fixture.holder, &dev)),
+        Ok(()),
+        "control: the untouched namespace must verify, or the refusal below proves nothing"
+    );
+
+    // Delete the LAST filter, so what is left is a prefix of the plan: order, protocol and every
+    // remaining match key are still perfect, and only the absence is wrong.
+    let victim = plan.filters.last().expect("a plan has filters");
+    let pref = victim.pref.to_string();
+    let protocol = maxplayer_core::sandbox_iface::tc_protocol(victim.family);
+    let (ok, _, err) = docker(
+        &[
+            "run",
+            "--rm",
+            "--network",
+            &format!("container:{}", fixture.holder),
+            "--cap-drop",
+            "ALL",
+            "--cap-add",
+            "NET_ADMIN",
+            "--entrypoint",
+            "tc",
+            &netfilter_image(),
+            "filter",
+            "del",
+            "dev",
+            &dev,
+            "clsact",
+            "egress",
+            "pref",
+            &pref,
+            "protocol",
+            protocol,
+        ],
+        None,
+    );
+    assert!(ok, "could not remove a filter to break containment with: {err}");
+
+    let broken = iface_readback(&fixture.holder, &dev);
+    let refusal = plan
+        .verify_readback(&broken)
+        .expect_err("a namespace missing an egress filter must be refused");
+    assert!(
+        refusal.contains("expected"),
+        "the refusal must say what is missing, got: {refusal}"
+    );
+}
+
+/// **The regression gate.** The `OUTPUT` chain alone does not contain a `runsc` job; the veth filters
+/// do. One namespace, one destination, one payload runtime — the only thing that changes between the
+/// two measurements is whether the interface plan is installed.
+///
+/// Leg 1 is the leak, and it is asserted as a *success*: with the iptables policy installed and
+/// verified, a job under gVisor still reaches a destination the policy denies, while a `runc` job in
+/// the very same namespace is refused. That pair is what makes this a runtime property rather than a
+/// broken fixture.
+///
+/// Leg 2 installs the same rendered policy on the veth and the same connection is refused, with two
+/// live positive controls so a refusal cannot be environmental: an allowed destination stays reachable
+/// from inside, and the denied listener stays reachable from outside the namespace.
+#[test]
+#[ignore = "needs docker, the netfilter image and a runsc runtime"]
+fn the_output_chain_alone_lets_a_runsc_job_out_and_the_veth_filters_stop_it() {
+    let runsc = runsc_runtime();
+    let canary = Canary::new("203.0.113.0/24", "198.18.7.0/24");
+    let holder = canary.fixture.holder.clone();
+    let inside = format!("container:{holder}");
+
+    // Control — before any rules exist, the gVisor joiner reaches both listeners. A test whose
+    // "denied" address was never reachable proves nothing later.
+    assert!(
+        connect_under(&runsc, &inside, &canary.denied_ip, Canary::PORT),
+        "control: {} must be reachable under {runsc} before any rules exist",
+        canary.denied_ip
+    );
+    assert!(
+        connect_under(&runsc, &inside, &canary.allowed_ip, Canary::PORT),
+        "control: {} must be reachable under {runsc} before any rules exist",
+        canary.allowed_ip
+    );
+
+    // LEG 1 — the shipped iptables policy, installed and verified.
+    let policy = policy("172.17.0.1");
+    let (plan, expected) = plan_stdin(&policy);
+    let (ok, applied, err) = canary.fixture.apply(&plan);
+    assert!(ok, "the sidecar refused the policy: {err}");
+    assert_eq!(applied.parse::<usize>().expect("a count"), expected);
+    for family in [Family::V4, Family::V6] {
+        let readback = canary.fixture.readback(family);
+        assert_eq!(
+            policy.verify_readback(family, &readback),
+            Ok(()),
+            "{} policy readback did not verify:\n{readback}",
+            family.binary()
+        );
+    }
+    // The discriminator: the same rules, the same namespace, the same address — contained for runc.
+    assert!(
+        !canary.can_reach(&canary.denied_ip),
+        "control: the OUTPUT chain must contain a runc job, or leg 1 measures a broken policy rather \
+         than a runtime bypass"
+    );
+    assert!(
+        connect_under(&runsc, &inside, &canary.denied_ip, Canary::PORT),
+        "THE LEAK this change exists to close did not reproduce: a {runsc} job failed to reach {} \
+         with only the OUTPUT chain installed. Do not read that as containment — read it as this \
+         gate no longer measuring what it claims.",
+        canary.denied_ip
+    );
+
+    // LEG 2 — the same rendered policy, translated onto the veth.
+    let dev = egress_dev(&holder);
+    let iface = IfacePlan::derive(&dev, &policy).expect("the plan renders");
+    let (iface_stdin, iface_expected) = maxplayer_core::sandbox_iface::plan_stdin(&iface);
+    let (ok, applied, err) =
+        run_argv(&iface_sidecar_argv(&holder, &netfilter_image()), Some(&iface_stdin));
+    assert!(ok, "the interface applier refused the plan: {err}");
+    assert_eq!(applied.parse::<usize>().expect("a count"), iface_expected);
+    let readback = iface_readback(&holder, &dev);
+    assert_eq!(
+        iface.verify_readback(&readback),
+        Ok(()),
+        "the egress filters did not verify on {dev}:\n{readback}"
+    );
+
+    assert!(
+        !connect_under(&runsc, &inside, &canary.denied_ip, Canary::PORT),
+        "a {runsc} job still reached the denied {} with the veth filters in force",
+        canary.denied_ip
+    );
+    assert!(
+        connect_under(&runsc, &inside, &canary.allowed_ip, Canary::PORT),
+        "positive control: the allowed destination {} must stay reachable — a filter that denies \
+         everything is not containment",
+        canary.allowed_ip
+    );
+    assert!(
+        canary.can_reach_from_outside(&canary.denied_net, &canary.denied_ip),
+        "positive control: the denied listener must still answer from outside the namespace, or the \
+         refusal above was a dead listener"
     );
 }

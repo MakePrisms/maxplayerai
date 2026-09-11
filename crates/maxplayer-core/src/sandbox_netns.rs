@@ -137,6 +137,10 @@ impl Drop for NetnsHolder {
 pub struct Containment {
     pub holder: NetnsHolder,
     pub proxy_host: String,
+    /// The link inside the namespace the egress filters were installed on, as measured — never a
+    /// guess like `eth0`. Carried so a caller, a log line or a test can name the interface that is
+    /// actually filtered rather than the one everybody assumes.
+    pub egress_dev: String,
 }
 
 /// The holder's container name for `job_id`.
@@ -690,7 +694,89 @@ pub async fn establish(
         })?;
     }
 
-    Ok(Containment { holder, proxy_host })
+    // ── The interface the packets actually leave by ───────────────────────────────────────────
+    //
+    // Everything above installs and verifies rules on the host kernel's `OUTPUT` chain, and a gVisor
+    // payload never traverses it: `runsc` runs its own netstack and hands finished packets straight
+    // to the namespace's veth. The readback above is entirely honest and the job is still uncontained
+    // — measured on this repo's fixtures, both families, over TCP.
+    //
+    // So the same rendered policy is translated onto the veth itself, and unconditionally rather than
+    // only for a `runsc` job: `establish` is not told which runtime the caller will launch under, and
+    // "contained under one runtime" is exactly the state being closed here. Under `runc` the filters
+    // are redundant with the chain above, which costs one qdisc and a handful of filters per job.
+    //
+    // Same failure discipline as the chain above: no partial success, no retry. Every `?` from here
+    // leaves through the holder guard, which destroys the namespace on the way out.
+    let dev = egress_device(&holder, sidecar_image).await?;
+    let iface = crate::sandbox_iface::IfacePlan::derive(&dev, &policy)
+        .map_err(|error| format!("the egress filter plan for {dev} could not be rendered — {error}"))?;
+    let (iface_plan, iface_expected) = crate::sandbox_iface::plan_stdin(&iface);
+    let (iface_applied, _) = run_docker(
+        crate::sandbox_iface::iface_sidecar_argv(holder.name(), sidecar_image),
+        Some(iface_plan),
+    )
+    .await
+    .map_err(|error| {
+        format!(
+            "egress filters were not installed on {dev} — {error} (the applier's exit 6 means this \
+             sidecar image shipped without iproute2, so no job can be contained by this build; its \
+             exit 3 means the interface is PARTIALLY filtered and the namespace is being destroyed \
+             rather than retried)"
+        )
+    })?;
+
+    // The same count cross-check the chain above does, for the same reason: a truncated stdin applies
+    // perfectly and exits 0, and only comparing the applier's own total against what was rendered
+    // reveals it.
+    let iface_applied: usize = iface_applied.parse().map_err(|_| {
+        format!("the interface applier reported {iface_applied:?} filters applied, not a number")
+    })?;
+    if iface_applied != iface_expected {
+        return Err(format!(
+            "egress filtering is incomplete: {iface_applied} of {iface_expected} steps applied on \
+             {dev} (the plan was truncated in transit)"
+        ));
+    }
+
+    // The readback, from a different container running a different verb, because everything above is
+    // still the installer's own account of its work. `verify_readback` checks presence, order, both
+    // families, the exceptions' width and that no drop carries a protocol match — the TCP-only drop
+    // is the bug this closes, not the fix.
+    let (iface_readback, _) = run_docker(
+        crate::sandbox_iface::filter_readback_argv(holder.name(), sidecar_image, &dev),
+        None,
+    )
+    .await
+    .map_err(|error| format!("could not read the egress filters back from {dev} — {error}"))?;
+    iface.verify_readback(&iface_readback).map_err(|error| {
+        format!("egress filtering did not verify on {dev} after installation — {error}")
+    })?;
+
+    Ok(Containment { holder, proxy_host, egress_dev: dev })
+}
+
+/// Which link inside the holder's namespace the job's packets leave by — measured from the
+/// namespace's own link list, never assumed to be `eth0`.
+///
+/// The probe is an **unprivileged** container (`--cap-drop ALL`, no `NET_ADMIN`): enumerating links
+/// is a read, and the one container in this design that can change an interface must not also be the
+/// thing that chooses which interface to change.
+///
+/// [`crate::sandbox_iface::select_egress_link`] refuses anything that is not a job's own namespace —
+/// a bridge among the links, no loopback, or more than one candidate — so a mis-aimed `--network`
+/// fails the launch here instead of installing drops on something shared.
+#[cfg(feature = "acp")]
+async fn egress_device(holder: &NetnsHolder, sidecar_image: &str) -> Result<String, String> {
+    let (links, _) =
+        run_docker(crate::sandbox_iface::link_probe_argv(holder.name(), sidecar_image), None)
+            .await
+            .map_err(|error| {
+                format!("could not enumerate the links in the job's namespace — {error}")
+            })?;
+    let link = crate::sandbox_iface::select_egress_link(&crate::sandbox_iface::parse_links(&links))
+        .map_err(|error| format!("the job's egress interface could not be identified — {error}"))?;
+    Ok(link.name)
 }
 
 #[cfg(test)]
