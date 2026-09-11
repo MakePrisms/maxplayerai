@@ -7,15 +7,24 @@
 //! worthless because the vendor rejects it directly.
 //!
 //! This is a test double. The production route does NOT add a second proxy: it EXTENDS `#647` by
-//! registering the vendor as one more credential (the `FileCredential` shape), whose `upstream`
+//! registering the vendor as one more per-job credential (`[[sandbox.mcp_tools]]`), whose upstream
 //! joins the proxy's destination allowlist. This binary exists only so the demo is self-contained.
 //!
-//! Header-only substitution, like the real proxy: the bearer header is swapped, the body is
-//! forwarded byte for byte. Substituting inside the body would be a credential-recovery hole.
+//! Header-only substitution, like the real proxy: the bearer header is swapped, every other request
+//! header and the body are forwarded as they are, and the response comes back with its status,
+//! headers and framing. Substituting inside the body would be a credential-recovery hole.
 
-use maxplayer_tool_kit::http::{self, read_request, write_response, Request};
+use maxplayer_tool_kit::http::{self, read_request, write_response_with, Request};
 use serde_json::json;
 use std::net::TcpListener;
+use std::time::Duration;
+
+struct Reply {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    chunked: bool,
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -41,37 +50,61 @@ fn main() {
             Ok(Some(r)) => r,
             _ => continue,
         };
-        let (status, body) = handle(&req, &placeholder, &real, &upstream, &allow);
-        let _ = write_response(&mut conn, status, &body);
+        let reply = handle(&req, &placeholder, &real, &upstream, &allow);
+        let headers: Vec<(&str, &str)> = reply.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let _ = write_response_with(&mut conn, reply.status, &headers, &reply.body, reply.chunked);
     }
 }
 
-fn handle(req: &Request, placeholder: &str, real: &str, upstream: &str, allow: &str) -> (u16, Vec<u8>) {
+fn handle(req: &Request, placeholder: &str, real: &str, upstream: &str, allow: &str) -> Reply {
     // 1. Identify the job by its placeholder. No known placeholder means no substitution.
     if req.bearer() != Some(placeholder) {
-        return (
+        return refusal(
             403,
-            json!({"error": "no known per-job placeholder in request; refusing without substitution"})
-                .to_string()
-                .into_bytes(),
+            "no known per-job placeholder in request; refusing without substitution".to_string(),
         );
     }
     // 2. The destination must be on the allowlist before the real credential is substituted.
     if authority_of(upstream) != allow {
-        return (
+        return refusal(
             403,
-            json!({"error": format!("destination {} not on the credential-substitution allowlist", authority_of(upstream))})
-                .to_string()
-                .into_bytes(),
+            format!(
+                "destination {} not on the credential-substitution allowlist",
+                authority_of(upstream)
+            ),
         );
     }
-    // 3. Swap the bearer header for the real credential and forward the body unchanged.
-    match http::request(upstream, &req.method, &req.path, Some(real), Some(&req.body)) {
-        Ok(resp) => (resp.status, resp.body),
-        Err(e) => (
-            502,
-            json!({"error": format!("upstream unreachable: {e}")}).to_string().into_bytes(),
-        ),
+    // 3. Swap the bearer header for the real credential; forward every other header and the body
+    //    unchanged. The response travels back with its status, its headers, and its framing.
+    let mut headers: Vec<(String, String)> = req
+        .headers
+        .iter()
+        .filter(|(name, _)| !name.eq_ignore_ascii_case("authorization"))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    headers.push(("Authorization".to_string(), format!("Bearer {real}")));
+    match http::request_with(upstream, &req.method, &req.path, &headers, Some(&req.body), Duration::from_secs(30)) {
+        Ok(resp) => {
+            let chunked = resp
+                .header("transfer-encoding")
+                .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"));
+            Reply {
+                status: resp.status,
+                headers: resp.headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                body: resp.body,
+                chunked,
+            }
+        }
+        Err(e) => refusal(502, format!("upstream unreachable: {e}")),
+    }
+}
+
+fn refusal(status: u16, message: String) -> Reply {
+    Reply {
+        status,
+        headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+        body: json!({"error": message}).to_string().into_bytes(),
+        chunked: false,
     }
 }
 
