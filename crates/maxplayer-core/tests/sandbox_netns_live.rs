@@ -1045,8 +1045,10 @@ fn a_namespace_missing_one_egress_filter_is_refused() {
             "del",
             "dev",
             &dev,
-            "clsact",
-            "egress",
+            // The hook spelling the daemon's own argv uses. `clsact egress` is what `filter show`
+            // accepts and `filter del` does not: measured on iproute2 in the gvisor-repro VM, which
+            // answers `Unknown filter "clsact", hence option "egress" is unparsable`.
+            maxplayer_core::sandbox_iface::EGRESS_HOOK,
             "pref",
             &pref,
             "protocol",
@@ -1072,91 +1074,311 @@ fn a_namespace_missing_one_egress_filter_is_refused() {
 ///
 /// Leg 1 is the leak, and it is asserted as a *success*: with the iptables policy installed and
 /// verified, a job under gVisor still reaches a destination the policy denies, while a `runc` job in
-/// the very same namespace is refused. That pair is what makes this a runtime property rather than a
-/// broken fixture.
+/// an identically prepared namespace is refused. That pair is what makes this a runtime property
+/// rather than a broken fixture.
 ///
 /// Leg 2 installs the same rendered policy on the veth and the same connection is refused, with two
 /// live positive controls so a refusal cannot be environmental: an allowed destination stays reachable
 /// from inside, and the denied listener stays reachable from outside the namespace.
+///
+/// **One namespace per gVisor payload, always.** `runsc` claims the namespace's links when it starts,
+/// and a SECOND joiner into the same namespace gets `ENETUNREACH` — a refusal no rule caused, which
+/// reads exactly like containment. Measured twice: by the prototype matrix ("single-use namespace")
+/// and here, where reusing one holder made a *control* fail before any rule existed. So every probe
+/// below builds its own holder through [`Payload`], and the listeners are what persist.
 #[test]
 #[ignore = "needs docker, the netfilter image and a runsc runtime"]
 fn the_output_chain_alone_lets_a_runsc_job_out_and_the_veth_filters_stop_it() {
     let runsc = runsc_runtime();
-    let canary = Canary::new("203.0.113.0/24", "198.18.7.0/24");
-    let holder = canary.fixture.holder.clone();
-    let inside = format!("container:{holder}");
-
-    // Control — before any rules exist, the gVisor joiner reaches both listeners. A test whose
-    // "denied" address was never reachable proves nothing later.
-    assert!(
-        connect_under(&runsc, &inside, &canary.denied_ip, Canary::PORT),
-        "control: {} must be reachable under {runsc} before any rules exist",
-        canary.denied_ip
-    );
-    assert!(
-        connect_under(&runsc, &inside, &canary.allowed_ip, Canary::PORT),
-        "control: {} must be reachable under {runsc} before any rules exist",
-        canary.allowed_ip
-    );
-
-    // LEG 1 — the shipped iptables policy, installed and verified.
+    let net = RunscNet::new();
     let policy = policy("172.17.0.1");
-    let (plan, expected) = plan_stdin(&policy);
-    let (ok, applied, err) = canary.fixture.apply(&plan);
-    assert!(ok, "the sidecar refused the policy: {err}");
-    assert_eq!(applied.parse::<usize>().expect("a count"), expected);
-    for family in [Family::V4, Family::V6] {
-        let readback = canary.fixture.readback(family);
-        assert_eq!(
-            policy.verify_readback(family, &readback),
-            Ok(()),
-            "{} policy readback did not verify:\n{readback}",
-            family.binary()
-        );
-    }
-    // The discriminator: the same rules, the same namespace, the same address — contained for runc.
+
+    // CONTROL — with no rules anywhere, a gVisor payload reaches both addresses. A "denied" address
+    // that was never reachable proves nothing later.
     assert!(
-        !canary.can_reach(&canary.denied_ip),
+        Payload::new(&net, "c1").reach(&runsc, RunscNet::DENIED_IP),
+        "control: {} must be reachable under {runsc} before any rules exist",
+        RunscNet::DENIED_IP
+    );
+    assert!(
+        Payload::new(&net, "c2").reach(&runsc, &net.allowed_ip),
+        "control: {} must be reachable under {runsc} before any rules exist",
+        net.allowed_ip
+    );
+
+    // LEG 1 — the shipped iptables policy alone, installed and verified in each namespace.
+    //
+    // The discriminator first: the same policy, prepared the same way, contains a runc job. Without
+    // it a leak below could just as well be a policy that never applied.
+    assert!(
+        !Payload::new(&net, "l1runc")
+            .with_output_policy(&policy)
+            .reach("runc", RunscNet::DENIED_IP),
         "control: the OUTPUT chain must contain a runc job, or leg 1 measures a broken policy rather \
          than a runtime bypass"
     );
     assert!(
-        connect_under(&runsc, &inside, &canary.denied_ip, Canary::PORT),
+        Payload::new(&net, "l1").with_output_policy(&policy).reach(&runsc, RunscNet::DENIED_IP),
         "THE LEAK this change exists to close did not reproduce: a {runsc} job failed to reach {} \
          with only the OUTPUT chain installed. Do not read that as containment — read it as this \
          gate no longer measuring what it claims.",
-        canary.denied_ip
+        RunscNet::DENIED_IP
     );
 
-    // LEG 2 — the same rendered policy, translated onto the veth.
-    let dev = egress_dev(&holder);
-    let iface = IfacePlan::derive(&dev, &policy).expect("the plan renders");
-    let (iface_stdin, iface_expected) = maxplayer_core::sandbox_iface::plan_stdin(&iface);
-    let (ok, applied, err) =
-        run_argv(&iface_sidecar_argv(&holder, &netfilter_image()), Some(&iface_stdin));
-    assert!(ok, "the interface applier refused the plan: {err}");
-    assert_eq!(applied.parse::<usize>().expect("a count"), iface_expected);
-    let readback = iface_readback(&holder, &dev);
-    assert_eq!(
-        iface.verify_readback(&readback),
-        Ok(()),
-        "the egress filters did not verify on {dev}:\n{readback}"
-    );
-
+    // LEG 2 — the same rendered policy, also translated onto the veth.
     assert!(
-        !connect_under(&runsc, &inside, &canary.denied_ip, Canary::PORT),
+        !Payload::new(&net, "l2")
+            .with_output_policy(&policy)
+            .with_veth_filters(&policy)
+            .reach(&runsc, RunscNet::DENIED_IP),
         "a {runsc} job still reached the denied {} with the veth filters in force",
-        canary.denied_ip
+        RunscNet::DENIED_IP
     );
     assert!(
-        connect_under(&runsc, &inside, &canary.allowed_ip, Canary::PORT),
-        "positive control: the allowed destination {} must stay reachable — a filter that denies \
-         everything is not containment",
-        canary.allowed_ip
+        Payload::new(&net, "l2ok")
+            .with_output_policy(&policy)
+            .with_veth_filters(&policy)
+            .reach(&runsc, &net.allowed_ip),
+        "positive control: the allowed destination {} must stay reachable under the veth filters — a \
+         filter that denies everything is not containment",
+        net.allowed_ip
     );
     assert!(
-        canary.can_reach_from_outside(&canary.denied_net, &canary.denied_ip),
-        "positive control: the denied listener must still answer from outside the namespace, or the \
-         refusal above was a dead listener"
+        net.reachable_from_outside(RunscNet::DENIED_IP),
+        "positive control: the denied listener must still answer from outside every contained \
+         namespace, or the refusal above was a dead listener"
     );
+}
+
+/// One network, one listener, two addresses — the topology a **contained job actually gets**.
+///
+/// The canary fixture above attaches its holder to three networks, which is right for the `OUTPUT`
+/// chain and wrong here: a job holder in production is created on exactly one network, so it has
+/// exactly one veth, and `select_egress_link` refuses to filter one of several links rather than
+/// leave the others open. Measured: the three-network holder made this gate fail with *"expected
+/// exactly one non-loopback link, found 3"*, which is the product being right and the fixture being
+/// unrealistic.
+///
+/// So the denied destination is a **second address on the same listener**, inside a denied prefix,
+/// with an on-link route added in each namespace. One veth, two destinations, and the only thing that
+/// decides reachability is the policy.
+struct RunscNet {
+    network: String,
+    listener: String,
+    /// Measured, never assumed: docker's IPAM picks it inside 203.0.113.0/24, which no policy rule
+    /// denies.
+    allowed_ip: String,
+}
+
+impl RunscNet {
+    /// Inside the denied 198.18.0.0/15 (RFC 2544 benchmarking space), which ordinary networks do not
+    /// use and this repo's policy drops.
+    const DENIED_IP: &'static str = "198.18.7.2";
+
+    fn new() -> Self {
+        let network = "mx-runsc-net".to_owned();
+        let listener = "mx-runsc-listener".to_owned();
+        docker(&["rm", "--force", "--volumes", &listener], None);
+        docker(&["network", "rm", &network], None);
+        let (ok, _, err) =
+            docker(&["network", "create", "--subnet", "203.0.113.0/24", &network], None);
+        assert!(ok, "could not create {network}: {err}");
+
+        // One process, both addresses: `nc -l` binds every local address, so a refusal can never be
+        // "that one was not listening".
+        let (ok, _, err) = docker(
+            &[
+                "run",
+                "--detach",
+                "--name",
+                &listener,
+                "--network",
+                &network,
+                "--cap-add",
+                "NET_ADMIN",
+                "--entrypoint",
+                "sh",
+                &netfilter_image(),
+                "-c",
+                &format!(
+                    "ip addr add {}/32 dev eth0 && while :; do nc -l -p {} >/dev/null 2>&1; done",
+                    Self::DENIED_IP,
+                    Canary::PORT
+                ),
+            ],
+            None,
+        );
+        assert!(ok, "could not start the listener: {err}");
+
+        let (ok, allowed_ip, err) = docker(
+            &[
+                "inspect",
+                "--format",
+                &format!("{{{{(index .NetworkSettings.Networks \"{network}\").IPAddress}}}}"),
+                &listener,
+            ],
+            None,
+        );
+        assert!(ok && !allowed_ip.is_empty(), "could not read the listener's address: {err}");
+        Self { network, listener, allowed_ip }
+    }
+
+    /// The same destination, from a container on the network but **outside** every contained
+    /// namespace. A success proves the listener is alive, which is the one thing a refusal inside
+    /// cannot distinguish itself from.
+    fn reachable_from_outside(&self, ip: &str) -> bool {
+        let (ok, _, _) = docker(
+            &[
+                "run",
+                "--rm",
+                "--network",
+                &self.network,
+                "--cap-add",
+                "NET_ADMIN",
+                "--entrypoint",
+                "sh",
+                &netfilter_image(),
+                "-c",
+                &format!("ip route add {ip}/32 dev eth0 && nc -w 2 {ip} {}", Canary::PORT),
+            ],
+            None,
+        );
+        ok
+    }
+}
+
+impl Drop for RunscNet {
+    fn drop(&mut self) {
+        docker(&["rm", "--force", "--volumes", &self.listener], None);
+        docker(&["network", "rm", &self.network], None);
+    }
+}
+
+/// A namespace for **one** payload: its own holder on the one network, carrying whichever containment
+/// layers the case under test installs. Removed on drop however the test exits.
+///
+/// It exists because a gVisor payload cannot share a namespace with an earlier one (see the gate
+/// above), which is also why production gives every job a fresh holder.
+struct Payload {
+    holder: String,
+}
+
+impl Payload {
+    fn new(net: &RunscNet, tag: &str) -> Self {
+        let holder = format!("mx-live-payload-{tag}");
+        docker(&["rm", "--force", "--volumes", &holder], None);
+        let (ok, _, err) = docker(
+            &[
+                "run",
+                "--detach",
+                "--name",
+                &holder,
+                "--network",
+                &net.network,
+                "--read-only",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges",
+                "--entrypoint",
+                "sleep",
+                &holder_image(),
+                "infinity",
+            ],
+            None,
+        );
+        assert!(ok, "could not start the payload holder {holder}: {err}");
+        // The denied address has to be ROUTABLE from this namespace before any rule exists, or a
+        // later refusal would be "no route" rather than "dropped" — and the two fail identically.
+        // On-link on the job's own veth, which is the interface the filters go on.
+        let dev = egress_dev(&holder);
+        let (ok, _, err) = docker(
+            &[
+                "run",
+                "--rm",
+                "--network",
+                &format!("container:{holder}"),
+                "--cap-drop",
+                "ALL",
+                "--cap-add",
+                "NET_ADMIN",
+                "--entrypoint",
+                "ip",
+                &netfilter_image(),
+                "route",
+                "add",
+                &format!("{}/32", RunscNet::DENIED_IP),
+                "dev",
+                &dev,
+            ],
+            None,
+        );
+        assert!(ok, "could not route {} into {holder}: {err}", RunscNet::DENIED_IP);
+        Self { holder }
+    }
+
+    /// The shipped iptables policy, through the real sidecar, verified per family before any payload.
+    fn with_output_policy(self, policy: &NetPolicy) -> Self {
+        let (plan, expected) = plan_stdin(policy);
+        let (ok, applied, err) = docker(
+            &[
+                "run",
+                "--rm",
+                "--interactive",
+                "--network",
+                &format!("container:{}", self.holder),
+                "--cap-drop",
+                "ALL",
+                "--cap-add",
+                "NET_ADMIN",
+                "--security-opt",
+                "no-new-privileges",
+                &netfilter_image(),
+            ],
+            Some(&plan),
+        );
+        assert!(ok, "the sidecar refused the policy: {err}");
+        assert_eq!(applied.parse::<usize>().expect("a count"), expected);
+        for family in [Family::V4, Family::V6] {
+            let argv = readback_argv(&self.holder, &netfilter_image(), family);
+            let (ok, readback, err) = run_argv(&argv, None);
+            assert!(ok, "policy readback failed: {err}");
+            assert_eq!(
+                policy.verify_readback(family, &readback),
+                Ok(()),
+                "{} policy readback did not verify:\n{readback}",
+                family.binary()
+            );
+        }
+        self
+    }
+
+    /// The same rendered policy on the veth, through the real applier, read back and verified.
+    fn with_veth_filters(self, policy: &NetPolicy) -> Self {
+        let dev = egress_dev(&self.holder);
+        let iface = IfacePlan::derive(&dev, policy).expect("the plan renders");
+        let (stdin, expected) = maxplayer_core::sandbox_iface::plan_stdin(&iface);
+        let (ok, applied, err) =
+            run_argv(&iface_sidecar_argv(&self.holder, &netfilter_image()), Some(&stdin));
+        assert!(ok, "the interface applier refused the plan: {err}");
+        assert_eq!(applied.parse::<usize>().expect("a count"), expected);
+        let readback = iface_readback(&self.holder, &dev);
+        assert_eq!(
+            iface.verify_readback(&readback),
+            Ok(()),
+            "the egress filters did not verify on {dev}:\n{readback}"
+        );
+        self
+    }
+
+    /// Run the one payload this namespace gets, under `runtime`, and report whether it connected.
+    fn reach(&self, runtime: &str, ip: &str) -> bool {
+        connect_under(runtime, &format!("container:{}", self.holder), ip, Canary::PORT)
+    }
+}
+
+impl Drop for Payload {
+    fn drop(&mut self) {
+        docker(&["rm", "--force", "--volumes", &self.holder], None);
+    }
 }
