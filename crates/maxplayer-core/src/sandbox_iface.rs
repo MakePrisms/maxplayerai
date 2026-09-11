@@ -647,10 +647,16 @@ mod tests {
         no_shadowed_exception(&ordered).expect("the pinhole above its covering deny is correct");
     }
 
-    /// The parser, against a literal `tc filter show dev eth0 egress` block rather than against
-    /// something this file generated.
+    /// The parser **and the verifier**, against a literal `tc filter show dev eth0 egress` block
+    /// rather than against something this file generated.
+    ///
+    /// The verifier leg is the one that matters: every other `verify_readback` test feeds it
+    /// [`as_tc_output`], which this file writes, so a parser and a renderer that agreed on a shape
+    /// the kernel never prints would pass all of them together. Here the expectation is hand-written
+    /// from the two filters the capture describes, and the input is the kernel's own text —
+    /// statistics lines, `installed`/`used` suffixes, trailing spaces and all.
     #[test]
-    fn the_parser_reads_the_shape_tc_actually_prints() {
+    fn the_parser_and_the_verifier_both_read_the_shape_tc_actually_prints() {
         const CAPTURE: &str = "\
 filter protocol ip pref 102 flower chain 0 
 filter protocol ip pref 102 flower chain 0 handle 0x1 
@@ -697,6 +703,97 @@ filter protocol ipv6 pref 111 flower chain 0 handle 0x1
             parsed[1].keys.iter().map(|(key, _)| key.as_str()).collect::<Vec<_>>(),
             vec!["eth_type", "dst_ip"]
         );
+
+        // The non-circular positive control. This plan is written out by hand from what the capture
+        // above *means* — a proxy pinhole and a unique-local deny — and never rendered by this file.
+        //
+        // The capture is one filter short of a verifiable plan: the box it came from had no IPv4
+        // drop, and `verify_readback` refuses a plan with an unfiltered family. So the third block
+        // is derived from the capture's own IPv6 drop block — every byte of layout, indentation,
+        // statistics and trailing whitespace is the kernel's, and only the family tokens and the
+        // prefix are changed. That keeps this leg a test of real `tc` text rather than of
+        // [`as_tc_output`].
+        let v6_drop_block: String = CAPTURE
+            .lines()
+            .skip_while(|line| !line.starts_with("filter protocol ipv6"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert!(v6_drop_block.contains("gact action drop"), "{v6_drop_block}");
+        let v4_drop_block = v6_drop_block
+            .replace("protocol ipv6", "protocol ip")
+            .replace("pref 111", "pref 101")
+            .replace("eth_type ipv6", "eth_type ipv4")
+            .replace("dst_ip fc00::/7", "dst_ip 10.0.0.0/8");
+        let captured_text = format!("{CAPTURE}{v4_drop_block}");
+        let captured = IfacePlan {
+            dev: DEV.to_owned(),
+            filters: vec![
+                IfaceFilter {
+                    family: Family::V4,
+                    pref: 102,
+                    dst: "172.17.0.1".to_owned(),
+                    ip_proto: Some("tcp".to_owned()),
+                    dst_port: Some("49200-49299".to_owned()),
+                    action: "pass",
+                    why: "the proxy pinhole, as the kernel printed it",
+                },
+                IfaceFilter {
+                    family: Family::V6,
+                    pref: 111,
+                    dst: "fc00::/7".to_owned(),
+                    ip_proto: None,
+                    dst_port: None,
+                    action: "drop",
+                    why: "the unique-local deny, as the kernel printed it",
+                },
+                IfaceFilter {
+                    family: Family::V4,
+                    pref: 101,
+                    dst: "10.0.0.0/8".to_owned(),
+                    ip_proto: None,
+                    dst_port: None,
+                    action: "drop",
+                    why: "the private-range deny, in the kernel's own layout",
+                },
+            ],
+        };
+        captured
+            .verify_readback(&captured_text)
+            .expect("the verifier must accept real tc output for the plan it describes");
+
+        // ...and it is not accepting it blindly: one word of that same capture changed, and the
+        // same verifier refuses. Without this leg the acceptance above could come from a verifier
+        // that accepts anything shaped like tc output.
+        let parked =
+            captured_text.replace("ipv6 pref 111 flower chain 0", "ipv6 pref 111 flower chain 7");
+        let refused = captured
+            .verify_readback(&parked)
+            .expect_err("a real capture with one filter parked in chain 7 must be refused");
+        assert!(refused.contains("chain"), "{refused}");
+    }
+
+    /// Rewrite only the lines that belong to a filter of `protocol`, leaving the other family's
+    /// lines exactly as they were.
+    ///
+    /// Every mutation below has to be applied per family and refused in both: a check that fires for
+    /// IPv4 and not for IPv6 is not a check, it is an IPv6-shaped hole with a passing test over it.
+    /// `edit` returns `Some(replacement)` for a line it rewrites (the replacement may be several
+    /// lines) and `None` to leave it alone.
+    fn in_family(text: &str, protocol: &str, edit: impl Fn(&str) -> Option<String>) -> String {
+        let mut out: Vec<String> = Vec::new();
+        let mut current = String::new();
+        for line in text.lines() {
+            if let Some(rest) = line.trim_start().strip_prefix("filter protocol ") {
+                current = rest.split_whitespace().next().unwrap_or_default().to_owned();
+            }
+            match edit(line).filter(|_| current == protocol) {
+                Some(replacement) => out.push(replacement),
+                None => out.push(line.to_owned()),
+            }
+        }
+        let mut text = out.join("\n");
+        text.push('\n');
+        text
     }
 
     /// F1: the substitutions that survive a *lossy* readback untouched. Every one of these is a
@@ -747,43 +844,65 @@ filter protocol ipv6 pref 111 flower chain 0 handle 0x1
         }
 
         // 3. A SECOND ACTION after the terminal one — the old parser kept only the last verb it saw.
-        let two_actions = faithful.replacen(
-            "action order 1: gact action drop",
-            "action order 1: gact action pass\n\taction order 2: gact action drop",
-            1,
-        );
-        let refused = plan
-            .verify_readback(&two_actions)
-            .expect_err("two actions on one filter must not verify");
-        assert!(refused.contains("actions") || refused.contains("action"), "{refused}");
+        for family in ["ip", "ipv6"] {
+            let two_actions = in_family(&faithful, family, |line| {
+                line.trim_start()
+                    .starts_with("action order 1: gact action")
+                    .then(|| format!("{line}\n\taction order 2: gact action pass"))
+            });
+            let refused = plan
+                .verify_readback(&two_actions)
+                .expect_err("two actions on one filter must not verify");
+            assert!(refused.contains("action"), "{family}: {refused}");
+        }
 
         // 4. A DUPLICATE key, where the second silently overwrote the first.
-        let duplicated = faithful.replace(
-            "  dst_ip 10.0.0.0/8\n",
-            "  dst_ip 0.0.0.0/0\n  dst_ip 10.0.0.0/8\n",
-        );
-        let refused =
-            plan.verify_readback(&duplicated).expect_err("a duplicated match key must not verify");
-        assert!(refused.contains("twice"), "{refused}");
+        for family in ["ip", "ipv6"] {
+            let duplicated = in_family(&faithful, family, |line| {
+                line.trim_start().starts_with("dst_ip ").then(|| format!("{line}\n{line}"))
+            });
+            let refused = plan
+                .verify_readback(&duplicated)
+                .expect_err("a duplicated match key must not verify");
+            assert!(refused.contains("twice"), "{family}: {refused}");
+        }
 
         // 5. A DIFFERENT CLASSIFIER matching by different rules under the same header fields.
-        let u32_classifier = faithful.replace("flower", "u32");
-        let refused = plan
-            .verify_readback(&u32_classifier)
-            .expect_err("a non-flower classifier must not verify");
-        assert!(refused.contains("classifier"), "{refused}");
+        for family in ["ip", "ipv6"] {
+            let u32_classifier =
+                in_family(&faithful, family, |line| Some(line.replace("flower", "u32")));
+            let refused = plan
+                .verify_readback(&u32_classifier)
+                .expect_err("a non-flower classifier must not verify");
+            assert!(refused.contains("classifier"), "{family}: {refused}");
+        }
 
         // 6. TRUNCATION: the listing stops after a header, before the rule it describes.
-        let cut = format!("{}\nfilter protocol ip pref 140 flower chain 0\n", faithful.trim_end());
-        let refused = plan.verify_readback(&cut).expect_err("a truncated listing must not verify");
-        assert!(refused.contains("truncated") || refused.contains("filters"), "{refused}");
+        for family in ["ip", "ipv6"] {
+            let cut = format!(
+                "{}\nfilter protocol {family} pref 140 flower chain 0\n",
+                faithful.trim_end()
+            );
+            let refused =
+                plan.verify_readback(&cut).expect_err("a truncated listing must not verify");
+            assert!(
+                refused.contains("truncated") || refused.contains("filters"),
+                "{family}: {refused}"
+            );
+        }
 
         // 7. An unknown predicate that is not a known bypass — refused because it is unread, not
         //    because this module happens to know what it does.
-        let unknown = faithful.replace("  dst_ip fc00::/7\n", "  dst_ip fc00::/7\n  tcp_flags 0x2\n");
-        let refused =
-            plan.verify_readback(&unknown).expect_err("an unknown predicate must not verify");
-        assert!(refused.contains("unknown match key"), "{refused}");
+        for family in ["ip", "ipv6"] {
+            let unknown = in_family(&faithful, family, |line| {
+                line.trim_start()
+                    .starts_with("dst_ip ")
+                    .then(|| format!("{line}\n  tcp_flags 0x2"))
+            });
+            let refused =
+                plan.verify_readback(&unknown).expect_err("an unknown predicate must not verify");
+            assert!(refused.contains("unknown match key"), "{family}: {refused}");
+        }
 
         // A verifier that refused everything would pass all seven. The real shape still verifies.
         plan.verify_readback(&faithful).expect("the faithful readback must still verify");
