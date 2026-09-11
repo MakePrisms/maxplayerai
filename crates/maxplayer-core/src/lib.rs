@@ -106,13 +106,15 @@ mod sandbox_dns_live;
 /// against its base to tell a regression from a preexisting condition. HARNESS ONLY.
 #[cfg(all(test, feature = "acp", feature = "wallet"))]
 mod sandbox_egress_live;
-/// Host-side network containment for a docker job (#797): which destinations a job may reach, and
-/// the `iptables` rules that enforce it on the two chains container traffic actually splits across.
+/// Offline validation of a *saved* live containment matrix: the record a live run writes down, and
+/// the checks that say whether it actually covers every required case.
 ///
-/// Deliberately UNGATED, unlike [`seller_exec`] and [`credential_proxy`] which it serves. Those are
-/// `wallet`-only, so a default-features test run cannot execute a line of them — the policy is the
-/// part that decides what a stranger's job can reach, and it is compiled and tested on every build
-/// rather than only on the money-path one.
+/// The live gates in `tests/sandbox_netns_live.rs` are `#[ignore]`d, so an ordinary `cargo test`
+/// reports them as ignored and proves nothing about containment. This module is what the offline
+/// acceptance entrypoint runs instead: it fails on a missing, duplicated, unknown or unscored case,
+/// and on a record that does not name the commit, artifact and host it came from. Ungated for the
+/// same reason as the policy modules below — a gate that can be compiled out is not a gate.
+pub mod sandbox_evidence;
 /// The same policy, on the interface the packets actually leave by.
 ///
 /// `sandbox_net`'s rules live on the host kernel's `OUTPUT` chain, which a gVisor payload never
@@ -121,6 +123,13 @@ mod sandbox_egress_live;
 /// containment stops depending on which runtime the job was launched under. Ungated for the same
 /// reason as the renderer it derives from.
 pub mod sandbox_iface;
+/// Host-side network containment for a docker job (#797): which destinations a job may reach, and
+/// the `iptables` rules that enforce it on the two chains container traffic actually splits across.
+///
+/// Deliberately UNGATED, unlike [`seller_exec`] and [`credential_proxy`] which it serves. Those are
+/// `wallet`-only, so a default-features test run cannot execute a line of them — the policy is the
+/// part that decides what a stranger's job can reach, and it is compiled and tested on every build
+/// rather than only on the money-path one.
 pub mod sandbox_net;
 /// Putting `sandbox_net`'s policy in force: the holder container that owns the job's network
 /// namespace, and the sidecar that installs the rules into it before the job exists. Unconditional
