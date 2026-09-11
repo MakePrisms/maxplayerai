@@ -1946,6 +1946,315 @@ fn one_jobs_cleanup_leaves_a_sibling_job_contained_and_running() {
     );
 }
 
+// ============================================================================================
+// F2 — the legs round 1 named missing: IPv6, both registered runtimes, and the proxy pinhole.
+//
+// **AUTHORED UNDER A HOLD THAT FORBIDS RUNNING THEM. NONE OF THESE HAS EVER EXECUTED.**
+// They compile, and that is the whole of what is known about them. They are not coverage, they do
+// not appear in any evidence record, and no containment claim rests on them until they have run
+// against a real daemon and their markers have been read back. Expect the first real run to need
+// adjustment — fixture addressing especially — and treat a failure on that run as information
+// about these tests, not yet as information about the policy.
+// ============================================================================================
+
+/// The `[sandbox]` section of [`gate_config`] plus the pinhole an operator configures. Kept apart
+/// from `gate_config` because the pinhole adds a second reason for a leg to differ from its
+/// control, which is exactly what the base matrix is built to avoid.
+fn gate_config_with_pinhole(network: &str, range: &str) -> maxplayer_core::home::SandboxConfig {
+    maxplayer_core::home::SandboxConfig {
+        proxy_port_range: Some(range.to_owned()),
+        ..gate_config(network)
+    }
+}
+
+/// [`gate_config`] pinned to one named container runtime.
+fn gate_config_with_runtime(
+    network: &str,
+    runtime: &str,
+) -> maxplayer_core::home::SandboxConfig {
+    maxplayer_core::home::SandboxConfig {
+        runtime: Some(runtime.to_owned()),
+        ..gate_config(network)
+    }
+}
+
+/// **The pinhole, as production installs it.**
+///
+/// Round 1's matrix configured no proxy range at all, so nothing measured the one rule whose job is
+/// to let traffic *through* a denied range. The hand-built fixture earlier in this file covers the
+/// pinhole's semantics; what was missing is that **production's own preparation path** puts it on
+/// the veth the packets leave by, with the range the operator wrote and no other.
+///
+/// This leg reads the prepared namespace's own `tc` output back in the window between containment
+/// and payload start, and checks the pinhole against the configured range rather than against
+/// anything this file rendered. The payload leg that follows is the discriminator: a pinhole wide
+/// enough to be useless would still satisfy a readback that only counted rules.
+#[test]
+#[ignore = "AUTHORED, NEVER RUN — needs docker and the production-tagged netfilter image"]
+fn the_pinhole_production_installs_is_the_one_the_policy_names() {
+    require_default_netfilter_image();
+    let net = RunscNet::new();
+    const RANGE: &str = "49200-49299";
+    const TC_RANGE: &str = "49200-49299";
+
+    let seen_range = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let recorder = std::sync::Arc::clone(&seen_range);
+
+    // The payload still goes to a denied destination: the pinhole must not become a hole.
+    let denied = integrated_leg_with(
+        gate_config_with_pinhole(&net.network, RANGE),
+        RunscNet::DENIED_IP,
+        Canary::PORT,
+        move |holder| {
+            route_on_link(holder, RunscNet::DENIED_IP);
+            let dev = egress_dev(holder);
+            let readback = iface_readback(holder, &dev);
+            let filters = maxplayer_core::sandbox_iface::parse_filters(&readback)
+                .expect("the prepared namespace's own tc output must parse");
+            let ports: Vec<String> = filters
+                .iter()
+                .filter(|filter| filter.actions == vec!["pass".to_owned()])
+                .filter_map(|filter| filter.key("dst_port").map(str::to_owned))
+                .collect();
+            *recorder.lock().expect("the recorder") = ports;
+        },
+    )
+    .expect("preparation must succeed");
+
+    let ports = seen_range.lock().expect("the recorder").clone();
+    assert!(
+        ports.iter().any(|port| port == TC_RANGE),
+        "production installed no pass rule for the configured proxy range {RANGE} — the pinhole the \
+         operator wrote is not on the veth the packets leave by. Pass rules carried ports: {ports:?}"
+    );
+    assert!(
+        ports.iter().all(|port| port == TC_RANGE),
+        "production installed a pass rule for a range the operator did not write: {ports:?} — a \
+         pinhole wider than its configuration is a hole"
+    );
+    assert_eq!(
+        denied,
+        PayloadOutcome::Refused,
+        "a configured pinhole must not make an unrelated denied destination reachable"
+    );
+}
+
+/// **Both registered runtimes, one production path.**
+///
+/// Round 1 proved containment under whichever runtime docker happens to default to. gVisor is the
+/// reason this work exists and `runsc` reimplements the network stack, so "contained under runc"
+/// and "contained under runsc" are two claims, not one. Running the identical leg under each is the
+/// only thing that tells them apart.
+#[test]
+#[ignore = "AUTHORED, NEVER RUN — needs docker, the production-tagged image and a runsc runtime"]
+fn both_registered_runtimes_are_contained_by_the_same_production_path() {
+    require_default_netfilter_image();
+    let net = RunscNet::new();
+    assert!(
+        net.reachable_from_outside(RunscNet::DENIED_IP),
+        "control: {} must answer from outside, or every refusal below proves nothing",
+        RunscNet::DENIED_IP
+    );
+
+    for runtime in ["runc".to_owned(), runsc_runtime()] {
+        let denied = integrated_leg_with(
+            gate_config_with_runtime(&net.network, &runtime),
+            RunscNet::DENIED_IP,
+            Canary::PORT,
+            |holder| route_on_link(holder, RunscNet::DENIED_IP),
+        )
+        .unwrap_or_else(|error| panic!("preparation must succeed under {runtime}: {error}"));
+        assert_eq!(
+            denied,
+            PayloadOutcome::Refused,
+            "under runtime {runtime} a job prepared and launched by production reached the denied {}",
+            RunscNet::DENIED_IP
+        );
+
+        let allowed = integrated_leg_with(
+            gate_config_with_runtime(&net.network, &runtime),
+            &net.allowed_ip,
+            Canary::PORT,
+            |_| {},
+        )
+        .unwrap_or_else(|error| panic!("preparation must succeed under {runtime}: {error}"));
+        assert_eq!(
+            allowed,
+            PayloadOutcome::Connected,
+            "positive control under runtime {runtime}: the allowed {} must stay reachable — a \
+             runtime whose networking is broken denies everything and looks contained",
+            net.allowed_ip
+        );
+    }
+}
+
+/// An IPv6-capable network with a listener answering on **both** an allowed and a denied v6 address.
+///
+/// The whole point of the v6 leg: the policy renders v6 drops, and until something dials a v6
+/// address through the production path, an unfiltered second address family is the cheapest bypass
+/// on the box — and the one a v4-only matrix cannot see.
+struct V6Net {
+    network: String,
+    listener: String,
+}
+
+impl V6Net {
+    /// Documentation prefix (RFC 3849). No policy rule denies it, so it is the allowed control.
+    const SUBNET: &'static str = "2001:db8:ff::/64";
+    const ALLOWED_IP: &'static str = "2001:db8:ff::2";
+    /// Unique-local (RFC 4193), inside the `fc00::/7` this repo's policy drops.
+    const DENIED_IP: &'static str = "fd00:dead:beef::2";
+
+    fn new() -> Self {
+        let network = owned_name("v6-net");
+        let listener = owned_name("v6-listener");
+        let (ok, _, err) = docker(
+            &[
+                "network",
+                "create",
+                "--ipv6",
+                "--label",
+                &owner_label(),
+                "--subnet",
+                Self::SUBNET,
+                &network,
+            ],
+            None,
+        );
+        assert!(
+            ok,
+            "could not create the v6 network {network}: {err}\n\
+             If this says IPv6 is not enabled, the daemon needs `\"ipv6\": true` — a daemon-level \
+             change, which is a decision to name rather than to make from a test."
+        );
+
+        // One process, both addresses, exactly as the v4 fixture does it.
+        let (ok, _, err) = docker(
+            &[
+                "run",
+                "--detach",
+                "--name",
+                &listener,
+                "--label",
+                &owner_label(),
+                "--network",
+                &network,
+                "--cap-add",
+                "NET_ADMIN",
+                "--entrypoint",
+                "sh",
+                &netfilter_image(),
+                "-c",
+                &format!(
+                    "ip -6 addr add {}/128 dev eth0 && while :; do nc -l -p {} >/dev/null 2>&1; done",
+                    Self::DENIED_IP,
+                    Canary::PORT
+                ),
+            ],
+            None,
+        );
+        assert!(ok, "could not start the v6 listener: {err}");
+        Self { network, listener }
+    }
+
+    /// From a container on the network but outside every contained namespace — the discriminator a
+    /// refusal inside cannot supply for itself.
+    fn reachable_from_outside(&self, ip: &str) -> bool {
+        let (ok, _, _) = docker(
+            &[
+                "run",
+                "--rm",
+                "--network",
+                &self.network,
+                "--cap-add",
+                "NET_ADMIN",
+                "--entrypoint",
+                "sh",
+                &netfilter_image(),
+                "-c",
+                &format!("ip -6 route add {ip}/128 dev eth0; nc -w 2 {ip} {}", Canary::PORT),
+            ],
+            None,
+        );
+        ok
+    }
+}
+
+impl Drop for V6Net {
+    fn drop(&mut self) {
+        remove_owned_container(&self.listener);
+        remove_owned_network(&self.network);
+    }
+}
+
+/// Make a v6 address reachable on-link inside the holder, so a refusal is the filters and not a
+/// missing route.
+fn route6_on_link(holder: &str, ip: &str) {
+    let (ok, _, err) = docker(
+        &[
+            "run",
+            "--rm",
+            "--network",
+            &format!("container:{holder}"),
+            "--cap-drop",
+            "ALL",
+            "--cap-add",
+            "NET_ADMIN",
+            "--entrypoint",
+            "ip",
+            &netfilter_image(),
+            "-6",
+            "route",
+            "add",
+            &format!("{ip}/128"),
+            "dev",
+            "eth0",
+        ],
+        None,
+    );
+    assert!(ok, "could not make {ip} routable inside {holder}: {err}");
+}
+
+/// **The second address family, through the production path.**
+///
+/// Same three-leg shape as the v4 matrix, and for the same reasons: an outside control so a refusal
+/// is not a dead listener, a denied leg, and an allowed leg so "denies everything" cannot pass as
+/// containment.
+#[test]
+#[ignore = "AUTHORED, NEVER RUN — needs docker, an IPv6-enabled daemon and the production image"]
+fn the_denied_v6_prefix_is_denied_through_the_production_path() {
+    require_default_netfilter_image();
+    let net = V6Net::new();
+
+    assert!(
+        net.reachable_from_outside(V6Net::DENIED_IP),
+        "control: {} must answer from outside, or the denied leg below proves nothing",
+        V6Net::DENIED_IP
+    );
+
+    let denied = integrated_leg(&net.network, V6Net::DENIED_IP, Canary::PORT, |holder| {
+        route6_on_link(holder, V6Net::DENIED_IP)
+    })
+    .expect("preparation must succeed");
+    assert_eq!(
+        denied,
+        PayloadOutcome::Refused,
+        "a job prepared and launched by production reached the denied v6 {} — an unfiltered second \
+         address family is the cheapest bypass there is",
+        V6Net::DENIED_IP
+    );
+
+    let allowed = integrated_leg(&net.network, V6Net::ALLOWED_IP, Canary::PORT, |_| {})
+        .expect("preparation must succeed");
+    assert_eq!(
+        allowed,
+        PayloadOutcome::Connected,
+        "positive control: the allowed v6 {} must stay reachable, or the denial above is just a \
+         broken v6 path",
+        V6Net::ALLOWED_IP
+    );
+}
+
 /// Build a launch into an EXISTING holder, for the sibling check's second probe. Goes through the
 /// production argv builder, and names the namespace explicitly rather than preparing a new one.
 fn prepared_launch_for(
