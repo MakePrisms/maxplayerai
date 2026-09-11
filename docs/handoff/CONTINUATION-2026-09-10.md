@@ -6,6 +6,9 @@ findings, and the plan for the production integration that remains.
 
 Author: Petar's local agent, 2026-09-10.
 
+**Current next step:** section 10 — finish the Proxy swap production wiring, then the real GitHub
+test. Read section 10 first if you are resuming.
+
 ## 1. What changed since `a0cc31d`
 
 | Area | Change |
@@ -172,3 +175,34 @@ The reason, stated plainly:
 
 This becomes supportable when a specific vendor offers a browser login with a refreshable session.
 The holder already accommodates that case; no redesign is needed.
+
+## 10. Next step — Proxy swap production wiring (agreed 2026-09-11)
+
+Petar's sequencing decision, 2026-09-11: finish all the coding first, then attempt the real GitHub
+test. Do not attempt the real test with half-built code. The real run is the one thing that cannot
+be tested synthetically, so everything else must be green before it.
+
+Scope: the Proxy swap production wiring, enough to run the GitHub acceptance test. The Holder-route
+production integration (section 7, doc 09) is separate and is NOT needed for the GitHub test. Do it
+only if Petar asks for it in the same push.
+
+Definition of done — "all the coding" is done when these four are built and green against synthetic
+fakes:
+
+1. **Config.** A seat can declare a proxy-swap vendor tool: the credential file, the upstream host,
+   the placeholder, and the client redirect. Reuse the `FileCredential` shape in `home.rs`.
+2. **Wiring.** `seller_exec` registers that credential on the real credential proxy (`#647`), adds
+   the upstream to the job's egress allowlist, and sets the job's `mcp_servers` to `mcp-http-bridge`.
+   Gate it on the config, so a seat without it is unchanged.
+3. **Image.** Bake `mcp-http-bridge` into the sandbox image (`docker/maxplayer-sandbox/Dockerfile`).
+4. **Tests.** Core-side tests against a synthetic vendor MCP and proxy: a job gets the tool through
+   the swap; the credential never enters the container; a bypass placeholder fails. All green.
+
+No operation filter for this test. GitHub's fine-grained PAT is scoped, so the scope fork does not
+apply.
+
+Status as of 2026-09-11: not started. The synthetic mechanism demo is done (the kit, 39 tests). This
+is production-core work, a step up in risk from the isolated kit; lean on the synthetic tests.
+
+When items 1 to 4 are green, tell Petar. Then the real GitHub run, per doc 10. It needs a real
+fine-grained read-only PAT and cannot run in the sandbox.
