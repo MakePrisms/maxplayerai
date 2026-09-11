@@ -60,6 +60,7 @@ this contract to be reported, not a silent amendment.
 | 07 | [Test entrypoints and evidence layout](07-test-entrypoints-and-evidence.md) | §5, §6 |
 | 08 | [Named gaps, unsupported and deferred cases](08-gaps-and-unsupported.md) | §6 stage 0 output |
 | 09 | [Production integration plan](09-production-integration.md) | post-review, later stage |
+| 10 | [Routing and options: the decision tree](10-routing-and-options.md) | post-review, the option picker |
 
 ## Scope fence
 
