@@ -45,10 +45,14 @@ Answer these questions in order. Stop at the first match.
    - Yes → **Proxy swap**. Go to the Proxy swap section.
    - No → question 4.
 4. **Must a real CLI or browser hold the login state?**
-   - Yes, in a container → **Holder**. Go to the Holder section. This route ships today.
-   - Yes, but machine- or hardware-bound → **Dedicated machine**. Go to the Dedicated machine section.
+   - Yes, a CLI in a container → **Holder**. Go to the Holder section. This route ships today.
+   - Yes, but a browser holds the login → **Browser login** — not supported at this moment. Print
+     the message in the Cross-cutting section and stop.
+   - Yes, but machine- or hardware-bound → **Dedicated machine** — not supported at this moment. Go
+     to the Dedicated machine section and print its message.
 
-Never pick a weaker route because its template exists.
+Never pick a weaker route because its template exists. If the only route left is one that is not
+supported at this moment, say so plainly and stop; do not improvise a substitute.
 
 ## Holder (ships today)
 
@@ -96,8 +100,22 @@ source-to-build receipt and the built image id.
 
 ## Public (manual setup)
 
-Use this for a tool that needs no credential. Install it in the job image. Report the result as
-manual setup, never as automated onboarding.
+Use this for a tool that needs no credential. The seller bakes the tool into a custom sandbox
+image, then points the seat at it. There is no automated adapter, so report the result as manual
+setup, never as automated onboarding.
+
+Configure it.
+
+1. Write a Dockerfile that starts `FROM` the maxplayer sandbox base image, so the image keeps the
+   agent runtime the job needs (node, the ACP adapter, git, CA certs). The base is
+   `crate::seller_exec::DEFAULT_SANDBOX_IMAGE`; the reference Dockerfile is
+   `docker/maxplayer-sandbox/Dockerfile`.
+2. Add the tool in that Dockerfile — a package install, or a copied binary on the `PATH`.
+3. Build and tag the image, for example `my-sandbox-with-tool`.
+4. Point the seat at it: set `image` under the seat's `[seller.sandbox]` docker config
+   (`SandboxConfig::image` in `home.rs`).
+5. Confirm the tool needs no credential and no network the egress policy denies. If it needs auth,
+   it is not Public; re-route it.
 
 ## Direct token (manual setup; its safe delivery is deferred)
 
@@ -120,16 +138,17 @@ plainly rather than implying the proxy delivery is ready.
 Use this for an authenticated HTTP API or a vendor-hosted MCP server whose auth is a header value.
 The job holds a placeholder; the credential proxy (`#647`) swaps the real credential in at egress.
 
-**Status: recognized, template deferred.** The low-level swap mechanism ships for the model
-credential, but the reviewed seller-tool template — the profile, the checker, the credential-custody
-handling, the transport, and the acceptance tests — is not built. So a seller cannot onboard this
-route by configuration today, and a run of it must never be reported as onboarded. This is a
-platform build item, not a seller task. Do not improvise per-seller custody; that is the unreviewed
-path the design refuses. If the tool also genuinely fits the Holder, offer that instead, but never as
-a silent downgrade.
+**Status: mechanism demonstrated; production template owed.** The mechanism is proven synthetically
+in the kit (`tests/proxy_swap_suite.rs`), and the transport shim `mcp-http-bridge` is built and
+tested. What is not built is the production template: registering the vendor on the real `#647`,
+the egress allow, the shim in the sandbox image, and a real-vendor acceptance run. So a seller still
+cannot onboard this route by configuration today, and a run must never be reported as onboarded.
+This is a platform build item, not a seller task. Do not improvise per-seller custody; that is the
+unreviewed path the design refuses. If the tool also genuinely fits the Holder, offer that instead,
+but never as a silent downgrade.
 
-What a Proxy swap template must wire, for the platform to build (this is the design, not a seller
-recipe):
+The credential swap extends the existing proxy (`#647`); it does not add a new one. What a Proxy
+swap template must wire, for the platform to build (this is the design, not a seller recipe):
 
 1. A credential entry (the `FileCredential` shape in `home.rs`): the file `path` and `field` for the
    real token, the `env` placeholder the container gets, the one `upstream` host, and the
@@ -140,23 +159,34 @@ recipe):
    alone is safe. If no, a trusted operation filter that is the job's only path to the vendor — never
    an in-container filter, which the job can skip because it holds the placeholder. That trusted
    filter is the Holder shape, for a remote tool.
-5. The transport: `McpServer` is `{name, command}`, stdio only, so a remote HTTPS MCP needs a
-   stdio-to-HTTP shim in the container pointed at the proxy, or driver-side HTTP MCP support.
+5. The transport, already built: `mcp-http-bridge` is the stdio-to-HTTP shim that runs in the job
+   container and forwards MCP to the proxy. It needs to be placed in the sandbox image. (`McpServer`
+   is `{name, command}`, stdio only, which is why the shim is needed.)
 
 Until that template exists, the honest outcome at this leaf is "recognized shape, template
 deferred".
 
-## Dedicated machine (deferred)
+## Dedicated machine (not supported at this moment)
 
-Use this only when a platform- or machine-bound login cannot run in a container. Run the tool on a
-dedicated isolated machine or VM, never on the seller's everyday host. Hardware-bound licences may
-make even this unsupported. The template is deferred, so this is not automated today.
+This is for a login bound to a specific machine or hardware licence, which cannot run in a job
+container. It is not supported at this moment. If routing lands here, it is the only route left and
+no other route fits. Print this plainly and stop:
+
+> This tool needs a dedicated machine to hold its login, which the platform does not support at this
+> moment. It cannot be onboarded now.
+
+Do not improvise a host executor on the seller's own machine.
 
 ## Cross-cutting
 
-- **Browser login is not supported for now.** It fits the Holder only when the login persists and
-  the holder can refresh it without a browser. A short-lived, non-refreshable login would force a
-  per-job re-login, which the enroll-once model cannot hold.
+- **Browser login is not supported at this moment.** It fits the Holder only when the login persists
+  and the holder can refresh it without a browser; a short-lived, non-refreshable login would force
+  a per-job re-login the enroll-once model cannot hold. If a tool's only viable route is a browser
+  login, print this plainly and stop:
+
+  > This tool needs a browser login, which the platform does not support at this moment. It cannot be
+  > onboarded now.
+
 - **Refuse a credential store that cannot separate its auth writes from job state.** See
   [08](../../../docs/specs/seller-tool-onboarding/08-gaps-and-unsupported.md) C.1.
 

@@ -14,7 +14,7 @@ and gives the rung in parentheses, so you never have to memorize a number.
 | --- | --- | --- |
 | **Public** (rung 1) | The tool needs no credential, so it is installed in the job's container image and the job calls it directly. | Handled, but manual. |
 | **Direct token** (rung 2) | The job is handed a short-lived, job-scoped token the vendor can revoke or bind to job-close, so a leak is bounded and the job calls the vendor itself. | Handled, but manual, and its safe delivery is the deferred Proxy swap. |
-| **Proxy swap** (rung 3) | The job holds a placeholder credential and the host-side credential proxy swaps the real one into the outgoing request header, so the secret never enters the container. | Not handled; deferred. Mechanism exists (`#647`). |
+| **Proxy swap** (rung 3) | The job holds a placeholder credential and the host-side credential proxy swaps the real one into the outgoing request header, so the secret never enters the container. | Mechanism demonstrated in the kit; production template owed. |
 | **Holder** (rung 4) | A persistent supervisor logs the real tool in one time and holds the session, exposing it to each job over a private socket while the credential and local files stay on the holder's side. | Handled and automated. This is `maxplayer-tool-kit`. |
 | **Dedicated machine** (rung 5) | For a login bound to a specific machine or hardware licence, the tool runs on a dedicated isolated machine rather than in the job container. | Not handled; deferred. |
 
@@ -53,6 +53,21 @@ State these plainly, because a reader assumes more than the proxy gives.
 - **An in-container filter is not a boundary.** The job holds the placeholder, so it can skip an
   in-container filter and call the vendor directly, and the proxy still swaps auth. A filter is a
   boundary only when it runs on the trusted side and is the job's only path to the vendor.
+
+## Proxy swap — what exists now, and what is owed
+
+The mechanism is demonstrated, synthetic and self-contained, in `crates/maxplayer-tool-kit`
+(`tests/proxy_swap_suite.rs`, 4 tests). The credential swap **extends** the existing proxy (`#647`);
+it does not add a new one. The proxy's engine is generic over credentials — its allowlist is the
+union of every credential's upstream — so a vendor tool is one more credential (the `FileCredential`
+shape). The only genuinely new component is the transport shim.
+
+- Built and tested: `mcp-http-bridge` (the stdio-to-HTTP shim a job container runs), plus the
+  `vendor-mcp` and `swap-proxy` test doubles that stand in for a real vendor MCP and `#647`.
+- Owed for the production template: register the vendor as a `FileCredential` on the real `#647`;
+  add the vendor host to the job's egress allowlist; get the shim into the sandbox image; and pass
+  a real-vendor acceptance run. The scope fork still holds: a broad credential needs a trusted
+  operation filter, which is the Holder shape for a remote tool.
 
 ## The decision tree
 
