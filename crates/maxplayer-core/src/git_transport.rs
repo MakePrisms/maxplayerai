@@ -431,10 +431,122 @@ pub fn push_branch_with_header(
     gated_oid: &str,
     header: Option<String>,
 ) -> Result<String, TransportError> {
+    let uploaded = upload_gated_branch(workdir, remote_url, branch, gated_oid, header.clone())?;
+    attest_pushed_branch(&uploaded, header)
+}
+
+/// A delivery whose pack the remote accepted and reported status for, and which is NOT yet attested.
+/// Deliberately not a `String`: the only way from here to a delivered commit oid is
+/// [`attest_pushed_branch`], so "uploaded" cannot be read as "verified" by a caller that drops the
+/// second leg.
+#[derive(Debug, Clone)]
+#[must_use = "an uploaded delivery is not delivered until attest_pushed_branch verifies the remote ref"]
+pub struct UploadedDelivery {
+    remote_url: String,
+    target_ref: String,
+    gated_oid: String,
+}
+
+impl UploadedDelivery {
+    /// Re-hydrate an upload the seller node JOURNALED durably, so a resume after a crash, a kill, or
+    /// a 401 on the read-back can run the SAME attestation the interrupted push owed — under a
+    /// freshly minted token — instead of re-pushing a pack the remote may already hold.
+    ///
+    /// This constructor is the resume path's only entry, and it grants nothing the read-back does not
+    /// re-check on the wire: [`attest_pushed_branch`] still asserts the outbound allowlist, still
+    /// opens a detached remote bound to `remote_url`, and still refuses unless `target_ref` is
+    /// advertised at exactly `gated_oid`. An `UploadedDelivery` built here is a QUESTION for the
+    /// remote, never an answer — a caller cannot turn it into a delivered oid without that check
+    /// passing.
+    pub fn from_journaled_upload(remote_url: String, target_ref: String, gated_oid: String) -> Self {
+        Self {
+            remote_url,
+            target_ref,
+            gated_oid,
+        }
+    }
+
+    /// The repo-root URL every leg of this delivery is bound to.
+    pub fn remote_url(&self) -> &str {
+        &self.remote_url
+    }
+
+    /// The fully-qualified ref the pack was pushed to (`refs/heads/<branch>`).
+    pub fn target_ref(&self) -> &str {
+        &self.target_ref
+    }
+
+    /// The gated commit that was pushed — the ONLY oid the attestation accepts.
+    pub fn gated_oid(&self) -> &str {
+        &self.gated_oid
+    }
+}
+
+/// Leg 1 of a delivery push: send the gated OBJECT to `refs/heads/<branch>` at `remote_url` and
+/// require the remote's status report to name exactly that ref with no error message. Nothing is
+/// attested here — the returned [`UploadedDelivery`] must be handed to [`attest_pushed_branch`].
+///
+/// `gated_oid` is the push SOURCE (refspec `<gated_oid>:refs/heads/<branch>`), so the bytes on the
+/// wire are that object's graph no matter where the local branch points during the push (C6). The
+/// workdir is opened through the layout gate ([`crate::seller_git::open_plain_workdir_repo`]) and
+/// every leg is bound to `remote_url`.
+pub fn upload_gated_branch(
+    workdir: &Path,
+    remote_url: &str,
+    branch: &str,
+    gated_oid: &str,
+    header: Option<String>,
+) -> Result<UploadedDelivery, TransportError> {
     assert_allowed_repo_locator(remote_url)?;
     ensure_registered()?;
     let repo = open_delivery_repo(workdir)?;
-    push_gated_object(&repo, remote_url, branch, gated_oid, header)
+    upload_gated_object(&repo, remote_url, branch, gated_oid, header)
+}
+
+/// Leg 2 of a delivery push: open a NEW connection to the SAME repo-root under `header`, read the
+/// remote's ref advertisement, and require the uploaded ref to point at the uploaded gated oid.
+/// Returns that attested oid — the delivered commit.
+///
+/// `header` is minted by the caller AFTER [`upload_gated_branch`] returns, which is the point of the
+/// split: the relay's default NIP-98 rule is a ±60 s window on `created_at`, so a token minted
+/// before a transfer that outlives that window is already refused when the read-back runs — a 401 on
+/// the verification of a push that succeeded. A fresh token is bounded exactly as the upload's was
+/// (signer-owned, repo-root-bound `u` tag, same ref scope): nothing is relaxed, and the oid compared
+/// is still the exact gated oid.
+///
+/// The connection is a DETACHED remote: it carries no repository config, so no `insteadOf` can
+/// rewrite it, and the transport still refuses any leg whose destination is not
+/// [`UploadedDelivery::remote_url`].
+pub fn attest_pushed_branch(
+    uploaded: &UploadedDelivery,
+    header: Option<String>,
+) -> Result<String, TransportError> {
+    assert_allowed_repo_locator(&uploaded.remote_url)?;
+    ensure_registered()?;
+    attest_uploaded_delivery(uploaded, header)
+}
+
+/// [`attest_pushed_branch`] without the outbound allowlist assertion, so the split legs can be
+/// exercised against a local bare repository — which the allowlist refuses on the public entry
+/// point — exactly as [`upload_gated_object`] is.
+fn attest_uploaded_delivery(
+    uploaded: &UploadedDelivery,
+    header: Option<String>,
+) -> Result<String, TransportError> {
+    let mut remote = Remote::create_detached(uploaded.remote_url.as_str())
+        .map_err(|error| TransportError::Io(format!("detached remote for attestation: {error}")))?;
+    let context = LegContext {
+        header,
+        short: false,
+        intended_url: uploaded.remote_url.clone(),
+    };
+    attest_remote_branch(
+        &mut remote,
+        context,
+        &uploaded.target_ref,
+        &uploaded.gated_oid,
+    )?;
+    Ok(uploaded.gated_oid.clone())
 }
 
 /// Open the committed workdir a delivery is pushed from, through the layout gate. A layout refusal
@@ -465,17 +577,18 @@ fn gated_commit(repo: &Repository, gated_oid: &str) -> Result<Oid, TransportErro
     Ok(oid)
 }
 
-/// The push proper, on an already-opened repository: bind the remote, push the OBJECT `gated_oid`
-/// to `refs/heads/<branch>`, check the status report, then read the remote back. Split from
-/// [`push_branch_with_header`] so the object-sourced push can be exercised against a local bare
+/// The upload proper, on an already-opened repository: bind the remote, push the OBJECT `gated_oid`
+/// to `refs/heads/<branch>` and check the status report. The remote read-back is NOT done here —
+/// it is [`attest_uploaded_delivery`], run under its own freshly minted token. Split from
+/// [`upload_gated_branch`] so the object-sourced push can be exercised against a local bare
 /// repository, which the transport allowlist refuses on the public entry point.
-fn push_gated_object(
+fn upload_gated_object(
     repo: &Repository,
     remote_url: &str,
     branch: &str,
     gated_oid: &str,
     header: Option<String>,
-) -> Result<String, TransportError> {
+) -> Result<UploadedDelivery, TransportError> {
     let gated = gated_commit(repo, gated_oid)?.to_string();
     let target_ref = delivery_ref(branch);
     let mut remote = bound_remote(repo, remote_url)?;
@@ -505,13 +618,16 @@ fn push_gated_object(
         short: false,
         intended_url: remote_url.to_owned(),
     };
-    with_context(context.clone(), || {
+    with_context(context, || {
         remote.push(&[refspec.as_str()], Some(&mut options))
     })?;
     drop(options);
     require_status_report(&reports.borrow(), &target_ref)?;
-    attest_remote_branch(&mut remote, context, &target_ref, &gated)?;
-    Ok(gated)
+    Ok(UploadedDelivery {
+        remote_url: remote_url.to_owned(),
+        target_ref,
+        gated_oid: gated,
+    })
 }
 
 /// Require that the remote's status report names exactly `target_ref`, with no error message. The
@@ -539,10 +655,11 @@ fn require_status_report(
     }
 }
 
-/// Remote attestation: open a NEW connection to the remote under the same header context, read its
-/// current ref advertisement, and require `target_ref` to point at `gated_oid`. One scoped token
-/// serves both the push and this read-back (the relay is method-agnostic and does not dedup the
-/// event id). The local branch is not consulted.
+/// Remote attestation: open a NEW connection to the remote under `context`, read its current ref
+/// advertisement, and require `target_ref` to point at `gated_oid`. The header in `context` is the
+/// read-back's OWN token (minted after the upload settled), not the upload's; the relay is
+/// method-agnostic and does not dedup the event id, so either would be accepted while fresh — only
+/// this one is still fresh after a slow transfer. The local branch is not consulted.
 fn attest_remote_branch(
     remote: &mut Remote<'_>,
     context: LegContext,
@@ -1235,8 +1352,9 @@ mod tests {
         let remote_url = bare.to_str().expect("utf8").to_owned();
 
         let repo = crate::seller_git::open_plain_workdir_repo(&workdir).expect("open workdir");
-        let pushed = push_gated_object(&repo, &remote_url, "job", &a.to_string(), None)
-            .expect("push the gated object");
+        let uploaded = upload_gated_object(&repo, &remote_url, "job", &a.to_string(), None)
+            .expect("upload the gated object");
+        let pushed = attest_uploaded_delivery(&uploaded, None).expect("attest the gated object");
         assert_eq!(pushed, a.to_string(), "the returned oid is the gated one");
 
         let remote_repo = Repository::open_bare(&bare).expect("open bare");
@@ -1249,8 +1367,9 @@ mod tests {
         assert_eq!(repo.refname_to_id("refs/heads/job").expect("local ref"), b);
 
         // A repeat push of the same object (the resume path) is accepted and attested again.
-        let again = push_gated_object(&repo, &remote_url, "job", &a.to_string(), None)
+        let re_uploaded = upload_gated_object(&repo, &remote_url, "job", &a.to_string(), None)
             .expect("re-push the gated object");
+        let again = attest_uploaded_delivery(&re_uploaded, None).expect("re-attest");
         assert_eq!(again, a.to_string());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1266,7 +1385,7 @@ mod tests {
         Repository::init_bare(&bare).expect("bare remote");
         let remote_url = bare.to_str().expect("utf8").to_owned();
         for bad in ["", "abc", &a.to_string()[..39], &"f".repeat(40)] {
-            let err = push_gated_object(&repo, &remote_url, "job", bad, None)
+            let err = upload_gated_object(&repo, &remote_url, "job", bad, None)
                 .expect_err("refused");
             assert!(matches!(err, TransportError::Io(_)), "{bad:?}: {err}");
         }
@@ -1291,7 +1410,9 @@ mod tests {
         Repository::init_bare(&bare).expect("bare remote");
         let remote_url = bare.to_str().expect("utf8").to_owned();
         let repo = crate::seller_git::open_plain_workdir_repo(&workdir).expect("open workdir");
-        push_gated_object(&repo, &remote_url, "job", &a.to_string(), None).expect("push A");
+        let uploaded_a = upload_gated_object(&repo, &remote_url, "job", &a.to_string(), None)
+            .expect("push A");
+        attest_uploaded_delivery(&uploaded_a, None).expect("attest A before it moves");
 
         // A second client moves the remote ref to B.
         {
@@ -1325,6 +1446,47 @@ mod tests {
         assert!(
             err.to_string().contains(&b.to_string()),
             "names the oid the remote holds: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // RESUME, with real git: an upload whose read-back never happened is re-verified from the
+    // JOURNALED facts alone (remote url + ref + oid — what the store holds), and the exact-oid gate
+    // still decides. Nothing is re-pushed here: the second call touches no workdir.
+    #[test]
+    fn a_journaled_upload_re_verifies_and_still_refuses_a_different_oid() {
+        let root = temp_root("resume-attest");
+        let (workdir, a, b) = workdir_with_moved_branch(&root);
+        let bare = root.join("remote.git");
+        Repository::init_bare(&bare).expect("bare remote");
+        let remote_url = bare.to_str().expect("utf8").to_owned();
+        let repo = crate::seller_git::open_plain_workdir_repo(&workdir).expect("open workdir");
+        // The pre-crash run: the pack lands on the remote, and its `UploadedDelivery` is DROPPED on
+        // purpose — that value did not survive the crash, only the journaled strings below did.
+        drop(upload_gated_object(&repo, &remote_url, "job", &a.to_string(), None).expect("upload A"));
+
+        // What the store journaled — no `UploadedDelivery` survived the crash, only these strings.
+        let journaled = UploadedDelivery::from_journaled_upload(
+            remote_url.clone(),
+            "refs/heads/job".to_owned(),
+            a.to_string(),
+        );
+        assert_eq!(
+            attest_uploaded_delivery(&journaled, None).expect("the pack is on the remote"),
+            a.to_string(),
+            "a resume re-verifies the journaled upload and returns the delivered oid"
+        );
+
+        // FAIL CLOSED on a wrong oid: same remote, same ref, an oid the remote does not hold.
+        let wrong = UploadedDelivery::from_journaled_upload(
+            remote_url,
+            "refs/heads/job".to_owned(),
+            b.to_string(),
+        );
+        let err = attest_uploaded_delivery(&wrong, None).expect_err("the remote disagrees");
+        assert!(
+            matches!(&err, TransportError::Rejected(m) if m.contains("remote attestation failed")),
+            "a journaled oid the remote does not hold is REJECTED, never delivered: {err}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -100,6 +100,12 @@ struct Controls {
     /// epoch, so its `#p`-pinned REQs read STALE (closed `auth-required:`) until it answers the new
     /// challenge and catches up — which is the in-place re-auth the fix re-issues its subs on.
     auth_generation: std::sync::atomic::AtomicU64,
+    /// R2B/O-B1: milliseconds this relay withholds each EVENT's `OK`.
+    ///
+    /// A SLOW relay, not a broken one. Every publish still succeeds, so nothing here is a hang or
+    /// a timeout to be detected — which is the point: an unbounded drain is owned by the SUM of a
+    /// backlog's individually reasonable waits, and that is invisible to any per-publish limit.
+    event_delay_ms: std::sync::atomic::AtomicU64,
 }
 
 /// A running fixture relay. Dropping it stops accepting new connections.
@@ -160,6 +166,17 @@ impl PGateRelay {
             connections,
             _accept: accept,
         }
+    }
+
+    /// R2B/O-B1: make every EVENT take `delay` to be acknowledged.
+    ///
+    /// Set after boot so the node's own startup publishes are not slowed — the test is about the
+    /// drain tick, and paying the delay on the seat advertisement would only make the boot slow.
+    pub(super) fn set_event_delay(&self, delay: Duration) {
+        self.controls.event_delay_ms.store(
+            delay.as_millis() as u64,
+            std::sync::atomic::Ordering::SeqCst,
+        );
     }
 
     /// How many sockets this relay has accepted.
@@ -377,6 +394,12 @@ async fn serve_connection(
                         })
                         .unwrap_or_default();
                     events.lock().await.push(PublishedEvent { kind, tags });
+                }
+                let delay = controls
+                    .event_delay_ms
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                if delay > 0 {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
                 }
                 send(&writer, json!(["OK", id, true, ""])).await?;
             }

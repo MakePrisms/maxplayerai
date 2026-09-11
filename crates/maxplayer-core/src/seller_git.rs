@@ -863,23 +863,83 @@ pub fn neutralize_push_config(workdir: &Path) -> Result<(), SellerGitError> {
     Ok(())
 }
 
-/// Off-runtime: neutralise `workdir`'s config, THEN push the gated commit. This is the host-path
-/// delivery push. The layout gate and the whole-file config replacement run first, so an
+/// Off-runtime: neutralise `workdir`'s config, THEN upload the gated commit. This is leg 1 of the
+/// host-path delivery push. The layout gate and the whole-file config replacement run first, so an
 /// `insteadOf`/`pushInsteadOf`/`include` the agent planted is gone before libgit2 reads the config;
-/// the push then sends the object `gated_oid`, binds every leg to `remote_url`, and reads the
-/// remote's advertisement back. Both run in one blocking op, so nothing runs between them.
-pub async fn neutralize_then_push_off_runtime(
+/// the upload then sends the object `gated_oid` and binds every leg to `remote_url`. Both run in one
+/// blocking op, so nothing runs between them.
+///
+/// The remote read-back is NOT part of this call: it is
+/// [`attest_pushed_branch_off_runtime`], which the caller runs under a token minted AFTER this
+/// returns, so a transfer that outlives the relay's ±60 s NIP-98 window cannot leave the
+/// verification leg holding an already-expired token.
+pub async fn neutralize_then_upload_off_runtime(
     workdir: PathBuf,
     remote_url: String,
     branch: String,
     gated_oid: String,
     header: Option<String>,
-) -> Result<String, SellerGitError> {
+    journal: impl FnOnce(&git_transport::UploadedDelivery) + Send + 'static,
+    custody: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> Result<git_transport::UploadedDelivery, SellerGitError> {
     off_runtime(move || {
+        // `custody` is the serialization permit for this seat's ONE delivery remote, and it is held
+        // HERE — inside the blocking op — not by the async caller. A `spawn_blocking` task runs to
+        // completion even when the future awaiting it is dropped, so an outer timeout or a
+        // cancellation releases nothing while a `git-receive-pack` is still in flight: the next
+        // delivery is admitted when this op ends, not when its caller gives up. Dropped with this
+        // closure on every exit path.
+        let _custody = custody;
         neutralize_push_config(&workdir)?;
-        push_branch_with_header(&workdir, &remote_url, &branch, &gated_oid, header)
+        let uploaded =
+            git_transport::upload_gated_branch(&workdir, &remote_url, &branch, &gated_oid, header)?;
+        // The remote has ACCEPTED the pack. Journal that fact from inside the blocking op, BEFORE
+        // the result is handed back to a caller that may already have timed out or been cancelled —
+        // a post-await journal cannot run for a caller that is no longer there.
+        journal(&uploaded);
+        eprintln!("seller push path=inprocess remote={remote_url} branch={branch} uploaded");
+        Ok(uploaded)
     })
     .await
+}
+
+/// Leg 2, for BOTH lanes: attest `uploaded` against the remote's advertisement under `header` — the
+/// token the caller minted after the upload settled (live) or at resume time (recovery). Returns the
+/// attested (delivered) oid.
+///
+/// It returns the transport's OWN error class rather than a [`SellerGitError`], and BOTH the live
+/// push and the resumed verification call THIS function, because the decision turns on a distinction
+/// `SellerGitError` folds away: `From<TransportError>` maps BOTH `Rejected` (the remote answered, and
+/// the ref is absent or at another oid — definitive, fail closed) and `Auth` (a 401/403 — we could
+/// not ask, so nothing is decided) onto `AuthFailed`. A live pass that treated a definitive rejection
+/// as an unknown, or an unknown as a rejection, would take exactly the wrong terminal action; one
+/// classifier over one raw outcome is what keeps the two lanes honest about which happened.
+///
+/// `lane` names the caller in the operator line only ("push" / "resume").
+pub async fn attest_upload_off_runtime(
+    uploaded: git_transport::UploadedDelivery,
+    header: Option<String>,
+    lane: &'static str,
+) -> Result<String, git_transport::TransportError> {
+    let remote_url = uploaded.remote_url().to_owned();
+    let target_ref = uploaded.target_ref().to_owned();
+    match tokio::task::spawn_blocking(move || git_transport::attest_pushed_branch(&uploaded, header))
+        .await
+    {
+        Ok(Ok(oid)) => {
+            eprintln!(
+                "seller push path=inprocess lane={lane} remote={remote_url} ref={target_ref} attested"
+            );
+            Ok(oid)
+        }
+        Ok(Err(error)) => Err(error),
+        // A blocking task that did not complete is an IO-class unknown, NOT a rejection: the remote
+        // never answered, so the caller must leave the delivery reconciliable rather than fail a
+        // delivery that may well be on the remote.
+        Err(error) => Err(git_transport::TransportError::Io(format!(
+            "blocking git task did not complete: {error}"
+        ))),
+    }
 }
 
 /// Run one blocking git operation on a blocking thread. A panic inside libgit2 surfaces as an error
@@ -1924,5 +1984,97 @@ mod snapshot_tests {
 
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&remote);
+    }
+}
+
+/// The CUSTODY property of the real blocking wrapper, driven with a controlled fake operation.
+///
+/// Every delivery upload runs through [`off_runtime`], and the serialization permit is passed INTO
+/// the blocking closure rather than held by the async caller. The reason is not stylistic: a
+/// `spawn_blocking` task runs to completion even when the future awaiting it is dropped, so a
+/// delivery timeout or a cancelled task can leave the caller gone while `git-receive-pack` is still
+/// on the wire. If custody were released at cancellation, the next delivery would be admitted to the
+/// same remote mid-transfer.
+///
+/// A git remote cannot express that window on demand, so the operation here is fake and CONTROLLED —
+/// it begins when the wrapper starts it and ends only when this test says so — while the wrapper
+/// itself is the production one. No infrastructure, and the timing is not a race.
+///
+/// RED ON REVERT: hold the permit in the async caller (drop it into the future instead of the
+/// closure) and the abort below frees the gate immediately, so `available_permits()` is 1 while the
+/// operation is still running and the custody assertion fires.
+#[cfg(test)]
+mod off_runtime_custody_tests {
+    use super::{off_runtime, SellerGitError};
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::sync::Semaphore;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cancelled_caller_does_not_release_custody_before_the_blocking_operation_ends() {
+        let gate = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&gate)
+            .acquire_owned()
+            .await
+            .expect("harness check: take the delivery gate");
+
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (ended_tx, ended_rx) = mpsc::channel::<()>();
+
+        let caller = tokio::spawn(off_runtime(move || {
+            // Custody rides INTO the blocking op, exactly as the upload leg passes it.
+            let _custody = permit;
+            entered_tx.send(()).ok();
+            // The controlled fake operation: this is the whole in-flight window, and it closes on
+            // this test's word, never on a timer.
+            release_rx.recv().ok();
+            ended_tx.send(()).ok();
+            Ok::<(), SellerGitError>(())
+        }));
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("harness check: the blocking operation must actually start");
+        assert_eq!(
+            gate.available_permits(),
+            0,
+            "harness check: the gate is held while the operation runs"
+        );
+
+        // The caller stops waiting — a delivery timeout, a cancelled task, a dropped future.
+        caller.abort();
+        assert!(
+            caller.await.is_err(),
+            "harness check: the awaiting future must be gone"
+        );
+
+        // THE PROPERTY: the operation is STILL running, so nothing may be admitted to the remote.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            gate.available_permits(),
+            0,
+            "custody must outlive the cancelled caller — the transfer it serializes is still in flight"
+        );
+
+        release_tx
+            .send(())
+            .expect("harness check: end the controlled operation");
+        ended_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the blocking operation must run to completion despite the cancelled caller");
+
+        // And released once the operation ENDS — bounded wait, because the permit drops as the
+        // closure returns, a moment after it announces the end.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while gate.available_permits() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            gate.available_permits(),
+            1,
+            "custody must be released when the operation ends, or no delivery is ever admitted again"
+        );
     }
 }

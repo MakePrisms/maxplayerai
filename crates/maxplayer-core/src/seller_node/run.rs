@@ -55,7 +55,6 @@ use crate::seller_exec::{
 use crate::seller_roster::{ExecutionFailure, Fault, LiveRoster, MissingCapability, Unavailable};
 use crate::seller_git::{self, DeliveryAgentIdentity};
 
-use super::outbox::drain_once;
 use super::publisher::RelayPublisher;
 use super::shutdown;
 use super::{now_unix, NodeError, SellerNode};
@@ -1529,6 +1528,10 @@ enum ResumeAction {
     /// from the stored commit (re-sign + enqueue — deterministic + idempotent) WITHOUT re-running the
     /// agent or re-pushing.
     FinalizeFromPushed(String),
+    /// A delivery whose pack the remote ACCEPTED but which nothing ever attested (journaled between
+    /// the two legs): re-run the READ-BACK under a freshly minted token, and complete only if the
+    /// remote advertises the ref at exactly this oid. Never a re-push, never an agent re-run.
+    VerifyUploadedDelivery(String),
     /// Already delivered / receipted, or a terminal state: nothing to do, never re-run.
     SkipTerminal,
     /// The offer's own absolute deadline has already passed: the award can no longer be paid (a buyer
@@ -1578,6 +1581,491 @@ fn resume_action(
     match pushed_commit {
         Some(commit) => ResumeAction::FinalizeFromPushed(commit),
         None => ResumeAction::RunAgent,
+    }
+}
+
+/// [`resume_action`] refined by the uploaded-but-unverified marker.
+///
+/// The marker is consulted LAST, and only where `resume_action` would otherwise `RunAgent` — the
+/// residual that means: slot-occupying, no delivery row, no receipt, not settled elsewhere, deadline
+/// still live, no VERIFIED pushed commit. Every other verdict outranks it, and each for a reason:
+///
+/// - `SkipTerminal` wins so a job that already produced a buyer-visible outcome (delivered,
+///   receipted, settled elsewhere, or failed) can never be completed a SECOND time by a resume that
+///   found an old upload marker. That is the no-duplicate-completion guarantee.
+/// - `SkipLapsed` wins so a verified-late delivery is never emitted after the offer's own deadline.
+/// - `FinalizeFromPushed` wins because `pushed_commit` means ALREADY VERIFIED; re-asking the remote
+///   would be redundant work on the recovery path.
+///
+/// Kept a refinement of `resume_action` rather than a branch inside it so #552/#563's decision keeps
+/// its exact shape and this layer's precedence is provable on its own.
+fn resume_action_with_upload_marker(
+    action: ResumeAction,
+    uploaded_unverified: Option<String>,
+) -> ResumeAction {
+    match (action, uploaded_unverified) {
+        (ResumeAction::RunAgent, Some(commit)) => ResumeAction::VerifyUploadedDelivery(commit),
+        (action, _) => action,
+    }
+}
+
+/// What a resume does with the answer the remote gave about a journaled upload.
+#[derive(Debug, PartialEq, Eq)]
+enum UploadedVerification {
+    /// The remote advertises the ref at exactly the journaled oid: arm the VERIFIED marker and
+    /// finalize from it (re-sign + enqueue, both idempotent). No push, no agent.
+    Deliver,
+    /// The remote ANSWERED, and its answer rules the delivery out: the ref is absent or at another
+    /// oid (`Rejected`), or the locator is refused outright (`Transport`, which never reaches a
+    /// network and can never start doing so). Fail the job — the exact-oid gate said no.
+    FailClosed,
+    /// No answer: authorization refused (`Auth` — a 401/403 says nothing about where the pack is) or
+    /// an io/transport fault. Decide NOTHING: leave the durable marker standing for the next resume.
+    /// Bounded by the offer deadline, which fails the row when it passes.
+    Unresolved,
+}
+
+/// Classify the read-back's outcome. Split from the handler so the fail-closed/leave-it boundary is
+/// unit-testable without a relay — and so the `Auth`-vs-`Rejected` distinction that
+/// `From<TransportError> for SellerGitError` folds away cannot be re-folded here by accident.
+fn uploaded_verification_outcome(
+    result: Result<(), &crate::git_transport::TransportError>,
+) -> UploadedVerification {
+    use crate::git_transport::TransportError;
+    match result {
+        Ok(()) => UploadedVerification::Deliver,
+        Err(TransportError::Rejected(_)) | Err(TransportError::Transport(_)) => {
+            UploadedVerification::FailClosed
+        }
+        Err(TransportError::Auth(_)) | Err(TransportError::Io(_)) => {
+            UploadedVerification::Unresolved
+        }
+    }
+}
+
+/// How many exact-oid read-backs a recovery spends on ONE marker before it stops asking and takes a
+/// terminal disposition. The wait is already bounded by the offer's own deadline; this bounds the
+/// pathological case where the deadline is far away and the remote keeps answering "could not tell",
+/// so an unverifiable delivery still reaches exactly one outcome instead of being asked forever.
+const UPLOAD_VERIFY_ATTEMPT_CAP: i64 = 8;
+
+/// R2: the ceiling on ONE awaited step of the recovery lane (mint, read-back, sign, envelope).
+///
+/// The sweep runs on the node's own drain tick. Every await it performs talks to something that can
+/// stop answering — a signer actor, a relay, a remote mid-transfer — and an unbounded await there
+/// does not just stall this job: it stalls the tick, and with it every other job's liveness. Each
+/// step is therefore bounded, and an elapsed bound DECIDES NOTHING: the durable marker stays, the
+/// attempt was charged, the next tick asks again.
+const RECOVERY_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What ONE recovery step may spend: the smaller of the fixed per-step liveness bound and whatever
+/// is LEFT of this pass's budget.
+///
+/// R2. Fixed 30s substeps are not a bound on the pass — four of them in sequence outlive a 120s
+/// budget, and the budget was only consulted BETWEEN rows, so a single row with several slow awaits
+/// could own the drain tick regardless. Every await on the recovery lane now draws from the same
+/// remaining time.
+///
+/// `None` means the budget is already gone: the caller stops there and decides nothing, exactly as
+/// an elapsed step bound does. A pass without a budget (boot recovery, which owns no tick) keeps
+/// the plain per-step bound.
+/// R2A test seam: what the delivery sampler actually read, per job.
+///
+/// A timing oracle must be able to assert its own premise — that the offer was still LIVE at the
+/// instant the route sampled, and only became unacceptable while the write waited for the lock.
+/// Without that, a test whose timing slipped would pass vacuously on an already-expired offer,
+/// which is the pre-expired-clock cheat wearing a stopwatch. Keyed by job so parallel tests cannot
+/// read each other's samples.
+#[cfg(test)]
+static DELIVERY_SAMPLES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, i64>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn record_delivery_sample(job_id: &str, now_ms: i64) {
+    let _ = DELIVERY_SAMPLES
+        .get_or_init(Default::default)
+        .lock()
+        .map(|mut samples| samples.insert(job_id.to_string(), now_ms));
+}
+
+#[cfg(test)]
+fn delivery_sample_ms(job_id: &str) -> Option<i64> {
+    DELIVERY_SAMPLES
+        .get_or_init(Default::default)
+        .lock()
+        .ok()
+        .and_then(|samples| samples.get(job_id).copied())
+}
+
+/// R2B: the pass's ORIGINAL ABSOLUTE DEADLINE, handed down untouched.
+///
+/// This deliberately does not convert to a remaining `Duration`. The moment it did, the value
+/// described a past that the recipient could not refresh: a step that received "800ms left" then
+/// looked up an offer, wrote to a contended store and produced a signature would begin its publish
+/// on time that had already been spent. Passing the instant means every consumer subtracts the
+/// clock where it is used — after the store write, after signing, immediately before the publish.
+fn recovery_step_budget(pass_deadline: Option<std::time::Instant>) -> crate::seller_node::outbox::DrainBudget {
+    let Some(pass_deadline) = pass_deadline else {
+        return crate::seller_node::outbox::DrainBudget::Unbudgeted;
+    };
+    if pass_deadline <= std::time::Instant::now() {
+        // R2B: SPENT, which is not the same fact as "no budget governs me". Collapsing the two into
+        // one `None` is what let a spent pass claim a fresh full terminal-drain ceiling.
+        crate::seller_node::outbox::DrainBudget::Exhausted
+    } else {
+        crate::seller_node::outbox::DrainBudget::Until(pass_deadline)
+    }
+}
+
+/// R2B: the ceiling on the drain that follows ONE job's terminal decision.
+///
+/// That drain exists for promptness — the buyer sees the result or the failure in this pass rather
+/// than at the next tick — and promptness is not worth the tick. A publisher waiting on a slow
+/// signer or a relay that accepts bytes and never answers would otherwise hold a completion open
+/// for as long as the remote likes. The row is durable before this runs, so the ceiling costs at
+/// most a tick of latency and never an event.
+const TERMINAL_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// R2B: the step budget, additionally constrained by the OFFER the step is working toward.
+///
+/// The pass budget answers "how much of the tick may this sweep spend". It does not answer "is this
+/// step still worth spending it on", and for the awaits that exist only to produce a result the
+/// buyer will accept, the offer answers that. Signing a receipt for thirty seconds against an offer
+/// that expires in two is the tick spent on an outcome the durable write will refuse the moment it
+/// lands — the deadline check is atomic now, so that work was always going to be thrown away.
+///
+/// `None` means DECIDE NOTHING here, and only a SPENT PASS says that. It is not a failure verdict:
+/// the verified marker stands, custody stays with the job, and a later pass resolves it. Deferring
+/// costs a tick; guessing costs a wrong disposition.
+///
+/// An offer ALREADY PAST deliberately does not veto the step, and getting this wrong cost a real
+/// regression on the way in: vetoing left a lapsed delivery sitting `awarded` with no terminal
+/// event at all, because the disposition an expired offer is owed is produced by finishing this
+/// route — the durable write refuses the late result and the failure path announces it. An expired
+/// offer is a job waiting for its ONE terminal answer, not a job to walk away from. The ceiling is
+/// therefore exactly what its name says: a cap on a LIVE offer's remaining time, never a gate.
+fn recovery_step_budget_within_offer(
+    pass_deadline: Option<std::time::Instant>,
+    offer_deadline_unix: i64,
+    now_ms: i64,
+) -> crate::seller_node::outbox::DrainBudget {
+    let budget = recovery_step_budget(pass_deadline);
+    // R2B/O-B4: the EXACT remainder, in milliseconds.
+    //
+    // Taking `offer_deadline - now_unix` in whole seconds granted up to a second that the offer
+    // does not have: 400ms before a deadline, the subtraction still answers "1s". That is the same
+    // floored-sample defect R2A fixed at the delivery decision, surviving here in the ceiling —
+    // and it matters most in exactly the case the ceiling exists for, the last second of an offer,
+    // where the step it admits can only produce a result the durable write will refuse.
+    let left_ms = offer_deadline_unix.saturating_mul(1_000).saturating_sub(now_ms);
+    if left_ms <= 0 {
+        // An EXPIRED offer is still owed its one terminal answer, so the ceiling never vetoes the
+        // step that produces it.
+        return budget;
+    }
+    budget.capped(std::time::Duration::from_millis(left_ms as u64))
+}
+
+/// R2: the ceiling on ONE sweep pass over the held rows, so a long worklist cannot own the tick.
+/// Rows not reached this pass are not lost — they are still held, and the next tick starts again.
+const RECOVERY_SWEEP_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// R1: proof that ONE live lane owns a job's delivery transfer, released when that lane's transfer
+/// actually ends.
+///
+/// Ownership must outlive the async caller, exactly as the serialization permit does. `spawn_blocking`
+/// runs to completion even when the future awaiting it is dropped, so a cancelled or timed-out caller
+/// can be gone while its `git-receive-pack` is still on the wire. This guard therefore travels INTO
+/// the blocking op and drops when the upload ends — not when the caller stops waiting. Releasing at
+/// cancellation would hand the sweep a job whose pack is still in flight, which is the precise race
+/// the ownership exists to prevent.
+struct DeliveryTransferOwnership {
+    job_id: String,
+    owners: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+impl Drop for DeliveryTransferOwnership {
+    fn drop(&mut self) {
+        // A poisoned lock must not leave the id claimed forever (that would silently disable recovery
+        // for this job until reboot), so recover the guard rather than propagating the panic.
+        let mut owned = match self.owners.lock() {
+            Ok(owned) => owned,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        owned.remove(&self.job_id);
+    }
+}
+
+/// What a delivery-push failure DID, as performed by [`SellerNodeRunner::handle_delivery_push_failure`].
+/// Returned so the caller — and the tests that drive the real handler — can assert the disposition
+/// rather than infer it from a log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryPushDisposition {
+    /// A terminal `delivery_failed` was emitted. Only reachable when nothing can be on the remote
+    /// unattested: the intent never landed, the authorization failed BEFORE the upload, the upload
+    /// was definitively refused, the remote definitively answered "not there", or the push timed out
+    /// before it began.
+    Failed,
+    /// The job keeps its slot and its durable marker, and NO buyer-visible event was emitted: the
+    /// pack is (or may be) on the remote, so only the remote's own exact-oid answer may complete or
+    /// fail this delivery now. Bounded by the offer deadline and the attempt cap.
+    HeldForVerification,
+}
+
+#[cfg(test)]
+mod uploaded_verification_tests {
+    use super::{uploaded_verification_outcome, UploadedVerification};
+    use crate::git_transport::TransportError;
+
+    // FAIL CLOSED on the remote's own answer. `Rejected` is what the exact-oid comparison returns
+    // when the ref is absent or at another oid — the delivery is not there, and a re-push is barred,
+    // so the job fails. `Transport` is an allowlist refusal: no network happened and none ever will.
+    #[test]
+    fn a_wrong_oid_or_a_refused_locator_fails_closed() {
+        assert_eq!(
+            uploaded_verification_outcome(Err(&TransportError::Rejected(
+                "remote attestation failed: refs/heads/job is at bbb, not at the pushed aaa".into()
+            ))),
+            UploadedVerification::FailClosed
+        );
+        assert_eq!(
+            uploaded_verification_outcome(Err(&TransportError::Rejected(
+                "remote attestation failed: refs/heads/job is absent from the remote after the push"
+                    .into()
+            ))),
+            UploadedVerification::FailClosed
+        );
+        assert_eq!(
+            uploaded_verification_outcome(Err(&TransportError::Transport("ext: refused".into()))),
+            UploadedVerification::FailClosed
+        );
+    }
+
+    // The AUTH gate, and the reason this classification exists: a 401 on the read-back is exactly
+    // the incident shape, and it says NOTHING about whether the pack is on the remote. It must not
+    // deliver (unverified) and must not fail (the delivery may be there) — it leaves the durable
+    // marker for the next resume. An io fault reads the same way.
+    #[test]
+    fn an_auth_refusal_or_io_fault_resolves_nothing() {
+        assert_eq!(
+            uploaded_verification_outcome(Err(&TransportError::Auth("401 Unauthorized".into()))),
+            UploadedVerification::Unresolved,
+            "a 401 must never be read as 'the delivery is not there'"
+        );
+        assert_eq!(
+            uploaded_verification_outcome(Err(&TransportError::Io("connect: timed out".into()))),
+            UploadedVerification::Unresolved
+        );
+    }
+
+    #[test]
+    fn only_the_remotes_agreement_delivers() {
+        assert_eq!(
+            uploaded_verification_outcome(Ok(())),
+            UploadedVerification::Deliver
+        );
+    }
+}
+
+#[cfg(test)]
+mod upload_marker_precedence_tests {
+    use super::{resume_action, resume_action_with_upload_marker, ResumeAction};
+    use crate::seller_node::store::JobState;
+
+    const NOW: i64 = 1_000_000;
+    const LIVE: Option<i64> = Some(NOW + 3_600);
+    const LAPSED: Option<i64> = Some(NOW - 1);
+
+    fn decide(
+        state: JobState,
+        has_delivery: bool,
+        has_receipt: bool,
+        pushed: Option<&str>,
+        uploaded: Option<&str>,
+        deadline: Option<i64>,
+    ) -> ResumeAction {
+        resume_action_with_upload_marker(
+            resume_action(
+                state,
+                has_delivery,
+                has_receipt,
+                false,
+                pushed.map(ToOwned::to_owned),
+                deadline,
+                NOW,
+            ),
+            uploaded.map(ToOwned::to_owned),
+        )
+    }
+
+    // THE RECOVERY: the exact row the 401 leaves behind — still executing, no delivery, no receipt,
+    // no VERIFIED commit, live deadline, and an uploaded-unverified marker. It re-verifies. Without
+    // the marker the same row runs the agent again, which is what the marker exists to prevent.
+    #[test]
+    fn an_uploaded_unverified_row_verifies_instead_of_re_running_the_agent() {
+        assert_eq!(
+            decide(JobState::Executing, false, false, None, Some("aaa"), LIVE),
+            ResumeAction::VerifyUploadedDelivery("aaa".to_owned())
+        );
+        assert_eq!(
+            decide(JobState::Awarded, false, false, None, Some("aaa"), LIVE),
+            ResumeAction::VerifyUploadedDelivery("aaa".to_owned())
+        );
+        assert_eq!(
+            decide(JobState::Executing, false, false, None, None, LIVE),
+            ResumeAction::RunAgent,
+            "no marker ⇒ the #552 foil is untouched: a genuine mid-flight award still runs"
+        );
+    }
+
+    // NO DUPLICATE BUYER COMPLETION. Every row that already produced (or can no longer produce) a
+    // buyer-visible outcome keeps its verdict even with the marker set: a delivery row, a receipt, a
+    // terminal state, and a lapsed deadline.
+    #[test]
+    fn the_marker_never_overrides_a_terminal_or_lapsed_row() {
+        for state in [JobState::Delivered, JobState::Paid, JobState::Failed] {
+            assert_eq!(
+                decide(state, false, false, None, Some("aaa"), LIVE),
+                ResumeAction::SkipTerminal,
+                "a terminal row is never re-completed from an old upload marker"
+            );
+        }
+        assert_eq!(
+            decide(JobState::Executing, true, false, None, Some("aaa"), LIVE),
+            ResumeAction::SkipTerminal,
+            "a delivery row already exists — verifying could only duplicate it"
+        );
+        assert_eq!(
+            decide(JobState::Executing, false, true, None, Some("aaa"), LIVE),
+            ResumeAction::SkipTerminal
+        );
+        assert_eq!(
+            decide(JobState::Executing, false, false, None, Some("aaa"), LAPSED),
+            ResumeAction::SkipLapsed,
+            "past the deadline the row fails — never a post-deadline delivery"
+        );
+    }
+
+    // RESTART, end to end through the real store: a delivery whose pack the remote accepted and whose
+    // read-back never confirmed it is journaled, the process goes away, and the decision a restart
+    // makes on the REOPENED file is "re-verify" — not "re-run the agent", which is what the same row
+    // without the marker gets. This is the composition `execute_job` performs, over durable state.
+    #[test]
+    fn a_restart_re_verifies_a_journaled_upload_instead_of_re_running() {
+        use crate::seller_node::store::SellerStore;
+
+        let path = std::env::temp_dir().join(format!(
+            "maxplayer-resume-upload-marker-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let commit = "d".repeat(40);
+
+        // The schema, then a mid-flight job row (two of them: one uploaded, one not).
+        {
+            SellerStore::open(&path).expect("create schema");
+        }
+        {
+            let conn = rusqlite::Connection::open(&path).expect("raw open");
+            conn.execute_batch(
+                "INSERT INTO jobs (job_id, offer_id, state, created_at_unix, updated_at_unix)
+                 VALUES ('job-uploaded', 'offer-1', 'executing', 1, 1),
+                        ('job-mid-flight', 'offer-2', 'executing', 1, 1);",
+            )
+            .expect("job rows");
+        }
+        // The run that uploaded and then lost its read-back.
+        {
+            let store = SellerStore::open(&path).expect("open");
+            store
+                .mark_uploaded_unverified("job-uploaded", &commit, NOW)
+                .expect("journal the upload");
+        }
+
+        // THE RESTART: a new process, a new handle on the same file, nothing in memory.
+        let store = SellerStore::open(&path).expect("reopen");
+        let decide_from_store = |job_id: &str| {
+            let state = store
+                .job_state(job_id)
+                .expect("job_state")
+                .expect("job row present");
+            resume_action_with_upload_marker(
+                resume_action(
+                    state,
+                    store.has_delivery(job_id).expect("has_delivery"),
+                    store.has_receipt(job_id).expect("has_receipt"),
+                    store
+                        .has_settled_elsewhere(job_id)
+                        .expect("has_settled_elsewhere"),
+                    store.pushed_commit(job_id).expect("pushed_commit"),
+                    LIVE,
+                    NOW,
+                ),
+                store
+                    .uploaded_unverified_commit(job_id)
+                    .expect("uploaded_unverified_commit"),
+            )
+        };
+        assert_eq!(
+            decide_from_store("job-uploaded"),
+            ResumeAction::VerifyUploadedDelivery(commit.clone()),
+            "the restart owes the remote a read-back for the journaled upload"
+        );
+        assert_eq!(
+            decide_from_store("job-mid-flight"),
+            ResumeAction::RunAgent,
+            "a row with no marker is still a genuine mid-flight award (the #552 foil)"
+        );
+
+        // Once the read-back succeeds, the verified marker takes over and the recovery becomes an
+        // ordinary #552 finalize — across a further restart, and with no second remote round-trip.
+        store
+            .mark_pushed("job-uploaded", &commit, NOW + 1)
+            .expect("verified");
+        drop(store);
+        let store = SellerStore::open(&path).expect("reopen again");
+        assert_eq!(
+            store
+                .uploaded_unverified_commit("job-uploaded")
+                .expect("read"),
+            None
+        );
+        assert_eq!(
+            resume_action_with_upload_marker(
+                resume_action(
+                    store.job_state("job-uploaded").expect("state").expect("row"),
+                    false,
+                    false,
+                    false,
+                    store.pushed_commit("job-uploaded").expect("pushed"),
+                    LIVE,
+                    NOW
+                ),
+                store
+                    .uploaded_unverified_commit("job-uploaded")
+                    .expect("read"),
+            ),
+            ResumeAction::FinalizeFromPushed(commit)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // A VERIFIED commit outranks an upload marker: `pushed_commit` was written only after a
+    // successful read-back, so the recovery is a finalize, not another remote round-trip.
+    #[test]
+    fn a_verified_pushed_commit_outranks_the_upload_marker() {
+        assert_eq!(
+            decide(
+                JobState::Executing,
+                false,
+                false,
+                Some("verified"),
+                Some("aaa"),
+                LIVE
+            ),
+            ResumeAction::FinalizeFromPushed("verified".to_owned())
+        );
     }
 }
 
@@ -1729,48 +2217,218 @@ const _: () = assert!(
      the whole-op TimedOut arm and false-strands a maybe-accepted delivery while masking the real Push error"
 );
 
-/// #562 delivery-push failure: distinguishes the transport/push error (which carries the reason for
-/// the operator log — the LEG-1 detail) from the bounded-timeout firing, so both route to the SINGLE
-/// `delivery_failed` handling while logging distinctly (never a new state).
-#[derive(Debug)]
-enum DeliveryPushErr {
-    /// The push itself failed; the inner error carries the transport reason (409 / auth / io).
-    Push(seller_git::SellerGitError),
-    /// The push did not settle within [`DELIVERY_PUSH_TIMEOUT`] (seconds); the lock was released.
-    TimedOut(u64),
+/// The margin added to [`DELIVERY_PUSH_TIMEOUT`] when the upload leg's token declares a NIP-40
+/// expiration: the whole-operation bound plus the slack for signing and the final status read. The
+/// token still dies with the operation it authorizes.
+const DELIVERY_PUSH_TOKEN_MARGIN_SECS: u64 = 30;
+
+/// The declared lifetime of the delivery UPLOAD token, in seconds: exactly the window in which the
+/// push it authorizes can still be running. A relay that grants scoped tokens a longer life
+/// (Requirement B) keeps authorizing a slow pack's later legs under it; a relay on the historical
+/// ±60 s rule ignores the tag entirely, so this is never a widening. It is bounded well under the
+/// relay brief's default 6-hour cap
+/// ([`crate::seller_exec::DEFAULT_CONTAINER_DELIVERY_TOKEN_CAP_SECS`]) — the compile-time assert
+/// below keeps it there, so no edit to the push timeout can silently mint an over-cap token.
+fn delivery_push_token_lifetime_secs() -> i64 {
+    (DELIVERY_PUSH_TIMEOUT.as_secs() + DELIVERY_PUSH_TOKEN_MARGIN_SECS) as i64
 }
 
-/// #562: push a delivery under `lock` — serializing concurrent deliveries to this seat's ONE delivery
-/// remote (concurrent `git-receive-pack` to one repo is what the relay 409s) — and bounded by
-/// `timeout` so a hung push releases the lock rather than starving every later delivery. Pure over
-/// (lock, timeout, push) so the serialization + timeout are unit-testable WITHOUT a relay. The lock is
-/// held ONLY across the push and released the instant it settles or times out. The push oid is stable
-/// (invariant 2), so ORDERING pushes never duplicates a delivery — this is exactly-once.
-async fn serialized_bounded_push<Fut>(
-    lock: &tokio::sync::Mutex<()>,
-    timeout: Duration,
-    push: impl FnOnce() -> Fut,
+const _: () = assert!(
+    DELIVERY_PUSH_TIMEOUT.as_secs() + DELIVERY_PUSH_TOKEN_MARGIN_SECS
+        <= crate::seller_exec::DEFAULT_CONTAINER_DELIVERY_TOKEN_CAP_SECS,
+    "the delivery upload token's declared lifetime (DELIVERY_PUSH_TIMEOUT + margin) must stay within      the relay's default scoped-token cap, or the relay refuses the token outright instead of      honouring it"
+);
+
+/// The authorized delivery push, leg by leg: JOURNAL INTENT → mint → upload → mint AGAIN → attest.
+///
+/// This is the shape the relay-401 class of failure turns on, so it is a function with its own
+/// tooth rather than a block inlined in the execute path. Four properties it exists to hold:
+///
+/// 1. `intent` runs FIRST and its failure ABORTS the push. The durable record that this job is about
+///    to put `commit` on the remote exists before the remote can hold it, so a crash, a
+///    cancellation, or a lost write anywhere after this line still leaves a job that can be
+///    reconciled by asking the remote — the recovery never depends on having OBSERVED the upload.
+/// 2. `mint` is called INSIDE this future, and the caller only starts this future once the
+///    delivery-push permit is held — so an upload token is never minted before a wait it must
+///    survive.
+/// 3. The verification token is minted AFTER `upload` resolves, whatever that took. A NIP-98 token's
+///    life is measured from its `created_at`, so a token minted before a slow transfer is already
+///    outside the relay's ±60 s window when the read-back runs: the push lands and its own
+///    verification 401s.
+/// 4. A mint failure is reported with the STAGE it happened at: before the upload nothing is on the
+///    remote and the delivery may fail; after it, the pack is there and only the remote may decide.
+///
+/// `stage` is published for the caller's timeout arm, which cannot otherwise tell a push that never
+/// started from one whose pack is already in flight. `relay_git` is false for a public/anonymous
+/// https remote, which takes no header at all; `mint` is then never called. `upload_expiry` is the
+/// NIP-40 expiration declared on the upload token only.
+async fn mint_upload_mint_attest<T, MintFut, UploadFut, AttestFut>(
+    relay_git: bool,
+    upload_expiry: i64,
+    stage: &std::sync::atomic::AtomicU8,
+    intent: impl FnOnce() -> Result<(), DeliveryPushErr>,
+    mint: impl Fn(Option<i64>) -> MintFut,
+    upload: impl FnOnce(Option<String>) -> UploadFut,
+    attest: impl FnOnce(T, Option<String>) -> AttestFut,
 ) -> Result<String, DeliveryPushErr>
 where
-    Fut: std::future::Future<Output = Result<String, seller_git::SellerGitError>>,
+    MintFut: std::future::Future<Output = Result<String, String>>,
+    UploadFut: std::future::Future<Output = Result<T, DeliveryPushErr>>,
+    AttestFut: std::future::Future<Output = Result<String, DeliveryPushErr>>,
 {
-    let _guard = lock.lock().await;
-    match tokio::time::timeout(timeout, push()).await {
-        Ok(Ok(oid)) => Ok(oid),
-        Ok(Err(error)) => Err(DeliveryPushErr::Push(error)),
-        Err(_elapsed) => Err(DeliveryPushErr::TimedOut(timeout.as_secs())),
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    stage.store(PushStage::BeforeUpload.as_u8(), AtomicOrdering::SeqCst);
+    // PRE-EFFECT and REQUIRED. Everything after this line is recoverable; nothing before it needs to
+    // be, because nothing before it can have reached the remote.
+    intent()?;
+    let upload_header = if relay_git {
+        Some(
+            mint(Some(upload_expiry))
+                .await
+                .map_err(DeliveryPushErr::PreUploadAuth)?,
+        )
+    } else {
+        None
+    };
+    // From here the pack may reach the remote at any moment — including after this future is dropped,
+    // because the blocking upload op finishes on its own thread.
+    stage.store(PushStage::UploadOutstanding.as_u8(), AtomicOrdering::SeqCst);
+    let uploaded = upload(upload_header).await?;
+    // The remote ACCEPTED it. The upload leg has already journaled that fact from inside its blocking
+    // op — not here — so a caller that timed out or was cancelled during the transfer cannot lose it.
+    stage.store(PushStage::AfterUpload.as_u8(), AtomicOrdering::SeqCst);
+    let verify_header = if relay_git {
+        Some(
+            mint(None)
+                .await
+                // The pack is on the remote and this token is what would have proved it. A failure
+                // here is NOT the same event as a failure before the upload, and the caller must not
+                // be able to treat it as one.
+                .map_err(DeliveryPushErr::PostUploadAuth)?,
+        )
+    } else {
+        None
+    };
+    attest(uploaded, verify_header).await
+}
+
+/// WHERE a delivery push had got to when it stopped. The distinction the relay-401 incident could
+/// not make, and the one that decides whether a failure may be terminal: once the pack is (or may
+/// be) on the remote, only the remote's own exact-oid answer may complete OR fail this delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PushStage {
+    /// Nothing has been sent: the intent is journaled, the upload has not begun.
+    BeforeUpload,
+    /// The upload is in flight. It may already have landed — a `git-receive-pack` the caller stopped
+    /// waiting for still runs to completion on its blocking thread.
+    UploadOutstanding,
+    /// The remote ACCEPTED the pack; the read-back is what remains.
+    AfterUpload,
+}
+
+impl PushStage {
+    /// A delivery past `BeforeUpload` may be on the remote, so no local decision may fail it: it is
+    /// held for the exact-oid read-back instead.
+    fn upload_may_have_landed(self) -> bool {
+        !matches!(self, PushStage::BeforeUpload)
     }
-    // `_guard` drops here — the lock is released the instant the push settles OR times out, never held
-    // into the sign/enqueue tail.
+
+    fn from_u8(raw: u8) -> Self {
+        match raw {
+            1 => PushStage::UploadOutstanding,
+            2 => PushStage::AfterUpload,
+            _ => PushStage::BeforeUpload,
+        }
+    }
+
+    fn as_u8(self) -> u8 {
+        match self {
+            PushStage::BeforeUpload => 0,
+            PushStage::UploadOutstanding => 1,
+            PushStage::AfterUpload => 2,
+        }
+    }
+}
+
+/// #562 delivery-push failure, STAGE-AWARE: each variant says what had already happened when it
+/// fired, because "the signer refused" and "the read-back timed out" have opposite terminal rights
+/// depending on whether a pack is on the remote. The one thing no variant may do is fail a job whose
+/// delivery may be sitting on the remote unattested — that is the landed-pack-orphaned defect.
+#[derive(Debug)]
+enum DeliveryPushErr {
+    /// The DURABLE PRE-EFFECT intent could not be journaled. Nothing was sent: this fires before the
+    /// upload it would have made recoverable, and refusing here is the point — an upload nothing
+    /// remembers is the fault this whole path exists to prevent.
+    IntentUnrecorded(String),
+    /// Minting the UPLOAD leg's NIP-98 authorization failed. Nothing was sent.
+    PreUploadAuth(String),
+    /// Minting the VERIFICATION leg's authorization failed AFTER the remote accepted the pack. The
+    /// pack is on the remote; only the read-back is missing. Never terminal.
+    PostUploadAuth(String),
+    /// The upload itself failed; the inner error carries the transport reason (409 / auth / io).
+    Push(seller_git::SellerGitError),
+    /// The read-back's RAW transport outcome, unclassified on purpose: the live handler and the
+    /// resumed handler run it through the SAME classifier, so a definitive rejection fails closed and
+    /// an unknown (401 / io) stays unresolved in both lanes.
+    Attest(crate::git_transport::TransportError),
+    /// The push did not settle within [`DELIVERY_PUSH_TIMEOUT`]. `stage` says whether an upload
+    /// effect may be outstanding; the serialization permit is held by the blocking op either way.
+    TimedOut { secs: u64, stage: PushStage },
+}
+
+/// #562 + custody: run a delivery push under `gate` — serializing concurrent deliveries to this
+/// seat's ONE delivery remote (concurrent `git-receive-pack` to one repo is what the relay 409s) —
+/// and bounded by `timeout` so a hung push does not starve every later delivery. Pure over
+/// (gate, timeout, stage, push) so the serialization + timeout are unit-testable WITHOUT a relay.
+///
+/// The permit is OWNED and handed to `push`, which passes it down into the blocking upload op. That
+/// is the custody rule: a timeout returns control to the caller, but it does NOT admit the next
+/// delivery while this one's `git-receive-pack` may still be running — a `spawn_blocking` task
+/// outlives the future that awaited it, and releasing the permit on the caller's clock is exactly how
+/// two receive-packs end up on one repo. Whatever `push` does not move into the blocking op is
+/// dropped with its future, so a push that never reached the upload releases the permit at once.
+///
+/// `push` is called only ONCE THE PERMIT IS HELD, and it owns the whole authorized sequence: journal
+/// intent, mint, upload, mint again, attest. That ordering is the fix for the relay-401 class of
+/// failure — a token minted before the wait for this permit has already spent part of the relay's
+/// ±60 s NIP-98 window on waiting, and the delivery ahead of it may hold the permit for up to
+/// `timeout`. `stage` lets the timeout arm report WHERE the push had got to, which is what keeps a
+/// timeout from failing a delivery whose pack is already on the remote.
+async fn serialized_bounded_push<Fut>(
+    gate: &std::sync::Arc<tokio::sync::Semaphore>,
+    timeout: Duration,
+    stage: &std::sync::atomic::AtomicU8,
+    push: impl FnOnce(tokio::sync::OwnedSemaphorePermit) -> Fut,
+) -> Result<String, DeliveryPushErr>
+where
+    Fut: std::future::Future<Output = Result<String, DeliveryPushErr>>,
+{
+    let permit = match std::sync::Arc::clone(gate).acquire_owned().await {
+        Ok(permit) => permit,
+        Err(error) => {
+            // The gate is closed only on shutdown; nothing was sent, so this is a pre-upload refusal.
+            return Err(DeliveryPushErr::IntentUnrecorded(format!(
+                "delivery push gate closed ({error})"
+            )));
+        }
+    };
+    match tokio::time::timeout(timeout, push(permit)).await {
+        Ok(Ok(oid)) => Ok(oid),
+        Ok(Err(error)) => Err(error),
+        Err(_elapsed) => Err(DeliveryPushErr::TimedOut {
+            secs: timeout.as_secs(),
+            stage: PushStage::from_u8(stage.load(std::sync::atomic::Ordering::SeqCst)),
+        }),
+    }
 }
 
 #[cfg(test)]
 mod serialized_bounded_push_tests {
-    use super::{serialized_bounded_push, DeliveryPushErr};
-    use crate::seller_git::SellerGitError;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use super::{serialized_bounded_push, DeliveryPushErr, PushStage};
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+    use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
     // #562 core: concurrent deliveries to ONE remote must serialize — the push closure records peak
     // concurrency, and under the lock peak is exactly 1. Red-on-revert: drop the `_guard` in
@@ -1778,20 +2436,22 @@ mod serialized_bounded_push_tests {
     // concurrent git-receive-pack the relay 409s).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_pushes_serialize_to_one_at_a_time() {
-        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let gate = Arc::new(Semaphore::new(1));
         let inflight = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
         let mut handles = Vec::new();
         for i in 0..8u32 {
-            let (lock, inflight, peak) = (lock.clone(), inflight.clone(), peak.clone());
+            let (gate, inflight, peak) = (gate.clone(), inflight.clone(), peak.clone());
             handles.push(tokio::spawn(async move {
-                serialized_bounded_push(&lock, Duration::from_secs(5), || async move {
+                let stage = AtomicU8::new(0);
+                serialized_bounded_push(&gate, Duration::from_secs(5), &stage, |permit| async move {
                     let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
                     peak.fetch_max(now, Ordering::SeqCst);
                     tokio::task::yield_now().await; // a racer would overlap here if unserialized
                     tokio::time::sleep(Duration::from_millis(5)).await;
                     inflight.fetch_sub(1, Ordering::SeqCst);
-                    Ok::<_, SellerGitError>(format!("oid{i}"))
+                    drop(permit);
+                    Ok::<_, DeliveryPushErr>(format!("oid{i}"))
                 })
                 .await
             }));
@@ -1811,23 +2471,498 @@ mod serialized_bounded_push_tests {
     // proceeds promptly rather than blocking behind the hung one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_hung_push_times_out_and_frees_the_lock() {
-        let lock = tokio::sync::Mutex::new(());
-        let hung = serialized_bounded_push(&lock, Duration::from_millis(50), || async move {
+        let gate = Arc::new(Semaphore::new(1));
+        let stage = AtomicU8::new(0);
+        let hung = serialized_bounded_push(&gate, Duration::from_millis(50), &stage, |permit| async move {
+            // A push that never began: the permit is dropped, so nothing is holding custody.
+            drop(permit);
             tokio::time::sleep(Duration::from_secs(30)).await;
-            Ok::<_, SellerGitError>("never".to_string())
+            Ok::<_, DeliveryPushErr>("never".to_string())
         })
         .await;
-        assert!(matches!(hung, Err(DeliveryPushErr::TimedOut(_))), "a hung push must time out");
-        // The lock is free again: the next push acquires it and completes promptly (not starved).
+        assert!(
+            matches!(hung, Err(DeliveryPushErr::TimedOut { stage: PushStage::BeforeUpload, .. })),
+            "a hung push must time out, reporting the stage it reached: {hung:?}"
+        );
+        // The gate is free again: the next push acquires it and completes promptly (not starved).
         let next = tokio::time::timeout(
             Duration::from_secs(2),
-            serialized_bounded_push(&lock, Duration::from_secs(5), || async move {
-                Ok::<_, SellerGitError>("next-oid".to_string())
+            serialized_bounded_push(&gate, Duration::from_secs(5), &stage, |permit| async move {
+                drop(permit);
+                Ok::<_, DeliveryPushErr>("next-oid".to_string())
             }),
         )
         .await
         .expect("the next delivery must not be starved behind the timed-out push");
         assert!(matches!(next, Ok(oid) if oid == "next-oid"));
+    }
+
+    // F3 CUSTODY. The upload leg keeps the serialization permit INSIDE its blocking op, so a caller
+    // that times out does not admit the next delivery while `git-receive-pack` is still running —
+    // concurrent receive-packs against one relay remote are exactly what #562 serializes away.
+    // Red-on-revert: drop the permit when the caller's future is dropped (return it instead of
+    // moving it into the op) and the second push is admitted while the first is still uploading.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_timed_out_upload_keeps_the_permit_until_the_transfer_ends() {
+        let gate = Arc::new(Semaphore::new(1));
+        let stage = Arc::new(AtomicU8::new(0));
+        let stage_in_op = stage.clone();
+        let (uploading_tx, uploading_rx) = tokio::sync::oneshot::channel::<OwnedSemaphorePermit>();
+        // The caller times out at 50 ms; the transfer "keeps running" holding the permit.
+        let timed_out = serialized_bounded_push(&gate, Duration::from_millis(50), &stage, |permit| async move {
+            stage_in_op.store(PushStage::UploadOutstanding.as_u8(), Ordering::SeqCst);
+            // Custody handed to the still-running transfer, exactly as the blocking op holds it.
+            uploading_tx.send(permit).expect("the transfer takes custody");
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok::<_, DeliveryPushErr>("never".to_string())
+        })
+        .await;
+        assert!(
+            matches!(
+                timed_out,
+                Err(DeliveryPushErr::TimedOut { stage: PushStage::UploadOutstanding, .. })
+            ),
+            "a timeout during the transfer must report that the upload may have landed: {timed_out:?}"
+        );
+        let held = uploading_rx.await.expect("the transfer holds the permit");
+        assert_eq!(
+            gate.available_permits(),
+            0,
+            "the next delivery must NOT be admitted while the timed-out transfer is still running"
+        );
+        drop(held); // the receive-pack ends
+        assert_eq!(gate.available_permits(), 1, "custody is released when the transfer ends");
+    }
+}
+
+#[cfg(test)]
+mod delivery_push_leg_tests {
+    use super::{
+        mint_upload_mint_attest, serialized_bounded_push, DeliveryPushErr, PushStage,
+        DELIVERY_PUSH_TIMEOUT, DELIVERY_PUSH_TOKEN_MARGIN_SECS,
+    };
+    use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::sync::Semaphore;
+
+    /// A stage cell for the tests that do not assert on it.
+    fn stage_cell() -> AtomicU8 {
+        AtomicU8::new(PushStage::BeforeUpload.as_u8())
+    }
+
+    /// What the delivery push did, in the order it did it — the fake clock reading at each step. This
+    /// is the sequence the relay-401 class turns on, so the tests assert on the SEQUENCE, not on
+    /// whether the calls happened.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Step {
+        /// A token minted at this clock reading, carrying this NIP-40 expiration (if any).
+        Mint { at: i64, expiration: Option<i64> },
+        /// The uploaded-but-unverified fact journaled durably at this clock reading.
+        Journal { at: i64, commit: String },
+        /// The read-back ran at this clock reading.
+        Attest { at: i64, authorized: bool },
+    }
+
+    /// A fake clock the fake upload advances, so "the transfer took longer than the relay's window"
+    /// is a value these tests assert on instead of a sleep.
+    #[derive(Clone, Default)]
+    struct Recorder {
+        clock: Arc<AtomicI64>,
+        steps: Arc<Mutex<Vec<Step>>>,
+    }
+
+    impl Recorder {
+        fn now(&self) -> i64 {
+            self.clock.load(Ordering::SeqCst)
+        }
+
+        fn push(&self, step: Step) {
+            self.steps.lock().expect("steps").push(step);
+        }
+
+        fn mint(&self, expiration: Option<i64>) -> String {
+            let at = self.now();
+            self.push(Step::Mint { at, expiration });
+            format!("token@{at}")
+        }
+
+        fn steps(&self) -> Vec<Step> {
+            self.steps.lock().expect("steps").clone()
+        }
+
+        fn mints(&self) -> Vec<Step> {
+            self.steps()
+                .into_iter()
+                .filter(|step| matches!(step, Step::Mint { .. }))
+                .collect()
+        }
+    }
+
+    /// The relay's historical NIP-98 rule, which is what a token minted before a slow transfer runs
+    /// into: `created_at` must be within ±60 s of the relay's clock when the request arrives.
+    const RELAY_FRESHNESS_WINDOW_SECS: i64 = 60;
+
+    // THE FIX, stated as the relay would judge it: a pack that takes longer than the relay's ±60 s
+    // freshness window must not leave the post-upload verification holding the upload's token. The
+    // fake upload advances the clock by 200 s — past the window — and the verification token must be
+    // minted at the LATER clock reading, so the relay would still accept it.
+    // Red-on-revert: mint once before the upload and pass that one token to both legs (v0.5.8's
+    // shape) and the verification token's age is 200 s ⇒ this fails.
+    #[tokio::test]
+    async fn the_verification_token_is_minted_after_a_slow_upload_not_before_it() {
+        let recorder = Recorder::default();
+        let upload_expiry = 10_000;
+        let stage = stage_cell();
+        let attested = mint_upload_mint_attest(
+            true,
+            upload_expiry,
+            &stage,
+            || Ok(()),
+            {
+                let recorder = recorder.clone();
+                move |expiration| {
+                    let recorder = recorder.clone();
+                    async move { Ok::<_, String>(recorder.mint(expiration)) }
+                }
+            },
+            {
+                let recorder = recorder.clone();
+                move |header| async move {
+                    assert!(header.is_some(), "a relay-git upload leg carries a token");
+                    // The transfer itself: 200 s on the wire, well past the relay's window.
+                    recorder.clock.fetch_add(200, Ordering::SeqCst);
+                    // Journaled from inside the transfer, before the caller is resumed.
+                    recorder.push(Step::Journal {
+                        at: recorder.now(),
+                        commit: "uploaded-oid".to_string(),
+                    });
+                    Ok("uploaded-oid".to_string())
+                }
+            },
+            |uploaded: String, header| {
+                let recorder = recorder.clone();
+                async move {
+                    assert_eq!(uploaded, "uploaded-oid");
+                    recorder.push(Step::Attest {
+                        at: recorder.now(),
+                        authorized: header.is_some(),
+                    });
+                    Ok("attested-oid".to_string())
+                }
+            },
+        )
+        .await
+        .expect("the legs run");
+
+        assert_eq!(attested, "attested-oid");
+        let steps = recorder.steps();
+        assert_eq!(
+            steps,
+            vec![
+                Step::Mint { at: 0, expiration: Some(upload_expiry) },
+                Step::Journal { at: 200, commit: "uploaded-oid".to_string() },
+                Step::Mint { at: 200, expiration: None },
+                Step::Attest { at: 200, authorized: true },
+            ],
+            "mint → upload → journal → mint AGAIN → attest, in that order"
+        );
+        let now = recorder.now();
+        // The two mint instants, named: the upload's token was signed before a 200 s transfer, the
+        // verification's after it. Only the second is still inside the relay's tolerance.
+        let upload_minted_at = 0;
+        let verification_minted_at = 200;
+        assert!(
+            now - verification_minted_at <= RELAY_FRESHNESS_WINDOW_SECS,
+            "the verification token must be inside the relay's ±60 s window when the read-back runs"
+        );
+        assert!(
+            now - upload_minted_at > RELAY_FRESHNESS_WINDOW_SECS,
+            "the upload's token is exactly the one the relay would have refused for the read-back"
+        );
+    }
+
+    // The two tokens are not interchangeable: only the upload leg declares an expiration (the slow-
+    // transfer seam), and it is bounded by the push's own whole-operation ceiling. The verification
+    // leg is a single immediate request, so it takes the plain fresh token.
+    #[tokio::test]
+    async fn only_the_upload_token_declares_an_expiration_and_it_is_bounded() {
+        let recorder = Recorder::default();
+        let upload_expiry = super::delivery_push_token_lifetime_secs();
+        let stage = stage_cell();
+        mint_upload_mint_attest(
+            true,
+            upload_expiry,
+            &stage,
+            || Ok(()),
+            |expiration| {
+                let recorder = recorder.clone();
+                async move { Ok::<_, String>(recorder.mint(expiration)) }
+            },
+            |_header| async { Ok("uploaded".to_string()) },
+            |_uploaded: String, _header| async { Ok("oid".to_string()) },
+        )
+        .await
+        .expect("the legs run");
+
+        assert_eq!(
+            recorder.mints(),
+            vec![
+                Step::Mint { at: 0, expiration: Some(upload_expiry) },
+                Step::Mint { at: 0, expiration: None },
+            ],
+            "the upload token declares the push window; the verification token needs no extended life"
+        );
+        assert_eq!(
+            upload_expiry as u64,
+            DELIVERY_PUSH_TIMEOUT.as_secs() + DELIVERY_PUSH_TOKEN_MARGIN_SECS,
+            "the declared lifetime is the push's own ceiling plus its margin — not an open-ended token"
+        );
+    }
+
+    // A public/anonymous https remote is not auth-gated: no token is minted for either leg, exactly
+    // as before the split. The journal still runs — durability does not depend on auth.
+    #[tokio::test]
+    async fn a_public_remote_mints_no_token_for_either_leg() {
+        let recorder = Recorder::default();
+        let stage = stage_cell();
+        mint_upload_mint_attest(
+            false,
+            10_000,
+            &stage,
+            || Ok(()),
+            {
+                let recorder = recorder.clone();
+                move |expiration| {
+                    let recorder = recorder.clone();
+                    async move { Ok::<_, String>(recorder.mint(expiration)) }
+                }
+            },
+            {
+                let recorder = recorder.clone();
+                move |header: Option<String>| async move {
+                    assert!(header.is_none(), "no auth on a public remote");
+                    // The journal is the upload leg's own act now — written inside the transfer.
+                    recorder.push(Step::Journal { at: 0, commit: "uploaded".to_string() });
+                    Ok("uploaded".to_string())
+                }
+            },
+            |_uploaded: String, header| async move {
+                assert!(header.is_none(), "no auth on a public remote");
+                Ok("oid".to_string())
+            },
+        )
+        .await
+        .expect("the legs run");
+        assert!(recorder.mints().is_empty(), "no token is minted for a public remote");
+        assert_eq!(
+            recorder.steps(),
+            vec![Step::Journal { at: 0, commit: "uploaded".to_string() }],
+            "the upload is still journaled durably on an unauthenticated remote"
+        );
+    }
+
+    // The other half of the freshness fix: the upload token is minted only once the delivery-push
+    // lock is HELD. A delivery that waits behind another one must not spend its token's window
+    // waiting. The first delivery holds the lock while the clock advances 300 s; the second's token
+    // must carry the LATER reading.
+    // Red-on-revert: mint before calling `serialized_bounded_push` (v0.5.8's shape) and the second
+    // token's `created_at` is 0 ⇒ this fails.
+    //
+    // The BARRIER here carries as much weight as the assertion. This test first tried to give the
+    // leading delivery the permit with a bare `yield_now()`, which guarantees nothing: the semaphore
+    // hands the permit to whichever task reaches `acquire` first, so on a runtime whose second worker
+    // is not polled promptly the QUEUED delivery took the gate first, minted at clock 0, and failed a
+    // freshness test for a reason that had nothing to do with freshness — and passed under load,
+    // which is worse than failing. The leading delivery now announces custody from INSIDE the gate,
+    // and tokio's semaphore is FIFO, so ours provably waits on every scheduling.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_upload_token_is_minted_after_the_push_lock_is_acquired() {
+        let gate = Arc::new(Semaphore::new(1));
+        let recorder = Recorder::default();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel::<()>();
+        let queued = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let first = {
+            let (gate, recorder) = (gate.clone(), recorder.clone());
+            tokio::spawn(async move {
+                let stage = stage_cell();
+                serialized_bounded_push(&gate, Duration::from_secs(30), &stage, |permit| async move {
+                    // Inside the gate: the delivery ahead of ours HOLDS the permit from here.
+                    acquired_tx.send(()).expect("announce custody of the gate");
+                    // The delivery ahead of ours holds the permit while time passes on the wire.
+                    release_rx.await.expect("released");
+                    recorder.clock.fetch_add(300, Ordering::SeqCst);
+                    drop(permit);
+                    Ok::<_, DeliveryPushErr>("first-oid".to_string())
+                })
+                .await
+            })
+        };
+
+        // The gate is HELD before ours exists — not "probably held after a yield".
+        acquired_rx.await.expect("the first delivery took the permit");
+        assert_eq!(gate.available_permits(), 0, "the delivery ahead of ours holds the gate");
+        let second = {
+            let (gate, recorder, queued) = (gate.clone(), recorder.clone(), queued.clone());
+            tokio::spawn(async move {
+                let stage = stage_cell();
+                queued.store(true, Ordering::SeqCst);
+                serialized_bounded_push(&gate, Duration::from_secs(30), &stage, |permit| {
+                    mint_upload_mint_attest(
+                        true,
+                        10_000,
+                        &stage,
+                        || Ok(()),
+                        {
+                            let recorder = recorder.clone();
+                            move |expiration| {
+                                let recorder = recorder.clone();
+                                async move { Ok::<_, String>(recorder.mint(expiration)) }
+                            }
+                        },
+                        |_header| async move {
+                            drop(permit);
+                            Ok("uploaded".to_string())
+                        },
+                        |_uploaded: String, _header| async { Ok("second-oid".to_string()) },
+                    )
+                })
+                .await
+            })
+        };
+
+        // Ours has reached the gate and is waiting on it; it cannot mint without the permit, and the
+        // permit is not free. Bounded so a genuinely stuck task fails loudly instead of hanging.
+        let reached_the_gate = tokio::time::timeout(Duration::from_secs(5), async {
+            while !queued.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(reached_the_gate.is_ok(), "the queued delivery never reached the gate");
+        assert!(
+            recorder.mints().is_empty(),
+            "nothing may be minted while the delivery is still waiting for the lock"
+        );
+        release_tx.send(()).expect("release the first delivery");
+        assert_eq!(first.await.expect("joined").expect("first push"), "first-oid");
+        assert_eq!(second.await.expect("joined").expect("second push"), "second-oid");
+
+        let mints = recorder.mints();
+        assert_eq!(mints.len(), 2, "the queued delivery minted both of its own tokens");
+        assert_eq!(
+            mints[0],
+            Step::Mint { at: 300, expiration: Some(10_000) },
+            "the upload token is minted after the lock was acquired, not before the wait: {mints:?}"
+        );
+    }
+
+    // An authorization failure on the SECOND mint is its own outcome: nothing is attested, and the
+    // caller sees `Auth` (a signer problem) rather than a transport error it would read as a failed
+    // push. The upload is ALREADY journaled when that happens — which is what makes the failure
+    // recoverable instead of a pack nobody remembers.
+    #[tokio::test]
+    async fn a_failed_verification_mint_refuses_before_the_read_back() {
+        let recorder = Recorder::default();
+        let mints = Arc::new(AtomicI64::new(0));
+        let stage = stage_cell();
+        let result = mint_upload_mint_attest(
+            true,
+            10_000,
+            &stage,
+            || Ok(()),
+            |_expiration| {
+                let mints = mints.clone();
+                async move {
+                    if mints.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Ok("upload-token".to_string())
+                    } else {
+                        Err("signer actor gone (test)".to_string())
+                    }
+                }
+            },
+            {
+                let recorder = recorder.clone();
+                move |_header| async move {
+                    recorder.push(Step::Journal { at: 0, commit: "uploaded-oid".to_string() });
+                    Ok("uploaded-oid".to_string())
+                }
+            },
+            |_uploaded: String, _header| {
+                let recorder = recorder.clone();
+                async move {
+                    recorder.push(Step::Attest { at: 0, authorized: false });
+                    Ok("never".to_string())
+                }
+            },
+        )
+        .await;
+        // F1: the SECOND mint's failure is its own variant — the pack is already on the remote, and
+        // the caller must not be able to read this as a push that never landed.
+        assert!(matches!(result, Err(DeliveryPushErr::PostUploadAuth(_))), "{result:?}");
+        assert_eq!(
+            PushStage::from_u8(stage.load(Ordering::SeqCst)),
+            PushStage::AfterUpload,
+            "the stage records that the pack was accepted before the mint failed"
+        );
+        assert_eq!(
+            recorder.steps(),
+            vec![Step::Journal { at: 0, commit: "uploaded-oid".to_string() }],
+            "the upload is journaled and NO read-back runs without its own authorization"
+        );
+    }
+
+    // FAULT INJECTION — upload succeeds, read-back fails. This is the incident's exact shape, and
+    // the property that makes it recoverable: the durable journal is written BEFORE the read-back,
+    // so a 401 (or a kill) on the verification leg leaves the fact in the store, not only in a log.
+    // Red-on-revert: journal after the attestation and this fails — nothing is recorded.
+    #[tokio::test]
+    async fn a_readback_failure_still_leaves_the_upload_journaled() {
+        let recorder = Recorder::default();
+        let stage = stage_cell();
+        let result = mint_upload_mint_attest(
+            true,
+            10_000,
+            &stage,
+            || Ok(()),
+            |expiration| {
+                let recorder = recorder.clone();
+                async move { Ok::<_, String>(recorder.mint(expiration)) }
+            },
+            {
+                let recorder = recorder.clone();
+                move |_header| async move {
+                    recorder.clock.fetch_add(200, Ordering::SeqCst);
+                    // Journaled from INSIDE the transfer, before it returns to the caller.
+                    recorder.push(Step::Journal {
+                        at: recorder.now(),
+                        commit: "landed-oid".to_string(),
+                    });
+                    Ok("landed-oid".to_string())
+                }
+            },
+            |_uploaded: String, _header| async {
+                Err(DeliveryPushErr::Attest(
+                    crate::git_transport::TransportError::Auth("401 Unauthorized".into()),
+                ))
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(DeliveryPushErr::Attest(_))),
+            "the caller learns the read-back failed, distinctly from a push that never landed: {result:?}"
+        );
+        assert!(
+            recorder.steps().contains(&Step::Journal {
+                at: 200,
+                commit: "landed-oid".to_string()
+            }),
+            "the uploaded-but-unverified fact is durable even though the delivery never verified: {:?}",
+            recorder.steps()
+        );
     }
 }
 
@@ -3721,6 +4856,22 @@ const RETRACTION_PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Cadence of the outbox drain / housekeeping tick.
 const DRAIN_INTERVAL: Duration = Duration::from_secs(5);
 
+/// R2B: the ceiling on ONE drain tick — the sweep AND the outbox drain that follows it, together.
+///
+/// The tick arm is not a background task. It runs on the select loop that also serves shutdown,
+/// the relay stream and the remittance timers, so every millisecond it spends awaiting a remote is
+/// a millisecond in which this seat answers nothing else. An unbounded drain made that arbitrary:
+/// a backlog of rows against a slow-but-finite publisher holds the loop for the SUM of their
+/// waits, none of which is individually a hang, which is why no per-publish timeout would have
+/// caught it.
+///
+/// One tick's period is the budget, because a tick that outlasts its own period cannot be keeping
+/// to a period. Nothing is lost when it binds: the rows are durable and still pending, and the next
+/// tick starts again. The cost of the cap is latency on a backlog; the cost of no cap is the loop.
+const DRAIN_TICK_BUDGET: Duration = DRAIN_INTERVAL;
+
+
+
 /// A booted seller node with its live relay surface.
 pub struct SellerNodeRunner {
     node: SellerNode,
@@ -3753,7 +4904,26 @@ pub struct SellerNodeRunner {
     /// `git-receive-pack` to one repo is what the relay 409s (the multi-slot delivery hazard). Held
     /// ONLY across the push (execution stays parallel) and bounded by [`DELIVERY_PUSH_TIMEOUT`], so a
     /// hung push releases it rather than starving every later delivery behind the lock.
-    delivery_push_lock: tokio::sync::Mutex<()>,
+    /// #562 + custody: admits ONE delivery push at a time to this seat's single delivery remote.
+    /// A semaphore rather than a mutex because the permit must be able to OUTLIVE the async caller:
+    /// the upload runs on a blocking thread that finishes even if its awaiting future is dropped at
+    /// a timeout, so the permit travels INTO that blocking op and is released when the
+    /// `git-receive-pack` actually ends — never while one is still in flight.
+    delivery_push_gate: std::sync::Arc<tokio::sync::Semaphore>,
+    /// R1: the job ids whose delivery transfer a LIVE in-process lane owns right now.
+    ///
+    /// The reconciliation sweep and a live push can hold opposite opinions about the same job: the
+    /// live lane has written its pre-upload intent and is mid-transfer; the sweep sees exactly that
+    /// intent row and would read the remote back — and fail the job — before the pack it is asking
+    /// about has landed. Ownership is the answer, and it is deliberately IN-PROCESS: an owner exists
+    /// only while a lane of THIS process is actually driving the transfer. A crashed lane leaves no
+    /// owner behind, so crashed-Intent recovery — the whole reason the marker is durable — keeps
+    /// working unchanged on the next boot.
+    delivery_transfer_owners: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// R2: the ceiling on ONE recovery sweep pass. A field rather than a bare const ONLY so a test
+    /// can drive the exhausted case; production sets it from [`RECOVERY_SWEEP_BUDGET`] and never
+    /// changes it.
+    recovery_sweep_budget: std::time::Duration,
     /// #541: relay-derived set of SETTLED offer ids (a co-signed kind-3400 receipt has been seen).
     /// Read before any claim to skip a terminal offer that re-appears via backfill or redelivery.
     /// Populated by [`Self::on_receipt`] from the live receipt subscription and its boot/reconnect
@@ -3798,6 +4968,15 @@ pub struct SellerNodeRunner {
     /// branch is exercised without waiting a minute.
     #[cfg(test)]
     remit_drain_bound_for_test: Mutex<Option<Duration>>,
+    /// R2B/O-B1 test seam: a shorter drain cadence than [`DRAIN_TICK_BUDGET`], so a test can watch
+    /// several real ticks without waiting five seconds each.
+    ///
+    /// Held PER RUNNER rather than in an environment variable deliberately. The cadence is also
+    /// the tick's BUDGET, so a global seam would shorten every concurrently running loop test's
+    /// budget too, cutting off their publishes and deferring rows they expect to land. A seam that
+    /// can make another test flake is not a seam.
+    #[cfg(test)]
+    drain_cadence_for_test: Mutex<Option<Duration>>,
 }
 
 /// How long a requested shutdown waits for a remittance attempt already in flight before it gives
@@ -4094,7 +5273,11 @@ impl SellerNodeRunner {
             agents,
             slots,
             capacity_skip_pending: std::sync::atomic::AtomicBool::new(false),
-            delivery_push_lock: tokio::sync::Mutex::new(()),
+            delivery_push_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            delivery_transfer_owners: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
+            recovery_sweep_budget: RECOVERY_SWEEP_BUDGET,
             terminal_offers: TerminalOffers::new(TERMINAL_OFFERS_CAP, TERMINAL_AUTHORS_PER_OFFER),
             fed_under_rate_offers: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
             shutdown: shutdown::ShutdownChannel::new(),
@@ -4108,6 +5291,8 @@ impl SellerNodeRunner {
             remit_effects_for_test: Mutex::new(None),
             #[cfg(test)]
             remit_drain_bound_for_test: Mutex::new(None),
+            #[cfg(test)]
+            drain_cadence_for_test: Mutex::new(None),
         })
     }
 
@@ -4124,6 +5309,34 @@ impl SellerNodeRunner {
             .remit_drain_bound_for_test
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = drain_bound;
+    }
+
+    /// R2B/O-B1 test seam: shorten this runner's drain cadence. Called BEFORE [`Self::run`].
+    #[cfg(test)]
+    fn drain_cadence_for_test(&self, cadence: Duration) {
+        *self
+            .drain_cadence_for_test
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cadence);
+    }
+
+    /// The effective drain cadence — which is ALSO the tick's budget.
+    ///
+    /// One reader for both deliberately. The budget IS one period, so a seam that shortened the
+    /// cadence without shortening the budget would let a test observe ticks while still granting
+    /// each the full production allowance: it would be measuring a tick that does not exist.
+    fn drain_interval(&self) -> Duration {
+        #[cfg(test)]
+        {
+            if let Some(cadence) = *self
+                .drain_cadence_for_test
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+            {
+                return cadence;
+            }
+        }
+        DRAIN_TICK_BUDGET
     }
 
     /// The effects factory a remittance thread should use: the test's, or none (live).
@@ -4635,7 +5848,7 @@ impl SellerNodeRunner {
             }
         }
 
-        let mut drain_tick = tokio::time::interval(DRAIN_INTERVAL);
+        let mut drain_tick = tokio::time::interval(self.drain_interval());
         let wrap_backfill_interval_secs = resolve_wrap_backfill_interval_secs();
         let mut wrap_backfill_tick =
             tokio::time::interval(Duration::from_secs(wrap_backfill_interval_secs));
@@ -4727,10 +5940,23 @@ impl SellerNodeRunner {
                     break;
                 }
                 _ = drain_tick.tick() => {
+                    // R2B: ONE deadline for the whole tick, taken BEFORE the first await.
+                    //
+                    // Taken here rather than between the two calls, so that a sweep which spends
+                    // the tick cannot hand the drain a fresh full window — the exact "each stage
+                    // re-reads its own allowance" overrun the absolute budget exists to stop. If
+                    // the sweep runs long the drain simply finds nothing left and defers; its rows
+                    // are durable and the next tick takes them.
+                    let tick_deadline = std::time::Instant::now() + self.drain_interval();
                     self.sweep_lapsed_claims();
                     self.reconsider_capacity_skips().await;
                     self.start_due_harness_probes();
-                    self.drain().await;
+                    // Held deliveries (uploaded/intended, unverified) are swept on THIS clock, so a
+                    // seat that just keeps running still verifies or lapses them — recovery no longer
+                    // waits for a new award or a reboot.
+                    self.sweep_uploaded_verifications().await;
+                    self.drain_bounded(crate::seller_node::outbox::DrainBudget::Until(tick_deadline))
+                        .await;
                     continue;
                 }
                 // Stage 2a, addendum 2: the remittance retry tick. Disabled while an attempt is in
@@ -6854,7 +8080,29 @@ impl SellerNodeRunner {
             // A fresh award, or any row that already skips/finalizes/fails on local markers: no derive.
             false
         };
-        match resume_action(state, has_delivery, has_receipt, settled_elsewhere, pushed, deadline_unix, now) {
+        // The uploaded-but-unverified marker: a pack the remote accepted whose read-back never
+        // confirmed it (a 401 on the verification leg, or a kill between the two legs). Read
+        // tolerantly like every other marker — a read error degrades to "no marker", which re-drives
+        // the agent exactly as a pre-marker binary would, rather than stalling a genuine award.
+        //
+        // It is NOT part of `is_live_residual` above: a row with this marker still gets the #563
+        // relay-derive, and a positive settled-elsewhere finding still outranks the verification
+        // (the buyer has left; there is nobody to deliver to).
+        // A read that FAILED is not a read that said "nothing". Degrading it to None is what would
+        // authorize the agent to run again for a delivery that may already be on the remote, so an
+        // unreadable marker declines to decide: this pass does nothing and the next tick asks again.
+        // (Absence, once actually read, still runs the agent — that is the #552 foil.)
+        let uploaded_unverified = match self.node.store().upload_marker(job_id) {
+            Ok(marker) => marker.map(|marker| marker.commit),
+            Err(error) => {
+                opline!("seller node execute job_id={job_id}: upload marker read failed ({error}); declining to decide this pass — no agent run and no push while it is unknown whether a delivery is already on the remote");
+                return;
+            }
+        };
+        match resume_action_with_upload_marker(
+            resume_action(state, has_delivery, has_receipt, settled_elsewhere, pushed, deadline_unix, now),
+            uploaded_unverified,
+        ) {
             ResumeAction::RunAgent => {
                 // #628: an `awarded` row records that a job was bound, never WHICH claim the buyer
                 // chose, so a resume cannot separate a job this seat won from one it lost in an
@@ -6872,7 +8120,14 @@ impl SellerNodeRunner {
                 opline!(
                     "seller node execute job_id={job_id}: delivery already pushed (commit={commit}) — finalizing from the stored commit, NOT re-running the agent (#552)"
                 );
-                self.finalize_pushed_delivery(job_id, &commit).await;
+                self.finalize_pushed_delivery(job_id, &commit, None).await;
+                return;
+            }
+            ResumeAction::VerifyUploadedDelivery(commit) => {
+                opline!(
+                    "seller node execute job_id={job_id}: delivery uploaded but NEVER verified (commit={commit}) — re-verifying the remote under a freshly minted token, NOT re-pushing and NOT re-running the agent"
+                );
+                self.verify_uploaded_delivery(job_id, &commit, None).await;
                 return;
             }
             ResumeAction::SkipTerminal => {
@@ -6909,7 +8164,7 @@ impl SellerNodeRunner {
             Ok(Some(creq)) => creq,
             _ => {
                 opline!("seller node execute fail job_id={job_id}: stored creq missing");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None, crate::seller_node::outbox::DrainBudget::Unbudgeted).await;
                 return;
             }
         };
@@ -6942,7 +8197,7 @@ impl SellerNodeRunner {
                  this node (never substituted)",
                 requested_agent.as_deref().unwrap_or("<any>")
             );
-            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, UNDISPATCHABLE_REASON_CODE, CAPABILITY_MISSING_FEEDBACK, None).await;
+            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, UNDISPATCHABLE_REASON_CODE, CAPABILITY_MISSING_FEEDBACK, None, crate::seller_node::outbox::DrainBudget::Unbudgeted).await;
             return;
         };
         let agent_command = selected.agent.argv.clone();
@@ -7063,13 +8318,14 @@ impl SellerNodeRunner {
                         reason_code,
                         EXEC_FAILURE_FEEDBACK,
                         Some(reason_detail),
+                        crate::seller_node::outbox::DrainBudget::Unbudgeted,
                     )
                     .await;
                     return;
                 }
                 Err(error) => {
                     opline!("seller node execute fail job_id={job_id}: workdir init failed ({error})");
-                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None).await;
+                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None, crate::seller_node::outbox::DrainBudget::Unbudgeted).await;
                     return;
                 }
             };
@@ -7092,7 +8348,7 @@ impl SellerNodeRunner {
                 Ok(sandbox) => sandbox,
                 Err(error) => {
                     opline!("seller node execute fail job_id={job_id}: sandbox config invalid ({error})");
-                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None).await;
+                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None, crate::seller_node::outbox::DrainBudget::Unbudgeted).await;
                     return;
                 }
             };
@@ -7120,7 +8376,7 @@ impl SellerNodeRunner {
                 Err(error) => {
                     opline!("seller node execute fail job_id={job_id}: agent run failed ({error})");
                     self.drop_harness(harness, harness_fault_for(&error));
-                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None).await;
+                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None, crate::seller_node::outbox::DrainBudget::Unbudgeted).await;
                     return;
                 }
             };
@@ -7200,7 +8456,7 @@ impl SellerNodeRunner {
                             (ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK)
                         }
                     };
-                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, reason_code, feedback, None)
+                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, reason_code, feedback, None, crate::seller_node::outbox::DrainBudget::Unbudgeted)
                         .await;
                     return;
                 }
@@ -7210,23 +8466,10 @@ impl SellerNodeRunner {
             // actor (which owns the seller key), so the push path is NOT a third custody site — the key
             // stays confined to the actor + the authenticated relay client, never re-read here. A
             // public/anonymous https remote takes no header (auth applies to relay-git remotes only).
-            let push_header = if crate::delivery_transport::is_relay_git_locator(&seller.git_remote) {
-                match self.node.signer().http_auth_header(seller.git_remote.clone(), Some(push_ref.clone()), None).await {
-                    Ok(Ok(header)) => Some(header),
-                    Ok(Err(error)) => {
-                        opline!("seller node execute fail job_id={job_id}: push auth sign failed ({error})");
-                        self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
-                        return;
-                    }
-                    Err(error) => {
-                        opline!("seller node execute fail job_id={job_id}: signer actor gone ({error})");
-                        self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
-                        return;
-                    }
-                }
-            } else {
-                None
-            };
+            // The header is NOT minted here. Both legs mint inside the closure below, which runs
+            // only once the delivery-push lock is held — see `serialized_bounded_push`.
+            let relay_git_remote =
+                crate::delivery_transport::is_relay_git_locator(&seller.git_remote);
             // #562: serialize the delivery push to this seat's ONE delivery remote, bounded so a hung
             // push frees the lock instead of starving every later delivery. Concurrent awarded jobs push
             // per-job branches to the same repo, and concurrent git-receive-pack to one repo is what the
@@ -7237,34 +8480,121 @@ impl SellerNodeRunner {
             // (tests/hostile_local_git_config.rs); the transport also binds every leg to
             // `seller.git_remote`. Safe here: the job container has already exited, so no agent
             // process is alive to re-plant the redirect between the rewrite and the push. Both run in
-            // one blocking op inside `neutralize_then_push_off_runtime`, which pushes the gated object
-            // and returns the oid the remote attests.
+            // one blocking op inside `neutralize_then_upload_off_runtime`, which uploads the gated
+            // object; the attestation is a second leg with a second, freshly minted token.
+            //
+            // Authorization freshness (the relay-401 class): BOTH tokens are minted inside this
+            // closure, which `serialized_bounded_push` runs only after the lock is held. The upload
+            // token therefore never spends its ±60 s NIP-98 window waiting behind another delivery
+            // (which may hold the lock for up to DELIVERY_PUSH_TIMEOUT), and the verification token
+            // is minted AFTER the pack is on the wire, so a slow transfer cannot leave the read-back
+            // holding a token the relay has already aged out. Both stay branch-scoped to `push_ref`
+            // and repo-root-bound to `seller.git_remote`, signed THROUGH the signer actor — the
+            // custody, the ref binding and the exact-oid attestation are unchanged.
+            // WHERE the push got to, published for the timeout arm below: a timeout cannot otherwise
+            // tell a push that never started from one whose pack is already in flight, and those two
+            // have opposite terminal rights.
+            let push_stage = std::sync::atomic::AtomicU8::new(PushStage::BeforeUpload.as_u8());
+            // The journal the upload leg runs from INSIDE its blocking op, on an owned store handle:
+            // a cancelled or timed-out caller is not there to run a post-await callback, and the fact
+            // that the remote accepted the pack must not depend on the caller still waiting.
+            let journal_store = self.node.store().clone();
+            let journal_job = job_id.to_owned();
+            // R1: OWN this job's transfer before the pre-upload intent is written, so the row the
+            // sweep enumerates never exists without a live owner standing behind it. `None` means a
+            // lane of this process is already driving the same job: that lane owns the outcome, so
+            // this one neither pushes nor fails the job — a second push would be the duplicate the
+            // ownership exists to prevent.
+            let Some(transfer_ownership) = self.claim_delivery_transfer(job_id) else {
+                opline!("seller node execute job_id={job_id}: a live delivery transfer already owns this job — not starting a second push");
+                return;
+            };
+            // Shared so the BLOCKING op can hold it: the caller's handle dies with a cancelled or
+            // timed-out future, the upload's handle dies when `git-receive-pack` actually ends.
+            let transfer_ownership = std::sync::Arc::new(transfer_ownership);
+            let upload_ownership = std::sync::Arc::clone(&transfer_ownership);
             let commit = match serialized_bounded_push(
-                &self.delivery_push_lock,
+                &self.delivery_push_gate,
                 DELIVERY_PUSH_TIMEOUT,
-                || {
-                    seller_git::neutralize_then_push_off_runtime(
-                        workdir.clone(),
-                        seller.git_remote.clone(),
-                        branch.clone(),
-                        gated_oid.clone(),
-                        push_header,
+                &push_stage,
+                |permit| {
+                    // A slow pack upload spans several HTTP legs under ONE token. Sizing the NIP-40
+                    // expiration to the whole-operation bound is what lets a relay that grants
+                    // scoped-token lifetimes (Requirement B) keep authorizing those legs; a relay on
+                    // the historical ±60 s rule ignores the tag and behaves exactly as before.
+                    // Bounded by the push's own ceiling — nothing longer.
+                    let upload_expiry = now_unix() + delivery_push_token_lifetime_secs();
+                    mint_upload_mint_attest(
+                        relay_git_remote,
+                        upload_expiry,
+                        &push_stage,
+                        || {
+                            // DURABLE PRE-EFFECT INTENT, and it is REQUIRED: this job is about to put
+                            // `gated_oid` on the remote, and from the next line onward the remote may
+                            // hold it whatever happens to this process. If the write does not land we
+                            // do NOT push — an upload nothing remembers is the fault this path exists
+                            // to prevent, and refusing costs one delivery instead of orphaning a pack.
+                            match self.node.store().mark_upload_intent(job_id, &gated_oid, now_unix()) {
+                                Ok(1..) => Ok(()),
+                                Ok(_) => Err(DeliveryPushErr::IntentUnrecorded(
+                                    "no jobs row accepted the upload intent".to_owned(),
+                                )),
+                                Err(error) => Err(DeliveryPushErr::IntentUnrecorded(error.to_string())),
+                            }
+                        },
+                        |expiry| self.mint_delivery_push_header(&seller.git_remote, &push_ref, expiry),
+                        |header| async {
+                            let journal_store = journal_store.clone();
+                            let journal_job = journal_job.clone();
+                            seller_git::neutralize_then_upload_off_runtime(
+                                workdir.clone(),
+                                seller.git_remote.clone(),
+                                branch.clone(),
+                                gated_oid.clone(),
+                                header,
+                                move |uploaded: &crate::git_transport::UploadedDelivery| {
+                                    // R1: ownership rides INTO the blocking op with the custody
+                                    // permit and is released only when this closure (and with it the
+                                    // upload) is dropped — so a cancelled caller cannot hand the
+                                    // sweep a job whose pack is still on the wire.
+                                    let _transfer_ownership = &upload_ownership;
+                                    // Upgrade intent → uploaded, inside the blocking op. Not
+                                    // load-bearing (the intent row already makes this job
+                                    // reconciliable); it sharpens what the operator and the sweep see.
+                                    if let Err(error) = journal_store.mark_uploaded_unverified(
+                                        &journal_job,
+                                        uploaded.gated_oid(),
+                                        now_unix(),
+                                    ) {
+                                        eprintln!("seller push journal job_id={journal_job}: uploaded-unverified upgrade failed ({error}); the pre-upload intent still stands");
+                                    }
+                                },
+                                // Custody: the serialization permit rides into the blocking op, so
+                                // the next delivery is admitted when this receive-pack ENDS, not when
+                                // this caller stops waiting for it.
+                                Some(permit),
+                            )
+                            .await
+                            .map_err(DeliveryPushErr::Push)
+                        },
+                        |uploaded, header| async {
+                            // RAW transport outcome: the same classifier decides for this live pass
+                            // and for a resumed one.
+                            seller_git::attest_upload_off_runtime(uploaded, header, "push")
+                                .await
+                                .map_err(DeliveryPushErr::Attest)
+                        },
                     )
                 },
             )
             .await
             {
                 Ok(oid) => oid,
-                Err(DeliveryPushErr::Push(error)) => {
-                    opline!("seller node execute fail job_id={job_id}: git push failed ({error})");
-                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
-                    return;
-                }
-                Err(DeliveryPushErr::TimedOut(secs)) => {
-                    // Timeout lands in the SAME delivery_failed handling (lead 37896 — no new state); the
-                    // lock is already released, so later deliveries are not starved behind this one.
-                    opline!("seller node execute fail job_id={job_id}: git push exceeded {secs}s (delivery-push lock released; treated as delivery_failed)");
-                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+                Err(error) => {
+                    // ONE production handler for every push failure, stage-aware, shared with the
+                    // tests that prove it: it decides terminal-or-held and performs the store effects.
+                    self.handle_delivery_push_failure(job_id, &offer.buyer_pubkey, error)
+                        .await;
                     return;
                 }
             };
@@ -7274,8 +8604,20 @@ impl SellerNodeRunner {
         // #552: arm the durable pushed-delivery marker IMMEDIATELY after the push (arm-state-after-
         // the-event) and BEFORE the sign+enqueue — so a crash in that window is a RESUMABLE delivery
         // (finalized from this commit) rather than a re-run that re-executes the agent and re-pushes.
-        if let Err(error) = self.node.store().mark_pushed(job_id, &commit, now_unix()) {
-            opline!("seller node execute job_id={job_id}: mark_pushed failed (continuing): {error}");
+        // R1: this fence is load-bearing, not bookkeeping. `Ok(0)` means the row did NOT move
+        // because the job is already terminal — a reconciliation pass answered for it while this
+        // pack was going up. Continuing would sign and enqueue a SECOND answer for a job the buyer
+        // has already been told about. The recovery lane has always honoured this; the live lane
+        // used to discard the count and push on regardless.
+        match self.node.store().mark_pushed(job_id, &commit, now_unix()) {
+            Ok(0) => {
+                opline!("seller node execute job_id={job_id}: the job reached a terminal state while the pack was being pushed — not finalizing over another lane's outcome");
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                opline!("seller node execute job_id={job_id}: mark_pushed failed (continuing): {error}");
+            }
         }
 
         // Bind the trade + delivered commit + STORED creq hash into the co-signature preimage and
@@ -7284,7 +8626,7 @@ impl SellerNodeRunner {
             Ok(kind) => kind,
             Err(error) => {
                 opline!("seller node execute fail job_id={job_id}: delivery kind typing failed ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None, crate::seller_node::outbox::DrainBudget::Unbudgeted).await;
                 return;
             }
         };
@@ -7302,12 +8644,12 @@ impl SellerNodeRunner {
             Ok(Ok(sig)) => sig,
             Ok(Err(error)) => {
                 opline!("seller node execute fail job_id={job_id}: receipt sign refused ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None, crate::seller_node::outbox::DrainBudget::Unbudgeted).await;
                 return;
             }
             Err(error) => {
                 opline!("seller node execute fail job_id={job_id}: signer actor gone ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None, crate::seller_node::outbox::DrainBudget::Unbudgeted).await;
                 return;
             }
         };
@@ -7352,26 +8694,17 @@ impl SellerNodeRunner {
             Ok(None) => {}
             Err(reason) => {
                 opline!("seller node execute fail job_id={job_id}: {reason}");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None, crate::seller_node::outbox::DrainBudget::Unbudgeted).await;
                 return;
             }
         }
         // Journal the delivery + enqueue the result in one transaction. Idempotent: a resumed job
         // that already delivered re-enqueues nothing (invariant 2 — no divergent double-publish).
-        let now = now_unix();
-        match self.node.store().deliver_and_enqueue(
-            job_id,
-            &commit,
-            // §3.2 — the mode the JOB was posted under, read off the journaled offer row, not
-            // inferred from the amount. `offer` came from the store precisely because execution can
-            // be a restart away from the claim.
-            offer.payment_mode,
-            &draft,
-            now,
-            now + RESULT_PUBLISH_WINDOW_SECS,
-            now,
-        ) {
-            Ok(true) => {
+        // §3.2 — the mode the JOB was posted under, read off the journaled offer row, not
+        // inferred from the amount. `offer` came from the store precisely because execution can be
+        // a restart away from the claim.
+        match self.journal_delivery_result(job_id, &commit, offer.payment_mode, &draft) {
+            Ok(crate::seller_node::store::DeliveryJournal::Enqueued) => {
                 // `agent=` is the RESOLVED harness id for this run, read from the SAME
                 // exec-metadata block stamped on the outgoing result — so the log provably
                 // matches the wire byte-for-byte (one vocabulary with the buyer's settled line;
@@ -7388,16 +8721,28 @@ impl SellerNodeRunner {
                     "seller node delivered job_id={job_id} commit={commit} agent={harness_id} result enqueued"
                 )
             }
-            Ok(false) => opline!(
+            Ok(crate::seller_node::store::DeliveryJournal::AlreadyDelivered) => opline!(
                 "seller node execute job_id={job_id}: delivery already journaled (dedup no-op)"
+            ),
+            // R1: the live lane lost a race to a terminal failure (a reconciliation pass already
+            // gave this job its one answer). The result is NOT enqueued on top of it.
+            Ok(crate::seller_node::store::DeliveryJournal::Fenced) => opline!(
+                "seller node execute job_id={job_id}: the job was already failed when the journal ran — no result enqueued (the fence held)"
+            ),
+            // R2: the deadline was judged INSIDE the write transaction, so this is the verdict that
+            // counts — every earlier check was separated from the write by a lock this lane did not
+            // hold while it signed and built the envelope.
+            Ok(crate::seller_node::store::DeliveryJournal::DeadlinePassed) => opline!(
+                "seller node execute job_id={job_id}: the offer deadline had passed at the instant of the durable write — no late result enqueued"
             ),
             Err(error) => {
                 opline!("seller node execute fail job_id={job_id}: deliver journal failed ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None, crate::seller_node::outbox::DrainBudget::Unbudgeted).await;
                 return;
             }
         }
-        self.drain().await;
+        // R2B: this job's result, promptly and bounded — not the whole backlog on this lane.
+        self.drain_terminal_event(job_id, crate::seller_node::outbox::DrainBudget::Unbudgeted).await;
     }
 
     /// Task B2: deliver `job_id` through ONE sandbox container that runs the agent AND all git. The
@@ -7778,6 +9123,549 @@ impl SellerNodeRunner {
         }
     }
 
+    /// Mint the branch-scoped NIP-98 header for ONE leg of the host delivery push, through the
+    /// signer actor (the seller key never leaves it). Called once per leg, each time from inside the
+    /// delivery-push lock, so every leg carries authorization minted for THAT leg — the whole point
+    /// being that a NIP-98 token's life is measured from `created_at`, not from when it is used.
+    /// `expiration_unix` is `Some` only where the leg may span several HTTP requests (the upload).
+    /// The header is returned to the caller and never logged.
+    async fn mint_delivery_push_header(
+        &self,
+        remote: &str,
+        push_ref: &str,
+        expiration_unix: Option<i64>,
+    ) -> Result<String, String> {
+        match self
+            .node
+            .signer()
+            .http_auth_header(remote.to_owned(), Some(push_ref.to_owned()), expiration_unix)
+            .await
+        {
+            Ok(Ok(header)) => Ok(header),
+            Ok(Err(error)) => Err(format!("push auth sign failed ({error})")),
+            Err(error) => Err(format!("signer actor gone ({error})")),
+        }
+    }
+
+    /// THE production disposition for every delivery-push failure, stage-aware.
+    ///
+    /// One rule decides all of them: **a delivery that may be on the remote may not be failed here.**
+    /// A `failed` row is terminal — resume precedence skips it before any marker can help — so
+    /// failing a job whose pack the remote already accepted orphans that pack forever. Only two kinds
+    /// of authority may end such a job: the remote's own exact-oid answer, or the offer's deadline.
+    ///
+    /// Everything that fires BEFORE the pack can exist keeps the old terminal behavior, because
+    /// nothing is orphaned by failing it: an unrecorded intent, an authorization refused before the
+    /// upload, a definitively refused upload, a timeout that fired before the transfer began.
+    ///
+    /// Returns what it did, so the caller and the tests read the disposition instead of a log line.
+    async fn handle_delivery_push_failure(
+        &self,
+        job_id: &str,
+        buyer_pubkey: &str,
+        error: DeliveryPushErr,
+    ) -> DeliveryPushDisposition {
+        let fail = |detail: String| async move {
+            opline!("seller node execute fail job_id={job_id}: {detail}");
+            self.fail_job_with_feedback(
+                job_id,
+                buyer_pubkey,
+                ReasonCode::DeliveryFailed,
+                DELIVERY_FAILURE_FEEDBACK,
+                None,
+                crate::seller_node::outbox::DrainBudget::Unbudgeted,
+            )
+            .await;
+            DeliveryPushDisposition::Failed
+        };
+        let hold = |detail: String| {
+            opline!("seller node execute job_id={job_id}: {detail}; the delivery is journaled and held for the exact-oid read-back — no failure event, no re-push, no agent re-run (bounded by the offer deadline)");
+            DeliveryPushDisposition::HeldForVerification
+        };
+        match error {
+            // Nothing was sent, and nothing WILL be: we refuse to upload what we could not first
+            // record. Failing costs one delivery; uploading anyway would risk a pack nothing knows about.
+            DeliveryPushErr::IntentUnrecorded(detail) => {
+                fail(format!(
+                    "delivery push refused before it began: the upload intent could not be journaled ({detail}) — never uploading a pack this seat could not first record"
+                ))
+                .await
+            }
+            // The signer refused BEFORE the upload: nothing reached the remote.
+            DeliveryPushErr::PreUploadAuth(detail) => {
+                fail(format!(
+                    "delivery push authorization failed before the upload ({detail})"
+                ))
+                .await
+            }
+            // THE F1 CASE. The pack is on the remote and the token that would have proved it never
+            // got signed. Failing here is what orphaned a landed delivery: the row went terminal and
+            // no resume ever looked at it again. It is held instead.
+            DeliveryPushErr::PostUploadAuth(detail) => hold(format!(
+                "the pack was accepted and the VERIFICATION authorization then failed ({detail})"
+            )),
+            DeliveryPushErr::Push(error) => match &error {
+                // An io fault mid-upload cannot tell us whether the remote took the pack. Unknown is
+                // not refused: hold it and let the read-back decide.
+                seller_git::SellerGitError::Io(detail) => hold(format!(
+                    "the upload could not be resolved ({detail}) — whether the remote holds the pack is unknown"
+                )),
+                // Refused (auth/rejected/no-sentinel/git failure): the remote did not take it.
+                _ => fail(format!("git push failed ({error})")).await,
+            },
+            // THE F5 CASE. The read-back's RAW outcome, classified by the SAME function the resumed
+            // lane uses: the remote's definitive "not there" fails closed on this live pass instead of
+            // waiting for a resume, and an unknown (401 / io) stays unresolved instead of failing a
+            // delivery that is probably sitting on the remote.
+            DeliveryPushErr::Attest(error) => {
+                match uploaded_verification_outcome(Err(&error)) {
+                    UploadedVerification::FailClosed => {
+                        fail(format!(
+                            "the remote answered and does not hold the delivery at the pushed oid ({error}) — failing closed, never re-pushing"
+                        ))
+                        .await
+                    }
+                    UploadedVerification::Unresolved => hold(format!(
+                        "the pack was accepted and the read-back could not be resolved ({error})"
+                    )),
+                    // `Ok` never reaches this handler; treat it as unresolved rather than inventing a
+                    // delivery from an error path.
+                    UploadedVerification::Deliver => hold(format!(
+                        "the read-back reported an error that classified as success ({error})"
+                    )),
+                }
+            }
+            // THE F3 CASE. A timeout says the caller stopped waiting, never that the remote stopped
+            // receiving: the blocking upload runs to completion on its own thread and still holds the
+            // serialization permit. Only a timeout that fired BEFORE the transfer began may be fatal.
+            DeliveryPushErr::TimedOut { secs, stage } => {
+                if stage.upload_may_have_landed() {
+                    hold(format!(
+                        "the delivery push exceeded {secs}s at stage {stage:?}; the upload may be on the remote (its blocking op keeps the serialization permit until it ends)"
+                    ))
+                } else {
+                    fail(format!(
+                        "delivery push exceeded {secs}s before the upload began (nothing was sent; the delivery-push permit is free)"
+                    ))
+                    .await
+                }
+            }
+        }
+    }
+
+    /// Has this job's offer deadline passed, as of NOW? `false` when the deadline is unknown — never
+    /// fail a genuine delivery on a fact we could not read (the same asymmetry `resume_action` uses).
+    fn offer_deadline_lapsed(&self, job_id: &str) -> bool {
+        match self.node.store().offer_row(job_id) {
+            Ok(Some(offer)) => offer.deadline_unix <= now_unix(),
+            _ => false,
+        }
+    }
+
+    /// R1: claim ownership of this job's delivery transfer for the live lane, or `None` when a lane
+    /// already owns it. Claimed BEFORE the pre-upload intent write, so no window exists in which the
+    /// intent row is visible to the sweep without an owner standing behind it.
+    fn claim_delivery_transfer(&self, job_id: &str) -> Option<DeliveryTransferOwnership> {
+        let mut owned = match self.delivery_transfer_owners.lock() {
+            Ok(owned) => owned,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !owned.insert(job_id.to_owned()) {
+            return None;
+        }
+        Some(DeliveryTransferOwnership {
+            job_id: job_id.to_owned(),
+            owners: self.delivery_transfer_owners.clone(),
+        })
+    }
+
+    /// R1: is a live lane of this process driving this job's transfer right now? The sweep asks
+    /// before touching a held row; `false` after a crash, which is what keeps crashed-Intent recovery
+    /// working.
+    fn delivery_transfer_owned(&self, job_id: &str) -> bool {
+        let owned = match self.delivery_transfer_owners.lock() {
+            Ok(owned) => owned,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        owned.contains(job_id)
+    }
+
+    /// The ONE terminal disposition for a journaled delivery that will not be completed: the
+    /// deadline passed, or the attempt cap was reached. Emits the same `delivery_failed` feedback the
+    /// live path emits, so a buyer cannot tell the lanes apart, and does it exactly once — a row that
+    /// is already terminal is skipped by `fail_job`'s own state guard.
+    /// R2B: the LAPSE route carries the pass budget too.
+    ///
+    /// A failure is a terminal decision like any other, and the publish that follows it is bounded
+    /// by what the sweep has left — not by a fresh ceiling it did not earn. Propagating the
+    /// remainder only through the success tail leaves the cheapest way to overrun a tick wide open:
+    /// fail a row late in a spent pass and the drain starts a new five seconds.
+    async fn fail_uploaded_delivery(&self, job_id: &str, why: &str, budget: crate::seller_node::outbox::DrainBudget) {
+        opline!("seller node verify job_id={job_id}: failing the journaled delivery — {why}");
+        match self.node.store().offer_row(job_id) {
+            Ok(Some(offer)) => {
+                self.fail_job_with_feedback(
+                    job_id,
+                    &offer.buyer_pubkey,
+                    ReasonCode::DeliveryFailed,
+                    DELIVERY_FAILURE_FEEDBACK,
+                    None,
+                    budget,
+                )
+                .await;
+            }
+            _ => self.fail_job(job_id).await,
+        }
+    }
+
+    /// LIVENESS WITHOUT A RESTART: sweep the jobs that still owe the remote a read-back.
+    ///
+    /// A held delivery used to depend on something else happening — a new award, or a reboot — to be
+    /// looked at again, so an idle-but-running seat could sit on a landed pack indefinitely. This runs
+    /// on the node's own drain tick: every held row is either verified now, or failed when its offer
+    /// deadline has passed. Both outcomes are terminal-or-progress; neither re-pushes and neither
+    /// re-runs an agent.
+    ///
+    /// The enumeration already excludes delivered, receipted and verified rows, and
+    /// `verify_uploaded_delivery` charges the attempt cap, so the sweep cannot spin.
+    async fn sweep_uploaded_verifications(&self) {
+        let held = match self.node.store().jobs_awaiting_upload_verification() {
+            Ok(held) => held,
+            Err(error) => {
+                opline!("seller node sweep: jobs_awaiting_upload_verification read failed (continuing): {error}");
+                return;
+            }
+        };
+        // R2: the pass has a budget. This runs on the node's own drain tick, and a long worklist of
+        // rows that each talk to a remote must not own that tick — every other job's liveness rides
+        // on it. Rows not reached this pass are not lost: they are still held, and the next tick
+        // starts again from the top.
+        let sweep_started = std::time::Instant::now();
+        let pass_deadline = sweep_started + self.recovery_sweep_budget;
+        for row in held {
+            if sweep_started.elapsed() >= self.recovery_sweep_budget {
+                opline!("seller node sweep: recovery budget spent this pass — remaining held rows stay held for the next tick (nothing decided, nothing lost)");
+                return;
+            }
+            // R1: a live lane of this process owns this job's transfer right now — its intent row is
+            // exactly what this worklist selects, and the pack it describes may still be on the wire.
+            // Reading the remote back now could fail a delivery that is about to land. The owner will
+            // record the outcome; if this process dies first, no owner survives and the very next
+            // boot's sweep picks the row up — crashed-Intent recovery is untouched.
+            if self.delivery_transfer_owned(&row.job_id) {
+                opline!(
+                    "seller node sweep job_id={}: a live transfer owns this delivery — leaving it to its owner this pass",
+                    row.job_id
+                );
+                continue;
+            }
+            let now = now_unix();
+            if row.deadline_unix.is_some_and(|deadline| deadline <= now) {
+                opline!(
+                    "seller node sweep job_id={}: the offer deadline passed with the delivery still unverified — one terminal disposition, no restart needed",
+                    row.job_id
+                );
+                self.fail_uploaded_delivery(
+                    &row.job_id,
+                    "the offer deadline passed while held",
+                    recovery_step_budget(Some(pass_deadline)),
+                )
+                .await;
+                continue;
+            }
+            opline!(
+                "seller node sweep job_id={}: re-verifying a journaled delivery (stage={:?}, attempts={})",
+                row.job_id,
+                row.marker.stage,
+                row.marker.attempts
+            );
+            self.verify_uploaded_delivery(&row.job_id, &row.marker.commit, Some(pass_deadline))
+                .await;
+        }
+
+        // R2: the OTHER held strand — deliveries the remote already attested at the exact oid that
+        // never reached a queued result. They carry no unverified marker (it was cleared by the
+        // same statement that armed `pushed_commit`), so the worklist above cannot see them, and
+        // they need no remote question — only the local finish that was interrupted.
+        //
+        // Boot recovery has always picked these up. A node that keeps RUNNING did not: a finalize
+        // that lost its signer round-trip, or spent this pass's budget, left a delivery this node
+        // had already proved sitting with nothing scheduled to complete it. The comment claiming
+        // the next pass would retry it was simply false. This is that next pass.
+        let verified = match self.node.store().jobs_verified_awaiting_enqueue() {
+            Ok(verified) => verified,
+            Err(error) => {
+                opline!("seller node sweep: jobs_verified_awaiting_enqueue read failed (continuing): {error}");
+                return;
+            }
+        };
+        for row in verified {
+            if sweep_started.elapsed() >= self.recovery_sweep_budget {
+                opline!("seller node sweep: recovery budget spent this pass — verified deliveries awaiting a result stay held for the next tick (nothing decided, nothing lost)");
+                return;
+            }
+            // A live lane is mid-completion on this job right now; its own finalize will finish it.
+            if self.delivery_transfer_owned(&row.job_id) {
+                continue;
+            }
+            // The lapse half: a verified delivery whose offer expired before it could be enqueued
+            // takes ONE terminal disposition here rather than waiting for a result it can no longer
+            // deliver. `deliver_and_enqueue` would refuse it anyway — this is the decision, made
+            // once, with the buyer told why.
+            if row.deadline_unix.is_some_and(|deadline| deadline <= now_unix()) {
+                opline!(
+                    "seller node sweep job_id={}: the offer deadline passed before the verified delivery reached a result — taking the terminal disposition",
+                    row.job_id
+                );
+                self.fail_uploaded_delivery(
+                    &row.job_id,
+                    "the offer deadline passed before the verified delivery reached a queued result",
+                    recovery_step_budget(Some(pass_deadline)),
+                )
+                .await;
+                continue;
+            }
+            opline!(
+                "seller node sweep job_id={}: a verified delivery never reached a queued result — finalizing it from the journaled commit (no re-push, no re-run)",
+                row.job_id
+            );
+            self.finalize_pushed_delivery(&row.job_id, &row.commit, Some(pass_deadline))
+                .await;
+        }
+    }
+
+/// R2A: the ONE place any completion route samples the deadline clock and asks the store to
+    /// journal a delivery.
+    ///
+    /// Both routes — the live execute path and the resumed finalize — used to carry their own copy
+    /// of this sample, and a clock rule kept in two copies drifts: the precision defect this fixes
+    /// lived in exactly such a copy, and fixing one copy would have left the other admitting late
+    /// results. One sampler, one precision, both routes.
+    ///
+    /// The sample is read ONCE at millisecond precision. `now` keeps the second-granularity row
+    /// timestamps byte-identical to before; `now_ms` is what the deadline is judged on, so the
+    /// caller's own subsecond position survives to the store, which adds the time it then spends
+    /// waiting for the write lock. Second-floored arithmetic discarded up to 999ms twice over —
+    /// once here, once there — and admitted a result the offer no longer accepted.
+    fn journal_delivery_result(
+        &self,
+        job_id: &str,
+        result_ref: &str,
+        payment_mode: crate::gateway::PaymentMode,
+        draft: &gateway::EventDraft,
+    ) -> Result<crate::seller_node::store::DeliveryJournal, super::store::StoreError> {
+        // R2A: ONE origin for this attempt, taken HERE — before the hand-off — and paired with the
+        // monotonic instant of the read. Every row timestamp below comes from it, and the store
+        // extrapolates that same origin to the transaction to judge the deadline. Sampling it here
+        // rather than in the store is what makes the sample -> store interval (marshalling,
+        // preemption, the lock wait) counted instead of invisible.
+        let clock = crate::seller_node::DeliveryClock::paired_now();
+        let now = clock.origin_unix();
+        // The seam reports the sample at MILLISECOND precision, taken from the same paired origin
+        // the store will extrapolate. Reporting `now * 1_000` instead re-floors the reading to the
+        // wall second, which is precisely the precision the sub-second oracles measure — a seam
+        // that rounds cannot witness a sub-second carry.
+        #[cfg(test)]
+        record_delivery_sample(job_id, (clock.now_ns() / 1_000_000) as i64);
+        self.node.store().deliver_and_enqueue(
+            job_id,
+            result_ref,
+            payment_mode,
+            draft,
+            now,
+            now + RESULT_PUBLISH_WINDOW_SECS,
+            now,
+            &clock,
+        )
+    }
+
+    /// Resume a delivery whose pack the remote accepted and whose read-back never confirmed it: ask
+    /// the remote, under a FRESHLY minted token, whether it advertises the delivery ref at exactly
+    /// the journaled oid — and complete the job only from that answer.
+    ///
+    /// What this path does NOT do, and each is the point of it:
+    /// - **No re-push.** No workdir is opened and no pack is sent. The job's tree may not even exist
+    ///   any more; the delivery either is on the remote or is not.
+    /// - **No agent re-run.** The result was produced once; re-running a non-deterministic harness
+    ///   would diverge the tree and burn the operator's compute for a delivery already made.
+    /// - **No unverified completion.** The exact-oid gate is the same one the live push runs; a
+    ///   `Deliver` verdict comes only from the remote's own advertisement.
+    /// - **No duplicate buyer completion.** `mark_pushed` then `finalize_pushed_delivery`, whose
+    ///   `deliver_and_enqueue` is idempotent (a job with a delivery row re-enqueues nothing), and a
+    ///   row that already reached a terminal state never arrives here at all
+    ///   (`resume_action_with_upload_marker`).
+    ///
+    /// An unresolved answer (a 401, an io fault) decides nothing and LEAVES the durable marker: the
+    /// next resume asks again. That wait is bounded by the offer's own deadline — once it passes,
+    /// `resume_action` fails the row, so a job that can never be verified still reaches exactly one
+    /// terminal outcome.
+    async fn verify_uploaded_delivery(
+        &self,
+        job_id: &str,
+        commit: &str,
+        pass_deadline: Option<std::time::Instant>,
+    ) {
+        let Some(seller) = self.node.home().config.seller.clone() else {
+            opline!("seller node verify skip job_id={job_id}: no [seller] config");
+            self.fail_job(job_id).await;
+            return;
+        };
+        // BOUND THE RETRY before spending another one. The offer deadline bounds the wait in wall
+        // time; this bounds it in attempts, so a remote that keeps answering "could not tell" cannot
+        // hold a slot forever. Charged BEFORE the attempt, so a crash mid-attempt still costs one.
+        match self.node.store().bump_upload_verify_attempt(job_id, now_unix()) {
+            Ok(attempts) if attempts > UPLOAD_VERIFY_ATTEMPT_CAP => {
+                opline!("seller node verify fail job_id={job_id}: {attempts} read-back attempts spent on the journaled delivery (cap {UPLOAD_VERIFY_ATTEMPT_CAP}) — taking the one terminal disposition rather than asking forever");
+                self.fail_uploaded_delivery(
+                    job_id,
+                    "the read-back attempt cap was reached",
+                    recovery_step_budget(pass_deadline),
+                )
+                .await;
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                // The counter is the bound; without it this path could spin. Decide nothing.
+                opline!("seller node verify job_id={job_id}: attempt counter write failed ({error}); marker left standing, nothing asked");
+                return;
+            }
+        }
+        // The offer's own budget, read HERE and re-read at completion below: a delivery finalized
+        // after the deadline is a post-settlement result the buyer will not pay for.
+        if self.offer_deadline_lapsed(job_id) {
+            opline!("seller node verify fail job_id={job_id}: the offer deadline passed before the read-back could run — one terminal disposition, no late delivery");
+            self.fail_uploaded_delivery(
+                job_id,
+                "the offer deadline passed before verification",
+                recovery_step_budget(pass_deadline),
+            )
+            .await;
+            return;
+        }
+        // The SAME ref this job's delivery is always pushed to — derived from the job id exactly as
+        // the push and the finalize derive it, never read back from anywhere a job could influence.
+        let branch = format!("maxplayer/{}", &job_id[..8.min(job_id.len())]);
+        let push_ref = crate::git_transport::delivery_ref(&branch);
+        let relay_git_remote =
+            crate::delivery_transport::is_relay_git_locator(&seller.git_remote);
+        // Fresh, minted NOW, through the signer actor, repo-root-bound and scoped to the same
+        // `push_ref` as the push's own tokens — and with NO expiration tag: this is one immediate
+        // request, not a transfer that has to outlive a window.
+        let header = if relay_git_remote {
+            // R2: BOUNDED. A signer actor that stops answering must not hold the drain tick open.
+            // An elapsed bound decides nothing — same disposition as a mint that failed outright.
+            let Some(step) = recovery_step_budget(pass_deadline).step(RECOVERY_STEP_TIMEOUT) else {
+                opline!("seller node verify job_id={job_id}: the pass budget was spent before the verification mint — nothing asked, nothing decided, marker stands");
+                return;
+            };
+            match tokio::time::timeout(
+                step,
+                self.mint_delivery_push_header(&seller.git_remote, &push_ref, None),
+            )
+            .await
+            {
+                Err(_elapsed) => {
+                    opline!("seller node verify job_id={job_id}: verification authorization did not answer within {}s; marker left standing for the next resume (no delivery, no failure)", step.as_secs());
+                    return;
+                }
+                Ok(Ok(header)) => Some(header),
+                Ok(Err(error)) => {
+                    // Nothing was asked and nothing is decided: the marker stands.
+                    opline!("seller node verify job_id={job_id}: verification authorization failed ({error:?}); marker left standing for the next resume (no delivery, no failure)");
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let journaled = crate::git_transport::UploadedDelivery::from_journaled_upload(
+            seller.git_remote.clone(),
+            push_ref.clone(),
+            commit.to_owned(),
+        );
+        // The SAME leg, the SAME raw error class the live pass classifies (F5): one classifier, two
+        // lanes, so "the remote says no" and "we could not ask" cannot swap places between them.
+        // R2: BOUNDED, for the same reason and with the same asymmetry — a remote that never answers
+        // is UNRESOLVED, never a failure. The marker stands and the attempt cap (already charged) is
+        // what stops this from repeating forever.
+        let Some(step) = recovery_step_budget(pass_deadline).step(RECOVERY_STEP_TIMEOUT) else {
+            opline!("seller node verify job_id={job_id}: the pass budget was spent before the read-back — unresolved, marker stands for the next tick");
+            return;
+        };
+        let readback = match tokio::time::timeout(
+            step,
+            seller_git::attest_upload_off_runtime(journaled, header, "resume"),
+        )
+        .await
+        {
+            Ok(readback) => readback,
+            Err(_elapsed) => {
+                opline!("seller node verify job_id={job_id}: the read-back did not answer within {}s — unresolved, marker left standing for the next resume", step.as_secs());
+                return;
+            }
+        };
+        let verdict = uploaded_verification_outcome(readback.as_ref().map(|_| ()));
+        match verdict {
+            UploadedVerification::Deliver => {
+                // AT COMPLETION, not at entry: the read-back awaited a signer and a network, and the
+                // deadline may have passed while it did. The exact-oid gate agreeing does not buy the
+                // right to enqueue a result the offer no longer admits, and this row must still reach
+                // exactly ONE terminal disposition.
+                if self.offer_deadline_lapsed(job_id) {
+                    opline!("seller node verify fail job_id={job_id}: the remote verified commit={commit} but the offer deadline passed while the read-back ran — no late delivery is enqueued");
+                    self.fail_uploaded_delivery(
+                        job_id,
+                        "the offer deadline passed while the read-back ran",
+                        recovery_step_budget(pass_deadline),
+                    )
+                    .await;
+                    return;
+                }
+                // The remote agrees at the exact oid. Arm the VERIFIED marker first (which clears
+                // the unverified one in the same statement), so a crash in the sign+enqueue window
+                // resumes as an ordinary #552 finalize instead of asking the remote again.
+                match self.node.store().mark_pushed(job_id, commit, now_unix()) {
+                    // R1: the fence moved NOTHING, so this job reached a terminal state while the
+                    // read-back ran. Finalizing now would enqueue a result for a job the buyer has
+                    // already been given a terminal answer for.
+                    Ok(0) => {
+                        opline!("seller node verify job_id={job_id}: the job reached a terminal state while the read-back ran — not finalizing over another lane's outcome");
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        opline!("seller node verify job_id={job_id}: mark_pushed failed (continuing): {error}");
+                    }
+                }
+                opline!("seller node verify job_id={job_id}: remote verified at the journaled commit={commit} — finalizing the delivery (no re-push, no re-run)");
+                self.finalize_pushed_delivery(job_id, commit, pass_deadline).await;
+            }
+            UploadedVerification::FailClosed => {
+                let detail = readback
+                    .as_ref()
+                    .err()
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
+                opline!("seller node verify fail job_id={job_id}: the remote does not hold the journaled delivery ({detail}) — failing closed, never re-pushing");
+                match self.node.store().offer_row(job_id) {
+                    Ok(Some(offer)) => {
+                        self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None, recovery_step_budget(pass_deadline)).await;
+                    }
+                    _ => self.fail_job(job_id).await,
+                }
+            }
+            UploadedVerification::Unresolved => {
+                let detail = readback
+                    .as_ref()
+                    .err()
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
+                opline!("seller node verify job_id={job_id}: verification unresolved ({detail}) — marker left standing for the next resume; bounded by the offer deadline");
+            }
+        }
+    }
+
     /// Fail a container-delivered job with the SAME feedback reason codes and harness attribution the
     /// host path emits for the equivalent failure, so a buyer cannot tell the two paths apart.
     async fn fail_container_delivery(
@@ -7818,7 +9706,7 @@ impl SellerNodeRunner {
                 (ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK)
             }
         };
-        self.fail_job_with_feedback(job_id, buyer_pubkey, reason_code, feedback, None).await;
+        self.fail_job_with_feedback(job_id, buyer_pubkey, reason_code, feedback, None, crate::seller_node::outbox::DrainBudget::Unbudgeted).await;
     }
 
     /// Complete an interrupted delivery from its journaled pushed commit (#552), WITHOUT re-running
@@ -7833,7 +9721,12 @@ impl SellerNodeRunner {
     /// random aux_rand; BIP340 verification is over the digest, not the bytes). Exec-metadata is
     /// degraded (no agent ran this pass) and rides only as UNSIGNED result tags — it is not in the
     /// signed digest, so its absence cannot make the buyer reject the receipt.
-    async fn finalize_pushed_delivery(&self, job_id: &str, commit: &str) {
+    async fn finalize_pushed_delivery(
+        &self,
+        job_id: &str,
+        commit: &str,
+        pass_deadline: Option<std::time::Instant>,
+    ) {
         let Some(seller) = self.node.home().config.seller.clone() else {
             opline!("seller node finalize skip job_id={job_id}: no [seller] config");
             self.fail_job(job_id).await;
@@ -7851,7 +9744,7 @@ impl SellerNodeRunner {
             Ok(Some(creq)) => creq,
             _ => {
                 opline!("seller node finalize fail job_id={job_id}: stored creq missing");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None, recovery_step_budget(pass_deadline)).await;
                 return;
             }
         };
@@ -7861,7 +9754,7 @@ impl SellerNodeRunner {
             Ok(kind) => kind,
             Err(error) => {
                 opline!("seller node finalize fail job_id={job_id}: delivery kind typing failed ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None, recovery_step_budget(pass_deadline)).await;
                 return;
             }
         };
@@ -7875,16 +9768,40 @@ impl SellerNodeRunner {
             delivery_kind.as_str(),
             creq_terms(&stored_creq),
         );
-        let seller_sig = match self.node.signer().sign_receipt_hash(preimage.digest_hex()).await {
+        // R2: BOUNDED. This is the longest await on the recovery lane and the one that runs AFTER the
+        // last deadline check, so an unbounded signer here stalls the drain tick and lands a result
+        // whose freshness nobody re-checked. An elapsed bound decides nothing: the verified marker is
+        // already armed, so the next tick finalizes from it — no re-push, no re-run.
+        // R2B: and bounded by the OFFER too — a receipt that cannot be written before the offer
+        // expires is the tick spent on a result the atomic deadline check will refuse.
+        let Some(step) = recovery_step_budget_within_offer(pass_deadline, offer.deadline_unix, crate::seller_node::wall_clock_ms())
+            .step(RECOVERY_STEP_TIMEOUT)
+        else {
+            opline!("seller node finalize job_id={job_id}: no budget left for the receipt signing within this pass or this offer — nothing enqueued; the verified marker stands");
+            return;
+        };
+        let signed = match tokio::time::timeout(
+            step,
+            self.node.signer().sign_receipt_hash(preimage.digest_hex()),
+        )
+        .await
+        {
+            Ok(signed) => signed,
+            Err(_elapsed) => {
+                opline!("seller node finalize job_id={job_id}: the signer did not answer within {}s — nothing enqueued; the verified marker stands for the next pass", step.as_secs());
+                return;
+            }
+        };
+        let seller_sig = match signed {
             Ok(Ok(sig)) => sig,
             Ok(Err(error)) => {
                 opline!("seller node finalize fail job_id={job_id}: receipt sign refused ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None, recovery_step_budget(pass_deadline)).await;
                 return;
             }
             Err(error) => {
                 opline!("seller node finalize fail job_id={job_id}: signer actor gone ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None, recovery_step_budget(pass_deadline)).await;
                 return;
             }
         };
@@ -7905,48 +9822,88 @@ impl SellerNodeRunner {
         // #613: mirror the execute path — a resumed contribution delivery finalizes the SAME
         // contribution result envelope (echo + seller-signed tuple) it would have on the live path,
         // so the buyer accepts whichever pass produced it. From-scratch (no pin) is unchanged.
-        match contribution_result_envelope_tags(
-            self.node.store(),
-            self.node.signer(),
-            job_id,
-            &seller_pubkey,
-            &seller.git_remote,
-            &branch,
-            commit,
+        // R2: BOUNDED, and drawn from the same remaining pass budget as every other step. This
+        // await signs through the signer actor too, so leaving it unbounded reopened the exact hole
+        // the receipt-signing bound closed — one hung envelope would own the drain tick.
+        // R2B: same two ceilings — the pass, and the offer this envelope is for.
+        let Some(step) = recovery_step_budget_within_offer(pass_deadline, offer.deadline_unix, crate::seller_node::wall_clock_ms())
+            .step(RECOVERY_STEP_TIMEOUT)
+        else {
+            opline!("seller node finalize job_id={job_id}: no budget left for the contribution envelope within this pass or this offer — nothing enqueued; the verified marker stands");
+            return;
+        };
+        let envelope = match tokio::time::timeout(
+            step,
+            contribution_result_envelope_tags(
+                self.node.store(),
+                self.node.signer(),
+                job_id,
+                &seller_pubkey,
+                &seller.git_remote,
+                &branch,
+                commit,
+            ),
         )
         .await
+        {
+            Ok(envelope) => envelope,
+            Err(_elapsed) => {
+                opline!("seller node finalize job_id={job_id}: the contribution envelope did not answer within {}s — nothing enqueued; the verified marker stands for the next pass", step.as_secs());
+                return;
+            }
+        };
+        match envelope
         {
             Ok(Some(extra)) => draft.tags.extend(extra),
             Ok(None) => {}
             Err(reason) => {
                 opline!("seller node finalize fail job_id={job_id}: {reason}");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None, recovery_step_budget(pass_deadline)).await;
                 return;
             }
         }
-        let now = now_unix();
-        match self.node.store().deliver_and_enqueue(
-            job_id,
-            commit,
-            offer.payment_mode,
-            &draft,
-            now,
-            now + RESULT_PUBLISH_WINDOW_SECS,
-            now,
-        ) {
-            Ok(true) => opline!(
+        // R2: RE-CHECK AT DURABLE COMPLETION, AFTER the signing — the last deadline check happened
+        // before a signer await and an envelope await, and either can outlast the offer. This is the
+        // final instant at which anything is still reversible: past the next statement the result is
+        // queued for the buyer.
+        if offer.deadline_unix <= now_unix() {
+            opline!("seller node finalize fail job_id={job_id}: the offer deadline passed while the receipt was being signed — no late result is enqueued");
+            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None, recovery_step_budget(pass_deadline)).await;
+            return;
+        }
+        // R1: and the same instant is where another lane's terminal outcome must be honoured. A job
+        // that went terminal while this one signed does not get a second answer.
+        if let Ok(Some(
+            crate::seller_node::store::JobState::Failed | crate::seller_node::store::JobState::Paid,
+        )) = self.node.store().job_state(job_id)
+        {
+            opline!("seller node finalize job_id={job_id}: the job reached a terminal state while the receipt was being signed — not enqueuing a result over it");
+            return;
+        }
+        match self.journal_delivery_result(job_id, commit, offer.payment_mode, &draft) {
+            Ok(crate::seller_node::store::DeliveryJournal::Enqueued) => opline!(
                 "seller node finalized interrupted delivery job_id={job_id} commit={commit} result enqueued (no agent re-run) (#552)"
             ),
-            Ok(false) => opline!(
+            Ok(crate::seller_node::store::DeliveryJournal::AlreadyDelivered) => opline!(
                 "seller node finalize job_id={job_id}: delivery already journaled (dedup no-op)"
+            ),
+            Ok(crate::seller_node::store::DeliveryJournal::Fenced) => opline!(
+                "seller node finalize job_id={job_id}: the job was already failed when the journal ran — no result enqueued (the fence held)"
+            ),
+            // R2: same atomic verdict on the resumed route. A finalize that waited out the deadline
+            // on the store lock is refused here even though its own pre-checks passed.
+            Ok(crate::seller_node::store::DeliveryJournal::DeadlinePassed) => opline!(
+                "seller node finalize job_id={job_id}: the offer deadline had passed at the instant of the durable write — no late result enqueued"
             ),
             Err(error) => {
                 opline!("seller node finalize fail job_id={job_id}: deliver journal failed ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None, recovery_step_budget(pass_deadline)).await;
                 return;
             }
         }
-        self.drain().await;
+        // R2B: a recovery pass hands down what IT has left, so the publish cannot outlive the
+        // sweep's ceiling; a direct finalize takes the standing terminal budget.
+        self.drain_terminal_event(job_id, recovery_step_budget(pass_deadline)).await;
     }
 
     /// Settle one gift-wrapped payment: decode it (through the signer actor — the NIP-44 decrypt
@@ -8407,6 +10364,14 @@ impl SellerNodeRunner {
     /// otherwise). Used at the post-offer execute fail points where the offer buyer is known; the
     /// caller passes the reason_code that names WHICH failure this is (execution vs delivery vs
     /// no_sentinel), so the buyer can class it without parsing the human-readable reason.
+    ///
+    /// R2B: `budget` is REQUIRED, and there is deliberately no convenience wrapper that supplies
+    /// `Unbudgeted` for you. A default is how the recovery exits became unbudgeted in the first
+    /// place: every one of them read as ordinary failure handling, and the missing argument was
+    /// invisible at the callsite. Making it explicit means a new exit cannot be written without
+    /// its author answering the question, and `Unbudgeted` at a live route is then a statement
+    /// rather than an omission.
+    #[allow(clippy::too_many_arguments)]
     async fn fail_job_with_feedback(
         &self,
         job_id: &str,
@@ -8414,24 +10379,169 @@ impl SellerNodeRunner {
         reason_code: ReasonCode,
         reason: &str,
         reason_detail: Option<&str>,
+        budget: crate::seller_node::outbox::DrainBudget,
     ) {
-        self.fail_job(job_id).await;
-        self.publish_buyer_feedback(job_id, buyer_pubkey, reason_code, reason, reason_detail)
-            .await;
+        let mut draft = error_draft(
+            job_id,
+            buyer_pubkey,
+            &self.seller_pubkey.to_hex(),
+            reason_code,
+            reason,
+        );
+        if let Some(reason_detail) = reason_detail {
+            draft
+                .tags
+                .push(gateway::TagSpec::new(["reason_detail", reason_detail]));
+        }
+        // R1: ONE terminal event, bound to the transition that actually won.
+        //
+        // This used to be two independent acts — fail the row, then announce the failure — and the
+        // announcement did not ask whether the failure had moved anything. A job already
+        // `delivered` could therefore emit `delivery_failed`, the exact opposite of its real
+        // disposition, and a repeated no-op failure could emit it again each time. Queueing the
+        // feedback inside the same transaction as the state change makes the announcement a
+        // consequence of the transition instead of a parallel guess about it.
+        //
+        // It is also DURABLE now. A direct send publishes nothing if the process dies between the
+        // state write and the relay call; an outbox row survives that crash and goes out on a later
+        // drain. Durability alone is not enough, though: queueing without draining here silently
+        // withheld every failure notice from the buyer until some other path happened to drain
+        // (five existing tests caught exactly that, each expecting a terminal event and seeing
+        // none). So the transition is followed by a drain pass, which publishes this row now and is
+        // a no-op when it was suppressed. The outbox keeps the crash guarantee; the drain keeps the
+        // promptness the direct send had.
+        let now = now_unix();
+        match self.node.store().fail_and_enqueue_feedback(
+            job_id,
+            &draft,
+            now,
+            now + RESULT_PUBLISH_WINDOW_SECS,
+            now,
+        ) {
+            Ok(crate::seller_node::store::FailureJournal::Transitioned) => {
+                opline!(
+                    "seller node job_id={job_id}: failed — buyer feedback queued durably reason_code={} reason={reason}",
+                    reason_code.as_str()
+                );
+                // Publish it in this pass. The row is already durable, so a crash before this
+                // returns still delivers on the next drain.
+                //
+                // R2B: scoped to this job and bounded by WHAT THE CALLER HAS LEFT. Failure feedback
+                // is reached from sweeps and from lanes holding execution slots, and an unbounded
+                // backlog publish here is how one buyer's error notice came to own the tick. The
+                // budget arrives from the caller, so a lapse inside a spent pass publishes nothing
+                // and leaves its durable row to the drain step.
+                self.drain_terminal_event(job_id, budget).await;
+            }
+            Ok(crate::seller_node::store::FailureJournal::NoOp) => opline!(
+                "seller node job_id={job_id}: failure feedback SUPPRESSED — the job is already terminal (state={}) and keeps its real disposition",
+                self.job_state_label(job_id)
+            ),
+            Err(error) => opline!(
+                "seller node job_id={job_id}: fail+feedback write error (continuing): {error}"
+            ),
+        }
     }
 
     /// One outbox drain pass over the shared authenticated client. Log-and-continue: a publish
     /// failure leaves the row pending for the next tick (never wedges the loop).
-    async fn drain(&self) {
+    /// R2B: publish THIS job's own terminal event now, bounded, without touching the backlog.
+    ///
+    /// The full outbox pass belongs to the periodic drain step, which exists precisely so that no
+    /// single job's completion has to carry everyone else's queue. A terminal decision needs only
+    /// its own row on the wire promptly; scoping the pass to `job_id` means a deep backlog cannot
+    /// turn one completion into an unbounded publish loop, and the budget means one unresponsive
+    /// remote cannot either.
+    ///
+    /// `budget` lets a recovery pass hand down what it has left, so a drain inside a sweep can
+    /// never outlive the sweep's own ceiling; `None` takes the standing terminal budget.
+    async fn drain_terminal_event(&self, job_id: &str, budget: crate::seller_node::outbox::DrainBudget) {
         let now = now_unix();
-        match drain_once(self.node.store(), &self.publisher, now).await {
-            Ok(report) if report.confirmed > 0 || report.failed > 0 => opline!(
-                "seller node outbox drain: confirmed={} failed={} expired={}",
-                report.confirmed, report.failed, report.expired
+        // R2B: a SPENT pass buys nothing here. The event is already durable, so the honest move is
+        // to leave it to the periodic drain rather than open a fresh five-second window on a tick
+        // this caller has already used up.
+        let budget = match budget {
+            crate::seller_node::outbox::DrainBudget::Exhausted => {
+                opline!("seller node terminal publish job_id={job_id}: the pass was spent before the publish — the row is durable and the drain step takes it");
+                return;
+            }
+            // Both live cases are the same rule: whichever ends sooner, the pass or the standing
+            // terminal ceiling. `capped` reads the clock now, so a pass that expired while this
+            // job was being decided cannot buy a fresh five seconds here.
+            live => live.capped(TERMINAL_DRAIN_BUDGET),
+        };
+        match crate::seller_node::outbox::drain_scoped(
+            self.node.store(),
+            &self.publisher,
+            now,
+            Some(job_id),
+            budget,
+        )
+        .await
+        {
+            Ok(report) if report.confirmed > 0 || report.failed > 0 || report.timed_out > 0 => opline!(
+                "seller node terminal publish job_id={job_id}: confirmed={} failed={} timed_out={} (backlog left to the drain step)",
+                report.confirmed, report.failed, report.timed_out
             ),
+            Ok(_) => {}
+            Err(error) => {
+                opline!("seller node terminal publish error job_id={job_id} (continuing): {error}")
+            }
+        }
+    }
+
+    /// R2B: the periodic drain, bounded by the tick that owns it.
+    ///
+    /// `deferred` is reported alongside the rest because a bounded pass that leaves rows behind is
+    /// a normal outcome here, not an error: the operator should be able to see the backlog being
+    /// carried rather than infer it from a drain that goes quiet.
+    async fn drain_bounded(&self, budget: crate::seller_node::outbox::DrainBudget) {
+        let now = now_unix();
+        match crate::seller_node::outbox::drain_scoped(
+            self.node.store(),
+            &self.publisher,
+            now,
+            None,
+            budget,
+        )
+        .await
+        {
+            Ok(report)
+                if report.confirmed > 0
+                    || report.failed > 0
+                    || report.timed_out > 0
+                    || report.deferred > 0 =>
+            {
+                opline!(
+                    "seller node outbox drain: confirmed={} failed={} expired={} timed_out={} deferred={} (deferred rows stay pending for the next tick)",
+                    report.confirmed, report.failed, report.expired, report.timed_out, report.deferred
+                )
+            }
             Ok(_) => {}
             Err(error) => opline!("seller node outbox drain error (continuing): {error}"),
         }
+    }
+
+    /// R2B: the outbox drain, bounded by ONE tick's worth of time.
+    ///
+    /// Every caller of this is on the select loop's critical path — the pre-first-tick catch-up
+    /// drain, the backfills, and the accept/award handlers — and the loop answers nothing else,
+    /// shutdown included, while one of them awaits. Bounding the primitive rather than each
+    /// callsite is deliberate: an unbudgeted drain reached from a NEW loop-path caller is the same
+    /// defect again, and the previous rounds' evidence is that callsite-by-callsite closure is
+    /// exactly what keeps missing one.
+    ///
+    /// Found by [`Self::the_drain_tick_yields_the_loop_under_a_slow_backlog`], which showed the
+    /// loop taking twelve seconds to answer a shutdown: the tick arm was already bounded, and the
+    /// catch-up drain that runs BEFORE the first tick published the entire backlog unbounded.
+    ///
+    /// The bound costs nothing durable. Rows that do not fit stay pending and the next tick takes
+    /// them; what it buys is a loop that keeps serving its other arms.
+    async fn drain(&self) {
+        self.drain_bounded(crate::seller_node::outbox::DrainBudget::Until(
+            std::time::Instant::now() + self.drain_interval(),
+        ))
+        .await;
     }
 }
 
@@ -12937,8 +15047,16 @@ mod tests {
         let has_receipt = store.has_receipt(job_id).expect("has_receipt");
         let settled = store.has_settled_elsewhere(job_id).expect("has_settled_elsewhere");
         let pushed = store.pushed_commit(job_id).expect("pushed_commit");
+        let uploaded = store
+            .uploaded_unverified_commit(job_id)
+            .expect("uploaded_unverified_commit");
         let deadline = store.offer_row(job_id).expect("offer_row").map(|o| o.deadline_unix);
-        resume_action(state, has_delivery, has_receipt, settled, pushed, deadline, now)
+        // The SAME composition `execute_job` performs, marker included — so these tests exercise the
+        // decision a restart actually makes, not a subset of it.
+        resume_action_with_upload_marker(
+            resume_action(state, has_delivery, has_receipt, settled, pushed, deadline, now),
+            uploaded,
+        )
     }
 
     // POSITIVE (spine arm 1) — OUR OWN result is on the relay (delivered by a pre-#552 binary, so no
@@ -13255,9 +15373,10 @@ mod tests {
                 &draft,
                 delivered_at,
                 delivered_at + RESULT_PUBLISH_WINDOW_SECS,
-                delivered_at
+                delivered_at,
+                &crate::seller_node::DeliveryClock::paired_at_unix(delivered_at),
             )
-            .expect("deliver"));
+            .expect("deliver").enqueued());
         assert_eq!(
             store.oldest_unsettled_delivery_unix().expect("unsettled"),
             Some(delivered_at),
@@ -13517,8 +15636,8 @@ mod tests {
 
         // Deliver ⇒ state Delivered ⇒ NOT re-execute-eligible (the guard early-returns).
         assert!(store
-            .deliver_and_enqueue(&job, &"c".repeat(40), crate::gateway::PaymentMode::Sat, &draft, 5000, 5000 + RESULT_PUBLISH_WINDOW_SECS, 5000)
-            .expect("deliver"));
+            .deliver_and_enqueue(&job, &"c".repeat(40), crate::gateway::PaymentMode::Sat, &draft, 5000, 5000 + RESULT_PUBLISH_WINDOW_SECS, 5000, &crate::seller_node::DeliveryClock::paired_at_unix(5000))
+            .expect("deliver").enqueued());
         assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Delivered));
         assert!(
             !should_resume_execution(store.job_state(&job).expect("s").expect("s")),
@@ -13578,9 +15697,11 @@ mod tests {
                     &draft,
                     5000,
                     5000 + RESULT_PUBLISH_WINDOW_SECS,
-                    5000
+                    5000,
+                    &crate::seller_node::DeliveryClock::paired_at_unix(5000),
                 )
                 .expect("deliver")
+                .enqueued()
         );
         assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Delivered));
 
@@ -14107,7 +16228,7 @@ mod tests {
             seed(&delivered, live, &format!("{}5", "w".repeat(63)));
             let ddraft = claim_draft(&delivered, &buyer, &seller, crate::gateway::ClaimPayment::Sat(&creq), &[], &Default::default());
             store
-                .deliver_and_enqueue(&delivered, &"c".repeat(40), crate::gateway::PaymentMode::Sat, &ddraft, 4, 4 + RESULT_PUBLISH_WINDOW_SECS, 4)
+                .deliver_and_enqueue(&delivered, &"c".repeat(40), crate::gateway::PaymentMode::Sat, &ddraft, 4, 4 + RESULT_PUBLISH_WINDOW_SECS, 4, &crate::seller_node::DeliveryClock::paired_at_unix(4))
                 .expect("deliver");
             // #563: a live-deadline row a PRIOR resume relay-derived as settled elsewhere. The durable
             // marker must survive the restart and short-circuit the next resume to SkipTerminal WITHOUT
@@ -14289,14 +16410,14 @@ mod tests {
         let now = 5000;
         assert!(
             store
-                .deliver_and_enqueue(&job, &commit_first, crate::gateway::PaymentMode::Sat, &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now)
-                .expect("deliver"),
+                .deliver_and_enqueue(&job, &commit_first, crate::gateway::PaymentMode::Sat, &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now, &crate::seller_node::DeliveryClock::paired_at_unix(now))
+                .expect("deliver").enqueued(),
             "first delivery journals + enqueues the result"
         );
         assert!(
             !store
-                .deliver_and_enqueue(&job, &commit_resume, crate::gateway::PaymentMode::Sat, &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now)
-                .expect("re-deliver"),
+                .deliver_and_enqueue(&job, &commit_resume, crate::gateway::PaymentMode::Sat, &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now, &crate::seller_node::DeliveryClock::paired_at_unix(now))
+                .expect("re-deliver").enqueued(),
             "resume adopts the existing tip: a second delivery re-enqueues nothing"
         );
         let result_rows = store
@@ -14951,14 +17072,14 @@ mod tests {
         let now = 5000;
         assert!(
             store
-                .deliver_and_enqueue(&job, &"c".repeat(40), crate::gateway::PaymentMode::Sat, &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now)
-                .expect("deliver"),
+                .deliver_and_enqueue(&job, &"c".repeat(40), crate::gateway::PaymentMode::Sat, &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now, &crate::seller_node::DeliveryClock::paired_at_unix(now))
+                .expect("deliver").enqueued(),
             "first (resumed) delivery lands"
         );
         assert!(
             !store
-                .deliver_and_enqueue(&job, &"c".repeat(40), crate::gateway::PaymentMode::Sat, &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now)
-                .expect("re-deliver"),
+                .deliver_and_enqueue(&job, &"c".repeat(40), crate::gateway::PaymentMode::Sat, &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now, &crate::seller_node::DeliveryClock::paired_at_unix(now))
+                .expect("re-deliver").enqueued(),
             "a resumed re-execution delivers at most once"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -17368,6 +19489,1441 @@ mod tests {
             ),
             "the unrunnable fault must be the recorded verdict: {verdict:?}"
         );
+    }
+
+    // ---- F1–F5: the REAL delivery-push failure orchestration ------------------------------------
+    //
+    // These drive the PRODUCTION handler (`handle_delivery_push_failure`, the one and only decision
+    // point the live push routes every failure through) on a REAL `SellerNodeRunner`, against a REAL
+    // store and a REAL relay. Nothing here reconstructs a decision from a helper: each case asserts
+    // the three facts a buyer and an operator can actually observe afterwards —
+    //   1. the durable job state,
+    //   2. whether the recovery marker still stands, and
+    //   3. whether a terminal buyer-visible feedback event (kind 3404) went on the wire.
+    //
+    // The dividing line under test: a delivery that MAY be on the remote must never be failed
+    // locally, because a `failed` row is terminal and would orphan the pack; a delivery that CANNOT
+    // be on the remote must still fail immediately, exactly as before.
+
+    /// Kind-3404 feedback events the seller actually published — the buyer-visible terminal event.
+    async fn feedback_on_the_wire(fixture: &PGateRelay) -> usize {
+        fixture
+            .event_kind_count(u64::from(crate::kinds::JOB_FEEDBACK_KIND))
+            .await
+    }
+
+    /// Bounded wait for `want` feedback events, so a slow publish cannot make a green run look red.
+    async fn feedback_settles_at_least(fixture: &PGateRelay, want: usize) -> usize {
+        let deadline = std::time::Instant::now() + FIXTURE_WAIT;
+        loop {
+            let count = feedback_on_the_wire(fixture).await;
+            if count >= want || std::time::Instant::now() >= deadline {
+                return count;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// A job that is awarded, undelivered, and carries a durable uploaded-unverified marker: the
+    /// exact row every one of these failures happens on.
+    fn seed_job_with_upload_marker(
+        runner: &SellerNodeRunner,
+        job_id: &str,
+        buyer_hex: &str,
+        deadline_unix: i64,
+        now: i64,
+        uploaded: bool,
+    ) {
+        let store = runner.node.store();
+        store
+            .record_offer(
+                &crate::seller_node::store::Offer {
+                    payment_mode: crate::gateway::PaymentMode::Sat,
+                    offer_id: job_id.to_owned(),
+                    buyer_pubkey: buyer_hex.to_owned(),
+                    amount_sats: 100,
+                    unit: "sat".to_owned(),
+                    task: "held delivery".to_owned(),
+                    deadline_unix,
+                    targeted: true,
+                    requested_agent: None,
+                    output: Some("text/plain".to_owned()),
+                },
+                now,
+            )
+            .expect("record the offer this delivery belongs to");
+        let draft = claim_draft(
+            job_id,
+            buyer_hex,
+            &"s".repeat(64),
+            crate::gateway::ClaimPayment::Sat("creq"),
+            &[],
+            &Default::default(),
+        );
+        store
+            .claim_and_enqueue(job_id, job_id, Some("creq"), &draft, now, now + 3_600, now)
+            .expect("park the claim");
+        // A UNIQUE award id per job — one shared id would make every award after the first a
+        // duplicate, and no jobs row would exist to hold the marker.
+        let award_id = format!("{}{}", &job_id[..32], "9".repeat(32));
+        store
+            .record_award(&award_id, job_id, buyer_hex, now)
+            .expect("record the award that creates the jobs row");
+        let commit = "d".repeat(40);
+        assert_eq!(
+            store
+                .mark_upload_intent(job_id, &commit, now)
+                .expect("journal the pre-effect upload intent"),
+            1,
+            "harness check: the intent must land on exactly this job's row (state={:?})",
+            store.job_state(job_id)
+        );
+        if uploaded {
+            store
+                .mark_uploaded_unverified(job_id, &commit, now)
+                .expect("upgrade the marker to uploaded");
+        }
+    }
+
+    /// A verified delivery that never reached a result is completed by a LATER periodic pass.
+    ///
+    /// R2. This is the strand the unverified worklist cannot see: `mark_pushed` armed
+    /// `pushed_commit` and cleared the unverified marker in one statement, so the remote question
+    /// is already answered — and then the local finish did not happen (a signer round-trip that
+    /// timed out, a pass that spent its budget). Boot recovery would have caught it; a node that
+    /// keeps RUNNING had nothing scheduled to, and the comment claiming otherwise was false.
+    ///
+    /// The delivery is finalized here from the journaled commit: no re-push, no agent re-run, no
+    /// second remote question.
+    ///
+    /// RED ON REVERT: delete the `jobs_verified_awaiting_enqueue` loop at the end of the sweep and
+    /// the job stays `awarded` with no result on the wire, forever, while the node runs ⇒ this
+    /// fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_verified_delivery_stranded_without_a_result_is_finished_by_a_later_pass() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("verifiedstrand");
+        let runner = boot_against(&root, &fixture, false).await;
+        let buyer = "b".repeat(64);
+        let now = now_unix();
+        let job = "e".repeat(64);
+        seed_job_with_upload_marker(&runner, &job, &buyer, now + 3_600, now, true);
+
+        // The remote already attested this exact oid: this is the state AFTER a successful
+        // read-back and BEFORE the result was ever queued.
+        let commit = "d".repeat(40);
+        assert_eq!(
+            runner
+                .node
+                .store()
+                .mark_pushed(&job, &commit, now)
+                .expect("arm the verified marker"),
+            1,
+            "harness check: the job must really be verified before the strand is tested"
+        );
+        assert!(
+            runner
+                .node
+                .store()
+                .jobs_awaiting_upload_verification()
+                .expect("the unverified worklist")
+                .iter()
+                .all(|row| row.job_id != job),
+            "harness check: the unverified worklist CANNOT see this row — that is why it was stranded"
+        );
+        assert!(
+            runner
+                .node
+                .store()
+                .jobs_verified_awaiting_enqueue()
+                .expect("the verified worklist")
+                .iter()
+                .any(|row| row.job_id == job),
+            "harness check: the verified-awaiting-enqueue worklist is the one that owns it"
+        );
+
+        runner.sweep_uploaded_verifications().await;
+
+        assert!(
+            results_settle_at_least(&fixture, 1).await >= 1,
+            "the periodic pass finalizes a delivery this node had already proved"
+        );
+        assert_eq!(
+            runner
+                .node
+                .store()
+                .job_state(&job)
+                .expect("state")
+                .expect("a job row"),
+            crate::seller_node::store::JobState::Delivered,
+            "and the job reaches its real terminal disposition"
+        );
+    }
+
+    /// A budget that runs out IN FLIGHT still makes progress, and the next pass finishes the rest.
+    ///
+    /// R2. The bound must not turn into a stall: a pass that decides nothing every time is just a
+    /// slower way to strand a delivery. With a real (non-zero) budget that elapses during the first
+    /// row's own work, the pass decides exactly what it had time for, leaves the remainder held,
+    /// and the FOLLOWING pass picks that remainder up. Nothing is lost and nothing repeats.
+    ///
+    /// This deliberately does not use a zero budget: a zero budget never enters the work at all,
+    /// so it cannot show progress — the property under test here.
+    ///
+    /// RED ON REVERT, and the revert has to be the FULL one. The deferral is guarded twice over:
+    /// by `recovery_step_budget` returning `None` inside the row's own awaits, and by the
+    /// between-rows check at the top of the loop. Probed separately, each single revert left this
+    /// test GREEN — either guard alone defers the second row — so neither is load-bearing by
+    /// itself and a single-mutation RED for this property does not exist. Reverting BOTH (step
+    /// budget ignoring the pass deadline AND the between-rows check deleted) decides both rows in
+    /// the first pass and fails here with `left: 2, right: 1`. That redundancy is deliberate
+    /// belt-and-braces; it is recorded as one proved bound, not two.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_recovery_pass_whose_budget_elapses_in_flight_still_advances_the_backlog() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("sweepprogress");
+        let mut runner = boot_against(&root, &fixture, false).await;
+        let buyer = "b".repeat(64);
+        let now = now_unix();
+        let commit = "d".repeat(40);
+        let jobs = ["e".repeat(64), "f".repeat(64)];
+        for job in &jobs {
+            seed_job_with_upload_marker(&runner, job, &buyer, now + 3_600, now, true);
+            assert_eq!(
+                runner
+                    .node
+                    .store()
+                    .mark_pushed(job, &commit, now)
+                    .expect("arm the verified marker"),
+                1,
+                "harness check: both rows start verified and unenqueued"
+            );
+        }
+        // Small but REAL: the first row's own finalize outlives it, so the budget is spent in
+        // flight rather than before the pass begins.
+        runner.recovery_sweep_budget = Duration::from_millis(1);
+
+        let delivered = |runner: &SellerNodeRunner| -> usize {
+            jobs.iter()
+                .filter(|job| {
+                    matches!(
+                        runner.node.store().job_state(job),
+                        Ok(Some(crate::seller_node::store::JobState::Delivered))
+                    )
+                })
+                .count()
+        };
+
+        runner.sweep_uploaded_verifications().await;
+        assert_eq!(
+            delivered(&runner),
+            1,
+            "the pass must make PROGRESS (one decided) without owning the tick (the other deferred)"
+        );
+
+        runner.sweep_uploaded_verifications().await;
+        assert_eq!(
+            delivered(&runner),
+            2,
+            "and the deferred row is picked up by the NEXT pass — held, never lost"
+        );
+    }
+
+    /// F1 + F3 + F5(unresolved). Every failure that leaves the pack possibly ON the remote keeps the
+    /// job alive: no terminal state, marker intact, and NOT ONE buyer-visible event — because only
+    /// the remote's own exact-oid answer (or the offer deadline) may end such a delivery.
+    ///
+    /// F1 is the second entry: an authorization failure on the VERIFICATION mint, after the remote
+    /// accepted the pack. That is the 401-incident shape, and it used to be terminal.
+    ///
+    /// RED ON REVERT: route any of these arms back through `fail(...)` in
+    /// `handle_delivery_push_failure` and that case's job goes `failed` and publishes a 3404 ⇒ both
+    /// the state assertion and the "no buyer event" assertion fire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_delivery_that_may_be_on_the_remote_is_held_and_never_failed_locally() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("pushheld");
+        let runner = boot_against(&root, &fixture, false).await;
+        let buyer = "b".repeat(64);
+        let now = now_unix();
+        let deadline = now + 3_600;
+
+        let held_cases: Vec<(&str, DeliveryPushErr)> = vec![
+            (
+                "1",
+                // F3: the caller stopped waiting; `git-receive-pack` did not.
+                DeliveryPushErr::TimedOut {
+                    secs: 150,
+                    stage: PushStage::UploadOutstanding,
+                },
+            ),
+            (
+                "2",
+                // F1: the pack landed and the token that would have proved it never got signed.
+                DeliveryPushErr::PostUploadAuth("signer actor gone".to_owned()),
+            ),
+            (
+                "3",
+                // F5: a 401 on the read-back says nothing about where the pack is.
+                DeliveryPushErr::Attest(crate::git_transport::TransportError::Auth(
+                    "401 Unauthorized".to_owned(),
+                )),
+            ),
+            (
+                "4",
+                // F5: an io fault on the read-back is "could not tell", not "not there".
+                DeliveryPushErr::Attest(crate::git_transport::TransportError::Io(
+                    "connection reset".to_owned(),
+                )),
+            ),
+            (
+                "5",
+                // An io fault mid-upload cannot tell us whether the remote took the pack.
+                DeliveryPushErr::Push(crate::seller_git::SellerGitError::Io(
+                    "broken pipe during receive-pack".to_owned(),
+                )),
+            ),
+        ];
+
+        for (seed, error) in held_cases {
+            let job = seed.repeat(64);
+            seed_job_with_upload_marker(&runner, &job, &buyer, deadline, now, true);
+            let label = format!("{error:?}");
+            let disposition = runner
+                .handle_delivery_push_failure(&job, &buyer, error)
+                .await;
+            assert_eq!(
+                disposition,
+                DeliveryPushDisposition::HeldForVerification,
+                "{label} may have left the pack on the remote and must be held"
+            );
+            assert_eq!(
+                runner.node.store().job_state(&job).expect("job state"),
+                Some(crate::seller_node::store::JobState::Awarded),
+                "{label} must not put the job in a terminal state — a `failed` row is never \
+                 revisited, so the landed pack would be orphaned"
+            );
+            let marker = runner
+                .node
+                .store()
+                .upload_marker(&job)
+                .expect("marker read")
+                .expect("the recovery marker must still stand");
+            assert_eq!(marker.commit, "d".repeat(40));
+        }
+
+        // The whole point, stated the way the buyer experiences it.
+        assert_eq!(
+            feedback_on_the_wire(&fixture).await,
+            0,
+            "a held delivery must publish NO terminal buyer event — the remote's answer decides it"
+        );
+        // And the recovery lane can still see every one of them.
+        assert_eq!(
+            runner
+                .node
+                .store()
+                .jobs_awaiting_upload_verification()
+                .expect("awaiting")
+                .len(),
+            5,
+            "every held delivery must be enumerable for the no-restart sweep"
+        );
+
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The other side of the same line, and the regression guard on it: a failure that happened
+    /// BEFORE the pack could exist — or a definitive "not there" from the remote itself — still
+    /// fails immediately, with exactly ONE buyer-visible event per job. Holding these would be its
+    /// own bug: nothing is on the remote, so nothing can ever complete them.
+    ///
+    /// F2's teeth are the first entry: an upload intent that could not be journaled refuses the push
+    /// outright rather than uploading a pack the store would not remember.
+    /// F5's teeth are the last two: the remote ANSWERED, so this fails closed on the live pass.
+    ///
+    /// RED ON REVERT: hold any of these (or drop the intent requirement) and that job stays
+    /// `awarded` with no buyer event ⇒ the state and the count assertions fire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_delivery_that_cannot_be_on_the_remote_still_fails_once() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("pushfail");
+        let runner = boot_against(&root, &fixture, false).await;
+        let buyer = "b".repeat(64);
+        let now = now_unix();
+        let deadline = now + 3_600;
+
+        let fail_cases: Vec<(&str, DeliveryPushErr)> = vec![
+            (
+                "6",
+                // F2: no durable intent ⇒ never upload. Nothing was sent.
+                DeliveryPushErr::IntentUnrecorded("disk full".to_owned()),
+            ),
+            (
+                "7",
+                DeliveryPushErr::PreUploadAuth("signer refused before the upload".to_owned()),
+            ),
+            (
+                "8",
+                DeliveryPushErr::Push(crate::seller_git::SellerGitError::AuthFailed(
+                    "401 on receive-pack".to_owned(),
+                )),
+            ),
+            (
+                "9",
+                // F5: the remote answered and the delivery ref is absent / at another oid.
+                DeliveryPushErr::Attest(crate::git_transport::TransportError::Rejected(
+                    "ref is at another oid".to_owned(),
+                )),
+            ),
+            (
+                "a",
+                // F5: an allowlist refusal never reached a network and never will.
+                DeliveryPushErr::Attest(crate::git_transport::TransportError::Transport(
+                    "remote is not an allowed locator".to_owned(),
+                )),
+            ),
+            (
+                "c",
+                // F3: a timeout BEFORE the transfer began — nothing was sent.
+                DeliveryPushErr::TimedOut {
+                    secs: 150,
+                    stage: PushStage::BeforeUpload,
+                },
+            ),
+        ];
+
+        let expected = fail_cases.len();
+        for (seed, error) in fail_cases {
+            let job = seed.repeat(64);
+            seed_job_with_upload_marker(&runner, &job, &buyer, deadline, now, false);
+            let label = format!("{error:?}");
+            let disposition = runner
+                .handle_delivery_push_failure(&job, &buyer, error)
+                .await;
+            assert_eq!(
+                disposition,
+                DeliveryPushDisposition::Failed,
+                "{label} cannot have left a pack on the remote and must fail now"
+            );
+            assert_eq!(
+                runner.node.store().job_state(&job).expect("job state"),
+                Some(crate::seller_node::store::JobState::Failed),
+                "{label} must reach the terminal delivery_failed state"
+            );
+        }
+
+        assert_eq!(
+            feedback_settles_at_least(&fixture, expected).await,
+            expected,
+            "exactly one terminal buyer event per failed delivery — no more, no fewer"
+        );
+        assert!(
+            runner
+                .node
+                .store()
+                .jobs_awaiting_upload_verification()
+                .expect("awaiting")
+                .is_empty(),
+            "a terminally failed job must never be handed to the recovery sweep again"
+        );
+
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// F4 — the recovery OWNS its own liveness and its own bound, with no restart in the story.
+    ///
+    /// Two held deliveries that must each reach exactly one terminal outcome from the node's own
+    /// drain tick: one whose offer deadline has passed, and one that has spent its read-back budget.
+    /// The old shape had neither — a held row waited for a new award or a reboot to be looked at
+    /// again, and an unverifiable one could be asked forever.
+    ///
+    /// RED ON REVERT (measured): delete the `sweep_uploaded_verifications` body and both jobs stay
+    /// `awarded` with zero buyer events ⇒ this fails.
+    ///
+    /// WITHDRAWN, and left withdrawn rather than re-argued: an earlier round of this comment also
+    /// claimed the ATTEMPT-CAP branch as red-on-revert. That probe was started and killed before it
+    /// finished, so it never produced a failing run. An aborted mutation is not red proof, and the
+    /// claim is not restated here on the strength of the reasoning alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_sweep_resolves_held_deliveries_without_a_restart() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("pushsweep");
+        let runner = boot_against(&root, &fixture, false).await;
+        let store = runner.node.store().clone();
+        let buyer = "b".repeat(64);
+        let now = now_unix();
+
+        // (a) held, and its offer deadline has passed: the delivery can no longer be sold.
+        let lapsed = "e".repeat(64);
+        seed_job_with_upload_marker(&runner, &lapsed, &buyer, now - 60, now, true);
+        // (b) held, deadline live, but the read-back budget is spent: it must still end.
+        let exhausted = "f".repeat(64);
+        seed_job_with_upload_marker(&runner, &exhausted, &buyer, now + 3_600, now, true);
+        for _ in 0..UPLOAD_VERIFY_ATTEMPT_CAP {
+            store
+                .bump_upload_verify_attempt(&exhausted, now)
+                .expect("spend a read-back attempt");
+        }
+
+        assert_eq!(
+            store.jobs_awaiting_upload_verification().expect("awaiting").len(),
+            2,
+            "harness check: both deliveries start held"
+        );
+
+        // ONE tick of the loop's own sweep — no restart, no new award, no agent.
+        runner.sweep_uploaded_verifications().await;
+
+        for job in [&lapsed, &exhausted] {
+            assert_eq!(
+                store.job_state(job).expect("job state"),
+                Some(crate::seller_node::store::JobState::Failed),
+                "a held delivery that can no longer be completed must reach ONE terminal outcome"
+            );
+        }
+        assert_eq!(
+            feedback_settles_at_least(&fixture, 2).await,
+            2,
+            "exactly one terminal buyer event per resolved delivery"
+        );
+        assert!(
+            store.jobs_awaiting_upload_verification().expect("awaiting").is_empty(),
+            "the sweep must not leave the rows it resolved on its own worklist"
+        );
+
+        // A second tick changes nothing: the bound is a bound, not a loop.
+        runner.sweep_uploaded_verifications().await;
+        assert_eq!(
+            feedback_on_the_wire(&fixture).await,
+            2,
+            "re-sweeping must not emit a second terminal event for the same job"
+        );
+
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Bounded wait for `want` kind-3403 results, so a slow publish cannot make a green run look red.
+    async fn results_settle_at_least(fixture: &PGateRelay, want: usize) -> usize {
+        let deadline = std::time::Instant::now() + FIXTURE_WAIT;
+        loop {
+            let count = fixture
+                .event_kind_count(u64::from(crate::kinds::JOB_RESULT_KIND))
+                .await;
+            if count >= want || std::time::Instant::now() >= deadline {
+                return count;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// R1 — THE SWEEP RACES A LIVE INTENT, and the fix must not cost crashed-Intent recovery.
+    ///
+    /// Both rows here are byte-identical on disk: a journaled pre-upload intent whose offer deadline
+    /// has already passed, which is exactly the input that makes the sweep fail a job. The ONLY
+    /// difference is that a live lane of this process owns one of the two transfers — its pack may be
+    /// on the wire right now. Failing that job would orphan a delivery the remote is in the middle of
+    /// accepting; failing the other one is the whole point of durable recovery.
+    ///
+    /// RED ON REVERT: drop the `delivery_transfer_owned` skip in `sweep_uploaded_verifications` and
+    /// the owned job is failed in the first pass ⇒ the first two assertions fire. Delete the owner
+    /// map instead (the tempting "just don't sweep intents" fix) and the crashed row is never
+    /// recovered ⇒ the third fires.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_sweep_defers_to_a_live_transfer_and_still_recovers_a_crashed_intent() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("sweeprace");
+        let runner = boot_against(&root, &fixture, false).await;
+        let store = runner.node.store().clone();
+        let buyer = "b".repeat(64);
+        let now = now_unix();
+
+        let owned = "a".repeat(64);
+        let crashed = "c".repeat(64);
+        seed_job_with_upload_marker(&runner, &owned, &buyer, now - 60, now, false);
+        seed_job_with_upload_marker(&runner, &crashed, &buyer, now - 60, now, false);
+        assert_eq!(
+            store.jobs_awaiting_upload_verification().expect("awaiting").len(),
+            2,
+            "harness check: both journaled intents start on the worklist"
+        );
+
+        // The live lane takes ownership exactly where the push path takes it: before the intent write
+        // is visible to anyone else.
+        let ownership = runner
+            .claim_delivery_transfer(&owned)
+            .expect("the live lane claims its own transfer");
+        assert!(
+            runner.claim_delivery_transfer(&owned).is_none(),
+            "a second lane must not be able to own the same transfer"
+        );
+        assert!(
+            !runner.delivery_transfer_owned(&crashed),
+            "harness check: a crashed lane leaves NO owner behind — that is what makes it recoverable"
+        );
+
+        runner.sweep_uploaded_verifications().await;
+
+        assert_ne!(
+            store.job_state(&owned).expect("owned state"),
+            Some(crate::seller_node::store::JobState::Failed),
+            "the sweep must not fail a delivery whose pack a live lane may still be putting on the remote"
+        );
+        assert!(
+            store
+                .jobs_awaiting_upload_verification()
+                .expect("awaiting")
+                .iter()
+                .any(|row| row.job_id == owned),
+            "and it must leave that row on the worklist — deferred to its owner, not resolved"
+        );
+        assert_eq!(
+            store.job_state(&crashed).expect("crashed state"),
+            Some(crate::seller_node::store::JobState::Failed),
+            "crashed-Intent recovery is untouched: an UNOWNED journaled intent still reaches its one terminal outcome"
+        );
+        assert_eq!(
+            feedback_settles_at_least(&fixture, 1).await,
+            1,
+            "exactly one buyer-visible terminal event — for the recovered job, not the owned one"
+        );
+
+        // The transfer ends. Ownership is a deferral, not an exemption: the very next pass resolves it.
+        drop(ownership);
+        assert!(!runner.delivery_transfer_owned(&owned), "the guard releases on drop");
+        runner.sweep_uploaded_verifications().await;
+        assert_eq!(
+            store.job_state(&owned).expect("owned state after release"),
+            Some(crate::seller_node::store::JobState::Failed),
+            "once no lane owns it, the held row reaches its terminal outcome on the next tick"
+        );
+
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// THE POSITIVE PATH, end to end: a verified delivery finalizes at the EXACT journaled oid,
+    /// enqueues exactly ONE result on the wire, and a replay of the same finalize adds nothing.
+    ///
+    /// Every other recovery oracle in this file proves a delivery is refused, held or failed. None of
+    /// them would notice a fence that refuses EVERYTHING — this one would.
+    ///
+    /// RED ON REVERT: widen the post-signing fence to cover `Delivered` (or return before the journal
+    /// on any state) and no result is ever enqueued ⇒ the wire assertion fires.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_verified_delivery_finalizes_once_at_the_exact_oid_and_dedups_on_replay() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("finalizeok");
+        let runner = boot_against(&root, &fixture, false).await;
+        let store = runner.node.store().clone();
+        let buyer = "b".repeat(64);
+        let now = now_unix();
+        let job = "d".repeat(64);
+        let commit = "d".repeat(40);
+        seed_job_with_upload_marker(&runner, &job, &buyer, now + 3_600, now, true);
+
+        // The exact-oid gate agreeing is what arms the verified marker — the same statement that
+        // clears the unverified one.
+        assert_eq!(
+            uploaded_verification_outcome(Ok(())),
+            UploadedVerification::Deliver,
+            "harness check: the remote advertising the journaled oid is a DELIVER verdict"
+        );
+        assert_eq!(
+            store.mark_pushed(&job, &commit, now).expect("arm the verified marker"),
+            1,
+            "harness check: the fence admits a live job"
+        );
+
+        runner.finalize_pushed_delivery(&job, &commit, None).await;
+
+        assert_eq!(
+            store.job_state(&job).expect("state"),
+            Some(crate::seller_node::store::JobState::Delivered),
+            "a verified delivery must actually complete — a fence that refuses everything is not a fix"
+        );
+        assert_eq!(
+            store.pushed_commit(&job).expect("pushed commit").as_deref(),
+            Some(commit.as_str()),
+            "and it completes at the EXACT journaled oid, not at whatever the remote happens to hold"
+        );
+        assert_eq!(
+            results_settle_at_least(&fixture, 1).await,
+            1,
+            "exactly one result event goes to the buyer"
+        );
+        assert!(
+            store
+                .jobs_awaiting_upload_verification()
+                .expect("awaiting")
+                .is_empty(),
+            "and the finalized row leaves the recovery worklist"
+        );
+
+        // The replay a second sweep tick would perform: idempotent, no second result.
+        runner.finalize_pushed_delivery(&job, &commit, None).await;
+        assert_eq!(
+            fixture
+                .event_kind_count(u64::from(crate::kinds::JOB_RESULT_KIND))
+                .await,
+            1,
+            "a replayed finalize must not enqueue a second result for the same job"
+        );
+        assert_eq!(
+            feedback_on_the_wire(&fixture).await,
+            0,
+            "and a delivered job is never given a terminal FAILURE event by the replay"
+        );
+
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// R2 — THE DEADLINE CROSSING THE SIGNER HIDES. The recovery lane's last deadline check happens
+    /// before the receipt signing and the envelope await; both can outlast the offer. The row here
+    /// crosses its deadline while "verified", which is precisely the state the old code enqueued from
+    /// without looking at the clock again.
+    ///
+    /// RED ON REVERT: remove the post-signing `offer.deadline_unix <= now_unix()` re-check in
+    /// `finalize_pushed_delivery` and the job is DELIVERED with a result on the wire ⇒ the state and
+    /// the result-count assertions both fire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_deadline_crossed_while_the_receipt_was_signed_enqueues_no_result() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("signlapse");
+        let runner = boot_against(&root, &fixture, false).await;
+        let store = runner.node.store().clone();
+        let buyer = "b".repeat(64);
+        let now = now_unix();
+        let job = "e".repeat(64);
+        let commit = "e".repeat(40);
+        // Verified, and the offer is already past — the exact state a signer await leaves behind.
+        seed_job_with_upload_marker(&runner, &job, &buyer, now - 1, now, true);
+        assert_eq!(
+            store.mark_pushed(&job, &commit, now).expect("arm the verified marker"),
+            1,
+            "harness check: the verified marker is armed before the finalize"
+        );
+
+        runner.finalize_pushed_delivery(&job, &commit, None).await;
+
+        assert_eq!(
+            store.job_state(&job).expect("state"),
+            Some(crate::seller_node::store::JobState::Failed),
+            "a delivery whose offer lapsed while the receipt was signed gets ONE terminal outcome, not a late result"
+        );
+        assert_eq!(
+            results_settle_at_least(&fixture, 1).await,
+            0,
+            "and NOTHING is enqueued for the buyer to pay for"
+        );
+        assert_eq!(
+            feedback_settles_at_least(&fixture, 1).await,
+            1,
+            "exactly one buyer-visible terminal event"
+        );
+
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// R2B — ONE JOB'S FAILURE NOTICE DOES NOT CARRY THE BACKLOG, on the production path.
+    ///
+    /// The outbox oracles prove the scoped pass in isolation; this drives the lane a real failure
+    /// takes. A job fails while another job's feedback is already queued and pending. The failing
+    /// job's own notice goes out in this pass — the promptness R1 asked for is intact — and the
+    /// unrelated row is NOT published on that lane.
+    ///
+    /// Then the drain step runs and takes it. That second half is the deferred-custody claim: the
+    /// bound moves work to a later loop, it does not lose it, and the later loop demonstrably makes
+    /// progress rather than being assumed to.
+    ///
+    /// RED ON REVERT: restore the unbounded `self.drain()` in the failure path and the first
+    /// assertion sees two events — one job's failure having published another's backlog.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_terminal_failure_publishes_its_own_notice_and_leaves_the_backlog_to_the_drain_step() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("terminalscope");
+        let runner = boot_against(&root, &fixture, false).await;
+        let store = runner.node.store().clone();
+        let buyer = "b".repeat(64);
+        let now = now_unix();
+        let failing = "a".repeat(64);
+        let other = "d".repeat(64);
+        seed_job_with_upload_marker(&runner, &failing, &buyer, now + 600, now, true);
+        seed_job_with_upload_marker(&runner, &other, &buyer, now + 600, now, true);
+
+        // The unrelated job already has a durable feedback row waiting: the backlog.
+        let backlog_draft = error_draft(
+            &other,
+            &buyer,
+            &runner.seller_pubkey.to_hex(),
+            ReasonCode::DeliveryFailed,
+            DELIVERY_FAILURE_FEEDBACK,
+        );
+        assert_eq!(
+            store
+                .fail_and_enqueue_feedback(&other, &backlog_draft, now, now + 3_600, now)
+                .expect("queue the backlog row"),
+            crate::seller_node::store::FailureJournal::Transitioned,
+            "harness check: there IS a pending row belonging to another job"
+        );
+
+        runner
+            .fail_job_with_feedback(
+                &failing,
+                &buyer,
+                ReasonCode::DeliveryFailed,
+                DELIVERY_FAILURE_FEEDBACK,
+                None,
+                crate::seller_node::outbox::DrainBudget::Unbudgeted,
+            )
+            .await;
+
+        assert_eq!(
+            feedback_settles_at_least(&fixture, 2).await,
+            1,
+            "the failing job published its OWN notice and nothing else"
+        );
+
+        // Later loop progress: the periodic drain step is where the backlog belongs, and it moves.
+        runner.drain().await;
+        assert_eq!(
+            feedback_settles_at_least(&fixture, 2).await,
+            2,
+            "the deferred row was still pending and the drain step published it"
+        );
+
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// R2B — A SPENT PASS BUYS NOTHING. Exhausted is not the same fact as unbudgeted.
+    ///
+    /// `recovery_step_budget` answered `None` for two unrelated situations: "no pass governs this
+    /// caller" and "this pass is already spent". The terminal drain read that single `None` as the
+    /// former and handed the caller a fresh full `TERMINAL_DRAIN_BUDGET` — so the cheapest way to
+    /// overrun a tick was to run out of it first. The row is durable either way; the pass that has
+    /// spent its time publishes nothing and the periodic drain does the work.
+    ///
+    /// RED ON REVERT: map `Exhausted` back onto the full terminal budget (round 5's
+    /// `budget.unwrap_or(TERMINAL_DRAIN_BUDGET)`) and the spent pass publishes here ⇒ this fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spent_pass_does_not_buy_a_fresh_terminal_drain() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("spentpass");
+        let runner = boot_against(&root, &fixture, false).await;
+        let store = runner.node.store().clone();
+        let buyer = "b".repeat(64);
+        let now = now_unix();
+        let job = "a".repeat(64);
+        seed_job_with_upload_marker(&runner, &job, &buyer, now + 600, now, true);
+
+        let draft = error_draft(
+            &job,
+            &buyer,
+            &runner.seller_pubkey.to_hex(),
+            ReasonCode::DeliveryFailed,
+            DELIVERY_FAILURE_FEEDBACK,
+        );
+        assert_eq!(
+            store
+                .fail_and_enqueue_feedback(&job, &draft, now, now + 3_600, now)
+                .expect("queue this job's own feedback row"),
+            crate::seller_node::store::FailureJournal::Transitioned,
+            "harness check: this job's OWN event is pending and durable"
+        );
+
+        // A pass with nothing left: not "no budget", but "no time".
+        let started = std::time::Instant::now();
+        runner
+            .drain_terminal_event(&job, crate::seller_node::outbox::DrainBudget::Exhausted)
+            .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            feedback_settles_at_least(&fixture, 1).await,
+            0,
+            "a pass with no time left must not publish: the row is durable and the drain step owns it"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "a spent pass must return at once rather than opening a fresh window (took {elapsed:?})"
+        );
+        assert_eq!(
+            store
+                .outbox_row(&format!("feedback:{job}"))
+                .expect("read the row")
+                .map(|(state, _, published)| (state, published)),
+            Some(("pending".to_string(), None)),
+            "the event is still pending and unpublished, so nothing was lost by deferring it"
+        );
+
+        // And the periodic step, which is what a spent pass defers TO, moves it.
+        runner.drain().await;
+        assert_eq!(
+            feedback_settles_at_least(&fixture, 1).await,
+            1,
+            "the deferred row reaches the relay on the drain tick"
+        );
+
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// R2B — THE LAPSE ROUTE CARRIES THE BUDGET, not only the success route.
+    ///
+    /// Round 5 threaded the remaining budget through `finalize_pushed_delivery` and left the
+    /// failure sites passing a literal `None`. A sweep that lapses a held delivery late in its pass
+    /// therefore started a fresh terminal drain — the same overrun, reached through the failure
+    /// door instead of the success one. Failing a job is a terminal decision like any other.
+    ///
+    /// The durable half is asserted too: the lapse still WRITES its feedback row. Deferring the
+    /// publish must never cost the buyer its answer.
+    ///
+    /// RED ON REVERT: restore `drain_terminal_event(job_id, None)` in the failure path ⇒ the notice
+    /// is published inside the spent pass and this fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lapse_inside_a_spent_pass_writes_its_row_and_publishes_nothing() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("spentlapse");
+        let runner = boot_against(&root, &fixture, false).await;
+        let store = runner.node.store().clone();
+        let buyer = "b".repeat(64);
+        let now = now_unix();
+        let job = "a".repeat(64);
+        seed_job_with_upload_marker(&runner, &job, &buyer, now + 600, now, true);
+
+        runner
+            .fail_uploaded_delivery(
+                &job,
+                "the offer deadline passed while held",
+                crate::seller_node::outbox::DrainBudget::Exhausted,
+            )
+            .await;
+
+        assert_eq!(
+            store.job_state(&job).expect("state"),
+            Some(crate::seller_node::store::JobState::Failed),
+            "the lapse is terminal in the store whatever the publish budget was"
+        );
+        assert_eq!(
+            store
+                .outbox_row(&format!("feedback:{job}"))
+                .expect("read the row")
+                .map(|(state, _, published)| (state, published)),
+            Some(("pending".to_string(), None)),
+            "the buyer's notice is written and durable, merely not published by this pass"
+        );
+        assert_eq!(
+            feedback_settles_at_least(&fixture, 1).await,
+            0,
+            "a lapse in a spent pass publishes nothing"
+        );
+
+        runner.drain().await;
+        assert_eq!(
+            feedback_settles_at_least(&fixture, 1).await,
+            1,
+            "and the drain step delivers the notice the lapse left it"
+        );
+
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+
+    /// R2B/O-B1 — THE PERIODIC LOOP KEEPS MOVING UNDER MULTIPLE FINITE SLOW PUBLISHES.
+    ///
+    /// The tick arm is not a background task: it shares the select loop with shutdown, the relay
+    /// stream and the remittance timers. `self.drain()` was awaited there unbounded, so a backlog
+    /// against a slow relay held the WHOLE loop for the sum of its waits.
+    ///
+    /// Every publish here SUCCEEDS, in 150ms. Nothing hangs, nothing errors, no single publish is
+    /// unreasonable — which is exactly why no per-publish timeout would have found this. Forty of
+    /// them is six seconds of relay time, and the question is whether the loop belongs to the
+    /// drain for that whole stretch.
+    ///
+    /// Three things are asserted, and the middle one is the verdict's actual demand:
+    ///   1. PROGRESS — the loop publishes repeatedly, across more ticks than one can hold.
+    ///   2. THE LOOP IS STILL ITS OWN — a shutdown asked for mid-backlog is answered in well under
+    ///      the backlog's remaining relay time, because the drain yields at its tick budget.
+    ///   3. NOTHING IS LOST — every row not yet published is still durable and pending.
+    ///
+    /// RED ON REVERT: restore the unbounded `self.drain()` in the tick arm and the in-flight drain
+    /// holds the loop for the rest of the backlog ⇒ the shutdown bound fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_drain_tick_yields_the_loop_under_a_slow_backlog() {
+        const ROWS: usize = 40;
+        const PER_PUBLISH: Duration = Duration::from_millis(150);
+        const CADENCE: Duration = Duration::from_millis(400);
+
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("slow-backlog-loop");
+        let runner = boot_against(&root, &fixture, false).await;
+        let store = runner.node.store().clone();
+        let buyer = "b".repeat(64);
+        let now = now_unix();
+
+        // A durable, unpublished feedback row per job: written by a spent pass, which is precisely
+        // how a real backlog of terminal notices accumulates.
+        for index in 0..ROWS {
+            // The seeding helper derives a unique award id from the job id's FIRST 32 characters,
+            // so the index has to lead. Zero-padding on the right (`{index:064x}`) makes all forty
+            // ids share a prefix, every award after the first is a duplicate, and no jobs row is
+            // created for the marker to land on.
+            let job = format!("{index:02x}{}", "c".repeat(62));
+            seed_job_with_upload_marker(&runner, &job, &buyer, now + 600, now, true);
+            runner
+                .fail_uploaded_delivery(
+                    &job,
+                    "seeded backlog",
+                    crate::seller_node::outbox::DrainBudget::Exhausted,
+                )
+                .await;
+        }
+        // Two durable rows per job — the parked claim and the terminal notice — so the backlog is
+        // counted from the OUTBOX rather than from one event kind on the wire. Counting rows also
+        // makes the progress assertion publisher-agnostic: it is the store that must empty.
+        let backlog = store.pending_outbox(now + 1).expect("read the outbox").len();
+        assert_eq!(
+            backlog,
+            ROWS * 2,
+            "harness check: every seeded job leaves a claim row and a feedback row, all durable \
+             and unpublished before the loop starts"
+        );
+        assert_eq!(
+            feedback_on_the_wire(&fixture).await,
+            0,
+            "harness check: a spent pass published none of it"
+        );
+
+        // Slow from here on, so the node's own boot publishes are not what is being measured.
+        fixture.set_event_delay(PER_PUBLISH);
+        runner.drain_cadence_for_test(CADENCE);
+        let shutdown = runner.shutdown_handle();
+
+        let local = tokio::task::LocalSet::new();
+        let loop_handle = local.spawn_local(async move { runner.run().await });
+        let (published_before_stop, stop_took) = local
+            .run_until(async {
+                // 1. PROGRESS. Five publishes at 150ms is 750ms of relay time — more than one
+                //    400ms tick can hold, so reaching it proves successive ticks each did work.
+                let progress_deadline = std::time::Instant::now() + FIXTURE_WAIT;
+                let drained_now = || {
+                    backlog
+                        - store
+                            .pending_outbox(now + 1)
+                            .expect("read the outbox")
+                            .len()
+                };
+                loop {
+                    if drained_now() >= 5 {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < progress_deadline,
+                        "the bounded drain must still DRAIN: {} of {backlog} rows published",
+                        drained_now()
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                let published_before_stop = drained_now();
+
+                // 2. THE LOOP IS STILL ITS OWN, with a large backlog still to go.
+                let asked_at = std::time::Instant::now();
+                assert!(
+                    shutdown.request("test-requested stop"),
+                    "the loop must accept a shutdown request"
+                );
+                let joined = tokio::time::timeout(FIXTURE_WAIT, loop_handle).await;
+                let stop_took = asked_at.elapsed();
+                joined
+                    .expect("the loop must RETURN on a shutdown request, not have to be killed")
+                    .expect("the loop task must not panic")
+                    .expect("a requested shutdown is a clean exit");
+                (published_before_stop, stop_took)
+            })
+            .await;
+
+        let remaining_relay_time = PER_PUBLISH * (backlog - published_before_stop) as u32;
+        assert!(
+            remaining_relay_time > Duration::from_secs(4),
+            "harness check: there must still be a LARGE backlog when the stop is asked for, or \
+             the bound is not being tested ({published_before_stop} of {backlog} published)"
+        );
+        // Scaled to the BACKLOG rather than stated as a wall-clock constant. An absolute bound
+        // measures the machine: this test runs alongside fifteen hundred others, and a loaded host
+        // stretches every wait. What is being claimed is a RATIO — the loop came back in a small
+        // fraction of the relay time its remaining queue represents — and that claim is the same
+        // whether the host is idle or saturated.
+        assert!(
+            stop_took * 2 < remaining_relay_time,
+            "the loop answered its shutdown in {stop_took:?}, which is not comfortably inside the \
+             {remaining_relay_time:?} of backlog still queued; an unbounded drain holds the loop \
+             for essentially all of it"
+        );
+
+        // 3. NOTHING IS LOST — and the drain plainly did not run the queue to the bottom.
+        //
+        // This is the load-independent half of the same claim. An unbounded drain leaves almost
+        // nothing pending, because it publishes the whole backlog before the loop looks at
+        // anything else; a bounded one leaves most of it for later ticks. No clock is involved.
+        let still_pending = store.pending_outbox(now + 1).expect("read the outbox").len();
+        assert!(
+            still_pending * 2 > backlog,
+            "most of the backlog must still be pending when the loop stops — a drain that owns \
+             the loop until the queue is empty leaves none of it ({still_pending} of {backlog})"
+        );
+        assert!(
+            still_pending < backlog,
+            "and the loop must have published SOME of it: {still_pending} of {backlog} pending"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// R2B/O-B2 — THE MATRIX ITSELF, ASSERTED: no recovery exit is unbudgeted.
+    ///
+    /// Every previous round closed this by inspection and every previous round missed an exit —
+    /// round 5 missed the failure sites, round 6 missed FailClosed, the finalize lapses and the
+    /// journal error. Inspection does not scale to a route with a dozen `return` points, and the
+    /// callsite added next week will not be in anyone's citation list.
+    ///
+    /// So the property is checked against the SOURCE, over whole function bodies rather than named
+    /// lines: within the recovery routes, no terminal publish may be reached with an unbudgeted or
+    /// implicit budget. A new exit written without one fails this test the day it is written,
+    /// which is the only form of "all exits" that stays true after I stop looking.
+    ///
+    /// Definitions are matched on their newline-and-indent prefix so that this test's own string
+    /// literals — which contain the same names — are not mistaken for declarations.
+    ///
+    /// This pairs with the behavioural oracles rather than replacing them: those prove that a
+    /// spent pass publishes nothing and still writes its durable row; this proves that the set
+    /// they apply to is the whole set.
+    #[test]
+    fn no_recovery_exit_reaches_a_terminal_publish_unbudgeted() {
+        const SOURCE: &str = include_str!("run.rs");
+
+        /// The text between a declaration's opening brace and its matching close.
+        fn body_of<'a>(source: &'a str, decl: &str) -> &'a str {
+            let start = source
+                .find(decl)
+                .unwrap_or_else(|| panic!("the declaration {decl:?} must exist to be checked"));
+            let open = start + source[start..].find('{').expect("a body follows a declaration");
+            let mut depth = 0usize;
+            for (offset, ch) in source[open..].char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return &source[open..open + offset];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("unbalanced braces while reading {decl:?}");
+        }
+
+        // The routes a recovery pass owns. Each is entered with the pass's absolute deadline, so
+        // each of its exits can carry it — and must.
+        for route in [
+            "\n    async fn verify_uploaded_delivery(\n",
+            "\n    async fn finalize_pushed_delivery(\n",
+        ] {
+            let body = body_of(SOURCE, route);
+            assert!(
+                !body.contains("DrainBudget::Unbudgeted"),
+                "{route:?} must not hand any exit an unbudgeted terminal publish"
+            );
+            for call in [
+                "self.fail_job_with_feedback(",
+                "self.fail_uploaded_delivery(",
+                "self.drain_terminal_event(",
+            ] {
+                for (index, _) in body.match_indices(call) {
+                    let tail = &body[index..];
+                    let close = tail
+                        .find(".await")
+                        .unwrap_or_else(|| panic!("{route:?}: could not read the end of {call}"));
+                    let args = &tail[..close];
+                    assert!(
+                        args.contains("recovery_step_budget(pass_deadline)"),
+                        "{route:?}: an exit through {call} does not carry the pass deadline. \
+                         Every exit must, not merely the ones anyone cited. Saw: {args}"
+                    );
+                }
+            }
+        }
+
+        // And the wrapper that made "unbudgeted" the default is GONE, not merely unused: a default
+        // is what let those exits be written without anyone deciding anything.
+        let entrypoint = "\n    async fn fail_job_with_feedback(\n";
+        assert_eq!(
+            SOURCE.matches(entrypoint).count(),
+            1,
+            "there must be exactly one terminal-failure entrypoint, not a budgeted one plus a \
+             convenience wrapper supplying Unbudgeted"
+        );
+        let decl_start = SOURCE.find(entrypoint).expect("the entrypoint exists");
+        let decl_end = decl_start
+            + SOURCE[decl_start..]
+                .find('{')
+                .expect("a body follows the entrypoint");
+        assert!(
+            SOURCE[decl_start..decl_end].contains("budget: crate::seller_node::outbox::DrainBudget"),
+            "the budget must be a REQUIRED parameter of the one terminal-failure entrypoint"
+        );
+    }
+
+    /// R2B — THE OFFER IS A CEILING ON THE STEP, not just the pass.
+    ///
+    /// Driven directly, because the arithmetic IS the claim: whichever of the pass and the offer
+    /// runs out first wins, and an offer already gone yields no budget at all rather than a long
+    /// await for a result the atomic deadline check would refuse.
+    ///
+    /// The offer-bounded cases are asserted as a tight WINDOW rather than an exact equality, and
+    /// that is the absolute budget showing through rather than a tolerance being smuggled in: the
+    /// grant is now an instant, so `step` subtracts the clock where it is used and necessarily
+    /// returns a hair under the nominal remainder. An exact `== 2s` could only pass if the value
+    /// were a stale `Duration` carried from before — which is the defect. The window is asserted
+    /// tight (under a millisecond of slack) so it still pins the arithmetic.
+    #[test]
+    fn the_offer_deadline_is_a_ceiling_on_a_recovery_step() {
+        let far = std::time::Instant::now() + Duration::from_secs(600);
+        let just_under = |got: Option<Duration>, nominal: Duration, what: &str| {
+            let got = got.unwrap_or_else(|| panic!("{what}: expected a live step budget"));
+            assert!(
+                got <= nominal && got + Duration::from_millis(1) >= nominal,
+                "{what}: expected just under {nominal:?}, got {got:?}"
+            );
+        };
+
+        just_under(
+            recovery_step_budget_within_offer(Some(far), 1_000, 998_000).step(RECOVERY_STEP_TIMEOUT),
+            Duration::from_secs(2),
+            "an offer with two seconds left caps a step the pass would have allowed to run long",
+        );
+        assert_eq!(
+            recovery_step_budget_within_offer(Some(far), 1_000_000, 998_000).step(RECOVERY_STEP_TIMEOUT),
+            Some(RECOVERY_STEP_TIMEOUT),
+            "a distant offer leaves the standing step ceiling in charge"
+        );
+        just_under(
+            recovery_step_budget_within_offer(None, 1_000, 998_000).step(RECOVERY_STEP_TIMEOUT),
+            Duration::from_secs(2),
+            "and the offer still binds a step running outside any pass",
+        );
+
+        // O-B4: the EXACT remainder. 400ms before the deadline the ceiling is 400ms, not the whole
+        // second the floored subtraction used to hand back.
+        just_under(
+            recovery_step_budget_within_offer(Some(far), 1_000, 999_600).step(RECOVERY_STEP_TIMEOUT),
+            Duration::from_millis(400),
+            "the last fraction of an offer is a fraction, not a rounded-up whole second",
+        );
+        // An expired offer still finishes this route: the terminal event it is owed is produced by
+        // completing the step, not by abandoning it. Vetoing here left the job `awarded` forever.
+        assert_eq!(
+            recovery_step_budget_within_offer(Some(far), 1_000, 1_000_000).step(RECOVERY_STEP_TIMEOUT),
+            Some(RECOVERY_STEP_TIMEOUT),
+            "an offer at its deadline is owed a terminal answer, so the step is not vetoed"
+        );
+        assert_eq!(
+            recovery_step_budget_within_offer(Some(far), 1_000, 1_200_000).step(RECOVERY_STEP_TIMEOUT),
+            Some(RECOVERY_STEP_TIMEOUT),
+            "and one already past is owed the same"
+        );
+        assert_eq!(
+            recovery_step_budget_within_offer(Some(std::time::Instant::now()), 1_000_000, 998_000)
+                .step(RECOVERY_STEP_TIMEOUT),
+            None,
+            "a spent pass still stops the step, whatever the offer allows"
+        );
+    }
+
+    /// R2A — THE SUBSECOND CARRY ON THE **RESUMED** ROUTE.
+    ///
+    /// The sibling of the store-level carry oracle, driven end-to-end through the route a restart
+    /// actually takes: `finalize_pushed_delivery` mints, reads back, signs the receipt, and only
+    /// then asks for the durable write. The precision defect lived in the arithmetic BOTH routes
+    /// share, so proving it on the live lane alone would have left this one admitting late results.
+    ///
+    /// The crossing is real, not simulated. A second connection holds the write lock, and — because
+    /// the store runs WAL — the route's pre-write READS still pass, so it gets as far as the
+    /// journal exactly as in production. The holder times its release from the ROUTE'S OWN SAMPLE
+    /// (read back through the test seam), so the crossing does not depend on how long minting and
+    /// signing happened to take on the day.
+    ///
+    /// Two premises are asserted rather than assumed, because a timing test that quietly loses its
+    /// timing is worse than no test: the offer was still LIVE when the route sampled, and the whole
+    /// lock wait stayed under one second. The second is what makes this a SUBSECOND carry — under
+    /// whole-second arithmetic the wait floors to zero and the deadline looks unreached.
+    ///
+    /// RED ON REVERT: restore the doubly-floored decision and a result is enqueued against an offer
+    /// that had already expired.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_subsecond_crossing_in_the_resumed_route_enqueues_no_result() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("carryresume");
+        let runner = boot_against(&root, &fixture, false).await;
+        let store = runner.node.store().clone();
+        let buyer = "b".repeat(64);
+        let job = "c".repeat(64);
+        let commit = "c".repeat(40);
+
+        // Fix the offer a few seconds out FIRST, then approach it. Deriving the deadline from a
+        // wall position read moments earlier is not atomic: a preemption between the two lands the
+        // deadline a whole second further off, and the wait this oracle measures silently picks up
+        // that second. Choosing the deadline up front and steering toward it keeps the premise
+        // sound under load, which is the only condition a parallel gate run offers.
+        let deadline = crate::seller_node::wall_clock_ms() / 1_000 + 3;
+        seed_job_with_upload_marker(&runner, &job, &buyer, deadline, deadline - 60, true);
+        assert_eq!(
+            store.mark_pushed(&job, &commit, deadline - 60).expect("arm the verified marker"),
+            1,
+            "harness check: the verified marker is armed before the finalize"
+        );
+
+        let db = root.join(crate::seller_node::STATE_DB_FILE);
+        let watched = job.clone();
+        let holder = std::thread::spawn(move || {
+            let conflicting = rusqlite::Connection::open(&db).expect("open the blocking writer");
+            conflicting
+                .busy_timeout(Duration::from_secs(5))
+                .expect("busy timeout");
+            conflicting
+                .execute_batch("BEGIN EXCLUSIVE;")
+                .expect("hold the write lock");
+            let sampled_ms = loop {
+                if let Some(ms) = delivery_sample_ms(&watched) {
+                    break ms;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            };
+            // Release just past the offer: the route has been waiting for this lock since its own
+            // sample, so the wait it measures is exactly the crossing.
+            let release_at_ms = deadline * 1_000 + 150;
+            let remaining = release_at_ms - crate::seller_node::wall_clock_ms();
+            if remaining > 0 {
+                std::thread::sleep(Duration::from_millis(remaining as u64));
+            }
+            conflicting.execute_batch("COMMIT;").expect("release the lock");
+            (sampled_ms, release_at_ms)
+        });
+        // Let the conflicting transaction take the lock before the route wants it.
+        std::thread::sleep(Duration::from_millis(30));
+
+        // Approach the offer to roughly half a second short of it, so the route samples while the
+        // offer is still LIVE and the wait for the lock stays well inside one second. Half a
+        // second of slack in both directions is what makes the two premises below hold on a loaded
+        // host instead of only on an idle one.
+        let enter_at_ms = deadline * 1_000 - 500;
+        while crate::seller_node::wall_clock_ms() < enter_at_ms {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        runner.finalize_pushed_delivery(&job, &commit, None).await;
+        let (sampled_ms, release_at_ms) = holder.join().expect("the blocking writer finishes");
+
+        let deadline_ms = deadline * 1_000;
+        assert!(
+            sampled_ms < deadline_ms,
+            "harness check: the offer must still be LIVE when the route samples, or this proves \
+             nothing about a crossing (sampled {sampled_ms}, deadline {deadline_ms})"
+        );
+        assert!(
+            release_at_ms - sampled_ms < 1_000,
+            "harness check: the whole lock wait must stay under one second, or whole-second \
+             arithmetic would have caught it too and the oracle would not be about precision \
+             (waited {}ms)",
+            release_at_ms - sampled_ms
+        );
+
+        assert_ne!(
+            store.job_state(&job).expect("state"),
+            Some(crate::seller_node::store::JobState::Delivered),
+            "a delivery whose offer expired while it waited for the write lock is not delivered"
+        );
+        assert_eq!(
+            results_settle_at_least(&fixture, 1).await,
+            0,
+            "and NOTHING is enqueued for the buyer to pay for"
+        );
+
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// R2 — A PERIODIC PASS MUST NOT OWN THE TICK. The sweep shares the drain tick with lapse
+    /// healing, capacity reconsideration, harness probes and the outbox; a worklist of rows that each
+    /// talk to a remote cannot be allowed to run to the end of the list before the tick is released.
+    ///
+    /// The budget is exercised at zero here — the honest way to drive "already spent" without a
+    /// two-minute test — and the property asserted is the one that matters: a pass that stops early
+    /// DECIDES NOTHING and LOSES NOTHING. The rows are still held, and the next tick resolves them.
+    ///
+    /// RED ON REVERT: delete the budget check and the exhausted pass resolves both rows ⇒ the
+    /// "nothing decided" assertions fire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_recovery_pass_that_spends_its_budget_decides_nothing_and_loses_nothing() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("sweepbudget");
+        let mut runner = boot_against(&root, &fixture, false).await;
+        let store = runner.node.store().clone();
+        let buyer = "b".repeat(64);
+        let now = now_unix();
+
+        let first = "1".repeat(64);
+        let second = "2".repeat(64);
+        seed_job_with_upload_marker(&runner, &first, &buyer, now - 60, now, true);
+        seed_job_with_upload_marker(&runner, &second, &buyer, now - 60, now, true);
+
+        // A pass with no budget left: the tick is handed back immediately.
+        runner.recovery_sweep_budget = Duration::from_millis(0);
+        runner.sweep_uploaded_verifications().await;
+
+        for job in [&first, &second] {
+            assert_ne!(
+                store.job_state(job).expect("state"),
+                Some(crate::seller_node::store::JobState::Failed),
+                "a pass that stopped on its budget must not have decided anything"
+            );
+        }
+        assert_eq!(
+            store.jobs_awaiting_upload_verification().expect("awaiting").len(),
+            2,
+            "and it must leave every unreached row exactly where it was — held, not lost"
+        );
+        assert_eq!(
+            feedback_on_the_wire(&fixture).await,
+            0,
+            "no buyer-visible event comes out of a pass that did no work"
+        );
+
+        // The next tick has a budget again, and the deferred work is simply done.
+        runner.recovery_sweep_budget = RECOVERY_SWEEP_BUDGET;
+        runner.sweep_uploaded_verifications().await;
+        for job in [&first, &second] {
+            assert_eq!(
+                store.job_state(job).expect("state"),
+                Some(crate::seller_node::store::JobState::Failed),
+                "deferred is not dropped: the next pass resolves what the budget cut short"
+            );
+        }
+        assert_eq!(
+            feedback_settles_at_least(&fixture, 2).await,
+            2,
+            "one terminal event per resolved delivery, and not one more"
+        );
+
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 

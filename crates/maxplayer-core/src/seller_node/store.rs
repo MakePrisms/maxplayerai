@@ -650,6 +650,38 @@ impl From<rusqlite::Error> for StoreError {
     }
 }
 
+
+/// WHICH SIDE of the upload side effect a delivery's recovery marker was written on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadStage {
+    /// Written BEFORE the pack was sent: the remote may or may not hold it. Required, not
+    /// best-effort — a delivery whose intent could not be journaled is never attempted.
+    Intent,
+    /// Written after the remote ACCEPTED the pack, from inside the blocking upload op.
+    Uploaded,
+}
+
+/// A delivery that owes the remote an exact-oid read-back before it may be completed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadMarker {
+    /// The oid the read-back must find the delivery ref at. Never re-pushed from here.
+    pub commit: String,
+    pub stage: UploadStage,
+    /// When the marker was written (unix seconds); operator evidence, never a decision input.
+    pub at_unix: i64,
+    /// Read-backs already spent on this marker. Bounds the retry.
+    pub attempts: i64,
+}
+
+/// One row of [`SellerStore::jobs_awaiting_upload_verification`]: the job, its marker, and the
+/// offer deadline that bounds its recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AwaitingVerification {
+    pub job_id: String,
+    pub marker: UploadMarker,
+    pub deadline_unix: Option<i64>,
+}
+
 /// An offer the relay ingester has seen and the node may claim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Offer {
@@ -822,6 +854,57 @@ pub struct HealthSnapshot {
     pub pending_outbox: i64,
 }
 
+/// What [`SellerStore::deliver_and_enqueue`] actually did. A completion, a replay and a refusal are
+/// three different facts about a job, and collapsing them into a bool is how "already journaled" ends
+/// up printed for a delivery that was never written (R1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryJournal {
+    /// The delivery row was written and the result event queued by THIS call.
+    Enqueued,
+    /// The job already had a delivery row: idempotent no-op, nothing re-enqueued.
+    AlreadyDelivered,
+    /// The job was already terminally `failed`; the result was deliberately NOT enqueued.
+    Fenced,
+    /// The offer's deadline had passed at the instant of the durable write. R2: eligibility is
+    /// decided HERE, inside the same immediate transaction as the enqueue, because every check
+    /// made before this point is separated from it by a lock acquisition the checker does not
+    /// hold. A caller that checked a live deadline and then waited on this lock can arrive late.
+    DeadlinePassed,
+}
+
+/// What [`SellerStore::fail_and_enqueue_feedback`] actually did (R1). A failure that moved the row
+/// and a failure that found the job already terminal are different facts, and only the first may
+/// announce itself to the buyer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureJournal {
+    /// This call moved the job to `failed` and queued exactly one buyer feedback event.
+    Transitioned,
+    /// The job was already terminal (`paid`, `delivered` or `failed`): nothing moved, and
+    /// deliberately nothing was announced.
+    NoOp,
+}
+
+impl FailureJournal {
+    /// True only when this call took the job terminal — never for a no-op over a settled job.
+    pub fn transitioned(self) -> bool {
+        matches!(self, FailureJournal::Transitioned)
+    }
+}
+
+/// A delivery the remote already attested, still awaiting its durable result enqueue.
+#[derive(Debug, Clone)]
+pub struct VerifiedAwaitingEnqueue {
+    pub job_id: String,
+    pub commit: String,
+    pub deadline_unix: Option<i64>,
+}
+
+impl DeliveryJournal {
+    /// True only when this call wrote the delivery — never for a replay or a fence.
+    pub fn enqueued(self) -> bool {
+        matches!(self, DeliveryJournal::Enqueued)
+    }
+}
 impl SellerStore {
     /// Open (creating if absent) the state DB at `path` with WAL + crash-safe pragmas and ensure
     /// the schema is present.
@@ -928,7 +1011,34 @@ impl SellerStore {
                  -- crash mid-derive leaves the row re-checkable. Provenance-honest: relay-derived,
                  -- DISTINCT from a local deliveries row. NULL means not derived-settled; a unix ts
                  -- means when we derived it.
-                 settled_elsewhere_at_unix INTEGER
+                 settled_elsewhere_at_unix INTEGER,
+                 -- The UPLOADED-BUT-NOT-YET-VERIFIED delivery oid, journaled as soon as the remote
+                 -- ACCEPTED the pack and BEFORE the exact-oid read-back runs. It records one fact
+                 -- and only that fact: the pack is (probably) on the remote and nothing has
+                 -- confirmed it. It is DELIBERATELY a different column from `pushed_commit`:
+                 -- `pushed_commit` means VERIFIED (resume finalizes from it without re-checking the
+                 -- remote), so writing the upload's oid there would let a resume complete a delivery
+                 -- no one ever attested. A resume that finds THIS column set re-runs the read-back
+                 -- under a freshly minted token and only then arms `pushed_commit`. NULL ⇒ nothing
+                 -- uploaded-unverified; `mark_pushed` clears it in the same statement that arms the
+                 -- verified marker, so the two can never both stand.
+                 uploaded_unverified_commit TEXT,
+                 -- When the upload above was journaled (unix seconds). Operator evidence and the
+                 -- age an inspection reads; the recovery decision never depends on it.
+                 uploaded_unverified_at_unix INTEGER,
+                 -- WHICH SIDE OF THE SIDE EFFECT the row was written on: 'intent' means the pack was
+                 -- about to be sent and may or may not have landed; 'uploaded' means the remote
+                 -- ACCEPTED it. The 'intent' write happens BEFORE the upload and is REQUIRED — a
+                 -- delivery whose intent could not be journaled is not attempted — which is what
+                 -- makes a crash, a cancellation or a lost write between about-to-push and pushed
+                 -- recoverable: BOTH stages resume the same way, by asking the remote, so the
+                 -- reconciliation never depends on having observed the acceptance. NULL with a commit
+                 -- set is a row from the first cut of this marker and reads as 'uploaded'.
+                 uploaded_unverified_stage TEXT,
+                 -- How many read-back attempts the recovery has spent on this marker. Bounds the
+                 -- retry so an unverifiable delivery reaches ONE terminal disposition instead of
+                 -- being asked forever. NULL/absent reads as 0.
+                 uploaded_verify_attempts INTEGER
              );
              -- One delivery per job (the seller-authored snapshot the daemon published).
              CREATE TABLE IF NOT EXISTS deliveries (
@@ -1128,6 +1238,27 @@ impl SellerStore {
         // + idempotent, exactly like the columns above.
         if !Self::column_exists(conn, "jobs", "settled_elsewhere_at_unix")? {
             conn.execute_batch("ALTER TABLE jobs ADD COLUMN settled_elsewhere_at_unix INTEGER;")?;
+        }
+        // The uploaded-but-unverified delivery marker. A store from a binary without it reads NULL
+        // (nothing uploaded-unverified) and is armed going forward at upload time. Additive +
+        // idempotent, exactly like the columns above.
+        if !Self::column_exists(conn, "jobs", "uploaded_unverified_commit")? {
+            conn.execute_batch("ALTER TABLE jobs ADD COLUMN uploaded_unverified_commit TEXT;")?;
+        }
+        if !Self::column_exists(conn, "jobs", "uploaded_unverified_at_unix")? {
+            conn.execute_batch(
+                "ALTER TABLE jobs ADD COLUMN uploaded_unverified_at_unix INTEGER;",
+            )?;
+        }
+        // The stage ('intent' before the upload, 'uploaded' after the remote accepted it) and the
+        // bounded attempt counter. A store from the first cut of this marker reads NULL for both:
+        // NULL stage on a row that HAS a commit means that row was written post-acceptance, so it
+        // reads as 'uploaded', and NULL attempts reads as 0. Additive + idempotent.
+        if !Self::column_exists(conn, "jobs", "uploaded_unverified_stage")? {
+            conn.execute_batch("ALTER TABLE jobs ADD COLUMN uploaded_unverified_stage TEXT;")?;
+        }
+        if !Self::column_exists(conn, "jobs", "uploaded_verify_attempts")? {
+            conn.execute_batch("ALTER TABLE jobs ADD COLUMN uploaded_verify_attempts INTEGER;")?;
         }
         // #686: the buyer's declared output type. A store from a pre-#686 binary reads NULL for its
         // existing offers — those jobs simply state no output type in their agent prompt — and is
@@ -1711,19 +1842,224 @@ impl SellerStore {
     /// on resume the job FINALIZES from this commit (re-sign + enqueue) rather than re-running the
     /// agent. Idempotent — last write wins; does NOT change `state` (the atomic advance to
     /// `delivered` stays with `deliver_and_enqueue`).
-    pub fn mark_pushed(&self, job_id: &str, commit: &str, now_unix: i64) -> Result<(), StoreError> {
+    ///
+    /// FENCED (R1): a row that already reached a terminal `failed` or `paid` state is NOT resurrected
+    /// into a completion. The reconciliation sweep and a live caller can both be holding an opinion
+    /// about the same delivery; whoever writes a terminal state first owns the outcome, and the loser
+    /// learns it from the returned count — 1 when this call moved the row, 0 when it was already
+    /// settled elsewhere. A caller that finalizes on 0 would publish a result for a job the buyer has
+    /// already been told failed.
+    pub fn mark_pushed(&self, job_id: &str, commit: &str, now_unix: i64) -> Result<usize, StoreError> {
         let conn = self.lock()?;
+        // ONE statement arms the verified marker and clears the uploaded-but-unverified one, so no
+        // crash can leave a row claiming both "verified at X" and "unverified upload pending". The
+        // verified marker is the only one a resume finalizes from; the unverified one is the only
+        // one a resume re-checks the remote for. They are mutually exclusive by construction here.
         conn.execute(
-            "UPDATE jobs SET pushed_commit = ?2, updated_at_unix = ?3 WHERE job_id = ?1",
+            "UPDATE jobs
+                SET pushed_commit = ?2,
+                    uploaded_unverified_commit = NULL,
+                    uploaded_unverified_at_unix = NULL,
+                    uploaded_unverified_stage = NULL,
+                    uploaded_verify_attempts = NULL,
+                    updated_at_unix = ?3
+              WHERE job_id = ?1 AND state NOT IN ('failed','paid')",
             params![job_id, commit, now_unix],
-        )?;
-        Ok(())
+        )
+        .map_err(StoreError::from)
     }
 
-    /// Record a delivery and enqueue its result event in ONE transaction. Idempotent — a replay for
-    /// a job that already has a delivery row changes nothing and re-enqueues nothing.
+    /// Journal the INTENT to upload a delivery, BEFORE the pack is sent: this job is about to push
+    /// `commit` to its delivery ref, and from this moment the remote may hold it.
+    ///
+    /// This is the pre-side-effect half of the recovery, and it is REQUIRED, not best-effort: the
+    /// caller refuses to upload when this write does not land. That is what closes the window a
+    /// post-effect journal cannot — a crash, a cancellation, or a lost write between the remote
+    /// accepting the pack and the seat learning that it did. Both stages resume identically (ask the
+    /// remote at the exact oid), so the recovery never depends on having OBSERVED the acceptance.
+    ///
+    /// Returns the number of rows moved; 0 means there is no such job row and the caller must treat
+    /// the intent as unrecorded. Never downgrades a marker already at `uploaded` for the same commit,
+    /// and does NOT change `state`.
+    pub fn mark_upload_intent(
+        &self,
+        job_id: &str,
+        commit: &str,
+        now_unix: i64,
+    ) -> Result<usize, StoreError> {
+        let conn = self.lock()?;
+        let moved = conn.execute(
+            "UPDATE jobs
+                SET uploaded_unverified_commit = ?2,
+                    uploaded_unverified_stage =
+                        CASE WHEN uploaded_unverified_commit = ?2
+                                  AND uploaded_unverified_stage = 'uploaded'
+                             THEN 'uploaded' ELSE 'intent' END,
+                    uploaded_unverified_at_unix = ?3,
+                    updated_at_unix = ?3
+              WHERE job_id = ?1",
+            params![job_id, commit, now_unix],
+        )?;
+        Ok(moved)
+    }
+
+    /// Upgrade the marker to UPLOADED: the remote ACCEPTED the pack for `commit` and the exact-oid
+    /// read-back has not confirmed it yet.
+    ///
+    /// Unlike [`Self::mark_upload_intent`] this write is not load-bearing for recovery — the intent
+    /// row already makes the job reconciliable — it sharpens the operator's picture and the log. It
+    /// is written from INSIDE the blocking upload op, so a cancelled or timed-out caller cannot lose
+    /// it. Returns rows moved; idempotent, last write wins; does NOT change `state`.
+    pub fn mark_uploaded_unverified(
+        &self,
+        job_id: &str,
+        commit: &str,
+        now_unix: i64,
+    ) -> Result<usize, StoreError> {
+        let conn = self.lock()?;
+        let moved = conn.execute(
+            "UPDATE jobs
+                SET uploaded_unverified_commit = ?2,
+                    uploaded_unverified_stage = 'uploaded',
+                    uploaded_unverified_at_unix = ?3,
+                    updated_at_unix = ?3
+              WHERE job_id = ?1",
+            params![job_id, commit, now_unix],
+        )?;
+        Ok(moved)
+    }
+
+    /// The full upload marker for `job_id`: the oid, which side of the side effect it was written on,
+    /// when, and how many read-backs the recovery has already spent on it. `Some` on a slot-occupying
+    /// row means a resume owes the remote a read-back before this job may be completed.
+    pub fn upload_marker(&self, job_id: &str) -> Result<Option<UploadMarker>, StoreError> {
+        let conn = self.lock()?;
+        let row = conn
+            .query_row(
+                "SELECT uploaded_unverified_commit,
+                        uploaded_unverified_stage,
+                        uploaded_unverified_at_unix,
+                        uploaded_verify_attempts
+                   FROM jobs WHERE job_id = ?1",
+                [job_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row.and_then(|(commit, stage, at_unix, attempts)| {
+            commit.map(|commit| UploadMarker {
+                commit,
+                // A row from the first cut of this marker has no stage and was written only after the
+                // remote accepted the pack: that is `Uploaded`, not a guess.
+                stage: match stage.as_deref() {
+                    Some("intent") => UploadStage::Intent,
+                    _ => UploadStage::Uploaded,
+                },
+                at_unix: at_unix.unwrap_or(0),
+                attempts: attempts.unwrap_or(0),
+            })
+        }))
+    }
+
+    /// The uploaded-but-unverified delivery oid for `job_id`, if any — [`Self::upload_marker`]
+    /// narrowed to the oid, for readers that need nothing else.
+    pub fn uploaded_unverified_commit(&self, job_id: &str) -> Result<Option<String>, StoreError> {
+        Ok(self.upload_marker(job_id)?.map(|marker| marker.commit))
+    }
+
+    /// Count one read-back attempt against the marker and return the NEW total. The recovery bounds
+    /// itself on this: an unverifiable delivery must reach one terminal disposition, not be asked
+    /// forever. Returns 0 when there is no marker to charge.
+    pub fn bump_upload_verify_attempt(
+        &self,
+        job_id: &str,
+        now_unix: i64,
+    ) -> Result<i64, StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE jobs
+                SET uploaded_verify_attempts = COALESCE(uploaded_verify_attempts, 0) + 1,
+                    updated_at_unix = ?2
+              WHERE job_id = ?1 AND uploaded_unverified_commit IS NOT NULL",
+            params![job_id, now_unix],
+        )?;
+        let attempts: Option<i64> = conn
+            .query_row(
+                "SELECT uploaded_verify_attempts FROM jobs WHERE job_id = ?1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(attempts.unwrap_or(0))
+    }
+
+    /// Every SLOT-OCCUPYING job that still owes the remote a read-back, with its marker and its
+    /// offer deadline. This is the liveness half of the recovery: a seat that keeps running (no
+    /// restart) sweeps these, so an unresolved delivery is either verified, or lapsed when its offer
+    /// deadline passes — never left waiting for the next boot.
+    ///
+    /// Rows that already have a delivery, a receipt or a verified commit are excluded here as well as
+    /// by the resume precedence: this enumeration must not hand the sweep a job that is already done.
+    pub fn jobs_awaiting_upload_verification(
+        &self,
+    ) -> Result<Vec<AwaitingVerification>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT j.job_id,
+                    j.uploaded_unverified_commit,
+                    j.uploaded_unverified_stage,
+                    j.uploaded_unverified_at_unix,
+                    j.uploaded_verify_attempts,
+                    o.deadline_unix
+               FROM jobs j
+               LEFT JOIN offers o ON o.offer_id = j.offer_id
+              WHERE j.uploaded_unverified_commit IS NOT NULL
+                AND j.pushed_commit IS NULL
+                AND j.state IN ('awarded','executing')
+                AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.job_id = j.job_id)
+                AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.job_id = j.job_id)
+              ORDER BY j.uploaded_unverified_at_unix ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(AwaitingVerification {
+                    job_id: row.get(0)?,
+                    marker: UploadMarker {
+                        commit: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                        stage: match row.get::<_, Option<String>>(2)?.as_deref() {
+                            Some("intent") => UploadStage::Intent,
+                            _ => UploadStage::Uploaded,
+                        },
+                        at_unix: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                        attempts: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                    },
+                    deadline_unix: row.get::<_, Option<i64>>(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Record a delivery and enqueue its result event in ONE transaction.
+    ///
+    /// Three outcomes, and they are deliberately NOT the same fact (R1):
+    /// - [`DeliveryJournal::Enqueued`] — this call wrote the delivery and queued the result.
+    /// - [`DeliveryJournal::AlreadyDelivered`] — idempotent replay; the job already has a delivery
+    ///   row, so nothing is written and nothing is re-enqueued.
+    /// - [`DeliveryJournal::Fenced`] — the job reached a terminal `failed` state before this caller
+    ///   got here, so the result is NOT enqueued. A racing reconciliation already told the buyer this
+    ///   delivery failed; enqueuing now would publish the opposite outcome for the same job. Reported
+    ///   separately from a dedup because an operator reading "already journaled" for a job that was
+    ///   actually fenced is reading a delivery that does not exist.
     #[allow(clippy::too_many_arguments)]
-    pub fn deliver_and_enqueue(
+    pub(crate) fn deliver_and_enqueue(
         &self,
         job_id: &str,
         result_ref: &str,
@@ -1732,7 +2068,8 @@ impl SellerStore {
         created_at_unix: i64,
         expires_at_unix: i64,
         now_unix: i64,
-    ) -> Result<bool, StoreError> {
+        clock: &crate::seller_node::DeliveryClock,
+    ) -> Result<DeliveryJournal, StoreError> {
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let exists: bool = tx
@@ -1745,7 +2082,52 @@ impl SellerStore {
             .is_some();
         if exists {
             tx.commit()?;
-            return Ok(false);
+            return Ok(DeliveryJournal::AlreadyDelivered);
+        }
+        // THE FENCE, inside the same immediate transaction as the write it guards: a job whose
+        // terminal answer is already `failed` does not acquire a delivery and a queued result here.
+        let terminal_failure: bool = tx
+            .query_row(
+                "SELECT 1 FROM jobs WHERE job_id = ?1 AND state = 'failed'",
+                [job_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if terminal_failure {
+            tx.commit()?;
+            return Ok(DeliveryJournal::Fenced);
+        }
+        // R2: THE deadline decision, atomic with the write it guards. Both routes reach this
+        // statement — the live execute path and the resumed finalize — so neither can enqueue a
+        // result the offer no longer accepts, however long it waited for this lock. A replay of an
+        // already-delivered job is settled above and is deliberately NOT re-judged here: that job
+        // was delivered on time and stays delivered.
+        let deadline: Option<i64> = tx
+            .query_row(
+                "SELECT o.deadline_unix FROM jobs j
+                   JOIN offers o ON o.offer_id = j.offer_id
+                  WHERE j.job_id = ?1",
+                [job_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        // Eligibility is judged at the instant of the WRITE, not at the instant the caller decided
+        // to attempt it. Those differ by everything between the caller's own sample and this
+        // statement — argument marshalling, scheduler preemption, and the unbounded wait for this
+        // very lock — none of which the caller can observe. Judging by the bare `now_unix` argument
+        // leaves exactly the hole this check exists to close.
+        //
+        // R2A: so the decision reads a CLOCK here, inside the transaction, rather than arithmetic
+        // on a stale sample. `DeliveryClock` carries the caller's own origin paired with the
+        // monotonic instant it was taken at, and extrapolates it to THIS moment in nanoseconds — one
+        // coherent timebase (so a synthetic-timebase caller is still judged on its own clock) with
+        // no floor anywhere in the path. Whole seconds lost up to 999ms of the measured interval and
+        // whole milliseconds lost up to 999us of it; both admitted deliveries whose offer had in
+        // fact expired. The deadline is a whole second, scaled UP to meet the instant.
+        if deadline.is_some_and(|deadline| clock.deadline_passed(deadline)) {
+            tx.commit()?;
+            return Ok(DeliveryJournal::DeadlinePassed);
         }
         // §3.2 — ruling 3's record, with the payment stated explicitly rather than inferred from
         // the absence of a receipt. A free job's row is written here and never advances past
@@ -1769,22 +2151,112 @@ impl SellerStore {
             now_unix,
         )?;
         tx.commit()?;
-        Ok(true)
+        Ok(DeliveryJournal::Enqueued)
     }
 
-    /// Mark a job failed. Idempotent (last write wins) but never overwrites a terminal `paid`.
+    /// Mark a job failed, FENCED against every terminal state — `paid`, `delivered` and an existing
+    /// `failed` alike.
     ///
-    /// Returns the number of rows failed — 0 or 1. This is the write `ResumeAction::SkipLapsed`
-    /// uses to heal a stale `awarded` row, so a caller that treats it as unconditional can report a
-    /// heal that never happened: the `state != 'paid'` guard (and an absent row) both yield 0.
+    /// Returns the number of rows failed — 0 or 1 — and that count is the transition itself, not a
+    /// formality. Two things turn on it:
+    /// - A delivered job is never rewritten to `failed`. A reconciliation pass and a live caller can
+    ///   race over one delivery; a late failure must not overwrite a completion the buyer already has.
+    /// - A job already `failed` moves nothing, so the caller can publish buyer feedback EXACTLY once.
+    ///   Feedback published on a no-op write is a second terminal answer for one job.
+    ///
+    /// This is also the write `ResumeAction::SkipLapsed` uses to heal a stale `awarded` row, so a
+    /// caller that treats it as unconditional can report a heal that never happened.
     pub fn fail_job(&self, job_id: &str, now_unix: i64) -> Result<usize, StoreError> {
         let conn = self.lock()?;
         let failed = conn.execute(
             "UPDATE jobs SET state = 'failed', updated_at_unix = ?2
-             WHERE job_id = ?1 AND state != 'paid'",
+             WHERE job_id = ?1 AND state NOT IN ('paid','delivered','failed')",
             params![job_id, now_unix],
         )?;
         Ok(failed)
+    }
+
+    /// Fail a job AND queue the buyer's failure feedback in ONE immediate transaction, so the
+    /// terminal event is bound to the terminal transition that won.
+    ///
+    /// R1. Failing and telling the buyer used to be two independent acts: `fail_job` fenced itself
+    /// correctly, then the caller published feedback regardless of whether that fence had moved
+    /// anything. Two consequences, both observed in review: a job already `delivered` could emit
+    /// `delivery_failed` — the exact opposite of its real disposition — and a repeated no-op
+    /// failure could emit that feedback again each time. The converse was also reachable: a crash
+    /// between the state write and a direct relay send lost the event entirely.
+    ///
+    /// Both disappear when the decision and its announcement share a transaction. The feedback is
+    /// queued only on the transition that actually moved the row, and it is queued DURABLY (the
+    /// outbox survives the crash that a direct send does not). `INSERT OR IGNORE` on the job's
+    /// dedup key makes the queueing exactly-once even if a later pass re-enters this call.
+    ///
+    /// The draft is queued UNSIGNED, exactly as every other outbox row is: the drain publisher
+    /// signs each item at its fixed `created_at_unix` when it sends it. That is what lets this be
+    /// one synchronous transaction — no async signing has to happen between deciding the
+    /// disposition and durably recording its announcement.
+    pub fn fail_and_enqueue_feedback(
+        &self,
+        job_id: &str,
+        draft: &EventDraft,
+        created_at_unix: i64,
+        expires_at_unix: i64,
+        now_unix: i64,
+    ) -> Result<FailureJournal, StoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let failed = tx.execute(
+            "UPDATE jobs SET state = 'failed', updated_at_unix = ?2
+             WHERE job_id = ?1 AND state NOT IN ('paid','delivered','failed')",
+            params![job_id, now_unix],
+        )?;
+        if failed == 0 {
+            tx.commit()?;
+            return Ok(FailureJournal::NoOp);
+        }
+        enqueue_event(
+            &tx,
+            &format!("feedback:{job_id}"),
+            draft,
+            created_at_unix,
+            expires_at_unix,
+            now_unix,
+        )?;
+        tx.commit()?;
+        Ok(FailureJournal::Transitioned)
+    }
+
+    /// Deliveries the remote has ALREADY attested at the exact oid, which never reached a queued
+    /// result — the strand between `mark_pushed` and `deliver_and_enqueue`.
+    ///
+    /// R2. The unverified worklist deliberately excludes these rows (they need no remote question),
+    /// and boot recovery picks them up, so on a node that keeps running they had no owner at all: a
+    /// finalize that lost its signer round-trip left the buyer waiting indefinitely for a delivery
+    /// this node had already proved. This is the periodic claim on them.
+    pub fn jobs_verified_awaiting_enqueue(
+        &self,
+    ) -> Result<Vec<VerifiedAwaitingEnqueue>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT j.job_id, j.pushed_commit, o.deadline_unix
+               FROM jobs j
+               LEFT JOIN offers o ON o.offer_id = j.offer_id
+              WHERE j.pushed_commit IS NOT NULL
+                AND j.state IN ('awarded','executing')
+                AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.job_id = j.job_id)
+                AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.job_id = j.job_id)
+              ORDER BY j.updated_at_unix ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(VerifiedAwaitingEnqueue {
+                    job_id: row.get(0)?,
+                    commit: row.get(1)?,
+                    deadline_unix: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Record a collected receipt and mark the job paid. The `receipt_id` is deduped: the first
@@ -3129,6 +3601,531 @@ mod tests {
         }
     }
 
+    /// Two production terminal writers race for ONE job, and the buyer gets ONE answer.
+    ///
+    /// R1. `deliver_and_enqueue` and `fail_and_enqueue_feedback` are the only two ways a job's
+    /// story ends. Before this round they could BOTH land: the failure path wrote its state and
+    /// announced itself without ever asking whether the delivery had already won. This drives them
+    /// concurrently through real store-lock contention — no manual ordering, no injected barrier —
+    /// and then reads back exactly what the buyer would see on the wire.
+    ///
+    /// RED ON REVERT: remove the terminal-failure fence inside `deliver_and_enqueue`, or let
+    /// `fail_and_enqueue_feedback` queue its feedback on a zero-row update, and a job ends up with
+    /// a result AND a `delivery_failed` queued for it ⇒ this fails.
+    #[test]
+    fn two_racing_terminal_decisions_leave_exactly_one_answer_on_the_wire() {
+        // Both ORDERS have to happen. Contention alone is not coverage: spawned together the
+        // delivering lane reaches the lock first essentially every time, and in that order the
+        // failure fence is never consulted — the failure's own state guard carries it. The
+        // dangerous order is the other one (failure first, delivery arriving late onto a job
+        // already taken terminal), so half these rounds hand the failure lane the head start, and
+        // the run asserts at the end that it really saw both dispositions win.
+        let mut saw_delivery_win = false;
+        let mut saw_failure_win = false;
+        for round in 0..8 {
+            let delivery_leads = round % 2 == 0;
+            let lag = std::time::Duration::from_millis(60);
+            let path = temp_db(&format!("race-terminal-{round}"));
+            let _ = std::fs::remove_file(&path);
+            let store = SellerStore::open(&path).expect("open");
+            let job = "raced";
+            insert_job(&store, job, JobState::Executing);
+            let commit = "c".repeat(40);
+            let result_draft = result();
+            let feedback_draft = wire_draft(3404);
+
+            let (delivered, failed) = std::thread::scope(|scope| {
+                let deliver = scope.spawn(|| {
+                    if !delivery_leads {
+                        std::thread::sleep(lag);
+                    }
+                    store.deliver_and_enqueue(
+                        job,
+                        &commit,
+                        crate::gateway::PaymentMode::Sat,
+                        &result_draft,
+                        1,
+                        10_000,
+                        1,
+                        &crate::seller_node::DeliveryClock::paired_at_unix(1),
+                    )
+                });
+                let fail = scope.spawn(|| {
+                    if delivery_leads {
+                        std::thread::sleep(lag);
+                    }
+                    store.fail_and_enqueue_feedback(job, &feedback_draft, 1, 10_000, 1)
+                });
+                (
+                    deliver.join().expect("the delivering lane"),
+                    fail.join().expect("the failing lane"),
+                )
+            });
+            let delivered = delivered.expect("deliver_and_enqueue").enqueued();
+            let failed = failed.expect("fail_and_enqueue_feedback").transitioned();
+
+            assert!(
+                delivered ^ failed,
+                "round {round}: exactly ONE lane may take the job terminal (delivered={delivered}, failed={failed})"
+            );
+            let queued: Vec<String> = store
+                .pending_outbox(1)
+                .expect("read the outbox")
+                .into_iter()
+                .map(|item| item.dedup_key)
+                .collect();
+            assert_eq!(
+                queued.len(),
+                1,
+                "round {round}: the buyer is told exactly once, not twice and not never (queued={queued:?})"
+            );
+            let expected = if delivered {
+                format!("result:{job}")
+            } else {
+                format!("feedback:{job}")
+            };
+            assert_eq!(
+                queued[0], expected,
+                "round {round}: the event on the wire must be the one the WINNING disposition implies"
+            );
+            let state = store.job_state(job).expect("state").expect("a job row");
+            let expected_state = if delivered {
+                JobState::Delivered
+            } else {
+                JobState::Failed
+            };
+            assert_eq!(
+                state, expected_state,
+                "round {round}: the durable state agrees with the event that went out"
+            );
+            saw_delivery_win |= delivered;
+            saw_failure_win |= failed;
+        }
+        assert!(
+            saw_delivery_win && saw_failure_win,
+            "this test only covers the fence if BOTH orders actually occurred \
+             (delivery won: {saw_delivery_win}, failure won: {saw_failure_win})"
+        );
+    }
+
+    /// A delivered job never emits the OPPOSITE failure, however many times a late lane tries.
+    ///
+    /// R1. This is the minimal counterexample the review named: finalize succeeds, then a lapsed
+    /// lane replays the failure path. The old shape failed the row (a no-op, correctly fenced) and
+    /// then published `delivery_failed` anyway — the exact opposite of the job's real disposition,
+    /// once per retry. Binding the announcement to the transition is what makes the retries silent.
+    ///
+    /// RED ON REVERT: publish the feedback outside the transition's transaction (or on a zero-row
+    /// update) and the delivered job accumulates one `delivery_failed` per attempt ⇒ this fails.
+    #[test]
+    fn a_delivered_job_emits_no_late_failure_however_often_the_failure_is_retried() {
+        let path = temp_db("delivered-then-late-failure");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        let job = "settled";
+        insert_job(&store, job, JobState::Executing);
+        assert!(
+            store
+                .deliver_and_enqueue(
+                    job,
+                    &"a".repeat(40),
+                    crate::gateway::PaymentMode::Sat,
+                    &result(),
+                    1,
+                    10_000,
+                    1,
+                    &crate::seller_node::DeliveryClock::paired_at_unix(1),
+                )
+                .expect("the delivery lands")
+                .enqueued(),
+            "harness check: the job really is delivered before the late failures arrive"
+        );
+
+        for attempt in 0..3 {
+            let outcome = store
+                .fail_and_enqueue_feedback(job, &wire_draft(3404), 2, 10_000, 2)
+                .expect("the late failure is handled, not an error");
+            assert_eq!(
+                outcome,
+                FailureJournal::NoOp,
+                "attempt {attempt}: a delivered job cannot be taken failed"
+            );
+        }
+
+        assert_eq!(
+            store.job_state(job).expect("state").expect("a job row"),
+            JobState::Delivered,
+            "the job keeps its real disposition"
+        );
+        let queued: Vec<String> = store
+            .pending_outbox(2)
+            .expect("read the outbox")
+            .into_iter()
+            .map(|item| item.dedup_key)
+            .collect();
+        assert_eq!(
+            queued,
+            vec![format!("result:{job}")],
+            "the result is the ONLY thing queued — no opposite failure, and none repeated"
+        );
+    }
+
+    /// A deadline that passes WHILE the writer waits for the store lock enqueues nothing.
+    ///
+    /// R2, and the reason the eligibility clock is read inside the transaction. Every check made
+    /// before this point is separated from the durable write by a lock the checker does not hold:
+    /// this lane is eligible when it calls, waits out a real conflicting transaction, and is no
+    /// longer eligible when it finally gets to write. The crossing is REAL — the offer is live at
+    /// the call and expires during the wait — not a pre-expired row staged to take the branch.
+    ///
+    /// RED ON REVERT: judge the deadline by the caller's `now_unix` argument instead of the clock
+    /// read inside the transaction, and this late result is enqueued ⇒ this fails.
+    /// R2A — THE SUBSECOND CARRY, which is the verdict's own arithmetic run as a test.
+    ///
+    /// Deadline 101. The caller samples at **100.900** — live, with 100ms to spare. It then waits
+    /// ~150ms for the write lock a conflicting transaction is holding, so the durable write decides
+    /// at **101.050**, past the offer. Whole-second arithmetic floors twice — the sample down to
+    /// 100 and the wait down to 0 — computes 100, and enqueues a result the buyer's offer no longer
+    /// accepts.
+    ///
+    /// Nothing here depends on the wall clock: the decision is the caller's own millisecond sample
+    /// plus a REAL monotonic lock wait, so the crossing is exact and repeatable while the
+    /// contention is genuine.
+    ///
+    /// RED ON REVERT: restore `now_unix.saturating_add(called_at.elapsed().as_secs())` and this
+    /// returns `Enqueued`.
+    #[test]
+    fn a_subsecond_crossing_during_the_lock_wait_enqueues_nothing() {
+        let path = temp_db("subsecond-carry-crossing");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        let job = "carry";
+        insert_job(&store, job, JobState::Executing);
+        let mut offer = sample_offer(&format!("offer-{job}"));
+        offer.deadline_unix = 101;
+        store.record_offer(&offer, 100).expect("record the offer");
+        let sampled_at_ms = 100_900;
+        // The caller's origin, taken HERE — so the wait it is about to spend is inside the
+        // measured interval rather than outside it.
+        let clock = crate::seller_node::DeliveryClock::paired_at_ns(i128::from(sampled_at_ms) * 1_000_000);
+        assert!(
+            sampled_at_ms < offer.deadline_unix * 1_000,
+            "harness check: the offer must be LIVE at the caller's sample, or this proves nothing \
+             about a crossing"
+        );
+
+        let outcome = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let holder = rusqlite::Connection::open(&path).expect("open the blocking writer");
+                holder
+                    .execute_batch("BEGIN EXCLUSIVE;")
+                    .expect("hold the write lock");
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                holder.execute_batch("COMMIT;").expect("release the lock");
+            });
+            // Let the conflicting transaction take the lock first, leaving ~150ms of real wait —
+            // longer than the 100ms the caller had left, and far under the whole second that
+            // second-granularity arithmetic needs before it notices anything at all.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            store
+                .deliver_and_enqueue(
+                    job,
+                    &"b".repeat(40),
+                    crate::gateway::PaymentMode::Sat,
+                    &result(),
+                    100,
+                    100 + 10_000,
+                    100,
+                    &clock,
+                )
+                .expect("the write completes rather than erroring")
+        });
+
+        assert_eq!(
+            outcome,
+            DeliveryJournal::DeadlinePassed,
+            "a crossing measured in hundreds of milliseconds is still a crossing"
+        );
+        assert_eq!(
+            store.job_state(job).expect("state"),
+            Some(JobState::Executing),
+            "and the job is not marked delivered"
+        );
+        assert!(
+            store
+                .pending_outbox(100)
+                .expect("read the outbox")
+                .is_empty(),
+            "nothing was queued for the buyer"
+        );
+    }
+
+    /// R2A — ACTUAL PRECISION: a crossing inside the final MILLISECOND is still a crossing.
+    ///
+    /// Round 4 judged this deadline in whole seconds; round 5 judged it in whole milliseconds. The
+    /// second is the first defect at a finer scale, and this test is the one that tells them apart.
+    /// The caller's origin sits **400 microseconds** before the deadline — live — and the decision
+    /// then comes **700 microseconds** later. The true instant, 101.0003, is past the deadline, so
+    /// nothing may be enqueued. Millisecond arithmetic floors the origin down to 100_999ms and the
+    /// wait down to 0ms, computes 100_999 < 101_000, and admits a delivery the offer no longer
+    /// accepts. Neither component is a whole millisecond; their sum is.
+    ///
+    /// The wait is STATED rather than slept: `thread::sleep` on this host overshoots a 600us
+    /// request past a full millisecond, which would hand the millisecond arithmetic the rounding it
+    /// needs to look correct and make this test pass against the defect it exists to catch.
+    ///
+    /// The second half is the half that stops this becoming a "refuse everything" fix: an origin
+    /// 50ms inside the deadline, judged at once, must still DELIVER.
+    ///
+    /// RED ON REVERT: restore the millisecond expression
+    /// (`now_ms + called_at.elapsed().as_millis()`) and the first half returns `Enqueued`.
+    #[test]
+    fn a_crossing_inside_the_final_millisecond_is_still_a_crossing() {
+        let deadline_ns = 101i128 * 1_000_000_000;
+
+        let path = temp_db("sub-ms-crossing");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        let job = "sub-ms";
+        insert_job(&store, job, JobState::Executing);
+        let mut offer = sample_offer(&format!("offer-{job}"));
+        offer.deadline_unix = 101;
+        store.record_offer(&offer, 100).expect("record the offer");
+        // 400us of room at the sample, then a 700us wait: LIVE at the sample, expired at the write,
+        // and neither margin is a whole millisecond.
+        let clock =
+            crate::seller_node::DeliveryClock::simulated(deadline_ns - 400_000, 700_000);
+        assert!(
+            deadline_ns - 400_000 < deadline_ns,
+            "harness check: the offer is live at the caller's sample"
+        );
+        assert!(
+            clock.now_ns() > deadline_ns,
+            "harness check: the decision instant is past the deadline"
+        );
+        let outcome = store
+            .deliver_and_enqueue(
+                job,
+                &"b".repeat(40),
+                crate::gateway::PaymentMode::Sat,
+                &result(),
+                100,
+                100 + 10_000,
+                100,
+                &clock,
+            )
+            .expect("the write completes rather than erroring");
+        assert_eq!(
+            outcome,
+            DeliveryJournal::DeadlinePassed,
+            "a crossing inside the last millisecond is a crossing: the offer expired before the write"
+        );
+        assert!(
+            store.pending_outbox(200).expect("read the outbox").is_empty(),
+            "nothing may be enqueued for a delivery the offer no longer accepts"
+        );
+        assert_eq!(
+            store.job_state(job).expect("state"),
+            Some(JobState::Executing),
+            "the job must not have been advanced to delivered"
+        );
+
+        // And the other direction: still inside the deadline ⇒ still delivered.
+        let live_path = temp_db("sub-ms-live");
+        let _ = std::fs::remove_file(&live_path);
+        let live = SellerStore::open(&live_path).expect("open");
+        let live_job = "sub-ms-live";
+        insert_job(&live, live_job, JobState::Executing);
+        let mut live_offer = sample_offer(&format!("offer-{live_job}"));
+        live_offer.deadline_unix = 101;
+        live.record_offer(&live_offer, 100).expect("record the offer");
+        let live_clock =
+            crate::seller_node::DeliveryClock::paired_at_ns(deadline_ns - 50_000_000);
+        let live_outcome = live
+            .deliver_and_enqueue(
+                live_job,
+                &"b".repeat(40),
+                crate::gateway::PaymentMode::Sat,
+                &result(),
+                100,
+                100 + 10_000,
+                100,
+                &live_clock,
+            )
+            .expect("the write completes");
+        assert_eq!(
+            live_outcome,
+            DeliveryJournal::Enqueued,
+            "a delivery decided 50ms INSIDE the deadline must still be enqueued"
+        );
+    }
+
+    /// R2A — PREEMPTION BETWEEN THE SAMPLE AND THE STORE, the interval round 5 never counted.
+    ///
+    /// Round 5 started its measurement with `Instant::now()` INSIDE the store. Everything before
+    /// that — argument marshalling, and above all the scheduler preempting the caller between its
+    /// own clock read and the call — was outside the measured interval and therefore free. That
+    /// interval is not sub-millisecond and it is not bounded.
+    ///
+    /// Here the caller samples at 100.0 against deadline 101, is preempted for 1.5s, and only then
+    /// reaches the store. There is NO lock contention at all: the whole crossing happens before the
+    /// store is even entered. The paired origin travels with the caller, so the store extrapolates
+    /// from the caller's own read and sees 101.5 — past the offer.
+    ///
+    /// RED ON REVERT: measure from inside the store (round 5's `called_at`) and this returns
+    /// `Enqueued`, because from the store's point of view no time passed at all.
+    #[test]
+    fn a_preemption_between_the_sample_and_the_store_is_counted() {
+        let path = temp_db("sample-to-store-preemption");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        let job = "preempted";
+        insert_job(&store, job, JobState::Executing);
+        let mut offer = sample_offer(&format!("offer-{job}"));
+        offer.deadline_unix = 101;
+        store.record_offer(&offer, 100).expect("record the offer");
+        let clock = crate::seller_node::DeliveryClock::paired_at_unix(100);
+        assert!(
+            clock.now_ns() < i128::from(offer.deadline_unix) * 1_000_000_000,
+            "harness check: the offer is LIVE at the caller's own sample"
+        );
+        // The caller loses the CPU here, between its clock read and the store call. No lock is
+        // contended; the store will acquire it instantly.
+        std::thread::sleep(std::time::Duration::from_millis(1_500));
+        let outcome = store
+            .deliver_and_enqueue(
+                job,
+                &"b".repeat(40),
+                crate::gateway::PaymentMode::Sat,
+                &result(),
+                100,
+                100 + 10_000,
+                100,
+                &clock,
+            )
+            .expect("the write completes rather than erroring");
+        assert_eq!(
+            outcome,
+            DeliveryJournal::DeadlinePassed,
+            "time the caller spent before reaching the store is time the offer spent expiring"
+        );
+        assert!(
+            store.pending_outbox(200).expect("read the outbox").is_empty(),
+            "no result may be enqueued for an offer that expired before the write"
+        );
+    }
+
+    /// R2A — the boundary itself, stated exactly rather than raced for.
+    ///
+    /// The deadline is a whole second and the instant is nanoseconds, so the comparison has one
+    /// correct direction: scale the deadline UP. At exactly the deadline the offer is over; one
+    /// nanosecond before it, it is not.
+    #[test]
+    fn the_deadline_boundary_is_judged_at_the_stated_nanosecond() {
+        for (offset_ns, expected) in [
+            (0i128, DeliveryJournal::DeadlinePassed),
+            (-1, DeliveryJournal::Enqueued),
+        ] {
+            let path = temp_db(&format!("ns-boundary-{}", offset_ns + 1));
+            let _ = std::fs::remove_file(&path);
+            let store = SellerStore::open(&path).expect("open");
+            let job = "boundary";
+            insert_job(&store, job, JobState::Executing);
+            let mut offer = sample_offer(&format!("offer-{job}"));
+            offer.deadline_unix = 101;
+            store.record_offer(&offer, 100).expect("record the offer");
+            let at = 101i128 * 1_000_000_000 + offset_ns;
+            let clock = crate::seller_node::DeliveryClock::stated(move || at);
+            let outcome = store
+                .deliver_and_enqueue(
+                    job,
+                    &"b".repeat(40),
+                    crate::gateway::PaymentMode::Sat,
+                    &result(),
+                    100,
+                    100 + 10_000,
+                    100,
+                    &clock,
+                )
+                .expect("the write completes");
+            assert_eq!(
+                outcome, expected,
+                "at deadline{offset_ns:+}ns the decision must be {expected:?}"
+            );
+        }
+    }
+
+
+    #[test]
+    fn a_deadline_crossed_while_waiting_for_the_store_lock_enqueues_nothing() {
+        let path = temp_db("deadline-crossed-under-contention");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        let job = "latecomer";
+        insert_job(&store, job, JobState::Executing);
+        // Sit down at the START of a wall second before sampling. `now_unix` floors, so a sample
+        // taken at X.950 leaves this test only 50ms of margin before its own premise expires — and
+        // under a loaded full-suite run that is how the harness check, not the property, decided
+        // the result. Anchoring the sample makes the margin the whole second it was meant to be.
+        while crate::seller_node::wall_clock_ms() % 1_000 >= 100 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let now = crate::seller_node::now_unix();
+        let mut offer = sample_offer(&format!("offer-{job}"));
+        // Live when the writer starts, expired while it waits — the writer spends materially longer
+        // than that on the lock, so the crossing survives scheduling slop rather than sitting on the
+        // edge of it.
+        offer.deadline_unix = now + 2;
+        store.record_offer(&offer, now).expect("record the offer");
+        // Taken at the caller's sample, before the lock is contended.
+        let clock = crate::seller_node::DeliveryClock::paired_at_unix(now);
+
+        let outcome = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let holder = rusqlite::Connection::open(&path).expect("open the blocking writer");
+                holder
+                    .execute_batch("BEGIN EXCLUSIVE;")
+                    .expect("hold the write lock");
+                std::thread::sleep(std::time::Duration::from_millis(3_500));
+                holder.execute_batch("COMMIT;").expect("release the lock");
+            });
+            // Let the conflicting transaction take the lock first.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert!(
+                offer.deadline_unix > crate::seller_node::now_unix(),
+                "harness check: the offer must still be LIVE at the instant this writer starts, \
+                 otherwise this proves nothing about a crossing"
+            );
+            store
+                .deliver_and_enqueue(
+                    job,
+                    &"b".repeat(40),
+                    crate::gateway::PaymentMode::Sat,
+                    &result(),
+                    now,
+                    now + 10_000,
+                    now,
+                    &clock,
+                )
+                .expect("the write completes rather than erroring")
+        });
+
+        assert_eq!(
+            outcome,
+            DeliveryJournal::DeadlinePassed,
+            "the deadline passed while this writer waited for the lock, so it must NOT enqueue"
+        );
+        assert!(
+            store.pending_outbox(now + 10).expect("read the outbox").is_empty(),
+            "nothing reaches the buyer from a write that lost its eligibility while waiting"
+        );
+        assert_eq!(
+            store.job_state(job).expect("state").expect("a job row"),
+            JobState::Executing,
+            "and the job is not marked delivered by a write that refused"
+        );
+    }
+
     /// A wire-valid draft carrying the protocol tags every maxplayer event needs.
     fn wire_draft(kind: u16) -> EventDraft {
         use crate::gateway::{MAXPLAYER_TAG, PROTOCOL_VERSION};
@@ -3191,6 +4188,334 @@ mod tests {
             store.offer_row("o2").expect("row").expect("o2").requested_agent,
             None
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // RESTART COVERAGE — the whole point of "durable". An upload the remote accepted whose read-back
+    // never confirmed it is journaled, the process goes away (the store is DROPPED and the sqlite
+    // file reopened, which is what a restart is here), and the fact is still there for the resume to
+    // act on. A log line would not have survived this test, and the fact that recovers the delivery
+    // must be the state, not the log.
+    //
+    // Bite (measured): make `mark_uploaded_unverified` a no-op, or drop the column from the
+    // migration, and the reopened read returns None — the resume then re-runs the agent for a
+    // delivery already on the remote.
+    #[test]
+    fn an_uploaded_unverified_delivery_survives_a_restart() {
+        let path = temp_db("uploaded-unverified");
+        let _ = std::fs::remove_file(&path);
+        let commit = "a".repeat(40);
+        {
+            let store = SellerStore::open(&path).expect("open");
+            insert_job(&store, "job-1", JobState::Executing);
+            // A second job that never uploaded: absence must read as absence, not as a default.
+            insert_job(&store, "job-2", JobState::Executing);
+            store
+                .mark_uploaded_unverified("job-1", &commit, 4_242)
+                .expect("journal the upload");
+        }
+        let store = SellerStore::open(&path).expect("reopen — the restart");
+        assert_eq!(
+            store.uploaded_unverified_commit("job-1").expect("read").as_deref(),
+            Some(commit.as_str()),
+            "the uploaded-but-unverified fact must outlive the process that learned it"
+        );
+        assert_eq!(
+            store.uploaded_unverified_commit("job-2").expect("read"),
+            None,
+            "a job that never uploaded has no marker"
+        );
+        // And it is NOT the verified marker: a resume must not be able to finalize from it.
+        assert_eq!(
+            store.pushed_commit("job-1").expect("read"),
+            None,
+            "an unverified upload is not a pushed (verified) commit — the resume owes the remote a read-back"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // The two markers are mutually exclusive, in ONE statement: arming the VERIFIED marker clears the
+    // unverified one, so no crash can leave a row that both claims a verified commit and asks for a
+    // re-verification. Also holds across a restart — the clear is committed, not in-memory.
+    #[test]
+    fn arming_the_verified_marker_clears_the_unverified_one() {
+        let path = temp_db("marker-exclusive");
+        let _ = std::fs::remove_file(&path);
+        let commit = "b".repeat(40);
+        {
+            let store = SellerStore::open(&path).expect("open");
+            insert_job(&store, "job-1", JobState::Executing);
+            store
+                .mark_uploaded_unverified("job-1", &commit, 10)
+                .expect("journal the upload");
+            store.mark_pushed("job-1", &commit, 11).expect("verified");
+            assert_eq!(
+                store.uploaded_unverified_commit("job-1").expect("read"),
+                None,
+                "the unverified marker is cleared by the same statement that arms the verified one"
+            );
+        }
+        let store = SellerStore::open(&path).expect("reopen");
+        assert_eq!(
+            store.pushed_commit("job-1").expect("read").as_deref(),
+            Some(commit.as_str())
+        );
+        assert_eq!(store.uploaded_unverified_commit("job-1").expect("read"), None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // R1/F3 — A JOURNAL FAULT AND A READ FAULT, ACROSS A REOPEN. Two faults the recovery lane has to
+    // survive without either losing a delivery or inventing one:
+    //
+    //   1. THE UPGRADE WRITE NEVER LANDS. `mark_uploaded_unverified` runs inside the blocking upload
+    //      op and is explicitly best-effort — the production path logs and continues. What must not
+    //      depend on it is RECOVERABILITY: the pre-upload intent was written before the pack was
+    //      sent, and it alone has to keep the row on the worklist across a restart.
+    //   2. THE STAGE COLUMN READS BACK UNKNOWN (an older writer, a partial migration, a hand-edited
+    //      row). The parser must not resolve that to `Intent` — the side that says "the remote
+    //      probably has nothing". It degrades to `Uploaded`, the side that still OWES the remote a
+    //      read-back, so an unreadable marker can only cost an extra question, never a lost pack.
+    //
+    // The fault is INJECTED ON THE SUBJECT ROW, not simulated beside it: a BEFORE UPDATE trigger
+    // aborts exactly this job's upgrade write, so `mark_uploaded_unverified` fails the way a real
+    // write error fails, on the row whose recovery is in question.
+    //
+    // Bite (measured): make `mark_upload_intent` a no-op and the reopened worklist is EMPTY for the
+    // faulted job — the blind-rerun state. Make the unknown stage parse as `Intent` and the second
+    // half fails instead.
+    #[test]
+    fn a_faulted_journal_upgrade_and_an_unknown_stage_still_reopen_as_a_recoverable_delivery() {
+        let path = temp_db("journal-fault-reopen");
+        let _ = std::fs::remove_file(&path);
+        let commit = "f".repeat(40);
+        {
+            let store = SellerStore::open(&path).expect("open");
+            insert_job(&store, "faulted-upgrade", JobState::Executing);
+            assert_eq!(
+                store
+                    .mark_upload_intent("faulted-upgrade", &commit, 10)
+                    .expect("journal the pre-effect intent"),
+                1,
+                "harness check: the required pre-upload write lands"
+            );
+            // THE FAULT, on the subject row itself: a trigger that aborts this job's upgrade write.
+            // The production path logs such an error and carries on, which is precisely the state
+            // under test — the upgrade is lost, and only the intent can still save the delivery.
+            {
+                let fault = rusqlite::Connection::open(&path).expect("open a fault connection");
+                fault
+                    .execute_batch(
+                        "CREATE TRIGGER fault_the_upgrade BEFORE UPDATE ON jobs
+                         WHEN NEW.job_id = 'faulted-upgrade'
+                          AND NEW.uploaded_unverified_stage = 'uploaded'
+                         BEGIN SELECT RAISE(ABORT, 'injected journal write fault'); END;",
+                    )
+                    .expect("arm the injected write fault");
+            }
+            let upgrade = store.mark_uploaded_unverified("faulted-upgrade", &commit, 11);
+            assert!(
+                upgrade.is_err(),
+                "harness check: the injected fault must actually break THIS row's upgrade write, \
+                 otherwise the rest of this test proves nothing (got {upgrade:?})"
+            );
+            {
+                let fault = rusqlite::Connection::open(&path).expect("open a fault connection");
+                fault
+                    .execute_batch("DROP TRIGGER fault_the_upgrade;")
+                    .expect("disarm the injected write fault");
+            }
+            assert_eq!(
+                store
+                    .upload_marker("faulted-upgrade")
+                    .expect("read the marker")
+                    .expect("the intent stands")
+                    .stage,
+                UploadStage::Intent,
+                "a faulted upgrade leaves the PRE-UPLOAD intent in place — it never erases it"
+            );
+        }
+
+        // The restart. Nothing in memory survives it; the intent is the only thing that can.
+        let store = SellerStore::open(&path).expect("reopen");
+        let held = store
+            .jobs_awaiting_upload_verification()
+            .expect("worklist after reopen");
+        assert!(
+            held.iter().any(|row| row.job_id == "faulted-upgrade"),
+            "a delivery whose upgrade write faulted is STILL recoverable after a restart — the intent is what makes it so"
+        );
+        assert_eq!(
+            held.iter()
+                .find(|row| row.job_id == "faulted-upgrade")
+                .map(|row| row.marker.commit.clone()),
+            Some(commit.clone()),
+            "and it is recoverable at the EXACT oid the pack was for"
+        );
+
+        // The read fault: a stage value no reader knows.
+        {
+            let conn = store.lock().expect("lock");
+            conn.execute(
+                "UPDATE jobs SET uploaded_unverified_stage = 'something-no-reader-knows' WHERE job_id = ?1",
+                ["faulted-upgrade"],
+            )
+            .expect("write an unknown stage");
+        }
+        assert_eq!(
+            store
+                .upload_marker("faulted-upgrade")
+                .expect("read the marker")
+                .expect("the marker is still there")
+                .stage,
+            UploadStage::Uploaded,
+            "an unreadable stage degrades to the side that still owes the remote a read-back — never to 'nothing was sent'"
+        );
+        assert!(
+            store
+                .jobs_awaiting_upload_verification()
+                .expect("worklist")
+                .iter()
+                .any(|row| row.job_id == "faulted-upgrade"),
+            "and the row stays on the worklist: an unreadable marker decides nothing by itself"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // F2 — THE PRE-EFFECT INTENT, across a restart. The gap this closes: the old marker was written
+    // only AFTER the remote accepted the pack, so a crash (or a kill, or an OOM) DURING the upload
+    // left a row that says "nothing was ever sent" while the remote may hold the pack. A resume then
+    // re-runs the agent and re-pushes blind.
+    //
+    // The intent is written BEFORE the pack is sent, so the recoverable window starts one line
+    // earlier than the side effect. The upgrade to `uploaded` sharpens it; both survive a reopen,
+    // which is what a restart is here.
+    //
+    // Bite (measured): make `mark_upload_intent` a no-op and the reopened read returns None for
+    // `crashed-mid-upload` — the exact blind-rerun state.
+    #[test]
+    fn an_upload_intent_is_journaled_before_the_pack_is_sent_and_survives_a_restart() {
+        let path = temp_db("upload-intent");
+        let _ = std::fs::remove_file(&path);
+        let commit = "c".repeat(40);
+        {
+            let store = SellerStore::open(&path).expect("open");
+            insert_job(&store, "crashed-mid-upload", JobState::Executing);
+            insert_job(&store, "accepted", JobState::Executing);
+            // Both jobs declare their intent; only the second learns the remote took the pack.
+            for job in ["crashed-mid-upload", "accepted"] {
+                assert_eq!(
+                    store.mark_upload_intent(job, &commit, 100).expect("intent"),
+                    1,
+                    "the intent write must report the row it moved — a required write that moved \
+                     nothing must be visible to the caller, which refuses to upload on it"
+                );
+            }
+            store
+                .mark_uploaded_unverified("accepted", &commit, 101)
+                .expect("upgrade to uploaded");
+        }
+        let store = SellerStore::open(&path).expect("reopen — the restart");
+        let crashed = store
+            .upload_marker("crashed-mid-upload")
+            .expect("read")
+            .expect("a job that MIGHT have uploaded must still be reconciliable after a crash");
+        assert_eq!(crashed.commit, commit);
+        assert_eq!(
+            crashed.stage,
+            UploadStage::Intent,
+            "the marker must say which SIDE of the side effect it was written on"
+        );
+        assert_eq!(crashed.attempts, 0, "no read-back has been spent yet");
+        assert_eq!(
+            store.upload_marker("accepted").expect("read").expect("marker").stage,
+            UploadStage::Uploaded
+        );
+        // Neither is a verified delivery: the exact-oid gate has not run for either.
+        for job in ["crashed-mid-upload", "accepted"] {
+            assert_eq!(
+                store.pushed_commit(job).expect("read"),
+                None,
+                "an intent is never a verified push"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // The other half of "required": the write must REPORT that it moved nothing. A job row that is
+    // not there yields 0, and the caller (`mint_upload_mint_attest`'s intent closure) refuses the
+    // push rather than uploading a pack the store would not remember.
+    //
+    // Bite (measured): return `Ok(1)` unconditionally from `mark_upload_intent` and this goes red —
+    // and production would then upload on a write that never landed.
+    #[test]
+    fn an_upload_intent_for_an_unknown_job_moves_no_rows() {
+        let (store, path) = fresh_store("upload-intent-unknown");
+        assert_eq!(
+            store
+                .mark_upload_intent("no-such-job", &"d".repeat(40), 5)
+                .expect("intent"),
+            0,
+            "no row accepted the intent, and the caller must be able to tell"
+        );
+        assert_eq!(store.upload_marker("no-such-job").expect("read"), None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // F4 — the RECOVERY WORKLIST and its bound, at the store level: the sweep enumerates exactly the
+    // deliveries that owe the remote a read-back, carries each one's offer deadline (so it can lapse
+    // them without a restart), and counts the read-backs already spent (so an unverifiable delivery
+    // cannot be asked forever). Verified, delivered and terminal rows are excluded by construction.
+    //
+    // Bite (measured): drop the `pushed_commit IS NULL` clause and the verified job reappears on the
+    // worklist; drop the `state IN (...)` clause and the failed job does, each re-asking the remote
+    // about a delivery that is already decided.
+    #[test]
+    fn the_recovery_worklist_carries_the_deadline_and_counts_the_attempts() {
+        let (store, path) = fresh_store("upload-worklist");
+        let commit = "e".repeat(40);
+        for job in ["held", "verified", "terminal"] {
+            insert_job(&store, job, JobState::Awarded);
+            let mut offer = sample_offer(&format!("offer-{job}"));
+            offer.deadline_unix = 9_000;
+            store.record_offer(&offer, 1).expect("record the offer");
+            store.mark_upload_intent(job, &commit, 10).expect("intent");
+        }
+        store.mark_uploaded_unverified("held", &commit, 11).expect("uploaded");
+        // One is verified by the remote; one went terminal. Neither may be swept again.
+        store.mark_pushed("verified", &commit, 12).expect("verified");
+        store.fail_job("terminal", 12).expect("fail");
+
+        let worklist = store.jobs_awaiting_upload_verification().expect("worklist");
+        assert_eq!(
+            worklist.iter().map(|row| row.job_id.as_str()).collect::<Vec<_>>(),
+            vec!["held"],
+            "only a delivery that still owes the remote a read-back belongs on the worklist"
+        );
+        assert_eq!(
+            worklist[0].deadline_unix,
+            Some(9_000),
+            "the sweep must be able to lapse a held delivery without reading anything else"
+        );
+        assert_eq!(worklist[0].marker.attempts, 0);
+
+        // The bound: attempts are counted, reported, and durable.
+        assert_eq!(store.bump_upload_verify_attempt("held", 13).expect("bump"), 1);
+        assert_eq!(store.bump_upload_verify_attempt("held", 14).expect("bump"), 2);
+        drop(store);
+        let store = SellerStore::open(&path).expect("reopen");
+        assert_eq!(
+            store.upload_marker("held").expect("read").expect("marker").attempts,
+            2,
+            "a restart must not hand a stuck delivery a fresh retry budget"
+        );
+        // And arming the verified marker clears the counter with the rest of the marker.
+        store.mark_pushed("held", &commit, 15).expect("verified");
+        assert_eq!(store.upload_marker("held").expect("read"), None);
+        assert!(store
+            .jobs_awaiting_upload_verification()
+            .expect("worklist")
+            .is_empty());
         let _ = std::fs::remove_file(&path);
     }
 
@@ -3446,6 +4771,22 @@ mod tests {
         );
         // The migrated column is writable: the refine can arm it going forward on the live store.
         store.mark_settled_elsewhere("old-job", 2).expect("mark on migrated store");
+        // The uploaded-but-unverified columns migrate onto the SAME old table: a store written by a
+        // binary that never had them reads "nothing uploaded-unverified" (never a spurious recovery)
+        // and is armable going forward, so a seat that upgrades mid-flight can journal its next
+        // upload instead of failing to.
+        assert_eq!(
+            store.uploaded_unverified_commit("old-job").expect("read"),
+            None,
+            "a row from before the column is not uploaded-unverified"
+        );
+        store
+            .mark_uploaded_unverified("old-job", &"c".repeat(40), 3)
+            .expect("arm on migrated store");
+        assert_eq!(
+            store.uploaded_unverified_commit("old-job").expect("read").as_deref(),
+            Some("c".repeat(40).as_str())
+        );
         assert!(store.has_settled_elsewhere("old-job").expect("read"), "marker persists post-migration");
         // Idempotent: opening again neither errors nor double-adds.
         drop(store);
@@ -3678,13 +5019,13 @@ mod tests {
         store.mark_executing(&job, 3).expect("exec");
 
         assert!(store
-            .deliver_and_enqueue(&job, "ref-1", crate::gateway::PaymentMode::Sat, &result(), 4, 999, 5)
-            .expect("deliver"));
+            .deliver_and_enqueue(&job, "ref-1", crate::gateway::PaymentMode::Sat, &result(), 4, 999, 5, &crate::seller_node::DeliveryClock::paired_at_unix(5))
+            .expect("deliver").enqueued());
         assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Delivered));
         // Replay: no second delivery, no second result enqueue.
         assert!(!store
-            .deliver_and_enqueue(&job, "ref-1", crate::gateway::PaymentMode::Sat, &result(), 4, 999, 6)
-            .expect("replay"));
+            .deliver_and_enqueue(&job, "ref-1", crate::gateway::PaymentMode::Sat, &result(), 4, 999, 6, &crate::seller_node::DeliveryClock::paired_at_unix(6))
+            .expect("replay").enqueued());
         assert_eq!(
             store.outbox_row(&format!("result:{job}")).expect("row").expect("exists").0,
             "pending"
@@ -5200,6 +6541,121 @@ mod tests {
         );
         let _ = std::fs::remove_file(&path);
     }
+
+    /// R2A — A DELAY **BETWEEN THE TWO READINGS** IS STILL ELAPSED TIME.
+    ///
+    /// The pair is built from two separate reads, and whichever is taken second is separated from
+    /// the first by however long this thread happens to be descheduled. Round 6 closed the
+    /// arithmetic AFTER the pair existed and left that construction window open, so a 1.5s sleep
+    /// after the clock was built proved nothing about it: the gap this test injects cannot be
+    /// reached from outside the constructor at all.
+    ///
+    /// The gap STRADDLES the deadline. The first reading happens ~300ms before it, the gap runs
+    /// 600ms, so the second reading lands ~300ms after it and the decision follows immediately.
+    /// Whichever reading is taken first, a correct clock places the decision instant past the
+    /// deadline; only a clock that DISCARDS the interval between its own two reads can believe the
+    /// offer is still live.
+    ///
+    /// The premises are measured from the wall directly, NOT from the clock under test, so the
+    /// mutant fails on the property rather than on a premise guard.
+    ///
+    /// RED ON REVERT: read the wall before the monotonic origin (round 6's order) and the interval
+    /// vanishes — the decision reads ~300ms BEFORE the deadline and the late delivery is enqueued.
+    #[test]
+    fn a_delay_between_the_two_clock_readings_is_counted() {
+        let path = temp_db("pair-gap");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        let job = "pair-gap";
+        insert_job(&store, job, JobState::Executing);
+
+        // Fix the deadline first, then approach it: deriving it from a position read moments
+        // earlier is not atomic and can pick up a whole second under load.
+        let deadline = crate::seller_node::wall_clock_ms() / 1_000 + 2;
+        let deadline_ms = deadline * 1_000;
+        let mut offer = sample_offer(&format!("offer-{job}"));
+        offer.deadline_unix = deadline;
+        store.record_offer(&offer, deadline - 60).expect("record the offer");
+
+        while crate::seller_node::wall_clock_ms() < deadline_ms - 300 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        let before = crate::seller_node::wall_clock_ms();
+        let clock = crate::seller_node::DeliveryClock::paired_now_with_gap(|| {
+            std::thread::sleep(std::time::Duration::from_millis(600));
+        });
+        let after = crate::seller_node::wall_clock_ms();
+
+        assert!(
+            before < deadline_ms,
+            "harness check: the offer is still LIVE when construction begins \
+             (before {before}, deadline {deadline_ms})"
+        );
+        assert!(
+            after > deadline_ms,
+            "harness check: the gap must STRADDLE the deadline, or there is no crossing to miss \
+             (after {after}, deadline {deadline_ms})"
+        );
+
+        let outcome = store
+            .deliver_and_enqueue(
+                job,
+                &"b".repeat(40),
+                crate::gateway::PaymentMode::Sat,
+                &result(),
+                deadline - 60,
+                deadline + 10_000,
+                deadline - 60,
+                &clock,
+            )
+            .expect("the write completes rather than erroring");
+
+        assert_eq!(
+            outcome,
+            DeliveryJournal::DeadlinePassed,
+            "the interval between the clock's own two readings is elapsed time like any other"
+        );
+        assert!(
+            store.pending_outbox(deadline + 1).expect("read the outbox").is_empty(),
+            "nothing may be enqueued for a delivery the offer no longer accepts"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// R2A — THE ORDER OF THE PAIR IS THE CLAIM, not merely its precision.
+    ///
+    /// A two-read pair cannot be exact, so the only question is which way it errs. Reading the wall
+    /// first makes the extrapolated instant run BEHIND the truth by the gap, and behind-the-truth
+    /// is the one direction a deadline gate cannot afford: it admits a delivery the offer has
+    /// already refused. Reading the monotonic first makes it run AHEAD, so a refusal can only be
+    /// early — a retry, not a wrongly admitted delivery.
+    ///
+    /// Asserted as an inequality against an independent wall reading rather than as a tolerance, so
+    /// it states the direction rather than a tuned magnitude.
+    ///
+    /// RED ON REVERT: swap the two reads and the clock reports ~600ms in the past ⇒ this fails.
+    #[test]
+    fn the_clock_pair_never_runs_behind_the_truth() {
+        let gap = std::time::Duration::from_millis(600);
+        let clock = crate::seller_node::DeliveryClock::paired_now_with_gap(|| {
+            std::thread::sleep(gap);
+        });
+        let truth_ms = crate::seller_node::wall_clock_ms();
+        let clock_ms = (clock.now_ns() / 1_000_000) as i64;
+
+        assert!(
+            clock_ms >= truth_ms,
+            "a conservative pair never reports an instant EARLIER than the wall it was built from \
+             (clock {clock_ms}, truth {truth_ms}, gap {gap:?})"
+        );
+        // And the gap is actually carried, not merely tolerated: the clock is ahead by about it.
+        assert!(
+            clock_ms - truth_ms >= 500,
+            "the interval between the readings is counted, not discarded \
+             (clock {clock_ms}, truth {truth_ms})"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -5269,8 +6725,8 @@ mod free_lane_tests {
                 .expect("award");
             assert!(
                 store
-                    .deliver_and_enqueue(job, "ref", mode, &wire_draft(crate::gateway::JOB_RESULT_KIND), 3, 9_999, 3)
-                    .expect("deliver"),
+                    .deliver_and_enqueue(job, "ref", mode, &wire_draft(crate::gateway::JOB_RESULT_KIND), 3, 9_999, 3, &crate::seller_node::DeliveryClock::paired_at_unix(3))
+                    .expect("deliver").enqueued(),
                 "the delivery row must be written for BOTH modes — ruling 3"
             );
             assert_eq!(
@@ -5404,4 +6860,3 @@ mod free_lane_tests {
         let _ = std::fs::remove_file(&path);
     }
 }
-

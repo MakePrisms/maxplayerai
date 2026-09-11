@@ -147,6 +147,192 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// The same wall clock as `now_unix`, in MILLISECONDS.
+///
+/// R2A. `now_unix` floors to the second, and a deadline decision that adds a second-floored wait
+/// to a second-floored sample loses the subsecond carry twice over: sampled at 100.900 with a
+/// 0.200s wait, the real instant is 101.100 but the arithmetic yields 100, and a delivery the offer
+/// no longer accepts is enqueued against deadline 101. Callers that judge a deadline sample THIS,
+/// and derive their second-granularity row timestamps from the same read, so the two can never
+/// disagree about which instant the caller meant.
+///
+/// Production now reads the clock through `DeliveryClock`, which pairs the wall reading with the
+/// monotonic instant it was taken at; this millisecond helper reads a wall position outright, for
+/// the one production use that genuinely wants a wall value rather than an elapsed one: comparing
+/// against an offer's absolute `deadline_unix`, which is itself a wall time.
+pub(crate) fn wall_clock_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// R2A: the clock the delivery deadline decision is taken on.
+///
+/// Round 4 judged that deadline in whole seconds and round 5 in whole milliseconds. Those are the
+/// SAME defect at two scales: a floored sample plus a floored wait discards part of the very
+/// interval being measured, so a crossing inside the last unit is admitted. Shrinking the unit
+/// again only moves the hole somewhere too small to notice. Two properties close it, and this type
+/// is both of them.
+///
+/// - **One coherent origin, read AT the transaction.** A wall reading is paired with the monotonic
+///   instant it was taken at, and the decision asks this for `now_ns()` inside the transaction — so
+///   the instant judged is the instant of the WRITE, not the instant the caller decided to attempt
+///   it. The caller's base is carried rather than re-read in the store, because a caller working in
+///   a synthetic timebase must be judged on the clock it passed; re-reading the wall clock there is
+///   what made six live deliveries look long expired on the first attempt at this.
+/// - **Nanoseconds, with no intermediate floor.** `wall_ns + elapsed_ns` rounds nothing away, and
+///   the whole-second deadline is scaled UP to meet the instant rather than the instant truncated
+///   DOWN to meet it.
+///
+/// The origin is taken by the CALLER before it hands off, so the interval from the caller's sample
+/// to the store — argument marshalling, scheduler preemption, and the wait for the store lock — is
+/// all counted. Starting the measurement inside the store, as round 5 did, leaves exactly that
+/// interval uncounted, and it is unbounded.
+pub(crate) struct DeliveryClock {
+    origin: DeliveryClockOrigin,
+}
+
+enum DeliveryClockOrigin {
+    /// A wall reading and the monotonic instant it was taken at, together.
+    Paired {
+        wall_ns: i128,
+        taken_at: std::time::Instant,
+    },
+    /// A clock the test states outright, so ACTUAL precision is asserted at an exact instant rather
+    /// than raced for at a granularity no test can reliably hit.
+    #[cfg(test)]
+    Stated(std::sync::Arc<dyn Fn() -> i128 + Send + Sync>),
+    /// An origin and a wait of EXACTLY the stated length, held apart.
+    ///
+    /// A sub-millisecond wait cannot be produced by sleeping: `thread::sleep` on this host
+    /// overshoots a 600us request past a full millisecond, which hands the defect the rounding it
+    /// needs to look correct. Stating the two components is the only way to assert what the
+    /// arithmetic does with the remainder of each.
+    #[cfg(test)]
+    Simulated { wall_ns: i128, elapsed_ns: i128 },
+}
+
+impl DeliveryClock {
+    /// The live clock: the MONOTONIC clock first, then the wall.
+    ///
+    /// R2A. The two readings are not simultaneous, and the gap between them has a DIRECTION.
+    ///
+    /// Reading the wall first — as this did — makes `now_ns()` under-report: elapsed is measured
+    /// from a monotonic origin taken AFTER the wall sample, so any preemption between the two
+    /// readings vanishes from every later calculation. Wall sampled at 100.9, 0.2s of preemption,
+    /// immediate store decision: the clock computes 100.9 where the truth is 101.1, and deadline
+    /// 101 is admitted. No wall-clock jump is needed; being descheduled between two adjacent lines
+    /// is enough.
+    ///
+    /// Reading the MONOTONIC first inverts the error. The same gap is now counted twice rather
+    /// than not at all, so the extrapolated instant runs slightly AHEAD of the truth and the
+    /// arithmetic is conservative: a deadline refusal can only ever be EARLY. For a gate that
+    /// decides whether an offer may still be delivered against, early refusal costs a retry while
+    /// late admission costs a delivery the buyer never agreed to pay for. The pair is ordered for
+    /// the error it can afford.
+    pub(crate) fn paired_now() -> Self {
+        Self::paired_now_with_gap(|| {})
+    }
+
+    /// `paired_now`, with a seam in the window BETWEEN the two readings.
+    ///
+    /// That window is the whole of the defect, and it cannot be reached from outside: a test that
+    /// waits before construction or after the clock exists exercises neither reading's separation
+    /// from the other. `between` runs in the gap, so a test can state exactly the preemption the
+    /// production pair must survive.
+    pub(crate) fn paired_now_with_gap(between: impl FnOnce()) -> Self {
+        // The monotonic origin FIRST, so whatever happens next is counted rather than lost.
+        let taken_at = std::time::Instant::now();
+        between();
+        let wall_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i128)
+            .unwrap_or(0);
+        Self {
+            origin: DeliveryClockOrigin::Paired { wall_ns, taken_at },
+        }
+    }
+
+    /// A paired origin at a STATED wall instant: the caller's own timebase, extrapolated from here
+    /// on the monotonic clock.
+    ///
+    /// No read ordering applies — the wall value is supplied rather than read, so there is no
+    /// second reading to be separated from. Production reads its pair through `paired_now`.
+    #[cfg(test)]
+    pub(crate) fn paired_at_ns(wall_ns: i128) -> Self {
+        Self {
+            origin: DeliveryClockOrigin::Paired {
+                wall_ns,
+                taken_at: std::time::Instant::now(),
+            },
+        }
+    }
+
+    /// A paired origin at a whole second — the shape every synthetic-timebase caller wants.
+    #[cfg(test)]
+    pub(crate) fn paired_at_unix(secs: i64) -> Self {
+        Self::paired_at_ns(i128::from(secs).saturating_mul(1_000_000_000))
+    }
+
+    /// An origin, plus a wait of exactly this many nanoseconds before the decision.
+    #[cfg(test)]
+    pub(crate) fn simulated(wall_ns: i128, elapsed_ns: i128) -> Self {
+        Self {
+            origin: DeliveryClockOrigin::Simulated {
+                wall_ns,
+                elapsed_ns,
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stated(now_ns: impl Fn() -> i128 + Send + Sync + 'static) -> Self {
+        Self {
+            origin: DeliveryClockOrigin::Stated(std::sync::Arc::new(now_ns)),
+        }
+    }
+
+    /// Wall-clock NANOSECONDS at the moment of this call.
+    pub(crate) fn now_ns(&self) -> i128 {
+        match &self.origin {
+            DeliveryClockOrigin::Paired { wall_ns, taken_at } => {
+                wall_ns.saturating_add(taken_at.elapsed().as_nanos() as i128)
+            }
+            #[cfg(test)]
+            DeliveryClockOrigin::Stated(now_ns) => now_ns(),
+            #[cfg(test)]
+            DeliveryClockOrigin::Simulated {
+                wall_ns,
+                elapsed_ns,
+            } => wall_ns.saturating_add(*elapsed_ns),
+        }
+    }
+
+    /// Has a whole-second deadline passed AT THIS INSTANT?
+    ///
+    /// The one place the comparison lives, so the scaling direction cannot drift between callers.
+    pub(crate) fn deadline_passed(&self, deadline_unix: i64) -> bool {
+        i128::from(deadline_unix).saturating_mul(1_000_000_000) <= self.now_ns()
+    }
+
+    /// The ORIGIN in whole seconds: the caller's own `now_unix`, from this same read, so a row
+    /// timestamp and the deadline decision can never disagree about which instant was meant.
+    pub(crate) fn origin_unix(&self) -> i64 {
+        (self.origin_ns() / 1_000_000_000) as i64
+    }
+
+    fn origin_ns(&self) -> i128 {
+        match &self.origin {
+            DeliveryClockOrigin::Paired { wall_ns, .. } => *wall_ns,
+            #[cfg(test)]
+            DeliveryClockOrigin::Stated(now_ns) => now_ns(),
+            #[cfg(test)]
+            DeliveryClockOrigin::Simulated { wall_ns, .. } => *wall_ns,
+        }
+    }
+}
+
 /// The persistent seller node: exclusive lock + durable store + serialized wallet/identity actors.
 pub struct SellerNode {
     home: MaxplayerHome,
