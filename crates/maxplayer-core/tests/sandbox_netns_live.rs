@@ -539,6 +539,8 @@ fn a_job_launched_through_the_policy_is_contained_and_an_uncontained_one_is_not(
         // This test measures egress, so no file-sourced credential: one would add a second reason
         // for the contained launch to differ from its control.
         file_credentials: Vec::new(),
+        // And no proxied vendor tool, for the same reason.
+        mcp_tools: Vec::new(),
         codex_chatgpt: None,
         // ABSENT, as an operator's docker config has it — which since the default moved means the
         // container delivery path. Written as `None` rather than `Some(false)` so this fixture stays

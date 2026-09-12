@@ -353,6 +353,14 @@ pub struct Phase1Inputs {
     /// gives the agent exactly these (with their values read from the container environment) plus the
     /// runtime baseline ([`AGENT_ENV_BASELINE`]) and the delivery identity, and nothing else.
     pub agent_env_names: Vec<String>,
+    /// The MCP servers the host minted for this launch — the Proxy swap vendor tools, one entry per
+    /// `[sandbox] mcp_tools`, each carrying only a per-job placeholder and the proxy's address
+    /// ([`crate::seller_exec::PreparedLaunch::mcp_servers`]). The orchestrator attaches them to the
+    /// agent's session as they are; inside the container the policy is pass-through and mints
+    /// nothing, so this is the only way they reach the session. Carries NO secret. Optional and
+    /// empty by default, so an inputs file written by a host without this field still parses.
+    #[serde(default)]
+    pub mcp_servers: Vec<crate::driver::McpServer>,
     /// The delivery remote the orchestrator pushes to (the seller's `git_remote`).
     pub relay_url: String,
     /// How the push token is obtained. See [`PushTokenSource`] for who can read it and when.
@@ -549,7 +557,7 @@ fn drive_acp_agent(
     workdir: &Path,
 ) -> Result<AgentOutcome, OrchestratorError> {
     use crate::seller_exec::{
-        AgentRunTimeout, ExecError, SandboxPolicy, run_agent_job_with_env, run_agent_with_retry,
+        AgentRunTimeout, ExecError, SandboxPolicy, run_agent_job_in_env, run_agent_with_retry,
         unified_job_timeout,
     };
     let identity = DeliveryAgentIdentity::for_seller(&inputs.seller_pubkey_hex);
@@ -567,7 +575,9 @@ fn drive_acp_agent(
         unix_now,
         |_attempt| {
             let timeout = unified_job_timeout(inputs.deadline_unix, unix_now());
-            run_agent_job_with_env(
+            // The host's MCP server list rides along: the pass-through policy here mints none, and
+            // the vendor tools were minted when the host prepared this container.
+            run_agent_job_in_env(
                 &inputs.agent_argv,
                 &policy,
                 &inputs.prompt,
@@ -575,6 +585,7 @@ fn drive_acp_agent(
                 &identity,
                 AgentRunTimeout::JobDeadline(timeout),
                 Some(env.clone()),
+                inputs.mcp_servers.clone(),
             )
         },
     ));
@@ -1729,6 +1740,7 @@ mod tests {
                 "ANTHROPIC_API_KEY".to_owned(),
                 "ANTHROPIC_BASE_URL".to_owned(),
             ],
+            mcp_servers: Vec::new(),
             relay_url: "ext::sh -c evil".to_owned(),
             push_token,
             handoff_nonce: NONCE.to_owned(),

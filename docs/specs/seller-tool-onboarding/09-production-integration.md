@@ -164,25 +164,35 @@ the corrected model.
 Site: `seller_exec.rs:2411`.
 
 ```rust
+use crate::driver::{McpServer, McpServerStdio};
 let mcp_servers = match &held {
-    Some(_) => vec![crate::driver::McpServer {
+    Some(_) => vec![McpServer::Stdio(McpServerStdio {
         name: "seller-tool".into(),
-        command: vec!["tool-mcp-bridge".into()],
-    }],
+        command: "/usr/local/bin/tool-mcp-bridge".into(),
+        args: Vec::new(),
+        env: Vec::new(),
+    })],
     None => Vec::new(),
 };
 // SessionConfig { cwd: launch.cwd, mcp_servers, env: identity.git_env() }
 ```
 
+The `McpServer` type changed with the Proxy swap wiring (2026-09-11). It is now the ACP wire shape
+the adapters read: a stdio entry `{ name, command, args, env }` with NO `type` key, or an http entry
+`{ type: "http", name, url, headers }`. The Proxy swap route already puts one such entry per
+`[[sandbox.mcp_tools]]` on the session through `PreparedLaunch::mcp_servers`; the Holder route adds
+its entry to the same list.
+
 Two facts make this work.
 
 1. The bridge binary must be inside the job container. Bake `tool-mcp-bridge` into the sandbox
-   image (`SandboxConfig::image`, default `DEFAULT_SANDBOX_IMAGE`), at `/usr/local/bin`. Build it
-   for that image's platform. Add it in `docker/maxplayer-sandbox/Dockerfile`.
-2. `McpServer` carries no environment. The bridge reads `HOLDER_JOB_SOCKET`, which defaults to
-   `/run/holder/job.sock`. Step 3 mounts the socket at exactly that path, so no environment is
-   needed. If a different path is ever needed, extend `McpServer` with an `env` field, or carry it
-   in `SandboxConfig::forward_env`.
+   image (`SandboxConfig::image`, default `DEFAULT_SANDBOX_IMAGE`), at `/usr/local/bin`, the way
+   `mcp-http-bridge` already is. Build it for that image's platform. Add it in
+   `docker/maxplayer-sandbox/Dockerfile`.
+2. The bridge reads `HOLDER_JOB_SOCKET`, which defaults to `/run/holder/job.sock`. Step 3 mounts
+   the socket at exactly that path, so no environment is needed. If a different path is ever
+   needed, pass it as an `args` flag: a stdio server's `args` reach the child on every harness,
+   while its `env` reaches it only if the harness maps it.
 
 ## Ordering and the feature gate
 

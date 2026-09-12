@@ -16,8 +16,9 @@ Read it for the full model. This skill is the actionable guide.
 
 - **Holder** — handled and automated. Onboard by config.
 - **Public** — handled, but manual. A human installs the tool in the image.
-- **Direct token** — handled, but manual, and its safe delivery is the deferred Proxy swap.
-- **Proxy swap** — not handled; deferred. The swap mechanism exists; the template does not.
+- **Direct token** — handled, but manual, and its safe delivery is the Proxy swap.
+- **Proxy swap** — handled by configuration (`[[sandbox.mcp_tools]]`). The real-vendor acceptance run
+  is pending; GitHub is first.
 - **Dedicated machine** — not handled; deferred.
 - **Browser login** — not supported for now.
 
@@ -117,7 +118,7 @@ Configure it.
 5. Confirm the tool needs no credential and no network the egress policy denies. If it needs auth,
    it is not Public; re-route it.
 
-## Direct token (manual setup; its safe delivery is deferred)
+## Direct token (manual setup; its safe delivery is the Proxy swap)
 
 Use this only when the vendor issues a job-scoped, revocable, close-bound token and all four
 predicates hold with evidence.
@@ -128,43 +129,87 @@ worthless outside the life of the job, so job-close-binding is ensured for you. 
 into the container only when the proxy cannot mediate the traffic (non-header auth, a signing
 protocol, or a client that will not route through the proxy), and record the residual leak risk.
 
-Be honest about what is available today. The proxy delivery above is the Proxy swap route, and Proxy
-swap is deferred. So the only self-serve option for a token tool today is the weaker one: the real
-token in the container, with the eligibility gate above and the residual leak recorded. State that
-plainly rather than implying the proxy delivery is ready.
+What is available today. The proxy delivery above is the Proxy swap route. It is configured by
+`[[sandbox.mcp_tools]]` for a vendor-hosted MCP server, and by `[[sandbox.file_credentials]]` for a
+client that takes a base-URL flag and a token from the environment. Its real-vendor acceptance run
+is still pending, so report the result as "configured, acceptance run pending". The weaker option,
+a real token in the container, stays manual setup with the residual leak recorded.
 
-## Proxy swap (deferred; not self-serve today)
+## Proxy swap (handled by configuration; real-vendor acceptance pending)
 
-Use this for an authenticated HTTP API or a vendor-hosted MCP server whose auth is a header value.
-The job holds a placeholder; the credential proxy (`#647`) swaps the real credential in at egress.
+Use this for a vendor-hosted MCP server, or an authenticated HTTP API, whose auth is one header
+value. The job holds a per-job placeholder. The credential proxy (`#647`) swaps the real credential
+in at egress, only for the vendor's host, only for the life of the job. The credential file stays on
+the host. It is never mounted.
 
-**Status: mechanism demonstrated; production template owed.** The mechanism is proven synthetically
-in the kit (`tests/proxy_swap_suite.rs`), and the transport shim `mcp-http-bridge` is built and
-tested. What is not built is the production template: registering the vendor on the real `#647`,
-the egress allow, the shim in the sandbox image, and a real-vendor acceptance run. So a seller still
-cannot onboard this route by configuration today, and a run must never be reported as onboarded.
-This is a platform build item, not a seller task. Do not improvise per-seller custody; that is the
-unreviewed path the design refuses. If the tool also genuinely fits the Holder, offer that instead,
-but never as a silent downgrade.
+**Status (2026-09-11).** The wiring is built and green against synthetic fakes: the config surface,
+the proxy registration, the MCP server entry on the job's session, the `mcp-http-bridge` shim in the
+sandbox image, and the core-side tests against the real proxy. The real-vendor acceptance run is
+still owed; GitHub is first (see
+[10](../../../docs/specs/seller-tool-onboarding/10-routing-and-options.md)). Until that run passes,
+report a Proxy swap onboarding as "configured, acceptance run pending". Never report it as
+"accepted".
 
-The credential swap extends the existing proxy (`#647`); it does not add a new one. What a Proxy
-swap template must wire, for the platform to build (this is the design, not a seller recipe):
+Two shapes, by what the job talks to:
 
-1. A credential entry (the `FileCredential` shape in `home.rs`): the file `path` and `field` for the
-   real token, the `env` placeholder the container gets, the one `upstream` host, and the
-   `endpoint_args` that point the client at the proxy.
-2. The vendor host on the job's egress allowlist, or the request dies at name resolution.
-3. Header-only auth: the proxy substitutes in header values only, never the body or the path.
-4. The scope fork. Is the credential already scoped to the job's resources? If yes, the proxy swap
-   alone is safe. If no, a trusted operation filter that is the job's only path to the vendor — never
-   an in-container filter, which the job can skip because it holds the placeholder. That trusted
-   filter is the Holder shape, for a remote tool.
-5. The transport, already built: `mcp-http-bridge` is the stdio-to-HTTP shim that runs in the job
-   container and forwards MCP to the proxy. It needs to be placed in the sandbox image. (`McpServer`
-   is `{name, command}`, stdio only, which is why the shim is needed.)
+- **A vendor-hosted MCP server** (GitHub's remote MCP, Figma's) → `[[sandbox.mcp_tools]]`. This is
+  the new wiring. Follow the steps below.
+- **A CLI or HTTP client in the job that takes a base-URL flag and a token from the environment**
+  → `[[sandbox.file_credentials]]`, the existing mechanism (proven on cursor-agent). The client's
+  redirect flag points it at the proxy; the placeholder rides in the named variable. See
+  `FileCredential` in `crates/maxplayer-core/src/home.rs`.
 
-Until that template exists, the honest outcome at this leaf is "recognized shape, template
-deferred".
+Configure a vendor MCP server.
+
+1. Scope the credential at the vendor first: read-only, one repository or one project. The proxy
+   constrains the destination host, not the operations. A broad credential stays broad behind it.
+   If the vendor cannot scope it, stop. That case needs a trusted operation filter (the Holder shape
+   for a remote tool), which is not built.
+2. Put the credential in a host JSON file, mode 0600, owned by the daemon's user:
+   `{"token": "<the credential>"}`. Use an absolute path. Never put it in `config.toml`, never on
+   an argv.
+3. Add the table to the seat's `config.toml`, under a docker `[sandbox]`:
+
+   ```toml
+   [[sandbox.mcp_tools]]
+   name = "github"                                # the MCP server name the agent sees
+   url = "https://api.githubcopilot.com/mcp/"     # the vendor's MCP endpoint
+   credential = { path = "/ABSOLUTE/path/github-mcp.json", field = "token" }
+   # transport = "stdio"                          # default: the bridge. "http" only for claude
+   ```
+
+   With egress containment on (`network` set), `proxy_port_range` must be set too. The pinhole is
+   how the job reaches the proxy.
+4. Restart the seller daemon. Read the boot line:
+   `seller node: [sandbox] mcp_tools: github -> https://api.githubcopilot.com/mcp/ through the
+   credential proxy (stdio bridge); credential file /ABSOLUTE/path/github-mcp.json reads`. A line
+   that says `UNREADABLE` means every job would fail to reach the tool. Fix the file first.
+5. Run a job that uses the tool. Confirm with the vendor's own record (GitHub: the token's last-used
+   time, the repository's access log), not with the job's word.
+
+What the job sees: an MCP server with the configured name, whose command is
+`/usr/local/bin/mcp-http-bridge` with the proxy address, the path and the placeholder as flags. No
+environment variable and no file in the container carries the credential. The placeholder starts
+with `mxp-mcp-` and is worthless outside this job: the vendor rejects it, and the proxy forgets it
+at job end.
+
+Invariants the wiring enforces. Keep them true in any change.
+
+1. The host reads the credential per job and registers it on the proxy with one upstream: the
+   scheme and host of `url`.
+2. The proxy substitutes in header values only, never in the body or the path.
+3. An unreadable credential file fails the launch before any proxy listens. No fallback puts the
+   real value in the container.
+4. Job end drops the proxy, which revokes the placeholder, open connections included.
+
+How to test, synthetically, both halves:
+
+- `cargo test -p maxplayer-tool-kit` — the bridge against a fake proxy and a fake vendor
+  (`tests/proxy_swap_suite.rs`), with SSE, a session id, chunked framing and notifications.
+- `cargo test -p maxplayer-core --features wallet,acp mcp_tool` — the config, the session entry,
+  and the real proxy against a stub vendor (`seller_exec::mcp_tool_tests`).
+
+Neither is third-party acceptance. The GitHub run is.
 
 ## Dedicated machine (not supported at this moment)
 

@@ -14,7 +14,7 @@ and gives the rung in parentheses, so you never have to memorize a number.
 | --- | --- | --- |
 | **Public** (rung 1) | The tool needs no credential, so it is installed in the job's container image and the job calls it directly. | Handled, but manual. |
 | **Direct token** (rung 2) | The job is handed a short-lived, job-scoped token the vendor can revoke or bind to job-close, so a leak is bounded and the job calls the vendor itself. | Handled, but manual, and its safe delivery is the deferred Proxy swap. |
-| **Proxy swap** (rung 3) | The job holds a placeholder credential and the host-side credential proxy swaps the real one into the outgoing request header, so the secret never enters the container. | Mechanism demonstrated in the kit; production template owed. |
+| **Proxy swap** (rung 3) | The job holds a placeholder credential and the host-side credential proxy swaps the real one into the outgoing request header, so the secret never enters the container. | Handled by configuration (`[[sandbox.mcp_tools]]`); real-vendor acceptance run pending. |
 | **Holder** (rung 4) | A persistent supervisor logs the real tool in one time and holds the session, exposing it to each job over a private socket while the credential and local files stay on the holder's side. | Handled and automated. This is `maxplayer-tool-kit`. |
 | **Dedicated machine** (rung 5) | For a login bound to a specific machine or hardware licence, the tool runs on a dedicated isolated machine rather than in the job container. | Not handled; deferred. |
 
@@ -56,18 +56,51 @@ State these plainly, because a reader assumes more than the proxy gives.
 
 ## Proxy swap — what exists now, and what is owed
 
-The mechanism is demonstrated, synthetic and self-contained, in `crates/maxplayer-tool-kit`
-(`tests/proxy_swap_suite.rs`, 4 tests). The credential swap **extends** the existing proxy (`#647`);
-it does not add a new one. The proxy's engine is generic over credentials — its allowlist is the
-union of every credential's upstream — so a vendor tool is one more credential (the `FileCredential`
-shape). The only genuinely new component is the transport shim.
+The route is wired into the product as of 2026-09-11. The credential swap **extends** the existing
+proxy (`#647`); it does not add a new one. The proxy's engine is generic over credentials — its
+destination allowlist is the union of every registered credential's upstream — so a vendor MCP
+server is one more per-job credential. The one new component is the transport shim in the job
+container.
 
-- Built and tested: `mcp-http-bridge` (the stdio-to-HTTP shim a job container runs), plus the
-  `vendor-mcp` and `swap-proxy` test doubles that stand in for a real vendor MCP and `#647`.
-- Owed for the production template: register the vendor as a `FileCredential` on the real `#647`;
-  add the vendor host to the job's egress allowlist; get the shim into the sandbox image; and pass
-  a real-vendor acceptance run. The scope fork still holds: a broad credential needs a trusted
-  operation filter, which is the Holder shape for a remote tool.
+Built and green against synthetic fakes:
+
+- **Config.** `[[sandbox.mcp_tools]]` in the seat's `config.toml`: `name`, `url`,
+  `credential = { path, field }` (the same two fields as `FileCredential`, read by the same code),
+  and an optional `transport` (`stdio`, the default, or `http`). `McpToolConfig` in
+  `crates/maxplayer-core/src/home.rs`.
+- **Wiring.** `seller_exec` reads the credential per job, mints a placeholder (`mxp-mcp-…`),
+  registers `(placeholder → real, upstream)` on the real proxy, and puts one MCP server entry on the
+  agent's session. Both launch paths carry it: the host agent launch, and the container-delivery
+  launch through `Phase1Inputs.mcp_servers`. A seat without the table is unchanged. The seller boot
+  line names each tool, its route, and whether its credential file reads.
+- **Image.** `mcp-http-bridge` is built in the sandbox image's builder stage from the workspace
+  lockfile and installed at `/usr/local/bin/mcp-http-bridge` (`docker/maxplayer-sandbox/Dockerfile`).
+- **Tests.** Core: `seller_exec::mcp_tool_tests` — config refusals, the URL split, the session entry,
+  the boot line, and the real proxy against a stub vendor: the job gets the tool through the swap;
+  nothing the container receives carries the credential; a bypass placeholder gets `401` at the
+  vendor; an unknown placeholder gets `502` at the proxy with no substitution; job end revokes.
+  Kit: `tests/proxy_swap_suite.rs` — the bridge against fakes, with SSE, a session id, chunked
+  framing, and notifications.
+
+A correction to the earlier plan: there is no job-side egress allowlist to add the vendor to. The
+job never reaches the vendor. It reaches the proxy through the firewall pinhole, and the proxy, a
+host process, reaches the vendor. The vendor's host joins the PROXY's destination allowlist, which
+`ProxyEngine::new` builds from the registered credentials.
+
+Two transport shapes, because the ACP `mcpServers` entry has two wire forms (read off the baked
+`claude-agent-acp` 0.67.0 adapter, not guessed):
+
+- `stdio` (default): the agent spawns the bridge with `--proxy-url`, `--path` and `--placeholder`
+  as flags. Flags, not env: a stdio server's `args` reach the child whenever a stdio server works at
+  all, while its `env` reaches it only if the harness maps it. Every ACP harness supports a stdio
+  MCP server.
+- `http`: the agent's own Streamable-HTTP MCP client dials the proxy with the placeholder as a
+  configured `Authorization` header. No bridge process. `claude-agent-acp` maps this shape; a
+  harness that does not gets no tool. Use it as the fallback if the bridge misbehaves against a real
+  vendor, so a transport fault and a proxy fault can be told apart.
+
+Owed: the real-vendor acceptance run. The scope fork still holds: a broad credential needs a
+trusted operation filter, which is the Holder shape for a remote tool, and that is not built.
 
 ### First acceptance vendor: GitHub (chosen, 2026-09-11)
 
@@ -79,13 +112,17 @@ remote MCP server.
 The acceptance run, when an environment with a real token is available (it cannot run in this
 sandbox):
 
-1. Mint a fine-grained PAT, read-only, scoped to one throwaway repository.
-2. Register it as a `FileCredential` on `#647`, with `upstream` set to GitHub's MCP host. Confirm the
-   current MCP endpoint, transport, and auth header from GitHub's MCP docs at setup.
-3. Add that host to the job's egress allowlist.
-4. Run `mcp-http-bridge` in the job, pointed at the proxy.
-5. Drive an MCP `tools/call` (a read, such as listing issues or reading a file) and confirm: it
-   succeeds through the swapped PAT; the job never holds the PAT; and a bypass placeholder fails.
+1. Mint a fine-grained PAT, read-only, scoped to one throwaway repository. Put it in a host file
+   `{"token": "…"}`, mode 0600, owned by the daemon's user.
+2. Configure `[[sandbox.mcp_tools]]` with `name = "github"`, `url =
+   "https://api.githubcopilot.com/mcp/"` and that file. Confirm the endpoint, the transport and the
+   auth header against GitHub's MCP docs at setup time.
+3. Restart the seller. Read the boot line; it must say the credential file reads.
+4. Run a job whose prompt uses the `github` MCP server for a read (list issues, read a file).
+5. Confirm three facts. From GitHub's side (the token's last-used time, the repository's access
+   log): the call arrived with the PAT. From the job container's capture: the PAT is absent and the
+   placeholder is present. From a bypass: the placeholder sent to `api.githubcopilot.com` directly
+   gets `401`.
 
 The read-only scope and the throwaway repository keep the run safe and free.
 
@@ -135,7 +172,7 @@ A route without a shipped template is not one behavior. It is two, and they must
   tree does real work: it confirms the route, runs the eligibility gate (Direct token's four
   predicates, each with evidence), gives the concrete known-safe steps, and reports the outcome as
   "manual setup", never as "onboarded". A human operator does a bounded, known-safe wiring.
-- **Deferred (Proxy swap, Dedicated machine, Browser login).** The tree recognizes the route,
+- **Deferred (Dedicated machine, Browser login).** The tree recognizes the route,
   returns "recognized shape, template deferred", and stops. It does not hand the route to the seller
   to improvise, and it does not silently drop to a weaker route that has a template. The missing
   template is reviewed platform machinery — the profile, the custody handling, the checker, the

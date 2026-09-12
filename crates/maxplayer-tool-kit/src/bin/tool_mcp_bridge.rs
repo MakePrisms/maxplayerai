@@ -1,17 +1,18 @@
 //! `tool-mcp-bridge` — the MCP server an agent runs **inside a job container**.
 //!
-//! This is the piece that matches `McpServer { name, command }`: the agent spawns it, speaks
-//! MCP JSON-RPC over stdio to it, and it forwards to the holder's per-job Unix socket.
+//! This is the piece an ACP `mcpServers` stdio entry names as its command: the agent spawns it,
+//! speaks MCP JSON-RPC over stdio to it, and it forwards to the holder's per-job Unix socket.
 //!
 //! It is a byte-faithful proxy: the request line goes out as it arrived, ids and all, and the
 //! holder's response line comes back unchanged. Nothing here validates, and nothing here holds
 //! a credential — validation and custody are the holder's, on the other side of the socket.
 //! Compromising this process gains exactly what the socket already allows.
 //!
-//! What it is NOT: it is not wired into maxplayer's seller execution path. That path currently
-//! attaches no MCP servers at all (`SessionConfig { mcp_servers: Vec::new(), .. }` in
-//! `seller_exec.rs`), so pointing a real job agent at this bridge needs a core-side change that
-//! is out of this task's scope. The MCP protocol here is real; the integration is not claimed.
+//! What it is NOT: it is not wired into maxplayer's seller execution path. The Proxy swap route
+//! is (`[[sandbox.mcp_tools]]` puts an `mcp-http-bridge` entry on the job's session through
+//! `PreparedLaunch::mcp_servers`); the Holder route is not yet, and its plan is
+//! `docs/specs/seller-tool-onboarding/09-production-integration.md`. The MCP protocol here is
+//! real; the Holder integration is not claimed.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;

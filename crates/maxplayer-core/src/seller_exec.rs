@@ -262,6 +262,10 @@ pub struct DockerPolicy {
     /// same reason as `proxy_ports`: the containment path that reads them is the one that builds the
     /// launch, so both come from one config value rather than being written down twice.
     file_credentials: Vec<crate::home::FileCredential>,
+    /// Vendor-hosted MCP servers offered through the proxy — the Proxy swap route. Resolved from
+    /// [`crate::home::SandboxConfig::mcp_tools`]. Carried on the policy for the same reason as
+    /// `file_credentials`: the containment path that mints their placeholders is the launch path.
+    mcp_tools: Vec<crate::home::McpToolConfig>,
     /// Container-side delivery (Track B), `None` ⇒ the host delivery path. Resolved from
     /// [`crate::home::SandboxConfig::container_delivery`] and its two companion keys. Carried on the
     /// policy so the one `[sandbox]` parse decides both the executor and where git runs.
@@ -554,6 +558,53 @@ impl SandboxPolicy {
                         )));
                     }
                 }
+                // Proxied vendor MCP tools (the Proxy swap route), refused HERE for the same reasons
+                // as a file credential: a relative path, a URL the proxy cannot route, or a name the
+                // agent cannot address would otherwise surface as a per-job failure with nothing
+                // naming the config line.
+                for tool in &config.mcp_tools {
+                    let name = tool.name.trim();
+                    if name.is_empty()
+                        || !name
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                    {
+                        return Err(ExecError::Config(format!(
+                            "[sandbox] mcp_tools: name {:?} must be non-empty and use only ASCII \
+                             letters, digits, `_` and `-` (url {})",
+                            tool.name, tool.url
+                        )));
+                    }
+                    if config
+                        .mcp_tools
+                        .iter()
+                        .filter(|other| other.name.trim() == name)
+                        .count()
+                        > 1
+                    {
+                        return Err(ExecError::Config(format!(
+                            "[sandbox] mcp_tools: name {name} is claimed by two entries — the agent \
+                             addresses tools by server name, so only one can be reached"
+                        )));
+                    }
+                    if let Err(why) = split_mcp_url(&tool.url) {
+                        return Err(ExecError::Config(format!(
+                            "[sandbox] mcp_tools: url {} {why} (tool {name})",
+                            tool.url
+                        )));
+                    }
+                    if !tool.credential.path.is_absolute() {
+                        return Err(ExecError::Config(format!(
+                            "[sandbox] mcp_tools: credential.path must be absolute, got {} (tool {name})",
+                            tool.credential.path.display()
+                        )));
+                    }
+                    if tool.credential.field.trim().is_empty() {
+                        return Err(ExecError::Config(format!(
+                            "[sandbox] mcp_tools: credential.field must not be empty (tool {name})"
+                        )));
+                    }
+                }
                 // A zero cap would refuse every long-lived mint; it is a typo, not a policy, and is
                 // refused at config resolution so the seat does not fail its first job instead.
                 if config.container_delivery_token_cap_secs == Some(0) {
@@ -580,6 +631,7 @@ impl SandboxPolicy {
                     network,
                     proxy_ports,
                     file_credentials: config.file_credentials.clone(),
+                    mcp_tools: config.mcp_tools.clone(),
                     container_delivery,
                 });
                 policy.codex_chatgpt = config.codex_chatgpt.clone();
@@ -651,6 +703,15 @@ impl SandboxPolicy {
     pub fn file_credentials(&self) -> &[crate::home::FileCredential] {
         match &self.kind {
             PolicyKind::Docker(policy) => &policy.file_credentials,
+            PolicyKind::Passthrough | PolicyKind::Launcher(_) => &[],
+        }
+    }
+
+    /// The vendor MCP servers this policy offers through the proxy (the Proxy swap route), empty
+    /// under a host policy — there is no container to keep a credential out of, and no proxy.
+    pub fn mcp_tools(&self) -> &[crate::home::McpToolConfig] {
+        match &self.kind {
+            PolicyKind::Docker(policy) => &policy.mcp_tools,
             PolicyKind::Passthrough | PolicyKind::Launcher(_) => &[],
         }
     }
@@ -2378,12 +2439,47 @@ pub async fn run_agent_job_with_env(
     timeout: AgentRunTimeout,
     agent_env: Option<Vec<(String, String)>>,
 ) -> Result<AgentRunReport, ExecError> {
+    run_agent_job_in_env(
+        agent_command,
+        policy,
+        prompt,
+        workdir,
+        identity,
+        timeout,
+        agent_env,
+        Vec::new(),
+    )
+    .await
+}
+
+/// [`run_agent_job_with_env`], plus MCP servers the caller carries in for the agent's session.
+///
+/// The session gets the union of two lists: what [`prepare_launch`] minted for THIS launch (a
+/// vendor tool behind the proxy, when the policy is docker and `[sandbox] mcp_tools` names one) and
+/// `mcp_servers`. The second list exists for the container-side delivery orchestrator: the HOST
+/// prepared the container and minted the placeholders, and inside the container the policy is
+/// pass-through and mints nothing, so the orchestrator hands the host's list back in here. Every
+/// other caller passes an empty list.
+#[cfg(feature = "acp")]
+#[allow(clippy::too_many_arguments)]
+pub async fn run_agent_job_in_env(
+    agent_command: &[String],
+    policy: &SandboxPolicy,
+    prompt: &str,
+    workdir: &Path,
+    identity: &DeliveryAgentIdentity,
+    timeout: AgentRunTimeout,
+    agent_env: Option<Vec<(String, String)>>,
+    mcp_servers: Vec<crate::driver::McpServer>,
+) -> Result<AgentRunReport, ExecError> {
     use crate::driver::{AcpDriver, AgentCommand, ContentBlock, PromptTurn, SessionConfig};
     use crate::engine::{run_job, RunParams};
     use crate::event::JobId;
     use crate::log::EventLog;
 
     let prepared = prepare_launch(agent_command, policy, workdir, identity, timeout.duration()).await?;
+    let mut session_mcp_servers = prepared.mcp_servers.clone();
+    session_mcp_servers.extend(mcp_servers);
     let job = JobLaunch {
         workdir,
         env: &prepared.env,
@@ -2408,7 +2504,7 @@ pub async fn run_agent_job_with_env(
     let params = RunParams {
         session_config: SessionConfig {
             cwd: launch.cwd,
-            mcp_servers: Vec::new(),
+            mcp_servers: session_mcp_servers,
             env: identity.git_env(),
         },
         prompt: PromptTurn {
@@ -2486,6 +2582,11 @@ pub(crate) struct PreparedLaunch {
     pub gid: u32,
     /// The netns holder's container name when egress containment is in force.
     pub holder_name: Option<String>,
+    /// The MCP servers this launch attaches to the agent's session: one per `[sandbox] mcp_tools`
+    /// entry, each carrying only the per-job placeholder and the proxy's address. Empty when the
+    /// seat offers no vendor tool. The agent launch puts them on its own `session/new`; the
+    /// container-delivery launch hands them to the orchestrator, which does the same inside.
+    pub mcp_servers: Vec<crate::driver::McpServer>,
     _proxy: Option<crate::credential_proxy::RunningProxy>,
     _containment: Option<crate::sandbox_netns::Containment>,
 }
@@ -2580,6 +2681,7 @@ pub(crate) async fn prepare_launch(
     // but cannot be established, the job FAILS — there is no fallback to putting the real credential
     // in the container.
     let mut _proxy: Option<crate::credential_proxy::RunningProxy> = None;
+    let mut mcp_servers: Vec<crate::driver::McpServer> = Vec::new();
     if policy.docker_image().is_some() {
         // A namespace-contained job reaches the proxy at the measured address, not at the docker
         // alias: `--add-host` and `--network=container:…` are mutually exclusive, so the alias would
@@ -2591,6 +2693,7 @@ pub(crate) async fn prepare_launch(
         match start_credential_containment(
             &forwarded,
             policy.file_credentials(),
+            policy.mcp_tools(),
             codex_chatgpt_session,
             job_lifetime,
             policy.proxy_ports(),
@@ -2614,6 +2717,9 @@ pub(crate) async fn prepare_launch(
                 // A file-sourced credential is reached through the client's own flag, not a base-URL
                 // variable, so the redirect has to land in the argv the driver spawns.
                 effective_command.extend(containment.argv_extra);
+                // A vendor MCP tool is reached through the session's MCP server list, so its
+                // placeholder lands there — never in the container environment.
+                mcp_servers = containment.mcp_servers;
                 _proxy = Some(containment.proxy);
             }
             None => env.extend(forwarded),
@@ -2628,6 +2734,7 @@ pub(crate) async fn prepare_launch(
         uid,
         gid,
         holder_name: holder.map(|(name, _)| name),
+        mcp_servers,
         _proxy,
         _containment,
     })
@@ -2870,6 +2977,10 @@ struct MintedCodexSession {
 struct Containment {
     env: Vec<(String, String)>,
     argv_extra: Vec<String>,
+    /// One MCP server per `[sandbox] mcp_tools` entry, carrying the placeholder and the proxy's
+    /// address — the third redirect shape, beside the env pair and the argv flag: a vendor MCP
+    /// tool is reached through the agent's MCP server list, so that is where its redirect lands.
+    mcp_servers: Vec<crate::driver::McpServer>,
     proxy: crate::credential_proxy::RunningProxy,
 }
 
@@ -2902,33 +3013,182 @@ const FILE_CREDENTIAL_PLACEHOLDER_LIFETIME: std::time::Duration =
 /// missing field names the field, never a value.
 #[cfg(feature = "acp")]
 fn read_file_credential(cred: &crate::home::FileCredential) -> Result<String, ExecError> {
-    let raw = std::fs::read_to_string(&cred.path).map_err(|error| {
+    read_credential_field(&cred.path, &cred.field, "file_credentials")
+}
+
+/// Read one credential from a host JSON file: the top-level string `field` of the object at
+/// `path`. Shared by `[sandbox] file_credentials` and `[sandbox] mcp_tools`, so both have the same
+/// error shape and the same rule: no error message can carry the file's content — a parse failure
+/// reports line and column only, and a missing field names the field, never a value. `table` names
+/// the config table for the message.
+fn read_credential_field(path: &Path, field: &str, table: &str) -> Result<String, ExecError> {
+    let raw = std::fs::read_to_string(path).map_err(|error| {
         ExecError::Config(format!(
-            "[sandbox] file_credentials: cannot read {}: {error}",
-            cred.path.display()
+            "[sandbox] {table}: cannot read {}: {error}",
+            path.display()
         ))
     })?;
     let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
         ExecError::Config(format!(
-            "[sandbox] file_credentials: {} is not valid JSON (line {}, column {})",
-            cred.path.display(),
+            "[sandbox] {table}: {} is not valid JSON (line {}, column {})",
+            path.display(),
             error.line(),
             error.column()
         ))
     })?;
     parsed
-        .get(&cred.field)
+        .get(field)
         .and_then(|value| value.as_str())
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
         .ok_or_else(|| {
             ExecError::Config(format!(
-                "[sandbox] file_credentials: {} has no non-empty string field `{}`",
-                cred.path.display(),
-                cred.field
+                "[sandbox] {table}: {} has no non-empty string field `{field}`",
+                path.display()
             ))
         })
+}
+
+/// Where the sandbox image installs the Proxy swap transport shim
+/// (`docker/maxplayer-sandbox/Dockerfile`). Absolute, like
+/// [`crate::delivery_orchestrator::CONTAINER_ORCHESTRATOR_BIN`]: the agent's MCP client spawns it
+/// with whatever `PATH` that harness gives a child, and that is not a thing to depend on.
+pub const CONTAINER_MCP_BRIDGE_BIN: &str = "/usr/local/bin/mcp-http-bridge";
+
+/// The placeholder shape for a proxied vendor MCP credential: a prefix that says what the value is
+/// to a human reading a capture, and a random tail. Nothing shape-validates it — the bridge forwards
+/// it and the vendor never sees it — so the prefix is for people, not parsers.
+const MCP_TOOL_PLACEHOLDER_PREFIX: &str = "mxp-mcp-";
+const MCP_TOOL_PLACEHOLDER_RANDOM_LEN: usize = 48;
+
+/// Split a vendor MCP URL into `(scheme://authority, path_and_query)`.
+///
+/// The first half is the ONE upstream the credential may be substituted for — what
+/// [`crate::credential_proxy::JobCredential::upstreams`] takes and what joins the proxy's
+/// destination allowlist. The second half is what the job's client posts to, through the proxy,
+/// which forwards it verbatim (`relay` appends the path to the upstream). A URL with no path gets
+/// `/`. Userinfo (`user@host`) and a fragment are refused: neither has a meaning here, and a `@`
+/// in the authority is how a URL smuggles a different host past a reader.
+pub fn split_mcp_url(url: &str) -> Result<(String, String), String> {
+    let url = url.trim();
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return Err("must start with http:// or https://".to_owned());
+    };
+    if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")) {
+        return Err(format!("has scheme {scheme:?}; only http and https are routable"));
+    }
+    let (authority, path) = match rest.find('/') {
+        Some(slash) => (&rest[..slash], &rest[slash..]),
+        None => (rest, "/"),
+    };
+    if authority.is_empty() {
+        return Err("has no host".to_owned());
+    }
+    if authority.contains('@') {
+        return Err("must not carry userinfo in the authority".to_owned());
+    }
+    if path.contains('#') || authority.contains('#') || authority.contains('?') {
+        return Err("must not carry a fragment or a query in the host".to_owned());
+    }
+    let upstream = format!("{}://{authority}", scheme.to_ascii_lowercase());
+    if crate::credential_proxy::authority_of(&upstream).is_none() {
+        return Err("is not a valid URL".to_owned());
+    }
+    Ok((upstream, path.to_owned()))
+}
+
+/// The MCP server entry a job's session gets for one proxied vendor tool. A pure transform, so a
+/// test can assert the real credential is absent and the redirect present without a container, a
+/// proxy or a real key — the same reason [`contain_env_values`] is pure.
+///
+/// `base_url` is the proxy's primary listener as the container reaches it; `path` is the vendor
+/// endpoint's path from [`split_mcp_url`]; `placeholder` is this job's stand-in for the credential.
+/// The real value is not a parameter, so no code path here can put it on the wire.
+///
+/// Two shapes, by [`crate::home::McpToolTransport`]:
+/// * `Stdio` — the agent spawns [`CONTAINER_MCP_BRIDGE_BIN`] with the three facts as flags. Flags
+///   rather than env, because a stdio server's `env` reaches the child only if the harness maps it
+///   and `args` reach it whenever a stdio server works at all; the placeholder is not a secret to
+///   the job that holds it, so its argv visibility costs nothing.
+/// * `Http` — the agent's own MCP client dials the proxy at `base_url + path` with the placeholder
+///   as its bearer.
+pub fn mcp_tool_server(
+    tool: &crate::home::McpToolConfig,
+    placeholder: &str,
+    path: &str,
+    base_url: &str,
+) -> crate::driver::McpServer {
+    use crate::driver::{EnvVariable, HttpTransport, McpServer, McpServerHttp, McpServerStdio};
+    match tool.transport {
+        crate::home::McpToolTransport::Stdio => McpServer::Stdio(McpServerStdio {
+            name: tool.name.trim().to_owned(),
+            command: CONTAINER_MCP_BRIDGE_BIN.to_owned(),
+            args: vec![
+                "--proxy-url".to_owned(),
+                base_url.to_owned(),
+                "--path".to_owned(),
+                path.to_owned(),
+                "--placeholder".to_owned(),
+                placeholder.to_owned(),
+            ],
+            env: Vec::new(),
+        }),
+        crate::home::McpToolTransport::Http => McpServer::Http(McpServerHttp {
+            transport: HttpTransport::Http,
+            name: tool.name.trim().to_owned(),
+            url: format!("{}{path}", base_url.trim_end_matches('/')),
+            headers: vec![EnvVariable {
+                name: "Authorization".to_owned(),
+                value: format!("Bearer {placeholder}"),
+            }],
+        }),
+    }
+}
+
+/// What the seller boot line says about each `[sandbox] mcp_tools` entry: the name, where it
+/// routes, the transport, and whether the credential file reads NOW. The read is a probe — the
+/// value is discarded here and read again per job — so an unreadable file is a boot-time line the
+/// operator sees, not a failure on the first awarded job. The line never carries the value.
+pub fn mcp_tool_boot_lines(policy: &SandboxPolicy) -> Vec<String> {
+    policy
+        .mcp_tools()
+        .iter()
+        .map(|tool| {
+            let route = match split_mcp_url(&tool.url) {
+                Ok((upstream, path)) => format!("{upstream}{path}"),
+                Err(why) => format!("{} (INVALID: {why})", tool.url),
+            };
+            let transport = match tool.transport {
+                crate::home::McpToolTransport::Stdio => "stdio bridge",
+                crate::home::McpToolTransport::Http => "http",
+            };
+            let credential = match read_credential_field(
+                &tool.credential.path,
+                &tool.credential.field,
+                "mcp_tools",
+            ) {
+                Ok(_) => format!("credential file {} reads", tool.credential.path.display()),
+                Err(error) => format!("credential UNREADABLE — jobs will fail to reach it: {error}"),
+            };
+            format!(
+                "seller node: [sandbox] mcp_tools: {} -> {route} through the credential proxy \
+                 ({transport}); {credential}",
+                tool.name.trim()
+            )
+        })
+        .collect()
+}
+
+/// A per-job vendor MCP credential to substitute at egress (the Proxy swap route).
+#[cfg(feature = "acp")]
+struct MintedMcpTool {
+    real: String,
+    placeholder: String,
+    /// `scheme://authority` of the vendor endpoint — the one approved upstream.
+    upstream: String,
+    /// The vendor endpoint's path, which the job's client posts to through the proxy.
+    path: String,
 }
 
 /// Establish credential containment for a docker job, or `Ok(None)` when no contained credential is
@@ -2948,6 +3208,7 @@ fn read_file_credential(cred: &crate::home::FileCredential) -> Result<String, Ex
 async fn start_credential_containment(
     forwarded: &[(String, String)],
     file_creds: &[crate::home::FileCredential],
+    mcp_tools: &[crate::home::McpToolConfig],
     codex_session: Option<crate::codex_subscription::ChatgptSession>,
     job_lifetime: Duration,
     proxy_ports: Option<crate::sandbox_net::PortRange>,
@@ -3076,7 +3337,43 @@ async fn start_credential_containment(
         }
     }
 
-    if minted.is_empty() && minted_files.is_empty() && minted_codex.is_none() {
+    // Vendor MCP tools (the Proxy swap route). Read and validated BEFORE the proxy starts, under the
+    // same rule as the two kinds above. The placeholder is prefix-plus-random: the bridge forwards
+    // it and the vendor never sees it, so nothing shape-validates it.
+    let mut minted_mcp: Vec<(&crate::home::McpToolConfig, MintedMcpTool)> = Vec::new();
+    for tool in mcp_tools {
+        let real =
+            read_credential_field(&tool.credential.path, &tool.credential.field, "mcp_tools")?;
+        let (upstream, path) = split_mcp_url(&tool.url).map_err(|why| {
+            ExecError::Config(format!("[sandbox] mcp_tools: url {} {why}", tool.url))
+        })?;
+        let host = proxy::authority_of(&upstream).ok_or_else(|| {
+            ExecError::Config(format!(
+                "[sandbox] mcp_tools: upstream {upstream} is not a valid URL"
+            ))
+        })?;
+        if !upstream_hosts.contains(&host) {
+            upstream_hosts.push(host);
+        }
+        minted_mcp.push((
+            tool,
+            MintedMcpTool {
+                real,
+                placeholder: proxy::mint_placeholder(
+                    MCP_TOOL_PLACEHOLDER_PREFIX,
+                    MCP_TOOL_PLACEHOLDER_RANDOM_LEN,
+                ),
+                upstream,
+                path,
+            },
+        ));
+    }
+
+    if minted.is_empty()
+        && minted_files.is_empty()
+        && minted_mcp.is_empty()
+        && minted_codex.is_none()
+    {
         return Ok(None);
     }
 
@@ -3133,6 +3430,27 @@ async fn start_credential_containment(
             .and_then(|authority| running.leg_base_url_via(proxy_host, &authority))
     })?;
 
+    // Vendor MCP tools: register the swap, then hand the session an MCP server entry that carries
+    // the PLACEHOLDER and the proxy's address. The primary listener routes it: a request carrying
+    // this placeholder forwards to this credential's one upstream, the vendor, and nowhere else.
+    //
+    // The real values join `substitutions` for the same reason the file credentials' do: a forwarded
+    // variable that happens to carry the same secret is scrubbed too.
+    let mut mcp_servers = Vec::with_capacity(minted_mcp.len());
+    for (tool, m) in &minted_mcp {
+        engine
+            .register(proxy::JobCredential {
+                placeholder: m.placeholder.clone(),
+                real: m.real.clone(),
+                upstreams: vec![m.upstream.clone()],
+            })
+            .map_err(|refusal| {
+                ExecError::Agent(format!("credential proxy registration refused: {refusal}"))
+            })?;
+        substitutions.push((m.real.clone(), m.placeholder.clone()));
+        mcp_servers.push(mcp_tool_server(tool, &m.placeholder, &m.path, &base_url));
+    }
+
     let mut codex_env = Vec::new();
     if let Some(m) = minted_codex {
         engine
@@ -3168,6 +3486,7 @@ async fn start_credential_containment(
     Ok(Some(Containment {
         env: contained,
         argv_extra,
+        mcp_servers,
         proxy: running,
     }))
 }
@@ -3287,6 +3606,22 @@ pub async fn run_agent_job_with_env(
     _identity: &DeliveryAgentIdentity,
     _timeout: AgentRunTimeout,
     _agent_env: Option<Vec<(String, String)>>,
+) -> Result<AgentRunReport, ExecError> {
+    Err(ExecError::AcpRequired)
+}
+
+/// Without the `acp` feature there is no agent runtime — fail closed with the rebuild hint.
+#[cfg(not(feature = "acp"))]
+#[allow(clippy::too_many_arguments)]
+pub async fn run_agent_job_in_env(
+    _agent_command: &[String],
+    _policy: &SandboxPolicy,
+    _prompt: &str,
+    _workdir: &Path,
+    _identity: &DeliveryAgentIdentity,
+    _timeout: AgentRunTimeout,
+    _agent_env: Option<Vec<(String, String)>>,
+    _mcp_servers: Vec<crate::driver::McpServer>,
 ) -> Result<AgentRunReport, ExecError> {
     Err(ExecError::AcpRequired)
 }
@@ -3426,6 +3761,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            mcp_tools: Vec::new(),
             container_delivery: None,
         });
         let env = vec![("GIT_AUTHOR_NAME".to_string(), "maxplayer-seller-abcd".to_string())];
@@ -3492,6 +3828,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            mcp_tools: Vec::new(),
             container_delivery: None,
         })
     }
@@ -3694,6 +4031,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            mcp_tools: Vec::new(),
             container_delivery: None,
         });
 
@@ -4383,6 +4721,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            mcp_tools: Vec::new(),
             container_delivery: None,
         });
         let launch = policy
@@ -4424,6 +4763,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            mcp_tools: Vec::new(),
             container_delivery: None,
         });
         let launch = policy
@@ -4480,6 +4820,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            mcp_tools: Vec::new(),
             container_delivery: None,
         });
         let launch = policy
@@ -5026,6 +5367,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            mcp_tools: Vec::new(),
             container_delivery: None,
         });
         let launch = default_rt
@@ -5045,6 +5387,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            mcp_tools: Vec::new(),
             container_delivery: None,
         });
         let launch = gvisor
@@ -5082,6 +5425,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            mcp_tools: Vec::new(),
             container_delivery: None,
         });
         let launch = unset
@@ -5100,6 +5444,7 @@ mod tests {
             network: Some("maxplayer-sbx".into()),
             proxy_ports: None,
             file_credentials: Vec::new(),
+            mcp_tools: Vec::new(),
             container_delivery: None,
         });
         let launch = joined
@@ -5300,6 +5645,7 @@ mod tests {
         let containment = start_credential_containment(
             &forwarded,
             policy.file_credentials(),
+            &[],
             session,
             job_lifetime,
             None,
@@ -5754,6 +6100,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            mcp_tools: Vec::new(),
             container_delivery: None,
         });
         let carried = forwarded_agent_env_from(&docker, daemon_env);
@@ -5954,6 +6301,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: vec![cred],
+            mcp_tools: Vec::new(),
             container_delivery: None,
         });
         let uncontained =
@@ -6143,6 +6491,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            mcp_tools: Vec::new(),
             container_delivery: None,
         });
         let carried = forwarded_agent_env_from(&policy, env);
@@ -6166,6 +6515,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            mcp_tools: Vec::new(),
             container_delivery: None,
         });
         let env = vec![("ANTHROPIC_API_KEY".to_string(), "sk-ant-xxx".to_string())];
@@ -6215,6 +6565,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            mcp_tools: Vec::new(),
             container_delivery: None,
         });
         let forwarded: Vec<(String, String)> =
@@ -6246,6 +6597,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            mcp_tools: Vec::new(),
             container_delivery: None,
         });
         // All four credentials, an operator var carrying one of the secrets (must be scrubbed too), and
@@ -6337,6 +6689,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            mcp_tools: Vec::new(),
             container_delivery: None,
         });
         let launch = policy
@@ -6362,6 +6715,7 @@ mod tests {
                 network: None,
                 proxy_ports: None,
                 file_credentials: Vec::new(),
+                mcp_tools: Vec::new(),
                 container_delivery: None,
             })
         };
@@ -6475,6 +6829,7 @@ mod tests {
                 network: None,
                 proxy_ports: None,
                 file_credentials: Vec::new(),
+                mcp_tools: Vec::new(),
                 container_delivery: None,
             });
         let job = JobLaunch {
@@ -7334,5 +7689,502 @@ mod tests {
         // And the clean form still resolves, so the guard is not refusing everything.
         SandboxPolicy::from_config(Some(&docker_with(vec![file_cred()])))
             .expect("an unpadded flag must still resolve");
+    }
+}
+
+/// The Proxy swap route's core-side wiring: `[sandbox] mcp_tools` resolves onto the policy, the
+/// containment mints a per-job placeholder and an MCP server entry that carries it, and the REAL
+/// credential proxy swaps the real value in for the vendor and for nobody else. The synthetic
+/// counterpart — a fake proxy and the bridge binary — is `maxplayer-tool-kit`'s
+/// `tests/proxy_swap_suite.rs`; this module is the half against the real proxy.
+#[cfg(test)]
+mod mcp_tool_tests {
+    use super::*;
+    use crate::driver::McpServer;
+    use crate::home::{CredentialFile, McpToolConfig, McpToolTransport, SandboxConfig, SandboxMode};
+
+    /// A synthetic stand-in for a fine-grained token. Not a real credential; the shape is what a
+    /// capture would show, so a leak in a test assertion would be legible.
+    const REAL: &str = "github_pat_SYNTHETIC_11AAAAAAA0000000000000000000000000000000000000000000000000000000000000";
+
+    fn scratch(tag: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("maxplayer-mcp-tool-{tag}-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    fn write_credential(dir: &Path) -> PathBuf {
+        let path = dir.join("github-mcp.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({"token": REAL, "note": "synthetic fixture"}).to_string(),
+        )
+        .expect("write credential file");
+        path
+    }
+
+    fn tool(url: &str, credential: &Path, transport: McpToolTransport) -> McpToolConfig {
+        McpToolConfig {
+            name: "github".into(),
+            url: url.into(),
+            credential: CredentialFile {
+                path: credential.to_path_buf(),
+                field: "token".into(),
+            },
+            transport,
+        }
+    }
+
+    fn docker_config(mcp_tools: Vec<McpToolConfig>) -> SandboxConfig {
+        SandboxConfig {
+            mode: SandboxMode::Docker,
+            image: Some("maxplayer-sandbox:test".into()),
+            mcp_tools,
+            ..Default::default()
+        }
+    }
+
+    fn config_error(config: &SandboxConfig) -> String {
+        match SandboxPolicy::from_config(Some(config)) {
+            Ok(_) => panic!("the config must be refused"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    // ---- config resolution -------------------------------------------------------------------
+
+    #[test]
+    fn a_valid_tool_resolves_onto_the_policy_and_a_host_policy_offers_none() {
+        let config = docker_config(vec![tool(
+            "https://api.githubcopilot.com/mcp/",
+            Path::new("/abs/github-mcp.json"),
+            McpToolTransport::Stdio,
+        )]);
+        let policy = SandboxPolicy::from_config(Some(&config)).expect("a valid tool resolves");
+        assert_eq!(policy.mcp_tools().len(), 1);
+        assert_eq!(policy.mcp_tools()[0].name, "github");
+        assert!(SandboxPolicy::passthrough().mcp_tools().is_empty());
+        assert!(SandboxPolicy::from_config(None).expect("no sandbox").mcp_tools().is_empty());
+    }
+
+    #[test]
+    fn a_relative_credential_path_is_refused_at_config_resolution() {
+        let config = docker_config(vec![tool(
+            "https://api.githubcopilot.com/mcp/",
+            Path::new("github-mcp.json"),
+            McpToolTransport::Stdio,
+        )]);
+        let error = config_error(&config);
+        assert!(error.contains("credential.path must be absolute"), "{error}");
+    }
+
+    #[test]
+    fn a_name_the_agent_cannot_address_is_refused() {
+        for bad in ["", "git hub", "a/b", "tool:1"] {
+            let mut entry = tool("https://h/mcp", Path::new("/abs/c.json"), McpToolTransport::Stdio);
+            entry.name = bad.into();
+            let error = config_error(&docker_config(vec![entry]));
+            assert!(error.contains("mcp_tools: name"), "{bad:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn two_tools_with_one_name_are_refused() {
+        let a = tool("https://a/mcp", Path::new("/abs/a.json"), McpToolTransport::Stdio);
+        let b = tool("https://b/mcp", Path::new("/abs/b.json"), McpToolTransport::Http);
+        let error = config_error(&docker_config(vec![a, b]));
+        assert!(error.contains("claimed by two entries"), "{error}");
+    }
+
+    #[test]
+    fn a_url_the_proxy_cannot_route_is_refused() {
+        for bad in [
+            "ftp://vendor.example/mcp",
+            "api.githubcopilot.com/mcp/",
+            "https://user@vendor.example/mcp",
+            "https://vendor.example/mcp#frag",
+            "https:///mcp",
+        ] {
+            let error = config_error(&docker_config(vec![tool(
+                bad,
+                Path::new("/abs/c.json"),
+                McpToolTransport::Stdio,
+            )]));
+            assert!(error.contains("mcp_tools: url"), "{bad}: {error}");
+        }
+        let error = config_error(&docker_config(vec![McpToolConfig {
+            credential: CredentialFile { path: "/abs/c.json".into(), field: "  ".into() },
+            ..tool("https://h/mcp", Path::new("/abs/c.json"), McpToolTransport::Stdio)
+        }]));
+        assert!(error.contains("credential.field must not be empty"), "{error}");
+    }
+
+    // ---- the URL split -----------------------------------------------------------------------
+
+    #[test]
+    fn the_vendor_url_splits_into_one_upstream_and_a_path() {
+        assert_eq!(
+            split_mcp_url("https://api.githubcopilot.com/mcp/").expect("github"),
+            ("https://api.githubcopilot.com".to_owned(), "/mcp/".to_owned())
+        );
+        assert_eq!(
+            split_mcp_url("HTTPS://Vendor.Example").expect("no path"),
+            ("https://Vendor.Example".to_owned(), "/".to_owned())
+        );
+        assert_eq!(
+            split_mcp_url("http://127.0.0.1:8080/x/y?z=1").expect("loopback with query"),
+            ("http://127.0.0.1:8080".to_owned(), "/x/y?z=1".to_owned())
+        );
+    }
+
+    // ---- the session entry, a pure transform -------------------------------------------------
+
+    #[test]
+    fn the_stdio_entry_spawns_the_bridge_with_the_placeholder_and_the_proxy_address() {
+        let entry = tool("https://api.githubcopilot.com/mcp/", Path::new("/abs/c.json"), McpToolTransport::Stdio);
+        let server = mcp_tool_server(&entry, "mxp-mcp-PLACEHOLDER", "/mcp/", "http://host.docker.internal:9100");
+        let McpServer::Stdio(stdio) = &server else {
+            panic!("the default transport is the stdio bridge, got {server:?}");
+        };
+        assert_eq!(stdio.name, "github");
+        assert_eq!(stdio.command, CONTAINER_MCP_BRIDGE_BIN);
+        assert_eq!(
+            stdio.args,
+            vec![
+                "--proxy-url",
+                "http://host.docker.internal:9100",
+                "--path",
+                "/mcp/",
+                "--placeholder",
+                "mxp-mcp-PLACEHOLDER",
+            ]
+        );
+        assert!(stdio.env.is_empty(), "the flags carry everything; env reaches the child only if the harness maps it");
+        let wire = serde_json::to_value(&server).expect("encode");
+        assert!(wire.get("type").is_none(), "a type key makes the adapter drop a stdio entry");
+    }
+
+    #[test]
+    fn the_http_entry_dials_the_proxy_with_the_placeholder_as_its_bearer() {
+        let entry = tool("https://api.githubcopilot.com/mcp/", Path::new("/abs/c.json"), McpToolTransport::Http);
+        let server = mcp_tool_server(&entry, "mxp-mcp-PLACEHOLDER", "/mcp/", "http://172.18.0.1:9100/");
+        let McpServer::Http(http) = &server else {
+            panic!("transport = http must give the http shape, got {server:?}");
+        };
+        assert_eq!(http.name, "github");
+        assert_eq!(http.url, "http://172.18.0.1:9100/mcp/", "one slash between base and path");
+        assert_eq!(http.headers.len(), 1);
+        assert_eq!(http.headers[0].name, "Authorization");
+        assert_eq!(http.headers[0].value, "Bearer mxp-mcp-PLACEHOLDER");
+        let wire = serde_json::to_value(&server).expect("encode");
+        assert_eq!(wire["type"], serde_json::json!("http"));
+    }
+
+    // ---- the boot line -----------------------------------------------------------------------
+
+    #[test]
+    fn the_boot_line_names_the_route_and_the_file_state_and_never_the_value() {
+        let dir = scratch("boot");
+        let readable = write_credential(&dir);
+        let policy = SandboxPolicy::from_config(Some(&docker_config(vec![
+            tool("https://api.githubcopilot.com/mcp/", &readable, McpToolTransport::Stdio),
+            McpToolConfig {
+                name: "missing".into(),
+                ..tool("https://vendor.example/mcp", &dir.join("absent.json"), McpToolTransport::Http)
+            },
+        ])))
+        .expect("resolves");
+        let lines = mcp_tool_boot_lines(&policy);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("github -> https://api.githubcopilot.com/mcp/"), "{}", lines[0]);
+        assert!(lines[0].contains("stdio bridge"), "{}", lines[0]);
+        assert!(lines[0].contains("reads"), "{}", lines[0]);
+        assert!(lines[1].contains("missing -> https://vendor.example/mcp"), "{}", lines[1]);
+        assert!(lines[1].contains("(http)"), "{}", lines[1]);
+        assert!(lines[1].contains("UNREADABLE"), "{}", lines[1]);
+        for line in &lines {
+            assert!(!line.contains(REAL), "a boot line must never carry the credential: {line}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- against the REAL proxy --------------------------------------------------------------
+
+    struct VendorSeen {
+        path: String,
+        authorization: Option<String>,
+    }
+
+    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// A loopback stand-in for a vendor MCP server. It answers a POST whose bearer is [`REAL`] with
+    /// a `tools/list` result and anything else with `401`, and records what it saw. It drains a
+    /// chunked request body, because the proxy relays a body as a stream and so frames it chunked.
+    #[cfg(feature = "acp")]
+    async fn spawn_vendor_stub() -> (std::net::SocketAddr, std::sync::Arc<std::sync::Mutex<Vec<VendorSeen>>>) {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.expect("bind stub");
+        let addr = listener.local_addr().expect("stub addr");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let record = Arc::clone(&record);
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    let head_end = loop {
+                        let n = sock.read(&mut tmp).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(i) = find_subslice(&buf, b"\r\n\r\n") {
+                            break i + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                    let header = |name: &str| {
+                        head.lines().find_map(|line| {
+                            let (k, v) = line.split_once(':')?;
+                            k.eq_ignore_ascii_case(name).then(|| v.trim().to_owned())
+                        })
+                    };
+                    let path = head
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("")
+                        .to_owned();
+                    let chunked = header("transfer-encoding")
+                        .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"));
+                    let length = header("content-length").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+                    loop {
+                        let done = if chunked {
+                            buf[head_end..].ends_with(b"0\r\n\r\n")
+                        } else {
+                            buf.len() >= head_end + length
+                        };
+                        if done {
+                            break;
+                        }
+                        let n = sock.read(&mut tmp).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                    let authorization = header("authorization");
+                    let authorized = authorization.as_deref() == Some(format!("Bearer {REAL}").as_str());
+                    record.lock().unwrap().push(VendorSeen { path, authorization });
+                    let (status, body) = if authorized {
+                        ("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"vendor-echo"}]}}"#)
+                    } else {
+                        ("401 Unauthorized", r#"{"error":"invalid_token"}"#)
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (addr, seen)
+    }
+
+    /// The whole route against the real proxy: the job's session gets an MCP server entry that
+    /// carries a placeholder and the proxy's address; nothing the container receives carries the
+    /// credential; the vendor sees the real credential only through the proxy; the placeholder is
+    /// worthless at the vendor and an unknown placeholder is refused at the proxy without any
+    /// substitution; and job end revokes the placeholder.
+    #[cfg(feature = "acp")]
+    #[tokio::test]
+    async fn the_job_gets_the_tool_through_the_swap_and_never_the_credential() {
+        let (stub_addr, seen) = spawn_vendor_stub().await;
+        let dir = scratch("live");
+        let credential = write_credential(&dir);
+        let entry = tool(&format!("http://{stub_addr}/mcp/"), &credential, McpToolTransport::Stdio);
+
+        let containment = start_credential_containment(
+            &[],
+            &[],
+            std::slice::from_ref(&entry),
+            None,
+            Duration::from_secs(60),
+            None,
+            "127.0.0.1",
+        )
+        .await
+        .expect("the proxy starts")
+        .expect("a vendor tool needs containment");
+
+        // 1. The session entry: the bridge, the proxy's address, a fresh placeholder.
+        assert_eq!(containment.mcp_servers.len(), 1);
+        let McpServer::Stdio(server) = &containment.mcp_servers[0] else {
+            panic!("the stdio bridge is the default transport");
+        };
+        let after = |flag: &str| {
+            let i = server.args.iter().position(|a| a == flag).expect(flag);
+            server.args[i + 1].clone()
+        };
+        let placeholder = after("--placeholder");
+        let proxy_url = after("--proxy-url");
+        assert!(placeholder.starts_with(MCP_TOOL_PLACEHOLDER_PREFIX), "{placeholder}");
+        assert_ne!(placeholder, REAL);
+        assert_eq!(after("--path"), "/mcp/");
+        assert_eq!(
+            proxy_url,
+            format!("http://127.0.0.1:{}", containment.proxy.local_addr().port()),
+            "the entry points at the proxy's primary listener, as the container reaches it"
+        );
+
+        // 2. Nothing the container receives carries the real value — not the environment, not the
+        //    session entry, not the docker argv built from them.
+        for (name, value) in &containment.env {
+            assert!(!value.contains(REAL), "{name} carries the credential");
+        }
+        let wire = serde_json::to_string(&containment.mcp_servers).expect("encode");
+        assert!(!wire.contains(REAL), "the session entry carries the credential");
+        assert!(wire.contains(&placeholder));
+        let policy = SandboxPolicy::from_config(Some(&docker_config(vec![entry.clone()]))).expect("policy");
+        let workdir = dir.join("job");
+        let (uid, gid) = job_identity();
+        let launch = policy
+            .launch(
+                &["claude-agent-acp".to_owned()],
+                &JobLaunch { workdir: &workdir, env: &containment.env, uid, gid, netns: None },
+            )
+            .expect("launch argv");
+        for arg in std::iter::once(&launch.program).chain(launch.args.iter()) {
+            assert!(!arg.contains(REAL), "docker argv carries the credential: {arg}");
+        }
+
+        // 3. Through the proxy, the vendor sees the REAL credential and answers.
+        let client = reqwest::Client::new();
+        let body = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}});
+        let swapped = client
+            .post(format!("{proxy_url}/mcp/"))
+            .header("authorization", format!("Bearer {placeholder}"))
+            .header("accept", "application/json, text/event-stream")
+            .json(&body)
+            .send()
+            .await
+            .expect("reach the proxy");
+        assert_eq!(swapped.status(), 200, "the swapped request must authenticate");
+        let text = swapped.text().await.expect("body");
+        assert!(text.contains("vendor-echo"), "{text}");
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].path, "/mcp/", "the path travels verbatim");
+            assert_eq!(seen[0].authorization.as_deref(), Some(format!("Bearer {REAL}").as_str()));
+            assert!(!seen[0].authorization.as_deref().unwrap_or("").contains(&placeholder));
+        }
+
+        // 4. The placeholder is worthless without the proxy: the vendor rejects it directly.
+        let direct = client
+            .post(format!("http://{stub_addr}/mcp/"))
+            .header("authorization", format!("Bearer {placeholder}"))
+            .json(&body)
+            .send()
+            .await
+            .expect("reach the stub");
+        assert_eq!(direct.status(), 401);
+        assert_eq!(seen.lock().unwrap().len(), 2);
+
+        // 5. An unknown placeholder at the proxy is refused, and nothing reaches the vendor.
+        let bogus = client
+            .post(format!("{proxy_url}/mcp/"))
+            .header("authorization", "Bearer mxp-mcp-not-registered-anywhere")
+            .json(&body)
+            .send()
+            .await
+            .expect("reach the proxy");
+        assert_eq!(bogus.status(), 502, "NoKnownPlaceholder is a 502 with no substitution");
+        assert_eq!(seen.lock().unwrap().len(), 2, "the refused request never reached the vendor");
+
+        // 6. Job end is revocation: the placeholder resolves nowhere once containment drops.
+        drop(containment);
+        let revoked = client
+            .post(format!("{proxy_url}/mcp/"))
+            .header("authorization", format!("Bearer {placeholder}"))
+            .json(&body)
+            .send()
+            .await;
+        assert!(revoked.is_err(), "the listener died with the job, got {revoked:?}");
+        assert_eq!(seen.lock().unwrap().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The transport knob reaches the session entry through the real containment too.
+    #[cfg(feature = "acp")]
+    #[tokio::test]
+    async fn the_http_transport_reaches_the_session_entry_through_containment() {
+        let dir = scratch("http");
+        let credential = write_credential(&dir);
+        let entry = tool("https://api.githubcopilot.com/mcp/", &credential, McpToolTransport::Http);
+        let containment = start_credential_containment(
+            &[],
+            &[],
+            std::slice::from_ref(&entry),
+            None,
+            Duration::from_secs(60),
+            None,
+            crate::credential_proxy::PROXY_HOST_ALIAS,
+        )
+        .await
+        .expect("the proxy starts")
+        .expect("a vendor tool needs containment");
+        let McpServer::Http(http) = &containment.mcp_servers[0] else {
+            panic!("transport = http must give the http shape");
+        };
+        assert_eq!(
+            http.url,
+            format!(
+                "http://{}:{}/mcp/",
+                crate::credential_proxy::PROXY_HOST_ALIAS,
+                containment.proxy.local_addr().port()
+            )
+        );
+        assert!(http.headers[0].value.starts_with("Bearer mxp-mcp-"));
+        assert!(!http.headers[0].value.contains(REAL));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unreadable credential file fails the launch BEFORE any proxy listens — the no-fallback
+    /// rule: a job never runs with a tool it cannot authenticate to, and never with the file's
+    /// contents anywhere but the host.
+    #[cfg(feature = "acp")]
+    #[tokio::test]
+    async fn a_missing_credential_file_fails_the_launch_before_the_proxy_starts() {
+        let dir = scratch("missing");
+        let entry = tool("https://api.githubcopilot.com/mcp/", &dir.join("absent.json"), McpToolTransport::Stdio);
+        let error = start_credential_containment(
+            &[],
+            &[],
+            std::slice::from_ref(&entry),
+            None,
+            Duration::from_secs(60),
+            None,
+            crate::credential_proxy::PROXY_HOST_ALIAS,
+        )
+        .await;
+        let message = match error {
+            Ok(_) => panic!("an unreadable credential file must fail the launch"),
+            Err(error) => error.to_string(),
+        };
+        assert!(message.contains("mcp_tools: cannot read"), "{message}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

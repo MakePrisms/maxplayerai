@@ -3521,6 +3521,13 @@ pub async fn probe_configured_harnesses(
              forward_env, or treat that credential as compromised and spend-cap it at the provider."
         );
     }
+    // Proxy swap vendor tools (`[sandbox] mcp_tools`): say what this seat offers and where each
+    // routes, and probe each credential file ONCE, so an unreadable file is a line the operator
+    // sees at boot rather than a failure on the first awarded job. The value is read and dropped;
+    // the line never carries it. Every boot, for the same reason as the delivery-path line.
+    for line in crate::seller_exec::mcp_tool_boot_lines(&sandbox) {
+        opline!("{line}");
+    }
     // The seat's own identity, established BEFORE the reap below because it is what scopes it. A
     // daemon that cannot name itself reaps nothing: the `?` here is the gate.
     let identity = DeliveryAgentIdentity::for_seller(&home::public_key_hex(home)?);
@@ -7527,6 +7534,9 @@ impl SellerNodeRunner {
             // C4: names only. The orchestrator hands the agent these (values from the container
             // environment), the runtime baseline, and the git identity — nothing else.
             agent_env_names: prepared.env.iter().map(|(key, _)| key.clone()).collect(),
+            // The Proxy swap vendor tools, minted with the containment above. Placeholders and the
+            // proxy's address only; the orchestrator attaches them to the agent's session.
+            mcp_servers: prepared.mcp_servers.clone(),
             relay_url: seller.git_remote.clone(),
             push_token,
             handoff_nonce: nonce.clone(),

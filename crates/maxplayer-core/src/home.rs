@@ -642,6 +642,16 @@ pub struct SandboxConfig {
     /// placeholder-and-substitute mechanism cover it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub file_credentials: Vec<FileCredential>,
+    /// `docker` mode: vendor-hosted MCP servers this seat offers to its jobs through the #647
+    /// proxy — the Proxy swap route of the seller-tool onboarding
+    /// (`docs/specs/seller-tool-onboarding/10-routing-and-options.md`). Empty ⇒ no such tool, which
+    /// is the shipped behaviour.
+    ///
+    /// The vendor credential never enters the container. Per job the host reads it from the named
+    /// file, mints a placeholder, registers the pair on the proxy, and hands the job an MCP server
+    /// entry that carries only the placeholder and the proxy's address. See [`McpToolConfig`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_tools: Vec<McpToolConfig>,
     /// `docker` mode: use a host Codex ChatGPT session through the per-job proxy.
     ///
     /// The auth file stays on the host. The container receives only per-job placeholders through the
@@ -749,6 +759,71 @@ pub struct CodexChatgptConfig {
     /// Absolute path to the Codex `auth.json` file. The file is read before each run and is never
     /// mounted into the job container.
     pub auth_file: PathBuf,
+}
+
+/// One vendor-hosted MCP server a docker seat offers to its jobs through the credential proxy — the
+/// Proxy swap route (`docs/specs/seller-tool-onboarding/10-routing-and-options.md`).
+///
+/// The job never holds the vendor credential. Per job the host reads the real value from
+/// `credential`, mints a placeholder, and registers `(placeholder → real, upstream)` on the #647
+/// proxy. The job's MCP client speaks to the proxy with the placeholder in its `Authorization:
+/// Bearer` header; the proxy swaps the real value in at egress, only for this vendor's host, only
+/// for the life of the job. A leaked placeholder is worthless: the vendor rejects it directly, and
+/// the proxy forgets it when the job ends.
+///
+/// The proxy constrains the DESTINATION, not the operations. A credential the vendor scoped to the
+/// job's resources (a read-only fine-grained token on one repository) is safe behind it; a broad
+/// credential is not, and nothing here narrows it. Scope the credential at the vendor.
+///
+/// `deny_unknown_fields`, like every `[sandbox]` table: a misspelled key is a config error at boot,
+/// not a tool that silently never appears.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpToolConfig {
+    /// The MCP server name the agent sees (`mcpServers[].name`). ASCII letters, digits, `_` and
+    /// `-` only; unique across the list. Checked in
+    /// [`crate::seller_exec::SandboxPolicy::from_config`].
+    pub name: String,
+    /// The vendor's MCP endpoint, scheme and host included (e.g.
+    /// `https://api.githubcopilot.com/mcp/`). Its scheme + authority is the ONE upstream the
+    /// credential may be substituted for; its path is what the job's client posts to, through the
+    /// proxy. `http://` is accepted for a test double on loopback and nothing else.
+    pub url: String,
+    /// Where the real credential lives on the host, and which JSON field holds it. The same two
+    /// fields as [`FileCredential`], read by the same code, per job. The file is never mounted into
+    /// the container.
+    pub credential: CredentialFile,
+    /// How the job's agent reaches the proxy. Omitted ⇒ [`McpToolTransport::Stdio`].
+    #[serde(default)]
+    pub transport: McpToolTransport,
+}
+
+/// A host file holding one credential in a top-level JSON string field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialFile {
+    /// ABSOLUTE host path. A relative path is refused rather than resolved, for the reason
+    /// [`FileCredential::path`] gives.
+    pub path: PathBuf,
+    /// The top-level JSON field holding the credential (e.g. `token`). Only this field is read.
+    pub field: String,
+}
+
+/// How a job's agent reaches a proxied vendor MCP server ([`McpToolConfig::transport`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpToolTransport {
+    /// The agent spawns `mcp-http-bridge`, baked into the sandbox image, as a stdio MCP server. The
+    /// bridge posts each JSON-RPC message to the proxy over HTTP with the placeholder as its bearer.
+    /// Works with every ACP harness that supports a stdio MCP server, which is all of them. The
+    /// default.
+    #[default]
+    Stdio,
+    /// The agent's own Streamable-HTTP MCP client connects to the proxy URL directly, with the
+    /// placeholder in an `Authorization` header the session config names. No bridge process.
+    /// `claude-agent-acp` maps this ACP shape (measured on 0.67.0); a harness that does not map it
+    /// gets no tool at all, so use this only where that is known.
+    Http,
 }
 
 /// One credential the proxy reads from a host file (#852).
@@ -2182,6 +2257,17 @@ fn documented_config_toml(config: &MaxplayerConfig) -> Result<String, HomeError>
 #   # image = "maxplayer-sandbox:latest" # LOCAL DEV: your locally-built tag (default GHCR ref is unpublished for dev)
 #   # forward_env = ["MY_AGENT_TOKEN"] # extra env names, atop the built-in auth allowlist
 #
+# Proxy swap - offer a vendor-hosted MCP server to jobs. The credential stays
+# on the host; the job holds a per-job placeholder that only the proxy can
+# redeem. Scope the credential AT THE VENDOR (read-only, one repository): the
+# proxy constrains the destination, not the operations. Repeat the table for
+# each tool. Docs: docs/specs/seller-tool-onboarding/10-routing-and-options.md
+#   [[sandbox.mcp_tools]]
+#   name = "github"                                # the MCP server name the agent sees
+#   url = "https://api.githubcopilot.com/mcp/"     # the vendor's MCP endpoint
+#   credential = { path = "/ABSOLUTE/path/github-mcp.json", field = "token" }  # host file, never mounted
+#   # transport = "stdio"                          # default; "http" only for a harness that maps it (claude)
+#
 # Option B - docker on macOS. Docker Desktop cannot load runsc, so OMIT the
 # runtime line; the platform VM is the boundary. Otherwise identical to A.
 #   [sandbox]
@@ -2755,6 +2841,11 @@ mod tests {
             "must show the Linux gVisor runtime line"
         );
         assert!(rendered.contains("macOS"), "must call out the macOS difference (omit runtime)");
+        // The Proxy swap example: an operator meets `[[sandbox.mcp_tools]]` here first.
+        assert!(
+            rendered.contains("[[sandbox.mcp_tools]]"),
+            "must show how to offer a vendor MCP server through the proxy"
+        );
     }
 
     #[test]
@@ -3534,6 +3625,94 @@ mod tests {
         assert_eq!(cred.legs.len(), 1);
         assert_eq!(cred.legs[0].endpoint_args, vec!["--agent-endpoint".to_owned()]);
         assert_eq!(cred.legs[0].upstream, "https://agentn.global.api5.cursor.sh");
+    }
+
+    // ---- [[sandbox.mcp_tools]] — the Proxy swap route's config surface ---------------------------
+
+    #[test]
+    fn an_mcp_tool_parses_and_defaults_to_the_stdio_bridge() {
+        let config = parse_config_toml(
+            r#"
+            relay_url = "r"
+            per_job_budget_sats = 1
+            [sandbox]
+            mode = "docker"
+            [[sandbox.mcp_tools]]
+            name = "github"
+            url = "https://api.githubcopilot.com/mcp/"
+            credential = { path = "/home/seller/.config/maxplayer/github-mcp.json", field = "token" }
+            "#,
+        )
+        .expect("a proxied MCP tool must parse");
+        let sandbox = config.sandbox.expect("[sandbox] present");
+        assert_eq!(sandbox.mcp_tools.len(), 1);
+        let tool = &sandbox.mcp_tools[0];
+        assert_eq!(tool.name, "github");
+        assert_eq!(tool.url, "https://api.githubcopilot.com/mcp/");
+        assert_eq!(
+            tool.credential.path,
+            PathBuf::from("/home/seller/.config/maxplayer/github-mcp.json")
+        );
+        assert_eq!(tool.credential.field, "token");
+        assert_eq!(tool.transport, McpToolTransport::Stdio, "omitted transport is the bridge");
+    }
+
+    #[test]
+    fn an_mcp_tool_can_select_the_http_transport() {
+        let tool: McpToolConfig = toml::from_str(
+            r#"
+            name = "github"
+            url = "https://api.githubcopilot.com/mcp/"
+            transport = "http"
+            [credential]
+            path = "/abs/github-mcp.json"
+            field = "token"
+            "#,
+        )
+        .expect("the http transport must parse");
+        assert_eq!(tool.transport, McpToolTransport::Http);
+    }
+
+    // A misspelled key must be a config error, not a tool that never appears. Both tables are
+    // `deny_unknown_fields`.
+    #[test]
+    fn an_mcp_tool_with_an_unknown_key_is_refused() {
+        for (label, body) in [
+            (
+                "top-level typo",
+                r#"
+                name = "github"
+                url = "https://api.githubcopilot.com/mcp/"
+                credentials = { path = "/abs/x.json", field = "token" }
+                "#,
+            ),
+            (
+                "credential typo",
+                r#"
+                name = "github"
+                url = "https://api.githubcopilot.com/mcp/"
+                credential = { path = "/abs/x.json", feild = "token" }
+                "#,
+            ),
+        ] {
+            let error = toml::from_str::<McpToolConfig>(body)
+                .expect_err(&format!("{label}: an unknown key must be refused"));
+            assert!(
+                error.to_string().contains("unknown field"),
+                "{label}: the error must name the unknown field, got: {error}"
+            );
+        }
+    }
+
+    // A `[sandbox]` written before this field existed parses to an empty list, so no seat changes
+    // behaviour on upgrade.
+    #[test]
+    fn a_sandbox_without_mcp_tools_parses_to_none_offered() {
+        let config = parse_config_toml(
+            "relay_url = 'r'\nper_job_budget_sats = 1\n[sandbox]\nmode = \"docker\"\n",
+        )
+        .expect("a pre-mcp_tools sandbox must parse unchanged");
+        assert!(config.sandbox.expect("[sandbox] present").mcp_tools.is_empty());
     }
 
     #[test]

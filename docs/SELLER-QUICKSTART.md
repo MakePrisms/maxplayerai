@@ -848,6 +848,47 @@ Known limits of this mode:
 - The usage and model metadata on the result come from the container's report. Metering at the
   credential proxy is a follow-up.
 
+### Offer a vendor MCP server to jobs — the Proxy swap (`[[sandbox.mcp_tools]]`)
+
+A docker seat can offer a vendor-hosted MCP server (GitHub's remote MCP, for example) to its jobs
+without the vendor credential ever entering the container. Per job, the host reads the credential
+from a file you name, mints a placeholder, and registers the pair on the credential proxy. The job's
+agent gets an MCP server entry that carries only the placeholder and the proxy's address. The proxy
+swaps the real credential in at egress, for the vendor's host only, for the life of the job only. A
+leaked placeholder is worthless: the vendor rejects it, and the proxy forgets it at job end.
+
+Scope the credential at the vendor. The proxy constrains the destination, not the operations, so a
+broad credential stays broad behind it. For GitHub: a fine-grained personal access token, read-only,
+on one repository.
+
+```toml
+[sandbox]
+mode = "docker"
+network = "maxplayer-jobs"
+proxy_port_range = "9100-9199"      # required with network: the pinhole is how the job reaches the proxy
+
+[[sandbox.mcp_tools]]
+name = "github"                                # the MCP server name the agent sees
+url = "https://api.githubcopilot.com/mcp/"     # the vendor's MCP endpoint
+credential = { path = "/home/seller/.config/maxplayer/github-mcp.json", field = "token" }
+# transport = "stdio"                          # default: the bridge in the image. "http" only for claude
+```
+
+The credential file is JSON with one top-level string field, mode `0600`, owned by the daemon's
+user: `{"token": "github_pat_…"}`. Use an absolute path. Never put the credential in `config.toml`
+or on a command line. The seller boot line reports each tool:
+
+```text
+seller node: [sandbox] mcp_tools: github -> https://api.githubcopilot.com/mcp/ through the credential proxy (stdio bridge); credential file /home/seller/.config/maxplayer/github-mcp.json reads
+```
+
+A line that says `UNREADABLE` means every job would fail to reach the tool; fix the file first. A
+credential file that cannot be read at job time fails that job before any proxy listens — nothing
+falls back to putting the real value in the container.
+
+Status: the wiring is tested against synthetic fakes. The first real-vendor acceptance run (GitHub)
+is pending; see `docs/specs/seller-tool-onboarding/10-routing-and-options.md`.
+
 ### `launcher` mode — only if this box cannot run docker
 
 The launcher below is `bwrap` (bubblewrap), and it is not present on a stock box. Install it before

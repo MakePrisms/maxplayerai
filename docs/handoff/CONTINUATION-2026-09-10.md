@@ -6,8 +6,8 @@ findings, and the plan for the production integration that remains.
 
 Author: Petar's local agent, 2026-09-10.
 
-**Current next step:** section 10 — finish the Proxy swap production wiring, then the real GitHub
-test. Read section 10 first if you are resuming.
+**Current next step:** section 10 — the Proxy swap production wiring is coded and tested
+(2026-09-11); the real GitHub acceptance run is next. Read section 10 first if you are resuming.
 
 ## 1. What changed since `a0cc31d`
 
@@ -176,7 +176,7 @@ The reason, stated plainly:
 This becomes supportable when a specific vendor offers a browser login with a refreshable session.
 The holder already accommodates that case; no redesign is needed.
 
-## 10. Next step — Proxy swap production wiring (agreed 2026-09-11)
+## 10. Proxy swap production wiring (agreed 2026-09-11; coding done 2026-09-11)
 
 Petar's sequencing decision, 2026-09-11: finish all the coding first, then attempt the real GitHub
 test. Do not attempt the real test with half-built code. The real run is the one thing that cannot
@@ -186,23 +186,104 @@ Scope: the Proxy swap production wiring, enough to run the GitHub acceptance tes
 production integration (section 7, doc 09) is separate and is NOT needed for the GitHub test. Do it
 only if Petar asks for it in the same push.
 
-Definition of done — "all the coding" is done when these four are built and green against synthetic
-fakes:
+### Definition of done, and what was built against it
 
-1. **Config.** A seat can declare a proxy-swap vendor tool: the credential file, the upstream host,
-   the placeholder, and the client redirect. Reuse the `FileCredential` shape in `home.rs`.
-2. **Wiring.** `seller_exec` registers that credential on the real credential proxy (`#647`), adds
-   the upstream to the job's egress allowlist, and sets the job's `mcp_servers` to `mcp-http-bridge`.
-   Gate it on the config, so a seat without it is unchanged.
-3. **Image.** Bake `mcp-http-bridge` into the sandbox image (`docker/maxplayer-sandbox/Dockerfile`).
-4. **Tests.** Core-side tests against a synthetic vendor MCP and proxy: a job gets the tool through
-   the swap; the credential never enters the container; a bypass placeholder fails. All green.
+"All the coding" is done when these four are built and green against synthetic fakes. As of
+2026-09-11 all four are built; the status of the gates is in the next subsection.
+
+1. **Config.** `[[sandbox.mcp_tools]]` in `config.toml`: `name`, `url`, `credential = { path,
+   field }`, optional `transport = "stdio" | "http"`. `McpToolConfig` in `home.rs`, beside
+   `FileCredential`, which it reuses in substance: the same `path` + `field` shape, read by one
+   shared function. The `[sandbox]` template comment shows the block. Refusals at config
+   resolution (`SandboxPolicy::from_config`): relative path, empty field, bad name, duplicate name,
+   a URL the proxy cannot route.
+2. **Wiring.** `seller_exec::start_credential_containment` reads the credential per job, mints a
+   placeholder (`mxp-mcp-` + 48 random), registers it on the real `#647` engine with one upstream
+   (the URL's scheme + host, which joins the proxy's destination allowlist), and returns one
+   `McpServer` per tool in `Containment::mcp_servers` → `PreparedLaunch::mcp_servers`. The host
+   agent launch puts them on `SessionConfig.mcp_servers`; the container-delivery launch carries them
+   in `Phase1Inputs.mcp_servers` (serde default, back-compatible) and the orchestrator hands them to
+   `run_agent_job_in_env`. A seat without the table is unchanged. A boot line per tool names the
+   route and whether the credential file reads.
+
+   Correction to the plan text: "adds the upstream to the job's egress allowlist" was wrong. The
+   job never reaches the vendor; the proxy does, from the host. The vendor's host joins the PROXY's
+   destination allowlist (`ProxyEngine::new`), which is what the wiring does.
+3. **Image.** `docker/maxplayer-sandbox/Dockerfile` builds `mcp-http-bridge` in the builder stage
+   (`cargo build --release -p maxplayer-tool-kit --bin mcp-http-bridge --locked`) and installs it at
+   `/usr/local/bin/mcp-http-bridge` (`seller_exec::CONTAINER_MCP_BRIDGE_BIN`).
+4. **Tests.** Core, `seller_exec::mcp_tool_tests`: config refusals, the URL split, the two session
+   entry shapes, the boot line, and — against the REAL proxy with a stub vendor — the job gets the
+   tool through the swap, nothing the container receives carries the credential (env, session
+   entry, docker argv), a bypass placeholder gets `401` at the vendor, an unknown placeholder gets
+   `502` at the proxy with no substitution, and job end revokes. Kit, `tests/proxy_swap_suite.rs`:
+   the bridge against fakes with SSE, a session id, chunked framing, a notification, and the
+   environment fallback. Plus unit tests for the bridge logic (`mcp_bridge.rs`) and the chunked
+   decoder (`http.rs`).
 
 No operation filter for this test. GitHub's fine-grained PAT is scoped, so the scope fork does not
 apply.
 
-Status as of 2026-09-11: not started. The synthetic mechanism demo is done (the kit, 39 tests). This
-is production-core work, a step up in risk from the isolated kit; lean on the synthetic tests.
+### Decisions taken while building
 
-When items 1 to 4 are green, tell Petar. Then the real GitHub run, per doc 10. It needs a real
-fine-grained read-only PAT and cannot run in the sandbox.
+- **The ACP `McpServer` type was wrong and is fixed.** `driver/acp.rs` had `{ name, command:
+  Vec<String> }`, which no adapter reads. It is now the wire shape read off the baked
+  `claude-agent-acp` 0.67.0 adapter: `McpServer::Stdio { name, command, args, env }` with NO `type`
+  key (the adapter drops a stdio entry that carries one), or `McpServer::Http { type: "http",
+  name, url, headers }`. Nothing constructed a non-empty list before, so nothing else changed.
+- **Flags, not env, for the bridge.** The placeholder and the proxy address travel as `args`:
+  a stdio server's `args` reach the child on every harness; its `env` only if the harness maps it.
+  The placeholder is not a secret to the job that holds it, so argv visibility costs nothing. The
+  bridge still reads `PROXY_URL` / `MCP_PATH` / `TOOL_PLACEHOLDER` as a fallback.
+- **The `http` transport exists as a fallback for the real test.** If the bridge misbehaves against
+  GitHub, `transport = "http"` lets claude's own MCP client dial the proxy directly, so a transport
+  fault and a proxy fault can be told apart.
+- **The bridge speaks Streamable HTTP for real.** Chunked decoding (hyper re-frames every proxied
+  response as chunked), SSE `data:` parsing, `Mcp-Session-Id` echo, `MCP-Protocol-Version` after
+  `initialize`, `Accept: application/json, text/event-stream`, notifications draw no reply, a
+  malformed line is answered locally.
+
+### Status of the gates (2026-09-11, evening)
+
+| Gate | Result |
+| --- | --- |
+| `cargo test -p maxplayer-core --locked --offline` | 419 pass. |
+| `cargo test -p maxplayer-core --features acp --locked --offline` | 469 pass, 1 ignored. |
+| `cargo test -p maxplayer-core --features wallet --locked --offline` | 1510 pass in the lib, all integration binaries pass. |
+| `cargo test -p maxplayer-core --features wallet,acp --locked --offline` | 1575 pass in the lib, all integration binaries pass. Includes the 16 `mcp_tool_tests`. |
+| `cargo test -p maxplayer-tool-kit` | 52 pass. |
+| `cargo clippy -p maxplayer-tool-kit --all-targets` | Clean. |
+| `cargo clippy -p maxplayer-core --features wallet,acp --all-targets` | No new warning in the changed files; the pre-existing ones stand. |
+| `cargo test -p maxplayer` (default and `acp,wallet`) | 160 and 198 pass; ONE test fails, see below. |
+| `cargo build -p maxplayer-tool-kit --bin mcp-http-bridge --locked` | Builds; the bridge exits 2 with a usage error when run without config. |
+| `docker build -f docker/maxplayer-sandbox/Dockerfile …` | NOT VERIFIED, see below. |
+
+Two items are not verified, both for the same environmental reason. On this machine, on the
+evening of 2026-09-11, the Docker Desktop daemon's registry client hangs: `docker pull`, the
+BuildKit step `resolve image config for docker.io/docker/dockerfile:1`, and `docker manifest
+inspect` all block without an answer, while `curl` from the host and `wget` from inside a container
+reach the registry in under a second. Two graceful `docker desktop restart`s did not clear it, and
+the host was under a load average above 80 from unrelated macOS daemons.
+
+1. **The sandbox image build.** The Dockerfile change is two lines in the builder stage and one
+   `COPY` in the final stage; the cargo line it adds is proven locally under the same lockfile.
+   Verify with:
+
+   ```sh
+   docker build -f docker/maxplayer-sandbox/Dockerfile -t maxplayer-sandbox:mcp-bridge .
+   docker run --rm --entrypoint /usr/local/bin/mcp-http-bridge maxplayer-sandbox:mcp-bridge; echo "rc=$?"   # expect rc=2 and a usage line
+   ```
+2. **`doctor::tests::sandbox_image_check_is_wired_into_the_boot_gate`** in the `maxplayer` crate.
+   It runs `docker manifest inspect` against an unresolvable host and expects a fast failure; with
+   the registry client hung it does not get one. The change here touched only a struct literal in
+   that file. Re-run it when docker answers:
+
+   ```sh
+   cargo test -p maxplayer --features acp,wallet --locked --offline sandbox_image_check
+   ```
+
+### Next: the real GitHub run
+
+It needs a real fine-grained read-only PAT and cannot run in this sandbox. The recipe is in doc 10,
+"First acceptance vendor: GitHub", and the seller-facing steps are in the skill's Proxy swap
+section. Report a Proxy swap onboarding as "configured, acceptance run pending" until it passes.
