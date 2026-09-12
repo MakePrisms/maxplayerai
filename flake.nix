@@ -18,6 +18,42 @@
         "x86_64-linux"
       ];
       forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
+
+      # Package versions are DERIVED from the Cargo manifest that owns each package —
+      # never re-typed as a literal here, where they drift silently from the crates.
+      # `version.workspace = true` parses (builtins.fromTOML) as an ATTRSET, not a
+      # string: that is the inheritance marker, and it resolves against the manifest
+      # of the workspace the crate is a member of. A plain string is a crate that
+      # pins its own version and must NOT be resolved against any workspace.
+      readManifest = path: builtins.fromTOML (builtins.readFile path);
+      cargoVersion =
+        { manifest, workspaceManifest }:
+        let
+          declared = (readManifest manifest).package.version;
+        in
+        if builtins.isString declared then
+          declared
+        else
+          (readManifest workspaceManifest).workspace.package.version;
+
+      # `maxplayer` and `maxplayer-relay-write-policy` are both members of the ROOT
+      # workspace and both inherit its [workspace.package] version.
+      maxplayerVersion = cargoVersion {
+        manifest = ./crates/maxplayer/Cargo.toml;
+        workspaceManifest = ./Cargo.toml;
+      };
+      writePolicyVersion = cargoVersion {
+        manifest = ./crates/maxplayer-relay-write-policy/Cargo.toml;
+        workspaceManifest = ./Cargo.toml;
+      };
+      # buzz-relay lives in the ISOLATED nested crates/buzz workspace AND opts out of
+      # inheriting it (`version = "…"` in its own [package]: it ships on its own release
+      # cadence). Resolving it against crates/buzz/Cargo.toml would be wrong; the helper
+      # takes the crate's own string and never looks at the workspace manifest.
+      buzzRelayVersion = cargoVersion {
+        manifest = ./crates/buzz/crates/buzz-relay/Cargo.toml;
+        workspaceManifest = ./crates/buzz/Cargo.toml;
+      };
     in
     {
       packages = forAllSystems (
@@ -41,7 +77,7 @@
           # Args common to every `maxplayer` build.
           maxplayerArgs = {
             pname = "maxplayer";
-            version = "0.1.1";
+            version = maxplayerVersion;
             src = self;
 
             # #818: `src = self` is a store copy with no `.git`, so the build script has nothing to
@@ -107,7 +143,7 @@
           # `lib.getExe` in `nixosModules.relay` resolves `meta.mainProgram`.
           relay-write-policy = pkgs.rustPlatform.buildRustPackage {
             pname = "maxplayer-relay-write-policy";
-            version = "0.1.1";
+            version = writePolicyVersion;
             src = self;
             cargoLock.lockFile = ./Cargo.lock;
             cargoBuildFlags = [
@@ -139,7 +175,7 @@
           # from git); crates/buzz/NOTICE says why that patch was dropped.
           maxplayer-relay = buzzRustPlatform.buildRustPackage {
             pname = "maxplayer-relay";
-            version = "0.1.0";
+            version = buzzRelayVersion;
             src = ./crates/buzz;
             # cargoHash of buzz's vendored dep set (crates.io + the rust-s3 git source). Recompute it
             # whenever crates/buzz/Cargo.lock changes: set pkgs.lib.fakeHash, build, copy the reported hash.
