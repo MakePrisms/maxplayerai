@@ -423,6 +423,16 @@ struct PostJobParams {
     base_oid: Option<String>,
     #[serde(default)]
     accepts: Option<Vec<String>>,
+    /// Optional per-job path scope (#957). Each axis is independently optional; ABSENT ⇒ no per-job
+    /// constraint on that axis (the home policy applies unchanged at `authorize_pay`). A PRESENT
+    /// `scope_allowed_paths` is a real constraint — an empty list is refused as disjoint (deny-all),
+    /// never read as "allow all". The scope can only TIGHTEN the home config (enforced at merge).
+    #[serde(default)]
+    scope_allowed_paths: Option<Vec<String>>,
+    #[serde(default)]
+    scope_forbidden_paths: Option<Vec<String>>,
+    #[serde(default)]
+    scope_max_diff_bytes: Option<u64>,
     /// Per-job spend ceiling for the background auto-award (defaults to `amount_sats`). The daemon
     /// never auto-awards a claim it cannot pay or priced above this.
     #[serde(default)]
@@ -506,12 +516,37 @@ fn post_job_kind(params: &PostJobParams) -> Result<JobKind, String> {
     ) {
         (None, None, None, None) => Ok(JobKind::FromScratch),
         (Some(owner), Some(url), Some(branch), Some(oid)) => {
+            // Build the optional per-job path scope (#957). A present-but-empty allowlist is a
+            // DISJOINT deny-all and is refused here (never read as "allow all").
+            if let Some(allowed) = &params.scope_allowed_paths {
+                if allowed.is_empty() {
+                    return Err(
+                        "post_job scope_allowed_paths is present but empty — an empty allowlist is a \
+                         disjoint deny-all (no allowed path), never \"allow all\"; either omit it or \
+                         list at least one prefix"
+                            .to_owned(),
+                    );
+                }
+            }
+            let scope = if params.scope_allowed_paths.is_none()
+                && params.scope_forbidden_paths.is_none()
+                && params.scope_max_diff_bytes.is_none()
+            {
+                None
+            } else {
+                Some(crate::contribution::JobPathScope {
+                    allowed_paths: params.scope_allowed_paths.clone(),
+                    forbidden_paths: params.scope_forbidden_paths.clone(),
+                    max_diff_bytes: params.scope_max_diff_bytes,
+                })
+            };
             Ok(JobKind::Contribution(ContributionSpec {
                 target_repo_owner: owner.clone(),
                 target_repo_url: url.clone(),
                 base_branch: branch.clone(),
                 base_oid: oid.clone(),
                 accepts: params.accepts.clone(),
+                scope,
             }))
         }
         _ => Err(
