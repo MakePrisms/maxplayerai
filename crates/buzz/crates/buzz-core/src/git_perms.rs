@@ -1002,27 +1002,25 @@ mod tests {
     }
 
     #[test]
-    fn pattern_length_boundary_literal() {
+    fn pattern_length_at_limit_is_accepted() {
         // Literal fixture at the documented MAX_PATTERN_LENGTH (256), NOT derived
         // from the constant and NOT constant-equality. "refs/" is 5 chars, so
-        // 251 more make exactly 256; 252 make 257.
+        // 251 more make exactly 256. The documented bound must be an accepted
+        // capacity: if the bound is lowered below 256, this 256-char pattern is
+        // refused and the test fails; a legitimate raise keeps it accepted and
+        // the test stays green (issue #933 property 2).
         let at_limit = format!("refs/{}", "a".repeat(251));
         assert_eq!(at_limit.len(), 256);
         assert!(RefPattern::parse(&at_limit).is_ok());
-
-        let over_limit = format!("refs/{}", "a".repeat(252));
-        assert_eq!(over_limit.len(), 257);
-        assert!(matches!(
-            RefPattern::parse(&over_limit),
-            Err(PatternError::TooLong)
-        ));
     }
 
     #[test]
-    fn protection_rule_count_boundary_literal() {
+    fn protection_rule_count_at_limit_is_accepted() {
         // Literal fixture at the documented MAX_PROTECTION_RULES (50), NOT derived
-        // from the constant. Exactly 50 valid protection tags are accepted; the
-        // 51st is refused with TooManyRules.
+        // from the constant. Exactly 50 valid protection tags must be an accepted
+        // capacity: if the bound is lowered below 50, the 50th is refused and the
+        // test fails; a legitimate raise keeps 50 accepted and the test stays
+        // green (issue #933 property 2).
         let mut tags: Vec<Vec<String>> = Vec::new();
         for i in 0..50 {
             tags.push(vec![
@@ -1033,16 +1031,5 @@ mod tests {
         }
         let parsed = parse_protection_tags(&tags).unwrap();
         assert_eq!(parsed.rules.len(), 50); // fixture size control: exactly 50
-
-        let mut over = tags;
-        over.push(vec![
-            "buzz-protect".to_string(),
-            "refs/heads/rule50".to_string(),
-            "push:admin".to_string(),
-        ]);
-        assert!(matches!(
-            parse_protection_tags(&over),
-            Err(RuleParseError::TooManyRules)
-        ));
     }
 }

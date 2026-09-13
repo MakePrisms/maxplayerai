@@ -468,22 +468,16 @@ mod tests {
     }
 
     #[test]
-    fn validate_pack_count_literal_boundary() {
+    fn validate_pack_and_ref_count_at_limit_are_accepted() {
         // Literal fixtures at the documented MAX_MANIFEST_PACKS (128) and
-        // MAX_MANIFEST_REFS (10_000), NOT derived from the constants. Exactly
-        // the documented count is accepted; one more is refused. This makes the
-        // test fail if the production limit is changed (drifted) — the point
-        // the boundary-relative tests miss.
+        // MAX_MANIFEST_REFS (10_000), NOT derived from the constants. Exactly the
+        // documented count must be an accepted capacity: if either bound is
+        // lowered, the corresponding at-limit fixture is refused and the test
+        // fails; a legitimate raise keeps them accepted and the test stays green
+        // (issue #933 property 2).
         let mut at = sample();
         at.packs = (0..128).map(|i| format!("packs/{i:064x}")).collect();
         at.validate().expect("exactly 128 packs must validate");
-
-        let mut over = sample();
-        over.packs = (0..129).map(|i| format!("packs/{i:064x}")).collect();
-        assert!(matches!(
-            over.validate(),
-            Err(ManifestError::TooManyPacks { .. })
-        ));
 
         let mut refs_at = sample();
         refs_at.refs.clear();
@@ -491,16 +485,6 @@ mod tests {
             refs_at.refs.insert(format!("refs/heads/r{i}"), "a".repeat(40));
         }
         refs_at.validate().expect("exactly 10_000 refs must validate");
-
-        let mut refs_over = sample();
-        refs_over.refs.clear();
-        for i in 0..10_001 {
-            refs_over.refs.insert(format!("refs/heads/r{i}"), "b".repeat(40));
-        }
-        assert!(matches!(
-            refs_over.validate(),
-            Err(ManifestError::TooManyRefs { .. })
-        ));
     }
 
     #[test]

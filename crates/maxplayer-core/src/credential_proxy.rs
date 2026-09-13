@@ -3574,19 +3574,14 @@ mod tests {
         );
     }
 
-    // A literal fixture pinning the documented MAX_REQUEST_BODY_BYTES ceiling (32 MiB), NOT derived
-    // from the constant. The sibling test `a_declared_over_cap_body_is_refused...` asserts the same
-    // behaviour but computes `MAX_REQUEST_BODY_BYTES + 1`, so a silent raise of the constant would
-    // move the test's own threshold and it would still pass — this test cannot: if the ceiling moves
-    // above 32 MiB + 1, the refusal is no longer triggered here and the test fails.
+    // A literal fixture at the documented MAX_REQUEST_BODY_BYTES ceiling (32 MiB), NOT derived
+    // from the constant. Exactly 32 MiB must be an accepted capacity: if the limit is lowered
+    // below 32 MiB, the proxy refuses this exact-size body (413) and the test fails; a legitimate
+    // raise keeps 32 MiB accepted and the test stays green (issue #933 property 2).
     #[tokio::test]
-    async fn a_declared_body_just_over_32_mib_is_refused() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let upstream_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
-        let upstream = format!("http://{}", upstream_listener.local_addr().unwrap());
+    async fn a_declared_body_of_32_mib_is_accepted() {
+        let (stub_addr, stub) = spawn_stub("UPSTREAM_OK").await;
+        let upstream = format!("http://{stub_addr}");
         let engine = Arc::new(ProxyEngine::new([authority_of(&upstream).unwrap()]));
         let placeholder = mint_anthropic_placeholder();
         engine
@@ -3599,51 +3594,28 @@ mod tests {
         let proxy = start(Arc::clone(&engine), None).await.unwrap();
         let port = proxy.local_addr().port();
 
-        // 32 MiB + 1 byte. Literal, so a raise of MAX_REQUEST_BODY_BYTES breaks this test.
-        let declared = 32 * 1024 * 1024 + 1;
-        let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        // Distinctive bytes so a truncation cannot be mistaken for success. 32 MiB, literal.
+        let big = vec![b'z'; 32 * 1024 * 1024];
+        let response = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .header("x-api-key", &placeholder)
+            .body(big.clone())
+            .send()
             .await
             .unwrap();
-        sock.write_all(
-            format!(
-                "POST /v1/messages HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\n\
-                 x-api-key: {placeholder}\r\ncontent-length: {declared}\r\n\r\n"
-            )
-            .as_bytes(),
-        )
-        .await
-        .unwrap();
-        sock.flush().await.unwrap();
-
-        let mut head = Vec::new();
-        let mut tmp = [0u8; 1024];
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let n = sock.read(&mut tmp).await.unwrap();
-                if n == 0 {
-                    break;
-                }
-                head.extend_from_slice(&tmp[..n]);
-                if find_subslice(&head, b"\r\n\r\n").is_some() {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("the proxy must refuse a declared over-cap length from the headers alone");
-
-        let text = String::from_utf8_lossy(&head).to_string();
-        let status_line = text.lines().next().unwrap_or_default().to_owned();
-        assert!(
-            status_line.starts_with("HTTP/1.1 413"),
-            "a declared 32 MiB + 1 body must be refused; got {status_line:?}"
+        assert_eq!(
+            response.status(),
+            200,
+            "a body of exactly 32 MiB must be accepted, not refused"
         );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(500), upstream_listener.accept())
-                .await
-                .is_err(),
-            "an over-cap request must not reach the upstream at all"
+
+        let seen = stub.await.unwrap();
+        assert_eq!(
+            seen.body.len(),
+            big.len(),
+            "the upstream must receive every byte of an exactly-at-cap body"
         );
+        assert_eq!(seen.api_key.as_deref(), Some(REAL));
     }
 
     // The backstop for a body whose length is NOT declared: a chunked stream cannot be judged from its

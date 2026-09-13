@@ -761,28 +761,19 @@ mod tests {
     }
 
     #[test]
-    fn safe_json_integer_boundary_literal() {
-        // Literal fixtures at the documented MAX_SAFE_JSON_INTEGER ((1<<53)-1),
-        // NOT derived from the constant. Generation exactly at the bound is
-        // accepted for a minimal inactive lease; one past the bound is refused.
-        // If the bound drifts upward, the refusal below no longer fires and the
-        // un-blessed generation is caught.
+    fn safe_json_integer_at_limit_is_accepted() {
+        // Literal fixture at the documented MAX_SAFE_JSON_INTEGER ((1<<53)-1),
+        // NOT derived from the constant. Generation exactly at the bound must be
+        // an accepted capacity for a minimal inactive lease: if the bound is
+        // lowered below (1<<53)-1, this generation is refused and the test
+        // fails; a legitimate raise keeps it accepted and the test stays green
+        // (issue #933 property 2).
         let at_bound = parse_plaintext(
             &format!(r##"{{"v":1,"origin":"o","generation":{},"active":false}}"##, (1_u64 << 53) - 1),
             4096,
         )
         .unwrap();
         assert!(validate_plaintext(&at_bound, &limits()).is_ok());
-
-        let past_bound = parse_plaintext(
-            &format!(r##"{{"v":1,"origin":"o","generation":{},"active":false}}"##, 1_u64 << 53),
-            4096,
-        )
-        .unwrap();
-        assert_eq!(
-            validate_plaintext(&past_bound, &limits()).unwrap_err(),
-            "generation must be a positive safe integer"
-        );
     }
 
     #[test]

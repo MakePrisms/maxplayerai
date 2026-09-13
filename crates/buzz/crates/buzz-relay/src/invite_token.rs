@@ -306,19 +306,20 @@ mod tests {
     }
 
     #[test]
-    fn invite_ttl_cap_literal() {
+    fn invite_ttl_at_limit_is_granted_uncapped() {
         // Literal fixture at the documented MAX_INVITE_TTL_SECS (30 days), NOT
-        // derived from the constant. Asking for a lifetime far beyond 30 days
-        // must be clamped to the canonical 30-day ceiling — if the ceiling
-        // drifts upward, this fails and the un-blessed extension is caught.
+        // derived from the constant. Requesting exactly 30 days must be granted
+        // as-is (the clamp must not lower it): if the ceiling is lowered below
+        // 30 days, the requested 30 days is clamped down and this fails; a
+        // legitimate raise keeps 30 days granted as-is and the test stays green
+        // (issue #933 property 2).
         let key = test_key();
-        let requested = 200 * 24 * 60 * 60; // 200 days
+        let requested = 30 * 24 * 60 * 60; // exactly the documented 30-day bound
         let (_, expires_at) = mint_invite(&key, community(), requested);
-        let cap = 30 * 24 * 60 * 60;
+        let granted = expires_at.saturating_sub(now_unix());
         assert!(
-            expires_at <= now_unix() + cap,
-            "invite TTL not clamped to 30-day ceiling: expires_at {} exceeds now+{cap}",
-            expires_at
+            granted >= 30 * 24 * 60 * 60 - 60,
+            "the 30-day bound must be granted, not clamped lower: granted {granted}s"
         );
     }
 
