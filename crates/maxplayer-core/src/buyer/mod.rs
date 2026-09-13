@@ -518,15 +518,15 @@ fn post_job_kind(params: &PostJobParams) -> Result<JobKind, String> {
         (Some(owner), Some(url), Some(branch), Some(oid)) => {
             // Build the optional per-job path scope (#957). A present-but-empty allowlist is a
             // DISJOINT deny-all and is refused here (never read as "allow all").
-            if let Some(allowed) = &params.scope_allowed_paths {
-                if allowed.is_empty() {
-                    return Err(
-                        "post_job scope_allowed_paths is present but empty — an empty allowlist is a \
-                         disjoint deny-all (no allowed path), never \"allow all\"; either omit it or \
-                         list at least one prefix"
-                            .to_owned(),
-                    );
-                }
+            if let Some(allowed) = &params.scope_allowed_paths
+                && allowed.is_empty()
+            {
+                return Err(
+                    "post_job scope_allowed_paths is present but empty — an empty allowlist is a \
+                     disjoint deny-all (no allowed path), never \"allow all\"; either omit it or \
+                     list at least one prefix"
+                        .to_owned(),
+                );
             }
             let scope = if params.scope_allowed_paths.is_none()
                 && params.scope_forbidden_paths.is_none()

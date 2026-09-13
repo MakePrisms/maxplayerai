@@ -460,10 +460,10 @@ fn allowed_intersection(home: &[String], job: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for h in home {
         for j in job {
-            if let Some(prefix) = overlap_prefix(h, j) {
-                if !out.contains(&prefix) {
-                    out.push(prefix);
-                }
+            if let Some(prefix) = overlap_prefix(h, j)
+                && !out.contains(&prefix)
+            {
+                out.push(prefix);
             }
         }
     }
