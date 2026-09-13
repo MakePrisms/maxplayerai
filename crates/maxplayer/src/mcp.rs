@@ -290,6 +290,21 @@ fn tools() -> Value {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Contribution mode (optional): accepted delivery forms. Defaults to [\"fork\"] and must include \"fork\" (v1 fork-only)."
+                    },
+                    "scope_allowed_paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Contribution mode (optional, #957): per-job path ALLOWLIST prefixes. A changed path must match one of these AND the home allowlist (prefix-aware intersection). An EMPTY array is refused at post — an empty allowlist is a disjoint DENY-ALL (no allowed path), never an unrestricted/\"allow all\" ask. Omit for no per-job allowlist (home applies unchanged)."
+                    },
+                    "scope_forbidden_paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Contribution mode (optional, #957): per-job path FORBIDDEN prefixes, unioned with the home forbid list. A changed path under any of these is refused. Omit for none."
+                    },
+                    "scope_max_diff_bytes": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Contribution mode (optional, #957): per-job cap on summed diff churn, min'd with the home cap. 0 caps any churn. Omit for no per-job cap."
                     }
                 },
                 "required": ["task", "output", "amount_sats"],
