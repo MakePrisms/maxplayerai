@@ -6538,4 +6538,71 @@ mod tests {
         );
         assert_eq!(paid["amount_sats"], 21);
     }
+
+    // ── #957 per-job path scope: post_job params build the scope; empty allowlist refused ─────
+    /// Real deserializer + `post_job_kind` — a `#[serde(default)]` that stopped defaulting, or a
+    /// field renamed on one side, is caught here rather than by inspection.
+    fn kind_for_body(body: Value) -> Result<JobKind, String> {
+        let params: PostJobParams = serde_json::from_value(body).expect("post_job params");
+        post_job_kind(&params)
+    }
+
+    #[test]
+    fn post_job_scope_params_build_the_per_job_scope() {
+        // All four contribution pins + a length-three scope set ⇒ a Contribution job carrying
+        // exactly that JobPathScope on its ContributionSpec.
+        let body = json!({
+            "task": "t", "output": "text/plain", "amount_sats": 7,
+            "target_repo_owner": "aa".repeat(32), "target_repo_url": "https://relay/repo.git",
+            "base_branch": "main", "base_oid": "bb".repeat(20),
+            "scope_allowed_paths": ["src", "docs/"],
+            "scope_forbidden_paths": ["src/secrets"],
+            "scope_max_diff_bytes": 4096,
+        });
+        let JobKind::Contribution(ContributionSpec { scope, .. }) =
+            kind_for_body(body).expect("valid contribution post")
+        else {
+            panic!("expected a contribution job");
+        };
+        assert_eq!(
+            scope,
+            Some(crate::contribution::JobPathScope {
+                allowed_paths: Some(vec!["src".into(), "docs/".into()]),
+                forbidden_paths: Some(vec!["src/secrets".into()]),
+                max_diff_bytes: Some(4096),
+            })
+        );
+    }
+
+    #[test]
+    fn post_job_absent_scope_produces_no_scope() {
+        // No scope params ⇒ the ContributionSpec scope is None (home policy applies unchanged).
+        let body = json!({
+            "task": "t", "output": "text/plain", "amount_sats": 7,
+            "target_repo_owner": "aa".repeat(32), "target_repo_url": "https://relay/repo.git",
+            "base_branch": "main", "base_oid": "bb".repeat(20),
+        });
+        let JobKind::Contribution(ContributionSpec { scope, .. }) =
+            kind_for_body(body).expect("valid contribution post")
+        else {
+            panic!("expected a contribution job");
+        };
+        assert_eq!(scope, None, "absent scope must be None, never a defaulted allow-all");
+    }
+
+    #[test]
+    fn post_job_empty_scope_allowlist_is_refused_as_disjoint() {
+        // A PRESENT-but-empty scope_allowed_paths must be REFUSED at post (never read as allow-all).
+        let body = json!({
+            "task": "t", "output": "text/plain", "amount_sats": 7,
+            "target_repo_owner": "aa".repeat(32), "target_repo_url": "https://relay/repo.git",
+            "base_branch": "main", "base_oid": "bb".repeat(20),
+            "scope_allowed_paths": [],
+        });
+        let err = kind_for_body(body).expect_err("empty allowlist must refuse at post");
+        assert!(
+            err.contains("scope_allowed_paths") && err.contains("deny-all"),
+            "the refusal must name the disjoint allowlist, got: {err}"
+        );
+    }
 }

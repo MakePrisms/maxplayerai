@@ -1018,6 +1018,147 @@ mod tests {
     }
 
     #[test]
+    fn job_scope_absent_leaves_home_policy_unchanged() {
+        let policy = ContentPolicy {
+            allowed_paths: vec!["src".into()],
+            forbidden_paths: vec!["src/secrets".into()],
+            max_diff_bytes: Some(100),
+            deny_all: false,
+        };
+        // A fully-absent job scope must be a byte-identical no-op (older behavior preserved).
+        let merged = policy.with_job_scope(&JobPathScope::default());
+        assert_eq!(merged, policy);
+        // And it stays REFUSING exactly what home refused (cannot loosen, even trivially).
+        assert!(merged
+            .evaluate(&[ChangedPath { path: "tests/x.rs".into(), bytes: 1 }])
+            .is_err());
+        assert!(merged
+            .evaluate(&[ChangedPath { path: "src/lib.rs".into(), bytes: 1 }])
+            .is_ok());
+    }
+
+    #[test]
+    fn job_scope_widens_nothing_but_narrows_to_deny_all_on_disjoint() {
+        // Home allows only `src`. A job that forbids `src` entirely leaves NOTHING in scope: the
+        // merged policy must DENY ALL, never read the empty intersection as "allow all".
+        let policy = ContentPolicy {
+            allowed_paths: vec!["src".into()],
+            forbidden_paths: Vec::new(),
+            max_diff_bytes: None,
+            deny_all: false,
+        };
+        let merged = policy.with_job_scope(&JobPathScope {
+            allowed_paths: Some(vec!["src".into(), "docs".into()]),
+            forbidden_paths: None,
+            max_diff_bytes: None,
+        });
+        // Intersection of `src` ∩ (`src`|`docs`) = `src`, so a src path still passes…
+        assert!(merged
+            .evaluate(&[ChangedPath { path: "src/lib.rs".into(), bytes: 1 }])
+            .is_ok());
+        // …and a docs path (in the job allowlist but NOT in home) is refused — home cannot be widened.
+        assert!(matches!(
+            merged.evaluate(&[ChangedPath { path: "docs/x.md".into(), bytes: 1 }]),
+            Err(ContentRefusal::OutOfScope { .. })
+        ));
+
+        // DISJOINT: home=`src`, job allowlist=`docs`. No allowed region ⇒ deny-all.
+        let disjoint = policy.with_job_scope(&JobPathScope {
+            allowed_paths: Some(vec!["docs".into()]),
+            forbidden_paths: None,
+            max_diff_bytes: None,
+        });
+        assert!(disjoint.deny_all, "disjoint allowlists must be an explicit deny_all");
+        assert!(matches!(
+            disjoint.evaluate(&[ChangedPath { path: "src/lib.rs".into(), bytes: 1 }]),
+            Err(ContentRefusal::DeniedAll)
+        ));
+        // deny_all refuses even a path that would otherwise be in home's allowlist.
+        assert!(matches!(
+            disjoint.evaluate(&[ChangedPath { path: "docs/x.md".into(), bytes: 1 }]),
+            Err(ContentRefusal::DeniedAll)
+        ));
+    }
+
+    #[test]
+    fn job_scope_present_but_empty_allowlist_is_deny_all_never_unrestricted() {
+        // A PRESENT-but-empty job allowlist is the one value that must never be read as "allow all".
+        let policy = ContentPolicy::floor(); // home = allow all
+        let merged = policy.with_job_scope(&JobPathScope {
+            allowed_paths: Some(Vec::new()),
+            forbidden_paths: None,
+            max_diff_bytes: None,
+        });
+        assert!(merged.deny_all, "empty present allowlist must be deny_all");
+        assert!(matches!(
+            merged.evaluate(&[ChangedPath { path: "anything.rs".into(), bytes: 1 }]),
+            Err(ContentRefusal::DeniedAll)
+        ));
+        // Sanity: the FLOOR itself still allows (so deny_all is a real, distinct state).
+        assert!(policy
+            .evaluate(&[ChangedPath { path: "anything.rs".into(), bytes: 1 }])
+            .is_ok());
+    }
+
+    #[test]
+    fn job_scope_tightens_forbid_union_and_max_min() {
+        let policy = ContentPolicy {
+            allowed_paths: vec!["src".into()],
+            forbidden_paths: vec!["src/secrets".into()],
+            max_diff_bytes: Some(1000),
+            deny_all: false,
+        };
+        let merged = policy.with_job_scope(&JobPathScope {
+            allowed_paths: None,
+            forbidden_paths: Some(vec!["src/gen".into()]),
+            max_diff_bytes: Some(50),
+        });
+        // Forbidden UNION: both the home and the job forbid list hold.
+        assert!(matches!(
+            merged.evaluate(&[ChangedPath { path: "src/secrets/key".into(), bytes: 1 }]),
+            Err(ContentRefusal::Forbidden { .. })
+        ));
+        assert!(matches!(
+            merged.evaluate(&[ChangedPath { path: "src/gen/out.rs".into(), bytes: 1 }]),
+            Err(ContentRefusal::Forbidden { .. })
+        ));
+        // Max bytes MIN: the job's 50 cap wins over home's 1000.
+        assert!(matches!(
+            merged.evaluate(&[ChangedPath { path: "src/lib.rs".into(), bytes: 51 }]),
+            Err(ContentRefusal::TooLarge { .. })
+        ));
+        // in-scope, under the joined cap → pass.
+        assert!(merged
+            .evaluate(&[ChangedPath { path: "src/lib.rs".into(), bytes: 40 }])
+            .is_ok());
+    }
+
+    #[test]
+    fn job_scope_cannot_widen_home_forbid_or_cap() {
+        // The job tries to RE-open a forbidden path and RAISE the cap. Home-only-tightens means
+        // neither is honored: the stricter home values hold.
+        let policy = ContentPolicy {
+            allowed_paths: Vec::new(),
+            forbidden_paths: vec!["src/secrets".into()],
+            max_diff_bytes: Some(100),
+            deny_all: false,
+        };
+        let merged = policy.with_job_scope(&JobPathScope {
+            allowed_paths: None,
+            forbidden_paths: Some(Vec::new()), // tries to clear the forbid — home forbids hold
+            max_diff_bytes: Some(100_000),     // tries to raise the cap — home cap holds
+        });
+        assert!(matches!(
+            merged.evaluate(&[ChangedPath { path: "src/secrets/key".into(), bytes: 1 }]),
+            Err(ContentRefusal::Forbidden { .. })
+        ));
+        assert!(matches!(
+            merged.evaluate(&[ChangedPath { path: "src/big.rs".into(), bytes: 101 }]),
+            Err(ContentRefusal::TooLarge { .. })
+        ));
+    }
+
+    #[test]
     fn offer_tags_round_trip_through_parse() {
         let offer = ContributionOffer {
             target: pin(),
@@ -1030,6 +1171,56 @@ mod tests {
         let parsed = parse_contribution_offer(&tags).expect("parse ok").expect("is contribution");
         assert_eq!(parsed, offer);
         assert!(parsed.accepts_fork());
+    }
+
+    #[test]
+    fn scope_tags_round_trip_through_parse() {
+        let offer = ContributionOffer {
+            target: pin(),
+            base: ContributionBase::new("main", "a".repeat(40)).unwrap(),
+            accepts: vec![ACCEPTS_FORK.to_owned()],
+            scope: Some(JobPathScope {
+                allowed_paths: Some(vec!["src".into(), "docs/".into()]),
+                forbidden_paths: Some(vec!["src/secrets".into()]),
+                max_diff_bytes: Some(4096),
+            }),
+        };
+        let tags = contribution_offer_tags(&offer);
+        assert!(is_contribution_tags(&tags));
+        let parsed = parse_contribution_offer(&tags)
+            .expect("parse ok")
+            .expect("is contribution");
+        assert_eq!(parsed.scope, Some(offer.scope.clone().unwrap()));
+        assert_eq!(parsed, offer);
+    }
+
+    #[test]
+    fn malformed_scope_tag_is_refused_not_silently_dropped() {
+        // A scope tag encodes across the round trip; strip one VALUE so the row is present but the
+        // allowlist is empty. `parse_job_path_scope` must REFUSE (never silently drop to "no scope"),
+        // because a buyer's mis-posted empty allowlist is a disjoint deny-all and must not read as
+        // unrestricted anywhere downstream.
+        let offer = ContributionOffer {
+            target: pin(),
+            base: ContributionBase::new("main", "a".repeat(40)).unwrap(),
+            accepts: vec![ACCEPTS_FORK.to_owned()],
+            scope: None,
+        };
+        let mut tags = contribution_offer_tags(&offer);
+        // Emulate a corrupted empty `scope-allowed` row.
+        tags.push(TagSpec::new([TAG_SCOPE_ALLOWED]));
+        let err = parse_contribution_offer(&tags).expect_err("empty allowlist must refuse");
+        assert!(matches!(err, ContributionError::MalformedOffer(_)), "got {err}");
+
+        // A non-integer max-diff must refuse too, not become no-cap.
+        let tags2 = [
+            TagSpec::new([TAG_JOB_CLASS, JOB_CLASS_CONTRIBUTION]),
+            TagSpec::new([TAG_SCOPE_MAX_DIFF, "not-a-number"]),
+        ];
+        assert!(matches!(
+            parse_job_path_scope(&tags2),
+            Err(ContributionError::MalformedOffer(_))
+        ));
     }
 
     #[cfg(feature = "gateway")]

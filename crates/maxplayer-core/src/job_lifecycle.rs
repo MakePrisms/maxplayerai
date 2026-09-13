@@ -5178,6 +5178,7 @@ mod tests {
                 base_branch: base_branch.to_owned(),
                 base_oid: base_oid.to_owned(),
                 accepts: vec!["fork".into()],
+                scope: None,
             }),
             requested_agent: None,
             requested_harness_family: None,
@@ -5304,6 +5305,7 @@ mod tests {
                 base_oid: "77".repeat(20),
                 tuple_signature: "cafe".into(),
                 store_ref: "refs/maxplayer/deliveries/eeee".into(),
+                scope: None,
             }),
         };
         let req = authorize_request_from_bind(&bind, 1, bind.commit_oid.clone()).expect("ok");
@@ -5328,6 +5330,7 @@ mod tests {
             .unwrap(),
             base: crate::contribution::ContributionBase::new("main", "77".repeat(20)).unwrap(),
             accepts: vec!["fork".into()],
+            scope: None,
         };
         let tags = crate::contribution::contribution_offer_tags(&offer);
         let view = contribution_offer_view(&tags).expect("parsed");
