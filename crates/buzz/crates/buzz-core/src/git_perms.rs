@@ -1000,4 +1000,49 @@ mod tests {
         assert_eq!(denials.len(), 1);
         assert_eq!(denials[0].ref_name, "refs/heads/main");
     }
+
+    #[test]
+    fn pattern_length_boundary_literal() {
+        // Literal fixture at the documented MAX_PATTERN_LENGTH (256), NOT derived
+        // from the constant and NOT constant-equality. "refs/" is 5 chars, so
+        // 251 more make exactly 256; 252 make 257.
+        let at_limit = format!("refs/{}", "a".repeat(251));
+        assert_eq!(at_limit.len(), 256);
+        assert!(RefPattern::parse(&at_limit).is_ok());
+
+        let over_limit = format!("refs/{}", "a".repeat(252));
+        assert_eq!(over_limit.len(), 257);
+        assert!(matches!(
+            RefPattern::parse(&over_limit),
+            Err(PatternError::TooLong)
+        ));
+    }
+
+    #[test]
+    fn protection_rule_count_boundary_literal() {
+        // Literal fixture at the documented MAX_PROTECTION_RULES (50), NOT derived
+        // from the constant. Exactly 50 valid protection tags are accepted; the
+        // 51st is refused with TooManyRules.
+        let mut tags: Vec<Vec<String>> = Vec::new();
+        for i in 0..50 {
+            tags.push(vec![
+                "buzz-protect".to_string(),
+                format!("refs/heads/rule{i}"),
+                "push:admin".to_string(),
+            ]);
+        }
+        let parsed = parse_protection_tags(&tags).unwrap();
+        assert_eq!(parsed.rules.len(), 50); // fixture size control: exactly 50
+
+        let mut over = tags;
+        over.push(vec![
+            "buzz-protect".to_string(),
+            "refs/heads/rule50".to_string(),
+            "push:admin".to_string(),
+        ]);
+        assert!(matches!(
+            parse_protection_tags(&over),
+            Err(RuleParseError::TooManyRules)
+        ));
+    }
 }

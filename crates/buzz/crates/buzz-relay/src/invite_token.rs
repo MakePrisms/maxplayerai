@@ -306,6 +306,23 @@ mod tests {
     }
 
     #[test]
+    fn invite_ttl_cap_literal() {
+        // Literal fixture at the documented MAX_INVITE_TTL_SECS (30 days), NOT
+        // derived from the constant. Asking for a lifetime far beyond 30 days
+        // must be clamped to the canonical 30-day ceiling — if the ceiling
+        // drifts upward, this fails and the un-blessed extension is caught.
+        let key = test_key();
+        let requested = 200 * 24 * 60 * 60; // 200 days
+        let (_, expires_at) = mint_invite(&key, community(), requested);
+        let cap = 30 * 24 * 60 * 60;
+        assert!(
+            expires_at <= now_unix() + cap,
+            "invite TTL not clamped to 30-day ceiling: expires_at {} exceeds now+{cap}",
+            expires_at
+        );
+    }
+
+    #[test]
     fn signed_role_other_than_member_rejected() {
         // Even a *correctly signed* payload with an elevated role must fail
         // verification (defense against a future buggy mint caller).
