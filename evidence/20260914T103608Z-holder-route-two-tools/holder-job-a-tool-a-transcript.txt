@@ -1,0 +1,8 @@
+-> {"id":1,"jsonrpc":"2.0","method":"initialize","params":{"capabilities":{},"protocolVersion":"2024-11-05"}}
+<- {"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"maxplayer-tool-kit-holder","version":"0.1.0"}}}
+-> {"id":2,"jsonrpc":"2.0","method":"tools/list","params":{}}
+<- {"jsonrpc":"2.0","id":2,"result":{"tools":[{"description":"Transform a text file from this job's directory and write the result back into it.","inputSchema":{"additionalProperties":false,"properties":{"input":{"description":"path relative to this job's own directory","type":"string"},"mode":{"enum":["upper","lower","reverse"],"type":"string"},"output":{"description":"output path relative to this job's own directory","type":"string"}},"required":["input","output","mode"],"type":"object"},"name":"transform-file"}]}}
+-> {"id":3,"jsonrpc":"2.0","method":"tools/call","params":{"arguments":{"input":"input.txt","mode":"upper","output":"out-a.txt"},"name":"transform-file"}}
+<- {"jsonrpc":"2.0","id":3,"result":{"content":[{"text":"wrote 17 bytes to /run/maxplayer-holder/staging/job-a-held-live-0/out-0","type":"text"}],"isError":false,"operation":"transform-file","outputs":[{"bytes":17,"path":"out-a.txt"}]}}
+-> {"id":4,"jsonrpc":"2.0","method":"tools/call","params":{"arguments":{"input":"../job-b-held-live/input.txt","mode":"upper","output":"stolen.txt"},"name":"transform-file"}}
+<- {"jsonrpc":"2.0","id":4,"error":{"code":1003,"message":"input: '.' and '..' components are not accepted"}}
