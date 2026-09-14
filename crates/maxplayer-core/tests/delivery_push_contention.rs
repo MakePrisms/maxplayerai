@@ -265,20 +265,26 @@ async fn run_delivery(
     } = delivery;
     journal.record(Moment::Requested(id));
     let body_journal = journal.clone();
-    let outcome = serialized_bounded_push(&lock, DELIVERY_PUSH_TIMEOUT, move || async move {
-        body_journal.record(Moment::Enter(id));
-        let result = seller_git::neutralize_then_push_off_runtime(
-            workdir,
-            url,
-            branch.to_owned(),
-            oid,
-            Some(minter),
-            Some(check),
-        )
-        .await;
-        body_journal.record(Moment::Exit(id));
-        result
-    })
+    let outcome = serialized_bounded_push(
+        &lock,
+        DELIVERY_PUSH_TIMEOUT,
+        deadline,
+        move |turn| async move {
+            body_journal.record(Moment::Enter(id));
+            let result = seller_git::neutralize_then_push_off_runtime(
+                workdir,
+                url,
+                branch.to_owned(),
+                oid,
+                Some(minter),
+                Some(check),
+                turn,
+            )
+            .await;
+            body_journal.record(Moment::Exit(id));
+            result
+        },
+    )
     .await;
     drop(authority);
     outcome
@@ -686,6 +692,7 @@ async fn a_token_signed_while_the_delivery_ended_is_never_transmitted() {
             &oid_for_push,
             Some(minter),
             Some(check),
+            None,
         )
     });
 

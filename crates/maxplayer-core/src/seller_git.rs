@@ -56,6 +56,11 @@ pub enum SellerGitError {
     /// chose, so the push path refuses before it opens the repository. See
     /// [`assert_plain_repo_layout`].
     Layout(String),
+    /// The delivery this work belonged to was cancelled, or its absolute deadline passed, BEFORE
+    /// this phase of the work ran. Distinct from [`Self::Io`] because nothing failed: the operation
+    /// refused to do more work for an owner that is gone, which is what bounds how long it can hold
+    /// the seat's delivery turn. See [`crate::delivery_turn`].
+    Cancelled(String),
 }
 
 impl std::fmt::Display for SellerGitError {
@@ -66,6 +71,9 @@ impl std::fmt::Display for SellerGitError {
             Self::CommandFailed(op) => write!(f, "seller git {op} failed"),
             Self::AuthFailed(message) => write!(f, "seller git auth failed: {message}"),
             Self::Io(message) => write!(f, "seller git io error: {message}"),
+            Self::Cancelled(message) => {
+                write!(f, "seller git delivery work ended: {message}")
+            }
             Self::NoExecutionObserved(message) => {
                 write!(f, "seller git no execution observed: {message}")
             }
@@ -511,6 +519,7 @@ pub fn push_branch_with_header(
         gated_oid,
         header.map(git_transport::static_auth),
         None,
+        None,
     )
 }
 
@@ -528,13 +537,14 @@ pub fn push_branch_with_minter(
     gated_oid: &str,
     mint: Option<git_transport::AuthMinter>,
     authority: Option<git_transport::AuthorityCheck>,
+    lifetime: Option<git_transport::AuthorityCheck>,
 ) -> Result<String, SellerGitError> {
     assert_allowed_repo_locator(remote_url)?;
     if branch.trim().is_empty() {
         return Err(SellerGitError::Io("branch must be non-empty".into()));
     }
     let oid = git_transport::push_branch_with_minter(
-        workdir, remote_url, branch, gated_oid, mint, authority,
+        workdir, remote_url, branch, gated_oid, mint, authority, lifetime,
     )?;
     eprintln!("seller push path=inprocess remote={remote_url} branch={branch} ok");
     Ok(oid)
@@ -904,6 +914,16 @@ pub fn neutralize_push_config(workdir: &Path) -> Result<(), SellerGitError> {
 /// request is transmitted (see [`git_transport::AuthorityCheck`]). The blocking thread this runs on
 /// OUTLIVES the future that spawned it — dropping the future does not stop the thread — so the
 /// thread has to find out for itself that its owner is gone.
+///
+/// `turn` is this delivery's exclusive turn at the seat's delivery remote, and it is MOVED onto the
+/// blocking thread below. Two things follow, and both are the point:
+///
+/// - the turn is handed back by the thread that does the work, when the work actually stops — not by
+///   the async task that dispatched it, which a cancelled caller or a shutting-down runtime can take
+///   away while the blocking thread is still uploading; and
+/// - a delivery revoked while its closure was still QUEUED for a blocking slot never runs at all,
+///   and hands its turn back immediately instead of holding it until some unrelated blocking work
+///   finishes (see [`crate::delivery_turn`]).
 pub async fn neutralize_then_push_off_runtime(
     workdir: PathBuf,
     remote_url: String,
@@ -911,22 +931,74 @@ pub async fn neutralize_then_push_off_runtime(
     gated_oid: String,
     mint: Option<git_transport::AuthMinter>,
     authority: Option<git_transport::AuthorityCheck>,
+    turn: crate::delivery_turn::DeliveryTurn,
 ) -> Result<String, SellerGitError> {
-    off_runtime(move || {
+    off_runtime_holding_the_turn(turn, move |work| {
+        // Phase boundary: the config rewrite is local and short, but a delivery revoked before it
+        // must not touch the workdir at all.
+        work.check()
+            .map_err(|ended| SellerGitError::Cancelled(format!("before neutralizing config: {ended}")))?;
         neutralize_push_config(&workdir)?;
-        push_branch_with_minter(&workdir, &remote_url, &branch, &gated_oid, mint, authority)
+        // Phase boundary: everything after this is pack generation and the wire.
+        work.check()
+            .map_err(|ended| SellerGitError::Cancelled(format!("before pushing: {ended}")))?;
+        push_branch_with_minter(
+            &workdir,
+            &remote_url,
+            &branch,
+            &gated_oid,
+            mint,
+            authority,
+            Some(work.checker()),
+        )
     })
     .await
 }
 
 /// Run one blocking git operation on a blocking thread. A panic inside libgit2 surfaces as an error
-/// rather than taking the caller down.
+/// rather than taking the caller down. For the delivery push — the one operation that owns the
+/// seat's delivery turn — see [`off_runtime_holding_the_turn`].
 async fn off_runtime<T, F>(operation: F) -> Result<T, SellerGitError>
 where
     F: FnOnce() -> Result<T, SellerGitError> + Send + 'static,
     T: Send + 'static,
 {
     match tokio::task::spawn_blocking(operation).await {
+        Ok(result) => result,
+        Err(error) => Err(SellerGitError::Io(format!(
+            "blocking git task did not complete: {error}"
+        ))),
+    }
+}
+
+/// Run one blocking git operation on a blocking thread, holding `turn` for exactly as long as that
+/// operation actually runs. A panic inside libgit2 surfaces as an error rather than taking the
+/// caller down. [`off_runtime`] is the same dispatch for operations that own no delivery turn.
+///
+/// The turn is moved INTO the closure, so it is dropped on the blocking thread when the operation
+/// returns — the one lifetime boundary that cannot disappear underneath started blocking work.
+/// [`crate::delivery_turn::DeliveryTurn::begin`] is the first thing the closure does: a revoked or
+/// expired delivery is refused at queue admission, having done nothing.
+async fn off_runtime_holding_the_turn<T, F>(
+    turn: crate::delivery_turn::DeliveryTurn,
+    operation: F,
+) -> Result<T, SellerGitError>
+where
+    F: FnOnce(&crate::delivery_turn::WorkLifetime) -> Result<T, SellerGitError> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(move || {
+        let running = turn
+            .begin()
+            .map_err(|ended| SellerGitError::Cancelled(format!("at dispatch: {ended}")))?;
+        let lifetime = running.lifetime();
+        let outcome = operation(&lifetime);
+        // `running` drops HERE, on this thread, when the work has really stopped.
+        drop(running);
+        outcome
+    })
+    .await
+    {
         Ok(result) => result,
         Err(error) => Err(SellerGitError::Io(format!(
             "blocking git task did not complete: {error}"

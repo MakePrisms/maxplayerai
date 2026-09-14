@@ -140,6 +140,13 @@ struct LegContext {
     /// Re-asked after the mint and immediately before each request is transmitted; `None` for
     /// operations with no owner to lose. See [`AuthorityCheck`].
     authority: Option<AuthorityCheck>,
+    /// Is this operation's WORK still entitled to run at all
+    /// (`crate::delivery_turn::WorkLifetime::checker`)? Asked BEFORE the mint — so a revoked push
+    /// never enters the signer queue — and on every chunk libgit2 buffers into a request body — so
+    /// pack generation and buffering stop at a cancellation or an absolute deadline instead of
+    /// running to completion with nobody left to receive them. `None` for operations that own no
+    /// turn (the read legs).
+    lifetime: Option<AuthorityCheck>,
     /// When true, use the SHORT-timeout HTTP client (the buyer money-path fetch: a hung fetch must
     /// fail CLOSED before authorize_pay burns budget).
     short: bool,
@@ -291,16 +298,17 @@ fn ensure_registered() -> Result<(), TransportError> {
             }
             git2::transport::register("https", |remote| {
                 let context = CONTEXT.with(|cell| cell.borrow().clone());
-                let (mint, authority, short, intended_url) = match context {
+                let (mint, authority, lifetime, short, intended_url) = match context {
                     Some(context) => (
                         context.mint,
                         context.authority,
+                        context.lifetime,
                         context.short,
                         Some(context.intended_url),
                     ),
                     // No operation context: no destination is bound, so `action` refuses every
                     // leg. Fail closed rather than send a request nobody named.
-                    None => (None, None, false, None),
+                    None => (None, None, None, false, None),
                 };
                 Transport::smart(
                     remote,
@@ -308,6 +316,7 @@ fn ensure_registered() -> Result<(), TransportError> {
                     NostrHttp {
                         mint,
                         authority,
+                        lifetime,
                         short,
                         intended_url,
                     },
@@ -533,6 +542,7 @@ pub fn push_branch_with_header(
         gated_oid,
         header.map(static_auth),
         None,
+        None,
     )
 }
 
@@ -555,11 +565,25 @@ pub fn push_branch_with_minter(
     gated_oid: &str,
     mint: Option<AuthMinter>,
     authority: Option<AuthorityCheck>,
+    lifetime: Option<AuthorityCheck>,
 ) -> Result<String, TransportError> {
     assert_allowed_repo_locator(remote_url)?;
     ensure_registered()?;
+    lifetime_gate(lifetime.as_ref(), "open the delivery workdir")?;
     let repo = open_delivery_repo(workdir)?;
-    push_gated_object(&repo, remote_url, branch, gated_oid, mint, authority)
+    push_gated_object(&repo, remote_url, branch, gated_oid, mint, authority, lifetime)
+}
+
+/// One phase boundary of the actual work: may this operation still do the next local phase?
+///
+/// A refusal here is a [`TransportError::Transport`] — fail closed, nothing sent, never retried.
+fn lifetime_gate(lifetime: Option<&AuthorityCheck>, phase: &str) -> Result<(), TransportError> {
+    match lifetime {
+        Some(check) => check().map_err(|ended| {
+            TransportError::Transport(format!("refusing to {phase}: {ended}"))
+        }),
+        None => Ok(()),
+    }
 }
 
 /// Open the committed workdir a delivery is pushed from, through the layout gate. A layout refusal
@@ -601,6 +625,7 @@ fn push_gated_object(
     gated_oid: &str,
     mint: Option<AuthMinter>,
     authority: Option<AuthorityCheck>,
+    lifetime: Option<AuthorityCheck>,
 ) -> Result<String, TransportError> {
     let gated = gated_commit(repo, gated_oid)?.to_string();
     let target_ref = delivery_ref(branch);
@@ -623,12 +648,31 @@ fn push_gated_object(
             Ok(())
         });
     }
+    {
+        // The last libgit2 hook before local pack generation begins: the advertisement has been
+        // read and the update list is decided, and nothing has been packed yet. A revoked or
+        // expired delivery stops HERE rather than spending the turn building a pack nobody will
+        // receive. (`write` on the stream covers the rest of that phase, chunk by chunk.)
+        let lifetime = lifetime.clone();
+        callbacks.push_negotiation(move |_updates| match &lifetime {
+            Some(check) => check().map_err(|ended| {
+                git2::Error::new(
+                    git2::ErrorCode::User,
+                    git2::ErrorClass::Net,
+                    format!("refusing to build a pack for this delivery: {ended}"),
+                )
+            }),
+            None => Ok(()),
+        });
+    }
     let mut options = PushOptions::new();
     options.remote_callbacks(callbacks);
 
+    lifetime_gate(lifetime.as_ref(), "begin the delivery push")?;
     let context = LegContext {
         mint,
         authority,
+        lifetime,
         short: false,
         intended_url: remote_url.to_owned(),
     };
@@ -698,6 +742,7 @@ pub fn fetch_refspecs(
         // A read leg owns nothing another job can take: no delivery lock, no push authority. There
         // is no owner to lose, so there is nothing to re-check.
         authority: None,
+        lifetime: None,
         short: short_timeout,
         intended_url: remote_url.to_owned(),
     };
@@ -739,6 +784,7 @@ pub fn list_remote(
     let context = LegContext {
         mint: header.map(static_auth),
         authority: None,
+        lifetime: None,
         short: false,
         intended_url: remote_url.to_owned(),
     };
@@ -791,6 +837,7 @@ fn map_git_error(error: git2::Error) -> TransportError {
 struct NostrHttp {
     mint: Option<AuthMinter>,
     authority: Option<AuthorityCheck>,
+    lifetime: Option<AuthorityCheck>,
     short: bool,
     /// The repo-root URL the caller named, from the operation context. `None` when the transport was
     /// created outside any [`with_context`]; then every leg is refused.
@@ -851,6 +898,7 @@ impl SmartSubtransport for NostrHttp {
         Ok(Box::new(HttpStream {
             mint: self.mint.clone(),
             authority: self.authority.clone(),
+            lifetime: self.lifetime.clone(),
             short: self.short,
             url: full_url,
             // The repo ROOT this leg belongs to, kept beside the service URL: it is what the token
@@ -876,6 +924,7 @@ impl SmartSubtransport for NostrHttp {
 struct HttpStream {
     mint: Option<AuthMinter>,
     authority: Option<AuthorityCheck>,
+    lifetime: Option<AuthorityCheck>,
     short: bool,
     url: String,
     destination: String,
@@ -893,6 +942,18 @@ impl HttpStream {
         } else {
             client_default()
         };
+        // BEFORE the mint, not after it: minting a delivery token calls the signer actor and can
+        // queue there. Work whose turn has been revoked, or whose absolute deadline has passed,
+        // must not even join that queue — the wait is part of the operation's drain, and the whole
+        // point of the bound is that no phase of a dead operation keeps running.
+        if let Some(lifetime) = &self.lifetime {
+            lifetime().map_err(|error| {
+                io::Error::other(format!(
+                    "refusing to start a {} leg to {}: {error}",
+                    self.service, self.destination
+                ))
+            })?;
+        }
         let mut request = if self.is_post {
             client
                 .post(&self.url)
@@ -974,7 +1035,20 @@ impl Read for HttpStream {
 }
 
 impl Write for HttpStream {
+    /// libgit2 streams the pack it is BUILDING into this buffer, chunk by chunk, before anything is
+    /// sent. That makes this the one interruption point in the pre-HTTP phase: refusing a chunk
+    /// aborts the push inside libgit2 instead of letting a revoked delivery build and buffer a whole
+    /// pack while the next delivery waits for its turn. The check is an atomic load and an `Instant`
+    /// comparison, against buffer writes that arrive in kilobyte-scale chunks.
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Some(lifetime) = &self.lifetime {
+            lifetime().map_err(|error| {
+                io::Error::other(format!(
+                    "refusing to keep building the {} body for {}: {error}",
+                    self.service, self.destination
+                ))
+            })?;
+        }
         self.request_body.extend_from_slice(buf);
         Ok(buf.len())
     }
@@ -1267,6 +1341,7 @@ mod tests {
     fn action_refuses_a_leg_to_any_other_destination() {
         let intended = "https://relay.example/git/o/r.git";
         let transport = NostrHttp {
+            lifetime: None,
             mint: Some(static_auth("Nostr token".to_owned())),
             authority: None,
             short: false,
@@ -1299,6 +1374,7 @@ mod tests {
         );
         // A transport created outside any operation context has no destination: nothing passes.
         let unbound = NostrHttp {
+            lifetime: None,
             mint: Some(static_auth("Nostr token".to_owned())),
             authority: None,
             short: false,
@@ -1375,7 +1451,7 @@ mod tests {
         let remote_url = bare.to_str().expect("utf8").to_owned();
 
         let repo = crate::seller_git::open_plain_workdir_repo(&workdir).expect("open workdir");
-        let pushed = push_gated_object(&repo, &remote_url, "job", &a.to_string(), None, None)
+        let pushed = push_gated_object(&repo, &remote_url, "job", &a.to_string(), None, None, None)
             .expect("push the gated object");
         assert_eq!(pushed, a.to_string(), "the returned oid is the gated one");
 
@@ -1389,7 +1465,7 @@ mod tests {
         assert_eq!(repo.refname_to_id("refs/heads/job").expect("local ref"), b);
 
         // A repeat push of the same object (the resume path) is accepted and ACKed again.
-        let again = push_gated_object(&repo, &remote_url, "job", &a.to_string(), None, None)
+        let again = push_gated_object(&repo, &remote_url, "job", &a.to_string(), None, None, None)
             .expect("re-push the gated object");
         assert_eq!(again, a.to_string());
         let _ = std::fs::remove_dir_all(&root);
@@ -1406,7 +1482,7 @@ mod tests {
         Repository::init_bare(&bare).expect("bare remote");
         let remote_url = bare.to_str().expect("utf8").to_owned();
         for bad in ["", "abc", &a.to_string()[..39], &"f".repeat(40)] {
-            let err = push_gated_object(&repo, &remote_url, "job", bad, None, None)
+            let err = push_gated_object(&repo, &remote_url, "job", bad, None, None, None)
                 .expect_err("refused");
             assert!(matches!(err, TransportError::Io(_)), "{bad:?}: {err}");
         }

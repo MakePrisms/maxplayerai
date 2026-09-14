@@ -1714,6 +1714,45 @@ mod resume_action_tests {
 /// the real bound rather than a stand-in for it.
 pub const DELIVERY_PUSH_TIMEOUT: Duration = Duration::from_secs(150);
 
+/// #994-followup (F3): the DOCUMENTED FINITE BOUND on how long one delivery can hold the seat's
+/// delivery turn, counted from the moment that turn is taken — **270 seconds**.
+///
+/// It is a bound on the WORK, not on an HTTP request and not on the caller's patience, and it covers
+/// every phase the turn is held across:
+///
+/// - **blocking-queue admission** — `delivery_turn::DeliveryTurn::begin` is the first act of the
+///   operation; work revoked while queued never starts and hands the turn back at once, so a queued
+///   phase contributes nothing;
+/// - **local config rewrite and pack generation** — phase checks in
+///   `seller_git::neutralize_then_push_off_runtime` and libgit2's `push_negotiation` hook;
+/// - **pack buffering** — `git_transport::HttpStream::write` refuses the next chunk;
+/// - **the signer wait** — `HttpStream::send` asks before minting, so a dead delivery never joins
+///   the signer queue, and the minter's own blocking call is bounded by this same absolute deadline;
+/// - **HTTP** — each leg is asked for before it is transmitted.
+///
+/// Every one of those checks tests the SAME absolute deadline, which is fixed no later than the
+/// moment the turn is taken and is at most [`DELIVERY_PUSH_TIMEOUT`] ahead of it. Between two
+/// consecutive checks the only uninterruptible span is a single in-flight HTTP request, capped by
+/// the transport's [`crate::git_transport::DEFAULT_HTTP_LEG_TIMEOUT`] including the body transfer.
+/// The worst case is therefore "deadline reached one instant after the last check passed, plus one
+/// full leg" = `DELIVERY_PUSH_TIMEOUT + DEFAULT_HTTP_LEG_TIMEOUT`.
+pub const DELIVERY_DRAIN_BOUND: Duration = Duration::from_secs(
+    DELIVERY_PUSH_TIMEOUT.as_secs() + crate::git_transport::DEFAULT_HTTP_LEG_TIMEOUT.as_secs(),
+);
+
+/// The drain bound is the sum of the two clocks it is made of, and it is FINITE. A future edit that
+/// makes either clock unbounded, or that stops the sum from covering the whole-operation deadline,
+/// fails the BUILD rather than silently unbounding how long one delivery can hold the seat's turn.
+const _: () = assert!(
+    DELIVERY_DRAIN_BOUND.as_secs()
+        == DELIVERY_PUSH_TIMEOUT.as_secs()
+            + crate::git_transport::DEFAULT_HTTP_LEG_TIMEOUT.as_secs()
+        && DELIVERY_DRAIN_BOUND.as_secs() > DELIVERY_PUSH_TIMEOUT.as_secs(),
+    "delivery drain bound (#994-followup/F3): the turn is held for at most the delivery's absolute \
+     work deadline plus ONE in-flight HTTP leg; both terms must stay finite and the bound must \
+     strictly exceed the whole-operation deadline it contains"
+);
+
 /// #563: make the two-clock ordering a COMPILE-TIME invariant instead of the cross-file prose above.
 /// git2 has no whole-operation timeout, so `DELIVERY_PUSH_TIMEOUT` is the ONLY whole-op bound on the
 /// delivery push; the push's single-leg cap is `git_transport::DEFAULT_HTTP_LEG_TIMEOUT` — the DEFAULT
@@ -1745,10 +1784,10 @@ pub enum DeliveryPushErr {
 
 /// #562: push a delivery under `lock` — serializing concurrent deliveries to this seat's ONE delivery
 /// remote (concurrent `git-receive-pack` to one repo is what the relay 409s) — and bounded by
-/// `timeout` so a hung push releases the lock rather than starving every later delivery. Pure over
-/// (lock, timeout, push) so the serialization + timeout are unit-testable WITHOUT a relay. The lock is
-/// held ONLY across the push and released the instant it settles or times out. The push oid is stable
-/// (invariant 2), so ORDERING pushes never duplicates a delivery — this is exactly-once.
+/// `timeout` so a hung push stops being WAITED ON rather than starving every later delivery. Pure
+/// over (lock, timeout, deadline, push) so the serialization + bound are unit-testable WITHOUT a
+/// relay. The push oid is stable (invariant 2), so ORDERING pushes never duplicates a delivery —
+/// this is exactly-once.
 ///
 /// `pub` so a test can drive THIS wrapper — not a re-creation of it — against a real git remote from
 /// its own process. The delivery-push auth question ("when is the waiting delivery's token signed?")
@@ -1763,46 +1802,64 @@ pub enum DeliveryPushErr {
 /// can interrupt a socket that thread is sitting on. If the lock were released at the moment this
 /// call returns, the next delivery would open `git-receive-pack` to the same repo while the previous
 /// upload was still on the wire — the exact concurrency the lock exists to prevent, reintroduced by
-/// the mechanism meant to stop one delivery starving the rest.
+/// the mechanism meant to stop one delivery starving the rest. **The lock is never freed merely
+/// because the caller timed out.**
 ///
-/// So the turn is owned by the WORK. The push is spawned holding an owned guard, and that guard is
-/// released on the push's own completion, on whichever thread reaches it. This call stops waiting at
-/// `timeout`; the lock stays taken until the upload is actually finished.
+/// So the turn is owned by the WORK, through [`crate::delivery_turn`]: the owned guard is moved into
+/// the turn, the turn is moved onto the blocking thread that does the operation, and it is handed
+/// back there — when the work actually stops, on whichever thread reaches it, including after this
+/// task or the whole runtime has gone away.
 ///
-/// That is bounded, not open-ended, and it is bounded by the clock that already bounds it: the
-/// transport client caps a single request at `git_transport::DEFAULT_HTTP_LEG_TIMEOUT` INCLUDING the
-/// body transfer, and the caller revokes push authority as soon as this returns, so no leg after the
-/// in-flight one is ever transmitted. The longest the lock can be held past this call is therefore
-/// one leg.
+/// The one case where THIS side hands the turn back is the case where the work provably never
+/// started: revoked while still queued for a blocking slot. Then nothing was rewritten, no pack was
+/// built and nothing reached the wire, and `begin` can no longer succeed. Leaving the turn taken
+/// there is what made the old bound dishonest — a revoked push could hold the delivery turn for as
+/// long as unrelated blocking work kept it queued.
 ///
-/// A dropped caller is the same story with no return value: the spawned push keeps its own turn,
-/// finishes or is refused, and releases the lock itself.
+/// # The bound
+///
+/// `deadline` is this delivery's ABSOLUTE work deadline, fixed no later than the moment the turn is
+/// taken. Every phase of the actual work re-checks it — queue admission, the local config rewrite,
+/// pack negotiation, each chunk of pack buffering, and each wire request before it is transmitted —
+/// so no phase of a revoked or expired delivery runs to completion. Between two consecutive checks
+/// the work is uninterruptible for at most one HTTP leg, which the transport client caps at
+/// `git_transport::DEFAULT_HTTP_LEG_TIMEOUT` including the body transfer. The turn is therefore held
+/// for at most [`DELIVERY_DRAIN_BOUND`] past the moment it was taken, whatever the caller does.
+///
+/// A dropped caller is the same story with no return value: [`crate::delivery_turn::TurnControl`]
+/// revokes on drop, running work keeps its turn until it stops, and pending work is refused.
 pub async fn serialized_bounded_push<Fut>(
     lock: &std::sync::Arc<tokio::sync::Mutex<()>>,
     timeout: Duration,
-    push: impl FnOnce() -> Fut,
+    deadline: std::time::Instant,
+    push: impl FnOnce(crate::delivery_turn::DeliveryTurn) -> Fut,
 ) -> Result<String, DeliveryPushErr>
 where
-    Fut: std::future::Future<Output = Result<String, seller_git::SellerGitError>> + Send + 'static,
+    Fut: std::future::Future<Output = Result<String, seller_git::SellerGitError>>,
 {
     let guard = lock.clone().lock_owned().await;
-    let work = push();
-    // Spawned, not awaited in place: a future dropped mid-push would drop the guard while the
-    // blocking thread it started is still uploading. Here the guard travels WITH the work.
-    let running = tokio::spawn(async move {
-        let outcome = work.await;
-        drop(guard);
-        outcome
-    });
-    match tokio::time::timeout(timeout, running).await {
-        Ok(Ok(Ok(oid))) => Ok(oid),
-        Ok(Ok(Err(error))) => Err(DeliveryPushErr::Push(error)),
-        // The push task itself died (panic inside libgit2, or the runtime shutting down). Same
-        // handling as any other push failure; never a new state.
-        Ok(Err(join)) => Err(DeliveryPushErr::Push(seller_git::SellerGitError::Io(format!(
-            "delivery push task did not complete: {join}"
-        )))),
-        Err(_elapsed) => Err(DeliveryPushErr::TimedOut(timeout.as_secs())),
+    // The guard is moved INTO the turn: from here on no copy of the seat's exclusion lives on this
+    // side of the operation, so nothing that happens to this task can release it early.
+    let (control, turn) = crate::delivery_turn::delivery_turn(guard, deadline);
+    let work = push(turn);
+    match tokio::time::timeout(timeout, work).await {
+        Ok(Ok(oid)) => Ok(oid),
+        Ok(Err(error)) => Err(DeliveryPushErr::Push(error)),
+        Err(_elapsed) => {
+            // Stopped WAITING, and revoked the work. Whether that hands the turn back is not this
+            // side's decision: `end` returns `NeverStarted` only when the work cannot have begun.
+            let release = control.end();
+            debug_assert!(
+                matches!(
+                    release,
+                    crate::delivery_turn::TurnRelease::NeverStarted
+                        | crate::delivery_turn::TurnRelease::StillRunning
+                        | crate::delivery_turn::TurnRelease::AlreadyEnded
+                ),
+                "unreachable"
+            );
+            Err(DeliveryPushErr::TimedOut(timeout.as_secs()))
+        }
     }
 }
 
@@ -1875,11 +1932,43 @@ impl Drop for PushAuthority {
 // client. What stays here is the pure (lock, timeout, push) unit.
 #[cfg(test)]
 mod serialized_bounded_push_tests {
-    use super::{serialized_bounded_push, DeliveryPushErr, PushAuthority};
+    use super::{
+        serialized_bounded_push, DeliveryPushErr, PushAuthority, DELIVERY_DRAIN_BOUND,
+        DELIVERY_PUSH_TIMEOUT,
+    };
+    use crate::delivery_turn::{DeliveryTurn, WorkEnded};
+    use crate::git_transport::DEFAULT_HTTP_LEG_TIMEOUT;
     use crate::seller_git::SellerGitError;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    /// A work deadline far enough away that only explicit cancellation can end these turns.
+    fn far() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
+
+    /// Run `body` the way production does: on a BLOCKING thread that owns the turn, so the turn is
+    /// handed back by the work itself and not by the future that dispatched it. Anything else would
+    /// test a shape the delivery path does not have.
+    async fn as_blocking_work<T>(
+        turn: DeliveryTurn,
+        body: impl FnOnce() -> Result<T, SellerGitError> + Send + 'static,
+    ) -> Result<T, SellerGitError>
+    where
+        T: Send + 'static,
+    {
+        tokio::task::spawn_blocking(move || {
+            let running = turn
+                .begin()
+                .map_err(|ended| SellerGitError::Cancelled(format!("at dispatch: {ended}")))?;
+            let outcome = body();
+            drop(running);
+            outcome
+        })
+        .await
+        .unwrap_or_else(|join| Err(SellerGitError::Io(format!("join: {join}"))))
+    }
 
     // #562 core: concurrent deliveries to ONE remote must serialize — the push closure records peak
     // concurrency, and under the lock peak is exactly 1. Red-on-revert: drop the `_guard` in
@@ -1894,13 +1983,15 @@ mod serialized_bounded_push_tests {
         for i in 0..8u32 {
             let (lock, inflight, peak) = (lock.clone(), inflight.clone(), peak.clone());
             handles.push(tokio::spawn(async move {
-                serialized_bounded_push(&lock, Duration::from_secs(5), || async move {
-                    let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
-                    peak.fetch_max(now, Ordering::SeqCst);
-                    tokio::task::yield_now().await; // a racer would overlap here if unserialized
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                    inflight.fetch_sub(1, Ordering::SeqCst);
-                    Ok::<_, SellerGitError>(format!("oid{i}"))
+                serialized_bounded_push(&lock, Duration::from_secs(5), far(), |turn| {
+                    as_blocking_work(turn, move || {
+                        let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        std::thread::yield_now(); // a racer would overlap here if unserialized
+                        std::thread::sleep(Duration::from_millis(5));
+                        inflight.fetch_sub(1, Ordering::SeqCst);
+                        Ok::<_, SellerGitError>(format!("oid{i}"))
+                    })
                 })
                 .await
             }));
@@ -1921,12 +2012,15 @@ mod serialized_bounded_push_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_hung_push_times_out_and_the_next_delivery_is_not_starved() {
         let lock = Arc::new(tokio::sync::Mutex::new(()));
-        let started = std::time::Instant::now();
-        let hung = serialized_bounded_push(&lock, Duration::from_millis(50), || async move {
-            // Finishes well after the caller's bound, and well before the 30s a starved next
-            // delivery would have to wait if the turn were never handed on.
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            Ok::<_, SellerGitError>("late".to_string())
+        let started = Instant::now();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let hung = serialized_bounded_push(&lock, Duration::from_millis(50), far(), |turn| {
+            as_blocking_work(turn, move || {
+                // Finishes when this test says so — after the caller's bound, and without a sleep
+                // standing in for the ordering.
+                let _ = released.recv_timeout(Duration::from_secs(5));
+                Ok::<_, SellerGitError>("late".to_string())
+            })
         })
         .await;
         assert!(matches!(hung, Err(DeliveryPushErr::TimedOut(_))), "a hung push must time out");
@@ -1934,10 +2028,11 @@ mod serialized_bounded_push_tests {
             started.elapsed() < Duration::from_millis(250),
             "the caller must stop waiting at its own bound, not at the push's completion"
         );
+        let _ = release.send(());
         let next = tokio::time::timeout(
             Duration::from_secs(5),
-            serialized_bounded_push(&lock, Duration::from_secs(5), || async move {
-                Ok::<_, SellerGitError>("next-oid".to_string())
+            serialized_bounded_push(&lock, Duration::from_secs(5), far(), |turn| {
+                as_blocking_work(turn, || Ok::<_, SellerGitError>("next-oid".to_string()))
             }),
         )
         .await
@@ -1959,13 +2054,16 @@ mod serialized_bounded_push_tests {
         let first_running = Arc::new(AtomicBool::new(false));
         let overlapped = Arc::new(AtomicBool::new(false));
 
+        let (release, released) = std::sync::mpsc::channel::<()>();
         let abandoned = {
             let first_running = first_running.clone();
-            serialized_bounded_push(&lock, Duration::from_millis(50), move || async move {
-                first_running.store(true, Ordering::SeqCst);
-                tokio::time::sleep(Duration::from_millis(400)).await;
-                first_running.store(false, Ordering::SeqCst);
-                Ok::<_, SellerGitError>("first".to_string())
+            serialized_bounded_push(&lock, Duration::from_millis(50), far(), move |turn| {
+                as_blocking_work(turn, move || {
+                    first_running.store(true, Ordering::SeqCst);
+                    let _ = released.recv_timeout(Duration::from_secs(5));
+                    first_running.store(false, Ordering::SeqCst);
+                    Ok::<_, SellerGitError>("first".to_string())
+                })
             })
             .await
         };
@@ -1978,21 +2076,158 @@ mod serialized_bounded_push_tests {
             "the abandoned push must still be running — otherwise this test proves nothing"
         );
 
-        let second = {
+        // The second delivery is started, and OBSERVED PENDING on acquisition, while the first is
+        // still running. No sleep decides this: the future is polled and answers Pending.
+        let mut second = Box::pin({
             let first_running = first_running.clone();
             let overlapped = overlapped.clone();
-            serialized_bounded_push(&lock, Duration::from_secs(5), move || async move {
-                if first_running.load(Ordering::SeqCst) {
-                    overlapped.store(true, Ordering::SeqCst);
-                }
-                Ok::<_, SellerGitError>("second".to_string())
+            serialized_bounded_push(&lock, Duration::from_secs(5), far(), move |turn| {
+                as_blocking_work(turn, move || {
+                    if first_running.load(Ordering::SeqCst) {
+                        overlapped.store(true, Ordering::SeqCst);
+                    }
+                    Ok::<_, SellerGitError>("second".to_string())
+                })
             })
+        });
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        for _ in 0..8 {
+            assert!(
+                std::future::Future::poll(second.as_mut(), &mut context).is_pending(),
+                "the second delivery must be QUEUED on acquisition while the abandoned push is \
+                 still running — a ready poll here is the freed-too-early lock itself"
+            );
+        }
+        assert!(
+            first_running.load(Ordering::SeqCst),
+            "the first push must still be running while the second is observed pending"
+        );
+
+        let _ = release.send(());
+        let second = tokio::time::timeout(Duration::from_secs(5), second)
             .await
-        };
+            .expect("the second delivery completes once the first actually stops");
         assert!(matches!(second, Ok(oid) if oid == "second"));
         assert!(
             !overlapped.load(Ordering::SeqCst),
             "a second delivery must never upload while the abandoned one is still on the wire"
+        );
+    }
+
+    /// F3's open case: cancellation BEFORE the blocking dispatch. The revoked work must never start
+    /// — and must not keep the delivery turn while it waits for a blocking slot that, by then, it
+    /// has no use for. Deterministic: the "queue" is an explicit gate this test opens.
+    ///
+    /// Red-on-revert: leave the turn taken until the queued closure is finally dispatched (the
+    /// pre-repair shape) and the second delivery is still Pending after the first was revoked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn work_revoked_before_dispatch_never_runs_and_frees_the_turn_at_once() {
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let dispatched = Arc::new(AtomicBool::new(false));
+        let (open_the_queue, queue) = std::sync::mpsc::channel::<()>();
+
+        let refused = {
+            let dispatched = dispatched.clone();
+            serialized_bounded_push(&lock, Duration::from_millis(50), far(), move |turn| {
+                let queued = tokio::task::spawn_blocking(move || {
+                    // Stands in for "no blocking slot yet": the closure exists, holds the turn, and
+                    // has not begun. Nothing here touches the workdir, the signer or the wire.
+                    let _ = queue.recv_timeout(Duration::from_secs(5));
+                    let begun = turn.begin();
+                    dispatched.store(true, Ordering::SeqCst);
+                    match begun {
+                        Ok(running) => {
+                            drop(running);
+                            Ok("ran".to_string())
+                        }
+                        Err(ended) => Err(SellerGitError::Cancelled(format!("at dispatch: {ended}"))),
+                    }
+                });
+                async move {
+                    queued
+                        .await
+                        .unwrap_or_else(|join| Err(SellerGitError::Io(format!("join: {join}"))))
+                }
+            })
+            .await
+        };
+        assert!(
+            matches!(refused, Err(DeliveryPushErr::TimedOut(_))),
+            "the caller stops waiting at its bound"
+        );
+        assert!(
+            !dispatched.load(Ordering::SeqCst),
+            "the queued work must not have been dispatched yet — otherwise this proves nothing"
+        );
+
+        // The turn is free NOW, with the revoked closure still queued: a second delivery acquires
+        // it without waiting for a blocking slot to come free.
+        let next = tokio::time::timeout(
+            Duration::from_secs(5),
+            serialized_bounded_push(&lock, Duration::from_secs(5), far(), |turn| {
+                as_blocking_work(turn, || Ok::<_, SellerGitError>("next".to_string()))
+            }),
+        )
+        .await
+        .expect("a revoked, never-started push must not hold the delivery turn");
+        assert!(matches!(next, Ok(oid) if oid == "next"));
+
+        // And when the slot finally comes free, the revoked work refuses instead of running.
+        let _ = open_the_queue.send(());
+    }
+
+    /// The absolute deadline is the WORK's, not the caller's: an expired delivery refuses at queue
+    /// admission having done nothing at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_expired_work_deadline_refuses_admission() {
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let ran = Arc::new(AtomicBool::new(false));
+        let outcome = {
+            let ran = ran.clone();
+            serialized_bounded_push(
+                &lock,
+                Duration::from_secs(5),
+                Instant::now() - Duration::from_millis(1),
+                move |turn| {
+                    as_blocking_work(turn, move || {
+                        ran.store(true, Ordering::SeqCst);
+                        Ok::<_, SellerGitError>("ran".to_string())
+                    })
+                },
+            )
+            .await
+        };
+        match outcome {
+            Err(DeliveryPushErr::Push(SellerGitError::Cancelled(message))) => assert!(
+                message.contains(WorkEnded::DeadlineExceeded.as_str()),
+                "the refusal must name the deadline, got {message:?}"
+            ),
+            other => panic!("expired work must be refused at admission, got {other:?}"),
+        }
+        assert!(!ran.load(Ordering::SeqCst), "expired work must not run");
+
+        // ...and the turn is free immediately afterwards.
+        let next = tokio::time::timeout(
+            Duration::from_secs(5),
+            serialized_bounded_push(&lock, Duration::from_secs(5), far(), |turn| {
+                as_blocking_work(turn, || Ok::<_, SellerGitError>("next".to_string()))
+            }),
+        )
+        .await
+        .expect("refused work holds no turn");
+        assert!(matches!(next, Ok(oid) if oid == "next"));
+    }
+
+    /// The bound this repair claims, as a number: the turn is held for at most the delivery's
+    /// absolute work deadline plus one in-flight HTTP leg. Pins the documented value so a change to
+    /// either clock has to restate the bound.
+    #[test]
+    fn the_drain_bound_is_the_work_deadline_plus_one_leg() {
+        assert_eq!(DELIVERY_DRAIN_BOUND, Duration::from_secs(270));
+        assert_eq!(
+            DELIVERY_DRAIN_BOUND,
+            DELIVERY_PUSH_TIMEOUT + DEFAULT_HTTP_LEG_TIMEOUT,
+            "the drain bound must stay the sum of the whole-operation deadline and one leg cap"
         );
     }
 
@@ -7500,16 +7735,26 @@ impl SellerNodeRunner {
                 let remote = seller.git_remote.clone();
                 let branch = branch.clone();
                 let gated = gated_oid.clone();
-                serialized_bounded_push(&self.delivery_push_lock, DELIVERY_PUSH_TIMEOUT, move || {
-                    seller_git::neutralize_then_push_off_runtime(
-                        workdir,
-                        remote,
-                        branch,
-                        gated,
-                        push_mint,
-                        Some(push_check),
-                    )
-                })
+                // `push_deadline` is this delivery's ABSOLUTE work deadline — the same one the
+                // minter is bounded by — and it is fixed before the turn can possibly be taken, so
+                // the turn is held for at most `DELIVERY_DRAIN_BOUND` past acquisition however long
+                // the wait for it was.
+                serialized_bounded_push(
+                    &self.delivery_push_lock,
+                    DELIVERY_PUSH_TIMEOUT,
+                    push_deadline,
+                    move |turn| {
+                        seller_git::neutralize_then_push_off_runtime(
+                            workdir,
+                            remote,
+                            branch,
+                            gated,
+                            push_mint,
+                            Some(push_check),
+                            turn,
+                        )
+                    },
+                )
                 .await
             };
             // Whatever the outcome, this delivery is done asking for authorizations. On the timeout
@@ -7527,9 +7772,11 @@ impl SellerNodeRunner {
                     return;
                 }
                 Err(DeliveryPushErr::TimedOut(secs)) => {
-                    // Timeout lands in the SAME delivery_failed handling (lead 37896 — no new state); the
-                    // lock is already released, so later deliveries are not starved behind this one.
-                    opline!("seller node execute fail job_id={job_id}: git push exceeded {secs}s (delivery-push lock released; treated as delivery_failed)");
+                    // Timeout lands in the SAME delivery_failed handling (lead 37896 — no new
+                    // state). The delivery turn is NOT released here: work still running keeps it
+                    // until it actually stops, bounded by DELIVERY_DRAIN_BOUND; work that never
+                    // started has already handed it back.
+                    opline!("seller node execute fail job_id={job_id}: git push exceeded {secs}s (delivery revoked; the turn is held until the work actually stops, at most {}s; treated as delivery_failed)", DELIVERY_DRAIN_BOUND.as_secs());
                     self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
                     return;
                 }
