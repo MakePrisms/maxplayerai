@@ -124,6 +124,54 @@ use serde::{Deserialize, Serialize};
 /// rather than hidden inside a longer wait.
 pub const REAP_BOUND: Duration = Duration::from_secs(5);
 
+/// The largest frame this protocol will read. A peer that writes without bound is backpressure the
+/// reader would otherwise absorb into unbounded memory — and unbounded parent-side buffering is
+/// itself a phase outside the drain bound. A frame over this cap is a protocol violation: the child
+/// is killed and reaped, not read further.
+///
+/// 1 MiB because every frame in this protocol is a handful of short fields; the only variable-length
+/// members are a workdir path, a remote URL and one NIP-98 header.
+pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+/// Children this process could NOT confirm dead. Incremented when a reap does not complete, and
+/// **never decremented** — an unconfirmed child is a permanent fact about this process, not a
+/// transient one.
+///
+/// This exists because `Drop` cannot report. Every other path returns [`ExecutorError::Unreaped`] to
+/// a caller that must retain exclusion; a drop on a panic or an early return has nowhere to return
+/// it to, and swallowing it silently would be exactly the defect this module exists to remove: a
+/// seat handed on while work may still be running. A seat consults [`unconfirmed_children`] before
+/// treating its delivery lane as free.
+static UNCONFIRMED_CHILDREN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many delivery-push children this process started and could not confirm had exited. Non-zero
+/// means at least one delivery lane must stay closed for the life of this process.
+pub fn unconfirmed_children() -> usize {
+    UNCONFIRMED_CHILDREN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Whether this seat's delivery turn may be released, given what the reap actually established.
+///
+/// The whole fail-closed rule in one place, so it can be tested as a rule rather than inferred from
+/// the paths that happen to call it. **Unknown exit is treated as still running.** A silent child is
+/// not a dead child; a kill that was issued is not an exit that was observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exclusion {
+    /// The kernel reported the child's exit. The work has stopped; the turn may go.
+    Release,
+    /// Exit unknown or unconfirmed. The turn is RETAINED. This sacrifices liveness on this seat
+    /// deliberately, and it is named as that rather than described as recovery.
+    Retain,
+}
+
+/// The rule: release only on a confirmed exit.
+pub fn exclusion_after_reap(reap: &Result<Duration, ExecutorError>) -> Exclusion {
+    match reap {
+        Ok(_) => Exclusion::Release,
+        Err(_) => Exclusion::Retain,
+    }
+}
+
 /// The platforms this product actually ships (`.github/release-platforms.json`). All POSIX: the
 /// `SIGKILL`/`waitpid` contract this executor rests on is available on every one of them, which is
 /// what makes the design *feasible* rather than aspirational. There is no Windows artifact, so no
@@ -381,12 +429,16 @@ impl KillableChild {
 
 impl Drop for KillableChild {
     fn drop(&mut self) {
-        if !self.reaped {
-            // Best effort by definition — `Drop` cannot report — but it is the same kill and the
-            // same wait, so the common paths (success, error, panic, early return) all leave a
-            // reaped child behind. The one path that must NOT reach here is the deadline breach,
-            // which calls `kill_and_reap` explicitly so the stall can be reported.
-            let _ = self.kill_and_reap();
+        if self.reaped {
+            return;
+        }
+        // The same kill and the same wait as every other path, so success, error, panic and early
+        // return all leave a reaped child behind. What `Drop` cannot do is REPORT, and an
+        // unconfirmed exit that nobody hears about is a seat handed on while work may still be
+        // running — the defect this module exists to remove. So a failure here is recorded in a
+        // process-wide counter that a seat must consult before it treats its lane as free.
+        if self.kill_and_reap().is_err() {
+            UNCONFIRMED_CHILDREN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 }
@@ -406,8 +458,20 @@ pub fn read_frame<R: BufRead, T: for<'de> Deserialize<'de>>(
     reader: &mut R,
 ) -> std::io::Result<Option<T>> {
     let mut line = String::new();
-    if reader.read_line(&mut line)? == 0 {
+    // Bounded read: `read_line` on an unbounded writer is unbounded memory in this process, and a
+    // buffer nobody capped is a phase nobody bounded.
+    // Spelled as a free-function call so resolution picks `impl Read for &mut R` rather than moving
+    // the caller's reader out from behind its reference.
+    let mut limited = std::io::Read::take(&mut *reader, MAX_FRAME_BYTES as u64 + 1);
+    let read = limited.read_line(&mut line)?;
+    if read == 0 {
         return Ok(None);
+    }
+    if read > MAX_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("frame exceeds {MAX_FRAME_BYTES} bytes"),
+        ));
     }
     let trimmed = line.trim_end();
     if trimmed.is_empty() {
@@ -752,6 +816,43 @@ mod tests {
         assert!(
             matches!(refused, Err(ExecutorError::Spawn(_))),
             "an empty override must not fall through to current_exe"
+        );
+    }
+
+    #[test]
+    fn an_unknown_exit_retains_the_turn_rather_than_permitting_overlap() {
+        // The rule the verdict names: issuing a kill is not proof of an exit. Only a reap the
+        // kernel completed releases the seat; every other outcome — a stalled reap, a wait error,
+        // anything at all — retains it, and that lost liveness is deliberate and named.
+        assert_eq!(
+            exclusion_after_reap(&Ok(Duration::from_millis(3))),
+            Exclusion::Release
+        );
+        assert_eq!(
+            exclusion_after_reap(&Err(ExecutorError::Unreaped {
+                waited: REAP_BOUND
+            })),
+            Exclusion::Retain,
+            "a child that could not be reaped must keep its seat closed"
+        );
+        assert_eq!(
+            exclusion_after_reap(&Err(ExecutorError::Protocol("wait failed".to_owned()))),
+            Exclusion::Retain,
+            "an unreadable exit status is an UNKNOWN exit, and unknown fails closed"
+        );
+    }
+
+    #[test]
+    fn a_frame_larger_than_the_cap_is_refused_rather_than_buffered() {
+        // Unbounded parent-side buffering is a phase outside the drain bound, so the reader caps
+        // what one frame may cost before it costs it.
+        let mut oversized = vec![b'x'; MAX_FRAME_BYTES + 16];
+        oversized.push(b'\n');
+        let mut reader = BufReader::new(oversized.as_slice());
+        let refused = read_frame::<_, ToChild>(&mut reader);
+        assert!(
+            refused.is_err(),
+            "a frame past the cap must be refused, not read into memory this process never bounded"
         );
     }
 
