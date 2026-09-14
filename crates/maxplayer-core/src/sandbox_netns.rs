@@ -116,32 +116,80 @@ impl NetnsHolder {
         stderr.contains("No such container")
     }
 
+    /// How long one `docker rm` may run before it is abandoned and reported as a leak.
+    ///
+    /// This runs inside `Drop`, on the thread that is tearing the job down, so it is a hard cap on
+    /// how long a wedged daemon can hold that thread. Long enough that an ordinary removal under
+    /// load is never cut short -- removals finish in well under a second -- and short enough that a
+    /// daemon which has stopped answering ends the job instead of pinning the caller forever.
+    const REMOVE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+    /// Wait for one child, bounded. On the deadline the child is killed and reaped, and the wait is
+    /// reported as a failure rather than as a removal that succeeded.
+    ///
+    /// `Child::wait`, and the `output()` this replaced, have no timeout at all: a docker client
+    /// talking to a daemon that never answers blocks forever, which in `Drop` means teardown never
+    /// returns. The word "bounded" was in the comment above this function long before anything in
+    /// it bounded anything.
+    fn wait_bounded(
+        child: &mut std::process::Child,
+        deadline: std::time::Duration,
+    ) -> Result<std::process::ExitStatus, String> {
+        let expires = std::time::Instant::now() + deadline;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) => {
+                    if std::time::Instant::now() >= expires {
+                        // Killed AND reaped: leaving a zombie behind would be its own small leak,
+                        // and the kill is what makes the bound real rather than advisory.
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(format!(
+                            "docker rm did not finish within {}s and was abandoned -- the container \
+                             may still exist",
+                            deadline.as_secs()
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(error) => return Err(format!("could not wait for docker rm: {error}")),
+            }
+        }
+    }
+
     /// Force-remove one container by name, bounded, and say what actually happened.
     ///
     /// `Ok(())` means docker reported the removal, or reported that there was nothing to remove.
     fn force_remove(name: &str) -> Result<(), String> {
-        let outcome = std::process::Command::new("docker")
+        let mut child = std::process::Command::new("docker")
             .args(["rm", "--force", "--volumes", name])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
-            .output();
-        match outcome {
-            Ok(done) if done.status.success() => Ok(()),
-            Ok(done) => {
-                let stderr = String::from_utf8_lossy(&done.stderr).trim().to_owned();
-                // Removing something that was never created is the expected path when a create was
-                // cancelled before it started, and it is not a cleanup failure.
-                if Self::force_remove_stderr_is_benign(&stderr) {
-                    Ok(())
-                } else {
-                    Err(if stderr.is_empty() {
-                        "docker rm failed and said nothing".to_owned()
-                    } else {
-                        stderr
-                    })
-                }
-            }
-            Err(error) => Err(format!("could not run docker rm: {error}")),
+            .spawn()
+            .map_err(|error| format!("could not run docker rm: {error}"))?;
+        let status = Self::wait_bounded(&mut child, Self::REMOVE_DEADLINE)?;
+        // Read after the wait returns. `docker rm` writes one short line at most, so this cannot
+        // deadlock on a full pipe the way a chatty child could.
+        let mut stderr_bytes = Vec::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            use std::io::Read as _;
+            let _ = pipe.read_to_end(&mut stderr_bytes);
+        }
+        if status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_owned();
+        // Removing something that was never created is the expected path when a create was
+        // cancelled before it started, and it is not a cleanup failure.
+        if Self::force_remove_stderr_is_benign(&stderr) {
+            Ok(())
+        } else {
+            Err(if stderr.is_empty() {
+                "docker rm failed and said nothing".to_owned()
+            } else {
+                stderr
+            })
         }
     }
 
@@ -1427,6 +1475,50 @@ mod tests {
         first.completed();
         drop(first);
         assert!(tracked(&holder).is_empty(), "a finished joiner is not an orphan");
+    }
+
+    /// A removal that never returns is abandoned on its deadline, killed, and reported as a
+    /// failure -- not waited on forever and not reported as a removal that worked.
+    ///
+    /// This is the property the word "bounded" claimed while the code called `output()`, which has
+    /// no timeout: a docker client talking to a wedged daemon blocked the teardown thread for as
+    /// long as the daemon stayed wedged. Exercised on a child that is guaranteed not to exit, so
+    /// the deadline is the only thing that can end the wait.
+    #[test]
+    fn a_removal_that_never_returns_is_abandoned_on_its_deadline() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let started = std::time::Instant::now();
+        let error = NetnsHolder::wait_bounded(&mut child, std::time::Duration::from_millis(250))
+            .expect_err("a child that never exits must hit the deadline");
+        let waited = started.elapsed();
+
+        assert!(error.contains("did not finish"), "{error}");
+        assert!(
+            error.contains("may still exist"),
+            "an abandoned removal must be reported as a possible leak, not as success: {error}"
+        );
+        assert!(waited < std::time::Duration::from_secs(10), "waited {waited:?}");
+        // Killed AND reaped, so the bound is real rather than advisory: the child is already gone
+        // and this returns its status immediately rather than blocking for the remaining ~59s.
+        assert!(
+            child.try_wait().expect("reap").is_some(),
+            "the abandoned child must be killed, not left running"
+        );
+    }
+
+    /// A removal that answers promptly is NOT abandoned -- the control that keeps the test above
+    /// from passing on a deadline that fires unconditionally.
+    #[test]
+    fn a_removal_that_returns_is_not_abandoned() {
+        let mut child = std::process::Command::new("true").spawn().expect("spawn true");
+        let status = NetnsHolder::wait_bounded(&mut child, std::time::Duration::from_secs(10))
+            .expect("a child that exits at once must be waited on normally");
+        assert!(status.success(), "{status:?}");
     }
 
     /// A **cancelled** sidecar command leaves its name with the holder.
