@@ -1675,7 +1675,15 @@ mod tests {
         let refused = policy
             .verify_readback(Family::V6, &shadowed)
             .expect_err("an ND ACCEPT appended below the range drops");
-        assert!(refused.contains("shadow"), "{refused}");
+        // The ND exceptions are checked for position by the SAME ordering check that guards the
+        // pinhole, so this refusal is worded like its siblings above: it names the rule, its index,
+        // and the drop that precedes it. Asserted on that wording rather than on a single adjective
+        // so the control cannot be satisfied by an unrelated refusal, and it must still name the
+        // advertisement specifically — a message about some other rule would not prove this one is
+        // guarded.
+        assert!(refused.contains("below the first range DROP"), "{refused}");
+        assert!(refused.contains("neighbour-advertisement"), "{refused}");
+        assert!(refused.contains("inert"), "{refused}");
 
         // And the rules() order this guards is the order actually installed.
         let all = policy.rules();
