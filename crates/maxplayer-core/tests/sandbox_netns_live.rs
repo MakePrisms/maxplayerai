@@ -277,23 +277,36 @@ fn a_truncated_plan_leaves_a_namespace_the_readback_refuses() {
     let policy = policy("172.17.0.1");
     let (plan, expected) = plan_stdin(&policy);
 
+    // The cut is expressed in terms of the v4 rule count, not as a fixed number of lines from the
+    // end, and that is a correctness fix rather than a tidy-up. The plan is every v4 rule followed
+    // by every v6 rule, so `expected - 4` silently meant "drop the v6 rules and one v4 rule" only
+    // while v6 had three. The moment v6 grew the two neighbour-discovery exceptions, the same cut
+    // removed four v6 lines and no v4 line at all: v4 verified, and the test that exists to catch a
+    // partial install passed while installing a complete v4 policy.
+    let v4_rules = policy.rule_count(Family::V4);
+    let truncated_to = v4_rules - 1;
     let short: String = plan
         .lines()
-        .take(expected - 4)
+        .take(truncated_to)
         .map(|line| format!("{line}\n"))
         .collect();
+    assert!(truncated_to < expected, "the plan must actually be truncated");
     let (ok, applied, err) = fixture.apply(&short);
     assert!(ok, "a short plan still applies cleanly, which is the point: {err}");
-    assert_eq!(applied.parse::<usize>().expect("a count"), expected - 4);
+    assert_eq!(applied.parse::<usize>().expect("a count"), truncated_to);
 
-    let readback = fixture.readback(Family::V4);
-    let refusal = policy
-        .verify_readback(Family::V4, &readback)
-        .expect_err("a partially contained namespace must not verify");
-    assert!(
-        refusal.contains("rules in OUTPUT"),
-        "the refusal must name the count it measured: {refusal}"
-    );
+    // Both families refuse, and for different reasons: v4 is short by exactly one rule, v6 was
+    // never reached at all.
+    for family in [Family::V4, Family::V6] {
+        let readback = fixture.readback(family);
+        let refusal = policy
+            .verify_readback(family, &readback)
+            .expect_err("a partially contained namespace must not verify");
+        assert!(
+            refusal.contains("rules in OUTPUT"),
+            "the refusal must name the count it measured: {refusal}"
+        );
+    }
 }
 
 /// A namespace missing exactly the metadata drop must be refused, and the refusal must name it.
