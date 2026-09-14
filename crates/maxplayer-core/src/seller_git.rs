@@ -971,6 +971,147 @@ pub async fn neutralize_then_push_off_runtime(
     .await
 }
 
+/// Off-runtime: the delivery push, run **in a killable child process**, holding this delivery's turn
+/// until that child has ACTUALLY EXITED.
+///
+/// This is the production path. [`neutralize_then_push_off_runtime`] does the same two steps in
+/// THIS process, where the local phase cannot be interrupted: libgit2's delta search refuses the one
+/// cancellation answer it is offered (`pack-objects.c:979`), so a revoked delivery whose thread is
+/// inside it keeps the seat's delivery turn until it finishes on its own. Moving that phase behind a
+/// process boundary replaces cooperation with `SIGKILL`, which cannot be caught, blocked or ignored.
+///
+/// What crosses the boundary, and what does not: the child gets a workdir, a remote, a branch, the
+/// gated oid and what is left of the budget. It gets **no key and no token** — not on argv, not in
+/// the environment. When the transport needs an `Authorization` header the child ASKS, and the
+/// answer is minted HERE by `mint`, the caller's existing per-request minter, with the seller key
+/// still confined to the signer actor.
+///
+/// `authority` is asked twice per leg, and the second ask is the point: after the mint returned and
+/// **before the header is written to the pipe**. A token for a leg this delivery no longer owns
+/// therefore never reaches the child at all, which is the same guarantee the in-process path gets
+/// from asking again before transmitting.
+///
+/// **The turn is released only on a confirmed exit.** If the child was killed and did not exit
+/// inside [`crate::delivery_executor::REAP_BOUND`], this delivery's turn is RETAINED for the life of
+/// this process rather than handed to a second delivery while the first may still be packing. That
+/// is a deliberate loss of liveness on this seat, and it is named rather than recovered from.
+#[allow(clippy::too_many_arguments)]
+pub async fn neutralize_then_push_in_child_off_runtime(
+    program: PathBuf,
+    workdir: PathBuf,
+    remote_url: String,
+    branch: String,
+    gated_oid: String,
+    mint: Option<git_transport::AuthMinter>,
+    authority: Option<git_transport::AuthorityCheck>,
+    turn: crate::delivery_turn::DeliveryTurn,
+) -> Result<String, SellerGitError> {
+    use crate::delivery_executor::{ExecutorError, PushRequest};
+
+    match tokio::task::spawn_blocking(move || {
+        let running = turn
+            .begin()
+            .map_err(|ended| SellerGitError::Cancelled(format!("at dispatch: {ended}")))?;
+        let lifetime = running.lifetime();
+        // Phase boundary: everything after this point is a process that has to be killed to be
+        // stopped, so a delivery already revoked never gets one spawned for it.
+        if let Some(authority) = &authority {
+            authority().map_err(|ended| {
+                SellerGitError::Cancelled(format!("before spawning the delivery push child: {ended}"))
+            })?;
+        }
+        lifetime.check().map_err(|ended| {
+            SellerGitError::Cancelled(format!("before spawning the delivery push child: {ended}"))
+        })?;
+
+        let request = PushRequest {
+            workdir,
+            remote_url,
+            branch,
+            gated_oid,
+            // A remote that takes no authorization is a remote the child must never ask about; the
+            // proxy below refuses anyway, so the two agree.
+            authenticated: mint.is_some(),
+            budget_ms: u64::try_from(lifetime.remaining().as_millis()).unwrap_or(u64::MAX),
+        };
+        // The absolute deadline this delivery has always had. It is the parent's, not the child's:
+        // the child is not trusted to bound itself, which is the entire reason it is a child.
+        let deadline = lifetime.deadline();
+        let proxy = |destination: &str| -> Result<String, String> {
+            if let Some(authority) = &authority {
+                authority().map_err(|ended| format!("{ended}; refusing to authorize another leg"))?;
+            }
+            lifetime
+                .check()
+                .map_err(|ended| format!("{ended}; refusing to authorize another leg"))?;
+            let minter = mint.as_ref().ok_or_else(|| {
+                "this delivery's remote takes no authorization; refusing to mint one".to_owned()
+            })?;
+            let header = minter(destination)?;
+            // Asked AGAIN, after the mint and before the header crosses the pipe. The mint is a call
+            // into the signer actor and it can block; the answer can change while it does, and a
+            // header that is never written is a header the child cannot transmit.
+            if let Some(authority) = &authority {
+                authority().map_err(|ended| {
+                    format!("{ended}; the token minted for this leg will not be handed over")
+                })?;
+            }
+            lifetime.check().map_err(|ended| {
+                format!("{ended}; the token minted for this leg will not be handed over")
+            })?;
+            Ok(header)
+        };
+
+        let outcome = crate::delivery_executor::run_push_in_child(&program, &request, deadline, proxy);
+        match outcome {
+            Ok(oid) => {
+                // `running` drops HERE, on this thread, after the child has exited and been reaped.
+                drop(running);
+                Ok(oid)
+            }
+            Err(ExecutorError::Unreaped { waited }) => {
+                // FAIL CLOSED. The kill was issued and the exit was NOT observed, so as far as this
+                // process can establish, a delivery push may still be running against this seat's
+                // one delivery remote. Releasing the turn here would be releasing it on a kill
+                // rather than on a stop. `forget` rather than `drop`: the turn is never handed back,
+                // for the life of this process, and `delivery_executor::unconfirmed_children` is the
+                // process-wide counter that says why.
+                std::mem::forget(running);
+                Err(SellerGitError::Io(format!(
+                    "delivery push child did not exit {}ms after SIGKILL; this seat's delivery turn \
+                     is retained for the life of this process rather than handed to a second \
+                     delivery while the first may still be packing",
+                    waited.as_millis()
+                )))
+            }
+            Err(ExecutorError::Killed { after, reap }) => {
+                drop(running);
+                Err(SellerGitError::Cancelled(format!(
+                    "the delivery push passed its deadline by {}ms and its child was killed; the \
+                     kernel confirmed the exit {}ms later",
+                    after.as_millis(),
+                    reap.as_millis()
+                )))
+            }
+            Err(error @ ExecutorError::Spawn(_)) => {
+                drop(running);
+                Err(SellerGitError::Io(error.to_string()))
+            }
+            Err(error) => {
+                drop(running);
+                Err(SellerGitError::Transport(error.to_string()))
+            }
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => Err(SellerGitError::Io(format!(
+            "blocking git task did not complete: {error}"
+        ))),
+    }
+}
+
 /// Run one blocking git operation on a blocking thread. A panic inside libgit2 surfaces as an error
 /// rather than taking the caller down. For the delivery push — the one operation that owns the
 /// seat's delivery turn — see [`off_runtime_holding_the_turn`].

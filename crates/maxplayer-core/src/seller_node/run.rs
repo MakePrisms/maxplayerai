@@ -7783,8 +7783,24 @@ impl SellerNodeRunner {
                     &self.delivery_push_lock,
                     DELIVERY_PUSH_TIMEOUT,
                     push_deadline,
-                    move |turn| {
-                        seller_git::neutralize_then_push_off_runtime(
+                    move |turn| async move {
+                        // The local phase runs in a CHILD, not on this thread. libgit2's delta
+                        // search cannot be interrupted from inside (`pack-objects.c:979` discards
+                        // the cancellation answer), so a revoked delivery that is already packing
+                        // would otherwise hold this seat's one delivery turn until it finished on
+                        // its own. A child can be killed; the parent returns only once the kernel
+                        // has confirmed that it exited. See
+                        // [`seller_git::neutralize_then_push_in_child_off_runtime`].
+                        //
+                        // `current_exe`, never a PATH lookup: the seller node runs inside the
+                        // shipped `maxplayer` binary, which dispatches the child subcommand. If that
+                        // cannot be resolved there is no killable local phase to be had, so this
+                        // delivery FAILS rather than quietly falling back to a push that cannot be
+                        // stopped. `turn` is dropped unused, which hands it straight back.
+                        let program = crate::delivery_executor::resolve_child_program()
+                            .map_err(|error| seller_git::SellerGitError::Io(error.to_string()))?;
+                        seller_git::neutralize_then_push_in_child_off_runtime(
+                            program,
                             workdir,
                             remote,
                             branch,
@@ -7793,6 +7809,7 @@ impl SellerNodeRunner {
                             Some(push_check),
                             turn,
                         )
+                        .await
                     },
                 )
                 .await
