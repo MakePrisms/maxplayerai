@@ -17,8 +17,8 @@ Read it for the full model. This skill is the actionable guide.
 - **Holder** — handled and automated. Onboard by config.
 - **Public** — handled, but manual. A human installs the tool in the image.
 - **Direct token** — handled, but manual, and its safe delivery is the Proxy swap.
-- **Proxy swap** — handled by configuration (`[[sandbox.mcp_tools]]`). The real-vendor acceptance run
-  is pending; GitHub is first.
+- **Proxy swap** — handled by configuration (`[[sandbox.mcp_tools]]`). Accepted against a real
+  vendor (GitHub) on 2026-09-14.
 - **Dedicated machine** — not handled; deferred.
 - **Browser login** — not supported for now.
 
@@ -131,24 +131,22 @@ protocol, or a client that will not route through the proxy), and record the res
 
 What is available today. The proxy delivery above is the Proxy swap route. It is configured by
 `[[sandbox.mcp_tools]]` for a vendor-hosted MCP server, and by `[[sandbox.file_credentials]]` for a
-client that takes a base-URL flag and a token from the environment. Its real-vendor acceptance run
-is still pending, so report the result as "configured, acceptance run pending". The weaker option,
-a real token in the container, stays manual setup with the residual leak recorded.
+client that takes a base-URL flag and a token from the environment. The weaker option, a real token
+in the container, stays manual setup with the residual leak recorded.
 
-## Proxy swap (handled by configuration; real-vendor acceptance pending)
+## Proxy swap (handled by configuration; accepted against GitHub)
 
 Use this for a vendor-hosted MCP server, or an authenticated HTTP API, whose auth is one header
 value. The job holds a per-job placeholder. The credential proxy (`#647`) swaps the real credential
 in at egress, only for the vendor's host, only for the life of the job. The credential file stays on
 the host. It is never mounted.
 
-**Status (2026-09-11).** The wiring is built and green against synthetic fakes: the config surface,
-the proxy registration, the MCP server entry on the job's session, the `mcp-http-bridge` shim in the
-sandbox image, and the core-side tests against the real proxy. The real-vendor acceptance run is
-still owed; GitHub is first (see
-[10](../../../docs/specs/seller-tool-onboarding/10-routing-and-options.md)). Until that run passes,
-report a Proxy swap onboarding as "configured, acceptance run pending". Never report it as
-"accepted".
+**Status (2026-09-14).** The wiring is built, green against synthetic fakes, and accepted against
+one real vendor: GitHub's remote MCP server, through the real proxy, the real launch, the sandbox
+image, and a real agent turn. The bundle is `evidence/20260914T085619Z-github-proxy-swap/`; the account is in
+[10](../../../docs/specs/seller-tool-onboarding/10-routing-and-options.md). For a NEW vendor, report
+the onboarding as "configured; accepted for GitHub, not yet for this vendor" until a run against
+that vendor passes. A run against a fake proves the mechanism only.
 
 Two shapes, by what the job talks to:
 
@@ -172,16 +170,20 @@ Configure a vendor MCP server.
 
    ```toml
    [[sandbox.mcp_tools]]
-   name = "github"                                # the MCP server name the agent sees
-   url = "https://api.githubcopilot.com/mcp/"     # the vendor's MCP endpoint
+   name = "github"                                      # the MCP server name the agent sees
+   url = "https://api.githubcopilot.com/mcp/readonly"   # the vendor's MCP endpoint; GitHub's read-only one
    credential = { path = "/ABSOLUTE/path/github-mcp.json", field = "token" }
-   # transport = "stdio"                          # default: the bridge. "http" only for claude
+   # transport = "stdio"                                # default: the bridge. "http" only for claude
    ```
+
+   Prefer a vendor endpoint that itself limits the operations (GitHub's `/mcp/readonly` lists only
+   read tools) when the token is read-only. The endpoint bounds the operations, the token bounds
+   the permissions, the proxy bounds the destination.
 
    With egress containment on (`network` set), `proxy_port_range` must be set too. The pinhole is
    how the job reaches the proxy.
 4. Restart the seller daemon. Read the boot line:
-   `seller node: [sandbox] mcp_tools: github -> https://api.githubcopilot.com/mcp/ through the
+   `seller node: [sandbox] mcp_tools: github -> https://api.githubcopilot.com/mcp/readonly through the
    credential proxy (stdio bridge); credential file /ABSOLUTE/path/github-mcp.json reads`. A line
    that says `UNREADABLE` means every job would fail to reach the tool. Fix the file first.
 5. Run a job that uses the tool. Confirm with the vendor's own record (GitHub: the token's last-used
@@ -209,7 +211,10 @@ How to test, synthetically, both halves:
 - `cargo test -p maxplayer-core --features wallet,acp mcp_tool` — the config, the session entry,
   and the real proxy against a stub vendor (`seller_exec::mcp_tool_tests`).
 
-Neither is third-party acceptance. The GitHub run is.
+Neither is third-party acceptance. The live tests are: `cargo test -p maxplayer-core --features
+wallet,acp --lib -- --ignored mcp_tool_tests::live_a` and `live_b`, with the environment the bundle's
+README (`evidence/20260914T085619Z-github-proxy-swap/README.md`) names. They need docker, the image, egress and a real read-only
+credential.
 
 ## Dedicated machine (not supported at this moment)
 

@@ -14,7 +14,7 @@ and gives the rung in parentheses, so you never have to memorize a number.
 | --- | --- | --- |
 | **Public** (rung 1) | The tool needs no credential, so it is installed in the job's container image and the job calls it directly. | Handled, but manual. |
 | **Direct token** (rung 2) | The job is handed a short-lived, job-scoped token the vendor can revoke or bind to job-close, so a leak is bounded and the job calls the vendor itself. | Handled, but manual, and its safe delivery is the deferred Proxy swap. |
-| **Proxy swap** (rung 3) | The job holds a placeholder credential and the host-side credential proxy swaps the real one into the outgoing request header, so the secret never enters the container. | Handled by configuration (`[[sandbox.mcp_tools]]`); real-vendor acceptance run pending. |
+| **Proxy swap** (rung 3) | The job holds a placeholder credential and the host-side credential proxy swaps the real one into the outgoing request header, so the secret never enters the container. | Handled by configuration (`[[sandbox.mcp_tools]]`); accepted against GitHub, 2026-09-14. |
 | **Holder** (rung 4) | A persistent supervisor logs the real tool in one time and holds the session, exposing it to each job over a private socket while the credential and local files stay on the holder's side. | Handled and automated. This is `maxplayer-tool-kit`. |
 | **Dedicated machine** (rung 5) | For a login bound to a specific machine or hardware licence, the tool runs on a dedicated isolated machine rather than in the job container. | Not handled; deferred. |
 
@@ -99,32 +99,52 @@ Two transport shapes, because the ACP `mcpServers` entry has two wire forms (rea
   harness that does not gets no tool. Use it as the fallback if the bridge misbehaves against a real
   vendor, so a transport fault and a proxy fault can be told apart.
 
-Owed: the real-vendor acceptance run. The scope fork still holds: a broad credential needs a
-trusted operation filter, which is the Holder shape for a remote tool, and that is not built.
+The real-vendor acceptance run passed on 2026-09-14; see the next section. The scope fork still
+holds: a broad credential needs a trusted operation filter, which is the Holder shape for a remote
+tool, and that is not built.
 
-### First acceptance vendor: GitHub (chosen, 2026-09-11)
+### First acceptance vendor: GitHub — passed 2026-09-14
 
-GitHub is the first real vendor for the Proxy swap acceptance run. It fits the criteria: a
-fine-grained Personal Access Token is header-borne (`Authorization: Bearer`), static, and scopable
-to one repository with read-only permissions, so no operation filter is needed; and GitHub hosts a
-remote MCP server.
+GitHub was chosen on 2026-09-11 because a fine-grained Personal Access Token is header-borne
+(`Authorization: Bearer`), static, and scopable to read-only, so no operation filter is needed, and
+GitHub hosts a remote MCP server. The run passed on 2026-09-14 on Petar's machine. The bundle is
+[`evidence/20260914T085619Z-github-proxy-swap/`](../../../evidence/20260914T085619Z-github-proxy-swap/README.md).
 
-The acceptance run, when an environment with a real token is available (it cannot run in this
-sandbox):
+What ran, three times, all against GitHub's own MCP server and all through the real components (the
+real proxy, the real launch argv, the real preparation and cleanup, the sandbox image built from this
+branch):
 
-1. Mint a fine-grained PAT, read-only, scoped to one throwaway repository. Put it in a host file
-   `{"token": "…"}`, mode 0600, owned by the daemon's user.
-2. Configure `[[sandbox.mcp_tools]]` with `name = "github"`, `url =
-   "https://api.githubcopilot.com/mcp/"` and that file. Confirm the endpoint, the transport and the
-   auth header against GitHub's MCP docs at setup time.
-3. Restart the seller. Read the boot line; it must say the credential file reads.
-4. Run a job whose prompt uses the `github` MCP server for a read (list issues, read a file).
-5. Confirm three facts. From GitHub's side (the token's last-used time, the repository's access
-   log): the call arrived with the PAT. From the job container's capture: the PAT is absent and the
-   placeholder is present. From a bypass: the placeholder sent to `api.githubcopilot.com` directly
-   gets `401`.
+| Run | In the container | Egress | Result |
+| --- | --- | --- | --- |
+| A, uncontained | `mcp-http-bridge` as the container command, driven with an agent's MCP dialogue | default bridge network, the proxy through the docker alias | `initialize`, `tools/list` (27 read-only tools), `get_me` → the token owner's login, a file read |
+| A, contained | the same | the seat's egress containment: a namespace holder and the firewall pinhole | the same |
+| B, contained | a REAL `claude-agent-acp` turn, driven by `run_agent_job` as an awarded job is | containment, as above | the agent called `mcp__github__get_me` through the bridge and replied `login=<owner>` |
 
-The read-only scope and the throwaway repository keep the run safe and free.
+The three facts the plan asked for, and how each was confirmed:
+
+1. **The call arrived with the PAT.** GitHub's MCP server answers `401` without a token (measured),
+   so its `200` and its `get_me` result naming the token owner are GitHub's word that the real
+   token arrived, swapped in at egress.
+2. **The PAT is absent from the container; the placeholder is present.** `docker inspect` of the
+   job container shows the placeholder in the command and no credential in the environment; the
+   real cleanup path's diagnostics capture, the MCP transcript and the agent's reply are scanned by
+   the tests for the token and it is in none of them.
+3. **The bypass fails.** The placeholder sent straight to `api.githubcopilot.com` gets `400`
+   (GitHub answers `400` to a bearer that is not shaped like one of its tokens, `401` to a missing
+   or GitHub-shaped bad one). An unknown placeholder at the proxy gets `502` with no substitution.
+   After job end the proxy port refuses the connection.
+
+Two facts learned at the vendor and folded back into the wiring:
+
+- GitHub's MCP server answers over SSE (`text/event-stream`) under chunked framing and issues an
+  `Mcp-Session-Id` on `initialize`. The bridge handles all three; a client that reads only one JSON
+  document would not work here.
+- GitHub offers a read-only endpoint, `https://api.githubcopilot.com/mcp/readonly`, which lists only
+  read tools. Use it with a read-only token: the endpoint bounds the operations the way the token
+  bounds the permissions, and the proxy bounds the destination.
+
+The tests are `seller_exec::mcp_tool_tests::live_a_…` and `live_b_…`, `#[ignore]`d because they
+need docker, the image, egress and a real credential. The bundle's README says how to rerun them.
 
 ## The decision tree
 

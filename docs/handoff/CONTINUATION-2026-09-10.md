@@ -6,8 +6,8 @@ findings, and the plan for the production integration that remains.
 
 Author: Petar's local agent, 2026-09-10.
 
-**Current next step:** section 10 — the Proxy swap production wiring is coded and tested
-(2026-09-11); the real GitHub acceptance run is next. Read section 10 first if you are resuming.
+**Current state:** section 10 — the Proxy swap route is coded, tested, and accepted against GitHub
+(2026-09-14). Nothing on this branch is pushed. Read section 10 first if you are resuming.
 
 ## 1. What changed since `a0cc31d`
 
@@ -176,7 +176,7 @@ The reason, stated plainly:
 This becomes supportable when a specific vendor offers a browser login with a refreshable session.
 The holder already accommodates that case; no redesign is needed.
 
-## 10. Proxy swap production wiring (agreed 2026-09-11; coding done 2026-09-11)
+## 10. Proxy swap production wiring (agreed 2026-09-11; coded 2026-09-11; accepted on GitHub 2026-09-14)
 
 Petar's sequencing decision, 2026-09-11: finish all the coding first, then attempt the real GitHub
 test. Do not attempt the real test with half-built code. The real run is the one thing that cannot
@@ -266,8 +266,39 @@ Docker Desktop registry client came back on its own (the host had been under a l
 The local image tag `maxplayer-sandbox:mcp-bridge` is what a real GitHub run on this machine
 should name in `[sandbox] image`, because the published default image predates the bridge.
 
-### Next: the real GitHub run
+### The real GitHub run — passed 2026-09-14
 
-It needs a real fine-grained read-only PAT and cannot run in this sandbox. The recipe is in doc 10,
-"First acceptance vendor: GitHub", and the seller-facing steps are in the skill's Proxy swap
-section. Report a Proxy swap onboarding as "configured, acceptance run pending" until it passes.
+Petar supplied a fine-grained PAT (read-only, public repositories) on 2026-09-14. It sits in
+`~/.config/maxplayer/github-mcp-readonly.json` on his machine, mode 0600, and never entered a
+container. Three live runs passed, all through the real components and GitHub's own MCP server:
+the bridge as the container command, uncontained and under the seat's egress containment; and a
+REAL `claude-agent-acp` turn driven by `run_agent_job`, which called `mcp__github__get_me` through
+the bridge and replied `login=pmilic021`. The bundle is `evidence/20260914T085619Z-github-proxy-swap/`; its README has the facts, the
+limits, and the rerun commands. Doc 10 has the account.
+
+Two things the run changed in the code:
+
+- `JobLaunch` gained `mcp_servers`, and the docker argv opens the `host.docker.internal` alias when
+  an MCP server entry names it. Before, only an environment value could open it, so a seat whose
+  only contained credential is a vendor tool would have had no alias on Linux.
+- `Containment` now hands every real credential value it holds (env, file, vendor, Codex) to the
+  capture redactor's exact-value pass, so a capture that somehow showed one would still be
+  redacted. The primary control is unchanged: none of them enters the container.
+
+Two live tests carry the run: `seller_exec::mcp_tool_tests::live_a_…` and `live_b_…`, `#[ignore]`d,
+configured by environment (`MAXPLAYER_MCP_LIVE_*`). The netfilter sidecar this dev build names
+(`…:v0.5.8`) is a local tag alias of the published `:v0.5.7` on Petar's machine.
+
+Gates for the acceptance commit, run the same day: core 419 / 468 / 1511 / 1576 across the four CI
+rows; kit 52; clippy clean in the changed files; the `maxplayer` crate 160 of 161 and 198 of 199.
+The one failure in both CLI rows is `doctor::tests::sandbox_image_check_is_wired_into_the_boot_gate`,
+which needs `docker manifest inspect` on an unresolvable host to fail fast. It passed at 09:49 that
+morning on the same code (161 and 199). By the evening run the Docker Desktop registry client had
+wedged again — a direct `docker manifest inspect no-such-registry.invalid/nope:v0` hung past 45 s,
+and one `docker desktop restart` did not clear it, exactly as on 2026-09-11. The failure is the
+environment's, not the change's; rerun that test when Docker answers.
+
+What is NOT covered, stated plainly: one vendor; one credential shape (static, header-borne); one
+agent turn with one tool call. A broad credential still needs a trusted operation filter (the
+Holder shape for a remote tool), which is not built. The Holder-route production integration
+(section 7, doc 09) remains separate and not started.

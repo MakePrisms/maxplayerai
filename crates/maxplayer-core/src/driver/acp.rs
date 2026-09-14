@@ -80,6 +80,22 @@ impl McpServer {
             Self::Http(server) => &server.name,
         }
     }
+
+    /// Whether any value this entry hands the agent — the command, an argument, an env value, the
+    /// URL, a header value — contains `needle`. The sandbox launch asks this about the proxy's
+    /// docker alias to decide whether the container needs that alias resolved.
+    pub fn references(&self, needle: &str) -> bool {
+        match self {
+            Self::Stdio(server) => {
+                server.command.contains(needle)
+                    || server.args.iter().any(|arg| arg.contains(needle))
+                    || server.env.iter().any(|pair| pair.value.contains(needle))
+            }
+            Self::Http(server) => {
+                server.url.contains(needle) || server.headers.iter().any(|pair| pair.value.contains(needle))
+            }
+        }
+    }
 }
 
 /// A stdio MCP server: the agent spawns `command args…` with `env` added to the child's

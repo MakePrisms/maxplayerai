@@ -331,6 +331,11 @@ pub struct JobLaunch<'a> {
     /// rules live in the namespace this names, and they were installed before this job's process
     /// existed. A `Some` here is therefore a containment claim, not a networking preference.
     pub netns: Option<&'a str>,
+    /// The MCP servers this launch attaches to the agent's session (the Proxy swap vendor tools,
+    /// [`PreparedLaunch::mcp_servers`]). The argv builder reads them for ONE fact: whether any of
+    /// them names the proxy's docker alias, which is what decides the `--add-host` pinhole for an
+    /// uncontained job. Empty for a launch with no vendor tool, and for every probe.
+    pub mcp_servers: &'a [crate::driver::McpServer],
 }
 
 /// What the ACP driver spawns: the process `program` + `args`, and the `cwd` the ACP session runs
@@ -939,7 +944,10 @@ impl DockerPolicy {
         // On Linux docker does not provide it by default; `--add-host …:host-gateway` maps it to the
         // host. This is the single pinhole to the proxy's host:port that #797's host-services deny must
         // preserve. Added only when something actually references the alias, so a docker run with no
-        // containment carries no inert flag.
+        // containment carries no inert flag. "Something" is the environment OR an MCP server entry:
+        // a Proxy swap vendor tool reaches the proxy through the address in its session entry, not
+        // through a variable, and a seat whose ONLY contained credential is such a tool would
+        // otherwise get no alias on Linux, where docker does not provide it by default.
         //
         // ⛔ NEVER under namespace containment: the daemon REFUSES the combination outright —
         // `conflicting options: custom host-to-IP mapping and the network mode` (measured, rc 125) —
@@ -947,10 +955,14 @@ impl DockerPolicy {
         // Such a job needs no alias: `sandbox_netns` measures the address and puts the literal in the
         // env, which is also what the firewall pinhole names.
         if job.netns.is_none()
-            && job
+            && (job
                 .env
                 .iter()
                 .any(|(_, value)| value.contains(crate::credential_proxy::PROXY_HOST_ALIAS))
+                || job
+                    .mcp_servers
+                    .iter()
+                    .any(|server| server.references(crate::credential_proxy::PROXY_HOST_ALIAS)))
         {
             argv.push("--add-host".into());
             argv.push(format!("{}:host-gateway", crate::credential_proxy::PROXY_HOST_ALIAS));
@@ -1084,6 +1096,7 @@ pub fn probe_launch_argv(
         uid,
         gid,
         netns: None,
+        mcp_servers: &[],
     };
     let launch = policy.launch(probe_command, &job)?;
     let mut argv = Vec::with_capacity(launch.args.len() + 1);
@@ -2486,6 +2499,7 @@ pub async fn run_agent_job_in_env(
         uid: prepared.uid,
         gid: prepared.gid,
         netns: prepared.holder_name.as_deref(),
+        mcp_servers: &prepared.mcp_servers,
     };
     let launch = policy.launch(&prepared.effective_command, &job)?;
     // The ACP idle/response timeout IS the unified job timeout — never a hardcoded 300s that could
@@ -2623,7 +2637,7 @@ pub(crate) async fn prepare_launch(
     //
     // ⛔ These are never printed, formatted into an error, or written anywhere but through
     // [`redact`], which replaces them. A capture path is exactly where a secret must not leak.
-    let forwarded_secrets: Vec<String> = forwarded.iter().map(|(_, value)| value.clone()).collect();
+    let mut forwarded_secrets: Vec<String> = forwarded.iter().map(|(_, value)| value.clone()).collect();
     // Credential containment (#647). Under docker the real model credential must NOT enter the
     // container: a stranger's job can read `-e ANTHROPIC_API_KEY` and exfiltrate a reusable secret.
     // Start a per-job host proxy that holds the real credential, forward a format-plausible
@@ -2720,6 +2734,12 @@ pub(crate) async fn prepare_launch(
                 // A vendor MCP tool is reached through the session's MCP server list, so its
                 // placeholder lands there — never in the container environment.
                 mcp_servers = containment.mcp_servers;
+                // File-sourced and vendor credentials join the redactor's exact-value pass too.
+                for secret in containment.secrets {
+                    if !forwarded_secrets.contains(&secret) {
+                        forwarded_secrets.push(secret);
+                    }
+                }
                 _proxy = Some(containment.proxy);
             }
             None => env.extend(forwarded),
@@ -2981,6 +3001,11 @@ struct Containment {
     /// address — the third redirect shape, beside the env pair and the argv flag: a vendor MCP
     /// tool is reached through the agent's MCP server list, so that is where its redirect lands.
     mcp_servers: Vec<crate::driver::McpServer>,
+    /// Every REAL credential value this containment holds — env-sourced, file-sourced, vendor MCP,
+    /// Codex — for the capture redactor's exact-value pass ([`PreparedLaunch::forwarded_secrets`]).
+    /// The primary control is that none of them enters the container; this is the belt for a
+    /// capture that somehow shows one anyway. ⛔ Never printed or formatted into an error.
+    secrets: Vec<String>,
     proxy: crate::credential_proxy::RunningProxy,
 }
 
@@ -3483,10 +3508,18 @@ async fn start_credential_containment(
     // Appended AFTER the rewrite: these pairs carry placeholders, which have nothing to scrub.
     contained.extend(file_env);
     contained.extend(codex_env);
+    // The real values, deduplicated: the same secret can arrive from the environment and a file.
+    let mut secrets: Vec<String> = Vec::with_capacity(substitutions.len());
+    for (real, _) in &substitutions {
+        if !real.is_empty() && !secrets.contains(real) {
+            secrets.push(real.clone());
+        }
+    }
     Ok(Some(Containment {
         env: contained,
         argv_extra,
         mcp_servers,
+        secrets,
         proxy: running,
     }))
 }
@@ -3652,6 +3685,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             netns: None,
+            mcp_servers: &[],
         }
     }
 
@@ -3982,7 +4016,7 @@ mod tests {
         let job_launch = policy
             .launch(
                 &job_command,
-                &JobLaunch { workdir, env: &[], uid, gid, netns: None },
+                &JobLaunch { workdir, env: &[], uid, gid, netns: None, mcp_servers: &[] },
             )
             .expect("a job renders");
         let job_argv: Vec<String> =
@@ -6838,6 +6872,7 @@ mod tests {
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             netns: None,
+            mcp_servers: &[],
         };
         let launch = policy.launch(&agent_command, &job).expect("docker launch");
 
@@ -7884,6 +7919,55 @@ mod mcp_tool_tests {
         assert_eq!(wire["type"], serde_json::json!("http"));
     }
 
+    // ---- the docker alias pinhole ----------------------------------------------------------
+
+    /// A seat whose ONLY contained credential is a vendor tool has nothing in the container
+    /// environment that names the proxy alias; the session entry names it instead. The launch must
+    /// still open the alias, or on Linux the bridge cannot resolve the proxy at all. And an entry
+    /// that names some other host (a namespace-contained job's measured address) must not open it.
+    #[test]
+    fn an_mcp_entry_naming_the_proxy_alias_opens_the_host_gateway_pinhole() {
+        let entry = tool("https://api.githubcopilot.com/mcp/", Path::new("/abs/c.json"), McpToolTransport::Stdio);
+        let policy = SandboxPolicy::from_config(Some(&docker_config(vec![entry.clone()]))).expect("policy");
+        let workdir = Path::new("/home/seller/.maxplayer/seller-jobs/job-alias");
+        let alias_flag = format!("{}:host-gateway", crate::credential_proxy::PROXY_HOST_ALIAS);
+        let has_alias = |args: &[String]| {
+            args.windows(2).any(|pair| pair[0] == "--add-host" && pair[1] == alias_flag)
+        };
+
+        let via_alias = vec![mcp_tool_server(
+            &entry,
+            "mxp-mcp-PLACEHOLDER",
+            "/mcp/",
+            &format!("http://{}:9100", crate::credential_proxy::PROXY_HOST_ALIAS),
+        )];
+        let launch = policy
+            .launch(
+                &["claude-agent-acp".to_owned()],
+                &JobLaunch { workdir, env: &[], uid: 1000, gid: 1000, netns: None, mcp_servers: &via_alias },
+            )
+            .expect("launch");
+        assert!(has_alias(&launch.args), "the entry names the alias, so the launch must open it: {:?}", launch.args);
+
+        let via_address = vec![mcp_tool_server(&entry, "mxp-mcp-PLACEHOLDER", "/mcp/", "http://172.18.0.1:9100")];
+        let launch = policy
+            .launch(
+                &["claude-agent-acp".to_owned()],
+                &JobLaunch { workdir, env: &[], uid: 1000, gid: 1000, netns: None, mcp_servers: &via_address },
+            )
+            .expect("launch");
+        assert!(!has_alias(&launch.args), "nothing names the alias, so no inert flag: {:?}", launch.args);
+
+        // Under namespace containment the flag is refused by docker, so it must never be added.
+        let launch = policy
+            .launch(
+                &["claude-agent-acp".to_owned()],
+                &JobLaunch { workdir, env: &[], uid: 1000, gid: 1000, netns: Some("holder"), mcp_servers: &via_alias },
+            )
+            .expect("launch");
+        assert!(!has_alias(&launch.args), "a namespace-contained job must not carry --add-host: {:?}", launch.args);
+    }
+
     // ---- the boot line -----------------------------------------------------------------------
 
     #[test]
@@ -8062,7 +8146,14 @@ mod mcp_tool_tests {
         let launch = policy
             .launch(
                 &["claude-agent-acp".to_owned()],
-                &JobLaunch { workdir: &workdir, env: &containment.env, uid, gid, netns: None },
+                &JobLaunch {
+                    workdir: &workdir,
+                    env: &containment.env,
+                    uid,
+                    gid,
+                    netns: None,
+                    mcp_servers: &containment.mcp_servers,
+                },
             )
             .expect("launch argv");
         for arg in std::iter::once(&launch.program).chain(launch.args.iter()) {
@@ -8186,5 +8277,539 @@ mod mcp_tool_tests {
         };
         assert!(message.contains("mcp_tools: cannot read"), "{message}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- LIVE acceptance against a REAL vendor ---------------------------------------------------
+    //
+    // `#[ignore]`d: they need a docker daemon, the sandbox image with the bridge, network egress to
+    // the vendor, and a REAL read-only credential in a host file. Nothing synthetic can stand in for
+    // the vendor here — that is the point of these two. Run them by hand:
+    //
+    //   MAXPLAYER_MCP_LIVE_CREDENTIAL_FILE=/abs/path/github-mcp-readonly.json \
+    //   cargo test -p maxplayer-core --features wallet,acp --lib mcp_tool_tests::live -- --ignored --nocapture
+    //
+    // Knobs (all optional): MAXPLAYER_MCP_LIVE_URL (default GitHub's read-only MCP endpoint),
+    // MAXPLAYER_SANDBOX_IMAGE (default `maxplayer-sandbox:mcp-bridge`), MAXPLAYER_MCP_LIVE_NETWORK +
+    // MAXPLAYER_MCP_LIVE_PROXY_PORTS (set both to run under egress containment, as a real seat does),
+    // MAXPLAYER_MCP_LIVE_EVIDENCE_DIR (write the transcript and the container inspection there),
+    // MAXPLAYER_MCP_LIVE_EXPECT_LOGIN (the vendor login the credential belongs to; asserted when set).
+    //
+    // ⛔ The credential is read into this process by the code under test and NEVER by the test: no
+    // assertion compares against it, no file the test writes may contain it, and the scan at the end
+    // reads the file itself back only to grep for its absence.
+
+    struct LiveInputs {
+        credential_file: PathBuf,
+        url: String,
+        image: String,
+        network: Option<String>,
+        proxy_ports: Option<String>,
+        evidence_dir: Option<PathBuf>,
+        expect_login: Option<String>,
+    }
+
+    fn live_inputs() -> LiveInputs {
+        let get = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
+        let credential_file = PathBuf::from(get("MAXPLAYER_MCP_LIVE_CREDENTIAL_FILE").expect(
+            "MAXPLAYER_MCP_LIVE_CREDENTIAL_FILE must name an absolute host JSON file {\"token\": ...}",
+        ));
+        assert!(credential_file.is_absolute(), "the credential file path must be absolute");
+        LiveInputs {
+            credential_file,
+            url: get("MAXPLAYER_MCP_LIVE_URL")
+                .unwrap_or_else(|| "https://api.githubcopilot.com/mcp/readonly".to_owned()),
+            image: get("MAXPLAYER_SANDBOX_IMAGE").unwrap_or_else(|| "maxplayer-sandbox:mcp-bridge".to_owned()),
+            network: get("MAXPLAYER_MCP_LIVE_NETWORK"),
+            proxy_ports: get("MAXPLAYER_MCP_LIVE_PROXY_PORTS"),
+            evidence_dir: get("MAXPLAYER_MCP_LIVE_EVIDENCE_DIR").map(PathBuf::from),
+            expect_login: get("MAXPLAYER_MCP_LIVE_EXPECT_LOGIN"),
+        }
+    }
+
+    fn live_config(inputs: &LiveInputs) -> SandboxConfig {
+        SandboxConfig {
+            mode: SandboxMode::Docker,
+            image: Some(inputs.image.clone()),
+            network: inputs.network.clone(),
+            proxy_port_range: inputs.proxy_ports.clone(),
+            mcp_tools: vec![McpToolConfig {
+                name: "github".into(),
+                url: inputs.url.clone(),
+                credential: CredentialFile { path: inputs.credential_file.clone(), field: "token".into() },
+                transport: McpToolTransport::Stdio,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// The real credential's value, read ONLY to assert its absence from artifacts. Held in a struct
+    /// with no `Debug`, so it cannot be formatted into a failure message by accident.
+    struct Absent(String);
+
+    impl Absent {
+        fn read(file: &Path) -> Self {
+            Self(read_credential_field(file, "token", "mcp_tools").expect("the live credential file reads"))
+        }
+
+        fn assert_absent_from(&self, label: &str, text: &str) {
+            assert!(
+                !text.contains(&self.0),
+                "the real credential appears in {label} — the boundary is broken"
+            );
+        }
+
+        fn assert_absent_from_tree(&self, dir: &Path) {
+            for entry in walk(dir) {
+                let bytes = std::fs::read(&entry).unwrap_or_default();
+                let text = String::from_utf8_lossy(&bytes);
+                self.assert_absent_from(&entry.display().to_string(), &text);
+            }
+        }
+    }
+
+    fn walk(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else { return out };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(walk(&path));
+            } else {
+                out.push(path);
+            }
+        }
+        out
+    }
+
+    /// A workdir shaped like a real job's, so `job_diagnostics_dir` resolves and the real cleanup
+    /// path captures into `<root>/seller-diagnostics/<job>/`.
+    fn live_workdir(tag: &str) -> (PathBuf, PathBuf) {
+        let root = scratch(&format!("live-{tag}"));
+        let workdir = root.join("seller-jobs").join(format!("mcp-live-{tag}"));
+        std::fs::create_dir_all(&workdir).expect("create the job workdir");
+        (root, workdir)
+    }
+
+    fn write_evidence(dir: Option<&Path>, name: &str, text: &str) {
+        let Some(dir) = dir else { return };
+        std::fs::create_dir_all(dir).expect("create the evidence dir");
+        std::fs::write(dir.join(name), text).expect("write evidence");
+    }
+
+    /// `docker inspect` of the job container: its environment and its command, which together are
+    /// everything the host handed the container besides stdin.
+    fn inspect_container(name: &str) -> serde_json::Value {
+        let output = std::process::Command::new("docker")
+            .args(["inspect", name])
+            .output()
+            .expect("docker inspect");
+        assert!(output.status.success(), "docker inspect {name} failed: {}", String::from_utf8_lossy(&output.stderr));
+        let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).expect("inspect json");
+        let container = &parsed[0];
+        serde_json::json!({
+            "Image": container["Image"],
+            "Env": container["Config"]["Env"],
+            "Cmd": container["Config"]["Cmd"],
+            "Args": container["Args"],
+            "NetworkMode": container["HostConfig"]["NetworkMode"],
+            "ExtraHosts": container["HostConfig"]["ExtraHosts"],
+            "Binds": container["HostConfig"]["Binds"],
+            "User": container["Config"]["User"],
+        })
+    }
+
+    struct Dialogue {
+        transcript: Vec<String>,
+        init: serde_json::Value,
+        listed: serde_json::Value,
+        me: serde_json::Value,
+        file: serde_json::Value,
+        exit_ok: bool,
+    }
+
+    /// One JSON-RPC request in, one reply line out, over the container's stdio.
+    fn live_exchange(
+        stdin: &mut std::process::ChildStdin,
+        stdout: &mut std::io::BufReader<std::process::ChildStdout>,
+        transcript: &mut Vec<String>,
+        request: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        use std::io::{BufRead, Write};
+        let line = request.to_string();
+        transcript.push(format!("-> {line}"));
+        writeln!(stdin, "{line}").map_err(|e| format!("write request: {e}"))?;
+        stdin.flush().map_err(|e| format!("flush: {e}"))?;
+        let mut reply = String::new();
+        let n = stdout.read_line(&mut reply).map_err(|e| format!("read reply: {e}"))?;
+        if n == 0 {
+            return Err("the bridge closed stdout before answering".into());
+        }
+        transcript.push(format!("<- {}", reply.trim_end()));
+        serde_json::from_str(reply.trim()).map_err(|e| format!("reply is not JSON: {e}"))
+    }
+
+    /// The MCP dialogue an agent would hold with the vendor, driven through the bridge running as the
+    /// container's command: initialize, the initialized notification, tools/list, get_me, a file read.
+    fn live_dialogue(program: &str, args: &[String]) -> Result<Dialogue, String> {
+        use std::io::Write;
+        let mut child = std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .map_err(|e| format!("spawn docker run: {e}"))?;
+        let mut stdin = child.stdin.take().ok_or("no stdin")?;
+        let mut stdout = std::io::BufReader::new(child.stdout.take().ok_or("no stdout")?);
+        let mut transcript = Vec::new();
+        let init = live_exchange(&mut stdin, &mut stdout, &mut transcript, serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "maxplayer-acceptance", "version": "0.1"}}
+        }))?;
+        // A notification draws no reply line; the NEXT exchange reading its own reply proves it.
+        let notice = serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}).to_string();
+        transcript.push(format!("-> {notice}"));
+        writeln!(stdin, "{notice}").map_err(|e| format!("write notification: {e}"))?;
+        stdin.flush().map_err(|e| format!("flush: {e}"))?;
+        let listed = live_exchange(&mut stdin, &mut stdout, &mut transcript, serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+        }))?;
+        let me = live_exchange(&mut stdin, &mut stdout, &mut transcript, serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "get_me", "arguments": {}}
+        }))?;
+        let file = live_exchange(&mut stdin, &mut stdout, &mut transcript, serde_json::json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {"name": "get_file_contents", "arguments": {"owner": "maxy-player", "repo": "maxplayerai", "path": "README.md"}}
+        }))?;
+        // Close stdin: the bridge exits, the container exits.
+        drop(stdin);
+        let status = child.wait().map_err(|e| format!("wait: {e}"))?;
+        Ok(Dialogue { transcript, init, listed, me, file, exit_ok: status.success() })
+    }
+
+    /// Acceptance A — the whole host path against the REAL vendor, with the bridge as the
+    /// container's command (the agent's part is to spawn it with exactly these arguments, which is
+    /// what acceptance B proves). The container is launched through the real `SandboxPolicy` argv,
+    /// prepared by the real `prepare_launch`, and cleaned up by the real capture path.
+    ///
+    /// Proves, with the vendor as the oracle: the tool works through the swap (`initialize`,
+    /// `tools/list`, `get_me`, a file read); the container received no credential (environment,
+    /// command, diagnostics capture); the placeholder is worthless at the vendor (`401`) and an
+    /// unknown placeholder is refused at the proxy (`502`); job end revokes the placeholder.
+    #[cfg(feature = "acp")]
+    #[ignore = "needs docker, the sandbox image with the bridge, egress to the vendor, and a real read-only credential"]
+    #[tokio::test]
+    async fn live_a_the_bridge_in_the_sandbox_image_reaches_the_real_vendor_through_the_swap() {
+        let inputs = live_inputs();
+        let absent = Absent::read(&inputs.credential_file);
+        let evidence = inputs.evidence_dir.as_deref();
+        let config = live_config(&inputs);
+        let policy = SandboxPolicy::from_config(Some(&config)).expect("the live config resolves");
+        let (root, workdir) = live_workdir("a");
+        let identity = DeliveryAgentIdentity::for_seller(&"e".repeat(64));
+
+        // The real preparation: reads the credential, starts the real proxy (and the netns holder,
+        // when a network is configured), mints the placeholder, builds the session entry.
+        let prepared = prepare_launch(
+            &[CONTAINER_MCP_BRIDGE_BIN.to_owned()],
+            &policy,
+            &workdir,
+            &identity,
+            Duration::from_secs(300),
+        )
+        .await
+        .expect("prepare the launch");
+        assert_eq!(prepared.mcp_servers.len(), 1);
+        let McpServer::Stdio(entry) = &prepared.mcp_servers[0] else {
+            panic!("the default transport is the stdio bridge");
+        };
+        let placeholder = {
+            let i = entry.args.iter().position(|a| a == "--placeholder").expect("--placeholder");
+            entry.args[i + 1].clone()
+        };
+        let proxy_url = {
+            let i = entry.args.iter().position(|a| a == "--proxy-url").expect("--proxy-url");
+            entry.args[i + 1].clone()
+        };
+        absent.assert_absent_from("the session entry", &serde_json::to_string(&prepared.mcp_servers).unwrap());
+        for (name, value) in &prepared.env {
+            absent.assert_absent_from(&format!("container env {name}"), value);
+        }
+
+        // The container command is the bridge with the session entry's own arguments — exactly what
+        // the agent's MCP client would spawn.
+        let mut command = vec![entry.command.clone()];
+        command.extend(entry.args.iter().cloned());
+        let launch = policy
+            .launch(
+                &command,
+                &JobLaunch {
+                    workdir: &workdir,
+                    env: &prepared.env,
+                    uid: prepared.uid,
+                    gid: prepared.gid,
+                    netns: prepared.holder_name.as_deref(),
+                    mcp_servers: &prepared.mcp_servers,
+                },
+            )
+            .expect("build the docker argv");
+        for arg in std::iter::once(&launch.program).chain(launch.args.iter()) {
+            absent.assert_absent_from("the docker argv", arg);
+        }
+        let container_name = job_container_name(&job_id_of(&workdir));
+        let mut container = JobContainer::adopt(container_name.clone());
+
+        // The dialogue runs on the BLOCKING pool: the proxy's accept loop lives on this runtime's one
+        // thread, so blocking child I/O here would starve the very proxy the bridge talks to.
+        let program = launch.program.clone();
+        let args = launch.args.clone();
+        let dialogue = tokio::task::spawn_blocking(move || live_dialogue(&program, &args));
+        let dialogue = match tokio::time::timeout(Duration::from_secs(400), dialogue).await {
+            Ok(joined) => joined.expect("the dialogue task panicked").expect("the vendor dialogue failed"),
+            Err(_) => {
+                let _ = std::process::Command::new("docker").args(["kill", &container_name]).output();
+                panic!("the vendor dialogue did not finish within 400 s; the container was killed");
+            }
+        };
+        let transcript = dialogue.transcript;
+        let init = dialogue.init;
+        assert!(init.get("result").is_some(), "initialize must succeed through the swap: {init}");
+        let server_name = init["result"]["serverInfo"]["name"].as_str().unwrap_or("").to_owned();
+        let listed = dialogue.listed;
+        assert_eq!(listed["id"], serde_json::json!(2), "the reply must be to tools/list, not to the notification: {listed}");
+        let tools: Vec<String> = listed["result"]["tools"]
+            .as_array()
+            .expect("a tool list")
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_owned))
+            .collect();
+        assert!(tools.iter().any(|t| t == "get_me"), "the vendor must list get_me: {tools:?}");
+        let me = dialogue.me;
+        assert!(me["result"]["isError"] != serde_json::json!(true), "get_me must succeed: {me}");
+        let me_text = me["result"]["content"][0]["text"].as_str().unwrap_or("").to_owned();
+        let login = serde_json::from_str::<serde_json::Value>(&me_text)
+            .ok()
+            .and_then(|v| v["login"].as_str().map(str::to_owned))
+            .expect("get_me returns the authenticated login");
+        if let Some(expected) = &inputs.expect_login {
+            assert_eq!(&login, expected, "the vendor must authenticate the configured credential's owner");
+        }
+        let file = dialogue.file;
+        assert!(file["result"]["isError"] != serde_json::json!(true), "a file read must succeed: {file}");
+        assert!(dialogue.exit_ok, "the bridge must exit cleanly once stdin closes");
+
+        // What the container was given: environment and command. The credential is in neither; the
+        // placeholder is in the command.
+        let inspected = inspect_container(&container_name);
+        let inspected_text = serde_json::to_string_pretty(&inspected).unwrap();
+        absent.assert_absent_from("docker inspect of the job container", &inspected_text);
+        assert!(inspected_text.contains(&placeholder), "the command must carry the placeholder");
+        let transcript_text = transcript.join("\n");
+        absent.assert_absent_from("the MCP transcript", &transcript_text);
+
+        // The bypass: the placeholder, sent straight to the vendor, authenticates nothing.
+        let client = reqwest::Client::new();
+        let (upstream, path) = split_mcp_url(&inputs.url).unwrap();
+        let bypass = client
+            .post(format!("{upstream}{path}"))
+            .header("authorization", format!("Bearer {placeholder}"))
+            .header("accept", "application/json, text/event-stream")
+            .json(&serde_json::json!({"jsonrpc": "2.0", "id": 9, "method": "tools/list", "params": {}}))
+            .send()
+            .await
+            .expect("reach the vendor");
+        let bypass_status = bypass.status().as_u16();
+        // Refused is what matters. GitHub answers 401 to a missing token and 400 to a bearer that is
+        // not even shaped like one of its tokens (measured 2026-09-14); either way nothing ran.
+        assert!(
+            (400..500).contains(&bypass_status),
+            "the placeholder must be worthless at the vendor, got HTTP {bypass_status}"
+        );
+
+        // The host reaches the proxy over loopback on the same port: the address the CONTAINER uses
+        // (the docker alias, or a measured namespace address) is not one this host can be relied on
+        // to resolve, and a probe that failed to resolve would read as "revoked" for the wrong reason.
+        let proxy_port = prepared
+            ._proxy
+            .as_ref()
+            .expect("a vendor tool starts the proxy")
+            .local_addr()
+            .port();
+        let host_proxy_url = format!("http://127.0.0.1:{proxy_port}");
+
+        // An unknown placeholder at the proxy: refused, no substitution. This is also the positive
+        // control for the revocation check below — the listener answers now.
+        let bogus = client
+            .post(format!("{host_proxy_url}{path}"))
+            .header("authorization", "Bearer mxp-mcp-not-registered-anywhere")
+            .json(&serde_json::json!({"jsonrpc": "2.0", "id": 9, "method": "tools/list", "params": {}}))
+            .send()
+            .await
+            .expect("the proxy listener must answer on loopback while the job lives");
+        let bogus_status = bogus.status().as_u16();
+        assert_eq!(bogus_status, 502, "NoKnownPlaceholder must be a 502 with no substitution");
+
+        // The real cleanup: capture the diagnostics (redacted with every real value this launch held),
+        // then remove the container.
+        cleanup_job_container(
+            std::mem::replace(&mut container, JobContainer::adopt("unused".into())),
+            &workdir,
+            workdir.join(crate::seller_git::SELLER_RUN_LOG),
+            prepared.forwarded_secrets.clone(),
+            CleanupPolicy::CaptureThenRemove,
+        )
+        .await;
+        container.settle();
+        let diagnostics = root.join("seller-diagnostics");
+        absent.assert_absent_from_tree(&diagnostics);
+
+        // Job end is revocation: drop the preparation, and the placeholder resolves nowhere.
+        let holder_was = prepared.holder_name.clone();
+        drop(prepared);
+        let revoked = client
+            .post(format!("{host_proxy_url}{path}"))
+            .header("authorization", format!("Bearer {placeholder}"))
+            .json(&serde_json::json!({"jsonrpc": "2.0", "id": 10, "method": "tools/list", "params": {}}))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await;
+        // The same listener that answered the unknown placeholder a moment ago now refuses the
+        // connection: the port is closed, not merely the credential forgotten.
+        let revoked_ok = revoked.is_err();
+
+        let summary = serde_json::json!({
+            "acceptance": "A - bridge in the sandbox image, real vendor, real proxy, real launch argv",
+            "vendor_url": inputs.url,
+            "image": inputs.image,
+            "image_id": inspected["Image"],
+            "network_mode": inspected["NetworkMode"],
+            "netns_holder": holder_was,
+            "server_name": server_name,
+            "tool_count": tools.len(),
+            "tools": tools,
+            "login": login,
+            "placeholder": placeholder,
+            "bypass_status_at_vendor": bypass_status,
+            "proxy_address_for_the_container": proxy_url,
+            "unknown_placeholder_status_at_proxy": bogus_status,
+            "placeholder_revoked_at_job_end": revoked_ok,
+            "credential_absent_from": ["session entry", "container env", "docker argv", "docker inspect", "transcript", "diagnostics capture"],
+        });
+        write_evidence(evidence, "a-summary.json", &serde_json::to_string_pretty(&summary).unwrap());
+        write_evidence(evidence, "a-transcript.txt", &transcript_text);
+        write_evidence(evidence, "a-container-inspect.json", &inspected_text);
+        for file in walk(&diagnostics) {
+            let name = format!("a-diagnostics-{}", file.file_name().unwrap().to_string_lossy());
+            write_evidence(evidence, &name, &String::from_utf8_lossy(&std::fs::read(&file).unwrap()));
+        }
+        if let Some(dir) = evidence {
+            absent.assert_absent_from_tree(dir);
+        }
+        assert!(revoked_ok, "after job end the placeholder must resolve nowhere");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Acceptance B — the production path end to end: a REAL agent turn (`claude-agent-acp` in the
+    /// sandbox image) whose session carries the vendor tool, driven by `run_agent_job` exactly as an
+    /// awarded job is. The agent must call the vendor tool through the bridge and report what the
+    /// vendor said. Needs the agent's own credential in this process's environment
+    /// (`CLAUDE_CODE_OAUTH_TOKEN`, contained by the same proxy).
+    #[cfg(feature = "acp")]
+    #[ignore = "needs docker, the sandbox image, egress, a real read-only vendor credential, and an agent credential"]
+    #[tokio::test]
+    async fn live_b_a_real_agent_turn_uses_the_vendor_tool_through_the_swap() {
+        let inputs = live_inputs();
+        let absent = Absent::read(&inputs.credential_file);
+        let evidence = inputs.evidence_dir.as_deref();
+        assert!(
+            FORWARDED_AGENT_ENV.iter().any(|name| std::env::var(name).is_ok_and(|v| !v.trim().is_empty())),
+            "an agent credential (e.g. CLAUDE_CODE_OAUTH_TOKEN) must be in this process's environment"
+        );
+        let expected_login = inputs
+            .expect_login
+            .clone()
+            .expect("MAXPLAYER_MCP_LIVE_EXPECT_LOGIN must name the credential owner's login for acceptance B");
+        let config = live_config(&inputs);
+        let policy = SandboxPolicy::from_config(Some(&config)).expect("the live config resolves");
+        let (root, workdir) = live_workdir("b");
+        let identity = DeliveryAgentIdentity::for_seller(&"e".repeat(64));
+        crate::seller_git::init_empty_delivery_workdir_off_runtime(workdir.clone(), identity.clone())
+            .await
+            .expect("init the job workdir");
+
+        let prompt = "You have an MCP server named `github`. Call its `get_me` tool once. Then reply with \
+                      exactly one line in the form `login=<the login field from the tool result>` and nothing \
+                      else. Do not create, edit or delete any file. Do not call any other tool.";
+        let report = run_agent_job(
+            &["claude-agent-acp".to_owned()],
+            &policy,
+            prompt,
+            &workdir,
+            &identity,
+            AgentRunTimeout::JobDeadline(Duration::from_secs(420)),
+        )
+        .await
+        .expect("the agent turn completes");
+        let message = report.last_agent_message.clone().unwrap_or_default();
+        absent.assert_absent_from("the agent's message", &message);
+
+        // Everything the run left on disk: the run log, the diagnostics capture, the workdir.
+        absent.assert_absent_from_tree(&root);
+        let diagnostics = root.join("seller-diagnostics");
+
+        // The agent's whole reply, as the run log recorded it. The driver captures ONE message at a
+        // time and a harness streams its reply in chunks, so the last message alone may be a
+        // fragment; the run log has every chunk in order.
+        let run_log = workdir.join(crate::seller_git::SELLER_RUN_LOG);
+        let run_log_text = std::fs::read_to_string(&run_log).unwrap_or_default();
+        let reply: String = run_log_text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| event["payload"]["type"] == serde_json::json!("agent.message"))
+            .filter_map(|event| event["payload"]["data"]["text"].as_str().map(str::to_owned))
+            .collect();
+
+        // The ACP wire the real cleanup captured from the container (`logs.txt`): the agent's own
+        // account of calling the vendor tool, and the vendor's answer coming back through it.
+        let wire = walk(&diagnostics)
+            .into_iter()
+            .filter(|file| file.file_name().is_some_and(|name| name == "logs.txt"))
+            .map(|file| std::fs::read_to_string(&file).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tool_call_on_wire = wire.contains("mcp__github__get_me");
+        let vendor_answer_on_wire = wire.contains(&format!("\\\"login\\\":\\\"{expected_login}\\\""));
+        let summary = serde_json::json!({
+            "acceptance": "B - a real claude-agent-acp turn in the sandbox image, vendor tool on the session",
+            "vendor_url": inputs.url,
+            "image": inputs.image,
+            "network": inputs.network,
+            "expected_login": expected_login,
+            "agent_reply": reply,
+            "last_agent_message": message,
+            "tool_call_on_the_acp_wire": tool_call_on_wire,
+            "vendor_answer_on_the_acp_wire": vendor_answer_on_wire,
+            "usage": report.usage,
+            "credential_absent_from": ["agent reply", "run log", "diagnostics capture (inspect, logs, event log)", "workdir"],
+        });
+        write_evidence(evidence, "b-summary.json", &serde_json::to_string_pretty(&summary).unwrap());
+        for file in walk(&diagnostics) {
+            let name = format!("b-diagnostics-{}", file.file_name().unwrap().to_string_lossy());
+            write_evidence(evidence, &name, &String::from_utf8_lossy(&std::fs::read(&file).unwrap()));
+        }
+        let run_log = workdir.join(crate::seller_git::SELLER_RUN_LOG);
+        if run_log.exists() {
+            write_evidence(evidence, "b-seller-run.jsonl", &String::from_utf8_lossy(&std::fs::read(&run_log).unwrap()));
+        }
+        if let Some(dir) = evidence {
+            absent.assert_absent_from_tree(dir);
+        }
+        assert!(tool_call_on_wire, "the agent must have called the vendor tool through the session's MCP server");
+        assert!(vendor_answer_on_wire, "the vendor's answer must have come back through the bridge to the agent");
+        assert!(
+            reply.contains(&format!("login={expected_login}")),
+            "the agent must report the vendor's answer, got: {reply:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

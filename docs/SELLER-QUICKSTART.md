@@ -868,26 +868,32 @@ network = "maxplayer-jobs"
 proxy_port_range = "9100-9199"      # required with network: the pinhole is how the job reaches the proxy
 
 [[sandbox.mcp_tools]]
-name = "github"                                # the MCP server name the agent sees
-url = "https://api.githubcopilot.com/mcp/"     # the vendor's MCP endpoint
+name = "github"                                      # the MCP server name the agent sees
+url = "https://api.githubcopilot.com/mcp/readonly"   # the vendor's MCP endpoint; GitHub's read-only one
 credential = { path = "/home/seller/.config/maxplayer/github-mcp.json", field = "token" }
-# transport = "stdio"                          # default: the bridge in the image. "http" only for claude
+# transport = "stdio"                                # default: the bridge in the image. "http" only for claude
 ```
+
+Prefer a vendor endpoint that itself limits the operations when the token is read-only: GitHub's
+`/mcp/readonly` lists only read tools. The endpoint bounds the operations, the token bounds the
+permissions, the proxy bounds the destination.
 
 The credential file is JSON with one top-level string field, mode `0600`, owned by the daemon's
 user: `{"token": "github_pat_…"}`. Use an absolute path. Never put the credential in `config.toml`
 or on a command line. The seller boot line reports each tool:
 
 ```text
-seller node: [sandbox] mcp_tools: github -> https://api.githubcopilot.com/mcp/ through the credential proxy (stdio bridge); credential file /home/seller/.config/maxplayer/github-mcp.json reads
+seller node: [sandbox] mcp_tools: github -> https://api.githubcopilot.com/mcp/readonly through the credential proxy (stdio bridge); credential file /home/seller/.config/maxplayer/github-mcp.json reads
 ```
 
 A line that says `UNREADABLE` means every job would fail to reach the tool; fix the file first. A
 credential file that cannot be read at job time fails that job before any proxy listens — nothing
 falls back to putting the real value in the container.
 
-Status: the wiring is tested against synthetic fakes. The first real-vendor acceptance run (GitHub)
-is pending; see `docs/specs/seller-tool-onboarding/10-routing-and-options.md`.
+Status: accepted against GitHub's remote MCP server on 2026-09-14, through the real proxy, the
+sandbox image, and a real agent turn; the bundle is `evidence/20260914T085619Z-github-proxy-swap/`. See
+`docs/specs/seller-tool-onboarding/10-routing-and-options.md`. Another vendor is another
+acceptance run.
 
 ### `launcher` mode — only if this box cannot run docker
 

@@ -2263,10 +2263,10 @@ fn documented_config_toml(config: &MaxplayerConfig) -> Result<String, HomeError>
 # proxy constrains the destination, not the operations. Repeat the table for
 # each tool. Docs: docs/specs/seller-tool-onboarding/10-routing-and-options.md
 #   [[sandbox.mcp_tools]]
-#   name = "github"                                # the MCP server name the agent sees
-#   url = "https://api.githubcopilot.com/mcp/"     # the vendor's MCP endpoint
+#   name = "github"                                      # the MCP server name the agent sees
+#   url = "https://api.githubcopilot.com/mcp/readonly"   # the vendor's MCP endpoint; GitHub's read-only one
 #   credential = { path = "/ABSOLUTE/path/github-mcp.json", field = "token" }  # host file, never mounted
-#   # transport = "stdio"                          # default; "http" only for a harness that maps it (claude)
+#   # transport = "stdio"                                # default; "http" only for a harness that maps it (claude)
 #
 # Option B - docker on macOS. Docker Desktop cannot load runsc, so OMIT the
 # runtime line; the platform VM is the boundary. Otherwise identical to A.

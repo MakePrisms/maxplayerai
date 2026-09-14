@@ -568,6 +568,7 @@ fn a_job_launched_through_the_policy_is_contained_and_an_uncontained_one_is_not(
                 uid: 0,
                 gid: 0,
                 netns: None,
+                mcp_servers: &[],
             },
         )
         .expect("the policy must build a launch");
@@ -592,6 +593,7 @@ fn a_job_launched_through_the_policy_is_contained_and_an_uncontained_one_is_not(
                 uid: 0,
                 gid: 0,
                 netns: Some(&canary.fixture.holder),
+                mcp_servers: &[],
             },
         )
         .expect("the policy must build a launch");

@@ -7567,6 +7567,7 @@ impl SellerNodeRunner {
             uid: prepared.uid,
             gid: prepared.gid,
             netns: prepared.holder_name.as_deref(),
+            mcp_servers: &prepared.mcp_servers,
         };
         let launch = sandbox
             .launch_with_mounts(
