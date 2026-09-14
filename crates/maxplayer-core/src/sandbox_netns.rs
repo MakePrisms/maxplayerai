@@ -69,6 +69,25 @@ pub const HOLDER_SEAT_LABEL: &str = "ai.maxplayer.netns-holder-seat";
 /// wait is the state in which cancellation leaves work nobody owns.
 pub const DOCKER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Environment override naming the `docker` client this process spawns.
+///
+/// Unset in production, where every spawn is the plain `docker` on `PATH`. It exists so the
+/// PRODUCTION functions — [`establish`] itself, its cleanup, its absence checks — can be exercised
+/// end to end without a daemon, instead of being approximated by a fixture that re-implements what
+/// they do. A test that drives a stand-in client runs the real control flow: the real ordering of
+/// adopt, fence, create, apply, read back, and the real cancellation and cleanup behaviour.
+///
+/// Deliberately NOT under the `MAXPLAYER_` prefix. That prefix is reserved for config: the
+/// environment layer maps every `MAXPLAYER_*` variable to a config field and refuses an unknown one
+/// fail-closed. A seam named there is not merely untidy — it makes config bootstrap fail for any
+/// process that sets it, which is how this was caught: 14 unrelated tests refused to start.
+const DOCKER_BIN_ENV: &str = "MX_SANDBOX_DOCKER_BIN";
+
+/// The docker client to spawn: the override when set, otherwise `docker`.
+fn docker_program() -> String {
+    std::env::var(DOCKER_BIN_ENV).unwrap_or_else(|_| "docker".to_owned())
+}
+
 /// A running holder container, and the guarantee that it goes away.
 ///
 /// Constructed **before** the container does, so that every `?` — and every cancellation — after
@@ -259,7 +278,7 @@ impl NetnsHolder {
     ///
     /// `Ok(())` means docker reported the removal, or reported that there was nothing to remove.
     fn force_remove(name: &str) -> Result<(), String> {
-        let mut child = std::process::Command::new("docker")
+        let mut child = std::process::Command::new(docker_program())
             .args(["rm", "--force", "--volumes", name])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
@@ -899,18 +918,49 @@ async fn run_bounded(
 
 /// As [`run_bounded`], and also says whether the docker CLIENT was reaped with an exit status.
 ///
-/// That second fact is custody, not diagnostics. `docker run --rm` removes the container when its
-/// client exits — including on a nonzero exit — so a reaped child is proof the container is gone. A
-/// client killed on our deadline, killed by a signal, or never waited for at all proves nothing of
-/// the kind: the daemon may still be creating, running, or removing that container. Treating those
-/// two cases alike is what allowed a sidecar to be struck off the cleanup registry while it existed.
+/// **That flag is not a removal receipt, and nothing downstream may read it as one.** It says one
+/// narrow thing: this process waited for the client and got a status back. It is `true` for a clean
+/// exit, a nonzero exit, AND a signal-terminated client — every case where `try_wait` yields a
+/// status — because all of them mean the same thing here, that the client is no longer running.
+///
+/// What it deliberately does NOT mean is that the container is gone. `docker run --rm` asks the
+/// daemon to remove the container on the container's own lifecycle; it is not discharged by this
+/// process reaping a local client, and on an error path the removal may never have been reached.
+/// Promoting "reaped" to "removed" here is what struck live containers off the registry that exists
+/// to remove them. The only thing entitled to end custody is a daemon-side absence check — see
+/// [`run_sidecar_confirmed`] and [`container_is_absent`].
+///
+/// A client that was never reaped at all (deadline kill before a status, a panicked task) yields
+/// `false`, which is weaker still: not even worth asking the daemon about yet.
 #[cfg(feature = "acp")]
 async fn run_bounded_tracked(
     argv: Vec<String>,
     stdin: Option<String>,
     deadline: std::time::Duration,
 ) -> (Result<(String, String), String>, bool) {
+    run_bounded_tracked_fenced(argv, stdin, deadline, None).await
+}
+
+/// As [`run_bounded_tracked`], optionally holding a [`CreationTicket`] for the duration of the
+/// blocking work.
+///
+/// The ticket exists because registering a name is not the same as fencing a create. Registration
+/// tells cleanup WHAT to remove; it says nothing about WHEN the container appears. A sidecar create
+/// still in flight when the holder drops would be removed by name, answered "No such container"
+/// because it does not exist yet, marked done — and would then land as an orphan pinning the very
+/// namespace the holder was trying to tear down.
+///
+/// As in [`run_docker_fenced`], the ticket is moved INTO the closure and never held by this future,
+/// so cancelling the future cannot release it while the create is still running.
+#[cfg(feature = "acp")]
+async fn run_bounded_tracked_fenced(
+    argv: Vec<String>,
+    stdin: Option<String>,
+    deadline: std::time::Duration,
+    ticket: Option<CreationTicket>,
+) -> (Result<(String, String), String>, bool) {
     let joined = tokio::task::spawn_blocking(move || {
+        let _ticket = ticket;
         let mut child_exited = false;
         let outcome = run_bounded_blocking(argv, stdin, deadline, &mut child_exited);
         (outcome, child_exited)
@@ -936,6 +986,10 @@ fn run_bounded_blocking(
         use std::process::{Command, Stdio};
 
         let (program, args) = argv.split_first().expect("an argv is never empty");
+        // Substituted at the SPAWN site, not in the argv builders: every rendered argv still reads
+        // `docker ...`, so what the plan tests assert is what production runs.
+        let program = if program == "docker" { docker_program() } else { program.clone() };
+        let program = program.as_str();
         let mut child = Command::new(program)
             .args(args)
             .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
@@ -974,8 +1028,11 @@ fn run_bounded_blocking(
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
-        // Reaped with a status. From here on, the container's removal is `--rm`'s guarantee; before
-        // this line it is an assumption, and that is the whole distinction this flag carries.
+        // Reaped with a status — ANY status, including a signal termination, which `code()` reports
+        // as `None` below. This flag means only "the client is no longer running", never "the
+        // container is gone": `--rm` is discharged by the daemon on the container's lifecycle, not
+        // by this process waiting on a client. The caller must still confirm absence with the
+        // daemon before ending custody.
         *child_exited = true;
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -1092,7 +1149,12 @@ async fn run_sidecar_confirmed(
     // Registered BEFORE the command starts: a cancellation between these two lines must still leave
     // a cleanup target behind, and registering afterwards would not.
     let mut registration = holder.watch_sidecar(name.clone());
-    let (outcome, child_exited) = run_bounded_tracked(argv, stdin, deadline).await;
+    // Registration says WHAT to remove; the ticket says WHEN it is safe to. Without it, a holder
+    // dropped while this create is in flight removes the name, is told "No such container" because
+    // the container does not exist YET, treats that as done — and the create then lands as an
+    // orphan pinning the namespace. Moved into the blocking closure, never held by this future.
+    let (outcome, child_exited) =
+        run_bounded_tracked_fenced(argv, stdin, deadline, Some(holder.fence_creation())).await;
     // Reaching this line at all proves the command is no longer in flight: a cancellation drops the
     // future before it, so a cancelled command's name stays a cleanup target.
     //
@@ -1118,7 +1180,7 @@ async fn run_sidecar_confirmed(
 /// answering, an unrecognised error — is `None`, which keeps custody.
 #[cfg(feature = "acp")]
 fn container_is_absent(name: &str) -> Option<bool> {
-    let mut child = std::process::Command::new("docker")
+    let mut child = std::process::Command::new(docker_program())
         .args(["inspect", "--type", "container", "--format", "{{.Id}}", name])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -2104,6 +2166,299 @@ mod tests {
             );
             std::mem::forget(holder);
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A SIGNAL-terminated client is reaped too, and must still not end custody on its own.
+    ///
+    /// The R3 verdict named this case precisely: `try_wait` yields a status for a signalled child
+    /// just as it does for an ordinary exit, so `child_exited` is `true` here, while `code()`
+    /// returns `None` and the call reports "killed by a signal". The old comments promised that
+    /// signal failures retain custody; the old code did not deliver it, because the flag alone was
+    /// allowed to release the name.
+    ///
+    /// This is the sharpest form of "reaped is not removed": a client killed mid-flight tells us
+    /// nothing whatever about whether the daemon created, is running, or removed that container.
+    /// Custody is kept unless the daemon itself says the container is gone.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_signal_killed_client_does_not_end_custody_by_itself() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("mx-signal-custody-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let suicide = dir.join("suicide");
+        // Kills ITSELF with SIGKILL: reaped with a status, but `code()` is None.
+        std::fs::write(&suicide, "#!/bin/sh\nkill -9 $$\n").expect("write suicide");
+        std::fs::set_permissions(&suicide, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        fn still_present(_name: &str) -> Option<bool> {
+            Some(false)
+        }
+
+        let holder = NetnsHolder::adopt("maxplayer-netns-signal-custody".into());
+        let outcome = run_sidecar_confirmed(
+            &holder,
+            "iface",
+            vec![suicide.to_string_lossy().into_owned(), "run".to_owned()],
+            None,
+            std::time::Duration::from_secs(10),
+            still_present,
+        )
+        .await;
+
+        let error = outcome.expect_err("a signalled client is a failure");
+        assert!(
+            error.contains("killed by a signal"),
+            "this must exercise the signal path, not an ordinary nonzero exit: {error}"
+        );
+        assert_eq!(
+            holder.sidecars.lock().expect("registry").len(),
+            1,
+            "a signal-killed client proves nothing about the container; custody must be kept"
+        );
+
+        std::mem::forget(holder);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── The production path itself ────────────────────────────────────────────────────────────
+    //
+    // Everything above tests a helper. These two drive `establish` — the function production calls,
+    // with its real ordering of adopt, fence, create, apply and cleanup — against a stand-in docker
+    // client, because the fault these close is precisely that a fixture was standing in for the
+    // production path and could agree with a bug the production path does not survive.
+
+    /// [`DOCKER_BIN_ENV`] is process-global, so the tests that set it run one at a time.
+    #[cfg(feature = "acp")]
+    static DOCKER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A stand-in `docker` that answers `establish`'s sequence and records what it was asked.
+    ///
+    /// Writes the applier's stdin to `stdin.txt` and every removed name to `rm.log`, so a test can
+    /// assert on what production actually sent rather than on what it believes production sends.
+    #[cfg(feature = "acp")]
+    fn stand_in_docker(work: &std::path::Path, create_delay: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let script = work.join("docker");
+        let body = r#"#!/bin/sh
+WORK="__WORK__"
+case "$*" in
+  *"--entrypoint getent"*)
+    echo "203.0.113.77   STREAM host.docker.internal"
+    exit 0
+    ;;
+  *"inspect --type container"*)
+    echo "Error response from daemon: No such container" >&2
+    exit 1
+    ;;
+  *"rm --force --volumes"*)
+    for a in "$@"; do last="$a"; done
+    echo "$last" >> "$WORK/rm.log"
+    exit 0
+    ;;
+  *--detach*)
+    : > "$WORK/creating"
+    __DELAY__
+    echo deadbeefcafe
+    exit 0
+    ;;
+esac
+cat > "$WORK/stdin.txt"
+echo 0
+exit 0
+"#
+        .replace("__WORK__", &work.to_string_lossy())
+        .replace("__DELAY__", create_delay);
+        std::fs::write(&script, body).expect("write stand-in docker");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        script
+    }
+
+    #[cfg(feature = "acp")]
+    fn stand_in_work_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("mx-establish-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("work dir");
+        dir
+    }
+
+    /// The address `establish` MEASURES is the address its rendered policy pinholes.
+    ///
+    /// The single-source property was only ever asserted against a hand-built `NetPolicy`. That
+    /// cannot catch the failure that matters: `establish` measuring one address and rendering the
+    /// plan from another, which produces a job whose firewall permits a proxy it is not pointed at,
+    /// or points at a proxy its firewall drops. Here the measurement comes from the stand-in client
+    /// and the assertion is made on the bytes production actually sent to the applier.
+    ///
+    /// The run ends at the applier's count cross-check, which is the point of interest: reaching it
+    /// proves the probe, the fenced holder create and the plan render all ran in production order.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_address_establish_measures_is_the_address_its_plan_pinholes() {
+        let _serial = DOCKER_ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let work = stand_in_work_dir("proxy");
+        let script = stand_in_docker(&work, "");
+
+        unsafe { std::env::set_var(DOCKER_BIN_ENV, &script) };
+        let outcome = establish(
+            "mx-scratch",
+            "holder:local",
+            "sidecar:local",
+            "host.docker.internal",
+            "proxy-route",
+            "seat",
+            1000,
+            1000,
+            Some(crate::sandbox_net::PortRange::new(9000, 9002).expect("valid range")),
+            false,
+            vec!["10.0.0.53".to_owned()],
+        )
+        .await;
+        unsafe { std::env::remove_var(DOCKER_BIN_ENV) };
+
+        let error = outcome.expect_err("the stand-in applier reports a short count");
+        assert!(
+            error.contains("containment is incomplete"),
+            "the run must reach the applier's count cross-check, not fail earlier: {error}"
+        );
+
+        let plan = std::fs::read_to_string(work.join("stdin.txt"))
+            .expect("production sent a plan to the applier");
+        assert!(
+            plan.contains("203.0.113.77"),
+            "the plan must pinhole the address establish measured, not some other one:\n{plan}"
+        );
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// A CANCELLED `establish` does not leave the container it created behind.
+    ///
+    /// Cancellation mid-create is the production shape of the delayed-create race: the future is
+    /// dropped while the blocking create is still running, and a cleanup that races it issues a
+    /// remove for a container that does not exist yet. The container then arrives, unowned, pinning
+    /// a namespace with nobody left to remove it.
+    ///
+    /// Two assertions, and both are needed: cleanup must OUTLAST the create (otherwise the removal
+    /// it issued named nothing), and it must actually name the holder (otherwise it waited and then
+    /// removed nothing).
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cancelled_establish_outlasts_its_create_and_removes_the_holder() {
+        let _serial = DOCKER_ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let work = stand_in_work_dir("cancel");
+        let script = stand_in_docker(&work, "sleep 1");
+
+        unsafe { std::env::set_var(DOCKER_BIN_ENV, &script) };
+        let mut establishing = Box::pin(establish(
+            "mx-scratch",
+            "holder:local",
+            "sidecar:local",
+            "host.docker.internal",
+            "cancelled-establish",
+            "seat",
+            1000,
+            1000,
+            None,
+            false,
+            vec!["10.0.0.53".to_owned()],
+        ));
+
+        // Cancel on the CREATE ITSELF, not on a stopwatch. A fixed deadline raced the probe and
+        // cancelled before the create had begun, which measures nothing: the marker is written by
+        // the stand-in as the create starts, so the drop below always lands mid-create.
+        let marker = work.join("creating");
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !marker.exists() {
+            tokio::select! {
+                _ = establishing.as_mut() => panic!("establish cannot finish against this client"),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
+            }
+            assert!(std::time::Instant::now() < give_up, "the create never started");
+        }
+
+        let started = std::time::Instant::now();
+        drop(establishing); // the cancellation under test; the holder's cleanup runs in here
+        let elapsed = started.elapsed();
+        unsafe { std::env::remove_var(DOCKER_BIN_ENV) };
+
+        assert!(
+            elapsed >= std::time::Duration::from_millis(700),
+            "cancellation returned in {elapsed:?}, while the create it had to outlast was still \
+             running: the container arrives afterwards with nobody holding it"
+        );
+
+        let removed = std::fs::read_to_string(work.join("rm.log")).unwrap_or_default();
+        assert!(
+            removed.contains("cancelled-establish"),
+            "a cancelled establish must remove the holder it created, got {removed:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// The same delayed-create failure, reproduced on the **sidecar** path rather than the holder's.
+    ///
+    /// This is the half that registration alone does not cover, and the distinction the R3 verdict
+    /// drew: pre-registering the name tells cleanup WHAT to remove and nothing about WHEN the
+    /// container appears. A sidecar create still in flight when the holder drops gets removed by
+    /// name, answered "No such container" because it does not exist yet, and marked done — then it
+    /// lands, pinning the namespace the holder was tearing down.
+    ///
+    /// The future is genuinely CANCELLED here (dropped by `timeout`) while its blocking work runs
+    /// on, which is the real shape of the bug: cancelling the future must not release the fence.
+    /// Remove the `Some(holder.fence_creation())` argument in `run_sidecar_confirmed` and this
+    /// fails, because `Drop` returns while the create is still running.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sidecar_create_still_in_flight_fences_cleanup() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("mx-sc-fence-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let slow = dir.join("slow");
+        std::fs::write(&slow, "#!/bin/sh\nsleep 1\n").expect("write slow");
+        std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        fn never_asked(_name: &str) -> Option<bool> {
+            panic!("a cancelled create must not reach the absence check")
+        }
+
+        let holder = NetnsHolder::adopt("maxplayer-netns-sidecar-fence".into());
+
+        // Cancel the future ~100ms in, leaving roughly 900ms of blocking create still running.
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            run_sidecar_confirmed(
+                &holder,
+                "iface",
+                vec![slow.to_string_lossy().into_owned(), "run".to_owned()],
+                None,
+                std::time::Duration::from_secs(10),
+                never_asked,
+            ),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the future must have been cancelled, not completed");
+        assert_eq!(
+            holder.sidecars.lock().expect("registry").len(),
+            1,
+            "a cancelled create must leave its name a cleanup target"
+        );
+
+        let started = std::time::Instant::now();
+        drop(holder);
+        let waited = started.elapsed();
+
+        assert!(
+            waited >= std::time::Duration::from_millis(400),
+            "cleanup returned in {waited:?}, while the sidecar create it had to outlast was still \
+             running: every remove it issued named a container that did not exist yet, and the one \
+             that arrives afterwards pins the namespace with nobody holding it"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

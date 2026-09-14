@@ -454,9 +454,44 @@ pub fn corroborate(base: &std::path::Path, matrix: &SavedMatrix) -> Result<(), V
             continue;
         }
         let path = base.join(relative);
+        // The check above is LEXICAL, and lexical confinement is not confinement: `raw/green.log`
+        // contains no `..` and is not absolute, and can still be a symlink to another run's log, or
+        // to anywhere on the host. Resolving both sides and requiring the result to stay under the
+        // record's own directory is what actually binds the evidence to this run.
+        //
+        // Resolution also fixes the file: what is read below is the path that was just checked, so a
+        // link cannot be swapped for one that passes and then read as one that would not.
+        let resolved = match (std::fs::canonicalize(base), std::fs::canonicalize(&path)) {
+            (Ok(root), Ok(target)) => {
+                if !target.starts_with(&root) {
+                    problems.push(format!(
+                        "case {}: log {:?} resolves to {}, outside the record's own directory {} \
+                         — evidence that reaches outside the run is not attributable to it, and a \
+                         relative-looking path that resolves away is exactly how that happens",
+                        case.id,
+                        case.log,
+                        target.display(),
+                        root.display()
+                    ));
+                    continue;
+                }
+                target
+            }
+            // An unresolvable path is the ABSENT-log case, not the escaping one, and it keeps the
+            // wording the absent case already had: a cited log that is not there is a missing gate.
+            _ => {
+                problems.push(format!(
+                    "case {}: named log {} could not be read (path does not resolve) — a cited log \
+                     that is not there is a missing gate, not an absent one",
+                    case.id,
+                    path.display()
+                ));
+                continue;
+            }
+        };
         let text = match sources.get(&case.log) {
             Some(text) => text.clone(),
-            None => match std::fs::read_to_string(&path) {
+            None => match std::fs::read_to_string(&resolved) {
                 Ok(text) => {
                     sources.insert(case.log.clone(), text.clone());
                     text
@@ -823,5 +858,46 @@ mod tests {
             corroborate(&dir, &escaping).expect_err("a log outside the run is not its evidence");
         assert!(problems[0].contains("inside the record's own directory"), "{}", problems[0]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A log that LOOKS local and resolves elsewhere is refused.
+    ///
+    /// The R3 verdict named this exactly: the confinement check was lexical, not symlink
+    /// confinement. `raw/green.log` is neither absolute nor contains `..`, so it passes every
+    /// textual test — and can still be a link to another run's green log, or to anywhere on the
+    /// host. Lexical checks are the ones an attacker-shaped mistake walks straight around, and here
+    /// the "attacker" is just a copied directory or a convenience symlink someone left behind.
+    ///
+    /// The positive control matters as much as the refusal: a REGULAR file at the same path must
+    /// still corroborate, or this check would be indistinguishable from one that refuses everything.
+    #[test]
+    fn a_log_that_is_a_symlink_out_of_the_record_directory_is_refused() {
+        let (dir, matrix) = matrix_with_logs(
+            "running 1 test\ntest sandbox_netns_live::{test} ... ok\n\ntest result: ok. 1 passed\n",
+        );
+        assert_eq!(corroborate(&dir, &matrix), Ok(()), "positive control: a real local log passes");
+
+        // Somewhere else entirely, holding a log that would corroborate if it were followed.
+        let outside = std::env::temp_dir().join(format!("mx-outside-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        let elsewhere = outside.join("green.log");
+        let named = &matrix.cases[0].log;
+        let local = dir.join(named);
+        std::fs::copy(&local, &elsewhere).expect("a green log outside the record directory");
+
+        // Replace the local log with a link to it. The recorded path does not change at all.
+        std::fs::remove_file(&local).expect("remove the real log");
+        std::os::unix::fs::symlink(&elsewhere, &local).expect("symlink");
+
+        let problems = corroborate(&dir, &matrix)
+            .expect_err("a log resolving outside the record directory is not its evidence");
+        assert!(
+            problems[0].contains("outside the record's own directory"),
+            "the refusal must name the escape, not some other complaint: {}",
+            problems[0]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }
