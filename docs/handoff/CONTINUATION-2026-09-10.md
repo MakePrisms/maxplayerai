@@ -243,7 +243,11 @@ apply.
   `initialize`, `Accept: application/json, text/event-stream`, notifications draw no reply, a
   malformed line is answered locally.
 
-### Status of the gates (2026-09-11, evening)
+### Status of the gates (closed 2026-09-14)
+
+All gates are green. The two that could not run on 2026-09-11 ran on 2026-09-14, after the
+Docker Desktop registry client came back on its own (the host had been under a load average above
+80 that evening; the machine was rebooted in between).
 
 | Gate | Result |
 | --- | --- |
@@ -251,36 +255,16 @@ apply.
 | `cargo test -p maxplayer-core --features acp --locked --offline` | 469 pass, 1 ignored. |
 | `cargo test -p maxplayer-core --features wallet --locked --offline` | 1510 pass in the lib, all integration binaries pass. |
 | `cargo test -p maxplayer-core --features wallet,acp --locked --offline` | 1575 pass in the lib, all integration binaries pass. Includes the 16 `mcp_tool_tests`. |
+| `cargo test -p maxplayer --locked --offline` | 161 pass. |
+| `cargo test -p maxplayer --features acp,wallet --locked --offline` | 199 pass, 1 ignored. Includes `sandbox_image_check_is_wired_into_the_boot_gate`, which needs Docker. |
 | `cargo test -p maxplayer-tool-kit` | 52 pass. |
 | `cargo clippy -p maxplayer-tool-kit --all-targets` | Clean. |
 | `cargo clippy -p maxplayer-core --features wallet,acp --all-targets` | No new warning in the changed files; the pre-existing ones stand. |
-| `cargo test -p maxplayer` (default and `acp,wallet`) | 160 and 198 pass; ONE test fails, see below. |
-| `cargo build -p maxplayer-tool-kit --bin mcp-http-bridge --locked` | Builds; the bridge exits 2 with a usage error when run without config. |
-| `docker build -f docker/maxplayer-sandbox/Dockerfile …` | NOT VERIFIED, see below. |
+| `docker build -f docker/maxplayer-sandbox/Dockerfile -t maxplayer-sandbox:mcp-bridge .` | Builds (rc 0; the builder stage compiled `mcp-http-bridge` under the workspace lockfile). |
+| `docker run --rm --entrypoint /usr/local/bin/mcp-http-bridge maxplayer-sandbox:mcp-bridge` | Exits 2 with the usage line, as designed; `maxplayer --version` in the same image reports commit `e1bbb0e`. |
 
-Two items are not verified, both for the same environmental reason. On this machine, on the
-evening of 2026-09-11, the Docker Desktop daemon's registry client hangs: `docker pull`, the
-BuildKit step `resolve image config for docker.io/docker/dockerfile:1`, and `docker manifest
-inspect` all block without an answer, while `curl` from the host and `wget` from inside a container
-reach the registry in under a second. Two graceful `docker desktop restart`s did not clear it, and
-the host was under a load average above 80 from unrelated macOS daemons.
-
-1. **The sandbox image build.** The Dockerfile change is two lines in the builder stage and one
-   `COPY` in the final stage; the cargo line it adds is proven locally under the same lockfile.
-   Verify with:
-
-   ```sh
-   docker build -f docker/maxplayer-sandbox/Dockerfile -t maxplayer-sandbox:mcp-bridge .
-   docker run --rm --entrypoint /usr/local/bin/mcp-http-bridge maxplayer-sandbox:mcp-bridge; echo "rc=$?"   # expect rc=2 and a usage line
-   ```
-2. **`doctor::tests::sandbox_image_check_is_wired_into_the_boot_gate`** in the `maxplayer` crate.
-   It runs `docker manifest inspect` against an unresolvable host and expects a fast failure; with
-   the registry client hung it does not get one. The change here touched only a struct literal in
-   that file. Re-run it when docker answers:
-
-   ```sh
-   cargo test -p maxplayer --features acp,wallet --locked --offline sandbox_image_check
-   ```
+The local image tag `maxplayer-sandbox:mcp-bridge` is what a real GitHub run on this machine
+should name in `[sandbox] image`, because the published default image predates the bridge.
 
 ### Next: the real GitHub run
 
