@@ -942,10 +942,21 @@ impl HttpStream {
         } else {
             client_default()
         };
-        // BEFORE the mint, not after it: minting a delivery token calls the signer actor and can
-        // queue there. Work whose turn has been revoked, or whose absolute deadline has passed,
-        // must not even join that queue — the wait is part of the operation's drain, and the whole
-        // point of the bound is that no phase of a dead operation keeps running.
+        // BEFORE the mint, not only after it: minting a delivery token calls the signer actor and
+        // can queue there. A delivery whose authority has ended, whose turn has been revoked, or
+        // whose absolute deadline has passed must not even join that queue — the wait is part of
+        // the operation's drain, and the whole point of the bound is that no phase of a dead
+        // operation keeps running. The post-mint ask below stays: it answers a different question
+        // ("did this delivery end WHILE we waited in that queue?") and neither ask replaces the
+        // other.
+        if let Some(authority) = &self.authority {
+            authority().map_err(|error| {
+                io::Error::other(format!(
+                    "refusing to start a {} leg to {}: {error}",
+                    self.service, self.destination
+                ))
+            })?;
+        }
         if let Some(lifetime) = &self.lifetime {
             lifetime().map_err(|error| {
                 io::Error::other(format!(

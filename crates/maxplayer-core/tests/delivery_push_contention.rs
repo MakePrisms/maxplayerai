@@ -255,8 +255,17 @@ async fn run_delivery(
         &authority,
         journal.clone(),
     );
-    let check = authority.check();
     let id = delivery.id;
+    // The transport's authority gate, observed. The gate itself is the production one — this only
+    // records its refusals in the same journal the minter uses, so a leg refused BEFORE it mints is
+    // as visible to the assertions as one refused after the mint.
+    let check: git_transport::AuthorityCheck = {
+        let inner = authority.check();
+        let refusals = journal.clone();
+        Arc::new(move || {
+            inner().inspect_err(|why: &String| refusals.record(Moment::Refused(id, why.clone())))
+        })
+    };
     let Delivery {
         workdir,
         branch,

@@ -83,6 +83,9 @@ pub enum TurnRelease {
 struct Turn {
     state: AtomicU8,
     cancelled: AtomicBool,
+    /// The supervising side has finished with the turn: it returned, timed out, was cancelled at an
+    /// await, or was dropped. It is NOT "the work stopped".
+    supervisor_done: AtomicBool,
     deadline: Instant,
     ownership: Mutex<Option<Box<dyn Send>>>,
 }
@@ -99,6 +102,25 @@ impl std::fmt::Debug for Turn {
 impl Turn {
     /// Hand the exclusion token back. Dropped OUTSIDE the lock: releasing a mutex guard can wake a
     /// waiter, and a waiter must never wake into this cell.
+    /// Hand the token back only when BOTH sides are finished with the turn: the work has actually
+    /// stopped (or provably never started) AND the supervising side is done with its critical
+    /// section. Either condition alone has already been a bug:
+    ///
+    /// - supervisor alone: the caller stops waiting while the push thread is still on the wire, and
+    ///   the next delivery starts against the same remote (F3/F5);
+    /// - work alone: the blocking operation returns and the turn is gone while the supervising arm
+    ///   is still inside the section the turn is supposed to exclude.
+    ///
+    /// `maybe_release` is called after each side publishes its half with `SeqCst`, so whichever
+    /// side is second sees both halves; `release_ownership` takes the slot, so running it twice is
+    /// harmless.
+    fn maybe_release(&self) {
+        if self.state.load(Ordering::SeqCst) == ENDED && self.supervisor_done.load(Ordering::SeqCst)
+        {
+            self.release_ownership();
+        }
+    }
+
     fn release_ownership(&self) {
         let taken = match self.ownership.lock() {
             Ok(mut slot) => slot.take(),
@@ -127,7 +149,7 @@ impl Turn {
 
     fn end_now(&self) {
         if self.state.swap(ENDED, Ordering::SeqCst) != ENDED {
-            self.release_ownership();
+            self.maybe_release();
         }
     }
 }
@@ -143,6 +165,7 @@ pub fn delivery_turn<O: Send + 'static>(
     let turn = Arc::new(Turn {
         state: AtomicU8::new(PENDING),
         cancelled: AtomicBool::new(false),
+        supervisor_done: AtomicBool::new(false),
         deadline,
         ownership: Mutex::new(Some(Box::new(ownership))),
     });
@@ -165,22 +188,25 @@ impl TurnControl {
     /// work never started.
     ///
     /// `cancelled` is set before the state race, so a `begin` that wins the race still sees the
-    /// revocation in its own immediate check and refuses. Exactly one of the two sides ever releases
-    /// ownership.
+    /// revocation in its own immediate check and refuses.
+    ///
+    /// Calling this also declares the supervising side finished with the turn, which is the truth on
+    /// every path that reaches it: an explicit `end` on timeout, and the `Drop` below. The token is
+    /// handed back here only if the work is finished too.
     pub fn end(&self) -> TurnRelease {
         self.turn.cancelled.store(true, Ordering::SeqCst);
-        match self
+        self.turn.supervisor_done.store(true, Ordering::SeqCst);
+        let release = match self
             .turn
             .state
             .compare_exchange(PENDING, ENDED, Ordering::SeqCst, Ordering::SeqCst)
         {
-            Ok(_) => {
-                self.turn.release_ownership();
-                TurnRelease::NeverStarted
-            }
+            Ok(_) => TurnRelease::NeverStarted,
             Err(RUNNING) => TurnRelease::StillRunning,
             Err(_) => TurnRelease::AlreadyEnded,
-        }
+        };
+        self.turn.maybe_release();
+        release
     }
 
     /// For assertions and operator logging: has the actual work begun?
@@ -378,8 +404,35 @@ mod tests {
         let refused = turn.begin().expect_err("expired work must not begin");
         assert_eq!(refused, WorkEnded::DeadlineExceeded);
         assert!(
+            control.work_ended(),
+            "work refused at admission is finished work"
+        );
+        // The work is finished; the supervising arm is not. The turn is handed back the moment that
+        // side is done too — which for the production wrapper is its own return.
+        control.end();
+        assert!(
             !control.holds_ownership(),
             "work refused at admission holds no turn"
+        );
+    }
+
+    /// The other half of the same rule: the operation finishing does NOT free the turn while the
+    /// arm that supervises it is still inside the section the turn excludes. Release it on the
+    /// work's return alone and the next delivery enters while the previous one is still finishing.
+    #[test]
+    fn finished_work_keeps_the_turn_until_the_supervisor_is_done_too() {
+        let (control, turn) = delivery_turn((), Instant::now() + Duration::from_secs(60));
+        let running = turn.begin().expect("work begins");
+        drop(running);
+        assert!(control.work_ended(), "the work has stopped");
+        assert!(
+            control.holds_ownership(),
+            "the turn stays taken until the supervising side is finished with it"
+        );
+        control.end();
+        assert!(
+            !control.holds_ownership(),
+            "both sides finished: the turn is handed back"
         );
     }
 

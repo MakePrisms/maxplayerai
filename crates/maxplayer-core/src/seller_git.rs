@@ -942,6 +942,22 @@ pub async fn neutralize_then_push_off_runtime(
         // Phase boundary: everything after this is pack generation and the wire.
         work.check()
             .map_err(|ended| SellerGitError::Cancelled(format!("before pushing: {ended}")))?;
+        // The gate the transport asks at every phase boundary answers TWO questions in one, in
+        // this order: is this delivery still entitled to send at all (its own authority, ended by
+        // the delivery arm's `Drop`), and is this work still inside its turn and its absolute
+        // deadline. Composing them here is what makes a phase refusal name the reason that came
+        // first, and keeps one gate to plumb instead of two at every boundary.
+        let work_gate = {
+            let authority = authority.clone();
+            let work = work.checker();
+            let gate: git_transport::AuthorityCheck = std::sync::Arc::new(move || {
+                if let Some(authority) = &authority {
+                    authority()?;
+                }
+                work()
+            });
+            gate
+        };
         push_branch_with_minter(
             &workdir,
             &remote_url,
@@ -949,7 +965,7 @@ pub async fn neutralize_then_push_off_runtime(
             &gated_oid,
             mint,
             authority,
-            Some(work.checker()),
+            Some(work_gate),
         )
     })
     .await
