@@ -7823,6 +7823,9 @@ impl SellerNodeRunner {
             uid: prepared.uid,
             gid: prepared.gid,
             netns: prepared.holder_name.as_deref(),
+            // The same resolver file the agent launch gets, for the same reason: this container runs
+            // real git operations, and under gVisor docker's embedded resolver never answers.
+            resolv_conf: prepared.resolv_conf.as_deref(),
         };
         let launch = sandbox
             .launch_with_mounts(

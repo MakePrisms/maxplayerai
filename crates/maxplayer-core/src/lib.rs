@@ -92,6 +92,20 @@ pub mod relay_auth;
 /// HTTP GET inside it needs `git-delivery`, which is the feature that carries `reqwest`.
 pub mod relay_info;
 pub mod runtime_guard;
+/// The resolver a contained job can actually reach, and the `/etc/resolv.conf` that names it.
+/// Ungated for the same reason as [`sandbox_net`] below: under gVisor a job that cannot resolve
+/// cannot deliver, so where its lookups go is policy, and it is compiled and tested on every build.
+pub mod sandbox_dns;
+/// The live DNS runtime gate: `#[ignore]`d tests that ask a real kernel whether a contained job can
+/// resolve through the file its launch wrote. HARNESS ONLY — no product behaviour lives here, and it
+/// compiles only under `cfg(test)` with the feature combination `prepare_launch` needs.
+#[cfg(all(test, feature = "acp", feature = "wallet"))]
+mod sandbox_dns_live;
+/// The live egress ATTRIBUTION gate: `#[ignore]`d numeric-IP probes that ask whether a contained
+/// gVisor payload reaches denied destinations, so the same file can be run against the DNS patch and
+/// against its base to tell a regression from a preexisting condition. HARNESS ONLY.
+#[cfg(all(test, feature = "acp", feature = "wallet"))]
+mod sandbox_egress_live;
 /// Host-side network containment for a docker job (#797): which destinations a job may reach, and
 /// the `iptables` rules that enforce it on the two chains container traffic actually splits across.
 ///

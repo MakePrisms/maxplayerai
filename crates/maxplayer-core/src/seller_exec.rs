@@ -262,6 +262,18 @@ pub struct DockerPolicy {
     /// same reason as `proxy_ports`: the containment path that reads them is the one that builds the
     /// launch, so both come from one config value rather than being written down twice.
     file_credentials: Vec<crate::home::FileCredential>,
+    /// Operator-named resolver addresses for contained jobs, from
+    /// [`crate::home::SandboxConfig::dns_servers`], **canonicalised and de-duplicated** by
+    /// [`crate::sandbox_dns::from_config`] — the same function every launch resolves through. Empty
+    /// ⇒ nothing usable was configured, so each launch discovers the host's own upstreams.
+    ///
+    /// Canonical rather than raw so that anything reading the policy describes the plan launches
+    /// actually install: two spellings of one address are one resolver and one pair of rules, and a
+    /// blank entry is not a resolver at all. Carried on the policy for the same reason as
+    /// `proxy_ports`: the argv that mounts the job's `resolv.conf` and the policy that opens port 53
+    /// to those addresses must name the same resolvers, or the job is handed a resolver its own
+    /// firewall drops.
+    dns_servers: Vec<String>,
     /// Container-side delivery (Track B), `None` ⇒ the host delivery path. Resolved from
     /// [`crate::home::SandboxConfig::container_delivery`] and its two companion keys. Carried on the
     /// policy so the one `[sandbox]` parse decides both the executor and where git runs.
@@ -327,6 +339,13 @@ pub struct JobLaunch<'a> {
     /// rules live in the namespace this names, and they were installed before this job's process
     /// existed. A `Some` here is therefore a containment claim, not a networking preference.
     pub netns: Option<&'a str>,
+    /// A host file to bind-mount read-only at `/etc/resolv.conf`, when this job needs a resolver
+    /// docker will not give it. `None` ⇒ the container keeps whatever the daemon wrote.
+    ///
+    /// Present for gVisor jobs and measured, not assumed: docker's embedded resolver at
+    /// `127.0.0.11` never answers inside a runsc sandbox, and `--dns` does not change what the
+    /// daemon writes on a user-defined network, so the file is the only lever that reaches the job.
+    pub resolv_conf: Option<&'a Path>,
 }
 
 /// What the ACP driver spawns: the process `program` + `args`, and the `cwd` the ACP session runs
@@ -453,6 +472,22 @@ impl SandboxPolicy {
                     .map_err(|error| {
                         ExecError::Config(format!("[sandbox] proxy_port_range: {error}"))
                     })?;
+                // Validated HERE, at config resolution, for the same reason as the port range: a
+                // resolver that is a hostname or a loopback stub cannot serve a sandboxed job, and
+                // discovering that at job time would fail every job with an error that names the
+                // symptom rather than the config key.
+                //
+                // The CANONICAL addresses are what the policy carries, not the raw config vector.
+                // `sandbox_dns::from_config` trims, drops blanks, canonicalises each address and
+                // de-duplicates, and every launch resolves through it — so a policy holding the raw
+                // list would describe a different plan from the one launches install: `["1.1.1.1",
+                // "1.1.1.1"]` claims four port-53 rules where two are rendered, and `[" "]` claims a
+                // named resolver where a launch performs host discovery. Anything reading the policy
+                // (`doctor` above all) then reports numbers no job will ever have.
+                let configured_resolvers = crate::sandbox_dns::from_config(&config.dns_servers)
+                    .map_err(|error| ExecError::Config(error.to_string()))?
+                    .map(|resolvers| resolvers.addresses().to_vec())
+                    .unwrap_or_default();
                 if let Some(codex) = &config.codex_chatgpt {
                     if !codex.auth_file.is_absolute() {
                         return Err(ExecError::Config(format!(
@@ -580,6 +615,7 @@ impl SandboxPolicy {
                     network,
                     proxy_ports,
                     file_credentials: config.file_credentials.clone(),
+                    dns_servers: configured_resolvers,
                     container_delivery,
                 });
                 policy.codex_chatgpt = config.codex_chatgpt.clone();
@@ -643,6 +679,18 @@ impl SandboxPolicy {
         match &self.kind {
             PolicyKind::Docker(policy) => policy.proxy_ports,
             PolicyKind::Passthrough | PolicyKind::Launcher(_) => None,
+        }
+    }
+
+    /// The operator-named resolver addresses, empty when none were configured — which means
+    /// "discover the host's own at launch", not "no resolver".
+    ///
+    /// Read by the containment path so the file a job is handed and the port-53 exceptions its
+    /// policy opens come from one config value rather than being decided twice.
+    pub fn dns_servers(&self) -> &[String] {
+        match &self.kind {
+            PolicyKind::Docker(policy) => &policy.dns_servers,
+            PolicyKind::Passthrough | PolicyKind::Launcher(_) => &[],
         }
     }
 
@@ -852,15 +900,31 @@ impl DockerPolicy {
             argv.push("-v".into());
             argv.push(format!("{}:{container_path}", host_dir.display()));
         }
+        // The job's resolver, read-only, when containment wrote one.
+        //
+        // ⛔ Not a preference and not a convenience: under gVisor docker's embedded resolver at
+        // `127.0.0.11` never answers, so without this file every lookup inside the job fails
+        // `EAI_AGAIN` while the identical container under runc resolves fine (measured, with the raw
+        // UDP datagram to `127.0.0.11:53` timing out). `--dns` cannot substitute — on a user-defined
+        // network the daemon writes `nameserver 127.0.0.11` whatever it is told — so the file is the
+        // lever, and `:ro` keeps a stranger's job from rewriting where its own lookups go.
+        if let Some(resolv_conf) = job.resolv_conf {
+            argv.push("-v".into());
+            argv.push(format!("{}:/etc/resolv.conf:ro", resolv_conf.display()));
+        }
         // Egress containment (#797): join the namespace a holder container already owns, where the
         // rendered policy is in force BEFORE this process exists — the rules are not applied to the
         // job, the job is started into them. `crate::sandbox_netns` establishes that; `None` here
         // means it was not established, and the job falls back to the configured network (or, unset,
         // to the daemon default — exactly the behaviour before any of this existed).
         //
-        // Name resolution survives the swap: a container joining a namespace still gets its own
-        // /etc/resolv.conf pointing at docker's embedded resolver on 127.0.0.11 (measured), which is
-        // why `sandbox_net` must never deny loopback.
+        // Name resolution does NOT survive the swap on its own. A container joining a namespace gets
+        // its own /etc/resolv.conf pointing at docker's embedded resolver on 127.0.0.11, and under
+        // gVisor that resolver is unreachable: the sandbox terminates loopback in its own network
+        // stack, so the packet never reaches the NAT rules or the daemon socket behind them
+        // (measured — runsc EAI_AGAIN, runc OK, identical image and network). That is what the
+        // `resolv_conf` mount above exists to fix, and `sandbox_net` still never denies loopback
+        // because a runc seat continues to rely on exactly that resolver.
         match job.netns {
             Some(holder) => {
                 argv.push("--network".into());
@@ -1023,6 +1087,7 @@ pub fn probe_launch_argv(
         uid,
         gid,
         netns: None,
+        resolv_conf: None,
     };
     let launch = policy.launch(probe_command, &job)?;
     let mut argv = Vec::with_capacity(launch.args.len() + 1);
@@ -2390,6 +2455,10 @@ pub async fn run_agent_job_with_env(
         uid: prepared.uid,
         gid: prepared.gid,
         netns: prepared.holder_name.as_deref(),
+        // Present exactly when containment was established, because that is the only path that
+        // wrote a resolver file and opened port 53 to the addresses in it. Handing a job this file
+        // without those pinholes would point it at a resolver its own firewall drops.
+        resolv_conf: prepared.resolv_conf.as_deref(),
     };
     let launch = policy.launch(&prepared.effective_command, &job)?;
     // The ACP idle/response timeout IS the unified job timeout — never a hardcoded 300s that could
@@ -2486,6 +2555,13 @@ pub(crate) struct PreparedLaunch {
     pub gid: u32,
     /// The netns holder's container name when egress containment is in force.
     pub holder_name: Option<String>,
+    /// The resolver file written for this job, bind-mounted read-only at `/etc/resolv.conf`.
+    ///
+    /// `Some` exactly when containment is in force, because that is the only path that wrote the
+    /// file AND opened port 53 to the addresses inside it. Carried on the prepared launch rather
+    /// than re-derived per call site so the agent launch and the container-delivery launch hand the
+    /// job the same resolvers its own firewall was told about.
+    pub resolv_conf: Option<std::path::PathBuf>,
     _proxy: Option<crate::credential_proxy::RunningProxy>,
     _containment: Option<crate::sandbox_netns::Containment>,
 }
@@ -2539,8 +2615,37 @@ pub(crate) async fn prepare_launch(
     // Established only for a docker policy with a configured network. No network ⇒ no containment,
     // which is the behaviour a seat had before any of this existed; it is not silently claimed.
     let _containment;
+    // The resolver file this job is handed, when it gets one. Declared out here so the argv built
+    // further down can name it: the file is written by the containment path, and only that path
+    // opens port 53 to the addresses inside it.
+    let mut job_resolv_conf: Option<std::path::PathBuf> = None;
     let holder = match (policy.docker_image(), policy.sandbox_network()) {
         (Some(image), Some(network)) => {
+            // Resolvers FIRST, before the namespace exists, so a seat with no usable resolver fails
+            // with that reason and leaves nothing to tear down. Docker's embedded resolver is not an
+            // option here — under gVisor it never answers — so a job that cannot be given a real
+            // resolver is refused rather than launched to fail EAI_AGAIN with no explanation.
+            //
+            // Resolved ONCE. The same `Resolvers` value renders the file below and is handed to
+            // `establish` for the port-53 exceptions, because a second discovery could disagree with
+            // the first and the job would be pointed at a resolver its own firewall drops.
+            let resolvers = crate::sandbox_dns::resolve(
+                policy.dns_servers(),
+                crate::sandbox_dns::host_resolv_conf,
+                crate::sandbox_dns::host_resolvectl,
+            )
+            .map_err(|error| ExecError::Policy(format!("[sandbox] {error}")))?;
+            let resolv_path = workdir
+                .parent()
+                .unwrap_or(workdir)
+                .join(format!("resolv-{}.conf", job_id_of(workdir)));
+            std::fs::write(&resolv_path, resolvers.render_resolv_conf()).map_err(|error| {
+                ExecError::Policy(format!(
+                    "[sandbox] could not write the job's resolver file {}: {error}",
+                    resolv_path.display()
+                ))
+            })?;
+            job_resolv_conf = Some(resolv_path);
             let established = crate::sandbox_netns::establish(
                 network,
                 image,
@@ -2554,6 +2659,7 @@ pub(crate) async fn prepare_launch(
                 gid,
                 policy.proxy_ports(),
                 true,
+                resolvers.addresses().to_vec(),
             )
             .await
             // Fail the job rather than run it uncontained. The whole point of moving containment into
@@ -2628,6 +2734,7 @@ pub(crate) async fn prepare_launch(
         uid,
         gid,
         holder_name: holder.map(|(name, _)| name),
+        resolv_conf: job_resolv_conf,
         _proxy,
         _containment,
     })
@@ -3317,6 +3424,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             netns: None,
+            resolv_conf: None,
         }
     }
 
@@ -3426,6 +3534,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
             container_delivery: None,
         });
         let env = vec![("GIT_AUTHOR_NAME".to_string(), "maxplayer-seller-abcd".to_string())];
@@ -3492,8 +3601,57 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
             container_delivery: None,
         })
+    }
+
+    /// The resolver file reaches the job as a read-only bind mount at `/etc/resolv.conf`, and only
+    /// when containment wrote one.
+    ///
+    /// Both halves matter. Without the mount the job keeps docker's `127.0.0.11`, which under gVisor
+    /// never answers; without `:ro` a stranger's job can rewrite the file and point its own lookups
+    /// wherever it likes, inside a namespace whose port 53 is open to the addresses we chose.
+    #[test]
+    fn the_resolver_file_is_mounted_read_only_at_etc_resolv_conf_and_only_when_one_was_written() {
+        let policy = docker_policy_for_probe();
+        let dir = ProbeDir::new("resolv");
+        let workdir = dir.path();
+        let (uid, gid) = job_identity();
+        let command = argv(&["claude-agent-acp"]);
+        let render = |resolv_conf: Option<&Path>| -> Vec<String> {
+            let launch = policy
+                .launch(
+                    &command,
+                    &JobLaunch { workdir, env: &[], uid, gid, netns: None, resolv_conf },
+                )
+                .expect("a job renders");
+            std::iter::once(launch.program).chain(launch.args).collect()
+        };
+
+        let path = PathBuf::from("/var/tmp/resolv-job-7.conf");
+        let with = render(Some(path.as_path()));
+        let mount = with
+            .windows(2)
+            .find(|pair| pair[0] == "-v" && pair[1].contains("/etc/resolv.conf"))
+            .expect("the resolver mount is rendered");
+        assert_eq!(
+            mount[1], "/var/tmp/resolv-job-7.conf:/etc/resolv.conf:ro",
+            "the exact source path, the exact container path, and read-only"
+        );
+
+        // Without a written file the flag is absent entirely: a seat that never established
+        // containment is left exactly as it was, not handed an empty or missing mount source.
+        let without = render(None);
+        assert!(
+            !without.iter().any(|arg| arg.contains("/etc/resolv.conf")),
+            "an uncontained job must not gain a resolver mount: {without:?}"
+        );
+        assert_eq!(
+            with.len(),
+            without.len() + 2,
+            "the mount is the only difference between the two argvs"
+        );
     }
 
     /// A REAL throwaway directory, because `probe_launch_argv` refuses one that does not exist — and
@@ -3645,7 +3803,7 @@ mod tests {
         let job_launch = policy
             .launch(
                 &job_command,
-                &JobLaunch { workdir, env: &[], uid, gid, netns: None },
+                &JobLaunch { workdir, env: &[], uid, gid, netns: None, resolv_conf: None },
             )
             .expect("a job renders");
         let job_argv: Vec<String> =
@@ -3694,6 +3852,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
             container_delivery: None,
         });
 
@@ -4383,6 +4542,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
             container_delivery: None,
         });
         let launch = policy
@@ -4424,6 +4584,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
             container_delivery: None,
         });
         let launch = policy
@@ -4480,6 +4641,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
             container_delivery: None,
         });
         let launch = policy
@@ -5026,6 +5188,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
             container_delivery: None,
         });
         let launch = default_rt
@@ -5045,6 +5208,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
             container_delivery: None,
         });
         let launch = gvisor
@@ -5082,6 +5246,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
             container_delivery: None,
         });
         let launch = unset
@@ -5100,6 +5265,7 @@ mod tests {
             network: Some("maxplayer-sbx".into()),
             proxy_ports: None,
             file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
             container_delivery: None,
         });
         let launch = joined
@@ -5754,6 +5920,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
             container_delivery: None,
         });
         let carried = forwarded_agent_env_from(&docker, daemon_env);
@@ -5954,6 +6121,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: vec![cred],
+            dns_servers: Vec::new(),
             container_delivery: None,
         });
         let uncontained =
@@ -6143,6 +6311,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
             container_delivery: None,
         });
         let carried = forwarded_agent_env_from(&policy, env);
@@ -6166,6 +6335,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
             container_delivery: None,
         });
         let env = vec![("ANTHROPIC_API_KEY".to_string(), "sk-ant-xxx".to_string())];
@@ -6215,6 +6385,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
             container_delivery: None,
         });
         let forwarded: Vec<(String, String)> =
@@ -6246,6 +6417,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
             container_delivery: None,
         });
         // All four credentials, an operator var carrying one of the secrets (must be scrubbed too), and
@@ -6337,6 +6509,7 @@ mod tests {
             network: None,
             proxy_ports: None,
             file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
             container_delivery: None,
         });
         let launch = policy
@@ -6362,6 +6535,7 @@ mod tests {
                 network: None,
                 proxy_ports: None,
                 file_credentials: Vec::new(),
+                dns_servers: Vec::new(),
                 container_delivery: None,
             })
         };
@@ -6475,6 +6649,7 @@ mod tests {
                 network: None,
                 proxy_ports: None,
                 file_credentials: Vec::new(),
+                dns_servers: Vec::new(),
                 container_delivery: None,
             });
         let job = JobLaunch {
@@ -6483,6 +6658,7 @@ mod tests {
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             netns: None,
+            resolv_conf: None,
         };
         let launch = policy.launch(&agent_command, &job).expect("docker launch");
 
