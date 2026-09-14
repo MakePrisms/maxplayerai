@@ -1288,9 +1288,21 @@ mod tests {
             dns_resolvers: Vec::new(),
         };
         let (stdin, _) = plan_stdin(&policy);
-        let accepts: Vec<&str> = stdin.lines().filter(|l| l.contains("ACCEPT")).collect();
-        assert_eq!(accepts.len(), 1, "exactly one pinhole: {accepts:?}");
+        // The pinhole is v4 — the proxy is reached at the namespace's v4 gateway. The v6 plan also
+        // carries ACCEPTs, and they are deliberately not pinholes: they are the two neighbour
+        // discovery exceptions, which name no host and open no port. Matching on "ACCEPT" alone
+        // would count them here and the assertion would be about arithmetic, not about the pinhole.
+        let accepts: Vec<&str> = stdin
+            .lines()
+            .filter(|l| l.starts_with("iptables ") && l.contains("ACCEPT"))
+            .collect();
+        assert_eq!(accepts.len(), 1, "exactly one v4 pinhole: {accepts:?}");
         assert!(accepts[0].contains(&measured), "the pinhole must name the measured host: {accepts:?}");
+        let v6_accepts = stdin
+            .lines()
+            .filter(|l| l.starts_with("ip6tables ") && l.contains("ACCEPT"))
+            .count();
+        assert_eq!(v6_accepts, 2, "v6 permits neighbour discovery and nothing else");
     }
 
     // ── Cancellation custody (F4) ─────────────────────────────────────────────────────────────

@@ -136,7 +136,16 @@ pub const REQUIRED_CASES: &[RequiredCase] = &[
     RequiredCase {
         id: "integrated.allowed.v6",
         outcome: Outcome::Connected,
-        establishes: "the IPv6 positive control",
+        establishes: "the IPv6 positive control — and, since v6 reaches nothing at all when \
+                      neighbour discovery is starved, the proof that the denied v6 leg above \
+                      measured a destination rule rather than a dead stack",
+    },
+    RequiredCase {
+        id: "integrated.denied.v6-link-local",
+        outcome: Outcome::Refused,
+        establishes: "the counter-control for the neighbour-discovery exception: permitting the \
+                      two ICMPv6 control messages must not permit ordinary traffic to fe80::/10, \
+                      which is exactly what an over-broad ND allowance opens",
     },
     RequiredCase {
         id: "integrated.allowed.neighbour-port",

@@ -2773,6 +2773,11 @@ pub async fn with_prepared_launch<R>(
         uid: prepared.uid,
         gid: prepared.gid,
         netns: prepared.holder_name.as_deref(),
+        // The resolver the contained job is handed, exactly as `run_agent_job` hands it over
+        // (see the production call site). Omitting it here would launch the live containment legs
+        // with no `/etc/resolv.conf` mount while production launches with one, so the gates would
+        // measure a job that cannot resolve and call it contained.
+        resolv_conf: prepared.resolv_conf.as_deref(),
     };
     let launch = policy.launch(&prepared.effective_command, &job)?;
     let outcome = run_payload(&launch, prepared.holder_name.as_deref());

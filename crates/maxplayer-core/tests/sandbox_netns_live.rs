@@ -1073,6 +1073,10 @@ fn establish_filters_the_veth_the_packets_actually_leave_by() {
         1000,
         Some(PortRange::new(49200, 49299).expect("valid range")),
         true,
+        // No resolver exception here either, for the same reason as the establish case above: this
+        // test asserts the veth filters mirror the rendered policy exactly, so an exception the
+        // fixture never measured would be an exception it cannot check.
+        Vec::new(),
     ));
 
     let containment = match outcome {
@@ -1093,6 +1097,10 @@ fn establish_filters_the_veth_the_packets_actually_leave_by() {
         gateway: containment.proxy_host.clone(),
         proxy_ports: Some(PortRange::new(49200, 49299).expect("valid range")),
         log_connections: true,
+        // Matches the `Vec::new()` handed to `establish` above: this must be the policy the daemon
+        // actually installed, so a resolver here that the call never passed would fail the
+        // comparison for the wrong reason.
+        dns_resolvers: Vec::new(),
     };
     let plan = IfacePlan::derive(&containment.egress_dev, &policy).expect("the plan renders");
     let readback = iface_readback(containment.holder.name(), &containment.egress_dev);
@@ -1682,6 +1690,18 @@ fn gate_config(network: &str) -> maxplayer_core::home::SandboxConfig {
         // No pinhole: this matrix measures denial and allowance, and a proxy range would add a
         // second reason for a leg to differ from its control. The pinhole has its own coverage.
         proxy_port_range: None,
+        // An explicit resolver, and deliberately not an empty list. Empty does not mean "no DNS":
+        // `sandbox_dns::resolve` falls back to the HOST's resolv.conf and then to resolvectl, and
+        // refuses a loopback address — which is exactly what a systemd host presents at
+        // `127.0.0.53`. Left empty, every integrated leg here would depend on the DNS configuration
+        // of whatever machine the matrix runs on, and would fail preparation on a perfectly healthy
+        // one. So the gate names its own.
+        //
+        // TEST-NET-1 (RFC 5737), which is reserved for documentation and routed nowhere. It
+        // exercises 995's real path — the resolver file is written and the port-53 exception is
+        // rendered and read back — while opening reach to nothing that exists. The payloads here
+        // dial numeric addresses and resolve nothing, so no leg depends on it answering.
+        dns_servers: vec!["192.0.2.53".to_owned()],
         file_credentials: Vec::new(),
         codex_chatgpt: None,
         container_delivery: None,
@@ -2278,6 +2298,43 @@ impl V6Net {
         net
     }
 
+    /// The listener's own link-local address, as the kernel assigned it.
+    ///
+    /// Discovered rather than constructed: it is derived from the interface's MAC, so computing it
+    /// here would be a second implementation of SLAAC and would silently drift from the address
+    /// the listener actually answers on.
+    fn listener_link_local(&self) -> String {
+        let (ok, out, err) = docker(
+            &[
+                "exec",
+                &self.listener,
+                "ip",
+                "-6",
+                "-oneline",
+                "addr",
+                "show",
+                "dev",
+                "eth0",
+                "scope",
+                "link",
+            ],
+            None,
+        );
+        assert!(ok, "could not read the v6 listener's link-local address: {err}");
+        let address = out
+            .split_whitespace()
+            .skip_while(|token| *token != "inet6")
+            .nth(1)
+            .and_then(|cidr| cidr.split('/').next())
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            address.starts_with("fe80:"),
+            "expected a link-local address on the listener, read {address:?} from {out:?}"
+        );
+        address
+    }
+
     /// [`Self::reachable_from_outside`], allowing the listener time to come up.
     ///
     /// `docker run --detach` returns when the container is *started*, not when the process inside
@@ -2384,29 +2441,63 @@ fn the_denied_v6_prefix_is_denied_through_the_production_path() {
         V6Net::DENIED_IP
     );
 
-    // The positive control, and the reason this leg does not yet prove v6 containment.
+    // The positive control, and what makes the denial above mean something.
     //
-    // On its first real run (2026-09-14) this control failed: the ALLOWED v6 address — in none of
-    // `DENIED_DESTINATIONS_V6` — was refused too. Measured cause, outside the production path
-    // entirely (evidence: `raw/v6-nd-starvation.txt`): an unfiltered holder reaches it, and
-    // installing ONLY the `ff00::/8` multicast drop makes it unreachable with the neighbour entry
-    // in state FAILED. IPv6 Neighbour Solicitation goes to a solicited-node **multicast** address,
-    // so dropping `ff00::/8` egress starves ND and the namespace loses every v6 destination.
+    // On its first real run (2026-09-14) this control failed, and the cause was in the policy, not
+    // in the test: the ALLOWED v6 address — in none of `DENIED_DESTINATIONS_V6` — was refused too.
+    // IPv6 Neighbour Solicitation goes to a solicited-node MULTICAST address, so the `ff00::/8`
+    // drop starved neighbour discovery and the namespace lost every v6 destination, denied and
+    // allowed alike. A denial measured on a dead v6 stack proves nothing about `fc00::/7`.
     //
-    // So the denied leg above is denial by a dead v6 stack, not proof that the `fc00::/7` rule did
-    // anything. Pinned to the measured behaviour deliberately: the day ND is permitted this
-    // assertion goes red, and whoever makes that change has to come back and restore the real
-    // positive control on the line below. Widening `DENIED_DESTINATIONS_V6` is a policy decision
-    // (`crates/maxplayer-core/src/sandbox_net.rs`), which is reported, not made from a test.
+    // `sandbox_net` now permits exactly the two ND control messages — solicitation to
+    // `ff02::1:ff00:0/104` and advertisement, both at hop limit 255 — and nothing else in
+    // `ff00::/8`. This assertion is the live proof that the narrowing works: the allowed address
+    // connects, which means ND resolved, which means the refusal above was the destination rule
+    // doing its job. If it ever reads `Refused` again the two legs must be read together, because
+    // a starved stack refuses both.
     let allowed = integrated_leg(&net.network, V6Net::ALLOWED_IP, Canary::PORT, |_| {})
         .expect("preparation must succeed");
     assert_eq!(
         allowed,
-        PayloadOutcome::Refused,
-        "the allowed v6 {} became reachable — ND is evidently no longer starved, so the denied leg \
-         above can and must now be proved against a WORKING v6 stack: restore this to \
-         `PayloadOutcome::Connected` and re-read the denial",
+        PayloadOutcome::Connected,
+        "the allowed v6 {} was refused by a job production contained — if neighbour discovery is \
+         starved again then the denied leg above is denial by a dead stack and proves nothing",
         V6Net::ALLOWED_IP
+    );
+}
+
+/// Permitting neighbour discovery must not have permitted link-local **traffic**.
+///
+/// This is the counter-control for the ND exception, and it is the leg that would catch the lazy
+/// fix. Making `integrated.allowed.v6` pass by widening `fe80::/10` — or by accepting all ICMPv6,
+/// or all multicast — would light up the positive control just as well, and this leg is what tells
+/// the two apart: the listener answers on its own link-local address, an unfiltered joiner reaches
+/// it, and a contained job must not.
+///
+/// `fe80::/10` is the range neighbour ADVERTISEMENT is sent into, so it is the one an over-broad ND
+/// exception opens first.
+#[test]
+#[ignore = "needs docker, an IPv6-enabled daemon and the production image"]
+fn permitting_neighbour_discovery_did_not_permit_link_local_traffic() {
+    require_default_netfilter_image();
+    let net = V6Net::new();
+    let link_local = net.listener_link_local();
+    // A link-local destination is only meaningful with the interface it is scoped to.
+    let scoped = format!("{link_local}%eth0");
+
+    assert!(
+        net.reachable_from_outside_within(&scoped, 10),
+        "control: the listener must answer on its own link-local {scoped} from an UNFILTERED \
+         joiner, or a refusal below proves nothing about the filters"
+    );
+
+    let outcome = integrated_leg(&net.network, &scoped, Canary::PORT, |_| {})
+        .expect("preparation must succeed");
+    assert_eq!(
+        outcome,
+        PayloadOutcome::Refused,
+        "a contained job reached the link-local {scoped} — the neighbour-discovery exception has \
+         been widened past the two ICMPv6 control messages into ordinary link-local traffic"
     );
 }
 
@@ -2427,6 +2518,9 @@ fn prepared_launch_for(
                 uid: 0,
                 gid: 0,
                 netns: Some(holder),
+                // The canary payload dials a numeric address and resolves nothing, so it is handed
+                // no `/etc/resolv.conf` mount. Containment is what this launch measures.
+                resolv_conf: None,
             },
         )
         .expect("the policy must build a launch")

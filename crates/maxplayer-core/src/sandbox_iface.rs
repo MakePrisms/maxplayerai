@@ -75,11 +75,21 @@ pub struct IfaceFilter {
     pub family: Family,
     pub pref: u16,
     /// The destination prefix, exactly as the policy spells it.
-    pub dst: String,
+    ///
+    /// `None` only where the policy rule itself names no `-d`: the neighbour-advertisement
+    /// exception, which is narrowed by ICMPv6 type and hop limit instead. Spelling that as
+    /// `::/0` would be the same match written as a wildcard, and a wildcard destination is the
+    /// one thing this field must never quietly acquire.
+    pub dst: Option<String>,
     /// `Some("tcp")` for an exception that names a protocol; **always `None` for a drop**.
     pub ip_proto: Option<String>,
     /// The destination port match in `tc` spelling (`49200-49299`), if the source rule had one.
     pub dst_port: Option<String>,
+    /// The ICMPv6 message type, for the two neighbour-discovery exceptions. `tc` takes this as
+    /// `type` and prints it as `icmp_type`.
+    pub icmp_type: Option<String>,
+    /// The hop-limit match (`255`), which is what confines an ND exception to this link.
+    pub ip_ttl: Option<String>,
     /// `pass` or `drop`.
     pub action: &'static str,
     /// Why this filter exists, carried from the policy rule it was derived from.
@@ -105,8 +115,20 @@ impl IfaceFilter {
             argv.push("ip_proto".into());
             argv.push(proto.clone());
         }
-        argv.push("dst_ip".into());
-        argv.push(self.dst.clone());
+        // `type` on the way in, `icmp_type` on the way back — measured on a live kernel, not
+        // assumed symmetric.
+        if let Some(icmp_type) = &self.icmp_type {
+            argv.push("type".into());
+            argv.push(icmp_type.clone());
+        }
+        if let Some(dst) = &self.dst {
+            argv.push("dst_ip".into());
+            argv.push(dst.clone());
+        }
+        if let Some(ttl) = &self.ip_ttl {
+            argv.push("ip_ttl".into());
+            argv.push(ttl.clone());
+        }
         if let Some(port) = &self.dst_port {
             argv.push("dst_port".into());
             argv.push(port.clone());
@@ -114,6 +136,12 @@ impl IfaceFilter {
         argv.push("action".into());
         argv.push(self.action.to_owned());
         argv
+    }
+
+    /// How this filter names its destination in a refusal message. A filter matching on type and
+    /// hop limit has none, and saying so is more useful than printing an empty string.
+    fn dst_label(&self) -> &str {
+        self.dst.as_deref().unwrap_or("no destination (ICMPv6 type match)")
     }
 }
 
@@ -153,14 +181,23 @@ impl IfacePlan {
                 }
             };
 
-            let Some(dst) = rule.destination() else {
-                // A destination-less ACCEPT is an egress hole; a destination-less DROP cannot be
-                // expressed as a flower prefix. Either way the answer is to refuse, not to guess.
+            let icmp_type = arg_after(&rule.args, "--icmpv6-type").map(str::to_owned);
+            let ip_ttl = arg_after(&rule.args, "--hl-eq").map(str::to_owned);
+            let dst = rule.destination();
+
+            // A rule with no `-d` is translatable only when something else narrows it as tightly.
+            // That is exactly the neighbour-advertisement exception: ICMPv6 type 136 at hop limit
+            // 255, which flower expresses natively (`ip_proto icmpv6 type 136 ip_ttl 255`) and
+            // which was measured accepted and read back on a live kernel. Anything else with no
+            // destination is still a refusal — a destination-less ACCEPT is an egress hole and a
+            // destination-less DROP has no flower prefix.
+            if dst.is_none() && !(icmp_type.is_some() && ip_ttl.is_some()) {
                 return Err(format!(
-                    "policy rule {:?} names no -d destination, so it has no flower equivalent",
+                    "policy rule {:?} names no -d destination and no ICMPv6 type/hop-limit \
+                     narrowing, so it has no flower equivalent",
                     rule.args
                 ));
-            };
+            }
 
             rendered += 1;
             let pref = PREF_BASE + rendered;
@@ -168,7 +205,17 @@ impl IfacePlan {
             filters.push(IfaceFilter {
                 family: rule.family,
                 pref,
-                dst: dst.to_owned(),
+                dst: dst.map(str::to_owned),
+                // Both carried for a pass and both dropped for a drop, for the same reason
+                // `ip_proto` is: a deny narrowed to one ICMPv6 type denies only that type.
+                icmp_type: match action {
+                    "pass" => icmp_type,
+                    _ => None,
+                },
+                ip_ttl: match action {
+                    "pass" => ip_ttl,
+                    _ => None,
+                },
                 // Protocol is carried for an exception — a pinhole must stay as narrow as the
                 // iptables one, and widening it here would be a widening of containment. It is
                 // dropped for a deny, because the leak this closes is protocol-independent and a
@@ -454,6 +501,11 @@ mod tests {
             gateway: "172.17.0.1".to_owned(),
             proxy_ports: Some(PortRange::new(49200, 49299).expect("valid range")),
             log_connections: true,
+            // No resolver in the base fixture, so the expected filter sets below stay the ones
+            // these tests were written against. The resolver pinholes need no separate translation
+            // here: this plan is derived from `policy.rules()`, so every ACCEPT the renderer emits
+            // — proxy, resolver or neighbour discovery — reaches the veth by the same path.
+            dns_resolvers: Vec::new(),
         }
     }
 
@@ -484,7 +536,15 @@ mod tests {
             if let Some(proto) = &filter.ip_proto {
                 out.push_str(&format!("  ip_proto {proto}\n"));
             }
-            out.push_str(&format!("  dst_ip {}\n", filter.dst));
+            if let Some(ttl) = &filter.ip_ttl {
+                out.push_str(&format!("  ip_ttl {ttl}\n"));
+            }
+            if let Some(dst) = &filter.dst {
+                out.push_str(&format!("  dst_ip {dst}\n"));
+            }
+            if let Some(icmp_type) = &filter.icmp_type {
+                out.push_str(&format!("  icmp_type {icmp_type}\n"));
+            }
             if let Some(port) = &filter.dst_port {
                 out.push_str(&format!("  dst_port {port}\n"));
             }
@@ -525,7 +585,7 @@ mod tests {
             assert!(
                 plan.filters.iter().any(|filter| {
                     filter.family == rule.family
-                        && filter.dst == destination
+                        && filter.dst.as_deref() == Some(destination)
                         && filter.action == "drop"
                 }),
                 "the policy denies {destination} on {:?} and the interface plan does not: {:#?}",
@@ -546,18 +606,28 @@ mod tests {
         let passes: Vec<_> = plan.filters.iter().filter(|f| f.action == "pass").collect();
         assert_eq!(accepts.len(), passes.len(), "{passes:#?}");
         for (rule, filter) in accepts.iter().zip(passes.iter()) {
-            assert_eq!(filter.dst, rule.destination().expect("an accept names a destination"));
+            assert_eq!(filter.dst.as_deref(), rule.destination());
             assert_eq!(
                 filter.ip_proto.as_deref(),
                 arg_after(&rule.args, "-p"),
                 "the pinhole must stay bound to the protocol the policy bound it to"
             );
-            assert_eq!(
-                filter.dst_port.as_deref(),
-                Some("49200-49299"),
-                "a pinhole that lost its port range is a pinhole onto every port"
-            );
+            // Each exception keeps every narrowing its policy rule had. The port range belongs to
+            // the v4 pinhole; the ICMPv6 type and the hop limit belong to the two ND exceptions,
+            // and dropping either of those here would widen this hook past the iptables one.
+            assert_eq!(filter.dst_port.as_deref(), arg_after(&rule.args, "--dport").map(|_| "49200-49299"));
+            assert_eq!(filter.icmp_type.as_deref(), arg_after(&rule.args, "--icmpv6-type"));
+            assert_eq!(filter.ip_ttl.as_deref(), arg_after(&rule.args, "--hl-eq"));
         }
+        assert!(
+            passes.iter().any(|filter| filter.dst_port.is_some()),
+            "the v4 pinhole's port range must be among the exceptions checked above"
+        );
+        assert_eq!(
+            passes.iter().filter(|filter| filter.icmp_type.is_some()).count(),
+            2,
+            "both ND exceptions must carry their ICMPv6 type"
+        );
     }
 
     /// A policy with no pinhole is a valid policy; it must not silently gain one, and must not render
@@ -568,10 +638,28 @@ mod tests {
         unconfigured.proxy_ports = None;
         let plan = IfacePlan::derive(DEV, &unconfigured).expect("renders");
         assert!(
-            plan.filters.iter().all(|filter| filter.action == "drop"),
-            "{:#?}",
+            plan.filters
+                .iter()
+                .filter(|filter| filter.family == Family::V4)
+                .all(|filter| filter.action == "drop"),
+            "a policy with no pinhole must open nothing on v4: {:#?}",
             plan.filters
         );
+        // v6 still passes neighbour discovery, and only that: without it the namespace reaches no
+        // v6 address at all, which is not containment but a dead stack that cannot tell a denied
+        // destination from an allowed one. Each pass carries its ICMPv6 type and its hop limit.
+        let v6_passes: Vec<&IfaceFilter> = plan
+            .filters
+            .iter()
+            .filter(|filter| filter.family == Family::V6 && filter.action == "pass")
+            .collect();
+        assert_eq!(v6_passes.len(), 2, "{v6_passes:#?}");
+        for filter in &v6_passes {
+            assert_eq!(filter.ip_proto.as_deref(), Some("icmpv6"), "{filter:#?}");
+            assert_eq!(filter.ip_ttl.as_deref(), Some("255"), "{filter:#?}");
+            assert!(filter.icmp_type.is_some(), "{filter:#?}");
+            assert!(filter.dst_port.is_none(), "an ND exception opens no port: {filter:#?}");
+        }
         assert!(plan.filter_count(Family::V4) > 0 && plan.filter_count(Family::V6) > 0);
     }
 
@@ -620,18 +708,22 @@ mod tests {
             IfaceFilter {
                 family: Family::V4,
                 pref: 101,
-                dst: "172.16.0.0/12".into(),
+                dst: Some("172.16.0.0/12".into()),
                 ip_proto: None,
                 dst_port: None,
+                icmp_type: None,
+                ip_ttl: None,
                 action: "drop",
                 why: "range deny",
             },
             IfaceFilter {
                 family: Family::V4,
                 pref: 102,
-                dst: "172.17.0.1".into(),
+                dst: Some("172.17.0.1".into()),
                 ip_proto: Some("tcp".into()),
                 dst_port: Some("49200-49299".into()),
+                icmp_type: None,
+                ip_ttl: None,
                 action: "pass",
                 why: "the proxy pinhole",
             },
@@ -731,27 +823,33 @@ filter protocol ipv6 pref 111 flower chain 0 handle 0x1
                 IfaceFilter {
                     family: Family::V4,
                     pref: 102,
-                    dst: "172.17.0.1".to_owned(),
+                    dst: Some("172.17.0.1".to_owned()),
                     ip_proto: Some("tcp".to_owned()),
                     dst_port: Some("49200-49299".to_owned()),
+                    icmp_type: None,
+                    ip_ttl: None,
                     action: "pass",
                     why: "the proxy pinhole, as the kernel printed it",
                 },
                 IfaceFilter {
                     family: Family::V6,
                     pref: 111,
-                    dst: "fc00::/7".to_owned(),
+                    dst: Some("fc00::/7".to_owned()),
                     ip_proto: None,
                     dst_port: None,
+                    icmp_type: None,
+                    ip_ttl: None,
                     action: "drop",
                     why: "the unique-local deny, as the kernel printed it",
                 },
                 IfaceFilter {
                     family: Family::V4,
                     pref: 101,
-                    dst: "10.0.0.0/8".to_owned(),
+                    dst: Some("10.0.0.0/8".to_owned()),
                     ip_proto: None,
                     dst_port: None,
+                    icmp_type: None,
+                    ip_ttl: None,
                     action: "drop",
                     why: "the private-range deny, in the kernel's own layout",
                 },
@@ -1179,11 +1277,24 @@ fn no_shadowed_exception(filters: &[IfaceFilter]) -> Result<(), String> {
             .filter(|filter| filter.action == "drop" && filter.family == pass.family)
             .filter(|filter| filter.pref < pass.pref)
         {
-            if prefix_contains(&drop.dst, &pass.dst) != Some(false) {
+            // A pass with no destination matches every address, so *any* earlier drop in its
+            // family shadows part of it. That is the conservative reading, and it is the right one
+            // here: the ND exceptions must sit above the range drops, and an ND exception the
+            // drops cover is the measured failure this whole check exists for — a namespace whose
+            // neighbour discovery is dropped cannot reach any v6 address at all.
+            let covered = match (&drop.dst, &pass.dst) {
+                (Some(drop_dst), Some(pass_dst)) => prefix_contains(drop_dst, pass_dst) != Some(false),
+                _ => true,
+            };
+            if covered {
                 return Err(format!(
                     "the exception for {} at pref {} sits below the drop for {} at pref {}, which \
                      covers it — tc takes the first match, so that exception is inert ({})",
-                    pass.dst, pass.pref, drop.dst, drop.pref, pass.why
+                    pass.dst_label(),
+                    pass.pref,
+                    drop.dst_label(),
+                    drop.pref,
+                    pass.why
                 ));
             }
         }
@@ -1275,7 +1386,8 @@ pub const CLASSIFIER: &str = "flower";
 /// The match keys a rendered filter may carry. **This list is the security boundary**: any other
 /// predicate — `src_ip` above all — narrows what the rule matches while leaving every field this
 /// module compares untouched, so an unknown key is refused rather than ignored.
-const KNOWN_KEYS: &[&str] = &["eth_type", "dst_ip", "ip_proto", "dst_port"];
+const KNOWN_KEYS: &[&str] =
+    &["eth_type", "dst_ip", "ip_proto", "dst_port", "icmp_type", "ip_ttl"];
 
 /// Valueless tokens `tc` prints that say nothing about what the rule matches. `skip_sw` is
 /// deliberately absent: it means the software path never evaluates the rule, so a filter carrying it
@@ -1721,7 +1833,9 @@ impl IfacePlan {
                     "filter {at} (pref {}, {}) sits in chain {}, not the active chain \
                      {ACTIVE_CHAIN} — a filter in an unreferenced chain is listed, is never \
                      consulted on egress, and looks exactly like containment",
-                    want.pref, want.dst, got.chain
+                    want.pref,
+                    want.dst_label(),
+                    got.chain
                 ));
             }
             if got.actions.len() != 1 {
@@ -1729,7 +1843,7 @@ impl IfacePlan {
                     "filter {at} (pref {}, {}) carries {} actions {:?}, expected exactly one — a \
                      second action runs after the first and can undo it",
                     want.pref,
-                    want.dst,
+                    want.dst_label(),
                     got.actions.len(),
                     got.actions
                 ));
@@ -1737,7 +1851,10 @@ impl IfacePlan {
             if got.actions[0] != want.action {
                 return Err(format!(
                     "filter {at} (pref {}, {}) has action {:?}, expected {}",
-                    want.pref, want.dst, got.actions[0], want.action
+                    want.pref,
+                    want.dst_label(),
+                    got.actions[0],
+                    want.action
                 ));
             }
 
@@ -1745,12 +1862,20 @@ impl IfacePlan {
             // different rule, whatever the fields an older parser happened to read.
             let mut expected: Vec<(&str, String)> =
                 vec![("eth_type", tc_eth_type(want.family).to_owned())];
-            expected.push(("dst_ip", normalise_prefix(&want.dst).to_owned()));
+            if let Some(dst) = want.dst.as_deref() {
+                expected.push(("dst_ip", normalise_prefix(dst).to_owned()));
+            }
             if let Some(proto) = want.ip_proto.as_deref() {
                 expected.push(("ip_proto", proto.to_owned()));
             }
             if let Some(port) = want.dst_port.as_deref() {
                 expected.push(("dst_port", port.to_owned()));
+            }
+            if let Some(icmp_type) = want.icmp_type.as_deref() {
+                expected.push(("icmp_type", icmp_type.to_owned()));
+            }
+            if let Some(ttl) = want.ip_ttl.as_deref() {
+                expected.push(("ip_ttl", ttl.to_owned()));
             }
             let mut seen: Vec<(&str, String)> = got
                 .keys
@@ -1769,7 +1894,11 @@ impl IfacePlan {
             if seen != expected {
                 return Err(format!(
                     "filter {at} (pref {}, {}) matches on {:?}, expected exactly {:?} — {}",
-                    want.pref, want.dst, seen, expected, want.why
+                    want.pref,
+                    want.dst_label(),
+                    seen,
+                    expected,
+                    want.why
                 ));
             }
         }
@@ -1785,9 +1914,11 @@ impl IfacePlan {
                     Family::V4
                 },
                 pref: filter.pref,
-                dst: filter.key("dst_ip").unwrap_or_default().to_owned(),
+                dst: filter.key("dst_ip").map(str::to_owned),
                 ip_proto: filter.key("ip_proto").map(str::to_owned),
                 dst_port: filter.key("dst_port").map(str::to_owned),
+                icmp_type: filter.key("icmp_type").map(str::to_owned),
+                ip_ttl: filter.key("ip_ttl").map(str::to_owned),
                 action: match filter.actions.first().map(String::as_str) {
                     Some("pass") => "pass",
                     _ => "drop",
