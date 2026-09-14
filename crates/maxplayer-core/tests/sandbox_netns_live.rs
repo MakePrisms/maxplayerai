@@ -1439,6 +1439,26 @@ impl RunscNet {
     }
 }
 
+/// Can **this process**, on the VM host and in no namespace at all, reach `ip:port`?
+///
+/// Every other probe in this file runs inside a container. That is the right instrument for asking
+/// what a contained job can do, and it is the wrong one for asking whether containment leaked into
+/// the host: a job's rules could be installed host-globally, break the host's own egress, and every
+/// container-side leg here would still read exactly the same.
+///
+/// So this one connects directly. A short timeout, because the failure being guarded against is a
+/// DROP, which does not answer at all rather than refusing.
+fn host_can_reach(ip: &str, port: &str) -> bool {
+    let address = format!("{ip}:{port}");
+    let Ok(mut addresses) = std::net::ToSocketAddrs::to_socket_addrs(&address) else {
+        return false;
+    };
+    let Some(address) = addresses.next() else {
+        return false;
+    };
+    std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_secs(2)).is_ok()
+}
+
 /// Retry `probe` once a second until it holds, up to `attempts` times.
 ///
 /// For fixture startup only — a container that has been *started* is not yet a container whose
@@ -2196,6 +2216,92 @@ fn one_jobs_cleanup_leaves_a_sibling_job_contained_and_running() {
         PayloadOutcome::Refused,
         "the sibling lost its containment after another job's cleanup — its veth filters were \
          deleted by a teardown that was not scoped to the job that owned them"
+    );
+}
+
+/// **The host's own egress is not collateral.** `host.unaffected.during-cleanup`.
+///
+/// This leg was REQUIRED by `sandbox_evidence::REQUIRED_CASES` and, until now, asserted by nothing.
+/// The round-2 record scored it `connected` on the strength of the sibling test running nearby;
+/// that test probes from inside containers, so it could not have observed the host's egress in
+/// either direction. The row was a claim, not a measurement, and the review was right to say so.
+///
+/// What is measured here: the host reaches the canary directly, in its own namespace, at three
+/// points — before a contained job exists, while one is prepared and running, and after its
+/// teardown. A job whose containment mutated host-global state (an `OUTPUT` rule that was not
+/// scoped to the veth, a teardown that flushed a shared chain) breaks one of the three.
+///
+/// The negative control is not decoration: a probe that returned `true` unconditionally would pass
+/// all three legs. A port nobody listens on must come back unreachable, from the same function, on
+/// the same address.
+#[test]
+#[ignore = "needs docker and the production-tagged netfilter image"]
+fn the_hosts_own_egress_is_unaffected_before_during_and_after_a_jobs_cleanup() {
+    require_default_netfilter_image();
+    let net = RunscNet::new();
+
+    // CONTROL: the instrument can say "no". 9997 is neither PORT nor OTHER_PORT, so nothing in the
+    // canary is listening on it.
+    assert!(
+        !host_can_reach(&net.allowed_ip, "9997"),
+        "the host probe reported a port nobody listens on as reachable — it cannot distinguish \
+         anything, and the three legs below would pass without measuring"
+    );
+
+    // BEFORE: no contained job has existed on this network yet.
+    assert!(
+        wait_until(20, || host_can_reach(&net.allowed_ip, Canary::PORT)),
+        "the host could not reach the canary at {}:{} before any job was prepared — the fixture, \
+         not the containment, is what this leg would otherwise blame",
+        net.allowed_ip,
+        Canary::PORT
+    );
+
+    let config = gate_config(&net.network);
+    let policy = maxplayer_core::seller_exec::SandboxPolicy::from_config(Some(&config))
+        .expect("a docker policy");
+    let workdir = std::env::temp_dir().join(owned_name("workdir-host"));
+    std::fs::create_dir_all(&workdir).expect("a workdir");
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+
+    // DURING: inside the window where the job is contained and its payload has run. The job itself
+    // is asserted as contained, so this is not measuring an empty namespace.
+    let during = runtime.block_on(maxplayer_core::seller_exec::with_prepared_launch(
+        &payload_command(RunscNet::DENIED_IP, Canary::PORT),
+        &policy,
+        &workdir,
+        &gate_identity(),
+        std::time::Duration::from_secs(120),
+        |launch, holder| {
+            let holder = holder.expect("containment");
+            route_on_link(holder, RunscNet::DENIED_IP);
+            let contained = run_launch_attributably(launch);
+            (contained, host_can_reach(&net.allowed_ip, Canary::PORT))
+        },
+    ));
+    let _ = std::fs::remove_dir_all(&workdir);
+    let (contained, host_during) = during.expect("preparation must succeed");
+
+    assert_eq!(
+        contained,
+        PayloadOutcome::Refused,
+        "the job was not contained, so the host leg beside it measured nothing about containment"
+    );
+    assert!(
+        host_during,
+        "the host lost its own egress to {}:{} while a job was contained — the job's rules are not \
+         scoped to its veth",
+        net.allowed_ip,
+        Canary::PORT
+    );
+
+    // AFTER: the guard has dropped, so teardown has run.
+    assert!(
+        host_can_reach(&net.allowed_ip, Canary::PORT),
+        "the host lost its own egress to {}:{} after a job's teardown — cleanup deleted something \
+         it did not own",
+        net.allowed_ip,
+        Canary::PORT
     );
 }
 

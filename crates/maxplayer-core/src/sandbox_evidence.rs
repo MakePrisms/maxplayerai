@@ -211,6 +211,14 @@ pub struct SavedCase {
     pub id: String,
     pub outcome: Outcome,
     pub log: String,
+    /// The `#[test]` function that asserts this case, as `cargo test` prints it.
+    ///
+    /// Present so the map from test function to case id stops being the author's word. Without it
+    /// the record names a log and asserts an outcome, and nothing connects the two: the log could
+    /// be any green run, the id could be attached to whichever test the author believed owned it,
+    /// and both readings pass a validator that only checks the log text is nonempty.
+    /// [`corroborate`] resolves this name in that log.
+    pub test: String,
 }
 
 /// A validated saved matrix: what produced it, and every case it scored.
@@ -352,11 +360,12 @@ pub fn validate(text: &str) -> Result<SavedMatrix, Vec<String>> {
     }
 }
 
-/// `id=… outcome=… log=…`, all three required and none of them empty.
+/// `id=… outcome=… log=… test=…`, all four required and none of them empty.
 fn parse_case(rest: &str, at: usize) -> Result<SavedCase, String> {
     let mut id = None;
     let mut outcome_word = None;
     let mut log = None;
+    let mut test = None;
     for field in rest.split_whitespace() {
         let (key, value) = field.split_once('=').ok_or_else(|| {
             format!("line {at}: {field:?} in a case record is not `key=value`")
@@ -370,6 +379,7 @@ fn parse_case(rest: &str, at: usize) -> Result<SavedCase, String> {
             "id" => &mut id,
             "outcome" => &mut outcome_word,
             "log" => &mut log,
+            "test" => &mut test,
             other => {
                 return Err(format!("line {at}: a case record has no {other:?} field"));
             }
@@ -405,7 +415,96 @@ fn parse_case(rest: &str, at: usize) -> Result<SavedCase, String> {
              not evidence"
         )
     })?;
-    Ok(SavedCase { id, outcome, log })
+    let test = test.filter(|value| !value.is_empty()).ok_or_else(|| {
+        format!(
+            "line {at}: case {id} names no test — without the function that asserts it, the tie \
+             between this id and that log is the author's word, which is what the record exists to \
+             replace"
+        )
+    })?;
+    Ok(SavedCase { id, outcome, log, test })
+}
+
+/// Read each case's named log and require it to show that case's test PASSING.
+///
+/// Separate from [`validate`] because this one touches the filesystem: `validate` is a pure reading
+/// of the record's text and stays usable on a record whose logs are elsewhere. Everything here is
+/// the check the review asked for and the text pass cannot make — that the log behind a case is
+/// that case's log, and that it is green.
+///
+/// `base` is the directory the record's relative log paths resolve against, i.e. the record's own
+/// directory. Absolute paths are refused: a record that reaches outside its own run is not
+/// self-contained evidence and could name a log from another machine.
+///
+/// What this establishes: the named log exists, contains the named test, and that test is recorded
+/// `ok` in it. What it does NOT establish: that the test's assertions are the right ones for the
+/// case id. Only reading the test body settles that, and this function makes no claim about it.
+pub fn corroborate(base: &std::path::Path, matrix: &SavedMatrix) -> Result<(), Vec<String>> {
+    let mut problems = Vec::new();
+    let mut sources: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    for case in &matrix.cases {
+        let relative = std::path::Path::new(&case.log);
+        if relative.is_absolute() || case.log.contains("..") {
+            problems.push(format!(
+                "case {}: log {:?} is not a path inside the record's own directory — evidence that \
+                 reaches outside the run is not attributable to it",
+                case.id, case.log
+            ));
+            continue;
+        }
+        let path = base.join(relative);
+        let text = match sources.get(&case.log) {
+            Some(text) => text.clone(),
+            None => match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    sources.insert(case.log.clone(), text.clone());
+                    text
+                }
+                Err(error) => {
+                    problems.push(format!(
+                        "case {}: named log {} could not be read ({error}) — a cited log that is not \
+                         there is a missing gate, not an absent one",
+                        case.id,
+                        path.display()
+                    ));
+                    continue;
+                }
+            },
+        };
+
+        // `cargo test` prints `test <path>::<name> ... ok`, and on failure `... FAILED` plus a
+        // `failures:` block naming it again. Requiring the `ok` line is what makes a red run
+        // unciteable; matching the bare name would find it in that failure block too.
+        let passed = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("test "))
+            .filter(|line| {
+                line.split_whitespace()
+                    .next()
+                    .is_some_and(|name| name == case.test || name.ends_with(&format!("::{}", case.test)))
+            })
+            .any(|line| line.ends_with(" ok"));
+
+        if !passed {
+            let named = text.contains(&case.test);
+            problems.push(format!(
+                "case {}: log {} does not record test {} as passing ({}) — the record's outcome {} \
+                 rests on a run this log does not show",
+                case.id,
+                path.display(),
+                case.test,
+                if named {
+                    "the test is named there, but not with an `ok` result"
+                } else {
+                    "the test is not named in that log at all"
+                },
+                case.outcome.word()
+            ));
+        }
+    }
+
+    if problems.is_empty() { Ok(()) } else { Err(problems) }
 }
 
 fn is_hex(value: &str, len: usize) -> bool {
@@ -432,10 +531,11 @@ mod tests {
         );
         for case in REQUIRED_CASES {
             text.push_str(&format!(
-                "case id={} outcome={} log=raw/{}.txt\n",
+                "case id={} outcome={} log=raw/{}.txt test=a_test_named_for_{}\n",
                 case.id,
                 case.outcome.word(),
-                case.id
+                case.id,
+                case.id.replace(['.', '-'], "_")
             ));
         }
         text
@@ -483,10 +583,21 @@ mod tests {
     #[test]
     fn an_unscored_case_fails_rather_than_passing_quietly() {
         for (record, expect) in [
-            ("case id=integrated.denied.v4 outcome= log=raw/x.txt", "empty outcome"),
-            ("case id=integrated.denied.v4 outcome=failed log=raw/x.txt", "not one of connected"),
-            ("case id=integrated.denied.v4 outcome=refused log=", "names no log"),
-            ("case id= outcome=refused log=raw/x.txt", "no id scores nothing"),
+            ("case id=integrated.denied.v4 outcome= log=raw/x.txt test=t", "empty outcome"),
+            (
+                "case id=integrated.denied.v4 outcome=failed log=raw/x.txt test=t",
+                "not one of connected",
+            ),
+            ("case id=integrated.denied.v4 outcome=refused log= test=t", "names no log"),
+            ("case id= outcome=refused log=raw/x.txt test=t", "no id scores nothing"),
+            (
+                "case id=integrated.denied.v4 outcome=refused log=raw/x.txt",
+                "names no test",
+            ),
+            (
+                "case id=integrated.denied.v4 outcome=refused log=raw/x.txt test=",
+                "names no test",
+            ),
         ] {
             let text = complete()
                 .lines()
@@ -528,11 +639,13 @@ mod tests {
     fn a_case_that_states_a_field_twice_fails() {
         for (record, expect) in [
             (
-                "case id=integrated.denied.v4 outcome=refused outcome=connected log=raw/x.txt",
+                "case id=integrated.denied.v4 outcome=refused outcome=connected log=raw/x.txt \
+                 test=t",
                 "states outcome twice",
             ),
             (
-                "case id=integrated.denied.v4 outcome=refused log=raw/x.txt log=raw/other.txt",
+                "case id=integrated.denied.v4 outcome=refused log=raw/x.txt log=raw/other.txt \
+                 test=t",
                 "states log twice",
             ),
         ] {
@@ -556,11 +669,12 @@ mod tests {
     #[test]
     fn duplicate_and_unknown_case_ids_fail() {
         let duplicated =
-            complete() + "case id=integrated.denied.v4 outcome=connected log=raw/again.txt\n";
+            complete() + "case id=integrated.denied.v4 outcome=connected log=raw/again.txt test=t\n";
         let problems = validate(&duplicated).expect_err("a duplicate must fail");
         assert!(problems.iter().any(|p| p.contains("recorded twice")), "{problems:?}");
 
-        let unknown = complete() + "case id=integrated.denied.v5 outcome=refused log=raw/x.txt\n";
+        let unknown =
+            complete() + "case id=integrated.denied.v5 outcome=refused log=raw/x.txt test=t\n";
         let problems = validate(&unknown).expect_err("an unknown id must fail");
         assert!(
             problems.iter().any(|p| p.contains("not one the matrix requires")),
@@ -619,11 +733,95 @@ mod tests {
                  is not there is a missing gate, not an absent one."
             )
         });
-        if let Err(problems) = validate(&text) {
-            panic!(
+        let matrix = match validate(&text) {
+            Ok(matrix) => matrix,
+            Err(problems) => panic!(
                 "the saved live matrix at {path} is not complete:\n  {}",
+                problems.join("\n  ")
+            ),
+        };
+
+        // The second leg: every case's named log must actually show that case's test passing.
+        // Without it the record's logs were checked only for being nonempty text, so a complete
+        // matrix could cite a green run that never contained the test the row claims.
+        let base = std::path::Path::new(&path).parent().unwrap_or(std::path::Path::new("."));
+        if let Err(problems) = corroborate(base, &matrix) {
+            panic!(
+                "the saved live matrix at {path} names logs that do not corroborate it:\n  {}",
                 problems.join("\n  ")
             );
         }
+    }
+
+    /// A record whose logs are written next to it, for the corroboration tests below.
+    fn matrix_with_logs(log_body: &str) -> (std::path::PathBuf, SavedMatrix) {
+        let dir = std::env::temp_dir().join(format!(
+            "mx-corroborate-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("raw")).expect("temp dir");
+        let matrix = validate(&complete()).expect("the fixture record is complete");
+        for case in &matrix.cases {
+            let body = log_body.replace("{test}", &case.test);
+            std::fs::write(dir.join(&case.log), body).expect("write log");
+        }
+        (dir, matrix)
+    }
+
+    /// The positive control: logs that record each case's test as passing corroborate the record.
+    #[test]
+    fn logs_that_show_each_case_passing_corroborate_the_record() {
+        let (dir, matrix) = matrix_with_logs(
+            "running 1 test\ntest sandbox_netns_live::{test} ... ok\n\ntest result: ok. 1 passed\n",
+        );
+        assert_eq!(corroborate(&dir, &matrix), Ok(()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The check the review asked for: a log that is nonempty, green, and about something else does
+    /// NOT corroborate the case. This is the exact hole — the old validator accepted any nonempty
+    /// log text, so a real green run of unrelated tests satisfied every row.
+    #[test]
+    fn a_green_log_that_never_names_the_test_does_not_corroborate_it() {
+        let (dir, matrix) = matrix_with_logs(
+            "running 1 test\ntest some::other_test ... ok\n\ntest result: ok. 1 passed\n",
+        );
+        let problems = corroborate(&dir, &matrix)
+            .expect_err("a log that never names the test cannot stand behind it");
+        assert_eq!(problems.len(), matrix.cases.len(), "every case must be reported, not the first");
+        assert!(problems[0].contains("not named in that log at all"), "{}", problems[0]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A log that names the test but records it FAILED does not corroborate it either. Matching the
+    /// bare name would have found it in cargo's `failures:` block and passed a red run.
+    #[test]
+    fn a_log_recording_the_test_as_failed_does_not_corroborate_it() {
+        let (dir, matrix) = matrix_with_logs(
+            "running 1 test\ntest sandbox_netns_live::{test} ... FAILED\n\nfailures:\n    \
+             sandbox_netns_live::{test}\n\ntest result: FAILED. 0 passed; 1 failed\n",
+        );
+        let problems = corroborate(&dir, &matrix).expect_err("a failed test is not evidence");
+        assert!(problems[0].contains("not with an `ok` result"), "{}", problems[0]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cited log that is not there fails; and a log path reaching outside the record's directory
+    /// is refused rather than followed.
+    #[test]
+    fn an_absent_or_escaping_log_is_refused() {
+        let (dir, matrix) = matrix_with_logs("test x ... ok\n");
+        std::fs::remove_file(dir.join(&matrix.cases[0].log)).expect("remove one log");
+        let problems = corroborate(&dir, &matrix).expect_err("a missing log is a missing gate");
+        assert!(problems[0].contains("could not be read"), "{}", problems[0]);
+
+        let mut escaping = matrix.clone();
+        escaping.cases[0].log = "../elsewhere/green.log".to_owned();
+        let problems =
+            corroborate(&dir, &escaping).expect_err("a log outside the run is not its evidence");
+        assert!(problems[0].contains("inside the record's own directory"), "{}", problems[0]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
