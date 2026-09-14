@@ -69,23 +69,27 @@ pub const HOLDER_SEAT_LABEL: &str = "ai.maxplayer.netns-holder-seat";
 /// wait is the state in which cancellation leaves work nobody owns.
 pub const DOCKER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Environment override naming the `docker` client this process spawns.
+/// The docker client this process spawns.
 ///
-/// Unset in production, where every spawn is the plain `docker` on `PATH`. It exists so the
-/// PRODUCTION functions — [`establish`] itself, its cleanup, its absence checks — can be exercised
-/// end to end without a daemon, instead of being approximated by a fixture that re-implements what
-/// they do. A test that drives a stand-in client runs the real control flow: the real ordering of
-/// adopt, fence, create, apply, read back, and the real cancellation and cleanup behaviour.
-///
-/// Deliberately NOT under the `MAXPLAYER_` prefix. That prefix is reserved for config: the
-/// environment layer maps every `MAXPLAYER_*` variable to a config field and refuses an unknown one
-/// fail-closed. A seam named there is not merely untidy — it makes config bootstrap fail for any
-/// process that sets it, which is how this was caught: 14 unrelated tests refused to start.
-const DOCKER_BIN_ENV: &str = "MX_SANDBOX_DOCKER_BIN";
-
-/// The docker client to spawn: the override when set, otherwise `docker`.
+/// In production this is the constant `docker`, resolved on `PATH`, and there is deliberately **no
+/// way to select another one**. An environment-selectable client would let anyone who can set a
+/// variable on this process redirect every containment command — create, inspect, remove — at a
+/// binary of their choosing. That is a privilege boundary, not a convenience knob, so the seam that
+/// lets tests drive [`establish`] without a daemon exists only under `cfg(test)` and cannot be
+/// compiled into a shipped binary.
+#[cfg(not(test))]
+#[inline]
 fn docker_program() -> String {
-    std::env::var(DOCKER_BIN_ENV).unwrap_or_else(|_| "docker".to_owned())
+    "docker".to_owned()
+}
+
+/// Test-only: the injected stand-in client, falling back to the production constant.
+///
+/// The override lives in a process-local static rather than an environment variable, so it neither
+/// survives into any shipped build nor leaks into the environment of unrelated tests.
+#[cfg(test)]
+fn docker_program() -> String {
+    tests::injected_docker_program().unwrap_or_else(|| "docker".to_owned())
 }
 
 /// A running holder container, and the guarantee that it goes away.
@@ -2230,9 +2234,34 @@ mod tests {
     // client, because the fault these close is precisely that a fixture was standing in for the
     // production path and could agree with a bug the production path does not survive.
 
-    /// [`DOCKER_BIN_ENV`] is process-global, so the tests that set it run one at a time.
-    #[cfg(feature = "acp")]
-    static DOCKER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// The injected client is process-local, so the tests that set it run one at a time.
+    static DOCKER_INJECT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The stand-in client, when a test has injected one.
+    static INJECTED_DOCKER: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+    /// Read by [`super::docker_program`] under `cfg(test)` only.
+    pub(super) fn injected_docker_program() -> Option<String> {
+        INJECTED_DOCKER.lock().unwrap_or_else(|poison| poison.into_inner()).clone()
+    }
+
+    /// Injects a stand-in client for the duration of one test, restoring production selection on
+    /// drop so a panicking test cannot leave the override set for anything that follows.
+    struct InjectedDocker;
+
+    impl InjectedDocker {
+        fn set(path: &std::path::Path) -> Self {
+            *INJECTED_DOCKER.lock().unwrap_or_else(|poison| poison.into_inner()) =
+                Some(path.to_string_lossy().into_owned());
+            Self
+        }
+    }
+
+    impl Drop for InjectedDocker {
+        fn drop(&mut self) {
+            *INJECTED_DOCKER.lock().unwrap_or_else(|poison| poison.into_inner()) = None;
+        }
+    }
 
     /// A stand-in `docker` that answers `establish`'s sequence and records what it was asked.
     ///
@@ -2298,11 +2327,11 @@ exit 0
     #[cfg(feature = "acp")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_address_establish_measures_is_the_address_its_plan_pinholes() {
-        let _serial = DOCKER_ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _serial = DOCKER_INJECT_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         let work = stand_in_work_dir("proxy");
         let script = stand_in_docker(&work, "");
 
-        unsafe { std::env::set_var(DOCKER_BIN_ENV, &script) };
+        let _injected = InjectedDocker::set(&script);
         let outcome = establish(
             "mx-scratch",
             "holder:local",
@@ -2317,7 +2346,6 @@ exit 0
             vec!["10.0.0.53".to_owned()],
         )
         .await;
-        unsafe { std::env::remove_var(DOCKER_BIN_ENV) };
 
         let error = outcome.expect_err("the stand-in applier reports a short count");
         assert!(
@@ -2348,11 +2376,11 @@ exit 0
     #[cfg(feature = "acp")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_cancelled_establish_outlasts_its_create_and_removes_the_holder() {
-        let _serial = DOCKER_ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _serial = DOCKER_INJECT_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         let work = stand_in_work_dir("cancel");
         let script = stand_in_docker(&work, "sleep 1");
 
-        unsafe { std::env::set_var(DOCKER_BIN_ENV, &script) };
+        let _injected = InjectedDocker::set(&script);
         let mut establishing = Box::pin(establish(
             "mx-scratch",
             "holder:local",
@@ -2383,7 +2411,6 @@ exit 0
         let started = std::time::Instant::now();
         drop(establishing); // the cancellation under test; the holder's cleanup runs in here
         let elapsed = started.elapsed();
-        unsafe { std::env::remove_var(DOCKER_BIN_ENV) };
 
         assert!(
             elapsed >= std::time::Duration::from_millis(700),
