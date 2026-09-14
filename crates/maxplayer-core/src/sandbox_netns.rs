@@ -228,9 +228,13 @@ struct SidecarGuard {
 }
 
 impl SidecarGuard {
-    /// The command returned, however it returned. `docker run --rm` has removed the container by
-    /// now -- including on a nonzero exit -- so the name is no longer a cleanup target and keeping
-    /// it would make the holder report a leak for something already gone.
+    /// The command's client was **reaped with an exit status**. `docker run --rm` removes the
+    /// container when its client exits -- including on a nonzero exit -- so from here the name is no
+    /// longer a cleanup target, and keeping it would make the holder report a leak for something
+    /// already gone.
+    ///
+    /// Deliberately NOT called for a result that merely returned: a deadline kill, a signal, or a
+    /// failure before the wait leaves a container this process never saw finish.
     fn completed(&mut self) {
         self.completed = true;
     }
@@ -752,7 +756,44 @@ async fn run_bounded(
     stdin: Option<String>,
     deadline: std::time::Duration,
 ) -> Result<(String, String), String> {
-    tokio::task::spawn_blocking(move || {
+    run_bounded_tracked(argv, stdin, deadline).await.0
+}
+
+/// As [`run_bounded`], and also says whether the docker CLIENT was reaped with an exit status.
+///
+/// That second fact is custody, not diagnostics. `docker run --rm` removes the container when its
+/// client exits — including on a nonzero exit — so a reaped child is proof the container is gone. A
+/// client killed on our deadline, killed by a signal, or never waited for at all proves nothing of
+/// the kind: the daemon may still be creating, running, or removing that container. Treating those
+/// two cases alike is what allowed a sidecar to be struck off the cleanup registry while it existed.
+#[cfg(feature = "acp")]
+async fn run_bounded_tracked(
+    argv: Vec<String>,
+    stdin: Option<String>,
+    deadline: std::time::Duration,
+) -> (Result<(String, String), String>, bool) {
+    let joined = tokio::task::spawn_blocking(move || {
+        let mut child_exited = false;
+        let outcome = run_bounded_blocking(argv, stdin, deadline, &mut child_exited);
+        (outcome, child_exited)
+    })
+    .await;
+    match joined {
+        Ok(pair) => pair,
+        // A panicked task establishes nothing about the container either.
+        Err(error) => (Err(format!("docker task panicked: {error}")), false),
+    }
+}
+
+/// The blocking half of [`run_bounded_tracked`]. Sets `child_exited` the moment the child is reaped.
+#[cfg(feature = "acp")]
+fn run_bounded_blocking(
+    argv: Vec<String>,
+    stdin: Option<String>,
+    deadline: std::time::Duration,
+    child_exited: &mut bool,
+) -> Result<(String, String), String> {
+    {
         use std::io::{Read, Write};
         use std::process::{Command, Stdio};
 
@@ -795,6 +836,9 @@ async fn run_bounded(
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
+        // Reaped with a status. From here on, the container's removal is `--rm`'s guarantee; before
+        // this line it is an assumption, and that is the whole distinction this flag carries.
+        *child_exited = true;
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         if let Some(mut pipe) = child.stdout.take() {
@@ -813,9 +857,7 @@ async fn run_bounded(
             Some(code) => Err(format!("exit {code}: {}", if stderr.is_empty() { &stdout } else { &stderr })),
             None => Err("killed by a signal".to_string()),
         }
-    })
-    .await
-    .map_err(|error| format!("docker task panicked: {error}"))?
+    }
 }
 
 /// A unique name for one temporary container joined to `holder`'s namespace.
@@ -860,10 +902,20 @@ async fn run_sidecar(
     // Registered BEFORE the command starts: a cancellation between these two lines must still leave
     // a cleanup target behind, and registering afterwards would not.
     let mut registration = holder.watch_sidecar(name);
-    let outcome = run_docker(argv, stdin).await;
-    // Marked only on the far side of the await. Reaching this line is the one proof the command is
-    // no longer in flight; a cancellation never gets here, and its name stays a cleanup target.
-    registration.completed();
+    let (outcome, child_exited) = run_bounded_tracked(argv, stdin, DOCKER_DEADLINE).await;
+    // Two separate facts, and the old code collapsed them into one.
+    //
+    // Reaching this line at all proves the command is no longer in flight: a cancellation drops the
+    // future before it, so a cancelled command's name stays a cleanup target. That part was right.
+    //
+    // `child_exited` is the half that was missing. The client returning is not the container being
+    // gone. A 120s deadline kill, a stdin write error, a failed wait — each of those returned an
+    // `Err` that deregistered the sidecar, while the daemon may still have been creating or running
+    // the container it names. That is precisely the surviving joiner the registry exists to catch,
+    // and the cleanup path was the thing removing it from the registry.
+    if child_exited {
+        registration.completed();
+    }
     drop(registration);
     outcome
 }
@@ -1643,6 +1695,54 @@ mod tests {
         assert!(
             error.contains("could not run") && error.contains(missing),
             "the failure must name the program it could not run: {error}"
+        );
+    }
+
+    /// F4 residual: the client returning is not the container being gone.
+    ///
+    /// `run_sidecar` used to call `registration.completed()` after **every** returned result, on the
+    /// stated grounds that `docker run --rm` has removed the container by then. That holds for a
+    /// client which was reaped with a status — including a nonzero one — and not otherwise. A client
+    /// killed on our own deadline, or one that failed before the wait, leaves a container the daemon
+    /// may still be creating or running; deregistering it struck the one cleanup target for a
+    /// container that outlived its client.
+    ///
+    /// Both halves are asserted here, because only the pair distinguishes the fix from "never
+    /// deregister", which would make every sidecar report a phantom leak.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn only_a_reaped_client_may_end_a_sidecars_custody() {
+        let (outcome, child_exited) = run_bounded_tracked(
+            vec!["sh".to_owned(), "-c".to_owned(), "exit 7".to_owned()],
+            None,
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+        let error = outcome.expect_err("a nonzero exit is still a failure to the caller");
+        assert!(error.contains("exit 7"), "the caller's error must name the code: {error}");
+        assert!(
+            child_exited,
+            "a nonzero exit is a REAPED client: --rm removed the container, so custody may end \
+             here, and refusing to end it would report a leak for something already gone"
+        );
+
+        let started = std::time::Instant::now();
+        let (outcome, child_exited) = run_bounded_tracked(
+            vec!["sleep".to_owned(), "30".to_owned()],
+            None,
+            std::time::Duration::from_millis(400),
+        )
+        .await;
+        let error = outcome.expect_err("a command past its deadline must not report success");
+        assert!(error.contains("did not finish within"), "{error}");
+        assert!(
+            !child_exited,
+            "a client killed on the deadline has shown nothing about its container, so the name \
+             must stay a cleanup target"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the deadline must be the thing that returned, not the command finishing"
         );
     }
 }

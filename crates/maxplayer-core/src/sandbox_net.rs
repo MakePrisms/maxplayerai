@@ -376,6 +376,13 @@ pub struct ReadbackRule {
     pub chain: String,
     /// Every predicate, in printed order.
     pub predicates: Vec<Predicate>,
+    /// Why this line could not be accounted for token by token, when it could not.
+    ///
+    /// A malformed line is kept rather than dropped, on purpose. Dropping it would shrink the rule
+    /// count and hide an unexpected rule from the very check that exists to notice one; keeping it
+    /// leaves it countable and visible, while [`ReadbackRule::value`] refuses to interpret it so it
+    /// can never satisfy a rule the policy requires.
+    pub malformed: Option<String>,
 }
 
 /// An exception rule reduced to the three things that decide what it lets through, and only after
@@ -429,8 +436,18 @@ impl ReadbackRule {
                 let chain = fields.next()?.to_owned();
                 let mut predicates: Vec<Predicate> = Vec::new();
                 let mut negated = false;
+                // Every token must land somewhere. The two cases below used to be discarded in
+                // silence, which let a line that is NOT the one this policy renders read back as one
+                // that is: the retained predicates were identical, so the rule compared equal to the
+                // canonical form and was accepted.
+                let mut malformed: Option<String> = None;
                 for field in fields {
                     if field == "!" {
+                        if negated {
+                            malformed.get_or_insert_with(|| {
+                                format!("`{line}` repeats `!` with no flag between them")
+                            });
+                        }
                         // iptables prints the inversion as its own token, before the flag.
                         negated = true;
                         continue;
@@ -445,9 +462,19 @@ impl ReadbackRule {
                     } else if let Some(current) = predicates.last_mut() {
                         // A flag can take more than one value: `--tcp-flags FIN,SYN,RST,ACK SYN`.
                         current.values.push(field.to_owned());
+                    } else {
+                        // A bare value with no flag to attach to, e.g. `-A OUTPUT garbage -p ...`.
+                        malformed.get_or_insert_with(|| {
+                            format!("`{line}` carries `{field}` before any flag")
+                        });
                     }
                 }
-                Some(Self { chain, predicates })
+                if negated {
+                    // A trailing `!` inverts the flag that never came. The pending inversion used to
+                    // be dropped when the loop ended, so the line parsed as its un-inverted twin.
+                    malformed.get_or_insert_with(|| format!("`{line}` ends with a dangling `!`"));
+                }
+                Some(Self { chain, predicates, malformed })
             })
             .collect()
     }
@@ -459,6 +486,11 @@ impl ReadbackRule {
     /// of those is a different rule from the one this policy renders, and answering with the value
     /// anyway is how an inverted match passes for a positive one.
     pub fn value(&self, key: &str) -> Option<&str> {
+        // A line with an unaccounted token is not interpreted at all. Answering for its retained
+        // predicates would be answering about a rule this parser demonstrably did not read whole.
+        if self.malformed.is_some() {
+            return None;
+        }
         let mut matching = self.predicates.iter().filter(|predicate| predicate.key == key);
         let first = matching.next()?;
         if matching.next().is_some() || first.negated || first.values.len() != 1 {
@@ -931,6 +963,16 @@ impl NetPolicy {
     /// to be looked at.
     pub fn verify_readback(&self, family: Family, stdout: &str) -> Result<(), String> {
         let found = ReadbackRule::parse_all(stdout);
+        // Before anything is counted or matched: a line this parser could not account for token by
+        // token is not evidence about the namespace, in either direction. Refusing here keeps the
+        // failure legible instead of surfacing later as a missing DROP.
+        if let Some(bad) = found.iter().find_map(|rule| rule.malformed.as_deref()) {
+            return Err(format!(
+                "{} printed a rule this parser cannot account for token by token: {bad} — an \
+                 unreadable readback is not an acceptable one",
+                family.binary()
+            ));
+        }
         let expected = self.rule_count(family);
         if found.len() != expected {
             return Err(format!(
@@ -1926,6 +1968,90 @@ mod tests {
             last_dns < first_range_drop,
             "a resolver exception below the range DROPs never matches: the job cannot resolve"
         );
+    }
+
+    /// A canonical ND ACCEPT with one unflagged token wedged in after the chain name.
+    ///
+    /// The retained predicates are IDENTICAL to the canonical rule's, which is exactly why this
+    /// slipped through: the stray token was dropped in silence, so every comparison this module
+    /// makes on predicates alone answered the same for both lines.
+    #[test]
+    fn an_unflagged_token_before_any_flag_is_not_read_back_as_the_canonical_rule() {
+        const CANONICAL: &str =
+            "-A OUTPUT -p ipv6-icmp -m icmp6 --icmpv6-type 136 -m hl --hl-eq 255 -j ACCEPT";
+        let smuggled_text = CANONICAL.replace("-A OUTPUT ", "-A OUTPUT garbage ");
+
+        let canonical_rules = ReadbackRule::parse_all(CANONICAL);
+        let smuggled_rules = ReadbackRule::parse_all(&smuggled_text);
+        let canonical = &canonical_rules[0];
+        let smuggled = &smuggled_rules[0];
+
+        assert_eq!(
+            canonical.predicates, smuggled.predicates,
+            "the counterexample rests on the retained predicates being identical"
+        );
+        assert!(canonical.malformed.is_none(), "the canonical rule must still parse");
+        let reason =
+            smuggled.malformed.as_deref().expect("an unflagged token must be accounted for");
+        assert!(reason.contains("garbage"), "the reason must name the token: {reason}");
+        assert_eq!(
+            smuggled.target(),
+            None,
+            "a line this parser did not read whole must not answer for its target"
+        );
+    }
+
+    /// A trailing `!` inverts the flag that never came. The pending inversion used to be discarded
+    /// when the loop ended, so the line read back as its un-inverted twin.
+    #[test]
+    fn a_trailing_inversion_is_not_discarded_when_the_line_ends() {
+        const CANONICAL: &str = "-A OUTPUT -d 2001:db8::53/128 -p udp -m udp --dport 53 -j ACCEPT";
+        let dangling_text = format!("{CANONICAL} !");
+
+        let canonical_rules = ReadbackRule::parse_all(CANONICAL);
+        let dangling_rules = ReadbackRule::parse_all(&dangling_text);
+        let canonical = &canonical_rules[0];
+        let dangling = &dangling_rules[0];
+
+        assert_eq!(
+            canonical.predicates, dangling.predicates,
+            "the counterexample rests on the retained predicates being identical"
+        );
+        assert!(canonical.malformed.is_none(), "the canonical rule must still parse");
+        let reason = dangling.malformed.as_deref().expect("a dangling `!` must be accounted for");
+        assert!(reason.contains("dangling"), "{reason}");
+        assert_eq!(
+            dangling.value("-d"),
+            None,
+            "a line this parser did not read whole must not answer for its destination"
+        );
+    }
+
+    /// The whole readback is refused, not just the one line: a namespace that prints something this
+    /// parser cannot account for is not evidence about that namespace in either direction.
+    ///
+    /// The malformed line is deliberately kept in the parsed list rather than dropped — dropping it
+    /// would shrink the rule count and hide an unexpected rule from the check that exists to notice
+    /// one — so the refusal has to come from the accounting, not from a count mismatch.
+    #[test]
+    fn a_line_that_cannot_be_accounted_for_refuses_the_whole_readback() {
+        let policy = policy_with_resolvers(&["10.0.0.2"]);
+        let good = readback_with_resolver();
+        assert_eq!(policy.verify_readback(Family::V4, &good), Ok(()), "positive control");
+
+        let smuggled = good.replace(
+            "-A OUTPUT -d 10.0.0.2/32 -p udp",
+            "-A OUTPUT garbage -d 10.0.0.2/32 -p udp",
+        );
+        assert_eq!(
+            ReadbackRule::parse_all(&smuggled).len(),
+            ReadbackRule::parse_all(&good).len(),
+            "the malformed line must stay countable, or it escapes the unexpected-rule check"
+        );
+        let refusal = policy
+            .verify_readback(Family::V4, &smuggled)
+            .expect_err("a line with an unaccounted token must refuse the readback");
+        assert!(refusal.contains("account for"), "{refusal}");
     }
 
     /// The pinhole count is per family, because the two chains are installed by different binaries
