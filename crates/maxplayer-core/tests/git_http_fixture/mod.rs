@@ -58,6 +58,12 @@ pub struct FixtureOptions {
     /// the test does whatever it needed the pause for and then opens the gate
     /// ([`RequestGate::release`]). Nothing in between depends on a clock.
     pub hold_first_request: Option<Arc<RequestGate>>,
+    /// Hold the Nth request (1-based) the same way, for a leg that is not the advertisement.
+    ///
+    /// A smart-HTTP push is two requests: `GET /info/refs` then `POST /git-receive-pack`. Holding
+    /// request 2 parks a test at the one instant where a real pack upload is genuinely on the wire
+    /// and cannot be called back.
+    pub hold_request_number: Option<(usize, Arc<RequestGate>)>,
 }
 
 /// A one-shot appointment between the fixture and the test: the fixture parks a request and waits;
@@ -342,14 +348,15 @@ fn handle_connection(
         .filter(|value| !value.trim().is_empty())
         .cloned();
 
-    requests
-        .lock()
-        .expect("requests lock")
-        .push(RecordedRequest {
+    let ordinal = {
+        let mut recorded = requests.lock().expect("requests lock");
+        recorded.push(RecordedRequest {
             method: method.clone(),
             target: target.clone(),
             authorization: authorization.clone(),
         });
+        recorded.len()
+    };
 
     let expects_continue = headers
         .get("expect")
@@ -392,6 +399,13 @@ fn handle_connection(
     // Same position, but held until the test says so rather than for a guessed duration.
     if let Some(gate) = &options.hold_first_request {
         if !gate_spent.swap(true, Ordering::SeqCst) {
+            gate.park();
+        }
+    }
+
+    // The same appointment, on a chosen leg rather than the first one.
+    if let Some((nth, gate)) = &options.hold_request_number {
+        if ordinal == *nth {
             gate.park();
         }
     }

@@ -1005,6 +1005,18 @@ impl HttpStream {
                 ))
             })?;
         }
+        // The same question about the work itself. The mint is exactly where a delivery's turn dies
+        // unnoticed: the supervising arm can be revoked, and the absolute deadline can pass, while
+        // this thread sits in the signer's queue. Asking only before the mint answers a question
+        // that the wait has since made stale.
+        if let Some(lifetime) = &self.lifetime {
+            lifetime().map_err(|error| {
+                io::Error::other(format!(
+                    "refusing to send {} leg to {}: {error}",
+                    self.service, self.destination
+                ))
+            })?;
+        }
         let response = request
             .send()
             .map_err(|error| io::Error::other(format!("http request: {error}")))?;

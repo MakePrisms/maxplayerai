@@ -244,6 +244,23 @@ async fn run_delivery(
     url: String,
     journal: Journal,
 ) -> Result<String, DeliveryPushErr> {
+    run_delivery_bounded(delivery, lock, signer, url, journal, DELIVERY_PUSH_TIMEOUT).await
+}
+
+/// The same delivery, with the CALLER's patience made explicit.
+///
+/// The production wrapper takes two bounds and they are not the same thing: `timeout` is how long
+/// this arm waits for an answer, and the work's own deadline is how long the operation may keep
+/// running. Tests about a caller giving up on live work set the first one short and leave the second
+/// where production has it.
+async fn run_delivery_bounded(
+    delivery: Delivery,
+    lock: Arc<tokio::sync::Mutex<()>>,
+    signer: SignerHandle,
+    url: String,
+    journal: Journal,
+    timeout: Duration,
+) -> Result<String, DeliveryPushErr> {
     let deadline = Instant::now() + DELIVERY_PUSH_TIMEOUT;
     let authority = PushAuthority::new();
     let minter = production_shaped_minter(
@@ -276,7 +293,7 @@ async fn run_delivery(
     let body_journal = journal.clone();
     let outcome = serialized_bounded_push(
         &lock,
-        DELIVERY_PUSH_TIMEOUT,
+        timeout,
         deadline,
         move |turn| async move {
             body_journal.record(Moment::Enter(id));
@@ -746,6 +763,365 @@ async fn a_token_signed_while_the_delivery_ended_is_never_transmitted() {
     assert!(
         bare.refname_to_id(&git_transport::delivery_ref(branch)).is_err(),
         "nothing may land for a delivery that ended"
+    );
+
+    drop(relay);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A delivery revoked WHILE its token is being signed stops at the signer, and never queues again.
+///
+/// The signer is an actor with a queue and a mutex-held key; a mint is a round trip through it. The
+/// hazard this covers is the one the lock bug left open: the supervising arm dies while the mint is
+/// parked in that queue. The blocking push thread is still alive, still holds the seat's turn, and
+/// when the signer finally answers it is holding a valid token for work that no longer exists.
+///
+/// The turn's lifetime — not the delivery's authority — is what must stop it here, so this test
+/// leaves the authority alive on purpose: only the supervisor disappears.
+///
+/// Red-on-revert: drop the lifetime gate in `HttpStream::send` and the parked leg goes out on the
+/// wire — the fixture records a request for a delivery whose supervisor is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delivery_revoked_while_its_token_is_signed_stops_at_the_signer() {
+    init_test_env();
+    let root = temp("revoked-mid-sign");
+    let branch = "maxplayer/eeee5555";
+    let (workdir, oid) = job_workdir(&root, "job-e", branch);
+
+    let relay_repo = root.join("relay.git");
+    git2::Repository::init_bare(&relay_repo).expect("relay bare");
+    let relay =
+        GitHttpAuthServer::spawn_with(&relay_repo, "/git/seller/r.git", FixtureOptions::default());
+    let url = relay.repo_url();
+
+    let home_root = root.join("home");
+    let home = bootstrap(&home_root).expect("bootstrap home");
+    let signer = signer::spawn(&home).expect("spawn signer");
+
+    // The delivery's own authority stays LIVE for the whole test: the only thing that ends here is
+    // the turn, and the turn alone must be enough.
+    let authority = PushAuthority::new();
+    let deadline = Instant::now() + DELIVERY_PUSH_TIMEOUT;
+    let (control, turn) = maxplayer_core::delivery_turn::delivery_turn((), deadline);
+
+    let signing = RequestGate::new();
+    let mints = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let minter: AuthMinter = {
+        let signing = Arc::clone(&signing);
+        let mints = Arc::clone(&mints);
+        let signer = signer.clone();
+        let scope = git_transport::delivery_ref(branch);
+        Arc::new(move |destination: &str| {
+            // Joining the signer's queue is the event being counted: a revoked delivery must not
+            // reach this line a second time.
+            mints.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            signing.park();
+            signer.http_auth_header_blocking(destination.to_owned(), Some(scope.clone()), deadline)
+        })
+    };
+
+    let check = authority.check();
+    let url_for_push = url.clone();
+    let push = tokio::spawn(async move {
+        seller_git::neutralize_then_push_off_runtime(
+            workdir,
+            url_for_push,
+            branch.to_owned(),
+            oid,
+            Some(minter),
+            Some(check),
+            turn,
+        )
+        .await
+    });
+
+    // Deterministic: returns when the mint is genuinely parked inside the signer round trip.
+    let signing_for_wait = Arc::clone(&signing);
+    tokio::task::spawn_blocking(move || signing_for_wait.wait_held())
+        .await
+        .expect("signing gate");
+    assert!(
+        relay.requests().is_empty(),
+        "nothing may have reached the relay before the first token exists: {:?}",
+        relay.requests()
+    );
+
+    // The supervisor disappears while the signer holds the request.
+    drop(control);
+    signing.release();
+
+    let error = push
+        .await
+        .expect("push task")
+        .expect_err("a delivery whose turn was revoked must not push")
+        .to_string();
+
+    assert!(
+        authority.is_live(),
+        "this test is about the turn, not the authority"
+    );
+    assert!(
+        relay.requests().is_empty(),
+        "a revoked delivery put a request on the wire: {:?}",
+        relay.requests()
+    );
+    assert_eq!(
+        mints.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a revoked delivery must not join the signer queue again"
+    );
+    assert!(
+        error.contains("cancelled"),
+        "the refusal must name the cancellation, got {error}"
+    );
+    let bare = git2::Repository::open_bare(&relay_repo).expect("relay bare");
+    assert!(
+        bare.refname_to_id(&git_transport::delivery_ref(branch))
+            .is_err(),
+        "nothing may land for a revoked delivery"
+    );
+
+    drop(relay);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A delivery revoked before it ever got a blocking slot does NO work at all — not the local part.
+///
+/// Between "this delivery was admitted to the turn" and "this delivery is on the wire" there is
+/// local work that used to run unconditionally: the workdir's push config is rewritten and the pack
+/// is built. A push cancelled while it waited for a blocking thread would still do all of it.
+///
+/// Red-on-revert: remove the `begin()` admission gate in `off_runtime_holding_the_turn` and the
+/// workdir's `.git/config` is rewritten for a delivery that was already dead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delivery_revoked_before_dispatch_does_no_local_work_and_never_dials() {
+    init_test_env();
+    let root = temp("revoked-pre-dispatch");
+    let branch = "maxplayer/ffff6666";
+    let (workdir, oid) = job_workdir(&root, "job-f", branch);
+
+    let relay_repo = root.join("relay.git");
+    git2::Repository::init_bare(&relay_repo).expect("relay bare");
+    let relay =
+        GitHttpAuthServer::spawn_with(&relay_repo, "/git/seller/r.git", FixtureOptions::default());
+    let url = relay.repo_url();
+
+    let config = workdir.join(".git").join("config");
+    let before = std::fs::read(&config).expect("read workdir config");
+
+    let mints = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let minter: AuthMinter = {
+        let mints = Arc::clone(&mints);
+        Arc::new(move |_destination: &str| {
+            mints.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("Nostr never-minted".to_owned())
+        })
+    };
+
+    let (control, turn) = maxplayer_core::delivery_turn::delivery_turn(
+        (),
+        Instant::now() + DELIVERY_PUSH_TIMEOUT,
+    );
+    // Revoked while it is still queued for a blocking thread: the work has not begun and now never
+    // will, so the turn is free immediately — this is the case the caller's timeout must not fake.
+    assert_eq!(
+        control.end(),
+        maxplayer_core::delivery_turn::TurnRelease::NeverStarted
+    );
+    assert!(
+        !control.holds_ownership(),
+        "work that never started must not keep the seat's turn"
+    );
+
+    let error = seller_git::neutralize_then_push_off_runtime(
+        workdir.clone(),
+        url.clone(),
+        branch.to_owned(),
+        oid,
+        Some(minter),
+        None,
+        turn,
+    )
+    .await
+    .expect_err("a revoked delivery must not push")
+    .to_string();
+
+    assert!(
+        error.contains("at dispatch"),
+        "the refusal must name the admission gate, got {error}"
+    );
+    assert_eq!(
+        std::fs::read(&config).expect("read workdir config"),
+        before,
+        "a revoked delivery rewrote the workdir's push config"
+    );
+    assert_eq!(
+        mints.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a revoked delivery minted a token"
+    );
+    assert!(
+        relay.requests().is_empty(),
+        "a revoked delivery dialled the remote: {:?}",
+        relay.requests()
+    );
+
+    drop(relay);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The caller gives up while a REAL pack upload is on the wire. The seat's turn is not given up
+/// with it, and the next delivery — a real one — waits on acquisition until the upload has stopped.
+///
+/// This is F3 and F5 in one run, with nothing simulated: a genuine `GET /info/refs` and a genuine
+/// `POST /git-receive-pack`, the second held open at the server while the arm that started it times
+/// out and returns. A second delivery is launched into that window and must be found PENDING — not
+/// merely slower — and must complete for real afterwards.
+///
+/// Red-on-revert: release the lock when the caller stops waiting (drop the guard in the timeout arm
+/// of `serialized_bounded_push` instead of ending the turn) and the second delivery enters while
+/// the first upload is still parked at the relay — `peak_concurrent_requests` goes to 2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_caller_timeout_across_a_live_upload_does_not_hand_the_seat_to_the_next_delivery() {
+    init_test_env();
+    let root = temp("timeout-live-upload");
+    let first_branch = "maxplayer/1111aaaa";
+    let second_branch = "maxplayer/2222bbbb";
+    let (first_workdir, first_oid) = job_workdir(&root, "job-1", first_branch);
+    let (second_workdir, second_oid) = job_workdir(&root, "job-2", second_branch);
+
+    let relay_repo = root.join("relay.git");
+    git2::Repository::init_bare(&relay_repo).expect("relay bare");
+    // Request 1 is the advertisement; request 2 is the pack POST. Hold the POST: that is the one
+    // instant where the bytes are genuinely on the wire and cannot be called back.
+    let upload = RequestGate::new();
+    let relay = GitHttpAuthServer::spawn_with(
+        &relay_repo,
+        "/git/seller/r.git",
+        FixtureOptions {
+            hold_request_number: Some((2, Arc::clone(&upload))),
+            ..FixtureOptions::default()
+        },
+    );
+    let url = relay.repo_url();
+
+    let home_root = root.join("home");
+    let home = bootstrap(&home_root).expect("bootstrap home");
+    let signer = signer::spawn(&home).expect("spawn signer");
+
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    let journal = Journal::default();
+
+    // A short CALLER bound; the work's own deadline stays at the production one.
+    let impatient = tokio::spawn(run_delivery_bounded(
+        Delivery {
+            id: 1,
+            workdir: first_workdir,
+            branch: first_branch,
+            oid: first_oid,
+        },
+        Arc::clone(&lock),
+        signer.clone(),
+        url.clone(),
+        journal.clone(),
+        Duration::from_secs(3),
+    ));
+
+    // Deterministic: returns when the pack POST is parked at the server.
+    let upload_for_wait = Arc::clone(&upload);
+    tokio::task::spawn_blocking(move || upload_for_wait.wait_held())
+        .await
+        .expect("upload gate");
+
+    let outcome = impatient.await.expect("first delivery task");
+    assert!(
+        matches!(outcome, Err(DeliveryPushErr::TimedOut(_))),
+        "the caller must report the timeout it suffered, got {outcome:?}"
+    );
+    assert_eq!(
+        relay.requests().len(),
+        2,
+        "the timeout must have landed on a live upload, not before it: {:?}",
+        relay.requests()
+    );
+
+    // A real second delivery, launched into exactly that window.
+    let second = tokio::spawn(run_delivery(
+        Delivery {
+            id: 2,
+            workdir: second_workdir,
+            branch: second_branch,
+            oid: second_oid,
+        },
+        Arc::clone(&lock),
+        signer.clone(),
+        url.clone(),
+        journal.clone(),
+    ));
+
+    // Wait for it to REACH the acquisition point, then prove it is stuck there.
+    let reached = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if journal
+                .entries()
+                .iter()
+                .any(|moment| matches!(moment, Moment::Requested(2)))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    reached.expect("the second delivery must at least start");
+    assert!(
+        lock.try_lock().is_err(),
+        "the seat's turn must still be taken by the abandoned upload"
+    );
+    let waiting = journal.entries();
+    assert!(
+        !waiting
+            .iter()
+            .any(|moment| matches!(moment, Moment::Enter(2))),
+        "the second delivery entered while the first upload was still on the wire: {waiting:?}"
+    );
+    assert_eq!(
+        relay.requests().len(),
+        2,
+        "nothing else may reach the remote while an abandoned upload holds it: {:?}",
+        relay.requests()
+    );
+
+    // Let the abandoned upload finish. Only then may the second delivery proceed.
+    upload.release();
+    let pushed = second
+        .await
+        .expect("second delivery task")
+        .expect("the second delivery pushes once the first has actually stopped");
+
+    let entries = journal.entries();
+    let entered_second = entries
+        .iter()
+        .position(|moment| matches!(moment, Moment::Enter(2)))
+        .expect("the second delivery must enter once the turn is free");
+    assert!(
+        entries[..entered_second]
+            .iter()
+            .any(|moment| matches!(moment, Moment::Mint(1, _))),
+        "the first delivery's wire work must precede the second's entry: {entries:?}"
+    );
+    assert_eq!(
+        relay.peak_concurrent_requests(),
+        1,
+        "two deliveries were on the seat's remote at once"
+    );
+    let bare = git2::Repository::open_bare(&relay_repo).expect("relay bare");
+    assert_eq!(
+        bare.refname_to_id(&git_transport::delivery_ref(second_branch))
+            .expect("the second delivery's ref must land")
+            .to_string(),
+        pushed,
+        "the second delivery landed exactly what it reported"
     );
 
     drop(relay);
