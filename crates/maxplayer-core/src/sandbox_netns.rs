@@ -102,7 +102,7 @@ impl NetnsHolder {
         if let Ok(mut names) = self.sidecars.lock() {
             names.push(name.clone());
         }
-        SidecarGuard { name, registry: std::sync::Arc::clone(&self.sidecars) }
+        SidecarGuard { name, registry: std::sync::Arc::clone(&self.sidecars), completed: false }
     }
 
     /// Whether a failed `docker rm` says "there was nothing here" rather than "I could not do it".
@@ -175,10 +175,37 @@ impl NetnsHolder {
 struct SidecarGuard {
     name: String,
     registry: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// Set only when the command returned. A guard dropped without this is a cancelled command.
+    completed: bool,
+}
+
+impl SidecarGuard {
+    /// The command returned, however it returned. `docker run --rm` has removed the container by
+    /// now -- including on a nonzero exit -- so the name is no longer a cleanup target and keeping
+    /// it would make the holder report a leak for something already gone.
+    fn completed(&mut self) {
+        self.completed = true;
+    }
 }
 
 impl Drop for SidecarGuard {
+    /// Deregisters ONLY a command that finished.
+    ///
+    /// This used to deregister unconditionally, which quietly inverted the custody it was written
+    /// for. Cancellation drops the future mid-command, which drops this guard, which struck the
+    /// name from the registry -- and the holder's own `Drop`, reading that registry moments later,
+    /// then saw nothing to remove. The container the blocking docker client had already created
+    /// stayed joined to the namespace with no guard, no record and no remover: exactly the orphan
+    /// the registry exists to prevent, produced by the cleanup path itself.
+    ///
+    /// So a cancelled command leaves its name behind deliberately. The cost of keeping a name whose
+    /// container never got created is one `docker rm` answering "No such container", which
+    /// [`NetnsHolder::force_remove_stderr_is_benign`] already treats as success. The cost of
+    /// dropping a name whose container does exist is a pinned namespace nothing will ever clean up.
     fn drop(&mut self) {
+        if !self.completed {
+            return;
+        }
         if let Ok(mut names) = self.registry.lock() {
             names.retain(|name| name != &self.name);
         }
@@ -784,8 +811,11 @@ async fn run_sidecar(
     let argv = with_container_name(argv, &name)?;
     // Registered BEFORE the command starts: a cancellation between these two lines must still leave
     // a cleanup target behind, and registering afterwards would not.
-    let registration = holder.watch_sidecar(name);
+    let mut registration = holder.watch_sidecar(name);
     let outcome = run_docker(argv, stdin).await;
+    // Marked only on the far side of the await. Reaching this line is the one proof the command is
+    // no longer in flight; a cancellation never gets here, and its name stays a cleanup target.
+    registration.completed();
     drop(registration);
     outcome
 }
@@ -1382,17 +1412,65 @@ mod tests {
         };
         assert!(tracked(&holder).is_empty(), "nothing is joined before anything runs");
 
-        let first = holder.watch_sidecar(sidecar_name(holder.name(), "iface"));
-        let second = holder.watch_sidecar(sidecar_name(holder.name(), "iface-readback"));
+        let mut first = holder.watch_sidecar(sidecar_name(holder.name(), "iface"));
+        let mut second = holder.watch_sidecar(sidecar_name(holder.name(), "iface-readback"));
         assert_eq!(tracked(&holder).len(), 2, "both live joiners are cleanup targets");
 
         // Finishing one deregisters only that one: the other is still running and still owned.
+        // `completed` is what makes this finishing rather than cancellation, and only a command
+        // that returned may claim it.
         let second_name = second.name.clone();
+        second.completed();
         drop(second);
         assert_eq!(tracked(&holder), vec![first.name.clone()], "{second_name} must be forgotten");
 
+        first.completed();
         drop(first);
         assert!(tracked(&holder).is_empty(), "a finished joiner is not an orphan");
+    }
+
+    /// A **cancelled** sidecar command leaves its name with the holder.
+    ///
+    /// The sibling above covers the finishing path. This one covers the path that produced the
+    /// defect: the guard was struck from the registry by cancellation itself, so the holder's `Drop`
+    /// found an empty list and removed nothing, while the container the blocking docker client had
+    /// already created stayed joined to the namespace.
+    ///
+    /// Cancellation is performed here the way tokio performs it -- the future is polled once, so the
+    /// registration exists and the command is in flight, and then the future is dropped. No runtime
+    /// and no docker are involved, so this measures the custody rule itself.
+    #[test]
+    fn a_cancelled_joiner_stays_a_cleanup_target() {
+        use std::future::Future as _;
+
+        let holder = NetnsHolder::adopt("maxplayer-netns-cancelled".into());
+        let name = sidecar_name(holder.name(), "iface");
+        {
+            let mut command = Box::pin(async {
+                let mut registration = holder.watch_sidecar(name.clone());
+                // Stands in for the docker command that never returns before the cancellation.
+                std::future::pending::<()>().await;
+                registration.completed();
+            });
+            let waker = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(waker);
+            assert!(
+                command.as_mut().poll(&mut cx).is_pending(),
+                "the command must still be in flight when it is cancelled"
+            );
+            assert_eq!(
+                holder.sidecars.lock().expect("registry").len(),
+                1,
+                "the joiner is registered before its command starts"
+            );
+        }
+
+        assert_eq!(
+            holder.sidecars.lock().expect("registry").clone(),
+            vec![name],
+            "a cancelled command must leave its container as a cleanup target -- deregistering here \
+             is what left an orphan pinning the namespace"
+        );
     }
 
     /// Cleanup reports what happened. "No such container" after a cancelled create is the expected
