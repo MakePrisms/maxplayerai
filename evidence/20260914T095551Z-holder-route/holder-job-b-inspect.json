@@ -1,0 +1,36 @@
+{
+  "Cmd": [
+    "/usr/local/bin/tool-mcp-bridge"
+  ],
+  "Env": [
+    "GIT_AUTHOR_NAME=maxplayer-seller-eeeeeeeeeeeeeeee",
+    "GIT_AUTHOR_EMAIL=eeeeeeeeeeeeeeee@seller.maxplayer.invalid",
+    "GIT_COMMITTER_NAME=maxplayer-seller-eeeeeeeeeeeeeeee",
+    "GIT_COMMITTER_EMAIL=eeeeeeeeeeeeeeee@seller.maxplayer.invalid",
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "NODE_VERSION=22.23.2",
+    "YARN_VERSION=1.22.22",
+    "HOME=/home/agent",
+    "XDG_STATE_HOME=/home/agent/state",
+    "XDG_CACHE_HOME=/home/agent/cache",
+    "XDG_CONFIG_HOME=/home/agent/config"
+  ],
+  "Mounts": [
+    {
+      "Destination": "/work",
+      "Name": null,
+      "RW": true,
+      "Source": "/var/folders/9q/w4l4c_qn38n62q8_2pt8ql7m0000gn/T/maxplayer-held-tool-live-69658-1789380080527264000/seller-jobs/job-b-held-live",
+      "Type": "bind"
+    },
+    {
+      "Destination": "/run/holder",
+      "Name": "maxplayer-held-tool-runtime-eeeeeeeeeeeeeeee",
+      "RW": true,
+      "Source": "/var/lib/docker/volumes/maxplayer-held-tool-runtime-eeeeeeeeeeeeeeee/_data",
+      "Type": "volume"
+    }
+  ],
+  "NetworkMode": "container:fedf80ff1ee5b6ebc12c425bffd9f511e52c6c7d0367855bbc0fa882e4e1dd24",
+  "User": "501:20"
+}

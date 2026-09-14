@@ -12,6 +12,15 @@ container received; the placeholder was refused at the vendor and revoked at job
 one bundle here that is NOT `mechanism_only`: the oracle is a third party. Read its `README.md`
 for what it proves, its limits, and how to rerun it.
 
+## Holder route through the daemon: `20260914T095551Z-holder-route/`
+
+The Holder route wired into the seller daemon (`held_tool.rs`, `[sandbox.held_tool]`) and proved
+live through the real daemon code on 2026-09-14: one holder container, two jobs on one enrolment
+(one under egress containment), an escape refused, a restart that resumed the persisted login, and
+a real `claude-agent-acp` turn that called the seller's tool through `tool-mcp-bridge`. The vendor
+is the kit's fake, so this is `mechanism_only` through production code — not third-party
+acceptance. Read its `README.md`.
+
 ## Holder demo bundles
 
 Each of the remaining subdirectories is one complete execution of
