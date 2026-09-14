@@ -897,12 +897,28 @@ async fn run_sidecar(
     argv: Vec<String>,
     stdin: Option<String>,
 ) -> Result<(String, String), String> {
+    run_sidecar_with_deadline(holder, verb, argv, stdin, DOCKER_DEADLINE).await
+}
+
+/// As [`run_sidecar`], with the bound named by the caller.
+///
+/// The deadline is a parameter solely so the custody rule below can be measured offline. A test
+/// cannot wait out the production bound, and a rule about what happens when the client is killed is
+/// worth nothing if the only thing measured is the flag feeding it.
+#[cfg(feature = "acp")]
+async fn run_sidecar_with_deadline(
+    holder: &NetnsHolder,
+    verb: &str,
+    argv: Vec<String>,
+    stdin: Option<String>,
+    deadline: std::time::Duration,
+) -> Result<(String, String), String> {
     let name = sidecar_name(holder.name(), verb);
     let argv = with_container_name(argv, &name)?;
     // Registered BEFORE the command starts: a cancellation between these two lines must still leave
     // a cleanup target behind, and registering afterwards would not.
     let mut registration = holder.watch_sidecar(name);
-    let (outcome, child_exited) = run_bounded_tracked(argv, stdin, DOCKER_DEADLINE).await;
+    let (outcome, child_exited) = run_bounded_tracked(argv, stdin, deadline).await;
     // Two separate facts, and the old code collapsed them into one.
     //
     // Reaching this line at all proves the command is no longer in flight: a cancellation drops the
@@ -1744,5 +1760,70 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(10),
             "the deadline must be the thing that returned, not the command finishing"
         );
+    }
+
+    /// The custody rule at the site that applies it.
+    ///
+    /// The sibling above measures the flag; this one measures what `run_sidecar` DOES with it, which
+    /// is the part a reviewer cannot take on trust. Written after a negative control showed the
+    /// flag test alone stayed green while the decision was reverted to the defective one.
+    ///
+    /// No docker and no daemon: the argv names a script that ignores its arguments, which is all
+    /// `with_container_name` needs (it requires `argv[1] == "run"` and splices the name after it).
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_sidecar_whose_client_was_killed_stays_a_cleanup_target() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("mx-custody-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let slow = dir.join("slow");
+        let quick = dir.join("quick");
+        std::fs::write(&slow, "#!/bin/sh\nsleep 30\n").expect("write slow");
+        std::fs::write(&quick, "#!/bin/sh\nexit 0\n").expect("write quick");
+        for path in [&slow, &quick] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+
+        let holder = NetnsHolder::adopt("maxplayer-netns-custody".into());
+
+        // A client killed on the deadline: the daemon may still be creating or running the
+        // container, so the name has to survive as a cleanup target.
+        let killed = run_sidecar_with_deadline(
+            &holder,
+            "iface",
+            vec![slow.to_string_lossy().into_owned(), "run".to_owned()],
+            None,
+            std::time::Duration::from_millis(400),
+        )
+        .await;
+        assert!(killed.is_err(), "a command past its deadline must not report success");
+        assert_eq!(
+            holder.sidecars.lock().expect("registry").len(),
+            1,
+            "a client killed on the deadline never showed its container gone, so its name must \
+             stay a cleanup target"
+        );
+
+        // A client reaped normally: `--rm` removed the container, so keeping the name would make
+        // the holder report a leak for something already gone. Without this half, "never
+        // deregister" would pass the assertion above.
+        run_sidecar_with_deadline(
+            &holder,
+            "iface",
+            vec![quick.to_string_lossy().into_owned(), "run".to_owned()],
+            None,
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .expect("a script that exits 0 must succeed");
+        assert_eq!(
+            holder.sidecars.lock().expect("registry").len(),
+            1,
+            "the reaped client's name must be struck, leaving only the killed one"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        std::mem::forget(holder);
     }
 }
