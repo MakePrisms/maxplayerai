@@ -1,0 +1,18 @@
+=== gate5d: environment ===
+utc=2026-09-10T02:40:40Z
+kernel=6.8.0-134-generic arch=aarch64 docker=29.1.3 runsc=runsc version release-20260817.0
+namespace established, plan applied (26 rules)
+
+=== gate5d: the namespace before any gVisor container has touched it ===
+  [before via runc] interfaces: lo=127.0.0.1 eth0=172.31.16.2 dns: 34.225.223.145 
+
+=== gate5d: one runsc container runs and exits ===
+  [the gVisor job itself via runsc] interfaces: lo=127.0.0.1 eth0=172.31.16.2 dns: 34.225.223.145 
+
+=== gate5d: the same namespace afterwards ===
+  [after, host runtime via runc] interfaces: lo=127.0.0.1 dns: EAI_AGAIN 
+  [after, a second gVisor job via runsc] interfaces: lo=127.0.0.1 dns: EAI_AGAIN 
+
+=== gate5d: read it off the two 'after' lines ===
+If 'before' has an eth0 address and 'after' says NONE, the namespace is single-use
+for gVisor, and gate5c's ENETUNREACH verdicts are void — a dead control, not a policy.

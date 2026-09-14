@@ -135,7 +135,13 @@ impl Drop for NetnsHolder {
 /// cannot disagree.
 #[derive(Debug)]
 pub struct Containment {
+    /// Declared first so it is DROPPED first: docker refuses to remove a network that still has an
+    /// endpoint attached, so the holder must be gone before [`Self::network`] is.
     pub holder: NetnsHolder,
+    /// The host-side rules keyed to this job's address. Dropping them removes the rules.
+    pub host_rules: HostRules,
+    /// This job's own network, dropped after the holder that sits on it.
+    pub network: JobNetwork,
     pub proxy_host: String,
 }
 
@@ -209,13 +215,24 @@ pub fn holder_argv(
 /// `--rm` is safe here specifically because the caller captures stdout and stderr before the container
 /// is removed; the evidence is in hand before the container is gone.
 pub fn sidecar_argv(holder: &NetnsHolder, image: &str) -> Vec<String> {
+    sidecar_argv_for(holder.name(), image)
+}
+
+/// [`sidecar_argv`] for a namespace addressed by NAME.
+///
+/// Exists for the doctor's delivery-route preflight, which builds and tears down its own throwaway
+/// namespace and so holds a name rather than a [`NetnsHolder`] guard. Taking the guard there would
+/// hand out a `Drop` that destroys a namespace the caller did not create. The argv is the same one
+/// the awarded-job path uses because it IS that argv — a preflight rendering its own would test a
+/// sidecar production never runs.
+pub fn sidecar_argv_for(holder: &str, image: &str) -> Vec<String> {
     [
         "docker",
         "run",
         "--rm",
         "--interactive",
         "--network",
-        &holder.network_mode(),
+        &NetnsHolder::network_mode_for(holder),
         "--cap-drop",
         "ALL",
         "--cap-add",
@@ -281,6 +298,256 @@ pub fn plan_stdin(policy: &NetPolicy) -> (String, usize) {
         out.push('\n');
     }
     (out, plan.len())
+}
+
+/// The per-job network's name, under the operator's configured network name as a prefix.
+///
+/// The configured `[sandbox] network` used to name one shared bridge every job sat on. It keeps
+/// its naming role — that is how a seat's networks are told from another daemon's on a shared host
+/// — and loses its sharing role. The job id is appended for the same reason [`holder_name`] uses
+/// it: a leaked network can be attributed to the job that leaked it.
+pub fn job_network_name(configured: &str, job_id: &str) -> String {
+    format!("{configured}-job-{job_id}")
+}
+
+/// `docker network create` argv for one job's own network.
+///
+/// # Why a job gets a network to itself
+///
+/// Measured in `docs/gvisor-dns-delivery` (aarch64, runsc release-20260817.0). With every job on
+/// one shared bridge, a gVisor job REACHED a live listener in another job's namespace, and no host
+/// rule stopped it: two containers on one bridge are **switched**, not routed, and on a host
+/// without `br_netfilter` those frames enter no iptables chain at all — `DOCKER-USER` with the
+/// right source key still read `REACHED`. Moving the neighbour to its own network changed the
+/// result to `timeout`.
+///
+/// So the per-job network is not tidiness. It is what leaves the job no on-link peer but its own
+/// gateway, which makes every other destination **routed** — and routed packets from a gVisor
+/// sandbox do traverse the host's chains, where [`crate::sandbox_net::HostPolicy`] can bind them.
+pub fn network_create_argv(name: &str) -> Vec<String> {
+    ["docker", "network", "create", "--driver", "bridge", name]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+/// `docker network rm` argv. Only succeeds once no container is attached, which is why the holder
+/// is dropped before the network is.
+pub fn network_rm_argv(name: &str) -> Vec<String> {
+    ["docker", "network", "rm", name].into_iter().map(String::from).collect()
+}
+
+/// `docker inspect` argv that reads the holder's address on `network`.
+///
+/// The host-side policy is keyed to this address, so it is read from docker rather than computed
+/// from the subnet: a policy keyed to a guess denies some other container and leaves this job open.
+pub fn holder_address_argv(holder_name: &str, network: &str) -> Vec<String> {
+    [
+        "docker",
+        "inspect",
+        "--format",
+        &format!("{{{{(index .NetworkSettings.Networks \"{network}\").IPAddress}}}}"),
+        holder_name,
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+/// `docker run` argv for the container that applies the **host-side** policy.
+///
+/// `--network host` is the whole point and the whole risk: these rules must land in the ROOT
+/// namespace's chains, because that is the only place a gVisor job's packets can be seen. It runs
+/// the same applier image as the sidecar, reading the same `<binary> <args…>` plan on stdin, so
+/// there is one applier in this design and not two.
+///
+/// It is safe to hand this container the host's network only because nothing untrusted is ever in
+/// it: it runs our own image, for milliseconds, on a plan rendered in Rust from
+/// [`crate::sandbox_net::HostPolicy`], and it is gone before the job starts. The job itself never
+/// comes near `--network host`.
+pub fn host_rules_argv(image: &str) -> Vec<String> {
+    [
+        "docker",
+        "run",
+        "--rm",
+        "--interactive",
+        "--network",
+        "host",
+        "--cap-drop",
+        "ALL",
+        "--cap-add",
+        "NET_ADMIN",
+        "--security-opt",
+        "no-new-privileges",
+        image,
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+/// One host-side plan as the applier reads it, plus its rule count for the same truncation
+/// cross-check [`plan_stdin`] exists for.
+fn host_stdin(argv: &[Vec<String>]) -> (String, usize) {
+    let mut out = String::new();
+    for rule in argv {
+        out.push_str(&rule.join(" "));
+        out.push('\n');
+    }
+    (out, argv.len())
+}
+
+/// The host-side plan that installs [`crate::sandbox_net::HostPolicy`].
+pub fn host_install_stdin(policy: &crate::sandbox_net::HostPolicy) -> (String, usize) {
+    host_stdin(&policy.install_argv())
+}
+
+/// The host-side plan that removes it again.
+pub fn host_teardown_stdin(policy: &crate::sandbox_net::HostPolicy) -> (String, usize) {
+    host_stdin(&policy.teardown_argv())
+}
+
+/// A created per-job network, and the guarantee that it goes away.
+///
+/// Same bargain as [`NetnsHolder`]: constructed the moment the network exists, so every later `?`
+/// removes it on the way out. Dropped AFTER the holder — docker refuses to remove a network that
+/// still has an endpoint attached — which the field order of [`Containment`] is what enforces.
+#[derive(Debug)]
+pub struct JobNetwork {
+    name: String,
+}
+
+impl JobNetwork {
+    /// Gated to the feature that contains the one caller, so a build without `acp` does not carry
+    /// a constructor nothing can reach.
+    #[cfg(feature = "acp")]
+    fn adopt(name: String) -> Self {
+        Self { name }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl Drop for JobNetwork {
+    fn drop(&mut self) {
+        let outcome = std::process::Command::new("docker")
+            .args(["network", "rm", &self.name])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output();
+        match outcome {
+            Ok(done) if done.status.success() => {}
+            Ok(done) => eprintln!(
+                "sandbox: could not remove job network {}: {}",
+                self.name,
+                String::from_utf8_lossy(&done.stderr).trim()
+            ),
+            Err(error) => {
+                eprintln!("sandbox: could not run docker network rm for {}: {error}", self.name)
+            }
+        }
+    }
+}
+
+/// Installed host-side rules, and the guarantee that they are removed.
+///
+/// The most important guard of the three, because its resource is invisible. A leaked holder is a
+/// container someone will notice; a leaked host rule is a line in a shared chain that outlives the
+/// job silently. Without this, `DOCKER-USER` grows by one ruleset per job forever, and a recycled
+/// address inherits a dead job's policy.
+#[derive(Debug)]
+pub struct HostRules {
+    policy: crate::sandbox_net::HostPolicy,
+    image: String,
+    /// Whether the install was **verified complete** — the applier exited 0 and its count matched
+    /// what was rendered. Set after that cross-check, never at construction.
+    ///
+    /// It decides how teardown is run, and gate 5i is why it exists. `apply-policy` aborts on the
+    /// first rule that fails, and the teardown plan is the exact inverse in reverse order. After a
+    /// PARTIAL install that inverse begins with a rule which was never created, so the applier
+    /// aborts on its first line and removes **nothing** — measured: 9 rules installed, 9 rules
+    /// still in `DOCKER-USER` afterwards.
+    ///
+    /// The applier's exit-3 contract tells the caller to destroy the holder, and for the namespace
+    /// plan that is a complete remedy because those rules die with the netns. These do not: they
+    /// are in the root netns, in chains shared with every container on the daemon.
+    complete: bool,
+}
+
+impl HostRules {
+    /// Adopt rules that may be only partly installed. Always the first thing done with them.
+    fn adopt(policy: crate::sandbox_net::HostPolicy, image: String) -> Self {
+        Self { policy, image, complete: false }
+    }
+
+    /// Record that every rendered rule is in the kernel, which licenses the one-shot teardown.
+    fn mark_complete(&mut self) {
+        self.complete = true;
+    }
+}
+
+/// Feeds one plan to the host-rule applier and reports whether it applied cleanly.
+fn run_host_plan(image: &str, plan: &str) -> Result<(), String> {
+    use std::io::Write;
+    let argv = host_rules_argv(image);
+    let (program, args) = argv.split_first().expect("a docker argv is never empty");
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        let _ = stdin.write_all(plan.as_bytes());
+    }
+    drop(child.stdin.take());
+    match child.wait_with_output() {
+        Ok(done) if done.status.success() => Ok(()),
+        Ok(done) => Err(String::from_utf8_lossy(&done.stderr).trim().to_owned()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+impl Drop for HostRules {
+    /// Synchronous, like [`NetnsHolder::drop`] and for the same reason: a task spawned here is
+    /// discarded on runtime shutdown, which is the path an aborted job takes.
+    fn drop(&mut self) {
+        if self.complete {
+            // Every rule is present, so the inverse plan matches it rule for rule and one
+            // invocation is both correct and cheapest.
+            let (plan, _) = host_teardown_stdin(&self.policy);
+            if let Err(error) = run_host_plan(&self.image, &plan) {
+                eprintln!(
+                    "sandbox: host-rule teardown for {} failed: {error} — \
+                     DOCKER-USER and INPUT still carry this job's rules",
+                    self.policy.job_addr
+                );
+            }
+            return;
+        }
+
+        // The install did not complete, so an unknown prefix of the plan is in the kernel and the
+        // rest never existed. One invocation would abort on the first absent rule and strand the
+        // present ones. Each rule gets its own invocation: a failure then means only "that rule was
+        // not there", which on this path is the expected case and not an error.
+        let rules = self.policy.teardown_argv();
+        let total = rules.len();
+        let mut removed = 0usize;
+        for rule in &rules {
+            let (plan, _) = host_stdin(std::slice::from_ref(rule));
+            if run_host_plan(&self.image, &plan).is_ok() {
+                removed += 1;
+            }
+        }
+        eprintln!(
+            "sandbox: host-rule install for {} did not complete; removed {removed} of {total} \
+             rules one at a time",
+            self.policy.job_addr
+        );
+    }
 }
 
 /// `docker run` argv that asks **docker** what `host-gateway` means on this platform, by resolving
@@ -638,13 +905,57 @@ pub async fn establish(
         format!("resolving {proxy_alias} produced no IPv4 address (got {probe_stdout:?})")
     })?;
 
+    // This job's own network, created before the holder that will sit on it. Adopted into a guard
+    // immediately, for the same reason the holder is: every `?` below must remove it.
+    let net_name = job_network_name(network, job_id);
+    run_docker(network_create_argv(&net_name), None)
+        .await
+        .map_err(|error| format!("could not create the job network {net_name} — {error}"))?;
+    let job_network = JobNetwork::adopt(net_name.clone());
+
     let name = holder_name(job_id);
-    run_docker(holder_argv(&name, network, holder_image, uid, gid, job_id, seat), None)
+    run_docker(holder_argv(&name, &net_name, holder_image, uid, gid, job_id, seat), None)
         .await
         .map_err(|error| format!("could not start the netns holder {name} — {error}"))?;
     // From here on the container exists, so every early return must tear it down. Adopting it into
     // the guard immediately is what makes that automatic rather than remembered.
     let holder = NetnsHolder::adopt(name);
+
+    // The host-side policy, keyed to the address docker actually gave the holder. Read, never
+    // computed: a policy keyed to a guessed address denies some other container and leaves this
+    // job wide open.
+    let (job_addr, _) = run_docker(holder_address_argv(holder.name(), &net_name), None)
+        .await
+        .map_err(|error| format!("could not read the job namespace's address — {error}"))?;
+    let job_addr = job_addr.trim().to_owned();
+    if job_addr.is_empty() {
+        return Err(format!(
+            "docker reported no address for {} on {net_name}, so the host-side policy would have \
+             no source key and would deny the range host-wide",
+            holder.name()
+        ));
+    }
+    let host_policy = crate::sandbox_net::HostPolicy { job_addr };
+    let (host_plan, host_expected) = host_install_stdin(&host_policy);
+    let host_applied = run_docker(host_rules_argv(sidecar_image), Some(host_plan)).await;
+    // Adopted before the result is examined: a plan that failed part-way has already installed
+    // rules, and those rules must come out whichever way this returns.
+    let mut host_rules = HostRules::adopt(host_policy, sidecar_image.to_owned());
+    let (host_applied, _) = host_applied
+        .map_err(|error| format!("host-side containment was not installed — {error}"))?;
+    let host_applied: usize = host_applied
+        .parse()
+        .map_err(|_| format!("the host-rule applier reported {host_applied:?}, not a number"))?;
+    if host_applied != host_expected {
+        return Err(format!(
+            "host-side containment is incomplete: {host_applied} of {host_expected} rules applied \
+             (the plan was truncated in transit)"
+        ));
+    }
+    // Only now is the one-shot inverse teardown known to match what is in the kernel. Before this
+    // line every early return unwinds rule-by-rule instead, which is the only way a partial
+    // install comes back out (gate 5i).
+    host_rules.mark_complete();
 
     // The resolvers arrive from the caller rather than being discovered here, and that is the one
     // property that keeps the job's `/etc/resolv.conf` and this policy in agreement: the caller
@@ -690,7 +1001,7 @@ pub async fn establish(
         })?;
     }
 
-    Ok(Containment { holder, proxy_host })
+    Ok(Containment { holder, host_rules, network: job_network, proxy_host })
 }
 
 #[cfg(test)]
@@ -1005,5 +1316,72 @@ mod tests {
         let accepts: Vec<&str> = stdin.lines().filter(|l| l.contains("ACCEPT")).collect();
         assert_eq!(accepts.len(), 1, "exactly one pinhole: {accepts:?}");
         assert!(accepts[0].contains(&measured), "the pinhole must name the measured host: {accepts:?}");
+    }
+
+    /// The containment plane runs on the daemon's own runtime, never the job's.
+    ///
+    /// Measured in the gVisor repro (aarch64, runsc release-20260817.0, evidence
+    /// `docs/gvisor-dns-delivery/evidence/gate2a-runsc-holder-FAIL-*.txt`): a runsc container
+    /// joining a **runsc** holder's namespace sees `lo` only — no eth0, no route, every lookup
+    /// `EAI_AGAIN` — because a gVisor sandbox's netstack lives inside that sandbox and a second one
+    /// cannot enter it. Joining a **runc** holder, the same runsc job gets the holder's interface
+    /// and address, so the host kernel's rules govern its traffic. `iptables-nft` also refuses to
+    /// initialise inside gVisor, so a sandboxed sidecar could not install the plan even if the
+    /// namespace were shared.
+    ///
+    /// So this is not a default anyone may "improve" by threading the seat's runtime through: doing
+    /// that returns a job with no network at all, and a policy nothing enforces.
+    #[test]
+    fn the_containment_plane_never_carries_the_jobs_runtime() {
+        let holder = holder_argv("h", "net", "img", 1000, 1000, "abc", &seat_b());
+        assert!(
+            !holder.iter().any(|a| a == "--runtime"),
+            "the holder must run on the daemon runtime, or the job cannot join its namespace: \
+             {holder:?}"
+        );
+        let sidecar = sidecar_argv(&NetnsHolder::adopt("h".into()), "netfilter");
+        assert!(
+            !sidecar.iter().any(|a| a == "--runtime"),
+            "the sidecar must run on the daemon runtime, or iptables cannot initialise: {sidecar:?}"
+        );
+    }
+
+    #[test]
+
+
+    /// Adoption must assume the install is partial; the one-shot teardown has to be earned.
+    ///
+    /// Gate 5i measured what happens when it is not: a 9-of-17 install torn down by the inverse
+    /// plan removed **nothing**, because the applier aborts on the first rule that was never
+    /// created. So `complete` starts false, and only the count cross-check sets it.
+    #[test]
+    fn adopted_host_rules_are_not_complete_until_the_count_check_passes() {
+        let policy = crate::sandbox_net::HostPolicy { job_addr: "172.18.0.2".to_owned() };
+        let mut rules = HostRules::adopt(policy, "image:tag".to_owned());
+        assert!(!rules.complete, "adoption must assume a partial install");
+        rules.mark_complete();
+        assert!(rules.complete, "the count cross-check is what licenses the one-shot teardown");
+        // Drop shells out to docker; this test is about the flag, not the teardown.
+        std::mem::forget(rules);
+    }
+
+    /// Each rule of the rule-by-rule teardown must stand alone as one valid delete.
+    ///
+    /// This is the path a partial install unwinds through, and the applier refuses an empty plan
+    /// (exit 4) and anything that is not iptables (exit 5), so every single-rule plan must be one
+    /// line, a delete, and still keyed to this job.
+    #[test]
+    fn the_per_rule_teardown_renders_one_valid_delete_per_rule() {
+        let policy = crate::sandbox_net::HostPolicy { job_addr: "172.18.0.2".to_owned() };
+        let rules = policy.teardown_argv();
+        assert!(!rules.is_empty(), "there is nothing to tear down");
+        for rule in &rules {
+            let (plan, count) = host_stdin(std::slice::from_ref(rule));
+            assert_eq!(count, 1, "a per-rule plan must carry exactly one rule");
+            assert_eq!(plan.lines().count(), 1, "a per-rule plan must be one line: {plan:?}");
+            let line = plan.lines().next().expect("one line");
+            assert!(line.starts_with("iptables -D "), "must be a delete: {line}");
+            assert!(line.contains("172.18.0.2/32"), "must stay keyed to this job: {line}");
+        }
     }
 }

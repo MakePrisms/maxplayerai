@@ -1,0 +1,102 @@
+=== gate2: environment ===
+utc=2026-09-10T01:48:54Z
+kernel=6.8.0-134-generic arch=aarch64
+os=Ubuntu 24.04.4 LTS
+docker=29.1.3
+runsc=runsc version release-20260817.0
+holder_runtime=runc job_runtime=runsc
+image=ghcr.io/makeprisms/maxplayer-sandbox:v0.5.8
+image_digest=ghcr.io/makeprisms/maxplayer-sandbox@sha256:1c50e46a35dfe91fcdbbba11876bff312a95567bda98d6dcb7f675c884777412
+netfilter_digest=ghcr.io/makeprisms/maxplayer-netfilter@sha256:913985269261c7169b4f7b14a5db69843b9a3421aa483145a26d6ac38db3da3a
+resolver=1.1.1.1
+/Users/forge/forge/v2/wt/w-gvisor-dns-delivery-r2/docs/gvisor-dns-delivery/scripts/gate2-namespace-dns-tls.sh: line 55: /home/forge.guest/gate2-resolv.conf: Permission denied
+resolv_conf=/home/forge.guest/gate2-resolv.conf sha256=24c2b7ed40eef08c2661229c666dce74d955b8e365b7ec598456cbf042bece91
+plan=/home/forge.guest/gate2-plan.txt rules=26 sha256=eb0fc310b18db6104445fd2f08553d1f0d068f3747eb58d97c434f7670360f43
+network=maxplayer-dns-gate2 subnet=172.31.7.0/24 gateway=172.31.7.1
+
+=== gate2/fresh: establish the shared job namespace ===
+holder=gate2-holder started=0
+--- sidecar applies the rendered plan ---
+26
+sidecar_exit=0
+--- readback (iptables -S) ---
+-P OUTPUT ACCEPT
+-A OUTPUT -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix "sbx-net-conn:"
+-A OUTPUT -p udp -m udp --dport 53 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix "sbx-net-dns:"
+-A OUTPUT -d 169.254.169.254/32 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix "sbx-net-deny-metadata:"
+-A OUTPUT -d 169.254.169.254/32 -j DROP
+-A OUTPUT -d 172.31.7.1/32 -p tcp -m tcp --dport 49200:49299 -j ACCEPT
+-A OUTPUT -d 1.1.1.1/32 -p udp -m udp --dport 53 -j ACCEPT
+-A OUTPUT -d 1.1.1.1/32 -p tcp -m tcp --dport 53 -j ACCEPT
+-A OUTPUT -d 10.0.0.0/8 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix "sbx-net-deny:"
+-A OUTPUT -d 10.0.0.0/8 -j DROP
+-A OUTPUT -d 172.16.0.0/12 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix "sbx-net-deny:"
+-A OUTPUT -d 172.16.0.0/12 -j DROP
+-A OUTPUT -d 192.168.0.0/16 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix "sbx-net-deny:"
+-A OUTPUT -d 192.168.0.0/16 -j DROP
+-A OUTPUT -d 169.254.0.0/16 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix "sbx-net-deny:"
+-A OUTPUT -d 169.254.0.0/16 -j DROP
+-A OUTPUT -d 100.64.0.0/10 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix "sbx-net-deny:"
+-A OUTPUT -d 100.64.0.0/10 -j DROP
+-A OUTPUT -d 198.18.0.0/15 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix "sbx-net-deny:"
+-A OUTPUT -d 198.18.0.0/15 -j DROP
+-A OUTPUT -d 224.0.0.0/4 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix "sbx-net-deny:"
+-A OUTPUT -d 224.0.0.0/4 -j DROP
+-A OUTPUT -d 240.0.0.0/4 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix "sbx-net-deny:"
+-A OUTPUT -d 240.0.0.0/4 -j DROP
+readback_exit=0
+
+=== gate2/fresh: job in the shared namespace — dns + verified tls ===
+resolv.conf: nameserver 1.1.1.1|options timeout:2 attempts:2
+lookup: OK 34.225.223.145
+tls: 200 cert-verified subject=relay.maxplayer.ai issuer=YE1 authorized=true
+job_exit=0
+--- containment still holds: metadata address ---
+metadata: denied (ENETUNREACH)
+metadata_exit=0
+
+=== gate2: destroy the namespace and rebuild it ===
+
+=== gate2/recreated: establish the shared job namespace ===
+holder=gate2-holder started=0
+--- sidecar applies the rendered plan ---
+26
+sidecar_exit=0
+--- readback (iptables -S) ---
+-P OUTPUT ACCEPT
+-A OUTPUT -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix "sbx-net-conn:"
+-A OUTPUT -p udp -m udp --dport 53 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix "sbx-net-dns:"
+-A OUTPUT -d 169.254.169.254/32 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix "sbx-net-deny-metadata:"
+-A OUTPUT -d 169.254.169.254/32 -j DROP
+-A OUTPUT -d 172.31.7.1/32 -p tcp -m tcp --dport 49200:49299 -j ACCEPT
+-A OUTPUT -d 1.1.1.1/32 -p udp -m udp --dport 53 -j ACCEPT
+-A OUTPUT -d 1.1.1.1/32 -p tcp -m tcp --dport 53 -j ACCEPT
+-A OUTPUT -d 10.0.0.0/8 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix "sbx-net-deny:"
+-A OUTPUT -d 10.0.0.0/8 -j DROP
+-A OUTPUT -d 172.16.0.0/12 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix "sbx-net-deny:"
+-A OUTPUT -d 172.16.0.0/12 -j DROP
+-A OUTPUT -d 192.168.0.0/16 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix "sbx-net-deny:"
+-A OUTPUT -d 192.168.0.0/16 -j DROP
+-A OUTPUT -d 169.254.0.0/16 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix "sbx-net-deny:"
+-A OUTPUT -d 169.254.0.0/16 -j DROP
+-A OUTPUT -d 100.64.0.0/10 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix "sbx-net-deny:"
+-A OUTPUT -d 100.64.0.0/10 -j DROP
+-A OUTPUT -d 198.18.0.0/15 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix "sbx-net-deny:"
+-A OUTPUT -d 198.18.0.0/15 -j DROP
+-A OUTPUT -d 224.0.0.0/4 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix "sbx-net-deny:"
+-A OUTPUT -d 224.0.0.0/4 -j DROP
+-A OUTPUT -d 240.0.0.0/4 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix "sbx-net-deny:"
+-A OUTPUT -d 240.0.0.0/4 -j DROP
+readback_exit=0
+
+=== gate2/recreated: job in the shared namespace — dns + verified tls ===
+resolv.conf: nameserver 1.1.1.1|options timeout:2 attempts:2
+lookup: OK 34.225.223.145
+tls: 200 cert-verified subject=relay.maxplayer.ai issuer=YE1 authorized=true
+job_exit=0
+--- containment still holds: metadata address ---
+metadata: denied (ENETUNREACH)
+metadata_exit=0
+
+=== gate2: verdict ===
+GATE2: PASS (fresh and recreated namespaces both resolved and completed verified TLS)

@@ -1,0 +1,22 @@
+utc=2026-09-10T03:47:21Z
+kernel=6.8.0-134-generic arch=aarch64 docker=29.1.3
+=== daemon.json ===
+{
+    "runtimes": {
+        "runsc": {
+            "path": "/usr/local/bin/runsc"
+        }
+    }
+}=== daemon ipv6 setting ===
+(docker info reports no ipv6 key)
+=== a job-shaped holder on a per-job network ===
+--- ip -6 addr inside the holder namespace ---
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 state UNKNOWN qlen 1000
+    inet6 ::1/128 scope host 
+       valid_lft forever preferred_lft forever
+--- global (non-link-local) v6 addresses seen ---
+0
+0
+--- does ip6tables even have a DOCKER-USER chain here? ---
+-N DOCKER-USER
+=== end ===

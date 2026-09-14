@@ -1,0 +1,15 @@
+=== gVisor DNS/delivery gates ===
+utc=2026-09-10T03:15:13Z
+kernel=6.8.0-134-generic arch=aarch64 docker=29.1.3 runsc=runsc version release-20260817.0
+per-gate timeout=420s total budget=800s evidence=/home/forge.guest/gate-evidence
+NOTE: results are labelled by architecture on purpose — x86_64 is NOT covered by this run.
+
+--- gate1: running (timeout 420s) -> /home/forge.guest/gate-evidence/gate1-20260910T031513Z.log
+--- gate5f: running (timeout 420s) -> /home/forge.guest/gate-evidence/gate5f-20260910T031522Z.log
+=== summary ===
+utc=2026-09-10T03:16:14Z
+arch=aarch64 runsc=runsc version release-20260817.0
+gate1    PASS     exit=0 log=gate1-20260910T031513Z.log
+gate5f   PASS     exit=0 log=gate5f-20260910T031522Z.log
+total=61s gates=2 not-passing=0
+ALL GATES: PASS

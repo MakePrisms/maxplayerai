@@ -1,0 +1,36 @@
+=== gate5i: environment ===
+utc=2026-09-10T03:39:18Z
+kernel=6.8.0-134-generic arch=aarch64 runsc=runsc version release-20260817.0
+chain depth at start: 2
+live host listener: 192.168.5.15:49257
+job address: 172.31.56.2
+rendered plan: 17 rules
+
+=== gate5i: A. applier cannot start (bad image) — nothing may be installed ===
+  applier said: Run 'docker run --help' for more information
+  rules keyed to 172.31.56.2: 0
+  ok: a non-starting applier installs nothing (establish() maps this to a hard error)
+
+=== gate5i: B. applier without NET_ADMIN — must not silently succeed ===
+  applier said: apply-policy: namespace is PARTIALLY configured — destroy the holder, do not retry
+  rules keyed to 172.31.56.2: 0
+  ok: no capability, no rules
+
+=== gate5i: C. TRUNCATED plan — does it apply cleanly and lie? ===
+  feeding 17 rendered rules as a 9-line plan
+  applier exit=0 said=9
+  rules actually in the kernel: 9 of 17 rendered
+  ok: CONFIRMED: a truncated plan exits 0 while under-installing — only the count reveals it
+  ok: count cross-check would refuse this job (9 != 17)
+  runsc -> live host 192.168.5.15:49257 with a PARTIAL firewall: REACHED
+  ok: a partially-installed policy leaves the job UNCONTAINED — refusing the job is the only safe move
+
+=== gate5i: D. teardown unwinds the partial install ===
+  rules keyed to 172.31.56.2 after teardown: 9
+  FAIL: 9 rule(s) survived teardown of a partial install
+
+=== gate5i: verdict ===
+chain depth: start=2 end=11
+  FAIL: chains changed 2 -> 11
+failing checks: 2
+GATE 5i: FAIL

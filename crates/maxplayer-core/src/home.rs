@@ -607,24 +607,28 @@ pub struct SandboxConfig {
     /// Unused under `launcher` mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
-    /// `docker` mode: the dedicated docker network a job's container joins (`docker run --network`).
-    /// Omitted ⇒ the daemon default (the shared `bridge` network).
+    /// `docker` mode: the **name prefix** for the docker network each job gets to itself.
+    /// Omitted ⇒ no containment, and the daemon default bridge.
     ///
     /// **Setting this is what turns #797 egress containment on for this seat.** A job launched under
     /// it runs in a network namespace whose rules were installed before the job process existed, and
     /// a job whose containment cannot be established FAILS rather than running exposed. There is no
     /// second step: no root command, and nothing to reinstall after a reboot.
     ///
-    /// Two reasons a *named* network rather than the default bridge:
+    /// **It names, it does not share.** This value is not one bridge every job sits on: each job gets
+    /// `<this>-job-<job_id>`, created before its holder and removed after it. The name still does the
+    /// job it always did — telling this seat's networks from a co-tenant daemon's — and no longer
+    /// puts two jobs on one wire. That changed because of a measurement: with jobs sharing a bridge,
+    /// a gVisor job REACHED a live listener inside another job's namespace and no host rule stopped
+    /// it, two containers on one bridge being switched rather than routed, and switched frames
+    /// entering no iptables chain at all on a host without `br_netfilter`. A network per job leaves
+    /// the job no on-link peer but its own gateway, which is also what makes every other destination
+    /// routed, and therefore visible to the host-side policy that binds a gVisor job at all.
     ///
-    /// * **The seller's own services are not on it.** The rules deny by destination, and the seat's
-    ///   LAN and host addresses fall inside those denies. A dedicated network keeps a job's traffic
-    ///   off the bridge every other container on the box shares.
-    /// * **DNS keeps working.** On a user-defined network a container resolves through docker's
-    ///   embedded resolver at `127.0.0.11` inside its own netns, so no packet crosses to a host or LAN
-    ///   resolver. On the shared default bridge docker copies the host's `resolv.conf` instead, and if
-    ///   that names a LAN or host resolver then denying the LAN also denies DNS — which presents as
-    ///   "the internet is broken" rather than as a firewall rule.
+    /// A *named* network rather than the default bridge, for a reason that predates all of that:
+    /// **the seller's own services are not on it.** The rules deny by destination, and the seat's LAN
+    /// and host addresses fall inside those denies, so a job must not share the bridge every other
+    /// container on the box uses.
     ///
     /// See [`crate::sandbox_net`] for what the rules are and [`crate::sandbox_netns`] for how they are
     /// put in force.

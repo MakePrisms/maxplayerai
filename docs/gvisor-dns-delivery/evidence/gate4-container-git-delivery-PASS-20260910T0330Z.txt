@@ -1,0 +1,42 @@
+=== gate4: environment ===
+utc=2026-09-10T02:21:28Z
+kernel=6.8.0-134-generic arch=aarch64
+os=Ubuntu 24.04.4 LTS
+docker=29.1.3
+runsc=runsc version release-20260817.0
+holder_runtime=runc job_runtime=runsc
+image_digest=ghcr.io/makeprisms/maxplayer-sandbox@sha256:1c50e46a35dfe91fcdbbba11876bff312a95567bda98d6dcb7f675c884777412
+container_git=git version 2.39.5
+public_repo=https://github.com/octocat/Hello-World.git
+/Users/forge/forge/v2/wt/w-gvisor-dns-delivery-r2/docs/gvisor-dns-delivery/scripts/gate4-container-git-delivery.sh: line 65: /home/forge.guest/gate4-resolv.conf: Permission denied
+plan=/home/forge.guest/gate4-plan.txt rules=26 sha256=70ab9b4e65dfe6a1a48911ea734e0fecf6ca84f9d0879a890d460e84830e3d78
+network=maxplayer-dns-gate4 subnet=172.31.8.0/24 gateway=172.31.8.1
+
+=== gate4: control — the remote's real HEAD, read from the VM (outside any container) ===
+control_head=7fd1a60b01f91b314f59955a4e4d4e80d8edf11d
+
+=== gate4: disposable write remote ===
+write_remote=git://172.31.8.1:49250/answer.git (disposable, unauthenticated, torn down on exit)
+remote_refs_before=0
+
+=== gate4: establish the shared job namespace ===
+holder_started=0
+26
+sidecar_exit=0
+
+=== gate4: job container (runsc, non-root, cap-drop ALL) ===
+--- read leg: clone over https from inside the sandbox ---
+delivered_head=7fd1a60b01f91b314f59955a4e4d4e80d8edf11d
+--- write leg: commit here, push to the remote outside this container ---
+answer_commit=a4a883b087273c86480ea1269f7e50ff965296b2
+push_exit=0
+job_exit=0
+
+=== gate4: verdict ===
+control_head=7fd1a60b01f91b314f59955a4e4d4e80d8edf11d
+delivered_head=7fd1a60b01f91b314f59955a4e4d4e80d8edf11d
+READ: PASS — the sandbox delivered the remote's real HEAD
+answer_commit=a4a883b087273c86480ea1269f7e50ff965296b2
+remote_hash=a4a883b087273c86480ea1269f7e50ff965296b2
+WRITE: PASS — the commit made inside the sandbox reached the remote, hash matches
+GATE4: PASS

@@ -1,0 +1,26 @@
+iptables -A OUTPUT -p tcp --syn -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix sbx-net-conn:
+iptables -A OUTPUT -p udp --dport 53 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix sbx-net-dns:
+iptables -A OUTPUT -d 169.254.169.254/32 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix sbx-net-deny-metadata:
+iptables -A OUTPUT -d 169.254.169.254/32 -j DROP
+iptables -A OUTPUT -p tcp -d 172.31.30.1 --dport 49200:49299 -j ACCEPT
+iptables -A OUTPUT -p udp -d 1.1.1.1/32 --dport 53 -j ACCEPT
+iptables -A OUTPUT -p tcp -d 1.1.1.1/32 --dport 53 -j ACCEPT
+iptables -A OUTPUT -d 10.0.0.0/8 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix sbx-net-deny:
+iptables -A OUTPUT -d 10.0.0.0/8 -j DROP
+iptables -A OUTPUT -d 172.16.0.0/12 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix sbx-net-deny:
+iptables -A OUTPUT -d 172.16.0.0/12 -j DROP
+iptables -A OUTPUT -d 192.168.0.0/16 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix sbx-net-deny:
+iptables -A OUTPUT -d 192.168.0.0/16 -j DROP
+iptables -A OUTPUT -d 169.254.0.0/16 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix sbx-net-deny:
+iptables -A OUTPUT -d 169.254.0.0/16 -j DROP
+iptables -A OUTPUT -d 100.64.0.0/10 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix sbx-net-deny:
+iptables -A OUTPUT -d 100.64.0.0/10 -j DROP
+iptables -A OUTPUT -d 198.18.0.0/15 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix sbx-net-deny:
+iptables -A OUTPUT -d 198.18.0.0/15 -j DROP
+iptables -A OUTPUT -d 224.0.0.0/4 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix sbx-net-deny:
+iptables -A OUTPUT -d 224.0.0.0/4 -j DROP
+iptables -A OUTPUT -d 240.0.0.0/4 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix sbx-net-deny:
+iptables -A OUTPUT -d 240.0.0.0/4 -j DROP
+ip6tables -A OUTPUT -d fc00::/7 -j DROP
+ip6tables -A OUTPUT -d fe80::/10 -j DROP
+ip6tables -A OUTPUT -d ff00::/8 -j DROP

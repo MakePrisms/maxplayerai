@@ -1,0 +1,38 @@
+=== gate5h: environment ===
+utc=2026-09-10T03:32:21Z
+kernel=6.8.0-134-generic arch=aarch64 runsc=runsc version release-20260817.0
+chain depth at start (DOCKER-USER + INPUT): 2
+live host listener: 192.168.5.15:49256
+
+=== gate5h: 1. job A establishes, rules appear, containment holds ===
+  job A address (read from docker inspect): 172.31.55.2
+  rules keyed to 172.31.55.2: before=0 after-install=17
+  ok: install added 17 host rules
+  namespace health: HEALTHY 172.31.55.2
+  runsc -> live host 192.168.5.15:49256: timeout
+  ok: A contained while its rules are installed
+
+=== gate5h: 2. job A tears down — rules must be GONE, network must be GONE ===
+  rules keyed to 172.31.55.2 after teardown: 0
+  ok: no leftover host rules
+  ok: network removed
+
+=== gate5h: 3. RECYCLED address — job B takes A's old address ===
+  job B address: 172.31.55.2 (A's was 172.31.55.2)
+  ok: address genuinely recycled — this is the case that matters
+  rules keyed to 172.31.55.2 BEFORE B installs its own: 0
+  ok: B inherits no stale firewall
+  runsc -> live host BEFORE B's rules (bare control, expect REACHED): REACHED
+  runsc -> live host AFTER B's rules: ENETUNREACH
+  ok: B contained by its own rules
+
+=== gate5h: 4. RECREATION — the same job id twice must not wedge ===
+  first incarnation address: 172.31.55.2
+  second incarnation address: 172.31.55.2
+  ok: same job id came up twice, no 'network already exists' wedge
+
+=== gate5h: verdict ===
+chain depth: start=2 end=2
+  ok: chains returned to starting depth — the gate left nothing behind
+failing checks: 0
+GATE 5h: PASS

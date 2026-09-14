@@ -1,0 +1,25 @@
+=== gate5b: environment ===
+utc=2026-09-10T02:33:28Z
+kernel=6.8.0-134-generic arch=aarch64
+docker=29.1.3 runsc=runsc version release-20260817.0
+network=maxplayer-dns-gate5b subnet=172.31.13.0/24 plan_rules=26
+26
+plan_applied_rules_reported=0
+neighbour=172.31.13.3:8080 running=true
+neighbour_is_inside_a_dropped_range=172.16.0.0/12
+
+=== gate5b: the same probe, the same namespace, two runtimes ===
+job_runtime=runc RESULT=timeout
+job_runtime=runsc RESULT=REACHED
+
+=== gate5b: the rule as installed, read back from the namespace ===
+11:-A OUTPUT -d 172.16.0.0/12 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix "sbx-net-deny:"
+12:-A OUTPUT -d 172.16.0.0/12 -j DROP
+
+=== gate5b: verdict ===
+runc_result=RESULT=timeout
+runsc_result=RESULT=REACHED
+FINDING: the plan binds a runc job and DOES NOT BIND a runsc job.
+gVisor's netstack emits packets to the veth itself; the host kernel's OUTPUT chain
+in that netns never sees them, so per-job egress policy is not enforced for the job
+it is written for. Containment for gVisor jobs cannot live in the netns OUTPUT chain.

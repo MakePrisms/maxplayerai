@@ -1,0 +1,17 @@
+iptables -I DOCKER-USER -s 172.31.33.10/32 -d 169.254.169.254/32 -j DROP
+iptables -I DOCKER-USER -s 172.31.33.10/32 -d 10.0.0.0/8 -j DROP
+iptables -I DOCKER-USER -s 172.31.33.10/32 -d 172.16.0.0/12 -j DROP
+iptables -I DOCKER-USER -s 172.31.33.10/32 -d 192.168.0.0/16 -j DROP
+iptables -I DOCKER-USER -s 172.31.33.10/32 -d 169.254.0.0/16 -j DROP
+iptables -I DOCKER-USER -s 172.31.33.10/32 -d 100.64.0.0/10 -j DROP
+iptables -I DOCKER-USER -s 172.31.33.10/32 -d 198.18.0.0/15 -j DROP
+iptables -I DOCKER-USER -s 172.31.33.10/32 -d 224.0.0.0/4 -j DROP
+iptables -I DOCKER-USER -s 172.31.33.10/32 -d 240.0.0.0/4 -j DROP
+iptables -I INPUT -s 172.31.33.10/32 -d 10.0.0.0/8 -j DROP
+iptables -I INPUT -s 172.31.33.10/32 -d 172.16.0.0/12 -j DROP
+iptables -I INPUT -s 172.31.33.10/32 -d 192.168.0.0/16 -j DROP
+iptables -I INPUT -s 172.31.33.10/32 -d 169.254.0.0/16 -j DROP
+iptables -I INPUT -s 172.31.33.10/32 -d 100.64.0.0/10 -j DROP
+iptables -I INPUT -s 172.31.33.10/32 -d 198.18.0.0/15 -j DROP
+iptables -I INPUT -s 172.31.33.10/32 -d 224.0.0.0/4 -j DROP
+iptables -I INPUT -s 172.31.33.10/32 -d 240.0.0.0/4 -j DROP

@@ -1,0 +1,66 @@
+=== gate2: environment ===
+utc=2026-09-10T01:45:37Z
+kernel=6.8.0-134-generic arch=aarch64
+os=Ubuntu 24.04.4 LTS
+docker=29.1.3
+runsc=runsc version release-20260817.0
+image=ghcr.io/makeprisms/maxplayer-sandbox:v0.5.8
+image_digest=ghcr.io/makeprisms/maxplayer-sandbox@sha256:1c50e46a35dfe91fcdbbba11876bff312a95567bda98d6dcb7f675c884777412
+netfilter_digest=ghcr.io/makeprisms/maxplayer-netfilter@sha256:913985269261c7169b4f7b14a5db69843b9a3421aa483145a26d6ac38db3da3a
+resolver=1.1.1.1
+resolv_conf=/home/forge.guest/gate2-resolv.conf sha256=24c2b7ed40eef08c2661229c666dce74d955b8e365b7ec598456cbf042bece91
+plan=/home/forge.guest/gate2-plan.txt rules=26 sha256=eb0fc310b18db6104445fd2f08553d1f0d068f3747eb58d97c434f7670360f43
+network=maxplayer-dns-gate2 subnet=172.31.7.0/24 gateway=172.31.7.1
+
+=== gate2/fresh: establish the shared job namespace ===
+holder=gate2-holder started=0
+--- sidecar applies the rendered plan ---
+iptables: Failed to initialize nft: Protocol not supported
+apply-policy: rule 1 failed: iptables -A OUTPUT -p tcp --syn -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix sbx-net-conn:
+apply-policy: namespace is PARTIALLY configured — destroy the holder, do not retry
+sidecar_exit=3
+--- readback (iptables -S) ---
+iptables: Failed to initialize nft: Protocol not supported
+readback_exit=1
+
+=== gate2/fresh: job in the shared namespace — dns + verified tls ===
+resolv.conf: nameserver 1.1.1.1|options timeout:2 attempts:2
+lookup: ERR EAI_AGAIN
+job_exit=1
+--- containment still holds: metadata address ---
+metadata: denied (ENETUNREACH)
+metadata_exit=0
+
+=== gate2: destroy the namespace and rebuild it ===
+
+=== gate2/recreated: establish the shared job namespace ===
+holder=gate2-holder started=0
+--- sidecar applies the rendered plan ---
+iptables: Failed to initialize nft: Protocol not supported
+apply-policy: rule 1 failed: iptables -A OUTPUT -p tcp --syn -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix sbx-net-conn:
+apply-policy: namespace is PARTIALLY configured — destroy the holder, do not retry
+sidecar_exit=3
+--- readback (iptables -S) ---
+iptables: Failed to initialize nft: Protocol not supported
+readback_exit=1
+
+=== gate2/recreated: job in the shared namespace — dns + verified tls ===
+resolv.conf: nameserver 1.1.1.1|options timeout:2 attempts:2
+lookup: ERR EAI_AGAIN
+job_exit=1
+--- containment still holds: metadata address ---
+metadata: denied (ENETUNREACH)
+metadata_exit=0
+
+=== gate2: verdict ===
+GATE2: FAIL
+
+=== gate2 diagnostic: interfaces a container sees, by runtime and network mode ===
+(probe: node os.networkInterfaces(); the sandbox image ships no iproute2)
+A runsc job joining a RUNSC holder netns: lo
+B runsc job joining a RUNC  holder netns: lo,eth0
+C runsc job on the bridge DIRECTLY:       lo,eth0
+D runc  job joining the RUNC holder:      lo
+=== iptables backend available to the sidecar, by runtime ===
+runc  sidecar on runc holder:  -P OUTPUT ACCEPT
+runsc sidecar on runsc holder: iptables: Failed to initialize nft: Protocol not supported

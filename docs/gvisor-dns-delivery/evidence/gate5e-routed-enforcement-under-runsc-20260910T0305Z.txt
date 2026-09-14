@@ -1,0 +1,33 @@
+=== gate5e: environment ===
+utc=2026-09-10T02:48:54Z
+kernel=6.8.0-134-generic arch=aarch64 docker=29.1.3 runsc=runsc version release-20260817.0
+br_netfilter=absent
+host_lan=192.168.5.15 (the VM's own eth0 — host-directed traffic lands in INPUT, not FORWARD)
+per-job networks: job1=172.31.19.0/24 job2=172.31.20.0/24
+live host listener: 192.168.5.15:49252 (bare tcp, answers every connection)
+live neighbour in job 2's own namespace: 172.31.20.2:8080
+
+=== gate5e: 1. the host itself, a routed private destination with a LIVE listener ===
+  runc  -> 192.168.5.15:49252, bare: timeout   [ns=172.31.19.2 rules=none]
+  runsc -> 192.168.5.15:49252, bare: REACHED   [ns=172.31.19.2 rules=none]
+  runsc -> 192.168.5.15:49252, DOCKER-USER: REACHED   [ns=172.31.19.2 rules=DOCKER-USER|-s 172.31.19.2/32 -d 192.168.0.0/16 -j DROP]
+  runsc -> 192.168.5.15:49252, INPUT: timeout   [ns=172.31.19.2 rules=INPUT|-s 172.31.19.2/32 -d 192.168.0.0/16 -j DROP]
+
+=== gate5e: 2. the metadata address (no listener anywhere — read only the DIFFERENCE) ===
+  runsc -> 169.254.169.254:80, bare: ECONNREFUSED   [ns=172.31.19.2 rules=none]
+  runsc -> 169.254.169.254:80, DOCKER-USER: timeout   [ns=172.31.19.2 rules=DOCKER-USER|-s 172.31.19.2/32 -d 169.254.169.254/32 -j DROP]
+
+=== gate5e: 3. cross-job, each job on its OWN network (the regression proof) ===
+  runsc -> job 2's live listener: timeout   [ns=172.31.19.2 rules=none]
+
+=== gate5e: 4. the public route, with the candidate rules installed ===
+  health: HEALTHY 172.31.19.2  rules=DOCKER-USER|-s 172.31.19.2/32 -d 169.254.169.254/32 -j DROP INPUT|-s 172.31.19.2/32 -d 192.168.0.0/16 -j DROP
+  PUBLIC-PASS dns=34.225.223.145 tls=200 verified=true
+  health: HEALTHY 172.31.19.2
+  PUBLIC-PASS git 7fd1a60b01f91b314f59955a4e4d4e80d8edf11d
+
+=== gate5e: how to read this ===
+leg 1 names the chain that binds a routed, host-directed destination for runsc.
+leg 2 is evidence ONLY if bare and ruled differ; identical timeouts prove nothing.
+leg 3 must be denied for per-job networks to be the cross-job answer.
+leg 4 must pass, or the candidate costs the job the route it exists to have.

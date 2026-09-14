@@ -1,0 +1,29 @@
+gate5k v3 — unsupported daemon default runtime
+kernel:  Linux 6.8.0-134-generic aarch64
+docker:  29.1.3
+runsc:   runsc version release-20260817.0
+ORIGINAL default runtime: runc
+
+---- LEG 1 — control: daemon default is runc (the supported configuration)
+default runtime now: runc
+listener 172.18.0.2 liveness: SERVING
+  holder runtime: runc
+  job: HEALTHY 172.18.0.3 | target=REACHED 
+  ^ expected here: HEALTHY <addr> and target=REACHED. This leg is the
+    positive control: it proves the harness CAN observe reachability, so
+    leg 2's silence means something.
+
+---- LEG 2 — daemon default switched to runsc (the UNSUPPORTED configuration)
+default runtime now: runsc
+listener 172.18.0.2 liveness: SERVING
+  holder runtime: runsc
+  job: SICK no-address | target=ENETUNREACH 
+
+---- VERDICT
+With a SERVING listener in both legs: leg 1 REACHED and leg 2 SICK/denied
+means the unsupported default FAILS CLOSED — no egress path to contain, an
+availability failure rather than a containment bypass. Leg 2 printing
+target=REACHED would mean it FAILS OPEN and is a security defect.
+failing_checks=0  (non-zero means a leg above proved nothing)
+---- restoring /etc/docker/daemon.json
+restored default runtime = runc

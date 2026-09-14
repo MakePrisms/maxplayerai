@@ -1,0 +1,27 @@
+gate5k v2 — unsupported daemon default runtime
+kernel:  Linux 6.8.0-134-generic aarch64
+docker:  29.1.3
+runsc:   runsc version release-20260817.0
+ORIGINAL default runtime: runc
+
+---- LEG 1 — control: daemon default is runc (the supported configuration)
+default runtime now: runc
+listener 172.18.0.2 liveness: NOT-SERVING
+leg 1 target is dead — NO EVIDENCE
+  holder runtime: runc
+  job: ifaces=    lo   eth0 | routes=eth0 eth0 | target=no-answer
+
+---- LEG 2 — daemon default switched to runsc (the UNSUPPORTED configuration)
+default runtime now: runsc
+listener 172.18.0.2 liveness: NOT-SERVING
+leg 2 target is dead — NO EVIDENCE, not a fail-closed result
+  holder runtime: runsc
+  job: ifaces=    lo | routes=| target=no-answer
+
+---- VERDICT
+Leg 2 with a SERVING listener: a job showing only 'lo', or refusing to run,
+FAILED CLOSED — no egress and no containment bypass. A job printing REACHED
+under the unsupported default FAILED OPEN and is a security defect.
+failing_checks=2  (a non-zero count means legs above proved nothing)
+---- restoring /etc/docker/daemon.json
+restored default runtime = runc

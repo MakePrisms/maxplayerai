@@ -1,0 +1,7 @@
+=== summary ===
+utc=2026-09-10T03:16:14Z
+arch=aarch64 runsc=runsc version release-20260817.0
+gate1    PASS     exit=0 log=gate1-20260910T031513Z.log
+gate5f   PASS     exit=0 log=gate5f-20260910T031522Z.log
+total=61s gates=2 not-passing=0
+ALL GATES: PASS

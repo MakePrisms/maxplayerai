@@ -1,0 +1,43 @@
+=== gate5f: environment ===
+utc=2026-09-10T03:05:46Z
+kernel=6.8.0-134-generic arch=aarch64 docker=29.1.3 runsc=runsc version release-20260817.0
+docker default-runtime=runc (helpers inherit this; the JOB always carries --runtime runsc)
+br_netfilter=absent
+host plan rendered by the product for job_addr=172.31.21.10: 17 rules
+chain depth before anything: DOCKER-USER=1 INPUT=1
+live listeners: same-bridge 172.31.21.20:8080 · own-network 172.31.22.10:8080 · host 192.168.5.15:49253
+
+=== gate5f: 1. BEFORE — the hole, with no host rules ===
+  runsc -> same-bridge neighbour 172.31.21.20:8080: REACHED
+  runsc -> own-network neighbour 172.31.22.10:8080: timeout
+  runsc -> host 192.168.5.15:49253: REACHED
+  runc  -> host 192.168.5.15:49253: timeout
+
+=== gate5f: 2. installing the product's rendered host policy ===
+  host-rule install: applier reported 17, plan had 17 rules
+  readback from the host kernel: DOCKER-USER carries 9, INPUT carries 8 rules for 172.31.21.10
+
+=== gate5f: 3. AFTER — the same probes, unchanged ===
+  runsc -> own-network neighbour 172.31.22.10:8080  (MUST be denied): timeout
+  runsc -> host 192.168.5.15:49253          (MUST be denied): timeout
+  runc  -> host 192.168.5.15:49253          (MUST be denied): timeout
+  runsc -> same-bridge neighbour 172.31.21.20:8080  (known unbindable): REACHED
+
+=== gate5f: 4. the public route must survive the policy ===
+  health: HEALTHY 172.31.21.10
+  PUBLIC-PASS dns=34.225.223.145 tls=200 verified=true
+  health: HEALTHY 172.31.21.10
+  PUBLIC-PASS git 7fd1a60b01f91b314f59955a4e4d4e80d8edf11d
+
+=== gate5f: 5. teardown must leave the shared chains exactly as it found them ===
+  host-rule teardown: applier reported 17, plan had 17 rules
+  readback from the host kernel: DOCKER-USER carries 0, INPUT carries 0 rules for 172.31.21.10
+  chain depth after teardown: DOCKER-USER=1 (was 1) INPUT=1 (was 1)
+  CLEAN — no rule leaked (this is the failure mode the HostRules drop guard exists to prevent)
+
+=== gate5f: how to read this ===
+The fix is proved by section 3 differing from section 1 on the own-network and host legs.
+The same-bridge leg is expected to stay REACHED: switched frames enter no chain on a host
+without br_netfilter, which is WHY the product gives every job its own network rather than
+trying to rule its way out of a shared one. It is measured here so that reason stays evidenced.
+Section 4 must pass, or the policy costs the job the delivery route it exists to have.

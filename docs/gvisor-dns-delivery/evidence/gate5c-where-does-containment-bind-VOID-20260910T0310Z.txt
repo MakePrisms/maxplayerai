@@ -1,0 +1,27 @@
+=== gate5c: environment ===
+utc=2026-09-10T02:37:36Z
+kernel=6.8.0-134-generic arch=aarch64
+docker=29.1.3 runsc=runsc version release-20260817.0
+br_netfilter=absent
+net_a=maxplayer-dns-gate5c-a 172.31.14.0/24 | net_b=maxplayer-dns-gate5c-b 172.31.15.0/24
+job_a=172.31.14.2 | live_neighbour_same_network=172.31.14.3:8080 | live_neighbour_other_network=172.31.15.2:8080
+
+=== gate5c: baseline — no host-side rule (this is today's behaviour) ===
+runc  -> live neighbour, same bridge: timeout
+runsc -> live neighbour, same bridge: REACHED
+
+=== gate5c: (b) per-job network — the neighbour is on a DIFFERENT bridge ===
+runsc -> live neighbour, other bridge: ENETUNREACH
+
+=== gate5c: (a) DOCKER-USER, keyed to the job namespace's source address ===
+installed: iptables -I DOCKER-USER -s 172.31.14.2/32 -d 172.16.0.0/12 -j DROP
+runc  -> live neighbour, same bridge: ENETUNREACH
+runsc -> live neighbour, same bridge: ENETUNREACH
+
+=== gate5c: does that rule cost the public route the job must keep? ===
+PUBLIC-FAIL dns EAI_AGAIN
+fatal: unable to access 'https://github.com/octocat/Hello-World.git/': Could not resolve host: github.com
+
+=== gate5c: read the finding off the table above ===
+(a) binds runsc if the DOCKER-USER runs show 'timeout' for BOTH runtimes
+(b) binds runsc if the other-bridge probe is not REACHED

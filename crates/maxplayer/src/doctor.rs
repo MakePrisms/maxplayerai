@@ -1117,6 +1117,430 @@ mod checks {
         }
     }
 
+    const DELIVERY_ROUTE_CHECK: &str = "sandbox delivery route";
+
+    /// The directory the route preflight runs its probe in, under the seat's real job tree — same
+    /// argument [`crate::sandbox_probe`] makes for its own paths: a launcher is configured for where
+    /// jobs run, so a probe somewhere else measures a route no job takes.
+    const ROUTE_WORKDIR_NAME: &str = ".route-preflight";
+
+    /// What exercising the real job route produced.
+    ///
+    /// Deliberately four outcomes rather than a bool: "the name never resolved", "it resolved but
+    /// TLS did not complete", and "the route could not be built at all" send an operator to three
+    /// different places, and collapsing them is how a doctor becomes something people skip.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) enum RouteProbe {
+        /// Resolved a name AND completed a certificate-VERIFIED TLS handshake, from inside the
+        /// namespace an awarded job gets.
+        Delivered { resolver: String, address: String, subject: String },
+        /// The lookup failed inside the job. The gVisor case this check was built for.
+        NoDns(String),
+        /// The name resolved, but TLS did not complete or its chain was not verified.
+        NoTls(String),
+        /// The route could not be built or the probe never reported. NOT a pass: a route that cannot
+        /// be measured has not been shown to work.
+        Unbuildable(String),
+        /// The instrument is absent — no docker on PATH — so there is nothing to measure and no
+        /// finding to report. Distinct from [`RouteProbe::Unbuildable`], which means the route WAS
+        /// asked and did not answer; the launcher check owns the missing-docker verdict and this one
+        /// must not double-report it.
+        Unmeasurable(String),
+    }
+
+    /// #? gVisor DNS delivery: does a job on THIS seat actually reach the network it is supposed to?
+    ///
+    /// Every other network check here asks the question from the HOST. That is precisely the hole:
+    /// the measured failure is a seat whose host resolves and fetches perfectly while every job it
+    /// runs dies on `EAI_AGAIN`, because docker's embedded resolver at `127.0.0.11` is unreachable
+    /// from inside a gVisor sandbox. A host-side probe reports that seat READY and it then fails
+    /// every job it wins. So this one runs the real thing: the seat's own image, in the namespace
+    /// [`maxplayer_core::sandbox_netns`] builds, under the seat's own runtime, uid, dropped
+    /// capabilities and `no-new-privileges`, with the resolver file a job is handed — and it must
+    /// both resolve a name and complete a VERIFIED TLS handshake.
+    ///
+    /// It BLOCKS. A `Fail` here keeps [`readiness_ok`] false, because advertising a seat whose jobs
+    /// cannot deliver is the exact outcome the gate exists to prevent. It is `transient`, so the
+    /// boot gate's bounded retry gives a daemon or a resolver a moment to come back before the seat
+    /// is refused — and if it is still broken after that, refused is correct.
+    ///
+    /// The advisory `check_sandbox_egress` above is untouched (petar, 2026-08-18): that one reports
+    /// whether the network EXISTS and never blocks. This one asks whether the route WORKS.
+    pub(super) fn check_sandbox_delivery_route(
+        sandbox: Option<SandboxConfig>,
+        home_root: std::path::PathBuf,
+    ) -> Check {
+        check_sandbox_delivery_route_in(sandbox, discover_resolvers, |policy, resolvers| {
+            // Ordering rule shared with check_sandbox_image and the Engine floor: ask only once
+            // docker itself resolves, or the spawn ENOENTs and a missing daemon is misreported as a
+            // broken route. A missing docker is the launcher check's verdict, not this one's. It
+            // lives in the REAL probe rather than in the injectable core so the unit tests below
+            // measure the verdicts and not the machine they run on.
+            if !argv0_resolvable("docker") {
+                return RouteProbe::Unmeasurable(
+                    "docker not resolvable; the job route was not measured (see sandbox launcher)"
+                        .to_owned(),
+                );
+            }
+            run_delivery_route(policy, resolvers, &home_root)
+        })
+    }
+
+    /// The resolvers a job would be handed, by the product's own selection order.
+    fn discover_resolvers(configured: &[String]) -> Result<Vec<String>, String> {
+        maxplayer_core::sandbox_dns::resolve(
+            configured,
+            maxplayer_core::sandbox_dns::host_resolv_conf,
+            maxplayer_core::sandbox_dns::host_resolvectl,
+        )
+        .map(|resolvers| resolvers.addresses().to_vec())
+        .map_err(|error| error.to_string())
+    }
+
+    /// [`check_sandbox_delivery_route`] over injected resolver discovery and an injected route
+    /// probe, so every verdict is testable on a host with no docker daemon at all — including the
+    /// one that matters most: host connectivity fine, job route broken, result still `Fail`.
+    pub(super) fn check_sandbox_delivery_route_in(
+        sandbox: Option<SandboxConfig>,
+        resolvers: impl Fn(&[String]) -> Result<Vec<String>, String>,
+        probe: impl Fn(&SandboxPolicy, &[String]) -> RouteProbe,
+    ) -> Check {
+        let policy = match SandboxPolicy::from_config(sandbox.as_ref()) {
+            // Already FAILed by the launcher check; do not double-report.
+            Err(_) => return Check::pass(DELIVERY_ROUTE_CHECK, "no resolvable docker executor"),
+            Ok(policy) => policy,
+        };
+        if policy.docker_image().is_none() {
+            return Check::pass(
+                DELIVERY_ROUTE_CHECK,
+                "not a docker executor; jobs use this host's own network",
+            );
+        }
+        let resolvers = match resolvers(policy.dns_servers()) {
+            Ok(resolvers) => resolvers,
+            // NOT transient: no retry discovers a resolver a misconfigured box does not have.
+            Err(error) => {
+                return Check::fail(
+                    DELIVERY_ROUTE_CHECK,
+                    format!("no resolver can be given to a job: {error}"),
+                    "set `[sandbox] dns_servers` to one or more resolver ADDRESSES the seat can \
+                     reach (for example `dns_servers = [\"1.1.1.1\"]`)",
+                )
+            }
+        };
+        match probe(&policy, &resolvers) {
+            RouteProbe::Delivered { resolver, address, subject } => Check::pass(
+                DELIVERY_ROUTE_CHECK,
+                format!(
+                    "a job resolved via {resolver} to {address} and completed a verified TLS \
+                     handshake with {subject}"
+                ),
+            ),
+            RouteProbe::NoDns(detail) => Check::fail_transient(
+                DELIVERY_ROUTE_CHECK,
+                format!("a job in the sandbox could not resolve names: {detail}"),
+                "the host resolving is not enough — the JOB must. Check `[sandbox] dns_servers` \
+                 and that port 53 to those addresses survives the job's egress policy",
+            ),
+            RouteProbe::NoTls(detail) => Check::fail_transient(
+                DELIVERY_ROUTE_CHECK,
+                format!("a job resolved, but could not complete a verified TLS handshake: {detail}"),
+                "check the job's egress policy allows 443 to the public internet and that the \
+                 sandbox image carries current CA certificates",
+            ),
+            RouteProbe::Unbuildable(detail) => Check::fail_transient(
+                DELIVERY_ROUTE_CHECK,
+                format!("the job's network route could not be measured: {detail}"),
+                "a route that cannot be measured has not been shown to work; check the docker \
+                 daemon, `[sandbox] network`, and that the sandbox image can run the probe",
+            ),
+            RouteProbe::Unmeasurable(detail) => Check::pass(DELIVERY_ROUTE_CHECK, detail),
+        }
+    }
+
+    /// The host the route probe resolves and shakes hands with: the relay, because that is where a
+    /// job's answer is delivered, so a route that cannot reach it cannot earn anything. Kept in step
+    /// with [`maxplayer_core::home::DEFAULT_RELAY_URL`] by the test below.
+    pub(super) const ROUTE_PROBE_HOST: &str = "relay.maxplayer.ai";
+
+    /// The markers the in-container payload prints. Parsed rather than trusted to an exit code,
+    /// because "the payload never ran" and "the payload ran and failed" must not be one outcome.
+    const ROUTE_DNS_OK: &str = "route-dns-ok";
+    const ROUTE_DNS_FAIL: &str = "route-dns-fail";
+    const ROUTE_TLS_OK: &str = "route-tls-ok";
+    const ROUTE_TLS_FAIL: &str = "route-tls-fail";
+
+    /// Build the real namespace, run the probe inside it, tear it down.
+    ///
+    /// Every container here comes from the PRODUCT's argv builders — `holder_argv`,
+    /// `sidecar_argv_for`, `plan_stdin`, and `SandboxPolicy::launch` — so this measures the route an
+    /// awarded job takes. A preflight that rendered its own argv would be a test of itself.
+    fn run_delivery_route(
+        policy: &SandboxPolicy,
+        resolvers: &[String],
+        home_root: &std::path::Path,
+    ) -> RouteProbe {
+        let workdir = home_root.join("seller-jobs").join(ROUTE_WORKDIR_NAME);
+        if let Err(error) = std::fs::create_dir_all(&workdir) {
+            return RouteProbe::Unbuildable(format!(
+                "cannot create the probe workdir {} ({error})",
+                workdir.display()
+            ));
+        }
+        let Some((uid, gid)) = owner_uid_gid(&workdir) else {
+            return RouteProbe::Unbuildable(
+                "cannot read the probe workdir's owner, so the probe could not run as the uid an \
+                 awarded job would get"
+                    .to_owned(),
+            );
+        };
+        let resolv_path = workdir.join("resolv.conf");
+        // Re-validated rather than trusted: these addresses came from discovery, and the file a job
+        // reads must be built by the same code that builds a job's real one.
+        let rendered = match maxplayer_core::sandbox_dns::from_config(resolvers) {
+            Ok(Some(resolvers)) => resolvers.render_resolv_conf(),
+            Ok(None) => {
+                return RouteProbe::Unbuildable(
+                    "resolver discovery returned no addresses at all".to_owned(),
+                )
+            }
+            Err(error) => return RouteProbe::Unbuildable(format!("resolvers rejected: {error}")),
+        };
+        if let Err(error) = std::fs::write(&resolv_path, rendered) {
+            return RouteProbe::Unbuildable(format!(
+                "cannot write the probe resolver file {} ({error})",
+                resolv_path.display()
+            ));
+        }
+
+        // No `[sandbox] network` ⇒ no namespace is established for a job either, so the honest route
+        // to measure is the daemon default the seat actually uses — with no resolver file, because
+        // nothing opened port 53 for one.
+        let Some(network) = policy.sandbox_network() else {
+            return job_leg(policy, &workdir, uid, gid, None, None, "the daemon's default network");
+        };
+
+        let gateway = match network_gateway(network) {
+            Ok(gateway) => gateway,
+            Err(error) => {
+                return RouteProbe::Unbuildable(format!(
+                    "cannot read the gateway of `[sandbox] network` '{network}': {error}"
+                ))
+            }
+        };
+        let image = policy.docker_image().unwrap_or_default().to_owned();
+        let holder_name = format!("maxplayer-route-preflight-{}", std::process::id());
+        // Torn down on EVERY exit below, including the early returns — a preflight that leaks a
+        // holder container leaves the seat holding a namespace nothing will ever reap.
+        let _ = docker_rm_f(&holder_name);
+        let holder = maxplayer_core::sandbox_netns::holder_argv(
+            &holder_name,
+            network,
+            &image,
+            uid,
+            gid,
+            "route-preflight",
+            "route-preflight",
+        );
+        if let Err(error) = run_docker_argv(&holder, None) {
+            let _ = docker_rm_f(&holder_name);
+            return RouteProbe::Unbuildable(format!("the namespace holder would not start: {error}"));
+        }
+
+        let net_policy = maxplayer_core::sandbox_net::NetPolicy {
+            gateway,
+            proxy_ports: None,
+            log_connections: false,
+            dns_resolvers: resolvers.to_vec(),
+        };
+        let (plan, _rules) = maxplayer_core::sandbox_netns::plan_stdin(&net_policy);
+        let sidecar = maxplayer_core::sandbox_netns::sidecar_argv_for(&holder_name, &image);
+        if let Err(error) = run_docker_argv(&sidecar, Some(plan)) {
+            let _ = docker_rm_f(&holder_name);
+            return RouteProbe::Unbuildable(format!("the egress policy would not install: {error}"));
+        }
+
+        let outcome = job_leg(
+            policy,
+            &workdir,
+            uid,
+            gid,
+            Some(holder_name.as_str()),
+            Some(resolv_path.as_path()),
+            "the job namespace",
+        );
+        let _ = docker_rm_f(&holder_name);
+        outcome
+    }
+
+    /// The job leg: the seat's own image, launched by [`SandboxPolicy::launch`] exactly as an
+    /// awarded job is, reporting the two legs that matter.
+    fn job_leg(
+        policy: &SandboxPolicy,
+        workdir: &std::path::Path,
+        uid: u32,
+        gid: u32,
+        netns: Option<&str>,
+        resolv_conf: Option<&std::path::Path>,
+        where_: &str,
+    ) -> RouteProbe {
+        let job = maxplayer_core::seller_exec::JobLaunch {
+            workdir,
+            env: &[],
+            uid,
+            gid,
+            netns,
+            resolv_conf,
+        };
+        let launch = match policy.launch(&route_payload(), &job) {
+            Ok(launch) => launch,
+            Err(error) => {
+                return RouteProbe::Unbuildable(format!("cannot build the probe launch: {error}"))
+            }
+        };
+        let mut argv = Vec::with_capacity(launch.args.len() + 1);
+        argv.push(launch.program);
+        argv.extend(launch.args);
+        let output = match run_docker_argv_capturing(&argv) {
+            Ok(output) => output,
+            Err(error) => {
+                return RouteProbe::Unbuildable(format!("the probe container did not run: {error}"))
+            }
+        };
+        read_route_markers(&output, where_)
+    }
+
+    /// Judge the payload's own words. Kept separate from the spawning so the verdicts are unit-
+    /// testable without a daemon, and so "neither marker appeared" stays a distinct outcome from
+    /// "the DNS marker said it failed".
+    pub(super) fn read_route_markers(output: &str, where_: &str) -> RouteProbe {
+        let marker = |name: &str| {
+            output.lines().find_map(|line| line.trim().strip_prefix(name).map(str::trim))
+        };
+        if let Some(detail) = marker(ROUTE_DNS_FAIL) {
+            return RouteProbe::NoDns(format!("{detail} (from inside {where_})"));
+        }
+        let Some(address) = marker(ROUTE_DNS_OK) else {
+            return RouteProbe::Unbuildable(format!(
+                "the probe in {where_} reported neither success nor failure; it likely never ran"
+            ));
+        };
+        if let Some(detail) = marker(ROUTE_TLS_FAIL) {
+            return RouteProbe::NoTls(format!("{detail} (from inside {where_})"));
+        }
+        match marker(ROUTE_TLS_OK) {
+            Some(subject) => RouteProbe::Delivered {
+                resolver: address.split_whitespace().nth(1).unwrap_or("?").to_owned(),
+                address: address.split_whitespace().next().unwrap_or("?").to_owned(),
+                subject: subject.to_owned(),
+            },
+            None => RouteProbe::NoTls(format!(
+                "the lookup succeeded in {where_} but the handshake reported nothing"
+            )),
+        }
+    }
+
+    /// The payload, in the image's own node: resolve, then complete a TLS request whose certificate
+    /// chain is VERIFIED.
+    ///
+    /// `rejectUnauthorized` is left at its default and `socket.authorized` is REPORTED, so a pass
+    /// cannot be a handshake that skipped verification — which is the failure mode a preflight for
+    /// delivery would be worst at catching.
+    fn route_payload() -> Vec<String> {
+        let script = format!(
+            "const dns=require('dns'),https=require('https');const h='{ROUTE_PROBE_HOST}';\
+             dns.lookup(h,(e,a)=>{{if(e){{console.log('{ROUTE_DNS_FAIL} '+e.code);process.exit(0);}}\
+             console.log('{ROUTE_DNS_OK} '+a);\
+             const r=https.request({{host:h,port:443,path:'/',method:'HEAD',timeout:15000}},(res)=>{{\
+             const c=res.socket.getPeerCertificate();\
+             if(res.socket.authorized){{console.log('{ROUTE_TLS_OK} '+((c&&c.subject&&c.subject.CN)||h));}}\
+             else{{console.log('{ROUTE_TLS_FAIL} certificate chain not verified');}}process.exit(0);}});\
+             r.on('timeout',()=>{{console.log('{ROUTE_TLS_FAIL} timeout');process.exit(0);}});\
+             r.on('error',(err)=>{{console.log('{ROUTE_TLS_FAIL} '+err.code);process.exit(0);}});r.end();}});"
+        );
+        vec!["node".to_owned(), "-e".to_owned(), script]
+    }
+
+    /// The uid/gid owning `path` — the uid an awarded job's container runs as, read from the
+    /// filesystem rather than through a `libc` dependency this crate does not otherwise carry.
+    fn owner_uid_gid(path: &std::path::Path) -> Option<(u32, u32)> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(path).ok().map(|m| (m.uid(), m.gid()))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            None
+        }
+    }
+
+    /// The gateway of a docker network, asked of the daemon rather than computed — the same trap
+    /// [`maxplayer_core::sandbox_netns`] documents: a computed gateway puts the pinhole on an
+    /// address nothing listens on while every rendering test stays green.
+    fn network_gateway(network: &str) -> Result<String, String> {
+        let output = std::process::Command::new("docker")
+            .args([
+                "network",
+                "inspect",
+                network,
+                "--format",
+                "{{(index .IPAM.Config 0).Gateway}}",
+            ])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+        }
+        let gateway = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if gateway.is_empty() {
+            return Err("the daemon reported no gateway for it".to_owned());
+        }
+        Ok(gateway)
+    }
+
+    fn docker_rm_f(name: &str) -> std::io::Result<std::process::Output> {
+        std::process::Command::new("docker").args(["rm", "-f", name]).output()
+    }
+
+    /// Run a `docker ...` argv (element 0 is the program), optionally feeding it stdin.
+    fn run_docker_argv(argv: &[String], stdin: Option<String>) -> Result<String, String> {
+        let (program, args) = argv.split_first().ok_or("empty argv")?;
+        let mut command = std::process::Command::new(program);
+        command.args(args);
+        command.stdin(match stdin {
+            Some(_) => std::process::Stdio::piped(),
+            None => std::process::Stdio::null(),
+        });
+        command.stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
+        let mut child = command.spawn().map_err(|error| error.to_string())?;
+        if let Some(stdin) = stdin {
+            use std::io::Write as _;
+            let mut pipe = child.stdin.take().ok_or("no stdin pipe")?;
+            pipe.write_all(stdin.as_bytes()).map_err(|error| error.to_string())?;
+        }
+        let output = child.wait_with_output().map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// Like [`run_docker_argv`], but the payload's OUTPUT is the evidence, so a non-zero exit still
+    /// yields what it said.
+    fn run_docker_argv_capturing(argv: &[String]) -> Result<String, String> {
+        let (program, args) = argv.split_first().ok_or("empty argv")?;
+        let output = std::process::Command::new(program)
+            .args(args)
+            .output()
+            .map_err(|error| error.to_string())?;
+        let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+        combined.push_str(&String::from_utf8_lossy(&output.stderr));
+        Ok(combined)
+    }
+
     const CREDENTIAL_CONTAINMENT_CHECK: &str = "sandbox credential containment";
 
     /// The #647 credential proxy keeps out of a docker container every model-credential variable named
@@ -2324,8 +2748,10 @@ fn build_checks(
     let sandbox_for_engine = sandbox.clone();
     let sandbox_for_egress = sandbox.clone();
     let sandbox_for_token_policy = sandbox.clone();
+    let sandbox_for_route = sandbox.clone();
     // The probe runs in the seat's OWN home, because that is where a launcher's config points.
     let home_root = home.root.clone();
+    let route_home_root = home.root.clone();
     // Reaching this box with stranger-written code is what the containment gate is about, and there
     // are TWO surfaces that do it. Both are off by default, so an unconfigured seat is reachable only
     // by the buyers its operator named and every one of these findings stays advisory.
@@ -2399,6 +2825,14 @@ fn build_checks(
     // one who can be told, so this WARNs. Advisory — never blocks boot, because turning a working
     // docker seat red on upgrade is a behaviour change, not a doctor's call.
     checks.push(Box::new(move || checks::check_sandbox_egress(sandbox_for_egress)));
+    // The route a JOB takes, measured from inside a job's own namespace. Unlike every other network
+    // check here it does not ask the host anything: a seat whose host resolves perfectly while its
+    // gVisor jobs die on EAI_AGAIN is exactly the state that produced this check, and a host-side
+    // probe calls that seat ready. BLOCKING, and transient so the boot gate's bounded retry gives a
+    // daemon a moment to come back before the seat is refused.
+    checks.push(Box::new(move || {
+        checks::check_sandbox_delivery_route(sandbox_for_route, route_home_root)
+    }));
     // #792 phase 3: under mode=docker, the image the seat runs jobs in must be present or pullable,
     // or the first awarded job stalls. On absence this prints the exact `docker pull` command. A
     // non-docker policy is a no-op Pass. Placed after the launcher (docker-resolves) check.
@@ -5698,4 +6132,156 @@ mod tests {
             run.err
         );
     }
+    /// RED-PROVE for the gVisor delivery failure: a seat whose HOST resolves and fetches perfectly
+    /// while its jobs cannot must be refused, and refused with words that send the operator to the
+    /// job's route rather than to their own network.
+    ///
+    /// This is the whole point of the check. Every other network row here is answered by the host,
+    /// and the measured failure — docker's embedded resolver at `127.0.0.11` being unreachable from
+    /// inside a gVisor sandbox — is invisible from there: the seat looks healthy, advertises, wins a
+    /// job, and fails it. So the probe result is INJECTED here and the host's own connectivity is
+    /// never consulted: these assertions hold on a laptop with perfect internet.
+    #[test]
+    fn doctor_delivery_route_fails_when_the_job_route_is_broken_however_healthy_the_host_is() {
+        use checks::RouteProbe;
+        use maxplayer_core::home::{SandboxConfig, SandboxMode};
+        let docker = || {
+            Some(SandboxConfig {
+                mode: SandboxMode::Docker,
+                image: Some("maxplayer-sandbox:latest".into()),
+                network: Some("sbx".into()),
+                ..Default::default()
+            })
+        };
+        let resolvers_ok = |_: &[String]| Ok(vec!["1.1.1.1".to_owned()]);
+
+        // The gVisor case itself: resolvers were found, the namespace was built, and the JOB still
+        // could not resolve. Blocking, and retryable.
+        let no_dns = checks::check_sandbox_delivery_route_in(docker(), resolvers_ok, |_, _| {
+            RouteProbe::NoDns("EAI_AGAIN (from inside the job namespace)".to_owned())
+        });
+        assert_eq!(no_dns.status, Status::Fail, "{}", no_dns.render());
+        assert!(no_dns.transient, "a resolver blip deserves the bounded retry: {}", no_dns.render());
+        assert!(
+            !readiness_ok(&[no_dns.clone()]),
+            "a seat whose jobs cannot resolve must not be advertised as ready: {}",
+            no_dns.render()
+        );
+        assert!(
+            no_dns.render().contains("JOB") && no_dns.render().contains("dns_servers"),
+            "the remedy must point at the job's route and the key that fixes it, not at the host: \
+             {}",
+            no_dns.render()
+        );
+
+        // Resolved, but the handshake never completed or its chain was not verified. Also blocking:
+        // a job that cannot complete verified TLS cannot deliver an answer.
+        let no_tls = checks::check_sandbox_delivery_route_in(docker(), resolvers_ok, |_, _| {
+            RouteProbe::NoTls("certificate chain not verified".to_owned())
+        });
+        assert_eq!(no_tls.status, Status::Fail, "{}", no_tls.render());
+        assert!(!readiness_ok(&[no_tls.clone()]), "{}", no_tls.render());
+
+        // Could not be measured at all. NOT a pass — "I could not ask" is not "it works", and this
+        // is the arm a future edit is most likely to soften into a Warn.
+        let unbuildable = checks::check_sandbox_delivery_route_in(docker(), resolvers_ok, |_, _| {
+            RouteProbe::Unbuildable("the namespace holder would not start".to_owned())
+        });
+        assert_eq!(unbuildable.status, Status::Fail, "{}", unbuildable.render());
+        assert!(!readiness_ok(&[unbuildable]));
+
+        // No resolver can be given to a job at all. Blocking and NOT transient: no retry discovers
+        // a resolver the box does not have, so burning the backoff budget only delays the same
+        // refusal.
+        let no_resolver = checks::check_sandbox_delivery_route_in(
+            docker(),
+            |_| Err("the host names only the systemd stub and resolvectl reported none".to_owned()),
+            |_, _| panic!("the probe must not run when no resolver can be handed to a job"),
+        );
+        assert_eq!(no_resolver.status, Status::Fail, "{}", no_resolver.render());
+        assert!(
+            !no_resolver.transient,
+            "retrying cannot conjure a resolver; refuse immediately: {}",
+            no_resolver.render()
+        );
+
+        // The healthy route passes, and says what it actually proved — a resolver, an address, and
+        // a VERIFIED peer — so a green row cannot be read as "docker looked fine".
+        let ok = checks::check_sandbox_delivery_route_in(docker(), resolvers_ok, |_, _| {
+            RouteProbe::Delivered {
+                resolver: "1.1.1.1".to_owned(),
+                address: "34.225.223.145".to_owned(),
+                subject: "relay.maxplayer.ai".to_owned(),
+            }
+        });
+        assert_eq!(ok.status, Status::Pass, "{}", ok.render());
+        assert!(
+            ok.detail.contains("verified") && ok.detail.contains("1.1.1.1"),
+            "a pass must name the resolver it used and that the handshake was verified: {}",
+            ok.detail
+        );
+        assert!(readiness_ok(&[ok]));
+
+        // A host executor has no container route to measure ⇒ never a spurious failure.
+        assert_eq!(
+            checks::check_sandbox_delivery_route_in(None, resolvers_ok, |_, _| panic!(
+                "a host executor has no job container to probe"
+            ))
+            .status,
+            Status::Pass,
+        );
+
+        // No docker on PATH is the launcher check's verdict, not this one's: reporting it here too
+        // would refuse a box twice for one fault and bury the row that names the real fix.
+        let unmeasurable =
+            checks::check_sandbox_delivery_route_in(docker(), resolvers_ok, |_, _| {
+                RouteProbe::Unmeasurable("docker not resolvable".to_owned())
+            });
+        assert_eq!(unmeasurable.status, Status::Pass, "{}", unmeasurable.render());
+    }
+
+    /// The payload's own words are judged, and silence is not consent: a container that printed
+    /// nothing (no node in the image, an entrypoint that swallowed the payload) must never read as a
+    /// working route.
+    #[test]
+    fn a_silent_route_probe_is_not_a_passing_route() {
+        use checks::RouteProbe;
+        assert!(matches!(
+            checks::read_route_markers("", "the job namespace"),
+            RouteProbe::Unbuildable(_)
+        ));
+        assert!(matches!(
+            checks::read_route_markers("sh: node: not found", "the job namespace"),
+            RouteProbe::Unbuildable(_)
+        ));
+        // Resolved, then nothing about the handshake: not a pass either.
+        assert!(matches!(
+            checks::read_route_markers("route-dns-ok 34.225.223.145", "the job namespace"),
+            RouteProbe::NoTls(_)
+        ));
+        assert!(matches!(
+            checks::read_route_markers("route-dns-fail EAI_AGAIN", "the job namespace"),
+            RouteProbe::NoDns(_)
+        ));
+        assert!(matches!(
+            checks::read_route_markers(
+                "route-dns-ok 34.225.223.145\nroute-tls-ok relay.maxplayer.ai",
+                "the job namespace"
+            ),
+            RouteProbe::Delivered { .. }
+        ));
+    }
+
+    /// The host the probe shakes hands with is the relay the seat actually delivers to. Pinned so a
+    /// relay move cannot leave the preflight proving reachability to an address nothing uses.
+    #[test]
+    fn the_route_probe_targets_the_configured_relay_host() {
+        assert!(
+            maxplayer_core::home::DEFAULT_RELAY_URL.contains(checks::ROUTE_PROBE_HOST),
+            "probe host {} is not the relay in DEFAULT_RELAY_URL {}",
+            checks::ROUTE_PROBE_HOST,
+            maxplayer_core::home::DEFAULT_RELAY_URL
+        );
+    }
+
 }

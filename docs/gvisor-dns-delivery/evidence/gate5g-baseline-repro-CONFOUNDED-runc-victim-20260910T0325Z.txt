@@ -1,0 +1,25 @@
+=== gate5g: environment ===
+utc=2026-09-10T03:25:09Z
+kernel=6.8.0-134-generic arch=aarch64 docker=29.1.3 runsc=runsc version release-20260817.0
+baseline commit=b45f865 (origin/main) · plan rules=24
+host rules installed by this script: NONE (origin/main has no HostPolicy — grep says 0)
+arrangement: ONE shared network 172.31.40.0/24, as a single [sandbox] network produced
+chain depth (untouched by this gate): DOCKER-USER=1 INPUT=1
+live listeners: victim job 172.31.40.20:8080 (inside 172.16.0.0/12, which the baseline plan DROPs) · host 192.168.5.15:49255
+
+=== gate5g: 1. cross-job on the baseline shared network, live victim ===
+  [ns gate5g-attacker-1: applier=24/24 rules, kernel readback shows 2 rule(s) for 172.16.0.0/12]
+  runc  -> victim 172.31.40.20:8080  (positive control: the plan MUST bind runc): timeout
+  [ns gate5g-attacker-2: applier=24/24 rules, kernel readback shows 2 rule(s) for 172.16.0.0/12]
+  runsc -> victim 172.31.40.20:8080  (the vulnerability): timeout
+
+=== gate5g: 2. private egress to the host itself, live listener ===
+  [ns gate5g-attacker-3: applier=24/24 rules, kernel readback shows 2 rule(s) for 172.16.0.0/12]
+  runc  -> host 192.168.5.15:49255  (positive control): timeout
+  [ns gate5g-attacker-4: applier=24/24 rules, kernel readback shows 2 rule(s) for 172.16.0.0/12]
+  runsc -> host 192.168.5.15:49255  (the vulnerability): REACHED
+
+=== gate5g: verdict ===
+baseline REACHED count (each is a containment failure on origin/main): 1
+BASELINE-VULNERABLE: CONFIRMED on b45f865 — the netns plan binds runc and not runsc,
+with no host-side enforcement present to catch it. The branch does not introduce this.

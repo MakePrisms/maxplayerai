@@ -1,0 +1,51 @@
+=== gate5: environment ===
+utc=2026-09-10T03:11:45Z
+kernel=6.8.0-134-generic arch=aarch64 docker=29.1.3 runsc=runsc version release-20260817.0
+docker default-runtime=runc · br_netfilter=absent
+chain depth before anything: DOCKER-USER=1 INPUT=1
+live listeners: host 192.168.5.15:49254 · neighbour job 172.31.34.10:8080 · name denied-lan.maxplayer.test -> 192.168.5.15
+
+=== gate5: 1. denial, BEFORE the host policy (so each leg has a baseline) ===
+  runsc -> host 192.168.5.15:49254 (live): REACHED
+  runsc -> denied-lan.maxplayer.test:49254 (live, by name): REACHED
+  runsc -> neighbour job 172.31.34.10:8080 (live): timeout
+  runsc -> 169.254.169.254:80 (nothing listens): ECONNREFUSED
+
+=== gate5: 2. the product's host policy, installed for the probe namespace ===
+  host policy install for 172.31.30.10: applier=17/17, host kernel now carries 17
+
+=== gate5: 3. denial, AFTER — every one of these MUST be denied ===
+  runsc -> host 192.168.5.15:49254 (live): timeout   (denied)
+  runsc -> denied-lan.maxplayer.test:49254 (live, by name): timeout   (denied)
+  runsc -> neighbour job 172.31.34.10:8080 (live): timeout   (denied)
+  runsc -> 169.254.169.254:80 (nothing listens): timeout   (denied)
+  ^ read the metadata leg ONLY as the difference against section 1; with no listener,
+    an identical result in both sections is NO EVIDENCE either way.
+
+=== gate5: 4. IPv6, measured rather than assumed ===
+  namespace v6: NO-V6
+  runsc v6:     NO-V6
+  The host-side plan renders NO ip6tables rules (DOCKER-USER may not exist there).
+  Where the job namespace has no global IPv6 there is nothing to deny; where it has,
+  host-side v6 denial for a runsc job is UNPROVEN and must not be claimed.
+
+=== gate5: 5. concurrent delivery, three jobs at once, all policies installed ===
+  host policy install for 172.31.31.10: applier=17/17, host kernel now carries 17
+  host policy install for 172.31.32.10: applier=17/17, host kernel now carries 17
+  host policy install for 172.31.33.10: applier=17/17, host kernel now carries 17
+  c1: OK dns=34.225.223.145 tls=200 verified=true OK git 7fd1a60b01f91b314f59955a4e4d4e80d8edf11d
+  c3: OK dns=34.225.223.145 tls=200 verified=true OK git 7fd1a60b01f91b314f59955a4e4d4e80d8edf11d
+  c2: OK dns=34.225.223.145 tls=200 verified=true OK git 7fd1a60b01f91b314f59955a4e4d4e80d8edf11d
+  host policy teardown for 172.31.31.10: applier=17/17, host kernel now carries 0
+  host policy teardown for 172.31.32.10: applier=17/17, host kernel now carries 0
+  host policy teardown for 172.31.33.10: applier=17/17, host kernel now carries 0
+
+=== gate5: 6. teardown leaves the shared chains as it found them ===
+  host policy teardown for 172.31.30.10: applier=17/17, host kernel now carries 0
+  DOCKER-USER=1 (was 1) · INPUT=1 (was 1)
+  CLEAN
+
+=== gate5: verdict ===
+denial legs failing: 0
+A concurrent line counts as delivery only if it reads OK dns=… tls=200 verified=true AND OK git <sha>.
+GATE5-DENIAL: PASS
