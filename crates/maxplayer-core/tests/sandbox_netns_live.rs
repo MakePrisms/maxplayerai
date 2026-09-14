@@ -1352,8 +1352,11 @@ impl RunscNet {
                 &netfilter_image(),
                 "-c",
                 &format!(
-                    "ip addr add {}/32 dev eth0 && while :; do nc -l -p {} >/dev/null 2>&1; done",
+                    "ip addr add {}/32 dev eth0 && \
+                     while :; do nc -l -p {} >/dev/null 2>&1; done & \
+                     while :; do nc -l -p {} >/dev/null 2>&1; done",
                     Self::DENIED_IP,
+                    Canary::OTHER_PORT,
                     Canary::PORT
                 ),
             ],
@@ -1390,12 +1393,32 @@ impl RunscNet {
              containment",
             Self::DENIED_IP
         );
+        // The neighbouring port is a control, so it carries the same readiness bar as the first.
+        // A leg that asserts the allowed destination stays reachable on OTHER_PORT is measuring
+        // policy only if something is listening there; unchecked, a slow second `nc -l` would read
+        // as a port-scoped denial and the control would pass for the wrong reason.
+        assert!(
+            wait_until(20, || self.reachable_on(&self.allowed_ip, Canary::OTHER_PORT)),
+            "the listener never answered on {}:{} — the neighbouring-port control cannot tell a \
+             policy denial from an absent listener",
+            self.allowed_ip,
+            Canary::OTHER_PORT
+        );
     }
 
     /// The same destination, from a container on the network but **outside** every contained
     /// namespace. A success proves the listener is alive, which is the one thing a refusal inside
     /// cannot distinguish itself from.
     fn reachable_from_outside(&self, ip: &str) -> bool {
+        self.reachable_on(ip, Canary::PORT)
+    }
+
+    /// The same probe, on a named port.
+    ///
+    /// Split out because the neighbouring-port control needs to establish that `OTHER_PORT` answers
+    /// from outside every contained namespace — the only thing that makes a refusal *inside* one
+    /// attributable to policy rather than to an absent listener.
+    fn reachable_on(&self, ip: &str, port: &str) -> bool {
         let (ok, _, _) = docker(
             &[
                 "run",
@@ -1408,7 +1431,7 @@ impl RunscNet {
                 "sh",
                 &netfilter_image(),
                 "-c",
-                &format!("ip route add {ip}/32 dev eth0 && nc -w 2 {ip} {}", Canary::PORT),
+                &format!("ip route add {ip}/32 dev eth0 && nc -w 2 {ip} {port}"),
             ],
             None,
         );
@@ -1744,6 +1767,15 @@ fn gate_identity() -> maxplayer_core::seller_git::DeliveryAgentIdentity {
     )
 }
 
+/// The resolver every gate in this file configures.
+///
+/// TEST-NET-1 (RFC 5737): reserved for documentation and routed nowhere. Named explicitly rather
+/// than left empty, because empty does not mean "no DNS" -- `sandbox_dns::resolve` falls back to
+/// the host's `resolv.conf` and then to `resolvectl`, and refuses a loopback address, which is
+/// exactly what a systemd host presents at `127.0.0.53`. Left empty, these legs would depend on the
+/// DNS configuration of whichever machine ran them.
+const GATE_DNS_RESOLVER: &str = "192.0.2.53";
+
 /// The `[sandbox]` section an operator writes, resolved through the same call a booting seat makes.
 fn gate_config(network: &str) -> maxplayer_core::home::SandboxConfig {
     maxplayer_core::home::SandboxConfig {
@@ -1768,7 +1800,7 @@ fn gate_config(network: &str) -> maxplayer_core::home::SandboxConfig {
         // exercises 995's real path — the resolver file is written and the port-53 exception is
         // rendered and read back — while opening reach to nothing that exists. The payloads here
         // dial numeric addresses and resolve nothing, so no leg depends on it answering.
-        dns_servers: vec!["192.0.2.53".to_owned()],
+        dns_servers: vec![GATE_DNS_RESOLVER.to_owned()],
         file_credentials: Vec::new(),
         codex_chatgpt: None,
         container_delivery: None,
@@ -2206,7 +2238,9 @@ fn the_pinhole_production_installs_is_the_one_the_policy_names() {
     const RANGE: &str = "49200-49299";
     const TC_RANGE: &str = "49200-49299";
 
-    let seen_range = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    // Port paired with destination: a port-53 rule is only admissible if it goes to the resolver
+    // the gate configured, and that is unanswerable from the port alone.
+    let seen_range = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
     let recorder = std::sync::Arc::clone(&seen_range);
 
     // The payload still goes to a denied destination: the pinhole must not become a hole.
@@ -2220,10 +2254,14 @@ fn the_pinhole_production_installs_is_the_one_the_policy_names() {
             let readback = iface_readback(holder, &dev);
             let filters = maxplayer_core::sandbox_iface::parse_filters(&readback)
                 .expect("the prepared namespace's own tc output must parse");
-            let ports: Vec<String> = filters
+            let ports: Vec<(String, String)> = filters
                 .iter()
                 .filter(|filter| filter.actions == vec!["pass".to_owned()])
-                .filter_map(|filter| filter.key("dst_port").map(str::to_owned))
+                .filter_map(|filter| {
+                    filter.key("dst_port").map(|port| {
+                        (port.to_owned(), filter.key("dst_ip").unwrap_or("any").to_owned())
+                    })
+                })
                 .collect();
             *recorder.lock().expect("the recorder") = ports;
         },
@@ -2232,14 +2270,36 @@ fn the_pinhole_production_installs_is_the_one_the_policy_names() {
 
     let ports = seen_range.lock().expect("the recorder").clone();
     assert!(
-        ports.iter().any(|port| port == TC_RANGE),
+        ports.iter().any(|(port, _)| port == TC_RANGE),
         "production installed no pass rule for the configured proxy range {RANGE} — the pinhole the \
          operator wrote is not on the veth the packets leave by. Pass rules carried ports: {ports:?}"
     );
+    // Every pass rule is one of exactly two things the configuration asked for: the proxy range, or
+    // a resolver pinhole on port 53 to a resolver the gate NAMED. The second admits the DNS
+    // exceptions without widening the check -- the destination is pinned to the configured address,
+    // so a port-53 rule to anywhere else still fails here, and so does any other port.
+    //
+    // Both intents, in one assertion. "No pinhole wider than its configuration" is the whole point
+    // of this leg, and a job that cannot resolve a name is useless: the resolver exception exists
+    // and is bounded, rather than being either banned or waved through.
+    let stray: Vec<&(String, String)> = ports
+        .iter()
+        .filter(|(port, dst)| {
+            let proxy = port == TC_RANGE;
+            let resolver = port == "53" && dst.starts_with(GATE_DNS_RESOLVER);
+            !proxy && !resolver
+        })
+        .collect();
     assert!(
-        ports.iter().all(|port| port == TC_RANGE),
-        "production installed a pass rule for a range the operator did not write: {ports:?} — a \
-         pinhole wider than its configuration is a hole"
+        stray.is_empty(),
+        "production installed a pass rule the operator did not write: {stray:?} (all pass rules: \
+         {ports:?}) — a pinhole wider than its configuration is a hole. Only the proxy range \
+         {TC_RANGE} and port 53 to the configured resolver {GATE_DNS_RESOLVER} are configured here"
+    );
+    assert!(
+        ports.iter().any(|(port, dst)| port == "53" && dst.starts_with(GATE_DNS_RESOLVER)),
+        "production installed no resolver pinhole for the configured {GATE_DNS_RESOLVER} — a job \
+         that cannot reach its own resolver resolves nothing. Pass rules carried: {ports:?}"
     );
     assert_eq!(
         denied,
