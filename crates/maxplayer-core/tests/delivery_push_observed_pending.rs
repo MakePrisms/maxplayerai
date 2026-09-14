@@ -228,6 +228,19 @@ async fn a_second_delivery_is_observed_pending_until_the_held_local_phase_is_kil
     // The handover is ORDERED, not merely eventual: the second delivery entered its push body after
     // the first delivery's call returned, which is after the reap.
     let acquired_at = second_acquired_at.lock().expect("clock").expect("acquired");
+
+    // THE NUMBERS, PRINTED. `cargo test ... -- --nocapture` reproduces the measurement rather than
+    // the claim: how long the wedged delivery actually held the seat against its stated budget, and
+    // how long the handover to the delivery that was waiting for it actually took.
+    eprintln!(
+        "MEASURED budget={:?} held={:?} overrun={:?} handover={:?} samples_pending={} reap_bound={:?}",
+        budget,
+        held,
+        held.saturating_sub(budget),
+        acquired_at.saturating_duration_since(returned),
+        samples,
+        Duration::from_secs(5),
+    );
     assert!(
         acquired_at >= returned,
         "the second delivery entered its push body before the first delivery returned"
