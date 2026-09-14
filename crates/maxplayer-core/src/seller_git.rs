@@ -231,7 +231,8 @@ fn checkout_base_branch(
 ) -> Result<(), SellerGitError> {
     let repo =
         Repository::open(workdir).map_err(|error| SellerGitError::Io(format!("open: {error}")))?;
-    let oid = Oid::from_str(base_oid).map_err(|_| SellerGitError::CommandFailed("checkout-base"))?;
+    let oid =
+        Oid::from_str(base_oid).map_err(|_| SellerGitError::CommandFailed("checkout-base"))?;
     let commit = repo
         .find_commit(oid)
         .map_err(|_| SellerGitError::CommandFailed("checkout-base"))?;
@@ -675,10 +676,8 @@ pub async fn push_branch_with_header_off_runtime(
     gated_oid: String,
     header: Option<String>,
 ) -> Result<String, SellerGitError> {
-    off_runtime(move || {
-        push_branch_with_header(&workdir, &remote_url, &branch, &gated_oid, header)
-    })
-    .await
+    off_runtime(move || push_branch_with_header(&workdir, &remote_url, &branch, &gated_oid, header))
+        .await
 }
 
 /// Refuse a job workdir whose repository layout would make libgit2 read state from outside
@@ -936,8 +935,9 @@ pub async fn neutralize_then_push_off_runtime(
     off_runtime_holding_the_turn(turn, move |work| {
         // Phase boundary: the config rewrite is local and short, but a delivery revoked before it
         // must not touch the workdir at all.
-        work.check()
-            .map_err(|ended| SellerGitError::Cancelled(format!("before neutralizing config: {ended}")))?;
+        work.check().map_err(|ended| {
+            SellerGitError::Cancelled(format!("before neutralizing config: {ended}"))
+        })?;
         neutralize_push_config(&workdir)?;
         // Phase boundary: everything after this is pack generation and the wire.
         work.check()
@@ -976,9 +976,13 @@ pub async fn neutralize_then_push_off_runtime(
 /// The fail-closed rule in one place, so it is a rule that can be tested rather than a judgement
 /// repeated at each arm of a match. **Unknown exit is treated as still running.**
 ///
-/// - [`ExecutorError::Unreaped`] is the only outcome that RETAINS the turn: a kill was issued and
-///   the exit was not observed, so as far as this process can establish, a push may still be running
-///   against this seat's one delivery remote.
+/// - [`ExecutorError::Unreaped`] RETAINS the turn: a kill was issued and the exit was not observed,
+///   so as far as this process can establish, a push may still be running against this seat's one
+///   delivery remote.
+/// - [`ExecutorError::CleanupUnbounded`] RETAINS for the same reason at one remove: the child was
+///   reaped, but the write end of its pipe was still held afterwards, which can only mean something
+///   that inherited it escaped the process group we killed. The process we named is gone; the work
+///   is not demonstrably over.
 /// - [`ExecutorError::Killed`] RELEASES, and that is not an exception to the rule: the executor
 ///   constructs it only after a reap the kernel completed, and it carries the measured kill-to-exit
 ///   time. A deadline breach whose reap did not complete is `Unreaped`, not `Killed`.
@@ -989,7 +993,9 @@ pub fn turn_after_child_push(
 ) -> crate::delivery_executor::Exclusion {
     use crate::delivery_executor::{Exclusion, ExecutorError};
     match outcome {
-        Err(ExecutorError::Unreaped { .. }) => Exclusion::Retain,
+        Err(ExecutorError::Unreaped { .. } | ExecutorError::CleanupUnbounded { .. }) => {
+            Exclusion::Retain
+        }
         Ok(_)
         | Err(
             ExecutorError::Killed { .. }
@@ -1022,6 +1028,9 @@ fn push_error_to_seller_git_error(
              the first may still be packing",
             waited.as_millis()
         )),
+        // Same family as `Unreaped`, and deliberately NOT `Transport`: nothing on the wire failed.
+        // This is a custody answer — we cannot say the local phase is over — and it reads as one.
+        error @ ExecutorError::CleanupUnbounded { .. } => SellerGitError::Io(error.to_string()),
         error @ ExecutorError::Spawn(_) => SellerGitError::Io(error.to_string()),
         error => SellerGitError::Transport(error.to_string()),
     }
@@ -1095,30 +1104,36 @@ pub async fn neutralize_then_push_in_child_off_runtime(
         // The absolute deadline this delivery has always had. It is the parent's, not the child's:
         // the child is not trusted to bound itself, which is the entire reason it is a child.
         let deadline = lifetime.deadline();
-        let proxy = |destination: &str| -> Result<String, String> {
-            if let Some(authority) = &authority {
-                authority().map_err(|ended| format!("{ended}; refusing to authorize another leg"))?;
-            }
-            lifetime
-                .check()
-                .map_err(|ended| format!("{ended}; refusing to authorize another leg"))?;
-            let minter = mint.as_ref().ok_or_else(|| {
-                "this delivery's remote takes no authorization; refusing to mint one".to_owned()
-            })?;
-            let header = minter(destination)?;
-            // Asked AGAIN, after the mint and before the header crosses the pipe. The mint is a call
-            // into the signer actor and it can block; the answer can change while it does, and a
-            // header that is never written is a header the child cannot transmit.
-            if let Some(authority) = &authority {
-                authority().map_err(|ended| {
+        // Behind an `Arc` because the parent now runs this OFF its drive thread: the signer can
+        // block, and a parent blocked in the signer is a parent that cannot issue the kill. The
+        // TOKEN it returns does cross the pipe to the child — that is the point of the round trip.
+        // The PRIVATE KEY does not: it stays in the signer actor this closure calls, on this side.
+        let proxy: crate::git_transport::AuthMinter =
+            std::sync::Arc::new(move |destination: &str| -> Result<String, String> {
+                if let Some(authority) = &authority {
+                    authority()
+                        .map_err(|ended| format!("{ended}; refusing to authorize another leg"))?;
+                }
+                lifetime
+                    .check()
+                    .map_err(|ended| format!("{ended}; refusing to authorize another leg"))?;
+                let minter = mint.as_ref().ok_or_else(|| {
+                    "this delivery's remote takes no authorization; refusing to mint one".to_owned()
+                })?;
+                let header = minter(destination)?;
+                // Asked AGAIN, after the mint and before the header crosses the pipe. The mint is a
+                // call into the signer actor and it can block; the answer can change while it does,
+                // and a header that is never written is a header the child cannot transmit.
+                if let Some(authority) = &authority {
+                    authority().map_err(|ended| {
+                        format!("{ended}; the token minted for this leg will not be handed over")
+                    })?;
+                }
+                lifetime.check().map_err(|ended| {
                     format!("{ended}; the token minted for this leg will not be handed over")
                 })?;
-            }
-            lifetime.check().map_err(|ended| {
-                format!("{ended}; the token minted for this leg will not be handed over")
-            })?;
-            Ok(header)
-        };
+                Ok(header)
+            });
 
         let outcome =
             crate::delivery_executor::run_push_in_child(&program, &request, deadline, proxy);
@@ -1301,8 +1316,11 @@ mod tests {
 
     #[test]
     fn preflight_push_probe_fails_closed_on_unreachable_https_remote() {
-        let err = preflight_push_probe("https://maxplayer-preflight.invalid/git/owner/repo.git", None)
-            .expect_err("unreachable remote must fail closed");
+        let err = preflight_push_probe(
+            "https://maxplayer-preflight.invalid/git/owner/repo.git",
+            None,
+        )
+        .expect_err("unreachable remote must fail closed");
         assert!(
             matches!(
                 err,
@@ -1337,12 +1355,8 @@ mod tests {
         let tree = repo
             .find_tree(index.write_tree().expect("tree"))
             .expect("find tree");
-        let sig = Signature::new(
-            "s",
-            "s@example.invalid",
-            &git2::Time::new(1_700_000_000, 0),
-        )
-        .expect("sig");
+        let sig = Signature::new("s", "s@example.invalid", &git2::Time::new(1_700_000_000, 0))
+            .expect("sig");
         repo.commit(Some("refs/heads/job"), &sig, &sig, "delivery", &tree, &[])
             .expect("commit");
         (root, workdir)
@@ -1420,7 +1434,11 @@ mod tests {
         let (root, workdir) = plain_repo("layout-gitfile");
         let real = root.join("real-gitdir");
         fs::rename(workdir.join(".git"), &real).expect("move git dir");
-        fs::write(workdir.join(".git"), format!("gitdir: {}\n", real.display())).expect("gitfile");
+        fs::write(
+            workdir.join(".git"),
+            format!("gitdir: {}\n", real.display()),
+        )
+        .expect("gitfile");
         assert!(
             Repository::open(&workdir).is_ok(),
             "fixture: libgit2 follows the gitfile"
@@ -1543,7 +1561,10 @@ mod tests {
         // gated open refuses instead of searching.
         let sub = workdir.join("sub");
         fs::create_dir_all(&sub).expect("subdir");
-        assert!(Repository::discover(&sub).is_ok(), "fixture: discover walks up");
+        assert!(
+            Repository::discover(&sub).is_ok(),
+            "fixture: discover walks up"
+        );
         assert!(matches!(
             open_plain_workdir_repo(&sub),
             Err(SellerGitError::Layout(_))
@@ -1657,8 +1678,10 @@ mod snapshot_tests {
 
     fn workdir(label: &str) -> PathBuf {
         let id = SEQ.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir()
-            .join(format!("maxplayer-snapshot-{label}-{}-{id}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "maxplayer-snapshot-{label}-{}-{id}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("mkdir workdir");
         dir
@@ -1742,7 +1765,8 @@ mod snapshot_tests {
     fn commit(dir: &Path, oid: &str) -> git2::Commit<'static> {
         // Leak the repo so the returned commit's lifetime is convenient in asserts.
         let repo = Box::leak(Box::new(Repository::open(dir).expect("open")));
-        repo.find_commit(Oid::from_str(oid).unwrap()).expect("commit")
+        repo.find_commit(Oid::from_str(oid).unwrap())
+            .expect("commit")
     }
 
     // ── Field case: agent edits, never commits — the daemon snapshots the workdir ──────────────
@@ -1753,12 +1777,22 @@ mod snapshot_tests {
         write(&dir, "src/feature.rs", "agent work, never committed\n");
         let id = identity();
 
-        let oid = snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "maxplayer delivery: task")
-            .expect("snapshot");
+        let oid = snapshot_delivery(
+            &dir,
+            &id,
+            Some(&base),
+            "maxplayer/job",
+            "maxplayer delivery: task",
+        )
+        .expect("snapshot");
 
         let c = commit(&dir, &oid);
         assert_eq!(c.parent_count(), 1, "delivery is one commit on top of base");
-        assert_eq!(c.parent_id(0).unwrap().to_string(), base, "parented on the pinned base");
+        assert_eq!(
+            c.parent_id(0).unwrap().to_string(),
+            base,
+            "parented on the pinned base"
+        );
         assert_eq!(c.author().email(), Some(id.email.as_str()));
         assert_eq!(c.committer().email(), Some(id.email.as_str()));
         assert!(tree_paths(&dir, &oid).contains(&"src/feature.rs".to_owned()));
@@ -1802,12 +1836,18 @@ mod snapshot_tests {
         // second tip). Same base commit on both passes, so the parent is fixed.
         let oid_a2 = snapshot_delivery_at(&dir, &id, Some(&base), "maxplayer/job", "msg", DATE)
             .expect("snapshot a2");
-        assert_eq!(oid_a, oid_a2, "same inputs + journaled date ⇒ identical delivery commit oid");
+        assert_eq!(
+            oid_a, oid_a2,
+            "same inputs + journaled date ⇒ identical delivery commit oid"
+        );
 
         // And the date is genuinely folded into the oid: a different date ⇒ a different commit.
         let oid_b = snapshot_delivery_at(&dir, &id, Some(&base), "maxplayer/job", "msg", DATE + 1)
             .expect("snapshot b");
-        assert_ne!(oid_a, oid_b, "a different authored-at must change the delivery oid");
+        assert_ne!(
+            oid_a, oid_b,
+            "a different authored-at must change the delivery oid"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1820,17 +1860,34 @@ mod snapshot_tests {
         // Agent makes two scratch commits under a foreign identity.
         write(&dir, "a.rs", "one\n");
         git(&dir, ["add", "-A"]);
-        run_env(&dir, ["commit", "-m", "scratch 1"], Some(("Claude", "c@anthropic.invalid")));
+        run_env(
+            &dir,
+            ["commit", "-m", "scratch 1"],
+            Some(("Claude", "c@anthropic.invalid")),
+        );
         write(&dir, "b.rs", "two\n");
         git(&dir, ["add", "-A"]);
-        run_env(&dir, ["commit", "-m", "scratch 2"], Some(("Claude", "c@anthropic.invalid")));
+        run_env(
+            &dir,
+            ["commit", "-m", "scratch 2"],
+            Some(("Claude", "c@anthropic.invalid")),
+        );
         let id = identity();
 
-        let oid = snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
+        let oid =
+            snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
 
         let c = commit(&dir, &oid);
-        assert_eq!(c.parent_id(0).unwrap().to_string(), base, "parented on base, not the scratch tip");
-        assert_eq!(c.author().email(), Some(id.email.as_str()), "delivery identity, not the agent's");
+        assert_eq!(
+            c.parent_id(0).unwrap().to_string(),
+            base,
+            "parented on base, not the scratch tip"
+        );
+        assert_eq!(
+            c.author().email(),
+            Some(id.email.as_str()),
+            "delivery identity, not the agent's"
+        );
         // Exactly one commit between base and the delivery tip.
         let repo = Repository::open(&dir).unwrap();
         let mut walk = repo.revwalk().unwrap();
@@ -1854,7 +1911,11 @@ mod snapshot_tests {
         let oid = snapshot_delivery(&dir, &id, None, "maxplayer/job", "msg").expect("snapshot");
 
         let c = commit(&dir, &oid);
-        assert_eq!(c.parent_count(), 0, "from-scratch delivery is a root commit");
+        assert_eq!(
+            c.parent_count(),
+            0,
+            "from-scratch delivery is a root commit"
+        );
         assert_eq!(c.author().email(), Some(id.email.as_str()));
         assert!(tree_paths(&dir, &oid).contains(&"out.rs".to_owned()));
         let _ = fs::remove_dir_all(&dir);
@@ -1911,7 +1972,10 @@ mod snapshot_tests {
             paths.contains(&crate::delivery_sentinel::SENTINEL_FILE.to_owned()),
             "the sentinel rides at its well-known path in the delivered tree"
         );
-        assert!(paths.contains(&"out.rs".to_owned()), "and the real work rides too");
+        assert!(
+            paths.contains(&"out.rs".to_owned()),
+            "and the real work rides too"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2017,7 +2081,11 @@ mod snapshot_tests {
         );
         // And concretely: exactly the one deliverable at its exact byte size (the transcript is gone).
         assert_eq!(actual_files, 1, "only answer.txt should be delivered");
-        assert_eq!(actual_bytes, answer.len() as u64, "at answer.txt's exact byte size");
+        assert_eq!(
+            actual_bytes,
+            answer.len() as u64,
+            "at answer.txt's exact byte size"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2044,7 +2112,8 @@ mod snapshot_tests {
         let dir = workdir("empty-scratch");
         let id = identity();
         init_empty_delivery_workdir(&dir, &id).expect("init");
-        let err = snapshot_delivery(&dir, &id, None, "maxplayer/job", "msg").expect_err("must refuse");
+        let err =
+            snapshot_delivery(&dir, &id, None, "maxplayer/job", "msg").expect_err("must refuse");
         assert!(
             matches!(err, SellerGitError::NoExecutionObserved(_)),
             "an empty from-scratch tree is a no-execution refusal (maps to no_sentinel), got: {err}"
@@ -2063,11 +2132,15 @@ mod snapshot_tests {
         write(&dir, "real.rs", "delivered\n");
         let id = identity();
 
-        let oid = snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
+        let oid =
+            snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
 
         let paths = tree_paths(&dir, &oid);
         assert!(paths.contains(&"real.rs".to_owned()));
-        assert!(!paths.contains(&"secret.txt".to_owned()), "ignored file must not be delivered");
+        assert!(
+            !paths.contains(&"secret.txt".to_owned()),
+            "ignored file must not be delivered"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2079,10 +2152,14 @@ mod snapshot_tests {
         write(&dir, "work.rs", "work\n");
         let id = identity();
 
-        let oid = snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
+        let oid =
+            snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
 
         for path in tree_paths(&dir, &oid) {
-            assert!(!path.starts_with(".git/") && path != ".git", "git internals leaked: {path}");
+            assert!(
+                !path.starts_with(".git/") && path != ".git",
+                "git internals leaked: {path}"
+            );
         }
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2097,7 +2174,8 @@ mod snapshot_tests {
         write(&dir, "work.rs", "work\n");
         let id = identity();
 
-        let oid = snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
+        let oid =
+            snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
 
         assert!(
             !commit(&dir, &oid).raw_header().unwrap().contains("gpgsig"),
@@ -2132,7 +2210,8 @@ mod snapshot_tests {
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
         let id = identity();
 
-        let oid = snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
+        let oid =
+            snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
 
         let repo = Repository::open(&dir).unwrap();
         let entry = repo
@@ -2142,7 +2221,11 @@ mod snapshot_tests {
             .unwrap()
             .get_path(Path::new("run.sh"))
             .unwrap();
-        assert_eq!(entry.filemode(), 0o100755, "executable bit must be preserved");
+        assert_eq!(
+            entry.filemode(),
+            0o100755,
+            "executable bit must be preserved"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2156,10 +2239,14 @@ mod snapshot_tests {
         write(&dir, "new.rs", "replacement\n");
         let id = identity();
 
-        let oid = snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
+        let oid =
+            snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
 
         let paths = tree_paths(&dir, &oid);
-        assert!(!paths.contains(&"README.md".to_owned()), "deleted file must not be delivered");
+        assert!(
+            !paths.contains(&"README.md".to_owned()),
+            "deleted file must not be delivered"
+        );
         assert!(paths.contains(&"new.rs".to_owned()));
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2176,7 +2263,9 @@ mod snapshot_tests {
         let mut index = repo.index().expect("index");
         index.add_path(Path::new("README.md")).expect("add");
         index.write().expect("index write");
-        let tree = repo.find_tree(index.write_tree().expect("wt")).expect("tree");
+        let tree = repo
+            .find_tree(index.write_tree().expect("wt"))
+            .expect("tree");
         let sig = Signature::now("Upstream", "u@u.invalid").expect("sig");
         let base = repo
             .commit(Some("HEAD"), &sig, &sig, "base", &tree, &[])
@@ -2201,11 +2290,16 @@ mod snapshot_tests {
         // Agent left scratch commits AND uncommitted edits — the daemon ignores all of it.
         write(&dir, "feature.rs", "impl\n");
         git(&dir, ["add", "-A"]);
-        run_env(&dir, ["commit", "-m", "scratch"], Some(("Claude", "c@anthropic.invalid")));
+        run_env(
+            &dir,
+            ["commit", "-m", "scratch"],
+            Some(("Claude", "c@anthropic.invalid")),
+        );
         write(&dir, "extra.rs", "more, uncommitted\n");
         let id = identity();
 
-        let oid = snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
+        let oid =
+            snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
 
         let remote = workdir("e2e-remote.git");
         git(&remote, ["init", "--bare", "--initial-branch=main"]);

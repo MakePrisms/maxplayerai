@@ -406,6 +406,98 @@ async fn an_unauthenticated_remote_cannot_obtain_a_token_by_asking() {
 /// fixture and this rule is gated at the decision rather than end to end. The decision is the whole
 /// of the policy: `neutralize_then_push_in_child_off_runtime` has exactly ONE release site and it
 /// asks this function, so an outcome that maps to `Retain` is an outcome that keeps the turn.
+/// F2(a), on the production path: cancellation while the SIGNER'S REPLY IS HELD.
+///
+/// Round 1 parked a test minter before it called the signer and called that a signer interleaving.
+/// This holds the minter itself — the call the parent makes into the signer actor — open forever,
+/// which is what a full signer queue or a held reply looks like from here. The mint runs OFF the
+/// parent's drive thread precisely so that this cannot happen: a parent blocked inside the signer
+/// is a parent that never issues the kill, and that is the wedge this seat must not have.
+///
+/// The assertion is that the deadline still lands: the child is killed, its exit confirmed, and the
+/// turn handed back, while the mint is still outstanding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_signer_whose_reply_never_comes_cannot_stop_the_deadline_from_landing() {
+    let dir = scratch("heldsigner");
+    let pidfile = dir.join("child.pid");
+    // The child says hello, asks to mint, and then waits for an answer that will never arrive. It
+    // ignores TERM, so only the kill can end it.
+    let program = fixture(
+        &dir,
+        &format!(
+            "trap '' TERM\necho $$ > {}\n{HELLO}\nprintf '{{\"t\":\"Mint\",\"destination\":\"https://relay.example.invalid/seller.git\"}}\\n'\nwhile :; do sleep 0.05; done\n",
+            pidfile.display()
+        ),
+    );
+
+    let asked = Arc::new(AtomicBool::new(false));
+    let minter: AuthMinter = {
+        let asked = Arc::clone(&asked);
+        Arc::new(move |_destination: &str| {
+            asked.store(true, Ordering::SeqCst);
+            // The signer's reply is HELD. Not slow: held.
+            loop {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })
+    };
+
+    let budget = Duration::from_millis(1_500);
+    let released = Arc::new(AtomicBool::new(false));
+    let (control, turn) = delivery_turn(Token(Arc::clone(&released)), Instant::now() + budget);
+
+    let started = Instant::now();
+    let outcome = neutralize_then_push_in_child_off_runtime(
+        program,
+        dir.join("workdir"),
+        "https://relay.example.invalid/seller.git".to_owned(),
+        "delivery/job".to_owned(),
+        "0123456789012345678901234567890123456789".to_owned(),
+        Some(minter),
+        None,
+        turn,
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    let error = match outcome {
+        Err(SellerGitError::Cancelled(error)) => error,
+        other => panic!("a held signer reply must not outlive the deadline: {other:?}"),
+    };
+    assert!(
+        error.contains("was killed") && error.contains("confirmed the exit"),
+        "the refusal must say the child was killed AND that its exit was confirmed: {error}"
+    );
+    assert!(
+        asked.load(Ordering::SeqCst),
+        "the gate is vacuous unless the child actually reached the mint request"
+    );
+    assert!(
+        elapsed >= budget && elapsed < budget + REAP_BOUND,
+        "the deadline must land while the signer is still holding its reply: {elapsed:?}"
+    );
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .expect("pidfile")
+        .trim()
+        .parse()
+        .expect("pid");
+    assert!(!alive(pid), "the killed child must be gone");
+
+    // The work is recorded as ENDED even though a thread is still sitting in that signer call. This
+    // is the assertion that the abandoned mint holds nothing: were it still holding this delivery's
+    // lifetime, the work would never be ended and this seat would stay shut with no rule able to
+    // see why.
+    assert!(
+        control.work_ended(),
+        "an abandoned mint must not keep this delivery's work alive"
+    );
+    control.end();
+    assert!(
+        !control.holds_ownership() && released.load(Ordering::SeqCst),
+        "the turn must come back even though the signer never answered"
+    );
+}
+
 #[test]
 fn the_turn_is_released_on_a_confirmed_exit_and_on_nothing_else() {
     // The one outcome that retains: a kill was issued and no exit was observed.
@@ -413,6 +505,14 @@ fn the_turn_is_released_on_a_confirmed_exit_and_on_nothing_else() {
         turn_after_child_push(&Err(ExecutorError::Unreaped { waited: REAP_BOUND })),
         Exclusion::Retain,
         "an unconfirmed exit must keep this seat's turn: a kill is not a stop"
+    );
+    // The second retaining outcome: the child WAS reaped, but the write end of its pipe was still
+    // held afterwards, so something that inherited it escaped the process group we killed. The
+    // process we named is gone; the work is not demonstrably over, so the seat stays shut.
+    assert_eq!(
+        turn_after_child_push(&Err(ExecutorError::CleanupUnbounded { waited: REAP_BOUND })),
+        Exclusion::Retain,
+        "a reaped child whose pipe outlived it must keep this seat's turn"
     );
     // A deadline breach releases ONLY because the executor reaped before reporting it — the reap
     // duration it carries is the evidence. A breach whose reap did not complete is Unreaped above.

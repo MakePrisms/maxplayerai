@@ -266,6 +266,10 @@ pub enum ExecutorError {
     Killed { after: Duration, reap: Duration },
     /// The child was killed and did NOT exit within [`REAP_BOUND`]. The turn is still held.
     Unreaped { waited: Duration },
+    /// The child was reaped, but the read end of its pipe was STILL HELD [`REAP_BOUND`] later —
+    /// which means something that inherited it outlived the process group we killed. We cannot say
+    /// the delivery's local phase is over, so the turn is still held.
+    CleanupUnbounded { waited: Duration },
     /// The push itself failed; the child exited on its own.
     Push(String),
 }
@@ -285,6 +289,13 @@ impl std::fmt::Display for ExecutorError {
                 f,
                 "delivery push child did not exit {}ms after SIGKILL; this seat stays held rather \
                  than hand the turn to a second delivery while the first may still be packing",
+                waited.as_millis()
+            ),
+            Self::CleanupUnbounded { waited } => write!(
+                f,
+                "delivery push child was reaped but its output pipe was still held {}ms later, so \
+                 something outlived its process group; this seat stays held rather than hand the \
+                 turn to a second delivery while the first may still be touching the workdir",
                 waited.as_millis()
             ),
             Self::Push(why) => write!(f, "delivery push failed: {why}"),
@@ -511,7 +522,7 @@ pub fn run_push_in_child(
     program: &Path,
     request: &PushRequest,
     deadline: Instant,
-    mut mint: impl FnMut(&str) -> Result<String, String>,
+    mint: crate::git_transport::AuthMinter,
 ) -> Result<String, ExecutorError> {
     let mut child = KillableChild::spawn(program, &[CHILD_SUBCOMMAND])?;
     let mut stdin = child
@@ -523,16 +534,31 @@ pub fn run_push_in_child(
     let (sink, frames) = channel();
     let pump = pump(stdout, sink);
 
-    let outcome = drive(
-        &mut stdin,
-        &frames,
-        request,
-        deadline,
-        &mut mint,
-        &mut child,
-    );
+    let outcome = drive(&mut stdin, &frames, request, deadline, &mint, &mut child);
     drop(stdin);
-    let _ = pump.join();
+
+    // CLEANUP, BOUNDED. Joining the pump is the obvious move and it is unbounded: the pump sits in
+    // a blocking read that only ends at EOF, and EOF only arrives when the LAST holder of the write
+    // end closes it. A grandchild that escaped the process group we killed still holds it, and then
+    // the join never returns and this parent never comes back at all. So we do not join: we wait
+    // for the channel to disconnect, which happens exactly when the pump returns, and we give that
+    // the same REAP_BOUND we give the reap. Losing that race is not a delivery failure we can
+    // shrug at — it says something from this delivery outlived the kill — so it fails closed.
+    let cleanup_started = Instant::now();
+    let cleaned = loop {
+        match frames.recv_timeout(REAP_BOUND.saturating_sub(cleanup_started.elapsed())) {
+            // Frames still queued behind the outcome; drain them, the decision is already made.
+            Ok(_) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break true,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break false,
+        }
+    };
+    if !cleaned {
+        return Err(ExecutorError::CleanupUnbounded {
+            waited: cleanup_started.elapsed(),
+        });
+    }
+    drop(pump);
     outcome
 }
 
@@ -541,7 +567,7 @@ fn drive(
     frames: &Receiver<std::io::Result<Option<ToParent>>>,
     request: &PushRequest,
     deadline: Instant,
-    mint: &mut impl FnMut(&str) -> Result<String, String>,
+    mint: &crate::git_transport::AuthMinter,
     child: &mut KillableChild,
 ) -> Result<String, ExecutorError> {
     let mut said_hello = false;
@@ -582,15 +608,38 @@ fn drive(
                         "child asked to mint for an unauthenticated remote".to_owned(),
                     ));
                 }
-                let answer = match mint(&destination) {
-                    Ok(header) => ToChild::Minted {
+                // The mint is bounded by the SAME deadline as every other phase, and it runs OFF
+                // this thread to make that true: a signer whose queue is full, or whose reply is
+                // being held, must not be able to stop the parent from issuing the kill. The
+                // abandoned thread carries no lock of ours and is bounded by the minter's own push
+                // deadline; the private key never leaves the actor either way.
+                let Some(left_for_mint) = deadline.checked_duration_since(Instant::now()) else {
+                    let after = Instant::now().saturating_duration_since(deadline);
+                    let reap = child.kill_and_reap()?;
+                    return Err(ExecutorError::Killed { after, reap });
+                };
+                let (answered, answer_rx) = channel();
+                let minter = std::sync::Arc::clone(mint);
+                let target = destination.clone();
+                std::thread::spawn(move || {
+                    let _ = answered.send(minter(&target));
+                });
+                let answer = match answer_rx.recv_timeout(left_for_mint) {
+                    Ok(Ok(header)) => ToChild::Minted {
                         header: Some(header),
                         refused: None,
                     },
-                    Err(refused) => ToChild::Minted {
+                    Ok(Err(refused)) => ToChild::Minted {
                         header: None,
                         refused: Some(refused),
                     },
+                    // The signer did not answer inside this delivery's own deadline (or died
+                    // trying). The work is stopped the same way any other overrun is stopped.
+                    Err(_) => {
+                        let after = Instant::now().saturating_duration_since(deadline);
+                        let reap = child.kill_and_reap()?;
+                        return Err(ExecutorError::Killed { after, reap });
+                    }
                 };
                 write_frame(stdin, &answer).map_err(|error| {
                     ExecutorError::Protocol(format!("answering a mint request: {error}"))
