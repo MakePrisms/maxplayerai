@@ -346,6 +346,29 @@ Two facts measured on the way, both recorded in the code:
 - The per-job socket reaches the job through a `volume-subpath` mount, which needs Docker Engine 26 or
   newer; boot probes for it once.
 
-What remains, stated plainly: one held tool per seat (a list is a config change and a socket per tool);
-real-vendor acceptance of a real CLI inside a seller-built holder image, per vendor; and the branch
-delivery (push, pull request, review), which needs Petar's go.
+### Several held tools per seat (added 2026-09-14, after "sounds good")
+
+Petar asked how several tools would work and approved the design. The single `[sandbox.held_tool]`
+table became the list `[[sandbox.held_tools]]`, each entry with a required, unique `server_name`:
+
+- The name is what the agent addresses (`mcp__<name>__<operation>`), and it names the holder container
+  and its volumes (`maxplayer-held-tool-<seat>-<name>`) and the job's socket directory
+  (`/run/holder/<name>`). Config resolution refuses a name that is not plain, a duplicate, or one that
+  a `[[sandbox.mcp_tools]]` entry also claims — both lists land on the job's session.
+- One holder per entry, each with its own image, credential, login and volumes. Boot starts them
+  concurrently; the fail posture applies per tool, and a refused boot stops the holders that did start.
+- Per job, one socket per tool: `JobToolEndpoint::attachments` mounts each tool's `jobs/<job>` subpath
+  at its own path and gives the bridge `--socket /run/holder/<name>/job.sock` as an argument.
+  `tool-mcp-bridge` gained that flag (the environment form stays for the demo). `JobAttachments::merge`
+  joins the per-tool attachments into the one list the launch takes.
+- A tool that needs two credentials at once is still a kit change, not a daemon change: each holder
+  holds one credential for one vendor.
+
+Proved live through the daemon code the same day, bundle `evidence/20260914T103608Z-holder-route-two-tools/`: two holders enrolled once each;
+one job drove both tools through their own sockets (its container had `/work`, `/run/holder/text-a`
+and `/run/holder/text-b`, nothing else); a contained job; a restart resumed both logins; and a real
+`claude-agent-acp` turn called `mcp__text-a__transform-file` and `mcp__text-b__transform-file`, each
+vendor seeing one login and one transform.
+
+What remains, stated plainly: real-vendor acceptance of a real CLI inside a seller-built holder image,
+per vendor; and the branch delivery (push, pull request, review), which needs Petar's go.

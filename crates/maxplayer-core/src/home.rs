@@ -652,16 +652,17 @@ pub struct SandboxConfig {
     /// entry that carries only the placeholder and the proxy's address. See [`McpToolConfig`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_tools: Vec<McpToolConfig>,
-    /// `docker` mode: ONE vendor CLI this seat holds logged in, in its own persistent holder
-    /// container, and offers to every job over a per-job Unix socket — the Holder route of the
-    /// seller-tool onboarding (`docs/specs/seller-tool-onboarding/10-routing-and-options.md`;
-    /// the kit is `crates/maxplayer-tool-kit`). Absent ⇒ no held tool, the shipped behaviour.
+    /// `docker` mode: the vendor CLIs this seat holds logged in, each in its own persistent holder
+    /// container, and offers to every job over a per-job Unix socket per tool — the Holder route of
+    /// the seller-tool onboarding (`docs/specs/seller-tool-onboarding/10-routing-and-options.md`;
+    /// the kit is `crates/maxplayer-tool-kit`). Empty ⇒ no held tool, the shipped behaviour.
     ///
     /// The credential and the vendor's login state live in the holder container, never in a job
-    /// container. A job gets exactly two things from the holder: its own socket, and the operations
-    /// the seller declared. See [`HeldToolConfig`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub held_tool: Option<HeldToolConfig>,
+    /// container. A job gets exactly two things from each holder: its own socket for that tool, and
+    /// the operations the seller declared. Each entry's `server_name` is what the agent sees, and it
+    /// must be unique across this list and `mcp_tools`. See [`HeldToolConfig`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held_tools: Vec<HeldToolConfig>,
     /// `docker` mode: use a host Codex ChatGPT session through the per-job proxy.
     ///
     /// The auth file stays on the host. The container receives only per-job placeholders through the
@@ -809,14 +810,16 @@ pub struct McpToolConfig {
 }
 
 /// One vendor CLI a docker seat holds logged in for its jobs — the Holder route
-/// (`[sandbox.held_tool]`).
+/// (`[[sandbox.held_tools]]`).
 ///
-/// The seller daemon runs ONE holder container per seat for the daemon's whole life: `tool-holderd`
+/// The seller daemon runs ONE holder container per entry for the daemon's whole life: `tool-holderd`
 /// from `crates/maxplayer-tool-kit`, plus the vendor's own CLI, in an image the seller builds. The
 /// holder enrols once at boot (or resumes the login it persisted in its state volume), then serves
 /// the seller-declared operations to each job over that job's own Unix socket. A job's agent reaches
 /// it through `tool-mcp-bridge`, baked into the sandbox image. Job end detaches the socket; the tool
-/// stays enrolled. Daemon stop takes the tool away; nothing else does.
+/// stays enrolled. Daemon stop takes the tool away; nothing else does. Several entries mean several
+/// holders, each with its own image, credential, login and volumes; a job gets one socket per tool,
+/// mounted at `/run/holder/<server_name>`.
 ///
 /// What never enters a job container: this credential file, the holder's state volume (the vendor
 /// login), and the holder's runtime volume beyond the one `jobs/<job>` directory that holds the
@@ -828,6 +831,10 @@ pub struct McpToolConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HeldToolConfig {
+    /// The MCP server name the agent sees (`mcp__<server_name>__<operation>` in Claude Code). ASCII
+    /// letters, digits, `_` and `-`; unique across `held_tools` and `mcp_tools`. It also names the
+    /// holder container and its volumes, and the job's socket directory `/run/holder/<server_name>`.
+    pub server_name: String,
     /// The holder image: `tool-holderd`, `holderctl` and the vendor CLI on `PATH`, built by the
     /// seller (`FROM` the kit image, or with its binaries copied in). The kit's own demo image
     /// (`crates/maxplayer-tool-kit/docker/Dockerfile`) is the reference.
@@ -850,9 +857,6 @@ pub struct HeldToolConfig {
     /// job is, because it has to reach the vendor by design.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<String>,
-    /// The MCP server name the agent sees. Omitted ⇒ `seller-tool`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub server_name: Option<String>,
     /// Refuse to boot when the holder cannot start or enrol, and refuse a job when it cannot be
     /// attached. Default false: the seat boots and logs the tool as unavailable, and a job runs
     /// without it — the same posture a vendor outage would give.
@@ -2330,16 +2334,17 @@ fn documented_config_toml(config: &MaxplayerConfig) -> Result<String, HomeError>
 #   credential = { path = "/ABSOLUTE/path/github-mcp.json", field = "token" }  # host file, never mounted
 #   # transport = "stdio"                                # default; "http" only for a harness that maps it (claude)
 #
-# Holder - hold a vendor CLI logged in, in its own persistent container, and
-# offer the operations you declare to every job over a per-job socket. The
-# credential and the login stay in the holder; a job gets a socket and nothing
-# else. Build the holder image from the kit (crates/maxplayer-tool-kit) with
-# your vendor CLI inside. Needs Docker Engine 26+. Docs: the kit's templates/README.md
-#   [sandbox.held_tool]
-#   image = "my-holder:latest"                            # tool-holderd + holderctl + your vendor CLI
-#   config = "/ABSOLUTE/path/seller-tool-config.json"     # the offering (operations, params, vendor URL)
-#   credential_file = "/ABSOLUTE/path/vendor-cred.json"   # host file, mounted read-only into the holder only
-#   # server_name = "seller-tool"                         # the MCP server name the agent sees
+# Holder - hold vendor CLIs logged in, each in its own persistent container, and
+# offer the operations you declare to every job over a per-job socket per tool.
+# The credential and the login stay in the holder; a job gets a socket and nothing
+# else. Build each holder image from the kit (crates/maxplayer-tool-kit) with the
+# vendor CLI inside. Repeat the table per tool; server_name must be unique. Needs
+# Docker Engine 26+. Docs: the kit's templates/README.md
+#   [[sandbox.held_tools]]
+#   server_name = "figma"                                 # the MCP server name the agent sees; names the holder too
+#   image = "my-figma-holder:latest"                      # tool-holderd + holderctl + the vendor CLI
+#   config = "/ABSOLUTE/path/figma-offering.json"         # the offering (operations, params, vendor URL)
+#   credential_file = "/ABSOLUTE/path/figma-cred.json"    # host file, mounted read-only into the holder only
 #   # required = false                                    # true: refuse to boot/run without the tool
 #
 # Option B - docker on macOS. Docker Desktop cannot load runsc, so OMIT the
@@ -2921,7 +2926,7 @@ mod tests {
             "must show how to offer a vendor MCP server through the proxy"
         );
         assert!(
-            rendered.contains("[sandbox.held_tool]"),
+            rendered.contains("[[sandbox.held_tools]]"),
             "must show how to hold a vendor CLI in a holder container"
         );
     }
@@ -3793,37 +3798,57 @@ mod tests {
         assert!(config.sandbox.expect("[sandbox] present").mcp_tools.is_empty());
     }
 
-    // ---- [sandbox.held_tool] — the Holder route's config surface ---------------------------------
+    // ---- [[sandbox.held_tools]] — the Holder route's config surface -------------------------------
 
     #[test]
-    fn a_held_tool_parses_and_defaults_its_optional_fields() {
+    fn held_tools_parse_as_a_list_and_default_their_optional_fields() {
         let config = parse_config_toml(
             r#"
             relay_url = "r"
             per_job_budget_sats = 1
             [sandbox]
             mode = "docker"
-            [sandbox.held_tool]
-            image = "my-holder:latest"
-            config = "/etc/maxplayer/seller-tool-config.json"
-            credential_file = "/home/seller/.config/maxplayer/vendor-cred.json"
+            [[sandbox.held_tools]]
+            server_name = "figma"
+            image = "my-figma-holder:latest"
+            config = "/etc/maxplayer/figma-offering.json"
+            credential_file = "/home/seller/.config/maxplayer/figma-cred.json"
+            [[sandbox.held_tools]]
+            server_name = "jira"
+            image = "my-jira-holder:latest"
+            config = "/etc/maxplayer/jira-offering.json"
+            credential_file = "/home/seller/.config/maxplayer/jira-cred.json"
+            required = true
             "#,
         )
-        .expect("a held tool must parse");
-        let held = config.sandbox.expect("[sandbox]").held_tool.expect("held_tool present");
-        assert_eq!(held.image, "my-holder:latest");
-        assert_eq!(held.config, PathBuf::from("/etc/maxplayer/seller-tool-config.json"));
-        assert_eq!(held.vendor_base_url, None);
-        assert_eq!(held.vendor_cli, None);
-        assert_eq!(held.network, None);
-        assert_eq!(held.server_name, None);
-        assert!(!held.required, "a held tool is optional unless the seat says otherwise");
+        .expect("held tools must parse");
+        let held = config.sandbox.expect("[sandbox]").held_tools;
+        assert_eq!(held.len(), 2);
+        assert_eq!(held[0].server_name, "figma");
+        assert_eq!(held[0].image, "my-figma-holder:latest");
+        assert_eq!(held[0].config, PathBuf::from("/etc/maxplayer/figma-offering.json"));
+        assert_eq!(held[0].vendor_base_url, None);
+        assert_eq!(held[0].vendor_cli, None);
+        assert_eq!(held[0].network, None);
+        assert!(!held[0].required, "a held tool is optional unless the seat says otherwise");
+        assert_eq!(held[1].server_name, "jira");
+        assert!(held[1].required);
     }
 
     #[test]
-    fn a_held_tool_with_an_unknown_key_is_refused() {
+    fn a_held_tool_without_a_server_name_or_with_an_unknown_key_is_refused() {
         let error = toml::from_str::<HeldToolConfig>(
             r#"
+            image = "my-holder:latest"
+            config = "/abs/c.json"
+            credential_file = "/abs/cred.json"
+            "#,
+        )
+        .expect_err("the server name is required");
+        assert!(error.to_string().contains("server_name"), "{error}");
+        let error = toml::from_str::<HeldToolConfig>(
+            r#"
+            server_name = "figma"
             image = "my-holder:latest"
             config = "/abs/c.json"
             credential = "/abs/cred.json"
@@ -3834,12 +3859,12 @@ mod tests {
     }
 
     #[test]
-    fn a_sandbox_without_a_held_tool_parses_to_none() {
+    fn a_sandbox_without_held_tools_parses_to_an_empty_list() {
         let config = parse_config_toml(
             "relay_url = 'r'\nper_job_budget_sats = 1\n[sandbox]\nmode = \"docker\"\n",
         )
-        .expect("a pre-held_tool sandbox must parse unchanged");
-        assert!(config.sandbox.expect("[sandbox]").held_tool.is_none());
+        .expect("a pre-held_tools sandbox must parse unchanged");
+        assert!(config.sandbox.expect("[sandbox]").held_tools.is_empty());
     }
 
     #[test]

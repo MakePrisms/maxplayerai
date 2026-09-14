@@ -8,11 +8,11 @@
 //! a credential — validation and custody are the holder's, on the other side of the socket.
 //! Compromising this process gains exactly what the socket already allows.
 //!
-//! What it is NOT: it is not wired into maxplayer's seller execution path. The Proxy swap route
-//! is (`[[sandbox.mcp_tools]]` puts an `mcp-http-bridge` entry on the job's session through
-//! `PreparedLaunch::mcp_servers`); the Holder route is not yet, and its plan is
-//! `docs/specs/seller-tool-onboarding/09-production-integration.md`. The MCP protocol here is
-//! real; the Holder integration is not claimed.
+//! The socket comes from `--socket <path>`, else `HOLDER_JOB_SOCKET`, else `/run/holder/job.sock`.
+//! The seller daemon passes the flag (`held_tool::JobToolEndpoint::attachments`), one bridge per
+//! held tool, each at `/run/holder/<server name>/job.sock`: a stdio MCP server's arguments reach
+//! the child on every harness, its environment only if the harness maps it. The environment form
+//! stays for a hand-run bridge and the kit demo.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -20,9 +20,15 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 fn main() {
-    let socket = std::env::var("HOLDER_JOB_SOCKET")
+    let args: Vec<String> = std::env::args().collect();
+    let socket = args
+        .iter()
+        .position(|a| a == "--socket")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .or_else(|| std::env::var("HOLDER_JOB_SOCKET").ok())
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/run/holder/job.sock"));
+        .unwrap_or_else(|| PathBuf::from("/run/holder/job.sock"));
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();

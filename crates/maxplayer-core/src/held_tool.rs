@@ -9,9 +9,11 @@
 //!   `tool-holderd` from `crates/maxplayer-tool-kit` beside the vendor's own CLI, in an image the
 //!   seller builds. It enrols once, or resumes the login it persisted in its state volume.
 //! * Per job, the daemon ATTACHES: the holder creates `jobs/<job>/job.sock` in its runtime volume,
-//!   and the job container mounts exactly that directory at `/run/holder`. The agent reaches it
-//!   through `tool-mcp-bridge`, baked into the sandbox image, as a stdio MCP server. Job end
-//!   DETACHES the socket; the tool stays enrolled.
+//!   and the job container mounts exactly that directory at `/run/holder/<server name>`. The agent
+//!   reaches it through `tool-mcp-bridge --socket …`, baked into the sandbox image, as a stdio MCP
+//!   server. Job end DETACHES the socket; the tool stays enrolled.
+//! * Several held tools are several holders: one container, two volumes and one socket per tool,
+//!   all named by the tool's `server_name`. A job gets one mount and one server entry per tool.
 //! * The credential file and the holder's state never enter a job container. A job gets a socket and
 //!   the seller-declared operations, and nothing else.
 //!
@@ -54,13 +56,22 @@ pub const HOLDER_CONTROL_SOCKET: &str = "/run/maxplayer-holder/holder.sock";
 /// Where the seat's job workdirs (`<home>/seller-jobs`) are mounted inside the holder, so the
 /// holder can stage a job's inputs and publish its outputs under that job's own directory.
 pub const HOLDER_JOBS_DIR: &str = "/srv/jobs";
-/// Where a job container mounts its own socket directory. The bridge's default socket path is
-/// `/run/holder/job.sock`, so no environment is needed.
-pub const JOB_SOCKET_MOUNT: &str = "/run/holder";
+/// Under which a job container mounts its socket directories, one per held tool:
+/// `/run/holder/<server name>`.
+pub const JOB_SOCKET_MOUNT_ROOT: &str = "/run/holder";
 /// The socket bridge inside the sandbox image (`docker/maxplayer-sandbox/Dockerfile`).
 pub const CONTAINER_TOOL_BRIDGE_BIN: &str = "/usr/local/bin/tool-mcp-bridge";
-/// The MCP server name the agent sees when the seat names none.
-pub const DEFAULT_SERVER_NAME: &str = "seller-tool";
+
+/// Where a job container mounts the socket directory of the tool named `server_name`.
+pub fn job_socket_mount(server_name: &str) -> String {
+    format!("{JOB_SOCKET_MOUNT_ROOT}/{server_name}")
+}
+
+/// The socket path inside the job container for the tool named `server_name` — what the bridge is
+/// told with `--socket`.
+pub fn job_socket_path(server_name: &str) -> String {
+    format!("{}/job.sock", job_socket_mount(server_name))
+}
 /// The label every holder container carries, valued with the seat's pubkey hex, so a stale holder
 /// can be attributed to the seat that leaked it.
 pub const HOLDER_LABEL: &str = "maxplayer.held-tool.seat";
@@ -69,9 +80,10 @@ pub const HOLDER_LABEL: &str = "maxplayer.held-tool.seat";
 const START_TIMEOUT: Duration = Duration::from_secs(90);
 const START_POLL: Duration = Duration::from_millis(500);
 
-/// The docker names one seat's holder uses: the container, and its two volumes. Derived from the
-/// seat, never random, for the reason `sandbox_netns::holder_name` gives: a stale one can be
-/// attributed, and a second daemon on the same seat collides loudly instead of leaking.
+/// The docker names one held tool uses: the container, and its two volumes. Derived from the seat
+/// and the tool's server name, never random, for the reason `sandbox_netns::holder_name` gives: a
+/// stale one can be attributed, and a second daemon on the same seat collides loudly instead of
+/// leaking.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HolderNames {
     pub container: String,
@@ -79,9 +91,11 @@ pub struct HolderNames {
     pub runtime_volume: String,
 }
 
-/// The names for `seat` (the seller pubkey hex; the first 16 characters are the suffix).
-pub fn holder_names(seat: &str) -> HolderNames {
-    let suffix: String = seat.chars().take(16).collect();
+/// The names for the tool `server_name` of `seat` (the seller pubkey hex; its first 16 characters
+/// are the seat's part of the suffix).
+pub fn holder_names(seat: &str, server_name: &str) -> HolderNames {
+    let seat: String = seat.chars().take(16).collect();
+    let suffix = format!("{seat}-{server_name}");
     HolderNames {
         container: format!("maxplayer-held-tool-{suffix}"),
         state_volume: format!("maxplayer-held-tool-state-{suffix}"),
@@ -295,7 +309,7 @@ pub struct HeldTool {
 }
 
 impl HeldTool {
-    /// Start the seat's holder and wait until it answers, enrolled or resumed.
+    /// Start the holder for one held tool and wait until it answers, enrolled or resumed.
     ///
     /// `jobs_root` is the seat's `seller-jobs` directory on the host; `uid`/`gid` the identity job
     /// containers run as ([`crate::seller_exec::job_identity`]). Fails — and the caller decides
@@ -323,12 +337,16 @@ impl HeldTool {
             }
         }
         if cfg.image.trim().is_empty() {
-            return Err("[sandbox] held_tool: image must not be empty".into());
+            return Err("[sandbox] held_tools: image must not be empty".into());
+        }
+        let server_name = cfg.server_name.trim();
+        if server_name.is_empty() || !server_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+            return Err(format!("[sandbox] held_tools: server_name {:?} is not a plain name", cfg.server_name));
         }
         std::fs::create_dir_all(jobs_root)
             .map_err(|error| format!("[sandbox] held_tool: cannot create {}: {error}", jobs_root.display()))?;
 
-        let names = holder_names(seat);
+        let names = holder_names(seat, server_name);
         // A stale holder from a daemon that died without its shutdown path: remove it by name, so
         // this boot's container is the one the name addresses.
         let _ = docker(vec!["docker".into(), "rm".into(), "--force".into(), names.container.clone()]).await;
@@ -387,13 +405,7 @@ impl HeldTool {
             seat: seat.to_owned(),
             names,
             image: cfg.image.clone(),
-            server_name: cfg
-                .server_name
-                .as_deref()
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .unwrap_or(DEFAULT_SERVER_NAME)
-                .to_owned(),
+            server_name: server_name.to_owned(),
             required: cfg.required,
             status,
             stopped: AtomicBool::new(false),
@@ -538,22 +550,23 @@ pub struct JobToolEndpoint {
 }
 
 impl JobToolEndpoint {
-    /// What the job gets: its own socket directory mounted at [`JOB_SOCKET_MOUNT`] (a subpath of the
-    /// holder's runtime volume, so no other job's socket and none of the holder's state come with
-    /// it), and one stdio MCP server entry that spawns the bridge. The bridge reads
-    /// `/run/holder/job.sock` by default, so the entry carries no arguments and no environment.
+    /// What the job gets for this tool: its own socket directory mounted at
+    /// `/run/holder/<server name>` (a subpath of the holder's runtime volume, so no other job's
+    /// socket and none of the holder's state come with it), and one stdio MCP server entry that
+    /// spawns the bridge with `--socket` pointing into that mount. A flag, not an environment
+    /// variable: a stdio server's arguments reach the child on every harness.
     pub fn attachments(&self) -> JobAttachments {
         JobAttachments {
             mcp_servers: vec![McpServer::Stdio(McpServerStdio {
                 name: self.server_name.clone(),
                 command: CONTAINER_TOOL_BRIDGE_BIN.to_owned(),
-                args: Vec::new(),
+                args: vec!["--socket".to_owned(), job_socket_path(&self.server_name)],
                 env: Vec::new(),
             })],
             extra_mounts: vec![ExtraMount::VolumeSubpath {
                 volume: self.runtime_volume.clone(),
                 subpath: format!("jobs/{}", self.job_id),
-                container: JOB_SOCKET_MOUNT.to_owned(),
+                container: job_socket_mount(&self.server_name),
             }],
         }
     }
@@ -606,13 +619,13 @@ mod tests {
 
     fn cfg() -> HeldToolConfig {
         HeldToolConfig {
+            server_name: "figma".into(),
             image: "my-holder:latest".into(),
             config: "/etc/maxplayer/seller-tool-config.json".into(),
             credential_file: "/home/seller/.config/maxplayer/vendor-cred.json".into(),
             vendor_base_url: Some("http://vendor:8080".into()),
             vendor_cli: None,
             network: Some("maxplayer-tools".into()),
-            server_name: None,
             required: false,
         }
     }
@@ -620,29 +633,32 @@ mod tests {
     const SEAT: &str = "25f6b60a3e3870d5533b7f08133fc1cdff4c43bad2c30974faec8b059dde019f";
 
     #[test]
-    fn the_names_derive_from_the_seat_and_nothing_random() {
-        let names = holder_names(SEAT);
-        assert_eq!(names.container, "maxplayer-held-tool-25f6b60a3e3870d5");
-        assert_eq!(names.state_volume, "maxplayer-held-tool-state-25f6b60a3e3870d5");
-        assert_eq!(names.runtime_volume, "maxplayer-held-tool-runtime-25f6b60a3e3870d5");
-        assert_eq!(holder_names(SEAT), names, "the same seat always names the same holder");
+    fn the_names_derive_from_the_seat_and_the_tool_and_nothing_random() {
+        let names = holder_names(SEAT, "figma");
+        assert_eq!(names.container, "maxplayer-held-tool-25f6b60a3e3870d5-figma");
+        assert_eq!(names.state_volume, "maxplayer-held-tool-state-25f6b60a3e3870d5-figma");
+        assert_eq!(names.runtime_volume, "maxplayer-held-tool-runtime-25f6b60a3e3870d5-figma");
+        assert_eq!(holder_names(SEAT, "figma"), names, "the same seat and tool always name the same holder");
+        assert_ne!(holder_names(SEAT, "jira"), names, "two tools of one seat never share a holder");
+        assert_eq!(job_socket_mount("figma"), "/run/holder/figma");
+        assert_eq!(job_socket_path("figma"), "/run/holder/figma/job.sock");
     }
 
     /// The holder is handed exactly five mounts — config and credential read-only, two volumes,
     /// the jobs directory — runs as the job uid, carries no environment, and is not `--rm`.
     #[test]
     fn the_holder_mounts_what_it_needs_read_only_and_runs_as_the_job_uid() {
-        let names = holder_names(SEAT);
+        let names = holder_names(SEAT, "figma");
         let argv = holder_run_argv(&cfg(), &names, SEAT, Path::new("/home/seller/.maxplayer/seller-jobs"), 501, 20);
         let text = argv.join(" ");
-        assert!(text.starts_with("docker run -d --name maxplayer-held-tool-25f6b60a3e3870d5 "));
+        assert!(text.starts_with("docker run -d --name maxplayer-held-tool-25f6b60a3e3870d5-figma "));
         assert!(text.contains(" --label maxplayer.held-tool.seat=25f6b60a3e3870d5533b7f08133fc1cdff4c43bad2c30974faec8b059dde019f "));
         assert!(text.contains(" --user 501:20 "));
         assert!(text.contains(" --network maxplayer-tools "));
         assert!(text.contains(" -v /etc/maxplayer/seller-tool-config.json:/etc/maxplayer/seller-tool-config.json:ro "));
         assert!(text.contains(" -v /home/seller/.config/maxplayer/vendor-cred.json:/run/secrets/cred.json:ro "));
-        assert!(text.contains(" -v maxplayer-held-tool-state-25f6b60a3e3870d5:/var/lib/maxplayer-holder "));
-        assert!(text.contains(" -v maxplayer-held-tool-runtime-25f6b60a3e3870d5:/run/maxplayer-holder "));
+        assert!(text.contains(" -v maxplayer-held-tool-state-25f6b60a3e3870d5-figma:/var/lib/maxplayer-holder "));
+        assert!(text.contains(" -v maxplayer-held-tool-runtime-25f6b60a3e3870d5-figma:/run/maxplayer-holder "));
         assert!(text.contains(" -v /home/seller/.maxplayer/seller-jobs:/srv/jobs my-holder:latest tool-holderd "));
         assert!(text.ends_with(
             "--config /etc/maxplayer/seller-tool-config.json --state /var/lib/maxplayer-holder --runtime \
@@ -661,12 +677,12 @@ mod tests {
         let mut bare = cfg();
         bare.network = None;
         bare.vendor_base_url = None;
-        let argv = holder_run_argv(&bare, &holder_names(SEAT), SEAT, Path::new("/jobs"), 1000, 1000);
+        let argv = holder_run_argv(&bare, &holder_names(SEAT, "figma"), SEAT, Path::new("/jobs"), 1000, 1000);
         assert!(!argv.iter().any(|a| a == "--network"));
         assert!(!argv.iter().any(|a| a == "--vendor-base-url"));
         let mut with_cli = cfg();
         with_cli.vendor_cli = Some("/opt/vendor/bin/vendorcli".into());
-        let argv = holder_run_argv(&with_cli, &holder_names(SEAT), SEAT, Path::new("/jobs"), 1000, 1000);
+        let argv = holder_run_argv(&with_cli, &holder_names(SEAT, "figma"), SEAT, Path::new("/jobs"), 1000, 1000);
         let i = argv.iter().position(|a| a == "--vendor-cli").expect("--vendor-cli");
         assert_eq!(argv[i + 1], "/opt/vendor/bin/vendorcli");
     }
@@ -684,14 +700,14 @@ mod tests {
 
     #[test]
     fn the_volume_init_runs_as_root_only_to_chown_and_the_probe_mounts_a_subpath() {
-        let names = holder_names(SEAT);
+        let names = holder_names(SEAT, "figma");
         let init = volume_init_argv("my-holder:latest", &names, 501, 20).join(" ");
         assert!(init.contains(" --rm --user 0:0 --entrypoint sh "));
         assert!(init.ends_with(" my-holder:latest -c chown 501:20 /var/lib/maxplayer-holder /run/maxplayer-holder"));
         let probe = subpath_probe_argv("my-holder:latest", &names).join(" ");
         assert!(probe.contains("--entrypoint true"));
         assert!(probe.contains(
-            "--mount type=volume,src=maxplayer-held-tool-runtime-25f6b60a3e3870d5,dst=/probe,volume-subpath=jobs"
+            "--mount type=volume,src=maxplayer-held-tool-runtime-25f6b60a3e3870d5-figma,dst=/probe,volume-subpath=jobs"
         ));
     }
 
@@ -715,57 +731,66 @@ mod tests {
         assert!(parse_status(r#"{"resumed_existing_session": true}"#).is_err(), "no healthy field");
     }
 
-    /// The job gets the bridge entry (no args, no env: the socket path is the bridge's default) and
-    /// ONE mount: the holder runtime volume's `jobs/<job>` subpath, at `/run/holder`.
+    /// Per tool, the job gets the bridge entry with `--socket` into that tool's mount, and ONE mount:
+    /// the tool's runtime volume `jobs/<job>` subpath at `/run/holder/<tool>`. Two tools merge into
+    /// two entries and two mounts at distinct paths.
     #[test]
-    fn a_job_endpoint_attaches_one_socket_mount_and_one_bridge_entry() {
-        let endpoint = JobToolEndpoint {
-            container: "maxplayer-held-tool-abc".into(),
-            runtime_volume: "maxplayer-held-tool-runtime-abc".into(),
+    fn job_endpoints_attach_one_socket_mount_and_one_bridge_entry_per_tool() {
+        let endpoint = |tool: &str| JobToolEndpoint {
+            container: format!("maxplayer-held-tool-abc-{tool}"),
+            runtime_volume: format!("maxplayer-held-tool-runtime-abc-{tool}"),
             job_id: "job-1".into(),
-            server_name: "seller-tool".into(),
+            server_name: tool.into(),
             detached: true, // no docker call on drop in a unit test
         };
-        let attachments = endpoint.attachments();
+        let attachments = endpoint("figma").attachments();
         assert_eq!(
             attachments.mcp_servers,
             vec![McpServer::Stdio(McpServerStdio {
-                name: "seller-tool".into(),
+                name: "figma".into(),
                 command: "/usr/local/bin/tool-mcp-bridge".into(),
-                args: Vec::new(),
+                args: vec!["--socket".into(), "/run/holder/figma/job.sock".into()],
                 env: Vec::new(),
             })]
         );
         assert_eq!(
             attachments.extra_mounts,
             vec![ExtraMount::VolumeSubpath {
-                volume: "maxplayer-held-tool-runtime-abc".into(),
+                volume: "maxplayer-held-tool-runtime-abc-figma".into(),
                 subpath: "jobs/job-1".into(),
-                container: "/run/holder".into(),
+                container: "/run/holder/figma".into(),
             }]
         );
         assert_eq!(
             attachments.extra_mounts[0].argv(),
             vec![
                 "--mount",
-                "type=volume,src=maxplayer-held-tool-runtime-abc,dst=/run/holder,volume-subpath=jobs/job-1",
+                "type=volume,src=maxplayer-held-tool-runtime-abc-figma,dst=/run/holder/figma,volume-subpath=jobs/job-1",
             ]
         );
+        let both = JobAttachments::merge([endpoint("figma").attachments(), endpoint("jira").attachments()]);
+        assert_eq!(both.mcp_servers.len(), 2);
+        assert_eq!(both.extra_mounts.len(), 2);
+        assert_eq!(both.mcp_servers[1].name(), "jira");
+        assert!(matches!(&both.extra_mounts[1], ExtraMount::VolumeSubpath { container, .. } if container == "/run/holder/jira"));
+        let wire = serde_json::to_string(&both.mcp_servers).unwrap();
+        assert!(wire.contains("/run/holder/figma/job.sock") && wire.contains("/run/holder/jira/job.sock"));
     }
 }
 
 /// LIVE end-to-end proof of the Holder route through the REAL daemon code: [`HeldTool::start`],
 /// [`HeldTool::attach`], the real `prepare_launch` and `launch_with_mounts`, the sandbox image with
-/// the bridge, and the real cleanup capture — against the kit's fake vendor, whose counters are the
-/// independent oracle. `#[ignore]`d: it needs docker, the kit image, and the sandbox image.
+/// the bridge, and the real cleanup capture — against the kit's fake vendors, whose counters are the
+/// independent oracle. Two held tools, so the per-tool naming, mounting and addressing is what is
+/// proved. `#[ignore]`d: it needs docker, the kit image, and the sandbox image.
 ///
 ///   cargo test -p maxplayer-core --features wallet,acp --lib -- --ignored --nocapture held_tool::live
 ///
 /// Knobs: MAXPLAYER_HELD_TOOL_LIVE_IMAGE (default `maxplayer-tool-kit:demo`), MAXPLAYER_SANDBOX_IMAGE
 /// (default `maxplayer-sandbox:tools`), MAXPLAYER_HELD_TOOL_LIVE_NETWORK + MAXPLAYER_HELD_TOOL_LIVE_PROXY_PORTS
-/// (run job B under egress containment), MAXPLAYER_HELD_TOOL_LIVE_EVIDENCE_DIR (write the record there).
+/// (run the contained job under egress containment), MAXPLAYER_HELD_TOOL_LIVE_EVIDENCE_DIR (write the record).
 ///
-/// Synthetic throughout: the credential is generated here and exists only inside the fake vendor.
+/// Synthetic throughout: each credential is generated here and exists only inside its fake vendor.
 #[cfg(all(test, feature = "acp"))]
 mod live_tests {
     use super::*;
@@ -779,6 +804,8 @@ mod live_tests {
     use std::path::PathBuf;
 
     const SEAT: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    /// Two tools from the same kit image, two vendors, two logins — the case the list exists for.
+    const TOOLS: [&str; 2] = ["text-a", "text-b"];
 
     fn env(name: &str) -> Option<String> {
         std::env::var(name).ok().filter(|v| !v.trim().is_empty())
@@ -816,20 +843,25 @@ mod live_tests {
         out
     }
 
-    /// The whole fixture: a scratch home, the synthetic credential, the tool config, a docker network,
-    /// and the fake vendor published on loopback so the HOST reads its counters. Torn down on drop.
+    /// One fake vendor per tool, published on loopback so the HOST reads its counters.
+    struct Vendor {
+        container: String,
+        url: String,
+        secret: String,
+    }
+
+    /// The whole fixture: a scratch home, one credential and one offering per tool, a docker network,
+    /// and one fake vendor per tool. Torn down on drop.
     struct Fixture {
         root: PathBuf,
         network: String,
-        vendor: String,
-        vendor_url: String,
-        secret: String,
-        cfg: HeldToolConfig,
+        vendors: Vec<Vendor>,
+        cfgs: Vec<HeldToolConfig>,
         evidence: Option<PathBuf>,
     }
 
     impl Fixture {
-        fn up() -> Self {
+        fn up(names: &[&str]) -> Self {
             let stamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -838,74 +870,83 @@ mod live_tests {
             let root = std::env::temp_dir().join(format!("maxplayer-held-tool-live-{tag}"));
             std::fs::create_dir_all(root.join("seller-jobs")).unwrap();
             let image = env("MAXPLAYER_HELD_TOOL_LIVE_IMAGE").unwrap_or_else(|| "maxplayer-tool-kit:demo".into());
-
-            // A synthetic credential, generated now, never on a command line.
-            let mut raw = [0u8; 12];
-            getrandom::fill(&mut raw).unwrap();
-            let secret = format!("synthetic-held-tool-secret-{}", hex::encode(raw));
-            let credential_file = root.join("cred.json");
-            std::fs::write(
-                &credential_file,
-                json!({"client_id": "synthetic-seller-client", "client_secret": secret}).to_string(),
-            )
-            .unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&credential_file, std::fs::Permissions::from_mode(0o600)).unwrap();
-            }
-            // The kit's fixture offering, copied so the holder gets an absolute host path.
-            let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../maxplayer-tool-kit/fixtures/seller-tool-config.json");
-            let config = root.join("seller-tool-config.json");
-            std::fs::copy(&fixture, &config).expect("copy the kit fixture config");
-
             let network = format!("mx-held-live-{tag}");
             sh(&["docker", "network", "create", &network]).expect("create the test network");
-            let vendor = format!("mx-held-vendor-{tag}");
-            sh(&[
-                "docker", "run", "-d", "--name", &vendor, "--network", &network, "--network-alias", "vendor",
-                "-p", "127.0.0.1:0:8080",
-                "-v", &format!("{}:/run/secrets/cred.json:ro", credential_file.display()),
-                &image, "vendor-service", "--listen", "0.0.0.0:8080", "--credential-file", "/run/secrets/cred.json",
-            ])
-            .expect("start the fake vendor");
-            let port = sh(&["docker", "port", &vendor, "8080/tcp"]).expect("vendor port");
-            let vendor_url = format!("http://{}", port.lines().next().unwrap().trim());
-            let this = Self {
-                root,
-                network: network.clone(),
-                vendor,
-                vendor_url,
-                secret,
-                cfg: HeldToolConfig {
-                    image,
+            let fixture_config = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../maxplayer-tool-kit/fixtures/seller-tool-config.json");
+
+            let mut vendors = Vec::new();
+            let mut cfgs = Vec::new();
+            for name in names {
+                // A synthetic credential per tool, generated now, never on a command line.
+                let mut raw = [0u8; 12];
+                getrandom::fill(&mut raw).unwrap();
+                let secret = format!("synthetic-held-tool-secret-{name}-{}", hex::encode(raw));
+                let credential_file = root.join(format!("cred-{name}.json"));
+                std::fs::write(
+                    &credential_file,
+                    json!({"client_id": format!("synthetic-seller-client-{name}"), "client_secret": secret}).to_string(),
+                )
+                .unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&credential_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+                }
+                // The kit's fixture offering, one copy per tool, so the holder gets an absolute host path.
+                let config = root.join(format!("offering-{name}.json"));
+                std::fs::copy(&fixture_config, &config).expect("copy the kit fixture config");
+                let container = format!("mx-held-vendor-{tag}-{name}");
+                let alias = format!("vendor-{name}");
+                sh(&[
+                    "docker", "run", "-d", "--name", &container, "--network", &network, "--network-alias", &alias,
+                    "-p", "127.0.0.1:0:8080",
+                    "-v", &format!("{}:/run/secrets/cred.json:ro", credential_file.display()),
+                    &image, "vendor-service", "--listen", "0.0.0.0:8080", "--credential-file", "/run/secrets/cred.json",
+                ])
+                .expect("start a fake vendor");
+                let port = sh(&["docker", "port", &container, "8080/tcp"]).expect("vendor port");
+                let url = format!("http://{}", port.lines().next().unwrap().trim());
+                vendors.push(Vendor { container, url, secret });
+                cfgs.push(HeldToolConfig {
+                    server_name: (*name).to_owned(),
+                    image: image.clone(),
                     config,
                     credential_file,
-                    vendor_base_url: Some("http://vendor:8080".into()),
+                    vendor_base_url: Some(format!("http://{alias}:8080")),
                     vendor_cli: None,
-                    network: Some(network),
-                    server_name: None,
+                    network: Some(network.clone()),
                     required: true,
-                },
+                });
+            }
+            let this = Self {
+                root,
+                network,
+                vendors,
+                cfgs,
                 evidence: env("MAXPLAYER_HELD_TOOL_LIVE_EVIDENCE_DIR").map(PathBuf::from),
             };
-            // The vendor answers before anything depends on it.
-            for _ in 0..50 {
-                if this.stats_blocking().is_ok() {
-                    return this;
+            // Every vendor answers before anything depends on it.
+            for vendor in &this.vendors {
+                let mut ready = false;
+                for _ in 0..50 {
+                    if Self::stats_blocking(&vendor.url).is_ok() {
+                        ready = true;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
                 }
-                std::thread::sleep(Duration::from_millis(200));
+                assert!(ready, "the fake vendor {} did not come up", vendor.container);
             }
-            panic!("the fake vendor did not come up");
+            this
         }
 
-        /// A plain-socket GET of the vendor's counters, for the readiness poll inside `up()`. Plain
+        /// A plain-socket GET of a vendor's counters, for the readiness poll inside `up()`. Plain
         /// std, not reqwest's blocking client: that client owns a runtime of its own, and dropping it
         /// inside this test's runtime is what tokio refuses.
-        fn stats_blocking(&self) -> Result<Value, String> {
+        fn stats_blocking(url: &str) -> Result<Value, String> {
             use std::io::{Read, Write};
-            let authority = self.vendor_url.trim_start_matches("http://");
+            let authority = url.trim_start_matches("http://");
             let mut stream = std::net::TcpStream::connect(authority).map_err(|e| e.to_string())?;
             stream.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
             write!(stream, "GET /admin/stats HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n")
@@ -916,14 +957,14 @@ mod live_tests {
             serde_json::from_str(body.trim()).map_err(|e| e.to_string())
         }
 
-        async fn stats(&self) -> Value {
-            let url = format!("{}/admin/stats", self.vendor_url);
+        async fn stats(&self, tool: usize) -> Value {
+            let url = format!("{}/admin/stats", self.vendors[tool].url);
             let body = reqwest::get(&url).await.expect("vendor stats").text().await.expect("stats body");
             serde_json::from_str(&body).expect("stats json")
         }
 
-        async fn login_count(&self) -> u64 {
-            self.stats().await["login_count"].as_u64().unwrap_or(u64::MAX)
+        async fn login_count(&self, tool: usize) -> u64 {
+            self.stats(tool).await["login_count"].as_u64().unwrap_or(u64::MAX)
         }
 
         fn write_evidence(&self, name: &str, text: &str) {
@@ -934,7 +975,9 @@ mod live_tests {
         }
 
         fn assert_secret_absent(&self, label: &str, text: &str) {
-            assert!(!text.contains(&self.secret), "the credential appears in {label}");
+            for vendor in &self.vendors {
+                assert!(!text.contains(&vendor.secret), "a credential appears in {label}");
+            }
         }
 
         fn job_workdir(&self, job_id: &str) -> PathBuf {
@@ -946,10 +989,14 @@ mod live_tests {
 
     impl Drop for Fixture {
         fn drop(&mut self) {
-            let _ = sh(&["docker", "rm", "--force", &self.vendor]);
-            let names = holder_names(SEAT);
-            let _ = sh(&["docker", "rm", "--force", &names.container]);
-            let _ = sh(&["docker", "volume", "rm", &names.runtime_volume, &names.state_volume]);
+            for vendor in &self.vendors {
+                let _ = sh(&["docker", "rm", "--force", &vendor.container]);
+            }
+            for cfg in &self.cfgs {
+                let names = holder_names(SEAT, &cfg.server_name);
+                let _ = sh(&["docker", "rm", "--force", &names.container]);
+                let _ = sh(&["docker", "volume", "rm", &names.runtime_volume, &names.state_volume]);
+            }
             let _ = sh(&["docker", "network", "rm", &self.network]);
             let _ = std::fs::remove_dir_all(&self.root);
         }
@@ -966,13 +1013,28 @@ mod live_tests {
         SandboxPolicy::from_config(Some(&config)).expect("the sandbox config resolves")
     }
 
+    /// Start every configured holder, concurrently, as the daemon does.
+    async fn start_all(fx: &Fixture) -> Vec<HeldTool> {
+        let (uid, gid) = job_identity();
+        let jobs_root = fx.root.join("seller-jobs");
+        let started = futures_util::future::join_all(
+            fx.cfgs.iter().map(|cfg| HeldTool::start(cfg, SEAT, &jobs_root, uid, gid)),
+        )
+        .await;
+        started
+            .into_iter()
+            .zip(&fx.cfgs)
+            .map(|(outcome, cfg)| outcome.unwrap_or_else(|e| panic!("the holder for {} starts: {e}", cfg.server_name)))
+            .collect()
+    }
+
     struct Dialogue {
         transcript: Vec<String>,
         replies: Vec<Value>,
         exit_ok: bool,
     }
 
-    /// Drive the bridge, running as the job container's command, with `requests`; one reply line per
+    /// Drive one bridge, running as the job container's command, with `requests`; one reply line per
     /// request. On the blocking pool, because the caller's runtime thread must stay free.
     fn dialogue(program: &str, args: &[String], requests: Vec<Value>) -> Result<Dialogue, String> {
         use std::io::{BufRead, Write};
@@ -1008,22 +1070,34 @@ mod live_tests {
         json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": name, "arguments": arguments}})
     }
 
-    /// One job through the real launch: attach, launch the bridge as the container command with the
-    /// endpoint's attachments, hold `requests`, capture and remove the container, detach. Returns the
-    /// dialogue and the `docker inspect` view of what the container was given.
+    /// One job through the real launch with EVERY tool attached: the container gets one socket mount
+    /// per tool, and its command is the bridge for the tool at `drive`, addressed exactly as the
+    /// session entry addresses it (`--socket /run/holder/<tool>/job.sock`). Capture, remove, detach.
+    /// Returns the dialogue, the `docker inspect` view of what the container was given, and the tool
+    /// list if one was requested.
     async fn run_job(
         fx: &Fixture,
-        tool: &HeldTool,
+        tools: &[HeldTool],
         job_id: &str,
         contained: bool,
+        drive: usize,
         requests: Vec<Value>,
     ) -> (Dialogue, Value, Vec<Value>) {
         let workdir = fx.job_workdir(job_id);
         let policy = sandbox_policy(contained);
         let identity = DeliveryAgentIdentity::for_seller(SEAT);
-        let endpoint = tool.attach(job_id).await.expect("attach the job");
-        let attachments = endpoint.attachments();
-        let prepared = prepare_launch(&[CONTAINER_TOOL_BRIDGE_BIN.to_owned()], &policy, &workdir, &identity, Duration::from_secs(120))
+        let mut endpoints = Vec::new();
+        for tool in tools {
+            endpoints.push(tool.attach(job_id).await.expect("attach the job"));
+        }
+        let attachments = JobAttachments::merge(endpoints.iter().map(JobToolEndpoint::attachments));
+        assert_eq!(attachments.extra_mounts.len(), tools.len(), "one socket mount per tool");
+        assert_eq!(attachments.mcp_servers.len(), tools.len(), "one bridge entry per tool");
+        // The agent's MCP client would spawn exactly this for the tool it calls.
+        let McpServer::Stdio(entry) = &attachments.mcp_servers[drive] else { panic!("stdio entries") };
+        let mut command = vec![entry.command.clone()];
+        command.extend(entry.args.iter().cloned());
+        let prepared = prepare_launch(&command, &policy, &workdir, &identity, Duration::from_secs(120))
             .await
             .expect("prepare the launch");
         let mut servers = prepared.mcp_servers.clone();
@@ -1086,42 +1160,49 @@ mod live_tests {
             let text = String::from_utf8_lossy(&std::fs::read(&file).unwrap()).to_string();
             fx.assert_secret_absent(&file.display().to_string(), &text);
         }
-        endpoint.detach().await;
-        let tools = dialogue
+        for endpoint in endpoints {
+            endpoint.detach().await;
+        }
+        let tool_list = dialogue
             .replies
             .iter()
             .find_map(|reply| reply["result"]["tools"].as_array().cloned())
             .unwrap_or_default();
-        (dialogue, view, tools)
+        (dialogue, view, tool_list)
     }
 
     #[test]
     #[ignore = "needs docker, the kit image (maxplayer-tool-kit:demo) and the sandbox image with tool-mcp-bridge"]
-    fn live_two_jobs_share_one_enrolment_and_a_daemon_restart_resumes_it() {
+    fn live_two_tools_serve_two_jobs_on_one_enrolment_each_and_a_restart_resumes_them() {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         runtime.block_on(async {
-            let fx = Fixture::up();
-            let (uid, gid) = job_identity();
-            let jobs_root = fx.root.join("seller-jobs");
-            assert_eq!(fx.login_count().await, 0, "nothing has logged in yet");
+            let fx = Fixture::up(&TOOLS);
+            for tool in 0..TOOLS.len() {
+                assert_eq!(fx.login_count(tool).await, 0, "nothing has logged in yet");
+            }
 
-            // Boot: the holder starts, enrols ONCE, and is healthy.
-            let tool = HeldTool::start(&fx.cfg, SEAT, &jobs_root, uid, gid).await.expect("the holder starts");
-            println!("{}", tool.boot_line());
-            assert!(tool.status().healthy, "{:?}", tool.status());
-            assert!(!tool.status().resumed_existing_session);
-            assert_eq!(tool.status().enrollments_this_process, 1);
-            assert_eq!(fx.login_count().await, 1, "the vendor saw exactly one login");
-            let boot_line_1 = tool.boot_line();
+            // Boot: two holders start, each enrols ONCE with its own vendor, both healthy.
+            let tools = start_all(&fx).await;
+            let mut boot_lines = Vec::new();
+            for (i, tool) in tools.iter().enumerate() {
+                println!("{}", tool.boot_line());
+                boot_lines.push(tool.boot_line());
+                assert!(tool.status().healthy, "{:?}", tool.status());
+                assert!(!tool.status().resumed_existing_session);
+                assert_eq!(tool.status().enrollments_this_process, 1);
+                assert_eq!(tool.server_name(), TOOLS[i]);
+                assert_eq!(fx.login_count(i).await, 1, "vendor {i} saw exactly one login");
+            }
+            assert_ne!(tools[0].container(), tools[1].container(), "two tools, two holders");
 
-            // Job A, uncontained: initialize, list, transform, and an escape attempt.
+            // Job A, uncontained, drives tool 0: initialize, list, transform, and an escape attempt.
             let job_a = "job-a-held-live";
             let workdir_a = fx.job_workdir(job_a);
             std::fs::write(workdir_a.join("input.txt"), "first job payload").unwrap();
-            let (dialogue_a, view_a, tools_a) = run_job(&fx, &tool, job_a, false, vec![
+            let (dialogue_a, view_a, tools_a) = run_job(&fx, &tools, job_a, false, 0, vec![
                 json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}}}),
                 json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
-                call(3, "transform-file", json!({"input": "input.txt", "output": "out.txt", "mode": "upper"})),
+                call(3, "transform-file", json!({"input": "input.txt", "output": "out-a.txt", "mode": "upper"})),
                 call(4, "transform-file", json!({"input": "../job-b-held-live/input.txt", "output": "stolen.txt", "mode": "upper"})),
             ])
             .await;
@@ -1129,67 +1210,94 @@ mod live_tests {
             assert!(dialogue_a.replies[0].get("result").is_some(), "initialize: {}", dialogue_a.replies[0]);
             assert!(tools_a.iter().any(|t| t["name"] == json!("transform-file")), "the offering lists transform-file: {tools_a:?}");
             assert_eq!(dialogue_a.replies[2]["result"]["isError"], json!(false), "the transform ran: {}", dialogue_a.replies[2]);
-            assert_eq!(std::fs::read_to_string(workdir_a.join("out.txt")).unwrap(), "FIRST JOB PAYLOAD");
+            assert_eq!(std::fs::read_to_string(workdir_a.join("out-a.txt")).unwrap(), "FIRST JOB PAYLOAD");
             let escape = &dialogue_a.replies[3];
             assert!(
                 escape.get("error").is_some() || escape["result"]["isError"] == json!(true),
                 "a path outside the job directory must be refused: {escape}"
             );
             assert!(!workdir_a.join("stolen.txt").exists() && !fx.root.join("seller-jobs/stolen.txt").exists());
-            // The container was given the workdir and ONE volume subpath, and nothing of the holder's.
+            // The container was given the workdir and ONE volume subpath PER TOOL, each at its own path,
+            // and nothing of the holders'.
             let mounts_a = view_a["Mounts"].as_array().expect("mounts").clone();
-            assert_eq!(mounts_a.len(), 2, "workdir + the job's socket directory, nothing else: {mounts_a:?}");
-            let socket_mount = mounts_a.iter().find(|m| m["Destination"] == json!(JOB_SOCKET_MOUNT)).expect("the socket mount");
-            assert_eq!(socket_mount["Type"], json!("volume"));
-            assert_eq!(socket_mount["Name"], json!(tool.names().runtime_volume));
-            assert!(!view_a.to_string().contains(HOLDER_STATE_DIR), "the holder's state volume is not mounted");
-            assert!(!view_a.to_string().contains("cred.json"), "the credential is not mounted");
-            assert_eq!(fx.login_count().await, 1, "job A caused no login");
+            assert_eq!(mounts_a.len(), 1 + TOOLS.len(), "workdir + one socket directory per tool: {mounts_a:?}");
+            for (i, tool) in tools.iter().enumerate() {
+                let mount = mounts_a
+                    .iter()
+                    .find(|m| m["Destination"] == json!(job_socket_mount(TOOLS[i])))
+                    .unwrap_or_else(|| panic!("the socket mount for {}", TOOLS[i]));
+                assert_eq!(mount["Type"], json!("volume"));
+                assert_eq!(mount["Name"], json!(tool.names().runtime_volume));
+            }
+            assert!(!view_a.to_string().contains(HOLDER_STATE_DIR), "no holder's state volume is mounted");
+            assert!(!view_a.to_string().contains("cred-"), "no credential is mounted");
 
-            // Job B, contained when the knobs say so: the same offering, the same login, its own socket.
+            // The same job drives tool 1 too: its own socket, its own vendor, its own output.
+            let (dialogue_a2, _, _) = run_job(&fx, &tools, job_a, false, 1, vec![
+                call(1, "transform-file", json!({"input": "input.txt", "output": "out-b.txt", "mode": "reverse"})),
+            ])
+            .await;
+            assert_eq!(dialogue_a2.replies[0]["result"]["isError"], json!(false), "{}", dialogue_a2.replies[0]);
+            assert_eq!(std::fs::read_to_string(workdir_a.join("out-b.txt")).unwrap(), "daolyap boj tsrif");
+            assert_eq!(fx.stats(0).await["transform_count"], json!(1), "tool 0's vendor ran one transform");
+            assert_eq!(fx.stats(1).await["transform_count"], json!(1), "tool 1's vendor ran one transform");
+
+            // Job B, contained when the knobs say so, drives tool 1: the same offering, the same login.
             let job_b = "job-b-held-live";
             let workdir_b = fx.job_workdir(job_b);
             std::fs::write(workdir_b.join("input.txt"), "second job payload").unwrap();
             let contained = env("MAXPLAYER_HELD_TOOL_LIVE_NETWORK").is_some();
-            let (dialogue_b, view_b, tools_b) = run_job(&fx, &tool, job_b, contained, vec![
+            let (dialogue_b, view_b, tools_b) = run_job(&fx, &tools, job_b, contained, 1, vec![
                 json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}),
-                call(2, "transform-file", json!({"input": "input.txt", "output": "out.txt", "mode": "reverse"})),
+                call(2, "transform-file", json!({"input": "input.txt", "output": "out.txt", "mode": "upper"})),
             ])
             .await;
             assert_eq!(dialogue_b.replies[1]["result"]["isError"], json!(false), "{}", dialogue_b.replies[1]);
-            assert_eq!(std::fs::read_to_string(workdir_b.join("out.txt")).unwrap(), "daolyap boj dnoces");
+            assert_eq!(std::fs::read_to_string(workdir_b.join("out.txt")).unwrap(), "SECOND JOB PAYLOAD");
             assert_eq!(tools_a, tools_b, "both jobs see the seller-level offering, whole schema compared");
             if contained {
                 assert!(view_b["NetworkMode"].as_str().unwrap_or("").starts_with("container:"), "{view_b}");
             }
-            assert_eq!(fx.login_count().await, 1, "two jobs, one login");
+            for tool in 0..TOOLS.len() {
+                assert_eq!(fx.login_count(tool).await, 1, "two jobs, one login per vendor");
+            }
 
-            // Daemon stop, daemon start: the persisted login is resumed, not re-established.
-            tool.shutdown().await;
-            let tool = HeldTool::start(&fx.cfg, SEAT, &jobs_root, uid, gid).await.expect("the holder restarts");
-            println!("{}", tool.boot_line());
-            assert!(tool.status().healthy);
-            assert!(tool.status().resumed_existing_session, "the state volume carried the login");
-            assert_eq!(tool.status().enrollments_this_process, 0);
-            assert_eq!(fx.login_count().await, 1, "a restart is not a login");
+            // Daemon stop, daemon start: every persisted login is resumed, none re-established.
+            for tool in &tools {
+                tool.shutdown().await;
+            }
+            let tools = start_all(&fx).await;
+            for (i, tool) in tools.iter().enumerate() {
+                println!("{}", tool.boot_line());
+                assert!(tool.status().healthy);
+                assert!(tool.status().resumed_existing_session, "the state volume of {} carried the login", TOOLS[i]);
+                assert_eq!(tool.status().enrollments_this_process, 0);
+                assert_eq!(fx.login_count(i).await, 1, "a restart is not a login");
+            }
             std::fs::write(workdir_b.join("input.txt"), "post restart payload").unwrap();
-            let (dialogue_c, _, _) = run_job(&fx, &tool, job_b, false, vec![
+            let (dialogue_c, _, _) = run_job(&fx, &tools, job_b, false, 0, vec![
                 call(1, "transform-file", json!({"input": "input.txt", "output": "out.txt", "mode": "upper"})),
             ])
             .await;
             assert_eq!(dialogue_c.replies[0]["result"]["isError"], json!(false), "{}", dialogue_c.replies[0]);
             assert_eq!(std::fs::read_to_string(workdir_b.join("out.txt")).unwrap(), "POST RESTART PAYLOAD");
-            let final_stats = fx.stats().await;
-            assert_eq!(final_stats["login_count"], json!(1));
-            assert_eq!(final_stats["auth_failures"], json!(0));
-            tool.shutdown().await;
+            let final_stats: Vec<Value> = vec![fx.stats(0).await, fx.stats(1).await];
+            for stats in &final_stats {
+                assert_eq!(stats["login_count"], json!(1));
+                assert_eq!(stats["auth_failures"], json!(0));
+            }
+            let restart_lines: Vec<String> = tools.iter().map(HeldTool::boot_line).collect();
+            for tool in &tools {
+                tool.shutdown().await;
+            }
 
             let summary = json!({
-                "acceptance": "Holder route through the real daemon code: HeldTool::start/attach/shutdown, prepare_launch, launch_with_mounts, cleanup capture",
-                "holder_image": fx.cfg.image,
+                "acceptance": "Holder route, TWO held tools, through the real daemon code: HeldTool::start/attach/shutdown per tool, prepare_launch, launch_with_mounts, cleanup capture",
+                "tools": TOOLS,
+                "holder_image": fx.cfgs[0].image,
                 "sandbox_image": env("MAXPLAYER_SANDBOX_IMAGE").unwrap_or_else(|| "maxplayer-sandbox:tools".into()),
-                "boot_line_first_start": boot_line_1,
-                "boot_line_after_restart": tool.boot_line(),
+                "boot_lines_first_start": boot_lines,
+                "boot_lines_after_restart": restart_lines,
                 "vendor_stats_final": final_stats,
                 "job_a_mounts": view_a["Mounts"],
                 "job_b_network_mode": view_b["NetworkMode"],
@@ -1198,7 +1306,8 @@ mod live_tests {
                 "credential_absent_from": ["docker argv", "docker inspect (both jobs)", "MCP transcripts", "diagnostics capture"],
             });
             fx.write_evidence("holder-summary.json", &serde_json::to_string_pretty(&summary).unwrap());
-            fx.write_evidence("holder-job-a-transcript.txt", &dialogue_a.transcript.join("\n"));
+            fx.write_evidence("holder-job-a-tool-a-transcript.txt", &dialogue_a.transcript.join("\n"));
+            fx.write_evidence("holder-job-a-tool-b-transcript.txt", &dialogue_a2.transcript.join("\n"));
             fx.write_evidence("holder-job-b-transcript.txt", &dialogue_b.transcript.join("\n"));
             fx.write_evidence("holder-job-b-after-restart-transcript.txt", &dialogue_c.transcript.join("\n"));
             fx.write_evidence("holder-job-a-inspect.json", &serde_json::to_string_pretty(&view_a).unwrap());
@@ -1212,23 +1321,24 @@ mod live_tests {
         });
     }
 
-    /// The production path end to end: a REAL agent turn (`claude-agent-acp`) driven by
-    /// `run_agent_job_in_env` with the held tool attached, exactly as `execute_job` does. The agent
-    /// must call the seller's tool through the socket bridge, and the file it asked for must appear.
-    /// Needs the agent credential in this process's environment (`CLAUDE_CODE_OAUTH_TOKEN`).
+    /// The production path end to end with TWO held tools: a REAL agent turn (`claude-agent-acp`)
+    /// driven by `run_agent_job_in_env` exactly as `execute_job` does. The agent must call each
+    /// tool through its own socket bridge, and both files it asked for must appear. Needs the agent
+    /// credential in this process's environment (`CLAUDE_CODE_OAUTH_TOKEN`).
     #[test]
     #[ignore = "needs docker, the kit image, the sandbox image with tool-mcp-bridge, and an agent credential"]
-    fn live_a_real_agent_turn_uses_the_held_tool_through_the_socket_bridge() {
+    fn live_a_real_agent_turn_uses_two_held_tools_through_their_socket_bridges() {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         runtime.block_on(async {
             assert!(
                 crate::seller_exec::FORWARDED_AGENT_ENV.iter().any(|name| env(name).is_some()),
                 "an agent credential (e.g. CLAUDE_CODE_OAUTH_TOKEN) must be in this process's environment"
             );
-            let fx = Fixture::up();
-            let (uid, gid) = job_identity();
-            let tool = HeldTool::start(&fx.cfg, SEAT, &fx.root.join("seller-jobs"), uid, gid).await.expect("the holder starts");
-            assert!(tool.status().healthy);
+            let fx = Fixture::up(&TOOLS);
+            let tools = start_all(&fx).await;
+            for tool in &tools {
+                assert!(tool.status().healthy);
+            }
             let job_id = "job-agent-held-live";
             let workdir = fx.job_workdir(job_id);
             let identity = DeliveryAgentIdentity::for_seller(SEAT);
@@ -1236,12 +1346,17 @@ mod live_tests {
                 .await
                 .expect("init the job workdir");
             std::fs::write(workdir.join("input.txt"), "agent payload").unwrap();
-            let endpoint = tool.attach(job_id).await.expect("attach");
-            let attachments = endpoint.attachments();
+            let mut endpoints = Vec::new();
+            for tool in &tools {
+                endpoints.push(tool.attach(job_id).await.expect("attach"));
+            }
+            let attachments = JobAttachments::merge(endpoints.iter().map(JobToolEndpoint::attachments));
             let contained = env("MAXPLAYER_HELD_TOOL_LIVE_NETWORK").is_some();
             let policy = sandbox_policy(contained);
-            let prompt = "You have an MCP server named `seller-tool` with one tool, `transform-file`. Call it exactly \
-                          once with arguments input=\"input.txt\", output=\"out.txt\", mode=\"upper\". Do not read, \
+            let prompt = "You have two MCP servers, `text-a` and `text-b`, each with one tool, `transform-file`. \
+                          Call `transform-file` on server `text-a` exactly once with arguments input=\"input.txt\", \
+                          output=\"out-a.txt\", mode=\"upper\". Then call `transform-file` on server `text-b` exactly \
+                          once with arguments input=\"input.txt\", output=\"out-b.txt\", mode=\"reverse\". Do not read, \
                           create, edit or delete any file yourself, and do not call any other tool. Then reply with \
                           exactly one line: `done`.";
             let report = crate::seller_exec::run_agent_job_in_env(
@@ -1256,29 +1371,41 @@ mod live_tests {
             )
             .await
             .expect("the agent turn completes");
-            endpoint.detach().await;
-            let out = std::fs::read_to_string(workdir.join("out.txt")).expect("the tool wrote the output through the holder");
-            assert_eq!(out, "AGENT PAYLOAD");
+            for endpoint in endpoints {
+                endpoint.detach().await;
+            }
+            let out_a = std::fs::read_to_string(workdir.join("out-a.txt")).expect("tool text-a wrote its output");
+            let out_b = std::fs::read_to_string(workdir.join("out-b.txt")).expect("tool text-b wrote its output");
+            assert_eq!(out_a, "AGENT PAYLOAD");
+            assert_eq!(out_b, "daolyap tnega");
             let wire = walk(&fx.root.join("seller-diagnostics"))
                 .into_iter()
                 .filter(|f| f.file_name().is_some_and(|n| n == "logs.txt"))
                 .map(|f| std::fs::read_to_string(&f).unwrap_or_default())
                 .collect::<Vec<_>>()
                 .join("\n");
-            assert!(wire.contains("mcp__seller-tool__transform-file"), "the agent called the seller's tool through the bridge");
+            assert!(wire.contains("mcp__text-a__transform-file"), "the agent called tool text-a through its bridge");
+            assert!(wire.contains("mcp__text-b__transform-file"), "the agent called tool text-b through its bridge");
             fx.assert_secret_absent("the ACP wire", &wire);
             fx.assert_secret_absent("the agent's message", report.last_agent_message.as_deref().unwrap_or(""));
-            let stats = fx.stats().await;
-            assert_eq!(stats["login_count"], json!(1));
-            tool.shutdown().await;
+            let stats: Vec<Value> = vec![fx.stats(0).await, fx.stats(1).await];
+            for s in &stats {
+                assert_eq!(s["login_count"], json!(1));
+                assert_eq!(s["transform_count"], json!(1));
+            }
+            for tool in &tools {
+                tool.shutdown().await;
+            }
             fx.write_evidence(
                 "holder-agent-summary.json",
                 &serde_json::to_string_pretty(&json!({
-                    "acceptance": "a real claude-agent-acp turn used the held tool through tool-mcp-bridge over the job's socket",
-                    "output": out,
+                    "acceptance": "a real claude-agent-acp turn used TWO held tools, each through its own tool-mcp-bridge over its own socket",
+                    "tools": TOOLS,
+                    "out_a": out_a,
+                    "out_b": out_b,
                     "last_agent_message": report.last_agent_message,
                     "usage": report.usage,
-                    "tool_call_on_the_acp_wire": true,
+                    "tool_calls_on_the_acp_wire": ["mcp__text-a__transform-file", "mcp__text-b__transform-file"],
                     "vendor_stats": stats,
                 }))
                 .unwrap(),

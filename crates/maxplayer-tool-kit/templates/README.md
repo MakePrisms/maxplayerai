@@ -65,8 +65,8 @@ The holder applies these rules to every call. You do not add them to the config.
 
 The seller daemon runs the holder for you. Build a holder image with `tool-holderd`, `holderctl`
 and the vendor CLI on `PATH` (start `FROM` the kit image), then declare it in the seat's
-`config.toml` under `[sandbox.held_tool]` with this config file and the credential file as absolute
-host paths. See `docs/SELLER-QUICKSTART.md`, "Hold a vendor CLI for jobs", and the daemon side in
+`config.toml` under `[[sandbox.held_tools]]` — one table per tool, each with a unique `server_name` —
+with this config file and the credential file as absolute host paths. See `docs/SELLER-QUICKSTART.md`, "Hold a vendor CLI for jobs", and the daemon side in
 `crates/maxplayer-core/src/held_tool.rs`.
 
 ## How to onboard a new tool

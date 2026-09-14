@@ -3749,10 +3749,10 @@ pub struct SellerNodeRunner {
     agents: Arc<LiveRoster>,
     /// Homogeneous execution-slot admission (reserve-at-claim). Behind an `Arc` so it is shared with
     /// the off-loop execution tasks; see [`SlotGate`].
-    /// The seat's held tool (the Holder route, `[sandbox.held_tool]`): a holder container this
-    /// daemon started at boot and stops at shutdown. `None` when the seat holds no tool, or holds
-    /// an OPTIONAL one that did not start (logged at boot).
-    held_tool: Option<Arc<crate::held_tool::HeldTool>>,
+    /// The seat's held tools (the Holder route, `[[sandbox.held_tools]]`): one holder container per
+    /// tool, started at boot and stopped at shutdown. Empty when the seat holds no tool. An OPTIONAL
+    /// tool that did not start is absent here and was logged at boot.
+    held_tools: Vec<Arc<crate::held_tool::HeldTool>>,
     slots: Arc<SlotGate>,
     /// #450: armed when an offer is skipped because every slot is busy (`SlotsBusy`). The drain tick
     /// consumes it once a slot frees to re-run the offer backfill, so a capacity-skipped offer is
@@ -4021,40 +4021,64 @@ impl SellerNodeRunner {
         // and narrows from there as harnesses prove they cannot deliver.
         let agents = Arc::new(LiveRoster::new(boot_agent_registry(node.home())?));
 
-        // The Holder route: start the seat's holder container BEFORE anything goes on the wire, so a
-        // REQUIRED tool that cannot start refuses the boot rather than a seat that advertises and
+        // The Holder route: start the seat's holder containers BEFORE anything goes on the wire, so
+        // a REQUIRED tool that cannot start refuses the boot rather than a seat that advertises and
         // fails every job. An optional tool that cannot start is logged, and the seat serves without
-        // it — the posture a vendor outage would give.
-        let held_tool = match node.home().config.sandbox.as_ref().and_then(|sandbox| sandbox.held_tool.as_ref()) {
-            None => None,
-            Some(cfg) => {
-                let (uid, gid) = job_identity();
-                let jobs_root = node.home().root.join("seller-jobs");
-                match crate::held_tool::HeldTool::start(cfg, node.seller_pubkey(), &jobs_root, uid, gid).await {
+        // it — the posture a vendor outage would give. Several tools start concurrently: each start
+        // waits on its own vendor's enrolment.
+        let held_tools = {
+            let cfgs: Vec<&crate::home::HeldToolConfig> = node
+                .home()
+                .config
+                .sandbox
+                .as_ref()
+                .map(|sandbox| sandbox.held_tools.iter().collect())
+                .unwrap_or_default();
+            let (uid, gid) = job_identity();
+            let jobs_root = node.home().root.join("seller-jobs");
+            let seat = node.seller_pubkey().to_owned();
+            let started = futures_util::future::join_all(
+                cfgs.iter()
+                    .map(|cfg| crate::held_tool::HeldTool::start(cfg, &seat, &jobs_root, uid, gid)),
+            )
+            .await;
+            let mut tools: Vec<Arc<crate::held_tool::HeldTool>> = Vec::with_capacity(cfgs.len());
+            let mut refusal: Option<String> = None;
+            for (cfg, outcome) in cfgs.iter().zip(started) {
+                match outcome {
                     Ok(tool) => {
                         opline!("{}", tool.boot_line());
-                        if cfg.required && !tool.status().healthy {
-                            tool.shutdown().await;
-                            return Err(NodeError::Sandbox(format!(
-                                "[sandbox] held_tool is required and the holder is unhealthy: {}",
+                        if cfg.required && !tool.status().healthy && refusal.is_none() {
+                            refusal = Some(format!(
+                                "[sandbox] held_tools: {} is required and its holder is unhealthy: {}",
+                                cfg.server_name,
                                 tool.status().health_detail
-                            )));
+                            ));
                         }
-                        Some(Arc::new(tool))
+                        tools.push(Arc::new(tool));
                     }
                     Err(error) if cfg.required => {
-                        return Err(NodeError::Sandbox(format!(
-                            "[sandbox] held_tool is required and did not start: {error}"
-                        )));
+                        if refusal.is_none() {
+                            refusal = Some(format!(
+                                "[sandbox] held_tools: {} is required and did not start: {error}",
+                                cfg.server_name
+                            ));
+                        }
                     }
-                    Err(error) => {
-                        opline!(
-                            "seller node: [sandbox] held_tool UNAVAILABLE — this seat serves without it: {error}"
-                        );
-                        None
-                    }
+                    Err(error) => opline!(
+                        "seller node: [sandbox] held_tools: {} UNAVAILABLE — this seat serves without it: {error}",
+                        cfg.server_name
+                    ),
                 }
             }
+            if let Some(reason) = refusal {
+                // A refused boot leaves no holder behind: stop the ones that did start.
+                for tool in &tools {
+                    tool.shutdown().await;
+                }
+                return Err(NodeError::Sandbox(reason));
+            }
+            tools
         };
 
         // Reconcile durable state before serving anything live: expire stale outbox rows, report the
@@ -4140,7 +4164,7 @@ impl SellerNodeRunner {
             seller_pubkey,
             boot_auth,
             agents,
-            held_tool,
+            held_tools,
             slots,
             capacity_skip_pending: std::sync::atomic::AtomicBool::new(false),
             delivery_push_lock: tokio::sync::Mutex::new(()),
@@ -4592,37 +4616,43 @@ impl SellerNodeRunner {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self.publish_retraction().await;
         self.drain_remit_in_flight().await;
-        // The held tool follows the daemon: stopping the daemon is the one thing that takes the tool
-        // away. Its login persists in the state volume for the next boot.
-        if let Some(tool) = &self.held_tool {
+        // The held tools follow the daemon: stopping the daemon is the one thing that takes them
+        // away. Each login persists in its state volume for the next boot.
+        for tool in &self.held_tools {
             tool.shutdown().await;
         }
         served
     }
 
-    /// Attach the seat's held tool for `job_id`, when there is one. `Ok(None)` when the seat holds no
-    /// tool, or holds an OPTIONAL one that could not be attached (logged; the job runs without it).
-    /// `Err` only for a REQUIRED tool that cannot be attached: that job must not run without it.
-    /// The job's workdir must exist on the host before this call — the holder canonicalizes it.
-    async fn attach_held_tool(
+    /// Attach the seat's held tools for `job_id`: one endpoint per tool that attached. An OPTIONAL
+    /// tool that cannot be attached is logged and left out (the job runs without it). `Err` only
+    /// for a REQUIRED tool that cannot be attached: that job must not run without it, and the
+    /// endpoints attached so far are detached again. The job's workdir must exist on the host
+    /// before this call — the holders canonicalize it.
+    async fn attach_held_tools(
         &self,
         job_id: &str,
-    ) -> Result<Option<crate::held_tool::JobToolEndpoint>, String> {
-        let Some(tool) = &self.held_tool else {
-            return Ok(None);
-        };
-        match tool.attach(job_id).await {
-            Ok(endpoint) => Ok(Some(endpoint)),
-            Err(error) if tool.required() => {
-                Err(format!("the required held tool could not be attached ({error})"))
-            }
-            Err(error) => {
-                opline!(
-                    "seller node execute job_id={job_id}: held tool not attached, running without it ({error})"
-                );
-                Ok(None)
+    ) -> Result<Vec<crate::held_tool::JobToolEndpoint>, String> {
+        let mut endpoints = Vec::with_capacity(self.held_tools.len());
+        for tool in &self.held_tools {
+            match tool.attach(job_id).await {
+                Ok(endpoint) => endpoints.push(endpoint),
+                Err(error) if tool.required() => {
+                    for endpoint in endpoints {
+                        endpoint.detach().await;
+                    }
+                    return Err(format!(
+                        "the required held tool {} could not be attached ({error})",
+                        tool.server_name()
+                    ));
+                }
+                Err(error) => opline!(
+                    "seller node execute job_id={job_id}: held tool {} not attached, running without it ({error})",
+                    tool.server_name()
+                ),
             }
         }
+        Ok(endpoints)
     }
 
     async fn serve(self: Arc<Self>) -> Result<(), NodeError> {
@@ -7175,21 +7205,20 @@ impl SellerNodeRunner {
                     return;
                 }
             };
-            // The seat's held tool, attached for this job's life (the Holder route): the job gets its
-            // own socket directory mounted and one MCP server entry that spawns the bridge. The
-            // workdir exists now, which the holder needs to record the job's directory.
-            let tool_endpoint = match self.attach_held_tool(job_id).await {
-                Ok(endpoint) => endpoint,
+            // The seat's held tools, attached for this job's life (the Holder route): per tool, the
+            // job gets its own socket directory mounted and one MCP server entry that spawns the
+            // bridge. The workdir exists now, which the holders need to record the job's directory.
+            let tool_endpoints = match self.attach_held_tools(job_id).await {
+                Ok(endpoints) => endpoints,
                 Err(error) => {
                     opline!("seller node execute fail job_id={job_id}: {error}");
                     self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None).await;
                     return;
                 }
             };
-            let attachments = tool_endpoint
-                .as_ref()
-                .map(crate::held_tool::JobToolEndpoint::attachments)
-                .unwrap_or_default();
+            let attachments = crate::seller_exec::JobAttachments::merge(
+                tool_endpoints.iter().map(crate::held_tool::JobToolEndpoint::attachments),
+            );
             let run_started = std::time::Instant::now();
             let run_result = run_agent_with_retry(
                 deadline,
@@ -7210,8 +7239,8 @@ impl SellerNodeRunner {
                 },
             )
             .await;
-            // Job end detaches the socket. The tool stays enrolled — that is the model.
-            if let Some(endpoint) = tool_endpoint {
+            // Job end detaches the sockets. The tools stay enrolled — that is the model.
+            for endpoint in tool_endpoints {
                 endpoint.detach().await;
             }
             let wall_time_ms = run_started.elapsed().as_millis() as u64;
@@ -7576,14 +7605,13 @@ impl SellerNodeRunner {
         let io_dir = container_exchange_dir(&self.node.home().root, job_id);
         orch::create_exchange_dir(&io_dir).map_err(|error| Fail::Setup(error.to_string()))?;
 
-        // The seat's held tool, attached for the container's life (the Holder route). The workdir
-        // exists now, which the holder needs; the container gets the job's socket directory as one
-        // more mount, and the orchestrator hands the agent the bridge entry.
-        let tool_endpoint = self.attach_held_tool(job_id).await.map_err(Fail::Setup)?;
-        let attachments = tool_endpoint
-            .as_ref()
-            .map(crate::held_tool::JobToolEndpoint::attachments)
-            .unwrap_or_default();
+        // The seat's held tools, attached for the container's life (the Holder route). The workdir
+        // exists now, which the holders need; the container gets one socket directory per tool as
+        // further mounts, and the orchestrator hands the agent the bridge entries.
+        let tool_endpoints = self.attach_held_tools(job_id).await.map_err(Fail::Setup)?;
+        let attachments = crate::seller_exec::JobAttachments::merge(
+            tool_endpoints.iter().map(crate::held_tool::JobToolEndpoint::attachments),
+        );
 
         // Containment (#797) and the credential proxy (#647), exactly as the agent launch prepares
         // them. The proxy is a host process; the container reaches it over the network. The
@@ -7674,7 +7702,7 @@ impl SellerNodeRunner {
             netns: prepared.holder_name.as_deref(),
             mcp_servers: &session_servers,
         };
-        // The exchange directory, then whatever the held tool attaches (its socket directory).
+        // The exchange directory, then whatever the held tools attach (their socket directories).
         let mut mounts = vec![ExtraMount::Bind {
             host: io_dir.clone(),
             container: orch::CONTAINER_EXCHANGE_DIR.to_owned(),
@@ -7778,8 +7806,8 @@ impl SellerNodeRunner {
             CleanupPolicy::CaptureThenRemove,
         )
         .await;
-        // The container is gone; the job's socket goes with it. The tool stays enrolled.
-        if let Some(endpoint) = tool_endpoint {
+        // The container is gone; the job's sockets go with it. The tools stay enrolled.
+        for endpoint in tool_endpoints {
             endpoint.detach().await;
         }
         // The container exited between two polls: the marker may not have been read yet.

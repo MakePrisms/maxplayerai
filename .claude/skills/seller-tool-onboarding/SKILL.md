@@ -15,7 +15,8 @@ Read it for the full model. This skill is the actionable guide.
 ## Where each route stands today
 
 - **Holder** — handled and automated, and wired into the seller daemon. Onboard by config
-  (`[sandbox.held_tool]`); proved live through the daemon code on 2026-09-14.
+  (`[[sandbox.held_tools]]`, one entry per tool); proved live through the daemon code on 2026-09-14,
+  with two tools.
 - **Public** — handled, but manual. A human installs the tool in the image.
 - **Direct token** — handled, but manual, and its safe delivery is the Proxy swap.
 - **Proxy swap** — handled by configuration (`[[sandbox.mcp_tools]]`). Accepted against a real
@@ -61,10 +62,12 @@ supported at this moment, say so plainly and stop; do not improvise a substitute
 Use this for a local CLI with a persistent login that acts on local files. The holder holds the
 login; the job reaches it over a private socket; the holder validates each operation and confines
 file access. The kit is `crates/maxplayer-tool-kit`; the daemon side is
-`crates/maxplayer-core/src/held_tool.rs`. The seller daemon starts ONE holder container per seat at
-boot, attaches each job's socket around the job, and stops the holder at shutdown. The login persists
-in the holder's state volume across daemon restarts. Live proof through the daemon code:
-`evidence/20260914T095551Z-holder-route/`.
+`crates/maxplayer-core/src/held_tool.rs`. The seller daemon starts ONE holder container per held tool
+at boot, attaches each job's socket for each tool around the job, and stops the holders at shutdown.
+Each login persists in its holder's state volume across daemon restarts. A seat holds as many tools
+as it declares; each has its own image, credential, holder and socket. Live proof through the daemon
+code, two tools:
+`evidence/20260914T103608Z-holder-route-two-tools/`.
 
 Configure the offering (the kit config), then the seat.
 
@@ -93,32 +96,40 @@ Part 2 — the holder image and the seat.
    `vendor-cli`, is the reference and the test double.
 2. Put the vendor credential in a host file, mode 0600, owned by the daemon's user, in the shape
    the vendor CLI's `login` reads. Never in `config.toml`.
-3. Add the table to the seat's `config.toml`, under a docker `[sandbox]`. Every path is an absolute
-   host path.
+3. Add one table per tool to the seat's `config.toml`, under a docker `[sandbox]`. Every path is an
+   absolute host path. `server_name` is the MCP server name the agent sees; it must be unique across
+   `held_tools` and `mcp_tools`, and it names the holder container and the job's socket directory.
 
    ```toml
-   [sandbox.held_tool]
-   image = "my-holder:latest"
-   config = "/ABSOLUTE/path/seller-tool-config.json"      # the offering from part 1
-   credential_file = "/ABSOLUTE/path/vendor-cred.json"    # mounted read-only into the holder only
+   [[sandbox.held_tools]]
+   server_name = "figma"                                  # the agent sees mcp__figma__<operation>
+   image = "my-figma-holder:latest"
+   config = "/ABSOLUTE/path/figma-offering.json"          # the offering from part 1
+   credential_file = "/ABSOLUTE/path/figma-cred.json"     # mounted read-only into this holder only
    # vendor_base_url = "https://vendor.example"           # overrides the config JSON's value
    # network = "my-tools-net"                             # the holder must reach the vendor
-   # server_name = "seller-tool"                          # the MCP server name the agent sees
    # required = false                                     # true: refuse to boot or run without it
+
+   [[sandbox.held_tools]]
+   server_name = "jira"
+   image = "my-jira-holder:latest"
+   config = "/ABSOLUTE/path/jira-offering.json"
+   credential_file = "/ABSOLUTE/path/jira-cred.json"
    ```
 
    Needs Docker Engine 26 or newer: the job's socket reaches its container through a volume
    subpath mount, and boot probes for it.
-4. Restart the seller daemon. Read the boot line. `HEALTHY, enrolled (1 login this start)` on the
-   first boot; `HEALTHY, resumed the persisted login (no new enrolment)` after. `UNHEALTHY` names
-   the vendor's answer; with `required = false` the seat still serves, without the tool.
-5. Run a job that uses the tool. The agent sees an MCP server named `seller-tool` whose tools are
-   the operations you declared. The job's outputs land in the job's own directory.
+4. Restart the seller daemon. Read one boot line per tool. `HEALTHY, enrolled (1 login this start)`
+   on the first boot; `HEALTHY, resumed the persisted login (no new enrolment)` after. `UNHEALTHY`
+   names the vendor's answer; with `required = false` the seat still serves, without that tool.
+5. Run a job that uses the tools. The agent sees one MCP server per entry, named by `server_name`,
+   whose tools are the operations you declared for it. The job's outputs land in the job's own
+   directory.
 
-What the job container gets, and only that: its workdir at `/work`, and its own socket directory
-at `/run/holder`, a subpath of the holder's runtime volume. Not the credential, not the holder's
-state, not another job's socket. The holder runs as the job's uid, so the outputs it publishes are
-the job's to read.
+What the job container gets, and only that: its workdir at `/work`, and one socket directory per
+tool at `/run/holder/<server_name>`, each a subpath of that holder's runtime volume. Not a
+credential, not a holder's state, not another job's socket. Each holder runs as the job's uid, so
+the outputs it publishes are the job's to read.
 
 Safety invariants the holder enforces. Keep them true in any change.
 
@@ -135,12 +146,13 @@ Through the daemon code, against the kit's fake vendor (needs docker, the kit im
 image with `tool-mcp-bridge`):
 
 ```sh
-cargo test -p maxplayer-core --features wallet,acp --lib -- --ignored --nocapture held_tool::live_tests::live_two_jobs
+cargo test -p maxplayer-core --features wallet,acp --lib -- --ignored --nocapture held_tool::live_tests::live_two_tools
 ```
 
-It starts the holder, runs two jobs on one enrolment (one under egress containment when
-`MAXPLAYER_HELD_TOOL_LIVE_NETWORK` is set), refuses an escape, restarts the holder and proves the
-login resumed. `live_a_real_agent` adds a real agent turn. The vendor's counters are the oracle.
+It starts two holders, runs two jobs against both on one enrolment each (one job under egress
+containment when `MAXPLAYER_HELD_TOOL_LIVE_NETWORK` is set), refuses an escape, restarts the holders
+and proves both logins resumed. `live_a_real_agent` adds a real agent turn that calls both tools.
+The vendors' counters are the oracle.
 
 The kit alone:
 

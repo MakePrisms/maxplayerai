@@ -378,6 +378,19 @@ pub struct JobAttachments {
     pub extra_mounts: Vec<ExtraMount>,
 }
 
+impl JobAttachments {
+    /// The union of several attachments, in order: several held tools give a job several sockets
+    /// and several server entries, and the launch takes them as one list.
+    pub fn merge(parts: impl IntoIterator<Item = JobAttachments>) -> Self {
+        let mut merged = Self::default();
+        for part in parts {
+            merged.mcp_servers.extend(part.mcp_servers);
+            merged.extra_mounts.extend(part.extra_mounts);
+        }
+        merged
+    }
+}
+
 /// What the ACP driver spawns: the process `program` + `args`, and the `cwd` the ACP session runs
 /// in. `cwd` is the host workdir for a host launch, and the in-container mount point for a docker
 /// launch (the host path does not exist inside the container).
@@ -648,6 +661,56 @@ impl SandboxPolicy {
                         return Err(ExecError::Config(format!(
                             "[sandbox] mcp_tools: credential.field must not be empty (tool {name})"
                         )));
+                    }
+                }
+                // Held tools (the Holder route). Refused HERE, so a seat that cannot address its tools
+                // does not boot and then fail every job: the server name is what the agent addresses
+                // AND what names the holder container and the job's socket directory, so it must be
+                // plain and unique — across held tools and across the proxied MCP tools, which share
+                // the session's server list.
+                for tool in &config.held_tools {
+                    let name = tool.server_name.trim();
+                    if name.is_empty()
+                        || !name
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                    {
+                        return Err(ExecError::Config(format!(
+                            "[sandbox] held_tools: server_name {:?} must be non-empty and use only ASCII \
+                             letters, digits, `_` and `-` (image {})",
+                            tool.server_name, tool.image
+                        )));
+                    }
+                    if config
+                        .held_tools
+                        .iter()
+                        .filter(|other| other.server_name.trim() == name)
+                        .count()
+                        > 1
+                    {
+                        return Err(ExecError::Config(format!(
+                            "[sandbox] held_tools: server_name {name} is claimed by two entries — the agent \
+                             addresses tools by server name, so only one can be reached"
+                        )));
+                    }
+                    if config.mcp_tools.iter().any(|mcp| mcp.name.trim() == name) {
+                        return Err(ExecError::Config(format!(
+                            "[sandbox] held_tools: server_name {name} is also a [[sandbox.mcp_tools]] name — \
+                             both land on the job's session, so only one can be reached"
+                        )));
+                    }
+                    if tool.image.trim().is_empty() {
+                        return Err(ExecError::Config(format!(
+                            "[sandbox] held_tools: image must not be empty (tool {name})"
+                        )));
+                    }
+                    for (label, path) in [("config", &tool.config), ("credential_file", &tool.credential_file)] {
+                        if !path.is_absolute() {
+                            return Err(ExecError::Config(format!(
+                                "[sandbox] held_tools: {label} must be absolute, got {} (tool {name})",
+                                path.display()
+                            )));
+                        }
                     }
                 }
                 // A zero cap would refuse every long-lived mint; it is a typo, not a policy, and is
@@ -7897,6 +7960,56 @@ mod mcp_tool_tests {
             ..tool("https://h/mcp", Path::new("/abs/c.json"), McpToolTransport::Stdio)
         }]));
         assert!(error.contains("credential.field must not be empty"), "{error}");
+    }
+
+    // ---- held tools: the names the agent addresses -----------------------------------------
+
+    fn held(name: &str) -> crate::home::HeldToolConfig {
+        crate::home::HeldToolConfig {
+            server_name: name.into(),
+            image: "my-holder:latest".into(),
+            config: "/abs/offering.json".into(),
+            credential_file: "/abs/cred.json".into(),
+            vendor_base_url: None,
+            vendor_cli: None,
+            network: None,
+            required: false,
+        }
+    }
+
+    fn docker_config_with_held(held_tools: Vec<crate::home::HeldToolConfig>, mcp_tools: Vec<McpToolConfig>) -> SandboxConfig {
+        SandboxConfig {
+            mode: SandboxMode::Docker,
+            image: Some("maxplayer-sandbox:test".into()),
+            held_tools,
+            mcp_tools,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn held_tools_need_plain_unique_server_names_that_no_mcp_tool_claims() {
+        SandboxPolicy::from_config(Some(&docker_config_with_held(vec![held("figma"), held("jira")], Vec::new())))
+            .expect("two distinct names resolve");
+        for bad in ["", "fig ma", "a/b", "tool:1"] {
+            let error = config_error(&docker_config_with_held(vec![held(bad)], Vec::new()));
+            assert!(error.contains("held_tools: server_name"), "{bad:?}: {error}");
+        }
+        let error = config_error(&docker_config_with_held(vec![held("figma"), held("figma")], Vec::new()));
+        assert!(error.contains("claimed by two entries"), "{error}");
+        let error = config_error(&docker_config_with_held(
+            vec![held("github")],
+            vec![tool("https://api.githubcopilot.com/mcp/", Path::new("/abs/c.json"), McpToolTransport::Stdio)],
+        ));
+        assert!(error.contains("also a [[sandbox.mcp_tools]] name"), "{error}");
+        let mut relative = held("figma");
+        relative.credential_file = "cred.json".into();
+        let error = config_error(&docker_config_with_held(vec![relative], Vec::new()));
+        assert!(error.contains("credential_file must be absolute"), "{error}");
+        let mut no_image = held("figma");
+        no_image.image = " ".into();
+        let error = config_error(&docker_config_with_held(vec![no_image], Vec::new()));
+        assert!(error.contains("image must not be empty"), "{error}");
     }
 
     // ---- the URL split -----------------------------------------------------------------------

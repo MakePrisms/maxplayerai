@@ -895,28 +895,37 @@ sandbox image, and a real agent turn; the bundle is `evidence/20260914T085619Z-g
 `docs/specs/seller-tool-onboarding/10-routing-and-options.md`. Another vendor is another
 acceptance run.
 
-### Hold a vendor CLI for jobs — the Holder (`[sandbox.held_tool]`)
+### Hold vendor CLIs for jobs — the Holder (`[[sandbox.held_tools]]`)
 
-A docker seat can hold a vendor CLI logged in, in its own persistent holder container the daemon
-starts at boot and stops at shutdown, and offer the operations you declare to every job over a
-per-job Unix socket. The credential and the login live in the holder; a job gets its own socket and
-the declared operations, nothing else. The login persists in the holder's state volume across
-restarts, so the tool enrols once. The kit is `crates/maxplayer-tool-kit`; its `templates/README.md`
-says how to declare the operations.
+A docker seat can hold vendor CLIs logged in, each in its own persistent holder container the
+daemon starts at boot and stops at shutdown, and offer the operations you declare to every job over
+a per-job Unix socket per tool. The credential and the login live in the holder; a job gets its own
+socket per tool and the declared operations, nothing else. Each login persists in its holder's
+state volume across restarts, so a tool enrols once. The kit is `crates/maxplayer-tool-kit`; its
+`templates/README.md` says how to declare the operations. Repeat the table per tool.
 
 ```toml
-[sandbox.held_tool]
-image = "my-holder:latest"                            # tool-holderd + holderctl + your vendor CLI
-config = "/home/seller/.config/maxplayer/seller-tool-config.json"   # the offering
-credential_file = "/home/seller/.config/maxplayer/vendor-cred.json" # host file; mounted read-only into the holder only
+[[sandbox.held_tools]]
+server_name = "figma"                                 # the agent sees mcp__figma__<operation>
+image = "my-figma-holder:latest"                      # tool-holderd + holderctl + the vendor CLI
+config = "/home/seller/.config/maxplayer/figma-offering.json"      # the offering
+credential_file = "/home/seller/.config/maxplayer/figma-cred.json" # host file; mounted read-only into this holder only
 # network = "maxplayer-tools"                         # the holder must reach the vendor
 # required = false                                    # true: refuse to boot or run a job without it
+
+[[sandbox.held_tools]]
+server_name = "jira"
+image = "my-jira-holder:latest"
+config = "/home/seller/.config/maxplayer/jira-offering.json"
+credential_file = "/home/seller/.config/maxplayer/jira-cred.json"
 ```
 
-Needs Docker Engine 26 or newer (the socket reaches the job through a volume subpath mount; boot
-probes for it). The boot line says `HEALTHY, enrolled` on the first boot and `HEALTHY, resumed the
-persisted login` after; `UNHEALTHY` names the vendor's answer. The agent sees an MCP server named
-`seller-tool`. Proved live through the daemon code against the kit's fake vendor on 2026-09-14
+`server_name` must be unique across `held_tools` and `mcp_tools`; it names the holder container and
+the job's socket directory `/run/holder/<server_name>`. Needs Docker Engine 26 or newer (the socket
+reaches the job through a volume subpath mount; boot probes for it). One boot line per tool says
+`HEALTHY, enrolled` on the first boot and `HEALTHY, resumed the persisted login` after; `UNHEALTHY`
+names the vendor's answer. Proved live through the daemon code with two tools against the kit's fake
+vendors on 2026-09-14 (`evidence/20260914T103608Z-holder-route-two-tools/`); a real vendor CLI is its own acceptance run. Proved live through the daemon code against the kit's fake vendor on 2026-09-14
 (`evidence/20260914T095551Z-holder-route/`); a real vendor CLI is its own acceptance run.
 
 ### `launcher` mode — only if this box cannot run docker
