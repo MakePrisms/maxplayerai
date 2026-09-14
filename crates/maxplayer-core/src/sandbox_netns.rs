@@ -69,27 +69,69 @@ pub const HOLDER_SEAT_LABEL: &str = "ai.maxplayer.netns-holder-seat";
 /// wait is the state in which cancellation leaves work nobody owns.
 pub const DOCKER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// The docker client this process spawns.
+/// The docker client one containment lifecycle spawns, carried **explicitly** by the code that uses
+/// it.
 ///
-/// In production this is the constant `docker`, resolved on `PATH`, and there is deliberately **no
-/// way to select another one**. An environment-selectable client would let anyone who can set a
-/// variable on this process redirect every containment command — create, inspect, remove — at a
-/// binary of their choosing. That is a privilege boundary, not a convenience knob, so the seam that
-/// lets tests drive [`establish`] without a daemon exists only under `cfg(test)` and cannot be
-/// compiled into a shipped binary.
-#[cfg(not(test))]
-#[inline]
-fn docker_program() -> String {
-    "docker".to_owned()
+/// There is no environment variable, no global, and no configuration field behind this. The only
+/// constructor a shipped build can reach is [`DockerCli::system`], which is the constant `docker` on
+/// `PATH`; a test that needs a stand-in passes one in as an argument to the single call under test,
+/// so two tests running in parallel cannot see or disturb each other's client.
+///
+/// The earlier shapes of this seam were both wrong, in instructive ways. An environment variable let
+/// anyone able to set a variable on the process redirect every containment command — create,
+/// inspect, remove — at a binary of their choosing, in a shipped build. Moving it to a
+/// `cfg(test)` process-global removed the shipped exposure but not the interference: a global is
+/// still shared, still needs a lock every reader must remember to take, and any helper that forgot
+/// — cleanup running from `Drop`, for instance — read whatever another test had installed. An
+/// argument has neither failure mode.
+#[derive(Clone, Debug)]
+pub struct DockerCli {
+    program: std::sync::Arc<str>,
 }
 
-/// Test-only: the injected stand-in client, falling back to the production constant.
+impl DockerCli {
+    /// The production client: `docker`, resolved on `PATH`. Nothing selects another.
+    #[must_use]
+    pub fn system() -> Self {
+        Self { program: std::sync::Arc::from("docker") }
+    }
+
+    /// Test-only: an explicit stand-in, handed to one call. Not reachable from a shipped build.
+    #[cfg(test)]
+    fn stand_in(path: &std::path::Path) -> Self {
+        Self { program: std::sync::Arc::from(path.to_string_lossy().as_ref()) }
+    }
+
+    fn program(&self) -> &str {
+        &self.program
+    }
+}
+
+/// How long cleanup will wait for an in-flight create, and how long an owner keeps trying after it.
 ///
-/// The override lives in a process-local static rather than an environment variable, so it neither
-/// survives into any shipped build nor leaks into the environment of unrelated tests.
-#[cfg(test)]
-fn docker_program() -> String {
-    tests::injected_docker_program().unwrap_or_else(|| "docker".to_owned())
+/// A parameter rather than a constant so the delayed path can be exercised in under a second. The
+/// production values are [`FenceBounds::production`]; nothing else constructs one outside tests.
+#[derive(Clone, Copy, Debug)]
+struct FenceBounds {
+    /// How long `Drop` itself blocks before handing off to an owner.
+    fast: std::time::Duration,
+    /// The outer bound on the handed-off owner, counted from when it takes over.
+    max: std::time::Duration,
+    /// How long the owner keeps asking the daemon to confirm the removal it issued.
+    confirm: std::time::Duration,
+}
+
+impl FenceBounds {
+    /// The bound that matters is the create client's own: [`DOCKER_DEADLINE`] kills it at 120s, so a
+    /// blocking create closure cannot outlive that, and an owner waiting a margin past it waits for
+    /// an event that is guaranteed to have happened rather than for a guessed duration.
+    fn production() -> Self {
+        Self {
+            fast: NetnsHolder::CREATE_SETTLE_DEADLINE,
+            max: DOCKER_DEADLINE + std::time::Duration::from_secs(15),
+            confirm: std::time::Duration::from_secs(10),
+        }
+    }
 }
 
 /// A running holder container, and the guarantee that it goes away.
@@ -184,6 +226,8 @@ pub struct NetnsHolder {
     name: String,
     sidecars: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     creation: std::sync::Arc<CreationFence>,
+    client: DockerCli,
+    bounds: FenceBounds,
 }
 
 impl NetnsHolder {
@@ -195,12 +239,27 @@ impl NetnsHolder {
     /// with no guard — running, joined to nothing, and invisible to this process.
     ///
     /// Adoption gives cleanup a name. [`CreationFence`] gives it a TIME. Both are required.
-    fn adopt(name: String) -> Self {
+    #[cfg(test)]
+    fn adopt(name: String, client: DockerCli) -> Self {
+        Self::adopt_bounded(name, client, FenceBounds::production())
+    }
+
+    /// As [`Self::adopt`], with the cleanup bounds named by the caller so the delayed path can be
+    /// exercised without waiting out the production ones.
+    fn adopt_bounded(name: String, client: DockerCli, bounds: FenceBounds) -> Self {
         Self {
             name,
             sidecars: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             creation: std::sync::Arc::new(CreationFence::default()),
+            client,
+            bounds,
         }
+    }
+
+    /// The docker client this holder was built with. Cleanup uses it too, so a stand-in cannot be
+    /// half-applied: whatever created the container is what removes and confirms it.
+    fn client(&self) -> &DockerCli {
+        &self.client
     }
 
     /// Take a ticket for a create about to be issued against this holder.
@@ -281,8 +340,8 @@ impl NetnsHolder {
     /// Force-remove one container by name, bounded, and say what actually happened.
     ///
     /// `Ok(())` means docker reported the removal, or reported that there was nothing to remove.
-    fn force_remove(name: &str) -> Result<(), String> {
-        let mut child = std::process::Command::new(docker_program())
+    fn force_remove(client: &DockerCli, name: &str) -> Result<(), String> {
+        let mut child = std::process::Command::new(client.program())
             .args(["rm", "--force", "--volumes", name])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
@@ -408,19 +467,82 @@ impl Drop for NetnsHolder {
         // Waiting here costs nothing in the ordinary path (nothing is in flight, the count is
         // already zero) and is the only thing that makes the removes below meaningful in the
         // cancelled path.
-        if !self.creation.wait_until_settled(Self::CREATE_SETTLE_DEADLINE) {
-            eprintln!(
-                "sandbox: a create against netns holder {} was still in flight after {:?} — removing \
-                 now anyway, but a container under that name may appear after this point and would \
-                 be LEAKED; the boot reaper is the backstop",
-                self.name,
-                Self::CREATE_SETTLE_DEADLINE
-            );
+        let cleanup = HolderCleanup {
+            name: self.name.clone(),
+            joiners: self.sidecars.lock().map(|names| names.clone()).unwrap_or_default(),
+            creation: std::sync::Arc::clone(&self.creation),
+            client: self.client.clone(),
+            bounds: self.bounds,
+        };
+        if self.creation.wait_until_settled(self.bounds.fast) {
+            // Ordinary path: nothing was in flight, or it finished while we waited. `docker rm`
+            // returning success here IS the daemon's answer, so no second question is asked.
+            cleanup.sweep();
+            return;
         }
-        let joiners: Vec<String> =
-            self.sidecars.lock().map(|names| names.clone()).unwrap_or_default();
-        for joiner in joiners {
-            if let Err(error) = Self::force_remove(&joiner) {
+        // Delayed path. The create is STILL running, and this is the case the previous version got
+        // wrong: it removed anyway, printed LEAKED, and returned — leaving nobody responsible for
+        // the container that was still on its way. "No such container" then read as success for an
+        // object about to exist.
+        //
+        // Removing now cannot be made safe by waiting longer, so cleanup is not removed — it is
+        // HANDED OVER. The owner below outlives this `Drop` and finishes the job on the create's own
+        // schedule: it waits for the ticket to actually settle, then removes, then keeps asking the
+        // daemon until absence is CONFIRMED. The wait is bounded by the create client's own
+        // `DOCKER_DEADLINE` kill plus a margin, so it waits for an event guaranteed to occur rather
+        // than for a duration someone guessed.
+        let name = self.name.clone();
+        let spawned = std::thread::Builder::new()
+            .name("mx-holder-cleanup".to_owned())
+            .spawn(move || cleanup.own_until_settled_or_confirmed());
+        match spawned {
+            Ok(_owner) => eprintln!(
+                "sandbox: a create against netns holder {name} is still in flight after {:?} — \
+                 cleanup is NOT removing ahead of it; an owner has been retained and will remove \
+                 and confirm once the create settles",
+                self.bounds.fast
+            ),
+            // No thread to hand it to: finish the job here rather than remove early. Blocking is
+            // the lesser harm; removing ahead of a live create is the one outcome with no recovery.
+            Err(error) => {
+                eprintln!(
+                    "sandbox: could not retain a cleanup owner for netns holder {name} ({error}) — \
+                     completing the wait inline instead"
+                );
+                let inline = HolderCleanup {
+                    name: self.name.clone(),
+                    joiners: self.sidecars.lock().map(|names| names.clone()).unwrap_or_default(),
+                    creation: std::sync::Arc::clone(&self.creation),
+                    client: self.client.clone(),
+                    bounds: self.bounds,
+                };
+                inline.own_until_settled_or_confirmed();
+            }
+        }
+    }
+}
+
+/// The cleanup that owns a holder's name once the holder itself is gone.
+///
+/// Split out of `Drop` for one reason: `Drop` must not be the last thing that cares about the
+/// container. When a create is still in flight, this outlives the holder and stays responsible until
+/// the create settles or the daemon confirms the name is gone.
+#[cfg(feature = "acp")]
+struct HolderCleanup {
+    name: String,
+    joiners: Vec<String>,
+    creation: std::sync::Arc<CreationFence>,
+    client: DockerCli,
+    bounds: FenceBounds,
+}
+
+#[cfg(feature = "acp")]
+impl HolderCleanup {
+    /// Remove the joiners, then the holder. Sidecars first: a joiner still running pins the
+    /// namespace the holder is being torn down to release.
+    fn sweep(&self) {
+        for joiner in &self.joiners {
+            if let Err(error) = NetnsHolder::force_remove(&self.client, joiner) {
                 eprintln!(
                     "sandbox: could not remove sidecar {joiner} joined to netns holder {}: {error} \
                      — the namespace may still be pinned by it",
@@ -428,14 +550,62 @@ impl Drop for NetnsHolder {
                 );
             }
         }
-        match Self::force_remove(&self.name) {
-            Ok(()) => {}
-            Err(error) => eprintln!(
+        if let Err(error) = NetnsHolder::force_remove(&self.client, &self.name) {
+            eprintln!(
                 "sandbox: could not remove netns holder {}: {error} — this holder is LEAKED, not \
                  destroyed; the boot reaper is the only remaining backstop",
                 self.name
-            ),
+            );
         }
+    }
+
+    /// Ask the daemon, repeatedly, whether the holder is actually gone.
+    ///
+    /// A removal issued is not a removal observed. `Some(true)` is the only answer that ends this;
+    /// "could not tell" is treated exactly like "still there", because the cost of asking again is a
+    /// bounded retry and the cost of believing it is an orphan nobody is looking for.
+    fn confirm_absent(&self) -> bool {
+        let give_up = std::time::Instant::now() + self.bounds.confirm;
+        let mut pause = std::time::Duration::from_millis(20);
+        loop {
+            if container_is_absent(&self.client, &self.name) == Some(true) {
+                return true;
+            }
+            if std::time::Instant::now() >= give_up {
+                return false;
+            }
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(std::time::Duration::from_millis(500));
+        }
+    }
+
+    /// Wait for the create to genuinely settle, then remove, then confirm.
+    ///
+    /// Ends on ACTUAL settlement followed by CONFIRMED absence. If the create never settles within
+    /// the bound, the sweep still runs and the confirmation still decides the verdict: a container
+    /// that never landed is confirmed absent and the case closes honestly; one that cannot be
+    /// confirmed gone is reported as leaked, with the reason, rather than silently written off.
+    fn own_until_settled_or_confirmed(self) {
+        let settled = self.creation.wait_until_settled(self.bounds.max);
+        self.sweep();
+        let confirmed = self.confirm_absent();
+        if confirmed {
+            if !settled {
+                eprintln!(
+                    "sandbox: a create against netns holder {} never settled within {:?}, but the \
+                     name is now CONFIRMED absent — nothing landed under it",
+                    self.name, self.bounds.max
+                );
+            }
+            return;
+        }
+        eprintln!(
+            "sandbox: netns holder {} could not be confirmed absent within {:?} after {} — this \
+             holder is LEAKED, not destroyed; the boot reaper is the only remaining backstop",
+            self.name,
+            self.bounds.confirm,
+            if settled { "its create settled" } else { "waiting out its create" }
+        );
     }
 }
 
@@ -775,7 +945,10 @@ pub async fn reapable_holders_live(seat: &str) -> Result<Vec<String>, String> {
     if seat.trim().is_empty() {
         return Err("refusing to reap: no owning seat was named".to_owned());
     }
-    let (listing, _) = run_docker(list_holders_argv(seat), None)
+    // The production client, named here and passed down. Nothing in this path reads an environment
+    // variable, a global, or a configuration field to decide what to spawn.
+    let client = DockerCli::system();
+    let (listing, _) = run_docker(&client, list_holders_argv(seat), None)
         .await
         .map_err(|error| format!("could not list containment holders — {error}"))?;
     let holders = parse_holder_listing(&listing);
@@ -783,11 +956,11 @@ pub async fn reapable_holders_live(seat: &str) -> Result<Vec<String>, String> {
         return Ok(Vec::new());
     }
 
-    let (all, _) = run_docker(list_all_containers_argv(), None)
+    let (all, _) = run_docker(&client, list_all_containers_argv(), None)
         .await
         .map_err(|error| format!("could not list containers — {error}"))?;
     let all: Vec<String> = all.lines().map(str::trim).filter(|id| !id.is_empty()).map(str::to_owned).collect();
-    let (modes, _) = run_docker(network_modes_argv(&all), None)
+    let (modes, _) = run_docker(&client, network_modes_argv(&all), None)
         .await
         .map_err(|error| format!("could not read container network modes — {error}"))?;
 
@@ -849,8 +1022,10 @@ impl ReapReport {
 #[cfg(feature = "acp")]
 pub async fn reap_orphans(seat: &str) -> Result<ReapReport, String> {
     let mut report = ReapReport::default();
+    let client = DockerCli::system();
     for holder in reapable_holders_live(seat).await? {
         match run_docker(
+            &client,
             ["docker", "rm", "--force", "--volumes", holder.as_str()]
                 .into_iter()
                 .map(String::from)
@@ -875,8 +1050,12 @@ pub async fn reap_orphans(seat: &str) -> Result<ReapReport, String> {
 /// built without the `process` feature, and reaching for it would widen the dependency of every
 /// default build to enable three calls that happen once per job.
 #[cfg(feature = "acp")]
-async fn run_docker(argv: Vec<String>, stdin: Option<String>) -> Result<(String, String), String> {
-    run_bounded(argv, stdin, DOCKER_DEADLINE).await
+async fn run_docker(
+    client: &DockerCli,
+    argv: Vec<String>,
+    stdin: Option<String>,
+) -> Result<(String, String), String> {
+    run_bounded(client, argv, stdin, DOCKER_DEADLINE).await
 }
 
 /// As [`run_docker`], but the create it issues is **fenced**: the ticket lives inside the blocking
@@ -886,16 +1065,18 @@ async fn run_docker(argv: Vec<String>, stdin: Option<String>) -> Result<(String,
 /// cancellation — at precisely the moment the create is still running — which is the bug.
 #[cfg(feature = "acp")]
 async fn run_docker_fenced(
+    client: &DockerCli,
     argv: Vec<String>,
     stdin: Option<String>,
     ticket: CreationTicket,
 ) -> Result<(String, String), String> {
+    let client = client.clone();
     let joined = tokio::task::spawn_blocking(move || {
         // Moved in, and dropped only when this closure ends: killed on the deadline, failed, or
         // finished. That drop is what "settled" means to `CreationFence::wait_until_settled`.
         let _ticket = ticket;
         let mut child_exited = false;
-        run_bounded_blocking(argv, stdin, DOCKER_DEADLINE, &mut child_exited)
+        run_bounded_blocking(&client, argv, stdin, DOCKER_DEADLINE, &mut child_exited)
     })
     .await;
     match joined {
@@ -913,11 +1094,12 @@ async fn run_docker_fenced(
 /// deadline rather than a hang that names nothing.
 #[cfg(feature = "acp")]
 async fn run_bounded(
+    client: &DockerCli,
     argv: Vec<String>,
     stdin: Option<String>,
     deadline: std::time::Duration,
 ) -> Result<(String, String), String> {
-    run_bounded_tracked(argv, stdin, deadline).await.0
+    run_bounded_tracked(client, argv, stdin, deadline).await.0
 }
 
 /// As [`run_bounded`], and also says whether the docker CLIENT was reaped with an exit status.
@@ -938,11 +1120,12 @@ async fn run_bounded(
 /// `false`, which is weaker still: not even worth asking the daemon about yet.
 #[cfg(feature = "acp")]
 async fn run_bounded_tracked(
+    client: &DockerCli,
     argv: Vec<String>,
     stdin: Option<String>,
     deadline: std::time::Duration,
 ) -> (Result<(String, String), String>, bool) {
-    run_bounded_tracked_fenced(argv, stdin, deadline, None).await
+    run_bounded_tracked_fenced(client, argv, stdin, deadline, None).await
 }
 
 /// As [`run_bounded_tracked`], optionally holding a [`CreationTicket`] for the duration of the
@@ -958,15 +1141,17 @@ async fn run_bounded_tracked(
 /// so cancelling the future cannot release it while the create is still running.
 #[cfg(feature = "acp")]
 async fn run_bounded_tracked_fenced(
+    client: &DockerCli,
     argv: Vec<String>,
     stdin: Option<String>,
     deadline: std::time::Duration,
     ticket: Option<CreationTicket>,
 ) -> (Result<(String, String), String>, bool) {
+    let client = client.clone();
     let joined = tokio::task::spawn_blocking(move || {
         let _ticket = ticket;
         let mut child_exited = false;
-        let outcome = run_bounded_blocking(argv, stdin, deadline, &mut child_exited);
+        let outcome = run_bounded_blocking(&client, argv, stdin, deadline, &mut child_exited);
         (outcome, child_exited)
     })
     .await;
@@ -980,6 +1165,7 @@ async fn run_bounded_tracked_fenced(
 /// The blocking half of [`run_bounded_tracked`]. Sets `child_exited` the moment the child is reaped.
 #[cfg(feature = "acp")]
 fn run_bounded_blocking(
+    client: &DockerCli,
     argv: Vec<String>,
     stdin: Option<String>,
     deadline: std::time::Duration,
@@ -992,7 +1178,8 @@ fn run_bounded_blocking(
         let (program, args) = argv.split_first().expect("an argv is never empty");
         // Substituted at the SPAWN site, not in the argv builders: every rendered argv still reads
         // `docker ...`, so what the plan tests assert is what production runs.
-        let program = if program == "docker" { docker_program() } else { program.clone() };
+        let program =
+            if program == "docker" { client.program().to_owned() } else { program.clone() };
         let program = program.as_str();
         let mut child = Command::new(program)
             .args(args)
@@ -1115,13 +1302,14 @@ async fn run_sidecar_with_deadline(
     run_sidecar_confirmed(holder, verb, argv, stdin, deadline, container_is_absent).await
 }
 
+
 /// How custody asks whether a container is gone. `Some(true)` = confirmed absent, `Some(false)` =
 /// confirmed present, `None` = could not be established.
 ///
 /// Injected so the rule below is measurable without a daemon. Only `Some(true)` releases custody, so
 /// a confirmer that cannot tell is treated exactly like one that says "still there".
 #[cfg(feature = "acp")]
-type ConfirmAbsent = fn(&str) -> Option<bool>;
+type ConfirmAbsent = fn(&DockerCli, &str) -> Option<bool>;
 
 /// As [`run_sidecar_with_deadline`], with the absence check injected.
 ///
@@ -1157,8 +1345,14 @@ async fn run_sidecar_confirmed(
     // dropped while this create is in flight removes the name, is told "No such container" because
     // the container does not exist YET, treats that as done — and the create then lands as an
     // orphan pinning the namespace. Moved into the blocking closure, never held by this future.
-    let (outcome, child_exited) =
-        run_bounded_tracked_fenced(argv, stdin, deadline, Some(holder.fence_creation())).await;
+    let (outcome, child_exited) = run_bounded_tracked_fenced(
+        holder.client(),
+        argv,
+        stdin,
+        deadline,
+        Some(holder.fence_creation()),
+    )
+    .await;
     // Reaching this line at all proves the command is no longer in flight: a cancellation drops the
     // future before it, so a cancelled command's name stays a cleanup target.
     //
@@ -1166,7 +1360,8 @@ async fn run_sidecar_confirmed(
     // creating or running that container — so custody is simply kept.
     if child_exited {
         let asked = name.clone();
-        let absent = tokio::task::spawn_blocking(move || confirm_absent(&asked))
+        let client = holder.client().clone();
+        let absent = tokio::task::spawn_blocking(move || confirm_absent(&client, &asked))
             .await
             .unwrap_or(None);
         if absent == Some(true) {
@@ -1183,8 +1378,8 @@ async fn run_sidecar_confirmed(
 /// `Some(false)`: the container is still there. Anything else — docker missing, the daemon not
 /// answering, an unrecognised error — is `None`, which keeps custody.
 #[cfg(feature = "acp")]
-fn container_is_absent(name: &str) -> Option<bool> {
-    let mut child = std::process::Command::new(docker_program())
+fn container_is_absent(client: &DockerCli, name: &str) -> Option<bool> {
+    let mut child = std::process::Command::new(client.program())
         .args(["inspect", "--type", "container", "--format", "{{.Id}}", name])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -1234,10 +1429,55 @@ pub async fn establish(
     log_connections: bool,
     dns_resolvers: Vec<String>,
 ) -> Result<Containment, String> {
+    // The production client is named here, once, and threaded down. This is the ONLY constructor a
+    // shipped build can reach, and it takes no input: no environment variable, no config field, no
+    // global. A test that needs a stand-in calls `establish_with` and hands one in.
+    establish_with(
+        &DockerCli::system(),
+        FenceBounds::production(),
+        network,
+        holder_image,
+        sidecar_image,
+        proxy_alias,
+        job_id,
+        seat,
+        uid,
+        gid,
+        proxy_ports,
+        log_connections,
+        dns_resolvers,
+    )
+    .await
+}
+
+/// [`establish`], with the docker client and the cleanup bounds supplied by the caller.
+///
+/// Private, and the only way to supply either. Tests pass a stand-in here as an ARGUMENT, so the
+/// substitution is confined to the one call under test: nothing is installed anywhere another test
+/// could read it, no lock has to be remembered, and two such tests can run in parallel without
+/// seeing each other.
+#[cfg(feature = "acp")]
+#[allow(clippy::too_many_arguments)]
+async fn establish_with(
+    client: &DockerCli,
+    bounds: FenceBounds,
+    network: &str,
+    holder_image: &str,
+    sidecar_image: &str,
+    proxy_alias: &str,
+    job_id: &str,
+    seat: &str,
+    uid: u32,
+    gid: u32,
+    proxy_ports: Option<crate::sandbox_net::PortRange>,
+    log_connections: bool,
+    dns_resolvers: Vec<String>,
+) -> Result<Containment, String> {
     // Measured BEFORE the holder exists, so a probe failure needs no cleanup.
-    let (probe_stdout, _) = run_docker(host_gateway_probe_argv(sidecar_image, proxy_alias), None)
-        .await
-        .map_err(|error| format!("could not resolve {proxy_alias} for the pinhole — {error}"))?;
+    let (probe_stdout, _) =
+        run_docker(client, host_gateway_probe_argv(sidecar_image, proxy_alias), None)
+            .await
+            .map_err(|error| format!("could not resolve {proxy_alias} for the pinhole — {error}"))?;
     let proxy_host = parse_getent_ipv4(&probe_stdout).ok_or_else(|| {
         format!("resolving {proxy_alias} produced no IPv4 address (got {probe_stdout:?})")
     })?;
@@ -1247,12 +1487,13 @@ pub async fn establish(
     // cancellation point, and the blocking create can complete after the future above it is gone:
     // adopting afterwards left exactly that container running with no guard and no record. The guard
     // costs one `docker rm` that reports "No such container" when the create never happened.
-    let holder = NetnsHolder::adopt(name.clone());
+    let holder = NetnsHolder::adopt_bounded(name.clone(), client.clone(), bounds);
     // Fenced, not merely adopted. The ticket is taken before the create is issued and travels into
     // the blocking closure, so a cancellation here leaves cleanup waiting for the create to settle
     // instead of racing it to a "No such container" that means "not yet".
     let ticket = holder.fence_creation();
     run_docker_fenced(
+        client,
         holder_argv(&name, network, holder_image, uid, gid, job_id, seat),
         None,
         ticket,
@@ -1511,7 +1752,7 @@ mod tests {
 
     #[test]
     fn the_job_joins_the_holders_namespace_and_never_names_a_network() {
-        let holder = NetnsHolder::adopt("maxplayer-netns-abc".into());
+        let holder = NetnsHolder::adopt("maxplayer-netns-abc".into(), DockerCli::system());
         assert_eq!(holder.network_mode(), "container:maxplayer-netns-abc");
     }
 
@@ -1555,7 +1796,7 @@ mod tests {
 
     #[test]
     fn only_the_sidecar_is_granted_net_admin() {
-        let holder = NetnsHolder::adopt("h".into());
+        let holder = NetnsHolder::adopt("h".into(), DockerCli::system());
         let sidecar = sidecar_argv(&holder, "netfilter");
         assert!(sidecar.windows(2).any(|w| w == ["--cap-add", "NET_ADMIN"]), "{sidecar:?}");
         // …and it still drops everything else first, so the grant is exactly one capability.
@@ -1567,7 +1808,7 @@ mod tests {
 
     #[test]
     fn the_sidecar_takes_the_plan_on_stdin_and_is_told_nothing_else() {
-        let holder = NetnsHolder::adopt("h".into());
+        let holder = NetnsHolder::adopt("h".into(), DockerCli::system());
         let sidecar = sidecar_argv(&holder, "netfilter");
         assert!(sidecar.iter().any(|a| a == "--interactive"), "no stdin: {sidecar:?}");
         // The image is the last word — no policy is passed as an argument.
@@ -1741,7 +1982,7 @@ mod tests {
     /// pinning the namespace open as the one container nothing can address.
     #[test]
     fn every_sidecar_is_named_so_a_cancelled_one_can_still_be_removed() {
-        let holder = NetnsHolder::adopt("maxplayer-netns-abc".into());
+        let holder = NetnsHolder::adopt("maxplayer-netns-abc".into(), DockerCli::system());
         let name = sidecar_name(holder.name(), "iface");
         for argv in [
             sidecar_argv(&holder, "netfilter"),
@@ -1792,7 +2033,7 @@ mod tests {
         assert!(err.contains("not a `docker run` argv"), "{err}");
         assert!(with_container_name(network_modes_argv(&["a".into()]), "x").is_err());
         // The positive control, so the refusal is not simply "always refuse".
-        let holder = NetnsHolder::adopt("h".into());
+        let holder = NetnsHolder::adopt("h".into(), DockerCli::system());
         assert!(with_container_name(sidecar_argv(&holder, "img"), "x").is_ok());
     }
 
@@ -1801,7 +2042,7 @@ mod tests {
     /// when it finishes, so a completed sidecar is not removed twice or reported as an orphan.
     #[test]
     fn a_joiner_is_tracked_while_it_runs_and_forgotten_when_it_finishes() {
-        let holder = NetnsHolder::adopt("maxplayer-netns-abc".into());
+        let holder = NetnsHolder::adopt("maxplayer-netns-abc".into(), DockerCli::system());
         let tracked = |holder: &NetnsHolder| -> Vec<String> {
             holder.sidecars.lock().expect("registry").clone()
         };
@@ -1882,7 +2123,7 @@ mod tests {
     fn a_cancelled_joiner_stays_a_cleanup_target() {
         use std::future::Future as _;
 
-        let holder = NetnsHolder::adopt("maxplayer-netns-cancelled".into());
+        let holder = NetnsHolder::adopt("maxplayer-netns-cancelled".into(), DockerCli::system());
         let name = sidecar_name(holder.name(), "iface");
         {
             let mut command = Box::pin(async {
@@ -1952,6 +2193,7 @@ mod tests {
     async fn a_command_that_outlives_its_deadline_is_killed_and_says_so() {
         let started = std::time::Instant::now();
         let outcome = run_bounded(
+            &DockerCli::system(),
             vec!["sleep".to_owned(), "30".to_owned()],
             None,
             std::time::Duration::from_secs(1),
@@ -1981,6 +2223,7 @@ mod tests {
     async fn a_program_that_cannot_be_started_fails_by_name() {
         let missing = "maxplayer-no-such-program-exists";
         let error = run_bounded(
+            &DockerCli::system(),
             vec![missing.to_owned()],
             None,
             std::time::Duration::from_secs(30),
@@ -2008,6 +2251,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn only_a_reaped_client_may_end_a_sidecars_custody() {
         let (outcome, child_exited) = run_bounded_tracked(
+            &DockerCli::system(),
             vec!["sh".to_owned(), "-c".to_owned(), "exit 7".to_owned()],
             None,
             std::time::Duration::from_secs(10),
@@ -2024,6 +2268,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         let (outcome, child_exited) = run_bounded_tracked(
+            &DockerCli::system(),
             vec!["sleep".to_owned(), "30".to_owned()],
             None,
             std::time::Duration::from_millis(400),
@@ -2065,7 +2310,7 @@ mod tests {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         }
 
-        let holder = NetnsHolder::adopt("maxplayer-netns-custody".into());
+        let holder = NetnsHolder::adopt("maxplayer-netns-custody".into(), DockerCli::system());
 
         // A client killed on the deadline: the daemon may still be creating or running the
         // container, so the name has to survive as a cleanup target.
@@ -2091,7 +2336,7 @@ mod tests {
         // The confirmer is injected rather than real. This used to call the production path, which
         // reached a live `docker inspect` from inside an offline unit test: the test passed only
         // because a daemon happened to answer, which is a dependency an offline suite must not have.
-        fn confirmed_gone(_name: &str) -> Option<bool> {
+        fn confirmed_gone(_client: &DockerCli, _name: &str) -> Option<bool> {
             Some(true)
         }
         run_sidecar_confirmed(
@@ -2136,11 +2381,11 @@ mod tests {
         std::fs::set_permissions(&failing, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
         /// Docker answering "that container is still here".
-        fn still_present(_name: &str) -> Option<bool> {
+        fn still_present(_client: &DockerCli, _name: &str) -> Option<bool> {
             Some(false)
         }
         /// Docker unable to answer at all — must be treated exactly like "still here".
-        fn cannot_tell(_name: &str) -> Option<bool> {
+        fn cannot_tell(_client: &DockerCli, _name: &str) -> Option<bool> {
             None
         }
 
@@ -2148,7 +2393,7 @@ mod tests {
             (still_present as ConfirmAbsent, "docker says the container is still there"),
             (cannot_tell as ConfirmAbsent, "docker cannot say whether it is there"),
         ] {
-            let holder = NetnsHolder::adopt("maxplayer-netns-err-custody".into());
+            let holder = NetnsHolder::adopt("maxplayer-netns-err-custody".into(), DockerCli::system());
             let outcome = run_sidecar_confirmed(
                 &holder,
                 "iface",
@@ -2197,11 +2442,11 @@ mod tests {
         std::fs::write(&suicide, "#!/bin/sh\nkill -9 $$\n").expect("write suicide");
         std::fs::set_permissions(&suicide, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
-        fn still_present(_name: &str) -> Option<bool> {
+        fn still_present(_client: &DockerCli, _name: &str) -> Option<bool> {
             Some(false)
         }
 
-        let holder = NetnsHolder::adopt("maxplayer-netns-signal-custody".into());
+        let holder = NetnsHolder::adopt("maxplayer-netns-signal-custody".into(), DockerCli::system());
         let outcome = run_sidecar_confirmed(
             &holder,
             "iface",
@@ -2234,34 +2479,12 @@ mod tests {
     // client, because the fault these close is precisely that a fixture was standing in for the
     // production path and could agree with a bug the production path does not survive.
 
-    /// The injected client is process-local, so the tests that set it run one at a time.
-    static DOCKER_INJECT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// The stand-in client, when a test has injected one.
-    static INJECTED_DOCKER: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-
-    /// Read by [`super::docker_program`] under `cfg(test)` only.
-    pub(super) fn injected_docker_program() -> Option<String> {
-        INJECTED_DOCKER.lock().unwrap_or_else(|poison| poison.into_inner()).clone()
-    }
-
-    /// Injects a stand-in client for the duration of one test, restoring production selection on
-    /// drop so a panicking test cannot leave the override set for anything that follows.
-    struct InjectedDocker;
-
-    impl InjectedDocker {
-        fn set(path: &std::path::Path) -> Self {
-            *INJECTED_DOCKER.lock().unwrap_or_else(|poison| poison.into_inner()) =
-                Some(path.to_string_lossy().into_owned());
-            Self
-        }
-    }
-
-    impl Drop for InjectedDocker {
-        fn drop(&mut self) {
-            *INJECTED_DOCKER.lock().unwrap_or_else(|poison| poison.into_inner()) = None;
-        }
-    }
+    // The stand-in client is passed to `establish_with` as an ARGUMENT. There is deliberately no
+    // lock and no shared cell here: the previous shape installed the client in a process-global,
+    // which meant every test that touched this path had to remember to take a mutex, any helper
+    // that ran outside one (cleanup from `Drop`, notably) read whatever another test had installed,
+    // and the tests below could not run in parallel. Passing it in removes the interference rather
+    // than serialising around it.
 
     /// A stand-in `docker` that answers `establish`'s sequence and records what it was asked.
     ///
@@ -2286,11 +2509,14 @@ case "$*" in
   *"rm --force --volumes"*)
     for a in "$@"; do last="$a"; done
     echo "$last" >> "$WORK/rm.log"
+    echo "rm $last" >> "$WORK/events.log"
     exit 0
     ;;
   *--detach*)
     : > "$WORK/creating"
+    echo "create-start" >> "$WORK/events.log"
     __DELAY__
+    echo "create-end" >> "$WORK/events.log"
     echo deadbeefcafe
     exit 0
     ;;
@@ -2327,12 +2553,12 @@ exit 0
     #[cfg(feature = "acp")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_address_establish_measures_is_the_address_its_plan_pinholes() {
-        let _serial = DOCKER_INJECT_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         let work = stand_in_work_dir("proxy");
         let script = stand_in_docker(&work, "");
 
-        let _injected = InjectedDocker::set(&script);
-        let outcome = establish(
+        let outcome = establish_with(
+            &DockerCli::stand_in(&script),
+            FenceBounds::production(),
             "mx-scratch",
             "holder:local",
             "sidecar:local",
@@ -2376,12 +2602,15 @@ exit 0
     #[cfg(feature = "acp")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_cancelled_establish_outlasts_its_create_and_removes_the_holder() {
-        let _serial = DOCKER_INJECT_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         let work = stand_in_work_dir("cancel");
         let script = stand_in_docker(&work, "sleep 1");
 
-        let _injected = InjectedDocker::set(&script);
-        let mut establishing = Box::pin(establish(
+        // Bound to the test, not to the call expression: the future below outlives the statement
+        // that builds it, so the client it borrows has to as well.
+        let client = DockerCli::stand_in(&script);
+        let mut establishing = Box::pin(establish_with(
+            &client,
+            FenceBounds::production(),
             "mx-scratch",
             "holder:local",
             "sidecar:local",
@@ -2427,6 +2656,99 @@ exit 0
         let _ = std::fs::remove_dir_all(&work);
     }
 
+    /// Cleanup whose wait for an in-flight create **times out** still removes only AFTER that create
+    /// has settled.
+    ///
+    /// This is the delayed path, and it is the one the previous version got wrong. It waited 30s for
+    /// a create the client itself allows 120s to run, and on expiry it removed anyway and printed
+    /// that the container might be LEAKED. Every part of that is the bug: the removal names a
+    /// container that does not exist yet, docker answers "No such container", cleanup treats that as
+    /// success, and the create then lands with nobody holding it. The log line did not make it safe;
+    /// it only made it documented.
+    ///
+    /// The bound is a parameter purely so this can be measured: `fast` expires here while the create
+    /// is still running, which is exactly the production shape at a scale a test can wait out. The
+    /// assertion is an ORDERING, not a duration — `rm` must appear after `create-end` in the client's
+    /// own event log — because the property under test is "never removes ahead of a live create",
+    /// and a stopwatch would pass for a version that simply slept longer before making the same
+    /// mistake.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cleanup_that_outwaits_its_bound_removes_only_after_the_create_settles() {
+        let work = stand_in_work_dir("late");
+        let script = stand_in_docker(&work, "sleep 1");
+        let client = DockerCli::stand_in(&script);
+        // `fast` expires mid-create; `max` is generous enough that the owner waits the create out.
+        let bounds = FenceBounds {
+            fast: std::time::Duration::from_millis(50),
+            max: std::time::Duration::from_secs(30),
+            confirm: std::time::Duration::from_secs(10),
+        };
+
+        let mut establishing = Box::pin(establish_with(
+            &client,
+            bounds,
+            "mx-scratch",
+            "holder:local",
+            "sidecar:local",
+            "host.docker.internal",
+            "late-cleanup",
+            "seat",
+            1000,
+            1000,
+            None,
+            false,
+            vec!["10.0.0.53".to_owned()],
+        ));
+
+        // Cancel on the create itself, so the drop below always lands while it is in flight.
+        let marker = work.join("creating");
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !marker.exists() {
+            tokio::select! {
+                _ = establishing.as_mut() => panic!("establish cannot finish against this client"),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
+            }
+            assert!(std::time::Instant::now() < give_up, "the create never started");
+        }
+        drop(establishing);
+
+        // The owner runs past this scope, so the removal is awaited here rather than assumed.
+        let events = work.join("events.log");
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let log = std::fs::read_to_string(&events).unwrap_or_default();
+            if log.contains("rm ") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < give_up,
+                "cleanup never removed the holder at all; the event log was {log:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let log = std::fs::read_to_string(&events).expect("the stand-in recorded its calls");
+        let lines: Vec<&str> = log.lines().collect();
+        let create_end = lines
+            .iter()
+            .position(|line| line.trim() == "create-end")
+            .expect("the create ran to completion");
+        let removed = lines
+            .iter()
+            .position(|line| line.starts_with("rm ") && line.contains("late-cleanup"))
+            .expect("cleanup removed the holder it created");
+        assert!(
+            removed > create_end,
+            "cleanup removed the holder at step {removed} but the create only settled at step \
+             {create_end}: the remove was issued ahead of a live create, which docker answers \
+             \"No such container\" and cleanup then treats as done — the container lands afterwards \
+             unowned. Event log:\n{log}"
+        );
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
     /// The same delayed-create failure, reproduced on the **sidecar** path rather than the holder's.
     ///
     /// This is the half that registration alone does not cover, and the distinction the R3 verdict
@@ -2450,11 +2772,11 @@ exit 0
         std::fs::write(&slow, "#!/bin/sh\nsleep 1\n").expect("write slow");
         std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
-        fn never_asked(_name: &str) -> Option<bool> {
+        fn never_asked(_client: &DockerCli, _name: &str) -> Option<bool> {
             panic!("a cancelled create must not reach the absence check")
         }
 
-        let holder = NetnsHolder::adopt("maxplayer-netns-sidecar-fence".into());
+        let holder = NetnsHolder::adopt("maxplayer-netns-sidecar-fence".into(), DockerCli::system());
 
         // Cancel the future ~100ms in, leaving roughly 900ms of blocking create still running.
         let cancelled = tokio::time::timeout(
@@ -2511,7 +2833,7 @@ exit 0
     fn cleanup_does_not_remove_ahead_of_a_create_that_is_still_in_flight() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let holder = NetnsHolder::adopt("maxplayer-netns-fence-probe".into());
+        let holder = NetnsHolder::adopt("maxplayer-netns-fence-probe".into(), DockerCli::system());
         let settled = std::sync::Arc::new(AtomicBool::new(false));
 
         let ticket = holder.fence_creation();

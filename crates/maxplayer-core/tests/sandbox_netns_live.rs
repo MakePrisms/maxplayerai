@@ -2782,3 +2782,198 @@ fn prepared_launch_for(
         )
         .expect("the policy must build a launch")
 }
+
+// ---------------------------------------------------------------------------------------------
+// The two legs the renewed round-1 verdict found missing: a proxy connection that actually
+// SUCCEEDS, and a cancellation resolved by the real daemon rather than by a stand-in.
+// ---------------------------------------------------------------------------------------------
+
+/// A real TCP listener on the host, accepting until the test drops it.
+///
+/// A listener in the test process rather than a container, because the leg under test is precisely
+/// container-to-HOST: a listener living on the docker network would prove the pinhole reaches
+/// another container, which is not where the credential proxy runs.
+struct HostListener {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HostListener {
+    fn bind(port: u16) -> Self {
+        let listener = std::net::TcpListener::bind(("0.0.0.0", port))
+            .unwrap_or_else(|error| panic!("could not bind the host listener on {port}: {error}"));
+        listener.set_nonblocking(true).expect("nonblocking");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                }
+            }
+        });
+        Self { stop, handle: Some(handle) }
+    }
+}
+
+impl Drop for HostListener {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// A contained job **actually reaches the credential proxy on the host**, through the pinhole
+/// production installed, under the gVisor runtime.
+///
+/// Every earlier live proxy test measured a DENIAL. Denial is the cheap half: a policy that drops
+/// everything passes all of them, and the job it contains cannot do its work. The half that was
+/// missing — and that the renewed round-1 verdict called out — is that the one address the job is
+/// supposed to reach is actually reachable. That is what this asserts first.
+///
+/// Both ports have a live listener on the host, and only one is inside `proxy_ports`. That is the
+/// control built into the run: a refused connection here cannot be blamed on an absent listener,
+/// and a permitted one cannot be blamed on a blanket allow, because the two legs differ only in
+/// whether the pinhole names the port.
+#[test]
+#[ignore = "needs docker, gVisor and the netfilter image"]
+fn a_contained_job_actually_connects_to_the_host_proxy_through_the_pinhole() {
+    let runtime_name = runsc_runtime();
+    let network = owned_name("net-proxy-reach");
+    let network = network.as_str();
+    let (ok, _, err) = docker(&["network", "create", "--label", &owner_label(), network], None);
+    assert!(ok, "could not create the test network: {err}");
+
+    // A multi-port range, which is the shape production ships and every other tc-path test uses.
+    // A single-port range is accepted by `PortRange` and documented by its parser, but renders
+    // `dst_port N-N`, which the tc flower classifier rejects outright ("max value should be greater
+    // than min value"); that is a separate production defect, reported rather than worked around
+    // here, and pinning this gate to it would only measure that bug instead of the proxy leg.
+    let pinhole = PortRange::new(49220, 49229).expect("valid range");
+    let allowed_port: u16 = 49221; // inside the pinhole
+    let denied_port: u16 = 49401; // outside it
+    let _allowed_listener = HostListener::bind(allowed_port);
+    let _denied_listener = HostListener::bind(denied_port);
+
+    let rt = tokio::runtime::Runtime::new().expect("a runtime");
+    let outcome = rt.block_on(maxplayer_core::sandbox_netns::establish(
+        network,
+        &holder_image(),
+        &netfilter_image(),
+        "host.docker.internal",
+        "live-proxy-reach",
+        "3333333333333333333333333333333333333333333333333333333333333333",
+        1000,
+        1000,
+        Some(pinhole),
+        true,
+        Vec::new(),
+    ));
+
+    let containment = match outcome {
+        Ok(containment) => containment,
+        Err(error) => {
+            remove_owned_network(network);
+            panic!("establish failed: {error}");
+        }
+    };
+    let holder = containment.holder.name().to_owned();
+    let proxy_host = containment.proxy_host.clone();
+    let netns = format!("container:{holder}");
+
+    let reached = connect_under(&runtime_name, &netns, &proxy_host, &allowed_port.to_string());
+    let refused = connect_under(&runtime_name, &netns, &proxy_host, &denied_port.to_string());
+
+    drop(containment);
+    remove_owned_network(network);
+
+    assert!(
+        reached,
+        "the contained job could NOT reach the proxy at {proxy_host}:{allowed_port}, the one \
+         address the pinhole exists to permit — a job under this policy cannot do its work"
+    );
+    assert!(
+        !refused,
+        "the contained job reached {proxy_host}:{denied_port}, which is OUTSIDE the pinhole: the \
+         permit is not confined to the port the policy names"
+    );
+}
+
+/// A cancelled `establish` leaves no holder behind **against the real docker daemon**.
+///
+/// The offline cancellation gate drives a stand-in client, which earns ordering credit and nothing
+/// more: a stand-in cannot show what a real daemon does with a create that was still running when
+/// its caller went away. Here the daemon is real, the create is real, and the question is answered
+/// by asking docker what containers exist afterwards.
+///
+/// The cancellation walks across the create window rather than firing once, because the window is
+/// short and a single fixed delay can miss it entirely — and a run that never cancelled mid-create
+/// would pass no matter what cleanup did. A leak in ANY attempt fails the gate.
+#[test]
+#[ignore = "needs docker and the netfilter image"]
+fn a_cancelled_establish_leaves_no_holder_behind_against_the_real_daemon() {
+    let network = owned_name("net-cancel-live");
+    let network = network.as_str();
+    let (ok, _, err) = docker(&["network", "create", "--label", &owner_label(), network], None);
+    assert!(ok, "could not create the test network: {err}");
+
+    let rt = tokio::runtime::Runtime::new().expect("a runtime");
+    let mut leaked: Vec<String> = Vec::new();
+    // Bound outside the future: it is polled to cancellation below, so anything it borrows has to
+    // outlive the statement that builds it.
+    let holder_image = holder_image();
+    let netfilter_image = netfilter_image();
+
+    for attempt in 0..5u32 {
+        let job = format!("live-cancel-{attempt}");
+        let holder = format!("maxplayer-netns-{job}");
+        let delay = std::time::Duration::from_millis(150 + u64::from(attempt) * 120);
+
+        rt.block_on(async {
+            let mut establishing = Box::pin(maxplayer_core::sandbox_netns::establish(
+                network,
+                &holder_image,
+                &netfilter_image,
+                "host.docker.internal",
+                &job,
+                "3333333333333333333333333333333333333333333333333333333333333333",
+                1000,
+                1000,
+                None,
+                true,
+                Vec::new(),
+            ));
+            tokio::select! {
+                _ = establishing.as_mut() => {}
+                _ = tokio::time::sleep(delay) => {}
+            }
+            drop(establishing); // the cancellation under test
+        });
+
+        // A create that outlived the cancellation can still land, so absence is asked for over a
+        // window rather than sampled once the instant the drop returns.
+        let gone = wait_until(30, || {
+            let (_, listed, _) = docker(
+                &["ps", "--all", "--quiet", "--filter", &format!("name={holder}")],
+                None,
+            );
+            listed.is_empty()
+        });
+        if !gone {
+            leaked.push(holder.clone());
+            remove_owned_container(&holder);
+        }
+    }
+
+    remove_owned_network(network);
+    assert!(
+        leaked.is_empty(),
+        "a cancelled establish left {leaked:?} running against the real daemon: the create landed \
+         after cleanup had already given up on it, and nothing owns those namespaces now"
+    );
+}
