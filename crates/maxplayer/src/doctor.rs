@@ -4344,6 +4344,7 @@ mod tests {
             // reason for the check to move.
             file_credentials: Vec::new(),
             mcp_tools: Vec::new(),
+            held_tool: None,
             // Same decision and the same reason: a host ChatGPT session is a containment concern,
             // and reading one here would give the check a second reason to move.
             codex_chatgpt: None,

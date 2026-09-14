@@ -895,6 +895,30 @@ sandbox image, and a real agent turn; the bundle is `evidence/20260914T085619Z-g
 `docs/specs/seller-tool-onboarding/10-routing-and-options.md`. Another vendor is another
 acceptance run.
 
+### Hold a vendor CLI for jobs — the Holder (`[sandbox.held_tool]`)
+
+A docker seat can hold a vendor CLI logged in, in its own persistent holder container the daemon
+starts at boot and stops at shutdown, and offer the operations you declare to every job over a
+per-job Unix socket. The credential and the login live in the holder; a job gets its own socket and
+the declared operations, nothing else. The login persists in the holder's state volume across
+restarts, so the tool enrols once. The kit is `crates/maxplayer-tool-kit`; its `templates/README.md`
+says how to declare the operations.
+
+```toml
+[sandbox.held_tool]
+image = "my-holder:latest"                            # tool-holderd + holderctl + your vendor CLI
+config = "/home/seller/.config/maxplayer/seller-tool-config.json"   # the offering
+credential_file = "/home/seller/.config/maxplayer/vendor-cred.json" # host file; mounted read-only into the holder only
+# network = "maxplayer-tools"                         # the holder must reach the vendor
+# required = false                                    # true: refuse to boot or run a job without it
+```
+
+Needs Docker Engine 26 or newer (the socket reaches the job through a volume subpath mount; boot
+probes for it). The boot line says `HEALTHY, enrolled` on the first boot and `HEALTHY, resumed the
+persisted login` after; `UNHEALTHY` names the vendor's answer. The agent sees an MCP server named
+`seller-tool`. Proved live through the daemon code against the kit's fake vendor on 2026-09-14
+(`evidence/20260914T095551Z-holder-route/`); a real vendor CLI is its own acceptance run.
+
 ### `launcher` mode — only if this box cannot run docker
 
 The launcher below is `bwrap` (bubblewrap), and it is not present on a stock box. Install it before

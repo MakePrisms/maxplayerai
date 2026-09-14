@@ -557,8 +557,8 @@ fn drive_acp_agent(
     workdir: &Path,
 ) -> Result<AgentOutcome, OrchestratorError> {
     use crate::seller_exec::{
-        AgentRunTimeout, ExecError, SandboxPolicy, run_agent_job_in_env, run_agent_with_retry,
-        unified_job_timeout,
+        AgentRunTimeout, ExecError, JobAttachments, SandboxPolicy, run_agent_job_in_env,
+        run_agent_with_retry, unified_job_timeout,
     };
     let identity = DeliveryAgentIdentity::for_seller(&inputs.seller_pubkey_hex);
     let env = agent_env_allowlist(&inputs.agent_env_names, &identity, |key| {
@@ -585,7 +585,8 @@ fn drive_acp_agent(
                 &identity,
                 AgentRunTimeout::JobDeadline(timeout),
                 Some(env.clone()),
-                inputs.mcp_servers.clone(),
+                // Servers only: the HOST mounted this container, so there is nothing to mount here.
+                JobAttachments { mcp_servers: inputs.mcp_servers.clone(), extra_mounts: Vec::new() },
             )
         },
     ));

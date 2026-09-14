@@ -114,6 +114,10 @@ pub mod seller_agents;
 /// own module (with a neutral error) so the run loop stays focused on the relay surface.
 #[cfg(feature = "wallet")]
 pub mod seller_exec;
+/// The Holder route's daemon side: one supervised holder container per seat, and a per-job socket
+/// attached and detached around each job. `wallet`, like `seller_exec`, its only caller.
+#[cfg(feature = "wallet")]
+pub mod held_tool;
 /// Host-side credential-containment proxy (#647): the real model credential never enters a
 /// docker-mode job's container. A per-job placeholder is forwarded in its place and substituted for
 /// the real value at egress, only for an allowlisted upstream. Gated to `wallet` like its sole caller

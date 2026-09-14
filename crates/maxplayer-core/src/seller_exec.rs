@@ -338,6 +338,46 @@ pub struct JobLaunch<'a> {
     pub mcp_servers: &'a [crate::driver::McpServer],
 }
 
+/// One bind or volume mount a docker launch adds after the workdir mount.
+///
+/// Two shapes because the two things a job may be handed live in different places. The
+/// container-delivery exchange directory is a HOST directory ([`Self::Bind`]). A held tool's per-job
+/// socket lives inside the holder's runtime VOLUME, in a directory the holder created after it
+/// started ([`Self::VolumeSubpath`]) — a bind mount cannot reach it, and mounting the whole volume
+/// would hand a job every other job's socket. `volume-subpath` needs Docker Engine 26 or newer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtraMount {
+    /// `-v <host>:<container>`, read-write.
+    Bind { host: PathBuf, container: String },
+    /// `--mount type=volume,src=<volume>,dst=<container>,volume-subpath=<subpath>`, read-write.
+    VolumeSubpath { volume: String, subpath: String, container: String },
+}
+
+impl ExtraMount {
+    /// The docker argv fragment for this mount.
+    pub fn argv(&self) -> Vec<String> {
+        match self {
+            Self::Bind { host, container } => {
+                vec!["-v".into(), format!("{}:{container}", host.display())]
+            }
+            Self::VolumeSubpath { volume, subpath, container } => vec![
+                "--mount".into(),
+                format!("type=volume,src={volume},dst={container},volume-subpath={subpath}"),
+            ],
+        }
+    }
+}
+
+/// What a caller attaches to one job beyond the agent command: MCP servers for the agent's
+/// session, and mounts for the job container. Empty for a job with no tool; the Holder route fills
+/// both (its socket mount and its bridge entry), the container-delivery orchestrator fills only the
+/// servers (the host already mounted its container).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JobAttachments {
+    pub mcp_servers: Vec<crate::driver::McpServer>,
+    pub extra_mounts: Vec<ExtraMount>,
+}
+
 /// What the ACP driver spawns: the process `program` + `args`, and the `cwd` the ACP session runs
 /// in. `cwd` is the host workdir for a host launch, and the in-container mount point for a docker
 /// launch (the host path does not exist inside the container).
@@ -769,16 +809,16 @@ impl SandboxPolicy {
         self.launch_with_mounts(agent_command, job, &[])
     }
 
-    /// [`Self::launch`] with extra read-write bind mounts for a docker launch: `(host_dir,
-    /// container_path)` pairs added after the workdir mount. A host executor has no mount namespace
-    /// to add to and ignores them. The container-delivery launch mounts its per-job exchange
-    /// directory this way; the agent launch adds nothing — so ONE argv builder still serves both, and
-    /// the only difference between the two launches is the command and this list.
+    /// [`Self::launch`] with extra read-write mounts for a docker launch ([`ExtraMount`]), added after
+    /// the workdir mount. A host executor has no mount namespace to add to and ignores them. The
+    /// container-delivery launch mounts its per-job exchange directory this way, and a held tool
+    /// mounts the job's socket directory — so ONE argv builder still serves every launch, and the
+    /// only difference between them is the command and this list.
     pub fn launch_with_mounts(
         &self,
         agent_command: &[String],
         job: &JobLaunch<'_>,
-        extra_mounts: &[(PathBuf, String)],
+        extra_mounts: &[ExtraMount],
     ) -> Result<AgentLaunch, ExecError> {
         if agent_command.is_empty() {
             return Err(ExecError::Config("agent_command empty".into()));
@@ -854,14 +894,15 @@ impl DockerPolicy {
     /// is the boundary there). The named runtime must be registered with the daemon, or the run fails
     /// at spawn — a fail-closed the seller boot doctor is meant to catch first.
     ///
-    /// `extra_mounts` — further read-write bind mounts, `(host_dir, container_path)`, after the
-    /// workdir. Empty for the agent launch. The container-delivery launch passes its exchange
-    /// directory, which lives OUTSIDE the workdir so the deliverable never contains it.
+    /// `extra_mounts` — further read-write mounts ([`ExtraMount`]) after the workdir. Empty for a
+    /// plain agent launch. The container-delivery launch passes its exchange directory, which lives
+    /// OUTSIDE the workdir so the deliverable never contains it; a held tool passes the job's own
+    /// socket directory out of the holder's runtime volume.
     fn run_argv(
         &self,
         agent_command: &[String],
         job: &JobLaunch<'_>,
-        extra_mounts: &[(PathBuf, String)],
+        extra_mounts: &[ExtraMount],
     ) -> Vec<String> {
         let mut argv: Vec<String> = vec!["docker".into(), "run".into(), "-i".into()];
         // Runtime first, so it is unambiguously a `docker run` flag and not read as the image.
@@ -914,9 +955,8 @@ impl DockerPolicy {
             "-w".into(),
             CONTAINER_WORKDIR.into(),
         ]);
-        for (host_dir, container_path) in extra_mounts {
-            argv.push("-v".into());
-            argv.push(format!("{}:{container_path}", host_dir.display()));
+        for mount in extra_mounts {
+            argv.extend(mount.argv());
         }
         // Egress containment (#797): join the namespace a holder container already owns, where the
         // rendered policy is in force BEFORE this process exists — the rules are not applied to the
@@ -2460,19 +2500,20 @@ pub async fn run_agent_job_with_env(
         identity,
         timeout,
         agent_env,
-        Vec::new(),
+        JobAttachments::default(),
     )
     .await
 }
 
-/// [`run_agent_job_with_env`], plus MCP servers the caller carries in for the agent's session.
+/// [`run_agent_job_with_env`], plus what the caller attaches to the job ([`JobAttachments`]): MCP
+/// servers for the agent's session, and mounts for the container.
 ///
 /// The session gets the union of two lists: what [`prepare_launch`] minted for THIS launch (a
 /// vendor tool behind the proxy, when the policy is docker and `[sandbox] mcp_tools` names one) and
-/// `mcp_servers`. The second list exists for the container-side delivery orchestrator: the HOST
-/// prepared the container and minted the placeholders, and inside the container the policy is
-/// pass-through and mints nothing, so the orchestrator hands the host's list back in here. Every
-/// other caller passes an empty list.
+/// the caller's `attachments.mcp_servers`. Two callers fill the second: the seller node, for a held
+/// tool (the bridge entry, with the job's socket directory in `extra_mounts`), and the container-side
+/// delivery orchestrator, which hands back the list the HOST minted, because inside the container the
+/// policy is pass-through and mints nothing.
 #[cfg(feature = "acp")]
 #[allow(clippy::too_many_arguments)]
 pub async fn run_agent_job_in_env(
@@ -2483,7 +2524,7 @@ pub async fn run_agent_job_in_env(
     identity: &DeliveryAgentIdentity,
     timeout: AgentRunTimeout,
     agent_env: Option<Vec<(String, String)>>,
-    mcp_servers: Vec<crate::driver::McpServer>,
+    attachments: JobAttachments,
 ) -> Result<AgentRunReport, ExecError> {
     use crate::driver::{AcpDriver, AgentCommand, ContentBlock, PromptTurn, SessionConfig};
     use crate::engine::{run_job, RunParams};
@@ -2492,16 +2533,16 @@ pub async fn run_agent_job_in_env(
 
     let prepared = prepare_launch(agent_command, policy, workdir, identity, timeout.duration()).await?;
     let mut session_mcp_servers = prepared.mcp_servers.clone();
-    session_mcp_servers.extend(mcp_servers);
+    session_mcp_servers.extend(attachments.mcp_servers);
     let job = JobLaunch {
         workdir,
         env: &prepared.env,
         uid: prepared.uid,
         gid: prepared.gid,
         netns: prepared.holder_name.as_deref(),
-        mcp_servers: &prepared.mcp_servers,
+        mcp_servers: &session_mcp_servers,
     };
-    let launch = policy.launch(&prepared.effective_command, &job)?;
+    let launch = policy.launch_with_mounts(&prepared.effective_command, &job, &attachments.extra_mounts)?;
     // The ACP idle/response timeout IS the unified job timeout — never a hardcoded 300s that could
     // override or conflict with `--job-timeout-secs`.
     let mut agent = AgentCommand::new(launch.program, launch.args);
@@ -3654,7 +3695,7 @@ pub async fn run_agent_job_in_env(
     _identity: &DeliveryAgentIdentity,
     _timeout: AgentRunTimeout,
     _agent_env: Option<Vec<(String, String)>>,
-    _mcp_servers: Vec<crate::driver::McpServer>,
+    _attachments: JobAttachments,
 ) -> Result<AgentRunReport, ExecError> {
     Err(ExecError::AcpRequired)
 }

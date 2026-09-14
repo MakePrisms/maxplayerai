@@ -6,8 +6,10 @@ findings, and the plan for the production integration that remains.
 
 Author: Petar's local agent, 2026-09-10.
 
-**Current state:** section 10 — the Proxy swap route is coded, tested, and accepted against GitHub
-(2026-09-14). Nothing on this branch is pushed. Read section 10 first if you are resuming.
+**Current state:** sections 10 and 11 — the Proxy swap route is coded, tested, and accepted against
+GitHub (2026-09-14); the Holder route is wired into the daemon and proved live through the daemon
+code (2026-09-14). Nothing on this branch is pushed. Read sections 10 and 11 first if you are
+resuming.
 
 ## 1. What changed since `a0cc31d`
 
@@ -103,7 +105,7 @@ old F3 lifecycle probe. A fresh demo run writes a new bundle with the F1, F3, an
 | Worked example A (file CLI) | The demo and `fixtures/seller-tool-config.json` are the runnable Walk A. |
 | Worked example B (HTTP) | Deferred. HTTP profiles are deferred in specs 03 and 06. |
 
-## 7. Production integration plan (still owed)
+## 7. Production integration plan (implemented 2026-09-14 — see section 11)
 
 A detailed, code-grounded version of this plan is in
 [`../specs/seller-tool-onboarding/09-production-integration.md`](../specs/seller-tool-onboarding/09-production-integration.md).
@@ -302,3 +304,48 @@ What is NOT covered, stated plainly: one vendor; one credential shape (static, h
 agent turn with one tool call. A broad credential still needs a trusted operation filter (the
 Holder shape for a remote tool), which is not built. The Holder-route production integration
 (section 7, doc 09) remains separate and not started.
+
+## 11. Holder route production integration (done 2026-09-14)
+
+Petar, 2026-09-14: "continue with the remaining planned work". The largest remaining piece was the
+Holder route's production integration (section 7, doc 09). It is implemented and proved live through
+the real daemon code. The bundle is `evidence/20260914T095551Z-holder-route/`; doc 09 now opens with what the implementation does
+differently from the plan and why.
+
+What was built:
+
+- `crates/maxplayer-core/src/held_tool.rs`: `HeldTool::start` (remove a stale holder, create the two
+  volumes, a one-shot root `chown` so the holder can own them as the job uid, `docker run -d` the
+  holder, wait for `holderctl status`, probe that this daemon can mount a volume subpath),
+  `HeldTool::attach` → `JobToolEndpoint` (the bridge entry and the `jobs/<job>` subpath mount),
+  `JobToolEndpoint::detach`, `HeldTool::shutdown` (polite stop, remove the container and the runtime
+  volume, keep the state volume), `Drop` fallbacks for both. Pure argv builders, unit-tested.
+- `home.rs`: `[sandbox.held_tool]` → `HeldToolConfig` with `image`, `config`, `credential_file`,
+  `vendor_base_url`, `vendor_cli`, `network`, `server_name`, `required`. Refusals: relative or missing
+  host paths, an empty image.
+- `seller_exec.rs`: `ExtraMount` (`Bind`, `VolumeSubpath`) replaces the `(PathBuf, String)` mount pair;
+  `JobAttachments` (`mcp_servers`, `extra_mounts`) is what `run_agent_job_in_env` takes.
+- `seller_node/run.rs`: the runner holds `held_tool: Option<Arc<HeldTool>>`; boot starts it before
+  anything goes on the wire (required → refuse the boot; optional → log and serve without); both job
+  paths attach after the workdir exists and detach after the run; `run_loop` shuts it down after the
+  retraction. The container-delivery path adds the socket mount beside the exchange directory and hands
+  the bridge entry to the orchestrator through `Phase1Inputs.mcp_servers`.
+- `docker/maxplayer-sandbox/Dockerfile`: `tool-mcp-bridge` installed beside `mcp-http-bridge`.
+
+Live tests (`#[ignore]`d, `held_tool::live_tests`): two jobs on one enrolment with job B under egress
+containment, an escape refused, a restart that resumed the login (vendor `login_count` 1 throughout);
+and a real `claude-agent-acp` turn that called `mcp__seller-tool__transform-file` through the socket
+bridge. The vendor counters are the oracle; the vendor is the kit's fake, so this is the mechanism
+through production code, not third-party acceptance.
+
+Two facts measured on the way, both recorded in the code:
+
+- A named volume first mounted over a directory that exists in the image is initialized from it, and a
+  `chown` of the volume root in that first container is lost (Docker Desktop 29). The holder's volumes
+  therefore mount at `/var/lib/maxplayer-holder` and `/run/maxplayer-holder`, paths no image ships.
+- The per-job socket reaches the job through a `volume-subpath` mount, which needs Docker Engine 26 or
+  newer; boot probes for it once.
+
+What remains, stated plainly: one held tool per seat (a list is a config change and a socket per tool);
+real-vendor acceptance of a real CLI inside a seller-built holder image, per vendor; and the branch
+delivery (push, pull request, review), which needs Petar's go.

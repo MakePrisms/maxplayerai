@@ -1,8 +1,26 @@
-# 09 — Production integration plan
+# 09 — Production integration plan — IMPLEMENTED 2026-09-14
 
-This document is a detailed, code-grounded plan for wiring the seller-tool holder into the product.
-It follows section 7 of `../../handoff/CONTINUATION-2026-09-10.md`. Every site named here was read
-in the source on 2026-09-10.
+**Status.** This plan was implemented on 2026-09-14 and proved live through the real daemon code:
+`crates/maxplayer-core/src/held_tool.rs`, wired into `seller_node/run.rs` (boot, both job paths,
+shutdown). The bundle is [`evidence/20260914T095551Z-holder-route/`](../../../evidence/20260914T095551Z-holder-route/README.md). The text below is the plan as
+written on 2026-09-10; the next section lists where the implementation differs from it, and why.
+
+## What the implementation does differently from this plan
+
+| Plan | Implementation | Why |
+| --- | --- | --- |
+| `SellerConfig.held_tool` | `[sandbox.held_tool]` on `SandboxConfig` (`HeldToolConfig` in `home.rs`) | `SellerConfig`'s literal lives in the money-path `seller.rs`, which nothing here may touch; and the feature is docker-only, like `mcp_tools`. |
+| The daemon reaches the holder's control socket over the shared runtime volume | `docker exec <holder> holderctl … --socket /run/maxplayer-holder/holder.sock` | A Unix socket on a bind mount does not cross the Docker Desktop VM boundary. The demo already used `docker exec`. |
+| The job mounts `<runtime>/jobs/<job_id>` from the host | A volume SUBPATH mount: `--mount type=volume,src=<runtime volume>,dst=/run/holder,volume-subpath=jobs/<job>` (`ExtraMount::VolumeSubpath`) | The holder's runtime is a named volume, and the job's socket directory is created after the holder started; a bind mount cannot reach it, and mounting the whole volume would hand a job every other job's socket. Needs Docker Engine 26 or newer; boot probes for it. |
+| Holder volumes at `/run/holder` and `/var/lib/holder` | `/run/maxplayer-holder` and `/var/lib/maxplayer-holder` | Measured: a named volume first mounted over a directory that exists in the image is initialized from it, and a `chown` of the volume root in that first container is lost. The holder runs as the job uid and must own its volumes. |
+| A `JobToolEndpoint` guard around `run_agent_job` | `HeldTool::attach` before the run, `JobToolEndpoint::detach` after, on BOTH job paths (host agent launch and container delivery); `Drop` is the fallback | The container-delivery path launches through `launch_with_mounts` and hands the bridge entry to the orchestrator in `Phase1Inputs.mcp_servers`, so both paths needed the wiring, not one. |
+| `run_agent_job` gains the mount and the server | `run_agent_job_in_env(…, JobAttachments)`: the caller attaches `mcp_servers` and `extra_mounts` | One shape serves the Proxy swap route (servers only), the Holder route (a server and a mount), and the orchestrator. |
+| The holder runs as root inside its container (unstated) | `--user <job uid>:<gid>`, and a one-shot root `chown` of the fresh volumes | The holder publishes outputs into the job's directory with mode 0600; a root holder would publish files the job cannot read. |
+
+The fail posture is the recommended one: an optional tool that cannot start or attach is logged and
+the seat serves without it; `required = true` refuses the boot or the job.
+
+## The plan as written on 2026-09-10
 
 Land all five steps together. Step 5 alone points every job at a socket that does not exist, so job
 start fails. Gate the whole feature on a per-seat config: a seat with no held tool behaves exactly

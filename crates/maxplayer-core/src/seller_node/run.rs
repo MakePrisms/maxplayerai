@@ -47,7 +47,8 @@ use crate::seller::rate_gate_allows;
 use crate::seller_agents::AgentRegistry;
 use crate::seller_exec::{
     cleanup_job_container, compose_agent_prompt, delivery_message, job_container_name, job_id_of,
-    job_identity, job_workdir, prepare_launch, run_agent_job, run_agent_with_retry,
+    job_identity, job_workdir, prepare_launch, run_agent_job, run_agent_job_in_env,
+    run_agent_with_retry, ExtraMount,
     seller_delivery_kind,
     seller_exec_metadata, unified_job_timeout, AgentRunTimeout, CleanupPolicy, ExecError,
     JobContainer, JobLaunch, SandboxPolicy, CONTAINER_WORKDIR,
@@ -3748,6 +3749,10 @@ pub struct SellerNodeRunner {
     agents: Arc<LiveRoster>,
     /// Homogeneous execution-slot admission (reserve-at-claim). Behind an `Arc` so it is shared with
     /// the off-loop execution tasks; see [`SlotGate`].
+    /// The seat's held tool (the Holder route, `[sandbox.held_tool]`): a holder container this
+    /// daemon started at boot and stops at shutdown. `None` when the seat holds no tool, or holds
+    /// an OPTIONAL one that did not start (logged at boot).
+    held_tool: Option<Arc<crate::held_tool::HeldTool>>,
     slots: Arc<SlotGate>,
     /// #450: armed when an offer is skipped because every slot is busy (`SlotsBusy`). The drain tick
     /// consumes it once a slot frees to re-run the offer backfill, so a capacity-skipped offer is
@@ -4016,6 +4021,42 @@ impl SellerNodeRunner {
         // and narrows from there as harnesses prove they cannot deliver.
         let agents = Arc::new(LiveRoster::new(boot_agent_registry(node.home())?));
 
+        // The Holder route: start the seat's holder container BEFORE anything goes on the wire, so a
+        // REQUIRED tool that cannot start refuses the boot rather than a seat that advertises and
+        // fails every job. An optional tool that cannot start is logged, and the seat serves without
+        // it — the posture a vendor outage would give.
+        let held_tool = match node.home().config.sandbox.as_ref().and_then(|sandbox| sandbox.held_tool.as_ref()) {
+            None => None,
+            Some(cfg) => {
+                let (uid, gid) = job_identity();
+                let jobs_root = node.home().root.join("seller-jobs");
+                match crate::held_tool::HeldTool::start(cfg, node.seller_pubkey(), &jobs_root, uid, gid).await {
+                    Ok(tool) => {
+                        opline!("{}", tool.boot_line());
+                        if cfg.required && !tool.status().healthy {
+                            tool.shutdown().await;
+                            return Err(NodeError::Sandbox(format!(
+                                "[sandbox] held_tool is required and the holder is unhealthy: {}",
+                                tool.status().health_detail
+                            )));
+                        }
+                        Some(Arc::new(tool))
+                    }
+                    Err(error) if cfg.required => {
+                        return Err(NodeError::Sandbox(format!(
+                            "[sandbox] held_tool is required and did not start: {error}"
+                        )));
+                    }
+                    Err(error) => {
+                        opline!(
+                            "seller node: [sandbox] held_tool UNAVAILABLE — this seat serves without it: {error}"
+                        );
+                        None
+                    }
+                }
+            }
+        };
+
         // Reconcile durable state before serving anything live: expire stale outbox rows, report the
         // non-terminal jobs that resume. Reconcile must NOT release parked claims (invariant 5).
         match node.reconcile_on_start(now_unix()) {
@@ -4099,6 +4140,7 @@ impl SellerNodeRunner {
             seller_pubkey,
             boot_auth,
             agents,
+            held_tool,
             slots,
             capacity_skip_pending: std::sync::atomic::AtomicBool::new(false),
             delivery_push_lock: tokio::sync::Mutex::new(()),
@@ -4550,7 +4592,37 @@ impl SellerNodeRunner {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self.publish_retraction().await;
         self.drain_remit_in_flight().await;
+        // The held tool follows the daemon: stopping the daemon is the one thing that takes the tool
+        // away. Its login persists in the state volume for the next boot.
+        if let Some(tool) = &self.held_tool {
+            tool.shutdown().await;
+        }
         served
+    }
+
+    /// Attach the seat's held tool for `job_id`, when there is one. `Ok(None)` when the seat holds no
+    /// tool, or holds an OPTIONAL one that could not be attached (logged; the job runs without it).
+    /// `Err` only for a REQUIRED tool that cannot be attached: that job must not run without it.
+    /// The job's workdir must exist on the host before this call — the holder canonicalizes it.
+    async fn attach_held_tool(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<crate::held_tool::JobToolEndpoint>, String> {
+        let Some(tool) = &self.held_tool else {
+            return Ok(None);
+        };
+        match tool.attach(job_id).await {
+            Ok(endpoint) => Ok(Some(endpoint)),
+            Err(error) if tool.required() => {
+                Err(format!("the required held tool could not be attached ({error})"))
+            }
+            Err(error) => {
+                opline!(
+                    "seller node execute job_id={job_id}: held tool not attached, running without it ({error})"
+                );
+                Ok(None)
+            }
+        }
     }
 
     async fn serve(self: Arc<Self>) -> Result<(), NodeError> {
@@ -7103,6 +7175,21 @@ impl SellerNodeRunner {
                     return;
                 }
             };
+            // The seat's held tool, attached for this job's life (the Holder route): the job gets its
+            // own socket directory mounted and one MCP server entry that spawns the bridge. The
+            // workdir exists now, which the holder needs to record the job's directory.
+            let tool_endpoint = match self.attach_held_tool(job_id).await {
+                Ok(endpoint) => endpoint,
+                Err(error) => {
+                    opline!("seller node execute fail job_id={job_id}: {error}");
+                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None).await;
+                    return;
+                }
+            };
+            let attachments = tool_endpoint
+                .as_ref()
+                .map(crate::held_tool::JobToolEndpoint::attachments)
+                .unwrap_or_default();
             let run_started = std::time::Instant::now();
             let run_result = run_agent_with_retry(
                 deadline,
@@ -7110,17 +7197,23 @@ impl SellerNodeRunner {
                 || now_unix() as u64,
                 |_attempt| {
                     let job_timeout = unified_job_timeout(deadline, now_unix() as u64);
-                    run_agent_job(
+                    run_agent_job_in_env(
                         &agent_command,
                         &sandbox,
                         &prompt,
                         &workdir,
                         &identity,
                         AgentRunTimeout::JobDeadline(job_timeout),
+                        None,
+                        attachments.clone(),
                     )
                 },
             )
             .await;
+            // Job end detaches the socket. The tool stays enrolled — that is the model.
+            if let Some(endpoint) = tool_endpoint {
+                endpoint.detach().await;
+            }
             let wall_time_ms = run_started.elapsed().as_millis() as u64;
             let report = match run_result {
                 Ok(report) => report,
@@ -7483,6 +7576,15 @@ impl SellerNodeRunner {
         let io_dir = container_exchange_dir(&self.node.home().root, job_id);
         orch::create_exchange_dir(&io_dir).map_err(|error| Fail::Setup(error.to_string()))?;
 
+        // The seat's held tool, attached for the container's life (the Holder route). The workdir
+        // exists now, which the holder needs; the container gets the job's socket directory as one
+        // more mount, and the orchestrator hands the agent the bridge entry.
+        let tool_endpoint = self.attach_held_tool(job_id).await.map_err(Fail::Setup)?;
+        let attachments = tool_endpoint
+            .as_ref()
+            .map(crate::held_tool::JobToolEndpoint::attachments)
+            .unwrap_or_default();
+
         // Containment (#797) and the credential proxy (#647), exactly as the agent launch prepares
         // them. The proxy is a host process; the container reaches it over the network. The
         // placeholders must outlive the push, hence the margin on the lifetime.
@@ -7518,6 +7620,8 @@ impl SellerNodeRunner {
         let nonce = random_nonce_hex().map_err(Fail::Setup)?;
         let fresh_mode = matches!(push_token, orch::PushTokenSource::FreshAfterAgent { .. });
 
+        let mut session_servers = prepared.mcp_servers.clone();
+        session_servers.extend(attachments.mcp_servers.iter().cloned());
         let inputs = orch::Phase1Inputs {
             job_hash,
             seller_pubkey_hex: identity.seller_pubkey_hex().to_owned(),
@@ -7534,9 +7638,10 @@ impl SellerNodeRunner {
             // C4: names only. The orchestrator hands the agent these (values from the container
             // environment), the runtime baseline, and the git identity — nothing else.
             agent_env_names: prepared.env.iter().map(|(key, _)| key.clone()).collect(),
-            // The Proxy swap vendor tools, minted with the containment above. Placeholders and the
-            // proxy's address only; the orchestrator attaches them to the agent's session.
-            mcp_servers: prepared.mcp_servers.clone(),
+            // The Proxy swap vendor tools minted with the containment above (placeholders and the
+            // proxy's address only), plus the held tool's bridge entry; the orchestrator attaches
+            // them to the agent's session.
+            mcp_servers: session_servers.clone(),
             relay_url: seller.git_remote.clone(),
             push_token,
             handoff_nonce: nonce.clone(),
@@ -7567,14 +7672,16 @@ impl SellerNodeRunner {
             uid: prepared.uid,
             gid: prepared.gid,
             netns: prepared.holder_name.as_deref(),
-            mcp_servers: &prepared.mcp_servers,
+            mcp_servers: &session_servers,
         };
+        // The exchange directory, then whatever the held tool attaches (its socket directory).
+        let mut mounts = vec![ExtraMount::Bind {
+            host: io_dir.clone(),
+            container: orch::CONTAINER_EXCHANGE_DIR.to_owned(),
+        }];
+        mounts.extend(attachments.extra_mounts.iter().cloned());
         let launch = sandbox
-            .launch_with_mounts(
-                &orchestrator,
-                &job,
-                &[(io_dir.clone(), orch::CONTAINER_EXCHANGE_DIR.to_owned())],
-            )
+            .launch_with_mounts(&orchestrator, &job, &mounts)
             .map_err(|error| Fail::Setup(format!("container argv: {error}")))?;
         // Adopted BEFORE the spawn: `docker run` can fail after creating the container.
         let container = JobContainer::adopt(job_container_name(&job_id_of(workdir)));
@@ -7671,6 +7778,10 @@ impl SellerNodeRunner {
             CleanupPolicy::CaptureThenRemove,
         )
         .await;
+        // The container is gone; the job's socket goes with it. The tool stays enrolled.
+        if let Some(endpoint) = tool_endpoint {
+            endpoint.detach().await;
+        }
         // The container exited between two polls: the marker may not have been read yet.
         if marker.is_none()
             && let Ok(Some(seen)) = orch::read_agent_done_marker(&io_dir, &nonce)
