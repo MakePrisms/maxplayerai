@@ -878,6 +878,30 @@ filter protocol ipv6 pref 111 flower chain 0 handle 0x1
                 "Sent 168 bytes 4 pkt (dropped 4, overlimits 0 requeues 0) ",
                 "Sent 168 bytes 4 pkt (dropped 4, overlimits 0 requeues 0) dst_ip 0.0.0.0/0",
             ),
+            // R2, F1: the blacklist that preceded this grammar asked only whether a statistics
+            // line contained a RECOGNISED predicate, so a narrowing key it had never heard of rode
+            // through untouched and left the verification unchanged. `src_ip` is that key: it is in
+            // neither token list, and it narrows the rule to one source.
+            (
+                "a source narrowing appended to a statistics line",
+                "Sent 168 bytes 4 pkt (dropped 4, overlimits 0 requeues 0) ",
+                "Sent 168 bytes 4 pkt (dropped 4, overlimits 0 requeues 0) src_ip 192.0.2.123",
+            ),
+            (
+                "the same narrowing in its IPv6 spelling",
+                "Sent 168 bytes 4 pkt (dropped 4, overlimits 0 requeues 0) ",
+                "Sent 168 bytes 4 pkt (dropped 4, overlimits 0 requeues 0) src_ip 2001:db8::123",
+            ),
+            (
+                "arbitrary text no list will ever contain",
+                "Sent 168 bytes 4 pkt (dropped 4, overlimits 0 requeues 0) ",
+                "Sent 168 bytes 4 pkt (dropped 4, overlimits 0 requeues 0) frobnicate 7",
+            ),
+            (
+                "a counter replaced by something that is not a count",
+                "Sent 168 bytes 4 pkt (dropped 4, overlimits 0 requeues 0) ",
+                "Sent 168 bytes 4 pkt (dropped dst_ip, overlimits 0 requeues 0) ",
+            ),
             (
                 "an unread token on the action bookkeeping line",
                 " index 2 ref 1 bind 1 installed 2 sec used 0 sec",
@@ -1657,15 +1681,72 @@ fn check_counter_line(
     fields: &[&str],
     at: usize,
 ) -> Result<(), String> {
-    if let Some(token) =
-        fields.iter().find(|token| SEMANTIC_TOKENS.contains(token) || KNOWN_KEYS.contains(token))
-    {
-        return Err(format!(
-            "line {at}: filter {} has {token:?} inside what is otherwise a statistics line \
-             ({fields:?}) — statistics are skipped, so a predicate hidden in one would be skipped \
-             with them",
+    // Read to the end against the shape `tc` actually prints, rather than scanned for known-bad
+    // tokens. The blacklist this replaces asked only whether a statistics line contained a
+    // recognised predicate, so anything it had never heard of rode through untouched: appending
+    // `src_ip 192.0.2.123` to a faithful `Sent` line left the parsed rule and the verification
+    // unchanged, and `src_ip` is a narrowing predicate. A list of what is forbidden cannot refuse
+    // what nobody thought to forbid; a grammar refuses everything it does not positively read.
+    let unread = |what: String| {
+        Err(format!(
+            "line {at}: filter {} carries {what} in a statistics line ({fields:?}) — statistics are \
+             skipped, so anything unread inside one is skipped with it, predicate or not",
             filter.describe()
-        ));
+        ))
+    };
+    // Counters print as bare integers except where iproute2 glues punctuation on: `(dropped 4,`
+    // and the closing `0)`. The units on a backlog (`0b`, `0p`) are handled at their position.
+    let counter = |token: &str| {
+        let trimmed = token.trim_start_matches('(').trim_end_matches([',', ')']);
+        !trimmed.is_empty() && trimmed.bytes().all(|byte| byte.is_ascii_digit())
+    };
+
+    match fields[0] {
+        // `Sent 168 bytes 4 pkt (dropped 4, overlimits 0 requeues 0)`
+        "Sent" => {
+            let expected: [(usize, &str); 6] = [
+                (2, "bytes"),
+                (4, "pkt"),
+                (5, "(dropped"),
+                (7, "overlimits"),
+                (9, "requeues"),
+                (10, ""),
+            ];
+            if fields.len() != 11 {
+                return unread(format!("{} tokens where a Sent line has 11", fields.len()));
+            }
+            for (index, word) in expected {
+                if !word.is_empty() && fields[index] != word {
+                    return unread(format!("{:?} where a Sent line has {word:?}", fields[index]));
+                }
+            }
+            for index in [1, 3, 6, 8, 10] {
+                if !counter(fields[index]) {
+                    return unread(format!("{:?} where a Sent line has a count", fields[index]));
+                }
+            }
+        }
+        // `backlog 0b 0p requeues 0`
+        "backlog" => {
+            if fields.len() != 5 {
+                return unread(format!("{} tokens where a backlog line has 5", fields.len()));
+            }
+            if !fields[1].ends_with('b') || !counter(fields[1].trim_end_matches('b')) {
+                return unread(format!("{:?} where a backlog line has a byte count", fields[1]));
+            }
+            if !fields[2].ends_with('p') || !counter(fields[2].trim_end_matches('p')) {
+                return unread(format!("{:?} where a backlog line has a packet count", fields[2]));
+            }
+            if fields[3] != "requeues" || !counter(fields[4]) {
+                return unread(format!("{:?} where a backlog line has requeues", &fields[3..]));
+            }
+        }
+        // `Action statistics:` introduces the counters below it and carries nothing else.
+        _ => {
+            if fields.len() != 2 {
+                return unread(format!("{:?} after an Action statistics header", &fields[2..]));
+            }
+        }
     }
     Ok(())
 }
