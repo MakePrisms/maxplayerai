@@ -111,6 +111,27 @@ fn shipped_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_maxplayer"))
 }
 
+/// These tests do not run at the same time, and the reason is the thing under test.
+///
+/// `SSL_CERT_FILE` is the delivery child's only trust input, and it is an environment variable:
+/// there is one per PROCESS, not one per test. Run in parallel, each test's fixture mints its own
+/// certificate and the last writer decides what every other test's child trusts. That is not a
+/// hypothetical — it failed exactly once, in the first full-workspace run of this file, as a
+/// held-wire delivery that ended in 30ms instead of waiting out its 4s budget, because its child
+/// was verifying against a neighbour's CA and never got past the handshake to the held pack upload.
+///
+/// Serialised rather than papered over, because the constraint is real: a seller node has one
+/// environment too, and the trust a delivery child is given is a property of the process that
+/// spawned it.
+static TRUST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn exclusive_trust() -> std::sync::MutexGuard<'static, ()> {
+    // A panicking test poisons this; the next one still needs to run and stages its own values.
+    TRUST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Stage the trust anchor and neutralize ambient proxy settings for loopback.
 ///
 /// SAFETY (edition 2024 `set_var`): called at the top of a `#[tokio::test]` body before any task is
@@ -133,6 +154,7 @@ fn stage_env(ca: &Path) {
 /// amount of parent-side bookkeeping can fake.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_shipped_binary_pushes_a_real_delivery_over_a_verified_https_remote() {
+    let _trust = exclusive_trust();
     let root = scratch("lands");
     let branch = "maxplayer/aaaa1111";
     let (workdir, oid) = job_workdir(&root, branch);
@@ -218,6 +240,7 @@ async fn the_shipped_binary_pushes_a_real_delivery_over_a_verified_https_remote(
 /// everything else held constant. If the remote still moved, the push was never the child's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_delivery_whose_child_does_not_run_delivers_nothing() {
+    let _trust = exclusive_trust();
     let root = scratch("nochild");
     let branch = "maxplayer/cccc3333";
     let (workdir, oid) = job_workdir(&root, branch);
@@ -292,6 +315,7 @@ async fn a_delivery_whose_child_does_not_run_delivers_nothing() {
 /// letting go.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_pack_upload_held_on_the_wire_is_stopped_at_the_deadline_and_delivers_nothing() {
+    let _trust = exclusive_trust();
     let root = scratch("held");
     let branch = "maxplayer/bbbb2222";
     let (workdir, oid) = job_workdir(&root, branch);
