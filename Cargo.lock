@@ -2564,7 +2564,7 @@ dependencies = [
 
 [[package]]
 name = "maxplayer"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "cashu",
  "cdk",
@@ -2580,7 +2580,7 @@ dependencies = [
 
 [[package]]
 name = "maxplayer-core"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2618,7 +2618,7 @@ dependencies = [
 
 [[package]]
 name = "maxplayer-desktop"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "eframe",
  "maxplayer-core",
@@ -2627,7 +2627,7 @@ dependencies = [
 
 [[package]]
 name = "maxplayer-evals"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "maxplayer-core",
  "serde",
@@ -2636,7 +2636,7 @@ dependencies = [
 
 [[package]]
 name = "maxplayer-relay-write-policy"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "serde",
  "serde_json",
