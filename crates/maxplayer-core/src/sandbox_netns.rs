@@ -80,10 +80,87 @@ pub const DOCKER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(
 /// readback is still running leaves the namespace pinned by a process nobody is tracking. Every
 /// sidecar is therefore named, registered here for its lifetime, and force-removed before the holder
 /// is.
+/// Counts creates that may still be in flight **after** the future awaiting them is gone.
+///
+/// Adoption alone was never a fence. It supplies a NAME to remove; it says nothing about WHEN the
+/// container under that name comes into existence. A create runs on a blocking pool thread, and
+/// cancelling the future above it does not stop that thread: the create can still be queued inside
+/// the daemon, or half-finished, at the instant cleanup runs. Cleanup then asks docker to remove a
+/// container that does not exist YET, is told "No such container" — which this module correctly
+/// treats as benign — and returns satisfied. Moments later the create lands. The result is a
+/// running container with a name nobody holds, which is the exact orphan the registry exists to
+/// prevent, manufactured by the cleanup path.
+///
+/// So a single early remove is not enough, and no ordering of removes fixes it: the remove has to
+/// happen on the far side of the create SETTLING. This fence is that far side. Every create takes a
+/// ticket before it is issued, the ticket is moved into the blocking closure, and it is released
+/// when that closure ends — whether it succeeded, failed, was killed on the deadline, or ran on
+/// past a cancelled future. Cleanup waits for the count to reach zero before it removes anything.
+#[derive(Debug, Default)]
+struct CreationFence {
+    in_flight: std::sync::Mutex<usize>,
+    settled: std::sync::Condvar,
+}
+
+impl CreationFence {
+    /// Take custody of one create that is about to be issued.
+    fn begin(self: &std::sync::Arc<Self>) -> CreationTicket {
+        {
+            let mut in_flight =
+                self.in_flight.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *in_flight += 1;
+        }
+        CreationTicket { fence: std::sync::Arc::clone(self) }
+    }
+
+    /// Block until every in-flight create has ended, or the bound expires.
+    ///
+    /// Returns whether it settled. A timeout is reported by the caller rather than swallowed: a
+    /// create still running after this bound is a create whose container this process may never see,
+    /// and saying so is the difference between a known leak and a silent one.
+    fn wait_until_settled(&self, bound: std::time::Duration) -> bool {
+        let started = std::time::Instant::now();
+        let mut in_flight = self.in_flight.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *in_flight > 0 {
+            let Some(left) = bound.checked_sub(started.elapsed()) else {
+                return false;
+            };
+            let (guard, timeout) = self
+                .settled
+                .wait_timeout(in_flight, left)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            in_flight = guard;
+            if timeout.timed_out() && *in_flight > 0 {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// One in-flight create. Releasing it is what "the create has settled" means.
+///
+/// Held by the blocking closure itself, never by the future awaiting it — that is the whole point.
+/// A cancelled future drops its side and the closure keeps this one until it genuinely ends.
+#[derive(Debug)]
+struct CreationTicket {
+    fence: std::sync::Arc<CreationFence>,
+}
+
+impl Drop for CreationTicket {
+    fn drop(&mut self) {
+        if let Ok(mut in_flight) = self.fence.in_flight.lock() {
+            *in_flight = in_flight.saturating_sub(1);
+        }
+        self.fence.settled.notify_all();
+    }
+}
+
 #[derive(Debug)]
 pub struct NetnsHolder {
     name: String,
     sidecars: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    creation: std::sync::Arc<CreationFence>,
 }
 
 impl NetnsHolder {
@@ -93,8 +170,19 @@ impl NetnsHolder {
     /// an await, an await is a cancellation point, and a cancelled create can still complete inside
     /// the blocking pool after the future is gone. Adopting afterwards left exactly that container
     /// with no guard — running, joined to nothing, and invisible to this process.
+    ///
+    /// Adoption gives cleanup a name. [`CreationFence`] gives it a TIME. Both are required.
     fn adopt(name: String) -> Self {
-        Self { name, sidecars: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())) }
+        Self {
+            name,
+            sidecars: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            creation: std::sync::Arc::new(CreationFence::default()),
+        }
+    }
+
+    /// Take a ticket for a create about to be issued against this holder.
+    fn fence_creation(&self) -> CreationTicket {
+        self.creation.begin()
     }
 
     /// Register a sidecar container name for the duration of one command.
@@ -123,6 +211,15 @@ impl NetnsHolder {
     /// load is never cut short -- removals finish in well under a second -- and short enough that a
     /// daemon which has stopped answering ends the job instead of pinning the caller forever.
     const REMOVE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+    /// How long cleanup waits for an in-flight create to settle before removing regardless.
+    ///
+    /// Bounded by the same reasoning as [`Self::REMOVE_DEADLINE`], and deliberately longer than it:
+    /// a create that has reached the daemon finishes in well under a second, while the thing this
+    /// guards against — removing BEFORE the container exists — is unrecoverable once it happens.
+    /// The create's own [`DOCKER_DEADLINE`] kills the client at 120s, so this can never wait for a
+    /// hung client indefinitely; it waits for the blocking closure to end, which that kill forces.
+    const CREATE_SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
     /// Wait for one child, bounded. On the deadline the child is killed and reaped, and the wait is
     /// reported as a failure rather than as a removal that succeeded.
@@ -281,6 +378,22 @@ impl Drop for NetnsHolder {
     /// failure is printed as a failure — "could not remove", not "destroyed" — and
     /// [`reap_orphans`] is the backstop. A cleanup that failed is a leak that is now on the record.
     fn drop(&mut self) {
+        // FIRST, before a single remove is issued: let any in-flight create finish.
+        //
+        // Removing ahead of the create is worse than not removing at all, because "No such
+        // container" reads as success and closes the case on a container that is about to exist.
+        // Waiting here costs nothing in the ordinary path (nothing is in flight, the count is
+        // already zero) and is the only thing that makes the removes below meaningful in the
+        // cancelled path.
+        if !self.creation.wait_until_settled(Self::CREATE_SETTLE_DEADLINE) {
+            eprintln!(
+                "sandbox: a create against netns holder {} was still in flight after {:?} — removing \
+                 now anyway, but a container under that name may appear after this point and would \
+                 be LEAKED; the boot reaper is the backstop",
+                self.name,
+                Self::CREATE_SETTLE_DEADLINE
+            );
+        }
         let joiners: Vec<String> =
             self.sidecars.lock().map(|names| names.clone()).unwrap_or_default();
         for joiner in joiners {
@@ -743,6 +856,31 @@ async fn run_docker(argv: Vec<String>, stdin: Option<String>) -> Result<(String,
     run_bounded(argv, stdin, DOCKER_DEADLINE).await
 }
 
+/// As [`run_docker`], but the create it issues is **fenced**: the ticket lives inside the blocking
+/// closure, so cleanup cannot remove ahead of a create that outlived the future awaiting it.
+///
+/// The ticket is deliberately not held by this future. Holding it here would release it on
+/// cancellation — at precisely the moment the create is still running — which is the bug.
+#[cfg(feature = "acp")]
+async fn run_docker_fenced(
+    argv: Vec<String>,
+    stdin: Option<String>,
+    ticket: CreationTicket,
+) -> Result<(String, String), String> {
+    let joined = tokio::task::spawn_blocking(move || {
+        // Moved in, and dropped only when this closure ends: killed on the deadline, failed, or
+        // finished. That drop is what "settled" means to `CreationFence::wait_until_settled`.
+        let _ticket = ticket;
+        let mut child_exited = false;
+        run_bounded_blocking(argv, stdin, DOCKER_DEADLINE, &mut child_exited)
+    })
+    .await;
+    match joined {
+        Ok(outcome) => outcome,
+        Err(error) => Err(format!("docker task panicked: {error}")),
+    }
+}
+
 /// Run an argv to completion with a **wall-clock bound**, optionally feeding `stdin`.
 ///
 /// The bound is the cancellation ownership this module was missing. A `docker` client that never
@@ -913,27 +1051,94 @@ async fn run_sidecar_with_deadline(
     stdin: Option<String>,
     deadline: std::time::Duration,
 ) -> Result<(String, String), String> {
+    run_sidecar_confirmed(holder, verb, argv, stdin, deadline, container_is_absent).await
+}
+
+/// How custody asks whether a container is gone. `Some(true)` = confirmed absent, `Some(false)` =
+/// confirmed present, `None` = could not be established.
+///
+/// Injected so the rule below is measurable without a daemon. Only `Some(true)` releases custody, so
+/// a confirmer that cannot tell is treated exactly like one that says "still there".
+#[cfg(feature = "acp")]
+type ConfirmAbsent = fn(&str) -> Option<bool>;
+
+/// As [`run_sidecar_with_deadline`], with the absence check injected.
+///
+/// **Custody ends on confirmed absence, and on nothing else.**
+///
+/// The previous rule ended it on a reaped client, reasoning that `docker run --rm` removes the
+/// container when its client exits. That reasoning describes the happy path and quietly covers the
+/// failure paths with it. A client reaped with a nonzero status, a stdin write that failed before
+/// the wait, a client killed on the deadline — each returns from the same call, and none of them is
+/// the DAEMON confirming the container is gone. `--rm` is a request to the daemon, not a receipt
+/// from it: removal can still be queued, in progress, or refused, and on an error path it may never
+/// have been reached at all. Deregistering on the client's say-so struck live containers off the
+/// registry that exists to remove them.
+///
+/// So the client's exit is now only a reason to ASK. The answer comes from docker, and a confirmer
+/// that cannot answer keeps the name a cleanup target — the cost of which is one `docker rm`
+/// replying "No such container", which cleanup already treats as success.
+#[cfg(feature = "acp")]
+async fn run_sidecar_confirmed(
+    holder: &NetnsHolder,
+    verb: &str,
+    argv: Vec<String>,
+    stdin: Option<String>,
+    deadline: std::time::Duration,
+    confirm_absent: ConfirmAbsent,
+) -> Result<(String, String), String> {
     let name = sidecar_name(holder.name(), verb);
     let argv = with_container_name(argv, &name)?;
     // Registered BEFORE the command starts: a cancellation between these two lines must still leave
     // a cleanup target behind, and registering afterwards would not.
-    let mut registration = holder.watch_sidecar(name);
+    let mut registration = holder.watch_sidecar(name.clone());
     let (outcome, child_exited) = run_bounded_tracked(argv, stdin, deadline).await;
-    // Two separate facts, and the old code collapsed them into one.
-    //
     // Reaching this line at all proves the command is no longer in flight: a cancellation drops the
-    // future before it, so a cancelled command's name stays a cleanup target. That part was right.
+    // future before it, so a cancelled command's name stays a cleanup target.
     //
-    // `child_exited` is the half that was missing. The client returning is not the container being
-    // gone. A 120s deadline kill, a stdin write error, a failed wait — each of those returned an
-    // `Err` that deregistered the sidecar, while the daemon may still have been creating or running
-    // the container it names. That is precisely the surviving joiner the registry exists to catch,
-    // and the cleanup path was the thing removing it from the registry.
+    // A client that was never reaped is not even worth asking about — the daemon may still be
+    // creating or running that container — so custody is simply kept.
     if child_exited {
-        registration.completed();
+        let asked = name.clone();
+        let absent = tokio::task::spawn_blocking(move || confirm_absent(&asked))
+            .await
+            .unwrap_or(None);
+        if absent == Some(true) {
+            registration.completed();
+        }
     }
     drop(registration);
     outcome
+}
+
+/// Ask docker whether a container name is gone.
+///
+/// `Some(true)` only for docker saying the object does not exist. A successful inspect is
+/// `Some(false)`: the container is still there. Anything else — docker missing, the daemon not
+/// answering, an unrecognised error — is `None`, which keeps custody.
+#[cfg(feature = "acp")]
+fn container_is_absent(name: &str) -> Option<bool> {
+    let mut child = std::process::Command::new("docker")
+        .args(["inspect", "--type", "container", "--format", "{{.Id}}", name])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    let status = NetnsHolder::wait_bounded(&mut child, NetnsHolder::REMOVE_DEADLINE).ok()?;
+    let mut stderr_bytes = Vec::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        use std::io::Read as _;
+        let _ = pipe.read_to_end(&mut stderr_bytes);
+    }
+    if status.success() {
+        return Some(false);
+    }
+    let stderr = String::from_utf8_lossy(&stderr_bytes);
+    if NetnsHolder::force_remove_stderr_is_benign(&stderr) || stderr.contains("No such object") {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 /// Establish containment for one job: measure the proxy address, create the namespace holder, install
@@ -977,9 +1182,17 @@ pub async fn establish(
     // adopting afterwards left exactly that container running with no guard and no record. The guard
     // costs one `docker rm` that reports "No such container" when the create never happened.
     let holder = NetnsHolder::adopt(name.clone());
-    run_docker(holder_argv(&name, network, holder_image, uid, gid, job_id, seat), None)
-        .await
-        .map_err(|error| format!("could not start the netns holder {name} — {error}"))?;
+    // Fenced, not merely adopted. The ticket is taken before the create is issued and travels into
+    // the blocking closure, so a cancellation here leaves cleanup waiting for the create to settle
+    // instead of racing it to a "No such container" that means "not yet".
+    let ticket = holder.fence_creation();
+    run_docker_fenced(
+        holder_argv(&name, network, holder_image, uid, gid, job_id, seat),
+        None,
+        ticket,
+    )
+    .await
+    .map_err(|error| format!("could not start the netns holder {name} — {error}"))?;
 
     // The resolvers arrive from the caller rather than being discovered here, and that is the one
     // property that keeps the job's `/etc/resolv.conf` and this policy in agreement: the caller
@@ -1738,8 +1951,9 @@ mod tests {
         assert!(error.contains("exit 7"), "the caller's error must name the code: {error}");
         assert!(
             child_exited,
-            "a nonzero exit is a REAPED client: --rm removed the container, so custody may end \
-             here, and refusing to end it would report a leak for something already gone"
+            "a nonzero exit is a REAPED client: that is a reason to ASK docker whether the \
+             container is gone. It is not itself an answer, and custody no longer ends on it \
+             alone — see `a_reaped_client_whose_container_is_still_there_keeps_custody`"
         );
 
         let started = std::time::Instant::now();
@@ -1805,25 +2019,143 @@ mod tests {
              stay a cleanup target"
         );
 
-        // A client reaped normally: `--rm` removed the container, so keeping the name would make
-        // the holder report a leak for something already gone. Without this half, "never
-        // deregister" would pass the assertion above.
-        run_sidecar_with_deadline(
+        // A client reaped normally AND docker confirming the container gone: only then may the name
+        // be struck. Without this half, "never deregister" would pass the assertion above.
+        //
+        // The confirmer is injected rather than real. This used to call the production path, which
+        // reached a live `docker inspect` from inside an offline unit test: the test passed only
+        // because a daemon happened to answer, which is a dependency an offline suite must not have.
+        fn confirmed_gone(_name: &str) -> Option<bool> {
+            Some(true)
+        }
+        run_sidecar_confirmed(
             &holder,
             "iface",
             vec![quick.to_string_lossy().into_owned(), "run".to_owned()],
             None,
             std::time::Duration::from_secs(10),
+            confirmed_gone,
         )
         .await
         .expect("a script that exits 0 must succeed");
         assert_eq!(
             holder.sidecars.lock().expect("registry").len(),
             1,
-            "the reaped client's name must be struck, leaving only the killed one"
+            "a reaped client whose container docker confirms gone must be struck, leaving only the \
+             killed one"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
         std::mem::forget(holder);
+    }
+
+    /// The `Err`-path custody failure, reproduced.
+    ///
+    /// This is the defect the verdict names: the client is reaped — `child_exited` is true, with a
+    /// NONZERO exit, exactly the shape a deadline-killed, I/O-failed or refused `docker run` returns
+    /// — and the container it named is **still there**. The old rule ended custody on the client's
+    /// exit alone and struck the only cleanup target for a live container.
+    ///
+    /// Hermetic: the confirmer is a stub, so this asserts the DECISION, not a daemon's mood. Revert
+    /// the rule to `if child_exited { registration.completed(); }` and this test fails.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_reaped_client_whose_container_is_still_there_keeps_custody() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("mx-err-custody-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let failing = dir.join("failing");
+        std::fs::write(&failing, "#!/bin/sh\nexit 7\n").expect("write failing");
+        std::fs::set_permissions(&failing, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        /// Docker answering "that container is still here".
+        fn still_present(_name: &str) -> Option<bool> {
+            Some(false)
+        }
+        /// Docker unable to answer at all — must be treated exactly like "still here".
+        fn cannot_tell(_name: &str) -> Option<bool> {
+            None
+        }
+
+        for (confirm, label) in [
+            (still_present as ConfirmAbsent, "docker says the container is still there"),
+            (cannot_tell as ConfirmAbsent, "docker cannot say whether it is there"),
+        ] {
+            let holder = NetnsHolder::adopt("maxplayer-netns-err-custody".into());
+            let outcome = run_sidecar_confirmed(
+                &holder,
+                "iface",
+                vec![failing.to_string_lossy().into_owned(), "run".to_owned()],
+                None,
+                std::time::Duration::from_secs(10),
+                confirm,
+            )
+            .await;
+
+            let error = outcome.expect_err("exit 7 is a failure");
+            assert!(error.contains("exit 7"), "the caller still sees the real error: {error}");
+            assert_eq!(
+                holder.sidecars.lock().expect("registry").len(),
+                1,
+                "the client was REAPED with a nonzero exit, but {label}: custody must be held \
+                 until the container is CONFIRMED GONE, or cleanup has no target for a container \
+                 that outlived its client"
+            );
+            std::mem::forget(holder);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The delayed-create timing failure, reproduced at the site that must fence it.
+    ///
+    /// The create runs on a blocking thread; cancelling the future above it does not stop that
+    /// thread. Cleanup used to run immediately, ask docker to remove a container that did not exist
+    /// YET, be told "No such container" — which is treated as success — and return satisfied, after
+    /// which the create landed and left an untracked container.
+    ///
+    /// Reproduced here by holding a creation ticket that is released 700ms from now, as an in-flight
+    /// create would be, and then dropping the holder. The assertion is not "the fence helper works":
+    /// it is that **`Drop` had not finished before the create settled**. Remove the
+    /// `wait_until_settled` call from `Drop` and this fails, because `Drop` returns while the flag
+    /// is still false.
+    ///
+    /// `Drop` does issue real `docker rm` calls, which on this path answer "No such container"; they
+    /// are not what makes this pass, and the elapsed-time assertion below is deliberately well under
+    /// the settle delay so a slow removal cannot substitute for the wait.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn cleanup_does_not_remove_ahead_of_a_create_that_is_still_in_flight() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let holder = NetnsHolder::adopt("maxplayer-netns-fence-probe".into());
+        let settled = std::sync::Arc::new(AtomicBool::new(false));
+
+        let ticket = holder.fence_creation();
+        let flag = std::sync::Arc::clone(&settled);
+        let creating = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            // The create finishes: the container now exists, and only now is removing it sound.
+            flag.store(true, Ordering::SeqCst);
+            drop(ticket);
+        });
+
+        let started = std::time::Instant::now();
+        drop(holder);
+        let waited = started.elapsed();
+
+        assert!(
+            settled.load(Ordering::SeqCst),
+            "cleanup finished while a create was still in flight: every remove it issued was \
+             aimed at a container that did not exist yet, and the one that arrived afterwards is \
+             an orphan no one holds"
+        );
+        assert!(
+            waited >= std::time::Duration::from_millis(500),
+            "cleanup returned in {waited:?}, far sooner than the create it had to outlast — it \
+             cannot have waited for the fence"
+        );
+        creating.join().expect("the create thread");
     }
 }

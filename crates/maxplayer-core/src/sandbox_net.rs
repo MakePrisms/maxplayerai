@@ -2054,6 +2054,58 @@ mod tests {
         assert!(refusal.contains("account for"), "{refusal}");
     }
 
+    /// The ND readback failure the verdict names, reproduced at the decision site on the canonical
+    /// ND ACCEPT rules themselves.
+    ///
+    /// The siblings above establish that the PARSER marks these shapes. That is not the claim that
+    /// matters. The claim that matters is the one the verdict made about behaviour: a canonical ND
+    /// ACCEPT carrying a leading unflagged token after `OUTPUT`, or a dangling final `!`, "retains
+    /// the same accepted predicates" — i.e. verification still passes, because the tokens the parser
+    /// could not consume changed nothing it went on to check.
+    ///
+    /// So this runs [`NetPolicy::verify_readback`] over the REAL measured v6 readback, mutated only
+    /// in those two ways, and requires refusal. Both mutations leave the predicate set the checker
+    /// reads untouched — that is precisely why tolerating them was a hole rather than a cosmetic
+    /// defect.
+    #[test]
+    fn a_canonical_nd_accept_carrying_an_unconsumed_token_refuses_the_readback() {
+        let policy = measured_policy();
+        assert_eq!(
+            policy.verify_readback(Family::V6, MEASURED_V6),
+            Ok(()),
+            "positive control: the unmutated measured readback must verify, or this test would \
+             pass for the wrong reason"
+        );
+
+        // Shape 1: an unflagged token between the chain and the first predicate.
+        let smuggled = MEASURED_V6.replace(
+            "-A OUTPUT -p ipv6-icmp -m icmp6 --icmpv6-type 136",
+            "-A OUTPUT garbage -p ipv6-icmp -m icmp6 --icmpv6-type 136",
+        );
+        assert_ne!(smuggled, MEASURED_V6, "the mutation must have applied");
+        assert_eq!(
+            ReadbackRule::parse_all(&smuggled).len(),
+            ReadbackRule::parse_all(MEASURED_V6).len(),
+            "the malformed line must stay countable, or it escapes the unexpected-rule check \
+             instead of being refused by the accounting"
+        );
+        let refusal = policy
+            .verify_readback(Family::V6, &smuggled)
+            .expect_err("an ND ACCEPT with an unconsumed leading token must refuse the readback");
+        assert!(refusal.contains("account for"), "{refusal}");
+
+        // Shape 2: a dangling inversion with nothing after it to invert.
+        let dangling = MEASURED_V6.replace(
+            "--icmpv6-type 136 -m hl --hl-eq 255 -j ACCEPT",
+            "--icmpv6-type 136 -m hl --hl-eq 255 -j ACCEPT !",
+        );
+        assert_ne!(dangling, MEASURED_V6, "the mutation must have applied");
+        let refusal = policy
+            .verify_readback(Family::V6, &dangling)
+            .expect_err("an ND ACCEPT ending in a dangling `!` must refuse the readback");
+        assert!(refusal.contains("account for"), "{refusal}");
+    }
+
     /// The pinhole count is per family, because the two chains are installed by different binaries
     /// and verified separately. A total would make a v6-only seat look like it owed v4 rules.
     #[test]
