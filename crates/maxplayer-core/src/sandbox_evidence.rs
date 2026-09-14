@@ -361,14 +361,27 @@ fn parse_case(rest: &str, at: usize) -> Result<SavedCase, String> {
         let (key, value) = field.split_once('=').ok_or_else(|| {
             format!("line {at}: {field:?} in a case record is not `key=value`")
         })?;
-        match key {
-            "id" => id = Some(value.to_owned()),
-            "outcome" => outcome_word = Some(value.to_owned()),
-            "log" => log = Some(value.to_owned()),
+        // Assigned ONCE. A repeated field used to overwrite the earlier one, so
+        // `outcome=refused outcome=connected` scored as Connected: the strictest reading of a line
+        // lost to the last word on it, and a record could carry its own contradiction and still
+        // pass. There is no honest reading of a case that states two outcomes -- refusing is the
+        // only answer that cannot be gamed by ordering.
+        let slot = match key {
+            "id" => &mut id,
+            "outcome" => &mut outcome_word,
+            "log" => &mut log,
             other => {
                 return Err(format!("line {at}: a case record has no {other:?} field"));
             }
+        };
+        if let Some(first) = slot.as_deref() {
+            return Err(format!(
+                "line {at}: a case record states {key} twice, {first:?} then {value:?} -- a record \
+                 that contradicts itself is not evidence, and the second value does not silently \
+                 win"
+            ));
         }
+        *slot = Some(value.to_owned());
     }
     let id = id.filter(|value| !value.is_empty()).ok_or_else(|| {
         format!("line {at}: a case record with no id scores nothing")
@@ -504,6 +517,38 @@ mod tests {
                 && p.contains("only evidence at connected")),
             "{problems:?}"
         );
+    }
+
+    /// A case that states a field twice fails, and the second value does not win. Overwriting made
+    /// the parser read only the last word: `outcome=refused outcome=connected` scored as Connected,
+    /// so a record could carry a refusal AND the pass that contradicts it, and the pass is what got
+    /// counted. Checked on the outcome, where it decides the grade, and on the log, where it
+    /// decides which file anyone reading the record would go and open.
+    #[test]
+    fn a_case_that_states_a_field_twice_fails() {
+        for (record, expect) in [
+            (
+                "case id=integrated.denied.v4 outcome=refused outcome=connected log=raw/x.txt",
+                "states outcome twice",
+            ),
+            (
+                "case id=integrated.denied.v4 outcome=refused log=raw/x.txt log=raw/other.txt",
+                "states log twice",
+            ),
+        ] {
+            let text = complete()
+                .lines()
+                .filter(|line| !line.contains("id=integrated.denied.v4 "))
+                .map(|line| format!("{line}\n"))
+                .collect::<String>()
+                + record
+                + "\n";
+            let problems = validate(&text).expect_err("a self-contradicting case must fail");
+            assert!(
+                problems.iter().any(|problem| problem.contains(expect)),
+                "expected {expect:?} in {problems:?}"
+            );
+        }
     }
 
     /// A duplicate and an unknown id both fail: the first hides a second measurement, the second is
