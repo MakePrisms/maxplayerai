@@ -1724,7 +1724,8 @@ pub const DELIVERY_PUSH_TIMEOUT: Duration = Duration::from_secs(150);
 ///   operation; work revoked while queued never starts and hands the turn back at once, so a queued
 ///   phase contributes nothing;
 /// - **local config rewrite and pack generation** — phase checks in
-///   `seller_git::neutralize_then_push_off_runtime` and libgit2's `push_negotiation` hook;
+///   `seller_git::neutralize_then_push_off_runtime`, libgit2's `pack_progress` hook (the object
+///   traversal and insert that run BEFORE negotiation) and its `push_negotiation` hook;
 /// - **pack buffering** — `git_transport::HttpStream::write` refuses the next chunk;
 /// - **the signer wait** — `HttpStream::send` asks before minting, so a dead delivery never joins
 ///   the signer queue, and the minter's own blocking call is bounded by this same absolute deadline;
@@ -1736,6 +1737,33 @@ pub const DELIVERY_PUSH_TIMEOUT: Duration = Duration::from_secs(150);
 /// the transport's [`crate::git_transport::DEFAULT_HTTP_LEG_TIMEOUT`] including the body transfer.
 /// The worst case is therefore "deadline reached one instant after the last check passed, plus one
 /// full leg" = `DELIVERY_PUSH_TIMEOUT + DEFAULT_HTTP_LEG_TIMEOUT`.
+///
+/// # The one span this bound does not reach, named rather than assumed
+///
+/// Between the negotiation hook and the first pack byte, libgit2 sorts the object list and runs its
+/// delta search (`git_packbuilder__prepare` → `ll_find_deltas`). That loop takes a progress callback
+/// and THROWS ITS RETURN AWAY — `pack-objects.c:979` (`report_delta_progress(pb, pb->nr_deltified,
+/// false);`, a bare statement), again at `:1356`, and the deltafication notification at `:1330-1331`
+/// likewise. libgit2 1.8.1, the tree this crate pins through `libgit2-sys 0.17.0+1.8.1`. There is no
+/// other hook inside that loop, and its window and depth are compile-time constants with no public
+/// setter. Nothing in this process can end that span once it has begun.
+///
+/// The phases on EITHER side of it are now interruptible, and the earlier one only recently so:
+/// object traversal and insert do check their progress callback's return (`pack-objects.c:256-270`),
+/// at a granularity of half a millisecond (`MIN_PROGRESS_UPDATE_INTERVAL` is 0.5 against a
+/// millisecond clock, `util.h:287-345`), and `git_transport`'s `pack_progress` hook uses exactly
+/// that. Before this followup neither traversal nor delta search was reachable at all, and the sum
+/// below was arithmetic about phases it did not cover.
+///
+/// So the honest statement of the bound is: **270 seconds over every phase this process can
+/// interrupt, plus the delta search's own duration**, which is a function of the delivery's object
+/// list rather than of any clock. A delivery pushes one gated commit, so that list is the job's own
+/// tree; `git_transport::UNINTERRUPTIBLE_DELTA_BUDGET` is what that span is expected to fit in, and
+/// exceeding it is MEASURED and reported on the operator's console, never silently absorbed.
+///
+/// Making that span a hard bound needs an executor that can be killed — the local phase in a child
+/// process, the deadline enforced by a signal, the turn released when the child is reaped. That is
+/// an architectural change and is deliberately not smuggled in behind this constant.
 pub const DELIVERY_DRAIN_BOUND: Duration = Duration::from_secs(
     DELIVERY_PUSH_TIMEOUT.as_secs() + crate::git_transport::DEFAULT_HTTP_LEG_TIMEOUT.as_secs(),
 );
@@ -1751,6 +1779,18 @@ const _: () = assert!(
     "delivery drain bound (#994-followup/F3): the turn is held for at most the delivery's absolute \
      work deadline plus ONE in-flight HTTP leg; both terms must stay finite and the bound must \
      strictly exceed the whole-operation deadline it contains"
+);
+
+/// The uninterruptible delta span is a BUDGET inside the bound, never a second bound beside it. A
+/// future edit that lets it grow to the size of the whole-operation deadline would make "the delta
+/// search overran" indistinguishable from "the delivery ran its full course", and the console line
+/// that reports the overrun would stop being evidence of anything. Fails the BUILD instead.
+const _: () = assert!(
+    crate::git_transport::UNINTERRUPTIBLE_DELTA_BUDGET.as_secs() > 0
+        && crate::git_transport::UNINTERRUPTIBLE_DELTA_BUDGET.as_secs()
+            < DELIVERY_PUSH_TIMEOUT.as_secs(),
+    "the span no in-process hook can end (libgit2's delta search) must stay a small, finite budget \
+     strictly inside the delivery's own work deadline"
 );
 
 /// #563: make the two-clock ordering a COMPILE-TIME invariant instead of the cross-file prose above.

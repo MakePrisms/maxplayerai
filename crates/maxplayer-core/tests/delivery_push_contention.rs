@@ -173,6 +173,122 @@ fn job_workdir(root: &Path, name: &str, branch: &str) -> (PathBuf, String) {
     (workdir, oid.to_string())
 }
 
+/// A committed workdir whose ONE commit carries enough incompressible content that libgit2's local
+/// pack phase — graph traversal, object insert, delta search — takes real time and reports progress
+/// many times over, instead of finishing before a deadline could ever land inside it.
+///
+/// The content is deliberately random: delta search spends its time on material that does not
+/// compress or delta away.
+fn bulky_job_workdir(
+    root: &Path,
+    name: &str,
+    branch: &str,
+    blobs: usize,
+    blob_bytes: usize,
+) -> (PathBuf, String) {
+    let workdir = root.join(name);
+    let repo = git2::Repository::init(&workdir).expect("init workdir");
+    let mut index = repo.index().expect("index");
+    // A cheap deterministic PRNG: the bytes must not compress, and the test must not depend on the
+    // machine's entropy source.
+    let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut blob = vec![0u8; blob_bytes];
+    for n in 0..blobs {
+        for byte in blob.iter_mut() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = (state >> 24) as u8;
+        }
+        let rel = format!("payload-{n:05}.bin");
+        std::fs::write(workdir.join(&rel), &blob).expect("write blob");
+        index.add_path(Path::new(&rel)).expect("add");
+    }
+    index.write().expect("write index");
+    let tree = repo
+        .find_tree(index.write_tree().expect("tree"))
+        .expect("find tree");
+    let sig = git2::Signature::new("s", "s@example.invalid", &git2::Time::new(1_700_000_000, 0))
+        .expect("sig");
+    let oid = repo
+        .commit(
+            Some(&git_transport::delivery_ref(branch)),
+            &sig,
+            &sig,
+            "bulky delivery",
+            &tree,
+            &[],
+        )
+        .expect("commit");
+    (workdir, oid.to_string())
+}
+
+/// A phase held open on purpose.
+///
+/// The Nth ask on a delivery's work gate blocks here until `hold_until` — the work's own deadline —
+/// has passed. `wait_held` tells the test the instant the phase IS held, so nothing in the test has
+/// to guess or sleep to find out.
+struct PhaseHold {
+    nth: usize,
+    hold_until: Instant,
+    state: Mutex<(bool, bool)>,
+    changed: std::sync::Condvar,
+}
+
+impl PhaseHold {
+    fn new(nth: usize, hold_until: Instant) -> Arc<Self> {
+        Arc::new(Self {
+            nth,
+            hold_until,
+            state: Mutex::new((false, false)),
+            changed: std::sync::Condvar::new(),
+        })
+    }
+
+    /// Install as the gate watcher: holds exactly once, on the ask this hold was built for.
+    fn watcher(self: &Arc<Self>) -> Arc<dyn Fn(usize) + Send + Sync> {
+        let hold = Arc::clone(self);
+        Arc::new(move |ask: usize| {
+            if ask != hold.nth {
+                return;
+            }
+            {
+                let mut state = hold.state.lock().expect("hold");
+                if state.1 {
+                    return;
+                }
+                state.0 = true;
+                state.1 = true;
+            }
+            hold.changed.notify_all();
+            // Hold the phase past the work's deadline. Waking is not the boundary: the gate is asked
+            // the moment this returns, and THAT answer is what ends the delivery.
+            let remaining = hold.hold_until.saturating_duration_since(Instant::now())
+                + Duration::from_millis(50);
+            std::thread::sleep(remaining);
+        })
+    }
+
+    /// Block until the phase is actually held. Deterministic — the holding thread signals it.
+    ///
+    /// Bounded on purpose: if the ask this hold was built for never arrives, the phase was never
+    /// entered, and a test that never enters the state it is about must FAIL rather than hang.
+    fn wait_held(&self) {
+        let give_up = Instant::now() + Duration::from_secs(120);
+        let mut state = self.state.lock().expect("hold");
+        while !state.0 {
+            let left = give_up.saturating_duration_since(Instant::now());
+            assert!(
+                !left.is_zero(),
+                "gate ask {} never arrived: the phase this hold is about was never entered",
+                self.nth
+            );
+            let (next, _) = self.changed.wait_timeout(state, left).expect("hold wait");
+            state = next;
+        }
+    }
+}
+
 /// The minter the delivery push runs with, built exactly as `execute` builds it — bound to this
 /// job's remote, scoped to this job's ref, signed through the actor, refusing once this delivery's
 /// authority has ended, bounded by the push deadline — wrapped so every call lands in the journal.
@@ -261,7 +377,39 @@ async fn run_delivery_bounded(
     journal: Journal,
     timeout: Duration,
 ) -> Result<String, DeliveryPushErr> {
-    let deadline = Instant::now() + DELIVERY_PUSH_TIMEOUT;
+    run_delivery_watched(
+        delivery,
+        lock,
+        signer,
+        url,
+        journal,
+        timeout,
+        DELIVERY_PUSH_TIMEOUT,
+        None,
+    )
+    .await
+}
+
+/// The same delivery again, with the WORK's own deadline made explicit and every phase gate the
+/// transport asks made observable.
+///
+/// `on_gate` is handed the 1-based number of each ask on this delivery's composed work gate, on the
+/// thread doing the work, BEFORE the answer is produced. A test that wants to hold a phase open
+/// holds it here: this is the same gate libgit2's pack hook, the config rewrite, the negotiation
+/// callback and every wire leg go through, so blocking in it blocks the real phase rather than a
+/// simulation of one.
+#[allow(clippy::too_many_arguments)]
+async fn run_delivery_watched(
+    delivery: Delivery,
+    lock: Arc<tokio::sync::Mutex<()>>,
+    signer: SignerHandle,
+    url: String,
+    journal: Journal,
+    timeout: Duration,
+    work_deadline: Duration,
+    on_gate: Option<Arc<dyn Fn(usize) + Send + Sync>>,
+) -> Result<String, DeliveryPushErr> {
+    let deadline = Instant::now() + work_deadline;
     let authority = PushAuthority::new();
     let minter = production_shaped_minter(
         delivery.id,
@@ -279,7 +427,12 @@ async fn run_delivery_bounded(
     let check: git_transport::AuthorityCheck = {
         let inner = authority.check();
         let refusals = journal.clone();
+        let asks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         Arc::new(move || {
+            if let Some(watcher) = &on_gate {
+                let nth = asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                watcher(nth);
+            }
             inner().inspect_err(|why: &String| refusals.record(Moment::Refused(id, why.clone())))
         })
     };
@@ -1122,6 +1275,202 @@ async fn a_caller_timeout_across_a_live_upload_does_not_hand_the_seat_to_the_nex
             .to_string(),
         pushed,
         "the second delivery landed exactly what it reported"
+    );
+
+    drop(relay);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A pre-HTTP phase held open ON PURPOSE cannot hold the delivery — or the seat — indefinitely.
+///
+/// This is the case the drain bound could not previously reach. libgit2 does its graph traversal,
+/// object insert and delta search BEFORE a single pack byte is written, so no HTTP timeout touches
+/// that span: an HTTP timeout cannot bound work that happens before HTTP. The fix is a hook inside
+/// the pack phase itself, and the only way to show a hook works is to enter the state it exists for.
+///
+/// So the state is constructed, not waited for. The delivery's workdir carries ~16MB of
+/// incompressible content, which makes the local pack phase long and makes libgit2 report progress
+/// through it many times over; the work gate is then HELD inside that phase, past the work's own
+/// deadline. Two facts pin the hold to local pack work rather than to anything else: at the moment
+/// it is held the remote has seen exactly ONE request (the advertisement, which precedes the pack
+/// phase) and no upload, and the refusal that finally ends the delivery is the pack hook's own,
+/// naming the packing stage it fired in.
+///
+/// What must be true while it is held: the seat is NOT free. What must be true after: the delivery
+/// ended at its own boundary rather than at its caller's patience, nothing was ever uploaded, and
+/// the next delivery got the seat only once the held thread actually returned.
+///
+/// Red-on-revert: delete the `pack_progress` hook in `push_gated_object` and the held delivery runs
+/// the whole pack phase out and is refused only at the first pack chunk — the refusal no longer
+/// names the packing stage, and the boundary is no longer the one being claimed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pre_http_phase_held_open_ends_at_the_boundary_and_frees_the_seat_only_then() {
+    init_test_env();
+    let root = temp("held-pre-http-phase");
+    let first_branch = "maxplayer/5555eeee";
+    let second_branch = "maxplayer/6666ffff";
+    // ~16MB in 2000 objects: enough local pack work for the deadline to land INSIDE it, and enough
+    // progress reports for the gate to be asked from the pack phase hundreds of times.
+    let (first_workdir, first_oid) = bulky_job_workdir(&root, "job-1", first_branch, 2000, 8 * 1024);
+    let (second_workdir, second_oid) = job_workdir(&root, "job-2", second_branch);
+
+    let relay_repo = root.join("relay.git");
+    git2::Repository::init_bare(&relay_repo).expect("relay bare");
+    let relay = GitHttpAuthServer::spawn_with(
+        &relay_repo,
+        "/git/seller/r.git",
+        FixtureOptions::default(),
+    );
+    let url = relay.repo_url();
+
+    let home_root = root.join("home");
+    let home = bootstrap(&home_root).expect("bootstrap home");
+    let signer = signer::spawn(&home).expect("spawn signer");
+
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    let journal = Journal::default();
+
+    // A short WORK deadline; the caller's patience is left long on purpose, so that whatever ends
+    // this delivery, it is not the caller giving up.
+    let work_deadline = Duration::from_millis(900);
+    // Ask 60 is inside the pack phase: the handful of gates before it (dispatch, config rewrite,
+    // push begin, workdir open, the advertisement leg's own asks, negotiation) number under a dozen
+    // and are all spent before libgit2 starts packing. The assertions below prove the placement
+    // rather than trusting this number.
+    let hold = PhaseHold::new(60, Instant::now() + work_deadline);
+    let held = tokio::spawn(run_delivery_watched(
+        Delivery {
+            id: 1,
+            workdir: first_workdir,
+            branch: first_branch,
+            oid: first_oid,
+        },
+        Arc::clone(&lock),
+        signer.clone(),
+        url.clone(),
+        journal.clone(),
+        Duration::from_secs(60),
+        work_deadline,
+        Some(hold.watcher()),
+    ));
+
+    // Deterministic: returns the instant the phase is actually held.
+    let hold_for_wait = Arc::clone(&hold);
+    tokio::task::spawn_blocking(move || hold_for_wait.wait_held())
+        .await
+        .expect("hold");
+
+    // WHERE the hold is: past the advertisement, before any upload — i.e. in local pack work.
+    let during = relay.requests();
+    assert_eq!(
+        during.len(),
+        1,
+        "the held phase must be local pack work: after the advertisement, before any upload: {during:?}"
+    );
+
+    // A real second delivery, launched into exactly that window, and proved stuck on acquisition.
+    let second = tokio::spawn(run_delivery(
+        Delivery {
+            id: 2,
+            workdir: second_workdir,
+            branch: second_branch,
+            oid: second_oid,
+        },
+        Arc::clone(&lock),
+        signer.clone(),
+        url.clone(),
+        journal.clone(),
+    ));
+    let reached = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if journal
+                .entries()
+                .iter()
+                .any(|moment| matches!(moment, Moment::Requested(2)))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    reached.expect("the second delivery must at least start");
+    assert!(
+        lock.try_lock().is_err(),
+        "the seat's turn must still be held while the pack phase is held"
+    );
+    assert!(
+        !journal
+            .entries()
+            .iter()
+            .any(|moment| matches!(moment, Moment::Enter(2))),
+        "the second delivery entered while a held pack phase still owned the seat: {:?}",
+        journal.entries()
+    );
+
+    // Nothing external releases the hold: the boundary is what ends it.
+    let outcome = tokio::time::timeout(Duration::from_secs(60), held)
+        .await
+        .expect("the held delivery must not run forever — that is the whole claim")
+        .expect("first delivery task");
+    let error = match outcome {
+        Err(DeliveryPushErr::Push(error)) => error.to_string(),
+        other => panic!("the held delivery must end at its own boundary, got {other:?}"),
+    };
+    assert!(
+        error.contains("refusing to keep packing"),
+        "the pack hook must be what ended it, not a later gate: {error}"
+    );
+
+    // It never got to upload anything, and the remote never saw a second request from it.
+    let after = relay.requests();
+    assert!(
+        after.len() <= 2,
+        "a delivery stopped inside its pack phase must not have uploaded a pack: {after:?}"
+    );
+    assert!(
+        !after
+            .iter()
+            .skip(1)
+            .any(|request| request.target.contains("git-receive-pack")),
+        "the held delivery must never have reached the upload: {after:?}"
+    );
+
+    // The seat changes hands only after the held thread actually returned.
+    let pushed = second
+        .await
+        .expect("second delivery task")
+        .expect("the second delivery pushes once the first has actually stopped");
+    let entries = journal.entries();
+    let exited_first = entries
+        .iter()
+        .position(|moment| matches!(moment, Moment::Exit(1)))
+        .expect("the held delivery must record its exit");
+    let entered_second = entries
+        .iter()
+        .position(|moment| matches!(moment, Moment::Enter(2)))
+        .expect("the second delivery must enter once the turn is free");
+    assert!(
+        exited_first < entered_second,
+        "the seat was handed over before the held work stopped: {entries:?}"
+    );
+    assert_eq!(
+        relay.peak_concurrent_requests(),
+        1,
+        "two deliveries were on the seat's remote at once"
+    );
+    let bare = git2::Repository::open_bare(&relay_repo).expect("relay bare");
+    assert_eq!(
+        bare.refname_to_id(&git_transport::delivery_ref(second_branch))
+            .expect("the second delivery's ref must land")
+            .to_string(),
+        pushed,
+        "the second delivery landed exactly what it reported"
+    );
+    assert!(
+        bare.refname_to_id(&git_transport::delivery_ref(first_branch))
+            .is_err(),
+        "the delivery that was stopped inside its pack phase must have landed nothing"
     );
 
     drop(relay);

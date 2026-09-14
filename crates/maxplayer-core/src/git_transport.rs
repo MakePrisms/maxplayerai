@@ -56,8 +56,8 @@ use std::time::Duration;
 
 use git2::transport::{Service, SmartSubtransport, SmartSubtransportStream, Transport};
 use git2::{
-    AutotagOption, ConfigLevel, Direction, FetchOptions, Oid, PushOptions, Remote, RemoteCallbacks,
-    Repository,
+    AutotagOption, ConfigLevel, Direction, FetchOptions, Oid, PackBuilderStage, PushOptions, Remote,
+    RemoteCallbacks, Repository,
 };
 
 use crate::delivery_transport::{assert_allowed_repo_locator, TransportRefuse};
@@ -574,6 +574,66 @@ pub fn push_branch_with_minter(
     push_gated_object(&repo, remote_url, branch, gated_oid, mint, authority, lifetime)
 }
 
+/// The typed refusal raised inside libgit2's pack-progress hook, and converted back into a
+/// [`TransportError::Transport`] the instant `remote.push` returns. See the hook in
+/// [`push_gated_object`] for why a panic is the only channel git2 0.19 leaves open there.
+#[derive(Debug)]
+struct LocalPackAbort(String);
+
+/// How long the ONE span of a delivery push that nothing in-process can interrupt is expected to
+/// take: libgit2's delta search (`git_packbuilder__prepare` → `ll_find_deltas`), which discards its
+/// progress callback's return value (`pack-objects.c:979`, `:1356`) and so cannot be ended from
+/// Rust once it has begun.
+///
+/// This is a BUDGET, not a guarantee, and the distinction is the whole point: exceeding it is
+/// reported on the operator's console with the measured overrun rather than being asserted away.
+/// The only construction that would make this span a hard bound is an executor that can be killed —
+/// i.e. running the local phase in a child process and enforcing the deadline with a signal. That is
+/// an architectural change, deliberately not smuggled in here.
+///
+/// A delivery pushes ONE gated commit to a fresh delivery ref, so the object list is the job's own
+/// tree; 5s is orders of magnitude above what that costs and still far below the
+/// [`crate::seller_node::run::DELIVERY_PUSH_TIMEOUT`] it sits inside.
+pub const UNINTERRUPTIBLE_DELTA_BUDGET: Duration = Duration::from_secs(5);
+
+/// The operator's line for a delta search that outlasted its budget, or `None` while it fits.
+///
+/// Separate from the push path so the REPORT can be asserted: the whole point of measuring a span
+/// nothing can interrupt is that an overrun is loud, and "it would have printed something" is not a
+/// claim a test can check. Reports the measured duration, not the fact of an overrun — an operator
+/// deciding whether a delivery is wedged needs the number.
+fn delta_overrun_line(residue: Duration) -> Option<String> {
+    if residue < UNINTERRUPTIBLE_DELTA_BUDGET {
+        return None;
+    }
+    Some(format!(
+        "delivery pack delta search held the seat's turn for {}ms, past the {}ms it is budgeted \
+         for; libgit2 discards this phase's cancellation answer (pack-objects.c:979), so no hook in \
+         this process can end it once entered — see UNINTERRUPTIBLE_DELTA_BUDGET",
+        residue.as_millis(),
+        UNINTERRUPTIBLE_DELTA_BUDGET.as_millis()
+    ))
+}
+
+/// Keep the pack hook's typed refusal off the operator's console.
+///
+/// [`LocalPackAbort`] is control flow, not a fault: it is raised deliberately, caught deliberately,
+/// and reported as a [`TransportError`] like every other lifetime refusal. Without this the default
+/// hook would print a panic message for an ordinary, expected cancellation. Every OTHER payload
+/// still reaches whatever hook was installed before — the previous hook is chained, never replaced.
+fn silence_local_pack_abort_panics() {
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if info.payload().downcast_ref::<LocalPackAbort>().is_some() {
+                return;
+            }
+            previous(info);
+        }));
+    });
+}
+
 /// One phase boundary of the actual work: may this operation still do the next local phase?
 ///
 /// A refusal here is a [`TransportError::Transport`] — fail closed, nothing sent, never retried.
@@ -638,6 +698,10 @@ fn push_gated_object(
     let refspec = format!("{gated}:{target_ref}");
     let reports: std::rc::Rc<RefCell<Vec<(String, Option<String>)>>> =
         std::rc::Rc::new(RefCell::new(Vec::new()));
+    // Set by the pack-progress hook the moment libgit2 announces the delta stage, so the one span
+    // no hook can end is measured from its true start rather than guessed at.
+    let deltafication_entered: std::rc::Rc<std::cell::Cell<Option<std::time::Instant>>> =
+        std::rc::Rc::new(std::cell::Cell::new(None));
     let mut callbacks = RemoteCallbacks::new();
     {
         let reports = reports.clone();
@@ -646,6 +710,40 @@ fn push_gated_object(
                 .borrow_mut()
                 .push((refname.to_owned(), status.map(str::to_owned)));
             Ok(())
+        });
+    }
+    {
+        // The ONLY hook libgit2 offers inside the local phase that runs BEFORE `push_negotiation`:
+        // `calculate_work` walks the object graph and inserts into the packbuilder, and that insert
+        // path — and only that path — checks what this callback returns (`pack-objects.c:256-270`,
+        // `if (ret) return git_error_set_after_callback(ret);`). Without this hook the traversal is
+        // uninterruptible, which is exactly the gap the drain bound could not cover: an HTTP timeout
+        // cannot bound work that happens before HTTP.
+        //
+        // Signalling that refusal is awkward for one binding-level reason, documented here so the
+        // next reader does not mistake it for cleverness: git2 0.19's `pack_progress_cb`
+        // (`remote_callbacks.rs:485-505`) DISCARDS whatever the Rust closure produces and hard-codes
+        // `0` to C; its closure type (`remote_callbacks.rs:93`) has no return value at all. The one
+        // nonzero this trampoline can ever hand libgit2 is the `-1` it produces when the closure
+        // PANICS, which git2 catches inside its own `extern "C"` frame (`panic::wrap`) — no unwind
+        // crosses a C frame — parks, and re-raises at the Rust boundary when the call returns
+        // (`panic::check`). So the refusal travels as a typed panic and is converted back into an
+        // ordinary `TransportError` at the `remote.push` call below. It is never observable as a
+        // panic by a caller of this module.
+        let lifetime = lifetime.clone();
+        let deltafication_entered = deltafication_entered.clone();
+        callbacks.pack_progress(move |stage, current, total| {
+            if matches!(stage, PackBuilderStage::Deltafication) {
+                deltafication_entered.set(Some(std::time::Instant::now()));
+            }
+            if let Some(check) = &lifetime {
+                if let Err(ended) = check() {
+                    std::panic::panic_any(LocalPackAbort(format!(
+                        "refusing to keep packing for this delivery (stage {stage:?}, \
+                         {current}/{total} objects): {ended}"
+                    )));
+                }
+            }
         });
     }
     {
@@ -668,6 +766,9 @@ fn push_gated_object(
     let mut options = PushOptions::new();
     options.remote_callbacks(callbacks);
 
+    if lifetime.is_some() {
+        silence_local_pack_abort_panics();
+    }
     lifetime_gate(lifetime.as_ref(), "begin the delivery push")?;
     let context = LegContext {
         mint,
@@ -676,10 +777,33 @@ fn push_gated_object(
         short: false,
         intended_url: remote_url.to_owned(),
     };
-    with_context(context, || {
-        remote.push(&[refspec.as_str()], Some(&mut options))
-    })?;
+    let pushed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        with_context(context, || {
+            remote.push(&[refspec.as_str()], Some(&mut options))
+        })
+    }));
     drop(options);
+    match pushed {
+        Ok(result) => result?,
+        Err(payload) => match payload.downcast::<LocalPackAbort>() {
+            // Our own refusal, raised in the pack-progress hook and carried out through git2's
+            // trampoline. Fail closed, exactly as the other lifetime gates do.
+            Ok(abort) => return Err(TransportError::Transport(abort.0)),
+            // Anything else is a real panic and stays one.
+            Err(other) => std::panic::resume_unwind(other),
+        },
+    }
+    // What the hook could NOT interrupt, measured rather than assumed. Between `push_negotiation`
+    // and the first pack byte libgit2 sorts the object list and runs `ll_find_deltas`, and that loop
+    // discards its progress callback's return (`pack-objects.c:979`, `:1356`; the deltafication
+    // notification at `:1330-1331` discards it too). Nothing in-process can end that span, so the
+    // span is TIMED and a breach is reported loudly instead of being asserted away.
+    if let Some(line) = deltafication_entered
+        .get()
+        .and_then(|entered| delta_overrun_line(entered.elapsed()))
+    {
+        crate::opline!("{line}");
+    }
     // The remote's per-ref ACK is the whole answer. Reading the advertisement back afterwards added
     // no authority the ACK does not already carry — it is the same server answering the same
     // question a second time — while costing a second authorized connection to the delivery remote
@@ -1084,6 +1208,39 @@ impl Write for HttpStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A delta search that fits its budget says nothing; one that outlasts it says how long it took.
+    ///
+    /// This is the whole difference between a bound that is enforced and one that is merely
+    /// asserted. The span cannot be interrupted from this process (`pack-objects.c:979` discards the
+    /// answer), so the honest treatment is to MEASURE it and make an overrun loud. A silent overrun
+    /// would make the drain bound unfalsifiable in exactly the phase it cannot cover.
+    ///
+    /// Red-on-revert: make `delta_overrun_line` return `None` unconditionally, or drop the measured
+    /// duration from the line, and this fails.
+    #[test]
+    fn a_delta_search_that_outlasts_its_budget_is_reported_with_the_number() {
+        assert_eq!(
+            delta_overrun_line(UNINTERRUPTIBLE_DELTA_BUDGET - Duration::from_millis(1)),
+            None,
+            "a delta search inside its budget is ordinary work, not an event"
+        );
+
+        let over = UNINTERRUPTIBLE_DELTA_BUDGET + Duration::from_millis(1_250);
+        let line = delta_overrun_line(over).expect("an overrun must be reported");
+        assert!(
+            line.contains(&format!("{}ms", over.as_millis())),
+            "the operator needs the MEASURED duration, not the fact of an overrun: {line}"
+        );
+        assert!(
+            line.contains(&format!("{}ms", UNINTERRUPTIBLE_DELTA_BUDGET.as_millis())),
+            "and what it was measured against: {line}"
+        );
+        assert!(
+            delta_overrun_line(UNINTERRUPTIBLE_DELTA_BUDGET).is_some(),
+            "the budget is the boundary: reaching it is already an overrun"
+        );
+    }
 
     #[test]
     fn ls_legs_hit_info_refs_post_legs_hit_service() {
