@@ -129,6 +129,30 @@ required-features = ["git-delivery"]
 name = "push_destination_binding"
 required-features = ["git-delivery"]
 
+# WHEN the delivery push token is signed, and whether a redirect can carry it away. The fixture
+# holds its first response, so "each leg mints its own" is measured in elapsed time; a second
+# endpoint proves an unfollowed redirect receives nothing. Gated like above.
+[[test]]
+name = "relay_push_fresh_auth"
+required-features = ["git-delivery"]
+
+# Two deliveries, one seat lock, one remote: does the delivery that WAITED sign its token after the
+# wait? Drives the production `serialized_bounded_push` with the real signer actor and the HTTPS
+# fixture. Its own process, because the transport's HTTP client (and its TLS trust) is built once
+# per process. Gated like above.
+[[test]]
+name = "delivery_push_contention"
+required-features = ["git-delivery"]
+
+# F2: reqwest's OWN retry. The workspace enables its `http2` feature, so the transport client speaks
+# h2 by ALPN, and reqwest replays a request — body and headers, below the minter — when the peer nacks
+# the stream. This drives a real h2 peer that delays and then refuses, and asserts the replay does not
+# happen. Its own binary for the same reason as the contention test: the transport's HTTP client is
+# built once per process and this one needs its TLS trust staged first.
+[[test]]
+name = "h2_no_hidden_replay"
+required-features = ["git-delivery"]
+
 # The container reap against a REAL zombie-leader survivor: a thread group whose leader exited while a
 # sibling thread lives. `#[ignore]`d, because it runs the production reaper, which SIGKILLs every
 # process but pid 1 and itself. It must be the only process tree of a fresh container; run it through
@@ -141,11 +165,19 @@ required-features = ["wallet"]
 [dev-dependencies]
 async-trait = "0.1.89"
 cdk-sqlite = "=0.17.2"
-# An HTTP/2 CLIENT, for the credential proxy's aggregate in-flight test only. The proxy's own h2
-# support is server-side (hyper `http2`), and `reqwest` here is the UPSTREAM client — enabling h2 on
-# it would change how we talk to real vendors, which is not this test's business. Already in the lock
-# transitively via hyper/http2, so no new resolution. Test-only: never in the shipped binary.
+# An HTTP/2 client AND server, both test-only. The client half is the credential proxy's aggregate
+# in-flight test. The server half is `tests/h2_no_hidden_replay.rs`, which has to BE an HTTP/2 peer:
+# the hidden retry it exists to rule out is one reqwest performs by itself on an h2 protocol nack, so
+# nothing below the h2 framing layer can stage it. Already in the lock transitively via hyper/http2,
+# so no new resolution. Never in the shipped binary.
 h2 = "0.4"
+# The h2 server fixture's request/response types and body bytes — h2's own API vocabulary, same
+# versions the workspace already resolves.
+http = "1"
+bytes = "1"
+# TLS for that fixture: h2 is negotiated by ALPN, so the server has to be an ASYNC rustls acceptor
+# (the smart-HTTP fixture's blocking `StreamOwned` cannot drive h2). Already in the lock via reqwest.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 # A5 (tests/no_system_git) builds git fixtures and reads commit graphs via libgit2 directly. Same
 # workspace pin as the optional [dependencies] git2, so it unifies to one crate instance.
 git2 = { workspace = true }
@@ -159,7 +191,7 @@ nostr-relay-builder = "0.44"
 # rcgen self-signed cert. ring-backed on both — aws-lc-rs is not in the workspace lock.
 rcgen = { version = "0.13", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-tokio = { version = "1.52.0", features = ["macros", "net", "rt", "rt-multi-thread", "time", "test-util"] }
+tokio = { version = "1.52.0", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "time", "test-util"] }
 # The p-gate relay fixture speaks raw NIP-01 over a websocket, because it has to answer a p-gated REQ
 # with the `restricted:` prefix — see the module docs for why nostr-relay-builder cannot.
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }

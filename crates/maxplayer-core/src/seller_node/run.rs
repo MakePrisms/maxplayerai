@@ -1710,7 +1710,10 @@ mod resume_action_tests {
 /// by design: a legit push finishes in seconds, so this never false-strands a slow-but-live push
 /// (which would be the very strand bug #562 is about). The `whole-op > per-leg` ordering that keeps
 /// this safe is no longer prose-only: the `const _` assert below binds the two clocks at COMPILE time.
-const DELIVERY_PUSH_TIMEOUT: Duration = Duration::from_secs(150);
+///
+/// `pub` alongside [`serialized_bounded_push`]: an out-of-process test drives the real wrapper with
+/// the real bound rather than a stand-in for it.
+pub const DELIVERY_PUSH_TIMEOUT: Duration = Duration::from_secs(150);
 
 /// #563: make the two-clock ordering a COMPILE-TIME invariant instead of the cross-file prose above.
 /// git2 has no whole-operation timeout, so `DELIVERY_PUSH_TIMEOUT` is the ONLY whole-op bound on the
@@ -1734,7 +1737,7 @@ const _: () = assert!(
 /// the operator log — the LEG-1 detail) from the bounded-timeout firing, so both route to the SINGLE
 /// `delivery_failed` handling while logging distinctly (never a new state).
 #[derive(Debug)]
-enum DeliveryPushErr {
+pub enum DeliveryPushErr {
     /// The push itself failed; the inner error carries the transport reason (409 / auth / io).
     Push(seller_git::SellerGitError),
     /// The push did not settle within [`DELIVERY_PUSH_TIMEOUT`] (seconds); the lock was released.
@@ -1747,29 +1750,135 @@ enum DeliveryPushErr {
 /// (lock, timeout, push) so the serialization + timeout are unit-testable WITHOUT a relay. The lock is
 /// held ONLY across the push and released the instant it settles or times out. The push oid is stable
 /// (invariant 2), so ORDERING pushes never duplicates a delivery — this is exactly-once.
-async fn serialized_bounded_push<Fut>(
-    lock: &tokio::sync::Mutex<()>,
+///
+/// `pub` so a test can drive THIS wrapper — not a re-creation of it — against a real git remote from
+/// its own process. The delivery-push auth question ("when is the waiting delivery's token signed?")
+/// is only answerable through the real lock, and the fixture that answers it needs a process whose
+/// TLS trust it can stage before anything else builds the shared HTTP client
+/// (`tests/delivery_push_contention.rs`).
+///
+/// # The turn ends when the WORK is quiescent, not when this call returns
+///
+/// Returning `TimedOut` says this delivery stopped waiting. It does not say the push stopped: the
+/// push runs on a blocking thread inside libgit2, and neither timing out nor dropping this future
+/// can interrupt a socket that thread is sitting on. If the lock were released at the moment this
+/// call returns, the next delivery would open `git-receive-pack` to the same repo while the previous
+/// upload was still on the wire — the exact concurrency the lock exists to prevent, reintroduced by
+/// the mechanism meant to stop one delivery starving the rest.
+///
+/// So the turn is owned by the WORK. The push is spawned holding an owned guard, and that guard is
+/// released on the push's own completion, on whichever thread reaches it. This call stops waiting at
+/// `timeout`; the lock stays taken until the upload is actually finished.
+///
+/// That is bounded, not open-ended, and it is bounded by the clock that already bounds it: the
+/// transport client caps a single request at `git_transport::DEFAULT_HTTP_LEG_TIMEOUT` INCLUDING the
+/// body transfer, and the caller revokes push authority as soon as this returns, so no leg after the
+/// in-flight one is ever transmitted. The longest the lock can be held past this call is therefore
+/// one leg.
+///
+/// A dropped caller is the same story with no return value: the spawned push keeps its own turn,
+/// finishes or is refused, and releases the lock itself.
+pub async fn serialized_bounded_push<Fut>(
+    lock: &std::sync::Arc<tokio::sync::Mutex<()>>,
     timeout: Duration,
     push: impl FnOnce() -> Fut,
 ) -> Result<String, DeliveryPushErr>
 where
-    Fut: std::future::Future<Output = Result<String, seller_git::SellerGitError>>,
+    Fut: std::future::Future<Output = Result<String, seller_git::SellerGitError>> + Send + 'static,
 {
-    let _guard = lock.lock().await;
-    match tokio::time::timeout(timeout, push()).await {
-        Ok(Ok(oid)) => Ok(oid),
-        Ok(Err(error)) => Err(DeliveryPushErr::Push(error)),
+    let guard = lock.clone().lock_owned().await;
+    let work = push();
+    // Spawned, not awaited in place: a future dropped mid-push would drop the guard while the
+    // blocking thread it started is still uploading. Here the guard travels WITH the work.
+    let running = tokio::spawn(async move {
+        let outcome = work.await;
+        drop(guard);
+        outcome
+    });
+    match tokio::time::timeout(timeout, running).await {
+        Ok(Ok(Ok(oid))) => Ok(oid),
+        Ok(Ok(Err(error))) => Err(DeliveryPushErr::Push(error)),
+        // The push task itself died (panic inside libgit2, or the runtime shutting down). Same
+        // handling as any other push failure; never a new state.
+        Ok(Err(join)) => Err(DeliveryPushErr::Push(seller_git::SellerGitError::Io(format!(
+            "delivery push task did not complete: {join}"
+        )))),
         Err(_elapsed) => Err(DeliveryPushErr::TimedOut(timeout.as_secs())),
     }
-    // `_guard` drops here — the lock is released the instant the push settles OR times out, never held
-    // into the sign/enqueue tail.
 }
 
+/// This delivery's permission to put a request on the wire, and the fact that permission ENDS.
+///
+/// Two separate things are true of a delivery push, and only the first one used to be modelled: the
+/// token has to be minted late (after the lock, per request), and the job has to still be entitled
+/// to send when the mint returns. Minting the delivery token calls the signer actor and can block
+/// there; a bounded block that returns a token is a bound on the wait, not a licence to transmit.
+///
+/// Revocation is by `Drop`, which is the only form that holds for the case that matters. An explicit
+/// `store(false)` at the end of the delivery arm runs on the paths that reach it — and the paths
+/// that DON'T reach it are exactly the dangerous ones: the delivery future cancelled at an await,
+/// the arm returning early on an error, the task aborted at shutdown. A guard cannot be skipped:
+/// unwind, early return and cancellation all drop it.
+///
+/// [`Self::check`] is what the transport asks immediately before each request leaves
+/// ([`crate::git_transport::AuthorityCheck`]), after the mint, with nothing in between.
+#[derive(Debug)]
+pub struct PushAuthority {
+    live: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PushAuthority {
+    /// A live authority. It stays live until this value is dropped — no other call ends it.
+    pub fn new() -> Self {
+        Self {
+            live: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }
+    }
+
+    /// The question the transport asks before transmitting: is this delivery still allowed to send?
+    ///
+    /// The returned closure holds only a weak-by-value flag, never the delivery's state, so the push
+    /// thread can outlive the delivery arm and still get a truthful answer.
+    pub fn check(&self) -> crate::git_transport::AuthorityCheck {
+        let live = self.live.clone();
+        std::sync::Arc::new(move || {
+            if live.load(std::sync::atomic::Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err("this delivery's push authority has ended".to_owned())
+            }
+        })
+    }
+
+    /// True while this authority is live. For assertions and for the minter's own early refusal.
+    pub fn is_live(&self) -> bool {
+        self.live.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Default for PushAuthority {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for PushAuthority {
+    fn drop(&mut self) {
+        self.live
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+// The same wrapper under CONTENTION — real signer actor, real HTTPS remote, and the question of
+// WHEN the waiting delivery's token is signed — lives in `tests/delivery_push_contention.rs`. It
+// needs its own process: the transport's HTTP client is built once per process, so a test whose
+// remote has a self-signed certificate must stage its TLS trust before any other test touches that
+// client. What stays here is the pure (lock, timeout, push) unit.
 #[cfg(test)]
 mod serialized_bounded_push_tests {
-    use super::{serialized_bounded_push, DeliveryPushErr};
+    use super::{serialized_bounded_push, DeliveryPushErr, PushAuthority};
     use crate::seller_git::SellerGitError;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1807,21 +1916,27 @@ mod serialized_bounded_push_tests {
         );
     }
 
-    // #562 constraint (lead 37896): a hung push must NOT starve later deliveries — it times out,
-    // returns TimedOut (→ delivery_failed at the caller), and RELEASES the lock so the next delivery
-    // proceeds promptly rather than blocking behind the hung one.
+    // #562 constraint (lead 37896): a hung push must NOT starve later deliveries — it times out and
+    // returns TimedOut (→ delivery_failed at the caller), and the next delivery proceeds as soon as
+    // the hung push is actually finished rather than waiting out ITS full budget behind it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_hung_push_times_out_and_frees_the_lock() {
-        let lock = tokio::sync::Mutex::new(());
+    async fn a_hung_push_times_out_and_the_next_delivery_is_not_starved() {
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let started = std::time::Instant::now();
         let hung = serialized_bounded_push(&lock, Duration::from_millis(50), || async move {
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            Ok::<_, SellerGitError>("never".to_string())
+            // Finishes well after the caller's bound, and well before the 30s a starved next
+            // delivery would have to wait if the turn were never handed on.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            Ok::<_, SellerGitError>("late".to_string())
         })
         .await;
         assert!(matches!(hung, Err(DeliveryPushErr::TimedOut(_))), "a hung push must time out");
-        // The lock is free again: the next push acquires it and completes promptly (not starved).
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "the caller must stop waiting at its own bound, not at the push's completion"
+        );
         let next = tokio::time::timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(5),
             serialized_bounded_push(&lock, Duration::from_secs(5), || async move {
                 Ok::<_, SellerGitError>("next-oid".to_string())
             }),
@@ -1829,6 +1944,104 @@ mod serialized_bounded_push_tests {
         .await
         .expect("the next delivery must not be starved behind the timed-out push");
         assert!(matches!(next, Ok(oid) if oid == "next-oid"));
+    }
+
+    // F3, the half a timeout does NOT cover: `TimedOut` says this delivery stopped waiting, not that
+    // its upload stopped. While the abandoned push is still on the wire the turn must still be its
+    // own — otherwise the next delivery opens a second concurrent `git-receive-pack` to the same
+    // repo, which is exactly what the lock exists to prevent.
+    //
+    // Red-on-revert: await the push in place instead of spawning it with an owned guard (the r2
+    // shape) and the guard drops at `timeout`, the second push starts while the first is still
+    // running, and `overlapped` is true.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_timed_out_push_keeps_the_turn_until_its_upload_is_finished() {
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let first_running = Arc::new(AtomicBool::new(false));
+        let overlapped = Arc::new(AtomicBool::new(false));
+
+        let abandoned = {
+            let first_running = first_running.clone();
+            serialized_bounded_push(&lock, Duration::from_millis(50), move || async move {
+                first_running.store(true, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                first_running.store(false, Ordering::SeqCst);
+                Ok::<_, SellerGitError>("first".to_string())
+            })
+            .await
+        };
+        assert!(
+            matches!(abandoned, Err(DeliveryPushErr::TimedOut(_))),
+            "the first delivery must stop waiting at its bound"
+        );
+        assert!(
+            first_running.load(Ordering::SeqCst),
+            "the abandoned push must still be running — otherwise this test proves nothing"
+        );
+
+        let second = {
+            let first_running = first_running.clone();
+            let overlapped = overlapped.clone();
+            serialized_bounded_push(&lock, Duration::from_secs(5), move || async move {
+                if first_running.load(Ordering::SeqCst) {
+                    overlapped.store(true, Ordering::SeqCst);
+                }
+                Ok::<_, SellerGitError>("second".to_string())
+            })
+            .await
+        };
+        assert!(matches!(second, Ok(oid) if oid == "second"));
+        assert!(
+            !overlapped.load(Ordering::SeqCst),
+            "a second delivery must never upload while the abandoned one is still on the wire"
+        );
+    }
+
+    // F3: authority ends by DROP, so it ends on the paths that never run another statement — here,
+    // a delivery future cancelled at an await. Red-on-revert: end authority with an explicit
+    // `store(false)` after the push (the r2 shape) and this check still answers Ok after the
+    // cancellation, which is a blocking push thread still entitled to transmit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_a_delivery_ends_its_push_authority() {
+        let escaped = Arc::new(std::sync::Mutex::new(None));
+        let handle = {
+            let escaped = escaped.clone();
+            tokio::spawn(async move {
+                let authority = PushAuthority::new();
+                // What the transport holds: it outlives the delivery arm by construction, because
+                // the blocking push thread does.
+                *escaped.lock().expect("not poisoned") = Some(authority.check());
+                assert!(authority.is_live(), "authority is live while the delivery runs");
+                // The cancellation point. This never returns.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                drop(authority);
+            })
+        };
+        // Let the task reach the await, then cancel it exactly as a dropped delivery would be.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        handle.abort();
+        let _ = handle.await;
+
+        let check = escaped.lock().expect("not poisoned").clone().expect("published");
+        let refused = check().expect_err("a cancelled delivery must not still authorize a request");
+        assert!(
+            refused.contains("authority has ended"),
+            "the refusal must name the ended authority, got {refused:?}"
+        );
+    }
+
+    // F3: the answer must be re-asked AFTER the mint. A signer that blocks is the whole hazard — the
+    // wait can outlast the delivery that started it, and a token in hand is not permission to send.
+    #[tokio::test]
+    async fn authority_answers_the_state_at_the_moment_it_is_asked() {
+        let authority = PushAuthority::new();
+        let check = authority.check();
+        assert!(check().is_ok(), "live before");
+        drop(authority);
+        assert!(
+            check().is_err(),
+            "a check taken while authority was live must refuse once it has ended"
+        );
     }
 }
 
@@ -3765,7 +3978,11 @@ pub struct SellerNodeRunner {
     /// `git-receive-pack` to one repo is what the relay 409s (the multi-slot delivery hazard). Held
     /// ONLY across the push (execution stays parallel) and bounded by [`DELIVERY_PUSH_TIMEOUT`], so a
     /// hung push releases it rather than starving every later delivery behind the lock.
-    delivery_push_lock: tokio::sync::Mutex<()>,
+    ///
+    /// `Arc` because the turn belongs to the push, not to the delivery arm that started it: the
+    /// guard is owned and travels with the spawned push, so it is released when the upload is
+    /// actually finished rather than when the arm stops waiting. See [`serialized_bounded_push`].
+    delivery_push_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     /// #541: relay-derived set of SETTLED offer ids (a co-signed kind-3400 receipt has been seen).
     /// Read before any claim to skip a terminal offer that re-appears via backfill or redelivery.
     /// Populated by [`Self::on_receipt`] from the live receipt subscription and its boot/reconnect
@@ -4167,7 +4384,7 @@ impl SellerNodeRunner {
             held_tools,
             slots,
             capacity_skip_pending: std::sync::atomic::AtomicBool::new(false),
-            delivery_push_lock: tokio::sync::Mutex::new(()),
+            delivery_push_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             terminal_offers: TerminalOffers::new(TERMINAL_OFFERS_CAP, TERMINAL_AUTHORS_PER_OFFER),
             fed_under_rate_offers: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
             shutdown: shutdown::ShutdownChannel::new(),
@@ -7335,27 +7552,66 @@ impl SellerNodeRunner {
                 }
             };
 
-            // Push under the seller's NIP-98 auth. The push authorization is signed THROUGH the signer
+            // Push under the seller's NIP-98 auth. The authorization is signed THROUGH the signer
             // actor (which owns the seller key), so the push path is NOT a third custody site — the key
             // stays confined to the actor + the authenticated relay client, never re-read here. A
             // public/anonymous https remote takes no header (auth applies to relay-git remotes only).
-            let push_header = if crate::delivery_transport::is_relay_git_locator(&seller.git_remote) {
-                match self.node.signer().http_auth_header(seller.git_remote.clone(), Some(push_ref.clone()), None).await {
-                    Ok(Ok(header)) => Some(header),
-                    Ok(Err(error)) => {
-                        opline!("seller node execute fail job_id={job_id}: push auth sign failed ({error})");
-                        self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
-                        return;
-                    }
-                    Err(error) => {
-                        opline!("seller node execute fail job_id={job_id}: signer actor gone ({error})");
-                        self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
-                        return;
-                    }
-                }
-            } else {
-                None
-            };
+            //
+            // A MINTER, not a header: what follows is a wait. This push queues behind this seat's one
+            // delivery lock, and behind the lock libgit2 opens a fresh stream for the advertisement,
+            // another for the pack POST, and another for any attempt after that. A token minted here
+            // would have to cover all of it — it would be oldest exactly when the relay finally checks
+            // it. Handing the push a closure instead moves signing to the instant before each request
+            // leaves, so every request carries its own fresh token and none of them needs a longer
+            // life than the round-trip it is on.
+            let push_deadline = std::time::Instant::now() + DELIVERY_PUSH_TIMEOUT;
+            // Authority ends when this delivery's turn ends — by DROP, so it also ends on the paths
+            // that never reach the bottom of this arm: an early return, a panic, or this whole
+            // delivery future being cancelled at an await. A push the bound abandoned may still have
+            // a blocking thread parked inside libgit2; this is what stops that thread from minting a
+            // token, and from transmitting one it already holds, for a request nobody is waiting for
+            // any more. See [`PushAuthority`].
+            let push_authority = PushAuthority::new();
+            let push_check = push_authority.check();
+            let push_mint: Option<crate::git_transport::AuthMinter> =
+                if crate::delivery_transport::is_relay_git_locator(&seller.git_remote) {
+                    let signer = self.node.signer().clone();
+                    let intended = seller.git_remote.clone();
+                    let scope = push_ref.clone();
+                    let authority = push_authority.check();
+                    Some(std::sync::Arc::new(move |destination: &str| {
+                        // Bind the token to the remote THIS job was told to deliver to, with the same
+                        // comparison the transport uses. The transport already refuses a leg to any
+                        // other destination; refusing to SIGN for one as well means a redirected or
+                        // rewritten leg cannot even obtain a token to carry.
+                        if !crate::git_transport::same_destination(&intended, destination) {
+                            return Err(format!(
+                                "refusing to authorize a leg to {destination}: this delivery is bound to {intended}"
+                            ));
+                        }
+                        // Before signing. The transport asks the SAME authority again after this
+                        // returns, because the signer call below can block and the answer can change
+                        // while it does.
+                        authority().map_err(|ended| {
+                            format!("{ended}; refusing to authorize another leg")
+                        })?;
+                        if std::time::Instant::now() >= push_deadline {
+                            return Err(
+                                "this delivery's push deadline has passed; refusing to authorize another leg"
+                                    .to_owned(),
+                            );
+                        }
+                        // Scoped to this job's ref, and bounded by what is left of the push budget so
+                        // a slow signer cannot park the thread holding the delivery lock.
+                        signer.http_auth_header_blocking(
+                            destination.to_owned(),
+                            Some(scope.clone()),
+                            push_deadline,
+                        )
+                    }))
+                } else {
+                    None
+                };
             // #562: serialize the delivery push to this seat's ONE delivery remote, bounded so a hung
             // push frees the lock instead of starving every later delivery. Concurrent awarded jobs push
             // per-job branches to the same repo, and concurrent git-receive-pack to one repo is what the
@@ -7367,22 +7623,32 @@ impl SellerNodeRunner {
             // `seller.git_remote`. Safe here: the job container has already exited, so no agent
             // process is alive to re-plant the redirect between the rewrite and the push. Both run in
             // one blocking op inside `neutralize_then_push_off_runtime`, which pushes the gated object
-            // and returns the oid the remote attests.
-            let commit = match serialized_bounded_push(
-                &self.delivery_push_lock,
-                DELIVERY_PUSH_TIMEOUT,
-                || {
+            // and returns the oid the remote ACKed.
+            let push_outcome = {
+                let workdir = workdir.clone();
+                let remote = seller.git_remote.clone();
+                let branch = branch.clone();
+                let gated = gated_oid.clone();
+                serialized_bounded_push(&self.delivery_push_lock, DELIVERY_PUSH_TIMEOUT, move || {
                     seller_git::neutralize_then_push_off_runtime(
-                        workdir.clone(),
-                        seller.git_remote.clone(),
-                        branch.clone(),
-                        gated_oid.clone(),
-                        push_header,
+                        workdir,
+                        remote,
+                        branch,
+                        gated,
+                        push_mint,
+                        Some(push_check),
                     )
-                },
-            )
-            .await
-            {
+                })
+                .await
+            };
+            // Whatever the outcome, this delivery is done asking for authorizations. On the timeout
+            // path that is the point: the bound stopped waiting and moved on, but the blocking
+            // thread can still be inside libgit2 waiting on a socket, and when it wakes it must not
+            // be able to sign a fresh token — or send one it is already holding — for a leg this job
+            // no longer owns. `drop` rather than a flag store: the same end on every path out of this
+            // arm, including the ones that never execute another statement here.
+            drop(push_authority);
+            let commit = match push_outcome {
                 Ok(oid) => oid,
                 Err(DeliveryPushErr::Push(error)) => {
                     opline!("seller node execute fail job_id={job_id}: git push failed ({error})");
@@ -7701,6 +7967,9 @@ impl SellerNodeRunner {
             gid: prepared.gid,
             netns: prepared.holder_name.as_deref(),
             mcp_servers: &session_servers,
+            // The same resolver file the agent launch gets, for the same reason: this container runs
+            // real git operations, and under gVisor docker's embedded resolver never answers.
+            resolv_conf: prepared.resolv_conf.as_deref(),
         };
         // The exchange directory, then whatever the held tools attach (their socket directories).
         let mut mounts = vec![ExtraMount::Bind {

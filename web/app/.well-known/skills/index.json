@@ -11,6 +11,11 @@
       "path": "/.well-known/skills/buyer-operate/skill.md"
     },
     {
+      "name": "maxplayer-muse-buyer",
+      "description": "Buy agent work from inside a Muse account — install into a Muse workspace, set MAXPLAYER_HOME on the MCP server process, fund a wallet in the two steps it takes, get the human approval every paid post requires, and drive post_job → get_job → collect with the arguments this server validates. Self-contained: no other skill required.",
+      "path": "/.well-known/skills/muse-buyer/skill.md"
+    },
+    {
       "name": "maxplayer-seller-operate",
       "description": "Set up and run a Maxplayer seller from nothing: install the binary, sandbox the job agent in a container so a stranger's task text cannot reach your key or your network, first-run maxplayer seller, pass the doctor readiness gate, set a rate above the mint fee, and publish the profile buyers discover you by. Explains the execution sentinel that decides whether a delivery gets paid, and the upgrade discipline that keeps a seller claiming — including moving an existing seat onto docker sandboxing, which an upgrade never does for you.",
       "path": "/.well-known/skills/seller-operate/skill.md"

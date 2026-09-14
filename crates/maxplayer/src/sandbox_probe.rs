@@ -420,6 +420,7 @@ fn run_in_container(policy: &SandboxPolicy, canary: &Path, workdir: &Path) -> Co
         // The behavioural egress canary that DOES run inside a contained namespace is separate work.
         netns: None,
         mcp_servers: &[],
+        resolv_conf: None,
     };
     let launch = match policy.launch(&payload, &job) {
         Ok(launch) => launch,

@@ -584,6 +584,20 @@ pub struct SandboxConfig {
     /// not name, or to carry a gateway base-URL. Unused under `launcher` mode.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forward_env: Vec<String>,
+    /// `docker` mode: the DNS resolver ADDRESSES a contained job's `/etc/resolv.conf` names.
+    /// Omitted ⇒ the host's own upstream resolvers are discovered and used; a host that names none
+    /// refuses to run jobs rather than picking a public resolver nobody chose.
+    ///
+    /// This exists because docker's embedded resolver at `127.0.0.11` is unreachable from a gVisor
+    /// sandbox — measured, with a runc control that succeeds on the identical image and network —
+    /// and because `docker run --dns` does not change what the daemon writes into a container on a
+    /// user-defined network. Addresses only, never hostnames: resolving the resolver is the problem
+    /// being fixed. A loopback address is refused for the same reason `127.0.0.11` fails.
+    ///
+    /// Each address named here is opened by the job's egress policy on port 53 and nothing else,
+    /// as a single host (`/32`, or `/128` for v6) — never a subnet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_servers: Vec<String>,
     /// `docker` mode: the container runtime to run the job under (`docker run --runtime <name>`).
     /// Omitted ⇒ the daemon's default runtime (`runc`). The v1 sandbox posture sets this to `runsc`
     /// on Linux, where the default container shares the host kernel and gVisor is the primary

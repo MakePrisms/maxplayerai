@@ -1112,6 +1112,7 @@ mod live_tests {
                     gid: prepared.gid,
                     netns: prepared.holder_name.as_deref(),
                     mcp_servers: &servers,
+                    resolv_conf: prepared.resolv_conf.as_deref(),
                 },
                 &attachments.extra_mounts,
             )

@@ -155,6 +155,7 @@ fn policy(gateway: &str) -> NetPolicy {
         gateway: gateway.to_owned(),
         proxy_ports: Some(PortRange::new(49200, 49299).expect("valid range")),
         log_connections: true,
+        dns_resolvers: Vec::new(),
     }
 }
 
@@ -371,6 +372,7 @@ fn the_pinhole_opens_one_port_and_the_rest_of_that_range_stays_denied() {
         gateway: canary.denied_ip.clone(),
         proxy_ports: Some(PortRange::new(port, port).expect("valid range")),
         log_connections: true,
+        dns_resolvers: Vec::new(),
     };
     let (plan, expected) = plan_stdin(&policy);
     let (ok, applied, err) = canary.fixture.apply(&plan);
@@ -542,6 +544,9 @@ fn a_job_launched_through_the_policy_is_contained_and_an_uncontained_one_is_not(
         // And no proxied vendor tool, for the same reason.
         mcp_tools: Vec::new(),
         held_tools: Vec::new(),
+        // No resolver either: the launch under test is compared against a control, and a resolver
+        // mount would differ between the two for a reason this test is not measuring.
+        dns_servers: Vec::new(),
         codex_chatgpt: None,
         // ABSENT, as an operator's docker config has it — which since the default moved means the
         // container delivery path. Written as `None` rather than `Some(false)` so this fixture stays
@@ -570,6 +575,7 @@ fn a_job_launched_through_the_policy_is_contained_and_an_uncontained_one_is_not(
                 gid: 0,
                 netns: None,
                 mcp_servers: &[],
+                resolv_conf: None,
             },
         )
         .expect("the policy must build a launch");
@@ -595,6 +601,7 @@ fn a_job_launched_through_the_policy_is_contained_and_an_uncontained_one_is_not(
                 gid: 0,
                 netns: Some(&canary.fixture.holder),
                 mcp_servers: &[],
+                resolv_conf: None,
             },
         )
         .expect("the policy must build a launch");
@@ -624,6 +631,7 @@ fn policy_for(gateway: &str) -> NetPolicy {
         // No pinhole: this test wants the denied address denied, not excepted.
         proxy_ports: Some(PortRange::new(port + 1, port + 1).expect("valid range")),
         log_connections: true,
+        dns_resolvers: Vec::new(),
     }
 }
 
@@ -826,6 +834,10 @@ fn establish_contains_a_namespace_and_tears_it_down_on_drop() {
         1000,
         Some(PortRange::new(49200, 49299).expect("valid range")),
         true,
+        // No resolver exception in this live case: the DNS pinholes are rendered and read back by
+        // unit tests, and adding one here would open port 53 to an address this fixture never
+        // measured.
+        Vec::new(),
     ));
 
     let holder_name = match outcome {

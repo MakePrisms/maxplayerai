@@ -1041,20 +1041,51 @@ mod checks {
             Ok(true) => {
                 // Also assert the policy is not vacuously empty. An empty plan would apply perfectly
                 // and contain nothing, which is the failure the sidecar's exit 4 exists to refuse.
+                // The resolvers are this seat's CONFIGURED ones and not an empty placeholder,
+                // because the count does depend on them — two port-53 rules per resolver — and a
+                // render with a resolver input no job will ever use would report a number for a
+                // different policy than the one launches install. Where the seat configured none,
+                // the resolvers are discovered per launch, so the number is a floor and the message
+                // says which case it is rather than certifying either silently.
+                let configured_resolvers = policy.dns_servers().to_vec();
+                let resolvers_named = configured_resolvers.len();
                 let rules = maxplayer_core::sandbox_net::NetPolicy {
-                    // A placeholder: the real address is measured per launch. Only the COUNT is read
-                    // here, and no rule's presence depends on which address this is.
+                    // A placeholder: the real address is measured per launch. No rule's presence
+                    // depends on which address this is.
                     gateway: "172.17.0.1".into(),
                     proxy_ports: policy.proxy_ports(),
                     log_connections: true,
+                    dns_resolvers: configured_resolvers,
                 }
                 .install_plan()
                 .len();
+                let (count_phrase, resolver_note) = if resolvers_named == 0 {
+                    (
+                        format!("renders AT LEAST {rules} rules"),
+                        "`[sandbox] dns_servers` names no resolver, so each job discovers this \
+                         host's own upstreams at launch and adds one udp and one tcp port-53 rule \
+                         per discovered resolver on top of that floor — this check does not run \
+                         that discovery, so how many resolvers a launch will find is UNVERIFIED \
+                         here, and a launch that finds none is refused rather than run without one"
+                            .to_owned(),
+                    )
+                } else {
+                    (
+                        format!("renders {rules} rules"),
+                        format!(
+                            "including one udp and one tcp port-53 rule for each of the \
+                             {resolvers_named} canonical resolver(s) `[sandbox] dns_servers` \
+                             resolves to — the same de-duplicated set every launch installs, not \
+                             the raw config list"
+                        ),
+                    )
+                };
                 Check::pass(
                     EGRESS_CHECK,
                     format!(
-                        "network '{network}' exists and the policy renders {rules} rules; each job \
-                         gets them installed in its own network namespace before it starts"
+                        "network '{network}' exists and the policy {count_phrase} \
+                         ({resolver_note}); each job gets them installed in its own network \
+                         namespace before it starts"
                     ),
                 )
             }
@@ -4053,6 +4084,131 @@ mod tests {
         );
     }
 
+    // RED-PROVE (verdict F2): doctor must describe the plan LAUNCHES install, not the raw config
+    // vector. A launch resolves `[sandbox] dns_servers` through `sandbox_dns::from_config`, which
+    // trims, drops blanks, canonicalises and de-duplicates; doctor reading the raw list claimed
+    // four port-53 rules for `["1.1.1.1", "1.1.1.1"]` where two are installed, and claimed a named
+    // resolver for `[" "]` where the launch performs host discovery instead.
+    //
+    // Asserted as a RELATION between doctor's number and the canonical resolver set rather than
+    // against hard-coded totals, so the test keeps meaning if the base policy gains a rule.
+    #[test]
+    fn doctor_counts_the_canonical_resolvers_a_launch_installs_not_the_raw_config_list() {
+        use maxplayer_core::home::{SandboxConfig, SandboxMode};
+
+        let seat = |resolvers: &[&str]| {
+            Some(SandboxConfig {
+                mode: SandboxMode::Docker,
+                image: Some("maxplayer-sandbox:latest".into()),
+                network: Some("sbx".into()),
+                dns_servers: resolvers.iter().map(|value| (*value).to_string()).collect(),
+                ..Default::default()
+            })
+        };
+        // The rule total out of the pass sentence, in either spelling. Panics rather than returning
+        // an option: a pass that stopped naming a number is itself the regression.
+        let rules_reported = |detail: &str| -> usize {
+            let tail = detail
+                .split_once("renders ")
+                .unwrap_or_else(|| panic!("a pass must state what the policy renders: {detail}"))
+                .1;
+            let tail = tail.strip_prefix("AT LEAST ").unwrap_or(tail);
+            tail.split_whitespace()
+                .next()
+                .and_then(|number| number.parse().ok())
+                .unwrap_or_else(|| panic!("a pass must state a rule COUNT: {detail}"))
+        };
+        let reported = |resolvers: &[&str]| -> usize {
+            let check = checks::check_sandbox_egress_in(seat(resolvers), |_| Ok(true));
+            assert_eq!(check.status, Status::Pass, "{}", check.render());
+            rules_reported(&check.detail)
+        };
+
+        // The floor: no resolver named at all. Every case below is measured against this, and one
+        // resolver is worth exactly one udp plus one tcp rule.
+        let floor = reported(&[]);
+        let one = reported(&["1.1.1.1"]);
+        assert_eq!(
+            one,
+            floor + 2,
+            "one resolver is one udp and one tcp port-53 rule",
+        );
+
+        // F2's first counterexample. The raw list has two entries; the launch installs one
+        // resolver's rules, so doctor must say so too.
+        assert_eq!(
+            reported(&["1.1.1.1", "1.1.1.1"]),
+            one,
+            "a repeated resolver is ONE resolver at launch — de-duplicated by \
+             `sandbox_dns::from_config` — so doctor must not double its rules",
+        );
+        assert_eq!(
+            reported(&["", "1.1.1.1", "   "]),
+            one,
+            "blank entries are not resolvers; a launch drops them before rendering any rule",
+        );
+        assert_eq!(
+            reported(&["2001:db8::1", "2001:0db8:0000:0000:0000:0000:0000:0001"]),
+            one,
+            "two spellings of one IPv6 address canonicalise to one resolver at launch",
+        );
+        assert_eq!(
+            reported(&["1.1.1.1", "2001:db8::1"]),
+            floor + 4,
+            "two distinct resolvers, one per family, are two pairs of rules",
+        );
+
+        // F2's second counterexample: whitespace-only is NOT a named resolver. The launch discovers
+        // the host's upstreams, so the number doctor prints is a floor and must say so — including
+        // that this check did not run that discovery.
+        let whitespace = checks::check_sandbox_egress_in(seat(&[" "]), |_| Ok(true));
+        assert_eq!(whitespace.status, Status::Pass, "{}", whitespace.render());
+        assert_eq!(
+            rules_reported(&whitespace.detail),
+            floor,
+            "a whitespace-only entry names no resolver, so the count is the discovery floor",
+        );
+        assert!(
+            whitespace.detail.contains("AT LEAST")
+                && whitespace.detail.contains("UNVERIFIED")
+                && whitespace.detail.contains("discovers"),
+            "the unconfigured case must read as an UNVERIFIED floor with discovery at launch, not \
+             as a certified plan: {}",
+            whitespace.detail
+        );
+        let unconfigured = checks::check_sandbox_egress_in(seat(&[]), |_| Ok(true));
+        assert!(
+            unconfigured.detail.contains("AT LEAST") && unconfigured.detail.contains("UNVERIFIED"),
+            "same wording for an empty list as for a blank one — they are the same state: {}",
+            unconfigured.detail
+        );
+        assert!(
+            !unconfigured.detail.contains("resolver(s) `[sandbox] dns_servers` resolves to"),
+            "an unconfigured seat must not claim a named resolver count: {}",
+            unconfigured.detail
+        );
+        // And the configured case must NOT read as a floor: it is the exact set launches install.
+        let configured = checks::check_sandbox_egress_in(seat(&["1.1.1.1"]), |_| Ok(true));
+        assert!(
+            !configured.detail.contains("AT LEAST") && configured.detail.contains("canonical"),
+            "a configured seat's count is exact and is the canonical set, not a floor: {}",
+            configured.detail
+        );
+
+        // Unusable resolvers never reach a count at all: config resolution refuses them, and the
+        // launcher check is the row that reports it. Doctor must not invent a plan for a config no
+        // job can run — nor claim DNS readiness from any of this.
+        for refused in ["127.0.0.53", "169.254.169.254", "dns.example.com"] {
+            let check = checks::check_sandbox_egress_in(seat(&[refused]), |_| Ok(true));
+            assert_eq!(
+                check.detail, "no resolvable docker executor",
+                "`{refused}` must not resolve to a policy, so this row defers to the launcher \
+                 check: {}",
+                check.render()
+            );
+        }
+    }
+
     // RED-PROVE (#792 phase 3): an absent docker sandbox image is flagged with the ACTIONABLE
     // `docker pull <ref>` command, not a raw failure — the operator can act without reading source.
     // A present image passes; a pullable one warns and still prints the pre-pull command.
@@ -4339,6 +4495,9 @@ mod tests {
             // sandbox field breaks this test and makes someone decide what it should be here.
             network: None,
             proxy_port_range: None,
+            // No resolver named: this check reads the engine floor, and the resolver a job gets is
+            // decided per launch.
+            dns_servers: Vec::new(),
             // Decision for this test, per the note above: none. It asserts the engine-version floor,
             // and a file-sourced credential is a containment concern that would only add a second
             // reason for the check to move.

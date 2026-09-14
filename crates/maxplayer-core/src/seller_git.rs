@@ -504,12 +504,38 @@ pub fn push_branch_with_header(
     gated_oid: &str,
     header: Option<String>,
 ) -> Result<String, SellerGitError> {
+    push_branch_with_minter(
+        workdir,
+        remote_url,
+        branch,
+        gated_oid,
+        header.map(git_transport::static_auth),
+        None,
+    )
+}
+
+/// [`push_branch_with_header`] with the NIP-98 authorization minted per wire request rather than
+/// once up front (see [`git_transport::AuthMinter`]). The delivery push uses this: it is called from
+/// a blocking thread after the seat's delivery lock was acquired, and each leg signs then.
+///
+/// `authority` is re-asked after each mint and before that request is transmitted (see
+/// [`git_transport::AuthorityCheck`]): the mint itself can wait on the signer actor, and the caller
+/// that owned this push may be gone — cancelled, timed out, dropped — by the time it returns.
+pub fn push_branch_with_minter(
+    workdir: &Path,
+    remote_url: &str,
+    branch: &str,
+    gated_oid: &str,
+    mint: Option<git_transport::AuthMinter>,
+    authority: Option<git_transport::AuthorityCheck>,
+) -> Result<String, SellerGitError> {
     assert_allowed_repo_locator(remote_url)?;
     if branch.trim().is_empty() {
         return Err(SellerGitError::Io("branch must be non-empty".into()));
     }
-    let oid =
-        git_transport::push_branch_with_header(workdir, remote_url, branch, gated_oid, header)?;
+    let oid = git_transport::push_branch_with_minter(
+        workdir, remote_url, branch, gated_oid, mint, authority,
+    )?;
     eprintln!("seller push path=inprocess remote={remote_url} branch={branch} ok");
     Ok(oid)
 }
@@ -866,18 +892,29 @@ pub fn neutralize_push_config(workdir: &Path) -> Result<(), SellerGitError> {
 /// Off-runtime: neutralise `workdir`'s config, THEN push the gated commit. This is the host-path
 /// delivery push. The layout gate and the whole-file config replacement run first, so an
 /// `insteadOf`/`pushInsteadOf`/`include` the agent planted is gone before libgit2 reads the config;
-/// the push then sends the object `gated_oid`, binds every leg to `remote_url`, and reads the
-/// remote's advertisement back. Both run in one blocking op, so nothing runs between them.
+/// the push then sends the object `gated_oid`, binds every leg to `remote_url`, and requires the
+/// remote's own per-ref ACK. Both run in one blocking op, so nothing runs between them.
+///
+/// `mint` authorizes each wire request as it is made, on the blocking thread this op runs on — see
+/// [`git_transport::AuthMinter`]. That is why it is a minter and not a header: this call is what
+/// sits behind the seat's delivery lock, so a header minted by the caller would have aged across
+/// the whole wait before the first byte moved.
+///
+/// `authority` is the same question asked one step later: after the mint returned and before that
+/// request is transmitted (see [`git_transport::AuthorityCheck`]). The blocking thread this runs on
+/// OUTLIVES the future that spawned it — dropping the future does not stop the thread — so the
+/// thread has to find out for itself that its owner is gone.
 pub async fn neutralize_then_push_off_runtime(
     workdir: PathBuf,
     remote_url: String,
     branch: String,
     gated_oid: String,
-    header: Option<String>,
+    mint: Option<git_transport::AuthMinter>,
+    authority: Option<git_transport::AuthorityCheck>,
 ) -> Result<String, SellerGitError> {
     off_runtime(move || {
         neutralize_push_config(&workdir)?;
-        push_branch_with_header(&workdir, &remote_url, &branch, &gated_oid, header)
+        push_branch_with_minter(&workdir, &remote_url, &branch, &gated_oid, mint, authority)
     })
     .await
 }

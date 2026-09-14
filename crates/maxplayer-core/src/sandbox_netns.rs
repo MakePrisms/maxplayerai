@@ -28,9 +28,13 @@
 //! [`host_gateway_probe_argv`] measures it rather than computing it — see the warning there, because
 //! the obvious computation is wrong in a way no rendering test can see.
 //!
-//! Name resolution is unaffected: a container joining the namespace still gets its own
+//! Name resolution needs its own answer. A container joining the namespace still gets its own
 //! `/etc/resolv.conf` pointing at docker's embedded resolver on `127.0.0.11`, which is why
-//! `sandbox_net`'s "loopback is never denied" test is load-bearing rather than decorative.
+//! `sandbox_net`'s "loopback is never denied" test is load-bearing rather than decorative for a
+//! runc seat. Under gVisor that resolver never answers at all — the sandbox terminates loopback in
+//! its own network stack, so the packet never reaches the daemon's socket — so a contained job is
+//! handed a real resolver file instead and this module carries the addresses inside it through to
+//! the policy, one port-53 exception per resolver. See [`crate::sandbox_dns`].
 
 use crate::sandbox_net::{Family, NetPolicy};
 
@@ -624,6 +628,7 @@ pub async fn establish(
     gid: u32,
     proxy_ports: Option<crate::sandbox_net::PortRange>,
     log_connections: bool,
+    dns_resolvers: Vec<String>,
 ) -> Result<Containment, String> {
     // Measured BEFORE the holder exists, so a probe failure needs no cleanup.
     let (probe_stdout, _) = run_docker(host_gateway_probe_argv(sidecar_image, proxy_alias), None)
@@ -641,10 +646,15 @@ pub async fn establish(
     // the guard immediately is what makes that automatic rather than remembered.
     let holder = NetnsHolder::adopt(name);
 
+    // The resolvers arrive from the caller rather than being discovered here, and that is the one
+    // property that keeps the job's `/etc/resolv.conf` and this policy in agreement: the caller
+    // resolves once, writes that file from the result, and hands the same addresses here. Two
+    // discoveries could disagree and the job would be pointed at a resolver its own firewall drops.
     let policy = NetPolicy {
         gateway: proxy_host.clone(),
         proxy_ports,
         log_connections,
+        dns_resolvers,
     };
     let (plan, expected) = plan_stdin(&policy);
     let (applied, _) = run_docker(sidecar_argv(&holder, sidecar_image), Some(plan))
@@ -693,6 +703,7 @@ mod tests {
             gateway: "172.17.0.1".into(),
             proxy_ports: Some(PortRange::new(9000, 9002).expect("valid range")),
             log_connections: true,
+            dns_resolvers: Vec::new(),
         }
     }
 
@@ -988,6 +999,7 @@ mod tests {
             gateway: measured.clone(),
             proxy_ports: Some(PortRange::new(9000, 9000).expect("valid range")),
             log_connections: false,
+            dns_resolvers: Vec::new(),
         };
         let (stdin, _) = plan_stdin(&policy);
         let accepts: Vec<&str> = stdin.lines().filter(|l| l.contains("ACCEPT")).collect();

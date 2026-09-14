@@ -39,3 +39,6 @@ evidence/**/*.tar.err
 # Editor / OS
 .DS_Store
 *.swp
+
+.claude
+.idea

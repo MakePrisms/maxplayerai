@@ -51,6 +51,18 @@ enum Command {
         expiration_unix: Option<i64>,
         reply: oneshot::Sender<Result<String, String>>,
     },
+    /// [`Command::HttpAuthHeader`] for a caller that is NOT on the runtime: the delivery push runs
+    /// on a blocking thread and mints one token per wire request from inside the transport, so it
+    /// cannot `.await` the reply.
+    ///
+    /// The reply rides a std channel rather than a `oneshot` on purpose: `oneshot::blocking_recv`
+    /// waits forever, while `SyncSender`/`recv_timeout` gives the blocking thread a bound with no
+    /// runtime in reach — and a parked push thread is exactly the failure this must not have.
+    HttpAuthHeaderBlocking {
+        remote_url: String,
+        ref_scope: Option<String>,
+        reply: std::sync::mpsc::SyncSender<Result<String, String>>,
+    },
     /// NIP-44/NIP-17 unwrap of a kind-1059 gift-wrap addressed to the seller, decoded to its NUT-18
     /// payment (or `None` when it is not a decodable own-payment wrap). The decrypt needs the seller
     /// key, so it runs INSIDE the actor; only the buyer's decrypted payment (never the seller key)
@@ -82,6 +94,10 @@ pub struct SignerHandle {
 /// so this is not a latency budget — it is a liveness bound. Its job is to guarantee the call
 /// *returns*, not to police how fast.
 const SIGNER_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How often the blocking bridge re-offers a command to a full signer queue. Short enough that a
+/// freed slot is taken promptly, long enough not to spin a core while waiting.
+const SIGNER_BLOCKING_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// A signer round-trip that did not complete: the actor exited, or it failed to answer within
 /// [`SIGNER_CALL_TIMEOUT`]. Carries which call and which leg, so the operator log names the exact
@@ -205,6 +221,62 @@ impl SignerHandle {
         .await
     }
 
+    /// [`SignerHandle::http_auth_header`] for a caller that cannot await: the delivery push mints a
+    /// token per wire request from inside the blocking transport thread.
+    ///
+    /// BOTH legs are bounded by `deadline`, because both can park. Handing the command to the actor
+    /// blocks while the queue is full (a busy signer), and waiting for the answer blocks while the
+    /// actor is slow or wedged. An unbounded wait on either one parks the push thread holding this
+    /// seat's delivery lock, which stops every later delivery too — so a missed deadline returns
+    /// `Err`, the leg is failed unauthorized, and the lock is released.
+    ///
+    /// The key stays in the actor: only the finished header crosses back.
+    pub fn http_auth_header_blocking(
+        &self,
+        remote_url: String,
+        ref_scope: Option<String>,
+        deadline: std::time::Instant,
+    ) -> Result<String, String> {
+        // Capacity 1: the reply is handed over and the actor moves on, never held by this channel.
+        let (reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut command = Command::HttpAuthHeaderBlocking {
+            remote_url,
+            ref_scope,
+            reply,
+        };
+        // Leg 1 — reach the actor. `try_send` + retry rather than `blocking_send`, which has no
+        // timeout and would park here indefinitely behind a saturated queue.
+        loop {
+            match self.tx.try_send(command) {
+                Ok(()) => break,
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Err("signer actor is gone; cannot authorize this leg".to_owned());
+                }
+                Err(mpsc::error::TrySendError::Full(returned)) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(
+                            "signer queue stayed full past this push's deadline; leg not authorized"
+                                .to_owned(),
+                        );
+                    }
+                    command = returned;
+                    std::thread::sleep(SIGNER_BLOCKING_POLL);
+                }
+            }
+        }
+        // Leg 2 — wait for the answer, never past the deadline.
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(
+                "signer did not answer before this push's deadline; leg not authorized".to_owned(),
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err("signer actor dropped the request; leg not authorized".to_owned())
+            }
+        }
+    }
+
     /// Decode a gift-wrap to its NUT-18 payment through the actor (the NIP-44 decrypt needs the
     /// seller key, which never leaves the actor). `Ok(None)` = not a decodable own-payment wrap.
     pub async fn unwrap_payment_wrap(
@@ -283,6 +355,22 @@ pub fn spawn(home: &MaxplayerHome) -> Result<SignerHandle, HomeError> {
                         expiration_unix,
                     )
                     .map_err(|error| error.to_string());
+                    let _ = reply.send(result);
+                }
+                Command::HttpAuthHeaderBlocking {
+                    remote_url,
+                    ref_scope,
+                    reply,
+                } => {
+                    let result = crate::git_transport::nip98_authorization_header_with_keys(
+                        &remote_url,
+                        &keys,
+                        ref_scope.as_deref(),
+                        None,
+                    )
+                    .map_err(|error| error.to_string());
+                    // The caller may already have given up on its deadline; a full or dropped
+                    // channel is that, not an actor fault.
                     let _ = reply.send(result);
                 }
                 Command::UnwrapPaymentWrap { event, reply } => {
@@ -504,6 +592,174 @@ mod tests {
             .expect("actor")
             .is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The delivery push mints from a BLOCKING thread, one token per wire request, through the real
+    // actor. Same custody as the async path: the header comes back, the secret does not.
+    #[tokio::test]
+    async fn the_blocking_bridge_mints_a_scoped_header_through_the_real_actor() {
+        let root = temp_home("blocking-httpauth");
+        let _ = std::fs::remove_dir_all(&root);
+        let home = bootstrap(&root).expect("bootstrap");
+        let secret = home::read_secret_key_hex(&home).expect("secret");
+        let signer = spawn(&home).expect("spawn");
+
+        // On a blocking thread, exactly as the transport calls it.
+        let minted = tokio::task::spawn_blocking({
+            let signer = signer.clone();
+            move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let first = signer.http_auth_header_blocking(
+                    "https://relay.example/git/o/r.git".to_owned(),
+                    Some("refs/heads/maxplayer/abc12345".to_owned()),
+                    deadline,
+                );
+                // A second call on the same thread proves the bridge is reusable — which is the
+                // property a multi-leg push depends on.
+                let second = signer.http_auth_header_blocking(
+                    "https://relay.example/git/o/r.git".to_owned(),
+                    Some("refs/heads/maxplayer/abc12345".to_owned()),
+                    deadline,
+                );
+                (first, second)
+            }
+        })
+        .await
+        .expect("blocking task");
+
+        let first = minted.0.expect("first header");
+        let second = minted.1.expect("second header");
+        assert!(first.starts_with("Nostr "), "NIP-98 auth scheme: {first}");
+        assert!(!first.contains(&secret), "header must not leak the secret");
+        assert!(!second.contains(&secret), "header must not leak the secret");
+        for header in [&first, &second] {
+            let json = {
+                use base64::Engine as _;
+                let b64 = header.strip_prefix("Nostr ").expect("Nostr scheme");
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(b64)
+                    .expect("base64");
+                String::from_utf8(bytes).expect("utf8")
+            };
+            assert!(
+                json.contains("refs/heads/maxplayer/abc12345"),
+                "the blocking mint carries the ref scope: {json}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The push thread that mints holds this seat's delivery lock. If a mint could park there, one
+    // wedged signer would stop not just this delivery but every delivery queued behind it — so BOTH
+    // legs of the bridge are bounded: reaching the actor, and waiting for its answer.
+    //
+    // Red-on-revert: swap the bounded send for `blocking_send`, or the `recv_timeout` for an
+    // unbounded receive, and the corresponding case below never returns — the outer `timeout` fires
+    // and the test fails instead of hanging the suite.
+    #[tokio::test]
+    async fn the_blocking_bridge_is_bounded_on_both_legs() {
+        // Leg 2: the actor takes the command and never answers.
+        let (tx, mut rx) = mpsc::channel::<Command>(8);
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some(command) = rx.recv().await {
+                held.push(command);
+            }
+        });
+        let stalled = SignerHandle {
+            tx,
+            public_key_hex: "00".repeat(32),
+        };
+        let waited = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tokio::task::spawn_blocking(move || {
+                let started = std::time::Instant::now();
+                let outcome = stalled.http_auth_header_blocking(
+                    "https://relay.example/git/o/r.git".to_owned(),
+                    Some("refs/heads/job".to_owned()),
+                    started + std::time::Duration::from_millis(250),
+                );
+                (outcome, started.elapsed())
+            }),
+        )
+        .await
+        .expect("the bridge must return, not park")
+        .expect("blocking task");
+        let error = waited.0.expect_err("a silent actor cannot authorize a leg");
+        assert!(error.contains("deadline"), "{error}");
+        assert!(
+            error.contains("not authorized"),
+            "the caller is told the leg is unauthorized: {error}"
+        );
+        assert!(
+            waited.1 < std::time::Duration::from_secs(5),
+            "it returned at its own deadline, not some far larger one: {:?}",
+            waited.1
+        );
+
+        // Leg 1: the queue is full and nothing drains it, so the command never even reaches an actor.
+        let (tx, _rx) = mpsc::channel::<Command>(1);
+        let (reply, _reply_rx) = oneshot::channel();
+        tx.try_send(Command::PublicKey { reply })
+            .expect("fill the one slot");
+        let saturated = SignerHandle {
+            tx,
+            public_key_hex: "00".repeat(32),
+        };
+        let waited = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tokio::task::spawn_blocking(move || {
+                let started = std::time::Instant::now();
+                let outcome = saturated.http_auth_header_blocking(
+                    "https://relay.example/git/o/r.git".to_owned(),
+                    Some("refs/heads/job".to_owned()),
+                    started + std::time::Duration::from_millis(250),
+                );
+                (outcome, started.elapsed())
+            }),
+        )
+        .await
+        .expect("the bridge must return, not park")
+        .expect("blocking task");
+        let error = waited
+            .0
+            .expect_err("a saturated queue cannot authorize a leg");
+        assert!(error.contains("queue"), "{error}");
+        assert!(
+            waited.1 < std::time::Duration::from_secs(5),
+            "it returned at its own deadline: {:?}",
+            waited.1
+        );
+    }
+
+    // A signer that has exited is not a reason to send an unauthorized request: the bridge says so
+    // immediately rather than waiting out the deadline.
+    #[tokio::test]
+    async fn the_blocking_bridge_fails_at_once_when_the_actor_is_gone() {
+        let (tx, rx) = mpsc::channel::<Command>(8);
+        drop(rx);
+        let handle = SignerHandle {
+            tx,
+            public_key_hex: "00".repeat(32),
+        };
+        let outcome = tokio::task::spawn_blocking(move || {
+            let started = std::time::Instant::now();
+            let result = handle.http_auth_header_blocking(
+                "https://relay.example/git/o/r.git".to_owned(),
+                Some("refs/heads/job".to_owned()),
+                started + std::time::Duration::from_secs(30),
+            );
+            (result, started.elapsed())
+        })
+        .await
+        .expect("blocking task");
+        let error = outcome.0.expect_err("no actor, no authorization");
+        assert!(error.contains("actor is gone"), "{error}");
+        assert!(
+            outcome.1 < std::time::Duration::from_secs(5),
+            "it did not wait out the deadline to learn this: {:?}",
+            outcome.1
+        );
     }
 
     // A signed event carries the protocol tags a live buyer requires (`parse_offer` rejects an event

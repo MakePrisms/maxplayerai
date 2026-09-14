@@ -147,9 +147,15 @@ fn the_header_never_follows_a_config_rewrite_to_another_host() {
 }
 
 /// Positive control: the same transport and the same fixture, no rewrite. The push reaches the
-/// endpoint the caller named, WITH the header, and the object-sourced push plus the remote read-back
-/// succeed against a real smart-HTTP server. This proves the fixture records headers, so the empty
-/// recording above is evidence and not a broken fixture.
+/// endpoint the caller named, WITH the header, and the object-sourced push succeeds against a real
+/// smart-HTTP server. This proves the fixture records headers, so the empty recording above is
+/// evidence and not a broken fixture.
+///
+/// It also pins the leg COUNT. The delivery push is now exactly two authorized requests — the
+/// receive-pack advertisement and the pack POST — because the remote's per-ref ACK in that POST's
+/// status report is the answer, and nothing is read back afterwards. A third authorized request to
+/// the delivery remote would be a regression of that.
+/// Red-on-revert: restore the post-push advertisement read and the count assertions below go red.
 #[test]
 fn the_intended_destination_receives_the_header_and_the_gated_object() {
     init_test_env();
@@ -168,7 +174,7 @@ fn the_intended_destination_receives_the_header_and_the_gated_object() {
 
     let pushed =
         push_branch_with_header(&workdir, &url, branch, &oid, Some(header)).expect("push");
-    assert_eq!(pushed, oid, "the attested oid is the gated one");
+    assert_eq!(pushed, oid, "the returned oid is the gated one");
 
     let requests = relay.requests();
     assert!(!requests.is_empty(), "the relay saw the push");
@@ -187,14 +193,21 @@ fn the_intended_destination_receives_the_header_and_the_gated_object() {
             .iter()
             .filter(|request| request.target == advertisement)
             .count(),
-        2,
-        "the push advertisement and the read-back: {requests:?}"
+        1,
+        "exactly one advertisement — the push's own; no read-back follows it: {requests:?}"
     );
-    assert!(
+    assert_eq!(
         requests
             .iter()
-            .any(|request| request.target == "/git/seller/r.git/git-receive-pack"),
-        "the receive-pack POST: {requests:?}"
+            .filter(|request| request.target == "/git/seller/r.git/git-receive-pack")
+            .count(),
+        1,
+        "exactly one receive-pack POST: {requests:?}"
+    );
+    assert_eq!(
+        requests.len(),
+        2,
+        "the delivery push is those two requests and nothing else: {requests:?}"
     );
     assert_eq!(
         git2::Repository::open_bare(&relay_repo)
