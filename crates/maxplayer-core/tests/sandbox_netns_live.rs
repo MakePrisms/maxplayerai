@@ -1774,6 +1774,18 @@ fn gate_identity() -> maxplayer_core::seller_git::DeliveryAgentIdentity {
 /// the host's `resolv.conf` and then to `resolvectl`, and refuses a loopback address, which is
 /// exactly what a systemd host presents at `127.0.0.53`. Left empty, these legs would depend on the
 /// DNS configuration of whichever machine ran them.
+///
+/// **This address answers nothing, and nothing in this file proves DNS works.** It is a
+/// deterministic fixture for *containment* legs: it makes the rendered rule set predictable so the
+/// pinhole leg can check the SHAPE of what production installed. A rendered `--dport 53 -j ACCEPT`
+/// and an enforced one produce the same green here.
+///
+/// Functioning resolution is a different claim and is measured elsewhere, against a resolver that
+/// actually answers: [`crate::sandbox_dns_live`] runs a real dnsmasq fixture through the same
+/// production path, covering v4/v6 resolution through the written `resolv.conf`, UDP truncation
+/// falling back to TCP 53, host-stub discovery, and the denied-neighbour controls (another private
+/// address, and a non-53 port on the resolver itself). Do not cite this constant, or this file's
+/// readback, as evidence that a contained job can resolve a name.
 const GATE_DNS_RESOLVER: &str = "192.0.2.53";
 
 /// The `[sandbox]` section an operator writes, resolved through the same call a booting seat makes.
@@ -2230,6 +2242,11 @@ fn gate_config_with_runtime(
 /// and payload start, and checks the pinhole against the configured range rather than against
 /// anything this file rendered. The payload leg that follows is the discriminator: a pinhole wide
 /// enough to be useless would still satisfy a readback that only counted rules.
+///
+/// **Scope.** This establishes that the pinhole production installs is no wider than the
+/// configuration -- including that the resolver exceptions go to the configured resolver and
+/// nowhere else. It does NOT establish that resolution works through them; see
+/// [`GATE_DNS_RESOLVER`] for where that is measured.
 #[test]
 #[ignore = "needs docker and the production-tagged netfilter image"]
 fn the_pinhole_production_installs_is_the_one_the_policy_names() {
