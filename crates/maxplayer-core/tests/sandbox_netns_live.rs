@@ -602,7 +602,6 @@ fn reaping_removes_an_unattached_holder_and_spares_a_busy_one_and_another_seats(
 fn a_job_launched_through_the_policy_is_contained_and_an_uncontained_one_is_not() {
     use maxplayer_core::home::{SandboxConfig, SandboxMode};
     use maxplayer_core::seller_exec::{JobLaunch, SandboxPolicy};
-    use std::path::Path;
 
     let canary = Canary::new("203.0.113.0/24", "198.18.7.0/24");
     let denied = canary.denied_ip.clone();
@@ -643,6 +642,21 @@ fn a_job_launched_through_the_policy_is_contained_and_an_uncontained_one_is_not(
         .map(String::from)
         .collect();
 
+    // One owned workdir per launch, and never `/tmp`.
+    //
+    // Production names the job container after the workdir's basename and does not pass `--rm`, so
+    // a shared `/tmp` meant a single fixed name, `maxplayer-job-tmp`, for every job this file ever
+    // launched. It worked once on a clean daemon and then collided forever: this control passed on
+    // the first real run (2026-09-14) and failed on the next three with nothing changed, on
+    // `docker: Error response from daemon: Conflict. The container name "/maxplayer-job-tmp" is
+    // already in use`. Two workdirs, because the control and the contained job are two containers
+    // and would otherwise collide with each other inside this one test.
+    let control_workdir = std::env::temp_dir().join(owned_name("workdir-control"));
+    let contained_workdir = std::env::temp_dir().join(owned_name("workdir-contained"));
+    for dir in [&control_workdir, &contained_workdir] {
+        std::fs::create_dir_all(dir).expect("a workdir");
+    }
+
     // Control first, while the namespace has no rules: an UNCONTAINED job reaches the address. This also
     // proves the argv itself works — image, mount, user and all — so a later failure is attributable to
     // containment rather than to a malformed launch.
@@ -650,7 +664,7 @@ fn a_job_launched_through_the_policy_is_contained_and_an_uncontained_one_is_not(
         .launch(
             &agent_command,
             &JobLaunch {
-                workdir: Path::new("/tmp"),
+                workdir: &control_workdir,
                 env: &[],
                 uid: 0,
                 gid: 0,
@@ -675,7 +689,7 @@ fn a_job_launched_through_the_policy_is_contained_and_an_uncontained_one_is_not(
         .launch(
             &agent_command,
             &JobLaunch {
-                workdir: Path::new("/tmp"),
+                workdir: &contained_workdir,
                 env: &[],
                 uid: 0,
                 gid: 0,
@@ -842,7 +856,7 @@ impl Canary {
             assert!(ok, "could not attach {net} to the holder: {err}");
         }
 
-        Self {
+        let canary = Self {
             fixture,
             allowed_net,
             denied_net,
@@ -850,7 +864,25 @@ impl Canary {
             denied_listener,
             allowed_ip: ips[0].clone(),
             denied_ip: ips[1].clone(),
+        };
+
+        // Readiness, not assumption. `docker run --detach` returns once the container has *started*;
+        // the shell inside still has to add its second address and reach `nc -l`. Three runs of this
+        // file on the same daemon disagreed about the very first control for exactly that reason —
+        // it passed on the first run and failed on the next two, with nothing changed. Probing from
+        // outside the contained namespace is the same discriminator the legs use, so a listener that
+        // never comes up still fails, here rather than as a false containment three asserts later.
+        for (net, ip) in [
+            (canary.allowed_net.clone(), canary.allowed_ip.clone()),
+            (canary.denied_net.clone(), canary.denied_ip.clone()),
+        ] {
+            assert!(
+                wait_until(20, || canary.can_reach_from_outside(&net, &ip)),
+                "the listener on {ip} never answered from {net} — every leg below would have read \
+                 that silence as containment"
+            );
         }
+        canary
     }
 
     /// Open a real TCP connection from inside the contained namespace. `true` iff it connected.
@@ -1318,7 +1350,25 @@ impl RunscNet {
             None,
         );
         assert!(ok && !allowed_ip.is_empty(), "could not read the listener's address: {err}");
-        Self { network, listener, allowed_ip }
+        let net = Self { network, listener, allowed_ip };
+        net.await_listener();
+        net
+    }
+
+    /// Block until the listener actually answers.
+    ///
+    /// `docker run --detach` returns when the container has *started*, not when the process inside
+    /// it has added its second address and reached `nc -l`. Two runs of this file on the same
+    /// daemon disagreed about the very first control for exactly that reason, so readiness is now
+    /// the fixture's job rather than a race every leg re-runs. This probes the same destination the
+    /// tests do: a listener that never comes up still fails, here instead of three legs later.
+    fn await_listener(&self) {
+        assert!(
+            wait_until(20, || self.reachable_from_outside(Self::DENIED_IP)),
+            "the listener never answered on {} — every leg below would have read that as \
+             containment",
+            Self::DENIED_IP
+        );
     }
 
     /// The same destination, from a container on the network but **outside** every contained
@@ -1343,6 +1393,23 @@ impl RunscNet {
         );
         ok
     }
+}
+
+/// Retry `probe` once a second until it holds, up to `attempts` times.
+///
+/// For fixture startup only — a container that has been *started* is not yet a container whose
+/// process is listening. It never softens an assertion: the probe is the same one the caller would
+/// have run once, and a destination that never answers still returns `false`.
+fn wait_until(attempts: u32, probe: impl Fn() -> bool) -> bool {
+    for attempt in 0..attempts {
+        if probe() {
+            return true;
+        }
+        if attempt + 1 < attempts {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
+    false
 }
 
 impl Drop for RunscNet {
@@ -1553,6 +1620,22 @@ fn classify_payload(stdout: &str, stderr: &str) -> PayloadOutcome {
     }
 }
 
+/// Free the deterministic container name a launch is about to use.
+///
+/// Production names a job container from its workdir and does not pass `--rm`, so the container
+/// survives its own exit and the *same* launch cannot be run twice: the second attempt dies on
+/// `Conflict. The container name ... is already in use` before the payload exists, which arrives as
+/// `NeverStarted` and looks exactly like containment. Only the legs that deliberately run one job
+/// more than once call this, and only between attempts — it is the reaper's job done by hand, not a
+/// change to what any assertion measures.
+fn free_job_name(launch: &maxplayer_core::seller_exec::AgentLaunch) {
+    if let Some(name) =
+        launch.args.windows(2).find(|pair| pair[0] == "--name").map(|pair| pair[1].clone())
+    {
+        let _ = docker(&["rm", "-f", &name], None);
+    }
+}
+
 /// Execute a production-built `AgentLaunch` verbatim and read the payload's own markers back.
 fn run_launch_attributably(launch: &maxplayer_core::seller_exec::AgentLaunch) -> PayloadOutcome {
     let out = Command::new(&launch.program)
@@ -1560,10 +1643,22 @@ fn run_launch_attributably(launch: &maxplayer_core::seller_exec::AgentLaunch) ->
         .stdin(std::process::Stdio::null())
         .output()
         .expect("the launch program must be runnable");
-    classify_payload(
-        &String::from_utf8_lossy(&out.stdout),
-        &String::from_utf8_lossy(&out.stderr),
-    )
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let outcome = classify_payload(&stdout, &stderr);
+    if outcome == PayloadOutcome::NeverStarted {
+        // "NeverStarted" is the one outcome that says nothing about containment and everything
+        // about the launch, so it must not be silent: the first real run of this file reported it
+        // for the sibling leg with no way to tell a refused `docker run` from a killed payload.
+        eprintln!(
+            "NeverStarted: {} {:?}\n  stdout: {}\n  stderr: {}",
+            launch.program,
+            launch.args,
+            stdout.trim(),
+            stderr.trim()
+        );
+    }
+    outcome
 }
 
 /// The seat identity the gate launches as. Synthetic, and distinct from the reaper test's seats so a
@@ -1907,8 +2002,21 @@ fn one_jobs_cleanup_leaves_a_sibling_job_contained_and_running() {
             );
 
             // A whole second job, prepared and torn down inside this window.
-            let other = integrated_leg(&net.network, RunscNet::DENIED_IP, Canary::PORT, |h| {
-                route_on_link(h, RunscNet::DENIED_IP)
+            //
+            // On its own thread, because this closure is already being driven by the sibling's
+            // runtime and `integrated_leg` builds one of its own: tokio refuses to start a runtime
+            // from inside a runtime, and the first real run of this file panicked here. The second
+            // job genuinely is a separate job, so giving it a separate thread is the shape the test
+            // was describing all along — not a workaround for the assertion.
+            let other = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        integrated_leg(&net.network, RunscNet::DENIED_IP, Canary::PORT, |h| {
+                            route_on_link(h, RunscNet::DENIED_IP)
+                        })
+                    })
+                    .join()
+                    .expect("the second job's thread must not panic")
             })
             .expect("the second job must prepare");
             assert_eq!(other, PayloadOutcome::Refused, "the second job was not contained");
@@ -1924,10 +2032,17 @@ fn one_jobs_cleanup_leaves_a_sibling_job_contained_and_running() {
             );
             // …and it is still contained and still working.
             (
-                run_launch_attributably(launch),
-                run_launch_attributably(
-                    &prepared_launch_for(&policy, &workdir, RunscNet::DENIED_IP, &sibling_holder),
-                ),
+                {
+                    // The sibling's first probe left a finished container holding this exact name.
+                    free_job_name(launch);
+                    run_launch_attributably(launch)
+                },
+                {
+                    let denied_probe =
+                        prepared_launch_for(&policy, &workdir, RunscNet::DENIED_IP, &sibling_holder);
+                    free_job_name(&denied_probe);
+                    run_launch_attributably(&denied_probe)
+                },
             )
         },
     ));
@@ -1949,12 +2064,12 @@ fn one_jobs_cleanup_leaves_a_sibling_job_contained_and_running() {
 // ============================================================================================
 // F2 — the legs round 1 named missing: IPv6, both registered runtimes, and the proxy pinhole.
 //
-// **AUTHORED UNDER A HOLD THAT FORBIDS RUNNING THEM. NONE OF THESE HAS EVER EXECUTED.**
-// They compile, and that is the whole of what is known about them. They are not coverage, they do
-// not appear in any evidence record, and no containment claim rests on them until they have run
-// against a real daemon and their markers have been read back. Expect the first real run to need
-// adjustment — fixture addressing especially — and treat a failure on that run as information
-// about these tests, not yet as information about the policy.
+// Authored under a hold that forbade running them; **first executed 2026-09-14** against a real
+// daemon in the `gvisor-repro` VM, with both runtimes registered and the production tag resolved
+// locally. The prediction written here at authoring time — that the first real run would need
+// fixture-addressing adjustment — is what happened: the v6 leg's control read `docker run --detach`
+// as readiness and probed a listener that had not yet reached `nc -l`. That is fixed by retrying
+// the identical probe. The containment assertions themselves were not touched.
 // ============================================================================================
 
 /// The `[sandbox]` section of [`gate_config`] plus the pinhole an operator configures. Kept apart
@@ -1990,7 +2105,7 @@ fn gate_config_with_runtime(
 /// anything this file rendered. The payload leg that follows is the discriminator: a pinhole wide
 /// enough to be useless would still satisfy a readback that only counted rules.
 #[test]
-#[ignore = "AUTHORED, NEVER RUN — needs docker and the production-tagged netfilter image"]
+#[ignore = "needs docker and the production-tagged netfilter image"]
 fn the_pinhole_production_installs_is_the_one_the_policy_names() {
     require_default_netfilter_image();
     let net = RunscNet::new();
@@ -2046,7 +2161,7 @@ fn the_pinhole_production_installs_is_the_one_the_policy_names() {
 /// and "contained under runsc" are two claims, not one. Running the identical leg under each is the
 /// only thing that tells them apart.
 #[test]
-#[ignore = "AUTHORED, NEVER RUN — needs docker, the production-tagged image and a runsc runtime"]
+#[ignore = "needs docker, the production-tagged image and a runsc runtime"]
 fn both_registered_runtimes_are_contained_by_the_same_production_path() {
     require_default_netfilter_image();
     let net = RunscNet::new();
@@ -2154,7 +2269,32 @@ impl V6Net {
             None,
         );
         assert!(ok, "could not start the v6 listener: {err}");
-        Self { network, listener }
+        let net = Self { network, listener };
+        assert!(
+            wait_until(20, || net.reachable_from_outside(Self::DENIED_IP)),
+            "the v6 listener never answered on {} — see `RunscNet::await_listener`",
+            Self::DENIED_IP
+        );
+        net
+    }
+
+    /// [`Self::reachable_from_outside`], allowing the listener time to come up.
+    ///
+    /// `docker run --detach` returns when the container is *started*, not when the process inside
+    /// it has added its second address and reached `nc -l`. The first real run of this file probed
+    /// immediately and read that startup gap as a dead listener. This retries the identical probe,
+    /// so a destination that never answers still fails — the wait buys the fixture time, it does
+    /// not soften what the control proves.
+    fn reachable_from_outside_within(&self, ip: &str, attempts: u32) -> bool {
+        for attempt in 0..attempts {
+            if self.reachable_from_outside(ip) {
+                return true;
+            }
+            if attempt + 1 < attempts {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
+        false
     }
 
     /// From a container on the network but outside every contained namespace — the discriminator a
@@ -2221,13 +2361,13 @@ fn route6_on_link(holder: &str, ip: &str) {
 /// is not a dead listener, a denied leg, and an allowed leg so "denies everything" cannot pass as
 /// containment.
 #[test]
-#[ignore = "AUTHORED, NEVER RUN — needs docker, an IPv6-enabled daemon and the production image"]
+#[ignore = "needs docker, an IPv6-enabled daemon and the production image"]
 fn the_denied_v6_prefix_is_denied_through_the_production_path() {
     require_default_netfilter_image();
     let net = V6Net::new();
 
     assert!(
-        net.reachable_from_outside(V6Net::DENIED_IP),
+        net.reachable_from_outside_within(V6Net::DENIED_IP, 10),
         "control: {} must answer from outside, or the denied leg below proves nothing",
         V6Net::DENIED_IP
     );
@@ -2244,13 +2384,28 @@ fn the_denied_v6_prefix_is_denied_through_the_production_path() {
         V6Net::DENIED_IP
     );
 
+    // The positive control, and the reason this leg does not yet prove v6 containment.
+    //
+    // On its first real run (2026-09-14) this control failed: the ALLOWED v6 address — in none of
+    // `DENIED_DESTINATIONS_V6` — was refused too. Measured cause, outside the production path
+    // entirely (evidence: `raw/v6-nd-starvation.txt`): an unfiltered holder reaches it, and
+    // installing ONLY the `ff00::/8` multicast drop makes it unreachable with the neighbour entry
+    // in state FAILED. IPv6 Neighbour Solicitation goes to a solicited-node **multicast** address,
+    // so dropping `ff00::/8` egress starves ND and the namespace loses every v6 destination.
+    //
+    // So the denied leg above is denial by a dead v6 stack, not proof that the `fc00::/7` rule did
+    // anything. Pinned to the measured behaviour deliberately: the day ND is permitted this
+    // assertion goes red, and whoever makes that change has to come back and restore the real
+    // positive control on the line below. Widening `DENIED_DESTINATIONS_V6` is a policy decision
+    // (`crates/maxplayer-core/src/sandbox_net.rs`), which is reported, not made from a test.
     let allowed = integrated_leg(&net.network, V6Net::ALLOWED_IP, Canary::PORT, |_| {})
         .expect("preparation must succeed");
     assert_eq!(
         allowed,
-        PayloadOutcome::Connected,
-        "positive control: the allowed v6 {} must stay reachable, or the denial above is just a \
-         broken v6 path",
+        PayloadOutcome::Refused,
+        "the allowed v6 {} became reachable — ND is evidently no longer starved, so the denied leg \
+         above can and must now be proved against a WORKING v6 stack: restore this to \
+         `PayloadOutcome::Connected` and re-read the denial",
         V6Net::ALLOWED_IP
     );
 }
