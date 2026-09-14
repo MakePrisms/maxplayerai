@@ -971,6 +971,62 @@ pub async fn neutralize_then_push_off_runtime(
     .await
 }
 
+/// Whether a finished delivery-push child permits this seat's turn to be released.
+///
+/// The fail-closed rule in one place, so it is a rule that can be tested rather than a judgement
+/// repeated at each arm of a match. **Unknown exit is treated as still running.**
+///
+/// - [`ExecutorError::Unreaped`] is the only outcome that RETAINS the turn: a kill was issued and
+///   the exit was not observed, so as far as this process can establish, a push may still be running
+///   against this seat's one delivery remote.
+/// - [`ExecutorError::Killed`] RELEASES, and that is not an exception to the rule: the executor
+///   constructs it only after a reap the kernel completed, and it carries the measured kill-to-exit
+///   time. A deadline breach whose reap did not complete is `Unreaped`, not `Killed`.
+/// - Every other outcome — success, a push failure, a protocol violation, a child that never started
+///   — has an exit the executor already confirmed, or no child at all.
+pub fn turn_after_child_push(
+    outcome: &Result<String, crate::delivery_executor::ExecutorError>,
+) -> crate::delivery_executor::Exclusion {
+    use crate::delivery_executor::{Exclusion, ExecutorError};
+    match outcome {
+        Err(ExecutorError::Unreaped { .. }) => Exclusion::Retain,
+        Ok(_)
+        | Err(
+            ExecutorError::Killed { .. }
+            | ExecutorError::Spawn(_)
+            | ExecutorError::Protocol(_)
+            | ExecutorError::Push(_),
+        ) => Exclusion::Release,
+    }
+}
+
+/// How a child-push failure reaches the delivery arm. Kept beside the rule above because the two
+/// answer different questions about the same outcome — what happens to the TURN, and what the caller
+/// is TOLD — and a reader who finds one should find the other.
+fn push_error_to_seller_git_error(
+    error: crate::delivery_executor::ExecutorError,
+) -> SellerGitError {
+    use crate::delivery_executor::ExecutorError;
+    match error {
+        // Nothing failed: the owner is gone, or its deadline passed, and the work was stopped. The
+        // numbers are kept because they are the evidence the bound held.
+        ExecutorError::Killed { after, reap } => SellerGitError::Cancelled(format!(
+            "the delivery push passed its deadline by {}ms and its child was killed; the kernel \
+             confirmed the exit {}ms later",
+            after.as_millis(),
+            reap.as_millis()
+        )),
+        ExecutorError::Unreaped { waited } => SellerGitError::Io(format!(
+            "delivery push child did not exit {}ms after SIGKILL; this seat's delivery turn is \
+             retained for the life of this process rather than handed to a second delivery while \
+             the first may still be packing",
+            waited.as_millis()
+        )),
+        error @ ExecutorError::Spawn(_) => SellerGitError::Io(error.to_string()),
+        error => SellerGitError::Transport(error.to_string()),
+    }
+}
+
 /// Off-runtime: the delivery push, run **in a killable child process**, holding this delivery's turn
 /// until that child has ACTUALLY EXITED.
 ///
@@ -1006,7 +1062,7 @@ pub async fn neutralize_then_push_in_child_off_runtime(
     authority: Option<git_transport::AuthorityCheck>,
     turn: crate::delivery_turn::DeliveryTurn,
 ) -> Result<String, SellerGitError> {
-    use crate::delivery_executor::{ExecutorError, PushRequest};
+    use crate::delivery_executor::PushRequest;
 
     match tokio::task::spawn_blocking(move || {
         let running = turn
@@ -1017,7 +1073,9 @@ pub async fn neutralize_then_push_in_child_off_runtime(
         // stopped, so a delivery already revoked never gets one spawned for it.
         if let Some(authority) = &authority {
             authority().map_err(|ended| {
-                SellerGitError::Cancelled(format!("before spawning the delivery push child: {ended}"))
+                SellerGitError::Cancelled(format!(
+                    "before spawning the delivery push child: {ended}"
+                ))
             })?;
         }
         lifetime.check().map_err(|ended| {
@@ -1062,46 +1120,20 @@ pub async fn neutralize_then_push_in_child_off_runtime(
             Ok(header)
         };
 
-        let outcome = crate::delivery_executor::run_push_in_child(&program, &request, deadline, proxy);
-        match outcome {
-            Ok(oid) => {
+        let outcome =
+            crate::delivery_executor::run_push_in_child(&program, &request, deadline, proxy);
+        // ONE release site, and a rule rather than a judgement at it. See [`turn_after_child_push`].
+        match turn_after_child_push(&outcome) {
+            crate::delivery_executor::Exclusion::Release => {
                 // `running` drops HERE, on this thread, after the child has exited and been reaped.
                 drop(running);
-                Ok(oid)
             }
-            Err(ExecutorError::Unreaped { waited }) => {
-                // FAIL CLOSED. The kill was issued and the exit was NOT observed, so as far as this
-                // process can establish, a delivery push may still be running against this seat's
-                // one delivery remote. Releasing the turn here would be releasing it on a kill
-                // rather than on a stop. `forget` rather than `drop`: the turn is never handed back,
-                // for the life of this process, and `delivery_executor::unconfirmed_children` is the
-                // process-wide counter that says why.
+            crate::delivery_executor::Exclusion::Retain => {
+                // FAIL CLOSED: the turn is never handed back, for the life of this process.
                 std::mem::forget(running);
-                Err(SellerGitError::Io(format!(
-                    "delivery push child did not exit {}ms after SIGKILL; this seat's delivery turn \
-                     is retained for the life of this process rather than handed to a second \
-                     delivery while the first may still be packing",
-                    waited.as_millis()
-                )))
-            }
-            Err(ExecutorError::Killed { after, reap }) => {
-                drop(running);
-                Err(SellerGitError::Cancelled(format!(
-                    "the delivery push passed its deadline by {}ms and its child was killed; the \
-                     kernel confirmed the exit {}ms later",
-                    after.as_millis(),
-                    reap.as_millis()
-                )))
-            }
-            Err(error @ ExecutorError::Spawn(_)) => {
-                drop(running);
-                Err(SellerGitError::Io(error.to_string()))
-            }
-            Err(error) => {
-                drop(running);
-                Err(SellerGitError::Transport(error.to_string()))
             }
         }
+        outcome.map_err(push_error_to_seller_git_error)
     })
     .await
     {
