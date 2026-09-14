@@ -8,8 +8,9 @@ Author: Petar's local agent, 2026-09-10.
 
 **Current state:** sections 10 and 11 — the Proxy swap route is coded, tested, and accepted against
 GitHub (2026-09-14); the Holder route is wired into the daemon and proved live through the daemon
-code (2026-09-14). Nothing on this branch is pushed. Read sections 10 and 11 first if you are
-resuming.
+code (2026-09-14). The branch is pushed to `MakePrisms/maxplayerai` and under review as pull request
+#1004 (https://github.com/MakePrisms/maxplayerai/pull/1004), merged with `main` at `1569010`. Read
+sections 10 and 11 first if you are resuming.
 
 ## 1. What changed since `a0cc31d`
 
@@ -371,4 +372,6 @@ and `/run/holder/text-b`, nothing else); a contained job; a restart resumed both
 vendor seeing one login and one transform.
 
 What remains, stated plainly: real-vendor acceptance of a real CLI inside a seller-built holder image,
-per vendor; and the branch delivery (push, pull request, review), which needs Petar's go.
+per vendor; and the review of pull request #1004. Petar gave the go to push and open it on 2026-09-14.
+`origin` (the `maxy-player` fork) refused the push — read access only — so the canonical repository
+`MakePrisms/maxplayerai` is the `upstream` remote and the pull request's home.
