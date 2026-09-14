@@ -993,9 +993,11 @@ pub fn turn_after_child_push(
 ) -> crate::delivery_executor::Exclusion {
     use crate::delivery_executor::{Exclusion, ExecutorError};
     match outcome {
-        Err(ExecutorError::Unreaped { .. } | ExecutorError::CleanupUnbounded { .. }) => {
-            Exclusion::Retain
-        }
+        Err(
+            ExecutorError::Unreaped { .. }
+            | ExecutorError::CleanupUnbounded { .. }
+            | ExecutorError::WaitFailed { .. },
+        ) => Exclusion::Retain,
         Ok(_)
         | Err(
             ExecutorError::Killed { .. }
@@ -1003,6 +1005,36 @@ pub fn turn_after_child_push(
             | ExecutorError::Protocol(_)
             | ExecutorError::Push(_),
         ) => Exclusion::Release,
+    }
+}
+
+/// Custody of the delivery turn across a path that can UNWIND.
+///
+/// `RunningWork`'s own `Drop` hands the turn back, which is right for every caller whose work is
+/// over when its stack is. It is wrong for this one: a panic in the supervisor or the minter used
+/// to unwind straight through it and free the seat while a child process that nobody had reaped was
+/// still holding the workdir and the remote. Here the DEFAULT is retention, and release is the
+/// explicit act — taken only where a confirmed exit was observed.
+struct ChildCustody(Option<crate::delivery_turn::RunningWork>);
+
+impl ChildCustody {
+    fn hold(running: crate::delivery_turn::RunningWork) -> Self {
+        Self(Some(running))
+    }
+
+    /// The child's exit was confirmed. Hand the turn on.
+    fn release(mut self) {
+        drop(self.0.take());
+    }
+}
+
+impl Drop for ChildCustody {
+    /// Reached on every path that is NOT an explicit release — including an unwind. FAIL CLOSED:
+    /// the turn is never handed back, for the life of this process.
+    fn drop(&mut self) {
+        if let Some(running) = self.0.take() {
+            std::mem::forget(running);
+        }
     }
 }
 
@@ -1031,6 +1063,9 @@ fn push_error_to_seller_git_error(
         // Same family as `Unreaped`, and deliberately NOT `Transport`: nothing on the wire failed.
         // This is a custody answer — we cannot say the local phase is over — and it reads as one.
         error @ ExecutorError::CleanupUnbounded { .. } => SellerGitError::Io(error.to_string()),
+        // Also a custody answer, and also not a transport one: the kernel would not tell us whether
+        // the child is gone.
+        error @ ExecutorError::WaitFailed { .. } => SellerGitError::Io(error.to_string()),
         error @ ExecutorError::Spawn(_) => SellerGitError::Io(error.to_string()),
         error => SellerGitError::Transport(error.to_string()),
     }
@@ -1074,10 +1109,26 @@ pub async fn neutralize_then_push_in_child_off_runtime(
     use crate::delivery_executor::PushRequest;
 
     match tokio::task::spawn_blocking(move || {
+        // THE CONSUMER of the unconfirmed-exit counter, on the production path, before any new
+        // delivery work starts. `Drop` has nobody to return an error to; a child it could not
+        // confirm dead is recorded there and refused HERE, which is what makes that counter a
+        // custody mechanism rather than a statistic. Never decremented: one unconfirmed child
+        // closes this process's delivery lane for the life of the process.
+        let unconfirmed = crate::delivery_executor::unconfirmed_children();
+        if unconfirmed > 0 {
+            return Err(SellerGitError::Io(format!(
+                "{unconfirmed} earlier delivery push child(ren) could not be confirmed to have \
+                 exited; this process will not start another delivery push while work that was \
+                 never observed to stop may still hold this seat's workdir and remote"
+            )));
+        }
         let running = turn
             .begin()
             .map_err(|ended| SellerGitError::Cancelled(format!("at dispatch: {ended}")))?;
         let lifetime = running.lifetime();
+        // From here the turn is held by a guard whose DEFAULT is retention, so an unwind through
+        // the supervisor or the minter cannot hand this seat on while a child may still be running.
+        let custody = ChildCustody::hold(running);
         // Phase boundary: everything after this point is a process that has to be killed to be
         // stopped, so a delivery already revoked never gets one spawned for it.
         if let Some(authority) = &authority {
@@ -1104,6 +1155,19 @@ pub async fn neutralize_then_push_in_child_off_runtime(
         // The absolute deadline this delivery has always had. It is the parent's, not the child's:
         // the child is not trusted to bound itself, which is the entire reason it is a child.
         let deadline = lifetime.deadline();
+        // What the CHILD asks the parent, across the pipe, immediately before it transmits. The
+        // same two questions the proxy below asks before it hands a token over, asked again at the
+        // only moment that bounds the wire: the one the child is at. Cloned here, ahead of the
+        // proxy, because both gates ask the same two sources.
+        let gate_authority = authority.clone();
+        let gate_lifetime = lifetime.clone();
+        let live: crate::git_transport::AuthorityCheck =
+            std::sync::Arc::new(move || -> Result<(), String> {
+                if let Some(authority) = &gate_authority {
+                    authority()?;
+                }
+                gate_lifetime.check().map_err(|ended| ended.to_string())
+            });
         // Behind an `Arc` because the parent now runs this OFF its drive thread: the signer can
         // block, and a parent blocked in the signer is a parent that cannot issue the kill. The
         // TOKEN it returns does cross the pipe to the child — that is the point of the round trip.
@@ -1136,16 +1200,16 @@ pub async fn neutralize_then_push_in_child_off_runtime(
             });
 
         let outcome =
-            crate::delivery_executor::run_push_in_child(&program, &request, deadline, proxy);
+            crate::delivery_executor::run_push_in_child(&program, &request, deadline, proxy, live);
         // ONE release site, and a rule rather than a judgement at it. See [`turn_after_child_push`].
         match turn_after_child_push(&outcome) {
             crate::delivery_executor::Exclusion::Release => {
-                // `running` drops HERE, on this thread, after the child has exited and been reaped.
-                drop(running);
+                // Released HERE, on this thread, after the child has exited and been reaped.
+                custody.release();
             }
             crate::delivery_executor::Exclusion::Retain => {
-                // FAIL CLOSED: the turn is never handed back, for the life of this process.
-                std::mem::forget(running);
+                // FAIL CLOSED: the guard's drop retains, for the life of this process.
+                drop(custody);
             }
         }
         outcome.map_err(push_error_to_seller_git_error)
@@ -1218,6 +1282,69 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    /// A delivery turn, and the control that can see whether it came back.
+    fn a_turn() -> (
+        crate::delivery_turn::TurnControl,
+        crate::delivery_turn::DeliveryTurn,
+    ) {
+        crate::delivery_turn::delivery_turn(
+            (),
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        )
+    }
+
+    /// An UNWIND through the child-push supervisor must not hand this seat on.
+    ///
+    /// `RunningWork`'s own `Drop` releases, which is right for work whose life is its stack. It was
+    /// wrong here: a panic in the supervisor or in the minter unwound straight through it and freed
+    /// the seat while a child process nobody had reaped still held the workdir and the remote. The
+    /// guard makes retention the DEFAULT and release the explicit act.
+    #[test]
+    fn a_panic_through_the_child_push_custody_keeps_the_turn() {
+        let (control, turn) = a_turn();
+        let running = turn.begin().expect("the turn begins");
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _custody = ChildCustody::hold(running);
+            panic!("the supervisor died holding a child");
+        }));
+        assert!(panicked.is_err(), "this test is about an unwind");
+        assert!(
+            !control.work_ended(),
+            "the work was never observed to stop, so the turn must NOT have been handed back"
+        );
+        // Even the supervisor giving up does not free the seat: the work is still RUNNING as far as
+        // this process can establish, and that is the state a panic must leave behind.
+        assert_eq!(
+            control.end(),
+            crate::delivery_turn::TurnRelease::StillRunning
+        );
+        assert!(
+            control.holds_ownership(),
+            "exclusion must still be held by the delivery whose child was never confirmed dead"
+        );
+    }
+
+    /// The other half of the same rule: a confirmed exit DOES hand the turn on. A guard that never
+    /// releases is not custody, it is a deadlock.
+    #[test]
+    fn an_explicit_release_after_a_confirmed_exit_hands_the_turn_on() {
+        let (control, turn) = a_turn();
+        let running = turn.begin().expect("the turn begins");
+        ChildCustody::hold(running).release();
+        assert!(control.work_ended(), "a released turn is an ended turn");
+        // Exclusion itself is handed back when BOTH sides are done with it; the supervisor's own
+        // end is the second half, and after it the token is free — which is what a panic must not
+        // be able to produce.
+        assert_eq!(
+            control.end(),
+            crate::delivery_turn::TurnRelease::AlreadyEnded
+        );
+        assert!(
+            !control.holds_ownership(),
+            "exclusion goes back to the seat once the child's exit was confirmed"
+        );
+    }
 
     fn temp(label: &str) -> std::path::PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);

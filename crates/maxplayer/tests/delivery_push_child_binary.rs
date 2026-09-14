@@ -155,6 +155,11 @@ fn a_push_request_crosses_the_pipe_and_its_outcome_comes_back() {
              kills for this, and it must never happen"
         ),
         ToParent::Hello { .. } => panic!("the child said hello twice"),
+        // The child's own pre-transmit gate. It never fires here: the push fails at the missing
+        // workdir, before the transport reaches a wire request.
+        ToParent::Check { phase } => panic!(
+            "the child asked about its authority at {phase} for a push that never reached the wire"
+        ),
     }
 
     drop(input);

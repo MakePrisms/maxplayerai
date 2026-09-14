@@ -110,7 +110,7 @@ use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, channel, sync_channel};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -133,6 +133,23 @@ pub const REAP_BOUND: Duration = Duration::from_secs(5);
 /// members are a workdir path, a remote URL and one NIP-98 header.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
+/// How many frames the parent will hold from the child while it is busy elsewhere — minting, or
+/// waiting on a write.
+///
+/// A per-frame size cap is not a memory bound: a child that writes a million small frames while the
+/// supervisor is inside the signer costs the parent unbounded memory, and "the parent's own
+/// buffering" is a phase nobody put a limit on. The queue is therefore SYNCHRONOUS and this small:
+/// once it is full the pump stops reading, the child's own writes block on pipe backpressure, and
+/// the stalled party is the one that can be killed rather than the one holding the kill.
+pub const MAX_QUEUED_FRAMES: usize = 64;
+
+/// How much of the child's stderr the parent will relay before it stops reading it. The child's
+/// stderr is where the transport prints its overrun and refusal diagnostics; a parent that pipes it
+/// and never drains it turns that diagnostic into a stalled child and prints nothing. Relayed, not
+/// buffered — and capped, because a child that writes forever must not be able to make the parent
+/// print forever.
+pub const MAX_CHILD_STDERR_BYTES: u64 = 256 * 1024;
+
 /// Children this process could NOT confirm dead. Incremented when a reap does not complete, and
 /// **never decremented** — an unconfirmed child is a permanent fact about this process, not a
 /// transient one.
@@ -148,6 +165,16 @@ static UNCONFIRMED_CHILDREN: std::sync::atomic::AtomicUsize = std::sync::atomic:
 /// means at least one delivery lane must stay closed for the life of this process.
 pub fn unconfirmed_children() -> usize {
     UNCONFIRMED_CHILDREN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Record a child whose exit this process could not establish.
+///
+/// The one place the count moves, so the fact and its consumer can be exercised as a pair rather
+/// than asserted about each other. Its production caller is [`KillableChild::drop`]; its production
+/// consumer is the delivery-push dispatch in `seller_git`, which refuses to start new work while
+/// this is non-zero.
+pub fn record_unconfirmed_child() {
+    UNCONFIRMED_CHILDREN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Whether this seat's delivery turn may be released, given what the reap actually established.
@@ -218,6 +245,10 @@ pub enum ToChild {
         header: Option<String>,
         refused: Option<String>,
     },
+    /// The answer to a [`ToParent::Check`]: the parent's LIVE answer, at the moment it was asked,
+    /// to "may this delivery still transmit?". `refused` set is an end of authority, and the child
+    /// must not transmit.
+    Authority { refused: Option<String> },
 }
 
 /// Child → parent.
@@ -234,6 +265,14 @@ pub enum ToParent {
     },
     /// The transport needs an `Authorization` header for this destination.
     Mint { destination: String },
+    /// The child is about to transmit and is asking the parent, ACROSS THE PIPE, whether this
+    /// delivery still owns its turn.
+    ///
+    /// This frame exists because the parent's own authority check is a check the parent makes about
+    /// a moment the parent chooses. Between the parent approving a mint and the child reaching
+    /// `send`, the owner can go away; a check the child never makes is not a boundary at the
+    /// child's submission. The child asks here, immediately before the request leaves it.
+    Check { phase: String },
     /// Terminal. Exactly one of `oid`/`error` is set.
     Done {
         oid: Option<String>,
@@ -270,6 +309,12 @@ pub enum ExecutorError {
     /// which means something that inherited it outlived the process group we killed. We cannot say
     /// the delivery's local phase is over, so the turn is still held.
     CleanupUnbounded { waited: Duration },
+    /// The kernel refused to tell us whether the child exited (`waitpid` itself failed). This is an
+    /// UNKNOWN exit, not a protocol fault: nothing about the child's behaviour is implicated, and
+    /// nothing about its death is established. It is separate from [`Self::Protocol`] precisely so
+    /// that the release rule can treat it as "still running" — a `waitpid` error folded into a
+    /// protocol error is an unknown exit wearing a releasable name.
+    WaitFailed { why: String },
     /// The push itself failed; the child exited on its own.
     Push(String),
 }
@@ -297,6 +342,11 @@ impl std::fmt::Display for ExecutorError {
                  something outlived its process group; this seat stays held rather than hand the \
                  turn to a second delivery while the first may still be touching the workdir",
                 waited.as_millis()
+            ),
+            Self::WaitFailed { why } => write!(
+                f,
+                "delivery push child's exit could not be established ({why}); this seat stays held \
+                 rather than hand the turn to a second delivery on an exit nobody observed"
             ),
             Self::Push(why) => write!(f, "delivery push failed: {why}"),
         }
@@ -424,9 +474,11 @@ impl KillableChild {
                     std::thread::sleep(Duration::from_millis(2));
                 }
                 Err(error) => {
-                    return Err(ExecutorError::Protocol(format!(
-                        "waiting for the delivery push child failed: {error}"
-                    )));
+                    // NOT `Protocol`: an unknown exit must not be able to wear a name the release
+                    // rule lets through. See [`ExecutorError::WaitFailed`].
+                    return Err(ExecutorError::WaitFailed {
+                        why: error.to_string(),
+                    });
                 }
             }
         }
@@ -449,18 +501,38 @@ impl Drop for KillableChild {
         // running — the defect this module exists to remove. So a failure here is recorded in a
         // process-wide counter that a seat must consult before it treats its lane as free.
         if self.kill_and_reap().is_err() {
-            UNCONFIRMED_CHILDREN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            record_unconfirmed_child();
         }
     }
 }
 
 /// One line of newline-delimited JSON per frame. JSON's own escaping means a serialized frame never
 /// contains a newline, so the framing is unambiguous without a length prefix.
-pub fn write_frame<W: Write, T: Serialize>(out: &mut W, frame: &T) -> std::io::Result<()> {
-    let line = serde_json::to_string(frame)
+///
+/// The line is produced and CAPPED before a byte is written. [`MAX_FRAME_BYTES`] used to bound only
+/// what this protocol would read; a cap on one direction is not a cap on the protocol, so it now
+/// bounds what either side will write as well. An over-cap frame is a bug on the writing side and is
+/// refused there, where it can still be reported, rather than discovered by the reader after the
+/// bytes are already in the pipe.
+pub fn encode_frame<T: Serialize>(frame: &T) -> std::io::Result<String> {
+    let mut line = serde_json::to_string(frame)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if line.len() > MAX_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "refusing to write a {}-byte frame; this protocol's cap is {MAX_FRAME_BYTES} bytes",
+                line.len()
+            ),
+        ));
+    }
+    line.push('\n');
+    Ok(line)
+}
+
+pub fn write_frame<W: Write, T: Serialize>(out: &mut W, frame: &T) -> std::io::Result<()> {
+    let line = encode_frame(frame)?;
     out.write_all(line.as_bytes())?;
-    out.write_all(b"\n")?;
     out.flush()
 }
 
@@ -498,7 +570,7 @@ pub fn read_frame<R: BufRead, T: for<'de> Deserialize<'de>>(
 /// that never issues the kill.
 fn pump<R: std::io::Read + Send + 'static>(
     stream: R,
-    sink: Sender<std::io::Result<Option<ToParent>>>,
+    sink: SyncSender<std::io::Result<Option<ToParent>>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stream);
@@ -523,19 +595,52 @@ pub fn run_push_in_child(
     request: &PushRequest,
     deadline: Instant,
     mint: crate::git_transport::AuthMinter,
+    authority: crate::git_transport::AuthorityCheck,
 ) -> Result<String, ExecutorError> {
     let mut child = KillableChild::spawn(program, &[CHILD_SUBCOMMAND])?;
-    let mut stdin = child
+    let stdin = child
         .stdin()
         .ok_or_else(|| ExecutorError::Spawn("child stdin unavailable".to_owned()))?;
     let stdout = child
         .stdout()
         .ok_or_else(|| ExecutorError::Spawn("child stdout unavailable".to_owned()))?;
-    let (sink, frames) = channel();
+    // Relayed and capped rather than piped-and-ignored: an undrained stderr pipe is a child that
+    // stalls on its own diagnostic, and a diagnostic the operator never sees.
+    if let Some(stderr) = child.stderr() {
+        relay_stderr(stderr);
+    }
+    let (sink, frames) = sync_channel(MAX_QUEUED_FRAMES);
     let pump = pump(stdout, sink);
+    let mut writer = Writer::spawn(stdin);
 
-    let outcome = drive(&mut stdin, &frames, request, deadline, &mint, &mut child);
-    drop(stdin);
+    let outcome = drive(
+        &mut writer,
+        &frames,
+        request,
+        deadline,
+        &mint,
+        &authority,
+        &mut child,
+    );
+    // Closing the parent's end is what the child reads as EOF. Dropping the handle drops the job
+    // channel, which is what the writer thread is normally parked on; a writer still stuck inside a
+    // `write_all` is NOT waited for, because waiting on it is the unbounded phase this type exists
+    // to remove. Its write fails once the child is gone.
+    drop(writer);
+
+    // FAIL CLOSED BY CONSTRUCTION. Every arm of `drive` reaps before it returns — but "every arm"
+    // is a property of a function that will be edited again, and the one thing this module may
+    // never do is release a seat on an exit nobody observed. So the rule is also stated ONCE, at
+    // the single point every return passes through: if this process has not seen the child exit,
+    // the outcome that leaves here is an unconfirmed-exit outcome, whatever `drive` decided.
+    let outcome = if child.is_reaped() {
+        outcome
+    } else {
+        match child.kill_and_reap() {
+            Ok(_) => outcome,
+            Err(unconfirmed) => Err(unconfirmed),
+        }
+    };
 
     // CLEANUP, BOUNDED. Joining the pump is the obvious move and it is unbounded: the pump sits in
     // a blocking read that only ends at EOF, and EOF only arrives when the LAST holder of the write
@@ -562,17 +667,96 @@ pub fn run_push_in_child(
     outcome
 }
 
+/// The parent's writes, off the drive thread and therefore boundable.
+///
+/// A blocking `write_all` to a child that is not draining its stdin parks the calling thread until
+/// the child reads — and the drive thread is the only thread that can issue the kill. Ordinary pipe
+/// backpressure is not the exotic uninterruptible-sleep case; it is the ordinary case, and it was
+/// outside the deadline. Here the write happens on its own thread and the drive waits for the
+/// acknowledgement with the SAME absolute deadline as every other phase.
+struct Writer {
+    lines: Option<Sender<String>>,
+    acks: Receiver<std::io::Result<()>>,
+}
+
+impl Writer {
+    fn spawn(mut stdin: std::process::ChildStdin) -> Self {
+        let (lines, jobs) = channel::<String>();
+        let (done, acks) = channel();
+        std::thread::spawn(move || {
+            while let Ok(line) = jobs.recv() {
+                let wrote = stdin
+                    .write_all(line.as_bytes())
+                    .and_then(|()| stdin.flush());
+                let failed = wrote.is_err();
+                if done.send(wrote).is_err() || failed {
+                    return;
+                }
+            }
+        });
+        Self {
+            lines: Some(lines),
+            acks,
+        }
+    }
+
+    /// Write one frame, or report that the write did not COMPLETE inside `left`. A timeout here is
+    /// not an error about the frame: it is a stalled parent phase, and the caller kills on it.
+    fn write(&mut self, frame: &ToChild, left: Duration) -> Result<(), WriteStall> {
+        let line = encode_frame(frame).map_err(|error| WriteStall::Failed(error.to_string()))?;
+        let Some(lines) = self.lines.as_ref() else {
+            return Err(WriteStall::Failed("the writer is closed".to_owned()));
+        };
+        if lines.send(line).is_err() {
+            return Err(WriteStall::Failed(
+                "the delivery push child's stdin is closed".to_owned(),
+            ));
+        }
+        match self.acks.recv_timeout(left) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(WriteStall::Failed(error.to_string())),
+            Err(RecvTimeoutError::Disconnected) => Err(WriteStall::Failed(
+                "the delivery push child's stdin writer stopped".to_owned(),
+            )),
+            Err(RecvTimeoutError::Timeout) => Err(WriteStall::TimedOut),
+        }
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        // Closes the job channel, which unparks the writer thread and drops the child's stdin with
+        // it. Deliberately no join: see `run_push_in_child`.
+        self.lines.take();
+    }
+}
+
+enum WriteStall {
+    /// The write did not complete within what was left of the deadline.
+    TimedOut,
+    Failed(String),
+}
+
+/// Relay the child's stderr to this process's stderr, bounded. Not joined, and not allowed to grow:
+/// see [`MAX_CHILD_STDERR_BYTES`].
+fn relay_stderr(stream: std::process::ChildStderr) {
+    std::thread::spawn(move || {
+        let mut capped = std::io::Read::take(stream, MAX_CHILD_STDERR_BYTES);
+        let _ = std::io::copy(&mut capped, &mut std::io::stderr());
+    });
+}
+
 fn drive(
-    stdin: &mut std::process::ChildStdin,
+    writer: &mut Writer,
     frames: &Receiver<std::io::Result<Option<ToParent>>>,
     request: &PushRequest,
     deadline: Instant,
     mint: &crate::git_transport::AuthMinter,
+    authority: &crate::git_transport::AuthorityCheck,
     child: &mut KillableChild,
 ) -> Result<String, ExecutorError> {
     let mut said_hello = false;
-    write_frame(stdin, &ToChild::Push(request.clone()))
-        .map_err(|error| ExecutorError::Spawn(format!("writing the push request: {error}")))?;
+    let mut sent_request = false;
 
     loop {
         let now = Instant::now();
@@ -585,6 +769,21 @@ fn drive(
                 reap,
             });
         };
+        // The one job, written INSIDE the deadline rather than before the first check of it. A
+        // child that never reads its stdin used to park this thread here, before any phase this
+        // loop bounds, with the kill unreachable behind it.
+        if !sent_request {
+            sent_request = true;
+            stalled_write(
+                writer,
+                &ToChild::Push(request.clone()),
+                left,
+                deadline,
+                child,
+                "writing the push request",
+            )?;
+            continue;
+        }
         match frames.recv_timeout(left) {
             Ok(Ok(Some(ToParent::Hello { version, .. }))) => {
                 if version != PROTOCOL_VERSION {
@@ -641,9 +840,46 @@ fn drive(
                         return Err(ExecutorError::Killed { after, reap });
                     }
                 };
-                write_frame(stdin, &answer).map_err(|error| {
-                    ExecutorError::Protocol(format!("answering a mint request: {error}"))
-                })?;
+                let Some(left_to_answer) = deadline.checked_duration_since(Instant::now()) else {
+                    let after = Instant::now().saturating_duration_since(deadline);
+                    let reap = child.kill_and_reap()?;
+                    return Err(ExecutorError::Killed { after, reap });
+                };
+                stalled_write(
+                    writer,
+                    &answer,
+                    left_to_answer,
+                    deadline,
+                    child,
+                    "answering a mint request",
+                )?;
+            }
+            Ok(Ok(Some(ToParent::Check { phase }))) => {
+                if !said_hello {
+                    child.kill_and_reap()?;
+                    return Err(ExecutorError::Protocol(
+                        "child asked about its authority before saying hello".to_owned(),
+                    ));
+                }
+                // The parent's LIVE answer, taken now rather than recalled from the mint. This is
+                // the boundary the child enforces on its own side; what the parent owes it is a
+                // current answer and a bounded one.
+                let refused = authority()
+                    .err()
+                    .map(|ended| format!("{ended} (at {phase})"));
+                let Some(left_to_answer) = deadline.checked_duration_since(Instant::now()) else {
+                    let after = Instant::now().saturating_duration_since(deadline);
+                    let reap = child.kill_and_reap()?;
+                    return Err(ExecutorError::Killed { after, reap });
+                };
+                stalled_write(
+                    writer,
+                    &ToChild::Authority { refused },
+                    left_to_answer,
+                    deadline,
+                    child,
+                    "answering an authority check",
+                )?;
             }
             Ok(Ok(Some(ToParent::Done { oid, error }))) => {
                 // The child says it is finished; that is not the same as being gone. Reap before
@@ -677,6 +913,32 @@ fn drive(
                     reap,
                 });
             }
+        }
+    }
+}
+
+/// One parent write, with the deadline on it and the kill behind it. A write that does not complete
+/// in time is the same overrun as any other, and is stopped the same way.
+fn stalled_write(
+    writer: &mut Writer,
+    frame: &ToChild,
+    left: Duration,
+    deadline: Instant,
+    child: &mut KillableChild,
+    what: &str,
+) -> Result<(), ExecutorError> {
+    match writer.write(frame, left) {
+        Ok(()) => Ok(()),
+        Err(WriteStall::TimedOut) => {
+            let after = Instant::now().saturating_duration_since(deadline);
+            let reap = child.kill_and_reap()?;
+            Err(ExecutorError::Killed { after, reap })
+        }
+        Err(WriteStall::Failed(why)) => {
+            // Reap BEFORE reporting. A write error used to return straight out of `drive` past a
+            // still-live child, leaving the kill to a `Drop` whose failure nobody could return.
+            child.kill_and_reap()?;
+            Err(ExecutorError::Protocol(format!("{what}: {why}")))
         }
     }
 }
@@ -757,18 +1019,37 @@ where
     R: BufRead + Send + 'static,
     W: Write + Send + 'static,
 {
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
+
+    // This child's OWN deadline, derived from the budget the parent sent. The parent's deadline is
+    // an `Instant` in another process and means nothing here; without this the child had no clock
+    // at all and `budget_ms` was a field nobody read. It does not replace the parent's kill — the
+    // child is still not trusted to bound itself — it is what makes the transport's own pre-wire
+    // gates real on this side instead of `None`.
+    let deadline = Instant::now() + Duration::from_millis(request.budget_ms);
+    let lifetime: crate::git_transport::AuthorityCheck = Arc::new(move || {
+        if Instant::now() >= deadline {
+            return Err(
+                "this delivery's work budget is spent; the child will not transmit".to_owned(),
+            );
+        }
+        Ok(())
+    });
+
+    // The pipe is shared by BOTH gates below, in one lock order (reader, then writer), because both
+    // are round trips on the one pipe and the transport may call either from a libgit2 thread.
+    let pipe = Arc::new(Mutex::new(reader));
 
     // The minter the transport will call: one round-trip to the parent per wire request. The parent
     // owns the key, the destination binding, the authority check and the deadline; this side owns
-    // nothing but the question. `Mutex` because the transport's minter is `Fn`, and because two
-    // concurrent asks on one pipe would interleave two answers.
-    let pipe = Mutex::new(reader);
-    let mint: crate::git_transport::AuthMinter = std::sync::Arc::new(move |destination: &str| {
-        let mut reader = pipe
+    // nothing but the question.
+    let ask_reader = Arc::clone(&pipe);
+    let ask_writer = Arc::clone(&output);
+    let mint: crate::git_transport::AuthMinter = Arc::new(move |destination: &str| {
+        let mut reader = ask_reader
             .lock()
             .map_err(|_| "the delivery push pipe is poisoned".to_owned())?;
-        let mut output = output
+        let mut output = ask_writer
             .lock()
             .map_err(|_| "the delivery push pipe is poisoned".to_owned())?;
         write_frame(
@@ -794,6 +1075,41 @@ where
         }
     });
 
+    // The authority gate the transport asks IMMEDIATELY BEFORE it transmits. It is a round trip to
+    // the parent, on the same pipe, for the same reason the mint is: the answer lives on the other
+    // side of the process boundary, and an answer the child recalls from the mint is an answer
+    // about a moment that has passed. Between the parent approving the mint and this point the
+    // child can be descheduled, the owner can go away, and the parent's own checks — which all
+    // happened before the header crossed the pipe — cannot see it.
+    let check_reader = Arc::clone(&pipe);
+    let check_writer = Arc::clone(&output);
+    let authority: crate::git_transport::AuthorityCheck = Arc::new(move || {
+        let mut reader = check_reader
+            .lock()
+            .map_err(|_| "the delivery push pipe is poisoned".to_owned())?;
+        let mut output = check_writer
+            .lock()
+            .map_err(|_| "the delivery push pipe is poisoned".to_owned())?;
+        write_frame(
+            &mut *output,
+            &ToParent::Check {
+                phase: "before transmitting".to_owned(),
+            },
+        )
+        .map_err(|error| format!("asking the parent whether this delivery still owns: {error}"))?;
+        match read_frame::<_, ToChild>(&mut *reader) {
+            Ok(Some(ToChild::Authority { refused: None })) => Ok(()),
+            Ok(Some(ToChild::Authority {
+                refused: Some(refused),
+            })) => Err(refused),
+            // FAIL CLOSED. No answer is not permission.
+            Ok(Some(_)) | Ok(None) => {
+                Err("the parent stopped answering authority checks; not transmitting".to_owned())
+            }
+            Err(error) => Err(format!("reading the parent's authority answer: {error}")),
+        }
+    });
+
     // The same two steps, in the same order, the in-process push has always taken: replace the
     // workdir's `.git/config` so a planted `insteadOf` cannot redirect the seller's token, then push
     // the gated object. `seller_git`'s async wrapper exists to hold a delivery turn on a blocking
@@ -811,8 +1127,12 @@ where
         } else {
             None
         },
-        None,
-        None,
+        // Both gates are the CHILD's, enforced on this side of the pipe. They were `None`, which
+        // meant the transport's pre-wire authority and lifetime checks did nothing at all in the
+        // production child — the one process that actually transmits. An anonymous remote mints no
+        // token and so asks the parent nothing about minting; it is still gated here.
+        Some(authority),
+        Some(lifetime),
     )
     .map_err(|error| error.to_string())
 }

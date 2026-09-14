@@ -532,6 +532,20 @@ fn the_turn_is_released_on_a_confirmed_exit_and_on_nothing_else() {
         Exclusion::Release,
         "a child that never started holds nothing"
     );
+    // The third retaining outcome, and the one this rule used to get WRONG. `waitpid` itself can
+    // fail; that is an UNKNOWN exit, and it used to be reported as a protocol fault — which this
+    // rule releases on. An unknown exit wearing a releasable name is a seat handed on while work
+    // may still be running, so it has its own outcome and it retains.
+    assert_eq!(
+        turn_after_child_push(&Err(ExecutorError::WaitFailed {
+            why: "No child processes".to_owned()
+        })),
+        Exclusion::Retain,
+        "an exit the kernel would not report is not an exit we may release on"
+    );
+    // `Protocol` releases, and may only ever be constructed where the exit WAS confirmed: every
+    // arm of `drive` reaps before it returns one, and `run_push_in_child` re-checks that the child
+    // is reaped before any outcome leaves it.
     assert_eq!(
         turn_after_child_push(&Err(ExecutorError::Protocol("out of turn".to_owned()))),
         Exclusion::Release
