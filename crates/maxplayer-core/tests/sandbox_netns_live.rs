@@ -1609,6 +1609,14 @@ enum PayloadOutcome {
     Connected,
     /// The payload ran and its connection was refused or timed out.
     Refused,
+    /// The payload ran, but what exited was the TOOL rather than the connection: `nc` missing,
+    /// not executable, or rejecting its own arguments. Never containment evidence.
+    ///
+    /// Split out of `Refused`, which used to absorb every nonzero status. An image without `nc`
+    /// exits 127 through `sh`, and 127 is not zero, so a leg measuring nothing at all scored as a
+    /// denial -- the single most flattering way this matrix could be wrong, since a fixture that
+    /// silently lost its payload would have reported perfect containment on every denied leg.
+    ToolFailed(i32),
 }
 
 /// The agent command for one connection attempt, bracketed by markers.
@@ -1635,10 +1643,44 @@ fn classify_payload(stdout: &str, stderr: &str) -> PayloadOutcome {
         .and_then(|code| code.trim().parse::<i32>().ok())
     {
         Some(0) => PayloadOutcome::Connected,
-        Some(_) => PayloadOutcome::Refused,
+        // BusyBox `nc`, which is what the Alpine fixture carries, exits 1 for a refused connection
+        // and 1 for the `-w` timeout. Those are the two shapes containment takes here, and they
+        // are the only statuses allowed to mean it.
+        Some(1) => PayloadOutcome::Refused,
+        // 127 not found, 126 not executable, 2 usage, 128+n killed by a signal. Every one of these
+        // is the tool failing rather than the network answering.
+        Some(other) => PayloadOutcome::ToolFailed(other),
         // Started, but never reported a result: killed mid-attempt. Not a denial.
         None => PayloadOutcome::NeverStarted,
     }
+}
+
+/// The denial oracle only calls a connection refused when the connection was refused.
+///
+/// Offline, because it is a property of the classifier rather than of any network, and because the
+/// whole matrix rests on it: every denied leg in the saved record is this function's verdict. The
+/// failure it guards against is the flattering one -- an image that lost `nc` exits 127, and while
+/// any nonzero status counted as a denial, a leg that measured nothing reported containment.
+#[test]
+fn only_a_connection_failure_is_scored_as_a_denial() {
+    let started = |code: &str| format!("{STARTED_MARKER}\n{RESULT_MARKER}{code}\n");
+
+    assert_eq!(classify_payload(&started("0"), ""), PayloadOutcome::Connected);
+    assert_eq!(
+        classify_payload(&started("1"), ""),
+        PayloadOutcome::Refused,
+        "BusyBox nc exits 1 for a refused connection and for the -w timeout"
+    );
+    for broken in [127, 126, 2, 137] {
+        assert_eq!(
+            classify_payload(&started(&broken.to_string()), ""),
+            PayloadOutcome::ToolFailed(broken),
+            "exit {broken} is the tool failing, not the network refusing"
+        );
+    }
+    // And the pre-existing boundaries still hold: no start marker, and a start with no result.
+    assert_eq!(classify_payload("", ""), PayloadOutcome::NeverStarted);
+    assert_eq!(classify_payload(STARTED_MARKER, ""), PayloadOutcome::NeverStarted);
 }
 
 /// Free the deterministic container name a launch is about to use.
@@ -1667,6 +1709,18 @@ fn run_launch_attributably(launch: &maxplayer_core::seller_exec::AgentLaunch) ->
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     let outcome = classify_payload(&stdout, &stderr);
+    if matches!(outcome, PayloadOutcome::ToolFailed(_)) {
+        // Loud for the same reason `NeverStarted` is loud, and louder in one respect: this leg's
+        // payload DID start, so the leg looks like it measured something.
+        eprintln!(
+            "ToolFailed ({outcome:?}): the payload's connection tool failed rather than being \
+             refused, so this leg measured nothing: {} {:?}\n  stdout: {}\n  stderr: {}",
+            launch.program,
+            launch.args,
+            stdout.trim(),
+            stderr.trim()
+        );
+    }
     if outcome == PayloadOutcome::NeverStarted {
         // "NeverStarted" is the one outcome that says nothing about containment and everything
         // about the launch, so it must not be silent: the first real run of this file reported it
@@ -1874,10 +1928,17 @@ fn a_job_prepared_and_launched_by_production_is_contained_on_its_veth() {
     // happened to match on one port number.
     let other_port = integrated_leg(&net.network, &net.allowed_ip, Canary::OTHER_PORT, |_| {})
         .expect("preparation must succeed");
-    assert_ne!(
+    // Asserted as Connected, which is what this leg's own comment claims and what the saved record
+    // states. `!= NeverStarted` passed on Refused too -- so a filter that DID silently become
+    // port-scoped, the exact failure this leg exists to rule out, satisfied it. A leg that accepts
+    // both answers to its own question is not a control.
+    assert_eq!(
         other_port,
-        PayloadOutcome::NeverStarted,
-        "the neighbouring-port leg never started, so it scored nothing"
+        PayloadOutcome::Connected,
+        "the allowed {} must stay reachable on the neighbouring port {}: the policy's denials are \
+         not port-scoped, and a leg that also accepted Refused would not have noticed if they were",
+        net.allowed_ip,
+        Canary::OTHER_PORT
     );
 }
 
