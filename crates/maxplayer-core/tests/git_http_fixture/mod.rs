@@ -131,6 +131,9 @@ impl RequestGate {
 pub struct GitHttpAuthServer {
     addr: SocketAddr,
     mount: String,
+    /// PEM of the exact certificate THIS server instance serves, so a client can be given a trust
+    /// anchor instead of being told to skip verification. See [`GitHttpAuthServer::ca_file`].
+    ca_pem: String,
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
     concurrency: Arc<Concurrency>,
     shutdown: Arc<AtomicBool>,
@@ -191,7 +194,8 @@ impl GitHttpAuthServer {
 
     /// [`GitHttpAuthServer::spawn`] with [`FixtureOptions`].
     pub fn spawn_with(repo: &Path, mount: &str, options: FixtureOptions) -> Self {
-        let tls_config = Arc::new(self_signed_tls_config());
+        let (config, ca_pem) = self_signed_tls_config_with_pem();
+        let tls_config = Arc::new(config);
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind fixture listener");
         listener
             .set_nonblocking(true)
@@ -249,11 +253,28 @@ impl GitHttpAuthServer {
         Self {
             addr,
             mount: mount.to_owned(),
+            ca_pem,
             requests,
             concurrency,
             shutdown,
             accept_thread: Some(accept_thread),
         }
+    }
+
+    /// Write this server's certificate where a client can be pointed at it as its ONLY trust
+    /// anchor, and hand back the path.
+    ///
+    /// The alternative every other fixture test in this crate takes is `GIT_SSL_NO_VERIFY=1`, which
+    /// is fine when the claim under test is "the right requests were made" and worthless when the
+    /// claim is about the transport. It is also unavailable to a delivery-push CHILD: that variable
+    /// is deliberately absent from `delivery_executor::CHILD_ENV_ALLOWLIST`, while `SSL_CERT_FILE`
+    /// is on it, for exactly this — a host whose trust store is not the default. So a child that
+    /// reaches this fixture at all reaches it with verification ON, through the same allowlisted
+    /// input a musl container image would use in production.
+    pub fn ca_file(&self, dir: &Path) -> PathBuf {
+        let path = dir.join(format!("fixture-ca-{}.pem", self.addr.port()));
+        std::fs::write(&path, &self.ca_pem).expect("write fixture CA");
+        path
     }
 
     /// Clone/fetch URL of the served repo (allowlist-shaped: https, credential-free).
@@ -285,19 +306,29 @@ impl Drop for GitHttpAuthServer {
 /// does: the client's trust decision is then identical, and the only thing that differs between the
 /// two fixtures is the protocol they negotiate.
 pub fn self_signed_tls_config() -> ServerConfig {
-    // SAN content is irrelevant to the tests (clients connect with GIT_SSL_NO_VERIFY),
-    // but keep it honest for 127.0.0.1 anyway.
+    self_signed_tls_config_with_pem().0
+}
+
+/// The same configuration, plus the PEM of the certificate it serves.
+///
+/// A self-signed leaf IS its own trust anchor, so this PEM is everything a client needs to verify
+/// this server and nothing else. The SANs cover `127.0.0.1` because the fixture is only ever dialled
+/// there, and a client verifying properly checks the name as well as the chain.
+pub fn self_signed_tls_config_with_pem() -> (ServerConfig, String) {
     let certified =
         rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned(), "localhost".to_owned()])
             .expect("generate self-signed cert");
+    let pem = certified.cert.pem();
     let cert: CertificateDer<'static> = certified.cert.der().clone();
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
-    ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .expect("protocol versions")
-        .with_no_client_auth()
-        .with_single_cert(vec![cert], key)
-        .expect("server cert")
+    let config =
+        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("protocol versions")
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .expect("server cert");
+    (config, pem)
 }
 
 fn handle_connection(

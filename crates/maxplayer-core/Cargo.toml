@@ -189,7 +189,11 @@ futures-util = { version = "0.3", default-features = false }
 nostr-relay-builder = "0.44"
 # Local git-over-HTTPS auth fixture (tests/git_http_fixture): rustls server with an
 # rcgen self-signed cert. ring-backed on both — aws-lc-rs is not in the workspace lock.
-rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+# `pem` so the fixture can hand a test the certificate it actually serves, as a trust anchor file:
+# `tests/delivery_push_verified_tls.rs` pushes with verification ON rather than `GIT_SSL_NO_VERIFY`,
+# because a delivery-push child is given `SSL_CERT_FILE` and never the bypass. The `pem` crate is
+# already in the lock (3.0.6); this adds a feature edge, not a resolution.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio = { version = "1.52.0", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "time", "test-util"] }
 # The p-gate relay fixture speaks raw NIP-01 over a websocket, because it has to answer a p-gated REQ

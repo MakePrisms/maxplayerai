@@ -109,3 +109,12 @@ cdk-sqlite = "=0.17.2"
 # the read-out is proven against a genuinely migrated row. Same version and feature the core crate
 # already resolves: no new crate or version enters the lockfile, only this dependency edge.
 rusqlite = { version = "0.31", features = ["bundled"] }
+# `tests/delivery_push_shipped_child.rs` stands up the core crate's local git-over-HTTPS fixture and
+# drives THIS crate's shipped binary through it as a real delivery-push child. The fixture has to be
+# here rather than in maxplayer-core because `CARGO_BIN_EXE_maxplayer` exists only in this crate, and
+# a test that guessed the binary's path would be proving something about a guess. Same versions and
+# features maxplayer-core already resolves for the same fixture, so no new resolution enters the
+# lockfile — only a dependency edge.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+libc = "0.2"
