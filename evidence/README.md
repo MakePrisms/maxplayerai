@@ -1,8 +1,22 @@
 # Evidence bundles
 
-Each subdirectory is one complete execution of `crates/maxplayer-tool-kit/docker/demo.sh`,
-named by its UTC start time. A bundle holds per-step verdicts (`results.txt`), both MCP
-transcripts, holder and vendor logs, vendor counter snapshots, and a `manifest.json`.
+Two kinds of bundle live here, named by UTC start time.
+
+## Real-vendor acceptance: `20260914T085619Z-github-proxy-swap/`
+
+The Proxy swap route (`docs/specs/seller-tool-onboarding/10-routing-and-options.md`) accepted
+against GitHub's remote MCP server on 2026-09-14: the bridge in the sandbox image, uncontained and
+under egress containment, and a real `claude-agent-acp` turn, all through the real credential
+proxy. The token owner's login came back from GitHub; the token was absent from everything the
+container received; the placeholder was refused at the vendor and revoked at job end. This is the
+one bundle here that is NOT `mechanism_only`: the oracle is a third party. Read its `README.md`
+for what it proves, its limits, and how to rerun it.
+
+## Holder demo bundles
+
+Each of the remaining subdirectories is one complete execution of
+`crates/maxplayer-tool-kit/docker/demo.sh`. A bundle holds per-step verdicts (`results.txt`), both
+MCP transcripts, holder and vendor logs, vendor counter snapshots, and a `manifest.json`.
 
 ## Current bundle: `20260910T125544Z` (post-repair, digest-pinned)
 
