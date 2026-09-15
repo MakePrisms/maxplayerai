@@ -18,8 +18,11 @@
 //! The signing key stays in the actor the parent calls. Both halves of that sentence are load
 //! bearing and neither is weakened by the other.
 
+use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::task::Poll;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -59,22 +62,19 @@ fn fixture(dir: &Path, body: &str) -> PathBuf {
 
 const HELLO: &str = r#"printf '{"t":"Hello","version":1,"argv":[],"env":{}}\n'"#;
 
-/// Wait until the second delivery has actually ASKED for the seat. Sampling before that point would
-/// only observe a task that had not been scheduled yet, which says nothing about the lock.
-async fn await_asked(state: &AtomicU8) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        match state.load(Ordering::SeqCst) {
-            PENDING => return,
-            ACQUIRED => panic!("the second delivery took the seat before it was observed asking"),
-            _ => tokio::time::sleep(Duration::from_millis(5)).await,
-        }
-    }
-    panic!("the second delivery never asked for the seat");
-}
-
 fn alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// ONE real poll of a real future, and the `Poll` it returned handed straight back.
+///
+/// This is the difference the verdict asked for. A marker the test stores before awaiting proves
+/// the test reached a line; `Future::poll` returning [`Poll::Pending`] is the serializer's own
+/// answer to "may this delivery have the seat", taken from the future under test rather than
+/// inferred around it. The waker is the real one the surrounding runtime supplies, so a future that
+/// was ready would say so here.
+async fn poll_once<F: Future>(mut future: Pin<&mut F>) -> Poll<F::Output> {
+    std::future::poll_fn(move |cx| Poll::Ready(future.as_mut().poll(cx))).await
 }
 
 /// The first delivery's local phase refuses to stop; the second delivery is watched sitting Pending
@@ -149,40 +149,46 @@ async fn a_second_delivery_is_observed_pending_until_the_held_local_phase_is_kil
         "the first delivery's local phase must actually be running before we queue a second"
     );
 
-    let second = {
-        let lock = Arc::clone(&lock);
+    // OBSERVED PENDING — the real one, and the reason this file was rewritten. The second delivery
+    // is no longer spawned onto another task and watched through a marker the test itself wrote
+    // before the call. Its future is held HERE and POLLED, and what every assertion below reads is
+    // the `Poll` that `serialized_bounded_push` returned. `Poll::Pending` out of the seat's own
+    // serializer, while delivery one's child is demonstrably alive, is the fact that was ordered.
+    let second = serialized_bounded_push(&lock, generous, Instant::now() + Duration::from_secs(20), {
         let state = Arc::clone(&second_state);
         let at = Arc::clone(&second_acquired_at);
-        tokio::spawn(async move {
-            state.store(PENDING, Ordering::SeqCst);
-            serialized_bounded_push(
-                &lock,
-                generous,
-                Instant::now() + Duration::from_secs(20),
-                move |turn| async move {
-                    // Reached ONLY with the turn in hand: `serialized_bounded_push` builds it from
-                    // the acquired guard, so this line cannot run while delivery one owns the seat.
-                    at.lock().expect("clock").replace(Instant::now());
-                    state.store(ACQUIRED, Ordering::SeqCst);
-                    drop(turn);
-                    Ok::<_, SellerGitError>("second-delivery-oid".to_owned())
-                },
-            )
-            .await
-        })
-    };
+        move |turn| async move {
+            // Reached ONLY with the turn in hand: `serialized_bounded_push` builds it from the
+            // acquired guard, so this line cannot run while delivery one owns the seat.
+            at.lock().expect("clock").replace(Instant::now());
+            state.store(ACQUIRED, Ordering::SeqCst);
+            drop(turn);
+            Ok::<_, SellerGitError>("second-delivery-oid".to_owned())
+        }
+    });
+    tokio::pin!(second);
 
-    // OBSERVED PENDING. First wait until the second delivery has genuinely asked, then sample
-    // repeatedly for as long as delivery one is still holding: every sample is an independent
-    // observation that a real second delivery has asked and not been let in.
-    await_asked(&second_state).await;
+    // The FIRST poll is the ask: it is what drives the future far enough to reach for the lock.
+    // There is no window here in which the second delivery has not yet asked, which is what the old
+    // `await_asked` spin existed to cover.
+    assert!(
+        poll_once(second.as_mut()).await.is_pending(),
+        "the second delivery's very first poll returned Ready while delivery one held the seat"
+    );
+    second_state.store(PENDING, Ordering::SeqCst);
+
     let mut samples = 0usize;
     let watch_until = Instant::now() + Duration::from_millis(1_200);
     while Instant::now() < watch_until {
+        assert!(
+            poll_once(second.as_mut()).await.is_pending(),
+            "the second delivery's future returned Ready while the first one's local phase was \
+             still running"
+        );
         assert_eq!(
             second_state.load(Ordering::SeqCst),
             PENDING,
-            "the second delivery took the seat while the first one's local phase was still running"
+            "the second delivery's push body ran while delivery one held the seat"
         );
         assert!(
             alive(wedged_pid),
@@ -193,7 +199,7 @@ async fn a_second_delivery_is_observed_pending_until_the_held_local_phase_is_kil
     }
     assert!(
         samples >= 20,
-        "too few observations of the pending second delivery to call it observed: {samples}"
+        "too few observed Poll::Pending returns to call it observed: {samples}"
     );
 
     let (outcome, started, returned) = first.await.expect("first delivery task");
@@ -218,7 +224,8 @@ async fn a_second_delivery_is_observed_pending_until_the_held_local_phase_is_kil
         "the killed child must be gone before the seat is handed on"
     );
 
-    let second_outcome = second.await.expect("second delivery task");
+    // Same future, now driven to completion by the ordinary await.
+    let second_outcome = second.await;
     assert_eq!(
         second_outcome.expect("the second delivery must get the seat once the first stops"),
         "second-delivery-oid"
@@ -282,38 +289,43 @@ async fn a_second_delivery_is_observed_pending_behind_a_first_that_succeeds() {
 
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let second = {
-        let lock = Arc::clone(&lock);
+    // The same real-poll oracle as the gate above: the second delivery's future is held here and
+    // POLLED, so "pending" is the serializer's answer and not a marker this test set.
+    let second = serialized_bounded_push(&lock, generous, Instant::now() + Duration::from_secs(20), {
         let state = Arc::clone(&state);
-        tokio::spawn(async move {
-            state.store(PENDING, Ordering::SeqCst);
-            serialized_bounded_push(
-                &lock,
-                generous,
-                Instant::now() + Duration::from_secs(20),
-                move |turn| async move {
-                    state.store(ACQUIRED, Ordering::SeqCst);
-                    drop(turn);
-                    Ok::<_, SellerGitError>("second-delivery-oid".to_owned())
-                },
-            )
-            .await
-        })
-    };
+        move |turn| async move {
+            state.store(ACQUIRED, Ordering::SeqCst);
+            drop(turn);
+            Ok::<_, SellerGitError>("second-delivery-oid".to_owned())
+        }
+    });
+    tokio::pin!(second);
 
-    await_asked(&state).await;
+    assert!(
+        poll_once(second.as_mut()).await.is_pending(),
+        "the second delivery's first poll returned Ready while the first still held the seat"
+    );
+    state.store(PENDING, Ordering::SeqCst);
+
     let mut samples = 0usize;
     let watch_until = Instant::now() + Duration::from_millis(600);
     while Instant::now() < watch_until {
+        assert!(
+            poll_once(second.as_mut()).await.is_pending(),
+            "the second delivery's future returned Ready while the first was still in its push body"
+        );
         assert_eq!(
             state.load(Ordering::SeqCst),
             PENDING,
-            "the second delivery took the seat while the first was still in its push body"
+            "the second delivery's push body ran while the first still held the seat"
         );
         samples += 1;
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
-    assert!(samples >= 10, "too few observations: {samples}");
+    assert!(
+        samples >= 10,
+        "too few observed Poll::Pending returns to call it observed: {samples}"
+    );
 
     release.send(()).expect("release the first delivery");
     assert_eq!(
@@ -321,7 +333,7 @@ async fn a_second_delivery_is_observed_pending_behind_a_first_that_succeeds() {
         "first-delivery-oid"
     );
     assert_eq!(
-        second.await.expect("second task").expect("second delivery"),
+        second.await.expect("second delivery"),
         "second-delivery-oid"
     );
     assert_eq!(state.load(Ordering::SeqCst), ACQUIRED);
