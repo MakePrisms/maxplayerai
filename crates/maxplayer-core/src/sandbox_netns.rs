@@ -1653,6 +1653,13 @@ pub struct ReapReport {
     pub removed: Vec<String>,
     /// The holders the selection chose and `docker rm` refused, each with docker's own reason.
     pub failed: Vec<(String, String)>,
+    /// Expired containers this pass SELECTED BUT NEVER ASKED DOCKER ABOUT — the backlog beyond
+    /// [`MAX_SWEEP_REMOVALS`], and whatever was left when [`SWEEP_PASS_BUDGET`] ran out.
+    ///
+    /// Reported rather than dropped, so "this pass removed 32" can be read as "and 140 more are
+    /// still waiting" instead of as "the host is clean now". Every one of them is still expired on
+    /// the next tick.
+    pub deferred: Vec<String>,
 }
 
 #[cfg(feature = "acp")]
@@ -1741,6 +1748,23 @@ pub const SWEEP_INTERVAL_SECS: u64 = 300;
 #[cfg(feature = "acp")]
 pub const MAX_SWEEP_REMOVALS: usize = 32;
 
+/// The WALL-CLOCK bound on one whole sweep pass, listing included.
+///
+/// [`MAX_SWEEP_REMOVALS`] bounds the COUNT, and it is not by itself a bound on duration: the
+/// removals run one after another, each with its own [`SWEEP_DOCKER_DEADLINE`], so a daemon that
+/// accepts the connection and then hangs turns a 32-removal pass into 32 × 20 s = 640 s of work
+/// — past two further ticks. That is the case this budget names. When it is spent the pass stops
+/// starting removals and reports what it did not attempt as [`ReapReport::deferred`]; those
+/// containers are still expired, so the next tick selects them again.
+///
+/// 240 s is chosen under [`SWEEP_INTERVAL_SECS`] deliberately: a pass therefore ends before the
+/// tick that follows it, so the pathological case degrades into "fewer removals per pass" rather
+/// than into overlapping passes. The guaranteed floor is what one budget buys at the per-call
+/// deadline — at least 11 removals per pass even when every single call burns its full 20 s, and
+/// the usual 32 when they answer in milliseconds.
+#[cfg(feature = "acp")]
+pub const SWEEP_PASS_BUDGET: std::time::Duration = std::time::Duration::from_secs(240);
+
 /// Remove this seat's containers whose own cleanup stamp `now_unix` has passed, and report what
 /// happened to each.
 ///
@@ -1774,18 +1798,50 @@ async fn sweep_expired_with(
     seat: &str,
     now_unix: u64,
 ) -> Result<ReapReport, String> {
+    sweep_expired_within(client, seat, now_unix, SWEEP_PASS_BUDGET).await
+}
+
+/// [`sweep_expired_with`], with the pass budget supplied by the caller so a test can spend it.
+#[cfg(feature = "acp")]
+async fn sweep_expired_within(
+    client: &DockerCli,
+    seat: &str,
+    now_unix: u64,
+    budget: std::time::Duration,
+) -> Result<ReapReport, String> {
     // Refused rather than run on an identity we do not have: an empty seat would match every
     // container whose seat label failed to parse. Same refusal, same reason, as
     // `reapable_holders_live`.
     if seat.trim().is_empty() {
         return Err("refusing to sweep: no owning seat was named".to_owned());
     }
+    // Started BEFORE the listing, because the listing is part of the pass a hung daemon can stall:
+    // a budget measured from the first removal would let one stuck `docker ps` spend 20 s that the
+    // caller's cadence never accounted for.
+    let started = std::time::Instant::now();
     let mut report = ReapReport::default();
     let (listing, _) = run_bounded(client, list_owned_argv(seat), None, SWEEP_DOCKER_DEADLINE)
         .await
         .map_err(|error| format!("could not list this seat's containers — {error}"))?;
-    let expired = expired_owned(&parse_owned_listing(&listing), seat, now_unix);
-    for id in expired.into_iter().take(MAX_SWEEP_REMOVALS) {
+    let mut expired = expired_owned(&parse_owned_listing(&listing), seat, now_unix);
+    // The count bound first: everything past it is deferred without being looked at, in the
+    // selection's own order, so a backlog drains deterministically instead of by whichever name
+    // docker happened to list first this time.
+    if expired.len() > MAX_SWEEP_REMOVALS {
+        report.deferred = expired.split_off(MAX_SWEEP_REMOVALS);
+    }
+    let mut queue = expired.into_iter();
+    for id in queue.by_ref() {
+        // Checked before STARTING a removal, never mid-call: a `docker rm` this pass has already
+        // issued is left to its own deadline, because abandoning it would leave the pass unable to
+        // say whether the container was removed.
+        if started.elapsed() >= budget {
+            // In front of whatever the count bound already deferred: these were selected earlier,
+            // so they are older, and the next pass should reach them first.
+            let unattempted: Vec<String> = std::iter::once(id).chain(queue).collect();
+            report.deferred.splice(0..0, unattempted);
+            break;
+        }
         match run_bounded(
             client,
             ["docker", "rm", "--force", "--volumes", id.as_str()]
@@ -3991,10 +4047,87 @@ exit 0
 
         let first = sweep_expired_with(&client, &seat, 5_000).await.expect("the listing answered");
         assert_eq!(first.removed.len(), MAX_SWEEP_REMOVALS, "one tick's bounded budget");
+        // The remainder is REPORTED, not silently dropped: "removed 32" on a host with 37 expired
+        // containers must not read as "the host is clean now".
+        assert_eq!(first.deferred.len(), 5, "the backlog this pass did not attempt is named");
+        assert!(
+            first.deferred.iter().all(|id| !first.removed.contains(id)),
+            "a container cannot be both removed and deferred"
+        );
+        assert_eq!(
+            rm_log(&work).len(),
+            MAX_SWEEP_REMOVALS,
+            "the deferred ones were never even asked about"
+        );
         let second = sweep_expired_with(&client, &seat, 5_000).await.expect("the listing answered");
         assert_eq!(second.removed.len(), 5, "the backlog clears on the following ticks");
+        assert!(second.deferred.is_empty(), "and nothing is left over from that pass");
         let third = sweep_expired_with(&client, &seat, 5_000).await.expect("the listing answered");
         assert!(third.removed.is_empty(), "and then there is nothing left to do");
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// A PASS IS BOUNDED IN WALL CLOCK, NOT ONLY IN COUNT — AND SAYS WHAT IT DID NOT REACH.
+    ///
+    /// `MAX_SWEEP_REMOVALS` bounds how many containers a pass removes, which is not a bound on how
+    /// long the pass takes: the removals are serial, each carries `SWEEP_DOCKER_DEADLINE`, and a
+    /// daemon that accepts the connection and then hangs makes 32 of them 640 s of work — past two
+    /// further ticks. `SWEEP_PASS_BUDGET` is the bound on the pass itself. Spent, the pass stops
+    /// STARTING removals and reports the rest as deferred; nothing is lost, because every one of
+    /// them is still expired when the next tick selects it.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pass_stops_at_its_wall_clock_budget_and_defers_what_it_did_not_start() {
+        let work = stand_in_work_dir("sweep-budget");
+        let client = DockerCli::stand_in(&stand_in_sweep_docker(&work));
+        let seat = seat_b();
+        let ids: Vec<String> = (0..6).map(|n| format!("slow{n}")).collect();
+        let rows: Vec<(&str, &str, &str, &str)> =
+            ids.iter().map(|id| (id.as_str(), seat.as_str(), "1000", ROLE_HOLDER)).collect();
+        write_listing(&work, &rows);
+
+        // A budget already spent when the pass reaches its first removal. Deterministic — no sleep,
+        // no timing window: the listing alone is enough elapsed time for a zero budget.
+        let spent = sweep_expired_within(&client, &seat, 5_000, std::time::Duration::ZERO)
+            .await
+            .expect("the listing still answered — the budget bounds removals, not the read");
+        assert!(spent.removed.is_empty(), "a spent budget starts no removal");
+        assert!(rm_log(&work).is_empty(), "and docker is never asked");
+        assert_eq!(spent.deferred.len(), 6, "every selected container is accounted for");
+
+        // Nothing about that pass consumed the work: the next one, with a real budget, does it all.
+        let next = sweep_expired_within(&client, &seat, 5_000, SWEEP_PASS_BUDGET)
+            .await
+            .expect("the listing answered");
+        assert_eq!(next.removed.len(), 6, "the deferred backlog is removed by the following pass");
+        assert!(next.deferred.is_empty());
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// THE DEFERRED BACKLOG IS OLDEST-FIRST, SO A PERMANENT BACKLOG STILL DRAINS.
+    ///
+    /// The count bound and the wall-clock bound defer different containers, and the ones the budget
+    /// stopped were selected EARLIER than the ones the count bound never looked at. Reporting them
+    /// in selection order is what makes the next pass reach the oldest leftovers first instead of
+    /// re-starting at whatever docker listed first this time.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_deferred_backlog_keeps_the_selection_order_the_next_pass_needs() {
+        let work = stand_in_work_dir("sweep-order");
+        let client = DockerCli::stand_in(&stand_in_sweep_docker(&work));
+        let seat = seat_b();
+        let ids: Vec<String> = (0..MAX_SWEEP_REMOVALS + 3).map(|n| format!("o{n:03}")).collect();
+        let rows: Vec<(&str, &str, &str, &str)> =
+            ids.iter().map(|id| (id.as_str(), seat.as_str(), "1000", ROLE_HOLDER)).collect();
+        write_listing(&work, &rows);
+
+        let stalled = sweep_expired_within(&client, &seat, 5_000, std::time::Duration::ZERO)
+            .await
+            .expect("the listing answered");
+        assert_eq!(
+            stalled.deferred, ids,
+            "budget-stopped names come first, count-bound names after, both in selection order"
+        );
         let _ = std::fs::remove_dir_all(&work);
     }
 

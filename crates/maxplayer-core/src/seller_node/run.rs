@@ -4188,6 +4188,19 @@ pub(crate) fn rearm_deadline(
     deadline.max(boot_floor)
 }
 
+/// Clears the expiry sweep's in-flight flag when the pass ends, however it ends.
+///
+/// A `set(false)` at the end of the task body would be skipped by a panic, and the flag would then
+/// suppress every later sweep for the life of the process — the sweep would stop silently, which is
+/// exactly the failure mode the periodic design exists to avoid.
+struct SweepGuard(std::rc::Rc<std::cell::Cell<bool>>);
+
+impl Drop for SweepGuard {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
 impl SellerNodeRunner {
     /// Boot the node and connect its authenticated relay client.
     ///
@@ -4453,8 +4466,12 @@ impl SellerNodeRunner {
     /// A clock that cannot be read skips the pass entirely. Every removal decision here is a
     /// comparison against `now`, and a `now` this process had to invent could only be wrong in the
     /// direction that removes a live job's containers.
+    ///
+    /// **A free function, not a method, and awaited by NOBODY in the run loop.** It is spawned by
+    /// [`spawn_expiry_sweep`], so it borrows nothing from the runner and the loop's `select!` is
+    /// free to serve offers, awards and the shutdown signal while docker is still answering.
     #[cfg(feature = "acp")]
-    async fn sweep_expired_containers(&self, seat: &str) {
+    async fn run_expiry_sweep(seat: &str) {
         let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
             opline!(
                 "seller node: skipping the container expiry sweep — the system clock is before the \
@@ -4479,6 +4496,17 @@ impl SellerNodeRunner {
                          harmless now, and the next sweep will select it again"
                     );
                 }
+                // The backlog, said out loud. "Removed 32" on a host with 400 leftovers reads as
+                // "the host is clean" unless the remainder is named with it.
+                if !report.deferred.is_empty() {
+                    opline!(
+                        "seller node: {} more expired container(s) were left for the next sweep \
+                         (this pass is bounded to {} removals and {}s of wall clock)",
+                        report.deferred.len(),
+                        crate::sandbox_netns::MAX_SWEEP_REMOVALS,
+                        crate::sandbox_netns::SWEEP_PASS_BUDGET.as_secs()
+                    );
+                }
             }
             Err(error) => opline!(
                 "seller node: the container expiry sweep could not read docker ({error}) — nothing \
@@ -4491,7 +4519,35 @@ impl SellerNodeRunner {
     /// its tick unconditionally and only the work behind it is feature-gated.
     #[cfg(not(feature = "acp"))]
     #[allow(clippy::unused_async)]
-    async fn sweep_expired_containers(&self, _seat: &str) {}
+    async fn run_expiry_sweep(_seat: &str) {}
+
+    /// Start one expiry sweep pass **as its own task** and return immediately.
+    ///
+    /// **This is what keeps the sweep off the run loop's critical path.** Awaiting the pass inside
+    /// the `select!` arm would stall every other arm — offers, awards, drains, the shutdown signal
+    /// — for as long as docker took to answer, which is bounded but not short: a listing plus up to
+    /// [`crate::sandbox_netns::MAX_SWEEP_REMOVALS`] serial removals, each with its own deadline.
+    /// Spawned, the loop's own cost is the spawn.
+    ///
+    /// `in_flight` is why a slow pass cannot stack with the next tick: a tick that arrives while a
+    /// pass is still running is DROPPED, not queued, so an unreachable daemon can never accumulate
+    /// one outstanding pass per five minutes. The flag is cleared by a guard, so a pass that panics
+    /// releases it too.
+    fn spawn_expiry_sweep(seat: String, in_flight: &std::rc::Rc<std::cell::Cell<bool>>) {
+        if in_flight.get() {
+            opline!(
+                "seller node: skipping this container expiry sweep — the previous pass is still \
+                 running, and the containers it has not reached stay expired for the next one"
+            );
+            return;
+        }
+        in_flight.set(true);
+        let done = SweepGuard(std::rc::Rc::clone(in_flight));
+        tokio::task::spawn_local(async move {
+            Self::run_expiry_sweep(&seat).await;
+            drop(done);
+        });
+    }
 
     /// A handle asking this node to leave the selling role: the run loop stops, publishes its
     /// terminal `accepting=n` beat (#747), and [`Self::run`] returns `Ok(())`.
@@ -4918,6 +4974,8 @@ impl SellerNodeRunner {
         let mut sweep_tick =
             tokio::time::interval(Duration::from_secs(crate::sandbox_netns::SWEEP_INTERVAL_SECS));
         let sweep_seat = self.seller_pubkey();
+        // One pass at a time, for the life of the loop. See `spawn_expiry_sweep`.
+        let sweep_in_flight = std::rc::Rc::new(std::cell::Cell::new(false));
         // Only when this node actually runs contained jobs. A seat with no sandbox network creates
         // no holders and no helpers, and a sweep there would spend a `docker ps` every five minutes
         // to look for containers this build never creates — on a host that may not even run docker.
@@ -5014,11 +5072,13 @@ impl SellerNodeRunner {
                     opline!("seller node: shutdown requested ({reason}); retracting the seat and ending the loop");
                     break;
                 }
-                // Expired-container sweep. Bounded per pass (`MAX_SWEEP_REMOVALS`) and bounded per
-                // docker call (`SWEEP_DOCKER_DEADLINE`), so a stuck daemon costs this loop seconds,
-                // not its cadence.
+                // Expired-container sweep. SPAWNED, never awaited here: the pass is bounded by
+                // count (`MAX_SWEEP_REMOVALS`), by call (`SWEEP_DOCKER_DEADLINE`) and by wall clock
+                // (`SWEEP_PASS_BUDGET`), but even its bounded worst case is minutes, and this loop
+                // must keep serving offers, awards and shutdown throughout. A tick that lands while
+                // the previous pass still runs is dropped rather than queued.
                 _ = sweep_tick.tick(), if sweep_enabled => {
-                    self.sweep_expired_containers(&sweep_seat).await;
+                    Self::spawn_expiry_sweep(sweep_seat.clone(), &sweep_in_flight);
                     continue;
                 }
                 _ = drain_tick.tick() => {
