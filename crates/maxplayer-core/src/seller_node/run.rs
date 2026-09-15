@@ -4254,6 +4254,30 @@ impl SellerNodeRunner {
             let (uid, gid) = job_identity();
             let jobs_root = node.home().root.join("seller-jobs");
             let seat = node.seller_pubkey().to_owned();
+            // A holder that survived a killed daemon and whose tool is no longer configured (removed
+            // or renamed) has no owner: remove it now, by the seat's label, before this boot's
+            // holders start. A configured tool's own stale container is replaced by `start` itself.
+            // Only a docker seat can have holders; a launcher seat refuses the table at config time.
+            let docker_seat = node
+                .home()
+                .config
+                .sandbox
+                .as_ref()
+                .is_some_and(|sandbox| matches!(sandbox.mode, crate::home::SandboxMode::Docker));
+            if docker_seat {
+                let configured: Vec<String> = cfgs.iter().map(|cfg| cfg.server_name.trim().to_owned()).collect();
+                match crate::held_tool::reconcile_stale_holders(&seat, &configured).await {
+                    Ok(removed) if removed.is_empty() => {}
+                    Ok(removed) => opline!(
+                        "seller node: [sandbox] held_tools: removed {} stale holder container(s) this config no longer names: {}",
+                        removed.len(),
+                        removed.join(", ")
+                    ),
+                    Err(error) => opline!(
+                        "seller node: [sandbox] held_tools: could not reconcile stale holders (continuing): {error}"
+                    ),
+                }
+            }
             let started = futures_util::future::join_all(
                 cfgs.iter()
                     .map(|cfg| crate::held_tool::HeldTool::start(cfg, &seat, &jobs_root, uid, gid)),
@@ -4291,7 +4315,9 @@ impl SellerNodeRunner {
             if let Some(reason) = refusal {
                 // A refused boot leaves no holder behind: stop the ones that did start.
                 for tool in &tools {
-                    tool.shutdown().await;
+                    if let Err(error) = tool.shutdown().await {
+                        opline!("seller node: {error}");
+                    }
                 }
                 return Err(NodeError::Sandbox(reason));
             }
@@ -4836,7 +4862,9 @@ impl SellerNodeRunner {
         // The held tools follow the daemon: stopping the daemon is the one thing that takes them
         // away. Each login persists in its state volume for the next boot.
         for tool in &self.held_tools {
-            tool.shutdown().await;
+            if let Err(error) = tool.shutdown().await {
+                opline!("seller node: {error}");
+            }
         }
         served
     }
@@ -4856,7 +4884,9 @@ impl SellerNodeRunner {
                 Ok(endpoint) => endpoints.push(endpoint),
                 Err(error) if tool.required() => {
                     for endpoint in endpoints {
-                        endpoint.detach().await;
+                        if let Err(error) = endpoint.detach().await {
+                            opline!("seller node execute job_id={job_id}: {error}");
+                        }
                     }
                     return Err(format!(
                         "the required held tool {} could not be attached ({error})",
@@ -7458,7 +7488,9 @@ impl SellerNodeRunner {
             .await;
             // Job end detaches the sockets. The tools stay enrolled — that is the model.
             for endpoint in tool_endpoints {
-                endpoint.detach().await;
+                if let Err(error) = endpoint.detach().await {
+                    opline!("seller node execute job_id={job_id}: {error}");
+                }
             }
             let wall_time_ms = run_started.elapsed().as_millis() as u64;
             let report = match run_result {
@@ -8077,7 +8109,9 @@ impl SellerNodeRunner {
         .await;
         // The container is gone; the job's sockets go with it. The tools stay enrolled.
         for endpoint in tool_endpoints {
-            endpoint.detach().await;
+            if let Err(error) = endpoint.detach().await {
+                opline!("seller node execute job_id={job_id}: {error}");
+            }
         }
         // The container exited between two polls: the marker may not have been read yet.
         if marker.is_none()

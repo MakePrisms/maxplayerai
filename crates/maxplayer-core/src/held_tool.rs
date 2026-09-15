@@ -260,29 +260,31 @@ pub fn parse_status(stdout: &str) -> Result<HolderStatus, String> {
     })
 }
 
-/// One `docker` CLI run on the blocking pool: exit code, stdout, stderr.
-async fn docker(argv: Vec<String>) -> Result<(i32, String, String), String> {
-    tokio::task::spawn_blocking(move || {
-        let (program, args) = argv.split_first().ok_or("an empty docker argv")?;
-        let done = std::process::Command::new(program)
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .map_err(|error| format!("could not run `{program}`: {error}"))?;
-        Ok((
-            done.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&done.stdout).trim().to_owned(),
-            String::from_utf8_lossy(&done.stderr).trim().to_owned(),
-        ))
-    })
-    .await
-    .map_err(|error| format!("docker task panicked: {error}"))?
+/// Deadlines for the `docker` CLI calls. A `docker` that hangs (a wedged daemon, a registry client
+/// that never answers, an `exec` that never returns) must not hold a boot or a job open. Each call
+/// is killed at its deadline and reported as a failure its caller handles.
+///
+/// Queries: `inspect`, `ps`, `volume create`, `volume rm`, `logs`.
+const DOCKER_QUERY_TIMEOUT: Duration = Duration::from_secs(20);
+/// `holderctl` through `docker exec`: `status`, `attach`, `detach`, `shutdown`.
+const DOCKER_CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
+/// `docker run` for the holder and for the two one-shot containers.
+const DOCKER_RUN_TIMEOUT: Duration = Duration::from_secs(120);
+/// `docker rm --force`.
+const DOCKER_REMOVE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// One `docker` CLI run on the blocking pool, bounded by `deadline`: exit code, stdout, stderr. At
+/// the deadline the child is killed and reaped, and the call is an `Err` that says so.
+async fn docker(argv: Vec<String>, deadline: Duration) -> Result<(i32, String, String), String> {
+    tokio::task::spawn_blocking(move || run_bounded(&argv, deadline))
+        .await
+        .map_err(|error| format!("docker task panicked: {error}"))?
 }
 
 /// [`docker`], succeeding only on exit 0; the error carries the command's own words.
-async fn docker_ok(argv: Vec<String>) -> Result<String, String> {
+async fn docker_ok(argv: Vec<String>, deadline: Duration) -> Result<String, String> {
     let shown = argv.join(" ");
-    let (code, stdout, stderr) = docker(argv).await?;
+    let (code, stdout, stderr) = docker(argv, deadline).await?;
     if code == 0 {
         Ok(stdout)
     } else {
@@ -293,11 +295,204 @@ async fn docker_ok(argv: Vec<String>) -> Result<String, String> {
     }
 }
 
+/// The blocking half of [`docker`]: spawn the child, drain both pipes on their own threads, poll
+/// for its exit, and kill it at the deadline. Every `Drop` fallback in this module runs through it
+/// too, so a fallback cannot hang either.
+fn run_bounded(argv: &[String], deadline: Duration) -> Result<(i32, String, String), String> {
+    use std::process::{Command, Stdio};
+    let (program, args) = argv.split_first().ok_or("an empty docker argv")?;
+    let shown = argv.join(" ");
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("could not run `{program}`: {error}"))?;
+    let stdout = drain_on_thread(child.stdout.take());
+    let stderr = drain_on_thread(child.stderr.take());
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "`{shown}` did not finish within {}s and was killed",
+                    deadline.as_secs()
+                ));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(error) => return Err(format!("could not wait for `{program}`: {error}")),
+        }
+    };
+    // The pipes close when the child exits. A grandchild that kept one open would block a plain
+    // read to the end, so the collection is bounded as well.
+    let collect = |rx: std::sync::mpsc::Receiver<Vec<u8>>| rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
+    Ok((
+        status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&collect(stdout)).trim().to_owned(),
+        String::from_utf8_lossy(&collect(stderr)).trim().to_owned(),
+    ))
+}
+
+fn drain_on_thread<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut buffer);
+        }
+        let _ = tx.send(buffer);
+    });
+    rx
+}
+
+/// Whether the container `name` exists, in any state.
+async fn container_exists(name: &str) -> Result<bool, String> {
+    let (code, _, _) = docker(
+        vec!["docker".into(), "inspect".into(), "--format".into(), "{{.Id}}".into(), name.to_owned()],
+        DOCKER_QUERY_TIMEOUT,
+    )
+    .await?;
+    Ok(code == 0)
+}
+
+/// Remove the container `name`. `Ok` only when it is confirmed gone: removed now, or absent already.
+async fn remove_container(name: &str) -> Result<(), String> {
+    let (code, stdout, stderr) =
+        docker(vec!["docker".into(), "rm".into(), "--force".into(), name.to_owned()], DOCKER_REMOVE_TIMEOUT).await?;
+    if code == 0 || stderr.contains("No such container") {
+        return Ok(());
+    }
+    // `rm` can report a failure for a container that is gone anyway; the fact that matters is
+    // whether it exists.
+    if !container_exists(name).await? {
+        return Ok(());
+    }
+    Err(format!(
+        "`docker rm --force {name}` exited {code}: {}",
+        if stderr.is_empty() { stdout } else { stderr }
+    ))
+}
+
+/// Remove the volume `name`. `Ok` when it is gone: removed now, or absent already.
+async fn remove_volume(name: &str) -> Result<(), String> {
+    let (code, stdout, stderr) =
+        docker(vec!["docker".into(), "volume".into(), "rm".into(), name.to_owned()], DOCKER_QUERY_TIMEOUT).await?;
+    if code == 0 || stderr.to_ascii_lowercase().contains("no such volume") {
+        return Ok(());
+    }
+    Err(format!(
+        "`docker volume rm {name}` exited {code}: {}",
+        if stderr.is_empty() { stdout } else { stderr }
+    ))
+}
+
+/// Remove a holder's container and runtime volume, and keep its state volume. The async path of
+/// a failed start and of [`reconcile_stale_holders`].
+async fn remove_holder_resources(names: &HolderNames) -> Result<(), String> {
+    remove_container(&names.container).await?;
+    remove_volume(&names.runtime_volume).await
+}
+
+/// The blocking twin of [`remove_holder_resources`], for the `Drop` fallbacks: `Drop` cannot await,
+/// and a task spawned from `Drop` is discarded when the runtime shuts down, which is exactly the
+/// path an aborted daemon takes. Bounded, so an aborted daemon cannot hang on it either.
+fn remove_holder_blocking(names: &HolderNames) {
+    let rm = vec!["docker".into(), "rm".into(), "--force".into(), names.container.clone()];
+    match run_bounded(&rm, DOCKER_REMOVE_TIMEOUT) {
+        Ok((0, _, _)) => {}
+        Ok((_, _, stderr)) if stderr.contains("No such container") => {}
+        Ok((code, stdout, stderr)) => eprintln!(
+            "seller node: [sandbox] held_tool: fallback removal of {} exited {code}: {}",
+            names.container,
+            if stderr.is_empty() { stdout } else { stderr }
+        ),
+        Err(error) => eprintln!(
+            "seller node: [sandbox] held_tool: fallback removal of {} failed: {error}",
+            names.container
+        ),
+    }
+    let rm_volume = vec!["docker".into(), "volume".into(), "rm".into(), names.runtime_volume.clone()];
+    let _ = run_bounded(&rm_volume, DOCKER_QUERY_TIMEOUT);
+}
+
+/// Owns the container and the runtime volume of a start that is not complete. Armed, its drop
+/// removes both, so a start that fails or is CANCELLED after `docker run` leaves no enrolled holder
+/// behind without an owner. The state volume stays: a login it holds is resumed by the next boot.
+/// [`HeldTool::start`] disarms it once the `HeldTool` owns the container.
+struct StartGuard {
+    names: HolderNames,
+    armed: bool,
+}
+
+impl Drop for StartGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            remove_holder_blocking(&self.names);
+        }
+    }
+}
+
+/// The holders of `seat` that a boot must remove: every container that carries the seat's label
+/// and is not the holder of one of the `configured` tools. Pure: `listed` is what
+/// `docker ps -a --filter label=… --format {{.Names}}` printed, one name per line.
+pub fn stale_holders(seat: &str, listed: &str, configured: &[String]) -> Vec<HolderNames> {
+    let wanted: std::collections::HashSet<String> =
+        configured.iter().map(|name| holder_names(seat, name).container).collect();
+    let seat16: String = seat.chars().take(16).collect();
+    let own_prefix = format!("maxplayer-held-tool-{seat16}-");
+    listed
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && !wanted.contains(*name))
+        .filter_map(|container| {
+            // The label already says the holder is this seat's; the name check is a second belt,
+            // so a container that merely carries the label is never removed by a name it lacks.
+            let suffix = container.strip_prefix("maxplayer-held-tool-")?;
+            container.strip_prefix(&own_prefix)?;
+            Some(HolderNames {
+                container: container.to_owned(),
+                state_volume: format!("maxplayer-held-tool-state-{suffix}"),
+                runtime_volume: format!("maxplayer-held-tool-runtime-{suffix}"),
+            })
+        })
+        .collect()
+}
+
+/// Remove the holders of `seat` that this boot's configuration no longer names: a tool that was
+/// removed or renamed while its holder survived a daemon that was killed. Their runtime volumes go
+/// with them; their state volumes stay, so a tool that is named again resumes its login. Returns
+/// the containers removed. Runs at boot, before the configured holders start.
+pub async fn reconcile_stale_holders(seat: &str, configured: &[String]) -> Result<Vec<String>, String> {
+    let listed = docker_ok(
+        vec![
+            "docker".into(),
+            "ps".into(),
+            "-a".into(),
+            "--filter".into(),
+            format!("label={HOLDER_LABEL}={seat}"),
+            "--format".into(),
+            "{{.Names}}".into(),
+        ],
+        DOCKER_QUERY_TIMEOUT,
+    )
+    .await?;
+    let mut removed = Vec::new();
+    for names in stale_holders(seat, &listed, configured) {
+        remove_holder_resources(&names).await?;
+        removed.push(names.container);
+    }
+    Ok(removed)
+}
+
 /// The seat's held tool: a running holder container the daemon owns for its whole life.
 ///
-/// Dropping it removes the container (blocking, like `NetnsHolder`), unless [`Self::shutdown`]
-/// already did so politely. The state volume is never removed here: it holds the vendor login the
-/// next boot resumes, which is the whole point of the enroll-once model.
+/// Dropping it removes the container (blocking, bounded, like `NetnsHolder`), unless
+/// [`Self::shutdown`] already confirmed the removal. The state volume is never removed here: it
+/// holds the vendor login the next boot resumes, which is the whole point of the enroll-once model.
 pub struct HeldTool {
     seat: String,
     names: HolderNames,
@@ -314,8 +509,12 @@ impl HeldTool {
     /// `jobs_root` is the seat's `seller-jobs` directory on the host; `uid`/`gid` the identity job
     /// containers run as ([`crate::seller_exec::job_identity`]). Fails — and the caller decides
     /// whether that refuses the boot — when a host path is missing, the image cannot run, the holder
-    /// exits before answering (an enrolment failure exits it), or this daemon cannot mount a volume
-    /// subpath. A holder that runs but reports UNHEALTHY starts successfully; the status says so.
+    /// exits before answering (an enrolment failure exits it), a `docker` call passes its deadline,
+    /// or this daemon cannot mount a volume subpath. A holder that runs but reports UNHEALTHY starts
+    /// successfully; the status says so.
+    ///
+    /// A start that fails after `docker run`, or is cancelled there, removes the container and the
+    /// runtime volume it created ([`StartGuard`]). The state volume stays.
     pub async fn start(
         cfg: &HeldToolConfig,
         seat: &str,
@@ -347,20 +546,55 @@ impl HeldTool {
             .map_err(|error| format!("[sandbox] held_tool: cannot create {}: {error}", jobs_root.display()))?;
 
         let names = holder_names(seat, server_name);
+        let mut guard = StartGuard { names: names.clone(), armed: true };
+        match Self::start_owned(cfg, seat, jobs_root, uid, gid, &names, server_name).await {
+            Ok(tool) => {
+                guard.armed = false;
+                Ok(tool)
+            }
+            Err(error) => {
+                // The explicit path: remove what this start created, and report both facts. The
+                // guard stays armed only for the cancelled case.
+                let cleanup = remove_holder_resources(&names).await;
+                guard.armed = false;
+                Err(match cleanup {
+                    Ok(()) => error,
+                    Err(more) => format!("{error}; the cleanup of the failed start also failed: {more}"),
+                })
+            }
+        }
+    }
+
+    /// [`Self::start`] from the first `docker` call on: the caller owns the cleanup of a failure.
+    async fn start_owned(
+        cfg: &HeldToolConfig,
+        seat: &str,
+        jobs_root: &Path,
+        uid: u32,
+        gid: u32,
+        names: &HolderNames,
+        server_name: &str,
+    ) -> Result<Self, String> {
         // A stale holder from a daemon that died without its shutdown path: remove it by name, so
         // this boot's container is the one the name addresses.
-        let _ = docker(vec!["docker".into(), "rm".into(), "--force".into(), names.container.clone()]).await;
+        remove_container(&names.container).await?;
         for volume in [&names.state_volume, &names.runtime_volume] {
-            docker_ok(vec!["docker".into(), "volume".into(), "create".into(), volume.clone()]).await?;
+            docker_ok(
+                vec!["docker".into(), "volume".into(), "create".into(), volume.clone()],
+                DOCKER_QUERY_TIMEOUT,
+            )
+            .await?;
         }
-        docker_ok(volume_init_argv(&cfg.image, &names, uid, gid)).await?;
-        docker_ok(holder_run_argv(cfg, &names, seat, jobs_root, uid, gid)).await?;
+        docker_ok(volume_init_argv(&cfg.image, names, uid, gid), DOCKER_RUN_TIMEOUT).await?;
+        docker_ok(holder_run_argv(cfg, names, seat, jobs_root, uid, gid), DOCKER_RUN_TIMEOUT).await?;
 
         // Wait for `status`. The holder enrols before it binds its control socket, so the wait
-        // covers a real login against the vendor.
+        // covers a real login against the vendor. Every call inside the loop is bounded, so the
+        // loop ends at START_TIMEOUT even when `docker exec` hangs.
         let started = std::time::Instant::now();
         let status = loop {
-            let (code, stdout, stderr) = docker(holderctl_argv(&names.container, &["status"])).await?;
+            let (code, stdout, stderr) =
+                docker(holderctl_argv(&names.container, &["status"]), DOCKER_CONTROL_TIMEOUT).await?;
             if (code == 0 || code == 1)
                 && !stdout.is_empty()
                 && let Ok(status) = parse_status(&stdout)
@@ -368,17 +602,23 @@ impl HeldTool {
                 break status;
             }
             // Gone already? Then its own last words are the diagnosis (an enrolment failure).
-            let (_, state, _) = docker(vec![
-                "docker".into(),
-                "inspect".into(),
-                "--format".into(),
-                "{{.State.Status}}".into(),
-                names.container.clone(),
-            ])
+            let (_, state, _) = docker(
+                vec![
+                    "docker".into(),
+                    "inspect".into(),
+                    "--format".into(),
+                    "{{.State.Status}}".into(),
+                    names.container.clone(),
+                ],
+                DOCKER_QUERY_TIMEOUT,
+            )
             .await?;
             if state == "exited" || state == "dead" {
-                let (_, logs_out, logs_err) =
-                    docker(vec!["docker".into(), "logs".into(), "--tail".into(), "20".into(), names.container.clone()]).await?;
+                let (_, logs_out, logs_err) = docker(
+                    vec!["docker".into(), "logs".into(), "--tail".into(), "20".into(), names.container.clone()],
+                    DOCKER_QUERY_TIMEOUT,
+                )
+                .await?;
                 return Err(format!(
                     "[sandbox] held_tool: the holder exited before it answered; its last output: {}",
                     if logs_err.is_empty() { logs_out } else { logs_err }
@@ -394,16 +634,18 @@ impl HeldTool {
         };
 
         // The per-job socket mount needs `volume-subpath`; prove it now, once, or say so.
-        docker_ok(subpath_probe_argv(&cfg.image, &names)).await.map_err(|error| {
-            format!(
-                "[sandbox] held_tool: this docker daemon cannot mount a volume subpath, which every \
-                 job's socket mount needs (Docker Engine 26 or newer): {error}"
-            )
-        })?;
+        docker_ok(subpath_probe_argv(&cfg.image, names), DOCKER_RUN_TIMEOUT)
+            .await
+            .map_err(|error| {
+                format!(
+                    "[sandbox] held_tool: this docker daemon cannot mount a volume subpath, which every \
+                     job's socket mount needs (Docker Engine 26 or newer): {error}"
+                )
+            })?;
 
         Ok(Self {
             seat: seat.to_owned(),
-            names,
+            names: names.clone(),
             image: cfg.image.clone(),
             server_name: server_name.to_owned(),
             required: cfg.required,
@@ -457,19 +699,27 @@ impl HeldTool {
 
     /// Attach `job_id`: the holder creates the job's socket and records the job's directory
     /// (`/srv/jobs/<job_id>` inside the holder, which is `<home>/seller-jobs/<job_id>` on the host —
-    /// the directory MUST exist before this call, because the holder canonicalizes it).
+    /// the directory MUST exist before this call, because the holder canonicalizes it). Bounded by
+    /// [`DOCKER_CONTROL_TIMEOUT`].
     pub async fn attach(&self, job_id: &str) -> Result<JobToolEndpoint, String> {
         let job_root = format!("{HOLDER_JOBS_DIR}/{job_id}");
-        let stdout = docker_ok(holderctl_argv(
-            &self.names.container,
-            &["attach", "--job-id", job_id, "--job-root", &job_root],
-        ))
+        let stdout = docker_ok(
+            holderctl_argv(&self.names.container, &["attach", "--job-id", job_id, "--job-root", &job_root]),
+            DOCKER_CONTROL_TIMEOUT,
+        )
         .await
         .map_err(|error| format!("[sandbox] held_tool: attach {job_id} failed: {error}"))?;
         let reply: Value = serde_json::from_str(stdout.trim())
             .map_err(|error| format!("[sandbox] held_tool: attach reply is not JSON: {error}"))?;
         let expected_socket = format!("{HOLDER_RUNTIME_DIR}/jobs/{job_id}/job.sock");
         if reply["socket"].as_str() != Some(expected_socket.as_str()) {
+            // The holder holds an attachment this daemon will not use: take it back, so the job's
+            // directory is not recorded under a socket nobody mounts.
+            let _ = docker(
+                holderctl_argv(&self.names.container, &["detach", "--job-id", job_id]),
+                DOCKER_CONTROL_TIMEOUT,
+            )
+            .await;
             return Err(format!(
                 "[sandbox] held_tool: the holder placed the socket at {:?}, not at {expected_socket}; \
                  the job mount would miss it",
@@ -487,26 +737,34 @@ impl HeldTool {
 
     /// Stop the holder politely, then remove its container and its runtime volume. The state
     /// volume stays: it is the login the next boot resumes.
-    pub async fn shutdown(&self) {
-        if self.stopped.swap(true, Ordering::SeqCst) {
-            return;
+    ///
+    /// `Ok` only when the container is confirmed gone. On `Err` the holder stays marked running, so
+    /// the drop fallback retries the removal; the error says what is still there.
+    pub async fn shutdown(&self) -> Result<(), String> {
+        if self.stopped.load(Ordering::SeqCst) {
+            return Ok(());
         }
-        let _ = docker(holderctl_argv(&self.names.container, &["shutdown"])).await;
-        if let Err(error) = docker_ok(vec![
-            "docker".into(),
-            "rm".into(),
-            "--force".into(),
-            self.names.container.clone(),
-        ])
-        .await
-        {
-            eprintln!("seller node: [sandbox] held_tool: could not remove {}: {error}", self.names.container);
+        let _ = docker(holderctl_argv(&self.names.container, &["shutdown"]), DOCKER_CONTROL_TIMEOUT).await;
+        remove_container(&self.names.container).await.map_err(|error| {
+            let message = format!(
+                "[sandbox] held_tool: holder {} is NOT removed ({error}); the drop fallback retries",
+                self.names.container
+            );
+            eprintln!("seller node: {message}");
+            message
+        })?;
+        self.stopped.store(true, Ordering::SeqCst);
+        if let Err(error) = remove_volume(&self.names.runtime_volume).await {
+            eprintln!(
+                "seller node: [sandbox] held_tool: runtime volume {} is not removed: {error}",
+                self.names.runtime_volume
+            );
         }
-        let _ = docker(vec!["docker".into(), "volume".into(), "rm".into(), self.names.runtime_volume.clone()]).await;
         eprintln!(
             "seller node: [sandbox] held_tool: holder {} stopped; the login persists in volume {} for the next boot",
             self.names.container, self.names.state_volume
         );
+        Ok(())
     }
 
     pub fn seat(&self) -> &str {
@@ -515,27 +773,13 @@ impl HeldTool {
 }
 
 impl Drop for HeldTool {
-    /// The backstop for a daemon that never reached [`Self::shutdown`]: remove the container,
-    /// blocking, for the reason `NetnsHolder::drop` gives — a task spawned from `Drop` can be
-    /// discarded when the runtime shuts down, and that is exactly the path an aborted daemon takes.
+    /// The backstop for a daemon that never reached [`Self::shutdown`], or whose shutdown could not
+    /// confirm the removal: remove the container and the runtime volume, blocking and bounded.
     fn drop(&mut self) {
         if self.stopped.load(Ordering::SeqCst) {
             return;
         }
-        let outcome = std::process::Command::new("docker")
-            .args(["rm", "--force", &self.names.container])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .output();
-        if let Ok(done) = outcome
-            && !done.status.success()
-        {
-            eprintln!(
-                "seller node: [sandbox] held_tool: fallback removal of {} failed: {}",
-                self.names.container,
-                String::from_utf8_lossy(&done.stderr).trim()
-            );
-        }
+        remove_holder_blocking(&self.names);
     }
 }
 
@@ -576,39 +820,49 @@ impl JobToolEndpoint {
     }
 
     /// Detach: the holder closes and removes this job's socket. The tool stays enrolled — the
-    /// holder's reply says so, and that is the property the corrected model turns on. Best effort:
-    /// a failure is logged, because the job is over either way.
-    pub async fn detach(mut self) {
-        self.detached = true;
-        match docker_ok(holderctl_argv(&self.container, &["detach", "--job-id", &self.job_id])).await {
-            Ok(reply) => {
-                if !reply.contains("\"tool_still_enrolled\": true") {
-                    eprintln!(
-                        "seller node: [sandbox] held_tool: detach {} did not confirm the tool stayed enrolled: {reply}",
-                        self.job_id
-                    );
-                }
+    /// holder's reply says so, and that is the property the corrected model turns on.
+    ///
+    /// `Ok` when the holder confirmed the detach, or said the job was not attached: the socket is
+    /// gone either way. On `Err` the endpoint stays marked attached, so the drop fallback retries
+    /// once, bounded.
+    pub async fn detach(mut self) -> Result<(), String> {
+        let (code, stdout, stderr) =
+            docker(holderctl_argv(&self.container, &["detach", "--job-id", &self.job_id]), DOCKER_CONTROL_TIMEOUT)
+                .await
+                .map_err(|error| format!("[sandbox] held_tool: detach {} failed: {error}", self.job_id))?;
+        if code == 0 {
+            self.detached = true;
+            if !stdout.contains("\"tool_still_enrolled\": true") {
+                eprintln!(
+                    "seller node: [sandbox] held_tool: detach {} did not confirm the tool stayed enrolled: {stdout}",
+                    self.job_id
+                );
             }
-            Err(error) => eprintln!("seller node: [sandbox] held_tool: detach {} failed: {error}", self.job_id),
+            return Ok(());
         }
+        if stderr.contains("no such attached job") {
+            self.detached = true;
+            return Ok(());
+        }
+        Err(format!(
+            "[sandbox] held_tool: detach {} failed: holderctl exited {code}: {}",
+            self.job_id,
+            if stderr.is_empty() { stdout } else { stderr }
+        ))
     }
 }
 
 impl Drop for JobToolEndpoint {
-    /// A job that left without detaching (a panic, an early `?`) still gets its socket removed. Off
-    /// the runtime, on its own thread: `Drop` cannot await, and the holder call is a blocking exec.
+    /// A job that left without a confirmed detach (a panic, an early `?`, a failed detach call)
+    /// still gets its socket removed. Off the runtime, on its own thread: `Drop` cannot await, and
+    /// the holder call is a blocking exec. Bounded, so the thread ends even when `docker` hangs.
     fn drop(&mut self) {
         if self.detached {
             return;
         }
         let argv = holderctl_argv(&self.container, &["detach", "--job-id", &self.job_id]);
         std::thread::spawn(move || {
-            let (program, args) = argv.split_first().expect("a docker argv");
-            let _ = std::process::Command::new(program)
-                .args(args)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+            let _ = run_bounded(&argv, DOCKER_CONTROL_TIMEOUT);
         });
     }
 }
@@ -709,6 +963,44 @@ mod tests {
         assert!(probe.contains(
             "--mount type=volume,src=maxplayer-held-tool-runtime-25f6b60a3e3870d5-figma,dst=/probe,volume-subpath=jobs"
         ));
+    }
+
+    #[test]
+    fn stale_holders_are_this_seats_unconfigured_holders_and_nothing_else() {
+        let listed = "maxplayer-held-tool-25f6b60a3e3870d5-figma\n\
+                      maxplayer-held-tool-25f6b60a3e3870d5-jira\n\
+                      maxplayer-held-tool-25f6b60a3e3870d5-old-name\n\
+                      maxplayer-held-tool-0000000000000000-figma\n\
+                      some-other-container\n\n";
+        let stale = stale_holders(SEAT, listed, &["figma".to_owned(), "jira".to_owned()]);
+        assert_eq!(
+            stale,
+            vec![HolderNames {
+                container: "maxplayer-held-tool-25f6b60a3e3870d5-old-name".into(),
+                state_volume: "maxplayer-held-tool-state-25f6b60a3e3870d5-old-name".into(),
+                runtime_volume: "maxplayer-held-tool-runtime-25f6b60a3e3870d5-old-name".into(),
+            }],
+            "a configured holder stays, another seat's name and a foreign name are never touched"
+        );
+        assert!(stale_holders(SEAT, "", &["figma".to_owned()]).is_empty());
+        let all_gone = stale_holders(SEAT, "maxplayer-held-tool-25f6b60a3e3870d5-figma\n", &[]);
+        assert_eq!(all_gone.len(), 1, "a seat that removed every tool removes every holder");
+    }
+
+    /// The deadline is real: a child that never exits is killed and reported, and the call returns
+    /// well before the child would have. A child that exits normally reports its code and both pipes.
+    #[test]
+    fn a_bounded_docker_call_is_killed_at_its_deadline() {
+        let started = std::time::Instant::now();
+        let error = run_bounded(&["sh".into(), "-c".into(), "sleep 30".into()], Duration::from_millis(300))
+            .expect_err("a child past its deadline is an error");
+        assert!(error.contains("did not finish within") && error.contains("was killed"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(10), "the call must return at the deadline, not at the child's end");
+        let (code, stdout, stderr) =
+            run_bounded(&["sh".into(), "-c".into(), "echo out; echo err >&2; exit 3".into()], Duration::from_secs(10))
+                .expect("a child that exits is reported");
+        assert_eq!((code, stdout.as_str(), stderr.as_str()), (3, "out", "err"));
+        assert!(run_bounded(&[], Duration::from_secs(1)).is_err(), "an empty argv is refused");
     }
 
     #[test]
@@ -1162,7 +1454,7 @@ mod live_tests {
             fx.assert_secret_absent(&file.display().to_string(), &text);
         }
         for endpoint in endpoints {
-            endpoint.detach().await;
+            endpoint.detach().await.expect("the job detaches");
         }
         let tool_list = dialogue
             .replies
@@ -1265,7 +1557,7 @@ mod live_tests {
 
             // Daemon stop, daemon start: every persisted login is resumed, none re-established.
             for tool in &tools {
-                tool.shutdown().await;
+                tool.shutdown().await.expect("the holder stops");
             }
             let tools = start_all(&fx).await;
             for (i, tool) in tools.iter().enumerate() {
@@ -1289,7 +1581,7 @@ mod live_tests {
             }
             let restart_lines: Vec<String> = tools.iter().map(HeldTool::boot_line).collect();
             for tool in &tools {
-                tool.shutdown().await;
+                tool.shutdown().await.expect("the holder stops");
             }
 
             let summary = json!({
@@ -1373,7 +1665,7 @@ mod live_tests {
             .await
             .expect("the agent turn completes");
             for endpoint in endpoints {
-                endpoint.detach().await;
+                endpoint.detach().await.expect("the job detaches");
             }
             let out_a = std::fs::read_to_string(workdir.join("out-a.txt")).expect("tool text-a wrote its output");
             let out_b = std::fs::read_to_string(workdir.join("out-b.txt")).expect("tool text-b wrote its output");
@@ -1395,7 +1687,7 @@ mod live_tests {
                 assert_eq!(s["transform_count"], json!(1));
             }
             for tool in &tools {
-                tool.shutdown().await;
+                tool.shutdown().await.expect("the holder stops");
             }
             fx.write_evidence(
                 "holder-agent-summary.json",
