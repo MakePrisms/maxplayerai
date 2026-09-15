@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use maxplayer_core::delivery_executor::{CANCELLATION_POLL, REAP_BOUND};
 use maxplayer_core::seller_git::{neutralize_then_push_in_child_off_runtime, SellerGitError};
 use maxplayer_core::seller_node::run::{serialized_bounded_push, DeliveryPushErr};
 
@@ -365,4 +366,170 @@ async fn wait_for_running_child(pidfile: &std::path::Path, bound: Duration) -> O
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+/// C: A REAL TASK-ABORT, AND A SECOND DELIVERY OBSERVED PENDING THROUGH IT.
+///
+/// **This is not a revocation.** No authority ends, nothing tells the delivery to stop, and the
+/// difference is the point: revocation is the OWNER withdrawing and the executor acting on it, and
+/// the two must not be argued for one another. Here the delivery's own tokio task is simply
+/// destroyed mid-flight — the shape of a cancelled request, a dropped select branch, a shutting-down
+/// supervisor — while its child is running and holding the seat.
+///
+/// The seat's exclusion is an `OwnedMutexGuard` moved into the turn, which is moved into the
+/// blocking call that runs the delivery. So an abort takes the awaiting task and leaves the work:
+/// the guard is not the aborter's to drop. The property that must hold, and had no gate, is that
+/// this is FAIL-CLOSED — a second delivery must not be let onto a seat whose previous child is
+/// still alive, however the first delivery's task died.
+///
+/// What was MEASURED here, and it is better than the fail-closed minimum: the abort drops the
+/// delivery's turn control, the executor sees that at its next cancellation poll, and the child is
+/// killed and reaped promptly — the seat comes back in a fraction of the remaining budget rather
+/// than at the deadline. So the gate asserts both halves, and the second one is what stops this
+/// from being a test that would pass on a seat that simply leaks: the handover must happen AFTER
+/// the child is gone, and BEFORE the deadline that would otherwise have ended it.
+///
+/// Three facts are established in order: the second delivery returns `Poll::Pending` while the
+/// aborted delivery's child is still running; the abort really happened (the first task is
+/// finished, and finished as a cancellation); and the seat is handed over only after that child is
+/// confirmed gone, within the executor's own poll and reap bounds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn an_aborted_delivery_task_does_not_hand_the_seat_on_while_its_child_still_runs() {
+    let dir = scratch("aborted");
+    let pidfile = dir.join("child.pid");
+    // Ignores TERM and never speaks again: only the executor's kill-and-reap ends this.
+    let program = fixture(
+        &dir,
+        &format!(
+            "trap '' TERM\necho $$ > {}\n{HELLO}\nwhile :; do sleep 0.05; done\n",
+            pidfile.display()
+        ),
+    );
+
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    let budget = Duration::from_millis(3_000);
+    let generous = Duration::from_secs(30);
+
+    let first = {
+        let lock = Arc::clone(&lock);
+        let program = program.clone();
+        let workdir = dir.join("workdir-one");
+        tokio::spawn(async move {
+            serialized_bounded_push(
+                &lock,
+                generous,
+                Instant::now() + budget,
+                move |turn| async move {
+                    neutralize_then_push_in_child_off_runtime(
+                        program,
+                        workdir,
+                        "https://relay.example.invalid/seller.git".to_owned(),
+                        "delivery/one".to_owned(),
+                        "0123456789012345678901234567890123456789".to_owned(),
+                        None,
+                        None,
+                        turn,
+                    )
+                    .await
+                },
+            )
+            .await
+        })
+    };
+
+    let wedged_pid = wait_for_running_child(&pidfile, Duration::from_secs(20))
+        .await
+        .expect("the first delivery's child must be running before its task is aborted");
+
+    // THE ABORT. The task awaiting the delivery is destroyed while the child is alive.
+    first.abort();
+    let aborted_at = Instant::now();
+    let joined = first.await;
+    assert!(
+        joined.as_ref().err().is_some_and(|error| error.is_cancelled()),
+        "this gate is only meaningful if the first delivery's task was really cancelled: \
+         {joined:?}"
+    );
+    assert!(
+        alive(wedged_pid),
+        "the child was already gone when its task was aborted; nothing was held"
+    );
+
+    let second_state = Arc::new(AtomicU8::new(NOT_STARTED));
+    let second_acquired_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+    let second = serialized_bounded_push(&lock, generous, Instant::now() + Duration::from_secs(20), {
+        let state = Arc::clone(&second_state);
+        let at = Arc::clone(&second_acquired_at);
+        move |turn| async move {
+            at.lock().expect("clock").replace(Instant::now());
+            state.store(ACQUIRED, Ordering::SeqCst);
+            drop(turn);
+            Ok::<_, SellerGitError>("second-delivery-oid".to_owned())
+        }
+    });
+    tokio::pin!(second);
+
+    assert!(
+        poll_once(second.as_mut()).await.is_pending(),
+        "a second delivery was admitted to a seat whose aborted predecessor's child is still alive"
+    );
+    second_state.store(PENDING, Ordering::SeqCst);
+
+    // Watch it wait, for as long as the aborted delivery's child is still running.
+    let mut samples = 0usize;
+    let mut last_alive_at = Instant::now();
+    while alive(wedged_pid) && Instant::now() < aborted_at + budget {
+        assert!(
+            poll_once(second.as_mut()).await.is_pending(),
+            "the second delivery became ready while the aborted delivery's child was still alive"
+        );
+        assert_eq!(
+            second_state.load(Ordering::SeqCst),
+            PENDING,
+            "the second delivery's push body ran while the aborted delivery's child was alive"
+        );
+        last_alive_at = Instant::now();
+        samples += 1;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Sampled at 5ms because the window is SHORT and that is the finding: the executor acts on the
+    // dropped control within its cancellation poll, so the child does not survive the abort for
+    // long. A sample rate chosen to make this window look big would be measuring the sampler.
+    assert!(
+        samples >= 5,
+        "too few observed Poll::Pending returns to call it observed: {samples}"
+    );
+
+    // The work the abort could not stop ended on its own deadline, and only then did the seat move.
+    let second_outcome = second.await;
+    assert_eq!(
+        second_outcome.expect("the seat must come back once the abandoned child is reaped"),
+        "second-delivery-oid"
+    );
+    let acquired = second_acquired_at.lock().expect("clock").expect("acquired");
+    assert!(
+        !alive(wedged_pid),
+        "the seat was handed on while the aborted delivery's child was still running"
+    );
+    assert!(
+        acquired >= last_alive_at,
+        "the second delivery entered its push body at {acquired:?}, before the aborted delivery's \
+         child was last seen alive at {last_alive_at:?}"
+    );
+    let handover = acquired.saturating_duration_since(aborted_at);
+    eprintln!(
+        "MEASURED abort_to_handover={handover:?} budget={budget:?} samples_pending={samples}"
+    );
+    // AND THE SEAT DID NOT WAIT OUT THE CLOCK. An abort that left the child to be stopped by its
+    // deadline would still satisfy everything above; it would also mean a cancelled request parks
+    // the seller's only delivery seat for the whole budget. The dropped turn control is acted on
+    // within the executor's own poll, and the reap follows inside its own bound.
+    assert!(
+        handover < CANCELLATION_POLL + REAP_BOUND + Duration::from_secs(2),
+        "the seat took {handover:?} to come back after an abort, past the poll and reap bounds          this executor states"
+    );
+    assert!(
+        handover < budget,
+        "the seat came back at the deadline ({budget:?}) rather than because the delivery's task          was aborted: {handover:?}"
+    );
 }
