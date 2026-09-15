@@ -328,6 +328,191 @@ async fn a_child_that_keeps_asking_for_authorizations_is_stopped_at_the_cap() {
     );
 }
 
+/// REVOCATION WHILE THE CHILD IS LOUD.
+///
+/// The bound the module states is a property of the parent's clock: while a child runs, the owner is
+/// re-asked at least every [`CANCELLATION_POLL`]. It was not. The only code that acted on a
+/// revocation was the arm that runs when NO frame arrived within the slice, so the interval was
+/// really "every poll, as long as the child stays quiet". This child is the opposite of quiet: it
+/// asks whether it still holds its turn in a tight loop, faster than the poll, and reads every
+/// answer. Nothing ever times out, so under the old shape nothing ever re-asked and the delivery ran
+/// to its deadline no matter when authority ended — which is precisely the child the fence exists
+/// for, since a real one checks before every leg of its transmission.
+///
+/// Two separate facts are asserted, because "it stopped" is not the whole claim: the child WAS being
+/// answered (the traffic was live, not a child parked on a read), and the delivery ended for
+/// revocation within the poll interval rather than at the deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revocation_during_a_flood_of_authority_checks_is_acted_on_within_the_poll() {
+    let dir = scratch("revoke-busy-checks");
+    let pidfile = dir.join("child.pid");
+    let answers = dir.join("answers");
+    // Asks, reads the answer, records it, repeats — with no pause. Every iteration is a frame the
+    // parent must serve, so the frame wait never expires.
+    let program = fixture(
+        &dir,
+        &format!(
+            "echo $$ > {}\n{HELLO}\nIFS= read -r _request\nwhile :; do \
+             printf '{{\"t\":\"Check\",\"phase\":\"send-pack\"}}\\n'; \
+             IFS= read -r reply || exit 0; printf '%s\\n' \"$reply\" >> {}; done\n",
+            pidfile.display(),
+            answers.display()
+        ),
+    );
+
+    let live = Arc::new(AtomicBool::new(true));
+    let asked = Arc::new(AtomicUsize::new(0));
+    let authority: AuthorityCheck = {
+        let live = Arc::clone(&live);
+        let asked = Arc::clone(&asked);
+        Arc::new(move || {
+            asked.fetch_add(1, Ordering::SeqCst);
+            if live.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err("the owner of this delivery went away".to_owned())
+            }
+        })
+    };
+
+    let revoke_at = {
+        let live = Arc::clone(&live);
+        let answers = answers.clone();
+        tokio::spawn(async move {
+            // Wait until the traffic is demonstrably flowing: several answers already written back
+            // by the child, so the revocation lands in the middle of the flood and not before it.
+            loop {
+                let served = std::fs::read_to_string(&answers)
+                    .map(|text| text.lines().count())
+                    .unwrap_or(0);
+                if served > 20 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let at = Instant::now();
+            live.store(false, Ordering::SeqCst);
+            at
+        })
+    };
+
+    let run = deliver(program, dir.join("workdir"), None, Some(authority), UNREACHABLE).await;
+    let revoked_at = revoke_at.await.expect("revoker");
+    let reacted_in = Instant::now().saturating_duration_since(revoked_at);
+
+    let why = message(&run.outcome);
+    assert!(
+        matches!(run.outcome, Err(SellerGitError::Cancelled(_))) && why.contains("revoked"),
+        "a delivery revoked under load must come back revoked, not as a deadline breach: {why}"
+    );
+    assert!(
+        reacted_in < CANCELLATION_POLL + REAP_BOUND + Duration::from_secs(2),
+        "the parent took {reacted_in:?} to act on a revocation while the child was busy; a poll          interval that only holds for a QUIET child is not the bound this module claims"
+    );
+    assert!(
+        run.took < UNREACHABLE / 2,
+        "this delivery ran to its deadline instead of stopping when it was revoked: {:?}",
+        run.took
+    );
+    // The traffic was real: the child was being served throughout, which is what makes this a load
+    // case rather than a child sitting on a read.
+    let served = std::fs::read_to_string(&answers)
+        .map(|text| text.lines().count())
+        .unwrap_or(0);
+    assert!(
+        served > 20,
+        "the child was answered {served} times; this gate is only meaningful if the parent was          kept busy"
+    );
+    assert!(
+        asked.load(Ordering::SeqCst) > served,
+        "the owner was asked no more often than the child asked; the parent's poll must be its own          clock, not a consequence of the child's traffic"
+    );
+    assert!(
+        !alive(pid_of(&pidfile)),
+        "the revoked delivery's child is still running"
+    );
+}
+
+/// REVOCATION WHILE THE PARENT'S OWN ANSWER IS STUCK IN THE PIPE.
+///
+/// The child asks whether it still holds its turn and then never reads what it is told. The answers
+/// pile up in the kernel's pipe buffer until it is full, and the parent is left inside the write,
+/// holding a frame the child will not take.
+///
+/// That wait used to be one uninterrupted block sized by the whole remaining deadline. It is the
+/// worst place for a revocation to arrive — the parent is stuck precisely because the child is
+/// misbehaving — and it was the one wait that never looked again. This gate revokes while the write
+/// is outstanding and requires the same bound as every other phase.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revocation_while_an_unread_answer_is_stuck_in_the_pipe_is_acted_on_within_the_poll() {
+    let dir = scratch("revoke-stuck-write");
+    let pidfile = dir.join("child.pid");
+    let asking = dir.join("asking");
+    // Asks without limit and reads NOTHING back. A pipe buffer is finite, so the parent's answers
+    // fill it and the next write cannot complete.
+    let program = fixture(
+        &dir,
+        &format!(
+            "echo $$ > {}\n{HELLO}\nIFS= read -r _request\ntouch {}\ni=0\nwhile [ $i -lt 20000 ]; do \
+             printf '{{\"t\":\"Check\",\"phase\":\"send-pack\"}}\\n'; i=$((i+1)); done\n\
+             while :; do sleep 0.05; done\n",
+            pidfile.display(),
+            asking.display()
+        ),
+    );
+
+    let live = Arc::new(AtomicBool::new(true));
+    let authority: AuthorityCheck = {
+        let live = Arc::clone(&live);
+        Arc::new(move || {
+            if live.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err("the owner of this delivery went away".to_owned())
+            }
+        })
+    };
+
+    let revoke_at = {
+        let live = Arc::clone(&live);
+        let asking = asking.clone();
+        tokio::spawn(async move {
+            while !asking.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            // Long enough for the unread answers to fill the buffer and leave the parent inside a
+            // write, and still a small fraction of the deadline.
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            let at = Instant::now();
+            live.store(false, Ordering::SeqCst);
+            at
+        })
+    };
+
+    let run = deliver(program, dir.join("workdir"), None, Some(authority), UNREACHABLE).await;
+    let revoked_at = revoke_at.await.expect("revoker");
+    let reacted_in = Instant::now().saturating_duration_since(revoked_at);
+
+    let why = message(&run.outcome);
+    assert!(
+        matches!(run.outcome, Err(SellerGitError::Cancelled(_))) && why.contains("revoked"),
+        "a delivery revoked while its own write was outstanding must come back revoked, and not as          the deadline breach that wait used to become: {why}"
+    );
+    assert!(
+        reacted_in < CANCELLATION_POLL + REAP_BOUND + Duration::from_secs(2),
+        "the parent took {reacted_in:?} to act on a revocation that arrived while it was blocked          writing to a child that had stopped reading"
+    );
+    assert!(
+        run.took < UNREACHABLE / 2,
+        "a child that stops reading must not be able to park the delivery until its deadline: {:?}",
+        run.took
+    );
+    assert!(
+        !alive(pid_of(&pidfile)),
+        "the revoked delivery's child is still running"
+    );
+}
+
 /// END OF FILE, A STOPPED READER AND A CONFIRMED EXIT ARE THREE DIFFERENT FACTS.
 ///
 /// This child closes its stdout and keeps running. The parent observes a real end of file — the
