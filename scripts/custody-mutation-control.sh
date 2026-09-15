@@ -3,73 +3,72 @@
 #
 # A custody test that cannot go RED is a comment. This applies the two mutations that matter to
 # `delivery_turn::CustodyBailiff::attempt_handoff`, one at a time, runs the custody suite against
-# each, and REQUIRES a failure — then restores the file and requires a pass.
+# each, and requires the NAMED test to fail for the NAMED reason — then restores the file and
+# requires a pass.
 #
 #   M-PREMATURE  the confirmed-exit condition is deleted: the seat moves on "the work ended",
 #                which in the executor's vocabulary is "a signal was issued and nobody looked".
 #   M-DEADLINE   the work-stopped condition is replaced by the clock: the seat moves once the
 #                deadline has passed, which is cleanup by calendar rather than by observation.
 #
-# Exit 0 means both mutants were CAUGHT and the unmutated tree is green. Any other exit means a
-# mutation survived, which is a hole in the suite and not a passing run.
+# What changed after review round 1, and why: the previous version accepted ANY cargo failure as a
+# catch. A mutant that did not compile would have been reported as caught, while nothing ran. It
+# also printed a failure count it never enforced, and its receipts could not be tied to the tree
+# they were taken from. All three are now conditions of passing — see `scripts/mutation-lib.sh`.
+#
+# Exit 0 means both mutants were CAUGHT for their stated reason and the unmutated tree is green.
 #
 # Usage: scripts/custody-mutation-control.sh [log-dir]
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-target="$root/crates/maxplayer-core/src/delivery_turn.rs"
 logs="${1:-$root/target/custody-mutation}"
 mkdir -p "$logs"
-backup="$(mktemp)"
-cp "$target" "$backup"
-restore() { cp "$backup" "$target"; rm -f "$backup"; }
-trap restore EXIT
+receipts="$logs/receipts.txt"
+: > "$receipts"
+
+# shellcheck source=scripts/mutation-lib.sh
+. "$root/scripts/mutation-lib.sh"
+
+target="$root/crates/maxplayer-core/src/delivery_turn.rs"
+register_target "$target"
 
 suite=(cargo test -p maxplayer-core --all-features --locked
        --test delivery_push_stalled_supervisor)
 
-mutate() {
-  python3 - "$target" "$1" "$2" <<'PY'
-import sys
-path, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
-body = open(path).read()
-if body.count(old) != 1:
-    sys.exit(f"mutation anchor appears {body.count(old)} times, expected exactly 1")
-open(path, "w").write(body.replace(old, new))
-PY
-}
-
-expect_red() {
-  local name="$1"
-  if "${suite[@]}" > "$logs/$name.log" 2>&1; then
-    echo "SURVIVED: $name — the suite passed against a mutant. See $logs/$name.log"
-    exit 1
-  fi
-  echo "CAUGHT:   $name — $(grep -c '^test .* FAILED\|^---- .* stdout' "$logs/$name.log" || true) failing assertion(s); $logs/$name.log"
-}
+receipt "custody mutation receipts"
+receipt "suite = ${suite[*]}"
 
 echo "== M-PREMATURE: release without a confirmed exit =="
-cp "$backup" "$target"
-mutate '        if !self.turn.exit_confirmed.load(Ordering::SeqCst) {
+run_mutant "M-PREMATURE" "$target" \
+'        if !self.turn.exit_confirmed.load(Ordering::SeqCst) {
             return CustodyHandoff::ExitUnconfirmed;
         }
-' ''
-expect_red m-premature
+' '' \
+  1 \
+  "an exit this process never observed must not release the seat" \
+  "$logs/m-premature.log" \
+  a_signal_without_a_confirmed_exit_does_not_hand_custody_on
 
 echo "== M-DEADLINE: fence on the clock instead of on the work having stopped =="
-cp "$backup" "$target"
-mutate '        if self.turn.state.load(Ordering::SeqCst) != ENDED {
+run_mutant "M-DEADLINE" "$target" \
+'        if self.turn.state.load(Ordering::SeqCst) != ENDED {
             return CustodyHandoff::WorkStillRunning;
         }' '        if Instant::now() < self.turn.deadline {
             return CustodyHandoff::WorkStillRunning;
-        }'
-expect_red m-deadline
+        }' \
+  2 \
+  "the clock is not a report that the work stopped" \
+  "$logs/m-deadline.log" \
+  a_passed_deadline_alone_does_not_hand_custody_on \
+  a_supervisor_inside_a_shared_state_section_is_not_fenced_out_from_under_itself
 
 echo "== CONTROL: unmutated tree =="
-cp "$backup" "$target"
-if ! "${suite[@]}" > "$logs/control.log" 2>&1; then
-  echo "the unmutated suite is RED; the mutants above prove nothing. See $logs/control.log"
-  exit 1
-fi
-echo "GREEN:    unmutated — $logs/control.log"
-echo "both mutants caught, control green"
+restore_targets
+receipt ""
+receipt "== CONTROL (unmutated)"
+receipt "  source_sha256       = $(sha_of "$target")"
+receipt "  root_tree           = $(root_tree)"
+expect_green "CONTROL" "$logs/control.log"
+
+echo "both mutants caught for their stated reason, control green; receipts: $receipts"
