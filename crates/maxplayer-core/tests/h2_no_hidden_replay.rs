@@ -233,6 +233,7 @@ async fn a_refused_h2_stream_is_never_replayed_under_the_minter() {
             &oid_for_push,
             Some(minter),
             None,
+            None,
         )
     })
     .await
@@ -320,6 +321,7 @@ async fn a_late_refusal_cannot_put_an_aged_token_back_on_the_wire() {
             &branch_owned,
             &oid_for_push,
             Some(minter),
+            None,
             None,
         )
     })

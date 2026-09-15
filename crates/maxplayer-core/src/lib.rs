@@ -22,8 +22,11 @@ pub mod crossmint;
 pub mod crossmint_hop;
 pub mod delivery;
 pub mod delivery_sentinel;
+pub mod delivery_turn;
 #[cfg(feature = "git-delivery")]
 pub mod delivery_git;
+#[cfg(feature = "git-delivery")]
+pub mod delivery_executor;
 #[cfg(feature = "git-delivery")]
 pub mod git_transport;
 #[cfg(feature = "git-delivery")]

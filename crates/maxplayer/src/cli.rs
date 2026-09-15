@@ -54,6 +54,17 @@ where
         Some("doctor") => crate::doctor::run(&args[2..], out, err),
         // INTERNAL (Track B): container-side delivery orchestrator. Not advertised in usage.
         Some("__deliver") => crate::deliver_cli::run(&args[2..], out, err),
+        // INTERNAL: the killable half of the delivery push (PR 1006). The seller re-execs ITSELF
+        // with this arm and drives it over a pipe, so libgit2's delta search — the one span that
+        // discards its own cancellation answer — runs somewhere the deadline can end it with a
+        // signal instead of a request. Never a user surface, never advertised, and it reads its
+        // protocol from the REAL stdin/stdout rather than from `out`/`err`: the frames are a pipe
+        // protocol between two processes, not CLI output a harness may capture or interleave.
+        #[cfg(feature = "wallet")]
+        Some("__delivery-push") => maxplayer_core::delivery_executor::child_main(
+            std::io::stdin(),
+            std::io::stdout(),
+        ),
         // Run BY the boot gate, inside the configured launcher, to report what the launcher let it
         // do. Reachable by hand too: an operator debugging a sandbox wants to run exactly what the
         // gate runs rather than a description of it.
