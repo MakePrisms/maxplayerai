@@ -776,3 +776,158 @@ async fn the_shipped_child_delivers_with_tokens_minted_by_the_real_signer_actor(
         "the seat was never handed back after a successful delivery"
     );
 }
+
+/// C: THE PRODUCTION SIGNER, HELD AND SATURATED.
+///
+/// The gate above proves the actor mints for a delivery that is going well. It says nothing about
+/// the two ways the actor can fail a leg under load, and those are the ones a seat meets on a bad
+/// day: a reply that does not come, and a queue with no room to ask.
+///
+/// Both legs of [`SignerHandle::http_auth_header_blocking`] are bounded by the push deadline and
+/// neither bound had a gate. They are different code and different failures — leg 1 is `try_send`
+/// against a full bounded queue, leg 2 is `recv_timeout` on the answer — so both are exercised
+/// here, against a REAL actor holding a REAL key, stalled in the one way that stalls an actor:
+/// its runtime cannot poll it.
+///
+/// The actor is spawned on its own current-thread runtime, and that runtime's single worker is
+/// occupied by a blocking sleep. This is not a mock of a slow signer; it is the real task, unable
+/// to run, exactly as it would be behind a saturated seat. Releasing the stall at the end and
+/// minting a real header is the control: it proves both refusals came from the hold and not from a
+/// dead actor or a broken home.
+///
+/// What must hold: every call RETURNS, inside its own deadline, with a named reason — a delivery
+/// that cannot be authorized is failed unauthorized, never parked on the seat's lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_and_saturated_signer_fails_legs_unauthorized_instead_of_parking_the_seat() {
+    let root = scratch("signer-saturation");
+    let home = maxplayer_core::home::bootstrap(root.join("home")).expect("bootstrap a home");
+
+    // 0 = the runtime cannot poll the actor, 1 = it can, 2 = shut down.
+    let phase = Arc::new(AtomicUsize::new(0));
+    let (handle_tx, handle_rx) = std::sync::mpsc::channel();
+    let actor_thread = {
+        let phase = Arc::clone(&phase);
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("actor runtime");
+            runtime.block_on(async move {
+                let signer =
+                    maxplayer_core::seller_node::signer::spawn(&home).expect("spawn the signer");
+                handle_tx.send(signer).expect("hand the handle to the test");
+                // THE HOLD. A blocking sleep on a current-thread runtime's only worker means the
+                // actor task is not polled at all: commands sit in its queue, and no reply is ever
+                // produced. Nothing about the actor is faked — it simply does not get to run.
+                while phase.load(Ordering::SeqCst) == 0 {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                // Released: from here the actor is polled normally.
+                while phase.load(Ordering::SeqCst) == 1 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            });
+        })
+    };
+    let signer = handle_rx.recv().expect("the signer handle");
+    let destination = "https://relay.example.invalid/seller.git".to_owned();
+
+    // LEG 2, the held reply. The queue has room, so the command is accepted; the answer never
+    // comes, because the actor cannot run. The call must give up at the deadline it was given.
+    let held = {
+        let signer = signer.clone();
+        let destination = destination.clone();
+        tokio::task::spawn_blocking(move || {
+            let deadline = Instant::now() + Duration::from_millis(400);
+            let started = Instant::now();
+            let answer = signer.http_auth_header_blocking(destination, None, deadline);
+            (answer, started.elapsed())
+        })
+        .await
+        .expect("held leg")
+    };
+    let (answer, took) = held;
+    let why = answer.expect_err("a signer that cannot run must not produce a header");
+    assert!(
+        why.contains("did not answer before this push's deadline"),
+        "a held reply must be named as a held reply, not as some other failure: {why}"
+    );
+    assert!(
+        took < Duration::from_secs(3),
+        "the blocking bridge waited {took:?} on an actor it was told to give up on at 400ms"
+    );
+
+    // SATURATION, leg 1. Fill the actor's bounded queue: each of these commands is accepted and
+    // then never serviced, so the room runs out. The callers abandon at their own deadlines; the
+    // commands they already sent stay queued, which is exactly the state a saturated seat is in.
+    let mut fillers = Vec::new();
+    for _ in 0..80 {
+        let signer = signer.clone();
+        let destination = destination.clone();
+        fillers.push(tokio::task::spawn_blocking(move || {
+            let deadline = Instant::now() + Duration::from_millis(300);
+            signer.http_auth_header_blocking(destination, None, deadline)
+        }));
+    }
+    for filler in fillers {
+        let _ = filler.await.expect("filler leg");
+    }
+
+    // With the queue full and the actor still unable to drain it, the NEXT delivery cannot even
+    // ask. That is a different refusal from the one above and it must say so.
+    let saturated = {
+        let signer = signer.clone();
+        let destination = destination.clone();
+        tokio::task::spawn_blocking(move || {
+            let deadline = Instant::now() + Duration::from_millis(400);
+            let started = Instant::now();
+            let answer = signer.http_auth_header_blocking(destination, None, deadline);
+            (answer, started.elapsed())
+        })
+        .await
+        .expect("saturated leg")
+    };
+    let (answer, took) = saturated;
+    let why = answer.expect_err("a signer whose queue is full must not produce a header");
+    assert!(
+        why.contains("signer queue stayed full past this push's deadline"),
+        "a full queue must be named as a full queue: {why}"
+    );
+    assert!(
+        took < Duration::from_secs(3),
+        "the blocking bridge spun {took:?} against a full queue instead of giving up at its deadline"
+    );
+
+    // THE CONTROL. Release the hold: the same handle, the same home, the same call — and a real
+    // NIP-98 header comes back. Both refusals above were about the hold, not about a signer that
+    // was never going to answer.
+    phase.store(1, Ordering::SeqCst);
+    let recovered = {
+        let signer = signer.clone();
+        let destination = destination.clone();
+        tokio::task::spawn_blocking(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            signer.http_auth_header_blocking(destination, None, deadline)
+        })
+        .await
+        .expect("recovered leg")
+    };
+    let header = recovered.expect("the released actor must mint for a live delivery");
+    assert!(
+        header.starts_with("Nostr "),
+        "the released actor produced something that is not a NIP-98 token: {header}"
+    );
+    // The key itself never crossed back: what returns is a token, and the home's secret is not in
+    // it. (The actor consumed the key at spawn; this is the byte-level check on the way out.)
+    let secret = maxplayer_core::home::read_secret_key_hex(
+        &maxplayer_core::home::bootstrap(root.join("home")).expect("re-open the home"),
+    )
+    .expect("read the seller key");
+    assert!(
+        !header.contains(&secret),
+        "the signer's answer carried the seller key"
+    );
+
+    phase.store(2, Ordering::SeqCst);
+    actor_thread.join().expect("the actor thread must finish");
+}
