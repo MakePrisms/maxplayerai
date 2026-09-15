@@ -184,7 +184,18 @@ impl std::error::Error for ProbeRunError {}
 /// while a probe that cannot answer inside its own health-check limit still fails the probe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentRunTimeout {
-    JobDeadline(Duration),
+    /// A real job: the window still remaining, AND the absolute unix second it ends at.
+    ///
+    /// **Both, deliberately.** The remaining window is what the run is bounded by; the absolute
+    /// deadline is what any durable artefact of the run — notably a container's cleanup stamp — must
+    /// be derived from. Reconstructing the second from the first at some later instant (#996 F3)
+    /// makes it a function of whatever the wall clock said then, which is exactly the property a
+    /// deadline must not have.
+    JobDeadline {
+        remaining: Duration,
+        deadline_unix: u64,
+    },
+    /// A harness probe, which has no job and therefore no job deadline — only its own limit.
     HarnessProbe(Duration),
 }
 
@@ -192,7 +203,19 @@ impl AgentRunTimeout {
     #[cfg(feature = "acp")]
     fn duration(self) -> Duration {
         match self {
-            Self::JobDeadline(duration) | Self::HarnessProbe(duration) => duration,
+            Self::JobDeadline { remaining, .. } | Self::HarnessProbe(remaining) => remaining,
+        }
+    }
+
+    /// The absolute deadline this run is bounded by, when it is a job's.
+    ///
+    /// `None` for a harness probe: there is no job deadline to carry, and inventing one from the
+    /// probe's limit would be the same reconstruction this exists to avoid.
+    #[cfg(feature = "acp")]
+    fn deadline_unix(self) -> Option<u64> {
+        match self {
+            Self::JobDeadline { deadline_unix, .. } => Some(deadline_unix),
+            Self::HarnessProbe(_) => None,
         }
     }
 }
@@ -1773,7 +1796,7 @@ pub enum CleanupPolicy {
 /// an abandoned probe container leaks exactly the same way.
 pub fn cleanup_policy(timeout: AgentRunTimeout) -> CleanupPolicy {
     match timeout {
-        AgentRunTimeout::JobDeadline(_) => CleanupPolicy::CaptureThenRemove,
+        AgentRunTimeout::JobDeadline { .. } => CleanupPolicy::CaptureThenRemove,
         AgentRunTimeout::HarnessProbe(_) => CleanupPolicy::RemoveOnly,
     }
 }
@@ -2448,7 +2471,15 @@ pub async fn run_agent_job_with_env(
     use crate::event::JobId;
     use crate::log::EventLog;
 
-    let prepared = prepare_launch(agent_command, policy, workdir, identity, timeout.duration()).await?;
+    let prepared = prepare_launch(
+        agent_command,
+        policy,
+        workdir,
+        identity,
+        timeout.duration(),
+        timeout.deadline_unix(),
+    )
+    .await?;
     let job = JobLaunch {
         workdir,
         env: &prepared.env,
@@ -2576,6 +2607,7 @@ pub(crate) async fn prepare_launch(
     workdir: &Path,
     identity: &DeliveryAgentIdentity,
     job_lifetime: Duration,
+    job_deadline_unix: Option<u64>,
 ) -> Result<PreparedLaunch, ExecError> {
     // Run the container/process as the seller's own uid/gid so a docker bind-mount's output is owned
     // by the seller and the delivery snapshot can read it. Ignored by the host executors.
@@ -2646,6 +2678,29 @@ pub(crate) async fn prepare_launch(
                 ))
             })?;
             job_resolv_conf = Some(resolv_path);
+            // The expiry this job's containers will be judged by: **the job's own absolute
+            // deadline**, carried down from the call site that chose it, with `cleanup_after_unix`
+            // adding the grace on top.
+            //
+            // It is NOT reconstructed as `now + remaining`. That reconstruction (#996 F3) read a
+            // fresh wall clock at create time, which made the stamp a measurement rather than a
+            // restatement: any backward clock step between the caller computing the remaining
+            // window and this create being issued lands the stamp EARLIER than the deadline the job
+            // is actually running under, and the sweep then removes a container out from under a
+            // job still inside its own deadline. Carrying the absolute value takes the clock out of
+            // the derivation altogether, so the stamp cannot be shortened by one.
+            //
+            // The `None` arm is reached only where there is no job deadline to carry — a harness
+            // probe, whose containers belong to no job. There the old derivation is still the best
+            // available, and an unreadable clock still yields `u64::MAX`, which is never swept,
+            // because an unreadable clock must not be able to date a live container into the past.
+            let cleanup_after = crate::sandbox_netns::launch_cleanup_stamp(
+                job_deadline_unix,
+                job_lifetime.as_secs(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(u64::MAX, |since| since.as_secs()),
+            );
             let established = crate::sandbox_netns::establish(
                 network,
                 image,
@@ -2660,6 +2715,7 @@ pub(crate) async fn prepare_launch(
                 policy.proxy_ports(),
                 true,
                 resolvers.addresses().to_vec(),
+                cleanup_after,
             )
             .await
             // Fail the job rather than run it uncontained. The whole point of moving containment into
@@ -2740,6 +2796,61 @@ pub(crate) async fn prepare_launch(
     })
 }
 
+/// Run the **production** preparation and launch construction for one job, hand the resulting argv
+/// to `run_payload`, and tear everything down afterwards.
+///
+/// This is the entrypoint the live containment gate goes through, and it exists because the
+/// alternative failed review: a gate that creates its own holder and installs its own plan proves
+/// those filters *can* be installed while saying nothing about whether a real job is launched with
+/// them. Here the same [`prepare_launch`] a seat calls establishes containment, the same
+/// [`SandboxPolicy::launch`] builds the argv, and `netns` is wired from `holder_name` exactly as
+/// [`run_agent_job_with_env`] wires it — one code path, exercised rather than re-implemented.
+///
+/// `run_payload` receives the argv to execute and the holder name, and its return value is passed
+/// back. The containment guard lives across the call and is dropped **after** it returns, so a
+/// caller that measures cleanup can compare what it saw during the call with what survives after.
+///
+/// `#[doc(hidden)]`: this is reachable so an integration test can exercise the real path, not an
+/// interface for callers. Production code calls `run_agent_job*`.
+#[cfg(feature = "acp")]
+#[doc(hidden)]
+pub async fn with_prepared_launch<R>(
+    agent_command: &[String],
+    policy: &SandboxPolicy,
+    workdir: &Path,
+    identity: &DeliveryAgentIdentity,
+    job_lifetime: Duration,
+    job_deadline_unix: Option<u64>,
+    run_payload: impl FnOnce(&AgentLaunch, Option<&str>) -> R,
+) -> Result<R, ExecError> {
+    let prepared = prepare_launch(
+        agent_command,
+        policy,
+        workdir,
+        identity,
+        job_lifetime,
+        job_deadline_unix,
+    )
+    .await?;
+    let job = JobLaunch {
+        workdir,
+        env: &prepared.env,
+        uid: prepared.uid,
+        gid: prepared.gid,
+        netns: prepared.holder_name.as_deref(),
+        // The resolver the contained job is handed, exactly as `run_agent_job` hands it over
+        // (see the production call site). Omitting it here would launch the live containment legs
+        // with no `/etc/resolv.conf` mount while production launches with one, so the gates would
+        // measure a job that cannot resolve and call it contained.
+        resolv_conf: prepared.resolv_conf.as_deref(),
+    };
+    let launch = policy.launch(&prepared.effective_command, &job)?;
+    let outcome = run_payload(&launch, prepared.holder_name.as_deref());
+    // `prepared` drops here: proxy first, then the namespace, in the declared field order.
+    drop(prepared);
+    Ok(outcome)
+}
+
 /// Without the `acp` feature there is no containment path to prepare — fail closed.
 #[cfg(not(feature = "acp"))]
 pub(crate) async fn prepare_launch(
@@ -2748,6 +2859,7 @@ pub(crate) async fn prepare_launch(
     _workdir: &Path,
     _identity: &DeliveryAgentIdentity,
     _job_lifetime: Duration,
+    _job_deadline_unix: Option<u64>,
 ) -> Result<PreparedLaunch, ExecError> {
     Err(ExecError::AcpRequired)
 }
@@ -3364,7 +3476,7 @@ fn classify_run_error(error: crate::engine::EngineError, timeout: AgentRunTimeou
     match (error, timeout) {
         (
             crate::engine::EngineError::Driver(crate::driver::DriverError::ResponseTimeout { .. }),
-            AgentRunTimeout::JobDeadline(_),
+            AgentRunTimeout::JobDeadline { .. },
         ) => ExecError::DeadlineExceeded,
         (error, _) => ExecError::Agent(error.to_string()),
     }
@@ -4917,7 +5029,10 @@ mod tests {
     #[test]
     fn an_awarded_job_captures_on_both_a_successful_and_a_failed_exit() {
         assert_eq!(
-            cleanup_policy(AgentRunTimeout::JobDeadline(Duration::from_secs(60))),
+            cleanup_policy(AgentRunTimeout::JobDeadline {
+                remaining: Duration::from_secs(60),
+                deadline_unix: 1_000
+            }),
             CleanupPolicy::CaptureThenRemove,
             "an awarded job's diagnostics are the ones a refund argument gets made from"
         );
@@ -6701,7 +6816,10 @@ mod tests {
 
         let deadline = classify_run_error(
             EngineError::Driver(DriverError::ResponseTimeout { request_id: 3 }),
-            AgentRunTimeout::JobDeadline(Duration::from_secs(60)),
+            AgentRunTimeout::JobDeadline {
+                remaining: Duration::from_secs(60),
+                deadline_unix: 1_000,
+            },
         );
         assert!(matches!(deadline, ExecError::DeadlineExceeded));
         assert_eq!(
@@ -7431,7 +7549,10 @@ mod tests {
             "task",
             Path::new("."),
             &identity,
-            AgentRunTimeout::JobDeadline(Duration::from_secs(1)),
+            AgentRunTimeout::JobDeadline {
+                remaining: Duration::from_secs(1),
+                deadline_unix: 1_000,
+            },
         )
         .await
         .expect_err("acp required");

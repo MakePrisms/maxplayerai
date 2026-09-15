@@ -573,7 +573,10 @@ fn drive_acp_agent(
                 &inputs.prompt,
                 workdir,
                 &identity,
-                AgentRunTimeout::JobDeadline(timeout),
+                AgentRunTimeout::JobDeadline {
+                    remaining: timeout,
+                    deadline_unix: inputs.deadline_unix,
+                },
                 Some(env.clone()),
             )
         },

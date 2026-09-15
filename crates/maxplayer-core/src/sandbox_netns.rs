@@ -64,20 +64,786 @@ pub const HOLDER_LABEL: &str = "ai.maxplayer.netns-holder";
 /// this whole module chooses whenever it has to choose.
 pub const HOLDER_SEAT_LABEL: &str = "ai.maxplayer.netns-holder-seat";
 
+/// The docker label carrying the absolute unix second after which this seat may remove the
+/// container **without consulting anything in this process**.
+///
+/// **Why the expiry is written into the container instead of remembered.** Everything this module
+/// used to rely on to finish a cleanup — a retained owner, a supervisor, a watch on the daemon's
+/// event stream — lives in the process that created the container, and so dies with it. A stamp on
+/// the container itself is the one record that survives a `SIGKILL`, a crash mid-create, and a
+/// container the daemon only materialises after this process is gone. The sweep that reads it needs
+/// no memory of the job at all: it asks docker what exists, and the answer carries its own verdict.
+///
+/// **Why `deadline + grace` and not a fixed cap.** A seat's jobs do not share a lifetime — the
+/// deadline is `--job-timeout-secs`, else the offer's own deadline, else the default, chosen per job
+/// by [`crate::seller::job_deadline_unix`]. A single global age would either strangle a long job
+/// that was legitimately awarded a long deadline, or leave a short one lying around for hours. This
+/// label carries the job's OWN effective deadline plus [`CLEANUP_GRACE_SECS`], so each container is
+/// judged against the lifetime its own job was actually granted.
+///
+/// A container carrying no expiry label, or one that does not parse, is **never** swept on this
+/// path: an unreadable stamp is not an expired one, and the boot reaper remains the backstop for
+/// anything older than this build.
+pub const HOLDER_CLEANUP_AFTER_LABEL: &str = "ai.maxplayer.netns-cleanup-after";
+
+/// The docker label naming what the container was for: the namespace holder, or one of the
+/// short-lived helpers that join its namespace.
+///
+/// Carried so the sweep can report what it removed in terms an operator can act on, and so a future
+/// role can be excluded without having to guess from a container name.
+pub const HOLDER_ROLE_LABEL: &str = "ai.maxplayer.netns-role";
+
+/// The holder that owns the job's network namespace for the whole run.
+pub const ROLE_HOLDER: &str = "holder";
+
+/// A short-lived helper that joins the holder's namespace (plan applier, readback probe).
+pub const ROLE_HELPER: &str = "helper";
+
+/// The docker label carrying the job id on a **helper**, as [`HOLDER_LABEL`] carries it on a holder.
+///
+/// **A separate label, and the separation is load-bearing.** The boot reaper selects on the presence
+/// of [`HOLDER_LABEL`] ([`list_holders_argv`]), and it removes what it selects by container id. Were
+/// a helper to carry that same label, the reaper would count a joiner as a namespace holder — and
+/// the one protection it has against removing a live one, the `container:<id>` attachment check, is
+/// about the holder's id and says nothing about a helper's. Helpers are therefore attributable to a
+/// job for reporting, and invisible to the reaper's selection, which is the property that keeps the
+/// two cleanup paths from overlapping.
+pub const HELPER_JOB_LABEL: &str = "ai.maxplayer.netns-job";
+
+/// The `--label` arguments every job-owned helper container carries: owning seat, this job's own
+/// cleanup stamp, its role, and the job it belongs to.
+///
+/// The seat and the stamp are the two the sweep judges by, and they are the same two the holder
+/// carries, produced here from the same values so the holder and its joiners expire **together**.
+/// A helper that outlived its holder by carrying no stamp is exactly the leftover this work exists
+/// to remove; a helper stamped differently from its holder would be a second, quieter deadline.
+///
+/// Every value here is derived by the seller from what it is itself enforcing. None of it is
+/// reachable from a job's payload, which is why a request cannot ask for a helper that never
+/// expires or one that belongs to another seat.
+#[must_use]
+pub fn helper_label_args(job_id: &str, seat: &str, cleanup_after: u64) -> Vec<String> {
+    [
+        "--label".to_owned(),
+        format!("{HOLDER_SEAT_LABEL}={seat}"),
+        "--label".to_owned(),
+        format!("{HOLDER_CLEANUP_AFTER_LABEL}={cleanup_after}"),
+        "--label".to_owned(),
+        format!("{HOLDER_ROLE_LABEL}={ROLE_HELPER}"),
+        "--label".to_owned(),
+        format!("{HELPER_JOB_LABEL}={job_id}"),
+    ]
+    .into_iter()
+    .collect()
+}
+
+/// How long after a job's own effective deadline its containers become sweepable.
+///
+/// **One hour, and the size is the point.** The deadline is when the job must be finished, not when
+/// its containers stop being legitimately in use: delivery, evidence capture and the teardown that
+/// normally removes these containers all happen after it. A grace shorter than that work would have
+/// the sweep racing the ordinary cleanup path for a container still in use — the one outcome worse
+/// than the leak it exists to fix. An hour is far past any of it, and the cost of the margin is a
+/// dead container occupying a name and no policy for at most that long.
+pub const CLEANUP_GRACE_SECS: u64 = 3_600;
+
+/// The value for [`HOLDER_CLEANUP_AFTER_LABEL`]: this job's effective deadline plus the grace.
+///
+/// Saturating, so a deadline near `u64::MAX` yields `u64::MAX` — a container that is never swept on
+/// this path — rather than wrapping to zero and becoming instantly removable while its job runs.
+/// Of the two failures available to arithmetic here, leaking is the one that does not destroy live
+/// work.
+#[must_use]
+pub fn cleanup_after_unix(effective_deadline_unix: u64) -> u64 {
+    effective_deadline_unix.saturating_add(CLEANUP_GRACE_SECS)
+}
+
+/// The cleanup stamp a launch writes onto its containers.
+///
+/// **`job_deadline_unix` is the whole point (#996 D3).** When the caller can name the job's absolute
+/// deadline, the stamp is a RESTATEMENT of it and `now_unix` is not consulted at all: the value
+/// cannot then be moved by whatever the wall clock happens to say at the create. The previous
+/// derivation — `now + remaining` — made the stamp a fresh measurement, so a clock that had stepped
+/// backward between the caller computing `remaining` and this create produced a stamp EARLIER than
+/// the deadline the job was actually running under, and the sweep would remove a container out from
+/// under a job still inside its own deadline.
+///
+/// `None` is for a launch with no job deadline to carry — a harness probe. There the remaining
+/// window is the best available statement, and an unreadable clock (`now_unix == u64::MAX`)
+/// saturates rather than wrapping, so it can never date a live container into the past.
+#[must_use]
+pub fn launch_cleanup_stamp(
+    job_deadline_unix: Option<u64>,
+    job_lifetime_secs: u64,
+    now_unix: u64,
+) -> u64 {
+    cleanup_after_unix(match job_deadline_unix {
+        Some(deadline_unix) => deadline_unix,
+        None => now_unix.saturating_add(job_lifetime_secs),
+    })
+}
+
+/// How long any one `docker` invocation in this module may take before it is killed. A create or a
+/// sidecar that never returns would otherwise hold the launch open indefinitely, and an unbounded
+/// wait is the state in which cancellation leaves work nobody owns.
+pub const DOCKER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long a deadline-killed command waits for its plan writer to notice the closed pipe.
+///
+/// Killing the child closes the read end, so a blocked `write_all` fails with `EPIPE` almost at
+/// once. This grace exists so that the common case is JOINED rather than abandoned; a writer still
+/// running after it is reported as outstanding, never waited on indefinitely. It is a bound on how
+/// long this process will wait for that thread -- not a claim about how quickly any particular
+/// writer unblocks.
+const WRITER_EPIPE_GRACE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The docker client one containment lifecycle spawns, carried **explicitly** by the code that uses
+/// it.
+///
+/// There is no environment variable, no global, and no configuration field behind this. The only
+/// constructor a shipped build can reach is [`DockerCli::system`], which is the constant `docker` on
+/// `PATH`; a test that needs a stand-in passes one in as an argument to the single call under test,
+/// so two tests running in parallel cannot see or disturb each other's client.
+///
+/// The earlier shapes of this seam were both wrong, in instructive ways. An environment variable let
+/// anyone able to set a variable on the process redirect every containment command — create,
+/// inspect, remove — at a binary of their choosing, in a shipped build. Moving it to a
+/// `cfg(test)` process-global removed the shipped exposure but not the interference: a global is
+/// still shared, still needs a lock every reader must remember to take, and any helper that forgot
+/// — cleanup running from `Drop`, for instance — read whatever another test had installed. An
+/// argument has neither failure mode.
+#[derive(Clone, Debug)]
+pub struct DockerCli {
+    program: std::sync::Arc<str>,
+}
+
+impl DockerCli {
+    /// The production client: `docker`, resolved on `PATH`. Nothing selects another.
+    #[must_use]
+    pub fn system() -> Self {
+        Self { program: std::sync::Arc::from("docker") }
+    }
+
+    /// Test-only: an explicit stand-in, handed to one call. Not reachable from a shipped build.
+    #[cfg(test)]
+    fn stand_in(path: &std::path::Path) -> Self {
+        Self { program: std::sync::Arc::from(path.to_string_lossy().as_ref()) }
+    }
+
+    fn program(&self) -> &str {
+        &self.program
+    }
+}
+
+/// How long cleanup will wait for an in-flight create, and how long an owner keeps trying after it.
+///
+/// A parameter rather than a constant so the delayed path can be exercised in under a second. The
+/// production values are [`FenceBounds::production`]; nothing else constructs one outside tests.
+#[derive(Clone, Copy, Debug)]
+struct FenceBounds {
+    /// How long `Drop` itself blocks before handing off to an owner.
+    fast: std::time::Duration,
+    /// The outer bound on the handed-off owner, counted from when it takes over.
+    max: std::time::Duration,
+    /// How long the owner keeps asking the daemon to confirm the removal it issued.
+    confirm: std::time::Duration,
+    /// How much longer the owner KEEPS the job after `max` expires with the create still running.
+    ///
+    /// `max` is where an owner used to stop being an owner: it swept, printed a leak, and returned
+    /// while the create was still in flight, so a container landing one millisecond later had
+    /// nobody responsible for it. This is the window in which that container is still SOMEBODY'S —
+    /// the owner stays on the create's own schedule, removes what lands, and confirms it gone.
+    retain: std::time::Duration,
+}
+
+impl FenceBounds {
+    /// The bound that matters is the create client's own: [`DOCKER_DEADLINE`] kills it at 120s, so a
+    /// blocking create closure cannot outlive that, and an owner waiting a margin past it waits for
+    /// an event that is guaranteed to have happened rather than for a guessed duration.
+    fn production() -> Self {
+        Self {
+            fast: NetnsHolder::CREATE_SETTLE_DEADLINE,
+            max: DOCKER_DEADLINE + std::time::Duration::from_secs(15),
+            confirm: std::time::Duration::from_secs(10),
+            // A create that has not settled by `max` is past its own client's kill, so this covers
+            // a daemon still working after the client it answered is gone — the case where the
+            // container appears with no client left to attribute it to.
+            retain: DOCKER_DEADLINE,
+        }
+    }
+}
+
 /// A running holder container, and the guarantee that it goes away.
 ///
-/// Constructed the instant the container exists, so that every `?` after that point tears it down on
-/// the way out — the holder is a resource with a lifetime, not a step in a procedure.
+/// Constructed **before** the container does, so that every `?` — and every cancellation — after
+/// that point tears it down on the way out. The holder is a resource with a lifetime, not a step in
+/// a procedure.
+///
+/// The guard also owns the **temporary containers joined to the namespace**. A sidecar is a joiner:
+/// while it lives the namespace cannot go away, so removing the holder while an applier or a
+/// readback is still running leaves the namespace pinned by a process nobody is tracking. Every
+/// sidecar is therefore named, registered here for its lifetime, and force-removed before the holder
+/// is.
+/// Counts creates that may still be in flight **after** the future awaiting them is gone.
+///
+/// Adoption alone was never a fence. It supplies a NAME to remove; it says nothing about WHEN the
+/// container under that name comes into existence. A create runs on a blocking pool thread, and
+/// cancelling the future above it does not stop that thread: the create can still be queued inside
+/// the daemon, or half-finished, at the instant cleanup runs. Cleanup then asks docker to remove a
+/// container that does not exist YET, is told "No such container" — which this module correctly
+/// treats as benign — and returns satisfied. Moments later the create lands. The result is a
+/// running container with a name nobody holds, which is the exact orphan the registry exists to
+/// prevent, manufactured by the cleanup path.
+///
+/// So a single early remove is not enough, and no ordering of removes fixes it: the remove has to
+/// happen on the far side of the create SETTLING. This fence is that far side. Every create takes a
+/// ticket before it is issued, the ticket is moved into the blocking closure, and it is released
+/// when that closure ends — whether it succeeded, failed, was killed on the deadline, or ran on
+/// past a cancelled future. Cleanup waits for the count to reach zero before it removes anything.
+#[derive(Debug)]
+struct CreationFence {
+    in_flight: std::sync::Mutex<usize>,
+    settled: std::sync::Condvar,
+    /// How many tickets this fence has EVER issued, which only ever grows.
+    ///
+    /// `in_flight` answers "is work outstanding now" and is therefore blind to work that started
+    /// and finished between two observations. This answers the different question "was anything
+    /// ever started under this fence at all", which is the only way to tell a create that was
+    /// refused before it began from one that was launched and instantly killed — those two look
+    /// identical from the outside, and exactly one of them leaves a container behind.
+    issued: std::sync::Mutex<usize>,
+    /// The owners this fence is RETAINING for jobs whose bounded owner ran out of wait.
+    ///
+    /// A bounded owner that reaches its limit with the create still in flight has exactly two
+    /// honest options: keep waiting (which only moves the edge), or hand the job to something that
+    /// outlives it. This is the something. It holds EVERY job handed to it — two owners that arrive
+    /// on the same fence are two obligations, and the second does not replace the first — and it is
+    /// drained the moment the create settles. It is still not a registry of containers: each entry
+    /// is one job for the one holder this fence exists to count.
+    retained: std::sync::Mutex<Vec<RetainedOwner>>,
+}
+
+impl Default for CreationFence {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// How many times a fence being DESTROYED re-runs an owner it still holds before giving up on it.
+///
+/// A removal that could not be confirmed puts itself back, so the runner — not the job — is what
+/// bounds the attempts. Destruction is the last moment THIS FENCE can act, and it is no longer the
+/// last moment anything can: a name this fence could not confirm absent belongs to a container that
+/// carries its own `cleanup-after` stamp, so the periodic [`sweep_expired`] pass removes it once its
+/// job's deadline plus [`CLEANUP_GRACE_SECS`] has passed. This is a bound on IN-PROCESS effort, and
+/// what replaces the retired process-lifetime custody thread: memory does not hold the obligation,
+/// the container's own label does.
+const RETAINED_FINAL_RUNS: usize = 3;
+
+/// Cleanup somebody holds on a holder's behalf after its bounded owner is gone.
+///
+/// Data, not a closure. A closure that is dropped does nothing and leaves no trace, and it cannot
+/// be reported on, merged, or re-scheduled by anyone but the code that built it. This carries the
+/// names it is responsible for and everything needed to act on them, so any owner — the fence, the
+/// supervisor, a test — can run one attempt and see exactly what is still outstanding afterwards.
+#[derive(Clone)]
+struct RetainedOwner {
+    holder: String,
+    names: Vec<String>,
+    client: DockerCli,
+    bounds: FenceBounds,
+}
+
+/// What every retained owner owes, and the only thing any of them owes since the per-job expiry
+/// sweep replaced continuous custody: remove these names and confirm each one absent.
+///
+/// It was one of two, the other being a watch on the docker event stream for a create whose answer
+/// this process never read. That obligation had no end short of the process's own, which is exactly
+/// the design Petar's revision superseded: the container now carries its own expiry, so a create
+/// that lands late is removed by a later sweep instead of by a watcher this process must keep alive.
+const OWED_LABEL: &str = "remove-and-confirm";
+
+/// What a retained owner reports after one attempt.
+///
+/// The point of returning this rather than `()` is that a cleanup which issued a removal and could
+/// not confirm absence has NOT finished, and must not be able to end by returning quietly. It hands
+/// back the job that is still owed, and the runner decides when it runs next — never whether.
+enum Custody {
+    /// Every name is discharged on a daemon observation. Nothing is owed.
+    Discharged,
+    /// Some names are still owed. This is the job that owes them, narrowed to exactly those names.
+    StillOwed(RetainedOwner),
+}
+
+/// What happened when a job was handed to a fence.
+///
+/// A registration that silently does nothing is the failure this type exists to make impossible:
+/// the caller cannot ignore the settled case, because the job comes back and must be run.
+#[must_use = "an already-settled fence hands the job back, and it must be run or it is lost"]
+enum Registration {
+    /// The fence took it; the create is still in flight, so a future last-ticket drop will run it.
+    Retained,
+    /// NOTHING was in flight at the instant of registration, so no future drop exists to run it.
+    /// The job is handed back rather than parked where it would never fire.
+    AlreadySettled(RetainedOwner),
+}
+
+impl std::fmt::Debug for RetainedOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "RetainedOwner({}, still owns {})",
+            OWED_LABEL,
+            self.names.join(", ")
+        )
+    }
+}
+
+impl RetainedOwner {
+    /// One bounded attempt at what this owner owes. Nothing here waits on a clock of its own: each
+    /// step is a removal or an inspect, all bounded by the existing deadlines.
+    fn attempt(self) -> Custody {
+        self.remove_and_confirm()
+    }
+
+    /// Remove and confirm. A failed confirmation returns THIS owner again over exactly the names
+    /// that could not be confirmed, so responsibility narrows to what is actually outstanding
+    /// instead of being discarded at the first disappointment.
+    fn remove_and_confirm(self) -> Custody {
+        // A fresh fence deliberately: the create this would have waited for is the one that already
+        // ended, so there is nothing left to wait for and the owner goes straight to removal and
+        // confirmation. It keeps no `Arc` back to the fence that holds it — that would be a cycle.
+        let owner = HolderCleanup {
+            name: self.holder.clone(),
+            joiners: self.names.iter().filter(|name| **name != self.holder).cloned().collect(),
+            creation: std::sync::Arc::new(CreationFence::default()),
+            client: self.client.clone(),
+            bounds: self.bounds,
+        };
+        owner.sweep();
+        match owner.confirm_all_absent() {
+            Ok(()) => Custody::Discharged,
+            Err(mut pending) => {
+                pending.sort();
+                pending.dedup();
+                eprintln!(
+                    "sandbox: a retained owner removed {} but could not confirm absence within {:?} \
+                     — it is NOT releasing them: the job is still owed",
+                    pending.join(", "),
+                    self.bounds.confirm
+                );
+                Custody::StillOwed(RetainedOwner { names: pending, ..self })
+            }
+        }
+    }
+
+}
+
+/// Build the owner that removes `names` under holder `name` and confirms each one absent.
+fn retained_removal(
+    name: String,
+    names: Vec<String>,
+    client: DockerCli,
+    bounds: FenceBounds,
+) -> RetainedOwner {
+    RetainedOwner { holder: name, names, client, bounds }
+}
+
+impl CreationFence {
+    /// A fence with nothing in flight and nothing retained.
+    ///
+    /// It carries no bounds of its own: every obligation it holds arrives already carrying the
+    /// bounds its owner ran under, and a fence no longer hands work to anything that would need to
+    /// choose new ones.
+    fn new() -> Self {
+        Self {
+            in_flight: std::sync::Mutex::new(0),
+            settled: std::sync::Condvar::new(),
+            issued: std::sync::Mutex::new(0),
+            retained: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Take custody of one create that is about to be issued.
+    fn begin(self: &std::sync::Arc<Self>) -> CreationTicket {
+        {
+            let mut in_flight =
+                self.in_flight.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *in_flight += 1;
+        }
+        {
+            let mut issued = self.issued.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *issued += 1;
+        }
+        CreationTicket { fence: std::sync::Arc::clone(self) }
+    }
+
+    /// Install a job, or hand it back because there is nothing left to run it.
+    ///
+    /// ATOMIC WITH THE ZERO TRANSITION, and that is the entire point of the shape. The check and
+    /// the installation happen under ONE `in_flight` guard, and [`CreationTicket::drop`] takes the
+    /// slot while still holding that same guard. Without this, a real ordering loses the job
+    /// outright: the bounded owner's wait times out, the last ticket drops and finds the slot
+    /// empty, and only then does cleanup install a callback that no further drop will ever run.
+    /// Now the two cases are exhaustive — either a drop is still coming and the fence keeps the
+    /// job, or none is, and the caller is handed it back and must run it.
+    ///
+    /// EVERY job is kept. A second registration on an occupied fence is a second obligation, and it
+    /// is pushed alongside the first — never assigned over it.
+    fn register(&self, owner: RetainedOwner) -> Registration {
+        let in_flight = self.in_flight.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *in_flight == 0 {
+            return Registration::AlreadySettled(owner);
+        }
+        self.retained.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(owner);
+        Registration::Retained
+    }
+
+    /// Take custody of a job: retained for the settlement that is coming, or RUN NOW if none is.
+    ///
+    /// Registering on an already-idle fence used to mean parking a closure that nothing would ever
+    /// fire, which reads exactly like ownership and behaves exactly like dropping it on the floor.
+    fn take_custody(&self, owner: RetainedOwner) {
+        match self.register(owner) {
+            Registration::Retained => {}
+            Registration::AlreadySettled(owner) => self.run_and_keep_if_still_owed(vec![owner]),
+        }
+    }
+
+    /// Run each owner once and PUT BACK every one that is still owed.
+    ///
+    /// A removal whose absence could not be confirmed has not finished, so it returns to the fence:
+    /// a later settlement runs it again, and if no later settlement ever comes, this fence's own
+    /// destruction does — and hands it on from there. Nothing is dropped and nothing is overwritten:
+    /// the still-owed job is pushed next to whatever else the fence holds.
+    fn run_and_keep_if_still_owed(&self, owners: Vec<RetainedOwner>) {
+        for owner in owners {
+            if let Custody::StillOwed(still_owed) = owner.attempt() {
+                self.retained
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(still_owed);
+            }
+        }
+    }
+
+    /// How much work has ever been started under this fence.
+    #[cfg(test)]
+    fn tickets_issued(&self) -> usize {
+        *self.issued.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Whether this fence is still holding somebody's cleanup.
+    ///
+    /// Exists so ownership can be ASSERTED rather than read out of a log line: a test can ask the
+    /// fence whether a job is still owned, which a message about ownership cannot answer.
+    #[cfg(test)]
+    fn holds_retained_owner(&self) -> bool {
+        self.retained
+            .lock()
+            .map(|retained| !retained.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Block until every in-flight create has ended, or the bound expires.
+    ///
+    /// Returns whether it settled. A timeout is reported by the caller rather than swallowed: a
+    /// create still running after this bound is a create whose container this process may never see,
+    /// and saying so is the difference between a known leak and a silent one.
+    fn wait_until_settled(&self, bound: std::time::Duration) -> bool {
+        let started = std::time::Instant::now();
+        let mut in_flight = self.in_flight.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *in_flight > 0 {
+            let Some(left) = bound.checked_sub(started.elapsed()) else {
+                return false;
+            };
+            let (guard, timeout) = self
+                .settled
+                .wait_timeout(in_flight, left)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            in_flight = guard;
+            if timeout.timed_out() && *in_flight > 0 {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// One in-flight create. Releasing it is what "the create has settled" means.
+///
+/// Held by the blocking closure itself, never by the future awaiting it — that is the whole point.
+/// A cancelled future drops its side and the closure keeps this one until it genuinely ends.
+#[derive(Debug)]
+struct CreationTicket {
+    fence: std::sync::Arc<CreationFence>,
+}
+
+impl CreationTicket {
+    /// The fence this ticket belongs to, so work spawned underneath it can take its OWN ticket.
+    ///
+    /// Detached IO threads use this. A reader or writer holding a pipe endpoint is work this
+    /// process is still doing, and until it takes a ticket of its own it is work nobody is counted
+    /// for — the closure could return, release the only ticket, and let cleanup conclude while the
+    /// thread was still reading.
+    fn fence(&self) -> &std::sync::Arc<CreationFence> {
+        &self.fence
+    }
+}
+
+impl Drop for CreationTicket {
+    fn drop(&mut self) {
+        // The decrement and the claim on the retained jobs are ONE critical section, taken in the
+        // same order as `register`: `in_flight` first, then `retained`. Releasing the count before
+        // looking at the slot is what opened the missed-handoff window -- a registration could slip
+        // in after this drop had already decided there was nothing to run.
+        let owners = {
+            let mut in_flight =
+                self.fence.in_flight.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *in_flight = in_flight.saturating_sub(1);
+            if *in_flight == 0 {
+                std::mem::take(
+                    &mut *self.fence.retained.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+                )
+            } else {
+                Vec::new()
+            }
+        };
+        self.fence.settled.notify_all();
+        // THE HANDOFF LANDS HERE, on the thread that actually ended the create.
+        //
+        // A create whose answer this process never read is no longer watched from memory: the name
+        // is stamped with its job's own expiry at create time, so a container that lands after this
+        // point is discovered by a later sweep from the container itself. See `sweep_expired`.
+        //
+        // A bounded owner that gave up earlier left its job with the fence instead of dropping it.
+        // This is the event it was waiting for -- not a clock, the create's own end -- so the job
+        // runs now, however long "now" took to arrive. The lock is released before it runs: the
+        // job removes and confirms, and both talk to the daemon.
+        if !owners.is_empty() {
+            self.fence.run_and_keep_if_still_owed(owners);
+        }
+    }
+}
+
+impl Drop for CreationFence {
+    /// THE LAST MOMENT THIS FENCE CAN ACT — and not the last moment this process can.
+    ///
+    /// The jobs still held run here, up to [`RETAINED_FINAL_RUNS`] rounds. What is still owed after
+    /// that is NAMED and left to the sweep: every container this fence could be owed is stamped
+    /// with its job's own `cleanup-after`, and [`sweep_expired`] runs every
+    /// [`SWEEP_INTERVAL_SECS`] for as long as the seller runs. So the obligation does not need an
+    /// in-memory owner that outlives the fence — which is the process-lifetime custody thread this
+    /// revision removed, per Petar's review of PR 996 — it needs the daemon to still be told, on a
+    /// schedule, about a container whose deadline has passed.
+    ///
+    /// The owners deliberately keep no `Arc` back to this fence (that would be a cycle, and the
+    /// fence would never be destroyed at all).
+    fn drop(&mut self) {
+        for _ in 0..RETAINED_FINAL_RUNS {
+            let owners = std::mem::take(
+                &mut *self.retained.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            );
+            if owners.is_empty() {
+                break;
+            }
+            for owner in owners {
+                if let Custody::StillOwed(still_owed) = owner.attempt() {
+                    self.retained
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(still_owed);
+                }
+            }
+        }
+        // Out of attempts HERE. Not out of owners.
+        let still_owed = std::mem::take(
+            &mut *self.retained.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        for owner in still_owed {
+            eprintln!(
+                "sandbox: {} could not be confirmed absent in {} attempts by a fence that is being \
+                 destroyed — these names are left to the expiry sweep, which removes them once the \
+                 job's own deadline plus the cleanup grace has passed",
+                owner.names.join(", "),
+                RETAINED_FINAL_RUNS
+            );
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct NetnsHolder {
     name: String,
+    sidecars: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    creation: std::sync::Arc<CreationFence>,
+    client: DockerCli,
+    bounds: FenceBounds,
+    /// The `--label` arguments stamped onto every helper this holder runs, from
+    /// [`helper_label_args`]. Empty for a holder adopted outside a production launch — a test
+    /// fixture has no seat and no deadline to attribute a helper to, and an empty seat label would
+    /// be worse than none.
+    helper_labels: Vec<String>,
 }
 
 impl NetnsHolder {
-    /// Adopt an already-created container as the holder. Private on purpose: a `NetnsHolder` that
-    /// does not correspond to a running container would promise a teardown it cannot perform.
-    fn adopt(name: String) -> Self {
-        Self { name }
+    /// Adopt a container name as the holder, whether or not the container exists yet.
+    ///
+    /// Private on purpose. Adoption happens **before** the create command is issued: the create is
+    /// an await, an await is a cancellation point, and a cancelled create can still complete inside
+    /// the blocking pool after the future is gone. Adopting afterwards left exactly that container
+    /// with no guard — running, joined to nothing, and invisible to this process.
+    ///
+    /// Adoption gives cleanup a name. [`CreationFence`] gives it a TIME. Both are required.
+    #[cfg(test)]
+    fn adopt(name: String, client: DockerCli) -> Self {
+        Self::adopt_bounded(name, client, FenceBounds::production())
+    }
+
+    /// As [`Self::adopt`], with the cleanup bounds named by the caller so the delayed path can be
+    /// exercised without waiting out the production ones.
+    fn adopt_bounded(name: String, client: DockerCli, bounds: FenceBounds) -> Self {
+        Self {
+            name,
+            sidecars: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            creation: std::sync::Arc::new(CreationFence::default()),
+            client,
+            bounds,
+            helper_labels: Vec::new(),
+        }
+    }
+
+    /// Stamp every helper this holder goes on to run with `labels` (from [`helper_label_args`]).
+    ///
+    /// Set once by [`establish_with`], which is the only place that knows the job, the seat and the
+    /// deadline at the same time. Applied centrally in [`run_sidecar_confirmed`] rather than in each
+    /// argv builder: every helper container in this module is created through that one funnel, so a
+    /// helper added later is stamped without its author having to remember to do it — and a forgotten
+    /// stamp is an unexpiring leftover, which is the failure this whole path exists to end.
+    fn label_helpers(&mut self, labels: Vec<String>) {
+        self.helper_labels = labels;
+    }
+
+    /// The helper stamp set by [`Self::label_helpers`]; empty when this holder was adopted outside a
+    /// production launch.
+    fn helper_labels(&self) -> &[String] {
+        &self.helper_labels
+    }
+
+    /// The docker client this holder was built with. Cleanup uses it too, so a stand-in cannot be
+    /// half-applied: whatever created the container is what removes and confirms it.
+    fn client(&self) -> &DockerCli {
+        &self.client
+    }
+
+    /// Take a ticket for a create about to be issued against this holder.
+    fn fence_creation(&self) -> CreationTicket {
+        self.creation.begin()
+    }
+
+    /// Register a sidecar container name for the duration of one command.
+    fn watch_sidecar(&self, name: String) -> SidecarGuard {
+        if let Ok(mut names) = self.sidecars.lock() {
+            names.push(name.clone());
+        }
+        SidecarGuard { name, registry: std::sync::Arc::clone(&self.sidecars), completed: false }
+    }
+
+    /// Whether a failed `docker rm` says "there was nothing here" rather than "I could not do it".
+    ///
+    /// The only benign failure. Because the holder is adopted **before** its create is issued, a run
+    /// cancelled in that window tears down a container that never existed, and docker rightly
+    /// objects. Every other message is a container this process could not remove — a leak, which the
+    /// caller reports as a leak. An empty stderr is not benign: a removal that failed without saying
+    /// why is the one case where assuming success would be a silent orphan.
+    fn force_remove_stderr_is_benign(stderr: &str) -> bool {
+        stderr.contains("No such container")
+    }
+
+    /// How long one `docker rm` may run before it is abandoned and reported as a leak.
+    ///
+    /// This runs inside `Drop`, on the thread that is tearing the job down, so it is a hard cap on
+    /// how long a wedged daemon can hold that thread. Long enough that an ordinary removal under
+    /// load is never cut short -- removals finish in well under a second -- and short enough that a
+    /// daemon which has stopped answering ends the job instead of pinning the caller forever.
+    const REMOVE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+    /// How long cleanup waits for an in-flight create to settle before removing regardless.
+    ///
+    /// Bounded by the same reasoning as [`Self::REMOVE_DEADLINE`], and deliberately longer than it:
+    /// a create that has reached the daemon finishes in well under a second, while the thing this
+    /// guards against — removing BEFORE the container exists — is unrecoverable once it happens.
+    /// The create's own [`DOCKER_DEADLINE`] kills the client at 120s, so this can never wait for a
+    /// hung client indefinitely; it waits for the blocking closure to end, which that kill forces.
+    const CREATE_SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Wait for one child, bounded. On the deadline the child is killed and reaped, and the wait is
+    /// reported as a failure rather than as a removal that succeeded.
+    ///
+    /// `Child::wait`, and the `output()` this replaced, have no timeout at all: a docker client
+    /// talking to a daemon that never answers blocks forever, which in `Drop` means teardown never
+    /// returns. The word "bounded" was in the comment above this function long before anything in
+    /// it bounded anything.
+    fn wait_bounded(
+        child: &mut std::process::Child,
+        deadline: std::time::Duration,
+    ) -> Result<std::process::ExitStatus, String> {
+        let expires = std::time::Instant::now() + deadline;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) => {
+                    if std::time::Instant::now() >= expires {
+                        // Killed AND reaped: leaving a zombie behind would be its own small leak,
+                        // and the kill is what makes the bound real rather than advisory.
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(format!(
+                            "docker rm did not finish within {}s and was abandoned -- the container \
+                             may still exist",
+                            deadline.as_secs()
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(error) => return Err(format!("could not wait for docker rm: {error}")),
+            }
+        }
+    }
+
+    /// Force-remove one container by name, bounded, and say what actually happened.
+    ///
+    /// `Ok(())` means docker reported the removal, or reported that there was nothing to remove.
+    fn force_remove(client: &DockerCli, name: &str) -> Result<(), String> {
+        let mut child = std::process::Command::new(client.program())
+            .args(["rm", "--force", "--volumes", name])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("could not run docker rm: {error}"))?;
+        let status = Self::wait_bounded(&mut child, Self::REMOVE_DEADLINE)?;
+        // Read after the wait returns. `docker rm` writes one short line at most, so this cannot
+        // deadlock on a full pipe the way a chatty child could.
+        let mut stderr_bytes = Vec::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            use std::io::Read as _;
+            let _ = pipe.read_to_end(&mut stderr_bytes);
+        }
+        if status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_owned();
+        // Removing something that was never created is the expected path when a create was
+        // cancelled before it started, and it is not a cleanup failure.
+        if Self::force_remove_stderr_is_benign(&stderr) {
+            Ok(())
+        } else {
+            Err(if stderr.is_empty() {
+                "docker rm failed and said nothing".to_owned()
+            } else {
+                stderr
+            })
+        }
     }
 
     /// The container name, for `docker` commands that address it directly.
@@ -100,32 +866,313 @@ impl NetnsHolder {
     }
 }
 
+/// One sidecar's registration, dropped when its command finishes however it finishes.
+///
+/// On a normal return the container is already gone (`--rm`) and this only deregisters. On
+/// cancellation the future is dropped mid-command, the name stays with the holder, and the holder's
+/// own `Drop` force-removes it — which is the case that used to leave a joiner pinning a namespace
+/// whose holder had just been removed.
+#[derive(Debug)]
+struct SidecarGuard {
+    name: String,
+    registry: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// Set only when the command returned. A guard dropped without this is a cancelled command.
+    completed: bool,
+}
+
+impl SidecarGuard {
+    /// The command's client was **reaped with an exit status**. `docker run --rm` removes the
+    /// container when its client exits -- including on a nonzero exit -- so from here the name is no
+    /// longer a cleanup target, and keeping it would make the holder report a leak for something
+    /// already gone.
+    ///
+    /// Deliberately NOT called for a result that merely returned: a deadline kill, a signal, or a
+    /// failure before the wait leaves a container this process never saw finish.
+    fn completed(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for SidecarGuard {
+    /// Deregisters ONLY a command that finished.
+    ///
+    /// This used to deregister unconditionally, which quietly inverted the custody it was written
+    /// for. Cancellation drops the future mid-command, which drops this guard, which struck the
+    /// name from the registry -- and the holder's own `Drop`, reading that registry moments later,
+    /// then saw nothing to remove. The container the blocking docker client had already created
+    /// stayed joined to the namespace with no guard, no record and no remover: exactly the orphan
+    /// the registry exists to prevent, produced by the cleanup path itself.
+    ///
+    /// So a cancelled command leaves its name behind deliberately. The cost of keeping a name whose
+    /// container never got created is one `docker rm` answering "No such container", which
+    /// [`NetnsHolder::force_remove_stderr_is_benign`] already treats as success. The cost of
+    /// dropping a name whose container does exist is a pinned namespace nothing will ever clean up.
+    fn drop(&mut self) {
+        if !self.completed {
+            return;
+        }
+        if let Ok(mut names) = self.registry.lock() {
+            names.retain(|name| name != &self.name);
+        }
+    }
+}
+
 impl Drop for NetnsHolder {
-    /// Destroy the holder, **synchronously**.
+    /// Destroy the holder, **synchronously**, and everything joined to it first.
     ///
     /// Deliberately a blocking `std::process::Command` and not a spawned task: a task spawned from
     /// `Drop` can be discarded when the runtime shuts down, and runtime shutdown is exactly the path a
     /// panicking or aborted job takes. A leaked holder is a container pinned to a namespace nothing
     /// will ever clean up, so the ~100 ms block is the cheaper end of that trade.
     ///
-    /// Failure is logged, never propagated: `Drop` cannot return, and the reaper in
-    /// [`reap_orphans`] is the backstop for the case where this did not work.
+    /// **Sidecars go first.** A joiner still running when the holder is removed keeps the namespace
+    /// alive, and is precisely what a cancelled applier or readback leaves behind. Only names this
+    /// run registered are removed; nothing is matched by pattern, so a sibling job's containers are
+    /// never in scope.
+    ///
+    /// Failure is reported, never propagated and never implied away: `Drop` cannot return, so each
+    /// failure is printed as a failure — "could not remove", not "destroyed" — and
+    /// [`reap_orphans`] is the backstop. A cleanup that failed is a leak that is now on the record.
     fn drop(&mut self) {
-        let outcome = std::process::Command::new("docker")
-            .args(["rm", "--force", "--volumes", &self.name])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .output();
-        match outcome {
-            Ok(done) if done.status.success() => {}
-            Ok(done) => eprintln!(
-                "sandbox: could not remove netns holder {}: {}",
-                self.name,
-                String::from_utf8_lossy(&done.stderr).trim()
-            ),
-            Err(error) => {
-                eprintln!("sandbox: could not run docker rm for netns holder {}: {error}", self.name)
+        // FIRST, before a single remove is issued: let any in-flight create finish.
+        //
+        // Removing ahead of the create is worse than not removing at all, because "No such
+        // container" reads as success and closes the case on a container that is about to exist.
+        // Waiting here costs nothing in the ordinary path (nothing is in flight, the count is
+        // already zero) and is the only thing that makes the removes below meaningful in the
+        // cancelled path.
+        let cleanup = HolderCleanup {
+            name: self.name.clone(),
+            joiners: self.sidecars.lock().map(|names| names.clone()).unwrap_or_default(),
+            creation: std::sync::Arc::clone(&self.creation),
+            client: self.client.clone(),
+            bounds: self.bounds,
+        };
+        if self.creation.wait_until_settled(self.bounds.fast) {
+            // Ordinary path: nothing was in flight, or it finished while we waited. `docker rm`
+            // returning success here IS the daemon's answer, so no second question is asked.
+            //
+            // A removal the daemon REFUSED is not answered by a log line alone. This path used to
+            // sweep, print "LEAKED" for whatever refused, and return, leaving nothing responsible.
+            // What refuses here is now NAMED and left to the expiry sweep: the container carries
+            // its own job's `cleanup-after` stamp, and the seller's periodic pass removes it once
+            // that deadline plus the grace has passed. `Drop` stays the ~100 ms it always was, and
+            // nothing is retried from memory for the life of the process.
+            let refused = cleanup.sweep();
+            if !refused.is_empty() {
+                eprintln!(
+                    "sandbox: {} refused removal in netns holder {}'s ordinary teardown — left to \
+                     the expiry sweep, which removes them once the job's deadline plus the cleanup \
+                     grace has passed",
+                    refused.join(", "),
+                    self.name
+                );
             }
+            return;
+        }
+        // Delayed path. The create is STILL running, and this is the case the previous version got
+        // wrong: it removed anyway, printed LEAKED, and returned — leaving nobody responsible for
+        // the container that was still on its way. "No such container" then read as success for an
+        // object about to exist.
+        //
+        // Removing now cannot be made safe by waiting longer, so cleanup is not removed — it is
+        // HANDED OVER. The owner below outlives this `Drop` and finishes the job on the create's own
+        // schedule: it waits for the ticket to actually settle, then removes, then keeps asking the
+        // daemon until absence is CONFIRMED. The wait is bounded by the create client's own
+        // `DOCKER_DEADLINE` kill plus a margin, so it waits for an event guaranteed to occur rather
+        // than for a duration someone guessed.
+        let name = self.name.clone();
+        let spawned = std::thread::Builder::new()
+            .name("mx-holder-cleanup".to_owned())
+            .spawn(move || cleanup.own_until_settled_or_confirmed());
+        match spawned {
+            Ok(_owner) => eprintln!(
+                "sandbox: a create against netns holder {name} is still in flight after {:?} — \
+                 cleanup is NOT removing ahead of it; an owner has been retained and will remove \
+                 and confirm once the create settles",
+                self.bounds.fast
+            ),
+            // No thread to hand it to: finish the job here rather than remove early. Blocking is
+            // the lesser harm; removing ahead of a live create is the one outcome with no recovery.
+            Err(error) => {
+                eprintln!(
+                    "sandbox: could not retain a cleanup owner for netns holder {name} ({error}) — \
+                     completing the wait inline instead"
+                );
+                let inline = HolderCleanup {
+                    name: self.name.clone(),
+                    joiners: self.sidecars.lock().map(|names| names.clone()).unwrap_or_default(),
+                    creation: std::sync::Arc::clone(&self.creation),
+                    client: self.client.clone(),
+                    bounds: self.bounds,
+                };
+                inline.own_until_settled_or_confirmed();
+            }
+        }
+    }
+}
+
+/// The cleanup that owns a holder's name once the holder itself is gone.
+///
+/// Split out of `Drop` for one reason: `Drop` must not be the last thing that cares about the
+/// container. When a create is still in flight, this outlives the holder and stays responsible until
+/// the create settles or the daemon confirms the name is gone.
+struct HolderCleanup {
+    name: String,
+    joiners: Vec<String>,
+    creation: std::sync::Arc<CreationFence>,
+    client: DockerCli,
+    bounds: FenceBounds,
+}
+
+impl HolderCleanup {
+    /// Remove the joiners, then the holder. Sidecars first: a joiner still running pins the
+    /// namespace the holder is being torn down to release.
+    ///
+    /// Returns every name whose removal the daemon REFUSED (or did not answer), in removal order, so
+    /// the caller can keep owning them. Logging a refusal was never the same as owning it.
+    fn sweep(&self) -> Vec<String> {
+        let mut refused = Vec::new();
+        for joiner in &self.joiners {
+            if let Err(error) = NetnsHolder::force_remove(&self.client, joiner) {
+                eprintln!(
+                    "sandbox: could not remove sidecar {joiner} joined to netns holder {}: {error} \
+                     — the namespace may still be pinned by it",
+                    self.name
+                );
+                refused.push(joiner.clone());
+            }
+        }
+        if let Err(error) = NetnsHolder::force_remove(&self.client, &self.name) {
+            eprintln!(
+                "sandbox: could not remove netns holder {}: {error} — not destroyed; it stays owed \
+                 to whoever called this sweep",
+                self.name
+            );
+            refused.push(self.name.clone());
+        }
+        refused
+    }
+
+    /// Ask the daemon, repeatedly, whether EVERY container this owner is responsible for is gone —
+    /// each joiner as well as the holder.
+    ///
+    /// A removal issued is not a removal observed. `Some(true)` is the only answer that retires a
+    /// name; "could not tell" is treated exactly like "still there", because the cost of asking
+    /// again is a bounded retry and the cost of believing it is an orphan nobody is looking for.
+    ///
+    /// Confirming the holder ALONE was not enough, and that was a real hole: [`Self::sweep`] only
+    /// LOGS a failed joiner removal, so a sidecar that refused to go on still pins the namespace
+    /// the holder was torn down to release. An owner ending on holder-absence announced a clean
+    /// release directly over the top of a container it owns and never asked about.
+    ///
+    /// Returns the names that could not be confirmed gone, so the caller can name them.
+    fn confirm_all_absent(&self) -> Result<(), Vec<String>> {
+        let give_up = std::time::Instant::now() + self.bounds.confirm;
+        let mut pause = std::time::Duration::from_millis(20);
+        // Joiners first: the holder's namespace is not actually released while one of them pins it.
+        let mut pending: Vec<String> =
+            self.joiners.iter().cloned().chain(std::iter::once(self.name.clone())).collect();
+        loop {
+            pending.retain(|name| container_is_absent(&self.client, name) != Some(true));
+            if pending.is_empty() {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= give_up {
+                return Err(pending);
+            }
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(std::time::Duration::from_millis(500));
+        }
+    }
+
+    /// Wait for the create to genuinely settle, then remove, then confirm.
+    ///
+    /// Ends on ACTUAL settlement followed by CONFIRMED absence. If the create never settles within
+    /// the bound, the sweep still runs and the confirmation still decides the verdict: a container
+    /// that never landed is confirmed absent and the case closes honestly; one that cannot be
+    /// confirmed gone is reported as leaked, with the reason, rather than silently written off.
+    fn own_until_settled_or_confirmed(self) {
+        let mut settled = self.creation.wait_until_settled(self.bounds.max);
+        // Best effort either way: whatever HAS landed should go now.
+        self.sweep();
+        if !settled {
+            // `max` expired with the create STILL RUNNING. This is where ownership used to end: it
+            // swept, printed a leak and returned, which handed the container that was still on its
+            // way to nobody. The sweep above cannot cover it — you cannot remove what has not
+            // appeared — so the only thing that keeps it owned is staying.
+            //
+            // So the job is KEPT for `retain` longer. If the create lands in that window it is
+            // swept again, by an owner that is still responsible for it, and then confirmed gone.
+            eprintln!(
+                "sandbox: a create against netns holder {} is STILL IN FLIGHT after {:?} — this \
+                 owner is NOT releasing it: custody is retained for a further {:?}, and anything \
+                 that lands in that window will be removed and confirmed by this owner",
+                self.name, self.bounds.max, self.bounds.retain
+            );
+            settled = self.creation.wait_until_settled(self.bounds.retain);
+            if settled {
+                // It landed late, and it is still this owner's to remove.
+                self.sweep();
+            }
+        }
+        if !settled {
+            // The wait is over and the create is STILL in flight. Ownership does NOT end here.
+            //
+            // Waiting longer was never the answer. Whatever the bound, the case that breaks is a
+            // container landing one millisecond past it, so a bigger window makes the orphan rarer
+            // without making it impossible -- it moves the edge, it does not remove it. The job is
+            // TRANSFERRED instead, to an owner the create's own fence retains. The fence is the one
+            // object that knows when this create genuinely ends, because the create's ticket is
+            // what releases it, so the handoff is to the settlement event itself rather than to
+            // another clock.
+            //
+            // This claims nothing about whether the daemon will finish. It is the narrower true
+            // thing: if the container ever lands, somebody still owns it.
+            self.creation.take_custody(retained_removal(
+                self.name.clone(),
+                self.joiners.clone(),
+                self.client.clone(),
+                self.bounds,
+            ));
+            eprintln!(
+                "sandbox: a create against netns holder {} was STILL IN FLIGHT after {:?} and did \
+                 not land within the further {:?} this owner retained it — custody is NOT being \
+                 released: it has been TRANSFERRED to an owner retained by the create's own fence, \
+                 which removes and confirms this holder and its {} joiner(s) when that create \
+                 settles, whenever that is",
+                self.name,
+                self.bounds.max,
+                self.bounds.retain,
+                self.joiners.len()
+            );
+            return;
+        }
+        if let Err(pending) = self.confirm_all_absent() {
+            // A removal was ISSUED and the daemon never confirmed absence. Responsibility used to
+            // end on the log line below -- the names were named, and then let go, which is
+            // indistinguishable downstream from a clean release. An unconfirmed name is kept
+            // instead: the fence retains an owner holding exactly those names, so they remain OWNED
+            // rather than merely mentioned, and a later create settling on this holder runs them
+            // again.
+            // THIS FENCE IS ALREADY IDLE. The create settled -- that is why confirmation ran at
+            // all -- so there is no future ticket drop here to fire a parked callback. Handing the
+            // job over therefore has to mean RUN IT, which `take_custody` does, and if it still
+            // cannot confirm absence it goes back into the slot where this fence's destruction
+            // will run it again rather than discard it.
+            self.creation.take_custody(retained_removal(
+                self.name.clone(),
+                pending.clone(),
+                self.client.clone(),
+                self.bounds,
+            ));
+            eprintln!(
+                "sandbox: could not confirm {} absent within {:?} after the create settled — these \
+                 are NOT released: an owner for them was run again on this holder's fence and is \
+                 kept there until it confirms, and the boot reaper remains the backstop",
+                pending.join(", "),
+                self.bounds.confirm
+            );
         }
     }
 }
@@ -137,6 +1184,10 @@ impl Drop for NetnsHolder {
 pub struct Containment {
     pub holder: NetnsHolder,
     pub proxy_host: String,
+    /// The link inside the namespace the egress filters were installed on, as measured — never a
+    /// guess like `eth0`. Carried so a caller, a log line or a test can name the interface that is
+    /// actually filtered rather than the one everybody assumes.
+    pub egress_dev: String,
 }
 
 /// The holder's container name for `job_id`.
@@ -160,6 +1211,13 @@ pub fn holder_name(job_id: &str) -> String {
 /// `seat` is the owning seller's public key hex and goes on as a second label. It is what lets the
 /// boot reaper tell this seat's holders from another daemon's on a shared host; see
 /// [`HOLDER_SEAT_LABEL`].
+///
+/// `cleanup_after` is the absolute unix second from [`cleanup_after_unix`] — this job's own
+/// effective deadline plus the grace. It goes on as a third label so the periodic sweep can judge
+/// this container **without knowing anything about the job**, including after the process that
+/// created it is gone. It is derived by the seller from the deadline it is itself enforcing; no part
+/// of it comes from the buyer's payload, which is why a request cannot ask for a container that
+/// never expires.
 pub fn holder_argv(
     name: &str,
     network: &str,
@@ -168,6 +1226,7 @@ pub fn holder_argv(
     gid: u32,
     job_id: &str,
     seat: &str,
+    cleanup_after: u64,
 ) -> Vec<String> {
     [
         "docker",
@@ -181,6 +1240,10 @@ pub fn holder_argv(
         &format!("{HOLDER_LABEL}={job_id}"),
         "--label",
         &format!("{HOLDER_SEAT_LABEL}={seat}"),
+        "--label",
+        &format!("{HOLDER_CLEANUP_AFTER_LABEL}={cleanup_after}"),
+        "--label",
+        &format!("{HOLDER_ROLE_LABEL}={ROLE_HOLDER}"),
         "--read-only",
         "--cap-drop",
         "ALL",
@@ -386,6 +1449,293 @@ pub fn parse_holder_listing(stdout: &str) -> Vec<HolderRecord> {
         .collect()
 }
 
+/// `docker` argv listing the containers **this seat owns**, with the metadata the expiry sweep
+/// judges them by: full id, owning seat, cleanup-after stamp, and role.
+///
+/// The `label=<seat>` filter is narrowing, exactly as in [`list_holders_argv`], and exactly as
+/// there it is **not** the guard: [`expired_owned`] re-checks the seat in Rust with an exact string
+/// comparison, because a filter that silently matched too much would be indistinguishable from one
+/// that worked. The filter's only failure that matters is matching too little, which leaks a
+/// container instead of removing a stranger's.
+///
+/// `--all` because an expired container is usually not running: a holder whose job died is
+/// `Exited`, and a helper that finished is `Exited` too. Listing only running containers would miss
+/// precisely the leftovers this sweep exists to remove.
+pub fn list_owned_argv(seat: &str) -> Vec<String> {
+    [
+        "docker",
+        "ps",
+        "--all",
+        "--no-trunc",
+        "--filter",
+        &format!("label={HOLDER_SEAT_LABEL}={seat}"),
+        "--format",
+        &format!(
+            "{{{{.ID}}}}\t{{{{.Label \"{HOLDER_SEAT_LABEL}\"}}}}\t{{{{.Label \"{HOLDER_CLEANUP_AFTER_LABEL}\"}}}}\t{{{{.Label \"{HOLDER_ROLE_LABEL}\"}}}}\t{{{{.Label \"{HELPER_JOB_LABEL}\"}}}}\t{{{{.Label \"{HOLDER_LABEL}\"}}}}"
+        ),
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+/// One container as the expiry sweep sees it.
+///
+/// Every field after `id` is an `Option` because every one of them can be absent on a real host: a
+/// container from a build older than these labels, a container whose labels were not applied
+/// because the create died between docker accepting the argv and recording it, or simply a
+/// container belonging to something else that happens to carry the seat label. Absence is never
+/// read as a permission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedContainer {
+    /// Full container id, as the sweep will name it to `docker rm`.
+    pub id: String,
+    /// Owning seat from [`HOLDER_SEAT_LABEL`]; `None` when the label is absent or empty.
+    pub seat: Option<String>,
+    /// Parsed [`HOLDER_CLEANUP_AFTER_LABEL`]; `None` when absent, empty, or not a unix second.
+    pub cleanup_after: Option<u64>,
+    /// Parsed [`HOLDER_ROLE_LABEL`]; `None` when absent or empty.
+    ///
+    /// **A removal criterion, as of #996.** It was previously parsed and then ignored, which let the
+    /// sweep act on any container wearing this seat's label whatever it was.
+    pub role: Option<String>,
+    /// Parsed [`HELPER_JOB_LABEL`] — the job whose deadline [`OwnedContainer::cleanup_after`] was
+    /// derived from; `None` when absent or empty.
+    ///
+    /// **Also a removal criterion.** A container that cannot name its job cannot be shown to have
+    /// outlived one, and the stamp alone is then just a number with no provenance.
+    pub job: Option<String>,
+}
+
+/// Parse `docker ps --format '{{.ID}}\t{{.Label …}}…'` output into one record per container.
+///
+/// **A malformed stamp parses to `None`, not to zero.** An absent label arrives from docker as an
+/// empty field, and a corrupted one as arbitrary text; reading either as the number 0 would date the
+/// container to 1970 and make it instantly sweepable. Every unreadable stamp therefore becomes
+/// `None`, which [`expired_owned`] refuses to act on. The failure mode is a leak the operator can
+/// see, never a removal nobody authorised.
+pub fn parse_owned_listing(stdout: &str) -> Vec<OwnedContainer> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let mut fields = line.split('\t');
+            let id = fields.next().unwrap_or_default().trim().to_owned();
+            let field = |fields: &mut std::str::Split<'_, char>| {
+                fields.next().map(str::trim).filter(|value| !value.is_empty()).map(str::to_owned)
+            };
+            let seat = field(&mut fields);
+            let cleanup_after = field(&mut fields).and_then(|value| value.parse::<u64>().ok());
+            let role = field(&mut fields);
+            // A helper names its job in HELPER_JOB_LABEL; a holder names the same job in
+            // HOLDER_LABEL and never carries the helper label at all. Reading only the helper
+            // label made every production holder parse as jobless, which the removal gate then
+            // refused forever as `MissingJob` — the leak this sweep exists to close.
+            let job = field(&mut fields).or_else(|| field(&mut fields));
+            OwnedContainer {
+                id,
+                seat,
+                cleanup_after,
+                role,
+                job,
+            }
+        })
+        .filter(|container| !container.id.is_empty())
+        .collect()
+}
+
+/// The containers `seat` may remove right now: **owned by `seat`** and carrying a **readable**
+/// cleanup stamp that `now_unix` has passed.
+///
+/// **Both legs are required and neither is sufficient**, for the same reason the boot reaper needs
+/// two. Ownership alone would remove a container whose job is still inside its deadline. Expiry
+/// alone would remove a co-tenant seat's container on a shared docker socket — the exact accident
+/// [`HOLDER_SEAT_LABEL`] was added to prevent.
+///
+/// **Attachment is deliberately NOT consulted here**, and that is the one place this predicate
+/// differs from [`reapable_holders`]. The boot reaper must not touch an attached holder, because a
+/// live job is joined to it and `unattached` is its only evidence the job is gone. This sweep has
+/// better evidence: the container's own stamp says its job's deadline passed more than
+/// [`CLEANUP_GRACE_SECS`] ago. A container still attached at that point is attached to something
+/// that outlived its own deadline by an hour, which is the leak — refusing to remove it would leave
+/// precisely the case this exists for. The grace is sized so that ordinary post-deadline work has
+/// long finished.
+///
+/// An empty `seat` selects nothing: a caller that cannot name itself owns nothing to remove.
+#[must_use]
+pub fn expired_owned(containers: &[OwnedContainer], seat: &str, now_unix: u64) -> Vec<String> {
+    partition_owned(containers, seat, now_unix).removable
+}
+
+/// Why the sweep refused to act on a container that carries this seat's label.
+///
+/// Every variant names a container the sweep SAW and left alone. They are carried out of the
+/// selection instead of being dropped because an unreadable record is exactly the shape a leak
+/// takes: a container nobody can prove is expired is also a container nobody will ever remove.
+/// Filtering them silently — the behaviour before #996 — made a growing pile of malformed
+/// containers indistinguishable from a clean host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkipReason {
+    /// The seat label came back absent or empty from a listing that filtered on it.
+    UnreadableSeat,
+    /// Absent, or a role this module never issues. Carries what was read, for the operator.
+    UnknownRole(Option<String>),
+    /// No job label: the container cannot be tied to a job whose deadline could have passed.
+    MissingJob,
+    /// The cleanup stamp is absent, empty, or not a unix second.
+    UnreadableStamp,
+}
+
+impl std::fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnreadableSeat => write!(f, "seat label absent or unreadable"),
+            Self::UnknownRole(Some(role)) => write!(f, "unrecognised role {role:?}"),
+            Self::UnknownRole(None) => write!(f, "role label absent"),
+            Self::MissingJob => write!(f, "job label absent"),
+            Self::UnreadableStamp => write!(f, "cleanup stamp absent or unparseable"),
+        }
+    }
+}
+
+/// What one look at the listing decided: what may be removed, and what was refused and why.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OwnedSelection {
+    /// Fully validated and past their stamp. These, and only these, may be handed to `docker rm`.
+    pub removable: Vec<String>,
+    /// Containers wearing this seat's label that failed validation, each with its reason.
+    ///
+    /// Reported whether or not their stamp has passed: a record that cannot be validated now will
+    /// not become valid by ageing, so the operator needs it the first time it is seen.
+    pub skipped: Vec<(String, SkipReason)>,
+}
+
+/// Split this seat's containers into what it may remove and what it refuses to touch.
+///
+/// **Four things must all hold before an id reaches `removable`**, and the point of each is that
+/// absence is never read as permission:
+///
+///   * the seat label is present and is THIS seat — ownership, the one thing that makes this safe
+///     on a docker socket shared with another seller daemon;
+///   * the role is one this module issues ([`ROLE_HOLDER`] or [`ROLE_HELPER`]) — a container of
+///     someone else's that happens to carry a matching seat label is not ours to remove;
+///   * the job label is present — the stamp has to belong to a job, or it is an unattributable
+///     number;
+///   * the stamp parses and `now_unix` has passed it.
+///
+/// A container of ours failing any of the middle three is REPORTED in `skipped` rather than
+/// dropped. A container belonging to another seat is neither removed nor reported: it is simply
+/// not our business, and reporting it would turn a co-tenant's normal operation into noise here.
+///
+/// An empty `seat` selects nothing: a caller that cannot name itself owns nothing to remove.
+#[must_use]
+pub fn partition_owned(containers: &[OwnedContainer], seat: &str, now_unix: u64) -> OwnedSelection {
+    let mut selection = OwnedSelection::default();
+    if seat.trim().is_empty() {
+        return selection;
+    }
+    for container in containers {
+        match container.seat.as_deref() {
+            // Someone else's container on a shared socket. Not ours to remove, not ours to report.
+            Some(owner) if owner != seat => continue,
+            Some(_) => {}
+            None => {
+                selection
+                    .skipped
+                    .push((container.id.clone(), SkipReason::UnreadableSeat));
+                continue;
+            }
+        }
+        let role = container.role.as_deref();
+        if role != Some(ROLE_HOLDER) && role != Some(ROLE_HELPER) {
+            selection.skipped.push((
+                container.id.clone(),
+                SkipReason::UnknownRole(container.role.clone()),
+            ));
+            continue;
+        }
+        if container.job.is_none() {
+            selection
+                .skipped
+                .push((container.id.clone(), SkipReason::MissingJob));
+            continue;
+        }
+        let Some(after) = container.cleanup_after else {
+            selection
+                .skipped
+                .push((container.id.clone(), SkipReason::UnreadableStamp));
+            continue;
+        };
+        if now_unix >= after {
+            selection.removable.push(container.id.clone());
+        }
+    }
+    selection
+}
+
+/// Choose this pass's attempts from `candidates`, resuming after `cursor` and wrapping.
+///
+/// `candidates` must be sorted and deduplicated; the caller sorts so that the order this walks is a
+/// property of the ids themselves and not of whatever order docker happened to list them in.
+///
+/// **This is the anti-starvation rule.** Taking the first `cap` ids every pass — the behaviour
+/// before #996 — means that when those `cap` removals keep failing, they are selected again on the
+/// next pass, and again, and the `cap + 1`th container is never once asked about however long it
+/// has been expired. Resuming after the last id attempted makes every candidate reachable within
+/// `ceil(len / cap)` passes no matter how many removals fail, because the cursor advances past an
+/// attempt whether it succeeded or not.
+///
+/// Returns `(attempt, deferred)`, `deferred` in the order the next pass will reach it.
+#[must_use]
+pub fn select_pass(
+    candidates: &[String],
+    cursor: Option<&str>,
+    cap: usize,
+) -> (Vec<String>, Vec<String>) {
+    if candidates.is_empty() || cap == 0 {
+        return (Vec::new(), candidates.to_vec());
+    }
+    // First id strictly after the cursor. `unwrap_or(0)` wraps to the front when the cursor is at
+    // or past the end — including when the ids it named have since been removed.
+    let start = match cursor {
+        Some(cursor) => candidates
+            .iter()
+            .position(|id| id.as_str() > cursor)
+            .unwrap_or(0),
+        None => 0,
+    };
+    let rotated: Vec<String> = candidates[start..]
+        .iter()
+        .chain(candidates[..start].iter())
+        .cloned()
+        .collect();
+    let take = cap.min(rotated.len());
+    (rotated[..take].to_vec(), rotated[take..].to_vec())
+}
+
+/// Where each seat's sweep left off, so the next pass resumes instead of restarting.
+///
+/// Keyed by seat because the cursor is only meaningful against one seat's candidate set, and a
+/// process that serves two seats must not let one seat's progress skip the other's containers.
+static SWEEP_CURSOR: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, String>>,
+> = std::sync::OnceLock::new();
+
+fn sweep_cursor_for(seat: &str) -> Option<String> {
+    SWEEP_CURSOR
+        .get_or_init(Default::default)
+        .lock()
+        .ok()
+        .and_then(|cursors| cursors.get(seat).cloned())
+}
+
+fn record_sweep_cursor(seat: &str, last_attempted: &str) {
+    if let Ok(mut cursors) = SWEEP_CURSOR.get_or_init(Default::default).lock() {
+        cursors.insert(seat.to_owned(), last_attempted.to_owned());
+    }
+}
+
 /// `docker` argv listing every container on the host by full id.
 pub fn list_all_containers_argv() -> Vec<String> {
     ["docker", "ps", "--all", "--no-trunc", "--quiet"]
@@ -462,7 +1812,10 @@ pub async fn reapable_holders_live(seat: &str) -> Result<Vec<String>, String> {
     if seat.trim().is_empty() {
         return Err("refusing to reap: no owning seat was named".to_owned());
     }
-    let (listing, _) = run_docker(list_holders_argv(seat), None)
+    // The production client, named here and passed down. Nothing in this path reads an environment
+    // variable, a global, or a configuration field to decide what to spawn.
+    let client = DockerCli::system();
+    let (listing, _) = run_docker(&client, list_holders_argv(seat), None)
         .await
         .map_err(|error| format!("could not list containment holders — {error}"))?;
     let holders = parse_holder_listing(&listing);
@@ -470,11 +1823,11 @@ pub async fn reapable_holders_live(seat: &str) -> Result<Vec<String>, String> {
         return Ok(Vec::new());
     }
 
-    let (all, _) = run_docker(list_all_containers_argv(), None)
+    let (all, _) = run_docker(&client, list_all_containers_argv(), None)
         .await
         .map_err(|error| format!("could not list containers — {error}"))?;
     let all: Vec<String> = all.lines().map(str::trim).filter(|id| !id.is_empty()).map(str::to_owned).collect();
-    let (modes, _) = run_docker(network_modes_argv(&all), None)
+    let (modes, _) = run_docker(&client, network_modes_argv(&all), None)
         .await
         .map_err(|error| format!("could not read container network modes — {error}"))?;
 
@@ -505,6 +1858,19 @@ pub struct ReapReport {
     pub removed: Vec<String>,
     /// The holders the selection chose and `docker rm` refused, each with docker's own reason.
     pub failed: Vec<(String, String)>,
+    /// Expired containers this pass SELECTED BUT NEVER ASKED DOCKER ABOUT — the backlog beyond
+    /// [`MAX_SWEEP_REMOVALS`], and whatever was left when [`SWEEP_PASS_BUDGET`] ran out.
+    ///
+    /// Reported rather than dropped, so "this pass removed 32" can be read as "and 140 more are
+    /// still waiting" instead of as "the host is clean now". Every one of them is still expired on
+    /// the next tick.
+    pub deferred: Vec<String>,
+    /// Containers wearing this seat's label that the sweep REFUSED to act on, each with its reason.
+    ///
+    /// Distinct from `failed`, which is docker refusing a removal this pass asked for. These were
+    /// never asked about: the record itself did not establish that removal was authorised. They are
+    /// surfaced because a malformed container is a leak that no future pass will clear on its own.
+    pub skipped: Vec<(String, SkipReason)>,
 }
 
 #[cfg(feature = "acp")]
@@ -536,8 +1902,10 @@ impl ReapReport {
 #[cfg(feature = "acp")]
 pub async fn reap_orphans(seat: &str) -> Result<ReapReport, String> {
     let mut report = ReapReport::default();
+    let client = DockerCli::system();
     for holder in reapable_holders_live(seat).await? {
         match run_docker(
+            &client,
             ["docker", "rm", "--force", "--volumes", holder.as_str()]
                 .into_iter()
                 .map(String::from)
@@ -556,18 +1924,361 @@ pub async fn reap_orphans(seat: &str) -> Result<ReapReport, String> {
     Ok(report)
 }
 
+/// Per-command bound for the periodic sweep's docker calls.
+///
+/// Shorter than [`DOCKER_DEADLINE`] on purpose. That bound sizes the calls a *job launch* depends
+/// on, where waiting two minutes beats failing the job. The sweep depends on nothing and is retried
+/// every tick, so a docker daemon that has stopped answering should cost this loop twenty seconds
+/// and be tried again later, not hold the seller's cadence for two minutes to reach the same
+/// conclusion.
+#[cfg(feature = "acp")]
+pub const SWEEP_DOCKER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How often the seller's run loop sweeps expired containers: **every five minutes**.
+///
+/// Not gated on `acp`, because the run loop schedules the tick on every build and only the docker
+/// work behind it needs the feature.
+///
+/// **The cadence is the honest half of the tradeoff.** A container is removed no earlier than its
+/// own job's deadline plus [`CLEANUP_GRACE_SECS`], and no later than that plus one interval — so the
+/// worst case an operator should expect is deadline + 1 h + 5 min, and longer if docker or the
+/// daemon itself was down, because a sweep that could not list is retried rather than assumed. Five
+/// minutes is chosen against the grace it serves: a cadence near the grace would make the *interval*
+/// the dominant term in how long a leftover survives, and a much tighter one would spend a `docker
+/// ps` on an idle host every few seconds to discover, almost always, nothing. Against a 3600 s grace
+/// this adds at most 8% to the wait and costs one listing per five minutes.
+pub const SWEEP_INTERVAL_SECS: u64 = 300;
+
+/// How many expired containers a single sweep will remove before leaving the rest to the next one.
+///
+/// **Bounded work, so the leak cannot become the outage.** A host that accumulated hundreds of
+/// leftovers — a crash loop, a docker daemon down for a day — would otherwise hand this loop an
+/// unbounded queue of removals on one tick, and the seller stops answering offers while it drains.
+/// The remainder is not lost: it is still expired on the next tick, and the sweep is periodic. A
+/// backlog clears across several minutes instead of blocking one.
+#[cfg(feature = "acp")]
+pub const MAX_SWEEP_REMOVALS: usize = 32;
+
+/// The WALL-CLOCK bound on one whole sweep pass, listing included.
+///
+/// [`MAX_SWEEP_REMOVALS`] bounds the COUNT, and it is not by itself a bound on duration: the
+/// removals run one after another, each with its own [`SWEEP_DOCKER_DEADLINE`], so a daemon that
+/// accepts the connection and then hangs turns a 32-removal pass into 32 × 20 s = 640 s of work
+/// — past two further ticks. That is the case this budget names. When it is spent the pass stops
+/// starting removals and reports what it did not attempt as [`ReapReport::deferred`]; those
+/// containers are still expired, so the next tick selects them again.
+///
+/// 240 s is chosen under [`SWEEP_INTERVAL_SECS`] deliberately: a pass therefore ends before the
+/// tick that follows it, so the pathological case degrades into "fewer removals per pass" rather
+/// than into overlapping passes. The guaranteed floor is what one budget buys at the per-call
+/// deadline — at least 11 removals per pass even when every single call burns its full 20 s, and
+/// the usual 32 when they answer in milliseconds.
+#[cfg(feature = "acp")]
+pub const SWEEP_PASS_BUDGET: std::time::Duration = std::time::Duration::from_secs(240);
+
+/// Remove this seat's containers whose own cleanup stamp `now_unix` has passed, and report what
+/// happened to each.
+///
+/// This is the replacement for keeping an owner alive in memory until every container is confirmed
+/// gone. Nothing here remembers a job: the stamp written at create time is the whole record, so a
+/// container that appeared **after** the process that asked for it had exited is discovered by the
+/// next sweep exactly like any other, and a seller that was `SIGKILL`ed mid-job cleans up after its
+/// own restart.
+///
+/// **A failed listing is never an empty one.** Both reads return `Err` rather than an empty
+/// selection, because "docker did not answer" and "nothing is expired" are the same value to a
+/// caller that only counts removals — and treating the first as the second is how a sweep reports
+/// success for a host it never looked at.
+///
+/// **A failed removal is retried by the NEXT sweep, not here.** The container stays expired, so the
+/// following tick selects it again. Retrying in place would spend this tick's bounded budget on a
+/// container docker has already refused once.
+#[cfg(feature = "acp")]
+pub async fn sweep_expired(seat: &str, now_unix: u64) -> Result<ReapReport, String> {
+    sweep_expired_with(&DockerCli::system(), seat, now_unix).await
+}
+
+/// [`sweep_expired`], with the docker client supplied by the caller.
+///
+/// Private for the same reason [`establish_with`] is: a test hands in a stand-in as an ARGUMENT, so
+/// the substitution is confined to the call under test and two such tests can run in parallel
+/// without sharing any global.
+#[cfg(feature = "acp")]
+async fn sweep_expired_with(
+    client: &DockerCli,
+    seat: &str,
+    now_unix: u64,
+) -> Result<ReapReport, String> {
+    sweep_expired_within(client, seat, now_unix, SWEEP_PASS_BUDGET).await
+}
+
+/// [`sweep_expired_with`], with the pass budget supplied by the caller so a test can spend it.
+#[cfg(feature = "acp")]
+async fn sweep_expired_within(
+    client: &DockerCli,
+    seat: &str,
+    now_unix: u64,
+    budget: std::time::Duration,
+) -> Result<ReapReport, String> {
+    // Refused rather than run on an identity we do not have: an empty seat would match every
+    // container whose seat label failed to parse. Same refusal, same reason, as
+    // `reapable_holders_live`.
+    if seat.trim().is_empty() {
+        return Err("refusing to sweep: no owning seat was named".to_owned());
+    }
+    // Started BEFORE the listing, because the listing is part of the pass a hung daemon can stall:
+    // a budget measured from the first removal would let one stuck `docker ps` spend 20 s that the
+    // caller's cadence never accounted for.
+    let started = std::time::Instant::now();
+    let mut report = ReapReport::default();
+    let (listing, _) = run_bounded(client, list_owned_argv(seat), None, SWEEP_DOCKER_DEADLINE)
+        .await
+        .map_err(|error| format!("could not list this seat's containers — {error}"))?;
+    let selection = partition_owned(&parse_owned_listing(&listing), seat, now_unix);
+    // Carried out of the pass whatever else happens: these are the containers the sweep cannot
+    // authorise itself to remove, and they are invisible to the operator anywhere else.
+    report.skipped = selection.skipped;
+    let mut candidates = selection.removable;
+    // Sorted so the rotation below walks a stable order rather than docker's listing order, which
+    // is free to differ between passes and would make "resume after" meaningless.
+    candidates.sort();
+    candidates.dedup();
+    // The count bound, applied from where the LAST pass stopped rather than from the front. See
+    // `select_pass`: starting at the front every time is what let 32 permanently-failing removals
+    // monopolise every pass while the 33rd container waited forever.
+    let cursor = sweep_cursor_for(seat);
+    let (attempt, deferred) = select_pass(&candidates, cursor.as_deref(), MAX_SWEEP_REMOVALS);
+    report.deferred = deferred;
+    let mut last_attempted: Option<String> = None;
+    let mut queue = attempt.into_iter();
+    for id in queue.by_ref() {
+        // Checked before STARTING a removal, never mid-call: a `docker rm` this pass has already
+        // issued is left to its own deadline, because abandoning it would leave the pass unable to
+        // say whether the container was removed.
+        if started.elapsed() >= budget {
+            // In front of whatever the count bound already deferred: these were selected earlier,
+            // so they are older, and the next pass should reach them first.
+            let unattempted: Vec<String> = std::iter::once(id).chain(queue).collect();
+            report.deferred.splice(0..0, unattempted);
+            break;
+        }
+        // Recorded BEFORE the outcome is known, and kept whether docker accepts or refuses: a
+        // cursor that only advanced past successes would park on a container docker always refuses
+        // and reproduce the starvation this replaced.
+        last_attempted = Some(id.clone());
+        match run_bounded(
+            client,
+            ["docker", "rm", "--force", "--volumes", id.as_str()]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            None,
+            SWEEP_DOCKER_DEADLINE,
+        )
+        .await
+        {
+            Ok(_) => report.removed.push(id),
+            // Collected and carried past, exactly as the boot reaper does: one container docker
+            // refuses must not stop the rest, and the failure is returned rather than dropped so
+            // the caller can say so in its log.
+            Err(error) => report.failed.push((id, error)),
+        }
+    }
+    // Advanced only past what this pass ACTUALLY asked docker about — never past what the count
+    // bound or the budget deferred, which no pass has attempted yet.
+    if let Some(last) = last_attempted {
+        record_sweep_cursor(seat, &last);
+    }
+    Ok(report)
+}
+
 /// Run a `docker` argv to completion, optionally feeding `stdin`, and return `(stdout, stderr)`.
 ///
 /// `std::process::Command` on a blocking pool thread, not `tokio::process`: this crate's tokio is
 /// built without the `process` feature, and reaching for it would widen the dependency of every
 /// default build to enable three calls that happen once per job.
 #[cfg(feature = "acp")]
-async fn run_docker(argv: Vec<String>, stdin: Option<String>) -> Result<(String, String), String> {
-    tokio::task::spawn_blocking(move || {
-        use std::io::Write;
+async fn run_docker(
+    client: &DockerCli,
+    argv: Vec<String>,
+    stdin: Option<String>,
+) -> Result<(String, String), String> {
+    run_bounded(client, argv, stdin, DOCKER_DEADLINE).await
+}
+
+/// As [`run_docker`], but the create it issues is **fenced**: the ticket lives inside the blocking
+/// closure, so cleanup cannot remove ahead of a create that outlived the future awaiting it.
+///
+/// The ticket is deliberately not held by this future. Holding it here would release it on
+/// cancellation — at precisely the moment the create is still running — which is the bug.
+#[cfg(feature = "acp")]
+async fn run_docker_fenced(
+    client: &DockerCli,
+    argv: Vec<String>,
+    stdin: Option<String>,
+    ticket: CreationTicket,
+) -> Result<(String, String), String> {
+    let client = client.clone();
+    // Taken HERE, on the caller's side of the queue. `spawn_blocking` hands work to a pool that can
+    // be saturated, and a clock started inside the closure cannot see the time spent waiting for a
+    // thread -- so a create could sit queued for longer than its own deadline and still be handed a
+    // full budget on arrival. The bound is measured from the moment the work was ASKED for.
+    let queued_at = std::time::Instant::now();
+    let joined = tokio::task::spawn_blocking(move || {
+        // Moved in, and dropped only when this closure ends: killed on the deadline, failed, or
+        // finished. That drop is what "settled" means to `CreationFence::wait_until_settled`.
+        let _ticket = ticket;
+        let mut child_exited = false;
+        run_bounded_blocking(
+            &client,
+            argv,
+            stdin,
+            DOCKER_DEADLINE,
+            queued_at,
+            Some(_ticket.fence()),
+            &mut child_exited,
+        )
+    })
+    .await;
+    match joined {
+        Ok(outcome) => outcome,
+        Err(error) => Err(format!("docker task panicked: {error}")),
+    }
+}
+
+/// Run an argv to completion with a **wall-clock bound**, optionally feeding `stdin`.
+///
+/// The bound is the cancellation ownership this module was missing. A `docker` client that never
+/// returns holds the launch open for as long as it likes, and while it is blocked in the pool the
+/// future above it can be cancelled — leaving a command nobody is waiting for and a container nobody
+/// is tracking. Past the deadline the child is killed and the caller gets a failure that names the
+/// deadline rather than a hang that names nothing.
+#[cfg(feature = "acp")]
+async fn run_bounded(
+    client: &DockerCli,
+    argv: Vec<String>,
+    stdin: Option<String>,
+    deadline: std::time::Duration,
+) -> Result<(String, String), String> {
+    run_bounded_tracked(client, argv, stdin, deadline).await.0
+}
+
+/// As [`run_bounded`], and also says whether the docker CLIENT was reaped with an exit status.
+///
+/// **That flag is not a removal receipt, and nothing downstream may read it as one.** It says one
+/// narrow thing: this process waited for the client and got a status back. It is `true` for a clean
+/// exit, a nonzero exit, AND a signal-terminated client — every case where `try_wait` yields a
+/// status — because all of them mean the same thing here, that the client is no longer running.
+///
+/// What it deliberately does NOT mean is that the container is gone. `docker run --rm` asks the
+/// daemon to remove the container on the container's own lifecycle; it is not discharged by this
+/// process reaping a local client, and on an error path the removal may never have been reached.
+/// Promoting "reaped" to "removed" here is what struck live containers off the registry that exists
+/// to remove them. The only thing entitled to end custody is a daemon-side absence check — see
+/// [`run_sidecar_confirmed`] and [`container_is_absent`].
+///
+/// A client that was never reaped at all (deadline kill before a status, a panicked task) yields
+/// `false`, which is weaker still: not even worth asking the daemon about yet.
+#[cfg(feature = "acp")]
+async fn run_bounded_tracked(
+    client: &DockerCli,
+    argv: Vec<String>,
+    stdin: Option<String>,
+    deadline: std::time::Duration,
+) -> (Result<(String, String), String>, bool) {
+    run_bounded_tracked_fenced(client, argv, stdin, deadline, None).await
+}
+
+/// As [`run_bounded_tracked`], optionally holding a [`CreationTicket`] for the duration of the
+/// blocking work.
+///
+/// The ticket exists because registering a name is not the same as fencing a create. Registration
+/// tells cleanup WHAT to remove; it says nothing about WHEN the container appears. A sidecar create
+/// still in flight when the holder drops would be removed by name, answered "No such container"
+/// because it does not exist yet, marked done — and would then land as an orphan pinning the very
+/// namespace the holder was trying to tear down.
+///
+/// As in [`run_docker_fenced`], the ticket is moved INTO the closure and never held by this future,
+/// so cancelling the future cannot release it while the create is still running.
+#[cfg(feature = "acp")]
+async fn run_bounded_tracked_fenced(
+    client: &DockerCli,
+    argv: Vec<String>,
+    stdin: Option<String>,
+    deadline: std::time::Duration,
+    ticket: Option<CreationTicket>,
+) -> (Result<(String, String), String>, bool) {
+    let client = client.clone();
+    // As in [`run_docker_fenced`]: the clock starts before the queue, not after it.
+    let queued_at = std::time::Instant::now();
+    let joined = tokio::task::spawn_blocking(move || {
+        let _ticket = ticket;
+        let mut child_exited = false;
+        let outcome = run_bounded_blocking(
+            &client,
+            argv,
+            stdin,
+            deadline,
+            queued_at,
+            _ticket.as_ref().map(CreationTicket::fence),
+            &mut child_exited,
+        );
+        (outcome, child_exited)
+    })
+    .await;
+    match joined {
+        Ok(pair) => pair,
+        // A panicked task establishes nothing about the container either.
+        Err(error) => (Err(format!("docker task panicked: {error}")), false),
+    }
+}
+
+/// The blocking half of [`run_bounded_tracked`]. Sets `child_exited` the moment the child is reaped.
+#[cfg(feature = "acp")]
+fn run_bounded_blocking(
+    client: &DockerCli,
+    argv: Vec<String>,
+    stdin: Option<String>,
+    deadline: std::time::Duration,
+    queued_at: std::time::Instant,
+    fence: Option<&std::sync::Arc<CreationFence>>,
+    child_exited: &mut bool,
+) -> Result<(String, String), String> {
+    {
+        use std::io::{Read, Write};
         use std::process::{Command, Stdio};
 
-        let (program, args) = argv.split_first().expect("a docker argv is never empty");
+        let (program, args) = argv.split_first().expect("an argv is never empty");
+        // Substituted at the SPAWN site, not in the argv builders: every rendered argv still reads
+        // `docker ...`, so what the plan tests assert is what production runs.
+        let program =
+            if program == "docker" { client.program().to_owned() } else { program.clone() };
+        let program = program.as_str();
+        // The clock was started by the CALLER, before this work was queued, and every wait below is
+        // measured against it: queue time, spawn, plan write, child wait, output drain and writer
+        // join all spend the same budget.
+        //
+        // Anchoring it after the stdin write left that write outside the bound entirely, and
+        // anchoring it inside this closure left the queue wait outside it. What is bounded here is
+        // exactly this process's flow; it is NOT a statement about when the daemon finishes creating
+        // a container, which only a daemon-side absence check can settle.
+        let started = queued_at;
+        // REFUSED BEFORE IT IS ISSUED, not bounded after it.
+        //
+        // The budget can already be gone before this closure runs at all: it sat in the blocking
+        // pool's queue, and queue time spends the same clock as every wait below. Spawning anyway
+        // starts a create whose caller is ALREADY past its bound -- the container can land with
+        // nothing waiting on it, which is the orphan this module exists to prevent, issued
+        // knowingly. Bounding the wait afterwards cannot help: by then the create exists. The only
+        // correct answer at this point is to not start it.
+        if started.elapsed() >= deadline {
+            return Err(format!(
+                "`{program}` was NOT started: its {}s budget was already spent while the work sat \
+                 queued for a blocking thread, so no create was issued — starting one here would \
+                 launch a container whose caller is already past its bound",
+                deadline.as_secs(),
+            ));
+        }
         let mut child = Command::new(program)
             .args(args)
             .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
@@ -575,32 +2286,414 @@ async fn run_docker(argv: Vec<String>, stdin: Option<String>) -> Result<(String,
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| format!("could not run `{program}`: {error}"))?;
-        if let Some(plan) = stdin {
-            child
-                .stdin
-                .as_mut()
-                .ok_or_else(|| "docker stdin was not piped".to_string())?
-                .write_all(plan.as_bytes())
-                .map_err(|error| format!("could not write the plan to the sidecar: {error}"))?;
-            // Dropped so the sidecar's `read` loop sees EOF; without this it waits forever and the
-            // job's launch hangs instead of failing.
-            drop(child.stdin.take());
+        // How much of the budget is left, measured from the caller's pre-queue clock. Every wait
+        // below asks this rather than starting a fresh one, so no step can quietly extend the bound.
+        let remaining = || deadline.saturating_sub(started.elapsed());
+
+        // Written on its own thread so a blocked write cannot outrun the deadline, and its result
+        // comes back through a CHANNEL rather than a `JoinHandle`.
+        //
+        // `JoinHandle::join` has no timeout. The old code joined it unconditionally, reasoning that
+        // reaping the child closes the read end -- but a descendant started by the client inherits
+        // that end and can hold it open, so the join could block after the bounded wait had already
+        // returned. A channel can be waited on WITH the remaining budget; the thread itself cannot
+        // be killed (Rust has no such thing), so when it outlives the bound it is NAMED instead of
+        // being silently dropped.
+        let (wrote_tx, wrote_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let writing = match stdin {
+            Some(plan) => {
+                let mut pipe =
+                    child.stdin.take().ok_or_else(|| "docker stdin was not piped".to_string())?;
+                // The writer takes a ticket of its OWN, and holds it until the write ends.
+                //
+                // Reporting that a writer is still running was never the same as owning it. The
+                // channel timeout below lets this CALL end; the thread keeps the pipe endpoint
+                // either way, and while it was ticketless the closure could return, release the
+                // only ticket, and let the fence read as settled with a write still in progress.
+                // Cleanup would then be free to remove against a create that had not finished
+                // being written to. Now the fence cannot reach zero while this thread exists.
+                let ticket = fence.map(|fence| fence.begin());
+                std::thread::spawn(move || {
+                    let _ticket = ticket;
+                    let outcome = pipe.write_all(plan.as_bytes()).map_err(|error| {
+                        format!("could not write the plan to the sidecar: {error}")
+                    });
+                    let _ = wrote_tx.send(outcome);
+                });
+                true
+            }
+            None => false,
+        };
+
+        // Poll rather than `wait_with_output`, so the deadline is enforceable at all.
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(format!("could not wait for `{program}`: {error}"));
+                }
+            }
+            if started.elapsed() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                // The daemon's answer to this create was never read, so whether the request was
+                // applied is unknown to this process. Nothing here records that: the create carried
+                // this job's own expiry as a label, so a container that lands after this point is
+                // removed by a later `sweep_expired` on the strength of that label alone.
+                // The writer is settled HERE too, not abandoned. Killing the child closes the read
+                // end, so a blocked `write_all` fails with `EPIPE` and the thread ends on its own;
+                // this waits a short, explicit grace for exactly that and reports the writer as
+                // still running when it does not arrive. Dropping the handle instead is how this
+                // flow used to end "complete" while a write was still in progress.
+                // Whichever way it goes, the writer's disposition is STATED. The failure this
+                // replaces was silence: the handle was dropped on the way out, so a caller could
+                // not tell a writer that had finished from one still pushing a plan into a pipe.
+                // Both answers are legitimate; not having asked is not.
+                let writer = if !writing {
+                    "; no plan was being written"
+                } else if wrote_rx.recv_timeout(WRITER_EPIPE_GRACE).is_ok() {
+                    "; the thread writing its plan was settled after the kill"
+                } else {
+                    "; the thread writing its plan is STILL RUNNING in this process and could not \
+                     be joined within the grace after the kill"
+                };
+                return Err(format!(
+                    "`{program}` did not finish within {}s and was killed — a command with no bound \
+                     is a launch that can hang and a container nobody is waiting for{writer}",
+                    deadline.as_secs(),
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        // Reaped with a status — ANY status, including a signal termination, which `code()` reports
+        // as `None` below. This flag means only "the client is no longer running", never "the
+        // container is gone": `--rm` is discharged by the daemon on the container's lifecycle, not
+        // by this process waiting on a client. The caller must still confirm absence with the
+        // daemon before ending custody.
+        *child_exited = true;
+        // Reaping the child does NOT close its pipes. A descendant it started inherits the write
+        // ends and can hold them open indefinitely, and `read_to_end` returns at EOF -- precisely
+        // what such a descendant withholds. Draining on this thread therefore put an UNBOUNDED wait
+        // directly after the bounded one, which is the hole this replaces: the drains run on their
+        // own threads and are collected against the same budget as everything above.
+        // Each reader sends its RESULT, not a buffer: a read that failed is an output this process
+        // did not get, and it is recorded as unknown rather than as "the client said nothing".
+        let (drained_tx, drained_rx) =
+            std::sync::mpsc::channel::<(&'static str, std::io::Result<Vec<u8>>)>();
+        let mut pending: Vec<&'static str> = Vec::new();
+        // Each drain takes its OWN ticket, for the same reason the writer does: a descendant can
+        // hold these endpoints open long past the channel timeout below, and a reader still blocked
+        // on a pipe is work this process is still doing. Ticketless, it was work nobody was counted
+        // for -- the closure returned, the last ticket went with it, and the fence said settled
+        // while two threads still held the create's output. The ticket is released when the read
+        // ends, not when this call does.
+        if let Some(mut pipe) = child.stdout.take() {
+            let tx = drained_tx.clone();
+            pending.push("stdout");
+            let ticket = fence.map(|fence| fence.begin());
+            std::thread::spawn(move || {
+                let _ticket = ticket;
+                let mut buffer = Vec::new();
+                let outcome = pipe.read_to_end(&mut buffer).map(|_| buffer);
+                let _ = tx.send(("stdout", outcome));
+            });
         }
-        let done = child
-            .wait_with_output()
-            .map_err(|error| format!("could not wait for `{program}`: {error}"))?;
+        if let Some(mut pipe) = child.stderr.take() {
+            let tx = drained_tx.clone();
+            pending.push("stderr");
+            let ticket = fence.map(|fence| fence.begin());
+            std::thread::spawn(move || {
+                let _ticket = ticket;
+                let mut buffer = Vec::new();
+                let outcome = pipe.read_to_end(&mut buffer).map(|_| buffer);
+                let _ = tx.send(("stderr", outcome));
+            });
+        }
+        drop(drained_tx);
+        let mut stdout = Vec::new();
+        // `None` until stderr is read TO EOF WITHOUT ERROR. A stream still held by a descendant, or
+        // a read that failed, leaves this unknown — and an unknown stderr is never read as "the
+        // daemon refused".
+        let mut stderr_read: Option<Vec<u8>> = None;
+        while !pending.is_empty() {
+            match drained_rx.recv_timeout(remaining()) {
+                Ok((which, outcome)) => {
+                    pending.retain(|name| *name != which);
+                    match (which, outcome) {
+                        ("stdout", Ok(buffer)) => stdout = buffer,
+                        ("stdout", Err(error)) => {
+                            eprintln!("sandbox: could not read `{program}` stdout: {error}");
+                        }
+                        (_, Ok(buffer)) => stderr_read = Some(buffer),
+                        (_, Err(error)) => {
+                            eprintln!(
+                                "sandbox: could not read `{program}` stderr: {error} — its answer, \
+                                 if it gave one, is unknown to this process"
+                            );
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let stderr_known = stderr_read
+            .as_deref()
+            .map(|bytes| String::from_utf8_lossy(bytes).trim().to_owned());
+        let done = std::process::Output {
+            status,
+            stdout,
+            stderr: stderr_read.clone().unwrap_or_default(),
+        };
         let stdout = String::from_utf8_lossy(&done.stdout).trim().to_owned();
-        let stderr = String::from_utf8_lossy(&done.stderr).trim().to_owned();
+        let stderr = stderr_known.clone().unwrap_or_default();
+        // CLASSIFIED HERE, before any early return below, and once. The client has ended; whether
+        // the daemon ANSWERED it — accepted, or refused — is decided from positive proof only: exit
+        // 0, the daemon's own refusal text in a stderr this process read to EOF, or a `run` whose
+        // exit code is the contained command's. Everything else — a signal, a client-side exit with
+        // no daemon text, a stderr still held by a descendant, a failed read — is an outcome this
+        // process does not know, and the name is recorded as unanswered so absence is not taken as
+        // proof for it. The previous flow returned on a pending drain BEFORE reaching its
+        // classification, so a reaped client whose pipe a descendant held was never recorded at all,
+        // and it recognised only eight stderr substrings as "lost the daemon", reading every other
+        // text as a refusal.
+        // A half-written plan is a sidecar that acted on a truncated instruction, so the write's own
+        // failure is reported -- but only when the child itself did not already fail, because the
+        // child's exit code names the refusal more precisely than a broken pipe does. Waited on with
+        // what is left of the budget, never unconditionally.
+        let mut writer_outstanding = false;
+        let wrote = if writing {
+            match wrote_rx.recv_timeout(remaining()) {
+                Ok(result) => result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    writer_outstanding = true;
+                    Err(format!(
+                        "the plan was still being written to `{program}` when the {}s bound expired \
+                         -- the writing thread is still running in this process, so this call ends \
+                         on its bound rather than reporting a completed write",
+                        deadline.as_secs()
+                    ))
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    Err("the thread writing the plan to the sidecar panicked".to_string())
+                }
+            }
+        } else {
+            Ok(())
+        };
+        // An output this process never finished reading is not an output it may report. Naming the
+        // stream and the still-running reader is the honest end; inventing a truncated success is
+        // how a caller comes to believe a create said something it never said.
+        if !pending.is_empty() {
+            return Err(format!(
+                "`{program}` was reaped, but its {} did not reach EOF within the {}s bound — a \
+                 descendant is holding the pipe open, so this call ends on its bound; the reading \
+                 thread(s) remain outstanding in this process{}",
+                pending.join(" and "),
+                deadline.as_secs(),
+                if writer_outstanding {
+                    ", as does the plan writer"
+                } else {
+                    ""
+                }
+            ));
+        }
         match done.status.code() {
-            Some(0) => Ok((stdout, stderr)),
+            Some(0) => match wrote {
+                Ok(()) => Ok((stdout, stderr)),
+                Err(error) => Err(error),
+            },
             // The sidecar's codes are an interface; pass them through in the message so the caller's
-            // error names WHICH refusal happened rather than "it failed".
-            Some(code) => Err(format!("exit {code}: {}", if stderr.is_empty() { &stdout } else { &stderr })),
+            // error names WHICH refusal happened rather than "it failed". Whether the daemon
+            // answered was decided above, before the drain check, from positive proof.
+            Some(code) => {
+                Err(format!("exit {code}: {}", if stderr.is_empty() { &stdout } else { &stderr }))
+            }
             None => Err("killed by a signal".to_string()),
         }
-    })
-    .await
-    .map_err(|error| format!("docker task panicked: {error}"))?
+    }
+}
+
+/// A unique name for one temporary container joined to `holder`'s namespace.
+///
+/// Unique per process and per call, so nothing here can address — or remove — a container belonging
+/// to another run.
+pub fn sidecar_name(holder: &str, verb: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!("{holder}-{verb}-{}-{serial}", std::process::id())
+}
+
+/// Give a `docker run` argv an explicit container name.
+///
+/// An unnamed sidecar cannot be cleaned up after a cancellation: docker assigns it a random name
+/// this process never learns, so the one container capable of pinning the namespace open is the one
+/// container nothing can address.
+pub fn with_container_name(mut argv: Vec<String>, name: &str) -> Result<Vec<String>, String> {
+    match argv.get(1).map(String::as_str) {
+        Some("run") => {
+            argv.splice(2..2, ["--name".to_owned(), name.to_owned()]);
+            Ok(argv)
+        }
+        other => Err(format!(
+            "refusing to name {other:?} as a container: this is not a `docker run` argv, and naming \
+             the wrong command would register a cleanup target that does not exist"
+        )),
+    }
+}
+
+/// Splice `labels` into a `docker run` argv, as [`with_container_name`] splices the name, and for
+/// the same reason: the argv builders stay pure and independently testable, and the one place that
+/// knows the owning job decorates what they produced.
+///
+/// Refuses anything that is not a `docker run` argv. Labels on a `docker ps` would be read as
+/// filters, and a cleanup path that quietly changed the meaning of a command is worse than one that
+/// stops. An empty `labels` is returned unchanged: a fixture holder with no job to attribute to
+/// stamps nothing rather than stamping emptiness.
+pub fn with_helper_labels(mut argv: Vec<String>, labels: &[String]) -> Result<Vec<String>, String> {
+    if labels.is_empty() {
+        return Ok(argv);
+    }
+    match argv.get(1).map(String::as_str) {
+        Some("run") => {
+            argv.splice(2..2, labels.iter().cloned());
+            Ok(argv)
+        }
+        other => Err(format!(
+            "refusing to label {other:?} as a job-owned helper: this is not a `docker run` argv, and \
+             labels spliced into another verb would change what that command means"
+        )),
+    }
+}
+
+/// Run one sidecar joined to the holder's namespace: named, registered for its lifetime, bounded.
+#[cfg(feature = "acp")]
+async fn run_sidecar(
+    holder: &NetnsHolder,
+    verb: &str,
+    argv: Vec<String>,
+    stdin: Option<String>,
+) -> Result<(String, String), String> {
+    run_sidecar_with_deadline(holder, verb, argv, stdin, DOCKER_DEADLINE).await
+}
+
+/// As [`run_sidecar`], with the bound named by the caller.
+///
+/// The deadline is a parameter solely so the custody rule below can be measured offline. A test
+/// cannot wait out the production bound, and a rule about what happens when the client is killed is
+/// worth nothing if the only thing measured is the flag feeding it.
+#[cfg(feature = "acp")]
+async fn run_sidecar_with_deadline(
+    holder: &NetnsHolder,
+    verb: &str,
+    argv: Vec<String>,
+    stdin: Option<String>,
+    deadline: std::time::Duration,
+) -> Result<(String, String), String> {
+    run_sidecar_confirmed(holder, verb, argv, stdin, deadline, container_is_absent).await
+}
+
+
+/// How custody asks whether a container is gone. `Some(true)` = confirmed absent, `Some(false)` =
+/// confirmed present, `None` = could not be established.
+///
+/// Injected so the rule below is measurable without a daemon. Only `Some(true)` releases custody, so
+/// a confirmer that cannot tell is treated exactly like one that says "still there".
+#[cfg(feature = "acp")]
+type ConfirmAbsent = fn(&DockerCli, &str) -> Option<bool>;
+
+/// As [`run_sidecar_with_deadline`], with the absence check injected.
+///
+/// **Custody ends on confirmed absence, and on nothing else.**
+///
+/// The previous rule ended it on a reaped client, reasoning that `docker run --rm` removes the
+/// container when its client exits. That reasoning describes the happy path and quietly covers the
+/// failure paths with it. A client reaped with a nonzero status, a stdin write that failed before
+/// the wait, a client killed on the deadline — each returns from the same call, and none of them is
+/// the DAEMON confirming the container is gone. `--rm` is a request to the daemon, not a receipt
+/// from it: removal can still be queued, in progress, or refused, and on an error path it may never
+/// have been reached at all. Deregistering on the client's say-so struck live containers off the
+/// registry that exists to remove them.
+///
+/// So the client's exit is now only a reason to ASK. The answer comes from docker, and a confirmer
+/// that cannot answer keeps the name a cleanup target — the cost of which is one `docker rm`
+/// replying "No such container", which cleanup already treats as success.
+#[cfg(feature = "acp")]
+async fn run_sidecar_confirmed(
+    holder: &NetnsHolder,
+    verb: &str,
+    argv: Vec<String>,
+    stdin: Option<String>,
+    deadline: std::time::Duration,
+    confirm_absent: ConfirmAbsent,
+) -> Result<(String, String), String> {
+    let name = sidecar_name(holder.name(), verb);
+    let argv = with_container_name(argv, &name)?;
+    // Stamped here, at the one funnel every helper in this module passes through, rather than in the
+    // individual argv builders. A helper missing the stamp is a container the sweep can never judge.
+    let argv = with_helper_labels(argv, holder.helper_labels())?;
+    // Registered BEFORE the command starts: a cancellation between these two lines must still leave
+    // a cleanup target behind, and registering afterwards would not.
+    let mut registration = holder.watch_sidecar(name.clone());
+    // Registration says WHAT to remove; the ticket says WHEN it is safe to. Without it, a holder
+    // dropped while this create is in flight removes the name, is told "No such container" because
+    // the container does not exist YET, treats that as done — and the create then lands as an
+    // orphan pinning the namespace. Moved into the blocking closure, never held by this future.
+    let (outcome, child_exited) = run_bounded_tracked_fenced(
+        holder.client(),
+        argv,
+        stdin,
+        deadline,
+        Some(holder.fence_creation()),
+    )
+    .await;
+    // Reaching this line at all proves the command is no longer in flight: a cancellation drops the
+    // future before it, so a cancelled command's name stays a cleanup target.
+    //
+    // A client that was never reaped is not even worth asking about — the daemon may still be
+    // creating or running that container — so custody is simply kept.
+    if child_exited {
+        let asked = name.clone();
+        let client = holder.client().clone();
+        let absent = tokio::task::spawn_blocking(move || confirm_absent(&client, &asked))
+            .await
+            .unwrap_or(None);
+        if absent == Some(true) {
+            registration.completed();
+        }
+    }
+    drop(registration);
+    outcome
+}
+
+/// Ask docker whether a container name is gone.
+///
+/// `Some(true)` only for docker saying the object does not exist. A successful inspect is
+/// `Some(false)`: the container is still there. Anything else — docker missing, the daemon not
+/// answering, an unrecognised error — is `None`, which keeps custody.
+fn container_is_absent(client: &DockerCli, name: &str) -> Option<bool> {
+    let mut child = std::process::Command::new(client.program())
+        .args(["inspect", "--type", "container", "--format", "{{.Id}}", name])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    let status = NetnsHolder::wait_bounded(&mut child, NetnsHolder::REMOVE_DEADLINE).ok()?;
+    let mut stderr_bytes = Vec::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        use std::io::Read as _;
+        let _ = pipe.read_to_end(&mut stderr_bytes);
+    }
+    if status.success() {
+        return Some(false);
+    }
+    let stderr = String::from_utf8_lossy(&stderr_bytes);
+    if NetnsHolder::force_remove_stderr_is_benign(&stderr) || stderr.contains("No such object") {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 /// Establish containment for one job: measure the proxy address, create the namespace holder, install
@@ -629,22 +2722,85 @@ pub async fn establish(
     proxy_ports: Option<crate::sandbox_net::PortRange>,
     log_connections: bool,
     dns_resolvers: Vec<String>,
+    cleanup_after: u64,
+) -> Result<Containment, String> {
+    // The production client is named here, once, and threaded down. This is the ONLY constructor a
+    // shipped build can reach, and it takes no input: no environment variable, no config field, no
+    // global. A test that needs a stand-in calls `establish_with` and hands one in.
+    establish_with(
+        &DockerCli::system(),
+        FenceBounds::production(),
+        network,
+        holder_image,
+        sidecar_image,
+        proxy_alias,
+        job_id,
+        seat,
+        uid,
+        gid,
+        proxy_ports,
+        log_connections,
+        dns_resolvers,
+        cleanup_after,
+    )
+    .await
+}
+
+/// [`establish`], with the docker client and the cleanup bounds supplied by the caller.
+///
+/// Private, and the only way to supply either. Tests pass a stand-in here as an ARGUMENT, so the
+/// substitution is confined to the one call under test: nothing is installed anywhere another test
+/// could read it, no lock has to be remembered, and two such tests can run in parallel without
+/// seeing each other.
+#[cfg(feature = "acp")]
+#[allow(clippy::too_many_arguments)]
+async fn establish_with(
+    client: &DockerCli,
+    bounds: FenceBounds,
+    network: &str,
+    holder_image: &str,
+    sidecar_image: &str,
+    proxy_alias: &str,
+    job_id: &str,
+    seat: &str,
+    uid: u32,
+    gid: u32,
+    proxy_ports: Option<crate::sandbox_net::PortRange>,
+    log_connections: bool,
+    dns_resolvers: Vec<String>,
+    cleanup_after: u64,
 ) -> Result<Containment, String> {
     // Measured BEFORE the holder exists, so a probe failure needs no cleanup.
-    let (probe_stdout, _) = run_docker(host_gateway_probe_argv(sidecar_image, proxy_alias), None)
-        .await
-        .map_err(|error| format!("could not resolve {proxy_alias} for the pinhole — {error}"))?;
+    let (probe_stdout, _) =
+        run_docker(client, host_gateway_probe_argv(sidecar_image, proxy_alias), None)
+            .await
+            .map_err(|error| format!("could not resolve {proxy_alias} for the pinhole — {error}"))?;
     let proxy_host = parse_getent_ipv4(&probe_stdout).ok_or_else(|| {
         format!("resolving {proxy_alias} produced no IPv4 address (got {probe_stdout:?})")
     })?;
 
     let name = holder_name(job_id);
-    run_docker(holder_argv(&name, network, holder_image, uid, gid, job_id, seat), None)
-        .await
-        .map_err(|error| format!("could not start the netns holder {name} — {error}"))?;
-    // From here on the container exists, so every early return must tear it down. Adopting it into
-    // the guard immediately is what makes that automatic rather than remembered.
-    let holder = NetnsHolder::adopt(name);
+    // Adopted BEFORE the create is issued, not after it returns. `run_docker` awaits, an await is a
+    // cancellation point, and the blocking create can complete after the future above it is gone:
+    // adopting afterwards left exactly that container running with no guard and no record. The guard
+    // costs one `docker rm` that reports "No such container" when the create never happened.
+    let mut holder = NetnsHolder::adopt_bounded(name.clone(), client.clone(), bounds);
+    // Every helper joined to this namespace carries the SAME seat and the SAME cleanup stamp as the
+    // holder created just below, so the sweep expires a job's containers as one set rather than
+    // leaving its joiners behind unattributable.
+    holder.label_helpers(helper_label_args(job_id, seat, cleanup_after));
+    // Fenced, not merely adopted. The ticket is taken before the create is issued and travels into
+    // the blocking closure, so a cancellation here leaves cleanup waiting for the create to settle
+    // instead of racing it to a "No such container" that means "not yet".
+    let ticket = holder.fence_creation();
+    run_docker_fenced(
+        client,
+        holder_argv(&name, network, holder_image, uid, gid, job_id, seat, cleanup_after),
+        None,
+        ticket,
+    )
+    .await
+    .map_err(|error| format!("could not start the netns holder {name} — {error}"))?;
 
     // The resolvers arrive from the caller rather than being discovered here, and that is the one
     // property that keeps the job's `/etc/resolv.conf` and this policy in agreement: the caller
@@ -657,9 +2813,10 @@ pub async fn establish(
         dns_resolvers,
     };
     let (plan, expected) = plan_stdin(&policy);
-    let (applied, _) = run_docker(sidecar_argv(&holder, sidecar_image), Some(plan))
-        .await
-        .map_err(|error| format!("containment was not installed — {error}"))?;
+    let (applied, _) =
+        run_sidecar(&holder, "iptables", sidecar_argv(&holder, sidecar_image), Some(plan))
+            .await
+            .map_err(|error| format!("containment was not installed — {error}"))?;
 
     // The count cross-check. A truncated stdin applies cleanly and exits 0, so no exit code reveals
     // it; only comparing the sidecar's own total against what was rendered does.
@@ -680,17 +2837,113 @@ pub async fn establish(
     // Both families are checked, and a v6 failure is as fatal as a v4 one: an unfiltered address family
     // is the cheapest bypass there is.
     for family in [Family::V4, Family::V6] {
-        let (readback, _) = run_docker(readback_argv(holder.name(), sidecar_image, family), None)
-            .await
-            .map_err(|error| {
-                format!("could not read {} rules back from the namespace — {error}", family.binary())
-            })?;
+        let (readback, _) = run_sidecar(
+            &holder,
+            "iptables-readback",
+            readback_argv(holder.name(), sidecar_image, family),
+            None,
+        )
+        .await
+        .map_err(|error| {
+            format!("could not read {} rules back from the namespace — {error}", family.binary())
+        })?;
         policy.verify_readback(family, &readback).map_err(|error| {
             format!("containment did not verify after installation — {error}")
         })?;
     }
 
-    Ok(Containment { holder, proxy_host })
+    // ── The interface the packets actually leave by ───────────────────────────────────────────
+    //
+    // Everything above installs and verifies rules on the host kernel's `OUTPUT` chain, and a gVisor
+    // payload never traverses it: `runsc` runs its own netstack and hands finished packets straight
+    // to the namespace's veth. The readback above is entirely honest and the job is still uncontained
+    // — measured on this repo's fixtures, both families, over TCP.
+    //
+    // So the same rendered policy is translated onto the veth itself, and unconditionally rather than
+    // only for a `runsc` job: `establish` is not told which runtime the caller will launch under, and
+    // "contained under one runtime" is exactly the state being closed here. Under `runc` the filters
+    // are redundant with the chain above, which costs one qdisc and a handful of filters per job.
+    //
+    // Same failure discipline as the chain above: no partial success, no retry. Every `?` from here
+    // leaves through the holder guard, which destroys the namespace on the way out.
+    let dev = egress_device(&holder, sidecar_image).await?;
+    let iface = crate::sandbox_iface::IfacePlan::derive(&dev, &policy)
+        .map_err(|error| format!("the egress filter plan for {dev} could not be rendered — {error}"))?;
+    let (iface_plan, iface_expected) = crate::sandbox_iface::plan_stdin(&iface);
+    let (iface_applied, _) = run_sidecar(
+        &holder,
+        "iface",
+        crate::sandbox_iface::iface_sidecar_argv(holder.name(), sidecar_image),
+        Some(iface_plan),
+    )
+    .await
+    .map_err(|error| {
+        format!(
+            "egress filters were not installed on {dev} — {error} (the applier's exit 6 means this \
+             sidecar image shipped without iproute2, so no job can be contained by this build; its \
+             exit 3 means the interface is PARTIALLY filtered and the namespace is being destroyed \
+             rather than retried)"
+        )
+    })?;
+
+    // The same count cross-check the chain above does, for the same reason: a truncated stdin applies
+    // perfectly and exits 0, and only comparing the applier's own total against what was rendered
+    // reveals it.
+    let iface_applied: usize = iface_applied.parse().map_err(|_| {
+        format!("the interface applier reported {iface_applied:?} filters applied, not a number")
+    })?;
+    if iface_applied != iface_expected {
+        return Err(format!(
+            "egress filtering is incomplete: {iface_applied} of {iface_expected} steps applied on \
+             {dev} (the plan was truncated in transit)"
+        ));
+    }
+
+    // The readback, from a different container running a different verb, because everything above is
+    // still the installer's own account of its work. `verify_readback` checks presence, order, both
+    // families, the exceptions' width and that no drop carries a protocol match — the TCP-only drop
+    // is the bug this closes, not the fix.
+    let (iface_readback, _) = run_sidecar(
+        &holder,
+        "iface-readback",
+        crate::sandbox_iface::filter_readback_argv(holder.name(), sidecar_image, &dev),
+        None,
+    )
+    .await
+    .map_err(|error| format!("could not read the egress filters back from {dev} — {error}"))?;
+    iface.verify_readback(&iface_readback).map_err(|error| {
+        format!("egress filtering did not verify on {dev} after installation — {error}")
+    })?;
+
+    Ok(Containment { holder, proxy_host, egress_dev: dev })
+}
+
+/// Which link inside the holder's namespace the job's packets leave by — measured from the
+/// namespace's own link list, never assumed to be `eth0`.
+///
+/// The probe is an **unprivileged** container (`--cap-drop ALL`, no `NET_ADMIN`): enumerating links
+/// is a read, and the one container in this design that can change an interface must not also be the
+/// thing that chooses which interface to change.
+///
+/// [`crate::sandbox_iface::select_egress_link`] refuses anything that is not a job's own namespace —
+/// a bridge among the links, no loopback, or more than one candidate — so a mis-aimed `--network`
+/// fails the launch here instead of installing drops on something shared.
+#[cfg(feature = "acp")]
+async fn egress_device(holder: &NetnsHolder, sidecar_image: &str) -> Result<String, String> {
+    let (links, _) = run_sidecar(
+        holder,
+        "link-probe",
+        crate::sandbox_iface::link_probe_argv(holder.name(), sidecar_image),
+        None,
+    )
+    .await
+    .map_err(|error| format!("could not enumerate the links in the job's namespace — {error}"))?;
+    let parsed = crate::sandbox_iface::parse_links(&links).map_err(|error| {
+        format!("the job's namespace listed a link this build cannot read — {error}")
+    })?;
+    let link = crate::sandbox_iface::select_egress_link(&parsed)
+        .map_err(|error| format!("the job's egress interface could not be identified — {error}"))?;
+    Ok(link.name)
 }
 
 #[cfg(test)]
@@ -800,13 +3053,13 @@ mod tests {
 
     #[test]
     fn the_job_joins_the_holders_namespace_and_never_names_a_network() {
-        let holder = NetnsHolder::adopt("maxplayer-netns-abc".into());
+        let holder = NetnsHolder::adopt("maxplayer-netns-abc".into(), DockerCli::system());
         assert_eq!(holder.network_mode(), "container:maxplayer-netns-abc");
     }
 
     #[test]
     fn the_holder_runs_sleep_in_exec_form_with_no_shell() {
-        let argv = holder_argv("h", "net", "img", 1000, 1000, "abc", &seat_b());
+        let argv = holder_argv("h", "net", "img", 1000, 1000, "abc", &seat_b(), 2_000_000_000);
         let tail = &argv[argv.len() - 4..];
         assert_eq!(tail, ["--entrypoint", "sleep", "img", "infinity"]);
         // A shell anywhere in the argv would mean the holder runs something that parses a string.
@@ -815,7 +3068,7 @@ mod tests {
 
     #[test]
     fn the_holder_is_locked_down_and_labelled_for_reaping() {
-        let argv = holder_argv("h", "net", "img", 1000, 1000, "abc", &seat_b());
+        let argv = holder_argv("h", "net", "img", 1000, 1000, "abc", &seat_b(), 2_000_000_000);
         for expected in ["--read-only", "--cap-drop", "ALL", "no-new-privileges"] {
             assert!(argv.iter().any(|a| a == expected), "missing {expected} in {argv:?}");
         }
@@ -829,7 +3082,7 @@ mod tests {
     /// nothing to match and every holder is unattributable — a reaper that correctly reaps nothing.
     #[test]
     fn the_holder_carries_the_seat_that_created_it() {
-        let argv = holder_argv("h", "net", "img", 1000, 1000, "abc", &seat_b());
+        let argv = holder_argv("h", "net", "img", 1000, 1000, "abc", &seat_b(), 2_000_000_000);
         assert!(
             argv.iter().any(|a| a == &format!("{HOLDER_SEAT_LABEL}={}", seat_b())),
             "{argv:?}"
@@ -844,19 +3097,19 @@ mod tests {
 
     #[test]
     fn only_the_sidecar_is_granted_net_admin() {
-        let holder = NetnsHolder::adopt("h".into());
+        let holder = NetnsHolder::adopt("h".into(), DockerCli::system());
         let sidecar = sidecar_argv(&holder, "netfilter");
         assert!(sidecar.windows(2).any(|w| w == ["--cap-add", "NET_ADMIN"]), "{sidecar:?}");
         // …and it still drops everything else first, so the grant is exactly one capability.
         assert!(sidecar.windows(2).any(|w| w == ["--cap-drop", "ALL"]), "{sidecar:?}");
         // The holder must never carry it: it shares its namespace with the job.
-        let holder_argv = holder_argv("h", "net", "img", 1000, 1000, "abc", &seat_b());
+        let holder_argv = holder_argv("h", "net", "img", 1000, 1000, "abc", &seat_b(), 2_000_000_000);
         assert!(!holder_argv.iter().any(|a| a == "NET_ADMIN"), "{holder_argv:?}");
     }
 
     #[test]
     fn the_sidecar_takes_the_plan_on_stdin_and_is_told_nothing_else() {
-        let holder = NetnsHolder::adopt("h".into());
+        let holder = NetnsHolder::adopt("h".into(), DockerCli::system());
         let sidecar = sidecar_argv(&holder, "netfilter");
         assert!(sidecar.iter().any(|a| a == "--interactive"), "no stdin: {sidecar:?}");
         // The image is the last word — no policy is passed as an argument.
@@ -1002,8 +3255,2572 @@ mod tests {
             dns_resolvers: Vec::new(),
         };
         let (stdin, _) = plan_stdin(&policy);
-        let accepts: Vec<&str> = stdin.lines().filter(|l| l.contains("ACCEPT")).collect();
-        assert_eq!(accepts.len(), 1, "exactly one pinhole: {accepts:?}");
+        // The pinhole is v4 — the proxy is reached at the namespace's v4 gateway. The v6 plan also
+        // carries ACCEPTs, and they are deliberately not pinholes: they are the two neighbour
+        // discovery exceptions, which name no host and open no port. Matching on "ACCEPT" alone
+        // would count them here and the assertion would be about arithmetic, not about the pinhole.
+        let accepts: Vec<&str> = stdin
+            .lines()
+            .filter(|l| l.starts_with("iptables ") && l.contains("ACCEPT"))
+            .collect();
+        assert_eq!(accepts.len(), 1, "exactly one v4 pinhole: {accepts:?}");
         assert!(accepts[0].contains(&measured), "the pinhole must name the measured host: {accepts:?}");
+        let v6_accepts = stdin
+            .lines()
+            .filter(|l| l.starts_with("ip6tables ") && l.contains("ACCEPT"))
+            .count();
+        assert_eq!(v6_accepts, 2, "v6 permits neighbour discovery and nothing else");
+    }
+
+    // ── Cancellation custody (F4) ─────────────────────────────────────────────────────────────
+    //
+    // A cancelled establish must leave nothing running that this process cannot name. These tests
+    // check the three properties that make that true without a daemon: the sidecar is addressable,
+    // its name is unique to this run, and the holder tracks it for exactly as long as it is alive.
+
+    /// Every container joined to the namespace is named by us. An unnamed sidecar gets a random name
+    /// this process never learns, so a cancellation mid-command leaves the one container capable of
+    /// pinning the namespace open as the one container nothing can address.
+    #[test]
+    fn every_sidecar_is_named_so_a_cancelled_one_can_still_be_removed() {
+        let holder = NetnsHolder::adopt("maxplayer-netns-abc".into(), DockerCli::system());
+        let name = sidecar_name(holder.name(), "iface");
+        for argv in [
+            sidecar_argv(&holder, "netfilter"),
+            readback_argv(holder.name(), "netfilter", Family::V4),
+            crate::sandbox_iface::iface_sidecar_argv(holder.name(), "netfilter"),
+            crate::sandbox_iface::filter_readback_argv(holder.name(), "netfilter", "eth0"),
+            crate::sandbox_iface::link_probe_argv(holder.name(), "netfilter"),
+        ] {
+            let named = with_container_name(argv, &name).expect("a docker run argv");
+            assert!(
+                named.windows(2).any(|w| w == ["--name", name.as_str()]),
+                "an unnamed joiner cannot be cleaned up: {named:?}"
+            );
+            // The name goes to the docker client, before the image and its command: appended at the
+            // end it would become an argument to the sidecar instead of a flag to `run`.
+            let at = named.iter().position(|a| a == "--name").expect("named");
+            let image = named.iter().position(|a| a == "netfilter").expect("the image");
+            assert!(at < image, "--name must precede the image: {named:?}");
+        }
+    }
+
+    /// The name must be unique per call. A deterministic sidecar name is a name two concurrent jobs
+    /// share, and cleaning up "the" sidecar would then remove a sibling's live container.
+    #[test]
+    fn sidecar_names_are_unique_per_call_so_cleanup_cannot_hit_a_sibling() {
+        let first = sidecar_name("maxplayer-netns-abc", "iface");
+        let second = sidecar_name("maxplayer-netns-abc", "iface");
+        assert_ne!(first, second, "two joiners of the same holder must not share a name");
+        // Each is still attributable to its holder and its purpose, which is what makes an orphan
+        // readable to an operator rather than merely unique.
+        for name in [&first, &second] {
+            assert!(name.starts_with("maxplayer-netns-abc-iface-"), "{name}");
+        }
+        // Different holders never collide either.
+        assert_ne!(
+            sidecar_name("maxplayer-netns-abc", "iface"),
+            sidecar_name("maxplayer-netns-def", "iface")
+        );
+    }
+
+    /// Naming is refused rather than misapplied. Splicing `--name` into something that is not a
+    /// `docker run` would register a cleanup target that does not exist, and a cleanup target that
+    /// does not exist reports success for a container still running.
+    #[test]
+    fn naming_a_non_run_argv_is_refused() {
+        let err = with_container_name(list_all_containers_argv(), "x")
+            .expect_err("`docker ps` takes no --name");
+        assert!(err.contains("not a `docker run` argv"), "{err}");
+        assert!(with_container_name(network_modes_argv(&["a".into()]), "x").is_err());
+        // The positive control, so the refusal is not simply "always refuse".
+        let holder = NetnsHolder::adopt("h".into(), DockerCli::system());
+        assert!(with_container_name(sidecar_argv(&holder, "img"), "x").is_ok());
+    }
+
+    /// A joiner is tracked for exactly its command's lifetime: registered before it starts (a
+    /// cancellation between registration and start must still leave a cleanup target) and dropped
+    /// when it finishes, so a completed sidecar is not removed twice or reported as an orphan.
+    #[test]
+    fn a_joiner_is_tracked_while_it_runs_and_forgotten_when_it_finishes() {
+        let holder = NetnsHolder::adopt("maxplayer-netns-abc".into(), DockerCli::system());
+        let tracked = |holder: &NetnsHolder| -> Vec<String> {
+            holder.sidecars.lock().expect("registry").clone()
+        };
+        assert!(tracked(&holder).is_empty(), "nothing is joined before anything runs");
+
+        let mut first = holder.watch_sidecar(sidecar_name(holder.name(), "iface"));
+        let mut second = holder.watch_sidecar(sidecar_name(holder.name(), "iface-readback"));
+        assert_eq!(tracked(&holder).len(), 2, "both live joiners are cleanup targets");
+
+        // Finishing one deregisters only that one: the other is still running and still owned.
+        // `completed` is what makes this finishing rather than cancellation, and only a command
+        // that returned may claim it.
+        let second_name = second.name.clone();
+        second.completed();
+        drop(second);
+        assert_eq!(tracked(&holder), vec![first.name.clone()], "{second_name} must be forgotten");
+
+        first.completed();
+        drop(first);
+        assert!(tracked(&holder).is_empty(), "a finished joiner is not an orphan");
+    }
+
+    /// A removal that never returns is abandoned on its deadline, killed, and reported as a
+    /// failure -- not waited on forever and not reported as a removal that worked.
+    ///
+    /// This is the property the word "bounded" claimed while the code called `output()`, which has
+    /// no timeout: a docker client talking to a wedged daemon blocked the teardown thread for as
+    /// long as the daemon stayed wedged. Exercised on a child that is guaranteed not to exit, so
+    /// the deadline is the only thing that can end the wait.
+    #[test]
+    fn a_removal_that_never_returns_is_abandoned_on_its_deadline() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let started = std::time::Instant::now();
+        let error = NetnsHolder::wait_bounded(&mut child, std::time::Duration::from_millis(250))
+            .expect_err("a child that never exits must hit the deadline");
+        let waited = started.elapsed();
+
+        assert!(error.contains("did not finish"), "{error}");
+        assert!(
+            error.contains("may still exist"),
+            "an abandoned removal must be reported as a possible leak, not as success: {error}"
+        );
+        assert!(waited < std::time::Duration::from_secs(10), "waited {waited:?}");
+        // Killed AND reaped, so the bound is real rather than advisory: the child is already gone
+        // and this returns its status immediately rather than blocking for the remaining ~59s.
+        assert!(
+            child.try_wait().expect("reap").is_some(),
+            "the abandoned child must be killed, not left running"
+        );
+    }
+
+    /// A removal that answers promptly is NOT abandoned -- the control that keeps the test above
+    /// from passing on a deadline that fires unconditionally.
+    #[test]
+    fn a_removal_that_returns_is_not_abandoned() {
+        let mut child = std::process::Command::new("true").spawn().expect("spawn true");
+        let status = NetnsHolder::wait_bounded(&mut child, std::time::Duration::from_secs(10))
+            .expect("a child that exits at once must be waited on normally");
+        assert!(status.success(), "{status:?}");
+    }
+
+    /// A **cancelled** sidecar command leaves its name with the holder.
+    ///
+    /// The sibling above covers the finishing path. This one covers the path that produced the
+    /// defect: the guard was struck from the registry by cancellation itself, so the holder's `Drop`
+    /// found an empty list and removed nothing, while the container the blocking docker client had
+    /// already created stayed joined to the namespace.
+    ///
+    /// Cancellation is performed here the way tokio performs it -- the future is polled once, so the
+    /// registration exists and the command is in flight, and then the future is dropped. No runtime
+    /// and no docker are involved, so this measures the custody rule itself.
+    #[test]
+    fn a_cancelled_joiner_stays_a_cleanup_target() {
+        use std::future::Future as _;
+
+        let holder = NetnsHolder::adopt("maxplayer-netns-cancelled".into(), DockerCli::system());
+        let name = sidecar_name(holder.name(), "iface");
+        {
+            let mut command = Box::pin(async {
+                let mut registration = holder.watch_sidecar(name.clone());
+                // Stands in for the docker command that never returns before the cancellation.
+                std::future::pending::<()>().await;
+                registration.completed();
+            });
+            let waker = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(waker);
+            assert!(
+                command.as_mut().poll(&mut cx).is_pending(),
+                "the command must still be in flight when it is cancelled"
+            );
+            assert_eq!(
+                holder.sidecars.lock().expect("registry").len(),
+                1,
+                "the joiner is registered before its command starts"
+            );
+        }
+
+        assert_eq!(
+            holder.sidecars.lock().expect("registry").clone(),
+            vec![name],
+            "a cancelled command must leave its container as a cleanup target -- deregistering here \
+             is what left an orphan pinning the namespace"
+        );
+    }
+
+    /// Cleanup reports what happened. "No such container" after a cancelled create is the expected
+    /// path and not a failure; anything else is a leak, and must be reported as one rather than
+    /// swallowed into a teardown that claims to have destroyed the namespace.
+    #[test]
+    fn removing_something_that_was_never_created_is_not_a_cleanup_failure() {
+        // The holder is adopted before the create is issued precisely so this case exists.
+        let name = holder_name("a-job-whose-create-was-cancelled");
+        assert!(name.starts_with("maxplayer-netns-"), "{name}");
+        // No daemon is touched here; the classification under test is the string one, and it is the
+        // only place a "nothing to remove" result is allowed to pass as success.
+        assert!(
+            NetnsHolder::force_remove_stderr_is_benign("Error: No such container: x"),
+            "a container that never existed is not a leak"
+        );
+        for real in [
+            "Error response from daemon: cannot remove a running container",
+            "permission denied while trying to connect to the Docker daemon socket",
+            "",
+        ] {
+            assert!(
+                !NetnsHolder::force_remove_stderr_is_benign(real),
+                "a failed removal must be reported as a leak, not as a teardown: {real:?}"
+            );
+        }
+    }
+
+    /// F4: **the bound itself, exercised.** Every other cancellation test in this module inspects
+    /// argv or drives `Drop` by hand; none of them ever let a command run long enough to be
+    /// stopped, so the deadline that owns cancellation was asserted only by reading it.
+    ///
+    /// `sleep 30` under a one-second bound needs no daemon and no docker: the property is that a
+    /// command which does not finish is **killed** and the caller gets a failure naming the
+    /// deadline — not a hang, and not a success. The elapsed-time assertion is the real one; an
+    /// implementation that returned the right error after waiting out the full thirty seconds would
+    /// satisfy the string check and still be the bug.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_command_that_outlives_its_deadline_is_killed_and_says_so() {
+        let started = std::time::Instant::now();
+        let outcome = run_bounded(
+            &DockerCli::system(),
+            vec!["sleep".to_owned(), "30".to_owned()],
+            None,
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        let error = outcome.expect_err("a command past its deadline must not report success");
+        assert!(
+            error.contains("did not finish within 1s"),
+            "the failure must name the deadline it broke: {error}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the bound returned after {elapsed:?} — a deadline that is only reported once the \
+             command finishes on its own is not a bound at all"
+        );
+    }
+
+    /// F4: a program that cannot be started fails **by name**, immediately.
+    ///
+    /// The path that matters is the one where docker is absent or unexecutable: that must surface as
+    /// a named failure rather than as a deadline timeout thirty seconds later, and it must never be
+    /// confused with a container that was created.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_program_that_cannot_be_started_fails_by_name() {
+        let missing = "maxplayer-no-such-program-exists";
+        let error = run_bounded(
+            &DockerCli::system(),
+            vec![missing.to_owned()],
+            None,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect_err("a program that cannot be run must not report success");
+        assert!(
+            error.contains("could not run") && error.contains(missing),
+            "the failure must name the program it could not run: {error}"
+        );
+    }
+
+    /// F4 residual: the client returning is not the container being gone.
+    ///
+    /// `run_sidecar` used to call `registration.completed()` after **every** returned result, on the
+    /// stated grounds that `docker run --rm` has removed the container by then. That holds for a
+    /// client which was reaped with a status — including a nonzero one — and not otherwise. A client
+    /// killed on our own deadline, or one that failed before the wait, leaves a container the daemon
+    /// may still be creating or running; deregistering it struck the one cleanup target for a
+    /// container that outlived its client.
+    ///
+    /// Both halves are asserted here, because only the pair distinguishes the fix from "never
+    /// deregister", which would make every sidecar report a phantom leak.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn only_a_reaped_client_may_end_a_sidecars_custody() {
+        let (outcome, child_exited) = run_bounded_tracked(
+            &DockerCli::system(),
+            vec!["sh".to_owned(), "-c".to_owned(), "exit 7".to_owned()],
+            None,
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+        let error = outcome.expect_err("a nonzero exit is still a failure to the caller");
+        assert!(error.contains("exit 7"), "the caller's error must name the code: {error}");
+        assert!(
+            child_exited,
+            "a nonzero exit is a REAPED client: that is a reason to ASK docker whether the \
+             container is gone. It is not itself an answer, and custody no longer ends on it \
+             alone — see `a_reaped_client_whose_container_is_still_there_keeps_custody`"
+        );
+
+        let started = std::time::Instant::now();
+        let (outcome, child_exited) = run_bounded_tracked(
+            &DockerCli::system(),
+            vec!["sleep".to_owned(), "30".to_owned()],
+            None,
+            std::time::Duration::from_millis(400),
+        )
+        .await;
+        let error = outcome.expect_err("a command past its deadline must not report success");
+        assert!(error.contains("did not finish within"), "{error}");
+        assert!(
+            !child_exited,
+            "a client killed on the deadline has shown nothing about its container, so the name \
+             must stay a cleanup target"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the deadline must be the thing that returned, not the command finishing"
+        );
+    }
+
+    /// The custody rule at the site that applies it.
+    ///
+    /// The sibling above measures the flag; this one measures what `run_sidecar` DOES with it, which
+    /// is the part a reviewer cannot take on trust. Written after a negative control showed the
+    /// flag test alone stayed green while the decision was reverted to the defective one.
+    ///
+    /// No docker and no daemon: the argv names a script that ignores its arguments, which is all
+    /// `with_container_name` needs (it requires `argv[1] == "run"` and splices the name after it).
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_sidecar_whose_client_was_killed_stays_a_cleanup_target() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("mx-custody-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let slow = dir.join("slow");
+        let quick = dir.join("quick");
+        std::fs::write(&slow, "#!/bin/sh\nsleep 30\n").expect("write slow");
+        std::fs::write(&quick, "#!/bin/sh\nexit 0\n").expect("write quick");
+        for path in [&slow, &quick] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+
+        let holder = NetnsHolder::adopt("maxplayer-netns-custody".into(), DockerCli::system());
+
+        // A client killed on the deadline: the daemon may still be creating or running the
+        // container, so the name has to survive as a cleanup target.
+        let killed = run_sidecar_with_deadline(
+            &holder,
+            "iface",
+            vec![slow.to_string_lossy().into_owned(), "run".to_owned()],
+            None,
+            std::time::Duration::from_millis(400),
+        )
+        .await;
+        assert!(killed.is_err(), "a command past its deadline must not report success");
+        assert_eq!(
+            holder.sidecars.lock().expect("registry").len(),
+            1,
+            "a client killed on the deadline never showed its container gone, so its name must \
+             stay a cleanup target"
+        );
+
+        // A client reaped normally AND docker confirming the container gone: only then may the name
+        // be struck. Without this half, "never deregister" would pass the assertion above.
+        //
+        // The confirmer is injected rather than real. This used to call the production path, which
+        // reached a live `docker inspect` from inside an offline unit test: the test passed only
+        // because a daemon happened to answer, which is a dependency an offline suite must not have.
+        fn confirmed_gone(_client: &DockerCli, _name: &str) -> Option<bool> {
+            Some(true)
+        }
+        run_sidecar_confirmed(
+            &holder,
+            "iface",
+            vec![quick.to_string_lossy().into_owned(), "run".to_owned()],
+            None,
+            std::time::Duration::from_secs(10),
+            confirmed_gone,
+        )
+        .await
+        .expect("a script that exits 0 must succeed");
+        assert_eq!(
+            holder.sidecars.lock().expect("registry").len(),
+            1,
+            "a reaped client whose container docker confirms gone must be struck, leaving only the \
+             killed one"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        std::mem::forget(holder);
+    }
+
+    /// The `Err`-path custody failure, reproduced.
+    ///
+    /// This is the defect the verdict names: the client is reaped — `child_exited` is true, with a
+    /// NONZERO exit, exactly the shape a deadline-killed, I/O-failed or refused `docker run` returns
+    /// — and the container it named is **still there**. The old rule ended custody on the client's
+    /// exit alone and struck the only cleanup target for a live container.
+    ///
+    /// Hermetic: the confirmer is a stub, so this asserts the DECISION, not a daemon's mood. Revert
+    /// the rule to `if child_exited { registration.completed(); }` and this test fails.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_reaped_client_whose_container_is_still_there_keeps_custody() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("mx-err-custody-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let failing = dir.join("failing");
+        std::fs::write(&failing, "#!/bin/sh\nexit 7\n").expect("write failing");
+        std::fs::set_permissions(&failing, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        /// Docker answering "that container is still here".
+        fn still_present(_client: &DockerCli, _name: &str) -> Option<bool> {
+            Some(false)
+        }
+        /// Docker unable to answer at all — must be treated exactly like "still here".
+        fn cannot_tell(_client: &DockerCli, _name: &str) -> Option<bool> {
+            None
+        }
+
+        for (confirm, label) in [
+            (still_present as ConfirmAbsent, "docker says the container is still there"),
+            (cannot_tell as ConfirmAbsent, "docker cannot say whether it is there"),
+        ] {
+            let holder = NetnsHolder::adopt("maxplayer-netns-err-custody".into(), DockerCli::system());
+            let outcome = run_sidecar_confirmed(
+                &holder,
+                "iface",
+                vec![failing.to_string_lossy().into_owned(), "run".to_owned()],
+                None,
+                std::time::Duration::from_secs(10),
+                confirm,
+            )
+            .await;
+
+            let error = outcome.expect_err("exit 7 is a failure");
+            assert!(error.contains("exit 7"), "the caller still sees the real error: {error}");
+            assert_eq!(
+                holder.sidecars.lock().expect("registry").len(),
+                1,
+                "the client was REAPED with a nonzero exit, but {label}: custody must be held \
+                 until the container is CONFIRMED GONE, or cleanup has no target for a container \
+                 that outlived its client"
+            );
+            std::mem::forget(holder);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A SIGNAL-terminated client is reaped too, and must still not end custody on its own.
+    ///
+    /// The R3 verdict named this case precisely: `try_wait` yields a status for a signalled child
+    /// just as it does for an ordinary exit, so `child_exited` is `true` here, while `code()`
+    /// returns `None` and the call reports "killed by a signal". The old comments promised that
+    /// signal failures retain custody; the old code did not deliver it, because the flag alone was
+    /// allowed to release the name.
+    ///
+    /// This is the sharpest form of "reaped is not removed": a client killed mid-flight tells us
+    /// nothing whatever about whether the daemon created, is running, or removed that container.
+    /// Custody is kept unless the daemon itself says the container is gone.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_signal_killed_client_does_not_end_custody_by_itself() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("mx-signal-custody-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let suicide = dir.join("suicide");
+        // Kills ITSELF with SIGKILL: reaped with a status, but `code()` is None.
+        std::fs::write(&suicide, "#!/bin/sh\nkill -9 $$\n").expect("write suicide");
+        std::fs::set_permissions(&suicide, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        fn still_present(_client: &DockerCli, _name: &str) -> Option<bool> {
+            Some(false)
+        }
+
+        let holder = NetnsHolder::adopt("maxplayer-netns-signal-custody".into(), DockerCli::system());
+        let outcome = run_sidecar_confirmed(
+            &holder,
+            "iface",
+            vec![suicide.to_string_lossy().into_owned(), "run".to_owned()],
+            None,
+            std::time::Duration::from_secs(10),
+            still_present,
+        )
+        .await;
+
+        let error = outcome.expect_err("a signalled client is a failure");
+        assert!(
+            error.contains("killed by a signal"),
+            "this must exercise the signal path, not an ordinary nonzero exit: {error}"
+        );
+        assert_eq!(
+            holder.sidecars.lock().expect("registry").len(),
+            1,
+            "a signal-killed client proves nothing about the container; custody must be kept"
+        );
+
+        std::mem::forget(holder);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── The production path itself ────────────────────────────────────────────────────────────
+    //
+    // Everything above tests a helper. These two drive `establish` — the function production calls,
+    // with its real ordering of adopt, fence, create, apply and cleanup — against a stand-in docker
+    // client, because the fault these close is precisely that a fixture was standing in for the
+    // production path and could agree with a bug the production path does not survive.
+
+    // The stand-in client is passed to `establish_with` as an ARGUMENT. There is deliberately no
+    // lock and no shared cell here: the previous shape installed the client in a process-global,
+    // which meant every test that touched this path had to remember to take a mutex, any helper
+    // that ran outside one (cleanup from `Drop`, notably) read whatever another test had installed,
+    // and the tests below could not run in parallel. Passing it in removes the interference rather
+    // than serialising around it.
+
+    /// A stand-in `docker` that answers `establish`'s sequence and records what it was asked.
+    ///
+    /// Writes the applier's stdin to `stdin.txt` and every removed name to `rm.log`, so a test can
+    /// assert on what production actually sent rather than on what it believes production sends.
+    #[cfg(feature = "acp")]
+    fn stand_in_docker(work: &std::path::Path, create_delay: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let script = work.join("docker");
+        let body = r#"#!/bin/sh
+WORK="__WORK__"
+# The daemon is unreachable: every query fails, and none of them may be read as "absent".
+if [ -f "$WORK/daemon-down" ]; then
+  echo "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?" >&2
+  exit 1
+fi
+case "$*" in
+  *"--entrypoint getent"*)
+    echo "203.0.113.77   STREAM host.docker.internal"
+    exit 0
+    ;;
+  *"inspect --type container"*)
+    for a in "$@"; do last="$a"; done
+    echo "inspect $last" >> "$WORK/events.log"
+    if [ -f "$WORK/present-$last" ]; then
+      echo "sha256:deadbeefcafe"
+      exit 0
+    fi
+    # THE RACE, made deterministic: this inspect answers ABSENT, and the container lands the instant
+    # after that answer — before any event query the caller makes next. `race-NAME` is consumed so
+    # it fires exactly once; `raced-NAME` records that it fired.
+    if [ -f "$WORK/race-$last" ]; then
+      mv "$WORK/race-$last" "$WORK/present-$last"
+      : > "$WORK/raced-$last"
+    fi
+    echo "Error response from daemon: No such container" >&2
+    exit 1
+    ;;
+  *"rm --force --volumes"*)
+    for a in "$@"; do last="$a"; done
+    echo "$last" >> "$WORK/rm.log"
+    echo "rm $last" >> "$WORK/events.log"
+    if [ -f "$WORK/rmfail-$last" ]; then
+      echo "Error response from daemon: cannot remove container $last" >&2
+      exit 1
+    fi
+    # A removal that succeeds makes the container ABSENT, exactly as the daemon would: the presence
+    # marker is what `inspect` answers from, so a test can assert the container really went away
+    # instead of asserting that a removal was merely attempted.
+    rm -f "$WORK/present-$last"
+    exit 0
+    ;;
+  *"events --since"*)
+    # The daemon's event log, in the production format `ID<TAB>name<TAB>action`: a container under
+    # NAME that is present now has a `create` and no `destroy`; one a test recorded as landed and
+    # since gone (`landed-NAME`) has both, for the same id. `evhang-NAME` leaves a descendant holding
+    # this query's stdout open after the client exits, as a client's child process can, for 20s;
+    # when it lets go it records `released-NAME`, so a test can assert ORDER against the hold.
+    for a in "$@"; do
+      case "$a" in
+        container=*)
+          n="${a#container=}"
+          echo "events $n" >> "$WORK/events.log"
+          if [ -f "$WORK/evhang-$n" ]; then
+            ( sleep 20; : > "$WORK/released-$n" ) &
+            exit 0
+          fi
+          if [ -f "$WORK/present-$n" ]; then
+            printf 'deadbeefcafe\t%s\tcreate\n' "$n"
+          fi
+          if [ -f "$WORK/landed-$n" ]; then
+            printf 'feedfacef00d\t%s\tcreate\nfeedfacef00d\t%s\tdestroy\n' "$n" "$n"
+          fi
+          # THE OTHER RACE, made deterministic: a container lands the instant after this event query
+          # answered — before the caller's next inspect. Consumed so it fires once; `raced-after-
+          # events-NAME` records that it did.
+          if [ -f "$WORK/land-after-events-$n" ]; then
+            mv "$WORK/land-after-events-$n" "$WORK/present-$n"
+            : > "$WORK/raced-after-events-$n"
+          fi
+          ;;
+      esac
+    done
+    exit 0
+    ;;
+  *--detach*)
+    : > "$WORK/creating"
+    echo "create-start" >> "$WORK/events.log"
+    __DELAY__
+    echo "create-end" >> "$WORK/events.log"
+    echo deadbeefcafe
+    exit 0
+    ;;
+esac
+cat > "$WORK/stdin.txt"
+echo 0
+exit 0
+"#
+        .replace("__WORK__", &work.to_string_lossy())
+        .replace("__DELAY__", create_delay);
+        std::fs::write(&script, body).expect("write stand-in docker");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        script
+    }
+
+    #[cfg(feature = "acp")]
+    fn stand_in_work_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("mx-establish-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("work dir");
+        dir
+    }
+
+    /// A world the expiry sweep can be run against: `docker ps` answers from a listing file, and
+    /// `docker rm` edits that same file.
+    ///
+    /// The listing is the daemon's state, not a fixture the test re-states between calls, because
+    /// the properties under test are all about a SECOND sweep seeing what the first one did: a
+    /// removal that succeeded must be gone from the next listing, a removal that failed must still
+    /// be in it, and a container that appears afterwards must be found without anything remembering
+    /// it. A stand-in that replayed a canned listing could not tell any of those apart.
+    #[cfg(feature = "acp")]
+    fn stand_in_sweep_docker(work: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let script = work.join("docker");
+        let body = r#"#!/bin/sh
+WORK="__WORK__"
+if [ -f "$WORK/daemon-down" ]; then
+  echo "Cannot connect to the Docker daemon at unix:///var/run/docker.sock." >&2
+  exit 1
+fi
+case "$*" in
+  *"ps --all"*)
+    echo "ps" >> "$WORK/calls.log"
+    cat "$WORK/listing.tsv" 2>/dev/null
+    exit 0
+    ;;
+  *"rm --force --volumes"*)
+    for a in "$@"; do last="$a"; done
+    echo "$last" >> "$WORK/rm.log"
+    if [ -f "$WORK/rmfail-$last" ]; then
+      echo "Error response from daemon: cannot remove container $last" >&2
+      exit 1
+    fi
+    grep -v "^$last	" "$WORK/listing.tsv" > "$WORK/listing.next" 2>/dev/null
+    mv "$WORK/listing.next" "$WORK/listing.tsv"
+    exit 0
+    ;;
+esac
+exit 0
+"#
+        .replace("__WORK__", &work.to_string_lossy());
+        std::fs::write(&script, body).expect("write sweep stand-in docker");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        script
+    }
+
+    /// Write the daemon's container listing in the exact format [`list_owned_argv`] asks for.
+    #[cfg(feature = "acp")]
+    fn write_listing(work: &std::path::Path, rows: &[(&str, &str, &str, &str)]) {
+        let mut out = String::new();
+        for (id, seat, cleanup_after, role) in rows {
+            // Every container this module creates carries a job label, so the default fixture does
+            // too. A row that needs the job ABSENT or a field malformed is written with
+            // `write_raw_listing`, which states the whole line.
+            out.push_str(&format!(
+                "{id}\t{seat}\t{cleanup_after}\t{role}\tjob-{id}\n"
+            ));
+        }
+        std::fs::write(work.join("listing.tsv"), out).expect("listing");
+    }
+
+    /// A listing written verbatim, for rows whose whole point is a field docker returned unusable.
+    #[cfg(feature = "acp")]
+    fn write_raw_listing(work: &std::path::Path, listing: &str) {
+        std::fs::write(work.join("listing.tsv"), listing).expect("listing");
+    }
+
+    /// A seat of this test's own, because the sweep cursor is PROCESS-GLOBAL and keyed by seat.
+    ///
+    /// Two sweep rows sharing one seat string share a resume point: whichever runs first leaves a
+    /// cursor, and the second starts mid-queue for reasons nothing in its own body states. That is
+    /// a property of the cursor being real state rather than a test defect to paper over — so each
+    /// row takes a distinct seat, exactly as two seats on one host would.
+    #[cfg(feature = "acp")]
+    fn sweep_seat(name: &str) -> String {
+        let mut seat: String = name.bytes().map(|b| format!("{b:02x}")).collect();
+        seat.truncate(64);
+        while seat.len() < 64 {
+            seat.push('0');
+        }
+        seat
+    }
+
+    #[cfg(feature = "acp")]
+    fn rm_log(work: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(work.join("rm.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// THE THRESHOLD IS THE JOB'S OWN DEADLINE PLUS THE GRACE, AND IT IS A FLOOR.
+    ///
+    /// One second before it the container is untouched; at it and after it, it is selected. The
+    /// boundary itself is asserted because `>` and `>=` are the same test everywhere else, and the
+    /// difference between them is a whole second in which a job's containers are either still its
+    /// own or already the sweep's.
+    #[test]
+    fn a_container_is_untouched_before_its_stamp_and_selected_at_it() {
+        let stamp = cleanup_after_unix(1_000);
+        assert_eq!(stamp, 1_000 + CLEANUP_GRACE_SECS, "the grace is the job's deadline plus an hour");
+        let owned = vec![OwnedContainer {
+            id: "c1".to_owned(),
+            seat: Some(seat_b()),
+            cleanup_after: Some(stamp),
+            role: Some(ROLE_HOLDER.to_owned()),
+            job: Some("job-c1".to_owned()),
+        }];
+        assert!(
+            expired_owned(&owned, &seat_b(), stamp - 1).is_empty(),
+            "a container one second inside its own grace is still the job's"
+        );
+        assert_eq!(expired_owned(&owned, &seat_b(), stamp), vec!["c1".to_owned()]);
+        assert_eq!(expired_owned(&owned, &seat_b(), stamp + 86_400), vec!["c1".to_owned()]);
+    }
+
+    /// EACH JOB IS JUDGED AGAINST ITS OWN DEADLINE, NOT A SHARED AGE.
+    ///
+    /// The whole reason the expiry is written onto the container: a seat runs a ten-minute job and an
+    /// eight-hour one at the same time, and a single global age would either strangle the long job or
+    /// keep the short one's leftovers for the long one's lifetime. At one instant the short job's
+    /// container is expired and the long job's is not.
+    #[test]
+    fn each_job_is_judged_against_its_own_deadline_not_a_shared_age() {
+        let short = cleanup_after_unix(1_000 + 600);
+        let long = cleanup_after_unix(1_000 + 28_800);
+        let owned = vec![
+            OwnedContainer {
+                id: "short-job".to_owned(),
+                seat: Some(seat_b()),
+                cleanup_after: Some(short),
+                role: Some(ROLE_HOLDER.to_owned()),
+                job: Some("short".to_owned()),
+            },
+            OwnedContainer {
+                id: "long-job".to_owned(),
+                seat: Some(seat_b()),
+                cleanup_after: Some(long),
+                role: Some(ROLE_HOLDER.to_owned()),
+                job: Some("long".to_owned()),
+            },
+        ];
+        let now = short + 1;
+        assert_eq!(
+            expired_owned(&owned, &seat_b(), now),
+            vec!["short-job".to_owned()],
+            "the long job's container is inside ITS OWN deadline and must be left alone"
+        );
+        assert_eq!(expired_owned(&owned, &seat_b(), long).len(), 2, "both, once both have passed");
+    }
+
+    /// AN UNREADABLE, ABSENT OR FOREIGN STAMP IS NEVER A PERMISSION.
+    ///
+    /// Four ways a container can fail to be this seat's expired one — no stamp, a corrupt stamp,
+    /// another seat's stamp, and a caller that cannot name its own seat — and none of them may be
+    /// read as "remove it". A corrupt stamp parsed as the number 0 would date the container to 1970
+    /// and make it instantly sweepable, which is why the parse is asserted too.
+    #[test]
+    fn an_unreadable_or_foreign_stamp_is_never_a_permission_to_remove() {
+        let listing = format!(
+            "unstamped\t{seat}\t\t{ROLE_HOLDER}\tjob-u\n\
+             mangled\t{seat}\tnot-a-number\t{ROLE_HELPER}\tjob-m\n\
+             stranger\tffff\t1\t{ROLE_HOLDER}\tjob-s\nshared\t\t\t\t\n",
+            seat = seat_b()
+        );
+        let owned = parse_owned_listing(&listing);
+        assert_eq!(owned.len(), 4, "every row is still reported: {owned:?}");
+        assert_eq!(owned[0].cleanup_after, None, "an absent stamp is None, never 0");
+        assert_eq!(owned[1].cleanup_after, None, "a corrupt stamp is None, never 0");
+        assert!(
+            expired_owned(&owned, &seat_b(), u64::MAX).is_empty(),
+            "not even at the end of time: an unreadable stamp is not an expired one, a stranger's \
+             container is not ours, and a shared container carries neither"
+        );
+        let stamped = vec![OwnedContainer {
+            id: "ours".to_owned(),
+            seat: Some(seat_b()),
+            cleanup_after: Some(1),
+            role: Some(ROLE_HOLDER.to_owned()),
+            job: Some("job-ours".to_owned()),
+        }];
+        assert!(
+            expired_owned(&stamped, "   ", u64::MAX).is_empty(),
+            "a caller that cannot name its seat owns nothing to remove"
+        );
+    }
+
+    /// EVERY CONTAINER THE SWEEP REFUSES IS REPORTED, AND ROLE AND JOB BOTH GATE REMOVAL.
+    ///
+    /// Before #996 D1 an unreadable stamp was filtered out in silence and `role` was parsed and then
+    /// ignored, so a container this seat could never remove looked exactly like a host with nothing
+    /// on it. Every row here is judged at `u64::MAX`, so no row is held back by its expiry: what
+    /// keeps each one out of `removable` is the validation, and every one comes back NAMED.
+    #[test]
+    fn a_container_the_sweep_cannot_validate_is_refused_and_reported() {
+        let stamp = 1_000_u64;
+        let listing = format!(
+            "good\t{seat}\t{stamp}\t{ROLE_HOLDER}\tjob-1\n\
+             no-role\t{seat}\t{stamp}\t\tjob-2\n\
+             odd-role\t{seat}\t{stamp}\tinterloper\tjob-3\n\
+             no-job\t{seat}\t{stamp}\t{ROLE_HELPER}\t\n\
+             bad-stamp\t{seat}\tnot-a-number\t{ROLE_HOLDER}\tjob-4\n\
+             no-seat\t\t{stamp}\t{ROLE_HOLDER}\tjob-5\n\
+             stranger\tffff\t{stamp}\t{ROLE_HOLDER}\tjob-6\n",
+            seat = seat_b()
+        );
+        let owned = parse_owned_listing(&listing);
+        let selection = partition_owned(&owned, &seat_b(), u64::MAX);
+        assert_eq!(
+            selection.removable,
+            vec!["good".to_owned()],
+            "only a container that establishes seat, role, job AND a passed stamp may be removed"
+        );
+        let reported: std::collections::BTreeMap<&str, String> = selection
+            .skipped
+            .iter()
+            .map(|(id, reason)| (id.as_str(), reason.to_string()))
+            .collect();
+        assert_eq!(
+            reported.keys().copied().collect::<Vec<_>>(),
+            vec!["bad-stamp", "no-job", "no-role", "no-seat", "odd-role"],
+            "every refused container of OURS is named rather than dropped: {reported:?}"
+        );
+        // A co-tenant's container is neither removed nor reported: reporting it would turn another
+        // seat's ordinary operation into a permanent complaint in this seat's log.
+        assert!(
+            !reported.contains_key("stranger"),
+            "another seat's container is not ours to remove OR to report: {reported:?}"
+        );
+        assert!(
+            reported["odd-role"].contains("interloper"),
+            "the reason carries what was actually read, so the operator can act on it: {reported:?}"
+        );
+        assert!(reported["no-role"].contains("role"), "{reported:?}");
+        assert!(reported["no-job"].contains("job"), "{reported:?}");
+        assert!(reported["bad-stamp"].contains("stamp"), "{reported:?}");
+        assert!(reported["no-seat"].contains("seat"), "{reported:?}");
+    }
+
+    /// A PRODUCTION HOLDER NAMES ITS JOB IN ITS OWN LABEL, AND THE SWEEP MUST READ IT THERE.
+    ///
+    /// Found by the live matrix at 647c457b, not by this module. Every holder production launches
+    /// carries its job in [`HOLDER_LABEL`] and NEVER wears [`HELPER_JOB_LABEL`], so a listing that
+    /// read the job only from the helper label parsed every real holder as jobless, and the D1 gate
+    /// then refused it as [`SkipReason::MissingJob`] on that pass and every later one. The holders
+    /// this sweep exists to reclaim would have been the one thing it could never remove. The unit
+    /// fixtures hid it because `write_listing` gives every row a helper job label; production does
+    /// not, which is why this row is written out in full.
+    #[test]
+    fn a_holder_stamped_the_way_production_stamps_it_is_swept_not_refused() {
+        let stamp = 1_000_u64;
+        let seat = sweep_seat("prod-shape");
+        // Exactly what `list_owned_argv` hands back for a live holder: the helper-job column is
+        // empty and the holder's own label carries the job.
+        let listing = format!(
+            "holder\t{seat}\t{stamp}\t{ROLE_HOLDER}\t\tjob-live\n\
+             helper\t{seat}\t{stamp}\t{ROLE_HELPER}\tjob-live\t\n\
+             jobless\t{seat}\t{stamp}\t{ROLE_HOLDER}\t\t\n"
+        );
+        let owned = parse_owned_listing(&listing);
+        assert_eq!(
+            owned[0].job.as_deref(),
+            Some("job-live"),
+            "a holder's job is read from its own label, not from a helper label it never wears"
+        );
+        assert_eq!(owned[1].job.as_deref(), Some("job-live"), "a helper still names its own job");
+        assert_eq!(owned[2].job, None, "a container naming no job in EITHER label names none");
+
+        let selection = partition_owned(&owned, &seat, u64::MAX);
+        assert!(
+            selection.removable.contains(&"holder".to_owned()),
+            "an expired production-stamped holder must be removable, not refused: {selection:?}"
+        );
+        assert!(
+            selection.removable.contains(&"helper".to_owned()),
+            "and the helper alongside it: {selection:?}"
+        );
+        assert_eq!(
+            selection.skipped,
+            vec![("jobless".to_owned(), SkipReason::MissingJob)],
+            "absence is still never permission: the row naming no job at all is the only refusal"
+        );
+    }
+
+    /// A PERSISTENTLY FAILING HEAD CANNOT STARVE THE TAIL OF THE QUEUE.
+    ///
+    /// The defect (#996 D2): the pass took the first [`MAX_SWEEP_REMOVALS`] candidates every time,
+    /// so when those removals kept failing they were selected again next pass, and again, and a
+    /// container behind them was never once asked about however long it had been expired. Resuming
+    /// after the last id ATTEMPTED — not after the last one that succeeded — bounds every
+    /// candidate's wait at `ceil(len / cap)` passes however many removals fail.
+    #[test]
+    fn a_failing_head_cannot_starve_the_tail_of_the_sweep_queue() {
+        let candidates: Vec<String> = (0..40).map(|n| format!("c{n:02}")).collect();
+        let cap = 32_usize;
+
+        let (first, deferred) = select_pass(&candidates, None, cap);
+        assert_eq!(first.len(), cap, "the count bound still holds");
+        assert_eq!(first[0], "c00");
+        assert_eq!(
+            deferred.len(),
+            8,
+            "the tail waits, and is reported as waiting"
+        );
+
+        // NOTHING was removed: every attempt failed, so the candidate set is unchanged. This is
+        // precisely the state the old selection could never escape.
+        let cursor = first
+            .last()
+            .cloned()
+            .expect("a pass that attempted something");
+        let (second, _) = select_pass(&candidates, Some(&cursor), cap);
+        assert_eq!(
+            &second[..8],
+            &candidates[32..40],
+            "the pass after a wholly failing one must start where that one stopped: {second:?}"
+        );
+        let reached: std::collections::BTreeSet<&String> =
+            first.iter().chain(second.iter()).collect();
+        assert_eq!(
+            reached.len(),
+            candidates.len(),
+            "every candidate is attempted within 2 passes even though not one removal succeeded"
+        );
+    }
+
+    /// THE RESUME POINT WRAPS, AND SURVIVES THE IDS IT NAMED BEING REMOVED.
+    #[test]
+    fn the_sweep_resume_point_wraps_and_survives_its_ids_disappearing() {
+        let candidates: Vec<String> = (0..5).map(|n| format!("c{n}")).collect();
+        // A cursor past every remaining id — the ordinary case once the tail has been swept.
+        let (attempt, deferred) = select_pass(&candidates, Some("zzz"), 2);
+        assert_eq!(
+            attempt,
+            vec!["c0".to_owned(), "c1".to_owned()],
+            "it wraps to the front"
+        );
+        assert_eq!(deferred.len(), 3);
+        // A cursor naming a container that has since been REMOVED: the next id after it is still
+        // well defined, so a pass that succeeded does not lose its place.
+        let survivors = vec!["c0".to_owned(), "c3".to_owned(), "c4".to_owned()];
+        let (attempt, _) = select_pass(&survivors, Some("c2"), 2);
+        assert_eq!(attempt, vec!["c3".to_owned(), "c4".to_owned()]);
+        // A cap of zero attempts nothing and DEFERS everything, rather than quietly dropping it.
+        let (attempt, deferred) = select_pass(&survivors, None, 0);
+        assert!(attempt.is_empty());
+        assert_eq!(deferred.len(), survivors.len());
+    }
+
+    /// THE STAMP IS A RESTATEMENT OF THE DEADLINE, NOT A MEASUREMENT TAKEN AT THE CREATE.
+    ///
+    /// #996 D3. The stamp a launch writes must be the same second whenever the create is issued;
+    /// the clock at the create is not evidence about the job's deadline. The backward step is the
+    /// case that mattered — it is the one that shortens the reconstruction.
+    #[test]
+    fn a_carried_deadline_stamps_the_same_second_whatever_the_clock_says() {
+        let deadline = 1_700_000_900_u64;
+        // The window the caller computed, at 1_700_000_000.
+        let lifetime = 900_u64;
+        let expected = deadline + CLEANUP_GRACE_SECS;
+        for now_at_create in [
+            1_700_000_000_u64,
+            1_700_000_450,
+            1_699_999_000,
+            1_700_000_899,
+        ] {
+            assert_eq!(
+                launch_cleanup_stamp(Some(deadline), lifetime, now_at_create),
+                expected,
+                "a carried deadline must not move with the clock at the create ({now_at_create})"
+            );
+        }
+        // What is being refused: reconstructing from a backward-stepped clock lands the stamp
+        // earlier than the job's real deadline.
+        assert!(
+            launch_cleanup_stamp(None, lifetime, 1_699_999_000) < expected,
+            "if the fallback ever stops being clock-dependent, this row has lost its subject"
+        );
+        // And with no deadline to carry, the window is still the best statement available.
+        assert_eq!(
+            launch_cleanup_stamp(None, lifetime, 1_700_000_000),
+            expected
+        );
+        // An unreadable clock saturates instead of wrapping into the past.
+        assert_eq!(launch_cleanup_stamp(None, lifetime, u64::MAX), u64::MAX);
+    }
+
+    /// THE PRODUCTION DEADLINE REACHES THE CONTAINER AND DECIDES THE SWEEP.
+    ///
+    /// The one test that spans the whole path rather than a link of it: the remaining window
+    /// `prepare_launch` computes for a job (`unified_job_timeout` against the deadline
+    /// `seller::job_deadline_unix` chose) becomes the stamp on the create argv, and that same stamp,
+    /// read back off a listing, is what the sweep judges. A build that stamped a *guessed* global cap
+    /// would still pass every test above and fail this one.
+    ///
+    /// `wallet`-gated because [`crate::seller_exec`] is: the module carrying the production
+    /// arithmetic does not exist on an `acp`-only build, and a test that named it there would fail
+    /// to compile a real CI row (see the feature note on `seller_exec` in `lib.rs`).
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn the_production_deadline_reaches_the_container_and_decides_the_sweep() {
+        let now = 1_700_000_000_u64;
+        // A seller-selected deadline of `now + 900`, as `job_deadline_unix` would return.
+        let deadline = now + 900;
+        let lifetime = crate::seller_exec::unified_job_timeout(deadline, now);
+        // The arithmetic `prepare_launch` performs since #996 D3: the job's ABSOLUTE deadline,
+        // carried down from the caller that chose it, plus the grace. No clock is read here.
+        let cleanup_after = cleanup_after_unix(deadline);
+        assert_eq!(cleanup_after, deadline + CLEANUP_GRACE_SECS, "the job's OWN deadline, plus grace");
+        // The property the carried deadline has and the reconstruction did not: the stamp does not
+        // depend on WHEN the create is issued. A clock that stepped backward between the caller
+        // computing `lifetime` and this create lands the old derivation EARLIER than the job's real
+        // deadline — and the sweep would then remove a container out from under a job still inside
+        // it. The reconstruction is modelled here only to show what is being refused.
+        let reconstructed_after_a_backward_step =
+            cleanup_after_unix((now - 300).saturating_add(lifetime.as_secs()));
+        assert!(
+            reconstructed_after_a_backward_step < cleanup_after,
+            "a backward clock step is what shortened the old derivation; if that stops being true \
+             the regression this row guards has changed shape and the row needs rewriting"
+        );
+
+        let argv = holder_argv("h", "net", "img", 1000, 1000, "job-1", &seat_b(), cleanup_after);
+        let label = format!("{HOLDER_CLEANUP_AFTER_LABEL}={cleanup_after}");
+        assert!(argv.iter().any(|a| a == &label), "the create must carry the stamp: {argv:?}");
+
+        // …and what docker would report for that container is what the sweep judges.
+        let listing = format!(
+            "deadbeef\t{}\t{cleanup_after}\t{ROLE_HOLDER}\tjob-1\n",
+            seat_b()
+        );
+        let owned = parse_owned_listing(&listing);
+        assert!(
+            expired_owned(&owned, &seat_b(), deadline + CLEANUP_GRACE_SECS - 1).is_empty(),
+            "still inside the hour after its real deadline"
+        );
+        assert_eq!(
+            expired_owned(&owned, &seat_b(), deadline + CLEANUP_GRACE_SECS),
+            vec!["deadbeef".to_owned()]
+        );
+    }
+
+    /// A JOB'S HELPERS CARRY THE SAME SEAT AND THE SAME STAMP AS ITS HOLDER.
+    ///
+    /// A helper stamped differently from its holder would be a second, quieter deadline; one stamped
+    /// not at all is the leftover this work exists to remove. The helper's job id is deliberately
+    /// NOT `HOLDER_LABEL`, because that label is what the boot reaper selects holders by.
+    #[test]
+    fn a_job_owned_helper_carries_the_same_seat_and_stamp_as_its_holder() {
+        let stamp = cleanup_after_unix(2_000);
+        let labels = helper_label_args("job-1", &seat_b(), stamp);
+        for expected in [
+            format!("{HOLDER_SEAT_LABEL}={}", seat_b()),
+            format!("{HOLDER_CLEANUP_AFTER_LABEL}={stamp}"),
+            format!("{HOLDER_ROLE_LABEL}={ROLE_HELPER}"),
+            format!("{HELPER_JOB_LABEL}=job-1"),
+        ] {
+            assert!(labels.iter().any(|l| l == &expected), "missing {expected} in {labels:?}");
+        }
+        assert!(
+            !labels.iter().any(|l| l.starts_with(&format!("{HOLDER_LABEL}="))),
+            "a helper carrying the holder label would be reaped as a namespace holder: {labels:?}"
+        );
+
+        let argv = with_helper_labels(sidecar_argv(&NetnsHolder::adopt("h".into(), DockerCli::system()), "img"), &labels)
+            .expect("a docker run argv takes labels");
+        assert_eq!(argv[1], "run", "the verb is untouched");
+        assert!(argv.iter().any(|a| a == &format!("{HOLDER_CLEANUP_AFTER_LABEL}={stamp}")), "{argv:?}");
+        // …and the same splice is refused on anything that is not a create.
+        with_helper_labels(list_owned_argv(&seat_b()), &labels)
+            .expect_err("labels spliced into `docker ps` would become filters");
+        assert_eq!(
+            with_helper_labels(list_owned_argv(&seat_b()), &[]).expect("no labels, no change"),
+            list_owned_argv(&seat_b()),
+            "a holder with nothing to attribute stamps nothing"
+        );
+    }
+
+    #[cfg(feature = "acp")]
+    fn quick_bounds() -> FenceBounds {
+        FenceBounds {
+            fast: std::time::Duration::from_millis(10),
+            max: std::time::Duration::from_millis(60),
+            confirm: std::time::Duration::from_millis(300),
+            retain: std::time::Duration::from_millis(400),
+        }
+    }
+
+    /// AGAINST A DAEMON: ONLY THIS SEAT'S EXPIRED CONTAINERS ARE REMOVED, HOLDER AND HELPER ALIKE.
+    ///
+    /// The selection above, now spent on a real `docker rm`: what the sweep reports removed is what
+    /// the daemon was actually asked to remove, and nothing else was touched.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_sweep_removes_only_this_seats_expired_containers() {
+        let work = stand_in_work_dir("sweep-basic");
+        let client = DockerCli::stand_in(&stand_in_sweep_docker(&work));
+        let seat = sweep_seat("sweep-basic");
+        write_listing(
+            &work,
+            &[
+                ("expired-holder", &seat, "1000", ROLE_HOLDER),
+                ("expired-helper", &seat, "1000", ROLE_HELPER),
+                ("live-holder", &seat, "9999", ROLE_HOLDER),
+                ("strangers", "ffff", "1", ROLE_HOLDER),
+                ("unstamped", &seat, "", ROLE_HOLDER),
+            ],
+        );
+
+        let report = sweep_expired_with(&client, &seat, 5_000).await.expect("the listing answered");
+
+        let mut removed = report.removed.clone();
+        removed.sort();
+        assert_eq!(removed, vec!["expired-helper".to_owned(), "expired-holder".to_owned()]);
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        let mut asked = rm_log(&work);
+        asked.sort();
+        assert_eq!(
+            asked,
+            vec!["expired-helper".to_owned(), "expired-holder".to_owned()],
+            "the daemon must not have been asked about the live, foreign or unstamped containers"
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// A REMOVAL DOCKER REFUSED IS REPORTED, NOT SWALLOWED — AND THE NEXT SWEEP TRIES AGAIN.
+    ///
+    /// The retry is the property, and it is a property of the CADENCE, not of a loop inside one
+    /// pass: the container is still expired, so the next listing selects it again. Asserted by
+    /// running a second sweep against the daemon the first one left behind.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_removal_docker_refuses_is_retried_by_the_next_sweep() {
+        let work = stand_in_work_dir("sweep-retry");
+        let client = DockerCli::stand_in(&stand_in_sweep_docker(&work));
+        let seat = sweep_seat("sweep-retry");
+        write_listing(&work, &[("stubborn", &seat, "1000", ROLE_HOLDER)]);
+        std::fs::write(work.join("rmfail-stubborn"), "").expect("marker");
+
+        let first = sweep_expired_with(&client, &seat, 5_000).await.expect("the listing answered");
+        assert!(first.removed.is_empty(), "a refused removal is not a removal");
+        assert_eq!(first.failed.len(), 1, "and it is reported: {:?}", first.failed);
+        assert_eq!(first.failed[0].0, "stubborn");
+
+        // The daemon relents; nothing re-registered the container anywhere.
+        std::fs::remove_file(work.join("rmfail-stubborn")).expect("marker");
+        let second = sweep_expired_with(&client, &seat, 5_000).await.expect("the listing answered");
+        assert_eq!(second.removed, vec!["stubborn".to_owned()], "the next sweep selects it again");
+        assert_eq!(rm_log(&work), vec!["stubborn".to_owned(), "stubborn".to_owned()]);
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// A LISTING DOCKER COULD NOT ANSWER IS AN ERROR, NOT AN EMPTY SWEEP.
+    ///
+    /// "Docker did not answer" and "nothing is expired" are the same value to a caller that only
+    /// counts removals, and reporting the first as the second is how a sweep claims success for a
+    /// host it never looked at. The operator log distinguishes them because this returns `Err`.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_listing_docker_could_not_answer_is_an_error_not_an_empty_sweep() {
+        let work = stand_in_work_dir("sweep-down");
+        let client = DockerCli::stand_in(&stand_in_sweep_docker(&work));
+        write_listing(&work, &[("expired", &seat_b(), "1000", ROLE_HOLDER)]);
+        std::fs::write(work.join("daemon-down"), "").expect("marker");
+
+        let error = sweep_expired_with(&client, &seat_b(), 5_000)
+            .await
+            .expect_err("a daemon that cannot be reached has not shown that nothing is expired");
+        assert!(error.contains("could not list"), "{error}");
+        assert!(rm_log(&work).is_empty(), "nothing may be removed on an unread host");
+
+        // And an empty seat is refused before any call is made at all.
+        sweep_expired_with(&client, "  ", 5_000).await.expect_err("no seat, no sweep");
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// A CONTAINER THAT APPEARS AFTER A SWEEP IS REMOVED BY THE NEXT ONE — WITH NO REGISTRY.
+    ///
+    /// This is the whole replacement for continuous custody, and the reason the expiry lives on the
+    /// container instead of in this process. The first sweep sees an empty host. The container then
+    /// appears — a create the daemon materialised after the process that asked for it was gone, or
+    /// one made by a seller that has since been killed and restarted — and the next sweep removes it
+    /// on the strength of its own label alone. Nothing between the two calls remembers anything: a
+    /// fresh `sweep_expired_with` is exactly what a restarted seller's first tick performs.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_container_that_appears_after_a_sweep_is_removed_by_the_next_one() {
+        let work = stand_in_work_dir("sweep-late");
+        let client = DockerCli::stand_in(&stand_in_sweep_docker(&work));
+        let seat = sweep_seat("sweep-late");
+        write_listing(&work, &[]);
+
+        let first = sweep_expired_with(&client, &seat, 5_000).await.expect("the listing answered");
+        assert!(first.removed.is_empty() && first.failed.is_empty(), "an empty host is not a leak");
+
+        // The late arrival, carrying the stamp written at ITS create.
+        write_listing(&work, &[("late-arrival", &seat, "1000", ROLE_HOLDER)]);
+        let second = sweep_expired_with(&client, &seat, 5_000).await.expect("the listing answered");
+        assert_eq!(second.removed, vec!["late-arrival".to_owned()]);
+
+        // …and it is really gone from the daemon, so a third sweep has nothing to do.
+        let third = sweep_expired_with(&client, &seat, 5_000).await.expect("the listing answered");
+        assert!(third.removed.is_empty(), "a removed container must not be selected forever");
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// ONE SWEEP REMOVES AT MOST ITS BOUND, AND THE BACKLOG CLEARS ACROSS LATER SWEEPS.
+    ///
+    /// A host that accumulated hundreds of leftovers must not hand this loop an unbounded queue of
+    /// removals on one tick — the seller stops answering offers while it drains. The remainder is not
+    /// lost: it is still expired on the next tick.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_sweep_removes_at_most_its_bound_and_the_rest_wait_for_the_next() {
+        let work = stand_in_work_dir("sweep-bound");
+        let client = DockerCli::stand_in(&stand_in_sweep_docker(&work));
+        let seat = sweep_seat("sweep-bound");
+        let ids: Vec<String> = (0..MAX_SWEEP_REMOVALS + 5).map(|n| format!("c{n}")).collect();
+        let rows: Vec<(&str, &str, &str, &str)> =
+            ids.iter().map(|id| (id.as_str(), seat.as_str(), "1000", ROLE_HOLDER)).collect();
+        write_listing(&work, &rows);
+
+        let first = sweep_expired_with(&client, &seat, 5_000).await.expect("the listing answered");
+        assert_eq!(first.removed.len(), MAX_SWEEP_REMOVALS, "one tick's bounded budget");
+        // The remainder is REPORTED, not silently dropped: "removed 32" on a host with 37 expired
+        // containers must not read as "the host is clean now".
+        assert_eq!(first.deferred.len(), 5, "the backlog this pass did not attempt is named");
+        assert!(
+            first.deferred.iter().all(|id| !first.removed.contains(id)),
+            "a container cannot be both removed and deferred"
+        );
+        assert_eq!(
+            rm_log(&work).len(),
+            MAX_SWEEP_REMOVALS,
+            "the deferred ones were never even asked about"
+        );
+        let second = sweep_expired_with(&client, &seat, 5_000).await.expect("the listing answered");
+        assert_eq!(second.removed.len(), 5, "the backlog clears on the following ticks");
+        assert!(second.deferred.is_empty(), "and nothing is left over from that pass");
+        let third = sweep_expired_with(&client, &seat, 5_000).await.expect("the listing answered");
+        assert!(third.removed.is_empty(), "and then there is nothing left to do");
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// A PASS IS BOUNDED IN WALL CLOCK, NOT ONLY IN COUNT — AND SAYS WHAT IT DID NOT REACH.
+    ///
+    /// `MAX_SWEEP_REMOVALS` bounds how many containers a pass removes, which is not a bound on how
+    /// long the pass takes: the removals are serial, each carries `SWEEP_DOCKER_DEADLINE`, and a
+    /// daemon that accepts the connection and then hangs makes 32 of them 640 s of work — past two
+    /// further ticks. `SWEEP_PASS_BUDGET` is the bound on the pass itself. Spent, the pass stops
+    /// STARTING removals and reports the rest as deferred; nothing is lost, because every one of
+    /// them is still expired when the next tick selects it.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pass_stops_at_its_wall_clock_budget_and_defers_what_it_did_not_start() {
+        let work = stand_in_work_dir("sweep-budget");
+        let client = DockerCli::stand_in(&stand_in_sweep_docker(&work));
+        let seat = sweep_seat("sweep-budget");
+        let ids: Vec<String> = (0..6).map(|n| format!("slow{n}")).collect();
+        let rows: Vec<(&str, &str, &str, &str)> =
+            ids.iter().map(|id| (id.as_str(), seat.as_str(), "1000", ROLE_HOLDER)).collect();
+        write_listing(&work, &rows);
+
+        // A budget already spent when the pass reaches its first removal. Deterministic — no sleep,
+        // no timing window: the listing alone is enough elapsed time for a zero budget.
+        let spent = sweep_expired_within(&client, &seat, 5_000, std::time::Duration::ZERO)
+            .await
+            .expect("the listing still answered — the budget bounds removals, not the read");
+        assert!(spent.removed.is_empty(), "a spent budget starts no removal");
+        assert!(rm_log(&work).is_empty(), "and docker is never asked");
+        assert_eq!(spent.deferred.len(), 6, "every selected container is accounted for");
+
+        // Nothing about that pass consumed the work: the next one, with a real budget, does it all.
+        let next = sweep_expired_within(&client, &seat, 5_000, SWEEP_PASS_BUDGET)
+            .await
+            .expect("the listing answered");
+        assert_eq!(next.removed.len(), 6, "the deferred backlog is removed by the following pass");
+        assert!(next.deferred.is_empty());
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// THE DEFERRED BACKLOG IS OLDEST-FIRST, SO A PERMANENT BACKLOG STILL DRAINS.
+    ///
+    /// The count bound and the wall-clock bound defer different containers, and the ones the budget
+    /// stopped were selected EARLIER than the ones the count bound never looked at. Reporting them
+    /// in selection order is what makes the next pass reach the oldest leftovers first instead of
+    /// re-starting at whatever docker listed first this time.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_deferred_backlog_keeps_the_selection_order_the_next_pass_needs() {
+        let work = stand_in_work_dir("sweep-order");
+        let client = DockerCli::stand_in(&stand_in_sweep_docker(&work));
+        let seat = sweep_seat("sweep-order");
+        let ids: Vec<String> = (0..MAX_SWEEP_REMOVALS + 3).map(|n| format!("o{n:03}")).collect();
+        let rows: Vec<(&str, &str, &str, &str)> =
+            ids.iter().map(|id| (id.as_str(), seat.as_str(), "1000", ROLE_HOLDER)).collect();
+        write_listing(&work, &rows);
+
+        let stalled = sweep_expired_within(&client, &seat, 5_000, std::time::Duration::ZERO)
+            .await
+            .expect("the listing answered");
+        assert_eq!(
+            stalled.deferred, ids,
+            "budget-stopped names come first, count-bound names after, both in selection order"
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// AGAINST A DAEMON: A PERSISTENTLY FAILING HEAD DOES NOT MONOPOLISE THE PASS.
+    ///
+    /// The #996 D2 defect, driven through the real `sweep_expired_with` rather than the selection
+    /// alone. Every removal here is refused, on every pass, so the candidate set never shrinks —
+    /// the state the old rule could not escape, because it re-selected the same first
+    /// [`MAX_SWEEP_REMOVALS`] ids each time and the tail was never once asked about.
+    ///
+    /// The assertion is deliberately about what the DAEMON WAS ASKED, not about what the report
+    /// says: `rm.log` is written by the stand-in when a removal is actually issued.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_permanently_failing_head_does_not_monopolise_the_sweep_pass() {
+        let work = stand_in_work_dir("sweep-starve");
+        let client = DockerCli::stand_in(&stand_in_sweep_docker(&work));
+        let seat = sweep_seat("sweep-starve");
+        // Zero-padded so lexical order is numeric order, which is the order the pass walks.
+        let ids: Vec<String> = (0..MAX_SWEEP_REMOVALS + 8)
+            .map(|n| format!("c{n:03}"))
+            .collect();
+        let rows: Vec<(&str, &str, &str, &str)> = ids
+            .iter()
+            .map(|id| (id.as_str(), seat.as_str(), "1000", ROLE_HOLDER))
+            .collect();
+        write_listing(&work, &rows);
+        // EVERY removal is refused, permanently.
+        for id in &ids {
+            std::fs::write(work.join(format!("rmfail-{id}")), "").expect("marker");
+        }
+
+        let first = sweep_expired_with(&client, &seat, 5_000)
+            .await
+            .expect("the listing answered");
+        assert!(
+            first.removed.is_empty(),
+            "nothing can be removed on this host"
+        );
+        assert_eq!(
+            first.failed.len(),
+            MAX_SWEEP_REMOVALS,
+            "the whole pass was spent failing"
+        );
+        assert_eq!(first.deferred.len(), 8, "and the tail is named as waiting");
+
+        let second = sweep_expired_with(&client, &seat, 5_000)
+            .await
+            .expect("the listing answered");
+        assert!(second.removed.is_empty(), "still nothing removable");
+
+        // THE POINT: the tail was reached on the second pass, even though not one removal has ever
+        // succeeded and the head is still expired and still failing. Under the old rule the daemon
+        // would have been asked about `c000..c031` twice and about `c032..c039` never.
+        let asked: std::collections::BTreeSet<String> = rm_log(&work).into_iter().collect();
+        for id in &ids {
+            assert!(
+                asked.contains(id),
+                "every expired container must be attempted within ceil(40/32) = 2 passes; \
+                 {id} never was — a failing head is starving the tail again"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// AGAINST A DAEMON: WHAT THE SWEEP REFUSES TO TOUCH COMES BACK NAMED.
+    ///
+    /// #996 D1 through the real pass. Each unusable row is long past any stamp, so expiry is not
+    /// what holds it back — the validation is — and the daemon is asked about none of them.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_sweep_reports_every_container_it_refused_to_act_on() {
+        let work = stand_in_work_dir("sweep-skipped");
+        let client = DockerCli::stand_in(&stand_in_sweep_docker(&work));
+        let seat = sweep_seat("sweep-skipped");
+        write_raw_listing(
+            &work,
+            &format!(
+                "good\t{seat}\t1000\t{ROLE_HOLDER}\tjob-1\n\
+                 bad-stamp\t{seat}\tnot-a-number\t{ROLE_HOLDER}\tjob-2\n\
+                 no-job\t{seat}\t1000\t{ROLE_HELPER}\t\n\
+                 odd-role\t{seat}\t1000\tinterloper\tjob-3\n"
+            ),
+        );
+
+        let report = sweep_expired_with(&client, &seat, 5_000)
+            .await
+            .expect("the listing answered");
+        assert_eq!(
+            report.removed,
+            vec!["good".to_owned()],
+            "only the valid, expired one"
+        );
+        assert_eq!(
+            rm_log(&work),
+            vec!["good".to_owned()],
+            "the daemon is asked about nothing else"
+        );
+
+        let named: std::collections::BTreeMap<String, String> = report
+            .skipped
+            .iter()
+            .map(|(id, why)| (id.clone(), why.to_string()))
+            .collect();
+        assert_eq!(
+            named.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                "bad-stamp".to_owned(),
+                "no-job".to_owned(),
+                "odd-role".to_owned()
+            ],
+            "the leak has to be visible in the report, not only absent from the removals: {named:?}"
+        );
+        assert!(named["bad-stamp"].contains("stamp"), "{named:?}");
+        assert!(named["no-job"].contains("job"), "{named:?}");
+        assert!(named["odd-role"].contains("interloper"), "{named:?}");
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// Cleanup owns the JOINERS too, and must confirm each one is really gone.
+    ///
+    /// `sweep` only LOGS a failed sidecar removal, and confirmation inspected the holder alone. A
+    /// sidecar that refused removal and is still running pins the very namespace the holder was
+    /// torn down to release — so an owner that ends on holder-absence alone reports a clean release
+    /// on top of a container it owns and never looked at. The daemon has to be asked about every
+    /// owned name, not just the convenient one.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn cleanup_confirms_every_owned_joiner_is_absent_not_only_the_holder() {
+        let work = stand_in_work_dir("joiner-confirm");
+        let script = stand_in_docker(&work, "");
+        // This sidecar refuses removal AND keeps answering "present": precisely the case that
+        // holder-only confirmation reports as clean.
+        std::fs::write(work.join("rmfail-side-1"), "").expect("marker");
+        std::fs::write(work.join("present-side-1"), "").expect("marker");
+
+        let cleanup = HolderCleanup {
+            name: "holder-joiner-confirm".to_owned(),
+            joiners: vec!["side-1".to_owned()],
+            // Nothing in flight, so settlement is immediate and this test is only about custody.
+            creation: std::sync::Arc::new(CreationFence::default()),
+            client: DockerCli::stand_in(&script),
+            bounds: quick_bounds(),
+        };
+        cleanup.own_until_settled_or_confirmed();
+
+        let log = std::fs::read_to_string(work.join("events.log")).unwrap_or_default();
+        assert!(
+            log.contains("inspect side-1"),
+            "cleanup ended custody without ever asking the daemon whether the sidecar it owns is \
+             gone. Its removal failed and it is still running, pinning the namespace, and this \
+             owner reported a clean release anyway. Event log:\n{log}"
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// An absence observed while a create is STILL IN FLIGHT is not proof of anything.
+    ///
+    /// This is success-shaped emptiness: "No such container" reads identically whether the create
+    /// never happened or has simply not landed yet. The previous owner waited out its bound, swept,
+    /// asked once, got "absent", and returned announcing that *nothing landed* — while the create
+    /// it was waiting on was still running and could land immediately afterwards, unowned.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn cleanup_does_not_take_absence_as_proof_while_a_create_is_still_in_flight() {
+        let work = stand_in_work_dir("unsettled-confirm");
+        let script = stand_in_docker(&work, "");
+        let fence = std::sync::Arc::new(CreationFence::default());
+        // Held for the whole test and never released: this create NEVER settles.
+        let _ticket = fence.begin();
+
+        let cleanup = HolderCleanup {
+            name: "holder-unsettled".to_owned(),
+            joiners: Vec::new(),
+            creation: std::sync::Arc::clone(&fence),
+            client: DockerCli::stand_in(&script),
+            bounds: quick_bounds(),
+        };
+        cleanup.own_until_settled_or_confirmed();
+
+        let log = std::fs::read_to_string(work.join("events.log")).unwrap_or_default();
+        assert!(
+            !log.contains("inspect holder-unsettled"),
+            "the create never settled, yet cleanup asked the daemon for an absence answer and ended \
+             on it. That answer cannot distinguish \"nothing landed\" from \"has not landed yet\", \
+             so resting a clean verdict on it is exactly the orphan this fence exists to prevent. \
+             Event log:\n{log}"
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// The deadline must bound the WHOLE create flow, stdin included.
+    ///
+    /// The timer used to start after the plan had already been written to the child. A client that
+    /// never reads its stdin fills the pipe and blocks that write forever, so the bound was never
+    /// armed and the launch hung with no deadline at all — the precise state in which cancellation
+    /// leaves work nobody owns.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn the_deadline_bounds_the_whole_create_flow_including_the_stdin_write() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let work = stand_in_work_dir("stdin-bound");
+        let script = work.join("docker");
+        // Never reads stdin, so a large plan fills the pipe and the write blocks.
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").expect("write stand-in");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let deadline = std::time::Duration::from_millis(300);
+        let mut child_exited = false;
+        let started = std::time::Instant::now();
+        let outcome = run_bounded_blocking(
+            &DockerCli::stand_in(&script),
+            vec!["docker".to_owned(), "create".to_owned()],
+            Some("x".repeat(4 * 1024 * 1024)),
+            deadline,
+            started,
+            None,
+            &mut child_exited,
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the bound never armed: a client that refuses to read its stdin blocked the write for \
+             {elapsed:?} against a {deadline:?} deadline. A create with no enforceable bound is a \
+             launch that can hang and a container nobody is waiting for."
+        );
+        assert!(outcome.is_err(), "a client killed on its deadline cannot report success");
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// A container that lands AFTER the bound is still removed — by an owner that never left.
+    ///
+    /// This is the ownership hole, and it is not a reporting one: when `max` expired with the
+    /// create still running, the owner swept what it could see, printed a leak and RETURNED. The
+    /// sweep cannot touch a container that has not appeared yet, so the one case the fence exists
+    /// for — a create landing late — ended with no owner at all, and the container stayed up until
+    /// a boot reaper happened to find it.
+    ///
+    /// The assertion is therefore about the CONTAINER, not the log: the stand-in daemon answers
+    /// `inspect` from a presence marker and drops that marker when a removal succeeds, so this
+    /// passes only if the thing that landed late was actually removed, and only if the removal came
+    /// after it landed.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn a_create_that_lands_after_the_bound_is_still_removed_by_its_retained_owner() {
+        use std::io::Write as _;
+
+        let work = stand_in_work_dir("late-custody");
+        let script = stand_in_docker(&work, "");
+        let fence = std::sync::Arc::new(CreationFence::default());
+        let ticket = fence.begin();
+
+        // The create lands strictly AFTER the owner's first sweep, and only then settles.
+        //
+        // Ordered on the observed sweep rather than on a sleep, deliberately: a wall-clock delay
+        // makes this test a race, and a lucky schedule where the pre-landing sweep happens to run
+        // late lets a dropped-custody build pass. Waiting for the removal to appear in the stand-in
+        // daemon's log pins the one ordering that matters — the owner has already swept, and the
+        // container arrives afterwards, which is exactly the case a sweep cannot cover.
+        let landing = work.clone();
+        let lander = std::thread::spawn(move || {
+            let give_up = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < give_up {
+                let swept = std::fs::read_to_string(landing.join("rm.log"))
+                    .map(|log| log.contains("holder-late"))
+                    .unwrap_or(false);
+                if swept {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            std::fs::write(landing.join("present-holder-late"), "").expect("presence marker");
+            let mut log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(landing.join("events.log"))
+                .expect("events log");
+            writeln!(log, "landed holder-late").expect("events log");
+            drop(ticket);
+        });
+
+        let cleanup = HolderCleanup {
+            name: "holder-late".to_owned(),
+            joiners: Vec::new(),
+            creation: std::sync::Arc::clone(&fence),
+            client: DockerCli::stand_in(&script),
+            bounds: FenceBounds {
+                retain: std::time::Duration::from_secs(5),
+                ..quick_bounds()
+            },
+        };
+        cleanup.own_until_settled_or_confirmed();
+        lander.join().expect("lander");
+
+        assert!(
+            !work.join("present-holder-late").exists(),
+            "the container landed after the owner's bound and is STILL RUNNING: custody was \
+             dropped at `max` while the create was in flight, so nothing removed what arrived \
+             afterwards. An owner that stops owning at a timeout is how this fence manufactures the \
+             orphan it exists to prevent."
+        );
+        let log = std::fs::read_to_string(work.join("events.log")).unwrap_or_default();
+        let landed = log
+            .lines()
+            .position(|line| line.contains("landed holder-late"))
+            .expect("the stand-in create never landed, so this test proved nothing");
+        assert!(
+            log.lines().skip(landed + 1).any(|line| line.contains("rm holder-late")),
+            "the only removal issued for this holder happened BEFORE it existed — a removal aimed \
+             at a container that had not landed yet, which the daemon answers 'No such container' \
+             and which proves nothing. Event log:\n{log}"
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// A create still in flight when every bound expires is TRANSFERRED, not released.
+    ///
+    /// This is the termination path, and it is the one a longer wait cannot reach. The bounded
+    /// owner waited `max`, then kept the job a further `retain`, and then — with the create still
+    /// running — printed a leak and RETURNED. A container landing after that had no owner at all,
+    /// which is the same hole the retained window was added to close, one window further out.
+    ///
+    /// Ownership is asserted here as a FACT ABOUT THE FENCE, not as a sentence in a log: the fence
+    /// is holding somebody's cleanup, and when the create finally settles that owner removes the
+    /// container that landed.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn a_create_still_in_flight_at_every_bound_is_transferred_to_a_retained_owner_that_removes_it() {
+        let work = stand_in_work_dir("retained-transfer");
+        let script = stand_in_docker(&work, "");
+        let fence = std::sync::Arc::new(CreationFence::default());
+        // Taken and NOT released: this create is still in flight through every bound below.
+        let ticket = fence.begin();
+
+        let cleanup = HolderCleanup {
+            name: "holder-transfer".to_owned(),
+            joiners: Vec::new(),
+            creation: std::sync::Arc::clone(&fence),
+            client: DockerCli::stand_in(&script),
+            bounds: quick_bounds(),
+        };
+        cleanup.own_until_settled_or_confirmed();
+
+        // The bounded owner is finished. Responsibility must NOT have ended with it.
+        assert!(
+            fence.holds_retained_owner(),
+            "the owner reached its last bound with the create still in flight and simply returned, \
+             so nothing is responsible for a container that has not landed yet. Another window \
+             would only move this same edge; the job has to belong to somebody once the wait is \
+             over."
+        );
+
+        // The create lands LONG after every bound expired, and only now settles.
+        std::fs::write(work.join("present-holder-transfer"), "").expect("presence marker");
+        drop(ticket);
+
+        assert!(
+            !work.join("present-holder-transfer").exists(),
+            "the container landed after every bound expired and is STILL RUNNING. The retained \
+             owner either never ran or never removed it — either way this is the orphan the fence \
+             exists to prevent, arriving exactly where the bounded owner stopped looking."
+        );
+        assert!(
+            !fence.holds_retained_owner(),
+            "the retained owner was never consumed, so the handoff did not actually run on \
+             settlement"
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// A name the daemon never confirmed absent stays OWNED.
+    ///
+    /// The removal was issued and the daemon would not say it was gone. That used to end in a log
+    /// line and a return: the names were named, then let go, which downstream is indistinguishable
+    /// from a clean release. An unconfirmed name is a container that may well still be running, so
+    /// ownership of it has to survive the failure to confirm it.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn names_that_could_not_be_confirmed_absent_stay_owned_rather_than_released() {
+        let work = stand_in_work_dir("confirm-failed");
+        let script = stand_in_docker(&work, "");
+        // The container is present, and every removal against it FAILS, so the daemon keeps
+        // answering that it is still there and confirmation cannot succeed.
+        std::fs::write(work.join("present-holder-unconfirmed"), "").expect("presence marker");
+        std::fs::write(work.join("rmfail-holder-unconfirmed"), "").expect("rm failure marker");
+        let fence = std::sync::Arc::new(CreationFence::default());
+
+        let cleanup = HolderCleanup {
+            name: "holder-unconfirmed".to_owned(),
+            joiners: Vec::new(),
+            creation: std::sync::Arc::clone(&fence),
+            client: DockerCli::stand_in(&script),
+            bounds: quick_bounds(),
+        };
+        cleanup.own_until_settled_or_confirmed();
+
+        assert!(
+            work.join("present-holder-unconfirmed").exists(),
+            "the fixture removed the container after all, so this test proved nothing about \
+             unconfirmed names"
+        );
+        assert!(
+            fence.holds_retained_owner(),
+            "the daemon never confirmed this name absent and the owner RELEASED it anyway. A \
+             container that could not be confirmed gone is one that may still be running, and \
+             naming it in a log is not the same as still owning it."
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// A CREATE THAT SETTLED BEFORE CLEANUP REGISTERED still gets its container removed.
+    ///
+    /// This is the ordering the previous version lost outright: the bounded wait times out, the
+    /// last ticket drops and finds an empty slot, and only THEN does cleanup install its callback.
+    /// No later drop exists to run it, so the job sat in the slot until the fence died. The earlier
+    /// test could not catch it because it deliberately held the last ticket alive across
+    /// registration — the one ordering in which the bug cannot occur.
+    ///
+    /// What is asserted is the CONTAINER, not the slot: the presence marker the stand-in answers
+    /// `inspect` from is gone, and the removal is in the daemon's own log.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn a_create_that_settled_before_cleanup_registered_is_still_removed() {
+        let work = stand_in_work_dir("settle-before-register");
+        let script = stand_in_docker(&work, "");
+        std::fs::write(work.join("present-holder-raced"), "").expect("presence marker");
+        let fence = std::sync::Arc::new(CreationFence::default());
+
+        // The create ENDS FIRST: this is the last ticket, and it drops while the slot is empty.
+        drop(fence.begin());
+
+        // Only now does the bounded owner hand its job over — to a fence with nothing left in
+        // flight that could ever fire it.
+        fence.take_custody(retained_removal(
+            "holder-raced".to_owned(),
+            Vec::new(),
+            DockerCli::stand_in(&script),
+            quick_bounds(),
+        ));
+
+        assert!(
+            !work.join("present-holder-raced").exists(),
+            "the create settled BEFORE cleanup registered, nothing ever ran the handed-over job, \
+             and the container is still there. A registration that lands after the last ticket \
+             drop has to run the job, not park it where no event can reach it."
+        );
+        let removals = std::fs::read_to_string(work.join("rm.log")).unwrap_or_default();
+        assert!(
+            removals.contains("holder-raced"),
+            "no removal was ever issued for a job handed to an already-settled fence: {removals:?}"
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// THE LAST `Arc` TO THE FENCE GOING AWAY RUNS THE JOB — it does not discard it.
+    ///
+    /// The retained job is a `FnOnce`, and a `FnOnce` that is merely dropped does nothing at all.
+    /// The closure deliberately keeps no `Arc` back to its own fence (that would be a cycle, and
+    /// the fence would never be destroyed at all), so nothing held the slot alive: once the holder
+    /// and every ticket were gone, destruction threw the cleanup away in silence — the one outcome
+    /// downstream cannot tell apart from never having owned the container.
+    ///
+    /// The container is what is inspected, after every owner the test holds is gone.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn cleanup_survives_the_loss_of_every_arc_to_the_fence_and_still_removes() {
+        let work = stand_in_work_dir("last-arc");
+        let script = stand_in_docker(&work, "");
+        std::fs::write(work.join("present-holder-lastarc"), "").expect("presence marker");
+        // Removal FAILS at first, so the job cannot discharge and stays owed in the slot — the only
+        // state in which a fence can be destroyed while still holding cleanup.
+        std::fs::write(work.join("rmfail-holder-lastarc"), "").expect("rm failure marker");
+        let fence = std::sync::Arc::new(CreationFence::default());
+
+        let cleanup = HolderCleanup {
+            name: "holder-lastarc".to_owned(),
+            joiners: Vec::new(),
+            creation: std::sync::Arc::clone(&fence),
+            client: DockerCli::stand_in(&script),
+            bounds: quick_bounds(),
+        };
+        cleanup.own_until_settled_or_confirmed();
+        assert!(
+            work.join("present-holder-lastarc").exists(),
+            "the fixture removed the container while removals were supposed to fail, so this test \
+             proved nothing about destruction"
+        );
+
+        // The daemon stops refusing: from here a removal would genuinely succeed.
+        std::fs::remove_file(work.join("rmfail-holder-lastarc")).expect("clear the rm failure");
+        // EVERY other owner is gone — the cleanup consumed itself — so this is the last `Arc`.
+        assert_eq!(
+            std::sync::Arc::strong_count(&fence),
+            1,
+            "this test is only meaningful while it holds the LAST Arc to the fence"
+        );
+        drop(fence);
+
+        assert!(
+            !work.join("present-holder-lastarc").exists(),
+            "the last Arc to the fence was dropped while it still held cleanup, and the job went \
+             with it: the container is STILL PRESENT. Destruction is the final moment this process \
+             can act on a container it owns, so it has to act rather than drop a live obligation."
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// A NAME THAT FAILED CONFIRMATION IS DISCHARGED LATER, BY THE OWNER THAT KEPT IT.
+    ///
+    /// Not "the slot is occupied" — that is the code's opinion of itself, and it reads the same
+    /// whether the owner is alive or inert. The claim under test is that the retained owner is
+    /// LIVE: when the container genuinely goes away later, this owner is what notices, and it stops
+    /// owing only then. Nothing notifies it; it has to look.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn a_name_that_failed_confirmation_is_discharged_by_its_owner_on_the_later_real_removal() {
+        let work = stand_in_work_dir("confirm-later");
+        let script = stand_in_docker(&work, "");
+        std::fs::write(work.join("present-holder-later"), "").expect("presence marker");
+        std::fs::write(work.join("rmfail-holder-later"), "").expect("rm failure marker");
+        let fence = std::sync::Arc::new(CreationFence::default());
+
+        let cleanup = HolderCleanup {
+            name: "holder-later".to_owned(),
+            joiners: Vec::new(),
+            creation: std::sync::Arc::clone(&fence),
+            client: DockerCli::stand_in(&script),
+            bounds: quick_bounds(),
+        };
+        cleanup.own_until_settled_or_confirmed();
+        let looked_before = std::fs::read_to_string(work.join("events.log"))
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert!(
+            work.join("present-holder-later").exists(),
+            "the fixture confirmed the name absent after all, so nothing was left owed"
+        );
+
+        // LATER, the container genuinely goes away: the daemon finally reaps what those failed
+        // removals were about, and removals start working again.
+        std::fs::remove_file(work.join("present-holder-later")).expect("the container goes away");
+        std::fs::remove_file(work.join("rmfail-holder-later")).expect("removals work again");
+
+        // A later create settles on this holder's fence — the event the owner was kept for.
+        drop(fence.begin());
+
+        let looked_after = std::fs::read_to_string(work.join("events.log"))
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert!(
+            looked_after > looked_before,
+            "the retained owner never ran again when a later create settled: it was not a live \
+             owner, only a flag recording that something had once gone wrong"
+        );
+        assert!(
+            !fence.holds_retained_owner(),
+            "the name is genuinely absent now and its owner did look, yet the job is still owed — \
+             an owner that cannot discharge on the real removal never ends"
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    // ---- Cleanup that ends: bounded in-process effort, then the expiry sweep -------------------
+    //
+    // Petar's review of PR 996 replaced process-lifetime custody with a per-job deadline stamped on
+    // the container itself. Nothing below waits on an in-memory owner outliving its fence: a name
+    // that is still owed when the fence dies is left to `sweep_expired`, whose gates live with the
+    // sweep. Each gate here asserts on CONTAINER STATE (the presence marker the stand-in daemon
+    // answers `inspect` from) and on the daemon's own `rm.log`, never on a log string.
+
+    // ---- Round-2 gates: F1..F4 ------------------------------------------------------------------
+
+    // ---- Live gates: the same paths against the real daemon on the approved VM -----------------
+    //
+    // Run with `cargo test --features acp,wallet -p maxplayer-core --lib -- --ignored live_`.
+    // The client is real `docker`; the containers are real. Where a fault is injected it is injected
+    // at the CLIENT (a wrapper that refuses `rm` while a marker exists) and is labelled as such — the
+    // daemon's answers to inspect, create, events and the eventual removal are the real daemon's.
+
+    /// Work whose budget expired IN THE QUEUE never starts a create at all.
+    ///
+    /// The clock starts before the work is queued, so a saturated blocking pool can consume the
+    /// entire budget before the closure runs. The previous flow spawned anyway and then bounded the
+    /// wait — but by then the create exists, and a container can land with its caller already past
+    /// its bound. That is an orphan issued knowingly. The only correct answer at that point is to
+    /// not start it, and what this asserts is that nothing was started.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn work_whose_budget_expired_in_the_queue_is_refused_before_anything_is_spawned() {
+        let work = stand_in_work_dir("queue-expired");
+        let script = stand_in_docker(&work, "");
+        let deadline = std::time::Duration::from_millis(200);
+        // The caller's clock, taken before the work was queued. It waited three budgets for a
+        // thread.
+        let queued_at = std::time::Instant::now() - std::time::Duration::from_millis(600);
+        let fence = std::sync::Arc::new(CreationFence::default());
+        let mut child_exited = false;
+
+        let outcome = run_bounded_blocking(
+            &DockerCli::stand_in(&script),
+            vec!["docker".to_owned(), "run".to_owned(), "--detach".to_owned()],
+            Some("plan".to_owned()),
+            deadline,
+            queued_at,
+            Some(&fence),
+            &mut child_exited,
+        );
+
+        outcome.expect_err("work whose budget was spent before it began cannot report success");
+        // THE ASSERTION IS THAT NOTHING WAS EVER STARTED UNDER THIS FENCE.
+        //
+        // Deliberately not the stand-in's side effects: a client that IS spawned with no budget
+        // left is killed within microseconds, long before a shell can reach its first line, so the
+        // markers it would have written are absent either way and prove nothing. (That is not a
+        // guess — with the pre-spawn refusal removed, the marker form of this gate stayed green.)
+        //
+        // Ticket issuance is the fact that survives that race. Spawning takes a ticket for the plan
+        // writer synchronously, on this thread, before any wait — so a fence that never issued one
+        // is a fence under which nothing was launched, whatever happened afterwards.
+        assert_eq!(
+            fence.tickets_issued(),
+            0,
+            "work whose budget had already expired in the queue was STARTED anyway: a ticket was \
+             issued under this fence, so a client was launched with nothing left to wait for it. \
+             The container it creates can land with its caller already past its bound — an orphan \
+             this module exists to prevent, issued knowingly. Bounding the wait afterwards is too \
+             late, because by then the create exists."
+        );
+        assert!(
+            !work.join("creating").exists(),
+            "a create against the stand-in daemon completed for work with no budget left"
+        );
+        assert!(!child_exited, "no child can have been reaped when none was ever spawned");
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// Reaping the client does not close its pipes: a DESCENDANT can hold them open.
+    ///
+    /// The bounded wait covered the child and stopped there. After the status came back the flow
+    /// ran `read_to_end` on stdout and stderr on this very thread, with no bound at all, on the
+    /// reasoning that a reaped child leaves closed pipes. It does not. Anything the client started
+    /// inherits the write ends, and `read_to_end` waits for an EOF that a living descendant never
+    /// sends — so the whole flow could block indefinitely immediately AFTER its deadline had been
+    /// satisfied. The client here exits at once and leaves a descendant holding stdout.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn a_descendant_holding_the_output_pipe_cannot_outlast_the_bound() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let work = stand_in_work_dir("descendant-pipe");
+        let script = work.join("docker");
+        // SYNCHRONIZED TO THE BRANCH THIS GATE EXISTS FOR.
+        //
+        // The branch under test is the drain that runs AFTER the client has been reaped. The
+        // previous fixture gave the client a 400ms budget and assumed it would exit inside it; on
+        // an independent loaded machine it did not, the deadline killed the client before it ever
+        // exited, and the run took the deadline-kill path instead. The gate failed having never
+        // reached the code it was written to exercise, which proves nothing either way — a fixture
+        // that dies before its branch tests nothing.
+        //
+        // So the client exits AT ONCE with no work in front of it, the descendant announces that it
+        // is holding the pipe, and the budget is wide enough that arriving at the drain is not a
+        // race. `child_exited` is then checked FIRST, because it is the fact that says which branch
+        // actually ran.
+        //
+        // TWO CONSTANTS WERE REMOVED FROM THIS FIXTURE, because on a loaded machine each of them
+        // decided the result on its own:
+        //
+        // * The BUDGET is no longer a guess about how fast this host spawns a process. It is eight
+        //   times a spawn measured on this host, seconds before, through this very function. A
+        //   machine slow enough to miss that is a machine that cannot spawn at all.
+        // * The descendant no longer `sleep`s for a fixed span. It holds the pipe until this test
+        //   RELEASES it, so "the drain returned while the pipe was still held" is a fact and not a
+        //   race between two timers. That also repairs what the fixed sleep quietly cost: a six
+        //   second hold is shorter than the four-deadline bound asserted below, so an unbounded
+        //   drain would have finished inside the bound and this gate would have passed through the
+        //   exact regression it exists for. Held until released, an unbounded drain runs into the
+        //   descendant's own safety cap and the bound fails, as it must.
+        let trivial = work.join("docker-trivial");
+        std::fs::write(&trivial, "#!/bin/sh\nexit 0\n").expect("write trivial stand-in");
+        std::fs::set_permissions(&trivial, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let measured = {
+            let fence = std::sync::Arc::new(CreationFence::default());
+            let mut exited = false;
+            let at = std::time::Instant::now();
+            let _ = run_bounded_blocking(
+                &DockerCli::stand_in(&trivial),
+                vec!["docker".to_owned(), "create".to_owned()],
+                None,
+                std::time::Duration::from_secs(60),
+                at,
+                Some(&fence),
+                &mut exited,
+            );
+            assert!(exited, "this host could not spawn and reap a `#!/bin/sh exit 0` inside a minute");
+            at.elapsed()
+        };
+        let deadline = std::cmp::max(std::time::Duration::from_secs(2), measured * 8);
+
+        // 0.05 s × 2400 = two minutes, the descendant's own safety cap: if an assertion below
+        // panics before the release, nothing is left holding a pipe on this machine indefinitely.
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n( echo holding > \"{work}/holding\"\n  i=0\n  while [ ! -f \"{work}/release\" ] && [ $i -lt 2400 ]; do sleep 0.05; i=$((i+1)); done ) &\nexit 0\n",
+                work = work.to_string_lossy()
+            ),
+        )
+        .expect("write stand-in");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let fence = std::sync::Arc::new(CreationFence::default());
+        let mut child_exited = false;
+        let started = std::time::Instant::now();
+        let outcome = run_bounded_blocking(
+            &DockerCli::stand_in(&script),
+            vec!["docker".to_owned(), "create".to_owned()],
+            None,
+            deadline,
+            started,
+            Some(&fence),
+            &mut child_exited,
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            child_exited,
+            "the client was killed on its {deadline:?} deadline — eight times the {measured:?} this \
+             host took to spawn and reap a no-op moments ago — before it ever exited, so the \
+             post-exit drain this gate exists for never ran. That is the FIXTURE failing, not the \
+             production code: it has to reach the branch under test before it can say anything \
+             about it."
+        );
+        assert!(
+            work.join("holding").exists(),
+            "the descendant never announced that it had the pipe, so nothing was holding stdout \
+             open and the drain had nothing to be blocked by"
+        );
+        assert!(
+            elapsed < deadline * 4,
+            "the flow ran unbounded AFTER the child was reaped: a descendant held stdout open and \
+             the drain waited {elapsed:?} against a {deadline:?} bound. A create whose tail is \
+             unbounded is a create nobody is waiting on."
+        );
+        outcome.expect_err(
+            "an output this process never finished reading is not a result it may report",
+        );
+        // OWNERSHIP, not wording. The call is over and a reader thread still holds the create's
+        // stdout. While it does, the fence must NOT read as settled: a settled fence is cleanup's
+        // permission to start removing, and that permission cannot be granted while this process is
+        // still doing the create's IO. The drain threads used to be ticketless, so the fence fell
+        // silent the instant this function returned and the reader became work nobody was counted
+        // for.
+        assert!(
+            !fence.wait_until_settled(std::time::Duration::from_millis(300)),
+            "the fence reported this create SETTLED while a reader thread still held its stdout \
+             open. Cleanup is entitled to remove on that answer, so unowned IO work outlived the \
+             ticket that was supposed to cover it."
+        );
+        // The release is the test's own act, so what follows is measured from a known event rather
+        // than from a sleep that may or may not have elapsed yet.
+        std::fs::write(work.join("release"), "go").expect("release the descendant");
+        // And it is not owned forever. When the descendant lets go, the read ends and the ticket
+        // goes with it: retained ownership means the lifecycle closes on the real event, not that
+        // it never closes.
+        assert!(
+            fence.wait_until_settled(std::time::Duration::from_secs(20)),
+            "the reader's ticket was never released even after the descendant exited and stdout \
+             reached EOF, so this fence can never settle and cleanup could never run"
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// A writer that outlives the deadline is NAMED, never silently dropped.
+    ///
+    /// On the deadline path the flow killed the child, returned, and dropped the writer handle on
+    /// the way out. Killing the direct client normally closes the read end and the blocked write
+    /// fails with `EPIPE` — but a descendant holding that end open defeats exactly that, leaving a
+    /// thread still writing a plan into a pipe while this call reports the command finished. The
+    /// returned error has to carry that outstanding custody instead of implying a settled flow.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn a_plan_writer_still_running_after_the_deadline_is_reported_not_abandoned() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let work = stand_in_work_dir("writer-outstanding");
+        let script = work.join("docker");
+        // Never reads stdin, so a large plan fills the pipe and the write blocks; the descendant
+        // keeps the READ end open, so killing the client does NOT deliver `EPIPE` to the writer and
+        // the outstanding-writer case is reached every time rather than by luck.
+        //
+        // The read end is parked on fd 3 on purpose. A background job in a non-interactive shell
+        // has its STDIN redirected to /dev/null by POSIX, so the obvious `sleep 30 &` holds nothing
+        // — and `sleep 30 <&0 &` does not help either, because that default is applied before the
+        // redirection resolves, leaving it duplicating /dev/null. An unrelated descriptor is
+        // inherited untouched, so fd 3 keeps the pipe genuinely open. Written the obvious way this
+        // test raced: the writer took `EPIPE` instead, and whether it arrived inside the grace
+        // decided the result — it passed single-threaded and failed under parallel load.
+        std::fs::write(&script, "#!/bin/sh\nexec 3<&0\nsleep 30 &\nsleep 30\n")
+            .expect("write stand-in");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let deadline = std::time::Duration::from_millis(300);
+        let mut child_exited = false;
+        let started = std::time::Instant::now();
+        let outcome = run_bounded_blocking(
+            &DockerCli::stand_in(&script),
+            vec!["docker".to_owned(), "create".to_owned()],
+            Some("x".repeat(4 * 1024 * 1024)),
+            deadline,
+            started,
+            None,
+            &mut child_exited,
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the bound never armed: {elapsed:?} against {deadline:?}."
+        );
+        let error = outcome.expect_err("a client killed on its deadline cannot report success");
+        // The assertion is that the writer was ACCOUNTED FOR, not which way it went.
+        //
+        // Both dispositions are correct: the kill normally closes the read end and the blocked
+        // write ends on `EPIPE`, while a descendant holding that end leaves the thread running and
+        // it has to be named. Which one happens depends on whether the stand-in reached its
+        // backgrounded holder before the kill, and under parallel load it sometimes does not — an
+        // earlier version of this test asserted the still-running branch and failed for that reason
+        // alone. What must never happen, and is what the production defect did, is ending the
+        // deadline path having said nothing about the writer at all.
+        assert!(
+            error.contains("the thread writing its plan") || error.contains("no plan was being written"),
+            "the deadline path ended without accounting for the thread writing the plan — that \
+             handle was dropped, so a write into a descendant-held pipe can continue while this \
+             call reads as finished. Got:\n{error}"
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// Time spent WAITING FOR A THREAD is time spent against the bound.
+    ///
+    /// `spawn_blocking` hands work to a pool that can be saturated, and the clock used to start
+    /// inside the closure — after the queue. A create could therefore sit queued for longer than
+    /// its entire deadline and still be handed a full fresh budget when a thread finally freed up,
+    /// which is not a bound on the flow at all. The clock is now taken on the caller's side and
+    /// passed in; this hands in a budget already mostly spent and requires the remainder to be
+    /// honoured rather than restarted.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn the_bound_counts_the_time_the_work_spent_queued_for_a_thread() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let work = stand_in_work_dir("queue-time");
+        let script = work.join("docker");
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").expect("write stand-in");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let deadline = std::time::Duration::from_millis(600);
+        let queued_for = std::time::Duration::from_millis(500);
+        // Stood for a call that waited `queued_for` on the pool before a thread took it.
+        let queued_at = std::time::Instant::now() - queued_for;
+        let mut child_exited = false;
+        let entered = std::time::Instant::now();
+        let outcome = run_bounded_blocking(
+            &DockerCli::stand_in(&script),
+            vec!["docker".to_owned(), "create".to_owned()],
+            None,
+            deadline,
+            queued_at,
+            None,
+            &mut child_exited,
+        );
+        let spent_here = entered.elapsed();
+
+        assert!(outcome.is_err(), "a client killed on its deadline cannot report success");
+        // What is left of the budget, plus slack for a loaded machine. A flow that restarts its
+        // clock on arrival instead spends the WHOLE deadline here and lands well outside this.
+        let remainder = deadline - queued_for + std::time::Duration::from_millis(250);
+        assert!(
+            spent_here < remainder,
+            "the queue wait was not counted: this call had {queued_for:?} of a {deadline:?} budget \
+             already spent before it started, so at most {remainder:?} remained — yet it ran a \
+             further {spent_here:?}, a full fresh deadline granted on arrival. Work that waits \
+             longer than its bound for a thread would never be cut off."
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// The address `establish` MEASURES is the address its rendered policy pinholes.
+    ///
+    /// The single-source property was only ever asserted against a hand-built `NetPolicy`. That
+    /// cannot catch the failure that matters: `establish` measuring one address and rendering the
+    /// plan from another, which produces a job whose firewall permits a proxy it is not pointed at,
+    /// or points at a proxy its firewall drops. Here the measurement comes from the stand-in client
+    /// and the assertion is made on the bytes production actually sent to the applier.
+    ///
+    /// The run ends at the applier's count cross-check, which is the point of interest: reaching it
+    /// proves the probe, the fenced holder create and the plan render all ran in production order.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_address_establish_measures_is_the_address_its_plan_pinholes() {
+        let work = stand_in_work_dir("proxy");
+        let script = stand_in_docker(&work, "");
+
+        let outcome = establish_with(
+            &DockerCli::stand_in(&script),
+            FenceBounds::production(),
+            "mx-scratch",
+            "holder:local",
+            "sidecar:local",
+            "host.docker.internal",
+            "proxy-route",
+            "seat",
+            1000,
+            1000,
+            Some(crate::sandbox_net::PortRange::new(9000, 9002).expect("valid range")),
+            false,
+            vec!["10.0.0.53".to_owned()],
+            2_000_000_000,
+        )
+        .await;
+
+        let error = outcome.expect_err("the stand-in applier reports a short count");
+        assert!(
+            error.contains("containment is incomplete"),
+            "the run must reach the applier's count cross-check, not fail earlier: {error}"
+        );
+
+        let plan = std::fs::read_to_string(work.join("stdin.txt"))
+            .expect("production sent a plan to the applier");
+        assert!(
+            plan.contains("203.0.113.77"),
+            "the plan must pinhole the address establish measured, not some other one:\n{plan}"
+        );
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// A CANCELLED `establish` does not leave the container it created behind.
+    ///
+    /// Cancellation mid-create is the production shape of the delayed-create race: the future is
+    /// dropped while the blocking create is still running, and a cleanup that races it issues a
+    /// remove for a container that does not exist yet. The container then arrives, unowned, pinning
+    /// a namespace with nobody left to remove it.
+    ///
+    /// Two assertions, and both are needed: cleanup must OUTLAST the create (otherwise the removal
+    /// it issued named nothing), and it must actually name the holder (otherwise it waited and then
+    /// removed nothing).
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cancelled_establish_outlasts_its_create_and_removes_the_holder() {
+        let work = stand_in_work_dir("cancel");
+        let script = stand_in_docker(&work, "sleep 1");
+
+        // Bound to the test, not to the call expression: the future below outlives the statement
+        // that builds it, so the client it borrows has to as well.
+        let client = DockerCli::stand_in(&script);
+        let mut establishing = Box::pin(establish_with(
+            &client,
+            FenceBounds::production(),
+            "mx-scratch",
+            "holder:local",
+            "sidecar:local",
+            "host.docker.internal",
+            "cancelled-establish",
+            "seat",
+            1000,
+            1000,
+            None,
+            false,
+            vec!["10.0.0.53".to_owned()],
+            2_000_000_000,
+        ));
+
+        // Cancel on the CREATE ITSELF, not on a stopwatch. A fixed deadline raced the probe and
+        // cancelled before the create had begun, which measures nothing: the marker is written by
+        // the stand-in as the create starts, so the drop below always lands mid-create.
+        let marker = work.join("creating");
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !marker.exists() {
+            tokio::select! {
+                _ = establishing.as_mut() => panic!("establish cannot finish against this client"),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
+            }
+            assert!(std::time::Instant::now() < give_up, "the create never started");
+        }
+
+        let started = std::time::Instant::now();
+        drop(establishing); // the cancellation under test; the holder's cleanup runs in here
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= std::time::Duration::from_millis(700),
+            "cancellation returned in {elapsed:?}, while the create it had to outlast was still \
+             running: the container arrives afterwards with nobody holding it"
+        );
+
+        let removed = std::fs::read_to_string(work.join("rm.log")).unwrap_or_default();
+        assert!(
+            removed.contains("cancelled-establish"),
+            "a cancelled establish must remove the holder it created, got {removed:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// Cleanup whose wait for an in-flight create **times out** still removes only AFTER that create
+    /// has settled.
+    ///
+    /// This is the delayed path, and it is the one the previous version got wrong. It waited 30s for
+    /// a create the client itself allows 120s to run, and on expiry it removed anyway and printed
+    /// that the container might be LEAKED. Every part of that is the bug: the removal names a
+    /// container that does not exist yet, docker answers "No such container", cleanup treats that as
+    /// success, and the create then lands with nobody holding it. The log line did not make it safe;
+    /// it only made it documented.
+    ///
+    /// The bound is a parameter purely so this can be measured: `fast` expires here while the create
+    /// is still running, which is exactly the production shape at a scale a test can wait out. The
+    /// assertion is an ORDERING, not a duration — `rm` must appear after `create-end` in the client's
+    /// own event log — because the property under test is "never removes ahead of a live create",
+    /// and a stopwatch would pass for a version that simply slept longer before making the same
+    /// mistake.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cleanup_that_outwaits_its_bound_removes_only_after_the_create_settles() {
+        let work = stand_in_work_dir("late");
+        let script = stand_in_docker(&work, "sleep 1");
+        let client = DockerCli::stand_in(&script);
+        // `fast` expires mid-create; `max` is generous enough that the owner waits the create out.
+        let bounds = FenceBounds {
+            fast: std::time::Duration::from_millis(50),
+            max: std::time::Duration::from_secs(30),
+            confirm: std::time::Duration::from_secs(10),
+            retain: std::time::Duration::from_secs(30),
+        };
+
+        let mut establishing = Box::pin(establish_with(
+            &client,
+            bounds,
+            "mx-scratch",
+            "holder:local",
+            "sidecar:local",
+            "host.docker.internal",
+            "late-cleanup",
+            "seat",
+            1000,
+            1000,
+            None,
+            false,
+            vec!["10.0.0.53".to_owned()],
+            2_000_000_000,
+        ));
+
+        // Cancel on the create itself, so the drop below always lands while it is in flight.
+        let marker = work.join("creating");
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !marker.exists() {
+            tokio::select! {
+                _ = establishing.as_mut() => panic!("establish cannot finish against this client"),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
+            }
+            assert!(std::time::Instant::now() < give_up, "the create never started");
+        }
+        drop(establishing);
+
+        // The owner runs past this scope, so the removal is awaited here rather than assumed.
+        let events = work.join("events.log");
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let log = std::fs::read_to_string(&events).unwrap_or_default();
+            if log.contains("rm ") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < give_up,
+                "cleanup never removed the holder at all; the event log was {log:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let log = std::fs::read_to_string(&events).expect("the stand-in recorded its calls");
+        let lines: Vec<&str> = log.lines().collect();
+        let create_end = lines
+            .iter()
+            .position(|line| line.trim() == "create-end")
+            .expect("the create ran to completion");
+        let removed = lines
+            .iter()
+            .position(|line| line.starts_with("rm ") && line.contains("late-cleanup"))
+            .expect("cleanup removed the holder it created");
+        assert!(
+            removed > create_end,
+            "cleanup removed the holder at step {removed} but the create only settled at step \
+             {create_end}: the remove was issued ahead of a live create, which docker answers \
+             \"No such container\" and cleanup then treats as done — the container lands afterwards \
+             unowned. Event log:\n{log}"
+        );
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// The same delayed-create failure, reproduced on the **sidecar** path rather than the holder's.
+    ///
+    /// This is the half that registration alone does not cover, and the distinction the R3 verdict
+    /// drew: pre-registering the name tells cleanup WHAT to remove and nothing about WHEN the
+    /// container appears. A sidecar create still in flight when the holder drops gets removed by
+    /// name, answered "No such container" because it does not exist yet, and marked done — then it
+    /// lands, pinning the namespace the holder was tearing down.
+    ///
+    /// The future is genuinely CANCELLED here (dropped by `timeout`) while its blocking work runs
+    /// on, which is the real shape of the bug: cancelling the future must not release the fence.
+    /// Remove the `Some(holder.fence_creation())` argument in `run_sidecar_confirmed` and this
+    /// fails, because `Drop` returns while the create is still running.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sidecar_create_still_in_flight_fences_cleanup() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("mx-sc-fence-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let slow = dir.join("slow");
+        std::fs::write(&slow, "#!/bin/sh\nsleep 1\n").expect("write slow");
+        std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        fn never_asked(_client: &DockerCli, _name: &str) -> Option<bool> {
+            panic!("a cancelled create must not reach the absence check")
+        }
+
+        let holder = NetnsHolder::adopt("maxplayer-netns-sidecar-fence".into(), DockerCli::system());
+
+        // Cancel the future ~100ms in, leaving roughly 900ms of blocking create still running.
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            run_sidecar_confirmed(
+                &holder,
+                "iface",
+                vec![slow.to_string_lossy().into_owned(), "run".to_owned()],
+                None,
+                std::time::Duration::from_secs(10),
+                never_asked,
+            ),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the future must have been cancelled, not completed");
+        assert_eq!(
+            holder.sidecars.lock().expect("registry").len(),
+            1,
+            "a cancelled create must leave its name a cleanup target"
+        );
+
+        let started = std::time::Instant::now();
+        drop(holder);
+        let waited = started.elapsed();
+
+        assert!(
+            waited >= std::time::Duration::from_millis(400),
+            "cleanup returned in {waited:?}, while the sidecar create it had to outlast was still \
+             running: every remove it issued named a container that did not exist yet, and the one \
+             that arrives afterwards pins the namespace with nobody holding it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The delayed-create timing failure, reproduced at the site that must fence it.
+    ///
+    /// The create runs on a blocking thread; cancelling the future above it does not stop that
+    /// thread. Cleanup used to run immediately, ask docker to remove a container that did not exist
+    /// YET, be told "No such container" — which is treated as success — and return satisfied, after
+    /// which the create landed and left an untracked container.
+    ///
+    /// Reproduced here by holding a creation ticket that is released 700ms from now, as an in-flight
+    /// create would be, and then dropping the holder. The assertion is not "the fence helper works":
+    /// it is that **`Drop` had not finished before the create settled**. Remove the
+    /// `wait_until_settled` call from `Drop` and this fails, because `Drop` returns while the flag
+    /// is still false.
+    ///
+    /// `Drop` does issue real `docker rm` calls, which on this path answer "No such container"; they
+    /// are not what makes this pass, and the elapsed-time assertion below is deliberately well under
+    /// the settle delay so a slow removal cannot substitute for the wait.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn cleanup_does_not_remove_ahead_of_a_create_that_is_still_in_flight() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let holder = NetnsHolder::adopt("maxplayer-netns-fence-probe".into(), DockerCli::system());
+        let settled = std::sync::Arc::new(AtomicBool::new(false));
+
+        let ticket = holder.fence_creation();
+        let flag = std::sync::Arc::clone(&settled);
+        let creating = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            // The create finishes: the container now exists, and only now is removing it sound.
+            flag.store(true, Ordering::SeqCst);
+            drop(ticket);
+        });
+
+        let started = std::time::Instant::now();
+        drop(holder);
+        let waited = started.elapsed();
+
+        assert!(
+            settled.load(Ordering::SeqCst),
+            "cleanup finished while a create was still in flight: every remove it issued was \
+             aimed at a container that did not exist yet, and the one that arrived afterwards is \
+             an orphan no one holds"
+        );
+        assert!(
+            waited >= std::time::Duration::from_millis(500),
+            "cleanup returned in {waited:?}, far sooner than the create it had to outlast — it \
+             cannot have waited for the fence"
+        );
+        creating.join().expect("the create thread");
     }
 }

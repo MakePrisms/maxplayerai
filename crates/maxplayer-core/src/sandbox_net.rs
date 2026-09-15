@@ -112,6 +112,31 @@ pub const DENIED_DESTINATIONS: &[&str] = &[
 /// carries no destination a job legitimately needs.
 pub const DENIED_DESTINATIONS_V6: &[&str] = &["fc00::/7", "fe80::/10", "ff00::/8"];
 
+/// The solicited-node multicast range, and the *only* multicast destination this policy lets out.
+///
+/// Every IPv6 address has exactly one solicited-node address derived from its low 24 bits, and
+/// Neighbour Solicitation is sent there rather than to the peer (RFC 4861 §7.2.2) — the peer's
+/// link-layer address is precisely what is not yet known. `ff02::1` (all-nodes) and `ff02::2`
+/// (all-routers) are outside this /104 and stay dropped by [`DENIED_DESTINATIONS_V6`].
+pub const ND_SOLICITED_NODE_MULTICAST: &str = "ff02::1:ff00:0/104";
+
+/// ICMPv6 Neighbour Solicitation.
+pub const ICMPV6_NEIGHBOUR_SOLICITATION: &str = "135";
+
+/// ICMPv6 Neighbour Advertisement — the reply half. Sent to whoever solicited, which on this link is
+/// a link-local address, so without an exception `fe80::/10` drops every answer this namespace owes.
+pub const ICMPV6_NEIGHBOUR_ADVERTISEMENT: &str = "136";
+
+/// The hop limit RFC 4861 §11 requires on a received ND message, and the reason these two exceptions
+/// cannot be relayed in from off-link: a router decrements, so 255 can only have been set by a node
+/// on this very link. It is the standard ND admission check, applied here to what leaves.
+pub const ND_HOP_LIMIT: &str = "255";
+
+/// How the two neighbour-discovery exceptions are named in a readback failure. Roles rather than
+/// rule text, so a reader is told which reach is missing instead of being handed an argv to diff.
+pub const ND_SOLICITATION_ROLE: &str = "the neighbour-solicitation exception";
+pub const ND_ADVERTISEMENT_ROLE: &str = "the neighbour-advertisement exception";
+
 /// Log lines are rate-limited so a job cannot fill the seller's disk by hammering a denied address.
 const LOG_RATE: &str = "6/min";
 const LOG_BURST: &str = "12";
@@ -351,6 +376,13 @@ pub struct ReadbackRule {
     pub chain: String,
     /// Every predicate, in printed order.
     pub predicates: Vec<Predicate>,
+    /// Why this line could not be accounted for token by token, when it could not.
+    ///
+    /// A malformed line is kept rather than dropped, on purpose. Dropping it would shrink the rule
+    /// count and hide an unexpected rule from the very check that exists to notice one; keeping it
+    /// leaves it countable and visible, while [`ReadbackRule::value`] refuses to interpret it so it
+    /// can never satisfy a rule the policy requires.
+    pub malformed: Option<String>,
 }
 
 /// An exception rule reduced to the three things that decide what it lets through, and only after
@@ -404,8 +436,18 @@ impl ReadbackRule {
                 let chain = fields.next()?.to_owned();
                 let mut predicates: Vec<Predicate> = Vec::new();
                 let mut negated = false;
+                // Every token must land somewhere. The two cases below used to be discarded in
+                // silence, which let a line that is NOT the one this policy renders read back as one
+                // that is: the retained predicates were identical, so the rule compared equal to the
+                // canonical form and was accepted.
+                let mut malformed: Option<String> = None;
                 for field in fields {
                     if field == "!" {
+                        if negated {
+                            malformed.get_or_insert_with(|| {
+                                format!("`{line}` repeats `!` with no flag between them")
+                            });
+                        }
                         // iptables prints the inversion as its own token, before the flag.
                         negated = true;
                         continue;
@@ -420,9 +462,19 @@ impl ReadbackRule {
                     } else if let Some(current) = predicates.last_mut() {
                         // A flag can take more than one value: `--tcp-flags FIN,SYN,RST,ACK SYN`.
                         current.values.push(field.to_owned());
+                    } else {
+                        // A bare value with no flag to attach to, e.g. `-A OUTPUT garbage -p ...`.
+                        malformed.get_or_insert_with(|| {
+                            format!("`{line}` carries `{field}` before any flag")
+                        });
                     }
                 }
-                Some(Self { chain, predicates })
+                if negated {
+                    // A trailing `!` inverts the flag that never came. The pending inversion used to
+                    // be dropped when the loop ended, so the line parsed as its un-inverted twin.
+                    malformed.get_or_insert_with(|| format!("`{line}` ends with a dangling `!`"));
+                }
+                Some(Self { chain, predicates, malformed })
             })
             .collect()
     }
@@ -434,6 +486,11 @@ impl ReadbackRule {
     /// of those is a different rule from the one this policy renders, and answering with the value
     /// anyway is how an inverted match passes for a positive one.
     pub fn value(&self, key: &str) -> Option<&str> {
+        // A line with an unaccounted token is not interpreted at all. Answering for its retained
+        // predicates would be answering about a rule this parser demonstrably did not read whole.
+        if self.malformed.is_some() {
+            return None;
+        }
         let mut matching = self.predicates.iter().filter(|predicate| predicate.key == key);
         let first = matching.next()?;
         if matching.next().is_some() || first.negated || first.values.len() != 1 {
@@ -545,6 +602,120 @@ impl ReadbackRule {
             protocol,
             dport: normalize_dport(&dport),
         })
+    }
+
+    /// The neighbour-discovery exception this rule is, named by role, if its shape is one this
+    /// policy renders.
+    ///
+    /// ND is judged here rather than through [`ReadbackRule::as_exception`] because it is a
+    /// different shape, not a variant of the same one: no transport, no port, and a destination on
+    /// the solicitation only. Projecting it through the udp/tcp reader would reject every correct
+    /// ND rule and, worse, invite loosening that reader until it accepted them.
+    ///
+    /// Narrowed on three axes at once, because each alone is a hole: a type-135 ACCEPT without the
+    /// destination reaches every multicast group, one without the hop-limit match carries traffic
+    /// relayed from off-link, and one that named no type at all would permit every ICMPv6 message
+    /// including echo — the one a payload can actually author. Extra and inverted predicates are
+    /// refused for exactly the reasons `as_exception` refuses them.
+    pub fn as_nd_exception(&self) -> Result<&'static str, String> {
+        if self.chain != OUTPUT_CHAIN {
+            return Err(format!(
+                "an ICMPv6 ACCEPT in chain {} rather than {OUTPUT_CHAIN} — it does not filter this \
+                 job's egress",
+                self.chain
+            ));
+        }
+        if let Some(negated) = self.predicates.iter().find(|predicate| predicate.negated) {
+            return Err(format!(
+                "an ICMPv6 ACCEPT whose {} match is INVERTED — it permits the complement of the \
+                 neighbour-discovery rule this policy renders",
+                negated.key
+            ));
+        }
+        if self.target() != Some("ACCEPT") {
+            return Err("a rule read as a neighbour-discovery exception does not jump to ACCEPT"
+                .to_owned());
+        }
+
+        let icmpv6_type = self.value("--icmpv6-type").ok_or_else(|| {
+            "an ICMPv6 ACCEPT that names no single message type — untyped, it permits every ICMPv6 \
+             message, including the echo a payload can author"
+                .to_owned()
+        })?;
+        match self.value("--hl-eq") {
+            Some(ND_HOP_LIMIT) => {}
+            other => {
+                return Err(format!(
+                    "an ICMPv6 ACCEPT at hop limit {other:?} rather than {ND_HOP_LIMIT} — without \
+                     that match the exception is not confined to this link, since only an on-link \
+                     node can present a hop limit a router has not decremented"
+                ));
+            }
+        }
+
+        let role = match icmpv6_type {
+            ICMPV6_NEIGHBOUR_SOLICITATION => match self.value("-d") {
+                Some(ND_SOLICITED_NODE_MULTICAST) => ND_SOLICITATION_ROLE,
+                other => {
+                    return Err(format!(
+                        "a neighbour solicitation aimed at {other:?} rather than \
+                         {ND_SOLICITED_NODE_MULTICAST} — a widened solicitation is still exactly \
+                         one ACCEPT, and it reaches every multicast group"
+                    ));
+                }
+            },
+            ICMPV6_NEIGHBOUR_ADVERTISEMENT => {
+                if let Some(destination) = self.value("-d") {
+                    return Err(format!(
+                        "a neighbour advertisement narrowed to {destination:?} — the answer is owed \
+                         to whichever on-link node solicited, so a fixed destination makes it inert"
+                    ));
+                }
+                ND_ADVERTISEMENT_ROLE
+            }
+            other => {
+                return Err(format!(
+                    "an ICMPv6 ACCEPT for message type {other:?} — this policy permits only \
+                     neighbour solicitation ({ICMPV6_NEIGHBOUR_SOLICITATION}) and advertisement \
+                     ({ICMPV6_NEIGHBOUR_ADVERTISEMENT}), and never echo"
+                ));
+            }
+        };
+
+        for predicate in &self.predicates {
+            let permitted = match predicate.key.as_str() {
+                "-p" | "--icmpv6-type" | "--hl-eq" | "-j" => true,
+                "-d" => role == ND_SOLICITATION_ROLE,
+                // The two match modules iptables inserts for its own predicates, and nothing else.
+                "-m" => predicate.values == ["icmp6"] || predicate.values == ["hl"],
+                _ => false,
+            };
+            if !permitted {
+                return Err(format!(
+                    "an ICMPv6 ACCEPT carrying `{} {}`, a predicate this policy never renders on a \
+                     neighbour-discovery exception",
+                    predicate.key,
+                    predicate.values.join(" ")
+                ));
+            }
+            // `-m` legitimately appears twice: `-m icmp6` for the type match and `-m hl` for the
+            // hop-limit one. Everything else is printed once per rule.
+            let allowed_repeats = usize::from(predicate.key == "-m");
+            let seen = self
+                .predicates
+                .iter()
+                .filter(|other| other.key == predicate.key)
+                .count();
+            if seen > 1 + allowed_repeats {
+                return Err(format!(
+                    "an ICMPv6 ACCEPT carrying {seen} `{}` predicates — this is not the plan this \
+                     policy sent",
+                    predicate.key
+                ));
+            }
+        }
+
+        Ok(role)
     }
 }
 
@@ -690,8 +861,41 @@ impl NetPolicy {
             ));
         }
 
-        // IPv6. No pinhole and no logging split — the proxy is v4, and a job has no legitimate v6
-        // destination inside these ranges.
+        // IPv6 neighbour discovery, and *only* neighbour discovery. These two ACCEPTs must precede
+        // the drops below, for the same reason the v4 pinhole does: `ff00::/8` otherwise shadows
+        // the solicitation and `fe80::/10` the advertisement.
+        //
+        // Measured in a live namespace, not reasoned about: with the drops alone, a job cannot
+        // reach *any* v6 address — allowed or denied — because Neighbour Solicitation goes to a
+        // solicited-node MULTICAST address, `ff00::/8` drops it, and the neighbour entry ends in
+        // state FAILED. That is denial by a dead v6 stack rather than by the destination policy,
+        // and it makes the v6 half of this policy untestable: every address fails identically
+        // whether or not it is denied.
+        //
+        // These exceptions are carried by the kernel's own ND, never by a job's payload: emitting
+        // ICMPv6 type 135/136 needs a raw socket, a job's namespace runs `--cap-drop ALL`, and a
+        // ping socket can only send echo (type 128), which stays dropped. The narrowing is
+        // destination, type and hop limit together — see [`ND_SOLICITED_NODE_MULTICAST`] and
+        // [`ND_HOP_LIMIT`].
+        rules.push(Rule::new(
+            Family::V6,
+            vec![
+                "-p", "icmpv6", "--icmpv6-type", ICMPV6_NEIGHBOUR_SOLICITATION, "-d",
+                ND_SOLICITED_NODE_MULTICAST, "-m", "hl", "--hl-eq", ND_HOP_LIMIT, "-j", "ACCEPT",
+            ],
+            "neighbour solicitation, or the namespace cannot resolve any v6 peer at all",
+        ));
+        rules.push(Rule::new(
+            Family::V6,
+            vec![
+                "-p", "icmpv6", "--icmpv6-type", ICMPV6_NEIGHBOUR_ADVERTISEMENT, "-m", "hl",
+                "--hl-eq", ND_HOP_LIMIT, "-j", "ACCEPT",
+            ],
+            "the answering half of neighbour discovery, owed to a link-local solicitor",
+        ));
+
+        // IPv6 destination denial. No pinhole and no logging split — the proxy is v4, and a job has
+        // no legitimate v6 destination inside these ranges.
         for denied in DENIED_DESTINATIONS_V6 {
             rules.push(Rule::new(
                 Family::V6,
@@ -759,6 +963,16 @@ impl NetPolicy {
     /// to be looked at.
     pub fn verify_readback(&self, family: Family, stdout: &str) -> Result<(), String> {
         let found = ReadbackRule::parse_all(stdout);
+        // Before anything is counted or matched: a line this parser could not account for token by
+        // token is not evidence about the namespace, in either direction. Refusing here keeps the
+        // failure legible instead of surfacing later as a missing DROP.
+        if let Some(bad) = found.iter().find_map(|rule| rule.malformed.as_deref()) {
+            return Err(format!(
+                "{} printed a rule this parser cannot account for token by token: {bad} — an \
+                 unreadable readback is not an acceptable one",
+                family.binary()
+            ));
+        }
         let expected = self.rule_count(family);
         if found.len() != expected {
             return Err(format!(
@@ -854,6 +1068,7 @@ impl NetPolicy {
 
         let mut unrendered: Vec<String> = Vec::new();
         let mut matched: Vec<(String, usize)> = Vec::new();
+        let mut nd_seen: Vec<&'static str> = Vec::new();
         for (at, rule) in found.iter().enumerate() {
             // Judged by the jump, so a rule whose `-j` is repeated or inverted still arrives here
             // rather than being skipped as "not an ACCEPT".
@@ -862,6 +1077,28 @@ impl NetPolicy {
                 .iter()
                 .any(|predicate| predicate.key == "-j" && predicate.values == ["ACCEPT"]);
             if !jumps_to_accept {
+                continue;
+            }
+            // Neighbour discovery is judged on its own terms, and only in v6. An ICMPv6 ACCEPT in
+            // the v4 chain is not a thing this policy renders at all.
+            if matches!(rule.value("-p"), Some("icmpv6" | "ipv6-icmp")) {
+                if family == Family::V4 {
+                    unrendered.push(format!("an ICMPv6 ACCEPT in the v4 chain (at index {at})"));
+                    continue;
+                }
+                match rule.as_nd_exception() {
+                    Ok(role) if nd_seen.contains(&role) => {
+                        unrendered.push(format!("a second `{role}` (at index {at})"));
+                    }
+                    Ok(role) => {
+                        nd_seen.push(role);
+                        // Into `matched`, so the position checks below apply to ND too: appended
+                        // under the range DROPs it is inert, and the namespace is back to a v6
+                        // stack that resolves no neighbour at all.
+                        matched.push((role.to_owned(), at));
+                    }
+                    Err(why) => unrendered.push(format!("{why} (at index {at})")),
+                }
                 continue;
             }
             match rule.as_exception(family) {
@@ -881,11 +1118,22 @@ impl NetPolicy {
             }
         }
 
-        let missing: Vec<String> = expected
+        let mut missing: Vec<String> = expected
             .iter()
             .filter(|(_, _, taken)| !*taken)
             .map(|(role, exception, _)| format!("{role} (`{exception}`)"))
             .collect();
+        if family == Family::V6 {
+            // Both halves are required, and their absence is reported as missing reach rather than
+            // as a count: without them the namespace resolves no v6 neighbour at all, every v6
+            // destination fails alike, and the denials this policy exists to prove become
+            // unattributable.
+            for role in [ND_SOLICITATION_ROLE, ND_ADVERTISEMENT_ROLE] {
+                if !nd_seen.contains(&role) {
+                    missing.push(role.to_owned());
+                }
+            }
+        }
         if !unrendered.is_empty() || !missing.is_empty() {
             // Both halves in one error deliberately: "an ACCEPT nobody rendered" and "an exception
             // that is gone" are usually the same edit seen from two sides, and reporting only one
@@ -1041,20 +1289,35 @@ mod tests {
                 "no configured range means the gateway is never singled out for access: {:?}",
                 rule.args
             );
-            assert_ne!(
-                rule.args.last().map(String::as_str),
-                Some("ACCEPT"),
-                "an unconfigured range must close the namespace, not accept anything: {:?}",
-                rule.args
-            );
+            // Scoped to v4, because v6 carries two ACCEPTs that are not a pinhole and do not
+            // depend on one: neighbour discovery is installed whether or not a proxy exists, and
+            // without it the namespace cannot reach any v6 address to be contained from. Their
+            // narrowness is proved in `a_widened_neighbour_discovery_exception_is_refused`.
+            if rule.family == Family::V4 {
+                assert_ne!(
+                    rule.args.last().map(String::as_str),
+                    Some("ACCEPT"),
+                    "an unconfigured range must close the namespace, not accept anything: {:?}",
+                    rule.args
+                );
+            }
+        }
+        // The v6 exceptions are exactly the two ND rules in both configurations — an unconfigured
+        // policy must not acquire a third.
+        for policy in [&configured, &unconfigured] {
+            let v6_accepts = policy
+                .rules()
+                .into_iter()
+                .filter(|rule| rule.family == Family::V6 && rule.target() == Some("ACCEPT"))
+                .count();
+            assert_eq!(v6_accepts, 2, "only neighbour discovery is permitted over v6");
         }
         // Positive control: the same assertions MUST fail on a configured policy, or they are
         // asserting nothing and would pass against a renderer that never emits a pinhole at all.
         assert!(
-            configured
-                .rules()
-                .iter()
-                .any(|rule| rule.args.last().map(String::as_str) == Some("ACCEPT")),
+            configured.rules().iter().any(|rule| {
+                rule.family == Family::V4 && rule.args.last().map(String::as_str) == Some("ACCEPT")
+            }),
             "the configured case must open the pinhole this test proves the unconfigured case does \
              not"
         );
@@ -1175,12 +1438,19 @@ mod tests {
             plan.iter().any(|(bin, _)| *bin == "ip6tables"),
             "no v6 rules in the plan — the family would be left unfiltered"
         );
-        for (binary, argv) in &plan {
-            let v6_arg = argv.iter().any(|arg| arg.contains("::"));
-            if v6_arg {
-                assert_eq!(*binary, "ip6tables", "v6 rule handed to iptables: {argv:?}");
-            } else {
-                assert_eq!(*binary, "iptables", "v4 rule handed to ip6tables: {argv:?}");
+        // The family is the rule's own, not a guess from its text. A v6 rule need not mention a v6
+        // address at all — the neighbour-advertisement exception matches on ICMPv6 type and hop
+        // limit only — so a `contains("::")` heuristic would hand it to `iptables` and call that
+        // correct.
+        for (rule, (binary, argv)) in policy().rules().iter().zip(&plan) {
+            assert_eq!(
+                *binary,
+                rule.family.binary(),
+                "{:?} rule handed to {binary}: {argv:?}",
+                rule.family
+            );
+            if argv.iter().any(|arg| arg.contains("::")) {
+                assert_eq!(*binary, "ip6tables", "v6 address handed to iptables: {argv:?}");
             }
         }
     }
@@ -1240,9 +1510,17 @@ mod tests {
 -A OUTPUT -d 240.0.0.0/4 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix \"sbx-net-deny:\"
 -A OUTPUT -d 240.0.0.0/4 -j DROP";
 
-    /// The v6 readback, measured in the same run. Textually identical to what was sent — these rules
-    /// carry no match module and no bare address, so there is nothing for iptables to rewrite.
+    /// The v6 readback, measured in a live namespace on 2026-09-14 (`lima:gvisor-repro`), pasted as
+    /// printed.
+    ///
+    /// The three DROPs come back textually identical — no match module, no bare address, nothing for
+    /// iptables to rewrite. The two ND exceptions do not: iptables **moves `-d` ahead of `-p`** and
+    /// makes the match module explicit (`-p icmpv6` ⇒ `-p ipv6-icmp -m icmp6`). Sent as
+    /// `-p icmpv6 --icmpv6-type 135 -d ff02::1:ff00:0/104 …`, printed as the first line below. One
+    /// more reason [`NetPolicy::verify_readback`] checks properties rather than strings.
     const MEASURED_V6: &str = "\
+-A OUTPUT -d ff02::1:ff00:0/104 -p ipv6-icmp -m icmp6 --icmpv6-type 135 -m hl --hl-eq 255 -j ACCEPT
+-A OUTPUT -p ipv6-icmp -m icmp6 --icmpv6-type 136 -m hl --hl-eq 255 -j ACCEPT
 -A OUTPUT -d fc00::/7 -j DROP
 -A OUTPUT -d fe80::/10 -j DROP
 -A OUTPUT -d ff00::/8 -j DROP";
@@ -1365,9 +1643,105 @@ mod tests {
         assert!(above.contains("above the metadata DROP"), "{above}");
 
         // A v6 range missing.
-        let v6_short = "-A OUTPUT -d fc00::/7 -j DROP\n-A OUTPUT -d fe80::/10 -j DROP\n-A OUTPUT -d fc00::/7 -j DROP";
+        // Five rules, so the count check passes and the missing `ff00::/8` is what fires: the ND
+        // pair, two of the three drops, and one repeated.
+        let v6_short = &MEASURED_V6.replace("-A OUTPUT -d ff00::/8 -j DROP", "-A OUTPUT -d fc00::/7 -j DROP");
         let v6_missing = policy.verify_readback(Family::V6, v6_short).expect_err("v6");
         assert!(v6_missing.contains("ff00::/8"), "{v6_missing}");
+    }
+
+    /// The neighbour-discovery exceptions are the only v6 traffic this policy permits, and each of
+    /// the three narrowings is load-bearing on its own. Every mutation below keeps the rule count
+    /// and every denied DROP intact — so each one is refused by the ND check itself rather than by
+    /// the count or the denial check firing first, which is what makes this a test of the
+    /// narrowing.
+    #[test]
+    fn a_widened_neighbour_discovery_exception_is_refused() {
+        let policy = measured_policy();
+        assert_eq!(policy.verify_readback(Family::V6, MEASURED_V6), Ok(()));
+
+        // The solicitation reaching every multicast group instead of solicited-node only. Still
+        // exactly one ACCEPT, still type 135, still hop limit 255.
+        let all_groups = MEASURED_V6.replace("-d ff02::1:ff00:0/104 ", "");
+        let refused = policy
+            .verify_readback(Family::V6, &all_groups)
+            .expect_err("a solicitation with no destination narrowing");
+        assert!(refused.contains(ND_SOLICITED_NODE_MULTICAST), "{refused}");
+
+        // `ff02::1` (all-nodes) is the reachable target that narrowing exists to exclude, and it
+        // is not inside the solicited-node range.
+        let all_nodes = MEASURED_V6.replace("ff02::1:ff00:0/104", "ff02::1/128");
+        let refused = policy
+            .verify_readback(Family::V6, &all_nodes)
+            .expect_err("a solicitation aimed at all-nodes");
+        assert!(refused.contains(ND_SOLICITED_NODE_MULTICAST), "{refused}");
+
+        // Without the hop-limit match the exception is no longer confined to this link: a router
+        // decrements, so only an on-link node can present 255.
+        for stripped in [
+            MEASURED_V6.replace(
+                "--icmpv6-type 135 -m hl --hl-eq 255",
+                "--icmpv6-type 135",
+            ),
+            MEASURED_V6.replace(
+                "--icmpv6-type 136 -m hl --hl-eq 255",
+                "--icmpv6-type 136",
+            ),
+        ] {
+            let refused = policy
+                .verify_readback(Family::V6, &stripped)
+                .expect_err("an ND exception with no hop-limit match");
+            assert!(refused.contains(ND_HOP_LIMIT), "{refused}");
+        }
+
+        // An echo request (type 128) is what an unprivileged payload can actually emit, so an
+        // exception carrying it is the hole a job could use. Type is the only thing changed.
+        let echo = MEASURED_V6.replace("--icmpv6-type 136", "--icmpv6-type 128");
+        let refused = policy
+            .verify_readback(Family::V6, &echo)
+            .expect_err("an echo-request exception");
+        assert!(refused.contains("advertisement"), "{refused}");
+    }
+
+    /// Order is load-bearing in v6 exactly as it is in v4, and getting it wrong is silent: the
+    /// drops shadow the exceptions, neighbour discovery dies, and every v6 destination becomes
+    /// unreachable — which reads as containment while proving nothing about it.
+    #[test]
+    fn a_neighbour_discovery_accept_below_the_drops_is_refused() {
+        let policy = measured_policy();
+        let mut lines: Vec<&str> = MEASURED_V6.lines().collect();
+        let advertisement = lines.remove(1);
+        lines.push(advertisement);
+        let shadowed = lines.join("\n");
+
+        let refused = policy
+            .verify_readback(Family::V6, &shadowed)
+            .expect_err("an ND ACCEPT appended below the range drops");
+        // The ND exceptions are checked for position by the SAME ordering check that guards the
+        // pinhole, so this refusal is worded like its siblings above: it names the rule, its index,
+        // and the drop that precedes it. Asserted on that wording rather than on a single adjective
+        // so the control cannot be satisfied by an unrelated refusal, and it must still name the
+        // advertisement specifically — a message about some other rule would not prove this one is
+        // guarded.
+        assert!(refused.contains("below the first range DROP"), "{refused}");
+        assert!(refused.contains("neighbour-advertisement"), "{refused}");
+        assert!(refused.contains("inert"), "{refused}");
+
+        // And the rules() order this guards is the order actually installed.
+        let all = policy.rules();
+        let v6: Vec<&Rule> = all.iter().filter(|rule| rule.family == Family::V6).collect();
+        let first_drop = v6
+            .iter()
+            .position(|rule| rule.target() == Some("DROP"))
+            .expect("a v6 drop");
+        let last_accept = v6
+            .iter()
+            .rposition(|rule| rule.target() == Some("ACCEPT"))
+            .expect("a v6 accept");
+        assert!(
+            last_accept < first_drop,
+            "the ND exceptions must be installed above the range drops"
+        );
     }
 
     /// A seat with no contained credential renders no pinhole, so any ACCEPT in its namespace is one
@@ -1594,6 +1968,142 @@ mod tests {
             last_dns < first_range_drop,
             "a resolver exception below the range DROPs never matches: the job cannot resolve"
         );
+    }
+
+    /// A canonical ND ACCEPT with one unflagged token wedged in after the chain name.
+    ///
+    /// The retained predicates are IDENTICAL to the canonical rule's, which is exactly why this
+    /// slipped through: the stray token was dropped in silence, so every comparison this module
+    /// makes on predicates alone answered the same for both lines.
+    #[test]
+    fn an_unflagged_token_before_any_flag_is_not_read_back_as_the_canonical_rule() {
+        const CANONICAL: &str =
+            "-A OUTPUT -p ipv6-icmp -m icmp6 --icmpv6-type 136 -m hl --hl-eq 255 -j ACCEPT";
+        let smuggled_text = CANONICAL.replace("-A OUTPUT ", "-A OUTPUT garbage ");
+
+        let canonical_rules = ReadbackRule::parse_all(CANONICAL);
+        let smuggled_rules = ReadbackRule::parse_all(&smuggled_text);
+        let canonical = &canonical_rules[0];
+        let smuggled = &smuggled_rules[0];
+
+        assert_eq!(
+            canonical.predicates, smuggled.predicates,
+            "the counterexample rests on the retained predicates being identical"
+        );
+        assert!(canonical.malformed.is_none(), "the canonical rule must still parse");
+        let reason =
+            smuggled.malformed.as_deref().expect("an unflagged token must be accounted for");
+        assert!(reason.contains("garbage"), "the reason must name the token: {reason}");
+        assert_eq!(
+            smuggled.target(),
+            None,
+            "a line this parser did not read whole must not answer for its target"
+        );
+    }
+
+    /// A trailing `!` inverts the flag that never came. The pending inversion used to be discarded
+    /// when the loop ended, so the line read back as its un-inverted twin.
+    #[test]
+    fn a_trailing_inversion_is_not_discarded_when_the_line_ends() {
+        const CANONICAL: &str = "-A OUTPUT -d 2001:db8::53/128 -p udp -m udp --dport 53 -j ACCEPT";
+        let dangling_text = format!("{CANONICAL} !");
+
+        let canonical_rules = ReadbackRule::parse_all(CANONICAL);
+        let dangling_rules = ReadbackRule::parse_all(&dangling_text);
+        let canonical = &canonical_rules[0];
+        let dangling = &dangling_rules[0];
+
+        assert_eq!(
+            canonical.predicates, dangling.predicates,
+            "the counterexample rests on the retained predicates being identical"
+        );
+        assert!(canonical.malformed.is_none(), "the canonical rule must still parse");
+        let reason = dangling.malformed.as_deref().expect("a dangling `!` must be accounted for");
+        assert!(reason.contains("dangling"), "{reason}");
+        assert_eq!(
+            dangling.value("-d"),
+            None,
+            "a line this parser did not read whole must not answer for its destination"
+        );
+    }
+
+    /// The whole readback is refused, not just the one line: a namespace that prints something this
+    /// parser cannot account for is not evidence about that namespace in either direction.
+    ///
+    /// The malformed line is deliberately kept in the parsed list rather than dropped — dropping it
+    /// would shrink the rule count and hide an unexpected rule from the check that exists to notice
+    /// one — so the refusal has to come from the accounting, not from a count mismatch.
+    #[test]
+    fn a_line_that_cannot_be_accounted_for_refuses_the_whole_readback() {
+        let policy = policy_with_resolvers(&["10.0.0.2"]);
+        let good = readback_with_resolver();
+        assert_eq!(policy.verify_readback(Family::V4, &good), Ok(()), "positive control");
+
+        let smuggled = good.replace(
+            "-A OUTPUT -d 10.0.0.2/32 -p udp",
+            "-A OUTPUT garbage -d 10.0.0.2/32 -p udp",
+        );
+        assert_eq!(
+            ReadbackRule::parse_all(&smuggled).len(),
+            ReadbackRule::parse_all(&good).len(),
+            "the malformed line must stay countable, or it escapes the unexpected-rule check"
+        );
+        let refusal = policy
+            .verify_readback(Family::V4, &smuggled)
+            .expect_err("a line with an unaccounted token must refuse the readback");
+        assert!(refusal.contains("account for"), "{refusal}");
+    }
+
+    /// The ND readback failure the verdict names, reproduced at the decision site on the canonical
+    /// ND ACCEPT rules themselves.
+    ///
+    /// The siblings above establish that the PARSER marks these shapes. That is not the claim that
+    /// matters. The claim that matters is the one the verdict made about behaviour: a canonical ND
+    /// ACCEPT carrying a leading unflagged token after `OUTPUT`, or a dangling final `!`, "retains
+    /// the same accepted predicates" — i.e. verification still passes, because the tokens the parser
+    /// could not consume changed nothing it went on to check.
+    ///
+    /// So this runs [`NetPolicy::verify_readback`] over the REAL measured v6 readback, mutated only
+    /// in those two ways, and requires refusal. Both mutations leave the predicate set the checker
+    /// reads untouched — that is precisely why tolerating them was a hole rather than a cosmetic
+    /// defect.
+    #[test]
+    fn a_canonical_nd_accept_carrying_an_unconsumed_token_refuses_the_readback() {
+        let policy = measured_policy();
+        assert_eq!(
+            policy.verify_readback(Family::V6, MEASURED_V6),
+            Ok(()),
+            "positive control: the unmutated measured readback must verify, or this test would \
+             pass for the wrong reason"
+        );
+
+        // Shape 1: an unflagged token between the chain and the first predicate.
+        let smuggled = MEASURED_V6.replace(
+            "-A OUTPUT -p ipv6-icmp -m icmp6 --icmpv6-type 136",
+            "-A OUTPUT garbage -p ipv6-icmp -m icmp6 --icmpv6-type 136",
+        );
+        assert_ne!(smuggled, MEASURED_V6, "the mutation must have applied");
+        assert_eq!(
+            ReadbackRule::parse_all(&smuggled).len(),
+            ReadbackRule::parse_all(MEASURED_V6).len(),
+            "the malformed line must stay countable, or it escapes the unexpected-rule check \
+             instead of being refused by the accounting"
+        );
+        let refusal = policy
+            .verify_readback(Family::V6, &smuggled)
+            .expect_err("an ND ACCEPT with an unconsumed leading token must refuse the readback");
+        assert!(refusal.contains("account for"), "{refusal}");
+
+        // Shape 2: a dangling inversion with nothing after it to invert.
+        let dangling = MEASURED_V6.replace(
+            "--icmpv6-type 136 -m hl --hl-eq 255 -j ACCEPT",
+            "--icmpv6-type 136 -m hl --hl-eq 255 -j ACCEPT !",
+        );
+        assert_ne!(dangling, MEASURED_V6, "the mutation must have applied");
+        let refusal = policy
+            .verify_readback(Family::V6, &dangling)
+            .expect_err("an ND ACCEPT ending in a dangling `!` must refuse the readback");
+        assert!(refusal.contains("account for"), "{refusal}");
     }
 
     /// The pinhole count is per family, because the two chains are installed by different binaries
