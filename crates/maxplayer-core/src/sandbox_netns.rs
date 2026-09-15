@@ -4680,18 +4680,54 @@ exit 0
         // is holding the pipe, and the budget is wide enough that arriving at the drain is not a
         // race. `child_exited` is then checked FIRST, because it is the fact that says which branch
         // actually ran.
+        //
+        // TWO CONSTANTS WERE REMOVED FROM THIS FIXTURE, because on a loaded machine each of them
+        // decided the result on its own:
+        //
+        // * The BUDGET is no longer a guess about how fast this host spawns a process. It is eight
+        //   times a spawn measured on this host, seconds before, through this very function. A
+        //   machine slow enough to miss that is a machine that cannot spawn at all.
+        // * The descendant no longer `sleep`s for a fixed span. It holds the pipe until this test
+        //   RELEASES it, so "the drain returned while the pipe was still held" is a fact and not a
+        //   race between two timers. That also repairs what the fixed sleep quietly cost: a six
+        //   second hold is shorter than the four-deadline bound asserted below, so an unbounded
+        //   drain would have finished inside the bound and this gate would have passed through the
+        //   exact regression it exists for. Held until released, an unbounded drain runs into the
+        //   descendant's own safety cap and the bound fails, as it must.
+        let trivial = work.join("docker-trivial");
+        std::fs::write(&trivial, "#!/bin/sh\nexit 0\n").expect("write trivial stand-in");
+        std::fs::set_permissions(&trivial, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let measured = {
+            let fence = std::sync::Arc::new(CreationFence::default());
+            let mut exited = false;
+            let at = std::time::Instant::now();
+            let _ = run_bounded_blocking(
+                &DockerCli::stand_in(&trivial),
+                vec!["docker".to_owned(), "create".to_owned()],
+                None,
+                std::time::Duration::from_secs(60),
+                at,
+                Some(&fence),
+                &mut exited,
+            );
+            assert!(exited, "this host could not spawn and reap a `#!/bin/sh exit 0` inside a minute");
+            at.elapsed()
+        };
+        let deadline = std::cmp::max(std::time::Duration::from_secs(2), measured * 8);
+
+        // 0.05 s × 2400 = two minutes, the descendant's own safety cap: if an assertion below
+        // panics before the release, nothing is left holding a pipe on this machine indefinitely.
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\n( echo holding > \"{}/holding\"; sleep 6 ) &\nexit 0\n",
-                work.to_string_lossy()
+                "#!/bin/sh\n( echo holding > \"{work}/holding\"\n  i=0\n  while [ ! -f \"{work}/release\" ] && [ $i -lt 2400 ]; do sleep 0.05; i=$((i+1)); done ) &\nexit 0\n",
+                work = work.to_string_lossy()
             ),
         )
         .expect("write stand-in");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
         let fence = std::sync::Arc::new(CreationFence::default());
-        let deadline = std::time::Duration::from_secs(2);
         let mut child_exited = false;
         let started = std::time::Instant::now();
         let outcome = run_bounded_blocking(
@@ -4707,9 +4743,11 @@ exit 0
 
         assert!(
             child_exited,
-            "the client was killed on its deadline before it ever exited, so the post-exit drain \
-             this gate exists for never ran. That is the FIXTURE failing, not the production code: \
-             it has to reach the branch under test before it can say anything about it."
+            "the client was killed on its {deadline:?} deadline — eight times the {measured:?} this \
+             host took to spawn and reap a no-op moments ago — before it ever exited, so the \
+             post-exit drain this gate exists for never ran. That is the FIXTURE failing, not the \
+             production code: it has to reach the branch under test before it can say anything \
+             about it."
         );
         assert!(
             work.join("holding").exists(),
@@ -4737,6 +4775,9 @@ exit 0
              open. Cleanup is entitled to remove on that answer, so unowned IO work outlived the \
              ticket that was supposed to cover it."
         );
+        // The release is the test's own act, so what follows is measured from a known event rather
+        // than from a sleep that may or may not have elapsed yet.
+        std::fs::write(work.join("release"), "go").expect("release the descendant");
         // And it is not owned forever. When the descendant lets go, the read ends and the ticket
         // goes with it: retained ownership means the lifecycle closes on the real event, not that
         // it never closes.
