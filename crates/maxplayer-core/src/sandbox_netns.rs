@@ -99,6 +99,44 @@ pub const ROLE_HOLDER: &str = "holder";
 /// A short-lived helper that joins the holder's namespace (plan applier, readback probe).
 pub const ROLE_HELPER: &str = "helper";
 
+/// The docker label carrying the job id on a **helper**, as [`HOLDER_LABEL`] carries it on a holder.
+///
+/// **A separate label, and the separation is load-bearing.** The boot reaper selects on the presence
+/// of [`HOLDER_LABEL`] ([`list_holders_argv`]), and it removes what it selects by container id. Were
+/// a helper to carry that same label, the reaper would count a joiner as a namespace holder — and
+/// the one protection it has against removing a live one, the `container:<id>` attachment check, is
+/// about the holder's id and says nothing about a helper's. Helpers are therefore attributable to a
+/// job for reporting, and invisible to the reaper's selection, which is the property that keeps the
+/// two cleanup paths from overlapping.
+pub const HELPER_JOB_LABEL: &str = "ai.maxplayer.netns-job";
+
+/// The `--label` arguments every job-owned helper container carries: owning seat, this job's own
+/// cleanup stamp, its role, and the job it belongs to.
+///
+/// The seat and the stamp are the two the sweep judges by, and they are the same two the holder
+/// carries, produced here from the same values so the holder and its joiners expire **together**.
+/// A helper that outlived its holder by carrying no stamp is exactly the leftover this work exists
+/// to remove; a helper stamped differently from its holder would be a second, quieter deadline.
+///
+/// Every value here is derived by the seller from what it is itself enforcing. None of it is
+/// reachable from a job's payload, which is why a request cannot ask for a helper that never
+/// expires or one that belongs to another seat.
+#[must_use]
+pub fn helper_label_args(job_id: &str, seat: &str, cleanup_after: u64) -> Vec<String> {
+    [
+        "--label".to_owned(),
+        format!("{HOLDER_SEAT_LABEL}={seat}"),
+        "--label".to_owned(),
+        format!("{HOLDER_CLEANUP_AFTER_LABEL}={cleanup_after}"),
+        "--label".to_owned(),
+        format!("{HOLDER_ROLE_LABEL}={ROLE_HELPER}"),
+        "--label".to_owned(),
+        format!("{HELPER_JOB_LABEL}={job_id}"),
+    ]
+    .into_iter()
+    .collect()
+}
+
 /// How long after a job's own effective deadline its containers become sweepable.
 ///
 /// **One hour, and the size is the point.** The deadline is when the job must be finished, not when
@@ -1186,6 +1224,11 @@ pub struct NetnsHolder {
     creation: std::sync::Arc<CreationFence>,
     client: DockerCli,
     bounds: FenceBounds,
+    /// The `--label` arguments stamped onto every helper this holder runs, from
+    /// [`helper_label_args`]. Empty for a holder adopted outside a production launch — a test
+    /// fixture has no seat and no deadline to attribute a helper to, and an empty seat label would
+    /// be worse than none.
+    helper_labels: Vec<String>,
 }
 
 impl NetnsHolder {
@@ -1211,7 +1254,25 @@ impl NetnsHolder {
             creation: std::sync::Arc::new(CreationFence::default()),
             client,
             bounds,
+            helper_labels: Vec::new(),
         }
+    }
+
+    /// Stamp every helper this holder goes on to run with `labels` (from [`helper_label_args`]).
+    ///
+    /// Set once by [`establish_with`], which is the only place that knows the job, the seat and the
+    /// deadline at the same time. Applied centrally in [`run_sidecar_confirmed`] rather than in each
+    /// argv builder: every helper container in this module is created through that one funnel, so a
+    /// helper added later is stamped without its author having to remember to do it — and a forgotten
+    /// stamp is an unexpiring leftover, which is the failure this whole path exists to end.
+    fn label_helpers(&mut self, labels: Vec<String>) {
+        self.helper_labels = labels;
+    }
+
+    /// The helper stamp set by [`Self::label_helpers`]; empty when this holder was adopted outside a
+    /// production launch.
+    fn helper_labels(&self) -> &[String] {
+        &self.helper_labels
     }
 
     /// Test-only: the SAME holder as [`Self::adopt_bounded`] — same fields, same `Drop` — whose fence
@@ -1230,6 +1291,7 @@ impl NetnsHolder {
             creation: std::sync::Arc::new(CreationFence::supervised_by(supervisor, bounds)),
             client,
             bounds,
+            helper_labels: Vec::new(),
         }
     }
 
@@ -2862,6 +2924,30 @@ pub fn with_container_name(mut argv: Vec<String>, name: &str) -> Result<Vec<Stri
     }
 }
 
+/// Splice `labels` into a `docker run` argv, as [`with_container_name`] splices the name, and for
+/// the same reason: the argv builders stay pure and independently testable, and the one place that
+/// knows the owning job decorates what they produced.
+///
+/// Refuses anything that is not a `docker run` argv. Labels on a `docker ps` would be read as
+/// filters, and a cleanup path that quietly changed the meaning of a command is worse than one that
+/// stops. An empty `labels` is returned unchanged: a fixture holder with no job to attribute to
+/// stamps nothing rather than stamping emptiness.
+pub fn with_helper_labels(mut argv: Vec<String>, labels: &[String]) -> Result<Vec<String>, String> {
+    if labels.is_empty() {
+        return Ok(argv);
+    }
+    match argv.get(1).map(String::as_str) {
+        Some("run") => {
+            argv.splice(2..2, labels.iter().cloned());
+            Ok(argv)
+        }
+        other => Err(format!(
+            "refusing to label {other:?} as a job-owned helper: this is not a `docker run` argv, and \
+             labels spliced into another verb would change what that command means"
+        )),
+    }
+}
+
 /// Run one sidecar joined to the holder's namespace: named, registered for its lifetime, bounded.
 #[cfg(feature = "acp")]
 async fn run_sidecar(
@@ -2925,6 +3011,9 @@ async fn run_sidecar_confirmed(
 ) -> Result<(String, String), String> {
     let name = sidecar_name(holder.name(), verb);
     let argv = with_container_name(argv, &name)?;
+    // Stamped here, at the one funnel every helper in this module passes through, rather than in the
+    // individual argv builders. A helper missing the stamp is a container the sweep can never judge.
+    let argv = with_helper_labels(argv, holder.helper_labels())?;
     // Registered BEFORE the command starts: a cancellation between these two lines must still leave
     // a cleanup target behind, and registering afterwards would not.
     let mut registration = holder.watch_sidecar(name.clone());
@@ -3222,7 +3311,11 @@ async fn establish_with(
     // cancellation point, and the blocking create can complete after the future above it is gone:
     // adopting afterwards left exactly that container running with no guard and no record. The guard
     // costs one `docker rm` that reports "No such container" when the create never happened.
-    let holder = NetnsHolder::adopt_bounded(name.clone(), client.clone(), bounds);
+    let mut holder = NetnsHolder::adopt_bounded(name.clone(), client.clone(), bounds);
+    // Every helper joined to this namespace carries the SAME seat and the SAME cleanup stamp as the
+    // holder created just below, so the sweep expires a job's containers as one set rather than
+    // leaving its joiners behind unattributable.
+    holder.label_helpers(helper_label_args(job_id, seat, cleanup_after));
     // Fenced, not merely adopted. The ticket is taken before the create is issued and travels into
     // the blocking closure, so a cancellation here leaves cleanup waiting for the create to settle
     // instead of racing it to a "No such container" that means "not yet".
