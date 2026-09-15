@@ -43,8 +43,9 @@ use std::time::{Duration, Instant};
 
 use maxplayer_core::delivery_executor::REAP_BOUND;
 use maxplayer_core::delivery_turn::delivery_turn;
-use maxplayer_core::git_transport::{self, AuthMinter};
+use maxplayer_core::git_transport::{self, AuthMinter, AuthorityCheck};
 use maxplayer_core::seller_git::{SellerGitError, neutralize_then_push_in_child_off_runtime};
+use maxplayer_core::seller_node::run::PushAuthority;
 use maxplayer_core::seller_node::signer::SignerHandle;
 
 #[path = "../../maxplayer-core/tests/git_http_fixture/mod.rs"]
@@ -196,10 +197,17 @@ impl Drop for HeldSigner {
 /// Destination binding, then the authority check, then the deadline check, then the real signer.
 /// `deadline` is this delivery's push deadline — the parameter production fills with
 /// `now + DELIVERY_PUSH_TIMEOUT`.
+///
+/// `authority` is the REAL [`PushAuthority::check`] closure, not a stand-in: production asks its
+/// authority here, between binding the destination and signing, because the signer call below can
+/// block and the answer can change while it does. Rebuilding every other call in this chain while
+/// leaving this one out would have made "same order, same calls" false in the one place the chain
+/// is about — a minter parked in the signer is exactly when an authority can end underneath it.
 fn production_minter(
     signer: SignerHandle,
     intended: String,
     scope: String,
+    authority: AuthorityCheck,
     deadline: Instant,
     asked: Arc<AtomicUsize>,
 ) -> AuthMinter {
@@ -210,6 +218,8 @@ fn production_minter(
                 "refusing to authorize a leg to {destination}: this delivery is bound to {intended}"
             ));
         }
+        // Before signing, with the same wrapping production gives it.
+        authority().map_err(|ended| format!("{ended}; refusing to authorize another leg"))?;
         if Instant::now() >= deadline {
             return Err(
                 "this delivery's push deadline has passed; refusing to authorize another leg"
@@ -244,10 +254,14 @@ async fn a_delivery_parked_in_the_real_signer_is_stopped_at_its_own_deadline_not
 
     // 60 seconds, standing in for production's 150: a signer bound far looser than the turn.
     let signer_deadline = Instant::now() + Duration::from_secs(60);
+    // The real authority, live for this delivery exactly as production's is: created before the
+    // push, asked by the minter before signing and by the transport before each request leaves.
+    let push_authority = PushAuthority::new();
     let minter = production_minter(
         signer.handle.clone(),
         relay.repo_url(),
         git_transport::delivery_ref(branch),
+        push_authority.check(),
         signer_deadline,
         Arc::clone(&asked),
     );
@@ -264,7 +278,7 @@ async fn a_delivery_parked_in_the_real_signer_is_stopped_at_its_own_deadline_not
         branch.to_owned(),
         oid.clone(),
         Some(minter),
-        None,
+        Some(push_authority.check()),
         turn,
     )
     .await;
@@ -405,10 +419,12 @@ async fn a_delivery_behind_a_saturated_real_signer_is_stopped_at_its_own_deadlin
 
     let asked = Arc::new(AtomicUsize::new(0));
     let signer_deadline = Instant::now() + Duration::from_secs(60);
+    let push_authority = PushAuthority::new();
     let minter = production_minter(
         signer.handle.clone(),
         relay.repo_url(),
         git_transport::delivery_ref(branch),
+        push_authority.check(),
         signer_deadline,
         Arc::clone(&asked),
     );
@@ -425,7 +441,7 @@ async fn a_delivery_behind_a_saturated_real_signer_is_stopped_at_its_own_deadlin
         branch.to_owned(),
         oid.clone(),
         Some(minter),
-        None,
+        Some(push_authority.check()),
         turn,
     )
     .await;
@@ -512,15 +528,19 @@ async fn a_turn_that_ended_before_the_first_leg_mints_nothing_and_touches_no_rem
     );
 
     let asked = Arc::new(AtomicUsize::new(0));
+    let push_authority = PushAuthority::new();
     let minter = production_minter(
         signer.handle.clone(),
         relay.repo_url(),
         git_transport::delivery_ref(branch),
+        push_authority.check(),
         Instant::now() + Duration::from_secs(60),
         Arc::clone(&asked),
     );
 
-    // The turn is already over when the delivery starts.
+    // The turn is already over when the delivery starts. The AUTHORITY, however, is live: this
+    // gate is about the turn stopping the delivery, so the one thing that must not do the stopping
+    // is an authority that was already dead before the push began.
     let released = Arc::new(AtomicBool::new(false));
     let (control, turn) = delivery_turn(
         Token(Arc::clone(&released)),
@@ -535,7 +555,7 @@ async fn a_turn_that_ended_before_the_first_leg_mints_nothing_and_touches_no_rem
         branch.to_owned(),
         oid.clone(),
         Some(minter),
-        None,
+        Some(push_authority.check()),
         turn,
     )
     .await;
@@ -597,10 +617,12 @@ async fn the_same_delivery_with_a_polled_signer_mints_real_tokens_and_lands() {
     signer.release();
 
     let asked = Arc::new(AtomicUsize::new(0));
+    let push_authority = PushAuthority::new();
     let minter = production_minter(
         signer.handle.clone(),
         relay.repo_url(),
         git_transport::delivery_ref(branch),
+        push_authority.check(),
         Instant::now() + Duration::from_secs(60),
         Arc::clone(&asked),
     );
@@ -617,7 +639,7 @@ async fn the_same_delivery_with_a_polled_signer_mints_real_tokens_and_lands() {
         branch.to_owned(),
         oid.clone(),
         Some(minter),
-        None,
+        Some(push_authority.check()),
         turn,
     )
     .await
