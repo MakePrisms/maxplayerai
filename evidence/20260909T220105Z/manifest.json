@@ -1,0 +1,32 @@
+{
+  "run_id": "20260909T220105Z",
+  "image": "maxplayer-tool-kit:demo",
+  "platform": "linux/arm64",
+  "docker_server_version": "29.5.2",
+  "generated_utc": "2026-09-09T22:01:28Z",
+
+  "mechanism_only": true,
+  "what_this_proves": "That the holder mechanism behaves as specified against a fake vendor and a CLI written for it.",
+  "what_this_does_not_prove": [
+    "Independent real-tool acceptance: the CLI and the vendor were both written for this contract and cannot falsify it.",
+    "General onboarding acceptance for any unseen third-party tool.",
+    "Production integration with maxplayer's seller execution path, which today attaches no MCP servers at all."
+  ],
+  "synthetic": {
+    "credential": "generated per run, host-only, never on a command line, removed on exit",
+    "live_account": false,
+    "spend": false,
+    "external_egress": false
+  },
+
+  "observers": {
+    "vendor_counters": "read from the host over a published loopback port, outside the system under test",
+    "job_container_network": "none",
+    "holder_self_report": "recorded but never used as the sole basis for a call-count claim"
+  },
+
+  "vendor_final_counters": {"auth_failures":1,"health_count":4,"live_tokens":1,"login_count":2,"transform_count":2},
+
+  "checks": { "passed": 27, "failed": 0 },
+  "verdict": "PASS"
+}

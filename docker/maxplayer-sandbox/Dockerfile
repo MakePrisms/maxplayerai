@@ -56,7 +56,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     set -eu; \
     cargo build --release -p maxplayer --features acp,wallet --locked; \
     install -m 0755 /src/target/release/maxplayer /usr/local/bin/maxplayer; \
-    strip /usr/local/bin/maxplayer
+    strip /usr/local/bin/maxplayer; \
+    cargo build --release -p maxplayer-tool-kit --bin mcp-http-bridge --bin tool-mcp-bridge --locked; \
+    install -m 0755 /src/target/release/mcp-http-bridge /usr/local/bin/mcp-http-bridge; \
+    strip /usr/local/bin/mcp-http-bridge; \
+    install -m 0755 /src/target/release/tool-mcp-bridge /usr/local/bin/tool-mcp-bridge; \
+    strip /usr/local/bin/tool-mcp-bridge
 
 FROM node:22-bookworm-slim
 
@@ -210,6 +215,24 @@ RUN set -eux; \
 # with no passwd entry here — can execute it. ENTRYPOINT and CMD stay unchanged: the host passes the
 # full command.
 COPY --from=builder --chmod=0755 /usr/local/bin/maxplayer /usr/local/bin/maxplayer
+
+# The Proxy swap transport shim (`crates/maxplayer-tool-kit/src/bin/mcp_http_bridge.rs`). When a
+# seat offers a vendor-hosted MCP server through the credential proxy (`[[sandbox.mcp_tools]]`), the
+# agent spawns THIS as a stdio MCP server. It holds only the per-job placeholder and the proxy's
+# address, both passed as flags by the host; it posts each JSON-RPC message to the proxy, which swaps
+# the real credential in on the way out. No secret is baked and none is reachable from here. Built in
+# the same builder stage from the same workspace lockfile, and installed at the absolute path
+# `seller_exec::CONTAINER_MCP_BRIDGE_BIN` names, because an MCP client spawns it with whatever PATH
+# its harness gives a child.
+COPY --from=builder --chmod=0755 /usr/local/bin/mcp-http-bridge /usr/local/bin/mcp-http-bridge
+
+# The Holder route's bridge (`crates/maxplayer-tool-kit/src/bin/tool_mcp_bridge.rs`). When a seat
+# holds a vendor CLI in its own persistent holder container (`[sandbox.held_tool]`), each job gets its
+# own Unix socket at /run/holder/job.sock, and the agent spawns THIS as a stdio MCP server to reach it.
+# It holds nothing: no credential, no vendor state; it forwards lines to the socket and back. Same
+# builder stage, same lockfile, same absolute-path rule as the bridge above
+# (`held_tool::CONTAINER_TOOL_BRIDGE_BIN`).
+COPY --from=builder --chmod=0755 /usr/local/bin/tool-mcp-bridge /usr/local/bin/tool-mcp-bridge
 
 # HOME is a CONTAINER-ONLY path, deliberately NOT the mounted workdir.
 #

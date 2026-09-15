@@ -223,6 +223,7 @@ fn run_payload(
                 uid,
                 gid,
                 netns,
+                mcp_servers: &[],
                 // ⛔ BASELINE ADAPTATION: this field does not exist at a0e7c3f and is removed there.
                 // It is `None` here so the patched tree injects no resolver file, keeping the two
                 // policies comparable.

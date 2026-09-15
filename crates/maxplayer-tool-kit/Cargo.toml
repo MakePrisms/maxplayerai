@@ -1,0 +1,59 @@
+[package]
+name = "maxplayer-tool-kit"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Seller-level tool holder: keeps a third-party tool logged in for as long as the seller daemon runs, and exposes a seller-configured operation list to that seller's jobs."
+
+# Deliberately depends on nothing in maxplayer-core and nothing outside std except
+# serde/serde_json. The dependency surface is the audit surface; a holder that
+# custodies a credential should be readable end to end in one sitting.
+#
+# Versions are explicit rather than inherited from the workspace so this crate also builds
+# standalone, from its own directory, with no parent manifest. That is what lets the Linux
+# demo image be built from a context containing only this crate. Cargo still unifies these
+# with the workspace lockfile when building in-tree.
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# libc is the one dependency beyond serde, and it earns the exception to the audit-surface rule
+# above: race-safe, no-follow directory traversal (openat with O_NOFOLLOW|O_DIRECTORY) is not
+# expressible in std, and the string-canonicalize alternative is exactly the check/use race the
+# holder must not have (advisor F2). It is used only in src/safeio.rs. libc has no transitive
+# dependencies, so it adds one crate, not a tree.
+libc = "0.2"
+
+[[bin]]
+name = "vendor-service"
+path = "src/bin/vendor_service.rs"
+
+[[bin]]
+name = "vendor-cli"
+path = "src/bin/vendor_cli.rs"
+
+[[bin]]
+name = "tool-holderd"
+path = "src/bin/tool_holderd.rs"
+
+[[bin]]
+name = "holderctl"
+path = "src/bin/holderctl.rs"
+
+[[bin]]
+name = "tool-mcp-bridge"
+path = "src/bin/tool_mcp_bridge.rs"
+
+# Proxy-swap route demo (synthetic). vendor-mcp and swap-proxy are test doubles, like
+# vendor-service. mcp-http-bridge is the real new piece: the stdio-to-HTTP transport shim a job
+# container would run to reach a vendor-hosted MCP through the credential proxy.
+[[bin]]
+name = "vendor-mcp"
+path = "src/bin/vendor_mcp.rs"
+
+[[bin]]
+name = "swap-proxy"
+path = "src/bin/swap_proxy.rs"
+
+[[bin]]
+name = "mcp-http-bridge"
+path = "src/bin/mcp_http_bridge.rs"

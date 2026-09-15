@@ -1,0 +1,3 @@
+control: identical scanner over the same archive with one file containing the secret
+files_containing_secret: 1
+interpretation: 1 proves the scanner detects the credential when it IS present

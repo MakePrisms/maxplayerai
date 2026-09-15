@@ -1,0 +1,9 @@
+tool-holderd: enrolled seller-demo-01 (first start)
+tool-holderd: control endpoint /run/holder/holder.sock
+tool-holderd: offering "Text transformation (upper/lower/reverse) over files the buyer's job supplies" with 1 operation(s), available while this process runs
+tool-holderd: existing session found; not logging in again
+tool-holderd: control endpoint /run/holder/holder.sock
+tool-holderd: offering "Text transformation (upper/lower/reverse) over files the buyer's job supplies" with 1 operation(s), available while this process runs
+tool-holderd: existing session found; not logging in again
+tool-holderd: control endpoint /run/holder/holder.sock
+tool-holderd: offering "Text transformation (upper/lower/reverse) over files the buyer's job supplies" with 1 operation(s), available while this process runs
