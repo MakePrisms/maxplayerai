@@ -57,6 +57,9 @@ fn fixture(dir: &Path, body: &str) -> PathBuf {
 
 const HELLO: &str = r#"printf '{"t":"Hello","version":1,"argv":[],"env":{}}\n'"#;
 
+/// The object every delivery in this file is gated on. A child may report THIS oid and no other.
+const GATED_OID: &str = "0123456789012345678901234567890123456789";
+
 /// The exclusion token the turn carries. In production it is the delivery lock's owned guard; here
 /// it is a token that RECORDS its own release, so "the turn was handed back" is an observation
 /// rather than an inference from a return value.
@@ -100,7 +103,7 @@ async fn a_local_phase_that_refuses_to_stop_is_ended_at_the_deadline_and_its_exi
         dir.join("workdir"),
         "https://relay.example.invalid/seller.git".to_owned(),
         "delivery/job".to_owned(),
-        "0123456789012345678901234567890123456789".to_owned(),
+        GATED_OID.to_owned(),
         None,
         None,
         turn,
@@ -153,12 +156,15 @@ async fn a_local_phase_that_refuses_to_stop_is_ended_at_the_deadline_and_its_exi
 /// The same path on the ordinary outcome: a child that finishes returns its oid, is reaped anyway,
 /// and hands the turn back. Without this, the test above would also pass on an executor that killed
 /// every push.
+///
+/// The fixture reports THE GATED OID, because that is now the only oid a child is allowed to
+/// report: a `Done` naming anything else is a protocol fault, gated just below.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_push_that_finishes_returns_its_oid_and_hands_the_turn_back() {
     let dir = scratch("finishes");
     let program = fixture(
         &dir,
-        &format!("{HELLO}\nprintf '{{\"t\":\"Done\",\"oid\":\"abc123\",\"error\":null}}\\n'\n"),
+        &format!("{HELLO}\nprintf '{{\"t\":\"Done\",\"oid\":\"{GATED_OID}\",\"error\":null}}\\n'\n"),
     );
     let released = Arc::new(AtomicBool::new(false));
     let (control, turn) = delivery_turn(
@@ -172,14 +178,14 @@ async fn a_push_that_finishes_returns_its_oid_and_hands_the_turn_back() {
         dir.join("workdir"),
         "https://relay.example.invalid/seller.git".to_owned(),
         "delivery/job".to_owned(),
-        "0123456789012345678901234567890123456789".to_owned(),
+        GATED_OID.to_owned(),
         None,
         None,
         turn,
     )
     .await;
 
-    assert_eq!(outcome.expect("the push reported an oid"), "abc123");
+    assert_eq!(outcome.expect("the push reported an oid"), GATED_OID);
     assert!(
         started.elapsed() < Duration::from_secs(10),
         "a finished push must not wait out the deadline"
@@ -217,7 +223,7 @@ async fn a_revoked_delivery_never_spawns_a_child() {
         dir.join("workdir"),
         "https://relay.example.invalid/seller.git".to_owned(),
         "delivery/job".to_owned(),
-        "0123456789012345678901234567890123456789".to_owned(),
+        GATED_OID.to_owned(),
         None,
         None,
         turn,
@@ -270,7 +276,7 @@ async fn the_child_receives_a_minted_header_it_never_held_and_the_parent_minted_
         dir.join("workdir"),
         "https://relay.example.invalid/seller.git".to_owned(),
         "delivery/job".to_owned(),
-        "0123456789012345678901234567890123456789".to_owned(),
+        GATED_OID.to_owned(),
         Some(mint),
         None,
         turn,
@@ -309,19 +315,40 @@ async fn authority_that_ends_during_the_mint_keeps_the_token_on_this_side_of_the
             answer.display()
         ),
     );
-    // Live for the pre-spawn check and the pre-mint check; ended by the time the mint returns.
-    let asked = Arc::new(AtomicUsize::new(0));
+    // Authority ends WHEN THE MINT RETURNS, and the trigger says exactly that.
+    //
+    // It used to be a call count: answer Ok twice, then Err. That counted on the parent asking
+    // exactly twice before the mint, which stopped being true when the parent began re-asking its
+    // authority on a cancellation poll every CANCELLATION_POLL — a tick or two of that, on a loaded
+    // machine, spent the two Oks before the child ever requested a mint, and the delivery was
+    // killed before reaching the moment under test. A count of calls was never the condition; the
+    // mint returning was.
+    //
+    // So: the minter sets `has_minted`, and authority ends the FIRST time it is asked after that.
+    // That is the post-mint check, the one this gate is about. Later ticks answer Ok again, which
+    // keeps this test to its own question — whether a token minted under authority that has since
+    // ended crosses the pipe — and leaves "what the parent does about a revocation" to the gates
+    // that exist for it, instead of racing a kill against the child's write here.
+    let has_minted = Arc::new(AtomicBool::new(false));
+    let refused_once = Arc::new(AtomicBool::new(false));
     let authority: AuthorityCheck = {
-        let asked = Arc::clone(&asked);
+        let has_minted = Arc::clone(&has_minted);
+        let refused_once = Arc::clone(&refused_once);
         Arc::new(move || {
-            if asked.fetch_add(1, Ordering::SeqCst) >= 2 {
+            if has_minted.load(Ordering::SeqCst) && !refused_once.swap(true, Ordering::SeqCst) {
                 Err("this delivery was cancelled".to_owned())
             } else {
                 Ok(())
             }
         })
     };
-    let mint: AuthMinter = Arc::new(|_: &str| Ok("Nostr SENTINEL-HEADER-VALUE".to_owned()));
+    let mint: AuthMinter = {
+        let has_minted = Arc::clone(&has_minted);
+        Arc::new(move |_: &str| {
+            has_minted.store(true, Ordering::SeqCst);
+            Ok("Nostr SENTINEL-HEADER-VALUE".to_owned())
+        })
+    };
     let (control, turn) = delivery_turn((), Instant::now() + Duration::from_secs(10));
 
     let outcome = neutralize_then_push_in_child_off_runtime(
@@ -329,7 +356,7 @@ async fn authority_that_ends_during_the_mint_keeps_the_token_on_this_side_of_the
         dir.join("workdir"),
         "https://relay.example.invalid/seller.git".to_owned(),
         "delivery/job".to_owned(),
-        "0123456789012345678901234567890123456789".to_owned(),
+        GATED_OID.to_owned(),
         Some(mint),
         Some(authority),
         turn,
@@ -370,7 +397,7 @@ async fn an_unauthenticated_remote_cannot_obtain_a_token_by_asking() {
         dir.join("workdir"),
         "https://public.example.invalid/seller.git".to_owned(),
         "delivery/job".to_owned(),
-        "0123456789012345678901234567890123456789".to_owned(),
+        GATED_OID.to_owned(),
         None,
         None,
         turn,
@@ -452,7 +479,7 @@ async fn a_signer_whose_reply_never_comes_cannot_stop_the_deadline_from_landing(
         dir.join("workdir"),
         "https://relay.example.invalid/seller.git".to_owned(),
         "delivery/job".to_owned(),
-        "0123456789012345678901234567890123456789".to_owned(),
+        GATED_OID.to_owned(),
         Some(minter),
         None,
         turn,
@@ -553,5 +580,57 @@ fn the_turn_is_released_on_a_confirmed_exit_and_on_nothing_else() {
     assert_eq!(
         turn_after_child_push(&Err(ExecutorError::Push("remote refused".to_owned()))),
         Exclusion::Release
+    );
+}
+
+/// THE OTHER SIDE OF THE SAME RULE: a child that reports a DIFFERENT oid is a protocol fault.
+///
+/// The gate above now has its fixture report the gated oid, which is correct and also removes the
+/// only place this refusal was being exercised — by accident, through a fixture that predated the
+/// check. Exercise it on purpose instead.
+///
+/// Why it matters: the oid is the whole delivery. The parent gated an object, and what the child
+/// says it shipped is the only claim that ever comes back. A child that names a different object
+/// and is believed turns "we delivered the wrong thing" into a success, and a caller that trusts
+/// the returned oid then records a delivery of something nobody gated. So the parent compares, and
+/// a mismatch ends the delivery rather than being reported as an oid.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_child_that_reports_an_oid_nobody_gated_is_a_protocol_fault() {
+    let dir = scratch("wrong-oid");
+    let program = fixture(
+        &dir,
+        &format!("{HELLO}\nprintf '{{\"t\":\"Done\",\"oid\":\"abc123\",\"error\":null}}\\n'\n"),
+    );
+    let released = Arc::new(AtomicBool::new(false));
+    let (control, turn) = delivery_turn(
+        Token(Arc::clone(&released)),
+        Instant::now() + Duration::from_secs(10),
+    );
+
+    let outcome = neutralize_then_push_in_child_off_runtime(
+        program,
+        dir.join("workdir"),
+        "https://relay.example.invalid/seller.git".to_owned(),
+        "delivery/job".to_owned(),
+        GATED_OID.to_owned(),
+        None,
+        None,
+        turn,
+    )
+    .await;
+
+    let error = outcome.expect_err("a child that reported an oid nobody gated must not succeed");
+    let text = error.to_string();
+    assert!(
+        text.contains("abc123") && text.contains(GATED_OID),
+        "the refusal must name both the oid the child claimed and the one this delivery gated: \
+         {text}"
+    );
+    // And the seat still comes back: the child broke the protocol, was killed, and its exit was
+    // confirmed — a stop, not an unknown.
+    control.end();
+    assert!(
+        released.load(Ordering::SeqCst),
+        "a protocol fault whose child was reaped must still hand the turn back"
     );
 }
