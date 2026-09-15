@@ -679,6 +679,11 @@ impl CleanupSupervisor {
                         .0;
                 }
             };
+            // An attempt STARTING is a state change too: whoever is waiting on this supervisor's
+            // condition (a test asserting an owner is mid-attempt, or anything that reports what is
+            // outstanding) has to be woken for it, not only for the attempt ending. Without this the
+            // running window is observable only by a poll that happens to land inside it.
+            self.changed.notify_all();
             self.run(next);
         }
     }
@@ -697,6 +702,7 @@ impl CleanupSupervisor {
             })
         };
         if let Some(scheduled) = taken {
+            self.changed.notify_all();
             self.run(scheduled);
         }
     }
@@ -4007,14 +4013,15 @@ case "$*" in
     # The daemon's event log, in the production format `ID<TAB>name<TAB>action`: a container under
     # NAME that is present now has a `create` and no `destroy`; one a test recorded as landed and
     # since gone (`landed-NAME`) has both, for the same id. `evhang-NAME` leaves a descendant holding
-    # this query's stdout open after the client exits, as a client's child process can.
+    # this query's stdout open after the client exits, as a client's child process can, for 20s;
+    # when it lets go it records `released-NAME`, so a test can assert ORDER against the hold.
     for a in "$@"; do
       case "$a" in
         container=*)
           n="${a#container=}"
           echo "events $n" >> "$WORK/events.log"
           if [ -f "$WORK/evhang-$n" ]; then
-            ( sleep 3 ) &
+            ( sleep 20; : > "$WORK/released-$n" ) &
             exit 0
           fi
           if [ -f "$WORK/present-$n" ]; then
@@ -5155,11 +5162,12 @@ exit 0
 
     /// F3b: A DESCENDANT HOLDING THE EVENT PIPE DOES NOT STALL ANOTHER OWED NAME.
     ///
-    /// A watched name's event query leaves a descendant holding stdout for 3s. The supervisor also
+    /// A watched name's event query leaves a descendant holding stdout for 20s. The supervisor also
     /// owes a plain removal of another name. The event reader used to be joined without a bound on
     /// the ONE supervisor thread, so the other name waited out the descendant. Now the watch gives up
     /// on the reader at the owner's confirm bound (300ms here), keeps its name as uncertain, and the
-    /// other name is removed and confirmed well inside the descendant's hold.
+    /// other name is removed and confirmed BEFORE the descendant lets go — asserted on the stand-in's
+    /// release marker, an ordering, not on a wall-clock figure this host's spawn latency can break.
     #[cfg(feature = "acp")]
     #[test]
     fn a_descendant_holding_the_event_pipe_does_not_stall_another_owed_name() {
@@ -5174,8 +5182,13 @@ exit 0
         let ticket = fence.begin();
         issue_unanswered_create(&client, &fence, "holder-eh");
         drop(ticket);
-        // The watch is mid-attempt, blocked on the held pipe, when the other name arrives.
-        assert!(supervisor.wait_until_running("holder-eh", std::time::Duration::from_secs(10)));
+        // The watch is mid-attempt when the other name arrives. (The fence settles only when the
+        // create's own drain lets go of its ticket, so this wait covers that settlement too.)
+        assert!(
+            supervisor.wait_until_running("holder-eh", std::time::Duration::from_secs(30)),
+            "the watch over holder-eh never ran an attempt: {:?}",
+            supervisor.outstanding()
+        );
         let adopted_at = std::time::Instant::now();
         supervisor.adopt(retained_removal(
             "other-eh".to_owned(),
@@ -5184,7 +5197,12 @@ exit 0
             quick_bounds(),
         ));
 
-        let discharged = supervisor.wait_for(std::time::Duration::from_millis(1500), |state| {
+        // The fact under test is an ORDERING, not a duration: other-eh is discharged BEFORE the
+        // descendant lets go of holder-eh's event pipe. The stand-in records that release as
+        // `released-holder-eh` after a 20s hold, so a worker that waited the hold out is caught by
+        // the marker regardless of how slowly this host spawns processes; the wall-clock bound
+        // below is only there so a stalled worker fails the test instead of hanging it.
+        let discharged = supervisor.wait_for(std::time::Duration::from_secs(10), |state| {
             !state.running.iter().any(|name| name == "other-eh")
                 && !state.queued.iter().any(|s| s.owner.names.iter().any(|name| name == "other-eh"))
         });
@@ -5195,13 +5213,19 @@ exit 0
              descendant holding another name's event pipe ({:?})",
             supervisor.outstanding()
         );
+        assert!(
+            !work.join("released-holder-eh").exists(),
+            "other-eh was discharged only after the descendant released holder-eh's event pipe \
+             ({took:?}): the worker waited the hold out instead of giving up on the reader at the \
+             confirm bound"
+        );
         assert!(!work.join("present-other-eh").exists(), "other-eh is STILL PRESENT");
         assert!(supervisor.owns("holder-eh"), "the uncertain event answer released the watched name");
 
         // The pipe is released and the daemon's log shows the lifecycle complete: the watch ends.
         std::fs::remove_file(work.join("evhang-holder-eh")).expect("clear hang");
         std::fs::write(work.join("landed-holder-eh"), "").expect("event record");
-        assert!(supervisor.wait_until_idle(std::time::Duration::from_secs(10)), "{:?}", supervisor.outstanding());
+        assert!(supervisor.wait_until_idle(std::time::Duration::from_secs(20)), "{:?}", supervisor.outstanding());
         let _ = std::fs::remove_dir_all(&work);
     }
 
