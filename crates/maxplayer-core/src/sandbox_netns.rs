@@ -69,6 +69,15 @@ pub const HOLDER_SEAT_LABEL: &str = "ai.maxplayer.netns-holder-seat";
 /// wait is the state in which cancellation leaves work nobody owns.
 pub const DOCKER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// How long a deadline-killed command waits for its plan writer to notice the closed pipe.
+///
+/// Killing the child closes the read end, so a blocked `write_all` fails with `EPIPE` almost at
+/// once. This grace exists so that the common case is JOINED rather than abandoned; a writer still
+/// running after it is reported as outstanding, never waited on indefinitely. It is a bound on how
+/// long this process will wait for that thread -- not a claim about how quickly any particular
+/// writer unblocks.
+const WRITER_EPIPE_GRACE: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// The docker client one containment lifecycle spawns, carried **explicitly** by the code that uses
 /// it.
 ///
@@ -119,6 +128,13 @@ struct FenceBounds {
     max: std::time::Duration,
     /// How long the owner keeps asking the daemon to confirm the removal it issued.
     confirm: std::time::Duration,
+    /// How much longer the owner KEEPS the job after `max` expires with the create still running.
+    ///
+    /// `max` is where an owner used to stop being an owner: it swept, printed a leak, and returned
+    /// while the create was still in flight, so a container landing one millisecond later had
+    /// nobody responsible for it. This is the window in which that container is still SOMEBODY'S —
+    /// the owner stays on the create's own schedule, removes what lands, and confirms it gone.
+    retain: std::time::Duration,
 }
 
 impl FenceBounds {
@@ -130,6 +146,10 @@ impl FenceBounds {
             fast: NetnsHolder::CREATE_SETTLE_DEADLINE,
             max: DOCKER_DEADLINE + std::time::Duration::from_secs(15),
             confirm: std::time::Duration::from_secs(10),
+            // A create that has not settled by `max` is past its own client's kill, so this covers
+            // a daemon still working after the client it answered is gone — the case where the
+            // container appears with no client left to attribute it to.
+            retain: DOCKER_DEADLINE,
         }
     }
 }
@@ -598,9 +618,29 @@ impl HolderCleanup {
     /// that never landed is confirmed absent and the case closes honestly; one that cannot be
     /// confirmed gone is reported as leaked, with the reason, rather than silently written off.
     fn own_until_settled_or_confirmed(self) {
-        let settled = self.creation.wait_until_settled(self.bounds.max);
+        let mut settled = self.creation.wait_until_settled(self.bounds.max);
         // Best effort either way: whatever HAS landed should go now.
         self.sweep();
+        if !settled {
+            // `max` expired with the create STILL RUNNING. This is where ownership used to end: it
+            // swept, printed a leak and returned, which handed the container that was still on its
+            // way to nobody. The sweep above cannot cover it — you cannot remove what has not
+            // appeared — so the only thing that keeps it owned is staying.
+            //
+            // So the job is KEPT for `retain` longer. If the create lands in that window it is
+            // swept again, by an owner that is still responsible for it, and then confirmed gone.
+            eprintln!(
+                "sandbox: a create against netns holder {} is STILL IN FLIGHT after {:?} — this \
+                 owner is NOT releasing it: custody is retained for a further {:?}, and anything \
+                 that lands in that window will be removed and confirmed by this owner",
+                self.name, self.bounds.max, self.bounds.retain
+            );
+            settled = self.creation.wait_until_settled(self.bounds.retain);
+            if settled {
+                // It landed late, and it is still this owner's to remove.
+                self.sweep();
+            }
+        }
         if !settled {
             // Custody ends here, but it ends as a KNOWN leak — never as a clean release, and never
             // on an absence answer. While the create is still running, "No such container" is
@@ -609,12 +649,14 @@ impl HolderCleanup {
             // whole fence exists to prevent gets manufactured by the cleanup path itself, so the
             // question is not asked and the honest verdict is recorded instead.
             eprintln!(
-                "sandbox: a create against netns holder {} was STILL IN FLIGHT after {:?} — its \
-                 removal has been issued, but absence CANNOT be confirmed while the create is \
-                 running, so this holder and its {} joiner(s) are reported LEAKED rather than \
-                 clean; the boot reaper is the only remaining backstop",
+                "sandbox: a create against netns holder {} was STILL IN FLIGHT after {:?} and did \
+                 not land within the further {:?} this owner retained it — its removal has been \
+                 issued, but absence CANNOT be confirmed while the create is running, so this \
+                 holder and its {} joiner(s) are reported LEAKED rather than clean; the boot reaper \
+                 is the only remaining backstop",
                 self.name,
                 self.bounds.max,
+                self.bounds.retain,
                 self.joiners.len()
             );
             return;
@@ -1092,12 +1134,17 @@ async fn run_docker_fenced(
     ticket: CreationTicket,
 ) -> Result<(String, String), String> {
     let client = client.clone();
+    // Taken HERE, on the caller's side of the queue. `spawn_blocking` hands work to a pool that can
+    // be saturated, and a clock started inside the closure cannot see the time spent waiting for a
+    // thread -- so a create could sit queued for longer than its own deadline and still be handed a
+    // full budget on arrival. The bound is measured from the moment the work was ASKED for.
+    let queued_at = std::time::Instant::now();
     let joined = tokio::task::spawn_blocking(move || {
         // Moved in, and dropped only when this closure ends: killed on the deadline, failed, or
         // finished. That drop is what "settled" means to `CreationFence::wait_until_settled`.
         let _ticket = ticket;
         let mut child_exited = false;
-        run_bounded_blocking(&client, argv, stdin, DOCKER_DEADLINE, &mut child_exited)
+        run_bounded_blocking(&client, argv, stdin, DOCKER_DEADLINE, queued_at, &mut child_exited)
     })
     .await;
     match joined {
@@ -1169,10 +1216,13 @@ async fn run_bounded_tracked_fenced(
     ticket: Option<CreationTicket>,
 ) -> (Result<(String, String), String>, bool) {
     let client = client.clone();
+    // As in [`run_docker_fenced`]: the clock starts before the queue, not after it.
+    let queued_at = std::time::Instant::now();
     let joined = tokio::task::spawn_blocking(move || {
         let _ticket = ticket;
         let mut child_exited = false;
-        let outcome = run_bounded_blocking(&client, argv, stdin, deadline, &mut child_exited);
+        let outcome =
+            run_bounded_blocking(&client, argv, stdin, deadline, queued_at, &mut child_exited);
         (outcome, child_exited)
     })
     .await;
@@ -1190,6 +1240,7 @@ fn run_bounded_blocking(
     argv: Vec<String>,
     stdin: Option<String>,
     deadline: std::time::Duration,
+    queued_at: std::time::Instant,
     child_exited: &mut bool,
 ) -> Result<(String, String), String> {
     {
@@ -1202,14 +1253,15 @@ fn run_bounded_blocking(
         let program =
             if program == "docker" { client.program().to_owned() } else { program.clone() };
         let program = program.as_str();
-        // The clock starts HERE: before the spawn, and therefore before the plan is written.
+        // The clock was started by the CALLER, before this work was queued, and every wait below is
+        // measured against it: queue time, spawn, plan write, child wait, output drain and writer
+        // join all spend the same budget.
         //
-        // Anchoring it after the stdin write left that write outside the bound entirely. A client
-        // that never reads its stdin fills the pipe buffer, `write_all` blocks indefinitely, and
-        // the deadline below was never even armed — an unbounded create is precisely the state in
-        // which cancellation leaves a container nobody is waiting for. The bound now covers the
-        // whole flow: spawn, plan write, wait, and the output read after it.
-        let started = std::time::Instant::now();
+        // Anchoring it after the stdin write left that write outside the bound entirely, and
+        // anchoring it inside this closure left the queue wait outside it. What is bounded here is
+        // exactly this process's flow; it is NOT a statement about when the daemon finishes creating
+        // a container, which only a daemon-side absence check can settle.
+        let started = queued_at;
         let mut child = Command::new(program)
             .args(args)
             .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
@@ -1217,20 +1269,33 @@ fn run_bounded_blocking(
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| format!("could not run `{program}`: {error}"))?;
-        // Written on its own thread so a blocked write cannot outrun the deadline. The thread owns
-        // the pipe and drops it on the way out, so the sidecar's `read` loop still sees EOF; if the
-        // deadline kills the child first, the write fails with `EPIPE` and the thread ends by
-        // itself rather than pinning this one.
-        let writer = match stdin {
+        // How much of the budget is left, measured from the caller's pre-queue clock. Every wait
+        // below asks this rather than starting a fresh one, so no step can quietly extend the bound.
+        let remaining = || deadline.saturating_sub(started.elapsed());
+
+        // Written on its own thread so a blocked write cannot outrun the deadline, and its result
+        // comes back through a CHANNEL rather than a `JoinHandle`.
+        //
+        // `JoinHandle::join` has no timeout. The old code joined it unconditionally, reasoning that
+        // reaping the child closes the read end -- but a descendant started by the client inherits
+        // that end and can hold it open, so the join could block after the bounded wait had already
+        // returned. A channel can be waited on WITH the remaining budget; the thread itself cannot
+        // be killed (Rust has no such thing), so when it outlives the bound it is NAMED instead of
+        // being silently dropped.
+        let (wrote_tx, wrote_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let writing = match stdin {
             Some(plan) => {
                 let mut pipe =
                     child.stdin.take().ok_or_else(|| "docker stdin was not piped".to_string())?;
-                Some(std::thread::spawn(move || {
-                    pipe.write_all(plan.as_bytes())
-                        .map_err(|error| format!("could not write the plan to the sidecar: {error}"))
-                }))
+                std::thread::spawn(move || {
+                    let outcome = pipe.write_all(plan.as_bytes()).map_err(|error| {
+                        format!("could not write the plan to the sidecar: {error}")
+                    });
+                    let _ = wrote_tx.send(outcome);
+                });
+                true
             }
-            None => None,
+            None => false,
         };
 
         // Poll rather than `wait_with_output`, so the deadline is enforceable at all.
@@ -1243,10 +1308,23 @@ fn run_bounded_blocking(
             if started.elapsed() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
+                // The writer is settled HERE too, not abandoned. Killing the child closes the read
+                // end, so a blocked `write_all` fails with `EPIPE` and the thread ends on its own;
+                // this waits a short, explicit grace for exactly that and reports the writer as
+                // still running when it does not arrive. Dropping the handle instead is how this
+                // flow used to end "complete" while a write was still in progress.
+                let writer_settled = !writing
+                    || wrote_rx.recv_timeout(WRITER_EPIPE_GRACE).is_ok();
                 return Err(format!(
                     "`{program}` did not finish within {}s and was killed — a command with no bound \
-                     is a launch that can hang and a container nobody is waiting for",
-                    deadline.as_secs()
+                     is a launch that can hang and a container nobody is waiting for{}",
+                    deadline.as_secs(),
+                    if writer_settled {
+                        ""
+                    } else {
+                        "; the thread writing its plan is STILL RUNNING in this process and could \
+                         not be joined within the grace after the kill"
+                    }
                 ));
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -1257,28 +1335,91 @@ fn run_bounded_blocking(
         // by this process waiting on a client. The caller must still confirm absence with the
         // daemon before ending custody.
         *child_exited = true;
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
+        // Reaping the child does NOT close its pipes. A descendant it started inherits the write
+        // ends and can hold them open indefinitely, and `read_to_end` returns at EOF -- precisely
+        // what such a descendant withholds. Draining on this thread therefore put an UNBOUNDED wait
+        // directly after the bounded one, which is the hole this replaces: the drains run on their
+        // own threads and are collected against the same budget as everything above.
+        let (drained_tx, drained_rx) = std::sync::mpsc::channel::<(&'static str, Vec<u8>)>();
+        let mut pending: Vec<&'static str> = Vec::new();
         if let Some(mut pipe) = child.stdout.take() {
-            let _ = pipe.read_to_end(&mut stdout);
+            let tx = drained_tx.clone();
+            pending.push("stdout");
+            std::thread::spawn(move || {
+                let mut buffer = Vec::new();
+                let _ = pipe.read_to_end(&mut buffer);
+                let _ = tx.send(("stdout", buffer));
+            });
         }
         if let Some(mut pipe) = child.stderr.take() {
-            let _ = pipe.read_to_end(&mut stderr);
+            let tx = drained_tx.clone();
+            pending.push("stderr");
+            std::thread::spawn(move || {
+                let mut buffer = Vec::new();
+                let _ = pipe.read_to_end(&mut buffer);
+                let _ = tx.send(("stderr", buffer));
+            });
+        }
+        drop(drained_tx);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        while !pending.is_empty() {
+            match drained_rx.recv_timeout(remaining()) {
+                Ok((which, buffer)) => {
+                    pending.retain(|name| *name != which);
+                    if which == "stdout" {
+                        stdout = buffer;
+                    } else {
+                        stderr = buffer;
+                    }
+                }
+                Err(_) => break,
+            }
         }
         let done = std::process::Output { status, stdout, stderr };
         let stdout = String::from_utf8_lossy(&done.stdout).trim().to_owned();
         let stderr = String::from_utf8_lossy(&done.stderr).trim().to_owned();
-        // The child is reaped, so the read end of the plan pipe is closed and this join cannot
-        // block. A half-written plan is a sidecar that acted on a truncated instruction, so the
-        // write's own failure is reported — but only when the child itself did not already fail,
-        // because the child's exit code names the refusal more precisely than a broken pipe does.
-        let wrote = match writer {
-            Some(writer) => match writer.join() {
+        // A half-written plan is a sidecar that acted on a truncated instruction, so the write's own
+        // failure is reported -- but only when the child itself did not already fail, because the
+        // child's exit code names the refusal more precisely than a broken pipe does. Waited on with
+        // what is left of the budget, never unconditionally.
+        let mut writer_outstanding = false;
+        let wrote = if writing {
+            match wrote_rx.recv_timeout(remaining()) {
                 Ok(result) => result,
-                Err(_) => Err("the thread writing the plan to the sidecar panicked".to_string()),
-            },
-            None => Ok(()),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    writer_outstanding = true;
+                    Err(format!(
+                        "the plan was still being written to `{program}` when the {}s bound expired \
+                         -- the writing thread is still running in this process, so this call ends \
+                         on its bound rather than reporting a completed write",
+                        deadline.as_secs()
+                    ))
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    Err("the thread writing the plan to the sidecar panicked".to_string())
+                }
+            }
+        } else {
+            Ok(())
         };
+        // An output this process never finished reading is not an output it may report. Naming the
+        // stream and the still-running reader is the honest end; inventing a truncated success is
+        // how a caller comes to believe a create said something it never said.
+        if !pending.is_empty() {
+            return Err(format!(
+                "`{program}` was reaped, but its {} did not reach EOF within the {}s bound — a \
+                 descendant is holding the pipe open, so this call ends on its bound; the reading \
+                 thread(s) remain outstanding in this process{}",
+                pending.join(" and "),
+                deadline.as_secs(),
+                if writer_outstanding {
+                    ", as does the plan writer"
+                } else {
+                    ""
+                }
+            ));
+        }
         match done.status.code() {
             Some(0) => match wrote {
                 Ok(()) => Ok((stdout, stderr)),
@@ -2566,6 +2707,10 @@ case "$*" in
       echo "Error response from daemon: cannot remove container $last" >&2
       exit 1
     fi
+    # A removal that succeeds makes the container ABSENT, exactly as the daemon would: the presence
+    # marker is what `inspect` answers from, so a test can assert the container really went away
+    # instead of asserting that a removal was merely attempted.
+    rm -f "$WORK/present-$last"
     exit 0
     ;;
   *--detach*)
@@ -2602,6 +2747,7 @@ exit 0
             fast: std::time::Duration::from_millis(10),
             max: std::time::Duration::from_millis(60),
             confirm: std::time::Duration::from_millis(300),
+            retain: std::time::Duration::from_millis(400),
         }
     }
 
@@ -2702,6 +2848,7 @@ exit 0
             vec!["docker".to_owned(), "create".to_owned()],
             Some("x".repeat(4 * 1024 * 1024)),
             deadline,
+            started,
             &mut child_exited,
         );
         let elapsed = started.elapsed();
@@ -2713,6 +2860,233 @@ exit 0
              launch that can hang and a container nobody is waiting for."
         );
         assert!(outcome.is_err(), "a client killed on its deadline cannot report success");
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// A container that lands AFTER the bound is still removed — by an owner that never left.
+    ///
+    /// This is the ownership hole, and it is not a reporting one: when `max` expired with the
+    /// create still running, the owner swept what it could see, printed a leak and RETURNED. The
+    /// sweep cannot touch a container that has not appeared yet, so the one case the fence exists
+    /// for — a create landing late — ended with no owner at all, and the container stayed up until
+    /// a boot reaper happened to find it.
+    ///
+    /// The assertion is therefore about the CONTAINER, not the log: the stand-in daemon answers
+    /// `inspect` from a presence marker and drops that marker when a removal succeeds, so this
+    /// passes only if the thing that landed late was actually removed, and only if the removal came
+    /// after it landed.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn a_create_that_lands_after_the_bound_is_still_removed_by_its_retained_owner() {
+        use std::io::Write as _;
+
+        let work = stand_in_work_dir("late-custody");
+        let script = stand_in_docker(&work, "");
+        let fence = std::sync::Arc::new(CreationFence::default());
+        let ticket = fence.begin();
+
+        // The create lands strictly AFTER the owner's first sweep, and only then settles.
+        //
+        // Ordered on the observed sweep rather than on a sleep, deliberately: a wall-clock delay
+        // makes this test a race, and a lucky schedule where the pre-landing sweep happens to run
+        // late lets a dropped-custody build pass. Waiting for the removal to appear in the stand-in
+        // daemon's log pins the one ordering that matters — the owner has already swept, and the
+        // container arrives afterwards, which is exactly the case a sweep cannot cover.
+        let landing = work.clone();
+        let lander = std::thread::spawn(move || {
+            let give_up = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < give_up {
+                let swept = std::fs::read_to_string(landing.join("rm.log"))
+                    .map(|log| log.contains("holder-late"))
+                    .unwrap_or(false);
+                if swept {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            std::fs::write(landing.join("present-holder-late"), "").expect("presence marker");
+            let mut log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(landing.join("events.log"))
+                .expect("events log");
+            writeln!(log, "landed holder-late").expect("events log");
+            drop(ticket);
+        });
+
+        let cleanup = HolderCleanup {
+            name: "holder-late".to_owned(),
+            joiners: Vec::new(),
+            creation: std::sync::Arc::clone(&fence),
+            client: DockerCli::stand_in(&script),
+            bounds: FenceBounds {
+                retain: std::time::Duration::from_secs(5),
+                ..quick_bounds()
+            },
+        };
+        cleanup.own_until_settled_or_confirmed();
+        lander.join().expect("lander");
+
+        assert!(
+            !work.join("present-holder-late").exists(),
+            "the container landed after the owner's bound and is STILL RUNNING: custody was \
+             dropped at `max` while the create was in flight, so nothing removed what arrived \
+             afterwards. An owner that stops owning at a timeout is how this fence manufactures the \
+             orphan it exists to prevent."
+        );
+        let log = std::fs::read_to_string(work.join("events.log")).unwrap_or_default();
+        let landed = log
+            .lines()
+            .position(|line| line.contains("landed holder-late"))
+            .expect("the stand-in create never landed, so this test proved nothing");
+        assert!(
+            log.lines().skip(landed + 1).any(|line| line.contains("rm holder-late")),
+            "the only removal issued for this holder happened BEFORE it existed — a removal aimed \
+             at a container that had not landed yet, which the daemon answers 'No such container' \
+             and which proves nothing. Event log:\n{log}"
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// Reaping the client does not close its pipes: a DESCENDANT can hold them open.
+    ///
+    /// The bounded wait covered the child and stopped there. After the status came back the flow
+    /// ran `read_to_end` on stdout and stderr on this very thread, with no bound at all, on the
+    /// reasoning that a reaped child leaves closed pipes. It does not. Anything the client started
+    /// inherits the write ends, and `read_to_end` waits for an EOF that a living descendant never
+    /// sends — so the whole flow could block indefinitely immediately AFTER its deadline had been
+    /// satisfied. The client here exits at once and leaves a descendant holding stdout.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn a_descendant_holding_the_output_pipe_cannot_outlast_the_bound() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let work = stand_in_work_dir("descendant-pipe");
+        let script = work.join("docker");
+        // The client exits immediately; the backgrounded descendant inherits stdout and holds it
+        // open, so stdout never reaches EOF.
+        std::fs::write(&script, "#!/bin/sh\nsleep 30 &\nexit 0\n").expect("write stand-in");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let deadline = std::time::Duration::from_millis(400);
+        let mut child_exited = false;
+        let started = std::time::Instant::now();
+        let outcome = run_bounded_blocking(
+            &DockerCli::stand_in(&script),
+            vec!["docker".to_owned(), "create".to_owned()],
+            None,
+            deadline,
+            started,
+            &mut child_exited,
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the flow ran unbounded AFTER the child was reaped: a descendant held stdout open and \
+             the drain waited {elapsed:?} against a {deadline:?} bound. A create whose tail is \
+             unbounded is a create nobody is waiting on."
+        );
+        let error = outcome.expect_err("an output this process never finished reading is not a result it may report");
+        assert!(
+            error.contains("stdout") && error.contains("descendant"),
+            "the call ended on its bound but did not name the unread stream or the reason, so a \
+             caller cannot tell a complete output from a truncated one. Got:\n{error}"
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// A writer that outlives the deadline is NAMED, never silently dropped.
+    ///
+    /// On the deadline path the flow killed the child, returned, and dropped the writer handle on
+    /// the way out. Killing the direct client normally closes the read end and the blocked write
+    /// fails with `EPIPE` — but a descendant holding that end open defeats exactly that, leaving a
+    /// thread still writing a plan into a pipe while this call reports the command finished. The
+    /// returned error has to carry that outstanding custody instead of implying a settled flow.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn a_plan_writer_still_running_after_the_deadline_is_reported_not_abandoned() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let work = stand_in_work_dir("writer-outstanding");
+        let script = work.join("docker");
+        // Never reads stdin, so a large plan fills the pipe; the descendant keeps the READ end open
+        // so killing the client does not deliver `EPIPE` to the writer.
+        std::fs::write(&script, "#!/bin/sh\nsleep 30 &\nsleep 30\n").expect("write stand-in");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let deadline = std::time::Duration::from_millis(300);
+        let mut child_exited = false;
+        let started = std::time::Instant::now();
+        let outcome = run_bounded_blocking(
+            &DockerCli::stand_in(&script),
+            vec!["docker".to_owned(), "create".to_owned()],
+            Some("x".repeat(4 * 1024 * 1024)),
+            deadline,
+            started,
+            &mut child_exited,
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the bound never armed: {elapsed:?} against {deadline:?}."
+        );
+        let error = outcome.expect_err("a client killed on its deadline cannot report success");
+        assert!(
+            error.contains("STILL RUNNING"),
+            "the deadline path ended without accounting for the thread still writing the plan — \
+             that handle was dropped, so a write into a descendant-held pipe continues while this \
+             call reads as finished. Got:\n{error}"
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// Time spent WAITING FOR A THREAD is time spent against the bound.
+    ///
+    /// `spawn_blocking` hands work to a pool that can be saturated, and the clock used to start
+    /// inside the closure — after the queue. A create could therefore sit queued for longer than
+    /// its entire deadline and still be handed a full fresh budget when a thread finally freed up,
+    /// which is not a bound on the flow at all. The clock is now taken on the caller's side and
+    /// passed in; this hands in a budget already mostly spent and requires the remainder to be
+    /// honoured rather than restarted.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn the_bound_counts_the_time_the_work_spent_queued_for_a_thread() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let work = stand_in_work_dir("queue-time");
+        let script = work.join("docker");
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").expect("write stand-in");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let deadline = std::time::Duration::from_millis(600);
+        let queued_for = std::time::Duration::from_millis(500);
+        // Stood for a call that waited `queued_for` on the pool before a thread took it.
+        let queued_at = std::time::Instant::now() - queued_for;
+        let mut child_exited = false;
+        let entered = std::time::Instant::now();
+        let outcome = run_bounded_blocking(
+            &DockerCli::stand_in(&script),
+            vec!["docker".to_owned(), "create".to_owned()],
+            None,
+            deadline,
+            queued_at,
+            &mut child_exited,
+        );
+        let spent_here = entered.elapsed();
+
+        assert!(outcome.is_err(), "a client killed on its deadline cannot report success");
+        // What is left of the budget, plus slack for a loaded machine. A flow that restarts its
+        // clock on arrival instead spends the WHOLE deadline here and lands well outside this.
+        let remainder = deadline - queued_for + std::time::Duration::from_millis(250);
+        assert!(
+            spent_here < remainder,
+            "the queue wait was not counted: this call had {queued_for:?} of a {deadline:?} budget \
+             already spent before it started, so at most {remainder:?} remained — yet it ran a \
+             further {spent_here:?}, a full fresh deadline granted on arrival. Work that waits \
+             longer than its bound for a thread would never be cut off."
+        );
         let _ = std::fs::remove_dir_all(&work);
     }
 
@@ -2859,6 +3233,7 @@ exit 0
             fast: std::time::Duration::from_millis(50),
             max: std::time::Duration::from_secs(30),
             confirm: std::time::Duration::from_secs(10),
+            retain: std::time::Duration::from_secs(30),
         };
 
         let mut establishing = Box::pin(establish_with(
