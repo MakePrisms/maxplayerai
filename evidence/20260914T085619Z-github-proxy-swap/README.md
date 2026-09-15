@@ -90,9 +90,10 @@ raw `docker logs` assertion. The run's files are not added to this bundle; the f
   scrubber. Since 2026-09-15 the swap is scoped to the `Authorization` header, so a job cannot
   choose the reflected header; GitHub does not reflect `Authorization`. This bundle does not prove
   that for any other vendor.
-- For run B the container's environment and command come from the same `prepare_launch` and
-  `launch` code that run A inspected raw. Run B's own raw view is the ACP wire in
-  `b-diagnostics-logs.txt`, which the redacting capture saved.
+- Run B has no raw observation of its own. Its container's environment and command come from the
+  same `prepare_launch` and `launch` code that run A inspected raw, and its ACP wire in
+  `b-diagnostics-logs.txt` is the REDACTED capture: the token's absence there proves the redactor,
+  not the boundary.
 - The read-only endpoint and the read-only token together bound what a job can do. The proxy itself
   constrains the destination host, not the operations; that is the scope fork in doc 10, unchanged.
 - Run B is one agent turn with one tool call. It proves the harness maps the session entry and

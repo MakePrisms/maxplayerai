@@ -9056,6 +9056,13 @@ mod mcp_tool_tests {
             .args(["logs", &container_name])
             .output()
             .expect("docker logs of the job container");
+        // A `docker logs` that failed scanned nothing; its error text carries no credential and
+        // would pass the check below for the wrong reason.
+        assert!(
+            raw_logs.status.success(),
+            "docker logs {container_name} failed, so the raw logs were not read: {}",
+            String::from_utf8_lossy(&raw_logs.stderr)
+        );
         let raw_logs_text = format!(
             "{}{}",
             String::from_utf8_lossy(&raw_logs.stdout),

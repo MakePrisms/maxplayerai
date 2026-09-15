@@ -4255,16 +4255,12 @@ impl SellerNodeRunner {
             let jobs_root = node.home().root.join("seller-jobs");
             let seat = node.seller_pubkey().to_owned();
             // A holder that survived a killed daemon and whose tool is no longer configured (removed
-            // or renamed) has no owner: remove it now, by the seat's label, before this boot's
-            // holders start. A configured tool's own stale container is replaced by `start` itself.
-            // Only a docker seat can have holders; a launcher seat refuses the table at config time.
-            let docker_seat = node
-                .home()
-                .config
-                .sandbox
-                .as_ref()
-                .is_some_and(|sandbox| matches!(sandbox.mode, crate::home::SandboxMode::Docker));
-            if docker_seat {
+            // or renamed, or the seat left docker mode, or `[sandbox]` is gone) has no owner: remove
+            // it now, by the seat's label, before this boot's holders start. A configured tool's own
+            // stale container is replaced by `start` itself. This runs whatever the mode is, because
+            // the holders to remove are the PREVIOUS configuration's. A host with no docker CLI has
+            // nothing to reconcile and is not a fault.
+            {
                 let configured: Vec<String> = cfgs.iter().map(|cfg| cfg.server_name.trim().to_owned()).collect();
                 match crate::held_tool::reconcile_stale_holders(&seat, &configured).await {
                     Ok(removed) if removed.is_empty() => {}
@@ -4273,6 +4269,7 @@ impl SellerNodeRunner {
                         removed.len(),
                         removed.join(", ")
                     ),
+                    Err(error) if error.contains(crate::held_tool::DOCKER_NOT_RUNNABLE) => {}
                     Err(error) => opline!(
                         "seller node: [sandbox] held_tools: could not reconcile stale holders (continuing): {error}"
                     ),

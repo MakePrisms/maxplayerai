@@ -27,6 +27,7 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -295,28 +296,45 @@ async fn docker_ok(argv: Vec<String>, deadline: Duration) -> Result<String, Stri
     }
 }
 
-/// The blocking half of [`docker`]: spawn the child, drain both pipes on their own threads, poll
-/// for its exit, and kill it at the deadline. Every `Drop` fallback in this module runs through it
-/// too, so a fallback cannot hang either.
+/// The words a `docker` call fails with when the program cannot be started at all: no docker CLI on
+/// this host. A boot with nothing to reconcile reads it as "nothing to do", not as a fault.
+pub const DOCKER_NOT_RUNNABLE: &str = "could not run `docker`";
+
+/// The least time the collection of a child's output gets after the child exits, when the deadline
+/// is nearly spent. A child that exits at the deadline's edge has flushed its pipes; a quarter
+/// second is enough to read them and is the only way a call can outlast its deadline.
+const COLLECT_FLOOR: Duration = Duration::from_millis(250);
+
+/// The blocking half of [`docker`]: spawn the child in its own process group, drain both pipes on
+/// their own threads, poll for its exit, and kill the group at the deadline. Every `Drop` fallback
+/// in this module runs through it too, so a fallback cannot hang either.
+///
+/// ONE deadline covers the run and the collection of its output. The pipes close only when every
+/// process that holds them has exited. A descendant the CLI left behind (a credential helper, a
+/// plugin) that keeps a pipe open past the deadline is killed with the group, and the call is an
+/// `Err`: never a success with empty output, which a caller would read as "nothing printed".
 fn run_bounded(argv: &[String], deadline: Duration) -> Result<(i32, String, String), String> {
+    use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     let (program, args) = argv.split_first().ok_or("an empty docker argv")?;
     let shown = argv.join(" ");
+    let started = std::time::Instant::now();
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn()
         .map_err(|error| format!("could not run `{program}`: {error}"))?;
+    let group = child.id() as libc::pid_t;
     let stdout = drain_on_thread(child.stdout.take());
     let stderr = drain_on_thread(child.stderr.take());
-    let started = std::time::Instant::now();
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if started.elapsed() >= deadline => {
-                let _ = child.kill();
+                kill_group(group);
                 let _ = child.wait();
                 return Err(format!(
                     "`{shown}` did not finish within {}s and was killed",
@@ -324,17 +342,41 @@ fn run_bounded(argv: &[String], deadline: Duration) -> Result<(i32, String, Stri
                 ));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(error) => return Err(format!("could not wait for `{program}`: {error}")),
+            Err(error) => {
+                kill_group(group);
+                let _ = child.wait();
+                return Err(format!("could not wait for `{program}`: {error}"));
+            }
         }
     };
-    // The pipes close when the child exits. A grandchild that kept one open would block a plain
-    // read to the end, so the collection is bounded as well.
-    let collect = |rx: std::sync::mpsc::Receiver<Vec<u8>>| rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
-    Ok((
-        status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&collect(stdout)).trim().to_owned(),
-        String::from_utf8_lossy(&collect(stderr)).trim().to_owned(),
-    ))
+    let code = status.code().unwrap_or(-1);
+    let remaining = || deadline.saturating_sub(started.elapsed()).max(COLLECT_FLOOR);
+    let out = stdout.recv_timeout(remaining());
+    let err = stderr.recv_timeout(remaining());
+    match (out, err) {
+        (Ok(out), Ok(err)) => Ok((
+            code,
+            String::from_utf8_lossy(&out).trim().to_owned(),
+            String::from_utf8_lossy(&err).trim().to_owned(),
+        )),
+        _ => {
+            kill_group(group);
+            Err(format!(
+                "`{shown}` exited {code}, but its output pipes stayed open past the {}s deadline: a \
+                 descendant of the command held them and was killed; nothing it printed was collected",
+                deadline.as_secs()
+            ))
+        }
+    }
+}
+
+/// Kill every process in the group `run_bounded` created for one call. The child is still held
+/// unreaped by the caller, so its id cannot have been reused.
+fn kill_group(group: libc::pid_t) {
+    // SAFETY: a plain signal to a process group this process created and still holds.
+    unsafe {
+        libc::killpg(group, libc::SIGKILL);
+    }
 }
 
 fn drain_on_thread<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::sync::mpsc::Receiver<Vec<u8>> {
@@ -349,14 +391,31 @@ fn drain_on_thread<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::s
     rx
 }
 
-/// Whether the container `name` exists, in any state.
+/// Whether the container `name` exists, in any state. Unknown is an `Err`, never "absent".
 async fn container_exists(name: &str) -> Result<bool, String> {
-    let (code, _, _) = docker(
+    let (code, _, stderr) = docker(
         vec!["docker".into(), "inspect".into(), "--format".into(), "{{.Id}}".into(), name.to_owned()],
         DOCKER_QUERY_TIMEOUT,
     )
     .await?;
-    Ok(code == 0)
+    inspect_outcome(name, code, &stderr)
+}
+
+/// The meaning of one `docker inspect <name>`: exit 0 is "exists"; the daemon's own "no such"
+/// words are "absent"; anything else (a daemon that is down, a client that failed) is unknown.
+/// Unknown is an error. A shutdown that read unknown as absent would mark a holder stopped that
+/// still runs, and disarm the fallback that would have removed it.
+fn inspect_outcome(name: &str, code: i32, stderr: &str) -> Result<bool, String> {
+    if code == 0 {
+        return Ok(true);
+    }
+    let words = stderr.to_ascii_lowercase();
+    if words.contains("no such object") || words.contains("no such container") {
+        return Ok(false);
+    }
+    Err(format!(
+        "`docker inspect {name}` exited {code} without saying whether the container exists: {stderr}"
+    ))
 }
 
 /// Remove the container `name`. `Ok` only when it is confirmed gone: removed now, or absent already.
@@ -419,21 +478,98 @@ fn remove_holder_blocking(names: &HolderNames) {
     let _ = run_bounded(&rm_volume, DOCKER_QUERY_TIMEOUT);
 }
 
-/// Owns the container and the runtime volume of a start that is not complete. Armed, its drop
-/// removes both, so a start that fails or is CANCELLED after `docker run` leaves no enrolled holder
-/// behind without an owner. The state volume stays: a login it holds is resumed by the next boot.
-/// [`HeldTool::start`] disarms it once the `HeldTool` owns the container.
-struct StartGuard {
-    names: HolderNames,
+/// Who cleans up after a `docker` call whose future was dropped.
+///
+/// `spawn_blocking` cannot be cancelled. A future dropped at its `.await` leaves the child running,
+/// and the effect the child produces afterwards (a container created, a job attached) has no owner.
+/// This type gives it one. The blocking task records when the call ended; the future's owner
+/// records the abandonment; whichever of the two comes SECOND runs `cleanup`, so it runs exactly
+/// once and only after the effect exists. A call that completes and is disarmed cleans up nothing.
+///
+/// A start owns its container this way (`cleanup` removes the container and the runtime volume);
+/// an attach owns its attachment (`cleanup` detaches the job again).
+struct OwnedCall {
+    pending: Arc<Mutex<Pending>>,
+    cleanup: Arc<dyn Fn() + Send + Sync>,
     armed: bool,
 }
 
-impl Drop for StartGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            remove_holder_blocking(&self.names);
+#[derive(Default)]
+struct Pending {
+    in_flight: bool,
+    abandoned: bool,
+}
+
+impl OwnedCall {
+    fn new(cleanup: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            pending: Arc::new(Mutex::new(Pending::default())),
+            cleanup: Arc::new(cleanup),
+            armed: true,
         }
     }
+
+    /// [`docker`], with the call's effect owned across a dropped future.
+    async fn docker(&self, argv: Vec<String>, deadline: Duration) -> Result<(i32, String, String), String> {
+        lock(&self.pending).in_flight = true;
+        let pending = Arc::clone(&self.pending);
+        let cleanup = Arc::clone(&self.cleanup);
+        tokio::task::spawn_blocking(move || {
+            let outcome = run_bounded(&argv, deadline);
+            let abandoned = {
+                let mut pending = lock(&pending);
+                pending.in_flight = false;
+                pending.abandoned
+            };
+            if abandoned {
+                cleanup();
+            }
+            outcome
+        })
+        .await
+        .map_err(|error| format!("docker task panicked: {error}"))?
+    }
+
+    /// [`docker_ok`], with the call's effect owned across a dropped future.
+    async fn docker_ok(&self, argv: Vec<String>, deadline: Duration) -> Result<String, String> {
+        let shown = argv.join(" ");
+        let (code, stdout, stderr) = self.docker(argv, deadline).await?;
+        if code == 0 {
+            Ok(stdout)
+        } else {
+            Err(format!(
+                "`{shown}` exited {code}: {}",
+                if stderr.is_empty() { stdout } else { stderr }
+            ))
+        }
+    }
+
+    /// The effect now has its owner (the value that was built from it): no cleanup on drop.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for OwnedCall {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let in_flight = {
+            let mut pending = lock(&self.pending);
+            pending.abandoned = true;
+            pending.in_flight
+        };
+        // A call still in flight cleans up itself when its child ends. One that ended, or never
+        // started, is cleaned up here and now.
+        if !in_flight {
+            (self.cleanup)();
+        }
+    }
+}
+
+fn lock(pending: &Mutex<Pending>) -> std::sync::MutexGuard<'_, Pending> {
+    pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The holders of `seat` that a boot must remove: every container that carries the seat's label
@@ -514,7 +650,7 @@ impl HeldTool {
     /// successfully; the status says so.
     ///
     /// A start that fails after `docker run`, or is cancelled there, removes the container and the
-    /// runtime volume it created ([`StartGuard`]). The state volume stays.
+    /// runtime volume it created ([`OwnedCall`]). The state volume stays.
     pub async fn start(
         cfg: &HeldToolConfig,
         seat: &str,
@@ -546,17 +682,18 @@ impl HeldTool {
             .map_err(|error| format!("[sandbox] held_tool: cannot create {}: {error}", jobs_root.display()))?;
 
         let names = holder_names(seat, server_name);
-        let mut guard = StartGuard { names: names.clone(), armed: true };
-        match Self::start_owned(cfg, seat, jobs_root, uid, gid, &names, server_name).await {
+        let owned_names = names.clone();
+        let mut owner = OwnedCall::new(move || remove_holder_blocking(&owned_names));
+        match Self::start_owned(cfg, seat, jobs_root, uid, gid, &names, server_name, &owner).await {
             Ok(tool) => {
-                guard.armed = false;
+                owner.disarm();
                 Ok(tool)
             }
             Err(error) => {
                 // The explicit path: remove what this start created, and report both facts. The
-                // guard stays armed only for the cancelled case.
+                // owner stays armed until then, for a cancellation during this cleanup.
                 let cleanup = remove_holder_resources(&names).await;
-                guard.armed = false;
+                owner.disarm();
                 Err(match cleanup {
                     Ok(()) => error,
                     Err(more) => format!("{error}; the cleanup of the failed start also failed: {more}"),
@@ -565,7 +702,10 @@ impl HeldTool {
         }
     }
 
-    /// [`Self::start`] from the first `docker` call on: the caller owns the cleanup of a failure.
+    /// [`Self::start`] from the first `docker` call on. Every call goes through `owner`, so a start
+    /// cancelled while `docker run` is still creating the holder removes it once it exists; the
+    /// caller owns the cleanup of a failure.
+    #[allow(clippy::too_many_arguments)]
     async fn start_owned(
         cfg: &HeldToolConfig,
         seat: &str,
@@ -574,27 +714,30 @@ impl HeldTool {
         gid: u32,
         names: &HolderNames,
         server_name: &str,
+        owner: &OwnedCall,
     ) -> Result<Self, String> {
         // A stale holder from a daemon that died without its shutdown path: remove it by name, so
         // this boot's container is the one the name addresses.
         remove_container(&names.container).await?;
         for volume in [&names.state_volume, &names.runtime_volume] {
-            docker_ok(
-                vec!["docker".into(), "volume".into(), "create".into(), volume.clone()],
-                DOCKER_QUERY_TIMEOUT,
-            )
-            .await?;
+            owner
+                .docker_ok(
+                    vec!["docker".into(), "volume".into(), "create".into(), volume.clone()],
+                    DOCKER_QUERY_TIMEOUT,
+                )
+                .await?;
         }
-        docker_ok(volume_init_argv(&cfg.image, names, uid, gid), DOCKER_RUN_TIMEOUT).await?;
-        docker_ok(holder_run_argv(cfg, names, seat, jobs_root, uid, gid), DOCKER_RUN_TIMEOUT).await?;
+        owner.docker_ok(volume_init_argv(&cfg.image, names, uid, gid), DOCKER_RUN_TIMEOUT).await?;
+        owner.docker_ok(holder_run_argv(cfg, names, seat, jobs_root, uid, gid), DOCKER_RUN_TIMEOUT).await?;
 
         // Wait for `status`. The holder enrols before it binds its control socket, so the wait
         // covers a real login against the vendor. Every call inside the loop is bounded, so the
         // loop ends at START_TIMEOUT even when `docker exec` hangs.
         let started = std::time::Instant::now();
         let status = loop {
-            let (code, stdout, stderr) =
-                docker(holderctl_argv(&names.container, &["status"]), DOCKER_CONTROL_TIMEOUT).await?;
+            let (code, stdout, stderr) = owner
+                .docker(holderctl_argv(&names.container, &["status"]), DOCKER_CONTROL_TIMEOUT)
+                .await?;
             if (code == 0 || code == 1)
                 && !stdout.is_empty()
                 && let Ok(status) = parse_status(&stdout)
@@ -602,23 +745,25 @@ impl HeldTool {
                 break status;
             }
             // Gone already? Then its own last words are the diagnosis (an enrolment failure).
-            let (_, state, _) = docker(
-                vec![
-                    "docker".into(),
-                    "inspect".into(),
-                    "--format".into(),
-                    "{{.State.Status}}".into(),
-                    names.container.clone(),
-                ],
-                DOCKER_QUERY_TIMEOUT,
-            )
-            .await?;
-            if state == "exited" || state == "dead" {
-                let (_, logs_out, logs_err) = docker(
-                    vec!["docker".into(), "logs".into(), "--tail".into(), "20".into(), names.container.clone()],
+            let (_, state, _) = owner
+                .docker(
+                    vec![
+                        "docker".into(),
+                        "inspect".into(),
+                        "--format".into(),
+                        "{{.State.Status}}".into(),
+                        names.container.clone(),
+                    ],
                     DOCKER_QUERY_TIMEOUT,
                 )
                 .await?;
+            if state == "exited" || state == "dead" {
+                let (_, logs_out, logs_err) = owner
+                    .docker(
+                        vec!["docker".into(), "logs".into(), "--tail".into(), "20".into(), names.container.clone()],
+                        DOCKER_QUERY_TIMEOUT,
+                    )
+                    .await?;
                 return Err(format!(
                     "[sandbox] held_tool: the holder exited before it answered; its last output: {}",
                     if logs_err.is_empty() { logs_out } else { logs_err }
@@ -634,7 +779,8 @@ impl HeldTool {
         };
 
         // The per-job socket mount needs `volume-subpath`; prove it now, once, or say so.
-        docker_ok(subpath_probe_argv(&cfg.image, names), DOCKER_RUN_TIMEOUT)
+        owner
+            .docker_ok(subpath_probe_argv(&cfg.image, names), DOCKER_RUN_TIMEOUT)
             .await
             .map_err(|error| {
                 format!(
@@ -703,12 +849,32 @@ impl HeldTool {
     /// [`DOCKER_CONTROL_TIMEOUT`].
     pub async fn attach(&self, job_id: &str) -> Result<JobToolEndpoint, String> {
         let job_root = format!("{HOLDER_JOBS_DIR}/{job_id}");
-        let stdout = docker_ok(
-            holderctl_argv(&self.names.container, &["attach", "--job-id", job_id, "--job-root", &job_root]),
-            DOCKER_CONTROL_TIMEOUT,
-        )
-        .await
-        .map_err(|error| format!("[sandbox] held_tool: attach {job_id} failed: {error}"))?;
+        let detach_argv = holderctl_argv(&self.names.container, &["detach", "--job-id", job_id]);
+        // The attachment is owned across a dropped future: a holder that attached the job after
+        // this daemon stopped waiting is told to detach it again (`OwnedCall`).
+        let mut owner = OwnedCall::new({
+            let detach_argv = detach_argv.clone();
+            move || {
+                let _ = run_bounded(&detach_argv, DOCKER_CONTROL_TIMEOUT);
+            }
+        });
+        let attached = owner
+            .docker_ok(
+                holderctl_argv(&self.names.container, &["attach", "--job-id", job_id, "--job-root", &job_root]),
+                DOCKER_CONTROL_TIMEOUT,
+            )
+            .await;
+        owner.disarm();
+        let stdout = match attached {
+            Ok(stdout) => stdout,
+            Err(error) => {
+                // A killed `docker exec` does not stop the `holderctl` it started: the attach may
+                // have landed anyway. Best effort, so a later attach of this id is not refused as
+                // live; a holder that never attached it answers "no such attached job".
+                let _ = docker(detach_argv, DOCKER_CONTROL_TIMEOUT).await;
+                return Err(format!("[sandbox] held_tool: attach {job_id} failed: {error}"));
+            }
+        };
         let reply: Value = serde_json::from_str(stdout.trim())
             .map_err(|error| format!("[sandbox] held_tool: attach reply is not JSON: {error}"))?;
         let expected_socket = format!("{HOLDER_RUNTIME_DIR}/jobs/{job_id}/job.sock");
@@ -1001,6 +1167,86 @@ mod tests {
                 .expect("a child that exits is reported");
         assert_eq!((code, stdout.as_str(), stderr.as_str()), (3, "out", "err"));
         assert!(run_bounded(&[], Duration::from_secs(1)).is_err(), "an empty argv is refused");
+    }
+
+    /// A child that exits but leaves a descendant holding its pipes is a failure of the call, never
+    /// a success with empty output: a boot that read "" from `docker ps` would remove nothing and
+    /// believe it. The group is killed, so the descendant does not survive the call.
+    #[test]
+    fn a_descendant_that_holds_the_pipes_fails_the_call_instead_of_emptying_its_output() {
+        let started = std::time::Instant::now();
+        let error = run_bounded(
+            &["sh".into(), "-c".into(), "echo out; sleep 30 & exit 0".into()],
+            Duration::from_secs(2),
+        )
+        .expect_err("pipes held past the deadline must fail the call");
+        assert!(error.contains("stayed open") && error.contains("exited 0"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(10), "the call ends at its deadline, not the descendant's");
+        let (code, out, _) = run_bounded(&["sh".into(), "-c".into(), "echo fast".into()], Duration::from_secs(5))
+            .expect("a child that closes its pipes is collected");
+        assert_eq!((code, out.as_str()), (0, "fast"));
+    }
+
+    #[test]
+    fn inspect_words_decide_presence_and_an_unknown_answer_is_an_error() {
+        assert_eq!(inspect_outcome("h", 0, ""), Ok(true));
+        assert_eq!(inspect_outcome("h", 1, "Error: No such object: h"), Ok(false));
+        assert_eq!(inspect_outcome("h", 1, "Error response from daemon: No such container: h"), Ok(false));
+        let down = inspect_outcome("h", 1, "Cannot connect to the Docker daemon at unix:///var/run/docker.sock");
+        assert!(down.is_err(), "a daemon that is down is unknown, not absent: {down:?}");
+        assert!(inspect_outcome("h", 125, "").is_err());
+    }
+
+    /// The handoff: a future dropped while its child runs does not clean up at once (the effect
+    /// does not exist yet) and does not forget (the blocking task cleans up when the child ends).
+    #[tokio::test]
+    async fn an_owned_call_dropped_in_flight_cleans_up_exactly_once_after_the_child_ends() {
+        use std::sync::atomic::AtomicUsize;
+        let cleaned = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&cleaned);
+        let owner = OwnedCall::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        let pending = Arc::clone(&owner.pending);
+        let task = tokio::spawn(async move {
+            let _ = owner.docker(vec!["sh".into(), "-c".into(), "sleep 1".into()], Duration::from_secs(10)).await;
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        task.abort();
+        let _ = task.await;
+        assert_eq!(cleaned.load(Ordering::SeqCst), 0, "the effect does not exist yet: no cleanup at the drop");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while cleaned.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(cleaned.load(Ordering::SeqCst), 1, "the task cleans up once the child ended");
+        assert!(!lock(&pending).in_flight);
+    }
+
+    #[tokio::test]
+    async fn an_owned_call_that_completes_cleans_up_only_when_it_stays_armed() {
+        use std::sync::atomic::AtomicUsize;
+        let cleaned = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&cleaned);
+        let mut owner = OwnedCall::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        let (code, out, _) = owner
+            .docker(vec!["sh".into(), "-c".into(), "echo hi".into()], Duration::from_secs(5))
+            .await
+            .expect("the call runs");
+        assert_eq!((code, out.as_str()), (0, "hi"));
+        owner.disarm();
+        drop(owner);
+        assert_eq!(cleaned.load(Ordering::SeqCst), 0, "a disarmed owner cleans up nothing");
+
+        let counter = Arc::clone(&cleaned);
+        let owner = OwnedCall::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        let _ = owner.docker(vec!["sh".into(), "-c".into(), "exit 3".into()], Duration::from_secs(5)).await;
+        drop(owner);
+        assert_eq!(cleaned.load(Ordering::SeqCst), 1, "an armed owner whose call ended cleans up at the drop");
     }
 
     #[test]
