@@ -26,6 +26,14 @@
 //! reads stdin only between complete responses cannot do that; it waits for a stream that waits
 //! for it.
 //!
+//! A worker for a REQUEST ends when the request's answer has gone out. The transport says the
+//! server should close the stream after the response; a server that keeps it open with
+//! heartbeats does not keep a worker and a connection alive here, because the bridge closes its
+//! side once the answer is written. Request workers are bounded ([`MAX_REQUESTS_IN_FLIGHT`]): a
+//! request over the bound gets one error line on its id and no worker. A notification and a
+//! response are never bounded and never wait, so the agent's answer to a server request always
+//! goes out.
+//!
 //! What it does not do: it opens no `GET` stream. A server message that does not ride on a
 //! response to one of the client's requests is not received.
 
@@ -36,6 +44,7 @@ use maxplayer_tool_kit::mcp_bridge::{
 };
 use serde_json::Value;
 use std::io::{BufRead, Read, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -46,11 +55,27 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 /// Largest error body the bridge quotes back into a JSON-RPC error.
 const MAX_ERROR_BODY: u64 = 1 << 20;
 
-/// What every worker shares: the configuration, the session facts, and the one stdout.
+/// Request workers that may run at once. Each holds one thread and one connection to the proxy
+/// until its answer is written. An agent that has more than this many tool calls in flight gets
+/// an error line for the ones over the bound, at once, on their own ids.
+const MAX_REQUESTS_IN_FLIGHT: usize = 32;
+
+/// What every worker shares: the configuration, the session facts, the one stdout, and the
+/// count of request workers alive.
 struct Shared {
     config: BridgeConfig,
     state: Mutex<SessionState>,
     stdout: Mutex<std::io::Stdout>,
+    requests_in_flight: AtomicUsize,
+}
+
+/// Releases one slot of [`MAX_REQUESTS_IN_FLIGHT`] when a request worker ends, however it ends.
+struct RequestSlot<'a>(&'a AtomicUsize);
+
+impl Drop for RequestSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Shared {
@@ -76,6 +101,7 @@ fn main() {
         config,
         state: Mutex::new(SessionState::default()),
         stdout: Mutex::new(std::io::stdout()),
+        requests_in_flight: AtomicUsize::new(0),
     });
 
     let stdin = std::io::stdin();
@@ -99,6 +125,20 @@ fn main() {
         let kind = classify(&message);
         let id = message.get("id").cloned().unwrap_or(Value::Null);
 
+        // The bound applies to requests only. The slot is taken here, on the reading thread, so
+        // the count never overshoots; the worker releases it when it ends.
+        if kind == MessageKind::Request
+            && shared.requests_in_flight.fetch_add(1, Ordering::SeqCst) >= MAX_REQUESTS_IN_FLIGHT
+        {
+            shared.requests_in_flight.fetch_sub(1, Ordering::SeqCst);
+            shared.emit(&error_line(
+                &id,
+                -32000,
+                &format!("too many requests in flight ({MAX_REQUESTS_IN_FLIGHT}); the bridge refused this request"),
+            ));
+            continue;
+        }
+
         workers.retain(|worker| !worker.is_finished());
         let shared = Arc::clone(&shared);
         let text = trimmed.to_owned();
@@ -121,11 +161,13 @@ fn main() {
 
 /// Post one message and forward what comes back, as it comes back.
 fn post(shared: &Shared, text: &str, kind: MessageKind, id: &Value) {
+    let is_request = kind == MessageKind::Request;
+    // The slot taken on the reading thread is released when this worker ends, on every path.
+    let _slot = is_request.then(|| RequestSlot(&shared.requests_in_flight));
     let headers = match shared.state.lock() {
         Ok(state) => state.request_headers(&shared.config.placeholder),
         Err(_) => return,
     };
-    let is_request = kind == MessageKind::Request;
     let mut response = match http::request_streaming(
         &shared.config.proxy_url,
         "POST",
@@ -174,13 +216,18 @@ fn post(shared: &Shared, text: &str, kind: MessageKind, id: &Value) {
     }
 }
 
-/// An SSE body: forward each event's message the moment the event is complete.
+/// An SSE body: forward each event's message the moment the event is complete. For a request,
+/// the read ends once the answer has gone out: the bridge closes its side of the stream then, so
+/// a server that keeps the stream open past the response holds no worker here.
 fn forward_stream(shared: &Shared, response: &mut http::StreamingResponse, is_request: bool, id: &Value) {
     let mut splitter = SseSplitter::default();
     let mut emitted = 0usize;
     let mut answered = false;
     let mut buffer = [0u8; 8192];
     loop {
+        if is_request && answered {
+            return;
+        }
         let payloads = match response.read(&mut buffer) {
             Ok(0) => {
                 let tail = splitter.finish();

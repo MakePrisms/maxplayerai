@@ -323,6 +323,78 @@ fn the_bridge_serves_two_requests_at_once_and_each_reply_carries_its_own_id() {
     assert_eq!(s["calls"], json!(1));
 }
 
+/// A vendor that keeps its stream open after the result (keepalive comments, no close) must not
+/// keep a bridge worker and a connection alive per request. Each reply arrives at once, and once
+/// the answer is written the bridge closes its side: the vendor's count of held streams returns
+/// to zero.
+#[test]
+fn a_request_worker_ends_when_its_answer_arrives_even_if_the_vendor_holds_the_stream() {
+    let vendor = spawn_vendor(&["--sse", "--hold-stream"]);
+    let proxy = spawn_proxy(&vendor, &vendor.addr);
+    let proxy_url = format!("http://{}", proxy.addr);
+
+    let mut bridge = Bridge::spawn(&proxy_url, PLACEHOLDER);
+    for i in 0..24u64 {
+        let started = std::time::Instant::now();
+        let called = bridge.request("tools/call", json!({"name": "vendor-echo", "arguments": {"text": format!("held-{i}")}}));
+        assert_eq!(called["result"]["content"][0]["text"], json!(format!("HELD-{i}")), "{called}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "a reply must not wait for the stream's end");
+    }
+
+    // The vendor opened 24 held streams; the bridge closed every one of them once it had its answer.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let s = loop {
+        let s = vendor_stats(&vendor.addr);
+        if s["streams_open"] == json!(0) || std::time::Instant::now() >= deadline {
+            break s;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert_eq!(s["streams_held_total"], json!(24), "{s}");
+    assert_eq!(s["streams_open"], json!(0), "the bridge must close a stream once its answer is out: {s}");
+    assert_eq!(s["calls"], json!(24));
+}
+
+/// The in-flight bound: forty requests at once, the vendor answering each after 1.5 s. Exactly
+/// thirty-two are served; the eight over the bound get one error line each, at once, on their own
+/// ids. Every id comes back exactly once.
+#[test]
+fn requests_over_the_in_flight_bound_get_one_error_line_and_the_rest_are_served() {
+    let vendor = spawn_vendor(&["--delay-ms", "1500"]);
+    let proxy = spawn_proxy(&vendor, &vendor.addr);
+    let proxy_url = format!("http://{}", proxy.addr);
+
+    let mut bridge = Bridge::spawn(&proxy_url, PLACEHOLDER);
+    for id in 1..=40u64 {
+        bridge.write_line(&json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": "vendor-echo", "arguments": {"text": format!("n{id}")}}}).to_string());
+    }
+
+    let started = std::time::Instant::now();
+    let mut refused_at = Vec::new();
+    let mut served = std::collections::BTreeSet::new();
+    let mut refused = std::collections::BTreeSet::new();
+    for _ in 0..40 {
+        let reply = bridge.read_line();
+        let id = reply["id"].as_u64().expect("every reply carries a numeric id");
+        if reply.get("error").is_some() {
+            assert_eq!(reply["error"]["code"], json!(-32000), "{reply}");
+            assert!(reply["error"]["message"].as_str().unwrap_or("").contains("too many requests in flight"), "{reply}");
+            refused_at.push(started.elapsed());
+            assert!(refused.insert(id), "id {id} refused twice");
+        } else {
+            assert_eq!(reply["result"]["content"][0]["text"], json!(format!("N{id}").to_uppercase()), "{reply}");
+            assert!(served.insert(id), "id {id} served twice");
+        }
+    }
+    assert_eq!(refused.len(), 8, "eight requests over the bound: {refused:?}");
+    assert_eq!(served.len(), 32, "thirty-two requests served: {served:?}");
+    assert!(served.is_disjoint(&refused));
+    for at in &refused_at {
+        assert!(*at < std::time::Duration::from_millis(1200), "a refusal is immediate, not after the vendor's delay: {at:?}");
+    }
+    assert_eq!(vendor_stats(&vendor.addr)["calls"], json!(32), "the refused requests never reached the vendor");
+}
+
 /// The environment shape still works for a hand-run bridge, and a line that is not JSON is answered
 /// with a parse error instead of being forwarded.
 #[test]

@@ -1,10 +1,13 @@
 //! A connection is bound to one attachment instance, and a job cannot hold the holder's threads.
 //!
-//! Two review findings drive this file. First: the holder used to resolve a job id through its
+//! Four review findings drive this file. First: the holder used to resolve a job id through its
 //! table at call time, so a connection held across a detach and a re-attach of the same id read
 //! and wrote the NEW attachment's directory. Second: a FIFO a job planted at an input or output
 //! name blocked a holder thread in `open`, past the job's detach, and an output FIFO could receive
-//! bytes after the detach.
+//! bytes after the detach. Third: a call that passed its last detach check could pause before it
+//! wrote, outlive the detach, and write into the directory a later attachment of the same id owned
+//! at the same pathname. Fourth: a silent connection held its slot for as long as the job stayed
+//! attached.
 //!
 //! Every test here runs the real daemon, the real fake vendor, real Unix sockets and real files.
 
@@ -274,3 +277,107 @@ fn a_fifo_planted_as_output_is_refused_and_receives_nothing() {
     use std::os::unix::fs::FileTypeExt;
     assert!(std::fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo(), "the FIFO was not replaced");
 }
+
+/// A wrapper that runs the real fake for `login` and `health`, and for `transform` turns the
+/// tool's staged OUTPUT into a FIFO and writes to it two seconds later, from a subshell that holds
+/// none of the holder's pipes. The holder's read of the staged output
+/// then blocks for those two seconds: a call paused between its last check and its writes, which
+/// is the window the publication lock closes. The staged path is holder-private; this wrapper
+/// stands in for slow tool output, not for a job's reach into staging.
+fn fifo_output_cli(root: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let script = root.join("fifo-output-vendor-cli.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n[ \"$1\" = transform ] || exec \"{real}\" \"$@\"\nout=\"\"\nprev=\"\"\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"--out\" ]; then out=\"$a\"; fi\n  prev=\"$a\"\ndone\n\
+             [ -n \"$out\" ] || exit 1\nmkfifo \"$out\" || exit 1\n( sleep 2; printf 'STALE' > \"$out\" ) < /dev/null > /dev/null 2>&1 &\nexit 0\n",
+            real = common::VENDOR_CLI
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+/// The publication race. A call passes its last detach check and pauses before it writes. The
+/// job is detached (detach must return at once, not wait two seconds) and the SAME id is attached
+/// again at the SAME pathname. When the old call resumes, it must write nothing: the new
+/// attachment's file keeps its content, and the old call is told its outputs were not published.
+#[test]
+fn a_call_that_pauses_before_publishing_cannot_write_after_the_detach() {
+    let scratch = std::env::temp_dir().join(format!("mtk-fifo-out-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).unwrap();
+    let fx = Fixture::start_with(|_| {}, &fifo_output_cli(&scratch));
+    let root = fx.make_job("j-race");
+    std::fs::write(root.join("input.txt"), "payload").unwrap();
+
+    let socket = fx.job_socket("j-race");
+    let call = std::thread::spawn(move || RawConn::open(&socket).send(1, "tools/call", transform("upper")));
+    // The wrapper exits at once; the holder is now blocked reading the staged FIFO, before the
+    // publication lock. Give it a moment to get there.
+    std::thread::sleep(Duration::from_millis(400));
+
+    let started = Instant::now();
+    let detached = fx.detach_job("j-race");
+    assert_eq!(detached["detached"], json!(true));
+    assert!(started.elapsed() < Duration::from_secs(1), "detach does not wait for a call that has not taken the publication lock");
+
+    // The same id, the same pathname, a new attachment, with a marker the old call must not touch.
+    std::fs::write(root.join("out.txt"), "NEW").unwrap();
+    let again = fx.make_job("j-race");
+    assert_eq!(again, root, "the re-attach uses the same pathname");
+
+    let reply = call.join().unwrap().expect("the old call is answered");
+    assert_eq!(reply["error"]["code"], json!(proto::CODE_REJECTED), "{reply}");
+    let message = reply["error"]["message"].as_str().unwrap_or("");
+    assert!(message.contains("detached") && message.contains("not published"), "{reply}");
+    assert_eq!(read(&root.join("out.txt")), "NEW", "the old call wrote nothing into the new attachment's directory");
+
+    // The new attachment serves its own directory with the real tool path untouched.
+    let listed = fx.job_call("j-race", "tools/list", json!({})).expect("the new attachment serves");
+    assert_eq!(listed["tools"][0]["name"], json!("transform-file"), "{listed}");
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// Idle expiry. Three connections that send nothing are closed by the holder after the idle
+/// timeout, attached job or not: the slots are released and a new connection is served.
+#[test]
+fn silent_connections_expire_after_the_idle_timeout() {
+    let fx = Fixture::start_with_args(|_| {}, Path::new(common::VENDOR_CLI), &["--job-idle-timeout-secs", "1"]);
+    fx.make_job("j-idle");
+    let socket = fx.job_socket("j-idle");
+
+    // The read timeout is set now, while the peer is open: a socket option on a Unix socket the
+    // peer already closed is refused by the kernel.
+    let silent: Vec<UnixStream> = (0..3)
+        .map(|_| {
+            let stream = UnixStream::connect(&socket).expect("connect");
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream
+        })
+        .collect();
+    wait_for_connections(&fx, "j-idle", 3);
+
+    // The holder closes them; the count goes to zero while the job stays attached.
+    wait_for_connections(&fx, "j-idle", 0);
+    for stream in &silent {
+        let mut buf = [0u8; 8];
+        let got = (&*stream).read(&mut buf);
+        let closed = matches!(got, Ok(0))
+            || matches!(&got, Err(e) if !matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut));
+        assert!(closed, "the holder closed the silent connection, got {got:?}");
+    }
+    drop(silent);
+
+    // The attachment is intact: a new connection is served.
+    let mut next = RawConn::open(&socket);
+    let listed = next.send(1, "tools/list", json!({})).expect("served after the idle expiry");
+    assert_eq!(listed["result"]["tools"][0]["name"], json!("transform-file"), "{listed}");
+    let status = fx.ctl("holder/status", json!({})).expect("status");
+    assert!(
+        status["attached_jobs"].as_array().is_some_and(|jobs| jobs.iter().any(|j| j["job_id"] == json!("j-idle"))),
+        "the job is still attached: {status}"
+    );
+}
+

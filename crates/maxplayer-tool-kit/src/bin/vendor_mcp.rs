@@ -16,6 +16,12 @@
 //!   arrive and the stream close. A client that waits for the end of the stream before it reads
 //!   stdin never answers, and the call times out on the vendor side.
 //!
+//! - `--hold-stream` (needs `--sse`): after the result event the stream stays OPEN, with an SSE
+//!   comment (`: keepalive`) every 200 ms, until the client closes its side. `streams_open` counts
+//!   the streams held now. A client that reads a stream to its end never gets there.
+//! - `--delay-ms <n>`: `tools/call` answers after `n` milliseconds, outside the shared lock, so
+//!   many calls wait at once. For a test of a client's in-flight bound.
+//!
 //! `--session` adds the session rule: `initialize` issues an `Mcp-Session-Id`, and every later
 //! request must echo it or is refused `400`. A notification (no `id`) is accepted with `202` and
 //! an empty body in every mode. Each rule is counted, so a test can assert the client kept it.
@@ -30,6 +36,7 @@ use maxplayer_tool_kit::http::{
     read_request, write_chunk, write_last_chunk, write_response_head, write_response_with, BodyFraming, Request,
 };
 use serde_json::{json, Value};
+use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -37,6 +44,10 @@ use std::time::Duration;
 
 /// How long the vendor waits for the client's answer to the server request it sent.
 const SERVER_REQUEST_WAIT: Duration = Duration::from_secs(5);
+/// The keepalive period of a held stream, and how often the vendor looks for the client's close.
+const KEEPALIVE_PERIOD: Duration = Duration::from_millis(200);
+/// The longest a held stream stays open without the client closing, so a test double never hangs.
+const HOLD_STREAM_MAX: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
 struct Counters {
@@ -54,12 +65,17 @@ struct Counters {
     protocol_header_ok: u64,
     sessions_issued: u64,
     saw_watch_token: bool,
+    /// Streams held open now under `--hold-stream`, and the total ever opened.
+    streams_open: u64,
+    streams_held_total: u64,
 }
 
 struct Modes {
     sse: bool,
     session: bool,
     server_request: bool,
+    hold_stream: bool,
+    delay: Duration,
 }
 
 /// What every connection shares.
@@ -104,9 +120,18 @@ fn main() {
         sse: has_flag(&args, "--sse"),
         session: has_flag(&args, "--session"),
         server_request: has_flag(&args, "--server-request"),
+        hold_stream: has_flag(&args, "--hold-stream"),
+        delay: Duration::from_millis(
+            flag(&args, "--delay-ms")
+                .map(|v| v.parse::<u64>().unwrap_or_else(|_| fatal("--delay-ms must be a whole number")))
+                .unwrap_or(0),
+        ),
     };
     if modes.server_request && !modes.sse {
         fatal("--server-request needs --sse: a server request rides an open event stream");
+    }
+    if modes.hold_stream && !modes.sse {
+        fatal("--hold-stream needs --sse: only an event stream can stay open after the result");
     }
 
     let listener = TcpListener::bind(&listen).unwrap_or_else(|e| fatal(&format!("bind {listen}: {e}")));
@@ -137,7 +162,16 @@ impl Vendor {
             Ok(Some(r)) => r,
             _ => return,
         };
+        // The configured delay for a tool call, outside the shared lock, so many delayed calls
+        // wait at the same time rather than one after another.
+        if !self.modes.delay.is_zero() && req.method == "POST" && req.path == "/mcp" {
+            let rpc: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+            if rpc.get("method").and_then(|m| m.as_str()) == Some("tools/call") {
+                std::thread::sleep(self.modes.delay);
+            }
+        }
         match self.handle(&req) {
+            Outcome::Reply(reply) if self.modes.hold_stream && reply.chunked => self.hold_open(conn, reply),
             Outcome::Reply(reply) => {
                 let headers: Vec<(&str, &str)> = reply.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
                 let _ = write_response_with(&mut conn, reply.status, &headers, &reply.body, reply.chunked);
@@ -178,6 +212,42 @@ impl Vendor {
         self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// `--hold-stream`: send the result event, then keep the stream open with a keepalive comment
+    /// every [`KEEPALIVE_PERIOD`] until the client closes its side (a read that returns zero bytes
+    /// or fails), or [`HOLD_STREAM_MAX`] passes. `streams_open` counts the streams held now.
+    fn hold_open(&self, mut conn: TcpStream, reply: Reply) {
+        let headers: Vec<(&str, &str)> = reply.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        if write_response_head(&mut conn, reply.status, &headers, BodyFraming::Chunked).is_err() {
+            return;
+        }
+        if write_chunk(&mut conn, &reply.body).is_err() {
+            return;
+        }
+        {
+            let mut state = self.lock();
+            state.counters.streams_open += 1;
+            state.counters.streams_held_total += 1;
+        }
+        let _ = conn.set_read_timeout(Some(KEEPALIVE_PERIOD));
+        let started = std::time::Instant::now();
+        let mut probe = [0u8; 64];
+        while started.elapsed() < HOLD_STREAM_MAX {
+            match conn.read(&mut probe) {
+                // The client closed its side: the stream is over.
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                    if write_chunk(&mut conn, b": keepalive\r\n\r\n").is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = write_last_chunk(&mut conn);
+        self.lock().counters.streams_open -= 1;
+    }
+
     fn handle(&self, req: &Request) -> Outcome {
         match (req.method.as_str(), req.path.as_str()) {
             ("GET", "/admin/stats") => {
@@ -197,6 +267,8 @@ impl Vendor {
                         "protocol_header_ok": c.protocol_header_ok,
                         "sessions_issued": c.sessions_issued,
                         "saw_watch_token": c.saw_watch_token,
+                        "streams_open": c.streams_open,
+                        "streams_held_total": c.streams_held_total,
                     }),
                 ))
             }

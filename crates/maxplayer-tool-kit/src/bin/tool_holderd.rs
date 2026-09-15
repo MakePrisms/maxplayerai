@@ -46,8 +46,15 @@ struct Attachment {
     root: PathBuf,
     socket: PathBuf,
     /// Set once, by detach or shutdown. A call checks it before validation, before the tool runs,
-    /// and before each output is published, so nothing is published into a detached directory.
+    /// and again under [`Self::publish`] before it writes, so nothing is published into a detached
+    /// directory.
     stop: AtomicBool,
+    /// The publication lock. A call holds it from its last `stop` check through its last write.
+    /// Detach sets `stop` and then takes this lock once, so detach returns only after a
+    /// publication in flight has finished, and a call that locks afterwards sees `stop`. Without
+    /// this, a call that passed its last check could pause, outlive the detach, and write into the
+    /// directory a later attachment of the same job id now owns at the same pathname.
+    publish: Mutex<()>,
     /// Connections open on this attachment's socket now, bounded by [`MAX_CONNECTIONS_PER_JOB`].
     live: AtomicUsize,
 }
@@ -64,10 +71,11 @@ impl Attachment {
 /// thread of its own.
 const MAX_CONNECTIONS_PER_JOB: usize = 16;
 
-/// How long a job connection may sit idle between requests before the holder looks at the
-/// attachment again. A connection that is idle across a detach ends at the next look, so a
-/// detached job holds no holder thread through an open, silent connection.
-const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a job connection may stay silent before the holder closes it, in seconds, unless
+/// `--job-idle-timeout-secs` says otherwise. `tool-mcp-bridge` opens one connection per message and
+/// closes it after the reply, so a silent connection is never one the bridge still needs. A job
+/// that opens connections and sends nothing holds a slot and a thread only this long.
+const DEFAULT_JOB_IDLE_TIMEOUT_SECS: u64 = 30;
 
 /// How long the accept thread waits for the first line of a connection over the bound, so it can
 /// answer with that request's id. Short: this stalls the accept loop of one job's socket only.
@@ -100,6 +108,8 @@ struct Holder {
     staging_seq: AtomicU64,
     started_at: SystemTime,
     jobs: Mutex<BTreeMap<String, Arc<Attachment>>>,
+    /// See [`DEFAULT_JOB_IDLE_TIMEOUT_SECS`].
+    job_idle_timeout: Duration,
 }
 
 /// The seller's tool never reads or writes a path a job can influence. Instead the holder copies
@@ -166,6 +176,12 @@ fn main() {
     let runtime = PathBuf::from(req(&args, "--runtime"));
     let vendor_cli = PathBuf::from(flag(&args, "--vendor-cli").unwrap_or_else(|| "vendor-cli".into()));
     let credential_file = flag(&args, "--credential-file").map(PathBuf::from);
+    let job_idle_timeout = Duration::from_secs(
+        flag(&args, "--job-idle-timeout-secs")
+            .map(|v| v.parse::<u64>().unwrap_or_else(|_| fatal("--job-idle-timeout-secs must be a whole number of seconds")))
+            .unwrap_or(DEFAULT_JOB_IDLE_TIMEOUT_SECS)
+            .max(1),
+    );
 
     let cfg = SellerToolConfig::load(Path::new(&cfg_path)).unwrap_or_else(|e| {
         eprintln!("tool-holderd: {e}");
@@ -228,6 +244,7 @@ fn main() {
         staging_seq: AtomicU64::new(0),
         started_at: SystemTime::now(),
         jobs: Mutex::new(BTreeMap::new()),
+        job_idle_timeout,
     });
 
     // Probe once at startup so `status` is meaningful before any job runs.
@@ -258,12 +275,13 @@ impl Holder {
     /// the connection arrived on — the job's identity comes from the listener it reached, never
     /// from the request body, and it is this instance for the life of the connection.
     ///
-    /// A job connection reads with [`IDLE_READ_TIMEOUT`]. On each timeout the holder looks at the
-    /// attachment: a detached one ends the connection, so no thread outlives a detach on an idle
-    /// connection. After a refusal for a detached attachment the connection is closed.
+    /// A job connection reads with the holder's idle timeout. A connection that delivers no
+    /// complete request within it is closed, attached or not: the thread ends and the slot is
+    /// released. So a silent connection, or one idle across a detach, holds nothing for long.
+    /// After a refusal for a detached attachment the connection is closed.
     fn serve_conn(self: &Arc<Self>, conn: UnixStream, job: Option<&Attachment>) -> std::io::Result<()> {
         if job.is_some() {
-            conn.set_read_timeout(Some(IDLE_READ_TIMEOUT))?;
+            conn.set_read_timeout(Some(self.job_idle_timeout))?;
         }
         let mut writer = conn.try_clone()?;
         let mut reader = BufReader::new(conn);
@@ -274,10 +292,8 @@ impl Holder {
                 Ok(0) => return Ok(()),
                 Ok(_) => {}
                 Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
-                    if job.is_some_and(Attachment::detached) {
-                        return Ok(());
-                    }
-                    continue;
+                    // Idle expiry: no complete request arrived in time. Close the connection.
+                    return Ok(());
                 }
                 Err(e) => return Err(e),
             }
@@ -559,15 +575,12 @@ impl Holder {
                 "job is detached; the tool ran but its outputs were not published",
             );
         }
-        let mut outputs: Vec<Value> = Vec::new();
+
+        // First, read every staged output into memory, outside the publication lock. The staged
+        // files are the tool's, in the holder-private staging directory, but a slow read must not
+        // hold the lock: detach waits on it.
+        let mut staged_outputs: Vec<(Vec<u8>, &PathBuf, u64)> = Vec::with_capacity(pending_outputs.len());
         for (staged, rel) in &pending_outputs {
-            if attachment.detached() {
-                return RpcResponse::err(
-                    id,
-                    proto::CODE_REJECTED,
-                    "job is detached; the remaining outputs were not published",
-                );
-            }
             let bytes = std::fs::metadata(staged).map(|m| m.len()).unwrap_or(0);
             if bytes as usize > call.max_output_bytes {
                 return RpcResponse::err(
@@ -580,17 +593,36 @@ impl Holder {
                 Ok(d) => d,
                 Err(e) => return RpcResponse::err(id, proto::CODE_INTERNAL, format!("read staged output: {e}")),
             };
+            staged_outputs.push((data, rel, bytes));
+        }
+
+        // Then publish under the attachment's lock. The `stop` check and the writes are one unit
+        // with respect to detach: detach sets `stop` and then takes this lock, so a call that
+        // holds it finishes its writes before detach returns, and a call that locks later sees
+        // `stop` here. Nothing inside the lock can block on the job: `create_output` refuses a
+        // FIFO or any other non-regular object at the output name before it writes.
+        let publication = attachment.publish.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if attachment.detached() {
+            return RpcResponse::err(
+                id,
+                proto::CODE_REJECTED,
+                "job is detached; the tool ran but its outputs were not published",
+            );
+        }
+        let mut outputs: Vec<Value> = Vec::new();
+        for (data, rel, bytes) in &staged_outputs {
             let mut dest = match safeio::create_output(&root, rel, "output") {
                 Ok(f) => f,
                 Err(reject) => return RpcResponse::err(id, proto::CODE_REJECTED, reject.to_string()),
             };
-            if let Err(e) = dest.write_all(&data) {
+            if let Err(e) = dest.write_all(data) {
                 return RpcResponse::err(id, proto::CODE_INTERNAL, format!("write output: {e}"));
             }
             // Report the path relative to the job's own root: the job has no business learning the
             // holder's filesystem layout.
             outputs.push(json!({"path": rel, "bytes": bytes}));
         }
+        drop(publication);
 
         self.calls_served.fetch_add(1, Ordering::SeqCst);
         self.set_health(Health::Healthy);
@@ -658,6 +690,7 @@ impl Holder {
                 root: root.clone(),
                 socket: sock.clone(),
                 stop: AtomicBool::new(false),
+                publish: Mutex::new(()),
                 live: AtomicUsize::new(0),
             });
             jobs.insert(job_id.to_string(), Arc::clone(&attachment));
@@ -801,11 +834,18 @@ impl Holder {
     }
 }
 
-/// End an attachment: set `stop` so every connection bound to it refuses its next call, wake the
-/// accept thread so it sees the flag and exits, then remove the socket file so no new connection
-/// reaches the old listener. Connections already open keep the instance and are refused on it.
+/// End an attachment: set `stop` so every connection bound to it refuses its next call, wait for
+/// a publication in flight to finish, wake the accept thread so it sees the flag and exits, then
+/// remove the socket file so no new connection reaches the old listener. Connections already open
+/// keep the instance and are refused on it.
+///
+/// The order matters. `stop` is set FIRST, then the publication lock is taken once and released.
+/// A call that holds the lock finishes its writes before this returns. A call that takes the lock
+/// after this sees `stop` and writes nothing. So when this returns, no call bound to this
+/// attachment can write into the job's directory, which a later attachment of the same id may own.
 fn stop_attachment(attachment: &Attachment) {
     attachment.stop.store(true, Ordering::SeqCst);
+    drop(attachment.publish.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
     let _ = UnixStream::connect(&attachment.socket);
     let _ = std::fs::remove_file(&attachment.socket);
 }

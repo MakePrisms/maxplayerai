@@ -37,6 +37,8 @@ pub struct Fixture {
     /// The program the holder runs as the vendor CLI. The real fake by default; a test can hand
     /// in a wrapper, for example one that makes the tool slow.
     pub vendor_cli: PathBuf,
+    /// Extra arguments for the daemon, for example a short `--job-idle-timeout-secs`.
+    pub holder_args: Vec<String>,
     vendor: Option<Child>,
     holder: Option<Child>,
 }
@@ -55,6 +57,11 @@ impl Fixture {
     /// Start with a patched config AND a different vendor CLI program. `vendor_cli` must be an
     /// executable the holder can run with a cleared environment.
     pub fn start_with(patch: impl FnOnce(&mut Value), vendor_cli: &Path) -> Self {
+        Self::start_with_args(patch, vendor_cli, &[])
+    }
+
+    /// [`Self::start_with`], plus extra arguments for the daemon.
+    pub fn start_with_args(patch: impl FnOnce(&mut Value), vendor_cli: &Path, holder_args: &[&str]) -> Self {
         let n = SEQ.fetch_add(1, Ordering::SeqCst);
         // Deliberately NOT `std::env::temp_dir()`. A Unix socket path is capped by `SUN_LEN`
         // (104 bytes on macOS, 108 on Linux), and macOS hands out temp directories like
@@ -119,6 +126,7 @@ impl Fixture {
             credential,
             vendor_base_url,
             vendor_cli: vendor_cli.to_path_buf(),
+            holder_args: holder_args.iter().map(|a| a.to_string()).collect(),
             vendor: Some(vendor),
             holder: None,
         };
@@ -143,6 +151,7 @@ impl Fixture {
             .arg(&self.vendor_cli)
             .arg("--vendor-base-url")
             .arg(&self.vendor_base_url)
+            .args(&self.holder_args)
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
