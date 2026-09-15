@@ -51,17 +51,34 @@
 #   T3  delivery_push_wire_abort_polled_through_reap
 #       CONTROL: the abort is not issued, and nothing else about the run changes.
 #
-#       Two product mutants were tried here first and BOTH SURVIVED, which is reported rather than
-#       buried:
+#       Two product mutants were tried here first and BOTH SURVIVED:
 #         - deleting the drive loop's periodic authority ask: survived, 7.91s;
-#         - deleting the parent's authority ANSWER in all four places it is produced (the reply to
-#           the child's own across-the-pipe question, and the three waits that re-ask the owner):
-#           survived, 7.9s.
-#       So on this branch an aborted wire delivery is not stopped by authority propagation at all;
-#       something else ends it well inside the bound, and neither mutant discriminates. Those two
-#       logs are kept beside this script's receipts. Finding WHICH mechanism stops it is a real
-#       question about the branch and is reported to the reviewer rather than answered by widening
-#       this fold.
+#         - deleting the parent's authority ANSWER in all four places it is produced: survived, 7.9s.
+#
+#       ROUND 3 SETTLED WHY, and the answer is not "the gate is weak": NEITHER MUTANT IS ON THIS
+#       PATH. This gate calls `neutralize_then_push_in_child_off_runtime` with `authority: None`,
+#       so the executor's authority ask and answer are not wired into an aborted wire delivery at
+#       all. Deleting them could not change a run that never used them.
+#
+#       What actually ends an aborted wire delivery, end to end:
+#         1. `first.abort()` drops the delivery future at its await. The blocking push is NOT
+#            cancelled by this — it runs under `spawn_blocking`, and dropping that JoinHandle
+#            leaves the closure running.
+#         2. Dropping the future drops the supervisor's `TurnControl`, whose `Drop` calls `end()`
+#            ("a supervisor that is dropped — cancelled at an await, aborted, or unwound — revokes
+#            exactly as one that returned"). That is the ONLY thing the abort itself does.
+#         3. The still-running blocking closure holds a `WorkLifetime` over the same turn, wired
+#            into the transport as its per-leg/per-chunk gate. The next gate check sees `WorkEnded`
+#            and fails the leg, and the child is then killed and reaped.
+#       So the abort stops the delivery through TURN REVOCATION OBSERVED BY THE TRANSPORT GATE,
+#       not through authority propagation and not through task cancellation.
+#
+#       R3-2/M-NO-REVOKE-ON-DROP below PROVES that at product level: `TurnControl::drop` is made a
+#       no-op and both abort gates go red at the abort-relative bound (B took the seat 58.7s and
+#       60.1s after the abort, against the 13.05s this stop is allowed) — which is precisely the
+#       "cancellation ignored until the delivery's own 60s deadline" shape. Both TIMEOUT gates in
+#       the same file stay GREEN, so the mutant discriminates the abort path rather than breaking
+#       the file.
 #
 #       What the round-2 verdict asked for is narrower and is settled here: the abort-relative bound
 #       must FAIL when a cancellation is ignored and the delivery dies at its natural 60-second
@@ -89,6 +106,8 @@ executor="$root/crates/maxplayer-core/src/delivery_executor.rs"
 register_target "$executor"
 wire_abort_gate="$root/crates/maxplayer/tests/delivery_push_wire_abort_polled_through_reap.rs"
 register_target "$wire_abort_gate"
+turn="$root/crates/maxplayer-core/src/delivery_turn.rs"
+register_target "$turn"
 
 receipt "red-before-green receipts for T1/T2/T3"
 
@@ -162,6 +181,28 @@ run_mutant "T3/C-NO-ABORT" "$wire_abort_gate" \
   a_pack_upload_whose_task_is_aborted_never_overlaps_a_second_delivery_polled_through_the_reap \
   an_advertisement_whose_task_is_aborted_never_overlaps_a_second_delivery_polled_through_the_reap
 
+echo "== R3-2: an aborted delivery's turn is never revoked =="
+# THE PRODUCT MUTANT for T3, and the answer to the two survivals recorded above. The whole file is
+# run, not just the two abort gates: the timeout gates staying green is the evidence that this
+# mutant removes the abort's stop specifically and not the file's premise.
+suite=(cargo test -p maxplayer --all-features --locked
+       --test delivery_push_wire_abort_polled_through_reap)
+run_mutant "R3-2/M-NO-REVOKE-ON-DROP" "$turn" \
+'    fn drop(&mut self) {
+        let _ = self.end();
+    }
+}
+
+/// The work'"'"'s end of the turn, before the work has started.' '    fn drop(&mut self) {}
+}
+
+/// The work'"'"'s end of the turn, before the work has started.' \
+  2 \
+  "a cancellation that is merely ignored until the delivery" \
+  "$logs/r3-2-no-revoke-on-drop.log" \
+  a_pack_upload_whose_task_is_aborted_never_overlaps_a_second_delivery_polled_through_the_reap \
+  an_advertisement_whose_task_is_aborted_never_overlaps_a_second_delivery_polled_through_the_reap
+
 echo "== R3-1a: the confirmation is published at the reap, before cleanup =="
 suite=(cargo test -p maxplayer-core --all-features --locked --lib
        -- --exact delivery_executor::tests::an_exit_confirmation_is_withheld_until_cleanup_is_established)
@@ -214,4 +255,4 @@ suite=(cargo test -p maxplayer-core --all-features --locked --lib
 receipt "  -- delivery_executor lib: exit-confirmation cleanup gate and reap charging"
 expect_green "CONTROL/r3-item1-lib" "$logs/control-r3-item1-lib.log"
 
-echo "all five mutants went red for their named reason and are green unmutated; receipts: $receipts"
+echo "all six mutants went red for their named reason and are green unmutated; receipts: $receipts"

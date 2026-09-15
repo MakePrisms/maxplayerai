@@ -25,6 +25,21 @@
 //! delivery would free the seat instantly while its child was still pushing. That is the overlap
 //! this file is here to rule out, and abort is how you provoke it.
 //!
+//! # What actually ends an aborted delivery here (round 3, item 2)
+//!
+//! The abort does NOT cancel the push. The push runs under `spawn_blocking`, and dropping that
+//! JoinHandle leaves the closure running to completion. What the abort does is drop the
+//! supervisor's `TurnControl`, whose `Drop` revokes the turn; the still-running closure holds a
+//! `WorkLifetime` over that same turn, wired into the transport as its per-leg/per-chunk gate, so
+//! the next gate check fails the leg and the child is killed and reaped.
+//!
+//! Turn revocation observed by the transport gate — NOT authority propagation, which is not even
+//! wired on this path (`authority: None` below), and NOT task cancellation. That is why the two
+//! authority mutants tried in round 2 both survived. `scripts/oracle-red-before-green.sh` proves
+//! this mechanism at product level with `R3-2/M-NO-REVOKE-ON-DROP`: making `TurnControl::drop` a
+//! no-op sends both abort gates red at the bound below (B took the seat 58.7s and 60.1s after the
+//! abort, against the 13.05s allowed) while both TIMEOUT gates in this file stay green.
+//!
 //! # Bound
 //!
 //! B may not enter its push body before A's turn is handed back, and A's turn is handed back only
