@@ -25,13 +25,29 @@
 //! destination binding, same authority check, same push deadline — and returns one scoped NIP-98
 //! token whose life is the round-trip it was minted for.
 //!
-//! Two properties follow, and both are load-bearing:
+//! Two properties follow, and both are load-bearing. Stated as narrowly as they are true:
 //!
-//! - **Custody is unchanged.** The key never leaves the actor. A child that is compromised, wedged
-//!   or killed mid-flight holds at most one short-lived token scoped to this job's ref.
-//! - **The parent's deadline binds the child even before the kill lands.** A child past its deadline
-//!   cannot obtain a header, so it cannot begin an authenticated leg no matter what state it is in.
-//!   The kill ends the *work*; the minter refusal ends the *authority*. Neither depends on the other.
+//! - **The key never leaves the actor.** What crosses the pipe is a minted header, so the child's
+//!   custody is over TOKENS, not over the key. Each token is short-lived and scoped to this job's
+//!   ref and destination.
+//! - **The parent's deadline bounds what the child can still be GIVEN.** A child past its deadline
+//!   cannot obtain a new header, so it cannot begin an authenticated leg it has not already been
+//!   authorized for. The kill ends the *work*; the minter refusal ends further *authority*.
+//!
+//! And, just as load-bearing, what those two do NOT say:
+//!
+//! - **Not "at most one token".** A push authenticates two legs and each can be challenged, so a
+//!   child may hold more than one token at once; [`MAX_MINT_REQUESTS`] caps how many it can ever
+//!   ask for, which is a bound, not a count of one.
+//! - **A token already minted is not recalled.** The parent can refuse the NEXT header; it cannot
+//!   reach into the child and invalidate one already handed over. Within that token's short life,
+//!   a child that has it can use it. What bounds that window is the token's own scope and lifetime
+//!   plus the kill — not a revocation that travels backwards.
+//! - **The check-to-send window is bounded, not zero.** The parent answers a child's authority check
+//!   with the truth at the moment it writes the answer; the child transmits some time after reading
+//!   it. The parent re-asks the owner every [`CANCELLATION_POLL`] while the child runs and kills on
+//!   a revocation, so that window is bounded by the poll interval instead of by the deadline. It is
+//!   not an atomic fence at the wire, and this module does not claim one.
 //!
 //! Nothing sensitive travels on argv or in the environment: both are world-readable through `ps` and
 //! `/proc/<pid>/environ`. The request travels as one frame on the child's stdin, and the child's
@@ -56,17 +72,41 @@
 //! | 9 | status-report read | child | the leg timeout, and the deadline |
 //! | 10 | deadline breach: `SIGKILL` to the child's process GROUP | parent | immediate; no delivery wait |
 //! | 11 | **reap — `waitpid` until the child has actually exited** | parent | see the assumptions below |
-//! | 12 | cleanup: pipes closed, reader thread joined, child status recorded | parent | bounded by 11 |
+//! | 12 | cleanup: wait for the stdout reader to reach END OF FILE | parent | [`REAP_BOUND`], applied on every path through that loop |
 //! | 13 | the turn is dropped, the lock is free | parent | — |
 //!
-//! Steps 10–12 run on **every** exit path, including success, error, panic and an early return,
+//! Steps 10–11 run on **every** exit path, including success, error, panic and an early return,
 //! because they are a `Drop` (see [`KillableChild`]). A kill that is merely *issued* releases
 //! nothing: [`KillableChild::reap`] returns only when the kernel has reported the child's exit
 //! status, which it does only once the process is gone.
 //!
+//! **Step 12 is a wait, not a join, and what it establishes is exactly one fact.** The reader thread
+//! is never joined — joining a thread parked in a read that only ends when the last holder of the
+//! write end lets go is the unbounded phase this module exists to remove. Instead the parent waits,
+//! under [`REAP_BOUND`], for that reader to report [`PumpEnd::Eof`]: the kernel returning zero
+//! bytes, which it does only once every holder of that descriptor has closed it. Anything else — the
+//! bound expiring, the read failing, a malformed frame — is NOT that fact and is reported as its own
+//! outcome ([`ExecutorError::CleanupUnbounded`], [`ExecutorError::CleanupUnobserved`]), both of
+//! which retain the seat.
+//!
+//! EOF is evidence about a DESCRIPTOR, not a census of processes. A descendant that closes this one
+//! descriptor and keeps running produces the same EOF, and nothing here detects it. The claim is
+//! "the pipe this delivery wrote on has no holders left", not "every process this delivery started
+//! is gone".
+//!
+//! Writer, minter and stderr-relay threads are likewise **detached, not joined**: each is bounded by
+//! this deadline for the purpose of the parent's own progress, and an arbitrary minter that never
+//! answers can outlive the delivery. The production minter carries its own deadline. What is
+//! established is that the PARENT returns and the direct child is gone — not that every thread this
+//! delivery started has ended.
+//!
 //! # What the bound guarantees, and under which assumptions
 //!
-//! `DELIVERY_DRAIN_BOUND` (150s work deadline + 120s for one in-flight leg) + [`REAP_BOUND`].
+//! The kill lands at the **caller's absolute deadline** — whatever the delivery arm passed in, which
+//! for the production path is `DELIVERY_DRAIN_BOUND` (150s work deadline + 120s for one in-flight
+//! leg) from when that delivery started. It is not a fresh 270s measured from the spawn, and a
+//! delivery handed a shorter deadline is killed at the shorter one. On top of it: [`REAP_BOUND`]
+//! for the reap, and a further [`REAP_BOUND`] for step 12.
 //!
 //! This is a **conditional** bound and is documented as one. What holds it up:
 //!
@@ -74,7 +114,15 @@
 //!   ships for are POSIX — see [`SHIPPED_PLATFORMS`]). No amount of libgit2 or C code in the child
 //!   can decline it. This is the property in-process cancellation could not have at any price.
 //! - **The kill goes to the process GROUP** (`kill(-pgid)`), and the child is made a group leader at
-//!   spawn, so a descendant cannot outlive the delivery even though libgit2 spawns none today.
+//!   spawn, so a descendant that is still IN that group is signalled with it — though libgit2 spawns
+//!   none today. A descendant that left the group first (its own `setsid`/`setpgid`) is not reached
+//!   by that signal, is not waited for, and is not claimed to be gone; step 12's EOF wait is what
+//!   notices one still holding the stdout pipe, and even that only while it holds it.
+//! - **The child's own budget is the parent's remaining time at the instant the request is
+//!   written**, and the child starts that clock when it reads the frame. The pipe transit between
+//!   those two moments is budget the child gets and the parent has already spent. It is small and it
+//!   is real; the parent's kill is what actually bounds the child, and the budget is what lets the
+//!   child refuse to start work it cannot finish.
 //! - **The parent waits for the actual exit.** A pid stays a zombie until it is reaped; we always
 //!   reap, so the turn is never returned to a pid that still exists.
 //!
@@ -233,6 +281,27 @@ pub const CHILD_PROGRAM_ENV: &str = "MAXPLAYER_DELIVERY_PUSH_EXE";
 /// thing this executor may never do is leave work running that it cannot account for.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// How long the parent will sit in ONE wait for a frame before it re-asks the owner whether this
+/// delivery is still authorized.
+///
+/// The parent's answer to a child's authority check is true when it is written, and the child reads
+/// it some unbounded time later: between those two moments the owner can go away, and nothing on
+/// this side was looking. The kill is what ends that window, and the kill used to be driven only by
+/// the DEADLINE — so a revocation with 140 seconds left on the clock was not acted on until the
+/// clock ran out. Polling here does not make the check-to-send window zero-width, and nothing in
+/// this module claims it does: it makes that window bounded by this interval instead of by the
+/// deadline.
+pub const CANCELLATION_POLL: Duration = Duration::from_millis(50);
+
+/// How many authorizations one child may ask this parent to mint.
+///
+/// A push makes two authenticated legs — the advertisement `GET` and the pack `POST` — and the
+/// transport can be challenged once on each, so four is the most the shipped child needs. The count
+/// used to be unbounded, which is why "a compromised child holds at most one token" was not a
+/// property of anything: nothing stopped it asking again. The headroom above four is for a
+/// challenge the transport retries, not for a child that keeps asking.
+pub const MAX_MINT_REQUESTS: u32 = 8;
+
 /// Parent → child.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "t")]
@@ -309,6 +378,18 @@ pub enum ExecutorError {
     /// which means something that inherited it outlived the process group we killed. We cannot say
     /// the delivery's local phase is over, so the turn is still held.
     CleanupUnbounded { waited: Duration },
+    /// The stdout pump stopped for a reason that is NOT end of file, so this parent never observed
+    /// the write end of the child's stdout being released. A reader that stopped is not a pipe that
+    /// closed: the descriptor's remaining owners are unaccounted for, which is the same unknown the
+    /// other retaining variants describe. Kept separate from [`Self::CleanupUnbounded`] because the
+    /// two are different facts — one is "still held after the bound", the other is "we stopped
+    /// looking" — and a reader who has to act on them needs to know which happened.
+    CleanupUnobserved { why: String },
+    /// The owner revoked this delivery, or its lifetime ended, while the child was running. The
+    /// child was killed and its exit was CONFIRMED, so this releases the turn — it is a stop, not
+    /// an unknown. Separate from [`Self::Killed`] because a revocation is not a deadline breach and
+    /// reporting it as one misstates why the work ended.
+    Revoked { why: String, reap: Duration },
     /// The kernel refused to tell us whether the child exited (`waitpid` itself failed). This is an
     /// UNKNOWN exit, not a protocol fault: nothing about the child's behaviour is implicated, and
     /// nothing about its death is established. It is separate from [`Self::Protocol`] precisely so
@@ -343,6 +424,18 @@ impl std::fmt::Display for ExecutorError {
                  turn to a second delivery while the first may still be touching the workdir",
                 waited.as_millis()
             ),
+            Self::CleanupUnobserved { why } => write!(
+                f,
+                "delivery push child was reaped but this parent never observed end of file on its \
+                 stdout ({why}), so the remaining owners of that pipe are unaccounted for; this \
+                 seat stays held rather than hand the turn to a second delivery"
+            ),
+            Self::Revoked { why, reap } => write!(
+                f,
+                "delivery push was revoked while its child was running ({why}); the child was \
+                 killed and the kernel confirmed the exit {}ms later",
+                reap.as_millis()
+            ),
             Self::WaitFailed { why } => write!(
                 f,
                 "delivery push child's exit could not be established ({why}); this seat stays held \
@@ -361,18 +454,47 @@ impl std::error::Error for ExecutorError {}
 ///
 /// Deliberately NOT a `PATH` lookup: resolving `maxplayer` by name would let whatever is first on
 /// `PATH` receive a delivery, which is a supply-chain hole in exchange for nothing.
+///
+/// **The override is honoured in every build, and that is a limitation, not a guarantee.** This is
+/// not "`current_exe` only": a process whose environment carries [`CHILD_PROGRAM_ENV`] delivers with
+/// the program named there. What is enforced is the weaker, checkable thing — the override must be
+/// an ABSOLUTE path to a file that exists. A relative path resolved against a working directory this
+/// process does not control is the `PATH` hole again in a different spelling, and it used to be
+/// accepted. Anyone who can set this parent's environment can already do worse to it; the honest
+/// claim is that a delivery cannot be redirected by the *ambient* filesystem, not that it cannot be
+/// redirected at all.
 pub fn resolve_child_program() -> Result<PathBuf, ExecutorError> {
     if let Some(explicit) = std::env::var_os(CHILD_PROGRAM_ENV) {
-        let path = PathBuf::from(explicit);
-        if path.as_os_str().is_empty() {
-            return Err(ExecutorError::Spawn(format!(
-                "{CHILD_PROGRAM_ENV} is set to an empty path"
-            )));
-        }
-        return Ok(path);
+        return child_program_from_override(&explicit);
     }
     std::env::current_exe()
         .map_err(|error| ExecutorError::Spawn(format!("current_exe is unreadable: {error}")))
+}
+
+/// What [`CHILD_PROGRAM_ENV`] is allowed to name. Separated from the lookup so the POLICY can be
+/// asserted directly, rather than through a test that has to mutate this process's environment
+/// while other tests are reading it.
+pub fn child_program_from_override(raw: &std::ffi::OsStr) -> Result<PathBuf, ExecutorError> {
+    let path = PathBuf::from(raw);
+    if path.as_os_str().is_empty() {
+        return Err(ExecutorError::Spawn(format!(
+            "{CHILD_PROGRAM_ENV} is set to an empty path"
+        )));
+    }
+    if !path.is_absolute() {
+        return Err(ExecutorError::Spawn(format!(
+            "{CHILD_PROGRAM_ENV} is set to the relative path {}; a delivery child is resolved from \
+             an absolute path or not at all",
+            path.display()
+        )));
+    }
+    if !path.is_file() {
+        return Err(ExecutorError::Spawn(format!(
+            "{CHILD_PROGRAM_ENV} names {}, which is not a file",
+            path.display()
+        )));
+    }
+    Ok(path)
 }
 
 /// The environment the child will be given: the allowlist, and only the entries of it this process
@@ -536,7 +658,12 @@ pub fn write_frame<W: Write, T: Serialize>(out: &mut W, frame: &T) -> std::io::R
     out.flush()
 }
 
-/// Read one frame. `Ok(None)` is a clean end of stream.
+/// Read one frame. **`Ok(None)` is end of file and NOTHING else**: the kernel returned zero bytes,
+/// which happens only once every holder of the write end has closed it.
+///
+/// A blank line used to return `Ok(None)` too, which made a parser-level event indistinguishable
+/// from a kernel-level one, and let a caller that reads "the stream ended" conclude "the writers are
+/// gone". It is a malformed frame and it is reported as one.
 pub fn read_frame<R: BufRead, T: for<'de> Deserialize<'de>>(
     reader: &mut R,
 ) -> std::io::Result<Option<T>> {
@@ -558,29 +685,73 @@ pub fn read_frame<R: BufRead, T: for<'de> Deserialize<'de>>(
     }
     let trimmed = line.trim_end();
     if trimmed.is_empty() {
-        return Ok(None);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "blank line where a frame was expected; this is a malformed frame, not end of file",
+        ));
     }
     serde_json::from_str(trimmed)
         .map(Some)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
+/// Why the stdout pump stopped. Three facts that used to arrive as one channel disconnection, and
+/// a caller that cannot tell them apart cannot say what it observed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PumpEnd {
+    /// **Observed end of file.** `read` returned zero, which the kernel does only once every holder
+    /// of the write end of that pipe has closed it. This is the only one of the three that says
+    /// anything about who still holds the descriptor.
+    Eof,
+    /// The read itself failed. The pump is gone; the pipe's owners are not accounted for.
+    ReadFailed(String),
+    /// The parent stopped listening — the receiving end went away while the child was still
+    /// writing. Says nothing about the child.
+    ParentStopped,
+}
+
 /// Pump the child's stdout into a channel so the parent can wait on frames WITH A DEADLINE. A
 /// blocking read cannot be given one, and a parent blocked in a read it cannot leave is a parent
 /// that never issues the kill.
+///
+/// **A malformed frame does not end the pump.** It used to: any parse failure returned the thread,
+/// the channel disconnected, and the cleanup below read that disconnection as a closed pipe — so a
+/// single blank line or bad byte was enough to make this parent report that it had seen the child's
+/// stdout close when it had seen no such thing. The parse failure is reported to the drive, which
+/// still treats it as a protocol fault and kills; the pump keeps reading the descriptor until the
+/// kernel actually ends it, because that read is the only thing that can establish [`PumpEnd::Eof`].
+///
+/// The reason it stopped is published in `end` BEFORE the sink is dropped, so a receiver that sees
+/// the disconnection can always read why it happened.
 fn pump<R: std::io::Read + Send + 'static>(
     stream: R,
     sink: SyncSender<std::io::Result<Option<ToParent>>>,
+    end: std::sync::Arc<std::sync::Mutex<Option<PumpEnd>>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stream);
-        loop {
+        let reason = loop {
             let frame = read_frame::<_, ToParent>(&mut reader);
-            let stop = !matches!(frame, Ok(Some(_)));
-            if sink.send(frame).is_err() || stop {
-                return;
+            // Only two things end this thread from the child's side: the kernel says the pipe is
+            // closed, or the read fails. A frame we could not parse is a message about the CHILD,
+            // not about the descriptor, so it is forwarded and the reading continues.
+            let stop = match &frame {
+                Ok(Some(_)) => None,
+                Ok(None) => Some(PumpEnd::Eof),
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => None,
+                Err(error) => Some(PumpEnd::ReadFailed(error.to_string())),
+            };
+            if sink.send(frame).is_err() {
+                break PumpEnd::ParentStopped;
             }
+            if let Some(reason) = stop {
+                break reason;
+            }
+        };
+        if let Ok(mut slot) = end.lock() {
+            *slot = Some(reason);
         }
+        drop(sink);
     })
 }
 
@@ -610,7 +781,8 @@ pub fn run_push_in_child(
         relay_stderr(stderr);
     }
     let (sink, frames) = sync_channel(MAX_QUEUED_FRAMES);
-    let pump = pump(stdout, sink);
+    let pump_end = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let pump = pump(stdout, sink, std::sync::Arc::clone(&pump_end));
     let mut writer = Writer::spawn(stdin);
 
     let outcome = drive(
@@ -649,22 +821,75 @@ pub fn run_push_in_child(
     // for the channel to disconnect, which happens exactly when the pump returns, and we give that
     // the same REAP_BOUND we give the reap. Losing that race is not a delivery failure we can
     // shrug at — it says something from this delivery outlived the kill — so it fails closed.
+    //
+    // THE DEADLINE IS TESTED ON EVERY PATH THROUGH THIS LOOP, including the one that receives a
+    // frame. `recv_timeout(REAP_BOUND - elapsed)` alone bounds a SINGLE wait, not the loop: once the
+    // bound is spent the remaining timeout is zero, and a queue that keeps being refilled keeps
+    // returning `Ok` from a zero-length wait, forever. A writer that escaped the kill is exactly the
+    // thing that can refill it, and it is the case this cleanup exists for.
     let cleanup_started = Instant::now();
-    let cleaned = loop {
-        match frames.recv_timeout(REAP_BOUND.saturating_sub(cleanup_started.elapsed())) {
-            // Frames still queued behind the outcome; drain them, the decision is already made.
-            Ok(_) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break true,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break false,
-        }
-    };
+    let cleaned = drain_until_pipe_ends(&frames, REAP_BOUND, cleanup_started);
     if !cleaned {
         return Err(ExecutorError::CleanupUnbounded {
             waited: cleanup_started.elapsed(),
         });
     }
+    // The channel disconnected — the pump returned. WHY it returned is the whole question. Only
+    // [`PumpEnd::Eof`] is an observation about the pipe: the kernel ends a read with zero bytes only
+    // once the last holder of the write end has let it go. A pump that stopped because its own read
+    // failed, or because nobody was listening any more, says nothing at all about who still holds
+    // that descriptor, and this parent may not call that a cleaned-up delivery. It used to: any
+    // disconnection was success, so a malformed frame was reported as a closed pipe.
+    //
+    // What EOF does NOT establish is stated at the claim, not only here: a descendant that closes
+    // this one descriptor and keeps running produces the same EOF. See the module header.
+    let ended = pump_end.lock().ok().and_then(|slot| slot.clone());
+    match ended {
+        Some(PumpEnd::Eof) => {}
+        Some(PumpEnd::ReadFailed(why)) => {
+            return Err(ExecutorError::CleanupUnobserved {
+                why: format!("the read on the child's stdout failed: {why}"),
+            });
+        }
+        Some(PumpEnd::ParentStopped) => {
+            return Err(ExecutorError::CleanupUnobserved {
+                why: "this parent stopped reading the child's stdout before it ended".to_owned(),
+            });
+        }
+        None => {
+            return Err(ExecutorError::CleanupUnobserved {
+                why: "the reader thread ended without recording why it stopped".to_owned(),
+            });
+        }
+    }
     drop(pump);
     outcome
+}
+
+/// Drain what is left in the frame channel until the pump drops its end, and return whether that
+/// happened inside `bound` measured from `started`.
+///
+/// Extracted so the loop that has to hold the bound can be driven directly by a test: the fault it
+/// guards against — a queue refilled as fast as it is drained — cannot be reproduced through a real
+/// child without an escaped descendant to do the refilling.
+pub(crate) fn drain_until_pipe_ends<T>(
+    frames: &Receiver<T>,
+    bound: Duration,
+    started: Instant,
+) -> bool {
+    loop {
+        // Checked FIRST, on every iteration, receiving or not. This is the bound.
+        let Some(left) = bound.checked_sub(started.elapsed()) else {
+            return false;
+        };
+        match frames.recv_timeout(left) {
+            // Frames still queued behind the outcome; drain them, the decision is already made.
+            // Back to the top, where the deadline is applied again.
+            Ok(_) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return true,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return false,
+        }
+    }
 }
 
 /// The parent's writes, off the drive thread and therefore boundable.
@@ -757,6 +982,7 @@ fn drive(
 ) -> Result<String, ExecutorError> {
     let mut said_hello = false;
     let mut sent_request = false;
+    let mut mints: u32 = 0;
 
     loop {
         let now = Instant::now();
@@ -774,9 +1000,17 @@ fn drive(
         // loop bounds, with the kill unreachable behind it.
         if !sent_request {
             sent_request = true;
+            // The budget is measured HERE, at the write, not when the request was built. It is the
+            // parent's remaining time handed across as a duration, and every millisecond spent
+            // between building the request and writing it — the spawn, the fork/exec, the
+            // handshake — used to be given back to the child as budget it never had. The child
+            // still starts this clock when it READS the frame, so the pipe transit is unaccounted
+            // for; that residue is named in the module header rather than claimed away.
+            let mut request = request.clone();
+            request.budget_ms = u64::try_from(left.as_millis()).unwrap_or(u64::MAX);
             stalled_write(
                 writer,
-                &ToChild::Push(request.clone()),
+                &ToChild::Push(request),
                 left,
                 deadline,
                 child,
@@ -784,7 +1018,11 @@ fn drive(
             )?;
             continue;
         }
-        match frames.recv_timeout(left) {
+        // Bounded by the cancellation poll, not only by the deadline: see [`CANCELLATION_POLL`].
+        // Every wait in this loop is short enough that the owner is re-asked while the child works,
+        // rather than only when the clock runs out.
+        let poll = left.min(CANCELLATION_POLL);
+        match frames.recv_timeout(poll) {
             Ok(Ok(Some(ToParent::Hello { version, .. }))) => {
                 if version != PROTOCOL_VERSION {
                     child.kill_and_reap()?;
@@ -792,9 +1030,26 @@ fn drive(
                         "child speaks protocol {version}, this parent speaks {PROTOCOL_VERSION}"
                     )));
                 }
+                // A handshake happens ONCE. A second hello is a child saying something this
+                // protocol has no meaning for, and "accepted it and carried on" is not a protocol
+                // this parent can describe.
+                if said_hello {
+                    child.kill_and_reap()?;
+                    return Err(ExecutorError::Protocol(
+                        "child said hello twice".to_owned(),
+                    ));
+                }
                 said_hello = true;
             }
             Ok(Ok(Some(ToParent::Mint { destination }))) => {
+                mints += 1;
+                if mints > MAX_MINT_REQUESTS {
+                    child.kill_and_reap()?;
+                    return Err(ExecutorError::Protocol(format!(
+                        "child asked for {mints} authorizations; this delivery's legs need at most \
+                         {MAX_MINT_REQUESTS}"
+                    )));
+                }
                 if !said_hello {
                     child.kill_and_reap()?;
                     return Err(ExecutorError::Protocol(
@@ -885,18 +1140,41 @@ fn drive(
                 // The child says it is finished; that is not the same as being gone. Reap before
                 // returning, so the turn this result releases is released after an exit we saw.
                 let _ = child.kill_and_reap()?;
+                if !said_hello {
+                    return Err(ExecutorError::Protocol(
+                        "child reported a result before saying hello".to_owned(),
+                    ));
+                }
                 return match (oid, error) {
-                    (Some(oid), None) => Ok(oid),
+                    // The oid the child reports is the one the parent ASKED for, or this delivery
+                    // did not deliver what it was told to. The parent held the gated oid the whole
+                    // time and never compared it; a result that names a different object was
+                    // returned to the caller as this delivery's result.
+                    (Some(oid), None) if oid == request.gated_oid => Ok(oid),
+                    (Some(oid), None) => Err(ExecutorError::Protocol(format!(
+                        "child reported delivering {oid}, but this delivery's gated object is {}",
+                        request.gated_oid
+                    ))),
                     (_, Some(error)) => Err(ExecutorError::Push(error)),
                     (None, None) => Err(ExecutorError::Protocol(
                         "child finished without an oid or an error".to_owned(),
                     )),
                 };
             }
-            Ok(Ok(None)) | Err(RecvTimeoutError::Disconnected) => {
+            // END OF FILE, observed: the kernel reported zero bytes on the child's stdout.
+            Ok(Ok(None)) => {
                 let _ = child.kill_and_reap()?;
                 return Err(ExecutorError::Protocol(
-                    "child closed its pipe without finishing the push".to_owned(),
+                    "child's stdout reached end of file without finishing the push".to_owned(),
+                ));
+            }
+            // The READER stopped. Not the same fact: it means this parent has no further view of
+            // that pipe, which is why the cleanup below asks the pump why it ended rather than
+            // treating its disappearance as a closed descriptor.
+            Err(RecvTimeoutError::Disconnected) => {
+                let _ = child.kill_and_reap()?;
+                return Err(ExecutorError::Protocol(
+                    "the reader on the child's stdout stopped before the push finished".to_owned(),
                 ));
             }
             Ok(Err(error)) => {
@@ -906,6 +1184,17 @@ fn drive(
                 )));
             }
             Err(RecvTimeoutError::Timeout) => {
+                // A tick, not the clock running out: re-ask the owner. This is the only place the
+                // parent acts on a revocation that arrives while the child is working — including
+                // during the interval between answering the child's authority check and the child
+                // reading that answer, which is the interval this parent cannot otherwise see into.
+                if poll < left {
+                    if let Err(why) = authority() {
+                        let reap = child.kill_and_reap()?;
+                        return Err(ExecutorError::Revoked { why, reap });
+                    }
+                    continue;
+                }
                 let overrun = Instant::now().saturating_duration_since(deadline);
                 let reap = child.kill_and_reap()?;
                 return Err(ExecutorError::Killed {
@@ -1060,14 +1349,10 @@ where
         )
         .map_err(|error| format!("asking the parent to authorize a leg: {error}"))?;
         match read_frame::<_, ToChild>(&mut *reader) {
-            Ok(Some(ToChild::Minted {
-                header: Some(header),
-                ..
-            })) => Ok(header),
-            Ok(Some(ToChild::Minted {
-                refused: Some(refused),
-                ..
-            })) => Err(refused),
+            // Both fields decided together, by the rule in [`minted_answer`]. Matching `header`
+            // first meant a frame carrying a header AND a refusal was read as permission — the
+            // child picking the answer it liked out of an answer that contradicted itself.
+            Ok(Some(ToChild::Minted { header, refused })) => minted_answer(header, refused),
             Ok(Some(_)) | Ok(None) => {
                 Err("the parent stopped answering authorization requests".to_owned())
             }
@@ -1135,6 +1420,26 @@ where
         Some(lifetime),
     )
     .map_err(|error| error.to_string())
+}
+
+/// What a `Minted` reply MEANS, as a rule rather than a match arm the next edit can reorder.
+///
+/// Exactly one of the two fields carries the answer. A reply with both is not permission with a
+/// note attached: it is a parent that contradicted itself, and the only safe reading of a
+/// contradiction on an authorization channel is refusal. A reply with neither is not permission
+/// either.
+pub fn minted_answer(header: Option<String>, refused: Option<String>) -> Result<String, String> {
+    match (header, refused) {
+        (Some(header), None) => Ok(header),
+        (None, Some(refused)) => Err(refused),
+        (Some(_), Some(refused)) => Err(format!(
+            "the parent's authorization both granted and refused this leg ({refused}); refusing to \
+             use it"
+        )),
+        (None, None) => {
+            Err("the parent's authorization was empty; refusing to transmit".to_owned())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1222,6 +1527,224 @@ mod tests {
         assert!(
             refused.is_err(),
             "a frame past the cap must be refused, not read into memory this process never bounded"
+        );
+    }
+
+    /// The cleanup drain must be bounded by the LOOP's deadline, not by one wait's timeout. A queue
+    /// refilled as fast as it is drained is the case that separates the two, and it is the case
+    /// this cleanup exists for: something that escaped the kill is what does the refilling.
+    #[test]
+    fn the_cleanup_drain_returns_at_its_bound_while_frames_keep_arriving() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc::{channel, sync_channel};
+
+        let (tx, rx) = sync_channel::<u8>(4);
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let feeder_stop = std::sync::Arc::clone(&stop);
+        // Holds its end of the channel and keeps it non-empty: the channel never disconnects and a
+        // receive with any timeout, including a zero one, keeps succeeding.
+        std::thread::spawn(move || {
+            while !feeder_stop.load(Ordering::SeqCst) {
+                if tx.send(1).is_err() {
+                    return;
+                }
+            }
+        });
+
+        let bound = Duration::from_millis(300);
+        let started = Instant::now();
+        let (done, finished) = channel();
+        std::thread::spawn(move || {
+            let cleaned = drain_until_pipe_ends(&rx, bound, started);
+            let _ = done.send((cleaned, started.elapsed()));
+        });
+
+        // A DEADLINE THAT IS NOT APPLIED ON THIS PATH NEVER RETURNS, so the failure this gate has to
+        // produce is a failure and not a hang: the drain is run on its own thread and waited for.
+        let (cleaned, took) = finished
+            .recv_timeout(bound * 10)
+            .expect("the cleanup drain never returned while frames kept arriving: its bound is not applied on the path that receives one");
+        stop.store(true, Ordering::SeqCst);
+
+        assert!(
+            !cleaned,
+            "a drain that never saw the channel disconnect must not report a cleaned-up pipe"
+        );
+        assert!(
+            took < bound * 3,
+            "the drain overran its bound by too much to call it bounded: {took:?}"
+        );
+    }
+
+    /// **The false-cleanup counterexample, as behaviour.** A malformed frame used to end the reader
+    /// thread; the channel then disconnected; and the cleanup read that disconnection as "the pipe
+    /// closed". So one blank line was enough to make this parent report an observation it had never
+    /// made — while the write end of that stdout was still held.
+    ///
+    /// The holder here is a reader that does not reach end of file until the test lets it, which is
+    /// what the kernel does while any process still holds the write end. It is a model of an
+    /// escaped descendant's effect on this parent, not a real escaped process: the group-kill gate
+    /// in `delivery_push_custody.rs` owns that half.
+    #[test]
+    fn a_malformed_frame_is_not_end_of_file_and_does_not_end_the_reader() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc::sync_channel;
+
+        /// Yields the scripted bytes, then BLOCKS — no end of file — until `closed` is set.
+        struct HeldPipe {
+            script: Vec<u8>,
+            at: usize,
+            closed: std::sync::Arc<AtomicBool>,
+        }
+
+        impl std::io::Read for HeldPipe {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.at < self.script.len() {
+                    let take = (self.script.len() - self.at).min(buf.len());
+                    buf[..take].copy_from_slice(&self.script[self.at..self.at + take]);
+                    self.at += take;
+                    return Ok(take);
+                }
+                while !self.closed.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(0)
+            }
+        }
+
+        let closed = std::sync::Arc::new(AtomicBool::new(false));
+        let pipe = HeldPipe {
+            script: b"\n".to_vec(),
+            at: 0,
+            closed: std::sync::Arc::clone(&closed),
+        };
+        let (sink, frames) = sync_channel(MAX_QUEUED_FRAMES);
+        let end = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let reader = pump(pipe, sink, std::sync::Arc::clone(&end));
+
+        let malformed = frames
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the malformed frame must reach the parent");
+        assert!(
+            malformed.is_err(),
+            "a blank line reached the parent as a clean end of stream: {malformed:?}"
+        );
+
+        // THE FACT UNDER TEST: with the write end still held, this parent must NOT be able to
+        // conclude the pipe ended. The drain has to time out.
+        assert!(
+            !drain_until_pipe_ends(&frames, Duration::from_millis(400), Instant::now()),
+            "the parent concluded its child's pipe had closed while that pipe was still held; a \
+             reader that stopped is not a descriptor that closed"
+        );
+        assert_eq!(
+            end.lock().expect("pump end").clone(),
+            None,
+            "the reader ended on a malformed frame instead of reading on to the actual end"
+        );
+
+        // And when the holder really does let go, the same parent observes the real thing.
+        closed.store(true, Ordering::SeqCst);
+        assert!(
+            drain_until_pipe_ends(&frames, Duration::from_secs(5), Instant::now()),
+            "a pipe whose holders let go must drain to a clean end"
+        );
+        reader.join().expect("reader thread");
+        assert_eq!(
+            end.lock().expect("pump end").clone(),
+            Some(PumpEnd::Eof),
+            "the only thing that may be recorded as end of file is a read that returned zero bytes"
+        );
+    }
+
+    /// The positive half of the same rule: when the writers really do let go, the drain says so.
+    #[test]
+    fn the_cleanup_drain_reports_a_pipe_whose_writers_let_go() {
+        use std::sync::mpsc::sync_channel;
+
+        let (tx, rx) = sync_channel::<u8>(4);
+        tx.send(7).expect("queue one frame behind the outcome");
+        drop(tx);
+        assert!(
+            drain_until_pipe_ends(&rx, Duration::from_millis(500), Instant::now()),
+            "a channel whose sender is gone must drain to a clean end"
+        );
+    }
+
+    /// Three different facts, three different answers. A blank line is a MALFORMED FRAME; only a
+    /// read that returns zero bytes is end of file.
+    #[test]
+    fn a_blank_line_is_a_malformed_frame_and_only_a_closed_pipe_is_end_of_file() {
+        let mut blank = BufReader::new(&b"\n"[..]);
+        let parsed = read_frame::<_, ToChild>(&mut blank);
+        assert!(
+            parsed.is_err(),
+            "a blank line must be reported as a malformed frame, not as the stream ending"
+        );
+
+        let mut empty = BufReader::new(&b""[..]);
+        assert!(
+            matches!(read_frame::<_, ToChild>(&mut empty), Ok(None)),
+            "a read that returns zero bytes is end of file, and is the only thing that is"
+        );
+    }
+
+    /// An authorization that both grants and refuses is a contradiction, and a contradiction on this
+    /// channel is a refusal. The child used to take the header and transmit.
+    #[test]
+    fn an_authorization_that_grants_and_refuses_is_refused() {
+        assert_eq!(
+            minted_answer(Some("Nostr abc".to_owned()), None),
+            Ok("Nostr abc".to_owned())
+        );
+        assert_eq!(
+            minted_answer(None, Some("revoked".to_owned())),
+            Err("revoked".to_owned())
+        );
+        let ambiguous = minted_answer(Some("Nostr abc".to_owned()), Some("revoked".to_owned()));
+        assert!(
+            ambiguous
+                .as_ref()
+                .err()
+                .is_some_and(|why| why.contains("both granted and refused")),
+            "a reply carrying a header AND a refusal must not be read as permission: {ambiguous:?}"
+        );
+        assert!(
+            minted_answer(None, None).is_err(),
+            "an empty authorization is not permission"
+        );
+    }
+
+    /// The override policy itself. A relative path is resolved against a working directory this
+    /// process does not control, which is the `PATH` hole in a different spelling; it used to be
+    /// accepted as given.
+    #[test]
+    fn a_child_program_override_must_be_an_absolute_path_to_a_file() {
+        use std::ffi::OsStr;
+
+        let relative = child_program_from_override(OsStr::new("maxplayer"));
+        assert!(
+            relative
+                .as_ref()
+                .err()
+                .is_some_and(|why| why.to_string().contains("relative path")),
+            "a relative override must be refused: {relative:?}"
+        );
+        assert!(
+            child_program_from_override(OsStr::new("")).is_err(),
+            "an empty override must be refused"
+        );
+        assert!(
+            child_program_from_override(OsStr::new("/nonexistent/maxplayer-delivery-child"))
+                .is_err(),
+            "an override naming nothing on disk must be refused"
+        );
+        // And the case production depends on: this test binary's own path, which is what a harness
+        // sets, is accepted unchanged.
+        let me = std::env::current_exe().expect("current_exe");
+        assert_eq!(
+            child_program_from_override(me.as_os_str()).expect("an absolute existing file"),
+            me
         );
     }
 

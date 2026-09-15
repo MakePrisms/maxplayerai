@@ -983,9 +983,15 @@ pub async fn neutralize_then_push_off_runtime(
 ///   reaped, but the write end of its pipe was still held afterwards, which can only mean something
 ///   that inherited it escaped the process group we killed. The process we named is gone; the work
 ///   is not demonstrably over.
+/// - [`ExecutorError::CleanupUnobserved`] RETAINS: the child was reaped, but this process never saw
+///   end of file on its stdout — the reader stopped for some other reason. A reader that stopped is
+///   not a pipe that closed, and the difference between those two is the difference between an
+///   observation and an assumption.
 /// - [`ExecutorError::Killed`] RELEASES, and that is not an exception to the rule: the executor
 ///   constructs it only after a reap the kernel completed, and it carries the measured kill-to-exit
 ///   time. A deadline breach whose reap did not complete is `Unreaped`, not `Killed`.
+/// - [`ExecutorError::Revoked`] RELEASES for the same reason: the owner went away, the child was
+///   killed for it, and the kernel confirmed the exit before the variant was built.
 /// - Every other outcome — success, a push failure, a protocol violation, a child that never started
 ///   — has an exit the executor already confirmed, or no child at all.
 pub fn turn_after_child_push(
@@ -996,11 +1002,13 @@ pub fn turn_after_child_push(
         Err(
             ExecutorError::Unreaped { .. }
             | ExecutorError::CleanupUnbounded { .. }
+            | ExecutorError::CleanupUnobserved { .. }
             | ExecutorError::WaitFailed { .. },
         ) => Exclusion::Retain,
         Ok(_)
         | Err(
             ExecutorError::Killed { .. }
+            | ExecutorError::Revoked { .. }
             | ExecutorError::Spawn(_)
             | ExecutorError::Protocol(_)
             | ExecutorError::Push(_),
@@ -1015,25 +1023,52 @@ pub fn turn_after_child_push(
 /// to unwind straight through it and free the seat while a child process that nobody had reaped was
 /// still holding the workdir and the remote. Here the DEFAULT is retention, and release is the
 /// explicit act — taken only where a confirmed exit was observed.
-struct ChildCustody(Option<crate::delivery_turn::RunningWork>);
+/// **Retention is what an unknown child costs, so it starts when there could BE one.** The guard
+/// used to retain from the moment it was built, which was before the spawn: a delivery revoked, or
+/// expired, between taking the turn and starting a process therefore closed this seat's delivery
+/// lane for the life of the process — permanently, over a child that was never created. Retaining
+/// for an unknown child is custody; retaining for a child nobody spawned is just a lost seat.
+///
+/// So there are two states, and [`Self::arm`] is the moment between them: before it, this process
+/// knows there is no child and a drop RELEASES; after it, a child may exist and a drop RETAINS.
+struct ChildCustody {
+    work: Option<crate::delivery_turn::RunningWork>,
+    /// True once a child spawn is about to be attempted — i.e. once this process can no longer say
+    /// from its own knowledge that no delivery process exists.
+    armed: bool,
+}
 
 impl ChildCustody {
     fn hold(running: crate::delivery_turn::RunningWork) -> Self {
-        Self(Some(running))
+        Self {
+            work: Some(running),
+            armed: false,
+        }
+    }
+
+    /// About to start a child. From here an unwind retains.
+    fn arm(&mut self) {
+        self.armed = true;
     }
 
     /// The child's exit was confirmed. Hand the turn on.
     fn release(mut self) {
-        drop(self.0.take());
+        drop(self.work.take());
     }
 }
 
 impl Drop for ChildCustody {
-    /// Reached on every path that is NOT an explicit release — including an unwind. FAIL CLOSED:
-    /// the turn is never handed back, for the life of this process.
+    /// Reached on every path that is NOT an explicit release — including an unwind.
+    ///
+    /// Armed: FAIL CLOSED — the turn is never handed back, for the life of this process.
+    /// Not armed: this process knows no child was started, so the turn goes back the ordinary way.
+    /// The two are not the same answer to the same question, and answering the second with the
+    /// first is how a refusal became a permanent loss of this seat.
     fn drop(&mut self) {
-        if let Some(running) = self.0.take() {
-            std::mem::forget(running);
+        if let Some(running) = self.work.take() {
+            if self.armed {
+                std::mem::forget(running);
+            }
         }
     }
 }
@@ -1060,9 +1095,20 @@ fn push_error_to_seller_git_error(
              the first may still be packing",
             waited.as_millis()
         )),
+        // The owner went away while the child was running. Cancelled, not failed — and separate
+        // from the deadline case above because saying "passed its deadline" about a revocation is
+        // telling the caller something that did not happen.
+        ExecutorError::Revoked { why, reap } => SellerGitError::Cancelled(format!(
+            "the delivery push was revoked while its child was running ({why}); the child was \
+             killed and the kernel confirmed the exit {}ms later",
+            reap.as_millis()
+        )),
         // Same family as `Unreaped`, and deliberately NOT `Transport`: nothing on the wire failed.
         // This is a custody answer — we cannot say the local phase is over — and it reads as one.
         error @ ExecutorError::CleanupUnbounded { .. } => SellerGitError::Io(error.to_string()),
+        // A custody answer too: the child was reaped, but end of file on its stdout was never
+        // observed, so who still holds that pipe is unknown.
+        error @ ExecutorError::CleanupUnobserved { .. } => SellerGitError::Io(error.to_string()),
         // Also a custody answer, and also not a transport one: the kernel would not tell us whether
         // the child is gone.
         error @ ExecutorError::WaitFailed { .. } => SellerGitError::Io(error.to_string()),
@@ -1091,10 +1137,13 @@ fn push_error_to_seller_git_error(
 /// therefore never reaches the child at all, which is the same guarantee the in-process path gets
 /// from asking again before transmitting.
 ///
-/// **The turn is released only on a confirmed exit.** If the child was killed and did not exit
-/// inside [`crate::delivery_executor::REAP_BOUND`], this delivery's turn is RETAINED for the life of
-/// this process rather than handed to a second delivery while the first may still be packing. That
-/// is a deliberate loss of liveness on this seat, and it is named rather than recovered from.
+/// **The turn is released only on a confirmed exit — or a confirmed non-start.** If the child was
+/// killed and did not exit inside [`crate::delivery_executor::REAP_BOUND`], this delivery's turn is
+/// RETAINED for the life of this process rather than handed to a second delivery while the first may
+/// still be packing. That is a deliberate loss of liveness on this seat, and it is named rather than
+/// recovered from. A delivery refused BEFORE any child was spawned is the opposite case and is
+/// treated as one: there is no unknown process, so the turn is handed back and the next delivery can
+/// take it.
 #[allow(clippy::too_many_arguments)]
 pub async fn neutralize_then_push_in_child_off_runtime(
     program: PathBuf,
@@ -1126,11 +1175,14 @@ pub async fn neutralize_then_push_in_child_off_runtime(
             .begin()
             .map_err(|ended| SellerGitError::Cancelled(format!("at dispatch: {ended}")))?;
         let lifetime = running.lifetime();
-        // From here the turn is held by a guard whose DEFAULT is retention, so an unwind through
-        // the supervisor or the minter cannot hand this seat on while a child may still be running.
-        let custody = ChildCustody::hold(running);
+        // The turn is held by a guard from here — but NOT yet a retaining one. Until the spawn
+        // there is no child, and a `?` out of the two checks below returns through this guard's
+        // drop. Retaining there closed the seat's delivery lane permanently every time a delivery
+        // was cancelled in this window: a refusal with no child to justify it. See [`ChildCustody`].
+        let mut custody = ChildCustody::hold(running);
         // Phase boundary: everything after this point is a process that has to be killed to be
-        // stopped, so a delivery already revoked never gets one spawned for it.
+        // stopped, so a delivery already revoked never gets one spawned for it. A refusal HERE is a
+        // confirmed-no-child refusal, and the turn goes back for the next delivery to take.
         if let Some(authority) = &authority {
             authority().map_err(|ended| {
                 SellerGitError::Cancelled(format!(
@@ -1199,6 +1251,10 @@ pub async fn neutralize_then_push_in_child_off_runtime(
                 Ok(header)
             });
 
+        // ARMED: the next statement can create a process, so from here an unwind must not hand this
+        // seat on. Everything the guard protected before — a panic in the supervisor, a panic in the
+        // minter — happens after this point, because all of it happens inside the call below.
+        custody.arm();
         let outcome =
             crate::delivery_executor::run_push_in_child(&program, &request, deadline, proxy, live);
         // ONE release site, and a rule rather than a judgement at it. See [`turn_after_child_push`].
