@@ -158,6 +158,31 @@ pub fn cleanup_after_unix(effective_deadline_unix: u64) -> u64 {
     effective_deadline_unix.saturating_add(CLEANUP_GRACE_SECS)
 }
 
+/// The cleanup stamp a launch writes onto its containers.
+///
+/// **`job_deadline_unix` is the whole point (#996 D3).** When the caller can name the job's absolute
+/// deadline, the stamp is a RESTATEMENT of it and `now_unix` is not consulted at all: the value
+/// cannot then be moved by whatever the wall clock happens to say at the create. The previous
+/// derivation — `now + remaining` — made the stamp a fresh measurement, so a clock that had stepped
+/// backward between the caller computing `remaining` and this create produced a stamp EARLIER than
+/// the deadline the job was actually running under, and the sweep would remove a container out from
+/// under a job still inside its own deadline.
+///
+/// `None` is for a launch with no job deadline to carry — a harness probe. There the remaining
+/// window is the best available statement, and an unreadable clock (`now_unix == u64::MAX`)
+/// saturates rather than wrapping, so it can never date a live container into the past.
+#[must_use]
+pub fn launch_cleanup_stamp(
+    job_deadline_unix: Option<u64>,
+    job_lifetime_secs: u64,
+    now_unix: u64,
+) -> u64 {
+    cleanup_after_unix(match job_deadline_unix {
+        Some(deadline_unix) => deadline_unix,
+        None => now_unix.saturating_add(job_lifetime_secs),
+    })
+}
+
 /// How long any one `docker` invocation in this module may take before it is killed. A create or a
 /// sidecar that never returns would otherwise hold the launch open indefinitely, and an unbounded
 /// wait is the state in which cancellation leaves work nobody owns.
@@ -1446,7 +1471,7 @@ pub fn list_owned_argv(seat: &str) -> Vec<String> {
         &format!("label={HOLDER_SEAT_LABEL}={seat}"),
         "--format",
         &format!(
-            "{{{{.ID}}}}\t{{{{.Label \"{HOLDER_SEAT_LABEL}\"}}}}\t{{{{.Label \"{HOLDER_CLEANUP_AFTER_LABEL}\"}}}}\t{{{{.Label \"{HOLDER_ROLE_LABEL}\"}}}}"
+            "{{{{.ID}}}}\t{{{{.Label \"{HOLDER_SEAT_LABEL}\"}}}}\t{{{{.Label \"{HOLDER_CLEANUP_AFTER_LABEL}\"}}}}\t{{{{.Label \"{HOLDER_ROLE_LABEL}\"}}}}\t{{{{.Label \"{HELPER_JOB_LABEL}\"}}}}"
         ),
     ]
     .into_iter()
@@ -1469,8 +1494,17 @@ pub struct OwnedContainer {
     pub seat: Option<String>,
     /// Parsed [`HOLDER_CLEANUP_AFTER_LABEL`]; `None` when absent, empty, or not a unix second.
     pub cleanup_after: Option<u64>,
-    /// Parsed [`HOLDER_ROLE_LABEL`]; reported, never a removal criterion on its own.
+    /// Parsed [`HOLDER_ROLE_LABEL`]; `None` when absent or empty.
+    ///
+    /// **A removal criterion, as of #996.** It was previously parsed and then ignored, which let the
+    /// sweep act on any container wearing this seat's label whatever it was.
     pub role: Option<String>,
+    /// Parsed [`HELPER_JOB_LABEL`] — the job whose deadline [`OwnedContainer::cleanup_after`] was
+    /// derived from; `None` when absent or empty.
+    ///
+    /// **Also a removal criterion.** A container that cannot name its job cannot be shown to have
+    /// outlived one, and the stamp alone is then just a number with no provenance.
+    pub job: Option<String>,
 }
 
 /// Parse `docker ps --format '{{.ID}}\t{{.Label …}}…'` output into one record per container.
@@ -1494,7 +1528,14 @@ pub fn parse_owned_listing(stdout: &str) -> Vec<OwnedContainer> {
             let seat = field(&mut fields);
             let cleanup_after = field(&mut fields).and_then(|value| value.parse::<u64>().ok());
             let role = field(&mut fields);
-            OwnedContainer { id, seat, cleanup_after, role }
+            let job = field(&mut fields);
+            OwnedContainer {
+                id,
+                seat,
+                cleanup_after,
+                role,
+                job,
+            }
         })
         .filter(|container| !container.id.is_empty())
         .collect()
@@ -1520,15 +1561,175 @@ pub fn parse_owned_listing(stdout: &str) -> Vec<OwnedContainer> {
 /// An empty `seat` selects nothing: a caller that cannot name itself owns nothing to remove.
 #[must_use]
 pub fn expired_owned(containers: &[OwnedContainer], seat: &str, now_unix: u64) -> Vec<String> {
-    if seat.trim().is_empty() {
-        return Vec::new();
+    partition_owned(containers, seat, now_unix).removable
+}
+
+/// Why the sweep refused to act on a container that carries this seat's label.
+///
+/// Every variant names a container the sweep SAW and left alone. They are carried out of the
+/// selection instead of being dropped because an unreadable record is exactly the shape a leak
+/// takes: a container nobody can prove is expired is also a container nobody will ever remove.
+/// Filtering them silently — the behaviour before #996 — made a growing pile of malformed
+/// containers indistinguishable from a clean host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkipReason {
+    /// The seat label came back absent or empty from a listing that filtered on it.
+    UnreadableSeat,
+    /// Absent, or a role this module never issues. Carries what was read, for the operator.
+    UnknownRole(Option<String>),
+    /// No job label: the container cannot be tied to a job whose deadline could have passed.
+    MissingJob,
+    /// The cleanup stamp is absent, empty, or not a unix second.
+    UnreadableStamp,
+}
+
+impl std::fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnreadableSeat => write!(f, "seat label absent or unreadable"),
+            Self::UnknownRole(Some(role)) => write!(f, "unrecognised role {role:?}"),
+            Self::UnknownRole(None) => write!(f, "role label absent"),
+            Self::MissingJob => write!(f, "job label absent"),
+            Self::UnreadableStamp => write!(f, "cleanup stamp absent or unparseable"),
+        }
     }
-    containers
+}
+
+/// What one look at the listing decided: what may be removed, and what was refused and why.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OwnedSelection {
+    /// Fully validated and past their stamp. These, and only these, may be handed to `docker rm`.
+    pub removable: Vec<String>,
+    /// Containers wearing this seat's label that failed validation, each with its reason.
+    ///
+    /// Reported whether or not their stamp has passed: a record that cannot be validated now will
+    /// not become valid by ageing, so the operator needs it the first time it is seen.
+    pub skipped: Vec<(String, SkipReason)>,
+}
+
+/// Split this seat's containers into what it may remove and what it refuses to touch.
+///
+/// **Four things must all hold before an id reaches `removable`**, and the point of each is that
+/// absence is never read as permission:
+///
+///   * the seat label is present and is THIS seat — ownership, the one thing that makes this safe
+///     on a docker socket shared with another seller daemon;
+///   * the role is one this module issues ([`ROLE_HOLDER`] or [`ROLE_HELPER`]) — a container of
+///     someone else's that happens to carry a matching seat label is not ours to remove;
+///   * the job label is present — the stamp has to belong to a job, or it is an unattributable
+///     number;
+///   * the stamp parses and `now_unix` has passed it.
+///
+/// A container of ours failing any of the middle three is REPORTED in `skipped` rather than
+/// dropped. A container belonging to another seat is neither removed nor reported: it is simply
+/// not our business, and reporting it would turn a co-tenant's normal operation into noise here.
+///
+/// An empty `seat` selects nothing: a caller that cannot name itself owns nothing to remove.
+#[must_use]
+pub fn partition_owned(containers: &[OwnedContainer], seat: &str, now_unix: u64) -> OwnedSelection {
+    let mut selection = OwnedSelection::default();
+    if seat.trim().is_empty() {
+        return selection;
+    }
+    for container in containers {
+        match container.seat.as_deref() {
+            // Someone else's container on a shared socket. Not ours to remove, not ours to report.
+            Some(owner) if owner != seat => continue,
+            Some(_) => {}
+            None => {
+                selection
+                    .skipped
+                    .push((container.id.clone(), SkipReason::UnreadableSeat));
+                continue;
+            }
+        }
+        let role = container.role.as_deref();
+        if role != Some(ROLE_HOLDER) && role != Some(ROLE_HELPER) {
+            selection.skipped.push((
+                container.id.clone(),
+                SkipReason::UnknownRole(container.role.clone()),
+            ));
+            continue;
+        }
+        if container.job.is_none() {
+            selection
+                .skipped
+                .push((container.id.clone(), SkipReason::MissingJob));
+            continue;
+        }
+        let Some(after) = container.cleanup_after else {
+            selection
+                .skipped
+                .push((container.id.clone(), SkipReason::UnreadableStamp));
+            continue;
+        };
+        if now_unix >= after {
+            selection.removable.push(container.id.clone());
+        }
+    }
+    selection
+}
+
+/// Choose this pass's attempts from `candidates`, resuming after `cursor` and wrapping.
+///
+/// `candidates` must be sorted and deduplicated; the caller sorts so that the order this walks is a
+/// property of the ids themselves and not of whatever order docker happened to list them in.
+///
+/// **This is the anti-starvation rule.** Taking the first `cap` ids every pass — the behaviour
+/// before #996 — means that when those `cap` removals keep failing, they are selected again on the
+/// next pass, and again, and the `cap + 1`th container is never once asked about however long it
+/// has been expired. Resuming after the last id attempted makes every candidate reachable within
+/// `ceil(len / cap)` passes no matter how many removals fail, because the cursor advances past an
+/// attempt whether it succeeded or not.
+///
+/// Returns `(attempt, deferred)`, `deferred` in the order the next pass will reach it.
+#[must_use]
+pub fn select_pass(
+    candidates: &[String],
+    cursor: Option<&str>,
+    cap: usize,
+) -> (Vec<String>, Vec<String>) {
+    if candidates.is_empty() || cap == 0 {
+        return (Vec::new(), candidates.to_vec());
+    }
+    // First id strictly after the cursor. `unwrap_or(0)` wraps to the front when the cursor is at
+    // or past the end — including when the ids it named have since been removed.
+    let start = match cursor {
+        Some(cursor) => candidates
+            .iter()
+            .position(|id| id.as_str() > cursor)
+            .unwrap_or(0),
+        None => 0,
+    };
+    let rotated: Vec<String> = candidates[start..]
         .iter()
-        .filter(|container| container.seat.as_deref() == Some(seat))
-        .filter(|container| container.cleanup_after.is_some_and(|after| now_unix >= after))
-        .map(|container| container.id.clone())
-        .collect()
+        .chain(candidates[..start].iter())
+        .cloned()
+        .collect();
+    let take = cap.min(rotated.len());
+    (rotated[..take].to_vec(), rotated[take..].to_vec())
+}
+
+/// Where each seat's sweep left off, so the next pass resumes instead of restarting.
+///
+/// Keyed by seat because the cursor is only meaningful against one seat's candidate set, and a
+/// process that serves two seats must not let one seat's progress skip the other's containers.
+static SWEEP_CURSOR: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, String>>,
+> = std::sync::OnceLock::new();
+
+fn sweep_cursor_for(seat: &str) -> Option<String> {
+    SWEEP_CURSOR
+        .get_or_init(Default::default)
+        .lock()
+        .ok()
+        .and_then(|cursors| cursors.get(seat).cloned())
+}
+
+fn record_sweep_cursor(seat: &str, last_attempted: &str) {
+    if let Ok(mut cursors) = SWEEP_CURSOR.get_or_init(Default::default).lock() {
+        cursors.insert(seat.to_owned(), last_attempted.to_owned());
+    }
 }
 
 /// `docker` argv listing every container on the host by full id.
@@ -1660,6 +1861,12 @@ pub struct ReapReport {
     /// still waiting" instead of as "the host is clean now". Every one of them is still expired on
     /// the next tick.
     pub deferred: Vec<String>,
+    /// Containers wearing this seat's label that the sweep REFUSED to act on, each with its reason.
+    ///
+    /// Distinct from `failed`, which is docker refusing a removal this pass asked for. These were
+    /// never asked about: the record itself did not establish that removal was authorised. They are
+    /// surfaced because a malformed container is a leak that no future pass will clear on its own.
+    pub skipped: Vec<(String, SkipReason)>,
 }
 
 #[cfg(feature = "acp")]
@@ -1823,14 +2030,23 @@ async fn sweep_expired_within(
     let (listing, _) = run_bounded(client, list_owned_argv(seat), None, SWEEP_DOCKER_DEADLINE)
         .await
         .map_err(|error| format!("could not list this seat's containers — {error}"))?;
-    let mut expired = expired_owned(&parse_owned_listing(&listing), seat, now_unix);
-    // The count bound first: everything past it is deferred without being looked at, in the
-    // selection's own order, so a backlog drains deterministically instead of by whichever name
-    // docker happened to list first this time.
-    if expired.len() > MAX_SWEEP_REMOVALS {
-        report.deferred = expired.split_off(MAX_SWEEP_REMOVALS);
-    }
-    let mut queue = expired.into_iter();
+    let selection = partition_owned(&parse_owned_listing(&listing), seat, now_unix);
+    // Carried out of the pass whatever else happens: these are the containers the sweep cannot
+    // authorise itself to remove, and they are invisible to the operator anywhere else.
+    report.skipped = selection.skipped;
+    let mut candidates = selection.removable;
+    // Sorted so the rotation below walks a stable order rather than docker's listing order, which
+    // is free to differ between passes and would make "resume after" meaningless.
+    candidates.sort();
+    candidates.dedup();
+    // The count bound, applied from where the LAST pass stopped rather than from the front. See
+    // `select_pass`: starting at the front every time is what let 32 permanently-failing removals
+    // monopolise every pass while the 33rd container waited forever.
+    let cursor = sweep_cursor_for(seat);
+    let (attempt, deferred) = select_pass(&candidates, cursor.as_deref(), MAX_SWEEP_REMOVALS);
+    report.deferred = deferred;
+    let mut last_attempted: Option<String> = None;
+    let mut queue = attempt.into_iter();
     for id in queue.by_ref() {
         // Checked before STARTING a removal, never mid-call: a `docker rm` this pass has already
         // issued is left to its own deadline, because abandoning it would leave the pass unable to
@@ -1842,6 +2058,10 @@ async fn sweep_expired_within(
             report.deferred.splice(0..0, unattempted);
             break;
         }
+        // Recorded BEFORE the outcome is known, and kept whether docker accepts or refuses: a
+        // cursor that only advanced past successes would park on a container docker always refuses
+        // and reproduce the starvation this replaced.
+        last_attempted = Some(id.clone());
         match run_bounded(
             client,
             ["docker", "rm", "--force", "--volumes", id.as_str()]
@@ -1859,6 +2079,11 @@ async fn sweep_expired_within(
             // the caller can say so in its log.
             Err(error) => report.failed.push((id, error)),
         }
+    }
+    // Advanced only past what this pass ACTUALLY asked docker about — never past what the count
+    // bound or the budget deferred, which no pass has attempted yet.
+    if let Some(last) = last_attempted {
+        record_sweep_cursor(seat, &last);
     }
     Ok(report)
 }
@@ -3721,9 +3946,36 @@ exit 0
     fn write_listing(work: &std::path::Path, rows: &[(&str, &str, &str, &str)]) {
         let mut out = String::new();
         for (id, seat, cleanup_after, role) in rows {
-            out.push_str(&format!("{id}\t{seat}\t{cleanup_after}\t{role}\n"));
+            // Every container this module creates carries a job label, so the default fixture does
+            // too. A row that needs the job ABSENT or a field malformed is written with
+            // `write_raw_listing`, which states the whole line.
+            out.push_str(&format!(
+                "{id}\t{seat}\t{cleanup_after}\t{role}\tjob-{id}\n"
+            ));
         }
         std::fs::write(work.join("listing.tsv"), out).expect("listing");
+    }
+
+    /// A listing written verbatim, for rows whose whole point is a field docker returned unusable.
+    #[cfg(feature = "acp")]
+    fn write_raw_listing(work: &std::path::Path, listing: &str) {
+        std::fs::write(work.join("listing.tsv"), listing).expect("listing");
+    }
+
+    /// A seat of this test's own, because the sweep cursor is PROCESS-GLOBAL and keyed by seat.
+    ///
+    /// Two sweep rows sharing one seat string share a resume point: whichever runs first leaves a
+    /// cursor, and the second starts mid-queue for reasons nothing in its own body states. That is
+    /// a property of the cursor being real state rather than a test defect to paper over — so each
+    /// row takes a distinct seat, exactly as two seats on one host would.
+    #[cfg(feature = "acp")]
+    fn sweep_seat(name: &str) -> String {
+        let mut seat: String = name.bytes().map(|b| format!("{b:02x}")).collect();
+        seat.truncate(64);
+        while seat.len() < 64 {
+            seat.push('0');
+        }
+        seat
     }
 
     #[cfg(feature = "acp")]
@@ -3750,6 +4002,7 @@ exit 0
             seat: Some(seat_b()),
             cleanup_after: Some(stamp),
             role: Some(ROLE_HOLDER.to_owned()),
+            job: Some("job-c1".to_owned()),
         }];
         assert!(
             expired_owned(&owned, &seat_b(), stamp - 1).is_empty(),
@@ -3775,12 +4028,14 @@ exit 0
                 seat: Some(seat_b()),
                 cleanup_after: Some(short),
                 role: Some(ROLE_HOLDER.to_owned()),
+                job: Some("short".to_owned()),
             },
             OwnedContainer {
                 id: "long-job".to_owned(),
                 seat: Some(seat_b()),
                 cleanup_after: Some(long),
                 role: Some(ROLE_HOLDER.to_owned()),
+                job: Some("long".to_owned()),
             },
         ];
         let now = short + 1;
@@ -3801,8 +4056,9 @@ exit 0
     #[test]
     fn an_unreadable_or_foreign_stamp_is_never_a_permission_to_remove() {
         let listing = format!(
-            "unstamped\t{seat}\t\t{ROLE_HOLDER}\nmangled\t{seat}\tnot-a-number\t{ROLE_HELPER}\n\
-             stranger\tffff\t1\t{ROLE_HOLDER}\nshared\t\t\t\n",
+            "unstamped\t{seat}\t\t{ROLE_HOLDER}\tjob-u\n\
+             mangled\t{seat}\tnot-a-number\t{ROLE_HELPER}\tjob-m\n\
+             stranger\tffff\t1\t{ROLE_HOLDER}\tjob-s\nshared\t\t\t\t\n",
             seat = seat_b()
         );
         let owned = parse_owned_listing(&listing);
@@ -3819,11 +4075,167 @@ exit 0
             seat: Some(seat_b()),
             cleanup_after: Some(1),
             role: Some(ROLE_HOLDER.to_owned()),
+            job: Some("job-ours".to_owned()),
         }];
         assert!(
             expired_owned(&stamped, "   ", u64::MAX).is_empty(),
             "a caller that cannot name its seat owns nothing to remove"
         );
+    }
+
+    /// EVERY CONTAINER THE SWEEP REFUSES IS REPORTED, AND ROLE AND JOB BOTH GATE REMOVAL.
+    ///
+    /// Before #996 D1 an unreadable stamp was filtered out in silence and `role` was parsed and then
+    /// ignored, so a container this seat could never remove looked exactly like a host with nothing
+    /// on it. Every row here is judged at `u64::MAX`, so no row is held back by its expiry: what
+    /// keeps each one out of `removable` is the validation, and every one comes back NAMED.
+    #[test]
+    fn a_container_the_sweep_cannot_validate_is_refused_and_reported() {
+        let stamp = 1_000_u64;
+        let listing = format!(
+            "good\t{seat}\t{stamp}\t{ROLE_HOLDER}\tjob-1\n\
+             no-role\t{seat}\t{stamp}\t\tjob-2\n\
+             odd-role\t{seat}\t{stamp}\tinterloper\tjob-3\n\
+             no-job\t{seat}\t{stamp}\t{ROLE_HELPER}\t\n\
+             bad-stamp\t{seat}\tnot-a-number\t{ROLE_HOLDER}\tjob-4\n\
+             no-seat\t\t{stamp}\t{ROLE_HOLDER}\tjob-5\n\
+             stranger\tffff\t{stamp}\t{ROLE_HOLDER}\tjob-6\n",
+            seat = seat_b()
+        );
+        let owned = parse_owned_listing(&listing);
+        let selection = partition_owned(&owned, &seat_b(), u64::MAX);
+        assert_eq!(
+            selection.removable,
+            vec!["good".to_owned()],
+            "only a container that establishes seat, role, job AND a passed stamp may be removed"
+        );
+        let reported: std::collections::BTreeMap<&str, String> = selection
+            .skipped
+            .iter()
+            .map(|(id, reason)| (id.as_str(), reason.to_string()))
+            .collect();
+        assert_eq!(
+            reported.keys().copied().collect::<Vec<_>>(),
+            vec!["bad-stamp", "no-job", "no-role", "no-seat", "odd-role"],
+            "every refused container of OURS is named rather than dropped: {reported:?}"
+        );
+        // A co-tenant's container is neither removed nor reported: reporting it would turn another
+        // seat's ordinary operation into a permanent complaint in this seat's log.
+        assert!(
+            !reported.contains_key("stranger"),
+            "another seat's container is not ours to remove OR to report: {reported:?}"
+        );
+        assert!(
+            reported["odd-role"].contains("interloper"),
+            "the reason carries what was actually read, so the operator can act on it: {reported:?}"
+        );
+        assert!(reported["no-role"].contains("role"), "{reported:?}");
+        assert!(reported["no-job"].contains("job"), "{reported:?}");
+        assert!(reported["bad-stamp"].contains("stamp"), "{reported:?}");
+        assert!(reported["no-seat"].contains("seat"), "{reported:?}");
+    }
+
+    /// A PERSISTENTLY FAILING HEAD CANNOT STARVE THE TAIL OF THE QUEUE.
+    ///
+    /// The defect (#996 D2): the pass took the first [`MAX_SWEEP_REMOVALS`] candidates every time,
+    /// so when those removals kept failing they were selected again next pass, and again, and a
+    /// container behind them was never once asked about however long it had been expired. Resuming
+    /// after the last id ATTEMPTED — not after the last one that succeeded — bounds every
+    /// candidate's wait at `ceil(len / cap)` passes however many removals fail.
+    #[test]
+    fn a_failing_head_cannot_starve_the_tail_of_the_sweep_queue() {
+        let candidates: Vec<String> = (0..40).map(|n| format!("c{n:02}")).collect();
+        let cap = 32_usize;
+
+        let (first, deferred) = select_pass(&candidates, None, cap);
+        assert_eq!(first.len(), cap, "the count bound still holds");
+        assert_eq!(first[0], "c00");
+        assert_eq!(
+            deferred.len(),
+            8,
+            "the tail waits, and is reported as waiting"
+        );
+
+        // NOTHING was removed: every attempt failed, so the candidate set is unchanged. This is
+        // precisely the state the old selection could never escape.
+        let cursor = first
+            .last()
+            .cloned()
+            .expect("a pass that attempted something");
+        let (second, _) = select_pass(&candidates, Some(&cursor), cap);
+        assert_eq!(
+            &second[..8],
+            &candidates[32..40],
+            "the pass after a wholly failing one must start where that one stopped: {second:?}"
+        );
+        let reached: std::collections::BTreeSet<&String> =
+            first.iter().chain(second.iter()).collect();
+        assert_eq!(
+            reached.len(),
+            candidates.len(),
+            "every candidate is attempted within 2 passes even though not one removal succeeded"
+        );
+    }
+
+    /// THE RESUME POINT WRAPS, AND SURVIVES THE IDS IT NAMED BEING REMOVED.
+    #[test]
+    fn the_sweep_resume_point_wraps_and_survives_its_ids_disappearing() {
+        let candidates: Vec<String> = (0..5).map(|n| format!("c{n}")).collect();
+        // A cursor past every remaining id — the ordinary case once the tail has been swept.
+        let (attempt, deferred) = select_pass(&candidates, Some("zzz"), 2);
+        assert_eq!(
+            attempt,
+            vec!["c0".to_owned(), "c1".to_owned()],
+            "it wraps to the front"
+        );
+        assert_eq!(deferred.len(), 3);
+        // A cursor naming a container that has since been REMOVED: the next id after it is still
+        // well defined, so a pass that succeeded does not lose its place.
+        let survivors = vec!["c0".to_owned(), "c3".to_owned(), "c4".to_owned()];
+        let (attempt, _) = select_pass(&survivors, Some("c2"), 2);
+        assert_eq!(attempt, vec!["c3".to_owned(), "c4".to_owned()]);
+        // A cap of zero attempts nothing and DEFERS everything, rather than quietly dropping it.
+        let (attempt, deferred) = select_pass(&survivors, None, 0);
+        assert!(attempt.is_empty());
+        assert_eq!(deferred.len(), survivors.len());
+    }
+
+    /// THE STAMP IS A RESTATEMENT OF THE DEADLINE, NOT A MEASUREMENT TAKEN AT THE CREATE.
+    ///
+    /// #996 D3. The stamp a launch writes must be the same second whenever the create is issued;
+    /// the clock at the create is not evidence about the job's deadline. The backward step is the
+    /// case that mattered — it is the one that shortens the reconstruction.
+    #[test]
+    fn a_carried_deadline_stamps_the_same_second_whatever_the_clock_says() {
+        let deadline = 1_700_000_900_u64;
+        // The window the caller computed, at 1_700_000_000.
+        let lifetime = 900_u64;
+        let expected = deadline + CLEANUP_GRACE_SECS;
+        for now_at_create in [
+            1_700_000_000_u64,
+            1_700_000_450,
+            1_699_999_000,
+            1_700_000_899,
+        ] {
+            assert_eq!(
+                launch_cleanup_stamp(Some(deadline), lifetime, now_at_create),
+                expected,
+                "a carried deadline must not move with the clock at the create ({now_at_create})"
+            );
+        }
+        // What is being refused: reconstructing from a backward-stepped clock lands the stamp
+        // earlier than the job's real deadline.
+        assert!(
+            launch_cleanup_stamp(None, lifetime, 1_699_999_000) < expected,
+            "if the fallback ever stops being clock-dependent, this row has lost its subject"
+        );
+        // And with no deadline to carry, the window is still the best statement available.
+        assert_eq!(
+            launch_cleanup_stamp(None, lifetime, 1_700_000_000),
+            expected
+        );
+        // An unreadable clock saturates instead of wrapping into the past.
+        assert_eq!(launch_cleanup_stamp(None, lifetime, u64::MAX), u64::MAX);
     }
 
     /// THE PRODUCTION DEADLINE REACHES THE CONTAINER AND DECIDES THE SWEEP.
@@ -3844,16 +4256,32 @@ exit 0
         // A seller-selected deadline of `now + 900`, as `job_deadline_unix` would return.
         let deadline = now + 900;
         let lifetime = crate::seller_exec::unified_job_timeout(deadline, now);
-        // The arithmetic `prepare_launch` performs, on the values it has at the create.
-        let cleanup_after = cleanup_after_unix(now.saturating_add(lifetime.as_secs()));
+        // The arithmetic `prepare_launch` performs since #996 D3: the job's ABSOLUTE deadline,
+        // carried down from the caller that chose it, plus the grace. No clock is read here.
+        let cleanup_after = cleanup_after_unix(deadline);
         assert_eq!(cleanup_after, deadline + CLEANUP_GRACE_SECS, "the job's OWN deadline, plus grace");
+        // The property the carried deadline has and the reconstruction did not: the stamp does not
+        // depend on WHEN the create is issued. A clock that stepped backward between the caller
+        // computing `lifetime` and this create lands the old derivation EARLIER than the job's real
+        // deadline — and the sweep would then remove a container out from under a job still inside
+        // it. The reconstruction is modelled here only to show what is being refused.
+        let reconstructed_after_a_backward_step =
+            cleanup_after_unix((now - 300).saturating_add(lifetime.as_secs()));
+        assert!(
+            reconstructed_after_a_backward_step < cleanup_after,
+            "a backward clock step is what shortened the old derivation; if that stops being true \
+             the regression this row guards has changed shape and the row needs rewriting"
+        );
 
         let argv = holder_argv("h", "net", "img", 1000, 1000, "job-1", &seat_b(), cleanup_after);
         let label = format!("{HOLDER_CLEANUP_AFTER_LABEL}={cleanup_after}");
         assert!(argv.iter().any(|a| a == &label), "the create must carry the stamp: {argv:?}");
 
         // …and what docker would report for that container is what the sweep judges.
-        let listing = format!("deadbeef\t{}\t{cleanup_after}\t{ROLE_HOLDER}\n", seat_b());
+        let listing = format!(
+            "deadbeef\t{}\t{cleanup_after}\t{ROLE_HOLDER}\tjob-1\n",
+            seat_b()
+        );
         let owned = parse_owned_listing(&listing);
         assert!(
             expired_owned(&owned, &seat_b(), deadline + CLEANUP_GRACE_SECS - 1).is_empty(),
@@ -3920,7 +4348,7 @@ exit 0
     async fn the_sweep_removes_only_this_seats_expired_containers() {
         let work = stand_in_work_dir("sweep-basic");
         let client = DockerCli::stand_in(&stand_in_sweep_docker(&work));
-        let seat = seat_b();
+        let seat = sweep_seat("sweep-basic");
         write_listing(
             &work,
             &[
@@ -3958,7 +4386,7 @@ exit 0
     async fn a_removal_docker_refuses_is_retried_by_the_next_sweep() {
         let work = stand_in_work_dir("sweep-retry");
         let client = DockerCli::stand_in(&stand_in_sweep_docker(&work));
-        let seat = seat_b();
+        let seat = sweep_seat("sweep-retry");
         write_listing(&work, &[("stubborn", &seat, "1000", ROLE_HOLDER)]);
         std::fs::write(work.join("rmfail-stubborn"), "").expect("marker");
 
@@ -4012,7 +4440,7 @@ exit 0
     async fn a_container_that_appears_after_a_sweep_is_removed_by_the_next_one() {
         let work = stand_in_work_dir("sweep-late");
         let client = DockerCli::stand_in(&stand_in_sweep_docker(&work));
-        let seat = seat_b();
+        let seat = sweep_seat("sweep-late");
         write_listing(&work, &[]);
 
         let first = sweep_expired_with(&client, &seat, 5_000).await.expect("the listing answered");
@@ -4039,7 +4467,7 @@ exit 0
     async fn one_sweep_removes_at_most_its_bound_and_the_rest_wait_for_the_next() {
         let work = stand_in_work_dir("sweep-bound");
         let client = DockerCli::stand_in(&stand_in_sweep_docker(&work));
-        let seat = seat_b();
+        let seat = sweep_seat("sweep-bound");
         let ids: Vec<String> = (0..MAX_SWEEP_REMOVALS + 5).map(|n| format!("c{n}")).collect();
         let rows: Vec<(&str, &str, &str, &str)> =
             ids.iter().map(|id| (id.as_str(), seat.as_str(), "1000", ROLE_HOLDER)).collect();
@@ -4080,7 +4508,7 @@ exit 0
     async fn a_pass_stops_at_its_wall_clock_budget_and_defers_what_it_did_not_start() {
         let work = stand_in_work_dir("sweep-budget");
         let client = DockerCli::stand_in(&stand_in_sweep_docker(&work));
-        let seat = seat_b();
+        let seat = sweep_seat("sweep-budget");
         let ids: Vec<String> = (0..6).map(|n| format!("slow{n}")).collect();
         let rows: Vec<(&str, &str, &str, &str)> =
             ids.iter().map(|id| (id.as_str(), seat.as_str(), "1000", ROLE_HOLDER)).collect();
@@ -4115,7 +4543,7 @@ exit 0
     async fn the_deferred_backlog_keeps_the_selection_order_the_next_pass_needs() {
         let work = stand_in_work_dir("sweep-order");
         let client = DockerCli::stand_in(&stand_in_sweep_docker(&work));
-        let seat = seat_b();
+        let seat = sweep_seat("sweep-order");
         let ids: Vec<String> = (0..MAX_SWEEP_REMOVALS + 3).map(|n| format!("o{n:03}")).collect();
         let rows: Vec<(&str, &str, &str, &str)> =
             ids.iter().map(|id| (id.as_str(), seat.as_str(), "1000", ROLE_HOLDER)).collect();
@@ -4128,6 +4556,122 @@ exit 0
             stalled.deferred, ids,
             "budget-stopped names come first, count-bound names after, both in selection order"
         );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// AGAINST A DAEMON: A PERSISTENTLY FAILING HEAD DOES NOT MONOPOLISE THE PASS.
+    ///
+    /// The #996 D2 defect, driven through the real `sweep_expired_with` rather than the selection
+    /// alone. Every removal here is refused, on every pass, so the candidate set never shrinks —
+    /// the state the old rule could not escape, because it re-selected the same first
+    /// [`MAX_SWEEP_REMOVALS`] ids each time and the tail was never once asked about.
+    ///
+    /// The assertion is deliberately about what the DAEMON WAS ASKED, not about what the report
+    /// says: `rm.log` is written by the stand-in when a removal is actually issued.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_permanently_failing_head_does_not_monopolise_the_sweep_pass() {
+        let work = stand_in_work_dir("sweep-starve");
+        let client = DockerCli::stand_in(&stand_in_sweep_docker(&work));
+        let seat = sweep_seat("sweep-starve");
+        // Zero-padded so lexical order is numeric order, which is the order the pass walks.
+        let ids: Vec<String> = (0..MAX_SWEEP_REMOVALS + 8)
+            .map(|n| format!("c{n:03}"))
+            .collect();
+        let rows: Vec<(&str, &str, &str, &str)> = ids
+            .iter()
+            .map(|id| (id.as_str(), seat.as_str(), "1000", ROLE_HOLDER))
+            .collect();
+        write_listing(&work, &rows);
+        // EVERY removal is refused, permanently.
+        for id in &ids {
+            std::fs::write(work.join(format!("rmfail-{id}")), "").expect("marker");
+        }
+
+        let first = sweep_expired_with(&client, &seat, 5_000)
+            .await
+            .expect("the listing answered");
+        assert!(
+            first.removed.is_empty(),
+            "nothing can be removed on this host"
+        );
+        assert_eq!(
+            first.failed.len(),
+            MAX_SWEEP_REMOVALS,
+            "the whole pass was spent failing"
+        );
+        assert_eq!(first.deferred.len(), 8, "and the tail is named as waiting");
+
+        let second = sweep_expired_with(&client, &seat, 5_000)
+            .await
+            .expect("the listing answered");
+        assert!(second.removed.is_empty(), "still nothing removable");
+
+        // THE POINT: the tail was reached on the second pass, even though not one removal has ever
+        // succeeded and the head is still expired and still failing. Under the old rule the daemon
+        // would have been asked about `c000..c031` twice and about `c032..c039` never.
+        let asked: std::collections::BTreeSet<String> = rm_log(&work).into_iter().collect();
+        for id in &ids {
+            assert!(
+                asked.contains(id),
+                "every expired container must be attempted within ceil(40/32) = 2 passes; \
+                 {id} never was — a failing head is starving the tail again"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// AGAINST A DAEMON: WHAT THE SWEEP REFUSES TO TOUCH COMES BACK NAMED.
+    ///
+    /// #996 D1 through the real pass. Each unusable row is long past any stamp, so expiry is not
+    /// what holds it back — the validation is — and the daemon is asked about none of them.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_sweep_reports_every_container_it_refused_to_act_on() {
+        let work = stand_in_work_dir("sweep-skipped");
+        let client = DockerCli::stand_in(&stand_in_sweep_docker(&work));
+        let seat = sweep_seat("sweep-skipped");
+        write_raw_listing(
+            &work,
+            &format!(
+                "good\t{seat}\t1000\t{ROLE_HOLDER}\tjob-1\n\
+                 bad-stamp\t{seat}\tnot-a-number\t{ROLE_HOLDER}\tjob-2\n\
+                 no-job\t{seat}\t1000\t{ROLE_HELPER}\t\n\
+                 odd-role\t{seat}\t1000\tinterloper\tjob-3\n"
+            ),
+        );
+
+        let report = sweep_expired_with(&client, &seat, 5_000)
+            .await
+            .expect("the listing answered");
+        assert_eq!(
+            report.removed,
+            vec!["good".to_owned()],
+            "only the valid, expired one"
+        );
+        assert_eq!(
+            rm_log(&work),
+            vec!["good".to_owned()],
+            "the daemon is asked about nothing else"
+        );
+
+        let named: std::collections::BTreeMap<String, String> = report
+            .skipped
+            .iter()
+            .map(|(id, why)| (id.clone(), why.to_string()))
+            .collect();
+        assert_eq!(
+            named.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                "bad-stamp".to_owned(),
+                "no-job".to_owned(),
+                "odd-role".to_owned()
+            ],
+            "the leak has to be visible in the report, not only absent from the removals: {named:?}"
+        );
+        assert!(named["bad-stamp"].contains("stamp"), "{named:?}");
+        assert!(named["no-job"].contains("job"), "{named:?}");
+        assert!(named["odd-role"].contains("interloper"), "{named:?}");
         let _ = std::fs::remove_dir_all(&work);
     }
 

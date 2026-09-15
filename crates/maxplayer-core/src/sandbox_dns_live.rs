@@ -412,6 +412,8 @@ async fn contained_delivery(
         workdir.path(),
         &identity(),
         Duration::from_secs(900),
+        // A live DNS probe, not a job — see the egress probe: no job deadline exists to carry.
+        None,
     )
     .await
     .expect("containment must be established");
@@ -806,6 +808,8 @@ async fn gate_a_scenario(tag: &str) -> GateA {
         workdir.path(),
         &identity(),
         Duration::from_secs(300),
+        // A live DNS probe, not a job: no job deadline exists to carry.
+        None,
     )
     .await
     .expect("containment must be established");
@@ -909,6 +913,8 @@ async fn diagnose_v6_resolver_reachability_inside_containment() {
         workdir.path(),
         &identity(),
         Duration::from_secs(300),
+        // A live DNS probe, not a job: no job deadline exists to carry.
+        None,
     )
     .await
     .expect("containment must be established");
@@ -977,6 +983,8 @@ async fn diagnose_v6_resolver_outside_the_denied_ranges() {
         workdir.path(),
         &identity(),
         Duration::from_secs(300),
+        // A live DNS probe, not a job: no job deadline exists to carry.
+        None,
     )
     .await
     .expect("containment must be established");
@@ -1024,6 +1032,8 @@ async fn a_truncated_udp_answer_falls_back_to_tcp_53_inside_containment() {
         workdir.path(),
         &identity(),
         Duration::from_secs(300),
+        // A live DNS probe, not a job: no job deadline exists to carry.
+        None,
     )
     .await
     .expect("containment must be established");
@@ -1081,6 +1091,8 @@ async fn host_stub_discovery_hands_the_job_a_canonical_upstream_not_the_stub() {
         workdir.path(),
         &identity(),
         Duration::from_secs(300),
+        // A live DNS probe, not a job: no job deadline exists to carry.
+        None,
     )
     .await
     .expect("containment must be established from discovered resolvers");
@@ -1126,6 +1138,8 @@ async fn no_usable_resolver_refuses_before_a_holder_or_a_payload_exists() {
             workdir.path(),
             &identity(),
             Duration::from_secs(300),
+            // A live DNS probe, not a job: no job deadline exists to carry.
+            None,
         )
         .await
         .err()

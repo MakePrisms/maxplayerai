@@ -266,6 +266,9 @@ async fn contained_run(tag: &str, runtime: &str) -> (String, String, String) {
         workdir.path(),
         &identity(),
         Duration::from_secs(300),
+        // A live egress probe, not a job: there is no job deadline to carry, so the stamp falls
+        // back to this probe's own lifetime rather than inventing an absolute one.
+        None,
     )
     .await
     .expect("containment must establish");

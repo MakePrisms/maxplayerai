@@ -2303,6 +2303,18 @@ fn integrated_leg(
 
 /// [`integrated_leg`], for a leg that needs a `[sandbox]` section other than the default one — a
 /// configured pinhole, or a named runtime. The path through production is identical.
+/// The absolute unix second a gate's launch is bounded by, `within` seconds from now.
+///
+/// The live gates state their deadline ABSOLUTELY, exactly as production does since #996 F3, so
+/// these rows exercise the carried-deadline path and not the `None` fallback, which only a
+/// deadline-less harness probe takes.
+fn gate_deadline_unix(within: u64) -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(u64::MAX, |since| since.as_secs())
+        .saturating_add(within)
+}
+
 fn integrated_leg_with(
     config: maxplayer_core::home::SandboxConfig,
     ip: &str,
@@ -2320,6 +2332,7 @@ fn integrated_leg_with(
         &workdir,
         &gate_identity(),
         std::time::Duration::from_secs(120),
+        Some(gate_deadline_unix(120)),
         |launch, holder| {
             let holder = holder.expect(
                 "a docker policy with a configured network must establish containment — a `None` \
@@ -2451,6 +2464,7 @@ fn a_payload_that_never_ran_is_not_scored_as_a_denial() {
             &workdir,
             &gate_identity(),
             std::time::Duration::from_secs(60),
+            Some(gate_deadline_unix(60)),
             |launch, _| run_launch_attributably(launch),
         ))
         .expect("preparation must succeed — it is the payload that cannot start");
@@ -2488,6 +2502,7 @@ fn containment_that_cannot_be_established_refuses_the_launch_and_leaves_nothing_
         &workdir,
         &gate_identity(),
         std::time::Duration::from_secs(60),
+        Some(gate_deadline_unix(60)),
         move |_, _| {
             observed.store(true, std::sync::atomic::Ordering::SeqCst);
         },
@@ -2549,6 +2564,7 @@ fn one_jobs_cleanup_leaves_a_sibling_job_contained_and_running() {
         &workdir,
         &gate_identity(),
         std::time::Duration::from_secs(180),
+        Some(gate_deadline_unix(180)),
         |launch, holder| {
             let sibling_holder = holder.expect("containment").to_owned();
             // Before: the sibling reaches its allowed destination.
@@ -2672,6 +2688,7 @@ fn the_hosts_own_egress_is_unaffected_before_during_and_after_a_jobs_cleanup() {
         &workdir,
         &gate_identity(),
         std::time::Duration::from_secs(120),
+        Some(gate_deadline_unix(120)),
         |launch, holder| {
             let holder = holder.expect("containment");
             route_on_link(holder, RunscNet::DENIED_IP);

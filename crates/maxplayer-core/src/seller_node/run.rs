@@ -4507,6 +4507,18 @@ impl SellerNodeRunner {
                         crate::sandbox_netns::SWEEP_PASS_BUDGET.as_secs()
                     );
                 }
+                // Every container the sweep REFUSED to act on, named one by one. These are the ones
+                // no later pass clears on its own: an unreadable stamp does not become readable by
+                // ageing, and a container with no job label never acquires one. A count would leave
+                // the operator unable to find them, and silence — the behaviour before #996 — made
+                // a growing pile of them look exactly like a clean host.
+                for (container, reason) in &report.skipped {
+                    opline!(
+                        "seller node: expiry sweep skipped container {container} ({reason}) — it \
+                         carries this seat's label but does not establish that removing it is \
+                         authorised, so it is left in place and named again every pass"
+                    );
+                }
             }
             Err(error) => opline!(
                 "seller node: the container expiry sweep could not read docker ({error}) — nothing \
@@ -7464,7 +7476,10 @@ impl SellerNodeRunner {
                         &prompt,
                         &workdir,
                         &identity,
-                        AgentRunTimeout::JobDeadline(job_timeout),
+                        AgentRunTimeout::JobDeadline {
+                            remaining: job_timeout,
+                            deadline_unix: deadline,
+                        },
                     )
                 },
             )
@@ -7885,8 +7900,18 @@ impl SellerNodeRunner {
         // placeholders must outlive the push, hence the margin on the lifetime.
         let job_lifetime = unified_job_timeout(deadline, now_unix().max(0) as u64)
             + Duration::from_secs(orch::PUSH_MARGIN_SECS);
-        let prepared = prepare_launch(agent_command, &sandbox, workdir, identity, job_lifetime)
-            .await
+        let prepared = prepare_launch(
+            agent_command,
+            &sandbox,
+            workdir,
+            identity,
+            job_lifetime,
+            // This launch legitimately outlives the job deadline by the push margin, so the margin
+            // is part of ITS effective deadline — the same total `job_lifetime` is measured to, but
+            // stated absolutely rather than re-derived from a clock read at create time.
+            Some(deadline.saturating_add(orch::PUSH_MARGIN_SECS)),
+        )
+        .await
             .map_err(|error| Fail::Setup(format!("container launch preparation failed ({error})")))?;
 
         // The push token source. A public/anonymous https remote takes no header (as on the host).
