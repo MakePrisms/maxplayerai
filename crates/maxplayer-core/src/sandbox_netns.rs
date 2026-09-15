@@ -204,12 +204,93 @@ struct CreationFence {
     retained: std::sync::Mutex<Option<RetainedOwner>>,
 }
 
+/// How many times a fence being DESTROYED will re-run an owner that is still owed.
+///
+/// A removal that could not be confirmed puts itself back, so the runner — not the job — is what
+/// bounds the attempts. Destruction is the last moment anything in this process can act, so it
+/// spends a few attempts there rather than one, and then says plainly that it is out of them.
+const RETAINED_FINAL_RUNS: usize = 3;
+
 /// Cleanup a fence holds on a job's behalf after its bounded owner's wait expired.
-struct RetainedOwner(Box<dyn FnOnce() + Send>);
+///
+/// Carries the names it is responsible for, so an owner that never discharges can be REPORTED as
+/// owing something specific rather than as an anonymous closure.
+struct RetainedOwner {
+    names: Vec<String>,
+    job: Box<dyn FnOnce() -> Custody + Send>,
+}
+
+/// What a retained owner reports after it has run.
+///
+/// The point of returning this rather than `()` is that a cleanup which issued a removal and could
+/// not confirm absence has NOT finished, and must not be able to end by returning quietly. It hands
+/// back the job that is still owed, and the runner decides what happens next.
+enum Custody {
+    /// Removed and CONFIRMED absent. Nothing is owed, and the slot stays empty.
+    Discharged,
+    /// A removal was issued and absence was not confirmed. This is the job that still owes it.
+    StillOwed(RetainedOwner),
+}
+
+/// What happened when a job was handed to a fence.
+///
+/// A registration that silently does nothing is the failure this type exists to make impossible:
+/// the caller cannot ignore the settled case, because the job comes back and must be run.
+#[must_use = "an already-settled fence hands the job back, and it must be run or it is lost"]
+enum Registration {
+    /// The fence took it; the create is still in flight, so a future last-ticket drop will run it.
+    Retained,
+    /// NOTHING was in flight at the instant of registration, so no future drop exists to run it.
+    /// The job is handed back rather than parked where it would never fire.
+    AlreadySettled(RetainedOwner),
+}
 
 impl std::fmt::Debug for RetainedOwner {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("RetainedOwner(cleanup still owned)")
+        write!(formatter, "RetainedOwner(still owns {})", self.names.join(", "))
+    }
+}
+
+/// Build the job that removes `names` under holder `name` and reports whether it is still owed.
+///
+/// Recursive by construction: a failed confirmation returns THIS function again over exactly the
+/// names that could not be confirmed, so responsibility narrows to what is actually outstanding
+/// instead of being discarded at the first disappointment. Nothing here waits; each attempt is a
+/// removal and a confirmation, both already bounded by `bounds.confirm`.
+fn retained_removal(
+    name: String,
+    names: Vec<String>,
+    client: DockerCli,
+    bounds: FenceBounds,
+) -> RetainedOwner {
+    RetainedOwner {
+        names: names.clone(),
+        job: Box::new(move || {
+            // A fresh fence deliberately: the create this would have waited for is the one that
+            // just ended, so there is nothing left to wait for and the owner goes straight to
+            // removal and confirmation.
+            let owner = HolderCleanup {
+                name: name.clone(),
+                joiners: names,
+                creation: std::sync::Arc::new(CreationFence::default()),
+                client: client.clone(),
+                bounds,
+            };
+            owner.sweep();
+            match owner.confirm_all_absent() {
+                Ok(()) => Custody::Discharged,
+                Err(pending) => {
+                    eprintln!(
+                        "sandbox: a retained owner removed {} but could not confirm absence within \
+                         {:?} — it is NOT releasing them: the job is still owed and goes back to \
+                         its fence",
+                        pending.join(", "),
+                        bounds.confirm
+                    );
+                    Custody::StillOwed(retained_removal(name, pending, client, bounds))
+                }
+            }
+        }),
     }
 }
 
@@ -228,15 +309,57 @@ impl CreationFence {
         CreationTicket { fence: std::sync::Arc::clone(self) }
     }
 
-    /// Transfer a job to an owner this fence RETAINS until the create settles.
+    /// Install a job, or hand it back because there is nothing left to run it.
     ///
-    /// Called when a bounded owner's wait runs out. The job is not run here and not timed here; it
-    /// is held, and [`CreationTicket::drop`] runs it at the moment the last in-flight create ends.
-    /// That is the whole difference between a window and an owner: a window expires, and this does
-    /// not.
-    fn retain_owner(&self, job: impl FnOnce() + Send + 'static) {
+    /// ATOMIC WITH THE ZERO TRANSITION, and that is the entire point of the shape. The check and
+    /// the installation happen under ONE `in_flight` guard, and [`CreationTicket::drop`] takes the
+    /// slot while still holding that same guard. Without this, a real ordering loses the job
+    /// outright: the bounded owner's wait times out, the last ticket drops and finds the slot
+    /// empty, and only then does cleanup install a callback that no further drop will ever run.
+    /// Now the two cases are exhaustive — either a drop is still coming and the fence keeps the
+    /// job, or none is, and the caller is handed it back and must run it.
+    fn register(&self, owner: RetainedOwner) -> Registration {
+        let in_flight = self.in_flight.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *in_flight == 0 {
+            return Registration::AlreadySettled(owner);
+        }
         let mut retained = self.retained.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        *retained = Some(RetainedOwner(Box::new(job)));
+        *retained = Some(owner);
+        Registration::Retained
+    }
+
+    /// Take custody of a job: retained for the settlement that is coming, or RUN NOW if none is.
+    ///
+    /// Registering on an already-idle fence used to mean parking a closure that nothing would ever
+    /// fire, which reads exactly like ownership and behaves exactly like dropping it on the floor.
+    fn take_custody(&self, owner: RetainedOwner) {
+        match self.register(owner) {
+            Registration::Retained => {}
+            Registration::AlreadySettled(owner) => self.run_and_keep_if_still_owed(owner),
+        }
+    }
+
+    /// Run an owner and PUT IT BACK if it is still owed.
+    ///
+    /// A removal whose absence could not be confirmed has not finished, so it returns to the slot:
+    /// a later settlement runs it again, and if no later settlement ever comes, this fence's own
+    /// destruction does. That is what stops a failed confirmation from ending ownership.
+    fn run_and_keep_if_still_owed(&self, owner: RetainedOwner) {
+        let Custody::StillOwed(still_owed) = (owner.job)() else {
+            return;
+        };
+        let mut retained = self.retained.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        match retained.as_ref() {
+            None => *retained = Some(still_owed),
+            // One slot, one job -- a registry of outstanding containers is deliberately not being
+            // built here. Nothing is overwritten silently: the job that cannot be kept is named.
+            Some(holding) => eprintln!(
+                "sandbox: {} is still owed, but this fence is already holding cleanup for {} — the \
+                 newer job is kept and the boot reaper remains the backstop for the rest",
+                still_owed.names.join(", "),
+                holding.names.join(", ")
+            ),
+        }
     }
 
     /// How much work has ever been started under this fence.
@@ -310,11 +433,23 @@ impl CreationTicket {
 
 impl Drop for CreationTicket {
     fn drop(&mut self) {
-        let settled = {
+        // The decrement and the claim on the retained job are ONE critical section, taken in the
+        // same order as `register`: `in_flight` first, then `retained`. Releasing the count before
+        // looking at the slot is what opened the missed-handoff window -- a registration could slip
+        // in after this drop had already decided there was nothing to run.
+        let owner = {
             let mut in_flight =
                 self.fence.in_flight.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             *in_flight = in_flight.saturating_sub(1);
-            *in_flight == 0
+            if *in_flight == 0 {
+                self.fence
+                    .retained
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+            } else {
+                None
+            }
         };
         self.fence.settled.notify_all();
         // THE HANDOFF LANDS HERE, on the thread that actually ended the create.
@@ -323,10 +458,43 @@ impl Drop for CreationTicket {
         // This is the event it was waiting for -- not a clock, the create's own end -- so the job
         // runs now, however long "now" took to arrive. The lock is released before it runs: the
         // job removes and confirms, and both talk to the daemon.
-        if settled {
-            if let Some(owner) = self.fence.take_retained_owner() {
-                (owner.0)();
+        if let Some(owner) = owner {
+            self.fence.run_and_keep_if_still_owed(owner);
+        }
+    }
+}
+
+impl Drop for CreationFence {
+    /// THE LAST MOMENT THIS PROCESS CAN ACT. A job still in the slot runs here.
+    ///
+    /// The slot holds a `FnOnce`, and a `FnOnce` that is merely dropped does nothing at all — so a
+    /// fence destroyed while still holding cleanup used to discard it in complete silence, which is
+    /// the one outcome indistinguishable from never having owned it. The owner deliberately keeps
+    /// no `Arc` back to this fence (that would be a cycle, and the fence would never be destroyed
+    /// at all); this is what makes that safe.
+    fn drop(&mut self) {
+        for _ in 0..RETAINED_FINAL_RUNS {
+            let taken =
+                self.retained.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+            let Some(owner) = taken else { return };
+            if let Custody::StillOwed(still_owed) = (owner.job)() {
+                *self.retained.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some(still_owed);
             }
+        }
+        // Out of attempts, with the names still unconfirmed. Nothing in this process outlives this
+        // point, so the honest end is to say exactly what is outstanding rather than to imply a
+        // clean release.
+        if let Some(owner) =
+            self.retained.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take()
+        {
+            eprintln!(
+                "sandbox: {} could not be confirmed absent after {} attempts by the retained owner, \
+                 and this fence is being destroyed — these are LEAKED in this process and the boot \
+                 reaper is the remaining backstop",
+                owner.names.join(", "),
+                RETAINED_FINAL_RUNS
+            );
         }
     }
 }
@@ -744,31 +912,12 @@ impl HolderCleanup {
             //
             // This claims nothing about whether the daemon will finish. It is the narrower true
             // thing: if the container ever lands, somebody still owns it.
-            let name = self.name.clone();
-            let joiners = self.joiners.clone();
-            let client = self.client.clone();
-            let bounds = self.bounds;
-            self.creation.retain_owner(move || {
-                // A fresh fence deliberately: the create this would have waited for is the one that
-                // just ended, so there is nothing left to wait for and the owner goes straight to
-                // removal and confirmation.
-                let owner = HolderCleanup {
-                    name,
-                    joiners,
-                    creation: std::sync::Arc::new(CreationFence::default()),
-                    client,
-                    bounds,
-                };
-                owner.sweep();
-                if let Err(pending) = owner.confirm_all_absent() {
-                    eprintln!(
-                        "sandbox: the retained owner removed {} once the create settled but could \
-                         not confirm absence within {:?} — these are LEAKED, not destroyed",
-                        pending.join(", "),
-                        owner.bounds.confirm
-                    );
-                }
-            });
+            self.creation.take_custody(retained_removal(
+                self.name.clone(),
+                self.joiners.clone(),
+                self.client.clone(),
+                self.bounds,
+            ));
             eprintln!(
                 "sandbox: a create against netns holder {} was STILL IN FLIGHT after {:?} and did \
                  not land within the further {:?} this owner retained it — custody is NOT being \
@@ -789,25 +938,21 @@ impl HolderCleanup {
             // instead: the fence retains an owner holding exactly those names, so they remain OWNED
             // rather than merely mentioned, and a later create settling on this holder runs them
             // again.
-            let unconfirmed = pending.clone();
-            let name = self.name.clone();
-            let client = self.client.clone();
-            let bounds = self.bounds;
-            self.creation.retain_owner(move || {
-                let owner = HolderCleanup {
-                    name,
-                    joiners: unconfirmed,
-                    creation: std::sync::Arc::new(CreationFence::default()),
-                    client,
-                    bounds,
-                };
-                owner.sweep();
-                let _ = owner.confirm_all_absent();
-            });
+            // THIS FENCE IS ALREADY IDLE. The create settled -- that is why confirmation ran at
+            // all -- so there is no future ticket drop here to fire a parked callback. Handing the
+            // job over therefore has to mean RUN IT, which `take_custody` does, and if it still
+            // cannot confirm absence it goes back into the slot where this fence's destruction
+            // will run it again rather than discard it.
+            self.creation.take_custody(retained_removal(
+                self.name.clone(),
+                pending.clone(),
+                self.client.clone(),
+                self.bounds,
+            ));
             eprintln!(
                 "sandbox: could not confirm {} absent within {:?} after the create settled — these \
-                 are NOT released: an owner for them is retained on this holder's fence, and the \
-                 boot reaper remains the backstop",
+                 are NOT released: an owner for them was run again on this holder's fence and is \
+                 kept there until it confirms, and the boot reaper remains the backstop",
                 pending.join(", "),
                 self.bounds.confirm
             );
@@ -3239,6 +3384,160 @@ exit 0
             "the daemon never confirmed this name absent and the owner RELEASED it anyway. A \
              container that could not be confirmed gone is one that may still be running, and \
              naming it in a log is not the same as still owning it."
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// A CREATE THAT SETTLED BEFORE CLEANUP REGISTERED still gets its container removed.
+    ///
+    /// This is the ordering the previous version lost outright: the bounded wait times out, the
+    /// last ticket drops and finds an empty slot, and only THEN does cleanup install its callback.
+    /// No later drop exists to run it, so the job sat in the slot until the fence died. The earlier
+    /// test could not catch it because it deliberately held the last ticket alive across
+    /// registration — the one ordering in which the bug cannot occur.
+    ///
+    /// What is asserted is the CONTAINER, not the slot: the presence marker the stand-in answers
+    /// `inspect` from is gone, and the removal is in the daemon's own log.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn a_create_that_settled_before_cleanup_registered_is_still_removed() {
+        let work = stand_in_work_dir("settle-before-register");
+        let script = stand_in_docker(&work, "");
+        std::fs::write(work.join("present-holder-raced"), "").expect("presence marker");
+        let fence = std::sync::Arc::new(CreationFence::default());
+
+        // The create ENDS FIRST: this is the last ticket, and it drops while the slot is empty.
+        drop(fence.begin());
+
+        // Only now does the bounded owner hand its job over — to a fence with nothing left in
+        // flight that could ever fire it.
+        fence.take_custody(retained_removal(
+            "holder-raced".to_owned(),
+            Vec::new(),
+            DockerCli::stand_in(&script),
+            quick_bounds(),
+        ));
+
+        assert!(
+            !work.join("present-holder-raced").exists(),
+            "the create settled BEFORE cleanup registered, nothing ever ran the handed-over job, \
+             and the container is still there. A registration that lands after the last ticket \
+             drop has to run the job, not park it where no event can reach it."
+        );
+        let removals = std::fs::read_to_string(work.join("rm.log")).unwrap_or_default();
+        assert!(
+            removals.contains("holder-raced"),
+            "no removal was ever issued for a job handed to an already-settled fence: {removals:?}"
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// THE LAST `Arc` TO THE FENCE GOING AWAY RUNS THE JOB — it does not discard it.
+    ///
+    /// The retained job is a `FnOnce`, and a `FnOnce` that is merely dropped does nothing at all.
+    /// The closure deliberately keeps no `Arc` back to its own fence (that would be a cycle, and
+    /// the fence would never be destroyed at all), so nothing held the slot alive: once the holder
+    /// and every ticket were gone, destruction threw the cleanup away in silence — the one outcome
+    /// downstream cannot tell apart from never having owned the container.
+    ///
+    /// The container is what is inspected, after every owner the test holds is gone.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn cleanup_survives_the_loss_of_every_arc_to_the_fence_and_still_removes() {
+        let work = stand_in_work_dir("last-arc");
+        let script = stand_in_docker(&work, "");
+        std::fs::write(work.join("present-holder-lastarc"), "").expect("presence marker");
+        // Removal FAILS at first, so the job cannot discharge and stays owed in the slot — the only
+        // state in which a fence can be destroyed while still holding cleanup.
+        std::fs::write(work.join("rmfail-holder-lastarc"), "").expect("rm failure marker");
+        let fence = std::sync::Arc::new(CreationFence::default());
+
+        let cleanup = HolderCleanup {
+            name: "holder-lastarc".to_owned(),
+            joiners: Vec::new(),
+            creation: std::sync::Arc::clone(&fence),
+            client: DockerCli::stand_in(&script),
+            bounds: quick_bounds(),
+        };
+        cleanup.own_until_settled_or_confirmed();
+        assert!(
+            work.join("present-holder-lastarc").exists(),
+            "the fixture removed the container while removals were supposed to fail, so this test \
+             proved nothing about destruction"
+        );
+
+        // The daemon stops refusing: from here a removal would genuinely succeed.
+        std::fs::remove_file(work.join("rmfail-holder-lastarc")).expect("clear the rm failure");
+        // EVERY other owner is gone — the cleanup consumed itself — so this is the last `Arc`.
+        assert_eq!(
+            std::sync::Arc::strong_count(&fence),
+            1,
+            "this test is only meaningful while it holds the LAST Arc to the fence"
+        );
+        drop(fence);
+
+        assert!(
+            !work.join("present-holder-lastarc").exists(),
+            "the last Arc to the fence was dropped while it still held cleanup, and the job went \
+             with it: the container is STILL PRESENT. Destruction is the final moment this process \
+             can act on a container it owns, so it has to act rather than drop a live obligation."
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// A NAME THAT FAILED CONFIRMATION IS DISCHARGED LATER, BY THE OWNER THAT KEPT IT.
+    ///
+    /// Not "the slot is occupied" — that is the code's opinion of itself, and it reads the same
+    /// whether the owner is alive or inert. The claim under test is that the retained owner is
+    /// LIVE: when the container genuinely goes away later, this owner is what notices, and it stops
+    /// owing only then. Nothing notifies it; it has to look.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn a_name_that_failed_confirmation_is_discharged_by_its_owner_on_the_later_real_removal() {
+        let work = stand_in_work_dir("confirm-later");
+        let script = stand_in_docker(&work, "");
+        std::fs::write(work.join("present-holder-later"), "").expect("presence marker");
+        std::fs::write(work.join("rmfail-holder-later"), "").expect("rm failure marker");
+        let fence = std::sync::Arc::new(CreationFence::default());
+
+        let cleanup = HolderCleanup {
+            name: "holder-later".to_owned(),
+            joiners: Vec::new(),
+            creation: std::sync::Arc::clone(&fence),
+            client: DockerCli::stand_in(&script),
+            bounds: quick_bounds(),
+        };
+        cleanup.own_until_settled_or_confirmed();
+        let looked_before = std::fs::read_to_string(work.join("events.log"))
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert!(
+            work.join("present-holder-later").exists(),
+            "the fixture confirmed the name absent after all, so nothing was left owed"
+        );
+
+        // LATER, the container genuinely goes away: the daemon finally reaps what those failed
+        // removals were about, and removals start working again.
+        std::fs::remove_file(work.join("present-holder-later")).expect("the container goes away");
+        std::fs::remove_file(work.join("rmfail-holder-later")).expect("removals work again");
+
+        // A later create settles on this holder's fence — the event the owner was kept for.
+        drop(fence.begin());
+
+        let looked_after = std::fs::read_to_string(work.join("events.log"))
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert!(
+            looked_after > looked_before,
+            "the retained owner never ran again when a later create settled: it was not a live \
+             owner, only a flag recording that something had once gone wrong"
+        );
+        assert!(
+            !fence.holds_retained_owner(),
+            "the name is genuinely absent now and its owner did look, yet the job is still owed — \
+             an owner that cannot discharge on the real removal never ends"
         );
         let _ = std::fs::remove_dir_all(&work);
     }
