@@ -57,6 +57,24 @@ fn fixture(dir: &Path, body: &str) -> PathBuf {
 
 const HELLO: &str = r#"printf '{"t":"Hello","version":1,"argv":[],"env":{}}\n'"#;
 
+/// What the CHILD is allowed for coming up, kept OUT of the budget whose bound is being measured.
+///
+/// The single 101 in gate-final.log was here. The deadline these tests arm has to cover the
+/// neutralize, the spawn, AND a /bin/sh reaching its first line — and that first line is where the
+/// fixture records its pid. Lose that race and the parent kills a child that has written nothing,
+/// so the closing `read_to_string(&pidfile)` fails with ENOENT: a failed PREMISE, reported as if it
+/// were a failed bound.
+///
+/// Measured on this machine, at this head: idle, the test still passes with the budget cut to
+/// 250ms, so the headroom at 1500ms is roughly 1350ms — which is why an ordinary busy CPU never
+/// showed it. Under the condition the gate actually creates, the workspace's own forty test
+/// binaries running in parallel, the window is lost 15 times out of 15.
+///
+/// The fix is neither a longer budget nor a retry. Startup gets its own named allowance, and every
+/// bound below is stated relative to the DEADLINE, so what is asserted is unchanged in strength:
+/// not before it, and within REAP_BOUND after it.
+const CHILD_STARTUP: Duration = Duration::from_secs(10);
+
 /// The object every delivery in this file is gated on. A child may report THIS oid and no other.
 const GATED_OID: &str = "0123456789012345678901234567890123456789";
 
@@ -95,9 +113,9 @@ async fn a_local_phase_that_refuses_to_stop_is_ended_at_the_deadline_and_its_exi
     // which is what makes the production number a claim about mechanism rather than about luck.
     let budget = Duration::from_millis(1_500);
     let released = Arc::new(AtomicBool::new(false));
-    let (control, turn) = delivery_turn(Token(Arc::clone(&released)), Instant::now() + budget);
+    let deadline = Instant::now() + CHILD_STARTUP + budget;
+    let (control, turn) = delivery_turn(Token(Arc::clone(&released)), deadline);
 
-    let started = Instant::now();
     let outcome = neutralize_then_push_in_child_off_runtime(
         program,
         dir.join("workdir"),
@@ -109,7 +127,7 @@ async fn a_local_phase_that_refuses_to_stop_is_ended_at_the_deadline_and_its_exi
         turn,
     )
     .await;
-    let elapsed = started.elapsed();
+    let returned = Instant::now();
 
     let error = match outcome {
         Err(SellerGitError::Cancelled(error)) => error,
@@ -120,16 +138,19 @@ async fn a_local_phase_that_refuses_to_stop_is_ended_at_the_deadline_and_its_exi
         "the refusal must say the child was killed AND that its exit was confirmed: {error}"
     );
 
-    // THE BOUND, MEASURED. Not "it returned eventually": it waited its whole budget (so the kill is
-    // the deadline's doing, not an early giveup) and returned inside budget + REAP_BOUND.
+    // THE BOUND, MEASURED — against the DEADLINE, not against the call. Not "it returned
+    // eventually": it waited until its deadline (so the kill is the deadline's doing, not an early
+    // giveup) and returned within REAP_BOUND of it. Startup happens before the deadline and is
+    // deliberately not part of what is bounded here.
     assert!(
-        elapsed >= budget,
-        "returned before the deadline it was given: {elapsed:?} < {budget:?}"
+        returned >= deadline,
+        "returned {:?} before the deadline it was given",
+        deadline - returned
     );
     assert!(
-        elapsed < budget + REAP_BOUND,
-        "the delivery turn was held for {elapsed:?}, past its own bound of {:?}",
-        budget + REAP_BOUND
+        returned.saturating_duration_since(deadline) < REAP_BOUND,
+        "the delivery turn was held for {:?} past its deadline, beyond REAP_BOUND of {REAP_BOUND:?}",
+        returned.saturating_duration_since(deadline)
     );
 
     // AND THE CHILD IS ACTUALLY GONE. A bound on the parent's patience is not a bound on the work;
@@ -471,9 +492,11 @@ async fn a_signer_whose_reply_never_comes_cannot_stop_the_deadline_from_landing(
 
     let budget = Duration::from_millis(1_500);
     let released = Arc::new(AtomicBool::new(false));
-    let (control, turn) = delivery_turn(Token(Arc::clone(&released)), Instant::now() + budget);
+    // Same startup allowance, same reason: this gate also closes by reading a pidfile the child can
+    // only have written after it came up.
+    let deadline = Instant::now() + CHILD_STARTUP + budget;
+    let (control, turn) = delivery_turn(Token(Arc::clone(&released)), deadline);
 
-    let started = Instant::now();
     let outcome = neutralize_then_push_in_child_off_runtime(
         program,
         dir.join("workdir"),
@@ -485,7 +508,7 @@ async fn a_signer_whose_reply_never_comes_cannot_stop_the_deadline_from_landing(
         turn,
     )
     .await;
-    let elapsed = started.elapsed();
+    let returned = Instant::now();
 
     let error = match outcome {
         Err(SellerGitError::Cancelled(error)) => error,
@@ -500,8 +523,9 @@ async fn a_signer_whose_reply_never_comes_cannot_stop_the_deadline_from_landing(
         "the gate is vacuous unless the child actually reached the mint request"
     );
     assert!(
-        elapsed >= budget && elapsed < budget + REAP_BOUND,
-        "the deadline must land while the signer is still holding its reply: {elapsed:?}"
+        returned >= deadline && returned.saturating_duration_since(deadline) < REAP_BOUND,
+        "the deadline must land while the signer is still holding its reply: {:?} past it",
+        returned.saturating_duration_since(deadline)
     );
     let pid: i32 = std::fs::read_to_string(&pidfile)
         .expect("pidfile")
