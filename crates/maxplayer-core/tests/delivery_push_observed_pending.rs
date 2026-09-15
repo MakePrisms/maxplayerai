@@ -138,16 +138,19 @@ async fn a_second_delivery_is_observed_pending_until_the_held_local_phase_is_kil
 
     // Let delivery one take the lock and get its child wedged before delivery two asks for it, so
     // that "pending" means "queued behind a held turn" and not "raced and won".
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let wedged_pid: i32 = std::fs::read_to_string(&pidfile)
-        .expect("the first delivery's child must have started and recorded its pid")
-        .trim()
-        .parse()
-        .expect("pid");
-    assert!(
-        alive(wedged_pid),
-        "the first delivery's local phase must actually be running before we queue a second"
-    );
+    //
+    // WAITED FOR, not slept at. A fixed sleep here reads as a setup convenience and is really an
+    // assumption about how fast this machine forks under load: the whole workspace suite runs these
+    // binaries in parallel, and a 300ms sleep failed there while passing alone. The condition is
+    // unchanged - the first child is RUNNING before a second delivery is queued - it is just now
+    // established by observing it rather than by guessing a duration. The bound still fails the
+    // test if the child never starts.
+    let wedged_pid = wait_for_running_child(&pidfile, Duration::from_secs(20))
+        .await
+        .expect(
+            "the first delivery's child must have started and recorded its pid before a second \
+             delivery is queued behind it",
+        );
 
     // OBSERVED PENDING — the real one, and the reason this file was rewritten. The second delivery
     // is no longer spawned onto another task and watched through a marker the test itself wrote
@@ -337,4 +340,29 @@ async fn a_second_delivery_is_observed_pending_behind_a_first_that_succeeds() {
         "second-delivery-oid"
     );
     assert_eq!(state.load(Ordering::SeqCst), ACQUIRED);
+}
+
+
+/// Wait until `pidfile` names a process that is actually alive, or give up at `bound`.
+///
+/// Used where a test needs a child to be RUNNING before it does the next thing. Polling the real
+/// condition keeps the gate honest under load — a machine that forks slowly makes this take longer,
+/// not make it pass early — while a timeout keeps a child that never starts a failure rather than a
+/// hang.
+async fn wait_for_running_child(pidfile: &std::path::Path, bound: Duration) -> Option<i32> {
+    let deadline = Instant::now() + bound;
+    loop {
+        if let Some(pid) = std::fs::read_to_string(pidfile)
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok())
+        {
+            if alive(pid) {
+                return Some(pid);
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
