@@ -634,3 +634,105 @@ async fn a_child_that_reports_an_oid_nobody_gated_is_a_protocol_fault() {
         "a protocol fault whose child was reaped must still hand the turn back"
     );
 }
+
+/// THE PERSISTENT CASE, restored.
+///
+/// The gate above deliberately lets authority come back after one refusal, so that it measures ONE
+/// thing: a token minted for a delivery whose owner has gone does not cross the pipe. That
+/// isolation cost something real. The test it replaced kept authority revoked, and so also proved
+/// what happens NEXT — and "next" is the whole of the seat's safety: an owner that has gone away
+/// stays gone, and the delivery ends, rather than the child being told no about one leg and left to
+/// carry on until its deadline.
+///
+/// Both are kept, because they are different claims and neither implies the other. Here authority
+/// ends when the mint returns and never comes back, and three things must follow: the minted token
+/// is withheld, the delivery ends as a REVOCATION (not as a deadline breach, and not successfully),
+/// and it ends promptly rather than at the deadline. The child is a process that will not stop on
+/// its own, so "the delivery ended" is checked against the process actually being gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn authority_that_ends_at_the_mint_and_stays_ended_stops_the_delivery_not_just_the_leg() {
+    let dir = scratch("late-revoke-persistent");
+    let answer = dir.join("answer.json");
+    let pidfile = dir.join("child.pid");
+    let program = fixture(
+        &dir,
+        &format!(
+            "trap '' TERM\necho $$ > {}\n{HELLO}\nIFS= read -r _request\nprintf '{{\"t\":\"Mint\",\"destination\":\"https://relay.example.invalid/seller.git\"}}\\n'\nIFS= read -r line\nprintf '%s' \"$line\" > {}\nwhile :; do sleep 0.05; done\n",
+            pidfile.display(),
+            answer.display()
+        ),
+    );
+
+    // Ends when the mint returns, and STAYS ended. No count, no one-shot: the owner is gone.
+    let has_minted = Arc::new(AtomicBool::new(false));
+    let authority: AuthorityCheck = {
+        let has_minted = Arc::clone(&has_minted);
+        Arc::new(move || {
+            if has_minted.load(Ordering::SeqCst) {
+                Err("this delivery was cancelled".to_owned())
+            } else {
+                Ok(())
+            }
+        })
+    };
+    let mint: AuthMinter = {
+        let has_minted = Arc::clone(&has_minted);
+        Arc::new(move |_: &str| {
+            has_minted.store(true, Ordering::SeqCst);
+            Ok("Nostr SENTINEL-HEADER-VALUE".to_owned())
+        })
+    };
+
+    let budget = Duration::from_secs(20);
+    let (control, turn) = delivery_turn((), Instant::now() + budget);
+    let started = Instant::now();
+    let outcome = neutralize_then_push_in_child_off_runtime(
+        program,
+        dir.join("workdir"),
+        "https://relay.example.invalid/seller.git".to_owned(),
+        "delivery/job".to_owned(),
+        GATED_OID.to_owned(),
+        Some(mint),
+        Some(authority),
+        turn,
+    )
+    .await;
+    let took = started.elapsed();
+    control.end();
+
+    let why = match &outcome {
+        Ok(oid) => panic!("a revoked delivery reported success: {oid}"),
+        Err(error) => error.to_string(),
+    };
+    // WITHHELD. The header the minter produced never reached the child.
+    let handed = std::fs::read_to_string(&answer).expect("the child recorded the parent's answer");
+    assert!(
+        !handed.contains("SENTINEL-HEADER-VALUE"),
+        "a token minted for a revoked delivery crossed the pipe: {handed}"
+    );
+    assert!(
+        handed.contains("refused") && handed.contains("cancelled"),
+        "the child must be told the leg was refused, and why: {handed}"
+    );
+    // ENDED, AND ENDED AS A REVOCATION. This is the half the narrowed test stopped proving.
+    assert!(
+        why.contains("revoked"),
+        "an owner that stayed away must end the delivery as a revocation, not as something else: \
+         {why}"
+    );
+    assert!(
+        took < budget / 2,
+        "the delivery ran on after its owner went away and was ended by its deadline instead: \
+         {took:?}"
+    );
+    // And the child is gone, not merely told no.
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .expect("the child must have recorded its pid")
+        .trim()
+        .parse()
+        .expect("pid");
+    assert!(
+        !alive(pid),
+        "the revoked delivery's child {pid} is still running"
+    );
+}

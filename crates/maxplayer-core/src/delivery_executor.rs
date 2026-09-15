@@ -1335,10 +1335,14 @@ fn drive(
                 )));
             }
             Err(RecvTimeoutError::Timeout) => {
-                // A tick, not the clock running out: re-ask the owner. This is the only place the
-                // parent acts on a revocation that arrives while the child is working — including
-                // during the interval between answering the child's authority check and the child
-                // reading that answer, which is the interval this parent cannot otherwise see into.
+                // A tick, not the clock running out: re-ask the owner. This covers the interval
+                // between answering the child's authority check and the child reading that answer,
+                // which is the interval this parent cannot otherwise see into.
+                //
+                // NO LONGER THE ONLY PLACE, and the comment here used to say it was. That sentence
+                // described the defect: a revocation was acted on only when the child had gone
+                // quiet. The owner is now also asked on elapsed time at the top of this loop, inside
+                // an unacknowledged write, and inside a mint whose reply has not come back.
                 if poll < left {
                     if let Err(why) = authority() {
                         let reap = child.kill_and_reap()?;
