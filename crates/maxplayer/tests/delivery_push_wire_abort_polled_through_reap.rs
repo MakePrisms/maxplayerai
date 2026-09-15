@@ -54,6 +54,25 @@ use git_http_fixture::{FixtureOptions, GitHttpAuthServer, RequestGate};
 /// loaded CI host, tight enough that an overlap long enough to matter cannot hide inside it.
 const MAX_SAMPLE_GAP: Duration = Duration::from_millis(50);
 
+/// **THE ABORT-RELATIVE BOUND, AND WHY THE ABORT CASE IS WORTHLESS WITHOUT ONE.**
+///
+/// A's budget in the abort case is 60 seconds, deliberately long so the deadline cannot fire first
+/// and steal the stop under test. But that same length is what made the gate weak: a cancellation
+/// that was IGNORED ENTIRELY, with A left to die at its natural 60-second deadline kill, satisfied
+/// every assertion in this file. No-overlap held, the child was gone before B ran, the ref had not
+/// moved — all true of a delivery that simply ran its full course. The gate proved the seat came
+/// back, not that aborting is what brought it back.
+///
+/// So the stop is measured FROM THE ABORT. The terms are the product's own: one cancellation poll
+/// for the executor to notice, two reap windows for the kill and the confirmation the seat requires,
+/// and a few seconds of scheduling slack. It is far below the 60-second budget on purpose — that
+/// gap is exactly the difference between "the abort stopped it" and "the deadline did".
+fn abort_stop_bound() -> Duration {
+    maxplayer_core::delivery_executor::CANCELLATION_POLL
+        + maxplayer_core::delivery_executor::REAP_BOUND * 2
+        + Duration::from_secs(3)
+}
+
 /// Records the instant the seat's exclusion token is handed back. The turn releases ownership only
 /// once the work is recorded stopped, which for a child delivery is after `kill_and_reap` confirmed
 /// the exit — so this instant IS "A's child is gone and the seat is free", taken from the
@@ -253,6 +272,10 @@ async fn a_parked_leg_is_stopped_and_b_never_overlaps(label: &str, leg: Leg, sto
     // which is the thing that has to hold. Left at the production shape (`DELIVERY_DRAIN_BOUND`
     // scale) so the stop observed here is the delivery's own.
     let serializer_timeout = Duration::from_secs(120);
+    // Hoisted so the assertions can compare against the deadline A would have died at ANYWAY. In
+    // the abort case that instant is the gate's whole discriminator: a stop that happens at or
+    // after it is the deadline's work, not the abort's.
+    let a_deadline = Instant::now() + budget;
 
     let first = {
         let lock = Arc::clone(&lock);
@@ -260,7 +283,7 @@ async fn a_parked_leg_is_stopped_and_b_never_overlaps(label: &str, leg: Leg, sto
         let branch = branch.to_owned();
         let oid = oid.clone();
         let released_at = Arc::clone(&released_at);
-        let deadline = Instant::now() + budget;
+        let deadline = a_deadline;
         tokio::spawn(async move {
             let started = Instant::now();
             let outcome = serialized_bounded_push(
@@ -336,9 +359,12 @@ async fn a_parked_leg_is_stopped_and_b_never_overlaps(label: &str, leg: Leg, sto
 
     // The abort is issued once A is demonstrably parked on the wire — not before, or there would be
     // nothing to abort out of.
-    if stop == Stop::TaskAbort {
+    let aborted_at = if stop == Stop::TaskAbort {
         first.abort();
-    }
+        Some(Instant::now())
+    } else {
+        None
+    };
 
     // THE OBSERVED WINDOW. B is polled until it takes the seat; every poll instant is recorded, and
     // the polls do not stop while A is being killed and reaped.
@@ -411,6 +437,26 @@ async fn a_parked_leg_is_stopped_and_b_never_overlaps(label: &str, leg: Leg, sto
         released_at.saturating_duration_since(acquired_at)
     );
 
+    // **THE ABORT ACTUALLY STOPPED IT.** Only meaningful in the abort case, and there it is the
+    // assertion that makes the case a test of cancellation rather than of patience. See
+    // `abort_stop_bound`.
+    if let Some(aborted_at) = aborted_at {
+        let stopped_in = acquired_at.saturating_duration_since(aborted_at);
+        assert!(
+            stopped_in <= abort_stop_bound(),
+            "B took the seat {stopped_in:?} after A was aborted, past the {:?} this stop is \
+             allowed: a cancellation that is merely ignored until the delivery's own {budget:?} \
+             deadline kills it would look exactly like this",
+            abort_stop_bound()
+        );
+        assert!(
+            acquired_at < a_deadline,
+            "B took the seat {:?} AFTER A's own deadline had already passed, so this run does not \
+             show the abort stopping anything — the deadline would have stopped it regardless",
+            acquired_at.saturating_duration_since(a_deadline)
+        );
+    }
+
     // CONTINUOUSLY POLLED, as a measured property of this run. The floor is on the GAP and NOT on
     // the count, for a reason this run demonstrates: once the kill stopped waiting behind the
     // supervisor's synchronous work, the whole stop got short enough to fit in two polls of a
@@ -450,9 +496,17 @@ async fn a_parked_leg_is_stopped_and_b_never_overlaps(label: &str, leg: Leg, sto
     let (outcome, started, returned) = match stop {
         Stop::TaskAbort => {
             let joined = first.await;
+            // CANCELLED, not merely "not Ok". `is_err` is also satisfied by a PANIC inside the
+            // delivery task, which is a different defect wearing the same shape: it would end the
+            // task, free the seat, and pass this gate while proving nothing about cancellation.
             assert!(
-                joined.is_err(),
-                "the aborted delivery task returned normally, so nothing was aborted"
+                joined
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.is_cancelled()),
+                "the aborted delivery task did not end as CANCELLED ({joined:?}); a task that \
+                 returned normally was never aborted, and one that panicked freed the seat by \
+                 failing rather than by being cancelled"
             );
             (None, None, None)
         }
