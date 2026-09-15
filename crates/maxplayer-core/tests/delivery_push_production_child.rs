@@ -73,6 +73,44 @@ const HELLO: &str = r#"printf '{"t":"Hello","version":1,"argv":[],"env":{}}\n'"#
 /// The fix is neither a longer budget nor a retry. Startup gets its own named allowance, and every
 /// bound below is stated relative to the DEADLINE, so what is asserted is unchanged in strength:
 /// not before it, and within REAP_BOUND after it.
+/// # The residual, named (review round 3, item 4)
+///
+/// This allowance REDUCES the window; it does not close it. Measured after the change, under the
+/// same deliberately harsh condition (the workspace's forty test binaries looping in parallel,
+/// far harsher than a gate, which runs each suite once), this test still loses the race 13 times
+/// out of 15, on the same missing pidfile. Headroom went from ~1.35s to ~11.35s — about eightfold
+/// — and a gate-shaped load does not spend it, which is why the single 101 in gate-final.log has
+/// not recurred across the round-2 and round-3 gate runs. But "smaller" is not "closed", and a
+/// lost race still presents as ENOENT on the pidfile: a failed PREMISE wearing the clothes of a
+/// failed bound. It is never to be waived as a flake.
+///
+/// ## What closing it actually requires
+///
+/// The budget here has to be handed over BEFORE the child exists: `delivery_turn` takes an
+/// absolute deadline, and the executor arms the watchdog at the earliest instant a pid exists —
+/// deliberately, so that no interval exists in which a child could go wrong unwatched. Both
+/// properties are load-bearing, and together they mean the clock necessarily starts before the
+/// child does. Every remedy inside the test is therefore a guess at how long startup takes; this
+/// constant is simply a much larger guess.
+///
+/// Closing it means the work deadline starts when the child is OBSERVED READY, which is a change
+/// to the executor's arming contract, not to this test:
+///
+///   * `arm_deadline_watchdog(deadline)` becomes TWO-PHASE — a startup bound armed at spawn, and
+///     the work deadline armed on an observed readiness signal from the child.
+///   * The executor's entry points take a BUDGET plus that readiness observation rather than one
+///     absolute `Instant`, so no caller can express "deadline before the child is up".
+///   * The child protocol gains the readiness signal itself, which is a wire change: today the
+///     first thing this fixture's child does is write its pid, and there is no frame for "up".
+///
+/// ## Why it is deferred
+///
+/// Arming the work deadline later reopens precisely the window the design closes: a child that
+/// hangs BEFORE readiness would be bounded only by the new startup bound, so that bound becomes a
+/// second safety property with its own custody and its own gates. That is a product change to the
+/// mechanism this PR exists to make trustworthy, and it is outside the four items of this round —
+/// it needs its own review, not a corner of this one. Named here, with its cost stated, rather
+/// than left silent or bought off with a retry.
 const CHILD_STARTUP: Duration = Duration::from_secs(10);
 
 /// The object every delivery in this file is gated on. A child may report THIS oid and no other.
