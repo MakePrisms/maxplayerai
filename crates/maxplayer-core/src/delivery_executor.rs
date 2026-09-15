@@ -1074,6 +1074,15 @@ impl KillableChild {
         }
     }
 
+    /// Time charged against this child's [`REAP_BOUND`] budget by EVERY reaper — the supervisor's
+    /// attempts and the watchdog's alike, which is the point of keeping the total on the guard.
+    pub fn spent_reaping(&self) -> Duration {
+        self.guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .spent_reaping
+    }
+
     /// True once the kernel has reported this child's exit status — to EITHER reaper.
     pub fn is_reaped(&self) -> bool {
         self.guard
@@ -1996,6 +2005,42 @@ fn attribute_vanished_child(
 ///    an ask therefore waited until 95 ms past it. It now shares the caller's [`PollClock`], so the
 ///    first slice is only what is left of the current interval, and an ask made in here is visible
 ///    to the drive loop when the write returns.
+/// How a failed WRITE to the child should be reported, once that child has been reaped.
+///
+/// A write to a dead child fails with `EPIPE`, and making the child dead on time is precisely the
+/// deadline watchdog's job. So one broken pipe means two different things: a child that broke the
+/// protocol, and a child THIS PROCESS STOPPED. Reporting both as `Protocol` loses the distinction
+/// exactly where it matters most — at the deadline, on the path the watchdog was added to own — and
+/// tells an operator a delivery was faulty when in fact it was cancelled on schedule.
+///
+/// The test `a_parent_write_to_a_child_that_never_reads_is_bounded_by_the_deadline` asserts the
+/// cause, and caught this: it saw `Protocol(broken pipe)` where the deadline had done its work.
+///
+/// CUSTODY IS UNCHANGED BY THIS CALL. Both causes release, and the reap that precedes it already
+/// decided the question: an unreaped or unwaitable child returns through `?` as `Unreaped` or
+/// `WaitFailed` and RETAINS, before this is ever reached. This corrects the name of an outcome, and
+/// nothing about who may take the seat next.
+///
+/// Attribution is on the watchdog's own flag rather than on "the deadline has passed". A clock
+/// reading would claim every late failure as a stop, including a genuine protocol fault that
+/// happened to land after the deadline; the flag is set by the thread that actually issued the
+/// kill, under the guard, and the reap above cannot return until that thread has released it.
+fn write_failure_cause(
+    watchdog_fired: bool,
+    deadline: Instant,
+    what: &str,
+    why: &str,
+    reap: Duration,
+) -> ExecutorError {
+    if watchdog_fired {
+        return ExecutorError::Killed {
+            after: Instant::now().saturating_duration_since(deadline),
+            reap,
+        };
+    }
+    ExecutorError::Protocol(format!("{what}: {why}"))
+}
+
 fn stalled_write(
     writer: &mut Writer,
     frame: &ToChild,
@@ -2008,8 +2053,9 @@ fn stalled_write(
     if let Err(WriteStall::Failed(why)) = writer.send_frame(frame) {
         // Reap BEFORE reporting. A write error used to return straight out of `drive` past a
         // still-live child, leaving the kill to a `Drop` whose failure nobody could return.
-        child.kill_and_reap()?;
-        return Err(ExecutorError::Protocol(format!("{what}: {why}")));
+        let reap = child.kill_and_reap()?;
+        let fired = child.watchdog_fired();
+        return Err(write_failure_cause(fired, deadline, what, &why, reap));
     }
     loop {
         let now = Instant::now();
@@ -2039,8 +2085,9 @@ fn stalled_write(
                 return Err(ExecutorError::Killed { after, reap });
             }
             Err(WriteStall::Failed(why)) => {
-                child.kill_and_reap()?;
-                return Err(ExecutorError::Protocol(format!("{what}: {why}")));
+                let reap = child.kill_and_reap()?;
+                let fired = child.watchdog_fired();
+                return Err(write_failure_cause(fired, deadline, what, &why, reap));
             }
         }
     }
@@ -2261,6 +2308,69 @@ pub fn minted_answer(header: Option<String>, refused: Option<String>) -> Result<
 mod tests {
     use super::*;
 
+    /// **A WRITE THAT FAILED BECAUSE WE KILLED THE CHILD IS A STOP, NOT A PROTOCOL FAULT.**
+    ///
+    /// Every write to a child this process has just killed fails with `EPIPE`, so the broken pipe
+    /// carries no information about whose fault it was. The deadline watchdog exists to make the
+    /// child go away on time; reporting its success as a protocol error tells an operator the
+    /// delivery was malformed when in fact it was cancelled exactly as designed, and it is the one
+    /// cause they would act on differently.
+    ///
+    /// Tested here rather than only through a child because the end-to-end path is a genuine race:
+    /// at the deadline the drive loop's slice expires and the watchdog's kill lands at almost the
+    /// same instant, so which of `TimedOut` and `Failed` wins is not something a test can pin.
+    /// `a_parent_write_to_a_child_that_never_reads_is_bounded_by_the_deadline` exercises the real
+    /// path and DID catch this, intermittently; this pins the rule it was intermittently catching.
+    #[test]
+    fn a_write_that_failed_after_the_watchdog_killed_the_child_is_reported_as_a_kill() {
+        let deadline = Instant::now() - Duration::from_millis(10);
+        let cause = write_failure_cause(
+            true,
+            deadline,
+            "writing the push request",
+            "Broken pipe (os error 32)",
+            Duration::from_millis(3),
+        );
+        match cause {
+            ExecutorError::Killed { reap, .. } => {
+                assert_eq!(reap, Duration::from_millis(3), "the reap must be carried through");
+            }
+            other => panic!(
+                "a write that failed after this process killed the child must be reported as a \
+                 deadline kill, not as {other:?}"
+            ),
+        }
+    }
+
+    /// The other half, so the rule above cannot be satisfied by calling EVERY write failure a kill.
+    ///
+    /// With no kill issued by this process, a broken pipe really is the child's doing and keeps its
+    /// protocol name — including the context and the underlying reason, which is all an operator
+    /// has to work from.
+    #[test]
+    fn a_write_that_failed_on_its_own_keeps_its_protocol_cause() {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let cause = write_failure_cause(
+            false,
+            deadline,
+            "writing the push request",
+            "Broken pipe (os error 32)",
+            Duration::from_millis(3),
+        );
+        match cause {
+            ExecutorError::Protocol(why) => {
+                assert!(
+                    why.contains("writing the push request") && why.contains("Broken pipe"),
+                    "the operator loses the cause if the context or the reason is dropped: {why}"
+                );
+            }
+            other => panic!(
+                "a write this process did not cause must keep its protocol cause, not become \
+                 {other:?}"
+            ),
+        }
+    }
+
     /// AN OVER-CAP FRAME IS ABANDONED MID-ENCODE, not built in full and then measured.
     ///
     /// `MAX_FRAME_BYTES` used to be checked against `line.len()` after `serde_json::to_string` had
@@ -2380,9 +2490,9 @@ mod tests {
         );
         assert!(child.is_reaped(), "the child was not confirmed gone");
         assert!(
-            child.spent_reaping <= REAP_BOUND,
+            child.spent_reaping() <= REAP_BOUND,
             "the child was charged {:?} against a {REAP_BOUND:?} window",
-            child.spent_reaping
+            child.spent_reaping()
         );
         // A second attempt on a reaped child costs nothing at all.
         assert_eq!(
