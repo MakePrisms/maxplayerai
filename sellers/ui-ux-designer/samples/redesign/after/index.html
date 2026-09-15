@@ -1,0 +1,228 @@
+<!doctype html>
+<!-- SAMPLE "AFTER": the same invented product, redesigned against the Plainsong identity.
+     Colors, spacing, type and motion all come from /design-identity/tokens.css, which is GENERATED
+     from tokens.json — no hex literal is typed into this file. Rationale: ../RATIONALE.md -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Invoices — Meridian</title>
+    <link rel="stylesheet" href="/design-identity/tokens.css" />
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: var(--font-sans);
+        font-size: var(--text-base);
+        line-height: var(--leading-base);
+        color: var(--color-ink-900);
+        background: var(--color-paper-100);
+      }
+      .skip {
+        position: absolute; left: var(--space-2); top: calc(-1 * var(--space-16));
+        background: var(--color-paper-000); color: var(--color-accent-700);
+        padding: var(--space-2) var(--space-4); border-radius: var(--radius-md);
+        transition: top var(--duration-fast) var(--ease-standard);
+      }
+      .skip:focus { top: var(--space-2); }
+      :where(a, button, input, [tabindex]):focus-visible {
+        outline: var(--focus-ring-width) solid var(--color-focus-ring);
+        outline-offset: var(--focus-ring-offset);
+      }
+      header { background: var(--color-paper-000); border-bottom: 1px solid var(--color-paper-300); }
+      .bar {
+        max-width: 1120px; margin: 0 auto; display: flex; align-items: center;
+        gap: var(--space-6); padding: var(--space-3) var(--space-6);
+      }
+      .brand { font-weight: var(--weight-semibold); letter-spacing: var(--tracking-lg); }
+      nav ul { display: flex; gap: var(--space-1); list-style: none; margin: 0; padding: 0; flex-wrap: wrap; }
+      nav a {
+        display: inline-flex; align-items: center; min-height: var(--target-recommended);
+        padding: var(--space-2) var(--space-3); color: var(--color-ink-700);
+        text-decoration: none; border-radius: var(--radius-md); font-size: var(--text-sm);
+        font-weight: var(--weight-medium);
+        transition: background var(--duration-fast) var(--ease-standard);
+      }
+      nav a:hover { background: var(--color-paper-200); }
+      nav a[aria-current="page"] { color: var(--color-accent-700); background: var(--color-accent-100); }
+      main { max-width: 1120px; margin: 0 auto; padding: var(--space-8) var(--space-6) var(--space-16); }
+      h1 { font-size: var(--text-3xl); line-height: var(--leading-3xl); letter-spacing: var(--tracking-3xl);
+           font-weight: var(--weight-semibold); margin: 0 0 var(--space-2); }
+      h2 { font-size: var(--text-xl); line-height: var(--leading-xl); letter-spacing: var(--tracking-xl);
+           font-weight: var(--weight-semibold); margin: var(--space-12) 0 var(--space-4); }
+      .lede { font-size: var(--text-lg); line-height: var(--leading-lg); color: var(--color-ink-700);
+              max-width: var(--measure); margin: 0 0 var(--space-6); }
+      .alert {
+        display: flex; gap: var(--space-3); align-items: flex-start;
+        background: var(--color-paper-000); border: 1px solid var(--color-ink-300);
+        border-left: var(--space-1) solid var(--color-warn-600);
+        border-radius: var(--radius-lg); padding: var(--space-4); margin-bottom: var(--space-8);
+      }
+      .alert svg { flex: none; margin-top: 2px; }
+      .alert p { margin: 0; color: var(--color-ink-900); }
+      .alert a { color: var(--color-accent-700); }
+      .card { background: var(--color-paper-000); border: 1px solid var(--color-paper-300);
+              border-radius: var(--radius-lg); box-shadow: var(--shadow-sm); padding: var(--space-6); }
+      .filters { display: flex; flex-wrap: wrap; gap: var(--space-4); align-items: flex-start; }
+      .field { display: grid; grid-template-rows: auto auto auto; gap: var(--space-1); }
+      /* Buttons sit on the input row, offset by exactly one label line + the field gap.
+         Derived from tokens, not eyeballed: label is --text-sm at --leading-sm. */
+      .filters .btn { margin-top: calc(var(--text-sm) * var(--leading-sm) + var(--space-1)); }
+      label { font-size: var(--text-sm); font-weight: var(--weight-medium); color: var(--color-ink-700); }
+      input {
+        min-height: var(--target-recommended); padding: var(--space-2) var(--space-3);
+        font: inherit; font-size: var(--text-base); color: var(--color-ink-900);
+        background: var(--color-paper-000);
+        border: 1px solid var(--color-ink-300); border-radius: var(--radius-md); width: 15rem; max-width: 100%;
+      }
+      .hint { font-size: var(--text-sm); color: var(--color-ink-600); }
+      .btn {
+        display: inline-flex; align-items: center; justify-content: center; gap: var(--space-2);
+        min-height: var(--target-recommended); min-width: var(--target-recommended);
+        padding: var(--space-2) var(--space-4); border-radius: var(--radius-md);
+        font: inherit; font-size: var(--text-base); font-weight: var(--weight-medium);
+        cursor: pointer; border: 1px solid transparent;
+        transition: background var(--duration-fast) var(--ease-standard),
+                    border-color var(--duration-fast) var(--ease-standard);
+      }
+      .btn-primary { background: var(--color-accent-600); color: var(--color-paper-000); }
+      .btn-primary:hover { background: var(--color-accent-700); }
+      .btn-secondary { background: var(--color-paper-000); color: var(--color-ink-900);
+                       border-color: var(--color-ink-300); }
+      .btn-secondary:hover { background: var(--color-paper-200); }
+      .btn[disabled] { opacity: 1; color: var(--color-ink-600); background: var(--color-paper-200);
+                       border-color: var(--color-paper-300); cursor: not-allowed; }
+      .table-wrap { overflow-x: auto; }
+      table { border-collapse: collapse; width: 100%; min-width: 34rem; }
+      caption { text-align: left; font-size: var(--text-sm); color: var(--color-ink-600);
+                padding-bottom: var(--space-3); }
+      th, td { text-align: left; padding: var(--space-3); border-bottom: 1px solid var(--color-paper-300);
+               font-size: var(--text-base); }
+      th { font-size: var(--text-sm); font-weight: var(--weight-semibold); color: var(--color-ink-700); }
+      td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+      .status { display: inline-flex; align-items: center; gap: var(--space-2);
+                font-size: var(--text-sm); font-weight: var(--weight-medium); }
+      .status-paid { color: var(--color-success-700); }
+      .status-late { color: var(--color-danger-700); }
+      .plan { display: flex; flex-wrap: wrap; gap: var(--space-4); align-items: center;
+              justify-content: space-between; }
+      .plan p { margin: 0 0 var(--space-1); max-width: var(--measure); }
+      footer { border-top: 1px solid var(--color-paper-300); margin-top: var(--space-16);
+               padding-top: var(--space-6); font-size: var(--text-sm); color: var(--color-ink-600); }
+      footer a { color: var(--color-accent-700); }
+      @media (max-width: 480px) {
+        .bar { flex-direction: column; align-items: flex-start; gap: var(--space-2); }
+        main { padding: var(--space-6) var(--space-4) var(--space-12); }
+        h1 { font-size: var(--text-2xl); }
+        input { width: 100%; }
+        .field { width: 100%; }
+      }
+    </style>
+  </head>
+  <body>
+    <a class="skip" href="#main">Skip to main content</a>
+
+    <header>
+      <div class="bar">
+        <span class="brand">Meridian</span>
+        <nav aria-label="Primary">
+          <ul>
+            <li><a href="#">Dashboard</a></li>
+            <li><a href="#" aria-current="page">Invoices</a></li>
+            <li><a href="#">Clients</a></li>
+            <li><a href="#">Settings</a></li>
+          </ul>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main">
+      <h1>Invoices</h1>
+      <p class="lede">
+        Filter, export and chase every invoice from one place. Reminders go out automatically the
+        morning after a due date passes — <a href="#">see how reminders are scheduled</a>.
+      </p>
+
+      <div class="alert" role="status">
+        <svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+          <path fill="currentColor" d="M10 1.6 19 18H1L10 1.6Zm0 5.4a1 1 0 0 0-1 1v4a1 1 0 1 0 2 0v-4a1 1 0 0 0-1-1Zm0 8.2a1.15 1.15 0 1 0 0 2.3 1.15 1.15 0 0 0 0-2.3Z"/>
+        </svg>
+        <p><strong>2 invoices are overdue.</strong> MRD-1040 and MRD-1039 passed their due date. <a href="#">Review overdue invoices</a>.</p>
+      </div>
+
+      <h2>Find an invoice</h2>
+      <div class="card">
+        <form class="filters">
+          <div class="field">
+            <label for="client">Client name</label>
+            <input id="client" name="client" type="text" autocomplete="off" />
+          </div>
+          <div class="field">
+            <label for="amount">Amount</label>
+            <input id="amount" name="amount" type="text" inputmode="decimal" aria-describedby="amount-hint" />
+            <span class="hint" id="amount-hint">Exact amount, or a minimum like 500</span>
+          </div>
+          <button class="btn btn-primary" type="submit">Search invoices</button>
+          <button class="btn btn-secondary" type="reset">Reset filters</button>
+        </form>
+      </div>
+
+      <h2>Recent invoices</h2>
+      <div class="card">
+        <div class="table-wrap">
+          <table>
+            <caption>Your four most recent invoices, newest first.</caption>
+            <thead>
+              <tr>
+                <th scope="col">Invoice</th>
+                <th scope="col">Client</th>
+                <th scope="col" class="num">Amount</th>
+                <th scope="col">Status</th>
+                <th scope="col">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <th scope="row">MRD-1041</th><td>Halden Works</td><td class="num">$2,400.00</td>
+                <td><span class="status status-paid">&#10003; Paid</span></td>
+                <td><button class="btn btn-secondary" type="button">Send receipt for MRD-1041</button></td>
+              </tr>
+              <tr>
+                <th scope="row">MRD-1040</th><td>Corbin &amp; Vale</td><td class="num">$860.00</td>
+                <td><span class="status status-late">&#9888; Overdue</span></td>
+                <td><button class="btn btn-primary" type="button">Send reminder for MRD-1040</button></td>
+              </tr>
+              <tr>
+                <th scope="row">MRD-1039</th><td>Okonkwo Studio</td><td class="num">$5,125.00</td>
+                <td><span class="status status-late">&#9888; Overdue</span></td>
+                <td><button class="btn btn-primary" type="button">Send reminder for MRD-1039</button></td>
+              </tr>
+              <tr>
+                <th scope="row">MRD-1038</th><td>Pine Street Co-op</td><td class="num">$310.00</td>
+                <td><span class="status status-paid">&#10003; Paid</span></td>
+                <td><button class="btn btn-secondary" type="button">Send receipt for MRD-1038</button></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <h2>Your plan</h2>
+      <div class="card plan">
+        <div>
+          <p><strong>Starter plan.</strong> 10 invoices a month, manual reminders.</p>
+          <p class="hint">Upgrade for unlimited invoices and automatic reminders.</p>
+        </div>
+        <div>
+          <button class="btn btn-primary" type="button">Upgrade plan</button>
+          <button class="btn btn-secondary" type="button" disabled aria-describedby="cancel-why">Cancel plan</button>
+          <p class="hint" id="cancel-why">Cancelling is available once your current billing period ends.</p>
+        </div>
+      </div>
+    </main>
+
+    <footer>
+      <p>&copy; 2026 Meridian. <a href="#">Terms</a> &middot; <a href="#">Privacy</a></p>
+    </footer>
+  </body>
+</html>

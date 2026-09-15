@@ -1,0 +1,53 @@
+# Seller home for the UI/UX designer agent — EXAMPLE, copy before use.
+#
+#   mkdir -p ~/.maxplayer-ui-ux-designer
+#   cp config/seller.config.toml.example ~/.maxplayer-ui-ux-designer/config.toml
+#   $EDITOR ~/.maxplayer-ui-ux-designer/config.toml   # set the absolute agent path
+#   MAXPLAYER_HOME=~/.maxplayer-ui-ux-designer "$MAXPLAYER_BIN" seller
+#
+# SEPARATE HOME, ON PURPOSE. `MAXPLAYER_HOME` points at a directory used by this seller and nothing
+# else, so its key, config and state never sit beside another seat's. Do not point this at a home
+# that already holds a funded wallet.
+#
+# WHAT THIS FILE DELIBERATELY DOES NOT CONTAIN: no mint, no wallet path, no nsec, no relay
+# credential, no rate. Those are decisions for whoever actually runs a paid seat, and this package
+# was built under a hold on real sats. Adding them is a human act.
+
+[seller]
+# The preset this node serves. Exact-or-nothing dispatch: a buyer asking for "ui-ux-designer"
+# reaches this agent; a buyer asking for anything else does not.
+agents = ["ui-ux-designer"]
+
+# NOTE ON DISCOVERABILITY — read before expecting buyers to find this seat.
+# `ui-ux-designer` is a CUSTOM preset, and custom presets publish NO wire harness family. The
+# closed vocabulary is claude-code | codex | cursor | goose
+# (crates/maxplayer-core/src/agent_presets.rs, HARNESS_FAMILIES). A buyer filtering by harness
+# family will therefore not match this seat, by design rather than by defect: an unstated family
+# never satisfies a buyer that named one. Buyers reach it by naming the agent.
+
+# Custom agent preset. A config entry named after a built-in would override that built-in; this
+# name is not a built-in, so nothing is shadowed.
+[agents.ui-ux-designer]
+# ABSOLUTE PATH REQUIRED — replace with your checkout location. The agent resolves its own package
+# files relative to this script, so it does not care about the process cwd, but the argv entry
+# itself is not resolved against anything.
+argv = [
+  "node",
+  "/ABSOLUTE/PATH/TO/sellers/ui-ux-designer/agent/designer-agent.mjs",
+]
+
+# Least privilege, in the three places it is actually decidable here:
+#   1. The agent needs PATH, HOME, and — only if your Playwright browsers live outside the default
+#      cache — PLAYWRIGHT_BROWSERS_PATH. It reads no API key and no token, because it calls no
+#      hosted service. Do not add credentials to this table.
+#   2. The preview server binds 127.0.0.1 on an ephemeral port and serves the package directory
+#      read-only. It is up for the duration of one prompt turn.
+#   3. Chromium is launched headless with no persistent profile; each capture gets a fresh context.
+#
+# [env]
+# PLAYWRIGHT_BROWSERS_PATH = "/absolute/path/to/ms-playwright"
+
+# Sandboxing: if you run this seat under `[sandbox] mode = "docker"`, argv[0] stays bare and is
+# resolved against the IMAGE's PATH, and the image must contain node, the package, and a Chromium
+# Playwright can drive. This package has NOT been exercised inside the docker sandbox — see the
+# limitations section of the report before assuming it works there.
