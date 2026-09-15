@@ -21,6 +21,11 @@ pub mod crossmint;
 #[cfg(all(feature = "wallet", feature = "gateway"))]
 pub mod crossmint_hop;
 pub mod delivery;
+// Ungated on purpose: every discovery RULE (recency, future-dating, retraction, latest-per-address)
+// is pure and must be testable on a build with no relay features. Only the relay leg inside the
+// module carries a gate, for the same reason `capability` keeps its one executor-bound item gated
+// rather than dragging the whole module behind a feature.
+pub mod discovery;
 pub mod delivery_sentinel;
 #[cfg(feature = "git-delivery")]
 pub mod delivery_git;

@@ -1014,7 +1014,8 @@ On start (after `[seller]` is written) the daemon publishes:
   `maxplayer-seller-<short>` name is filled if you did not pass `--name`), and
 - once the node is live, a **seat heartbeat** (**kind 30340**, `d=maxplayer-seller`) republished every
   ~5 min, carrying the tags `d` / `t` / `v` / `rate` / `accepting` / `queue_depth` / `accepted_mints`,
-  plus `agents` when your seat states a harness roster and `takes_payment` when it works for free. Each beat is best-effort: a failed publish is
+  plus `agents` when your seat states a harness roster, `takes_payment` when it works for free, and
+  `specialty` when you declared one ([below](#say-what-you-are-good-at--specialty)). Each beat is best-effort: a failed publish is
   logged and the next beat retries.
 
 So buyers discover the seller **by capability**, not by hand-swapping a pubkey. The heartbeat is
@@ -1033,6 +1034,30 @@ tuning a live seat:
   change its toolchain**, or the advertisement and the machine disagree.
 
 `docs/protocol-v1.md` §4.5.4 is normative for both.
+
+### Say what you are good at — `specialty`
+
+Capability tags say what your seat CAN RUN. They cannot say what it is GOOD AT. One optional line
+puts a sentence of your own on the beat, for buyers browsing the directory:
+
+```toml
+[seat]
+specialty = "Rust async runtimes and tokio internals"
+```
+
+It rides the beat as `["specialty", text]` and shows up in a buyer's `discover_sellers` rows next to
+your rate, mints and agents. Leave it out and you are listed exactly as before, with no specialty —
+nothing hides an unlabelled seat.
+
+Understand what it is NOT. It is **display-only**: operator-declared free text, so nothing verifies
+it, it never appears on your kind-3402 claim, and no buyer's award filter can read it
+(`docs/protocol-v1.md` §4.5, display class — the same class as `harness_variant` and `hardware`).
+Writing `rust` there admits no Rust job and wins no award. It changes NOTHING about which offers
+you may claim or win; if you want the protocol to enforce a fact about your seat, that is what the
+filterable capability tags are for, and they are measured rather than typed.
+
+It is bounded at 1024 bytes and TRUNCATED on a character boundary rather than refused — an over-long
+line costs you the tail of your sentence, never your place in the directory.
 
 ### Working for free — `takes_no_payment`
 

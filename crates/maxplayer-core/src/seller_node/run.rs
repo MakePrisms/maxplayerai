@@ -17102,6 +17102,7 @@ mod tests {
             config.seat = crate::home::SeatConfig {
                 harness_variant: Some("my-fork".to_owned()),
                 hardware: Some("mac studio, 64GB".to_owned()),
+                specialty: Some("Rust async runtimes and tokio internals".to_owned()),
             };
             config.relay_url = fixture.url();
         })
@@ -17135,6 +17136,15 @@ mod tests {
             beat.tag_value(crate::heartbeat::HARDWARE_TAG),
             Some("mac studio, 64GB")
         );
+        // The discovery chain's first link, end to end: `[seat] specialty` in config.toml reached a
+        // SIGNED announcement the relay confirmed. Read off the landed event, not off a rebuilt
+        // draft, so nothing between config and the wire can quietly drop it.
+        assert_eq!(
+            beat.tag_value(crate::heartbeat::SPECIALTY_TAG),
+            Some("Rust async runtimes and tokio internals"),
+            "a buyer discovers this seat by reading this tag off this event; an absent tag here \
+             makes the specialty unfindable however well the config is written"
+        );
 
         // The other half of the contract, and the reason passing the config to the CLAIM's
         // capability is not a leak: display fields are separated at EMIT. `claim_draft` asks for
@@ -17149,6 +17159,7 @@ mod tests {
             !filterable.iter().any(|tag| {
                 tag.first() == Some(crate::heartbeat::HARNESS_VARIANT_TAG)
                     || tag.first() == Some(crate::heartbeat::HARDWARE_TAG)
+                    || tag.first() == Some(crate::heartbeat::SPECIALTY_TAG)
             }),
             "a display-only field on a claim would be weight no award decision reads: {filterable:?}"
         );

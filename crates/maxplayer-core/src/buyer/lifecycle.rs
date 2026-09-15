@@ -1745,6 +1745,7 @@ mod tests {
             capabilities: vec!["python".to_owned()],
             harness_variant: None,
             hardware: None,
+            specialty: None,
         };
         // The seat serves the `codex` PRESET as well as the family. A model axis now has to name a
         // preset, because dispatch reads nothing else — so without this the model case would be
@@ -3677,6 +3678,7 @@ mod tests {
             capabilities: capabilities.iter().map(|c| (*c).to_owned()).collect(),
             harness_variant: None,
             hardware: None,
+            specialty: None,
         }
     }
 

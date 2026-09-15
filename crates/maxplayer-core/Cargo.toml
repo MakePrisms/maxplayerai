@@ -197,3 +197,10 @@ tokio = { version = "1.52.0", features = ["io-util", "macros", "net", "rt", "rt-
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
 url = "2.5.8"
 uuid = "1.23.5"
+
+# F3 (advisor verdict on the discovery foundation): the discovery read driven over a SCRIPTED relay,
+# so an EOSE, a timeout, a drop and a CLOSED each land where they must. Needs the buyer identity and
+# the relay leg, both `wallet`-gated, and tokio-tungstenite for the fixture's raw NIP-01 socket.
+[[test]]
+name = "discovery_relay_behavior"
+required-features = ["wallet"]

@@ -1571,15 +1571,15 @@ pub struct MaxplayerConfig {
 /// `[seat]` — the operator-declared half of the seat's advertisement (#784).
 ///
 /// These are the DISPLAY-ONLY fields of [`crate::heartbeat::SeatCapability`], and they are declared
-/// here precisely because they are the fields no probe can answer. A fork name and a machine
-/// description are facts about the operator's intent and hardware; nothing the daemon can run
-/// measures them.
+/// here precisely because they are the fields no probe can answer. A fork name, a machine
+/// description and a statement of what the seat is FOR are facts about the operator's intent and
+/// hardware; nothing the daemon can run measures them.
 ///
 /// ## Why a config key is safe here and forbidden for `capabilities`
 ///
 /// The provenance rule is [`crate::heartbeat::SeatCapability`]'s: **filterable ⟺ machine-sourced**,
 /// because a buyer commits sats at award and an operator-typed claim has nothing to contradict it.
-/// These two are never filtered — they ride the kind-30340 beat alone and no award decision reads
+/// These are never filtered — they ride the kind-30340 beat alone and no award decision reads
 /// them — so an operator may state them freely. That is the same rule read from its other end, not
 /// an exception to it. Adding a FILTERABLE field to this struct would break it; see
 /// [`crate::seller_roster::Advertisement::capability`] for the seam that keeps the two halves apart.
@@ -1600,6 +1600,28 @@ pub struct SeatConfig {
     /// [`crate::heartbeat::HARDWARE_TAG`] documents why that is acceptable: nothing filters on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hardware: Option<String>,
+    /// Free-text description of what this seat SPECIALISES in — e.g.
+    /// `specialty = "Rust async runtimes, tokio internals, and tracing instrumentation"`. Absent ⇒
+    /// the tag is omitted and the seat states nothing, which is NOT a claim to be a generalist.
+    ///
+    /// This is the field a buyer that has never met this seat reads to decide whether to target
+    /// it. It belongs in this struct and not in `[seller]` for the reason the other two do:
+    /// **EXPLICITLY UNVERIFIED.** No probe can measure whether an operator is good at Rust, so by
+    /// [`crate::heartbeat::SeatCapability`]'s provenance rule the field can be operator-typed only
+    /// because nothing filters on it — it rides the kind-30340 beat alone and no award decision
+    /// reads it. Adding a match gate on it later would move it to the filterable half and break
+    /// that rule; see [`crate::heartbeat::SPECIALTY_TAG`].
+    ///
+    /// Bounded at [`crate::heartbeat::SPECIALTY_MAX_BYTES`] bytes of UTF-8. A longer value is
+    /// truncated at publish, never refused — the seat stays on the market and only the description
+    /// is shortened.
+    ///
+    /// ⛔ It is a DESCRIPTION the operator wrote, and nothing else. The daemon never fills it from
+    /// local memory, a client list, an episode log, or any file on the box: everything on a beat is
+    /// public to every relay reader, and a field that auto-published who a seat has worked for
+    /// would leak the operator's business as a side effect of being discoverable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub specialty: Option<String>,
 }
 
 impl SeatConfig {

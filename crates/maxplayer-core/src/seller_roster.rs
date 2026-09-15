@@ -283,6 +283,9 @@ impl Advertisement {
         capability.capabilities = self.capabilities.clone();
         capability.harness_variant = display.harness_variant.clone();
         capability.hardware = display.hardware.clone();
+        // Bounded HERE, at the one seam between config and something emittable, so no publish path
+        // can carry an unbounded description and no caller has to remember the bound.
+        capability.specialty = crate::heartbeat::bounded_specialty(display.specialty.as_deref());
         capability
     }
 }
@@ -793,6 +796,7 @@ mod tests {
             .capability(&crate::home::SeatConfig::default());
         assert_eq!(undeclared.harness_variant, None);
         assert_eq!(undeclared.hardware, None);
+        assert_eq!(undeclared.specialty, None);
         assert!(
             undeclared.display_tags().is_empty(),
             "an operator who declared nothing publishes no display tag"
@@ -803,14 +807,57 @@ mod tests {
         let declared = roster.advertisement().capability(&crate::home::SeatConfig {
             harness_variant: Some("my-fork".to_owned()),
             hardware: Some("mac studio, 64GB".to_owned()),
+            specialty: Some("Rust async runtimes and tokio internals".to_owned()),
         });
         assert_eq!(
             declared.display_tags(),
             vec![
                 crate::gateway::TagSpec::new(["harness_variant", "my-fork"]),
                 crate::gateway::TagSpec::new(["hardware", "mac studio, 64GB"]),
+                crate::gateway::TagSpec::new([
+                    "specialty",
+                    "Rust async runtimes and tokio internals"
+                ]),
             ]
         );
+    }
+
+    #[test]
+    fn a_configured_specialty_is_bounded_at_the_one_config_to_wire_seam() {
+        // The bound belongs HERE and not at every publish site. An operator who pastes an essay
+        // into `[seat] specialty` must still get a publishable beat — the description is shortened,
+        // the seat is not taken off the market — and no caller of `capability()` has to remember it.
+        let roster = named(&["claude"]);
+        let essay = "x".repeat(crate::heartbeat::SPECIALTY_MAX_BYTES + 1_000);
+        let bounded = roster.advertisement().capability(&crate::home::SeatConfig {
+            specialty: Some(essay),
+            ..crate::home::SeatConfig::default()
+        });
+        let carried = bounded
+            .specialty
+            .as_deref()
+            .expect("shortened, never dropped");
+        assert_eq!(carried.len(), crate::heartbeat::SPECIALTY_MAX_BYTES);
+        let filterable = bounded.filterable_tags();
+        assert!(
+            !filterable
+                .iter()
+                .any(|tag| tag.first() == Some(crate::heartbeat::SPECIALTY_TAG)),
+            "and it reaches nothing an award decision reads: {filterable:?}"
+        );
+        assert!(
+            !filterable.is_empty(),
+            "POSITIVE CONTROL: this roster does state filterable fields, so the absence above is \
+             about the specialty and not about an empty tag list"
+        );
+
+        // All-whitespace is UNSTATED, not a present-and-blank specialty.
+        let blank = roster.advertisement().capability(&crate::home::SeatConfig {
+            specialty: Some("   \t\n ".to_owned()),
+            ..crate::home::SeatConfig::default()
+        });
+        assert_eq!(blank.specialty, None);
+        assert!(blank.display_tags().is_empty());
     }
 
     #[test]
