@@ -1258,6 +1258,13 @@ fn a_production_stamped_helper_past_its_expiry_is_swept_against_the_real_daemon(
     let seen_role = label_of(HOLDER_ROLE_LABEL);
     let seen_job = label_of(HELPER_JOB_LABEL);
 
+    // PRODUCTION's own listing argv, run here before the sweep, so a red says whether the daemon
+    // failed to show the sweep this helper or the sweep saw it and left it.
+    let listing_argv = maxplayer_core::sandbox_netns::list_owned_argv(&seat);
+    let listing_argv: Vec<&str> = listing_argv.iter().skip(1).map(String::as_str).collect();
+    let (_, seen_by_sweep, _) = docker(&listing_argv, None);
+    let seen_by_sweep = seen_by_sweep.replace('\t', "|").replace('\n', " ;; ");
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("a clock after 1970")
@@ -1274,6 +1281,20 @@ fn a_production_stamped_helper_past_its_expiry_is_swept_against_the_real_daemon(
     };
     let helper_survived = still_listed(&helper_name);
     let holder_survived = still_listed(&holder_name);
+    // Captured BEFORE the cleanup below destroys the evidence: what the daemon still holds for this
+    // seat, so a failure names the surviving containers instead of only the one this test looked up.
+    let (_, seat_listing, _) = docker(
+        &[
+            "ps",
+            "--all",
+            "--filter",
+            &format!("label={}={seat}", maxplayer_core::sandbox_netns::HOLDER_SEAT_LABEL),
+            "--format",
+            "{{.Names}}/{{.State}}",
+        ],
+        None,
+    );
+    let seat_listing = seat_listing.split_whitespace().collect::<Vec<_>>().join(" ");
 
     drop(containment);
     let _ = docker(&["rm", "--force", "--volumes", &helper_name], None);
@@ -1289,11 +1310,14 @@ fn a_production_stamped_helper_past_its_expiry_is_swept_against_the_real_daemon(
     assert_eq!(seen_job, job, "the helper must name the job it belongs to");
     assert!(
         !helper_survived,
-        "the sweep must remove the expired helper, but {helper_name} is still listed"
+        "the sweep must remove the expired helper, but {helper_name} is still listed \
+         (report {report:?}; the sweep's own listing saw [{seen_by_sweep}]; \
+         seat still holds [{seat_listing}])"
     );
     assert!(
         !holder_survived,
-        "the sweep must remove the expired holder too, but {holder_name} is still listed"
+        "the sweep must remove the expired holder too, but {holder_name} is still listed \
+         (report {report:?}; seat still holds [{seat_listing}])"
     );
     assert_eq!(
         report.selected(),
