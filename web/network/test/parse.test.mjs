@@ -565,4 +565,59 @@ assert.equal(orphanRow.total_tokens, null, "receipt with no result → usage das
 assert.equal(orphanRow.input_tokens, null);
 assert.equal(orphanRow.output_tokens, null);
 
+// ——— legacy enum-adjunct fields: strings pass through, unknown stays VISIBLE ———
+
+// usage_transport: known, unknown (preserved), empty, non-string.
+assert.equal(
+  extractUsageAdjunct({ usage_transport: "acp-native" }).usage_transport,
+  "acp-native",
+);
+assert.equal(
+  extractUsageAdjunct({ usage_transport: "mystery-transport" }).usage_transport,
+  "mystery-transport", // unknown string PRESERVED, not enforced/blanked
+);
+assert.equal(extractUsageAdjunct({ usage_transport: "" }).usage_transport, null);
+assert.equal(extractUsageAdjunct({ usage_transport: 42 }).usage_transport, null);
+assert.equal(extractUsageAdjunct({}).usage_transport, null);
+
+// harness_family: known, unknown (preserved), empty, non-string.
+assert.equal(
+  extractUsageAdjunct({ harness_family: "cursor" }).harness_family,
+  "cursor",
+);
+assert.equal(
+  extractUsageAdjunct({ harness_family: "warp-tool" }).harness_family,
+  "warp-tool", // unknown string PRESERVED
+);
+assert.equal(extractUsageAdjunct({ harness_family: "" }).harness_family, null);
+assert.equal(extractUsageAdjunct({ harness_family: 42 }).harness_family, null);
+assert.equal(extractUsageAdjunct({}).harness_family, null);
+
+// full parse path: legacy JSON on a receipt → unknown strings SURVIVE into stored usage.
+const legacyReceipt = ok({
+  id: "1a".padEnd(64, "0"),
+  pubkey: "1b".padEnd(64, "0"),
+  kind: RECEIPT,
+  created_at: 830,
+  tags: [
+    ["amount", "4", "sat"],
+    ["e", offerId, "", "root"],
+    ["mint", "https://testnut.cashu.space"],
+  ],
+  content: JSON.stringify({
+    usage_transport: "wire-unknown",
+    harness_family: "warp-tool",
+  }),
+});
+assert.equal(
+  legacyReceipt.receipt.usage.usage_transport,
+  "wire-unknown",
+  "legacy unknown transport survives onto the parsed receipt",
+);
+assert.equal(
+  legacyReceipt.receipt.usage.harness_family,
+  "warp-tool",
+  "legacy unknown harness survives onto the parsed receipt",
+);
+
 console.log("ok — parse/store suite passed");

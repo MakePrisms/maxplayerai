@@ -157,18 +157,10 @@ export function extractUsageAdjunct(contentJson, tags = []) {
       ),
       usage_transport:
         firstTagValue(tags, "usage_transport") ??
-        asEnumString(adjunct.usage_transport ?? root.usage_transport, [
-          "acp-native",
-          "side-channel",
-        ]),
+        asString(adjunct.usage_transport ?? root.usage_transport),
       harness_family:
         harnessFamilyFromId(firstTagValue(tags, "harness")) ??
-        asEnumString(adjunct.harness_family ?? root.harness_family, [
-          "codex",
-          "claude",
-          "cursor",
-          "other",
-        ]),
+        asString(adjunct.harness_family ?? root.harness_family),
       paid_price_sats: amountSatsFromTags(tags),
     };
   } catch {
@@ -440,12 +432,6 @@ function asNumberOrNull(v) {
     if (Number.isFinite(n)) return n;
   }
   return null;
-}
-
-function asEnumString(v, allowed) {
-  const s = asString(v);
-  if (!s) return null;
-  return allowed.includes(s) ? s : s; // keep unknown strings visible; don't blank
 }
 
 /**
