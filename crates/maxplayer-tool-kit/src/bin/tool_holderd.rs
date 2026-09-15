@@ -29,14 +29,57 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
-struct JobSlot {
+/// One attachment of one job to this holder. Immutable for its whole life.
+///
+/// A connection that arrives on the job's socket is bound to THIS instance, never to the job id.
+/// The finding this closes: the holder used to resolve the job id through its table at call time,
+/// so a connection held across a detach and a re-attach of the same id read and wrote the NEW
+/// attachment's directory. Now a detach sets `stop` on the instance the old connections hold, and
+/// every call on them is refused. A later attach of the same id is a different instance.
+struct Attachment {
+    job_id: String,
+    /// The job's canonical directory. Every file a call names resolves inside it, no-follow.
     root: PathBuf,
     socket: PathBuf,
-    stop: Arc<AtomicBool>,
+    /// Set once, by detach or shutdown. A call checks it before validation, before the tool runs,
+    /// and before each output is published, so nothing is published into a detached directory.
+    stop: AtomicBool,
+    /// Connections open on this attachment's socket now, bounded by [`MAX_CONNECTIONS_PER_JOB`].
+    live: AtomicUsize,
+}
+
+impl Attachment {
+    fn detached(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+}
+
+/// Connections one attachment serves at the same time. The MCP bridge opens one connection per
+/// message, so a job needs a few; a job that opens many holds a holder thread with each one. The
+/// connection over the bound gets one error line and is closed, on the accept thread, with no
+/// thread of its own.
+const MAX_CONNECTIONS_PER_JOB: usize = 16;
+
+/// How long a job connection may sit idle between requests before the holder looks at the
+/// attachment again. A connection that is idle across a detach ends at the next look, so a
+/// detached job holds no holder thread through an open, silent connection.
+const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the accept thread waits for the first line of a connection over the bound, so it can
+/// answer with that request's id. Short: this stalls the accept loop of one job's socket only.
+const OVER_BOUND_READ_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Decrements an attachment's live-connection count when a connection ends, however it ends.
+struct LiveConnection<'a>(&'a Attachment);
+
+impl Drop for LiveConnection<'_> {
+    fn drop(&mut self) {
+        self.0.live.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 struct Holder {
@@ -56,7 +99,7 @@ struct Holder {
     /// job never collide on a staging path.
     staging_seq: AtomicU64,
     started_at: SystemTime,
-    jobs: Mutex<BTreeMap<String, JobSlot>>,
+    jobs: Mutex<BTreeMap<String, Arc<Attachment>>>,
 }
 
 /// The seller's tool never reads or writes a path a job can influence. Instead the holder copies
@@ -211,29 +254,52 @@ fn main() {
 }
 
 impl Holder {
-    /// Serve one connection. `job` is `None` for the seller's control socket, or the job id when
-    /// the connection arrived on a per-job socket — the job's identity comes from the listener
-    /// it reached, never from the request body.
-    fn serve_conn(self: &Arc<Self>, conn: UnixStream, job: Option<String>) -> std::io::Result<()> {
+    /// Serve one connection. `job` is `None` for the seller's control socket, or the attachment
+    /// the connection arrived on — the job's identity comes from the listener it reached, never
+    /// from the request body, and it is this instance for the life of the connection.
+    ///
+    /// A job connection reads with [`IDLE_READ_TIMEOUT`]. On each timeout the holder looks at the
+    /// attachment: a detached one ends the connection, so no thread outlives a detach on an idle
+    /// connection. After a refusal for a detached attachment the connection is closed.
+    fn serve_conn(self: &Arc<Self>, conn: UnixStream, job: Option<&Attachment>) -> std::io::Result<()> {
+        if job.is_some() {
+            conn.set_read_timeout(Some(IDLE_READ_TIMEOUT))?;
+        }
         let mut writer = conn.try_clone()?;
-        let reader = BufReader::new(conn);
-        for line in reader.lines() {
-            let line = line?;
+        let mut reader = BufReader::new(conn);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => return Ok(()),
+                Ok(_) => {}
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                    if job.is_some_and(Attachment::detached) {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
             if line.trim().is_empty() {
                 continue;
             }
+            let detached = job.is_some_and(Attachment::detached);
             let resp = match serde_json::from_str::<RpcRequest>(&line) {
-                Ok(req) => self.dispatch(req, job.as_deref()),
+                Ok(req) if detached => detached_response(req.id),
+                Ok(req) => self.dispatch(req, job),
                 Err(e) => RpcResponse::err(None, proto::CODE_INVALID_PARAMS, format!("malformed request: {e}")),
             };
             writer.write_all(resp.to_line().as_bytes())?;
             writer.write_all(b"\n")?;
             writer.flush()?;
+            if detached {
+                return Ok(());
+            }
         }
-        Ok(())
     }
 
-    fn dispatch(self: &Arc<Self>, req: RpcRequest, job: Option<&str>) -> RpcResponse {
+    fn dispatch(self: &Arc<Self>, req: RpcRequest, job: Option<&Attachment>) -> RpcResponse {
         let id = req.id.clone();
         match req.method.as_str() {
             proto::METHOD_INITIALIZE => RpcResponse::ok(
@@ -249,7 +315,7 @@ impl Holder {
             proto::METHOD_TOOLS_LIST => RpcResponse::ok(id, json!({"tools": self.tool_descriptors()})),
 
             proto::METHOD_TOOLS_CALL => match job {
-                Some(job_id) => self.tools_call(id, req.params, job_id),
+                Some(attachment) => self.tools_call(id, req.params, attachment),
                 None => RpcResponse::err(
                     id,
                     proto::CODE_INVALID_PARAMS,
@@ -269,7 +335,14 @@ impl Holder {
                     .lock()
                     .map(|j| {
                         j.iter()
-                            .map(|(id, slot)| json!({"job_id": id, "root": slot.root, "socket": slot.socket}))
+                            .map(|(id, att)| {
+                                json!({
+                                    "job_id": id,
+                                    "root": att.root,
+                                    "socket": att.socket,
+                                    "connections": att.live.load(Ordering::SeqCst),
+                                })
+                            })
                             .collect()
                     })
                     .unwrap_or_default();
@@ -349,7 +422,12 @@ impl Holder {
             .collect()
     }
 
-    fn tools_call(self: &Arc<Self>, id: Option<Value>, params: Value, job_id: &str) -> RpcResponse {
+    fn tools_call(self: &Arc<Self>, id: Option<Value>, params: Value, attachment: &Attachment) -> RpcResponse {
+        // The attachment is the connection's, fixed at accept time. A detached one serves nothing.
+        if attachment.detached() {
+            return detached_response(id);
+        }
+        let job_id = attachment.job_id.as_str();
         let Some(name) = params["name"].as_str() else {
             return RpcResponse::err(id, proto::CODE_INVALID_PARAMS, "params.name is required");
         };
@@ -371,13 +449,9 @@ impl Holder {
             }
         }
 
-        let root = match self.jobs.lock() {
-            Ok(j) => match j.get(job_id) {
-                Some(slot) => slot.root.clone(),
-                None => return RpcResponse::err(id, proto::CODE_INTERNAL, "job is no longer attached"),
-            },
-            Err(_) => return RpcResponse::err(id, proto::CODE_INTERNAL, "state poisoned"),
-        };
+        // The directory comes from the attachment, never from the table: a re-attach of the same
+        // id is a different instance with a different directory, and this connection is not it.
+        let root = attachment.root.clone();
 
         let arg_map: BTreeMap<String, Value> = args.into_iter().collect();
         let call = match validate_call(&self.cfg, name, &arg_map, &root) {
@@ -434,6 +508,12 @@ impl Holder {
             }
         }
 
+        // A detach that landed while the inputs were staged: the tool does not run for a job that
+        // is gone. The `Staging` guard removes the staged copies.
+        if attachment.detached() {
+            return detached_response(id);
+        }
+
         // Fixed program, fixed subcommand, staged operands, cleared environment, cwd pinned to the
         // holder-private staging directory. No shell anywhere on this path, and no job-writable
         // path in the child's argv or cwd.
@@ -469,8 +549,25 @@ impl Holder {
         // staged file, before anything is written into the job's directory, so an oversized
         // result never lands there at all. The destination is created no-follow, so a symlink a
         // job planted at the output name is refused rather than written through.
+        //
+        // A detach while the tool ran: nothing is published. The job's directory may already be
+        // another attachment's, or gone; the staged results go with the `Staging` guard.
+        if attachment.detached() {
+            return RpcResponse::err(
+                id,
+                proto::CODE_REJECTED,
+                "job is detached; the tool ran but its outputs were not published",
+            );
+        }
         let mut outputs: Vec<Value> = Vec::new();
         for (staged, rel) in &pending_outputs {
+            if attachment.detached() {
+                return RpcResponse::err(
+                    id,
+                    proto::CODE_REJECTED,
+                    "job is detached; the remaining outputs were not published",
+                );
+            }
             let bytes = std::fs::metadata(staged).map(|m| m.len()).unwrap_or(0);
             if bytes as usize > call.max_output_bytes {
                 return RpcResponse::err(
@@ -533,45 +630,66 @@ impl Holder {
         // job container without handing over the directory that holds every other job's. A flat
         // `jobs/<id>.sock` layout would make per-job isolation unexpressible as a mount.
         let dir = self.runtime.join("jobs").join(job_id);
-        if let Err(e) = private_dir(&dir) {
-            return RpcResponse::err(id, proto::CODE_INTERNAL, format!("job socket dir: {e}"));
-        }
         let sock = dir.join("job.sock");
-        let listener = match bind_private(&sock) {
-            Ok(l) => l,
-            Err(e) => return RpcResponse::err(id, proto::CODE_INTERNAL, e),
-        };
 
-        let stop = Arc::new(AtomicBool::new(false));
-        {
+        // Bind and record under the one lock, so an id is attached once: a second attach of a
+        // live id is refused, never a silent replacement of the socket the first job holds.
+        let attachment = {
             let mut jobs = match self.jobs.lock() {
                 Ok(j) => j,
                 Err(_) => return RpcResponse::err(id, proto::CODE_INTERNAL, "state poisoned"),
             };
-            jobs.insert(
-                job_id.to_string(),
-                JobSlot { root: root.clone(), socket: sock.clone(), stop: Arc::clone(&stop) },
-            );
-        }
+            if jobs.contains_key(job_id) {
+                return RpcResponse::err(
+                    id,
+                    proto::CODE_INVALID_PARAMS,
+                    format!("job {job_id:?} is already attached; detach it first"),
+                );
+            }
+            if let Err(e) = private_dir(&dir) {
+                return RpcResponse::err(id, proto::CODE_INTERNAL, format!("job socket dir: {e}"));
+            }
+            let listener = match bind_private(&sock) {
+                Ok(l) => l,
+                Err(e) => return RpcResponse::err(id, proto::CODE_INTERNAL, e),
+            };
+            let attachment = Arc::new(Attachment {
+                job_id: job_id.to_string(),
+                root: root.clone(),
+                socket: sock.clone(),
+                stop: AtomicBool::new(false),
+                live: AtomicUsize::new(0),
+            });
+            jobs.insert(job_id.to_string(), Arc::clone(&attachment));
+            (attachment, listener)
+        };
+        let (attachment, listener) = attachment;
 
+        // The accept thread hands EVERY connection the same attachment instance. It ends when the
+        // instance is detached and woken. It does not remove the socket file: by the time it runs
+        // again, the same path may already be a later attachment's socket. Detach removes the file.
         let holder = Arc::clone(self);
-        let job_owned = job_id.to_string();
-        let sock_owned = sock.clone();
+        let accept_for = Arc::clone(&attachment);
         std::thread::spawn(move || {
             for conn in listener.incoming() {
-                if stop.load(Ordering::SeqCst) {
+                if accept_for.detached() {
                     break;
                 }
                 let Ok(conn) = conn else { continue };
-                let holder2 = Arc::clone(&holder);
-                let job2 = job_owned.clone();
+                if accept_for.live.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS_PER_JOB {
+                    accept_for.live.fetch_sub(1, Ordering::SeqCst);
+                    refuse_over_bound(conn);
+                    continue;
+                }
+                let holder = Arc::clone(&holder);
+                let bound_to = Arc::clone(&accept_for);
                 std::thread::spawn(move || {
-                    if let Err(e) = holder2.serve_conn(conn, Some(job2)) {
+                    let _live = LiveConnection(&bound_to);
+                    if let Err(e) = holder.serve_conn(conn, Some(&bound_to)) {
                         eprintln!("tool-holderd: job connection: {e}");
                     }
                 });
             }
-            let _ = std::fs::remove_file(&sock_owned);
         });
 
         RpcResponse::ok(
@@ -589,17 +707,14 @@ impl Holder {
         let Some(job_id) = params["job_id"].as_str() else {
             return RpcResponse::err(id, proto::CODE_INVALID_PARAMS, "job_id is required");
         };
-        let slot = match self.jobs.lock() {
+        let attachment = match self.jobs.lock() {
             Ok(mut j) => j.remove(job_id),
             Err(_) => return RpcResponse::err(id, proto::CODE_INTERNAL, "state poisoned"),
         };
-        let Some(slot) = slot else {
+        let Some(attachment) = attachment else {
             return RpcResponse::err(id, proto::CODE_INVALID_PARAMS, "no such attached job");
         };
-        slot.stop.store(true, Ordering::SeqCst);
-        // Unblock the accept loop so the thread notices the flag and removes its socket.
-        let _ = UnixStream::connect(&slot.socket);
-        let _ = std::fs::remove_file(&slot.socket);
+        stop_attachment(&attachment);
 
         // The tool is untouched: still enrolled, still healthy, still serving other jobs. This
         // is the assertion the correction turns on, so it is stated in the reply.
@@ -677,15 +792,49 @@ impl Holder {
     }
 
     fn cleanup(&self) {
-        if let Ok(jobs) = self.jobs.lock() {
-            for slot in jobs.values() {
-                slot.stop.store(true, Ordering::SeqCst);
-                let _ = UnixStream::connect(&slot.socket);
-                let _ = std::fs::remove_file(&slot.socket);
+        if let Ok(mut jobs) = self.jobs.lock() {
+            for (_, attachment) in std::mem::take(&mut *jobs) {
+                stop_attachment(&attachment);
             }
         }
         let _ = std::fs::remove_file(self.runtime.join("holder.sock"));
     }
+}
+
+/// End an attachment: set `stop` so every connection bound to it refuses its next call, wake the
+/// accept thread so it sees the flag and exits, then remove the socket file so no new connection
+/// reaches the old listener. Connections already open keep the instance and are refused on it.
+fn stop_attachment(attachment: &Attachment) {
+    attachment.stop.store(true, Ordering::SeqCst);
+    let _ = UnixStream::connect(&attachment.socket);
+    let _ = std::fs::remove_file(&attachment.socket);
+}
+
+/// The one reply a connection gets on a detached attachment, addressed to its request.
+fn detached_response(id: Option<Value>) -> RpcResponse {
+    RpcResponse::err(id, proto::CODE_REJECTED, "job is detached; this endpoint no longer serves calls")
+}
+
+/// Answer a connection over [`MAX_CONNECTIONS_PER_JOB`] with one error line and close it. Runs on
+/// the accept thread with a short read timeout, so the refusal carries the request's own id when
+/// the first line arrives in time and costs the holder no thread.
+fn refuse_over_bound(conn: UnixStream) {
+    let _ = conn.set_read_timeout(Some(OVER_BOUND_READ_TIMEOUT));
+    let mut writer = match conn.try_clone() {
+        Ok(w) => w,
+        Err(_) => return,
+    };
+    let mut line = String::new();
+    let _ = BufReader::new(conn).read_line(&mut line);
+    let id = serde_json::from_str::<RpcRequest>(&line).ok().and_then(|req| req.id);
+    let resp = RpcResponse::err(
+        id,
+        proto::CODE_REJECTED,
+        format!("too many connections on this job endpoint (limit {MAX_CONNECTIONS_PER_JOB}); close one and retry"),
+    );
+    let _ = writer.write_all(resp.to_line().as_bytes());
+    let _ = writer.write_all(b"\n");
+    let _ = writer.flush();
 }
 
 /// 0700 directory, created restrictively.

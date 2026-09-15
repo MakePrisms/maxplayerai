@@ -7,15 +7,22 @@
 //! credential. Compromising it gains only what the placeholder already allows, which is nothing
 //! without the proxy.
 //!
-//! The vendor side is the MCP Streamable HTTP transport. Three of its rules land here:
+//! The vendor side is the MCP Streamable HTTP transport. Four of its rules land here:
 //! - A response is either one JSON document or an SSE stream (`text/event-stream`) whose `data:`
 //!   payloads are JSON-RPC messages. Both shapes are read; each message is one output line.
+//!   [`SseSplitter`] cuts the stream into events as the bytes arrive, so a message is forwarded
+//!   before the stream ends.
 //! - A server may issue `Mcp-Session-Id` on the `initialize` response; the client echoes it on every
 //!   later request. [`SessionState`] carries it.
 //! - After `initialize`, the client sends `MCP-Protocol-Version` with the version the server
 //!   negotiated. [`SessionState`] carries that too.
+//! - A server may send its own request inside an open SSE stream and wait for the client's answer
+//!   before it finishes the stream. The client's answer is a JSON-RPC RESPONSE, posted as its own
+//!   request while the stream is open; the server accepts it with `202` and no body.
+//!   [`classify`] tells a response apart from a request and a notification.
 //!
-//! A notification (no `id`) is posted and draws no output line, whatever the server answers.
+//! A notification (no `id`) and a response (no `method`) are posted and draw no output line,
+//! whatever the server answers.
 
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -110,21 +117,137 @@ impl SessionState {
     /// Learn from one successful response: a session id header, and the protocol version an
     /// `initialize` result names.
     pub fn observe(&mut self, response_headers: &BTreeMap<String, String>, messages: &[Value]) {
+        self.observe_headers(response_headers);
+        for message in messages {
+            self.observe_message(message);
+        }
+    }
+
+    /// Learn the session id from the headers of one successful response. Call it before the first
+    /// message of that response is written out, so the client's next request carries the id.
+    pub fn observe_headers(&mut self, response_headers: &BTreeMap<String, String>) {
         if let Some(id) = response_headers.get("mcp-session-id") {
             let id = id.trim();
             if !id.is_empty() {
                 self.session_id = Some(id.to_string());
             }
         }
-        for message in messages {
-            if let Some(version) = message
-                .get("result")
-                .and_then(|result| result.get("protocolVersion"))
-                .and_then(Value::as_str)
-            {
-                self.protocol_version = Some(version.to_string());
+    }
+
+    /// Learn the protocol version from one message, when it is an `initialize` result.
+    pub fn observe_message(&mut self, message: &Value) {
+        if let Some(version) = message
+            .get("result")
+            .and_then(|result| result.get("protocolVersion"))
+            .and_then(Value::as_str)
+        {
+            self.protocol_version = Some(version.to_string());
+        }
+    }
+}
+
+/// What one JSON-RPC message from the client is, by its members.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageKind {
+    /// Has an `id`: the server owes it exactly one response.
+    Request,
+    /// Has no `id`: the server owes it nothing.
+    Notification,
+    /// Has an `id` and a `result` or an `error`, and no `method`: the client's answer to a request
+    /// the server sent. The server owes it nothing; it accepts it with `202`.
+    Response,
+}
+
+/// Classify one message from the client. An `id` member that is present, even `null`, counts as
+/// an id: that is how the old rule read it, and a client that sends `"id": null` still waits.
+pub fn classify(message: &Value) -> MessageKind {
+    let has_id = message.get("id").is_some();
+    let has_method = message.get("method").is_some();
+    let has_outcome = message.get("result").is_some() || message.get("error").is_some();
+    if has_id && !has_method && has_outcome {
+        MessageKind::Response
+    } else if has_id {
+        MessageKind::Request
+    } else {
+        MessageKind::Notification
+    }
+}
+
+/// Whether `message` is the server's response to the client request with id `request_id`: it
+/// carries that id, a `result` or an `error`, and no `method`.
+pub fn answers(message: &Value, request_id: &Value) -> bool {
+    message.get("method").is_none()
+        && (message.get("result").is_some() || message.get("error").is_some())
+        && message.get("id") == Some(request_id)
+}
+
+/// An SSE stream cut into events as its bytes arrive. Feed it what the wire delivered; it returns
+/// the `data:` payload of every event that is complete. Events end at a blank line; several `data:`
+/// lines in one event join with `\n`; `event:`, `id:`, `retry:` and comment lines are skipped.
+/// `\r\n` line ends are accepted. [`Self::finish`] returns a final event without a trailing blank
+/// line, which counts.
+#[derive(Debug, Default)]
+pub struct SseSplitter {
+    /// Bytes of the line that has no line end yet.
+    partial: Vec<u8>,
+    /// The `data:` lines of the event that has no blank line yet.
+    data: Vec<String>,
+}
+
+impl SseSplitter {
+    /// Take in `bytes` and return the payloads of the events they complete, in order.
+    pub fn feed(&mut self, bytes: &[u8]) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = bytes;
+        while let Some(newline) = rest.iter().position(|&b| b == b'\n') {
+            self.partial.extend_from_slice(&rest[..newline]);
+            rest = &rest[newline + 1..];
+            let line = std::mem::take(&mut self.partial);
+            let line = String::from_utf8_lossy(&line).into_owned();
+            if let Some(payload) = self.line(line.strip_suffix('\r').unwrap_or(&line)) {
+                out.push(payload);
             }
         }
+        self.partial.extend_from_slice(rest);
+        out
+    }
+
+    /// The stream ended. A last line without a line end and a last event without a blank line
+    /// both count.
+    pub fn finish(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.partial.is_empty() {
+            let line = std::mem::take(&mut self.partial);
+            let line = String::from_utf8_lossy(&line).into_owned();
+            if let Some(payload) = self.line(line.strip_suffix('\r').unwrap_or(&line)) {
+                out.push(payload);
+            }
+        }
+        if !self.data.is_empty() {
+            out.push(std::mem::take(&mut self.data).join("\n"));
+        }
+        out
+    }
+
+    /// One complete line. A blank line closes the event and returns its payload.
+    fn line(&mut self, line: &str) -> Option<String> {
+        if line.is_empty() {
+            if self.data.is_empty() {
+                return None;
+            }
+            return Some(std::mem::take(&mut self.data).join("\n"));
+        }
+        if line.starts_with(':') {
+            return None;
+        }
+        let (field, value) = match line.split_once(':') {
+            Some((field, value)) => (field, value.strip_prefix(' ').unwrap_or(value)),
+            None => (line, ""),
+        };
+        if field == "data" {
+            self.data.push(value.to_string());
+        }
+        None
     }
 }
 
@@ -158,35 +281,12 @@ pub fn messages_in(content_type: Option<&str>, body: &[u8]) -> Result<Vec<Value>
     })
 }
 
-/// The `data:` payloads of an SSE stream, one per event. Events end at a blank line; several
-/// `data:` lines in one event join with `\n`; `event:`, `id:`, `retry:` and comment lines are
-/// skipped. `\r\n` line ends are accepted. A final event without a trailing blank line counts.
+/// The `data:` payloads of a complete SSE stream, one per event. [`SseSplitter`] run over text
+/// already in memory.
 pub fn sse_data_payloads(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut data: Vec<&str> = Vec::new();
-    for raw_line in text.split('\n') {
-        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
-        if line.is_empty() {
-            if !data.is_empty() {
-                out.push(data.join("\n"));
-                data.clear();
-            }
-            continue;
-        }
-        if line.starts_with(':') {
-            continue;
-        }
-        let (field, value) = match line.split_once(':') {
-            Some((field, value)) => (field, value.strip_prefix(' ').unwrap_or(value)),
-            None => (line, ""),
-        };
-        if field == "data" {
-            data.push(value);
-        }
-    }
-    if !data.is_empty() {
-        out.push(data.join("\n"));
-    }
+    let mut splitter = SseSplitter::default();
+    let mut out = splitter.feed(text.as_bytes());
+    out.extend(splitter.finish());
     out
 }
 
@@ -303,6 +403,61 @@ mod tests {
             sse_data_payloads(stream),
             vec!["{\"a\":\n1}".to_string(), "{\"b\":2}".to_string(), "{\"c\":3}".to_string()]
         );
+    }
+
+    #[test]
+    fn the_splitter_returns_an_event_as_soon_as_its_blank_line_arrives_whatever_the_cuts() {
+        let stream = b": keep-alive\r\nevent: message\r\nid: 7\r\ndata: {\"a\":\r\ndata: 1}\r\n\r\ndata:{\"b\":2}\n\nretry: 5\n\ndata: {\"c\":3}";
+        // Byte by byte: every cut point a socket could produce.
+        let mut splitter = SseSplitter::default();
+        let mut seen = Vec::new();
+        for byte in stream.iter() {
+            seen.extend(splitter.feed(&[*byte]));
+        }
+        assert_eq!(seen, vec!["{\"a\":\n1}".to_string(), "{\"b\":2}".to_string()], "two events are complete on the wire");
+        seen.extend(splitter.finish());
+        assert_eq!(seen.len(), 3, "the last event has no trailing blank line and counts at the end");
+        assert_eq!(seen[2], "{\"c\":3}");
+        assert!(splitter.finish().is_empty(), "a second finish returns nothing");
+
+        // The first event is available before the second has arrived.
+        let mut splitter = SseSplitter::default();
+        let first = splitter.feed(b"data: {\"x\":1}\n\ndata: {\"y\"");
+        assert_eq!(first, vec!["{\"x\":1}".to_string()]);
+        assert!(splitter.feed(b":2}\n").is_empty(), "the second event has no blank line yet");
+        assert_eq!(splitter.feed(b"\n"), vec!["{\"y\":2}".to_string()]);
+    }
+
+    #[test]
+    fn a_message_is_a_request_a_notification_or_a_response_by_its_members() {
+        assert_eq!(classify(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})), MessageKind::Request);
+        assert_eq!(classify(&json!({"jsonrpc":"2.0","id":null,"method":"x"})), MessageKind::Request, "a null id still waits");
+        assert_eq!(classify(&json!({"jsonrpc":"2.0","method":"notifications/initialized"})), MessageKind::Notification);
+        assert_eq!(classify(&json!({"jsonrpc":"2.0","id":"srv-1","result":{}})), MessageKind::Response);
+        assert_eq!(classify(&json!({"jsonrpc":"2.0","id":"srv-1","error":{"code":1,"message":"m"}})), MessageKind::Response);
+        assert_eq!(classify(&json!({"jsonrpc":"2.0","id":9})), MessageKind::Request, "an id without an outcome is a request");
+        assert_eq!(classify(&json!([1, 2])), MessageKind::Notification, "an array has no id");
+
+        let id = json!(3);
+        assert!(answers(&json!({"jsonrpc":"2.0","id":3,"result":{}}), &id));
+        assert!(answers(&json!({"jsonrpc":"2.0","id":3,"error":{"code":1,"message":"m"}}), &id));
+        assert!(!answers(&json!({"jsonrpc":"2.0","id":"srv-1","method":"ping"}), &id), "a server request is not the answer");
+        assert!(!answers(&json!({"jsonrpc":"2.0","method":"notifications/progress"}), &id));
+        assert!(!answers(&json!({"jsonrpc":"2.0","id":4,"result":{}}), &id), "another id");
+    }
+
+    #[test]
+    fn the_session_learns_the_id_from_headers_and_the_version_from_a_message_separately() {
+        let mut state = SessionState::default();
+        let mut headers = BTreeMap::new();
+        headers.insert("mcp-session-id".to_string(), "sess-9".to_string());
+        state.observe_headers(&headers);
+        assert_eq!(state.session_id.as_deref(), Some("sess-9"));
+        assert!(state.protocol_version.is_none());
+        state.observe_message(&json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}));
+        assert_eq!(state.protocol_version.as_deref(), Some("2025-06-18"));
+        state.observe_message(&json!({"jsonrpc":"2.0","id":"srv-1","method":"ping"}));
+        assert_eq!(state.protocol_version.as_deref(), Some("2025-06-18"), "a message without a version changes nothing");
     }
 
     #[test]

@@ -252,6 +252,77 @@ fn the_proxy_refuses_an_unknown_placeholder() {
     assert_eq!(s["calls"], json!(0));
 }
 
+/// A server may ask the client something in the middle of a response and wait for the answer
+/// before it finishes the stream (the Streamable HTTP transport permits it). The bridge must
+/// forward the server's request as soon as its event arrives, post the client's answer while the
+/// stream is still open, and only then read the tool result. A bridge that waits for the end of
+/// the stream before it reads stdin deadlocks here: the vendor's call times out unanswered.
+#[test]
+fn the_bridge_relays_a_server_request_mid_stream_and_posts_the_answer_while_the_stream_is_open() {
+    let vendor = spawn_vendor(&["--sse", "--session", "--server-request"]);
+    let proxy = spawn_proxy(&vendor, &vendor.addr);
+    let proxy_url = format!("http://{}", proxy.addr);
+
+    let mut bridge = Bridge::spawn(&proxy_url, PLACEHOLDER);
+    let init = bridge.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    assert_eq!(init["result"]["protocolVersion"], json!("2025-06-18"), "{init}");
+    bridge.notify("notifications/initialized", json!({}));
+
+    // The call. The FIRST line back is the server's own request, not the result.
+    bridge.write_line(&json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "vendor-echo", "arguments": {"text": "interactive"}}}).to_string());
+    let server_request = bridge.read_line();
+    assert_eq!(server_request["method"], json!("ping"), "the server's request arrives before the stream ends: {server_request}");
+    assert_eq!(server_request["id"], json!("srv-1"));
+
+    // The client answers, as an agent would: a JSON-RPC RESPONSE on stdin, while the stream is open.
+    bridge.write_line(&json!({"jsonrpc": "2.0", "id": "srv-1", "result": {}}).to_string());
+
+    // Only now does the vendor finish the call.
+    let called = bridge.read_line();
+    assert_eq!(called["id"], json!(7), "the next line is the tool result, not a reply to the response: {called}");
+    assert_eq!(called["result"]["content"][0]["text"], json!("INTERACTIVE"), "{called}");
+
+    // The response POST drew no line: the next request reads its own reply first.
+    let listed = bridge.request("tools/list", json!({}));
+    assert_eq!(listed["result"]["tools"][0]["name"], json!("vendor-echo"), "{listed}");
+
+    let s = vendor_stats(&vendor.addr);
+    assert_eq!(s["server_requests_answered"], json!(1), "the vendor received the client's answer while it waited: {s}");
+    assert_eq!(s["server_requests_unanswered"], json!(0), "{s}");
+    assert_eq!(s["stray_responses"], json!(0), "{s}");
+    assert_eq!(s["calls"], json!(1));
+    assert_eq!(s["auth_ok"], json!(5), "initialize, the notification, tools/call, the response, tools/list");
+    assert_eq!(s["session_missing"], json!(0), "the response carried the session id too");
+    assert_eq!(s["saw_watch_token"], json!(false));
+}
+
+/// Two requests in flight at once: the bridge posts the second while the first stream is still
+/// open, and each reply lands on its own id. The vendor holds the first call open until its
+/// server request is answered, so the second request's reply is read first.
+#[test]
+fn the_bridge_serves_two_requests_at_once_and_each_reply_carries_its_own_id() {
+    let vendor = spawn_vendor(&["--sse", "--server-request"]);
+    let proxy = spawn_proxy(&vendor, &vendor.addr);
+    let proxy_url = format!("http://{}", proxy.addr);
+
+    let mut bridge = Bridge::spawn(&proxy_url, PLACEHOLDER);
+    bridge.write_line(&json!({"jsonrpc": "2.0", "id": 100, "method": "tools/call", "params": {"name": "vendor-echo", "arguments": {"text": "first"}}}).to_string());
+    let server_request = bridge.read_line();
+    assert_eq!(server_request["id"], json!("srv-1"), "{server_request}");
+    // While the first call waits on its answer, a second request goes through.
+    let listed = bridge.request("tools/list", json!({}));
+    assert_eq!(listed["result"]["tools"][0]["name"], json!("vendor-echo"), "{listed}");
+    // Now answer the server, and the first call completes.
+    bridge.write_line(&json!({"jsonrpc": "2.0", "id": "srv-1", "result": {}}).to_string());
+    let first = bridge.read_line();
+    assert_eq!(first["id"], json!(100), "{first}");
+    assert_eq!(first["result"]["content"][0]["text"], json!("FIRST"));
+
+    let s = vendor_stats(&vendor.addr);
+    assert_eq!(s["server_requests_answered"], json!(1), "{s}");
+    assert_eq!(s["calls"], json!(1));
+}
+
 /// The environment shape still works for a hand-run bridge, and a line that is not JSON is answered
 /// with a parse error instead of being forwarded.
 #[test]

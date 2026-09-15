@@ -34,6 +34,9 @@ pub struct Fixture {
     pub config: PathBuf,
     pub credential: PathBuf,
     pub vendor_base_url: String,
+    /// The program the holder runs as the vendor CLI. The real fake by default; a test can hand
+    /// in a wrapper, for example one that makes the tool slow.
+    pub vendor_cli: PathBuf,
     vendor: Option<Child>,
     holder: Option<Child>,
 }
@@ -46,6 +49,12 @@ impl Fixture {
     /// Start with the committed seller config, optionally patched. Used by the ceiling test,
     /// which needs a limit small enough to actually cross.
     pub fn start_configured(patch: impl FnOnce(&mut Value)) -> Self {
+        Self::start_with(patch, Path::new(VENDOR_CLI))
+    }
+
+    /// Start with a patched config AND a different vendor CLI program. `vendor_cli` must be an
+    /// executable the holder can run with a cleared environment.
+    pub fn start_with(patch: impl FnOnce(&mut Value), vendor_cli: &Path) -> Self {
         let n = SEQ.fetch_add(1, Ordering::SeqCst);
         // Deliberately NOT `std::env::temp_dir()`. A Unix socket path is capped by `SUN_LEN`
         // (104 bytes on macOS, 108 on Linux), and macOS hands out temp directories like
@@ -109,6 +118,7 @@ impl Fixture {
             config,
             credential,
             vendor_base_url,
+            vendor_cli: vendor_cli.to_path_buf(),
             vendor: Some(vendor),
             holder: None,
         };
@@ -130,7 +140,7 @@ impl Fixture {
             .arg("--credential-file")
             .arg(&self.credential)
             .arg("--vendor-cli")
-            .arg(VENDOR_CLI)
+            .arg(&self.vendor_cli)
             .arg("--vendor-base-url")
             .arg(&self.vendor_base_url)
             .stdout(Stdio::null())

@@ -6,27 +6,50 @@
 //! rejections, and it can watch for one specific token — the placeholder — so a test can prove the
 //! placeholder never reached it.
 //!
-//! Transport is the MCP Streamable HTTP shape, in two modes:
+//! Transport is the MCP Streamable HTTP shape, in these modes:
 //! - default: POST one JSON-RPC request to `/mcp`, get one JSON-RPC response as a JSON document;
 //! - `--sse`: the same response arrives as `text/event-stream` (`event: message` / `data: {...}`)
-//!   with chunked framing, the way a streaming server answers.
+//!   with chunked framing, the way a streaming server answers;
+//! - `--server-request` (needs `--sse`): `tools/call` first sends the SERVER's own request
+//!   (`ping`, id `srv-1`) as one event, holds the stream open, and waits for the client to POST
+//!   its response. That POST is accepted with `202` and no body. Only then does the tool result
+//!   arrive and the stream close. A client that waits for the end of the stream before it reads
+//!   stdin never answers, and the call times out on the vendor side.
 //!
 //! `--session` adds the session rule: `initialize` issues an `Mcp-Session-Id`, and every later
 //! request must echo it or is refused `400`. A notification (no `id`) is accepted with `202` and
 //! an empty body in every mode. Each rule is counted, so a test can assert the client kept it.
 //!
+//! One thread per connection, because `--server-request` holds one response open while it
+//! needs to accept another. The counters and the session live behind one lock.
+//!
 //! Synthetic throughout: the token is a literal passed on the command line for the fixture, never a
 //! real credential.
 
-use maxplayer_tool_kit::http::{read_request, write_response_with, Request};
+use maxplayer_tool_kit::http::{
+    read_request, write_chunk, write_last_chunk, write_response_head, write_response_with, BodyFraming, Request,
+};
 use serde_json::{json, Value};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+/// How long the vendor waits for the client's answer to the server request it sent.
+const SERVER_REQUEST_WAIT: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
 struct Counters {
     auth_ok: u64,
     auth_fail: u64,
     calls: u64,
     notifications: u64,
+    /// Client responses (to a server request) that arrived while one was awaited.
+    server_requests_answered: u64,
+    /// Server requests whose answer did not arrive in time.
+    server_requests_unanswered: u64,
+    /// Client responses that arrived while no server request waited for one.
+    stray_responses: u64,
     session_missing: u64,
     protocol_header_ok: u64,
     sessions_issued: u64,
@@ -36,6 +59,15 @@ struct Counters {
 struct Modes {
     sse: bool,
     session: bool,
+    server_request: bool,
+}
+
+/// What every connection shares.
+struct State {
+    counters: Counters,
+    current_session: Option<String>,
+    /// The channel the open `tools/call` waits on for the client's answer.
+    pending_answer: Option<Sender<Value>>,
 }
 
 struct Reply {
@@ -43,6 +75,22 @@ struct Reply {
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     chunked: bool,
+}
+
+/// How one request is answered.
+enum Outcome {
+    /// One complete reply.
+    Reply(Reply),
+    /// An SSE stream with a server request first: send it, wait for the answer on `answer`, then
+    /// send `result` and close.
+    Interactive { headers: Vec<(String, String)>, server_request: Value, answer: Receiver<Value>, result: Value },
+}
+
+struct Vendor {
+    token: String,
+    watch: Option<String>,
+    modes: Modes,
+    state: Mutex<State>,
 }
 
 fn main() {
@@ -55,7 +103,11 @@ fn main() {
     let modes = Modes {
         sse: has_flag(&args, "--sse"),
         session: has_flag(&args, "--session"),
+        server_request: has_flag(&args, "--server-request"),
     };
+    if modes.server_request && !modes.sse {
+        fatal("--server-request needs --sse: a server request rides an open event stream");
+    }
 
     let listener = TcpListener::bind(&listen).unwrap_or_else(|e| fatal(&format!("bind {listen}: {e}")));
     match listener.local_addr() {
@@ -64,140 +116,209 @@ fn main() {
     }
     let _ = std::io::Write::flush(&mut std::io::stdout());
 
-    let mut counters = Counters {
-        auth_ok: 0,
-        auth_fail: 0,
-        calls: 0,
-        notifications: 0,
-        session_missing: 0,
-        protocol_header_ok: 0,
-        sessions_issued: 0,
-        saw_watch_token: false,
-    };
-    let mut current_session: Option<String> = None;
+    let vendor = Arc::new(Vendor {
+        token,
+        watch,
+        modes,
+        state: Mutex::new(State { counters: Counters::default(), current_session: None, pending_answer: None }),
+    });
 
     for conn in listener.incoming() {
-        let Ok(mut conn) = conn else { continue };
-        let Ok(peer) = conn.try_clone() else { continue };
-        let req = match read_request(peer) {
-            Ok(Some(r)) => r,
-            _ => continue,
-        };
-        let reply = handle(&req, &token, watch.as_deref(), &modes, &mut counters, &mut current_session);
-        let headers: Vec<(&str, &str)> = reply.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        let _ = write_response_with(&mut conn, reply.status, &headers, &reply.body, reply.chunked);
+        let Ok(conn) = conn else { continue };
+        let vendor = Arc::clone(&vendor);
+        std::thread::spawn(move || vendor.serve(conn));
     }
 }
 
-fn handle(
-    req: &Request,
-    token: &str,
-    watch: Option<&str>,
-    modes: &Modes,
-    counters: &mut Counters,
-    current_session: &mut Option<String>,
-) -> Reply {
-    match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/admin/stats") => json_reply(
-            200,
-            json!({
-                "auth_ok": counters.auth_ok,
-                "auth_fail": counters.auth_fail,
-                "calls": counters.calls,
-                "notifications": counters.notifications,
-                "session_missing": counters.session_missing,
-                "protocol_header_ok": counters.protocol_header_ok,
-                "sessions_issued": counters.sessions_issued,
-                "saw_watch_token": counters.saw_watch_token,
-            }),
-        ),
-
-        ("POST", "/mcp") => {
-            let presented = req.bearer();
-            // Record if the watched token (the placeholder) ever reaches the vendor.
-            if let (Some(w), Some(p)) = (watch, presented) {
-                if p == w {
-                    counters.saw_watch_token = true;
+impl Vendor {
+    fn serve(&self, mut conn: TcpStream) {
+        let Ok(peer) = conn.try_clone() else { return };
+        let req = match read_request(peer) {
+            Ok(Some(r)) => r,
+            _ => return,
+        };
+        match self.handle(&req) {
+            Outcome::Reply(reply) => {
+                let headers: Vec<(&str, &str)> = reply.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                let _ = write_response_with(&mut conn, reply.status, &headers, &reply.body, reply.chunked);
+            }
+            Outcome::Interactive { mut headers, server_request, answer, result } => {
+                headers.push(("Content-Type".to_string(), "text/event-stream".to_string()));
+                let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                if write_response_head(&mut conn, 200, &headers, BodyFraming::Chunked).is_err() {
+                    return;
                 }
-            }
-            // Authenticate. Only the real token is accepted; a placeholder is rejected here, which
-            // is what makes the placeholder worthless without the swap.
-            if presented != Some(token) {
-                counters.auth_fail += 1;
-                return json_reply(401, json!({"error": "invalid_token"}));
-            }
-            counters.auth_ok += 1;
-
-            let rpc: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
-            let method = rpc.get("method").and_then(|m| m.as_str()).unwrap_or("");
-            let is_initialize = method == "initialize";
-
-            // The session rule, before the method: a request outside the session is refused.
-            if modes.session
-                && !is_initialize
-                && (current_session.is_none()
-                    || req.header("mcp-session-id") != current_session.as_deref())
-            {
-                counters.session_missing += 1;
-                return json_reply(400, json!({"error": "missing_or_wrong_session"}));
-            }
-            if !is_initialize && req.header("mcp-protocol-version").is_some() {
-                counters.protocol_header_ok += 1;
-            }
-
-            // A notification: accepted, no body, no id to answer.
-            let Some(id) = rpc.get("id").cloned() else {
-                counters.notifications += 1;
-                return Reply { status: 202, headers: Vec::new(), body: Vec::new(), chunked: false };
-            };
-
-            let mut extra_headers = Vec::new();
-            let message = match method {
-                "initialize" => {
-                    if modes.session {
-                        counters.sessions_issued += 1;
-                        let session_id = format!("sess-{}", counters.sessions_issued);
-                        extra_headers.push(("Mcp-Session-Id".to_string(), session_id.clone()));
-                        *current_session = Some(session_id);
+                // The server's request goes out now, as its own event; the stream stays open.
+                if write_chunk(&mut conn, sse_event(&server_request).as_bytes()).is_err() {
+                    return;
+                }
+                let message = match answer.recv_timeout(SERVER_REQUEST_WAIT) {
+                    Ok(_) => {
+                        self.lock().counters.server_requests_answered += 1;
+                        result
                     }
-                    ok(id, json!({
-                        "protocolVersion": "2025-06-18",
-                        "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "vendor-mcp", "version": "0.2.0"},
-                    }))
-                }
-                "tools/list" => ok(id, json!({
-                    "tools": [{
-                        "name": "vendor-echo",
-                        "description": "Uppercase the given text, on the vendor's side.",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {"text": {"type": "string"}},
-                            "required": ["text"],
-                            "additionalProperties": false,
-                        },
-                    }],
-                })),
-                "tools/call" => {
-                    let params = &rpc["params"];
-                    if params["name"].as_str() != Some("vendor-echo") {
-                        err(id, -32602, "unknown tool")
-                    } else if let Some(text) = params["arguments"]["text"].as_str() {
-                        counters.calls += 1;
-                        ok(id, json!({
-                            "content": [{"type": "text", "text": text.to_uppercase()}],
-                            "isError": false,
-                        }))
-                    } else {
-                        err(id, -32602, "arguments.text is required")
+                    Err(_) => {
+                        let mut state = self.lock();
+                        state.counters.server_requests_unanswered += 1;
+                        state.pending_answer = None;
+                        err(
+                            result["id"].clone(),
+                            -32000,
+                            "the client did not answer the server's request; the call was abandoned",
+                        )
                     }
-                }
-                other => err(id, -32601, &format!("unknown method {other:?}")),
-            };
-            message_reply(message, extra_headers, modes.sse)
+                };
+                let _ = write_chunk(&mut conn, sse_event(&message).as_bytes());
+                let _ = write_last_chunk(&mut conn);
+            }
         }
+    }
 
-        _ => json_reply(404, json!({"error": "not_found"})),
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn handle(&self, req: &Request) -> Outcome {
+        match (req.method.as_str(), req.path.as_str()) {
+            ("GET", "/admin/stats") => {
+                let state = self.lock();
+                let c = &state.counters;
+                Outcome::Reply(json_reply(
+                    200,
+                    json!({
+                        "auth_ok": c.auth_ok,
+                        "auth_fail": c.auth_fail,
+                        "calls": c.calls,
+                        "notifications": c.notifications,
+                        "server_requests_answered": c.server_requests_answered,
+                        "server_requests_unanswered": c.server_requests_unanswered,
+                        "stray_responses": c.stray_responses,
+                        "session_missing": c.session_missing,
+                        "protocol_header_ok": c.protocol_header_ok,
+                        "sessions_issued": c.sessions_issued,
+                        "saw_watch_token": c.saw_watch_token,
+                    }),
+                ))
+            }
+
+            ("POST", "/mcp") => {
+                let mut state = self.lock();
+                let presented = req.bearer();
+                // Record if the watched token (the placeholder) ever reaches the vendor.
+                if let (Some(w), Some(p)) = (self.watch.as_deref(), presented) {
+                    if p == w {
+                        state.counters.saw_watch_token = true;
+                    }
+                }
+                // Authenticate. Only the real token is accepted; a placeholder is rejected here,
+                // which is what makes the placeholder worthless without the swap.
+                if presented != Some(self.token.as_str()) {
+                    state.counters.auth_fail += 1;
+                    return Outcome::Reply(json_reply(401, json!({"error": "invalid_token"})));
+                }
+                state.counters.auth_ok += 1;
+
+                let rpc: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+                let method = rpc.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                let is_initialize = method == "initialize";
+
+                // The session rule, before the method: a request outside the session is refused.
+                if self.modes.session
+                    && !is_initialize
+                    && (state.current_session.is_none()
+                        || req.header("mcp-session-id") != state.current_session.as_deref())
+                {
+                    state.counters.session_missing += 1;
+                    return Outcome::Reply(json_reply(400, json!({"error": "missing_or_wrong_session"})));
+                }
+                if !is_initialize && req.header("mcp-protocol-version").is_some() {
+                    state.counters.protocol_header_ok += 1;
+                }
+
+                // The client's answer to the server's request: no method, an id, an outcome. It is
+                // accepted with 202 and no body, and it wakes the call that waits for it.
+                if rpc.get("method").is_none()
+                    && rpc.get("id").is_some()
+                    && (rpc.get("result").is_some() || rpc.get("error").is_some())
+                {
+                    match state.pending_answer.take() {
+                        Some(waiting) if rpc["id"] == json!("srv-1") => {
+                            let _ = waiting.send(rpc);
+                        }
+                        other => {
+                            state.pending_answer = other;
+                            state.counters.stray_responses += 1;
+                        }
+                    }
+                    return Outcome::Reply(accepted());
+                }
+
+                // A notification: accepted, no body, no id to answer.
+                let Some(id) = rpc.get("id").cloned() else {
+                    state.counters.notifications += 1;
+                    return Outcome::Reply(accepted());
+                };
+
+                let mut extra_headers = Vec::new();
+                let message = match method {
+                    "initialize" => {
+                        if self.modes.session {
+                            state.counters.sessions_issued += 1;
+                            let session_id = format!("sess-{}", state.counters.sessions_issued);
+                            extra_headers.push(("Mcp-Session-Id".to_string(), session_id.clone()));
+                            state.current_session = Some(session_id);
+                        }
+                        ok(id, json!({
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "vendor-mcp", "version": "0.3.0"},
+                        }))
+                    }
+                    "tools/list" => ok(id, json!({
+                        "tools": [{
+                            "name": "vendor-echo",
+                            "description": "Uppercase the given text, on the vendor's side.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {"text": {"type": "string"}},
+                                "required": ["text"],
+                                "additionalProperties": false,
+                            },
+                        }],
+                    })),
+                    "tools/call" => {
+                        let params = &rpc["params"];
+                        if params["name"].as_str() != Some("vendor-echo") {
+                            err(id, -32602, "unknown tool")
+                        } else if let Some(text) = params["arguments"]["text"].as_str() {
+                            state.counters.calls += 1;
+                            let result = ok(id, json!({
+                                "content": [{"type": "text", "text": text.to_uppercase()}],
+                                "isError": false,
+                            }));
+                            if self.modes.server_request {
+                                // Ask the client first; the result waits for its answer.
+                                let (tx, rx) = mpsc::channel();
+                                state.pending_answer = Some(tx);
+                                return Outcome::Interactive {
+                                    headers: extra_headers,
+                                    server_request: json!({"jsonrpc": "2.0", "id": "srv-1", "method": "ping"}),
+                                    answer: rx,
+                                    result,
+                                };
+                            }
+                            result
+                        } else {
+                            err(id, -32602, "arguments.text is required")
+                        }
+                    }
+                    other => err(id, -32601, &format!("unknown method {other:?}")),
+                };
+                Outcome::Reply(message_reply(message, extra_headers, self.modes.sse))
+            }
+
+            _ => Outcome::Reply(json_reply(404, json!({"error": "not_found"}))),
+        }
     }
 }
 
@@ -206,12 +327,21 @@ fn handle(
 fn message_reply(message: Value, mut headers: Vec<(String, String)>, sse: bool) -> Reply {
     if sse {
         headers.push(("Content-Type".to_string(), "text/event-stream".to_string()));
-        let body = format!("event: message\r\ndata: {message}\r\n\r\n").into_bytes();
-        Reply { status: 200, headers, body, chunked: true }
+        Reply { status: 200, headers, body: sse_event(&message).into_bytes(), chunked: true }
     } else {
         headers.push(("Content-Type".to_string(), "application/json".to_string()));
         Reply { status: 200, headers, body: message.to_string().into_bytes(), chunked: false }
     }
+}
+
+/// One SSE event that carries `message`.
+fn sse_event(message: &Value) -> String {
+    format!("event: message\r\ndata: {message}\r\n\r\n")
+}
+
+/// `202 Accepted`, no body: the answer to a notification and to a client response.
+fn accepted() -> Reply {
+    Reply { status: 202, headers: Vec::new(), body: Vec::new(), chunked: false }
 }
 
 fn json_reply(status: u16, body: Value) -> Reply {
