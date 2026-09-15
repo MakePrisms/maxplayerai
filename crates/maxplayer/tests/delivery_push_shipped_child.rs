@@ -931,3 +931,193 @@ async fn a_held_and_saturated_signer_fails_legs_unauthorized_instead_of_parking_
     phase.store(2, Ordering::SeqCst);
     actor_thread.join().expect("the actor thread must finish");
 }
+
+/// ONE real poll of a real future, and the `Poll` it returned handed straight back. The second
+/// delivery's state is taken from the future under test, not inferred around it.
+async fn poll_once<F: std::future::Future>(
+    mut future: std::pin::Pin<&mut F>,
+) -> std::task::Poll<F::Output> {
+    std::future::poll_fn(move |cx| std::task::Poll::Ready(future.as_mut().poll(cx))).await
+}
+
+/// C: A SECOND DELIVERY OBSERVED PENDING BEHIND A HELD SHIPPED-LIBGIT2 PACK UPLOAD.
+///
+/// The contention gates in `maxplayer-core` hold the seat with a shell that ignores `SIGTERM`. That
+/// proves the serializer waits, and the verdict credited it — while naming what it is not: the
+/// first held phase is a SHELL, not libgit2 packing inside the shipped binary. The two differ in
+/// every way that matters here. The shipped child has a real repository open, a real delta search
+/// behind it, a TLS connection to a real smart-HTTP server, and a pack half-written onto the wire.
+/// It is the state a seat is actually stuck in when a delivery goes wrong, and it is the state no
+/// gate had a second delivery waiting behind.
+///
+/// So: delivery one is the shipped binary, pushing a real pack over verified TLS, parked by the
+/// fixture at `POST /git-receive-pack` — the one instant where a real pack is in flight. Delivery
+/// two runs the seat's own `serialized_bounded_push` and is polled repeatedly while that pack is
+/// held. Pending is observed, the handover is compared against delivery one's return instant, and
+/// the remote is asked afterwards whether anything was delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_second_delivery_is_observed_pending_behind_a_held_shipped_pack_upload() {
+    let _trust = exclusive_trust();
+    let root = scratch("pending-behind-pack");
+    let branch = "maxplayer/cccc7777";
+    let (workdir, oid) = job_workdir(&root, branch);
+
+    let bare = root.join("relay.git");
+    git2::Repository::init_bare(&bare).expect("relay bare");
+    let gate = RequestGate::new();
+    let relay = GitHttpAuthServer::spawn_with(
+        &bare,
+        "/git/seller/r.git",
+        FixtureOptions {
+            hold_request_number: Some((2, Arc::clone(&gate))),
+            ..FixtureOptions::default()
+        },
+    );
+    stage_env(&relay.ca_file(&root));
+
+    let lock: Arc<tokio::sync::Mutex<()>> = Arc::new(tokio::sync::Mutex::new(()));
+    let budget = Duration::from_secs(4);
+    let released = Arc::new(AtomicBool::new(false));
+
+    // DELIVERY ONE: the shipped binary, through the seat's own serializer.
+    let first = {
+        let lock = Arc::clone(&lock);
+        let url = relay.repo_url();
+        let branch = branch.to_owned();
+        let oid = oid.clone();
+        let released = Arc::clone(&released);
+        tokio::spawn(async move {
+            let started = Instant::now();
+            let outcome = maxplayer_core::seller_node::run::serialized_bounded_push(
+                &lock,
+                Duration::from_secs(120),
+                Instant::now() + budget,
+                move |turn| async move {
+                    let minter: AuthMinter = Arc::new(|_| Ok("Nostr fixture-token".to_owned()));
+                    let _keep = Token(released);
+                    neutralize_then_push_in_child_off_runtime(
+                        shipped_binary(),
+                        workdir,
+                        url,
+                        branch,
+                        oid,
+                        Some(minter),
+                        None,
+                        turn,
+                    )
+                    .await
+                },
+            )
+            .await;
+            (outcome, started, Instant::now())
+        })
+    };
+
+    // Wait for the pack to be ON THE WIRE and parked. Until this returns, delivery one has not
+    // reached the state this gate is about, and polling delivery two would prove nothing.
+    tokio::task::spawn_blocking({
+        let gate = Arc::clone(&gate);
+        move || gate.wait_held()
+    })
+    .await
+    .expect("the fixture must park the pack upload");
+
+    // DELIVERY TWO: the same serializer, the same lock, asking for the same seat.
+    let acquired_at: Arc<std::sync::Mutex<Option<Instant>>> = Arc::new(std::sync::Mutex::new(None));
+    let second = maxplayer_core::seller_node::run::serialized_bounded_push(
+        &lock,
+        Duration::from_secs(30),
+        Instant::now() + Duration::from_secs(60),
+        {
+            let at = Arc::clone(&acquired_at);
+            move |turn| async move {
+                at.lock().expect("clock").replace(Instant::now());
+                drop(turn);
+                Ok::<_, SellerGitError>("second-delivery-oid".to_owned())
+            }
+        },
+    );
+    tokio::pin!(second);
+
+    assert!(
+        poll_once(second.as_mut()).await.is_pending(),
+        "the second delivery's first poll returned Ready while a pack upload held the seat"
+    );
+
+    let mut samples = 0usize;
+    let watch_until = Instant::now() + Duration::from_millis(1_200);
+    while Instant::now() < watch_until {
+        assert!(
+            poll_once(second.as_mut()).await.is_pending(),
+            "the second delivery became ready while delivery one's pack was still on the wire"
+        );
+        assert!(
+            acquired_at.lock().expect("clock").is_none(),
+            "the second delivery's push body ran while delivery one held the seat"
+        );
+        samples += 1;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    assert!(
+        samples >= 20,
+        "too few observed Poll::Pending returns to call it observed: {samples}"
+    );
+
+    let (outcome, started, returned) = first.await.expect("delivery one task");
+    let held = returned.saturating_duration_since(started);
+
+    match outcome {
+        Err(maxplayer_core::seller_node::run::DeliveryPushErr::Push(SellerGitError::Cancelled(
+            why,
+        ))) => {
+            assert!(
+                why.contains("was killed") && why.contains("confirmed the exit"),
+                "delivery one must report the kill AND the confirmed exit: {why}"
+            );
+        }
+        other => panic!("delivery one must be killed at its deadline, not awaited: {other:?}"),
+    }
+    assert!(
+        held >= budget && held < budget + Duration::from_secs(10),
+        "delivery one held the seat for {held:?}, outside its budget {budget:?} + reap bound"
+    );
+
+    // The seat comes back, and delivery two takes it — after delivery one returned, not before.
+    let second_outcome = second.await;
+    assert_eq!(
+        second_outcome.expect("the second delivery must get the seat once the first stops"),
+        "second-delivery-oid"
+    );
+    let acquired = acquired_at.lock().expect("clock").expect("acquired");
+    assert!(
+        acquired >= returned,
+        "the second delivery entered its push body before the first delivery returned"
+    );
+    assert!(
+        released.load(Ordering::SeqCst),
+        "delivery one's turn was never handed back"
+    );
+
+    // The hold was real and is still parked now: delivery one was stopped WHILE its pack was on the
+    // wire, and nothing reached the remote.
+    gate.wait_held();
+    gate.release();
+    let seen: Vec<String> = relay
+        .requests()
+        .iter()
+        .map(|request| format!("{} {}", request.method, request.target))
+        .collect();
+    assert!(
+        seen.iter().any(|line| line.contains("git-receive-pack")),
+        "the pack upload never reached the server, so nothing was held: {seen:?}"
+    );
+    assert_eq!(
+        remote_head(&bare, branch),
+        None,
+        "a delivery killed mid-pack must leave the remote ref untouched"
+    );
+    eprintln!(
+        "MEASURED held={held:?} budget={budget:?} samples_pending={samples} handover={:?}",
+        acquired.saturating_duration_since(returned)
+    );
+}
