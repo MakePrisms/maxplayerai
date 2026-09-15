@@ -4440,6 +4440,59 @@ impl SellerNodeRunner {
         self.seller_pubkey.to_hex()
     }
 
+    /// One pass of the expiry sweep: remove this seat's containers whose own cleanup stamp has
+    /// passed, and say what happened in the operator log.
+    ///
+    /// **Best-effort, never a gate, and never retried in place.** A leftover container owns a
+    /// namespace and carries no policy, so failing to remove one wastes a container rather than
+    /// opening anything — the same standing this loop already gives the boot reap. Whatever this
+    /// pass could not do is still expired on the next tick, which is why nothing here loops: the
+    /// cadence is the retry, and a docker daemon that has stopped answering must cost this loop one
+    /// bounded call rather than hold the seller's other work while it insists.
+    ///
+    /// A clock that cannot be read skips the pass entirely. Every removal decision here is a
+    /// comparison against `now`, and a `now` this process had to invent could only be wrong in the
+    /// direction that removes a live job's containers.
+    #[cfg(feature = "acp")]
+    async fn sweep_expired_containers(&self, seat: &str) {
+        let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+            opline!(
+                "seller node: skipping the container expiry sweep — the system clock is before the \
+                 unix epoch, and no container can be judged expired against a time this process had \
+                 to guess"
+            );
+            return;
+        };
+        match crate::sandbox_netns::sweep_expired(seat, now.as_secs()).await {
+            Ok(report) => {
+                if !report.removed.is_empty() {
+                    opline!(
+                        "seller node: swept {} expired container(s) of this seat (past their own \
+                         job's deadline plus {}s)",
+                        report.removed.len(),
+                        crate::sandbox_netns::CLEANUP_GRACE_SECS
+                    );
+                }
+                for (container, error) in &report.failed {
+                    opline!(
+                        "seller node: could not remove expired container {container} ({error}) — \
+                         harmless now, and the next sweep will select it again"
+                    );
+                }
+            }
+            Err(error) => opline!(
+                "seller node: the container expiry sweep could not read docker ({error}) — nothing \
+                 was removed this pass, and expired containers stay until a later one succeeds"
+            ),
+        }
+    }
+
+    /// The same entry point on a build without the docker runner, so the run loop below schedules
+    /// its tick unconditionally and only the work behind it is feature-gated.
+    #[cfg(not(feature = "acp"))]
+    #[allow(clippy::unused_async)]
+    async fn sweep_expired_containers(&self, _seat: &str) {}
+
     /// A handle asking this node to leave the selling role: the run loop stops, publishes its
     /// terminal `accepting=n` beat (#747), and [`Self::run`] returns `Ok(())`.
     ///
@@ -4853,6 +4906,24 @@ impl SellerNodeRunner {
         }
 
         let mut drain_tick = tokio::time::interval(DRAIN_INTERVAL);
+        // The container expiry sweep rides THIS loop, for the same reason the heartbeat does: a
+        // side-thread would need its own shutdown, its own clock and its own reason to exist, and
+        // this loop already stops when the node stops.
+        //
+        // `interval` fires immediately on first poll, and here that is the point: the first sweep
+        // happens at startup. A seller that was `SIGKILL`ed mid-job, or one whose containers the
+        // daemon only materialised after it was gone, therefore rediscovers those leftovers from
+        // their own labels on the next boot with no memory of the jobs that made them — the boot
+        // reaper covers the attached-holder case, this covers everything the stamp can judge.
+        let mut sweep_tick =
+            tokio::time::interval(Duration::from_secs(crate::sandbox_netns::SWEEP_INTERVAL_SECS));
+        let sweep_seat = self.seller_pubkey();
+        // Only when this node actually runs contained jobs. A seat with no sandbox network creates
+        // no holders and no helpers, and a sweep there would spend a `docker ps` every five minutes
+        // to look for containers this build never creates — on a host that may not even run docker.
+        let sweep_enabled = SandboxPolicy::from_config(self.node.home().config.sandbox.as_ref())
+            .map(|sandbox| sandbox.sandbox_network().is_some())
+            .unwrap_or(false);
         let wrap_backfill_interval_secs = resolve_wrap_backfill_interval_secs();
         let mut wrap_backfill_tick =
             tokio::time::interval(Duration::from_secs(wrap_backfill_interval_secs));
@@ -4942,6 +5013,13 @@ impl SellerNodeRunner {
                 reason = shutdown::next_request(&mut shutdown_rx) => {
                     opline!("seller node: shutdown requested ({reason}); retracting the seat and ending the loop");
                     break;
+                }
+                // Expired-container sweep. Bounded per pass (`MAX_SWEEP_REMOVALS`) and bounded per
+                // docker call (`SWEEP_DOCKER_DEADLINE`), so a stuck daemon costs this loop seconds,
+                // not its cadence.
+                _ = sweep_tick.tick(), if sweep_enabled => {
+                    self.sweep_expired_containers(&sweep_seat).await;
+                    continue;
                 }
                 _ = drain_tick.tick() => {
                     self.sweep_lapsed_claims();

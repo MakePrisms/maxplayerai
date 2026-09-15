@@ -2318,6 +2318,21 @@ pub async fn reap_orphans(seat: &str) -> Result<ReapReport, String> {
 #[cfg(feature = "acp")]
 pub const SWEEP_DOCKER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// How often the seller's run loop sweeps expired containers: **every five minutes**.
+///
+/// Not gated on `acp`, because the run loop schedules the tick on every build and only the docker
+/// work behind it needs the feature.
+///
+/// **The cadence is the honest half of the tradeoff.** A container is removed no earlier than its
+/// own job's deadline plus [`CLEANUP_GRACE_SECS`], and no later than that plus one interval — so the
+/// worst case an operator should expect is deadline + 1 h + 5 min, and longer if docker or the
+/// daemon itself was down, because a sweep that could not list is retried rather than assumed. Five
+/// minutes is chosen against the grace it serves: a cadence near the grace would make the *interval*
+/// the dominant term in how long a leftover survives, and a much tighter one would spend a `docker
+/// ps` on an idle host every few seconds to discover, almost always, nothing. Against a 3600 s grace
+/// this adds at most 8% to the wait and costs one listing per five minutes.
+pub const SWEEP_INTERVAL_SECS: u64 = 300;
+
 /// How many expired containers a single sweep will remove before leaving the rest to the next one.
 ///
 /// **Bounded work, so the leak cannot become the outage.** A host that accumulated hundreds of
