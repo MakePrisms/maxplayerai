@@ -338,7 +338,7 @@ async fn a_pack_upload_held_on_the_wire_is_stopped_at_the_deadline_and_delivers_
     // Small enough to run as a gate, same shape as the production budget.
     let budget = Duration::from_secs(4);
     let released = Arc::new(AtomicBool::new(false));
-    let (_control, turn) = delivery_turn(Token(Arc::clone(&released)), Instant::now() + budget);
+    let (control, turn) = delivery_turn(Token(Arc::clone(&released)), Instant::now() + budget);
 
     let started = Instant::now();
     let outcome = neutralize_then_push_in_child_off_runtime(
@@ -395,5 +395,253 @@ async fn a_pack_upload_held_on_the_wire_is_stopped_at_the_deadline_and_delivers_
     assert!(
         seen.iter().any(|line| line.contains("git-receive-pack")),
         "the pack upload never reached the server, so nothing was held: {seen:?}"
+    );
+}
+
+/// What one held-leg delivery through the shipped child produced.
+struct HeldRun {
+    outcome: Result<String, SellerGitError>,
+    elapsed: Duration,
+    seen: Vec<String>,
+    remote: Option<String>,
+    ended: bool,
+    released: bool,
+}
+
+/// One cell of the hold matrix, run end to end through the SHIPPED binary.
+///
+/// The R3 verdict credited exactly one cell of this grid — the pack upload held until the deadline —
+/// and named the rest missing. The two axes are: **which leg is held** (1 is the
+/// `GET .../info/refs` advertisement, before any pack exists; 2 is the `POST .../git-receive-pack`
+/// that carries it) and **what ends the delivery** (its deadline, or a revocation while it hangs).
+/// They are different code: a deadline is the parent's timer firing, a revocation is the parent's
+/// cancellation poll re-asking authority and killing early. Holding the advertisement matters
+/// separately because the child is then stopped before it has produced a pack at all.
+async fn delivery_against_a_held_leg(
+    label: &str,
+    branch: &str,
+    hold_leg: usize,
+    budget: Duration,
+    revoke_after: Option<Duration>,
+) -> HeldRun {
+    let root = scratch(label);
+    let (workdir, oid) = job_workdir(&root, branch);
+
+    let bare = root.join("relay.git");
+    git2::Repository::init_bare(&bare).expect("relay bare");
+    let gate = RequestGate::new();
+    let relay = GitHttpAuthServer::spawn_with(
+        &bare,
+        "/git/seller/r.git",
+        FixtureOptions {
+            hold_request_number: Some((hold_leg, Arc::clone(&gate))),
+            ..FixtureOptions::default()
+        },
+    );
+    stage_env(&relay.ca_file(&root));
+
+    let minter: AuthMinter = Arc::new(|_| Ok("Nostr fixture-token".to_owned()));
+    let authority: Option<git_transport::AuthorityCheck> = revoke_after.map(|after| {
+        let revoked_at = Instant::now() + after;
+        let check: git_transport::AuthorityCheck = Arc::new(move || {
+            if Instant::now() >= revoked_at {
+                Err("the owner of this delivery went away".to_owned())
+            } else {
+                Ok(())
+            }
+        });
+        check
+    });
+
+    let released = Arc::new(AtomicBool::new(false));
+    let (control, turn) = delivery_turn(Token(Arc::clone(&released)), Instant::now() + budget);
+
+    let started = Instant::now();
+    let outcome = neutralize_then_push_in_child_off_runtime(
+        shipped_binary(),
+        workdir,
+        relay.repo_url(),
+        branch.to_owned(),
+        oid,
+        Some(minter),
+        authority,
+        turn,
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    // The hold was real, and it is still parked now: whatever stopped the delivery above happened
+    // while the wire was held, not after the server let it go.
+    gate.wait_held();
+    gate.release();
+
+    let seen: Vec<String> = relay
+        .requests()
+        .iter()
+        .map(|request| format!("{} {}", request.method, request.target))
+        .collect();
+    let remote = remote_head(&bare, branch);
+
+    // WHETHER THE SEAT CAME BACK. `work_ended` is the fact that decides it: the custody guard hands
+    // the turn on by DROPPING `RunningWork`, and retains by `mem::forget`ing it, so a retained turn
+    // can never report ended. The ownership token is then dropped once the supervisor is also
+    // finished — which is what dropping the control below stands for — so the two together are
+    // "the child's exit was confirmed AND the seat is free", not either one alone.
+    let ended = control.work_ended();
+    drop(control);
+    let remote = remote;
+    HeldRun {
+        outcome,
+        elapsed,
+        seen,
+        remote,
+        ended,
+        released: released.load(Ordering::SeqCst),
+    }
+}
+
+/// MATRIX CELL: advertisement leg × deadline.
+///
+/// The child is stopped on `GET .../info/refs`, before libgit2 has negotiated anything or built a
+/// pack. The existing gate holds the POST; this one proves the bound does not depend on the child
+/// having reached the upload, which is the point in the delivery where a real relay that accepts
+/// connections and then stops talking would park it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_advertisement_held_on_the_wire_is_stopped_at_the_deadline_and_delivers_nothing() {
+    let _trust = exclusive_trust();
+    let budget = Duration::from_secs(4);
+    let run =
+        delivery_against_a_held_leg("held-get", "maxplayer/cccc3333", 1, budget, None).await;
+
+    assert!(
+        run.elapsed >= budget,
+        "the delivery ended at {:?}, before its own {budget:?} budget: whatever stopped it was not \
+         the deadline",
+        run.elapsed
+    );
+    assert!(
+        run.elapsed < budget + Duration::from_secs(30),
+        "the delivery was still running {:?} after a {budget:?} budget; the bound is not a bound",
+        run.elapsed
+    );
+    match &run.outcome {
+        Err(SellerGitError::Cancelled(error)) => assert!(
+            error.contains("was killed") && error.contains("confirmed the exit"),
+            "a held delivery must be reported as killed AND as confirmed exited: {error}"
+        ),
+        other => panic!("a delivery held on the advertisement must be cancelled, not {other:?}"),
+    }
+    assert_eq!(
+        run.remote, None,
+        "the remote moved despite the advertisement being held and the delivery killed"
+    );
+    assert!(
+        run.seen.iter().any(|line| line.contains("info/refs")),
+        "the advertisement never reached the server, so nothing was held: {:?}",
+        run.seen
+    );
+    assert!(
+        !run.seen.iter().any(|line| line.starts_with("POST ")),
+        "a delivery held at the advertisement must never have uploaded a pack: {:?}",
+        run.seen
+    );
+    assert!(
+        run.ended && run.released,
+        "the seat was never handed back after a confirmed exit (work_ended={}, ownership \
+         dropped={})",
+        run.ended,
+        run.released
+    );
+}
+
+/// MATRIX CELL: pack-upload leg × revocation.
+///
+/// The delivery is not allowed to run out of time — it is CANCELLED while it hangs, and the proof
+/// that this is the revocation and not the deadline is that it ends well before the budget. This is
+/// the abort column the verdict named missing, exercised through the shipped binary rather than a
+/// shell stand-in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revoked_delivery_held_on_the_pack_upload_is_stopped_early_and_delivers_nothing() {
+    let _trust = exclusive_trust();
+    // Long enough that reaching it would be a failure of this gate, not a pass.
+    let budget = Duration::from_secs(60);
+    let run = delivery_against_a_held_leg(
+        "revoked-post",
+        "maxplayer/dddd4444",
+        2,
+        budget,
+        Some(Duration::from_secs(2)),
+    )
+    .await;
+
+    assert!(
+        run.elapsed < Duration::from_secs(30),
+        "the delivery ran {:?} against a {budget:?} budget after being revoked at 2s; it was \
+         stopped by its deadline or by nothing at all",
+        run.elapsed
+    );
+    match &run.outcome {
+        Err(SellerGitError::Cancelled(error)) => assert!(
+            error.contains("was killed") && error.contains("confirmed the exit"),
+            "a revoked delivery must be reported as killed AND as confirmed exited: {error}"
+        ),
+        other => panic!("a revoked delivery must be cancelled, not {other:?}"),
+    }
+    assert_eq!(
+        run.remote, None,
+        "the remote moved despite the upload being held and the delivery revoked"
+    );
+    assert!(
+        run.seen.iter().any(|line| line.starts_with("POST ")),
+        "the pack upload never reached the server, so nothing was held: {:?}",
+        run.seen
+    );
+    assert!(
+        run.ended && run.released,
+        "the seat was never handed back after a confirmed exit (work_ended={}, ownership \
+         dropped={})",
+        run.ended,
+        run.released
+    );
+}
+
+/// MATRIX CELL: advertisement leg × revocation. The fourth corner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revoked_delivery_held_on_the_advertisement_is_stopped_early_and_delivers_nothing() {
+    let _trust = exclusive_trust();
+    let budget = Duration::from_secs(60);
+    let run = delivery_against_a_held_leg(
+        "revoked-get",
+        "maxplayer/eeee5555",
+        1,
+        budget,
+        Some(Duration::from_secs(2)),
+    )
+    .await;
+
+    assert!(
+        run.elapsed < Duration::from_secs(30),
+        "the delivery ran {:?} against a {budget:?} budget after being revoked at 2s",
+        run.elapsed
+    );
+    match &run.outcome {
+        Err(SellerGitError::Cancelled(error)) => assert!(
+            error.contains("was killed") && error.contains("confirmed the exit"),
+            "a revoked delivery must be reported as killed AND as confirmed exited: {error}"
+        ),
+        other => panic!("a revoked delivery must be cancelled, not {other:?}"),
+    }
+    assert_eq!(run.remote, None, "the remote moved despite the revocation");
+    assert!(
+        !run.seen.iter().any(|line| line.starts_with("POST ")),
+        "a delivery revoked at the advertisement must never have uploaded a pack: {:?}",
+        run.seen
+    );
+    assert!(
+        run.ended && run.released,
+        "the seat was never handed back after a confirmed exit (work_ended={}, ownership \
+         dropped={})",
+        run.ended,
+        run.released
     );
 }
