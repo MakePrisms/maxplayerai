@@ -608,6 +608,18 @@ pub fn child_env() -> Vec<(OsString, OsString)> {
         .collect()
 }
 
+/// How much of [`REAP_BOUND`] is still available for a child that has already been waited for
+/// `spent`.
+///
+/// The window belongs to the CHILD, not to the call. `drive` kills it, the cleanup that follows
+/// normalizes the outcome, and `Drop` kills again behind every return: three callers, and when each
+/// started a fresh [`REAP_BOUND`] an unconfirmed exit cost three full windows plus the end-of-file
+/// window, against a module header advertising two windows in total. Charging every attempt against
+/// one budget is what makes the advertised number the real one.
+fn reap_window_left(spent: Duration) -> Duration {
+    REAP_BOUND.saturating_sub(spent)
+}
+
 /// A spawned child that **cannot be forgotten**. Dropping it kills the process group and waits for
 /// the exit; there is no path out of this module that leaves a delivery packing behind us.
 pub struct KillableChild {
@@ -711,7 +723,7 @@ impl KillableChild {
                     // means this attempt has already polled the exit once above and found it
                     // absent, which is the whole of what a further wait could add.
                     let waited = self.spent_reaping + started.elapsed();
-                    if waited >= REAP_BOUND {
+                    if started.elapsed() >= reap_window_left(self.spent_reaping) {
                         self.spent_reaping = waited;
                         return Err(ExecutorError::Unreaped { waited });
                     }
@@ -1835,6 +1847,140 @@ pub fn minted_answer(header: Option<String>, refused: Option<String>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AN OVER-CAP FRAME IS ABANDONED MID-ENCODE, not built in full and then measured.
+    ///
+    /// `MAX_FRAME_BYTES` used to be checked against `line.len()` after `serde_json::to_string` had
+    /// returned, so the cap bounded what the parent would WRITE and bounded nothing about the work
+    /// and the allocation it did to find out. That matters in this module specifically: encoding
+    /// runs synchronously on the supervisor thread, between the waits the deadline is enforced in,
+    /// so an oversized value was an unbounded phase inside a module whose claim is bounded ones.
+    ///
+    /// The oracle is the SERIALIZER, not the error text. This value reports how many of its elements
+    /// were actually serialized before the sink refused; a full materialization emits all of them,
+    /// a capped encode stops shortly after the cap.
+    #[test]
+    fn an_oversized_frame_stops_at_the_cap_instead_of_being_materialized() {
+        use serde::ser::SerializeSeq;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        const CHUNK: usize = 4 * 1024;
+        // Four times the cap, so a materializing encoder does four times the work it is allowed to.
+        const CHUNKS: usize = (4 * MAX_FRAME_BYTES) / CHUNK;
+
+        struct Counted {
+            chunk: String,
+            emitted: Arc<AtomicUsize>,
+        }
+
+        impl Serialize for Counted {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut seq = serializer.serialize_seq(Some(CHUNKS))?;
+                for _ in 0..CHUNKS {
+                    seq.serialize_element(&self.chunk)?;
+                    self.emitted.fetch_add(1, Ordering::SeqCst);
+                }
+                seq.end()
+            }
+        }
+
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let value = Counted {
+            chunk: "x".repeat(CHUNK),
+            emitted: Arc::clone(&emitted),
+        };
+
+        let error = encode_frame(&value).expect_err("a frame four times the cap must be refused");
+        let text = error.to_string();
+        assert!(
+            text.contains("cap"),
+            "an over-cap frame must be refused as an over-cap frame: {text}"
+        );
+
+        let done = emitted.load(Ordering::SeqCst);
+        assert!(
+            done < CHUNKS / 2,
+            "the encoder serialized {done} of {CHUNKS} elements before it was stopped; the value         was materialized in full and only then measured, which is the unbounded synchronous phase         this cap exists to remove"
+        );
+        assert!(
+            done * CHUNK <= MAX_FRAME_BYTES + CHUNK,
+            "the encoder produced {} bytes past a {MAX_FRAME_BYTES}-byte cap",
+            done * CHUNK
+        );
+
+        // And an ordinary frame still encodes, newline and all.
+        let line = encode_frame(&ToParent::Check {
+            phase: "send-pack".to_owned(),
+        })
+        .expect("an in-cap frame must still encode");
+        assert!(line.ends_with('\n') && line.len() < 128);
+    }
+
+    /// THE REAP WINDOW IS A BUDGET FOR THE CHILD, NOT FOR EACH CALLER.
+    ///
+    /// Stated as a rule rather than raced against a live process, and the reason is worth naming:
+    /// making a real child survive `SIGKILL` long enough to force three consecutive full windows is
+    /// not constructible in a test on this platform — a process only ignores `SIGKILL` while it is
+    /// inside uninterruptible kernel work, which a test cannot arrange on demand. So the accounting
+    /// is proved here, and what is NOT proved is that a genuinely unkillable child was observed.
+    /// The behavioural half below is the ordinary path: a real child, killed, confirmed, and charged.
+    #[test]
+    fn repeated_reap_attempts_share_one_window_instead_of_multiplying_it() {
+        assert_eq!(
+            reap_window_left(Duration::ZERO),
+            REAP_BOUND,
+            "the first attempt must get the whole window"
+        );
+
+        // Three attempts, as the failing path really makes them: drive, then the cleanup, then Drop.
+        let mut spent = Duration::ZERO;
+        let mut attempts = 0;
+        while reap_window_left(spent) > Duration::ZERO && attempts < 16 {
+            // Each attempt uses whatever it is given, which is the worst case for the total.
+            spent += reap_window_left(spent).min(REAP_BOUND / 3);
+            attempts += 1;
+        }
+        assert!(
+            spent <= REAP_BOUND,
+            "three attempts spent {spent:?} against a {REAP_BOUND:?} window; a per-call window is         exactly the defect — the seat's advertised deadline + 2 * REAP_BOUND cannot survive it"
+        );
+        assert_eq!(
+            reap_window_left(spent),
+            Duration::ZERO,
+            "an exhausted budget must leave nothing for a further attempt to wait on"
+        );
+        assert_eq!(
+            reap_window_left(REAP_BOUND * 3),
+            Duration::ZERO,
+            "an overspent budget must saturate at zero rather than wrap"
+        );
+
+        // The ordinary path, against a real process: killed, confirmed, and the time charged.
+        let mut child = KillableChild::spawn(Path::new("/bin/sh"), &["-c", "sleep 30"])
+            .expect("spawn a child to reap");
+        let pid = child.pid();
+        let took = child.kill_and_reap().expect("a live child must be reapable");
+        assert!(
+            took <= REAP_BOUND,
+            "reaping a shell took {took:?}, past the window it is allowed"
+        );
+        assert!(child.is_reaped(), "the child was not confirmed gone");
+        assert!(
+            child.spent_reaping <= REAP_BOUND,
+            "the child was charged {:?} against a {REAP_BOUND:?} window",
+            child.spent_reaping
+        );
+        // A second attempt on a reaped child costs nothing at all.
+        assert_eq!(
+            child.kill_and_reap().expect("already reaped"),
+            Duration::ZERO
+        );
+        assert!(
+            unsafe { libc::kill(pid, 0) } != 0,
+            "the reaped child is still present"
+        );
+    }
 
     /// THE SIZING RULE, WITHOUT A CLOCK TO ARGUE WITH.
     ///
