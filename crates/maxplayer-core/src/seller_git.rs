@@ -1417,18 +1417,24 @@ mod tests {
         );
     }
 
-    /// An UNWIND through the child-push supervisor must not hand this seat on.
+    /// An UNWIND ONCE A CHILD MAY EXIST must not hand this seat on.
     ///
     /// `RunningWork`'s own `Drop` releases, which is right for work whose life is its stack. It was
     /// wrong here: a panic in the supervisor or in the minter unwound straight through it and freed
-    /// the seat while a child process nobody had reaped still held the workdir and the remote. The
-    /// guard makes retention the DEFAULT and release the explicit act.
+    /// the seat while a child process nobody had reaped still held the workdir and the remote.
+    ///
+    /// ARMED is what makes the difference, and this test is the armed half. `arm()` is called
+    /// immediately before the spawn, i.e. at the exact point this process stops being able to say
+    /// from its own knowledge that no delivery process exists. From there an unwind is an UNKNOWN,
+    /// and the only safe answer to an unknown child is to keep the seat.
     #[test]
-    fn a_panic_through_the_child_push_custody_keeps_the_turn() {
+    fn a_panic_after_the_custody_is_armed_keeps_the_turn() {
         let (control, turn) = a_turn();
         let running = turn.begin().expect("the turn begins");
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _custody = ChildCustody::hold(running);
+            let mut custody = ChildCustody::hold(running);
+            // The spawn is about to happen; from this line on a child may exist.
+            custody.arm();
             panic!("the supervisor died holding a child");
         }));
         assert!(panicked.is_err(), "this test is about an unwind");
@@ -1445,6 +1451,35 @@ mod tests {
         assert!(
             control.holds_ownership(),
             "exclusion must still be held by the delivery whose child was never confirmed dead"
+        );
+    }
+
+    /// THE UNARMED HALF, and the reason `arm` exists at all.
+    ///
+    /// The guard used to retain unconditionally, which read as caution and was not: a delivery
+    /// refused between `begin()` and the spawn — no child, nothing to reap, nothing on the wire —
+    /// took this seat with it for the life of the process. "We cannot say whether a child exists"
+    /// and "we know none does" are different facts, and answering the second with the first turns
+    /// an ordinary refusal into a permanently dead seat.
+    ///
+    /// So before `arm`, an unwind releases the ordinary way.
+    #[test]
+    fn a_panic_before_any_child_could_exist_hands_the_turn_back() {
+        let (control, turn) = a_turn();
+        let running = turn.begin().expect("the turn begins");
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _custody = ChildCustody::hold(running);
+            panic!("the supervisor died before it ever tried to spawn");
+        }));
+        assert!(panicked.is_err(), "this test is about an unwind");
+        assert!(
+            control.work_ended(),
+            "no child could exist yet, so this seat must go back rather than be stranded"
+        );
+        control.end();
+        assert!(
+            !control.holds_ownership(),
+            "exclusion was retained over a delivery that never started a child"
         );
     }
 
