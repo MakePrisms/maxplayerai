@@ -54,7 +54,7 @@ const KIND_MOBEE_JOB_OFFER: u32 = 5109;
 const KIND_MOBEE_JOB_RESULT: u32 = 6109;
 const KIND_MOBEE_JOB_FEEDBACK: u32 = 7000;
 
-// Mobee trade path — the contiguous mobee-owned block 3400-3406, plus the
+// Mobee trade path — the contiguous mobee-owned block 3400-3407, plus the
 // addressable seller heartbeat (30340) and the NIP-89 handler advertisement
 // (31990), which historical maxplayer-core writers emitted on the wire. The trade
 // registry mirrors the trade-kind subset this relay accepts from maxplayerai
@@ -67,6 +67,7 @@ const KIND_MOBEE_TRADE_RESULT: u32 = 3403;
 const KIND_MOBEE_TRADE_FEEDBACK: u32 = 3404;
 const KIND_MOBEE_TRADE_AWARD: u32 = 3405;
 const KIND_MOBEE_TRADE_ACCEPT: u32 = 3406;
+const KIND_MOBEE_TRADE_REJECT: u32 = 3407;
 const KIND_MOBEE_SELLER_HEARTBEAT: u32 = 30340;
 const KIND_MOBEE_NIP89_HANDLER: u32 = 31990;
 // NIP-17 DM-relay list (standard kind 10050). Pre-allowed by mobee for future
@@ -357,6 +358,7 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         | KIND_MOBEE_TRADE_FEEDBACK
         | KIND_MOBEE_TRADE_AWARD
         | KIND_MOBEE_TRADE_ACCEPT
+        | KIND_MOBEE_TRADE_REJECT
         | KIND_MOBEE_SELLER_HEARTBEAT => Ok(Scope::MessagesWrite),
         // Mobee self-describing discovery/config kinds — the NIP-89 handler
         // advertisement and the NIP-17 DM-relay list. Grouped with kind-0's
@@ -2800,7 +2802,7 @@ mod tests {
     #[test]
     fn mobee_kinds_require_messages_write_scope() {
         let dummy = make_dummy_event();
-        // The deployed mobee protocol is the contiguous 3400-3406 trade block plus
+        // The deployed mobee protocol is the contiguous 3400-3407 trade block plus
         // 30340 heartbeat, 31990 NIP-89 discovery, and 10050 NIP-17 DM-relay list.
         // Asserting KIND_MOBEE_TRADE_OFFER (3401) is the load-bearing acceptance
         // check: 3401 discriminates the maxplayer-core scheme from the fork's DVM-only
@@ -2814,6 +2816,7 @@ mod tests {
             KIND_MOBEE_TRADE_FEEDBACK,   // 3404
             KIND_MOBEE_TRADE_AWARD,      // 3405
             KIND_MOBEE_TRADE_ACCEPT,     // 3406 (pay-bind, #329)
+            KIND_MOBEE_TRADE_REJECT,     // 3407 (verified delivery refusal — #961)
             KIND_MOBEE_SELLER_HEARTBEAT, // 30340
         ] {
             assert_eq!(
@@ -2834,6 +2837,13 @@ mod tests {
                 "mobee discovery kind {kind} should require UsersWrite scope"
             );
         }
+        // Negative control (#961): the trade block admits 3400-3407 and nothing
+        // else. 3408 (just past the block) must NOT be admitted — proving no
+        // general admission broadening beyond the one kind joining the arm.
+        assert!(
+            required_scope_for_kind(3408, &dummy).is_err(),
+            "3408 must remain rejected under closed ingest (no general broadening)"
+        );
         // Literal 3401: fails if the relay only knows the fork's DVM numbering.
         assert_eq!(
             required_scope_for_kind(3401, &dummy).unwrap(),
