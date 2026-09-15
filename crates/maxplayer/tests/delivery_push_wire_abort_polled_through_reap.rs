@@ -399,6 +399,11 @@ async fn a_parked_leg_is_stopped_and_b_never_overlaps(label: &str, leg: Leg, sto
     // alive at that instant, and starving the observer takes such samples away rather than moving
     // them later.
     let mut child_last_alive_at: Option<Instant> = None;
+    // WHEN THE OBSERVER LAST LOOKED, whatever it saw. `child_last_alive_at` records only sightings
+    // of a LIVING child, so by itself it cannot tell "the child was gone" from "nobody looked" --
+    // and starvation produces the second. Recording every look is what lets the silence below be
+    // turned into a failure.
+    let mut last_sample_at: Option<Instant> = None;
     // The instant observation starts, recorded BEFORE the first poll so the leading interval is
     // measured like every other one. Without it the gap between "the stop was ordered" and the
     // first sample was the one interval this test never looked at.
@@ -409,6 +414,7 @@ async fn a_parked_leg_is_stopped_and_b_never_overlaps(label: &str, leg: Leg, sto
         // Checked on EVERY iteration, not merely until the child is first seen absent: a child that
         // is still alive after B takes the seat is exactly the overlap this gate exists to catch,
         // and a check that stopped looking once it saw an absence could never witness it.
+        last_sample_at = Some(at);
         if pid_exists(a_child) {
             child_last_alive_at = Some(at);
         } else if child_gone_at.is_none() {
@@ -421,8 +427,12 @@ async fn a_parked_leg_is_stopped_and_b_never_overlaps(label: &str, leg: Leg, sto
         // acquisition by construction, and the single interval this check exists to witness would
         // be invisible. Presence after the acquisition is the whole evidence, so it is looked for
         // on both sides of the poll.
+        // Stamped BEFORE the lookup so the recorded instant is never later than the look itself:
+        // the claim "this run looked at or after T" must stay conservative.
+        let post_at = Instant::now();
+        last_sample_at = Some(post_at);
         if pid_exists(a_child) {
-            child_last_alive_at = Some(Instant::now());
+            child_last_alive_at = Some(post_at);
         }
         match polled {
             std::task::Poll::Pending => samples.push(at),
@@ -466,6 +476,22 @@ async fn a_parked_leg_is_stopped_and_b_never_overlaps(label: &str, leg: Leg, sto
     // — a sample that found the child alive proves it WAS alive then, and a starved observer takes
     // fewer samples rather than later ones. So the overlap is asserted from the evidence that can
     // actually witness it: A's child alive at or after the instant B entered its push body.
+    // **COVERAGE BEFORE CONCLUSION: THIS DEGRADES TO FAILURE, NOT TO SILENCE.** The check below
+    // fires only on a sighting of a LIVING child, so with no samples at all it would simply pass --
+    // and starving the observer is exactly what removes samples. That is fail-open: under the very
+    // conditions this assertion exists to survive it would go quiet rather than red, and a later
+    // reader could not tell "nothing overlapped" from "nobody looked". So the run must first show
+    // it looked at the interval it judges: some sample taken at or after the instant B entered its
+    // push body. Absent evidence is not evidence of absence, and here it is a failure.
+    let last_sample_at =
+        last_sample_at.expect("the observation loop never sampled the process table at all");
+    assert!(
+        last_sample_at >= acquired_at,
+        "no sample of A's child was taken at or after B entered its push body -- the last look was \
+         {:?} BEFORE it -- so this run observed nothing about the interval it exists to judge and \
+         cannot corroborate exclusion",
+        acquired_at.saturating_duration_since(last_sample_at)
+    );
     if let Some(alive_at) = child_last_alive_at {
         assert!(
             alive_at < acquired_at,
