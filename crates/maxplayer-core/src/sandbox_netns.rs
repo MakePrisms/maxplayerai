@@ -185,6 +185,32 @@ impl FenceBounds {
 struct CreationFence {
     in_flight: std::sync::Mutex<usize>,
     settled: std::sync::Condvar,
+    /// How many tickets this fence has EVER issued, which only ever grows.
+    ///
+    /// `in_flight` answers "is work outstanding now" and is therefore blind to work that started
+    /// and finished between two observations. This answers the different question "was anything
+    /// ever started under this fence at all", which is the only way to tell a create that was
+    /// refused before it began from one that was launched and instantly killed — those two look
+    /// identical from the outside, and exactly one of them leaves a container behind.
+    issued: std::sync::Mutex<usize>,
+    /// The owner this fence is RETAINING for a job whose bounded owner ran out of wait.
+    ///
+    /// This is the termination path the previous version did not have. A bounded owner that
+    /// reaches its limit with the create still in flight has exactly two honest options: keep
+    /// waiting (which only moves the edge), or hand the job to something that outlives it. This
+    /// slot is the something. It is not a registry of containers and not a journal — it holds one
+    /// job, for the one create this fence already exists to count, and it is consumed the moment
+    /// that create settles.
+    retained: std::sync::Mutex<Option<RetainedOwner>>,
+}
+
+/// Cleanup a fence holds on a job's behalf after its bounded owner's wait expired.
+struct RetainedOwner(Box<dyn FnOnce() + Send>);
+
+impl std::fmt::Debug for RetainedOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RetainedOwner(cleanup still owned)")
+    }
 }
 
 impl CreationFence {
@@ -195,7 +221,45 @@ impl CreationFence {
                 self.in_flight.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             *in_flight += 1;
         }
+        {
+            let mut issued = self.issued.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *issued += 1;
+        }
         CreationTicket { fence: std::sync::Arc::clone(self) }
+    }
+
+    /// Transfer a job to an owner this fence RETAINS until the create settles.
+    ///
+    /// Called when a bounded owner's wait runs out. The job is not run here and not timed here; it
+    /// is held, and [`CreationTicket::drop`] runs it at the moment the last in-flight create ends.
+    /// That is the whole difference between a window and an owner: a window expires, and this does
+    /// not.
+    fn retain_owner(&self, job: impl FnOnce() + Send + 'static) {
+        let mut retained = self.retained.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *retained = Some(RetainedOwner(Box::new(job)));
+    }
+
+    /// How much work has ever been started under this fence.
+    fn tickets_issued(&self) -> usize {
+        *self.issued.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Whether this fence is still holding somebody's cleanup.
+    ///
+    /// Exists so ownership can be ASSERTED rather than read out of a log line: a test can ask the
+    /// fence whether the job is still owned, which a message about ownership cannot answer.
+    fn holds_retained_owner(&self) -> bool {
+        self.retained
+            .lock()
+            .map(|retained| retained.is_some())
+            .unwrap_or(false)
+    }
+
+    fn take_retained_owner(&self) -> Option<RetainedOwner> {
+        self.retained
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
     }
 
     /// Block until every in-flight create has ended, or the bound expires.
@@ -232,12 +296,38 @@ struct CreationTicket {
     fence: std::sync::Arc<CreationFence>,
 }
 
+impl CreationTicket {
+    /// The fence this ticket belongs to, so work spawned underneath it can take its OWN ticket.
+    ///
+    /// Detached IO threads use this. A reader or writer holding a pipe endpoint is work this
+    /// process is still doing, and until it takes a ticket of its own it is work nobody is counted
+    /// for — the closure could return, release the only ticket, and let cleanup conclude while the
+    /// thread was still reading.
+    fn fence(&self) -> &std::sync::Arc<CreationFence> {
+        &self.fence
+    }
+}
+
 impl Drop for CreationTicket {
     fn drop(&mut self) {
-        if let Ok(mut in_flight) = self.fence.in_flight.lock() {
+        let settled = {
+            let mut in_flight =
+                self.fence.in_flight.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             *in_flight = in_flight.saturating_sub(1);
-        }
+            *in_flight == 0
+        };
         self.fence.settled.notify_all();
+        // THE HANDOFF LANDS HERE, on the thread that actually ended the create.
+        //
+        // A bounded owner that gave up earlier left its job with the fence instead of dropping it.
+        // This is the event it was waiting for -- not a clock, the create's own end -- so the job
+        // runs now, however long "now" took to arrive. The lock is released before it runs: the
+        // job removes and confirms, and both talk to the daemon.
+        if settled {
+            if let Some(owner) = self.fence.take_retained_owner() {
+                (owner.0)();
+            }
+        }
     }
 }
 
@@ -642,18 +732,49 @@ impl HolderCleanup {
             }
         }
         if !settled {
-            // Custody ends here, but it ends as a KNOWN leak — never as a clean release, and never
-            // on an absence answer. While the create is still running, "No such container" is
-            // indistinguishable from "has not landed yet": the container can appear the instant
-            // after the daemon answers. Treating that emptiness as proof is how the orphan this
-            // whole fence exists to prevent gets manufactured by the cleanup path itself, so the
-            // question is not asked and the honest verdict is recorded instead.
+            // The wait is over and the create is STILL in flight. Ownership does NOT end here.
+            //
+            // Waiting longer was never the answer. Whatever the bound, the case that breaks is a
+            // container landing one millisecond past it, so a bigger window makes the orphan rarer
+            // without making it impossible -- it moves the edge, it does not remove it. The job is
+            // TRANSFERRED instead, to an owner the create's own fence retains. The fence is the one
+            // object that knows when this create genuinely ends, because the create's ticket is
+            // what releases it, so the handoff is to the settlement event itself rather than to
+            // another clock.
+            //
+            // This claims nothing about whether the daemon will finish. It is the narrower true
+            // thing: if the container ever lands, somebody still owns it.
+            let name = self.name.clone();
+            let joiners = self.joiners.clone();
+            let client = self.client.clone();
+            let bounds = self.bounds;
+            self.creation.retain_owner(move || {
+                // A fresh fence deliberately: the create this would have waited for is the one that
+                // just ended, so there is nothing left to wait for and the owner goes straight to
+                // removal and confirmation.
+                let owner = HolderCleanup {
+                    name,
+                    joiners,
+                    creation: std::sync::Arc::new(CreationFence::default()),
+                    client,
+                    bounds,
+                };
+                owner.sweep();
+                if let Err(pending) = owner.confirm_all_absent() {
+                    eprintln!(
+                        "sandbox: the retained owner removed {} once the create settled but could \
+                         not confirm absence within {:?} — these are LEAKED, not destroyed",
+                        pending.join(", "),
+                        owner.bounds.confirm
+                    );
+                }
+            });
             eprintln!(
                 "sandbox: a create against netns holder {} was STILL IN FLIGHT after {:?} and did \
-                 not land within the further {:?} this owner retained it — its removal has been \
-                 issued, but absence CANNOT be confirmed while the create is running, so this \
-                 holder and its {} joiner(s) are reported LEAKED rather than clean; the boot reaper \
-                 is the only remaining backstop",
+                 not land within the further {:?} this owner retained it — custody is NOT being \
+                 released: it has been TRANSFERRED to an owner retained by the create's own fence, \
+                 which removes and confirms this holder and its {} joiner(s) when that create \
+                 settles, whenever that is",
                 self.name,
                 self.bounds.max,
                 self.bounds.retain,
@@ -662,9 +783,31 @@ impl HolderCleanup {
             return;
         }
         if let Err(pending) = self.confirm_all_absent() {
+            // A removal was ISSUED and the daemon never confirmed absence. Responsibility used to
+            // end on the log line below -- the names were named, and then let go, which is
+            // indistinguishable downstream from a clean release. An unconfirmed name is kept
+            // instead: the fence retains an owner holding exactly those names, so they remain OWNED
+            // rather than merely mentioned, and a later create settling on this holder runs them
+            // again.
+            let unconfirmed = pending.clone();
+            let name = self.name.clone();
+            let client = self.client.clone();
+            let bounds = self.bounds;
+            self.creation.retain_owner(move || {
+                let owner = HolderCleanup {
+                    name,
+                    joiners: unconfirmed,
+                    creation: std::sync::Arc::new(CreationFence::default()),
+                    client,
+                    bounds,
+                };
+                owner.sweep();
+                let _ = owner.confirm_all_absent();
+            });
             eprintln!(
                 "sandbox: could not confirm {} absent within {:?} after the create settled — these \
-                 are LEAKED, not destroyed; the boot reaper is the only remaining backstop",
+                 are NOT released: an owner for them is retained on this holder's fence, and the \
+                 boot reaper remains the backstop",
                 pending.join(", "),
                 self.bounds.confirm
             );
@@ -1144,7 +1287,15 @@ async fn run_docker_fenced(
         // finished. That drop is what "settled" means to `CreationFence::wait_until_settled`.
         let _ticket = ticket;
         let mut child_exited = false;
-        run_bounded_blocking(&client, argv, stdin, DOCKER_DEADLINE, queued_at, &mut child_exited)
+        run_bounded_blocking(
+            &client,
+            argv,
+            stdin,
+            DOCKER_DEADLINE,
+            queued_at,
+            Some(_ticket.fence()),
+            &mut child_exited,
+        )
     })
     .await;
     match joined {
@@ -1221,8 +1372,15 @@ async fn run_bounded_tracked_fenced(
     let joined = tokio::task::spawn_blocking(move || {
         let _ticket = ticket;
         let mut child_exited = false;
-        let outcome =
-            run_bounded_blocking(&client, argv, stdin, deadline, queued_at, &mut child_exited);
+        let outcome = run_bounded_blocking(
+            &client,
+            argv,
+            stdin,
+            deadline,
+            queued_at,
+            _ticket.as_ref().map(CreationTicket::fence),
+            &mut child_exited,
+        );
         (outcome, child_exited)
     })
     .await;
@@ -1241,6 +1399,7 @@ fn run_bounded_blocking(
     stdin: Option<String>,
     deadline: std::time::Duration,
     queued_at: std::time::Instant,
+    fence: Option<&std::sync::Arc<CreationFence>>,
     child_exited: &mut bool,
 ) -> Result<(String, String), String> {
     {
@@ -1262,6 +1421,22 @@ fn run_bounded_blocking(
         // exactly this process's flow; it is NOT a statement about when the daemon finishes creating
         // a container, which only a daemon-side absence check can settle.
         let started = queued_at;
+        // REFUSED BEFORE IT IS ISSUED, not bounded after it.
+        //
+        // The budget can already be gone before this closure runs at all: it sat in the blocking
+        // pool's queue, and queue time spends the same clock as every wait below. Spawning anyway
+        // starts a create whose caller is ALREADY past its bound -- the container can land with
+        // nothing waiting on it, which is the orphan this module exists to prevent, issued
+        // knowingly. Bounding the wait afterwards cannot help: by then the create exists. The only
+        // correct answer at this point is to not start it.
+        if started.elapsed() >= deadline {
+            return Err(format!(
+                "`{program}` was NOT started: its {}s budget was already spent while the work sat \
+                 queued for a blocking thread, so no create was issued — starting one here would \
+                 launch a container whose caller is already past its bound",
+                deadline.as_secs(),
+            ));
+        }
         let mut child = Command::new(program)
             .args(args)
             .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
@@ -1287,7 +1462,17 @@ fn run_bounded_blocking(
             Some(plan) => {
                 let mut pipe =
                     child.stdin.take().ok_or_else(|| "docker stdin was not piped".to_string())?;
+                // The writer takes a ticket of its OWN, and holds it until the write ends.
+                //
+                // Reporting that a writer is still running was never the same as owning it. The
+                // channel timeout below lets this CALL end; the thread keeps the pipe endpoint
+                // either way, and while it was ticketless the closure could return, release the
+                // only ticket, and let the fence read as settled with a write still in progress.
+                // Cleanup would then be free to remove against a create that had not finished
+                // being written to. Now the fence cannot reach zero while this thread exists.
+                let ticket = fence.map(|fence| fence.begin());
                 std::thread::spawn(move || {
+                    let _ticket = ticket;
                     let outcome = pipe.write_all(plan.as_bytes()).map_err(|error| {
                         format!("could not write the plan to the sidecar: {error}")
                     });
@@ -1346,10 +1531,18 @@ fn run_bounded_blocking(
         // own threads and are collected against the same budget as everything above.
         let (drained_tx, drained_rx) = std::sync::mpsc::channel::<(&'static str, Vec<u8>)>();
         let mut pending: Vec<&'static str> = Vec::new();
+        // Each drain takes its OWN ticket, for the same reason the writer does: a descendant can
+        // hold these endpoints open long past the channel timeout below, and a reader still blocked
+        // on a pipe is work this process is still doing. Ticketless, it was work nobody was counted
+        // for -- the closure returned, the last ticket went with it, and the fence said settled
+        // while two threads still held the create's output. The ticket is released when the read
+        // ends, not when this call does.
         if let Some(mut pipe) = child.stdout.take() {
             let tx = drained_tx.clone();
             pending.push("stdout");
+            let ticket = fence.map(|fence| fence.begin());
             std::thread::spawn(move || {
+                let _ticket = ticket;
                 let mut buffer = Vec::new();
                 let _ = pipe.read_to_end(&mut buffer);
                 let _ = tx.send(("stdout", buffer));
@@ -1358,7 +1551,9 @@ fn run_bounded_blocking(
         if let Some(mut pipe) = child.stderr.take() {
             let tx = drained_tx.clone();
             pending.push("stderr");
+            let ticket = fence.map(|fence| fence.begin());
             std::thread::spawn(move || {
+                let _ticket = ticket;
                 let mut buffer = Vec::new();
                 let _ = pipe.read_to_end(&mut buffer);
                 let _ = tx.send(("stderr", buffer));
@@ -2853,6 +3048,7 @@ exit 0
             Some("x".repeat(4 * 1024 * 1024)),
             deadline,
             started,
+            None,
             &mut child_exited,
         );
         let elapsed = started.elapsed();
@@ -2952,6 +3148,158 @@ exit 0
         let _ = std::fs::remove_dir_all(&work);
     }
 
+    /// A create still in flight when every bound expires is TRANSFERRED, not released.
+    ///
+    /// This is the termination path, and it is the one a longer wait cannot reach. The bounded
+    /// owner waited `max`, then kept the job a further `retain`, and then — with the create still
+    /// running — printed a leak and RETURNED. A container landing after that had no owner at all,
+    /// which is the same hole the retained window was added to close, one window further out.
+    ///
+    /// Ownership is asserted here as a FACT ABOUT THE FENCE, not as a sentence in a log: the fence
+    /// is holding somebody's cleanup, and when the create finally settles that owner removes the
+    /// container that landed.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn a_create_still_in_flight_at_every_bound_is_transferred_to_a_retained_owner_that_removes_it() {
+        let work = stand_in_work_dir("retained-transfer");
+        let script = stand_in_docker(&work, "");
+        let fence = std::sync::Arc::new(CreationFence::default());
+        // Taken and NOT released: this create is still in flight through every bound below.
+        let ticket = fence.begin();
+
+        let cleanup = HolderCleanup {
+            name: "holder-transfer".to_owned(),
+            joiners: Vec::new(),
+            creation: std::sync::Arc::clone(&fence),
+            client: DockerCli::stand_in(&script),
+            bounds: quick_bounds(),
+        };
+        cleanup.own_until_settled_or_confirmed();
+
+        // The bounded owner is finished. Responsibility must NOT have ended with it.
+        assert!(
+            fence.holds_retained_owner(),
+            "the owner reached its last bound with the create still in flight and simply returned, \
+             so nothing is responsible for a container that has not landed yet. Another window \
+             would only move this same edge; the job has to belong to somebody once the wait is \
+             over."
+        );
+
+        // The create lands LONG after every bound expired, and only now settles.
+        std::fs::write(work.join("present-holder-transfer"), "").expect("presence marker");
+        drop(ticket);
+
+        assert!(
+            !work.join("present-holder-transfer").exists(),
+            "the container landed after every bound expired and is STILL RUNNING. The retained \
+             owner either never ran or never removed it — either way this is the orphan the fence \
+             exists to prevent, arriving exactly where the bounded owner stopped looking."
+        );
+        assert!(
+            !fence.holds_retained_owner(),
+            "the retained owner was never consumed, so the handoff did not actually run on \
+             settlement"
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// A name the daemon never confirmed absent stays OWNED.
+    ///
+    /// The removal was issued and the daemon would not say it was gone. That used to end in a log
+    /// line and a return: the names were named, then let go, which downstream is indistinguishable
+    /// from a clean release. An unconfirmed name is a container that may well still be running, so
+    /// ownership of it has to survive the failure to confirm it.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn names_that_could_not_be_confirmed_absent_stay_owned_rather_than_released() {
+        let work = stand_in_work_dir("confirm-failed");
+        let script = stand_in_docker(&work, "");
+        // The container is present, and every removal against it FAILS, so the daemon keeps
+        // answering that it is still there and confirmation cannot succeed.
+        std::fs::write(work.join("present-holder-unconfirmed"), "").expect("presence marker");
+        std::fs::write(work.join("rmfail-holder-unconfirmed"), "").expect("rm failure marker");
+        let fence = std::sync::Arc::new(CreationFence::default());
+
+        let cleanup = HolderCleanup {
+            name: "holder-unconfirmed".to_owned(),
+            joiners: Vec::new(),
+            creation: std::sync::Arc::clone(&fence),
+            client: DockerCli::stand_in(&script),
+            bounds: quick_bounds(),
+        };
+        cleanup.own_until_settled_or_confirmed();
+
+        assert!(
+            work.join("present-holder-unconfirmed").exists(),
+            "the fixture removed the container after all, so this test proved nothing about \
+             unconfirmed names"
+        );
+        assert!(
+            fence.holds_retained_owner(),
+            "the daemon never confirmed this name absent and the owner RELEASED it anyway. A \
+             container that could not be confirmed gone is one that may still be running, and \
+             naming it in a log is not the same as still owning it."
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// Work whose budget expired IN THE QUEUE never starts a create at all.
+    ///
+    /// The clock starts before the work is queued, so a saturated blocking pool can consume the
+    /// entire budget before the closure runs. The previous flow spawned anyway and then bounded the
+    /// wait — but by then the create exists, and a container can land with its caller already past
+    /// its bound. That is an orphan issued knowingly. The only correct answer at that point is to
+    /// not start it, and what this asserts is that nothing was started.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn work_whose_budget_expired_in_the_queue_is_refused_before_anything_is_spawned() {
+        let work = stand_in_work_dir("queue-expired");
+        let script = stand_in_docker(&work, "");
+        let deadline = std::time::Duration::from_millis(200);
+        // The caller's clock, taken before the work was queued. It waited three budgets for a
+        // thread.
+        let queued_at = std::time::Instant::now() - std::time::Duration::from_millis(600);
+        let fence = std::sync::Arc::new(CreationFence::default());
+        let mut child_exited = false;
+
+        let outcome = run_bounded_blocking(
+            &DockerCli::stand_in(&script),
+            vec!["docker".to_owned(), "run".to_owned(), "--detach".to_owned()],
+            Some("plan".to_owned()),
+            deadline,
+            queued_at,
+            Some(&fence),
+            &mut child_exited,
+        );
+
+        outcome.expect_err("work whose budget was spent before it began cannot report success");
+        // THE ASSERTION IS THAT NOTHING WAS EVER STARTED UNDER THIS FENCE.
+        //
+        // Deliberately not the stand-in's side effects: a client that IS spawned with no budget
+        // left is killed within microseconds, long before a shell can reach its first line, so the
+        // markers it would have written are absent either way and prove nothing. (That is not a
+        // guess — with the pre-spawn refusal removed, the marker form of this gate stayed green.)
+        //
+        // Ticket issuance is the fact that survives that race. Spawning takes a ticket for the plan
+        // writer synchronously, on this thread, before any wait — so a fence that never issued one
+        // is a fence under which nothing was launched, whatever happened afterwards.
+        assert_eq!(
+            fence.tickets_issued(),
+            0,
+            "work whose budget had already expired in the queue was STARTED anyway: a ticket was \
+             issued under this fence, so a client was launched with nothing left to wait for it. \
+             The container it creates can land with its caller already past its bound — an orphan \
+             this module exists to prevent, issued knowingly. Bounding the wait afterwards is too \
+             late, because by then the create exists."
+        );
+        assert!(
+            !work.join("creating").exists(),
+            "a create against the stand-in daemon completed for work with no budget left"
+        );
+        assert!(!child_exited, "no child can have been reaped when none was ever spawned");
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
     /// Reaping the client does not close its pipes: a DESCENDANT can hold them open.
     ///
     /// The bounded wait covered the child and stopped there. After the status came back the flow
@@ -2967,12 +3315,31 @@ exit 0
 
         let work = stand_in_work_dir("descendant-pipe");
         let script = work.join("docker");
-        // The client exits immediately; the backgrounded descendant inherits stdout and holds it
-        // open, so stdout never reaches EOF.
-        std::fs::write(&script, "#!/bin/sh\nsleep 30 &\nexit 0\n").expect("write stand-in");
+        // SYNCHRONIZED TO THE BRANCH THIS GATE EXISTS FOR.
+        //
+        // The branch under test is the drain that runs AFTER the client has been reaped. The
+        // previous fixture gave the client a 400ms budget and assumed it would exit inside it; on
+        // an independent loaded machine it did not, the deadline killed the client before it ever
+        // exited, and the run took the deadline-kill path instead. The gate failed having never
+        // reached the code it was written to exercise, which proves nothing either way — a fixture
+        // that dies before its branch tests nothing.
+        //
+        // So the client exits AT ONCE with no work in front of it, the descendant announces that it
+        // is holding the pipe, and the budget is wide enough that arriving at the drain is not a
+        // race. `child_exited` is then checked FIRST, because it is the fact that says which branch
+        // actually ran.
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n( echo holding > \"{}/holding\"; sleep 6 ) &\nexit 0\n",
+                work.to_string_lossy()
+            ),
+        )
+        .expect("write stand-in");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
-        let deadline = std::time::Duration::from_millis(400);
+        let fence = std::sync::Arc::new(CreationFence::default());
+        let deadline = std::time::Duration::from_secs(2);
         let mut child_exited = false;
         let started = std::time::Instant::now();
         let outcome = run_bounded_blocking(
@@ -2981,21 +3348,50 @@ exit 0
             None,
             deadline,
             started,
+            Some(&fence),
             &mut child_exited,
         );
         let elapsed = started.elapsed();
 
         assert!(
-            elapsed < std::time::Duration::from_secs(10),
+            child_exited,
+            "the client was killed on its deadline before it ever exited, so the post-exit drain \
+             this gate exists for never ran. That is the FIXTURE failing, not the production code: \
+             it has to reach the branch under test before it can say anything about it."
+        );
+        assert!(
+            work.join("holding").exists(),
+            "the descendant never announced that it had the pipe, so nothing was holding stdout \
+             open and the drain had nothing to be blocked by"
+        );
+        assert!(
+            elapsed < deadline * 4,
             "the flow ran unbounded AFTER the child was reaped: a descendant held stdout open and \
              the drain waited {elapsed:?} against a {deadline:?} bound. A create whose tail is \
              unbounded is a create nobody is waiting on."
         );
-        let error = outcome.expect_err("an output this process never finished reading is not a result it may report");
+        outcome.expect_err(
+            "an output this process never finished reading is not a result it may report",
+        );
+        // OWNERSHIP, not wording. The call is over and a reader thread still holds the create's
+        // stdout. While it does, the fence must NOT read as settled: a settled fence is cleanup's
+        // permission to start removing, and that permission cannot be granted while this process is
+        // still doing the create's IO. The drain threads used to be ticketless, so the fence fell
+        // silent the instant this function returned and the reader became work nobody was counted
+        // for.
         assert!(
-            error.contains("stdout") && error.contains("descendant"),
-            "the call ended on its bound but did not name the unread stream or the reason, so a \
-             caller cannot tell a complete output from a truncated one. Got:\n{error}"
+            !fence.wait_until_settled(std::time::Duration::from_millis(300)),
+            "the fence reported this create SETTLED while a reader thread still held its stdout \
+             open. Cleanup is entitled to remove on that answer, so unowned IO work outlived the \
+             ticket that was supposed to cover it."
+        );
+        // And it is not owned forever. When the descendant lets go, the read ends and the ticket
+        // goes with it: retained ownership means the lifecycle closes on the real event, not that
+        // it never closes.
+        assert!(
+            fence.wait_until_settled(std::time::Duration::from_secs(20)),
+            "the reader's ticket was never released even after the descendant exited and stdout \
+             reached EOF, so this fence can never settle and cleanup could never run"
         );
         let _ = std::fs::remove_dir_all(&work);
     }
@@ -3038,6 +3434,7 @@ exit 0
             Some("x".repeat(4 * 1024 * 1024)),
             deadline,
             started,
+            None,
             &mut child_exited,
         );
         let elapsed = started.elapsed();
@@ -3095,6 +3492,7 @@ exit 0
             None,
             deadline,
             queued_at,
+            None,
             &mut child_exited,
         );
         let spent_here = entered.elapsed();
