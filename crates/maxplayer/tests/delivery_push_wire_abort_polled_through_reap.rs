@@ -414,7 +414,17 @@ async fn a_parked_leg_is_stopped_and_b_never_overlaps(label: &str, leg: Leg, sto
         } else if child_gone_at.is_none() {
             child_gone_at = Some(at);
         }
-        match poll_once(second.as_mut()).await {
+        let polled = poll_once(second.as_mut()).await;
+        // Sampled AGAIN, after the poll. B stamps its acquisition DURING the poll, so a sample
+        // taken only before it can never fall after that stamp: on the last iteration -- the one
+        // where B takes the seat and may finish -- the pre-poll sample is earlier than the
+        // acquisition by construction, and the single interval this check exists to witness would
+        // be invisible. Presence after the acquisition is the whole evidence, so it is looked for
+        // on both sides of the poll.
+        if pid_exists(a_child) {
+            child_last_alive_at = Some(Instant::now());
+        }
+        match polled {
             std::task::Poll::Pending => samples.push(at),
             std::task::Poll::Ready(outcome) => {
                 b_ready_at = Some(at);
@@ -449,8 +459,6 @@ async fn a_parked_leg_is_stopped_and_b_never_overlaps(label: &str, leg: Leg, sto
     // The turn, the token and the error string are all things the code under test produces; the pid
     // is not. A stop that released the seat while its child was still pushing would satisfy every
     // other assertion in this file and fail here.
-    let child_gone_at =
-        child_gone_at.expect("A's child was still in the process table when B took the seat");
     // **THE OVERLAP CHECK, STATED SO A DESCHEDULED OBSERVER CANNOT DECIDE IT.** This assertion used
     // to demand that A's child be OBSERVED ABSENT before B acquired the seat. Absence is observed
     // late under load: the poller is descheduled, the first absent sample lands after B has already
@@ -470,6 +478,11 @@ async fn a_parked_leg_is_stopped_and_b_never_overlaps(label: &str, leg: Leg, sto
         !pid_exists(a_child),
         "A's child {a_child} is still alive after B took the seat"
     );
+    // Whether the child was ever SEEN to go is reported below, not required here. Demanding a
+    // positive sighting of absence is the scheduling-dependent form this file just moved away
+    // from: under load the first absent sample lands late, or never, on a run where nothing
+    // overlapped. A child that really did outlive the handover is caught by the assertion above
+    // and by the process-table check beside it, neither of which needs that sighting.
     // And the seat's own token agrees with the operating system.
     assert!(
         acquired_at >= released_at,
@@ -512,22 +525,26 @@ async fn a_parked_leg_is_stopped_and_b_never_overlaps(label: &str, leg: Leg, sto
     widest = widest.max(b_ready_at.saturating_duration_since(
         *samples.last().expect("at least one sample"),
     ));
-    // COVERAGE, REPORTED AND NOT ASSERTED. This number says how often the observer got to look. It
-    // does not say whether anything overlapped, and it never could: the gap grows when the poller is
+    // COVERAGE REPORTING, NOT AN EXCLUSION CLAIM. Read that literally, and do not let this number
+    // be cited later as proof that two deliveries did not overlap: it is not one, and it never was.
+    // It says how often the observer got to look.
+    //
+    // It does not say whether anything overlapped, and it never could: the gap grows when the poller is
     // descheduled under load, so a ceiling on it reds for the machine rather than for a defect.
     // Raising that ceiling would be the worse repair — a wider ceiling enlarges the interval in
     // which the seat goes unwatched while still proving nothing, turning a failing oracle into a
     // silent one. The exclusion this file is about is decided above, by stamps the participants
     // record themselves (`acquired_at` against `released_at`) and by the positive alive-samples of
     // A's child. The gap is printed because it tells a reader how strongly THIS run corroborates
-    // those checks: a run whose gap is wide is a weakly corroborated run, not a failing one.
+    // those checks: a run whose gap is wide is a weakly corroborated run, not a failing one. The
+    // exclusion claims of this file are the assertions above; this line is coverage reporting.
     eprintln!(
         "observation coverage: {} Pending samples across {:?} of stop, widest gap between looks \
          {widest:?} (cadence aimed at {MAX_SAMPLE_GAP:?}; reported, not asserted), A's child first \
          seen gone {:?} into the window",
         samples.len(),
         b_ready_at.saturating_duration_since(polling_began),
-        child_gone_at.saturating_duration_since(polling_began),
+        child_gone_at.map(|at| at.saturating_duration_since(polling_began)),
     );
     // The observation really does span the stop: it starts while A is parked on the wire and ends
     // after the seat changed hands.
