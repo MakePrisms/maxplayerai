@@ -1,0 +1,524 @@
+//! T3: a shipped delivery parked on a real wire leg is stopped — by TIMEOUT and by TASK ABORT —
+//! while a second delivery is polled **continuously, through the reap**, and never overlaps it.
+//!
+//! # What the existing gate does and where it stops
+//!
+//! `delivery_push_shipped_child.rs::a_second_delivery_is_observed_pending_behind_a_held_shipped_pack_upload`
+//! parks the shipped child at `POST /git-receive-pack` and polls a second delivery while the pack
+//! is on the wire. It was credited for that. But its polling loop ENDS before the first delivery's
+//! deadline fires, and it then does a single `first.await` — so across the window that actually
+//! decides whether two deliveries can overlap (the deadline firing, the `SIGKILL`, and the wait for
+//! the exit) the second delivery is not polled at all. The seat is unobserved for exactly the
+//! interval the contract is about.
+//!
+//! These gates poll delivery B through that window, at a cadence they then assert, and record every
+//! sample. The claim is checkable rather than rhetorical: *B was polled with no gap wider than
+//! [`MAX_SAMPLE_GAP`] from before A's deadline until after A handed the seat back, and every one of
+//! those polls returned `Pending`.*
+//!
+//! # Task abort is a different path from timeout, and it is the dangerous one
+//!
+//! A timeout runs `serialized_bounded_push`'s own timeout arm. An ABORT drops the whole delivery
+//! future where it stands — the case `PushAuthority` and the turn's ownership transfer exist for
+//! (`run.rs:1880-1883`: the seat's lock guard is moved INTO the turn, so nothing that happens to the
+//! awaiting task can release it early). If the guard had stayed on the task's side, an aborted
+//! delivery would free the seat instantly while its child was still pushing. That is the overlap
+//! this file is here to rule out, and abort is how you provoke it.
+//!
+//! # Bound
+//!
+//! B may not enter its push body before A's turn is handed back, and A's turn is handed back only
+//! after its child's exit is confirmed. Both instants are recorded and compared; neither is
+//! inferred from a sleep.
+
+#![cfg(all(unix, feature = "wallet"))]
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+use maxplayer_core::delivery_turn::DeliveryTurn;
+use maxplayer_core::git_transport::{self, AuthMinter};
+use maxplayer_core::seller_git::{SellerGitError, neutralize_then_push_in_child_off_runtime};
+use maxplayer_core::seller_node::run::{DeliveryPushErr, serialized_bounded_push};
+
+#[path = "../../maxplayer-core/tests/git_http_fixture/mod.rs"]
+mod git_http_fixture;
+
+use git_http_fixture::{FixtureOptions, GitHttpAuthServer, RequestGate};
+
+/// The widest gap allowed between two consecutive polls of delivery B while delivery A is being
+/// stopped. A loop that sampled twice a second could sit through an entire overlap and call it
+/// continuous; this is what makes "continuously" a measured property. Generous enough to survive a
+/// loaded CI host, tight enough that an overlap long enough to matter cannot hide inside it.
+const MAX_SAMPLE_GAP: Duration = Duration::from_millis(50);
+
+/// Records the instant the seat's exclusion token is handed back. The turn releases ownership only
+/// once the work is recorded stopped, which for a child delivery is after `kill_and_reap` confirmed
+/// the exit — so this instant IS "A's child is gone and the seat is free", taken from the
+/// production type rather than from a sleep in the test.
+struct Token {
+    released_at: Arc<std::sync::Mutex<Option<Instant>>>,
+}
+
+impl Drop for Token {
+    fn drop(&mut self) {
+        self.released_at
+            .lock()
+            .expect("release clock")
+            .get_or_insert_with(Instant::now);
+    }
+}
+
+static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+fn scratch(label: &str) -> PathBuf {
+    let id = NEXT.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!(
+        "maxplayer-wire-abort-{label}-{}-{id}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    dir
+}
+
+fn shipped_binary() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_maxplayer"))
+}
+
+fn job_workdir(root: &Path, branch: &str) -> (PathBuf, String) {
+    let workdir = root.join("workdir");
+    let repo = git2::Repository::init(&workdir).expect("init workdir");
+    std::fs::write(workdir.join("deliverable.txt"), "wire abort\n").expect("write");
+    let mut index = repo.index().expect("index");
+    index.add_path(Path::new("deliverable.txt")).expect("add");
+    index.write().expect("write index");
+    let tree_oid = index.write_tree().expect("tree");
+    let sig = git2::Signature::new("s", "s@example.invalid", &git2::Time::new(1_700_000_000, 0))
+        .expect("sig");
+    let oid = {
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+        repo.commit(
+            Some(&git_transport::delivery_ref(branch)),
+            &sig,
+            &sig,
+            "delivery",
+            &tree,
+            &[],
+        )
+        .expect("commit")
+    };
+    (workdir, oid.to_string())
+}
+
+fn stage_env(ca: &Path) {
+    // SAFETY (edition 2024 `set_var`): staged at the top of the test body before any task is
+    // spawned, and every test in this binary stages the same values under one lock.
+    unsafe {
+        std::env::set_var("SSL_CERT_FILE", ca);
+        std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
+        std::env::set_var("no_proxy", "127.0.0.1,localhost");
+        std::env::remove_var("GIT_SSL_NO_VERIFY");
+    }
+}
+
+static TRUST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn exclusive_trust() -> std::sync::MutexGuard<'static, ()> {
+    TRUST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The pids of this process's direct children.
+///
+/// The delivery child is spawned by this process, so it appears here while it lives. Read from
+/// `ps` rather than from anything the executor reports, because the point of asking is to check the
+/// executor's report against the operating system.
+///
+/// `ps` is itself a direct child of this process and lists itself, so its own pid is captured and
+/// removed — otherwise the probe finds a second "delivery child" that is really the probe.
+fn direct_children() -> Vec<i32> {
+    let me = std::process::id();
+    let mut probe = std::process::Command::new("ps")
+        .args(["-ax", "-o", "pid=,ppid="])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn ps");
+    let probe_pid = probe.id() as i32;
+    let output = probe.wait_with_output().expect("ps");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid: i32 = fields.next()?.parse().ok()?;
+            let ppid: u32 = fields.next()?.parse().ok()?;
+            (ppid == me && pid != probe_pid).then_some(pid)
+        })
+        .collect()
+}
+
+/// Does this pid still exist?
+///
+/// `kill(pid, 0)` performs the permission and existence checks and sends nothing. It succeeds for a
+/// ZOMBIE too — a child that exited but has not been waited for — so this returns false only once
+/// the parent has actually reaped it. That is the property this gate needs: "gone" must mean gone
+/// from the process table, not merely stopped.
+fn pid_exists(pid: i32) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// ONE real poll of a real future, and the `Poll` it returned handed straight back.
+async fn poll_once<F: std::future::Future>(
+    mut future: std::pin::Pin<&mut F>,
+) -> std::task::Poll<F::Output> {
+    std::future::poll_fn(move |cx| std::task::Poll::Ready(future.as_mut().poll(cx))).await
+}
+
+/// Which wire leg the fixture parks. The advertisement is request 1; the pack upload is request 2.
+#[derive(Clone, Copy)]
+enum Leg {
+    Advertisement,
+    PackUpload,
+}
+
+impl Leg {
+    fn held_request_number(self) -> usize {
+        match self {
+            Leg::Advertisement => 1,
+            Leg::PackUpload => 2,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Leg::Advertisement => "GET /info/refs",
+            Leg::PackUpload => "POST /git-receive-pack",
+        }
+    }
+}
+
+/// How delivery A is stopped.
+#[derive(Clone, Copy, PartialEq)]
+enum Stop {
+    /// `serialized_bounded_push`'s own timeout arm.
+    Timeout,
+    /// The whole delivery future dropped where it stands.
+    TaskAbort,
+}
+
+/// The body shared by all four gates.
+///
+/// Delivery A is the shipped binary, parked by the fixture on `leg`. Delivery B asks the same
+/// serializer for the same seat. B is polled continuously from before A is stopped until after it
+/// gets the seat, and every sample instant is kept so the cadence can be asserted rather than
+/// claimed.
+async fn a_parked_leg_is_stopped_and_b_never_overlaps(label: &str, leg: Leg, stop: Stop) {
+    let _trust = exclusive_trust();
+    let root = scratch(label);
+    let branch = "maxplayer/7c3a0001";
+    let (workdir, oid) = job_workdir(&root, branch);
+
+    let bare = root.join("relay.git");
+    git2::Repository::init_bare(&bare).expect("relay bare");
+    let gate = RequestGate::new();
+    let relay = GitHttpAuthServer::spawn_with(
+        &bare,
+        "/git/seller/r.git",
+        FixtureOptions {
+            hold_request_number: Some((leg.held_request_number(), Arc::clone(&gate))),
+            ..FixtureOptions::default()
+        },
+    );
+    stage_env(&relay.ca_file(&root));
+
+    let lock: Arc<tokio::sync::Mutex<()>> = Arc::new(tokio::sync::Mutex::new(()));
+    let released_at: Arc<std::sync::Mutex<Option<Instant>>> = Arc::new(std::sync::Mutex::new(None));
+
+    // Whatever this process already had as children before the delivery starts. Tests in this
+    // binary run in one process, and a neighbouring harness thread may hold one of its own; the
+    // child under test is identified as the one that APPEARS, not as "the only one there".
+    let before: std::collections::HashSet<i32> = direct_children().into_iter().collect();
+
+    // A's budget. For the abort case the budget is long: the stop under test is the abort, and a
+    // deadline that could fire first would let this gate pass without ever exercising it.
+    let budget = match stop {
+        Stop::Timeout => Duration::from_secs(3),
+        Stop::TaskAbort => Duration::from_secs(60),
+    };
+    // The serializer's outer wait is deliberately far longer than the budget in BOTH cases. It is
+    // not the control under test: if it fired first, `serialized_bounded_push` would return
+    // `TimedOut` from its own arm and this gate would never reach the executor's deadline kill —
+    // which is the thing that has to hold. Left at the production shape (`DELIVERY_DRAIN_BOUND`
+    // scale) so the stop observed here is the delivery's own.
+    let serializer_timeout = Duration::from_secs(120);
+
+    let first = {
+        let lock = Arc::clone(&lock);
+        let url = relay.repo_url();
+        let branch = branch.to_owned();
+        let oid = oid.clone();
+        let released_at = Arc::clone(&released_at);
+        let deadline = Instant::now() + budget;
+        tokio::spawn(async move {
+            let started = Instant::now();
+            let outcome = serialized_bounded_push(
+                &lock,
+                serializer_timeout,
+                deadline,
+                move |turn: DeliveryTurn| async move {
+                    let minter: AuthMinter = Arc::new(|_| Ok("Nostr fixture-token".to_owned()));
+                    let _keep = Token { released_at };
+                    neutralize_then_push_in_child_off_runtime(
+                        shipped_binary(),
+                        workdir,
+                        url,
+                        branch,
+                        oid,
+                        Some(minter),
+                        None,
+                        turn,
+                    )
+                    .await
+                },
+            )
+            .await;
+            (outcome, started, Instant::now())
+        })
+    };
+
+    // Until the fixture has actually parked the leg, A is not in the state this gate is about.
+    tokio::task::spawn_blocking({
+        let gate = Arc::clone(&gate);
+        move || gate.wait_held()
+    })
+    .await
+    .expect("the fixture must park the leg under test");
+    let parked_at = Instant::now();
+
+    // A's CHILD, as the operating system sees it: the process that appeared between the baseline
+    // above and this leg being parked on the wire. Identified by difference rather than by count,
+    // so an unrelated child of this test binary cannot be mistaken for the delivery's.
+    let appeared: Vec<i32> = direct_children()
+        .into_iter()
+        .filter(|pid| !before.contains(pid))
+        .collect();
+    assert_eq!(
+        appeared.len(),
+        1,
+        "expected exactly one NEW child while the leg is parked, found {appeared:?} (baseline \
+         {before:?}): this gate's liveness probe would otherwise be watching the wrong process"
+    );
+    let a_child = appeared[0];
+    assert!(
+        pid_exists(a_child),
+        "A's child {a_child} was already gone while its leg was still parked on the wire"
+    );
+
+    // DELIVERY B: same serializer, same lock, same seat.
+    let acquired_at: Arc<std::sync::Mutex<Option<Instant>>> = Arc::new(std::sync::Mutex::new(None));
+    let second = serialized_bounded_push(&lock, Duration::from_secs(60), Instant::now() + Duration::from_secs(90), {
+        let at = Arc::clone(&acquired_at);
+        move |turn| async move {
+            at.lock().expect("clock").replace(Instant::now());
+            drop(turn);
+            Ok::<_, SellerGitError>("b-delivered".to_owned())
+        }
+    });
+    tokio::pin!(second);
+
+    assert!(
+        poll_once(second.as_mut()).await.is_pending(),
+        "B's first poll returned Ready while A held the seat parked on {}",
+        leg.label()
+    );
+
+    // The abort is issued once A is demonstrably parked on the wire — not before, or there would be
+    // nothing to abort out of.
+    if stop == Stop::TaskAbort {
+        first.abort();
+    }
+
+    // THE OBSERVED WINDOW. B is polled until it takes the seat; every poll instant is recorded, and
+    // the polls do not stop while A is being killed and reaped.
+    let mut samples: Vec<Instant> = Vec::new();
+    let mut b_ready_at: Option<Instant> = None;
+    let mut b_outcome: Option<Result<String, DeliveryPushErr>> = None;
+    // The first instant A's child was observed absent from the process table.
+    let mut child_gone_at: Option<Instant> = None;
+    let watchdog = Instant::now() + budget + Duration::from_secs(45);
+    while Instant::now() < watchdog {
+        let at = Instant::now();
+        if child_gone_at.is_none() && !pid_exists(a_child) {
+            child_gone_at = Some(at);
+        }
+        match poll_once(second.as_mut()).await {
+            std::task::Poll::Pending => samples.push(at),
+            std::task::Poll::Ready(outcome) => {
+                b_ready_at = Some(at);
+                b_outcome = Some(outcome);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let b_ready_at = b_ready_at.expect("B never took the seat: A's stop did not hand it back");
+    assert_eq!(
+        b_outcome
+            .expect("B's outcome")
+            .expect("B must be able to deliver once the seat is free"),
+        "b-delivered"
+    );
+
+    // The seat was handed back, and the instant it happened is the production type's, not a sleep.
+    let released_at = released_at
+        .lock()
+        .expect("release clock")
+        .expect("A's turn was never handed back");
+    let acquired_at = acquired_at
+        .lock()
+        .expect("clock")
+        .expect("B never entered its push body");
+
+    // NO OVERLAP, ASKED OF THE OPERATING SYSTEM. B's push body ran only after A's child had left
+    // the process table entirely.
+    //
+    // This is the assertion that does not depend on the executor's own bookkeeping being honest.
+    // The turn, the token and the error string are all things the code under test produces; the pid
+    // is not. A stop that released the seat while its child was still pushing would satisfy every
+    // other assertion in this file and fail here.
+    let child_gone_at =
+        child_gone_at.expect("A's child was still in the process table when B took the seat");
+    assert!(
+        acquired_at >= child_gone_at,
+        "B entered its push body {:?} BEFORE A's child left the process table: two deliveries \
+         were live against the same workdir at once",
+        child_gone_at.saturating_duration_since(acquired_at)
+    );
+    assert!(
+        !pid_exists(a_child),
+        "A's child {a_child} is still alive after B took the seat"
+    );
+    // And the seat's own token agrees with the operating system.
+    assert!(
+        acquired_at >= released_at,
+        "B entered its push body {:?} BEFORE A handed the seat back: the two deliveries overlapped",
+        released_at.saturating_duration_since(acquired_at)
+    );
+
+    // CONTINUOUSLY POLLED, as a measured property of this run. The floor is on the GAP rather than
+    // on the count, because a fast stop legitimately yields few samples: what must not happen is a
+    // long unobserved interval, at any speed.
+    assert!(
+        samples.len() >= 3,
+        "only {} polls of B across the whole stop: that is not observation at all",
+        samples.len()
+    );
+    let mut widest = Duration::ZERO;
+    for pair in samples.windows(2) {
+        widest = widest.max(pair[1].saturating_duration_since(pair[0]));
+    }
+    // From the last Pending sample to the instant B was Ready, too: the interesting gap is the last
+    // one, and leaving it out would let the loop stop polling exactly when it matters.
+    widest = widest.max(b_ready_at.saturating_duration_since(
+        *samples.last().expect("at least one sample"),
+    ));
+    assert!(
+        widest <= MAX_SAMPLE_GAP,
+        "B went unpolled for {widest:?} during A's stop (limit {MAX_SAMPLE_GAP:?}): the seat was \
+         unobserved for long enough that an overlap could have hidden there"
+    );
+    // The observation really does span the stop: it starts while A is parked on the wire and ends
+    // after the seat changed hands.
+    assert!(
+        *samples.first().expect("first sample") >= parked_at
+            && *samples.last().expect("last sample") >= released_at.min(b_ready_at) - MAX_SAMPLE_GAP,
+        "the polling window did not span A's stop"
+    );
+
+    // A's own outcome.
+    let (outcome, started, returned) = match stop {
+        Stop::TaskAbort => {
+            let joined = first.await;
+            assert!(
+                joined.is_err(),
+                "the aborted delivery task returned normally, so nothing was aborted"
+            );
+            (None, None, None)
+        }
+        Stop::Timeout => {
+            let (outcome, started, returned) = first.await.expect("A's task");
+            (Some(outcome), Some(started), Some(returned))
+        }
+    };
+    if let (Some(outcome), Some(started), Some(returned)) = (outcome, started, returned) {
+        match outcome {
+            Err(DeliveryPushErr::Push(SellerGitError::Cancelled(why))) => {
+                assert!(
+                    why.contains("was killed") && why.contains("confirmed the exit"),
+                    "A must report the kill AND the confirmed exit: {why}"
+                );
+            }
+            other => panic!("A must be killed at its deadline, not awaited: {other:?}"),
+        }
+        let held = returned.saturating_duration_since(started);
+        assert!(
+            held >= budget && held < budget + Duration::from_secs(10),
+            "A held the seat for {held:?}, outside its budget {budget:?} + reap bound"
+        );
+        assert!(
+            released_at <= returned,
+            "A returned before its own turn was handed back"
+        );
+    }
+
+    // Nothing was delivered by the stopped delivery.
+    assert!(
+        git2::Repository::open_bare(&bare)
+            .expect("open bare")
+            .find_reference(&format!("refs/heads/{branch}"))
+            .is_err(),
+        "the remote ref moved for a delivery stopped on {}",
+        leg.label()
+    );
+    assert_eq!(
+        maxplayer_core::delivery_executor::unconfirmed_children(),
+        0,
+        "an unconfirmed child was left behind, so the seat was handed on without custody"
+    );
+
+    gate.release();
+}
+
+/// T3a. Pack upload parked on the wire, A stopped by its own TIMEOUT.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_pack_upload_stopped_by_timeout_never_overlaps_a_second_delivery_polled_through_the_reap()
+{
+    a_parked_leg_is_stopped_and_b_never_overlaps("post-timeout", Leg::PackUpload, Stop::Timeout)
+        .await;
+}
+
+/// T3b. Advertisement parked on the wire, A stopped by its own TIMEOUT.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn an_advertisement_stopped_by_timeout_never_overlaps_a_second_delivery_polled_through_the_reap()
+ {
+    a_parked_leg_is_stopped_and_b_never_overlaps("get-timeout", Leg::Advertisement, Stop::Timeout)
+        .await;
+}
+
+/// T3c. Pack upload parked on the wire, A's whole delivery future ABORTED.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_pack_upload_whose_task_is_aborted_never_overlaps_a_second_delivery_polled_through_the_reap()
+ {
+    a_parked_leg_is_stopped_and_b_never_overlaps("post-abort", Leg::PackUpload, Stop::TaskAbort)
+        .await;
+}
+
+/// T3d. Advertisement parked on the wire, A's whole delivery future ABORTED.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn an_advertisement_whose_task_is_aborted_never_overlaps_a_second_delivery_polled_through_the_reap()
+ {
+    a_parked_leg_is_stopped_and_b_never_overlaps("get-abort", Leg::Advertisement, Stop::TaskAbort)
+        .await;
+}
