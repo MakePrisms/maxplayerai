@@ -4257,23 +4257,40 @@ impl SellerNodeRunner {
             // A holder that survived a killed daemon and whose tool is no longer configured (removed
             // or renamed, or the seat left docker mode, or `[sandbox]` is gone) has no owner: remove
             // it now, by the seat's label, before this boot's holders start. A configured tool's own
-            // stale container is replaced by `start` itself. This runs whatever the mode is, because
-            // the holders to remove are the PREVIOUS configuration's. A host with no docker CLI has
+            // stale container is replaced by `start` itself. The holders to remove are the PREVIOUS
+            // configuration's, so the mode is not the test: the marker file is. It is written when
+            // holders start and removed once a boot with no held tools has reconciled, so a seat
+            // that never held a tool makes no `docker` call here. A host with no docker CLI has
             // nothing to reconcile and is not a fault.
-            {
-                let configured: Vec<String> = cfgs.iter().map(|cfg| cfg.server_name.trim().to_owned()).collect();
+            let configured: Vec<String> = cfgs.iter().map(|cfg| cfg.server_name.trim().to_owned()).collect();
+            let marker = crate::held_tool::marker_path(&node.home().root);
+            if !configured.is_empty() || marker.exists() {
                 match crate::held_tool::reconcile_stale_holders(&seat, &configured).await {
-                    Ok(removed) if removed.is_empty() => {}
-                    Ok(removed) => opline!(
-                        "seller node: [sandbox] held_tools: removed {} stale holder container(s) this config no longer names: {}",
-                        removed.len(),
-                        removed.join(", ")
-                    ),
+                    Ok(removed) => {
+                        if !removed.is_empty() {
+                            opline!(
+                                "seller node: [sandbox] held_tools: removed {} stale holder container(s) this config no longer names: {}",
+                                removed.len(),
+                                removed.join(", ")
+                            );
+                        }
+                        if configured.is_empty() {
+                            let _ = std::fs::remove_file(&marker);
+                        }
+                    }
                     Err(error) if error.contains(crate::held_tool::DOCKER_NOT_RUNNABLE) => {}
                     Err(error) => opline!(
                         "seller node: [sandbox] held_tools: could not reconcile stale holders (continuing): {error}"
                     ),
                 }
+            }
+            if !configured.is_empty()
+                && let Err(error) = crate::held_tool::write_marker(&node.home().root, &seat, &configured)
+            {
+                opline!(
+                    "seller node: [sandbox] held_tools: could not write {} (continuing): {error}",
+                    marker.display()
+                );
             }
             let started = futures_util::future::join_all(
                 cfgs.iter()

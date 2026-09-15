@@ -423,6 +423,37 @@ test that proves it.
   it. The agent-turn live tests (`live_b`, `live_a_real_agent_turn…`) were not rerun; each spends a
   model turn, and neither the launch path nor the ACP wire shape changed in this round.
 
+### Review round 3 — the re-review of round 2 (2026-09-15)
+
+The same Codex agent re-reviewed `2f92830..367e899` with its round-1 reproductions and the fake
+Docker harness. It closed findings 1, 2, 8 and 9 outright, closed 3 and 4 for the reported cases,
+and returned eight new findings on the fixes themselves. I agree with all eight. The core five:
+
+| # | Severity | Finding | Fix | Proof |
+| --- | --- | --- | --- | --- |
+| R3-1 | MUST-FIX | A call that passed the last `detached()` check could pause before it wrote (the reviewer paused it with a FIFO as the staged output); detach completed, the same job id attached again at the same pathname, and the old call wrote into the new directory. | `Attachment.publish: Mutex<()>`. Every staged output is read into memory first, outside the lock; the `stop` check and the writes are one unit under the lock; `stop_attachment` sets `stop`, then takes and releases the lock (waits for a publication in flight), then removes the socket. After detach returns, no old call can write. | `attachment_binding::a_call_that_pauses_before_publishing_cannot_write_after_the_detach`; the `HEAD` daemon fails it as the reviewer described. |
+| R3-2 | MUST-FIX | `StartGuard` removed the holder's resources at once when the start future was dropped while `docker run` still ran on the blocking pool; the container then appeared with no owner. | `OwnedCall`: the blocking task records when the call ended, the future's owner records the abandonment, and whichever comes second runs the cleanup, exactly once and only after the effect exists. Every call in `start_owned` goes through it. `attach` owns its attachment the same way, which also closes the cancelled-attach gap round 2 left open. | `an_owned_call_dropped_in_flight_cleans_up_exactly_once_after_the_child_ends`, `an_owned_call_that_completes_cleans_up_only_when_it_stays_armed`. |
+| R3-3 | MUST-FIX | `container_exists` read any non-zero `docker inspect` as "absent": a daemon that was down let `shutdown` mark a running holder stopped and disarm its fallback. | `inspect_outcome`: exit 0 is present, the daemon's own "no such" words are absent, anything else is an error that keeps the flag unset. | `inspect_words_decide_presence_and_an_unknown_answer_is_an_error`. |
+| R3-4 | MUST-FIX | `run_bounded` collected the pipes for two seconds and turned a timeout into empty output with a success code; a descendant that held a pipe made `docker ps` read as empty and the reconcile remove nothing. | The child runs in its own process group; one deadline covers the run and the collection; a pipe held past it is an `Err`, and the group is killed so the descendant does not outlive the call. | `a_descendant_that_holds_the_pipes_fails_the_call_instead_of_emptying_its_output`. |
+| R3-5 | SHOULD-FIX | A vendor that sent the final response and then kept its SSE stream open left the bridge's worker reading forever; every request added a worker and a connection. | A request worker stops reading and drops its connection once its answer is written. Request workers are bounded (`MAX_REQUESTS_IN_FLIGHT = 32`): a request over the bound gets one immediate error line on its id; notifications and responses are never bounded, so an answer to a server request always goes out. `vendor-mcp --hold-stream` and `--delay-ms` are the test modes. | `proxy_swap_suite::a_request_worker_ends_when_its_answer_arrives_even_if_the_vendor_holds_the_stream`, `requests_over_the_in_flight_bound_get_one_error_line_and_the_rest_are_served`. |
+| R3-6 | SHOULD-FIX | The holder's read timeout only checked `detached()` and continued, so silent connections on an attached job held every slot, and section 12's "idles out in 30 s" was false. | `tool-mcp-bridge` opens one connection per message, so idle expiry is safe: a job connection with no complete request within the idle timeout is closed, attached or not. Daemon flag `--job-idle-timeout-secs` (default 30). | `attachment_binding::silent_connections_expire_after_the_idle_timeout`; the `HEAD` daemon fails it. |
+| R3-7 | SHOULD-FIX | The boot reconciled stale holders only when the current mode was docker; a seat that left docker mode kept its old holders. | The mode is no longer the test. A marker file in the seat's home (`held-tools-started`) is written when holders start and removed once a boot with no held tools has reconciled; the reconcile runs when the config names held tools OR the marker exists. A seat that never held a tool makes no `docker` call at boot (an unconditional call shifted the timing of the relay-fixture tests). A host with no docker CLI is quiet (`DOCKER_NOT_RUNNABLE`). | Read: the predicate; `marker_path`, `write_marker`. |
+| R3-8 | SHOULD-FIX | Live test A did not check that `docker logs` succeeded, so a failed retrieval passed the absence check on the error text; the README called run B's redacted wire a raw view. | The test asserts the exit status first. The README says run B has no raw observation of its own. | Read. |
+
+#### Reruns after round 3 (2026-09-15, on `c015c66` and the marker change)
+
+- Kit: 78 pass (was 74), clippy clean. Core: 449 / 498 / 1568 / 1633 across the four rows. CLI:
+  162 / 162 and 200 / 200 with the anonymous docker config (the doctor test reaches the registry
+  client that way). Clippy on core: no site inside the changed lines.
+- One core test failed once in a full row and passed three times alone:
+  `seller_node::run::tests::offer_backfill_recovers_an_offer_the_deaf_live_sub_never_delivered`,
+  at its relay fixture's `expect("relay run")`, the #548 fixture flake. The reviewer saw the same
+  shape once in `seller_node::lock::tests::second_acquire_fails_closed_while_first_is_held`; it
+  passed five times alone here. Neither module is touched by the branch.
+- Both images rebuilt from this tree; the Holder live proof with two tools (contained) and the
+  GitHub acceptance of the Proxy swap route (run A, contained) passed again on them; the token is
+  in none of the run's files. The agent-turn live tests were not rerun (each spends a model turn).
+
 What stays open after this round, stated plainly:
 
 - The residual path of finding 1 is the vendor: a vendor that reflects its `Authorization` header
@@ -432,8 +463,6 @@ What stays open after this round, stated plainly:
 - A detach does not kill a tool run in flight; the publish step refuses afterwards.
 - The bridge opens no `GET` stream. A server message that does not ride on a response to a client
   request is not received.
-- The holder's connection bound (16) and idle timeout (30 s) are constants; the idle path has no test.
-- A cancelled `attach` future still completes its `docker exec` on the blocking pool (bounded now);
-  the endpoint it would have produced is not detached by anyone. The daemon never cancels an attach
-  except at shutdown, which removes the holder.
+- The holder's connection bound (16) is a constant; the idle timeout defaults to 30 s and the core
+  daemon does not pass the flag. The bridge's in-flight request bound (32) is a constant.
 

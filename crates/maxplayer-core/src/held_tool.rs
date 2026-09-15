@@ -77,6 +77,26 @@ pub fn job_socket_path(server_name: &str) -> String {
 /// can be attributed to the seat that leaked it.
 pub const HOLDER_LABEL: &str = "maxplayer.held-tool.seat";
 
+/// The file in the seat's home that says "this seat started holders". Written when holders start,
+/// removed when a boot with no held tools reconciles and finds nothing left to own. It is what lets
+/// a boot that left docker mode, or dropped `[sandbox]`, still remove the holders of its previous
+/// configuration, without a `docker` call at the boot of every seat that never held a tool.
+pub const HELD_TOOLS_MARKER: &str = "held-tools-started";
+
+/// The marker's path under the seat's home directory.
+pub fn marker_path(home_root: &Path) -> std::path::PathBuf {
+    home_root.join(HELD_TOOLS_MARKER)
+}
+
+/// Record that `seat` starts holders for `server_names` now. Informational content; the file's
+/// presence is the fact.
+pub fn write_marker(home_root: &Path, seat: &str, server_names: &[String]) -> std::io::Result<()> {
+    std::fs::write(
+        marker_path(home_root),
+        format!("seat {seat}\nheld tools: {}\n", server_names.join(", ")),
+    )
+}
+
 /// How long boot waits for the holder to answer `status` — enrolment against a vendor is inside it.
 const START_TIMEOUT: Duration = Duration::from_secs(90);
 const START_POLL: Duration = Duration::from_millis(500);
