@@ -1,0 +1,66 @@
+# cdk-mintd 0.17.2 — sandbox-local FAKEWALLET test mint.
+#
+# WORTHLESS TEST ECASH. This mint has no Lightning backend and no onchain backend that can move
+# real value: it is built --no-default-features --features fakewallet,sqlite, so the cln / lnd /
+# lnbits / bdk / ldk-node backends are not compiled in at all. Quotes auto-settle after a short
+# fake delay. Never put this mint's URL in a seller's `accepted_mints`.
+#
+# Schema verified against cdk-mintd 0.17.2 sources (example.config.toml:116-119 for [ln],
+# :283 for [fake_wallet], src/config.rs:1002 `struct Settings`). Note this is NOT the
+# `[payment_backend] backend = "fakewallet"` shape some older notes describe.
+#
+# `test-mint` renders the __PLACEHOLDER__ values and writes the result into the job workdir; the
+# seed is supplied separately via --seed-file and never appears here.
+
+[info]
+url = "__MINT_URL__"
+listen_host = "__LISTEN_HOST__"
+listen_port = __LISTEN_PORT__
+# input_fee_ppk left at the default (0) so test arithmetic is exact unless a test opts into fees.
+
+[info.quote_ttl]
+mint_ttl = 600
+melt_ttl = 120
+
+[info.logging]
+# Console only. The mint writes no log file into the job workdir, so a job's deliverable cannot
+# accidentally carry mint logs.
+output = "stderr"
+console_level = "info"
+
+[info.http_cache]
+backend = "memory"
+ttl = 60
+tti = 60
+
+[mint_info]
+name = "maxplayer sandbox test mint"
+description = "Worthless test ecash. Fakewallet backend, loopback only."
+
+[database]
+engine = "sqlite"
+
+# Single fakewallet backend on sat. Repeat as [[ln]] with a different `unit` to exercise
+# multi-unit; duplicate (unit, method) pairs are rejected at startup.
+# min_mint/max_mint/min_melt/max_melt are REQUIRED here, even though cdk-mintd's own
+# example.config.toml shows them commented out: `struct Ln` (src/config.rs:170-179) gives them no
+# #[serde(default)], so omitting any one of them fails the whole file with the unhelpful
+# "data did not match any variant of untagged enum LnOneOrMany for key `ln`". Measured: that is
+# exactly how the first run of this rig failed. Values below mirror `impl Default for Ln`.
+[ln]
+ln_backend = "fakewallet"
+unit = "sat"
+min_mint = 1
+max_mint = 500000
+min_melt = 1
+max_melt = 500000
+
+[fake_wallet]
+# Non-zero so melt fee-reserve behaviour is exercised rather than silently skipped.
+fee_percent = 0.02
+reserve_fee_min = 1
+custom_payment_methods = []
+# Short but non-zero: a quote that settles instantly hides pending-state bugs, and a long delay
+# makes the acceptance run slow. 1-3s is the upstream example's own range.
+min_delay_time = 1
+max_delay_time = 3

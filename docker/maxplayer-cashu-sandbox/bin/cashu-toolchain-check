@@ -1,0 +1,95 @@
+#!/bin/sh
+# cashu-toolchain-check — prove this image carries a working OFFLINE Rust/CDK build environment.
+#
+# The advisor's F1 was that the first cut shipped precompiled binaries only: BuildKit cache mounts
+# never become image layers, so "a dependency cache exists" was true of the build, not of the
+# image. The answer to that is not a claim, it is a compile. This script copies the shipped example
+# crate into a writable directory and builds it with `--offline --locked` against the baked
+# registry. No network is used, and it fails loudly rather than falling back to a fetch.
+#
+# It deliberately does NOT build inside the delivered workdir: compiling there would put a target/
+# directory into the buyer's deliverable.
+#
+# PATH is set here rather than inherited. The image's ENV puts the toolchain on PATH, but a LOGIN
+# shell discards that — Debian's /etc/profile assigns PATH unconditionally — so this script failed
+# with `rustc: not found` under `bash -lc` in an image that was in fact complete. A proof script
+# that reports a false negative depending on how its caller spawned a shell is not a proof, so it
+# now resolves its own toolchain.
+PATH="/opt/rust/toolchain/bin:/opt/rust/cargo/bin:$PATH"
+export PATH
+CARGO_HOME="${CARGO_HOME:-/opt/rust/cargo}"
+export CARGO_HOME
+
+set -eu
+
+usage() {
+    cat <<EOF
+cashu-toolchain-check — offline Rust/CDK build proof
+
+  cashu-toolchain-check            build the example offline (compile proof only)
+  cashu-toolchain-check --run      build it, then run it against a live test mint
+  cashu-toolchain-check --help
+
+Environment: TEST_MINT_STATE_ROOT (default /var/lib/cashu-test-state) — the scratch build root
+lives under it, so build output is disposable with the container and never delivered.
+EOF
+}
+
+RUN_IT=no
+case "${1:-}" in
+    --help|-h) usage; exit 0 ;;
+    --run) RUN_IT=yes ;;
+    "") ;;
+    *) echo "cashu-toolchain-check: unknown argument '$1'" >&2; usage >&2; exit 64 ;;
+esac
+
+STATE_ROOT="${TEST_MINT_STATE_ROOT:-/var/lib/cashu-test-state}"
+BUILD_ROOT="${STATE_ROOT}/toolchain-check"
+SRC=/opt/cashu/examples/wallet-roundtrip
+
+echo "== toolchain identity"
+rustc --version
+cargo --version
+echo "CARGO_HOME=${CARGO_HOME:-unset}"
+echo "CARGO_NET_OFFLINE=${CARGO_NET_OFFLINE:-unset}"
+cat /opt/rust/TOOLCHAIN.txt 2>/dev/null || true
+
+echo
+echo "== dependency cache"
+crates=$(find "${CARGO_HOME}/registry/cache" -name '*.crate' 2>/dev/null | wc -l | tr -d ' ')
+echo "cached .crate archives: ${crates}"
+if [ "${crates}" -lt 50 ]; then
+    echo "cashu-toolchain-check: dependency cache looks empty (${crates} archives) — F1 not satisfied" >&2
+    exit 1
+fi
+for want in cdk-0.17.2 cashu-0.17.2 cdk-sqlite-0.17.2; do
+    if find "${CARGO_HOME}/registry/cache" -name "${want}.crate" | grep -q .; then
+        echo "  present: ${want}.crate"
+    else
+        echo "cashu-toolchain-check: ${want}.crate missing from the cache" >&2
+        exit 1
+    fi
+done
+
+echo
+echo "== offline build of ${SRC}"
+rm -rf "${BUILD_ROOT}"
+mkdir -p "${BUILD_ROOT}"
+cp -a "${SRC}/." "${BUILD_ROOT}/"
+cd "${BUILD_ROOT}"
+test -f Cargo.lock || { echo "cashu-toolchain-check: example has no Cargo.lock" >&2; exit 1; }
+# --offline AND --locked: no fetch, no resolution change. If the baked cache is missing anything the
+# lockfile names, this fails here instead of quietly reaching the network.
+cargo build --offline --locked --quiet
+echo "built: ${BUILD_ROOT}/target/debug/wallet-roundtrip"
+ls -l target/debug/wallet-roundtrip
+
+if [ "${RUN_IT}" = "yes" ]; then
+    echo
+    echo "== running it against the test mint"
+    test-mint status >/dev/null 2>&1 || test-mint start >/dev/null
+    FAKE_INVOICE="$(test-mint invoice 4000)" ./target/debug/wallet-roundtrip
+fi
+
+echo
+echo "PASS — offline toolchain + CDK cache verified in-image"
