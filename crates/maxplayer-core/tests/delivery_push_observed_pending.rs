@@ -409,6 +409,12 @@ async fn an_aborted_delivery_task_does_not_hand_the_seat_on_while_its_child_stil
     let lock = Arc::new(tokio::sync::Mutex::new(()));
     let budget = Duration::from_millis(3_000);
     let generous = Duration::from_secs(30);
+    // THE ORIGINAL DEADLINE AS AN INSTANT, taken out here rather than inside the task. Comparing the
+    // handover against `budget` compares it against the WHOLE initial allowance, which ordinary
+    // deadline cleanup also satisfies once any of that allowance has been spent before the abort.
+    // What discriminates prompt abort cleanup from deadline cleanup is the time that was still LEFT
+    // on this deadline when the abort happened, and that needs the deadline itself.
+    let deadline = Instant::now() + budget;
 
     let first = {
         let lock = Arc::clone(&lock);
@@ -418,7 +424,7 @@ async fn an_aborted_delivery_task_does_not_hand_the_seat_on_while_its_child_stil
             serialized_bounded_push(
                 &lock,
                 generous,
-                Instant::now() + budget,
+                deadline,
                 move |turn| async move {
                     neutralize_then_push_in_child_off_runtime(
                         program,
@@ -478,7 +484,7 @@ async fn an_aborted_delivery_task_does_not_hand_the_seat_on_while_its_child_stil
     // Watch it wait, for as long as the aborted delivery's child is still running.
     let mut samples = 0usize;
     let mut last_alive_at = Instant::now();
-    while alive(wedged_pid) && Instant::now() < aborted_at + budget {
+    while alive(wedged_pid) && Instant::now() < deadline {
         assert!(
             poll_once(second.as_mut()).await.is_pending(),
             "the second delivery became ready while the aborted delivery's child was still alive"
@@ -517,8 +523,11 @@ async fn an_aborted_delivery_task_does_not_hand_the_seat_on_while_its_child_stil
          child was last seen alive at {last_alive_at:?}"
     );
     let handover = acquired.saturating_duration_since(aborted_at);
+    // What was actually still owed to this delivery when its task was aborted. Deadline cleanup
+    // cannot beat this number; abort cleanup must.
+    let remaining_at_abort = deadline.saturating_duration_since(aborted_at);
     eprintln!(
-        "MEASURED abort_to_handover={handover:?} budget={budget:?} samples_pending={samples}"
+        "MEASURED abort_to_handover={handover:?} remaining_at_abort={remaining_at_abort:?}          budget={budget:?} samples_pending={samples}"
     );
     // AND THE SEAT DID NOT WAIT OUT THE CLOCK. An abort that left the child to be stopped by its
     // deadline would still satisfy everything above; it would also mean a cancelled request parks
@@ -528,8 +537,25 @@ async fn an_aborted_delivery_task_does_not_hand_the_seat_on_while_its_child_stil
         handover < CANCELLATION_POLL + REAP_BOUND + Duration::from_secs(2),
         "the seat took {handover:?} to come back after an abort, past the poll and reap bounds          this executor states"
     );
+    // AGAINST THE REMAINING DEADLINE, NOT THE WHOLE BUDGET. `handover < budget` was not the
+    // discriminator it read as: the abort happens after the child is up, so some of the budget is
+    // already gone by then, and a seat released by ORDINARY DEADLINE CLEANUP hands over in
+    // `remaining_at_abort + reap` — which can be comfortably under the full initial budget. The
+    // comparison that separates the two is against what was still owed at the moment of the abort.
     assert!(
-        handover < budget,
-        "the seat came back at the deadline ({budget:?}) rather than because the delivery's task          was aborted: {handover:?}"
+        acquired < deadline,
+        "the seat came back at or after this delivery's ORIGINAL DEADLINE, which is what ordinary          deadline cleanup does; an abort must release it earlier. handover={handover:?}          remaining_at_abort={remaining_at_abort:?}"
+    );
+    assert!(
+        handover < remaining_at_abort,
+        "the handover took {handover:?} with {remaining_at_abort:?} still left on the original          deadline; that is deadline cleanup wearing an abort's name"
+    );
+    // And by a MARGIN, so a deadline that happened to fall moments after the abort cannot pass for
+    // one. Half is not arbitrary: the abort path is bounded by the cancellation poll plus the reap,
+    // while deadline cleanup cannot start before the deadline, so anything near `remaining_at_abort`
+    // is indistinguishable and this gate refuses to call it.
+    assert!(
+        handover * 2 < remaining_at_abort,
+        "the handover ({handover:?}) is not clearly shorter than the {remaining_at_abort:?} the          delivery still had; at that margin this gate cannot tell abort cleanup from deadline cleanup"
     );
 }
