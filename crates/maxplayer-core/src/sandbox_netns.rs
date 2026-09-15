@@ -1471,7 +1471,7 @@ pub fn list_owned_argv(seat: &str) -> Vec<String> {
         &format!("label={HOLDER_SEAT_LABEL}={seat}"),
         "--format",
         &format!(
-            "{{{{.ID}}}}\t{{{{.Label \"{HOLDER_SEAT_LABEL}\"}}}}\t{{{{.Label \"{HOLDER_CLEANUP_AFTER_LABEL}\"}}}}\t{{{{.Label \"{HOLDER_ROLE_LABEL}\"}}}}\t{{{{.Label \"{HELPER_JOB_LABEL}\"}}}}"
+            "{{{{.ID}}}}\t{{{{.Label \"{HOLDER_SEAT_LABEL}\"}}}}\t{{{{.Label \"{HOLDER_CLEANUP_AFTER_LABEL}\"}}}}\t{{{{.Label \"{HOLDER_ROLE_LABEL}\"}}}}\t{{{{.Label \"{HELPER_JOB_LABEL}\"}}}}\t{{{{.Label \"{HOLDER_LABEL}\"}}}}"
         ),
     ]
     .into_iter()
@@ -1528,7 +1528,11 @@ pub fn parse_owned_listing(stdout: &str) -> Vec<OwnedContainer> {
             let seat = field(&mut fields);
             let cleanup_after = field(&mut fields).and_then(|value| value.parse::<u64>().ok());
             let role = field(&mut fields);
-            let job = field(&mut fields);
+            // A helper names its job in HELPER_JOB_LABEL; a holder names the same job in
+            // HOLDER_LABEL and never carries the helper label at all. Reading only the helper
+            // label made every production holder parse as jobless, which the removal gate then
+            // refused forever as `MissingJob` — the leak this sweep exists to close.
+            let job = field(&mut fields).or_else(|| field(&mut fields));
             OwnedContainer {
                 id,
                 seat,
@@ -4133,6 +4137,51 @@ exit 0
         assert!(reported["no-job"].contains("job"), "{reported:?}");
         assert!(reported["bad-stamp"].contains("stamp"), "{reported:?}");
         assert!(reported["no-seat"].contains("seat"), "{reported:?}");
+    }
+
+    /// A PRODUCTION HOLDER NAMES ITS JOB IN ITS OWN LABEL, AND THE SWEEP MUST READ IT THERE.
+    ///
+    /// Found by the live matrix at 647c457b, not by this module. Every holder production launches
+    /// carries its job in [`HOLDER_LABEL`] and NEVER wears [`HELPER_JOB_LABEL`], so a listing that
+    /// read the job only from the helper label parsed every real holder as jobless, and the D1 gate
+    /// then refused it as [`SkipReason::MissingJob`] on that pass and every later one. The holders
+    /// this sweep exists to reclaim would have been the one thing it could never remove. The unit
+    /// fixtures hid it because `write_listing` gives every row a helper job label; production does
+    /// not, which is why this row is written out in full.
+    #[test]
+    fn a_holder_stamped_the_way_production_stamps_it_is_swept_not_refused() {
+        let stamp = 1_000_u64;
+        let seat = sweep_seat("prod-shape");
+        // Exactly what `list_owned_argv` hands back for a live holder: the helper-job column is
+        // empty and the holder's own label carries the job.
+        let listing = format!(
+            "holder\t{seat}\t{stamp}\t{ROLE_HOLDER}\t\tjob-live\n\
+             helper\t{seat}\t{stamp}\t{ROLE_HELPER}\tjob-live\t\n\
+             jobless\t{seat}\t{stamp}\t{ROLE_HOLDER}\t\t\n"
+        );
+        let owned = parse_owned_listing(&listing);
+        assert_eq!(
+            owned[0].job.as_deref(),
+            Some("job-live"),
+            "a holder's job is read from its own label, not from a helper label it never wears"
+        );
+        assert_eq!(owned[1].job.as_deref(), Some("job-live"), "a helper still names its own job");
+        assert_eq!(owned[2].job, None, "a container naming no job in EITHER label names none");
+
+        let selection = partition_owned(&owned, &seat, u64::MAX);
+        assert!(
+            selection.removable.contains(&"holder".to_owned()),
+            "an expired production-stamped holder must be removable, not refused: {selection:?}"
+        );
+        assert!(
+            selection.removable.contains(&"helper".to_owned()),
+            "and the helper alongside it: {selection:?}"
+        );
+        assert_eq!(
+            selection.skipped,
+            vec![("jobless".to_owned(), SkipReason::MissingJob)],
+            "absence is still never permission: the row naming no job at all is the only refusal"
+        );
     }
 
     /// A PERSISTENTLY FAILING HEAD CANNOT STARVE THE TAIL OF THE QUEUE.
