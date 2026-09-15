@@ -1836,6 +1836,97 @@ pub fn minted_answer(header: Option<String>, refused: Option<String>) -> Result<
 mod tests {
     use super::*;
 
+    /// THE SIZING RULE, WITHOUT A CLOCK TO ARGUE WITH.
+    ///
+    /// The behavioural cadence gate in `tests/delivery_push_protocol_and_revocation.rs` can only
+    /// bound the worst observed gap, and on a host whose timed wakeups are coalesced its floor is
+    /// wider than the defect. The defect is a sizing rule, so it is proved here as one: every wait
+    /// in a delivery is cut at ONE shared next-ask deadline, and a wait entered late in the current
+    /// interval gets WHAT REMAINS of it rather than a fresh full interval of its own. No sleeping,
+    /// nothing to be late, nothing a scheduler can make pass.
+    #[test]
+    fn poll_clock_sizes_every_wait_from_one_shared_deadline() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let plenty = Duration::from_secs(30);
+
+        // A wait entered 40 ms into a 50 ms interval may block for the remaining 10, not for 50.
+        // The old code computed `left.min(CANCELLATION_POLL)` here and got the full interval, which
+        // is how a delivery making steady progress reached ~90 ms between observations.
+        let mut clock = PollClock::armed_now();
+        clock.next_ask = Instant::now() + Duration::from_millis(10);
+        let slice = clock.slice(plenty);
+        assert!(
+            slice <= Duration::from_millis(10),
+            "a wait entered late in the interval was sized {slice:?}; it must be cut at the shared             next ask, not given a slice of its own"
+        );
+        assert!(
+            slice < CANCELLATION_POLL,
+            "the wait was handed a full fresh interval ({slice:?}) despite most of the current one             already being spent"
+        );
+
+        // TWO CONSECUTIVE WAITS, NO ASK BETWEEN THEM. The second must not be refreshed by the first
+        // having returned early: that is exactly the nested mint/ACK case, where an inner wait used
+        // to start its own full slice with no knowledge of when the owner was last asked.
+        let second = clock.slice(plenty);
+        assert!(
+            second <= slice,
+            "a second wait with no ask between them was sized {second:?} after {slice:?}; the         deadline is shared, so it can only shrink"
+        );
+
+        // `left` still wins when the delivery's own deadline is nearer than the next ask.
+        let nearly_over = Duration::from_millis(3);
+        assert_eq!(
+            clock.slice(nearly_over),
+            nearly_over,
+            "a wait must never be sized past the delivery's remaining time"
+        );
+
+        // Due means due: a zero slice, so the wait returns at once and the ask happens. A floor here
+        // would let a wait outlive the deadline it exists to enforce.
+        clock.next_ask = Instant::now() - Duration::from_millis(1);
+        assert_eq!(
+            clock.slice(plenty),
+            Duration::ZERO,
+            "an ask that is already due must not buy the next wait any time at all"
+        );
+
+        // An ask happens exactly once when due, and re-arms from the ask itself.
+        let asked = Arc::new(AtomicUsize::new(0));
+        let authority: crate::git_transport::AuthorityCheck = {
+            let asked = Arc::clone(&asked);
+            Arc::new(move || {
+                asked.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        };
+        clock.ask_if_due(&authority).expect("still authorized");
+        assert_eq!(asked.load(Ordering::SeqCst), 1, "a due ask was not made");
+        clock.ask_if_due(&authority).expect("still authorized");
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            1,
+            "the owner was asked again immediately; re-arming must start a new interval, not         leave the ask due"
+        );
+        let after = clock.slice(plenty);
+        assert!(
+            after > CANCELLATION_POLL / 2 && after <= CANCELLATION_POLL,
+            "the interval after an ask was {after:?}; it must be a full {CANCELLATION_POLL:?}"
+        );
+
+        // A revocation is reported to the caller rather than swallowed, and only when the ask is due.
+        let ended: crate::git_transport::AuthorityCheck =
+            Arc::new(|| Err("the owner of this delivery went away".to_owned()));
+        let mut clock = PollClock::armed_now();
+        clock.ask_if_due(&ended).expect("not due yet, so not asked");
+        clock.next_ask = Instant::now() - Duration::from_millis(1);
+        let why = clock
+            .ask_if_due(&ended)
+            .expect_err("a due ask must surface the owner's refusal");
+        assert!(why.contains("went away"), "the refusal was rewritten: {why}");
+    }
+
     /// The child's two bounds, and the rule that picks between them.
     ///
     /// The end-to-end consequence of the ABSOLUTE bound — a child that read its request too late

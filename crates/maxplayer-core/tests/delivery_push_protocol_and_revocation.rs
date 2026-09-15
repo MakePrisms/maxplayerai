@@ -20,7 +20,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use maxplayer_core::delivery_executor::{CANCELLATION_POLL, MAX_MINT_REQUESTS, REAP_BOUND};
@@ -553,5 +553,166 @@ async fn a_child_that_closes_its_stdout_is_at_end_of_file_but_not_yet_confirmed_
     assert!(
         run.work_ended && run.released,
         "a confirmed exit must hand the seat on"
+    );
+}
+
+/// THE INTERVAL ITSELF, MEASURED — not the reaction to one revocation.
+///
+/// Every other gate in this file revokes and then times the reaction. That proves the parent acts,
+/// and says nothing about how often it LOOKS while nothing is wrong. The claim in the module header
+/// is about the looking, and slicing each wait at `CANCELLATION_POLL` independently did not deliver
+/// it: after an ask at `t0`, a frame arriving at `t0 + 40ms` is not a timeout, so no arm re-asked,
+/// and the wait entered next then began a FULL fresh 50 ms slice. The owner was not observed again
+/// until roughly `t0 + 90ms`. Progressing execution — not a stall, not a misbehaving child — could
+/// sit at nearly twice the advertised interval, and a nested mint wait made it worse because it
+/// started its own full slice with no knowledge of when the last ask happened.
+///
+/// This child arrives deliberately LATE IN THE INTERVAL: it sleeps 40 ms and then asks for an
+/// authorization the minter holds for 300 ms, three times over. The gate records the wall-clock
+/// instant of every authority call and asserts the WORST gap between consecutive observations,
+/// measured only while a mint is outstanding so that neither the spawn nor any other one-off
+/// synchronous phase is inside the window.
+///
+/// WHAT THIS GATE CAN AND CANNOT SEE, measured rather than assumed. On a host whose timed wakeups
+/// are coalesced — this one — a wait asked to return in 50 ms returns in about 190 ms, and a shell
+/// `sleep 0.04` takes longer than a whole poll interval. The 40 ms difference between one shared
+/// deadline and a fresh per-wait slice is therefore BELOW the measurement floor here, and any
+/// assertion claiming to see it would be reporting the scheduler. So this gate calibrates the host's
+/// own overshoot with the same primitive the executor waits on, and bounds the worst observed gap by
+/// `CANCELLATION_POLL + that overshoot + slack`: enough to reject a return to deadline-long waits,
+/// not enough to discriminate one interval from two. The exact sizing rule — that a wait entered
+/// late in the interval is cut at what REMAINS of it rather than given a fresh full slice — is
+/// proved deterministically in `poll_clock_sizes_every_wait_from_one_shared_deadline` in the module
+/// itself, where no clock is involved. Naming that split is the point: this is the liveness half.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_owner_is_observed_within_the_poll_even_when_every_wait_is_entered_late_in_it() {
+    const HOLD: Duration = Duration::from_millis(300);
+    const CYCLES: usize = 3;
+    /// Slack on top of the host's measured wakeup overshoot, for the synchronous parent work
+    /// between one wait returning and the next ask.
+    const TOLERANCE: Duration = Duration::from_millis(40);
+
+    /// How late THIS host returns from a timed wait of exactly one poll interval, measured on the
+    /// same primitive `drive` blocks on. On an unloaded Linux box this is a fraction of a
+    /// millisecond; under macOS timer coalescing it is over 100 ms, and a bound that ignored it
+    /// would be a flake rather than a gate.
+    fn wakeup_overshoot() -> Duration {
+        let (keep_open, rx) = std::sync::mpsc::channel::<()>();
+        let mut worst = Duration::ZERO;
+        for _ in 0..8 {
+            let at = Instant::now();
+            let _ = rx.recv_timeout(CANCELLATION_POLL);
+            worst = worst.max(at.elapsed().saturating_sub(CANCELLATION_POLL));
+        }
+        drop(keep_open);
+        worst
+    }
+
+    let dir = scratch("poll-cadence");
+    let pidfile = dir.join("child.pid");
+    // Sleeps 40 ms — most of one interval — and only THEN asks. Every wait the parent enters on this
+    // child's behalf is entered with little of the current interval left.
+    let program = fixture(
+        &dir,
+        &format!(
+            "echo $$ > {}\n{HELLO}\nIFS= read -r _request\ni=0\n\
+             while [ $i -lt {CYCLES} ]; do sleep 0.04; \
+             printf '{{\"t\":\"Mint\",\"destination\":\"{REMOTE}\"}}\\n'; \
+             IFS= read -r _reply || exit 0; i=$((i+1)); done\n\
+             printf '{{\"t\":\"Done\",\"oid\":null,\"error\":\"finished the cadence run\"}}\\n'\n\
+             sleep 5\n",
+            pidfile.display()
+        ),
+    );
+
+    // WHEN the owner was asked, not merely how often. A count cannot tell a steady 50 ms cadence
+    // from one that spends half its samples at 90 ms.
+    let asks: Arc<Mutex<Vec<Instant>>> = Arc::new(Mutex::new(Vec::new()));
+    let authority: AuthorityCheck = {
+        let asks = Arc::clone(&asks);
+        Arc::new(move || {
+            asks.lock().expect("asks").push(Instant::now());
+            Ok(())
+        })
+    };
+
+    // Each mint is held open, so the parent is inside a wait it must poll through for 300 ms at a
+    // time. The window is recorded to keep the measurement away from spawn and teardown.
+    let windows: Arc<Mutex<Vec<(Instant, Instant)>>> = Arc::new(Mutex::new(Vec::new()));
+    let mint: AuthMinter = {
+        let windows = Arc::clone(&windows);
+        Arc::new(move |_destination: &str| {
+            let started = Instant::now();
+            std::thread::sleep(HOLD);
+            windows
+                .lock()
+                .expect("windows")
+                .push((started, Instant::now()));
+            Ok("Nostr held-for-the-cadence-gate".to_owned())
+        })
+    };
+
+    let run = deliver(
+        program,
+        dir.join("workdir"),
+        Some(mint),
+        Some(authority),
+        UNREACHABLE,
+    )
+    .await;
+
+    assert!(
+        run.outcome.is_err(),
+        "the child ended this delivery itself; it must not come back as a success"
+    );
+    assert!(
+        run.took < UNREACHABLE / 2,
+        "this gate measures a cadence, not a deadline; it took {:?}",
+        run.took
+    );
+
+    let windows = windows.lock().expect("windows").clone();
+    assert_eq!(
+        windows.len(),
+        CYCLES,
+        "the child did not complete its mint cycles, so the held waits under measurement did not      all happen"
+    );
+    let from = windows[0].0;
+    let to = windows[CYCLES - 1].1;
+
+    let asks = asks.lock().expect("asks").clone();
+    // Start from the LAST ask before the first mint was entered: the gap that spans the entry is the
+    // one the per-wait design got wrong, and dropping it would measure only the easy interior.
+    let first = asks.iter().rposition(|at| *at <= from).unwrap_or(0);
+    let sampled: Vec<Instant> = asks[first..]
+        .iter()
+        .copied()
+        .filter(|at| *at <= to)
+        .collect();
+    assert!(
+        sampled.len() >= 12,
+        "only {} authority observations across {CYCLES} held mints; the parent was not polling      through them at all",
+        sampled.len()
+    );
+
+    let mut worst = Duration::ZERO;
+    let mut worst_after = 0usize;
+    for (index, pair) in sampled.windows(2).enumerate() {
+        let gap = pair[1].saturating_duration_since(pair[0]);
+        if gap > worst {
+            worst = gap;
+            worst_after = index;
+        }
+    }
+    let overshoot = wakeup_overshoot();
+    let ceiling = CANCELLATION_POLL + overshoot + TOLERANCE;
+    assert!(
+        worst <= ceiling,
+        "the longest interval between two authority observations was {worst:?} (after sample      {worst_after} of {}), against an advertised {CANCELLATION_POLL:?} and a ceiling of {ceiling:?}      on a host measured to return {overshoot:?} late from a {CANCELLATION_POLL:?} wait. A gap this      long means a wait was not cut at the shared next-ask deadline at all",
+        sampled.len()
+    );
+    assert!(
+        !alive(pid_of(&pidfile)),
+        "the child outlived the delivery that owns it"
     );
 }
