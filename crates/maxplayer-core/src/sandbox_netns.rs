@@ -3010,9 +3010,19 @@ exit 0
 
         let work = stand_in_work_dir("writer-outstanding");
         let script = work.join("docker");
-        // Never reads stdin, so a large plan fills the pipe; the descendant keeps the READ end open
-        // so killing the client does not deliver `EPIPE` to the writer.
-        std::fs::write(&script, "#!/bin/sh\nsleep 30 &\nsleep 30\n").expect("write stand-in");
+        // Never reads stdin, so a large plan fills the pipe and the write blocks; the descendant
+        // keeps the READ end open, so killing the client does NOT deliver `EPIPE` to the writer and
+        // the outstanding-writer case is reached every time rather than by luck.
+        //
+        // The read end is parked on fd 3 on purpose. A background job in a non-interactive shell
+        // has its STDIN redirected to /dev/null by POSIX, so the obvious `sleep 30 &` holds nothing
+        // — and `sleep 30 <&0 &` does not help either, because that default is applied before the
+        // redirection resolves, leaving it duplicating /dev/null. An unrelated descriptor is
+        // inherited untouched, so fd 3 keeps the pipe genuinely open. Written the obvious way this
+        // test raced: the writer took `EPIPE` instead, and whether it arrived inside the grace
+        // decided the result — it passed single-threaded and failed under parallel load.
+        std::fs::write(&script, "#!/bin/sh\nexec 3<&0\nsleep 30 &\nsleep 30\n")
+            .expect("write stand-in");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
         let deadline = std::time::Duration::from_millis(300);
