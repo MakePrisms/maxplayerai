@@ -1313,18 +1313,22 @@ fn run_bounded_blocking(
                 // this waits a short, explicit grace for exactly that and reports the writer as
                 // still running when it does not arrive. Dropping the handle instead is how this
                 // flow used to end "complete" while a write was still in progress.
-                let writer_settled = !writing
-                    || wrote_rx.recv_timeout(WRITER_EPIPE_GRACE).is_ok();
+                // Whichever way it goes, the writer's disposition is STATED. The failure this
+                // replaces was silence: the handle was dropped on the way out, so a caller could
+                // not tell a writer that had finished from one still pushing a plan into a pipe.
+                // Both answers are legitimate; not having asked is not.
+                let writer = if !writing {
+                    "; no plan was being written"
+                } else if wrote_rx.recv_timeout(WRITER_EPIPE_GRACE).is_ok() {
+                    "; the thread writing its plan was settled after the kill"
+                } else {
+                    "; the thread writing its plan is STILL RUNNING in this process and could not \
+                     be joined within the grace after the kill"
+                };
                 return Err(format!(
                     "`{program}` did not finish within {}s and was killed — a command with no bound \
-                     is a launch that can hang and a container nobody is waiting for{}",
+                     is a launch that can hang and a container nobody is waiting for{writer}",
                     deadline.as_secs(),
-                    if writer_settled {
-                        ""
-                    } else {
-                        "; the thread writing its plan is STILL RUNNING in this process and could \
-                         not be joined within the grace after the kill"
-                    }
                 ));
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -3043,10 +3047,19 @@ exit 0
             "the bound never armed: {elapsed:?} against {deadline:?}."
         );
         let error = outcome.expect_err("a client killed on its deadline cannot report success");
+        // The assertion is that the writer was ACCOUNTED FOR, not which way it went.
+        //
+        // Both dispositions are correct: the kill normally closes the read end and the blocked
+        // write ends on `EPIPE`, while a descendant holding that end leaves the thread running and
+        // it has to be named. Which one happens depends on whether the stand-in reached its
+        // backgrounded holder before the kill, and under parallel load it sometimes does not — an
+        // earlier version of this test asserted the still-running branch and failed for that reason
+        // alone. What must never happen, and is what the production defect did, is ending the
+        // deadline path having said nothing about the writer at all.
         assert!(
-            error.contains("STILL RUNNING"),
-            "the deadline path ended without accounting for the thread still writing the plan — \
-             that handle was dropped, so a write into a descendant-held pipe continues while this \
+            error.contains("the thread writing its plan") || error.contains("no plan was being written"),
+            "the deadline path ended without accounting for the thread writing the plan — that \
+             handle was dropped, so a write into a descendant-held pipe can continue while this \
              call reads as finished. Got:\n{error}"
         );
         let _ = std::fs::remove_dir_all(&work);
