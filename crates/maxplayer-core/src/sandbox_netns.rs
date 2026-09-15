@@ -992,7 +992,6 @@ impl Drop for NetnsHolder {
 /// Split out of `Drop` for one reason: `Drop` must not be the last thing that cares about the
 /// container. When a create is still in flight, this outlives the holder and stays responsible until
 /// the create settles or the daemon confirms the name is gone.
-#[cfg(feature = "acp")]
 struct HolderCleanup {
     name: String,
     joiners: Vec<String>,
@@ -1001,7 +1000,6 @@ struct HolderCleanup {
     bounds: FenceBounds,
 }
 
-#[cfg(feature = "acp")]
 impl HolderCleanup {
     /// Remove the joiners, then the holder. Sidecars first: a joiner still running pins the
     /// namespace the holder is being torn down to release.
@@ -2389,7 +2387,6 @@ async fn run_sidecar_confirmed(
 /// `Some(true)` only for docker saying the object does not exist. A successful inspect is
 /// `Some(false)`: the container is still there. Anything else — docker missing, the daemon not
 /// answering, an unrecognised error — is `None`, which keeps custody.
-#[cfg(feature = "acp")]
 fn container_is_absent(client: &DockerCli, name: &str) -> Option<bool> {
     let mut child = std::process::Command::new(client.program())
         .args(["inspect", "--type", "container", "--format", "{{.Id}}", name])
