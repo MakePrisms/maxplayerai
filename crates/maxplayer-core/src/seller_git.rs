@@ -1357,6 +1357,66 @@ mod tests {
         )
     }
 
+    /// A REVOCATION IS NOT A DEADLINE BREACH — asserted on the TYPED variants, at the one place
+    /// that turns them into prose.
+    ///
+    /// The integration gates can only read `SellerGitError`, so all they can say about which of the
+    /// two stops happened is what the sentence says. That is a string assertion standing in for a
+    /// type, and it holds only while this mapping keeps them apart. So pin the mapping itself:
+    /// `Killed` and `Revoked` both mean the work stopped and the seat comes back, both arrive as
+    /// `Cancelled`, and the ONE thing that must never blur is which of the two it was.
+    ///
+    /// A future edit that folds the two arms together — the obvious simplification, since they
+    /// produce the same variant — fails here rather than silently making every revocation report a
+    /// deadline the delivery never reached.
+    #[test]
+    fn a_revocation_and_a_deadline_are_told_apart_where_the_type_becomes_a_sentence() {
+        let reap = std::time::Duration::from_millis(7);
+        let deadline = push_error_to_seller_git_error(
+            crate::delivery_executor::ExecutorError::Killed {
+                after: std::time::Duration::from_millis(11),
+                reap,
+            },
+        );
+        let revoked = push_error_to_seller_git_error(
+            crate::delivery_executor::ExecutorError::Revoked {
+                why: "the owner went away".to_owned(),
+                reap,
+            },
+        );
+
+        // Both are stops, not failures: an `Io` here would be a custody answer and would retain.
+        assert!(
+            matches!(deadline, SellerGitError::Cancelled(_)),
+            "a killed delivery must be cancelled, not failed: {deadline}"
+        );
+        assert!(
+            matches!(revoked, SellerGitError::Cancelled(_)),
+            "a revoked delivery must be cancelled, not failed: {revoked}"
+        );
+
+        let deadline = deadline.to_string();
+        let revoked = revoked.to_string();
+        assert_ne!(
+            deadline, revoked,
+            "a revocation and a deadline breach reached the caller as the same sentence, so \
+             nothing downstream can tell them apart"
+        );
+        assert!(
+            revoked.contains("revoked") && !revoked.contains("deadline"),
+            "a revocation must not be reported as a deadline breach: {revoked}"
+        );
+        assert!(
+            deadline.contains("deadline"),
+            "a deadline breach must say so: {deadline}"
+        );
+        // The reap measurement survives the mapping in both: it is the evidence the bound held.
+        assert!(
+            revoked.contains("7ms") && deadline.contains("7ms"),
+            "the confirmed-exit measurement was dropped on the way to the caller"
+        );
+    }
+
     /// An UNWIND through the child-push supervisor must not hand this seat on.
     ///
     /// `RunningWork`'s own `Drop` releases, which is right for work whose life is its stack. It was
