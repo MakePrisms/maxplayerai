@@ -36,7 +36,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use maxplayer_core::delivery_turn::delivery_turn;
@@ -643,5 +643,136 @@ async fn a_revoked_delivery_held_on_the_advertisement_is_stopped_early_and_deliv
          dropped={})",
         run.ended,
         run.released
+    );
+}
+
+/// THE REAL SIGNER ACTOR, not a closure that returns a fixture string.
+///
+/// Every other gate in this file hands the parent an `AuthMinter` that answers from a literal. That
+/// proves a token crosses the pipe on demand; it proves nothing about the thing production actually
+/// calls, which is an ACTOR — a tokio task that owns the seller key, reached through a bounded
+/// queue, answered on a channel, and bounded at both legs by the push deadline.
+///
+/// So this gate builds the minter production builds: the same destination binding, the same
+/// authority re-ask before signing, the same deadline refusal, and
+/// `SignerHandle::http_auth_header_blocking` underneath. The key is loaded from a real home and
+/// consumed into the actor's task; it is never in this test's hands after `spawn`, and it is never
+/// in the child's.
+///
+/// What is proved: the shipped child delivers, over verified TLS, carrying a NIP-98 header that a
+/// real signer actor minted per request — and the remote's own refs move because of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_shipped_child_delivers_with_tokens_minted_by_the_real_signer_actor() {
+    let _trust = exclusive_trust();
+    let root = scratch("real-signer");
+    let branch = "maxplayer/ffff6666";
+    let (workdir, oid) = job_workdir(&root, branch);
+
+    let bare = root.join("relay.git");
+    git2::Repository::init_bare(&bare).expect("relay bare");
+    let relay = GitHttpAuthServer::spawn_with(&bare, "/git/seller/r.git", FixtureOptions::default());
+    stage_env(&relay.ca_file(&root));
+
+    // A real home with a real seller key, and the actor that owns it. `spawn` consumes the secret
+    // into its task: from here the only way to a signature is a round trip through the queue.
+    let home = maxplayer_core::home::bootstrap(root.join("home")).expect("bootstrap a home");
+    let signer = maxplayer_core::seller_node::signer::spawn(&home).expect("spawn the signer actor");
+    let signer_pubkey = signer.public_key_hex().to_owned();
+    assert!(
+        !signer_pubkey.is_empty(),
+        "the actor must be able to name the key it holds"
+    );
+
+    let budget = Duration::from_secs(30);
+    let push_deadline = Instant::now() + budget;
+    let released = Arc::new(AtomicBool::new(false));
+    let (control, turn) = delivery_turn(Token(Arc::clone(&released)), push_deadline);
+
+    // Production's minter, assembled the way production assembles it.
+    let minted = Arc::new(AtomicUsize::new(0));
+    let minter: AuthMinter = {
+        let intended = relay.repo_url();
+        let scope = format!("refs/heads/{branch}");
+        let counted = Arc::clone(&minted);
+        Arc::new(move |destination: &str| {
+            if !git_transport::same_destination(&intended, destination) {
+                return Err(format!(
+                    "refusing to authorize a leg to {destination}: this delivery is bound to \
+                     {intended}"
+                ));
+            }
+            if Instant::now() >= push_deadline {
+                return Err(
+                    "this delivery's push deadline has passed; refusing to authorize another leg"
+                        .to_owned(),
+                );
+            }
+            counted.fetch_add(1, Ordering::SeqCst);
+            // THE ACTOR. Queue in, answer out, both legs bounded by the push deadline.
+            signer.http_auth_header_blocking(
+                destination.to_owned(),
+                Some(scope.clone()),
+                push_deadline,
+            )
+        })
+    };
+
+    let outcome = neutralize_then_push_in_child_off_runtime(
+        shipped_binary(),
+        workdir,
+        relay.repo_url(),
+        branch.to_owned(),
+        oid.clone(),
+        Some(minter),
+        None,
+        turn,
+    )
+    .await;
+    let ended = control.work_ended();
+    drop(control);
+
+    assert_eq!(
+        outcome.expect("the delivery must succeed against a remote that accepts its token"),
+        oid,
+        "the child reported an oid other than the one this delivery was gated on"
+    );
+    // THE REMOTE'S ANSWER, not the client's. The bare repo moved.
+    assert_eq!(
+        remote_head(&bare, branch).as_deref(),
+        Some(oid.as_str()),
+        "the remote ref did not move, so nothing was delivered"
+    );
+    assert!(
+        minted.load(Ordering::SeqCst) >= 1,
+        "no leg asked the signer actor for a token"
+    );
+
+    // Every authorized leg carried a NIP-98 header, and it came from the actor.
+    let authorized: Vec<String> = relay
+        .requests()
+        .iter()
+        .filter_map(|request| request.authorization.clone())
+        .collect();
+    assert!(
+        !authorized.is_empty(),
+        "the remote challenged for authorization and saw none"
+    );
+    assert!(
+        authorized.iter().all(|header| header.starts_with("Nostr ")),
+        "a leg carried something other than a NIP-98 token: {authorized:?}"
+    );
+
+    // Custody: the key was loaded into the actor, and the SHIPPED CHILD never had a path to it. The
+    // child's environment is an allowlist, and the key file is not on it.
+    assert!(
+        !maxplayer_core::delivery_executor::CHILD_ENV_ALLOWLIST
+            .iter()
+            .any(|name| name.to_ascii_lowercase().contains("key")
+                || name.to_ascii_lowercase().contains("secret")),
+        "the child environment allowlist carries something key-shaped"
+    );
+    assert!(
+        ended && released.load(Ordering::SeqCst),
+        "the seat was never handed back after a successful delivery"
     );
 }
