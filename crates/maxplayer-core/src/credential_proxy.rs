@@ -224,6 +224,39 @@ const HOP_BY_HOP: &[&str] = &[
     "upgrade",
 ];
 
+/// The request headers a placeholder is recognized in and substituted in.
+///
+/// The proxy substitutes header VALUES only, never a body. This scope narrows WHICH headers. A
+/// vendor that reflects a request header into its response body can return the real value in an
+/// encoding the byte scrubber does not see (a JSON `\u` escape, base64). A job that may put its
+/// placeholder in any header can therefore choose the reflected header. With [`Self::Only`] the job
+/// cannot: the placeholder counts only where the credential belongs, and every other header goes to
+/// the vendor as the job wrote it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeaderScope {
+    /// Any request header. The behavior every credential had before the vendor MCP route: a
+    /// forwarded agent credential rides `x-api-key` on one vendor and `authorization` on another,
+    /// and the operator names no header for a file credential.
+    Any,
+    /// Only the named headers, compared without regard to case. A placeholder in any other header
+    /// is neither recognized nor substituted.
+    Only(Vec<String>),
+}
+
+impl HeaderScope {
+    /// The scope of a bearer credential: `authorization` and nothing else.
+    pub fn authorization() -> Self {
+        Self::Only(vec!["authorization".to_owned()])
+    }
+
+    fn covers(&self, header_name: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Only(names) => names.iter().any(|name| name.eq_ignore_ascii_case(header_name)),
+        }
+    }
+}
+
 /// One job's containment secret: the placeholder the container was handed, the real credential it
 /// stands in for, and the approved upstream base URLs that credential may be substituted for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,6 +265,8 @@ pub struct JobCredential {
     pub placeholder: String,
     /// The real credential. Never enters the container; held only in this host process.
     pub real: String,
+    /// The headers this placeholder is recognized in and substituted in. See [`HeaderScope`].
+    pub substitute_in: HeaderScope,
     /// The approved real upstream base URLs (scheme + host[:port]) this credential is valid for.
     ///
     /// The FIRST entry is the primary: it is where [`ProxyEngine::authorize`] — the primary
@@ -245,6 +280,25 @@ pub struct JobCredential {
     /// authority, so order inside the list never has to break a tie: at most one entry can match
     /// any listener.
     pub upstreams: Vec<String>,
+}
+
+impl JobCredential {
+    /// Whether this credential's placeholder is present in a header its scope covers.
+    fn identified_by(&self, headers: &[(String, String)]) -> bool {
+        headers
+            .iter()
+            .any(|(name, value)| self.substitute_in.covers(name) && value.contains(&self.placeholder))
+    }
+
+    /// The outgoing value of one header: substituted when the scope covers the header, otherwise
+    /// exactly what the job wrote.
+    fn outgoing_value(&self, name: &str, value: &str) -> String {
+        if self.substitute_in.covers(name) {
+            value.replace(&self.placeholder, &self.real)
+        } else {
+            value.to_owned()
+        }
+    }
 }
 
 /// One Codex ChatGPT session whose two required headers must move as one unit.
@@ -282,6 +336,9 @@ pub enum Refusal {
     /// than tie-broken: a duplicate is a config error, and any tie-break rule would silently pick a
     /// base URL the operator may not have meant (`https://a` vs `https://a:443/v2`).
     DuplicateUpstream { host: String },
+    /// A credential's header scope names no header. Refused at registration: a scope that covers
+    /// nothing would make the placeholder unrecognizable, and the operator meant something else.
+    NoSubstitutionHeader,
 }
 
 impl std::fmt::Display for Refusal {
@@ -305,6 +362,9 @@ impl std::fmt::Display for Refusal {
             }
             Self::DuplicateUpstream { host } => {
                 write!(f, "credential lists {host} more than once; refusing registration")
+            }
+            Self::NoSubstitutionHeader => {
+                write!(f, "credential names no header to substitute in; refusing registration")
             }
         }
     }
@@ -404,6 +464,11 @@ impl ProxyEngine {
     pub fn register(&self, cred: JobCredential) -> Result<(), Refusal> {
         if cred.upstreams.is_empty() {
             return Err(Refusal::NoUpstream);
+        }
+        if let HeaderScope::Only(names) = &cred.substitute_in
+            && names.iter().all(|name| name.trim().is_empty())
+        {
+            return Err(Refusal::NoSubstitutionHeader);
         }
         let mut authorities: Vec<String> = Vec::with_capacity(cred.upstreams.len());
         for upstream in &cred.upstreams {
@@ -509,12 +574,11 @@ impl ProxyEngine {
         headers: &[(String, String)],
         select: impl FnOnce(&JobCredential) -> Result<String, Refusal>,
     ) -> Decision {
+        // Identification honors the credential's header scope: a placeholder that appears only in
+        // a header outside the scope identifies nothing, and the request is refused rather than
+        // forwarded with a credential the job put in the wrong place.
         let creds = self.creds.lock().unwrap();
-        let Some(cred) = creds
-            .values()
-            .find(|c| placeholder_present(&c.placeholder, headers))
-            .cloned()
-        else {
+        let Some(cred) = creds.values().find(|c| c.identified_by(headers)).cloned() else {
             return Decision::Refuse(Refusal::NoKnownPlaceholder);
         };
         drop(creds);
@@ -533,7 +597,7 @@ impl ProxyEngine {
         let headers = headers
             .iter()
             .filter(|(name, _)| !is_hop_by_hop(name))
-            .map(|(name, value)| (name.clone(), value.replace(&cred.placeholder, &cred.real)))
+            .map(|(name, value)| (name.clone(), cred.outgoing_value(name, value)))
             .collect();
         Decision::Forward {
             upstream,
@@ -645,10 +709,6 @@ fn codex_request_allowed(method: &str, path: &str) -> bool {
 /// The BODY is not searched either. A body-only match could never authenticate anything (the upstream
 /// reads the header), so it identified nothing while widening what counted as "a request from this
 /// job" — and it was the first half of the recovery attack the module docs describe.
-fn placeholder_present(placeholder: &str, headers: &[(String, String)]) -> bool {
-    headers.iter().any(|(_, v)| v.contains(placeholder))
-}
-
 fn replace_bytes_many(haystack: &[u8], substitutions: &[(String, String)]) -> Vec<u8> {
     let mut buffer = haystack.to_vec();
     scrub_buffer(&mut buffer, substitutions, true)
@@ -762,11 +822,47 @@ fn strip_default_port(authority: &str) -> &str {
         .unwrap_or(authority)
 }
 
-/// Whether two authorities name the same service, treating an explicit default port as equivalent to
-/// none. The one comparison both the allowlist and a redirect decision go through, so neither can
-/// drift from the other on `host` versus `host:443`.
+/// Whether two authorities name the same service. An explicit default port equals NO port, so
+/// `host:443` and `host` match. Two different explicit ports never match: `host:443` and `host:80`
+/// are two services. The allowlist and the leg lookup both go through this one comparison.
 fn same_authority(a: &str, b: &str) -> bool {
-    a == b || strip_default_port(a) == strip_default_port(b)
+    a == b || strip_default_port(a) == b || a == strip_default_port(b)
+}
+
+/// The origin of a URL: its scheme, its lowercased host, and its effective port (the explicit
+/// port, or the scheme's default). `None` for a scheme other than `http` and `https`, an empty
+/// host, or a port that is not a number. Two URLs are one origin only when all three agree, so
+/// `https://h` and `http://h` differ, and so do `https://h:443` and `https://h:80`.
+fn origin_of(url: &str) -> Option<(String, String, u16)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    let default_port = match scheme.as_str() {
+        "https" => 443,
+        "http" => 80,
+        _ => return None,
+    };
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    if authority.is_empty() {
+        return None;
+    }
+    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        let (host, after) = bracketed.split_once(']')?;
+        match after.strip_prefix(':') {
+            Some(port) => (host, Some(port.parse::<u16>().ok()?)),
+            None if after.is_empty() => (host, None),
+            None => return None,
+        }
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port.parse::<u16>().ok()?)),
+            None => (authority, None),
+        }
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some((scheme, host.to_ascii_lowercase(), port.unwrap_or(default_port)))
 }
 
 /// Whether a redirect may carry the credential minted for `original` on to `target`.
@@ -838,9 +934,15 @@ fn forwarding_client() -> reqwest::Result<reqwest::Client> {
         .build()
 }
 
+/// A redirect is approved only when `target` has the SAME ORIGIN as `original`: scheme, host and
+/// effective port. The scheme is part of it, so a `301` from `https://vendor` to `http://vendor`
+/// is refused: the credential would otherwise travel in clear text to a port the seller never
+/// approved. The port is compared as a number, so `https://vendor` and `https://vendor:443` are one
+/// origin while `https://vendor:80` is not. Either side that is not an `http` or `https` URL with
+/// a host is refused.
 pub fn allows_paired_redirect(original: &str, target: &str) -> bool {
-    match (authority_of(original), authority_of(target)) {
-        (Some(from), Some(to)) => same_authority(&from, &to),
+    match (origin_of(original), origin_of(target)) {
+        (Some(from), Some(to)) => from == to,
         _ => false,
     }
 }
@@ -1639,7 +1741,9 @@ async fn handle_request(
                 }
                 // Registration-time refusals; reachable here only through `authorize`'s defensive
                 // empty-list arm, never through a credential `register` accepted.
-                Refusal::NoUpstream | Refusal::DuplicateUpstream { .. } => StatusCode::FORBIDDEN,
+                Refusal::NoUpstream | Refusal::DuplicateUpstream { .. } | Refusal::NoSubstitutionHeader => {
+                    StatusCode::FORBIDDEN
+                }
             };
             Ok(refusal_response(status, &reason.to_string()))
         }
@@ -2032,6 +2136,7 @@ mod tests {
         engine.creds.lock().unwrap().insert(
             placeholder.to_owned(),
             JobCredential {
+                substitute_in: HeaderScope::Any,
                 placeholder: placeholder.to_owned(),
                 real: REAL.to_owned(),
                 upstreams: vec![upstream.to_owned()],
@@ -2246,6 +2351,66 @@ mod tests {
         }
     }
 
+    // The scope of a bearer credential: `authorization` and nothing else. A placeholder the job put
+    // in a second header is not substituted there, so a vendor that reflects that header returns
+    // the placeholder, not the credential.
+    #[test]
+    fn a_scoped_placeholder_is_substituted_only_in_its_own_header() {
+        let ph = mint_placeholder("mxp-mcp-", 48);
+        let engine = ProxyEngine::new([authority_of(UPSTREAM).unwrap()]);
+        engine
+            .register(JobCredential {
+                placeholder: ph.clone(),
+                real: REAL.to_owned(),
+                substitute_in: HeaderScope::authorization(),
+                upstreams: vec![UPSTREAM.to_owned()],
+            })
+            .unwrap();
+        let headers = hdr(&[("Authorization", &format!("Bearer {ph}")), ("x-echo-me", &ph)]);
+        match engine.authorize(&headers) {
+            Decision::Forward { headers, .. } => {
+                let auth = headers.iter().find(|(n, _)| n == "Authorization").unwrap();
+                assert_eq!(auth.1, format!("Bearer {REAL}"), "the scoped header is substituted, case-insensitively");
+                let echo = headers.iter().find(|(n, _)| n == "x-echo-me").unwrap();
+                assert_eq!(echo.1, ph, "a header outside the scope goes out as the job wrote it");
+            }
+            other => panic!("expected Forward, got {other:?}"),
+        }
+    }
+
+    // A placeholder that appears ONLY outside its scope identifies no credential: the request is
+    // refused with no substitution, and nothing reaches the vendor.
+    #[test]
+    fn a_scoped_placeholder_outside_its_header_identifies_nothing() {
+        let ph = mint_placeholder("mxp-mcp-", 48);
+        let engine = ProxyEngine::new([authority_of(UPSTREAM).unwrap()]);
+        engine
+            .register(JobCredential {
+                placeholder: ph.clone(),
+                real: REAL.to_owned(),
+                substitute_in: HeaderScope::authorization(),
+                upstreams: vec![UPSTREAM.to_owned()],
+            })
+            .unwrap();
+        let headers = hdr(&[("x-echo-me", &ph), ("x-api-key", &ph)]);
+        assert_eq!(engine.authorize(&headers), Decision::Refuse(Refusal::NoKnownPlaceholder));
+    }
+
+    // A scope that names no header is a configuration error, refused before the credential is held.
+    #[test]
+    fn a_scope_that_names_no_header_is_refused_at_registration() {
+        let engine = ProxyEngine::new([authority_of(UPSTREAM).unwrap()]);
+        for names in [Vec::new(), vec![String::new()], vec!["  ".to_owned()]] {
+            let refused = engine.register(JobCredential {
+                placeholder: mint_placeholder("mxp-mcp-", 48),
+                real: REAL.to_owned(),
+                substitute_in: HeaderScope::Only(names),
+                upstreams: vec![UPSTREAM.to_owned()],
+            });
+            assert_eq!(refused, Err(Refusal::NoSubstitutionHeader));
+        }
+    }
+
     // BACK-COMPAT IS THE ACCEPTANCE: a credential listing ONE upstream is decided exactly as it
     // always was — same Forward, same substitution target, same refusal shapes. The claude/codex
     // path IS this case (every env-sourced credential registers a one-entry list), so this test is
@@ -2256,6 +2421,7 @@ mod tests {
         let engine = ProxyEngine::new([authority_of(&upstream).unwrap()]);
         engine
             .register(JobCredential {
+                substitute_in: HeaderScope::Any,
                 placeholder: "PLACEHOLDER".into(),
                 real: "REAL_VALUE".into(),
                 upstreams: vec![upstream.clone()],
@@ -2285,6 +2451,7 @@ mod tests {
             ProxyEngine::new([authority_of(&a).unwrap(), authority_of(&b).unwrap()]);
         engine
             .register(JobCredential {
+                substitute_in: HeaderScope::Any,
                 placeholder: "PLACEHOLDER".into(),
                 real: "REAL_VALUE".into(),
                 upstreams: vec![a.clone(), b],
@@ -2310,6 +2477,7 @@ mod tests {
             ProxyEngine::new([authority_of(&a).unwrap(), b_authority.clone()]);
         engine
             .register(JobCredential {
+                substitute_in: HeaderScope::Any,
                 placeholder: "LISTS_BOTH".into(),
                 real: "REAL_BOTH".into(),
                 upstreams: vec![a.clone(), b.clone()],
@@ -2317,6 +2485,7 @@ mod tests {
             .expect("the two-upstream credential must register");
         engine
             .register(JobCredential {
+                substitute_in: HeaderScope::Any,
                 placeholder: "LISTS_A_ONLY".into(),
                 real: "REAL_A".into(),
                 upstreams: vec![a],
@@ -2347,6 +2516,7 @@ mod tests {
         let engine = ProxyEngine::new(["api.anthropic.com".to_owned()]);
         let refusal = engine
             .register(JobCredential {
+                substitute_in: HeaderScope::Any,
                 placeholder: "PLACEHOLDER".into(),
                 real: "REAL_VALUE".into(),
                 upstreams: vec![],
@@ -2363,6 +2533,7 @@ mod tests {
         let engine = ProxyEngine::new(["api2.cursor.sh".to_owned()]);
         let refusal = engine
             .register(JobCredential {
+                substitute_in: HeaderScope::Any,
                 placeholder: "PLACEHOLDER".into(),
                 real: "REAL_VALUE".into(),
                 upstreams: vec![
@@ -2396,6 +2567,7 @@ mod tests {
         let placeholder = mint_anthropic_placeholder();
         engine
             .register(JobCredential {
+                substitute_in: HeaderScope::Any,
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
                 upstreams: vec![primary, leg],
@@ -2448,6 +2620,7 @@ mod tests {
         let placeholder = mint_anthropic_placeholder();
         engine
             .register(JobCredential {
+                substitute_in: HeaderScope::Any,
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
                 upstreams: vec![upstream.clone()],
@@ -2661,12 +2834,14 @@ mod tests {
     fn register_refuses_an_unapproved_upstream() {
         let engine = ProxyEngine::new([authority_of(UPSTREAM).unwrap()]);
         let bad = JobCredential {
+            substitute_in: HeaderScope::Any,
             placeholder: mint_anthropic_placeholder(),
             real: REAL.to_owned(),
             upstreams: vec!["https://evil.example.com".to_owned()],
         };
         assert!(matches!(engine.register(bad), Err(Refusal::DestinationNotAllowed { .. })));
         let good = JobCredential {
+            substitute_in: HeaderScope::Any,
             placeholder: mint_anthropic_placeholder(),
             real: REAL.to_owned(),
             upstreams: vec![UPSTREAM.to_owned()],
@@ -2893,6 +3068,7 @@ mod tests {
         let placeholder = mint_anthropic_placeholder();
         engine
             .register(JobCredential {
+                substitute_in: HeaderScope::Any,
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
                 upstreams: vec![upstream.clone()],
@@ -3022,6 +3198,7 @@ mod tests {
         let placeholder = mint_anthropic_placeholder();
         engine
             .register(JobCredential {
+                substitute_in: HeaderScope::Any,
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
                 upstreams: vec![upstream],
@@ -3339,6 +3516,7 @@ mod tests {
         let placeholder = mint_anthropic_placeholder();
         engine
             .register(JobCredential {
+                substitute_in: HeaderScope::Any,
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
                 upstreams: vec![upstream.clone()],
@@ -3458,6 +3636,7 @@ mod tests {
         let placeholder = mint_anthropic_placeholder();
         engine
             .register(JobCredential {
+                substitute_in: HeaderScope::Any,
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
                 upstreams: vec![upstream.clone()],
@@ -3509,6 +3688,7 @@ mod tests {
         let placeholder = mint_anthropic_placeholder();
         engine
             .register(JobCredential {
+                substitute_in: HeaderScope::Any,
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
                 upstreams: vec![upstream.clone()],
@@ -3586,6 +3766,7 @@ mod tests {
         let placeholder = mint_anthropic_placeholder();
         engine
             .register(JobCredential {
+                substitute_in: HeaderScope::Any,
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
                 upstreams: vec![upstream.clone()],
@@ -3699,6 +3880,61 @@ mod tests {
                 "a target off the paired upstream must be refused: {target}"
             );
         }
+    }
+
+    // The scheme is part of the origin. A `3xx` from the vendor's https endpoint to http on the SAME
+    // host is refused: the credential would travel in clear text to a service the seller never
+    // approved. The port is compared as a number, so an explicit 443 equals the https default and
+    // an explicit 80 does not.
+    #[test]
+    fn a_redirect_that_changes_the_scheme_or_the_port_is_refused() {
+        for (original, target) in [
+            ("https://api.anthropic.com", "http://api.anthropic.com/v1/messages"),
+            ("https://api.anthropic.com", "http://api.anthropic.com:443/v1/messages"),
+            ("https://api.anthropic.com:443", "https://api.anthropic.com:80/v1/messages"),
+            ("https://api.anthropic.com:443", "http://api.anthropic.com:80/v1/messages"),
+            ("http://api.anthropic.com", "https://api.anthropic.com/v1/messages"),
+            ("https://api.anthropic.com", "ftp://api.anthropic.com/v1/messages"),
+        ] {
+            assert!(
+                !allows_paired_redirect(original, target),
+                "a change of scheme or port must be refused: {original} -> {target}"
+            );
+        }
+        assert!(
+            allows_paired_redirect("http://vendor.test:8080", "http://vendor.test:8080/next"),
+            "an explicit non-default port that stays the same is one origin"
+        );
+        assert!(
+            allows_paired_redirect("http://vendor.test", "http://vendor.test:80/next"),
+            "the http default port is 80"
+        );
+    }
+
+    #[test]
+    fn origins_parse_scheme_host_and_effective_port() {
+        assert_eq!(origin_of("https://Api.Vendor.test/x"), Some(("https".into(), "api.vendor.test".into(), 443)));
+        assert_eq!(origin_of("http://vendor.test/x"), Some(("http".into(), "vendor.test".into(), 80)));
+        assert_eq!(origin_of("HTTPS://vendor.test:8443"), Some(("https".into(), "vendor.test".into(), 8443)));
+        assert_eq!(origin_of("https://user:pw@vendor.test/"), Some(("https".into(), "vendor.test".into(), 443)));
+        assert_eq!(origin_of("https://[::1]:9443/x"), Some(("https".into(), "::1".into(), 9443)));
+        assert_eq!(origin_of("https://[::1]/x"), Some(("https".into(), "::1".into(), 443)));
+        for bad in ["", "vendor.test/x", "https://", "https:///x", "https://vendor.test:port", "ws://vendor.test"] {
+            assert_eq!(origin_of(bad), None, "{bad:?}");
+        }
+    }
+
+    // The allowlist comparison: an explicit default port equals the bare host, but two different
+    // explicit ports are two services.
+    #[test]
+    fn an_explicit_default_port_matches_the_bare_host_but_not_another_port() {
+        assert!(same_authority("vendor.test:443", "vendor.test"));
+        assert!(same_authority("vendor.test", "vendor.test:443"));
+        assert!(same_authority("vendor.test:80", "vendor.test"));
+        assert!(same_authority("vendor.test:8080", "vendor.test:8080"));
+        assert!(!same_authority("vendor.test:443", "vendor.test:80"));
+        assert!(!same_authority("vendor.test:80", "vendor.test:443"));
+        assert!(!same_authority("vendor.test:8080", "vendor.test"));
     }
 
     // THE CASE THIS FUNCTION EXISTS FOR, and the one an allowlist-membership check cannot see. Both
@@ -3913,6 +4149,7 @@ mod tests {
         let placeholder = mint_anthropic_placeholder();
         engine
             .register(JobCredential {
+                substitute_in: HeaderScope::Any,
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
                 upstreams: vec![upstream.clone()],
@@ -3952,6 +4189,7 @@ mod tests {
         let placeholder = mint_anthropic_placeholder();
         engine
             .register(JobCredential {
+                substitute_in: HeaderScope::Any,
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
                 upstreams: vec![upstream.clone()],
@@ -4044,6 +4282,7 @@ mod tests {
         let placeholder = mint_anthropic_placeholder();
         engine
             .register(JobCredential {
+                substitute_in: HeaderScope::Any,
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
                 upstreams: vec![upstream.clone()],
@@ -4210,6 +4449,7 @@ mod tests {
         let placeholder = mint_anthropic_placeholder();
         engine
             .register(JobCredential {
+                substitute_in: HeaderScope::Any,
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
                 upstreams: vec![upstream.clone()],
@@ -4361,6 +4601,7 @@ mod tests {
         let placeholder = mint_anthropic_placeholder();
         engine
             .register(JobCredential {
+                substitute_in: HeaderScope::Any,
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
                 upstreams: vec![upstream.clone()],
@@ -4453,6 +4694,7 @@ mod tests {
         let placeholder = mint_anthropic_placeholder();
         engine
             .register(JobCredential {
+                substitute_in: HeaderScope::Any,
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
                 upstreams: vec![upstream.clone()],
@@ -4572,6 +4814,7 @@ mod tests {
         let placeholder = mint_anthropic_placeholder();
         engine
             .register(JobCredential {
+                substitute_in: HeaderScope::Any,
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
                 upstreams: vec![upstream.clone()],
@@ -4751,6 +4994,7 @@ mod tests {
                 let placeholder = mint_anthropic_placeholder();
                 engine
                     .register(JobCredential {
+                        substitute_in: HeaderScope::Any,
                         placeholder: placeholder.clone(),
                         real: REAL.to_owned(),
                         upstreams: vec![upstream.clone()],

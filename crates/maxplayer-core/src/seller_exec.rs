@@ -504,6 +504,19 @@ impl SandboxPolicy {
                             .into(),
                     ));
                 }
+                // The tool tables name a container that launcher mode never creates: the Proxy swap
+                // route hands the session an MCP entry the launcher path never builds, and the
+                // Holder route mounts a socket directory into a container. A seat that declares a
+                // tool under `launcher` would start holders at boot and then run every job without
+                // them, silently. Refused instead.
+                if !config.mcp_tools.is_empty() || !config.held_tools.is_empty() {
+                    return Err(ExecError::Config(
+                        "[sandbox] mcp_tools and held_tools require mode = \"docker\": launcher mode \
+                         creates no container to hand a tool to, so a tool declared here would be \
+                         accepted and then never reach a job"
+                            .into(),
+                    ));
+                }
                 Ok(Self::wrapped(config.launcher.clone()))
             }
             SandboxMode::Docker => {
@@ -3630,6 +3643,7 @@ async fn start_credential_containment(
             .register(proxy::JobCredential {
                 placeholder: m.placeholder.clone(),
                 real: m.real.clone(),
+                substitute_in: proxy::HeaderScope::Any,
                 upstreams: m.upstreams.clone(),
             })
             .map_err(|refusal| {
@@ -3653,6 +3667,7 @@ async fn start_credential_containment(
             .register(proxy::JobCredential {
                 placeholder: m.placeholder.clone(),
                 real: m.real.clone(),
+                substitute_in: proxy::HeaderScope::Any,
                 upstreams: m.upstreams.clone(),
             })
             .map_err(|refusal| {
@@ -3670,6 +3685,11 @@ async fn start_credential_containment(
     // the PLACEHOLDER and the proxy's address. The primary listener routes it: a request carrying
     // this placeholder forwards to this credential's one upstream, the vendor, and nowhere else.
     //
+    // The swap is scoped to the `authorization` header. The bridge sends the placeholder as a
+    // bearer, and nowhere else. A job that puts the placeholder in another header gets that header
+    // forwarded as written: a vendor that reflects request headers into its body then reflects the
+    // placeholder, not the credential.
+    //
     // The real values join `substitutions` for the same reason the file credentials' do: a forwarded
     // variable that happens to carry the same secret is scrubbed too.
     let mut mcp_servers = Vec::with_capacity(minted_mcp.len());
@@ -3678,6 +3698,7 @@ async fn start_credential_containment(
             .register(proxy::JobCredential {
                 placeholder: m.placeholder.clone(),
                 real: m.real.clone(),
+                substitute_in: proxy::HeaderScope::authorization(),
                 upstreams: vec![m.upstream.clone()],
             })
             .map_err(|refusal| {
@@ -8116,6 +8137,28 @@ mod mcp_tool_tests {
     }
 
     #[test]
+    fn launcher_mode_refuses_both_tool_tables() {
+        let credential = Path::new("/etc/maxplayer/github.json");
+        let mcp_only = SandboxConfig {
+            mode: SandboxMode::Launcher,
+            mcp_tools: vec![tool("https://vendor.test/mcp", credential, McpToolTransport::Stdio)],
+            ..Default::default()
+        };
+        let error = config_error(&mcp_only);
+        assert!(error.contains("mcp_tools and held_tools require mode = \"docker\""), "{error}");
+        let held_only = SandboxConfig {
+            mode: SandboxMode::Launcher,
+            held_tools: vec![held("figma")],
+            ..Default::default()
+        };
+        let error = config_error(&held_only);
+        assert!(error.contains("require mode = \"docker\""), "{error}");
+        // The empty tables under launcher are every launcher seat: they resolve as before.
+        SandboxPolicy::from_config(Some(&SandboxConfig { mode: SandboxMode::Launcher, ..Default::default() }))
+            .expect("a launcher seat without tools resolves");
+    }
+
+    #[test]
     fn a_url_the_proxy_cannot_route_is_refused() {
         for bad in [
             "ftp://vendor.example/mcp",
@@ -8331,6 +8374,9 @@ mod mcp_tool_tests {
     struct VendorSeen {
         path: String,
         authorization: Option<String>,
+        /// A second header the request carried, as the vendor saw it. The proxy must leave it as
+        /// the job wrote it: the swap is scoped to `authorization`.
+        echo: Option<String>,
     }
 
     fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -8398,7 +8444,8 @@ mod mcp_tool_tests {
                     }
                     let authorization = header("authorization");
                     let authorized = authorization.as_deref() == Some(format!("Bearer {REAL}").as_str());
-                    record.lock().unwrap().push(VendorSeen { path, authorization });
+                    let echo = header("x-echo-me");
+                    record.lock().unwrap().push(VendorSeen { path, authorization, echo });
                     let (status, body) = if authorized {
                         ("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"vendor-echo"}]}}"#)
                     } else {
@@ -8494,9 +8541,13 @@ mod mcp_tool_tests {
         // 3. Through the proxy, the vendor sees the REAL credential and answers.
         let client = reqwest::Client::new();
         let body = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}});
+        //    The job also puts its placeholder in a header of its own choosing. The swap is scoped
+        //    to `authorization`, so that header reaches the vendor as written: a vendor that reflects
+        //    it reflects the placeholder, never the credential.
         let swapped = client
             .post(format!("{proxy_url}/mcp/"))
             .header("authorization", format!("Bearer {placeholder}"))
+            .header("x-echo-me", &placeholder)
             .header("accept", "application/json, text/event-stream")
             .json(&body)
             .send()
@@ -8511,7 +8562,23 @@ mod mcp_tool_tests {
             assert_eq!(seen[0].path, "/mcp/", "the path travels verbatim");
             assert_eq!(seen[0].authorization.as_deref(), Some(format!("Bearer {REAL}").as_str()));
             assert!(!seen[0].authorization.as_deref().unwrap_or("").contains(&placeholder));
+            assert_eq!(
+                seen[0].echo.as_deref(),
+                Some(placeholder.as_str()),
+                "a header outside the scope carries the placeholder, not the credential"
+            );
         }
+        //    The placeholder ONLY in a header outside the scope identifies nothing: refused, nothing
+        //    reaches the vendor.
+        let misplaced = client
+            .post(format!("{proxy_url}/mcp/"))
+            .header("x-echo-me", &placeholder)
+            .json(&body)
+            .send()
+            .await
+            .expect("reach the proxy");
+        assert_eq!(misplaced.status(), 502, "a placeholder outside its header is NoKnownPlaceholder");
+        assert_eq!(seen.lock().unwrap().len(), 1, "the refused request never reached the vendor");
 
         // 4. The placeholder is worthless without the proxy: the vendor rejects it directly.
         let direct = client
@@ -8981,8 +9048,24 @@ mod mcp_tool_tests {
         let bogus_status = bogus.status().as_u16();
         assert_eq!(bogus_status, 502, "NoKnownPlaceholder must be a 502 with no substitution");
 
+        // RAW, before the redacting capture: the container's own output. The capture below is
+        // redacted with every real value this launch held, so the credential's absence THERE proves
+        // the redactor, not the boundary. This read of `docker logs` is unredacted, and it is what
+        // proves the boundary for the container's output.
+        let raw_logs = std::process::Command::new("docker")
+            .args(["logs", &container_name])
+            .output()
+            .expect("docker logs of the job container");
+        let raw_logs_text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&raw_logs.stdout),
+            String::from_utf8_lossy(&raw_logs.stderr)
+        );
+        absent.assert_absent_from("docker logs of the job container (raw, before the redacting capture)", &raw_logs_text);
+        write_evidence(evidence, "a-container-logs-raw.txt", &raw_logs_text);
+
         // The real cleanup: capture the diagnostics (redacted with every real value this launch held),
-        // then remove the container.
+        // then remove the container. The absence check on the capture is a check of the redactor.
         cleanup_job_container(
             std::mem::replace(&mut container, JobContainer::adopt("unused".into())),
             &workdir,
