@@ -347,6 +347,10 @@ async fn a_parked_leg_is_stopped_and_b_never_overlaps(label: &str, leg: Leg, sto
     let mut b_outcome: Option<Result<String, DeliveryPushErr>> = None;
     // The first instant A's child was observed absent from the process table.
     let mut child_gone_at: Option<Instant> = None;
+    // The instant observation starts, recorded BEFORE the first poll so the leading interval is
+    // measured like every other one. Without it the gap between "the stop was ordered" and the
+    // first sample was the one interval this test never looked at.
+    let polling_began = Instant::now();
     let watchdog = Instant::now() + budget + Duration::from_secs(45);
     while Instant::now() < watchdog {
         let at = Instant::now();
@@ -407,15 +411,20 @@ async fn a_parked_leg_is_stopped_and_b_never_overlaps(label: &str, leg: Leg, sto
         released_at.saturating_duration_since(acquired_at)
     );
 
-    // CONTINUOUSLY POLLED, as a measured property of this run. The floor is on the GAP rather than
-    // on the count, because a fast stop legitimately yields few samples: what must not happen is a
-    // long unobserved interval, at any speed.
+    // CONTINUOUSLY POLLED, as a measured property of this run. The floor is on the GAP and NOT on
+    // the count, for a reason this run demonstrates: once the kill stopped waiting behind the
+    // supervisor's synchronous work, the whole stop got short enough to fit in two polls of a
+    // 1ms loop. A count floor would have failed for the stop being FASTER, which is backwards.
+    //
+    // What actually has to hold is that no interval of the stop went unobserved, and that is now
+    // asserted over the COMPLETE window: from the instant observation began, across every sample,
+    // to the instant B was Ready. Every point in [polling_began, b_ready_at] is therefore within
+    // MAX_SAMPLE_GAP of a poll, whether the stop produced fifty samples or one.
     assert!(
-        samples.len() >= 3,
-        "only {} polls of B across the whole stop: that is not observation at all",
-        samples.len()
+        !samples.is_empty(),
+        "B was never polled Pending during A's stop: that is not observation at all"
     );
-    let mut widest = Duration::ZERO;
+    let mut widest = samples[0].saturating_duration_since(polling_began);
     for pair in samples.windows(2) {
         widest = widest.max(pair[1].saturating_duration_since(pair[0]));
     }

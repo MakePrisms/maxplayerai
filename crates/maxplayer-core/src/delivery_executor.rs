@@ -163,9 +163,29 @@
 //! The claims that hold, each said only as wide as it is. `S` below is the SYNCHRONOUS SUPERVISOR
 //! TIME defined under "the phases no clock here interrupts"; it is an additive term, not a timer:
 //!
-//! * **The child.** Within `deadline + REAP_BOUND + S` the child process has been killed and its
-//!   exit confirmed, or the executor says it could not confirm it and the seat stays held.
-//! * **The seat.** Within `deadline + 2 * REAP_BOUND + S` the turn has been handed on, or it is
+//! * **The SIGNAL — and this one no longer carries `S` at all.** Within
+//!   `deadline + WATCHDOG_TICK + w` the child's process group has been sent `SIGKILL`, where `w` is
+//!   the time this OS takes to wake a sleeping thread and deliver a signal. The kill is issued by
+//!   [`KillableChild::arm_deadline_watchdog`]'s thread, which is armed the instant a pid exists and
+//!   whose entire body is sleep-wake-signal: it never encodes a frame, never decodes one, never
+//!   calls the minter, never asks the owner anything, and is not behind the spawn. So the instant of
+//!   the kill does not depend on where the supervisor thread is, which is what `S` measured.
+//!
+//!   ASSUMPTIONS, STATED RATHER THAN HIDDEN. This is a claim about a machine that is still
+//!   scheduling this process: that a sleeping thread whose sleep has expired is eventually run, and
+//!   that `SIGKILL` to a process group is delivered. No number is printed for `w` and no universal
+//!   OS guarantee is claimed for it — on a machine that has stopped scheduling this process, or
+//!   against a child in uninterruptible sleep (see above), this bound is late by that stall like
+//!   every other bound here. What IS claimed, and could not be claimed before, is the SHAPE: the
+//!   term is scheduler latency, and it does not grow with the size of a frame, the cost of the
+//!   owner's check, or how long a signer takes to answer.
+//! * **The child.** Within `deadline + WATCHDOG_TICK + w + REAP_BOUND + S` the child process has
+//!   been killed and its exit confirmed, or the executor says it could not confirm it and the seat
+//!   stays held. `S` survives HERE and honestly so: confirming an exit and reporting it is the
+//!   supervisor's job, and the supervisor still has to reach it. What changed is that the child is
+//!   no longer RUNNING during that `S` — it was signalled at the first bullet's bound.
+//! * **The seat.** Within `deadline + WATCHDOG_TICK + w + 2 * REAP_BOUND + S` the turn has been
+//!   handed on, or it is
 //!   retained for the life of this process with the reason named
 //!   ([`ExecutorError::Unreaped`], [`ExecutorError::CleanupUnbounded`],
 //!   [`ExecutorError::CleanupUnobserved`], [`ExecutorError::WaitFailed`]).
@@ -224,6 +244,7 @@ use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, channel, sync_channel};
 use std::time::{Duration, Instant};
 
@@ -237,6 +258,17 @@ use serde::{Deserialize, Serialize};
 /// assumption above) is distinguished from a slow one, so the stall can be reported as a stall
 /// rather than hidden inside a longer wait.
 pub const REAP_BOUND: Duration = Duration::from_secs(5);
+
+/// How often the deadline watchdog re-checks whether its child is still wanted.
+///
+/// This is the granularity of the watchdog's wake-up, and therefore the only term this module adds
+/// to "the child is signalled at its deadline". It is not a timeout and it is not a retry interval:
+/// the watchdog sleeps for whichever is shorter, this tick or the time actually left, so the final
+/// sleep ends AT the deadline and this value only bounds how long a finished child leaves the
+/// thread parked before it notices it can stop.
+///
+/// See [`KillableChild::arm_deadline_watchdog`] for the bound it participates in.
+pub const WATCHDOG_TICK: Duration = Duration::from_millis(25);
 
 /// The largest frame this protocol will read. A peer that writes without bound is backpressure the
 /// reader would otherwise absorb into unbounded memory — and unbounded parent-side buffering is
@@ -630,6 +662,44 @@ pub struct KillableChild {
     /// it. [`REAP_BOUND`] is charged against this total rather than against one call, so the
     /// retries on the failing path cannot multiply the advertised window. See `kill_and_reap`.
     spent_reaping: Duration,
+    /// Shared with the deadline watchdog. See [`ExitGuard`].
+    guard: std::sync::Arc<std::sync::Mutex<ExitGuard>>,
+    /// Set by the watchdog when IT issued the kill, for the operator line and for tests that need
+    /// to know which side stopped the child.
+    watchdog_fired: std::sync::Arc<AtomicBool>,
+}
+
+/// The interlock between the supervisor and the deadline watchdog.
+///
+/// A pid is only safe to signal until it has been reaped; afterwards the number can be reused by an
+/// unrelated process, and a late `SIGKILL` would land on a stranger. Both sides therefore go
+/// through this mutex: the supervisor only calls `try_wait` while holding it and sets `disarmed` in
+/// the same critical section as a successful reap, and the watchdog only signals while holding it
+/// and only when `disarmed` is still false. There is no window between "the kernel reaped the pid"
+/// and "the watchdog knows", because the two are one locked section.
+struct ExitGuard {
+    pid: i32,
+    /// True once this pid has been reaped, or once the child is otherwise known finished. A
+    /// disarmed guard never signals again.
+    disarmed: bool,
+}
+
+impl ExitGuard {
+    /// `SIGKILL` the process GROUP and then the process, if this guard is still armed.
+    ///
+    /// Returns whether a signal was issued. `ESRCH` is not an error here: it means the group is
+    /// already gone, which is the outcome being asked for.
+    fn kill_if_armed(&self) -> bool {
+        if self.disarmed {
+            return false;
+        }
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-self.pid, libc::SIGKILL);
+            libc::kill(self.pid, libc::SIGKILL);
+        }
+        true
+    }
 }
 
 impl KillableChild {
@@ -658,7 +728,90 @@ impl KillableChild {
             pid,
             reaped: false,
             spent_reaping: Duration::ZERO,
+            guard: std::sync::Arc::new(std::sync::Mutex::new(ExitGuard {
+                pid,
+                disarmed: false,
+            })),
+            watchdog_fired: std::sync::Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Hand this child's absolute deadline to a thread of its own.
+    ///
+    /// THE KILL STOPS BEING SOMETHING THE SUPERVISOR HAS TO REACH. Before this existed, the signal
+    /// was issued by the supervisor loop, so it was behind every synchronous section that loop runs
+    /// between waits — the `S` term documented at the top of this module. `S` has no number: the
+    /// spawn happens before `drive` is even entered, and the authority check is whatever the owner's
+    /// closure costs. A stop that is late by `S` is a child still writing to the seat's workdir
+    /// after its turn ended, which is the defect this module exists to remove.
+    ///
+    /// The watchdog holds the same absolute deadline and nothing else. It sleeps, wakes, and
+    /// signals — it never encodes a frame, never decodes one, never calls the minter and never asks
+    /// the owner anything. So the instant the child is signalled does not depend on where the
+    /// supervisor is, only on this thread being scheduled.
+    ///
+    /// # The bound, and what it assumes
+    ///
+    /// Once armed, the child's process group is signalled within `deadline + WATCHDOG_TICK + w`,
+    /// where `w` is the time the OS takes to wake a sleeping thread and deliver a signal on a
+    /// machine that is still scheduling this process. `w` is NOT a guarantee this module can make —
+    /// it is the same assumption as "this process still runs at all" — and no figure is printed for
+    /// it. What IS claimed, and what the previous formulation could not claim, is that the term is
+    /// scheduler latency rather than `S`: it does not grow with the size of a frame, the cost of the
+    /// owner's check, or how long a signer takes to answer.
+    ///
+    /// Arming is deliberately at the EARLIEST point a pid exists. The supervisor's own kill stays
+    /// exactly where it is: the watchdog bounds when the child is SIGNALLED, and the supervisor
+    /// still owns confirming the exit, reporting it, and the custody decision when it cannot.
+    pub fn arm_deadline_watchdog(&self, deadline: Instant) {
+        let guard = std::sync::Arc::clone(&self.guard);
+        let fired = std::sync::Arc::clone(&self.watchdog_fired);
+        std::thread::spawn(move || {
+            loop {
+                // Sliced rather than one long sleep, so a child that finishes normally stops this
+                // thread promptly instead of leaving it parked until a deadline nobody needs.
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                std::thread::sleep(left.min(WATCHDOG_TICK));
+                let Ok(state) = guard.lock() else { return };
+                if state.disarmed {
+                    return;
+                }
+            }
+            // The deadline has passed. Signal under the lock, so this cannot race a reap that is
+            // happening right now and land on a recycled pid.
+            let Ok(state) = guard.lock() else { return };
+            if state.kill_if_armed() {
+                fired.store(true, Ordering::SeqCst);
+            }
+        });
+    }
+
+    /// True when the deadline watchdog, rather than the supervisor, issued this child's kill.
+    pub fn watchdog_fired(&self) -> bool {
+        self.watchdog_fired.load(Ordering::SeqCst)
+    }
+
+    /// `try_wait`, performed in the same critical section that disarms the watchdog.
+    ///
+    /// Reaping and disarming must be indivisible: between them the pid is free for the kernel to
+    /// reuse, and a watchdog that signalled in that window would kill an unrelated process.
+    fn guarded_try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let mut state = self
+            .guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(child) = self.child.as_mut() else {
+            state.disarmed = true;
+            return Ok(None);
+        };
+        let outcome = child.try_wait();
+        if matches!(outcome, Ok(Some(_))) {
+            state.disarmed = true;
+        }
+        outcome
     }
 
     pub fn pid(&self) -> i32 {
@@ -697,22 +850,28 @@ impl KillableChild {
         if self.reaped {
             return Ok(Duration::ZERO);
         }
-        #[cfg(unix)]
         {
             // The GROUP, not the pid: a descendant that outlived its parent would otherwise keep
             // packing with nobody watching. Negative pid is the group. An ESRCH here means the
             // group is already gone, which is the outcome we wanted.
-            unsafe { libc::kill(-self.pid, libc::SIGKILL) };
-            unsafe { libc::kill(self.pid, libc::SIGKILL) };
+            //
+            // Issued through the SAME interlock the watchdog uses, so the supervisor's kill and the
+            // watchdog's kill cannot both be in flight around a reap. Whichever arrives first, the
+            // guard makes sure neither signals a pid this process has already waited for.
+            let state = self
+                .guard
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.kill_if_armed();
         }
-        let Some(child) = self.child.as_mut() else {
+        if self.child.is_none() {
             return Ok(started.elapsed());
-        };
+        }
         // Poll rather than block: a blocking `wait` on a child in uninterruptible sleep never
         // returns, and "we cannot confirm the exit" is an outcome this executor must be able to
         // REPORT rather than an outcome it hangs in.
         loop {
-            match child.try_wait() {
+            match self.guarded_try_wait() {
                 Ok(Some(_status)) => {
                     self.spent_reaping += started.elapsed();
                     self.reaped = true;
@@ -957,6 +1116,15 @@ pub fn run_push_in_child(
     authority: crate::git_transport::AuthorityCheck,
 ) -> Result<String, ExecutorError> {
     let mut child = KillableChild::spawn(program, &[CHILD_SUBCOMMAND])?;
+    // ARMED HERE, AT THE EARLIEST INSTANT A PID EXISTS — before the pipes are taken, before the
+    // pump and writer threads exist, and before `drive` is entered.
+    //
+    // Everything between this line and the first deadline check inside `drive` is synchronous
+    // supervisor work (the `S` term at the top of this module): taking three pipe handles, spawning
+    // the relay, the pump and the writer, and then the first encode. None of it is interruptible by
+    // the loop that used to own the kill, so a child that went wrong during it was stopped late by
+    // however long that work took. From here the signal is owned by a thread that does none of it.
+    child.arm_deadline_watchdog(deadline);
     let stdin = child
         .stdin()
         .ok_or_else(|| ExecutorError::Spawn("child stdin unavailable".to_owned()))?;
@@ -1513,25 +1681,34 @@ fn drive(
             }
             // END OF FILE, observed: the kernel reported zero bytes on the child's stdout.
             Ok(Ok(None)) => {
-                let _ = child.kill_and_reap()?;
-                return Err(ExecutorError::Protocol(
-                    "child's stdout reached end of file without finishing the push".to_owned(),
+                let reap = child.kill_and_reap()?;
+                return Err(attribute_vanished_child(
+                    child,
+                    deadline,
+                    reap,
+                    "child's stdout reached end of file without finishing the push",
                 ));
             }
             // The READER stopped. Not the same fact: it means this parent has no further view of
             // that pipe, which is why the cleanup below asks the pump why it ended rather than
             // treating its disappearance as a closed descriptor.
             Err(RecvTimeoutError::Disconnected) => {
-                let _ = child.kill_and_reap()?;
-                return Err(ExecutorError::Protocol(
-                    "the reader on the child's stdout stopped before the push finished".to_owned(),
+                let reap = child.kill_and_reap()?;
+                return Err(attribute_vanished_child(
+                    child,
+                    deadline,
+                    reap,
+                    "the reader on the child's stdout stopped before the push finished",
                 ));
             }
             Ok(Err(error)) => {
-                let _ = child.kill_and_reap()?;
-                return Err(ExecutorError::Protocol(format!(
-                    "unreadable frame from the child: {error}"
-                )));
+                let reap = child.kill_and_reap()?;
+                return Err(attribute_vanished_child(
+                    child,
+                    deadline,
+                    reap,
+                    &format!("unreadable frame from the child: {error}"),
+                ));
             }
             Err(RecvTimeoutError::Timeout) => {
                 // A tick, not the clock running out: re-ask the owner. This covers the interval
@@ -1559,6 +1736,39 @@ fn drive(
             }
         }
     }
+}
+
+/// Say WHY a child stopped speaking, when the deadline is one of the candidate reasons.
+///
+/// A child whose stdout reaches end of file has, from the supervisor's seat, done one of two very
+/// different things: it violated the protocol, or it was stopped on purpose and the pipe closed
+/// because the process is gone. Before the deadline watchdog existed the second case could not
+/// arise here — the supervisor issued every kill itself, so it always knew — and so end of file was
+/// reported as [`ExecutorError::Protocol`] unconditionally.
+///
+/// That is now a misattribution waiting to happen, and misattribution is not cosmetic: an operator
+/// reading "the child spoke out of turn" goes looking for a protocol bug, and a caller matching on
+/// [`ExecutorError::Killed`] to account for an overrun never sees it. A deadline stop must be
+/// reported as a deadline stop by whichever side issued it.
+///
+/// Both conditions are checked, and the pair is deliberate. `watchdog_fired` is the precise fact but
+/// it is published just after the signal, so the child's end of file can reach this loop first; the
+/// deadline comparison closes that window. Either one means the same thing — this delivery was out
+/// of time — and the overrun is measured from the deadline either way.
+fn attribute_vanished_child(
+    child: &KillableChild,
+    deadline: Instant,
+    reap: Duration,
+    otherwise: &str,
+) -> ExecutorError {
+    let now = Instant::now();
+    if child.watchdog_fired() || now >= deadline {
+        return ExecutorError::Killed {
+            after: now.saturating_duration_since(deadline),
+            reap,
+        };
+    }
+    ExecutorError::Protocol(otherwise.to_owned())
 }
 
 /// One parent write, with the deadline on it and the kill behind it. A write that does not complete
