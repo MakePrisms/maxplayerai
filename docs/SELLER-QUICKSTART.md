@@ -977,6 +977,78 @@ the sandbox image unless it is already local (`doctor` warns and hands you the `
 it up front), and under gVisor a dependency-install-heavy job runs slower than on the host. Switch one
 seat, watch it claim and deliver, then move the rest.
 
+## 3d. Seat memory — `MEMORY.md`
+
+A seat can carry **durable, operator-written context** into every job: brand guidelines, house style,
+what a class of job actually takes, buyers worth noting. It lives in `MAXPLAYER_HOME/memory/` as a
+`MEMORY.md` index plus plain-markdown topic files it links with `[[wikilinks]]`. Nothing here is ever an
+input to pay, the journal, or the receipt — it is a quality lever for the agent, not a money-path object.
+
+**Nearly every seat has no `memory/` dir, and that is fine.** The daemon never creates it. A seat without
+one runs every job as a generalist, quietly and with no warning: this whole section is opt-**in** by
+writing the file.
+
+**What loads at job start.** When `MEMORY.md` exists and is non-empty, its **content** is inlined into the
+job prompt, appended **last** so it never pushes the buyer's task down. Only the index's own text loads —
+under `mode = "docker"` the topic files it links sit outside the job's mount namespace and the agent cannot
+open them, so anything the agent must see goes in `MEMORY.md` itself, not in a file it points to. Under
+`launcher` or no sandbox the agent may follow the links, but do not design for that.
+
+**Config, and the defaults:**
+
+```toml
+[seller_memory]
+# memory_enabled = true      # inline MEMORY.md into every job prompt; false ⇒ prompt is byte-identical to a seat with no memory
+# retro_enabled = true       # post-job write-back (see below)
+# read_on_start_template_path = "…"   # plugin seam: how the index is framed in the prompt
+# retro_prompt_path = "…"             # plugin seam: what a retro turn distills
+```
+
+`retro_enabled` is **declared, not yet live**: no code path runs a retro turn or writes `memory/` today, so
+`MEMORY.md` is whatever *you* wrote. Files carrying frontmatter `author: operator` (including
+`operator-notes.md`) are the ones a future retro is bound to leave untouched; write yours that way.
+
+**The injection budget — 64 KiB.** The index is capped at `MAX_MEMORY_INDEX_BYTES` = 65,536 bytes per
+job. An index **over** the budget is **truncated, never dropped**: the job gets everything up to the last
+complete line at or before the budget whose head still has content once trailing whitespace is trimmed,
+then one marker line —
+
+```
+[maxplayer: MEMORY.md truncated to the 65536-byte injection budget — <shown> of <total> bytes shown, tail dropped]
+```
+
+— so the agent reads a fragment as a fragment and the seat keeps its specialization *head*. Two shapes get
+no usable complete line to cut on: a single line longer than the budget, or a file that opens with nothing
+but whitespace before one huge line — one blank line, several, a `\r\n` blank line or an indented one, all
+alike — because every newline in the window would leave a head that trims away to nothing. Those are cut
+at a character boundary inside the long line — never mid-character, so the text stays valid — and the
+file's own opening bytes are kept, not skipped, because an empty head would inject nothing. What the rule
+cannot do is reach text that only starts *after* the budget: an index whose whole first 64 KiB is
+whitespace has no head to keep and gets none. The marker's bytes are reserved before the cut, so the
+index text plus the marker stays ≤ 64 KiB;
+that bound is the index and marker only, not the surrounding prompt template. You are told
+three times: once at **boot** (`seller node WARNING: memory index … is N bytes, over the 65536-byte
+injection budget — every job prompt will get a TRUNCATED copy …`), once **per job** in the daemon log, and
+by `maxplayer doctor` on demand. Fix it by shortening `MEMORY.md` itself; moving text into a linked topic
+file does not help a docker seat (see above).
+
+**`maxplayer doctor` — the `seller memory` row.** Advisory only: it never FAILs and never blocks boot.
+
+| Row says | Meaning |
+|----------|---------|
+| `PASS … is N bytes, injected whole; M bytes of headroom under the 65536-byte injection budget` | working; M is how much more you can write |
+| `PASS no memory dir; jobs run without seat memory` | the default state, nothing to fix |
+| `PASS memory injection is off (…memory_enabled = false…)` | you opted out; the file is not consulted |
+| `WARN memory dir exists but has no MEMORY.md` / `WARN MEMORY.md … is empty` | you started to specialize and stopped: every job injects nothing; the fix names the path |
+| `WARN MEMORY.md … is N bytes, over the 65536-byte injection budget — every job prompt gets a TRUNCATED copy` | shorten the file |
+| `WARN MEMORY.md … could not be read (…)` | permissions or not UTF-8; jobs run without memory until it reads |
+
+Like every other consumer, `doctor` only reads — it never creates `memory/`.
+
+**Opt out** with `memory_enabled = false` under `[seller_memory]`; the composed prompt is then
+byte-identical to a seat that never had the file. Deleting `memory/` does the same and is the cleaner
+choice for a seat that will not use it.
+
 ---
 
 ## 4. Delivery — relay-git default, or BYO
@@ -1591,4 +1663,5 @@ signed in for you is not signed in for the service unless its config lives under
 → discoverability: kind-0 profile on start; capability on the kind-30340 seat heartbeat, republished every ~5 min
 → both open surfaces off by default; --accept-open-targeted for targeted offers from unnamed buyers, --claim-open-pool for the open pool
 → --rate-sats defaults to 100, the rate buyers post at: wallet nets face − fee; receipt records FACE, not net; dust refused up front
+→ seat memory (§3d): MEMORY.md under MAXPLAYER_HOME/memory/ is inlined last into every job prompt when present; over 64 KiB it is TRUNCATED with a marker (never dropped), warned at boot + per job, and `doctor` has a `seller memory` row (advisory, never FAIL, never creates memory/)
 ```

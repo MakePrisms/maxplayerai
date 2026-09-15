@@ -2112,11 +2112,14 @@ pub fn job_prompt(
 /// from this path would flip every existing seller from inert to injecting on its next job without
 /// any operator writing a word. Creating memory stays an operator act.
 ///
-/// **It degrades and never propagates.** `read_on_start_section` REFUSES an index over
-/// [`MAX_MEMORY_INDEX_BYTES`](crate::seller_memory::MAX_MEMORY_INDEX_BYTES) with `InvalidData`, and
-/// an unreadable file is an error too. Neither may fail a job: this is diagnostic/economic context
-/// that never feeds the pay gate, the journal or the receipt bind, so a job that would otherwise
-/// have been delivered and PAID must not die over it. An error is logged and read as "no memory".
+/// **It degrades and never propagates.** An index over
+/// [`MAX_MEMORY_INDEX_BYTES`](crate::seller_memory::MAX_MEMORY_INDEX_BYTES) is TRUNCATED by
+/// `read_on_start` — the surviving head plus a marker line is injected, and the cut is WARNED on
+/// the console with the real byte count, the budget and the path, because a seat silently running
+/// as a generalist is the failure this exists to make visible. An unreadable file is still an
+/// error, and an error may never fail a job: this is diagnostic/economic context that never feeds
+/// the pay gate, the journal or the receipt bind, so a job that would otherwise have been delivered
+/// and PAID must not die over it. An error is logged and read as "no memory".
 pub fn job_memory_section(
     home_root: &std::path::Path,
     config: &crate::home::SellerMemoryConfig,
@@ -2125,15 +2128,63 @@ pub fn job_memory_section(
         return None;
     }
     let dir = crate::seller_memory::memory_dir(home_root);
-    match crate::seller_memory::read_on_start_section(
-        &dir,
-        config.read_on_start_template_path.as_deref(),
-    ) {
-        Ok(section) => section,
+    match crate::seller_memory::read_on_start(&dir, config.read_on_start_template_path.as_deref()) {
+        Ok(Some(read)) => {
+            if let Some(truncation) = read.truncation {
+                opline!(
+                    "{}",
+                    memory_index_truncated_warning(
+                        &dir.join(crate::seller_memory::MEMORY_INDEX_FILE),
+                        truncation
+                    )
+                );
+            }
+            Some(read.section)
+        }
+        Ok(None) => None,
         Err(error) => {
             opline!("seller node memory read skipped ({error}); running the job without memory");
             None
         }
+    }
+}
+
+/// The per-job console line for a truncated index: the real size, the budget, and the path — the
+/// three things an operator needs to act. Pure, so the wording is assertable.
+fn memory_index_truncated_warning(
+    index_path: &std::path::Path,
+    truncation: crate::seller_memory::IndexTruncation,
+) -> String {
+    format!(
+        "seller node WARNING: memory index {} is {} bytes, over the {}-byte injection budget — \
+         injected the first {} bytes plus a truncation marker; the tail is dropped from this job's \
+         prompt. Shorten MEMORY.md itself: under a container policy the topic files it links are \
+         outside the job's mount namespace, so this file's own content is all that loads.",
+        index_path.display(),
+        truncation.total_bytes,
+        crate::seller_memory::MAX_MEMORY_INDEX_BYTES,
+        truncation.shown_bytes
+    )
+}
+
+/// The boot siren for a seat whose `MEMORY.md` is over the injection budget, in the shape of
+/// [`unreachable_seat_warning`]: pure over what the inspector saw, the caller emits. A per-job log
+/// line is not a surface anyone reads; the boot scroll is. `None` for every state that is not
+/// over budget — a missing or empty index is `maxplayer doctor`'s to report, not boot's, because
+/// nearly every seat has no memory dir and must not be nagged at every start.
+fn memory_index_budget_warning(
+    index_path: &std::path::Path,
+    state: crate::seller_memory::IndexState,
+) -> Option<String> {
+    match state {
+        crate::seller_memory::IndexState::OverBudget { bytes } => Some(format!(
+            "seller node WARNING: memory index {} is {bytes} bytes, over the {}-byte injection \
+             budget — every job prompt will get a TRUNCATED copy (the head that fits, plus a marker) \
+             and the tail is dropped. Shorten MEMORY.md itself; `maxplayer doctor` reports this too.",
+            index_path.display(),
+            crate::seller_memory::MAX_MEMORY_INDEX_BYTES
+        )),
+        _ => None,
     }
 }
 
@@ -3872,6 +3923,27 @@ pub async fn boot_advertising_only_proven(
         .and_then(unreachable_seat_warning)
     {
         opline!("{warning}");
+    }
+
+    // Same surface, same reason: an over-budget `MEMORY.md` used to cost the seat its whole
+    // specialization with one per-job log line as the only signal. Now it is truncated per job, and
+    // said ONCE here where an operator watching the boot scroll will see it. READ-ONLY — this must
+    // never create `memory/` (see `job_memory_section`); an inspection error is reported, not fatal.
+    if home.config.seller_memory.memory_enabled {
+        let memory_dir = crate::seller_memory::memory_dir(&home.root);
+        let index_path = memory_dir.join(crate::seller_memory::MEMORY_INDEX_FILE);
+        match crate::seller_memory::inspect_index(&memory_dir) {
+            Ok(state) => {
+                if let Some(warning) = memory_index_budget_warning(&index_path, state) {
+                    opline!("{warning}");
+                }
+            }
+            Err(error) => opline!(
+                "seller node WARNING: memory index {} could not be read ({error}); jobs will run \
+                 without memory until it is readable",
+                index_path.display()
+            ),
+        }
     }
 
     // Take the home lock BEFORE anything reaches the relay. The publish below is the first thing this
@@ -10110,6 +10182,77 @@ mod tests {
             unreachable_seat_warning(&mixed),
             None,
             "one buyer that can actually match is a way in, whatever else is listed"
+        );
+    }
+
+    // THE MEMORY BUDGET SIREN. Fires on exactly the over-budget state, naming bytes, budget and
+    // path; stays silent for every other state, because boot must not nag the seats (nearly all)
+    // that have no memory dir — those are `maxplayer doctor`'s to report. The per-job line carries
+    // the same three facts plus how many bytes survived.
+    #[test]
+    fn the_memory_budget_warnings_name_bytes_budget_and_path() {
+        use crate::seller_memory::{IndexState, IndexTruncation, MAX_MEMORY_INDEX_BYTES};
+        let path = std::path::Path::new("/seat/home/memory/MEMORY.md");
+        let over = MAX_MEMORY_INDEX_BYTES + 4242;
+
+        let boot = memory_index_budget_warning(path, IndexState::OverBudget { bytes: over })
+            .expect("an over-budget index must warn at boot");
+        assert!(
+            boot.contains(&over.to_string()),
+            "names the real size: {boot}"
+        );
+        assert!(
+            boot.contains(&MAX_MEMORY_INDEX_BYTES.to_string()),
+            "names the budget: {boot}"
+        );
+        assert!(
+            boot.contains("/seat/home/memory/MEMORY.md"),
+            "names the path: {boot}"
+        );
+        assert!(
+            boot.contains("TRUNCATED"),
+            "says what happens to the prompt: {boot}"
+        );
+
+        for quiet in [
+            IndexState::NoMemoryDir,
+            IndexState::NoIndex,
+            IndexState::Empty,
+            IndexState::Fits { bytes: 12 },
+            IndexState::Fits {
+                bytes: MAX_MEMORY_INDEX_BYTES,
+            },
+        ] {
+            assert_eq!(
+                memory_index_budget_warning(path, quiet),
+                None,
+                "{quiet:?} must not warn at boot"
+            );
+        }
+
+        let per_job = memory_index_truncated_warning(
+            path,
+            IndexTruncation {
+                shown_bytes: 65_000,
+                total_bytes: over,
+            },
+        );
+        assert!(
+            per_job.contains(&over.to_string()),
+            "names the real size: {per_job}"
+        );
+        assert!(
+            per_job.contains(&MAX_MEMORY_INDEX_BYTES.to_string()),
+            "names the budget: {per_job}"
+        );
+        assert!(per_job.contains("65000"), "names what survived: {per_job}");
+        assert!(
+            per_job.contains("/seat/home/memory/MEMORY.md"),
+            "names the path: {per_job}"
+        );
+        assert!(
+            !per_job.contains("without memory"),
+            "the old 'running the job without memory' wording is gone: {per_job}"
         );
     }
 
