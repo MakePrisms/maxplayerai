@@ -327,7 +327,7 @@ fn a_passed_deadline_alone_does_not_hand_custody_on() {
     std::thread::sleep(Duration::from_millis(100));
     assert!(running.check().is_err(), "the deadline must really be past");
 
-    let refusing_until = Instant::now() + Duration::from_millis(500);
+    let refusing_until = Instant::now() + Duration::from_millis(300);
     while Instant::now() < refusing_until {
         assert_eq!(
             bailiff.attempt_handoff(),
@@ -337,10 +337,28 @@ fn a_passed_deadline_alone_does_not_hand_custody_on() {
         assert!(control.holds_ownership(), "the seat was handed on under running work");
         std::thread::sleep(CUSTODY_TICK);
     }
+
+    // AND THE DANGEROUS CASE, WHICH IS REAL: the child has been reaped and the work has NOT
+    // returned. That is the executor between its reap and its bounded cleanup drain — the exit is
+    // confirmed, and the work thread is still holding the workdir. Every term a clock-driven fence
+    // looks at is now satisfied, and the seat must still not move.
+    running.confirm_exit();
+    let refusing_until = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < refusing_until {
+        assert_eq!(
+            bailiff.attempt_handoff(),
+            CustodyHandoff::WorkStillRunning,
+            "a confirmed exit under work that has not returned is still not a handoff"
+        );
+        assert!(
+            control.holds_ownership(),
+            "the seat was handed on while the work thread was still running"
+        );
+        std::thread::sleep(CUSTODY_TICK);
+    }
     assert!(!released.load(Ordering::SeqCst));
 
-    // And once the work really does stop, with a confirmed exit, the same bailiff hands it on.
-    running.confirm_exit();
+    // And once the work really does stop, the same bailiff hands it on.
     drop(running);
     assert_eq!(bailiff.attempt_handoff(), CustodyHandoff::HandedOn);
     assert!(released.load(Ordering::SeqCst));
