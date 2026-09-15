@@ -1012,27 +1012,85 @@ fn runsc_runtime() -> String {
     )
 }
 
+/// What a probe launched inside the namespace actually established.
+///
+/// A bare boolean could not tell a DENIED packet from a probe that never ran. "the `docker run`
+/// exited non-zero" is true when the filters dropped the packet, and equally true when the image is
+/// missing, the runtime is not installed, or `nc` is not on the image — and a failure that never
+/// reached the path proves nothing whatsoever about the path. Read as a denial, such a failure
+/// reports containment that was never exercised.
+#[derive(Debug)]
+enum Reach {
+    /// `nc` connected.
+    Connected,
+    /// `nc` ran, reached the path, and did not get through: a real denial.
+    Denied,
+    /// The probe never ran. A broken fixture, not a containment result.
+    ToolFailure(String),
+}
+
+impl Reach {
+    fn connected(&self) -> bool {
+        matches!(self, Reach::Connected)
+    }
+
+    /// A denial that is REALLY a denial — or a loud failure. Never a silent "not connected".
+    fn denied(&self, what: &str) -> bool {
+        match self {
+            Reach::Denied => true,
+            Reach::Connected => false,
+            Reach::ToolFailure(why) => panic!(
+                "the probe for {what} never ran ({why}), so this run establishes nothing about \
+                 containment: a tool failure is not a denial"
+            ),
+        }
+    }
+}
+
+/// Run docker and report the child's EXIT CODE, not merely success.
+///
+/// The code is what separates "the packet was denied" from "the probe never ran": docker reserves
+/// 125 for its own failure, 126 for a command it cannot execute and 127 for one it cannot find,
+/// while any other non-zero code is the payload itself speaking.
+fn docker_exit(args: &[&str]) -> (Option<i32>, String) {
+    let out = Command::new("docker")
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("docker must be on PATH for a live containment test");
+    (out.status.code(), String::from_utf8_lossy(&out.stderr).trim().to_owned())
+}
+
 /// Connect from a container started under an explicit `--runtime`.
-fn connect_under(runtime: &str, network: &str, ip: &str, port: &str) -> bool {
-    let (ok, _, _) = docker(
-        &[
-            "run",
-            "--rm",
-            "--runtime",
-            runtime,
-            "--network",
-            network,
-            "--entrypoint",
-            "nc",
-            &netfilter_image(),
-            "-w",
-            "2",
-            ip,
-            port,
-        ],
-        None,
-    );
-    ok
+fn connect_under(runtime: &str, network: &str, ip: &str, port: &str) -> Reach {
+    let image = netfilter_image();
+    let (code, stderr) = docker_exit(&[
+        "run",
+        "--rm",
+        "--runtime",
+        runtime,
+        "--network",
+        network,
+        "--entrypoint",
+        "nc",
+        &image,
+        "-w",
+        "2",
+        ip,
+        port,
+    ]);
+    match code {
+        Some(0) => Reach::Connected,
+        // docker's own reserved codes: the container never got as far as running the probe.
+        Some(code @ (125 | 126 | 127)) => {
+            Reach::ToolFailure(format!("docker exited {code}: {stderr}"))
+        }
+        // `nc` ran and reported that it could not connect.
+        Some(_) => Reach::Denied,
+        None => Reach::ToolFailure(format!("the probe was killed by a signal: {stderr}")),
+    }
 }
 
 /// Run a daemon-built argv verbatim. Every helper below goes through this rather than assembling its
@@ -1602,8 +1660,18 @@ impl Payload {
     }
 
     /// Run the one payload this namespace gets, under `runtime`, and report whether it connected.
+    ///
+    /// A probe that never ran is raised here rather than folded into `false`: "did not connect"
+    /// because the image is missing is not the same measurement as "did not connect" because the
+    /// filters stopped it, and only one of them says anything about containment.
     fn reach(&self, runtime: &str, ip: &str) -> bool {
-        connect_under(runtime, &format!("container:{}", self.holder), ip, Canary::PORT)
+        let probe = connect_under(runtime, &format!("container:{}", self.holder), ip, Canary::PORT);
+        if let Reach::ToolFailure(why) = &probe {
+            panic!(
+                "the canary probe never ran ({why}): a tool failure is not a containment result"
+            );
+        }
+        probe.connected()
     }
 }
 
@@ -2850,10 +2918,10 @@ fn a_contained_job_actually_connects_to_the_host_proxy_through_the_pinhole() {
     assert!(ok, "could not create the test network: {err}");
 
     // A multi-port range, which is the shape production ships and every other tc-path test uses.
-    // A single-port range is accepted by `PortRange` and documented by its parser, but renders
-    // `dst_port N-N`, which the tc flower classifier rejects outright ("max value should be greater
-    // than min value"); that is a separate production defect, reported rather than worked around
-    // here, and pinning this gate to it would only measure that bug instead of the proxy leg.
+    // The one-port shape is measured on its own by
+    // [`a_single_port_pinhole_establishes_and_the_job_reaches_only_that_port`]: it used to render
+    // `dst_port N-N` and be refused by the tc flower classifier outright. Keeping the two shapes in
+    // separate gates means neither can cover for a regression in the other.
     let pinhole = PortRange::new(49220, 49229).expect("valid range");
     let allowed_port: u16 = 49221; // inside the pinhole
     let denied_port: u16 = 49401; // outside it
@@ -2893,14 +2961,98 @@ fn a_contained_job_actually_connects_to_the_host_proxy_through_the_pinhole() {
     remove_owned_network(network);
 
     assert!(
-        reached,
+        reached.connected(),
         "the contained job could NOT reach the proxy at {proxy_host}:{allowed_port}, the one \
-         address the pinhole exists to permit — a job under this policy cannot do its work"
+         address the pinhole exists to permit — a job under this policy cannot do its work \
+         ({reached:?})"
     );
+    // `denied` refuses to read a tool failure as a denial: if the probe never ran, this panics
+    // rather than crediting containment that was never exercised.
     assert!(
-        !refused,
+        refused.denied(&format!("{proxy_host}:{denied_port}")),
         "the contained job reached {proxy_host}:{denied_port}, which is OUTSIDE the pinhole: the \
          permit is not confined to the port the policy names"
+    );
+}
+
+/// The SINGLE-PORT pinhole, end to end against a real kernel.
+///
+/// A one-port proxy range is supported configuration — `PortRange::new` accepts equal endpoints and
+/// the parser documents a bare `"49200"` — and until this round it could not run at all. iptables
+/// renders it `49221:49221`, the tc translation turned that into `dst_port 49221-49221`, and the
+/// flower classifier refused it outright, so the filters never installed and establishment refused
+/// the launch. Fail-closed, but a supported configuration that cannot start is still broken.
+///
+/// Rendering it as the bare port is what the offline gates assert. Only a real `tc` can say whether
+/// that rendering is one it ACCEPTS, and that is what this measures — the half no amount of string
+/// assertion can reach.
+///
+/// The control is the same as the range gate's, and tighter: both ports carry a live host listener,
+/// and the denied one sits directly ABOVE the single permitted port, so a permit that quietly
+/// widened by even one port fails here.
+#[test]
+#[ignore = "needs docker, gVisor and the netfilter image"]
+fn a_single_port_pinhole_establishes_and_the_job_reaches_only_that_port() {
+    let runtime_name = runsc_runtime();
+    let network = owned_name("net-proxy-singleton");
+    let network = network.as_str();
+    let (ok, _, err) = docker(&["network", "create", "--label", &owner_label(), network], None);
+    assert!(ok, "could not create the test network: {err}");
+
+    // start == end: the exact shape that could not be installed before this round.
+    let pinhole = PortRange::new(49221, 49221).expect("a single port is a valid range");
+    let allowed_port: u16 = 49221;
+    let denied_port: u16 = 49222;
+    let _allowed_listener = HostListener::bind(allowed_port);
+    let _denied_listener = HostListener::bind(denied_port);
+
+    let rt = tokio::runtime::Runtime::new().expect("a runtime");
+    let outcome = rt.block_on(maxplayer_core::sandbox_netns::establish(
+        network,
+        &holder_image(),
+        &netfilter_image(),
+        "host.docker.internal",
+        "live-proxy-singleton",
+        "3333333333333333333333333333333333333333333333333333333333333333",
+        1000,
+        1000,
+        Some(pinhole),
+        true,
+        Vec::new(),
+    ));
+
+    let containment = match outcome {
+        Ok(containment) => containment,
+        Err(error) => {
+            remove_owned_network(network);
+            // Exactly the failure the defect produced: tc refuses the filter, so containment cannot
+            // be established and the job never launches.
+            panic!(
+                "establish FAILED for a single-port pinhole: {error} — a supported one-port proxy \
+                 range must install like any other"
+            );
+        }
+    };
+    let holder = containment.holder.name().to_owned();
+    let proxy_host = containment.proxy_host.clone();
+    let netns = format!("container:{holder}");
+
+    let reached = connect_under(&runtime_name, &netns, &proxy_host, &allowed_port.to_string());
+    let refused = connect_under(&runtime_name, &netns, &proxy_host, &denied_port.to_string());
+
+    drop(containment);
+    remove_owned_network(network);
+
+    assert!(
+        reached.connected(),
+        "the contained job could NOT reach {proxy_host}:{allowed_port}, the single port its own \
+         pinhole names ({reached:?}) — a one-port range must be installable, not merely accepted \
+         by the type"
+    );
+    assert!(
+        refused.denied(&format!("{proxy_host}:{denied_port}")),
+        "the contained job reached {proxy_host}:{denied_port}, one port ABOVE its single-port \
+         pinhole: collapsing an equal-endpoint range to a bare port must not widen what it permits"
     );
 }
 
@@ -2924,6 +3076,10 @@ fn a_cancelled_establish_leaves_no_holder_behind_against_the_real_daemon() {
 
     let rt = tokio::runtime::Runtime::new().expect("a runtime");
     let mut leaked: Vec<String> = Vec::new();
+    // How many attempts actually cancelled an establish that was still running. Nothing in the
+    // previous version required this to be above zero, so a walk that never crossed the create
+    // window would have reported a clean pass having cancelled nothing at all.
+    let mut cancelled_in_flight = 0u32;
     // Bound outside the future: it is polled to cancellation below, so anything it borrows has to
     // outlive the statement that builds it.
     let holder_image = holder_image();
@@ -2933,6 +3089,9 @@ fn a_cancelled_establish_leaves_no_holder_behind_against_the_real_daemon() {
         let job = format!("live-cancel-{attempt}");
         let holder = format!("maxplayer-netns-{job}");
         let delay = std::time::Duration::from_millis(150 + u64::from(attempt) * 120);
+        // Whether the cancellation landed on a still-running establish, rather than after one that
+        // had already finished.
+        let mut hit_creation = false;
 
         rt.block_on(async {
             let mut establishing = Box::pin(maxplayer_core::sandbox_netns::establish(
@@ -2949,28 +3108,87 @@ fn a_cancelled_establish_leaves_no_holder_behind_against_the_real_daemon() {
                 Vec::new(),
             ));
             tokio::select! {
+                // establish won the race: this attempt exercised cleanup after SUCCESS. That must
+                // still not leak, but it says nothing about cancellation, so it is not counted as
+                // one.
                 _ = establishing.as_mut() => {}
-                _ = tokio::time::sleep(delay) => {}
+                _ = tokio::time::sleep(delay) => hit_creation = true,
             }
             drop(establishing); // the cancellation under test
         });
+        if hit_creation {
+            cancelled_in_flight += 1;
+        }
 
-        // A create that outlived the cancellation can still land, so absence is asked for over a
-        // window rather than sampled once the instant the drop returns.
-        let gone = wait_until(30, || {
-            let (_, listed, _) = docker(
-                &["ps", "--all", "--quiet", "--filter", &format!("name={holder}")],
+        // Absence, asked so that only a real absence can answer it. Three things together, because
+        // any one of them alone is satisfiable by a run that measured nothing:
+        //
+        //  * a SUCCESSFUL daemon query. `docker ps` that fails prints nothing on stdout, and an
+        //    empty stdout is exactly what a clean daemon prints too — success-shaped emptiness that
+        //    reads identically whether the oracle worked or never ran at all.
+        //  * the HOLDER AND ITS JOINERS. Sidecars are named `<holder>-<verb>-<pid>-<serial>`, so
+        //    this substring filter covers them; a surviving sidecar pins the namespace the holder
+        //    was torn down to release, and checking holder names alone would miss it entirely.
+        //  * absence that is STABLE across consecutive answers rather than the first one seen. A
+        //    create that outlived its cancellation can still land, so an early empty listing is a
+        //    container that has not appeared YET, not one that never will.
+        const STABLE_ANSWERS: u32 = 5;
+        let mut consecutive_absent = 0u32;
+        let mut answered = 0u32;
+        let mut survivors: Vec<String> = Vec::new();
+        let mut last_error = String::new();
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let (ok, listed, err) = docker(
+                &["ps", "--all", "--format", "{{.Names}}", "--filter", &format!("name={holder}")],
                 None,
             );
-            listed.is_empty()
-        });
-        if !gone {
-            leaked.push(holder.clone());
-            remove_owned_container(&holder);
+            if ok {
+                answered += 1;
+                let names: Vec<String> = listed
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                if names.is_empty() {
+                    consecutive_absent += 1;
+                } else {
+                    consecutive_absent = 0;
+                    survivors = names;
+                }
+            } else {
+                // A daemon that cannot answer is not a daemon reporting "clean".
+                consecutive_absent = 0;
+                last_error = err;
+            }
+            if consecutive_absent >= STABLE_ANSWERS || std::time::Instant::now() >= give_up {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+
+        assert!(
+            answered > 0,
+            "the daemon never successfully answered what exists under {holder} (last error: \
+             {last_error:?}); with no answer at all there is nothing to conclude, and concluding \
+             \"absent\" from a failed query is the whole defect this gate exists to catch"
+        );
+        if consecutive_absent < STABLE_ANSWERS {
+            leaked.push(if survivors.is_empty() { holder.clone() } else { survivors.join(", ") });
+            for name in survivors.iter().chain(std::iter::once(&holder)) {
+                remove_owned_container(name);
+            }
         }
     }
 
     remove_owned_network(network);
+    assert!(
+        cancelled_in_flight > 0,
+        "not one of the attempts cancelled an establish that was still running — every one of them \
+         finished first, so this run measured cleanup after success and never exercised \
+         cancellation at all. A green here would be a green for a property nothing tested."
+    );
     assert!(
         leaked.is_empty(),
         "a cancelled establish left {leaked:?} running against the real daemon: the create landed \

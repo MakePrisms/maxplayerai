@@ -559,20 +559,32 @@ impl HolderCleanup {
         }
     }
 
-    /// Ask the daemon, repeatedly, whether the holder is actually gone.
+    /// Ask the daemon, repeatedly, whether EVERY container this owner is responsible for is gone —
+    /// each joiner as well as the holder.
     ///
-    /// A removal issued is not a removal observed. `Some(true)` is the only answer that ends this;
-    /// "could not tell" is treated exactly like "still there", because the cost of asking again is a
-    /// bounded retry and the cost of believing it is an orphan nobody is looking for.
-    fn confirm_absent(&self) -> bool {
+    /// A removal issued is not a removal observed. `Some(true)` is the only answer that retires a
+    /// name; "could not tell" is treated exactly like "still there", because the cost of asking
+    /// again is a bounded retry and the cost of believing it is an orphan nobody is looking for.
+    ///
+    /// Confirming the holder ALONE was not enough, and that was a real hole: [`Self::sweep`] only
+    /// LOGS a failed joiner removal, so a sidecar that refused to go on still pins the namespace
+    /// the holder was torn down to release. An owner ending on holder-absence announced a clean
+    /// release directly over the top of a container it owns and never asked about.
+    ///
+    /// Returns the names that could not be confirmed gone, so the caller can name them.
+    fn confirm_all_absent(&self) -> Result<(), Vec<String>> {
         let give_up = std::time::Instant::now() + self.bounds.confirm;
         let mut pause = std::time::Duration::from_millis(20);
+        // Joiners first: the holder's namespace is not actually released while one of them pins it.
+        let mut pending: Vec<String> =
+            self.joiners.iter().cloned().chain(std::iter::once(self.name.clone())).collect();
         loop {
-            if container_is_absent(&self.client, &self.name) == Some(true) {
-                return true;
+            pending.retain(|name| container_is_absent(&self.client, name) != Some(true));
+            if pending.is_empty() {
+                return Ok(());
             }
             if std::time::Instant::now() >= give_up {
-                return false;
+                return Err(pending);
             }
             std::thread::sleep(pause);
             pause = (pause * 2).min(std::time::Duration::from_millis(500));
@@ -587,25 +599,34 @@ impl HolderCleanup {
     /// confirmed gone is reported as leaked, with the reason, rather than silently written off.
     fn own_until_settled_or_confirmed(self) {
         let settled = self.creation.wait_until_settled(self.bounds.max);
+        // Best effort either way: whatever HAS landed should go now.
         self.sweep();
-        let confirmed = self.confirm_absent();
-        if confirmed {
-            if !settled {
-                eprintln!(
-                    "sandbox: a create against netns holder {} never settled within {:?}, but the \
-                     name is now CONFIRMED absent — nothing landed under it",
-                    self.name, self.bounds.max
-                );
-            }
+        if !settled {
+            // Custody ends here, but it ends as a KNOWN leak — never as a clean release, and never
+            // on an absence answer. While the create is still running, "No such container" is
+            // indistinguishable from "has not landed yet": the container can appear the instant
+            // after the daemon answers. Treating that emptiness as proof is how the orphan this
+            // whole fence exists to prevent gets manufactured by the cleanup path itself, so the
+            // question is not asked and the honest verdict is recorded instead.
+            eprintln!(
+                "sandbox: a create against netns holder {} was STILL IN FLIGHT after {:?} — its \
+                 removal has been issued, but absence CANNOT be confirmed while the create is \
+                 running, so this holder and its {} joiner(s) are reported LEAKED rather than \
+                 clean; the boot reaper is the only remaining backstop",
+                self.name,
+                self.bounds.max,
+                self.joiners.len()
+            );
             return;
         }
-        eprintln!(
-            "sandbox: netns holder {} could not be confirmed absent within {:?} after {} — this \
-             holder is LEAKED, not destroyed; the boot reaper is the only remaining backstop",
-            self.name,
-            self.bounds.confirm,
-            if settled { "its create settled" } else { "waiting out its create" }
-        );
+        if let Err(pending) = self.confirm_all_absent() {
+            eprintln!(
+                "sandbox: could not confirm {} absent within {:?} after the create settled — these \
+                 are LEAKED, not destroyed; the boot reaper is the only remaining backstop",
+                pending.join(", "),
+                self.bounds.confirm
+            );
+        }
     }
 }
 
@@ -1181,6 +1202,14 @@ fn run_bounded_blocking(
         let program =
             if program == "docker" { client.program().to_owned() } else { program.clone() };
         let program = program.as_str();
+        // The clock starts HERE: before the spawn, and therefore before the plan is written.
+        //
+        // Anchoring it after the stdin write left that write outside the bound entirely. A client
+        // that never reads its stdin fills the pipe buffer, `write_all` blocks indefinitely, and
+        // the deadline below was never even armed — an unbounded create is precisely the state in
+        // which cancellation leaves a container nobody is waiting for. The bound now covers the
+        // whole flow: spawn, plan write, wait, and the output read after it.
+        let started = std::time::Instant::now();
         let mut child = Command::new(program)
             .args(args)
             .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
@@ -1188,20 +1217,23 @@ fn run_bounded_blocking(
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| format!("could not run `{program}`: {error}"))?;
-        if let Some(plan) = stdin {
-            child
-                .stdin
-                .as_mut()
-                .ok_or_else(|| "docker stdin was not piped".to_string())?
-                .write_all(plan.as_bytes())
-                .map_err(|error| format!("could not write the plan to the sidecar: {error}"))?;
-            // Dropped so the sidecar's `read` loop sees EOF; without this it waits forever and the
-            // job's launch hangs instead of failing.
-            drop(child.stdin.take());
-        }
+        // Written on its own thread so a blocked write cannot outrun the deadline. The thread owns
+        // the pipe and drops it on the way out, so the sidecar's `read` loop still sees EOF; if the
+        // deadline kills the child first, the write fails with `EPIPE` and the thread ends by
+        // itself rather than pinning this one.
+        let writer = match stdin {
+            Some(plan) => {
+                let mut pipe =
+                    child.stdin.take().ok_or_else(|| "docker stdin was not piped".to_string())?;
+                Some(std::thread::spawn(move || {
+                    pipe.write_all(plan.as_bytes())
+                        .map_err(|error| format!("could not write the plan to the sidecar: {error}"))
+                }))
+            }
+            None => None,
+        };
 
         // Poll rather than `wait_with_output`, so the deadline is enforceable at all.
-        let started = std::time::Instant::now();
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
@@ -1236,8 +1268,22 @@ fn run_bounded_blocking(
         let done = std::process::Output { status, stdout, stderr };
         let stdout = String::from_utf8_lossy(&done.stdout).trim().to_owned();
         let stderr = String::from_utf8_lossy(&done.stderr).trim().to_owned();
+        // The child is reaped, so the read end of the plan pipe is closed and this join cannot
+        // block. A half-written plan is a sidecar that acted on a truncated instruction, so the
+        // write's own failure is reported — but only when the child itself did not already fail,
+        // because the child's exit code names the refusal more precisely than a broken pipe does.
+        let wrote = match writer {
+            Some(writer) => match writer.join() {
+                Ok(result) => result,
+                Err(_) => Err("the thread writing the plan to the sidecar panicked".to_string()),
+            },
+            None => Ok(()),
+        };
         match done.status.code() {
-            Some(0) => Ok((stdout, stderr)),
+            Some(0) => match wrote {
+                Ok(()) => Ok((stdout, stderr)),
+                Err(error) => Err(error),
+            },
             // The sidecar's codes are an interface; pass them through in the message so the caller's
             // error names WHICH refusal happened rather than "it failed".
             Some(code) => Err(format!("exit {code}: {}", if stderr.is_empty() { &stdout } else { &stderr })),
@@ -2503,6 +2549,12 @@ case "$*" in
     exit 0
     ;;
   *"inspect --type container"*)
+    for a in "$@"; do last="$a"; done
+    echo "inspect $last" >> "$WORK/events.log"
+    if [ -f "$WORK/present-$last" ]; then
+      echo "sha256:deadbeefcafe"
+      exit 0
+    fi
     echo "Error response from daemon: No such container" >&2
     exit 1
     ;;
@@ -2510,6 +2562,10 @@ case "$*" in
     for a in "$@"; do last="$a"; done
     echo "$last" >> "$WORK/rm.log"
     echo "rm $last" >> "$WORK/events.log"
+    if [ -f "$WORK/rmfail-$last" ]; then
+      echo "Error response from daemon: cannot remove container $last" >&2
+      exit 1
+    fi
     exit 0
     ;;
   *--detach*)
@@ -2538,6 +2594,126 @@ exit 0
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("work dir");
         dir
+    }
+
+    #[cfg(feature = "acp")]
+    fn quick_bounds() -> FenceBounds {
+        FenceBounds {
+            fast: std::time::Duration::from_millis(10),
+            max: std::time::Duration::from_millis(60),
+            confirm: std::time::Duration::from_millis(300),
+        }
+    }
+
+    /// Cleanup owns the JOINERS too, and must confirm each one is really gone.
+    ///
+    /// `sweep` only LOGS a failed sidecar removal, and confirmation inspected the holder alone. A
+    /// sidecar that refused removal and is still running pins the very namespace the holder was
+    /// torn down to release — so an owner that ends on holder-absence alone reports a clean release
+    /// on top of a container it owns and never looked at. The daemon has to be asked about every
+    /// owned name, not just the convenient one.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn cleanup_confirms_every_owned_joiner_is_absent_not_only_the_holder() {
+        let work = stand_in_work_dir("joiner-confirm");
+        let script = stand_in_docker(&work, "");
+        // This sidecar refuses removal AND keeps answering "present": precisely the case that
+        // holder-only confirmation reports as clean.
+        std::fs::write(work.join("rmfail-side-1"), "").expect("marker");
+        std::fs::write(work.join("present-side-1"), "").expect("marker");
+
+        let cleanup = HolderCleanup {
+            name: "holder-joiner-confirm".to_owned(),
+            joiners: vec!["side-1".to_owned()],
+            // Nothing in flight, so settlement is immediate and this test is only about custody.
+            creation: std::sync::Arc::new(CreationFence::default()),
+            client: DockerCli::stand_in(&script),
+            bounds: quick_bounds(),
+        };
+        cleanup.own_until_settled_or_confirmed();
+
+        let log = std::fs::read_to_string(work.join("events.log")).unwrap_or_default();
+        assert!(
+            log.contains("inspect side-1"),
+            "cleanup ended custody without ever asking the daemon whether the sidecar it owns is \
+             gone. Its removal failed and it is still running, pinning the namespace, and this \
+             owner reported a clean release anyway. Event log:\n{log}"
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// An absence observed while a create is STILL IN FLIGHT is not proof of anything.
+    ///
+    /// This is success-shaped emptiness: "No such container" reads identically whether the create
+    /// never happened or has simply not landed yet. The previous owner waited out its bound, swept,
+    /// asked once, got "absent", and returned announcing that *nothing landed* — while the create
+    /// it was waiting on was still running and could land immediately afterwards, unowned.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn cleanup_does_not_take_absence_as_proof_while_a_create_is_still_in_flight() {
+        let work = stand_in_work_dir("unsettled-confirm");
+        let script = stand_in_docker(&work, "");
+        let fence = std::sync::Arc::new(CreationFence::default());
+        // Held for the whole test and never released: this create NEVER settles.
+        let _ticket = fence.begin();
+
+        let cleanup = HolderCleanup {
+            name: "holder-unsettled".to_owned(),
+            joiners: Vec::new(),
+            creation: std::sync::Arc::clone(&fence),
+            client: DockerCli::stand_in(&script),
+            bounds: quick_bounds(),
+        };
+        cleanup.own_until_settled_or_confirmed();
+
+        let log = std::fs::read_to_string(work.join("events.log")).unwrap_or_default();
+        assert!(
+            !log.contains("inspect holder-unsettled"),
+            "the create never settled, yet cleanup asked the daemon for an absence answer and ended \
+             on it. That answer cannot distinguish \"nothing landed\" from \"has not landed yet\", \
+             so resting a clean verdict on it is exactly the orphan this fence exists to prevent. \
+             Event log:\n{log}"
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// The deadline must bound the WHOLE create flow, stdin included.
+    ///
+    /// The timer used to start after the plan had already been written to the child. A client that
+    /// never reads its stdin fills the pipe and blocks that write forever, so the bound was never
+    /// armed and the launch hung with no deadline at all — the precise state in which cancellation
+    /// leaves work nobody owns.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn the_deadline_bounds_the_whole_create_flow_including_the_stdin_write() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let work = stand_in_work_dir("stdin-bound");
+        let script = work.join("docker");
+        // Never reads stdin, so a large plan fills the pipe and the write blocks.
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").expect("write stand-in");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let deadline = std::time::Duration::from_millis(300);
+        let mut child_exited = false;
+        let started = std::time::Instant::now();
+        let outcome = run_bounded_blocking(
+            &DockerCli::stand_in(&script),
+            vec!["docker".to_owned(), "create".to_owned()],
+            Some("x".repeat(4 * 1024 * 1024)),
+            deadline,
+            &mut child_exited,
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the bound never armed: a client that refuses to read its stdin blocked the write for \
+             {elapsed:?} against a {deadline:?} deadline. A create with no enforceable bound is a \
+             launch that can hang and a container nobody is waiting for."
+        );
+        assert!(outcome.is_err(), "a client killed on its deadline cannot report success");
+        let _ = std::fs::remove_dir_all(&work);
     }
 
     /// The address `establish` MEASURES is the address its rendered policy pinholes.

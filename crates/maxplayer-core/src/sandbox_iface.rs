@@ -485,8 +485,25 @@ pub fn tc_eth_type(family: Family) -> &'static str {
 }
 
 /// iptables spells a port range `49200:49299`; `tc` flower spells it `49200-49299`.
+///
+/// The singleton is the case that cannot be translated mechanically. A one-port proxy range is
+/// supported configuration — `PortRange::new` accepts equal endpoints and `PortRange::parse`
+/// documents a bare `"49200"` — and iptables renders it `49221:49221`. Replacing the colon would
+/// produce `dst_port 49221-49221`, which `tc` flower refuses outright:
+///
+/// ```text
+/// Illegal "dst_port" - max value should be greater than min value
+/// ```
+///
+/// The filter then never installs, establishment refuses the launch, and a configuration the rest
+/// of the stack accepts cannot run at all. `tc` spells that same match as the bare port, so an
+/// equal-endpoint range collapses to one port here. A range with distinct endpoints keeps both:
+/// collapsing those too would narrow the pinhole to its first port and deny the rest.
 fn to_tc_port_range(dport: &str) -> String {
-    dport.replace(':', "-")
+    match dport.split_once(':') {
+        Some((start, end)) if start == end => start.to_owned(),
+        _ => dport.replace(':', "-"),
+    }
 }
 
 #[cfg(test)]
@@ -511,6 +528,77 @@ mod tests {
 
     fn plan() -> IfacePlan {
         IfacePlan::derive(DEV, &policy()).expect("the shipped policy must render")
+    }
+
+    fn plan_for(start: u16, end: u16) -> IfacePlan {
+        let policy = NetPolicy {
+            proxy_ports: Some(PortRange::new(start, end).expect("a valid range")),
+            ..policy()
+        };
+        IfacePlan::derive(DEV, &policy).expect("a supported policy must render")
+    }
+
+    fn rendered_ports(plan: &IfacePlan) -> Vec<String> {
+        plan.filters.iter().filter_map(|f| f.dst_port.clone()).collect()
+    }
+
+    /// A supported SINGLE-PORT proxy range must render a filter `tc` will actually accept.
+    ///
+    /// `PortRange::new` accepts equal endpoints and `PortRange::parse` documents a bare `"49200"`,
+    /// so a one-port proxy range is supported configuration, not abuse. iptables spells it
+    /// `49221:49221`; a mechanical colon-to-hyphen translation spells it `dst_port 49221-49221`,
+    /// and `tc` flower REJECTS that outright — `Illegal "dst_port" - max value should be greater
+    /// than min value`. The filter never installs, establishment refuses the launch, and a
+    /// supported configuration cannot run at all. This is a fail-closed availability defect, not a
+    /// packet escape, and it is still a defect.
+    #[test]
+    fn a_single_port_proxy_range_renders_a_filter_tc_accepts() {
+        let plan = plan_for(49221, 49221);
+        let ports = rendered_ports(&plan);
+        assert!(!ports.is_empty(), "the pinhole must still carry a port match: {plan:#?}");
+        for port in &ports {
+            assert!(
+                !port.contains('-'),
+                "tc rejects an equal-endpoint range; a single port must render bare: dst_port {port}"
+            );
+            assert_eq!(port, "49221", "the one supported port is the one that must be matched");
+        }
+    }
+
+    /// The negative half of the same repair: collapsing EQUAL endpoints must not collapse a real
+    /// range. Without this, "fix the singleton" could be satisfied by emitting a bare start port
+    /// for every range, which would silently narrow the pinhole to one port and deny the rest.
+    #[test]
+    fn a_multi_port_proxy_range_still_renders_as_a_range() {
+        let ports = rendered_ports(&plan_for(49200, 49299));
+        assert!(
+            ports.iter().any(|port| port == "49200-49299"),
+            "a real range must keep both endpoints: {ports:#?}"
+        );
+        for port in &ports {
+            assert!(
+                !port.chars().all(|c| c.is_ascii_digit()),
+                "a multi-port range must not collapse to a single port: dst_port {port}"
+            );
+        }
+    }
+
+    /// And the invariant behind both halves: `tc` rejects every `N-N`, so the renderer must never
+    /// emit one for ANY supported range, at either end of the port space.
+    #[test]
+    fn no_supported_range_ever_renders_an_equal_endpoint_tc_range() {
+        for (start, end) in
+            [(49221u16, 49221u16), (1, 1), (65535, 65535), (49200, 49299), (1, 65535)]
+        {
+            for port in rendered_ports(&plan_for(start, end)) {
+                if let Some((low, high)) = port.split_once('-') {
+                    assert_ne!(
+                        low, high,
+                        "tc rejects dst_port {port} from range {start}-{end}: max must exceed min"
+                    );
+                }
+            }
+        }
     }
 
     /// Render a plan the way `tc filter show` prints it.
