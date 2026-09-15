@@ -965,6 +965,7 @@ fn establish_contains_a_namespace_and_tears_it_down_on_drop() {
         // unit tests, and adding one here would open port 53 to an address this fixture never
         // measured.
         Vec::new(),
+        2_000_000_000,
     ));
 
     let holder_name = match outcome {
@@ -1148,6 +1149,7 @@ fn establish_filters_the_veth_the_packets_actually_leave_by() {
         // test asserts the veth filters mirror the rendered policy exactly, so an exception the
         // fixture never measured would be an exception it cannot check.
         Vec::new(),
+        2_000_000_000,
     ));
 
     let containment = match outcome {
@@ -2941,6 +2943,7 @@ fn a_contained_job_actually_connects_to_the_host_proxy_through_the_pinhole() {
         Some(pinhole),
         true,
         Vec::new(),
+        2_000_000_000,
     ));
 
     let containment = match outcome {
@@ -3019,6 +3022,7 @@ fn a_single_port_pinhole_establishes_and_the_job_reaches_only_that_port() {
         Some(pinhole),
         true,
         Vec::new(),
+        2_000_000_000,
     ));
 
     let containment = match outcome {
@@ -3106,6 +3110,7 @@ fn a_cancelled_establish_leaves_no_holder_behind_against_the_real_daemon() {
                 None,
                 true,
                 Vec::new(),
+                2_000_000_000,
             ));
             tokio::select! {
                 // establish won the race: this attempt exercised cleanup after SUCCESS. That must

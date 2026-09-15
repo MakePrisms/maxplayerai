@@ -1171,6 +1171,7 @@ async fn a_failed_installer_destroys_the_holder_and_leaves_nothing_to_launch_int
         None,
         true,
         vec![RESOLVER_V4.to_owned()],
+        2_000_000_000,
     )
     .await;
     let error = result.err().expect("an installer that cannot apply must fail the launch");

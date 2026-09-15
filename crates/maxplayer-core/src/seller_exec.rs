@@ -2646,6 +2646,25 @@ pub(crate) async fn prepare_launch(
                 ))
             })?;
             job_resolv_conf = Some(resolv_path);
+            // The expiry the job's own containers will be judged by, traced from the deadline this
+            // job is ACTUALLY being run under rather than re-derived from config. `job_lifetime` is
+            // the remaining window the caller computed with `unified_job_timeout` from
+            // `job_deadline_unix`, so `now + job_lifetime` is this job's effective deadline, and
+            // `cleanup_after_unix` adds the grace. Two properties matter and both are one-sided:
+            //
+            //   * It can only land LATER than the true deadline, never earlier. Time passes between
+            //     the caller computing the window and this create being issued, and one caller adds
+            //     a push margin on top. A stamp later than the deadline leaves a container a little
+            //     longer; a stamp earlier than it would let the sweep remove a container out from
+            //     under a job still inside its own deadline. Only one of those is survivable.
+            //   * A clock that cannot be read yields `u64::MAX`, which is never swept. An
+            //     unreadable clock must not be able to date a live job to the past.
+            let cleanup_after = crate::sandbox_netns::cleanup_after_unix(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(u64::MAX, |since| since.as_secs())
+                    .saturating_add(job_lifetime.as_secs()),
+            );
             let established = crate::sandbox_netns::establish(
                 network,
                 image,
@@ -2660,6 +2679,7 @@ pub(crate) async fn prepare_launch(
                 policy.proxy_ports(),
                 true,
                 resolvers.addresses().to_vec(),
+                cleanup_after,
             )
             .await
             // Fail the job rather than run it uncontained. The whole point of moving containment into
