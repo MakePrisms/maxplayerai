@@ -160,24 +160,64 @@
 //! something else inherited stays open after the process we killed is gone. Stating one bound for
 //! two consecutive waits understated the worst case by a whole reap bound.
 //!
-//! The claims that hold, each said only as wide as it is:
+//! The claims that hold, each said only as wide as it is. `S` below is the SYNCHRONOUS SUPERVISOR
+//! TIME defined under "the phases no clock here interrupts"; it is an additive term, not a timer:
 //!
-//! * **The child.** Within `deadline + REAP_BOUND` the child process has been killed and its exit
-//!   confirmed, or the executor says it could not confirm it and the seat stays held.
-//! * **The seat.** Within `deadline + 2 * REAP_BOUND` the turn has been handed on, or it is
+//! * **The child.** Within `deadline + REAP_BOUND + S` the child process has been killed and its
+//!   exit confirmed, or the executor says it could not confirm it and the seat stays held.
+//! * **The seat.** Within `deadline + 2 * REAP_BOUND + S` the turn has been handed on, or it is
 //!   retained for the life of this process with the reason named
 //!   ([`ExecutorError::Unreaped`], [`ExecutorError::CleanupUnbounded`],
 //!   [`ExecutorError::CleanupUnobserved`], [`ExecutorError::WaitFailed`]).
+//! * **The same two numbers on the EXCEPTION path.** A child that will not die is killed and waited
+//!   for by `drive`, again by the cleanup that normalizes the outcome, and again by
+//!   `KillableChild::drop`. Those retries used to start a fresh [`REAP_BOUND`] each, so the
+//!   worst case was three reap windows plus the end-of-file window while the text above said two
+//!   windows in total. [`REAP_BOUND`] is now a BUDGET PER CHILD: the time already spent waiting for
+//!   that child is accumulated, later attempts re-signal, poll the exit once and return. Retrying
+//!   changes how certain the outcome is, never the bound.
+//!
+//! # The phases no clock here interrupts — the term `S`
+//!
+//! The deadlines above are enforced at WAITS. Between two waits the supervisor thread runs work
+//! that nothing in this module can cut short, and honesty requires it be added rather than assumed
+//! away. `S` is the total of, per delivery:
+//!
+//! * **Encode.** Serializing each outbound frame. Bounded by construction at [`MAX_FRAME_BYTES`]:
+//!   `encode_frame` serializes into a sink that REFUSES past the cap, so an oversized value is
+//!   abandoned mid-encode. Before that the whole value was built and then measured, which made this
+//!   phase as large as the value — unbounded work inside a module that claims bounded ones.
+//! * **Decode.** Parsing one inbound frame, read under the same cap.
+//! * **Spawn.** One `Command::spawn` on the first pass, before `drive` and therefore before any
+//!   deadline check can reach it.
+//! * **The authority call itself.** Whatever the owner's check costs, once per ask.
+//!
+//! `S` is NOT given a number here and no OS guarantee is claimed for it. It is the same class of
+//! assumption as "this process is still being scheduled": if the machine stalls inside one of those
+//! phases, every bound in this module is late by that stall, and the module says so instead of
+//! printing a figure it cannot enforce. What IS claimed is that each contributor is either capped
+//! by size ([`MAX_FRAME_BYTES`]) or is a single bounded-count operation, and that the number of
+//! contributions is finite — mint frames are capped in count by [`MAX_MINT_REQUESTS`] and the
+//! parent's queue by [`MAX_QUEUED_FRAMES`].
 //! * **Not claimed at all:** that every process which inherited the child's stdout has stopped.
 //!   The executor kills the child's process group and then asks whether the pipe closed; if it did
 //!   not, that is reported as an unknown and the seat is kept, which is the whole of the answer.
 //!   Anything that escaped the group is outside what this module can establish.
 //!
-//! Revocation is bounded separately and by the parent's own clock: while the child runs, the owner
-//! is re-asked at least every [`CANCELLATION_POLL`] — through the frame wait, through a write the
-//! child has not acknowledged, and through a mint whose reply the signer is holding. It does not
-//! depend on the child being quiet, and a child that floods the parent with frames cannot postpone
-//! it.
+//! Revocation is bounded separately and by the parent's own clock. While the child runs, every wait
+//! in the delivery — the frame wait, a write the child has not acknowledged, and a mint whose reply
+//! the signer is holding — is cut at ONE shared next-ask deadline held in [`PollClock`], and each
+//! ask re-arms it. It does not depend on the child being quiet, and a child that floods the parent
+//! with frames cannot postpone it.
+//!
+//! The exact claim, because the obvious stronger one is false: NO WAIT OUTLIVES THE SHARED NEXT
+//! ASK. The wall-clock interval between two authority observations is [`CANCELLATION_POLL`] plus
+//! the synchronous parent work between one wait returning and the next ask — frame decode, encode
+//! and allocation of the next frame, and process spawn on the first pass. That work runs on this
+//! thread and no clock inside this module can interrupt it; it is accounted for as the progressing
+//! -phase allowance on [`CANCELLATION_POLL`], not hidden inside a flat "every 50 ms". Independent
+//! per-wait slices — the previous design — allowed several full intervals to pass between
+//! observations while the delivery was making progress; that is what the shared deadline removes.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -574,6 +614,10 @@ pub struct KillableChild {
     child: Option<Child>,
     pid: i32,
     reaped: bool,
+    /// Time already spent waiting for THIS child's exit, across every `kill_and_reap` call made on
+    /// it. [`REAP_BOUND`] is charged against this total rather than against one call, so the
+    /// retries on the failing path cannot multiply the advertised window. See `kill_and_reap`.
+    spent_reaping: Duration,
 }
 
 impl KillableChild {
@@ -601,6 +645,7 @@ impl KillableChild {
             child: Some(child),
             pid,
             reaped: false,
+            spent_reaping: Duration::ZERO,
         })
     }
 
@@ -624,6 +669,17 @@ impl KillableChild {
     ///
     /// Returns how long the exit took to confirm, or [`ExecutorError::Unreaped`] if the child was
     /// still not gone after [`REAP_BOUND`] — in which case the caller must NOT release the turn.
+    ///
+    /// [`REAP_BOUND`] IS A BUDGET FOR THE CHILD, NOT FOR ONE CALL. A child that does not exit is
+    /// killed and waited for more than once on the failing path: `drive` kills it, the cleanup that
+    /// follows normalizes the outcome, and [`Drop`] kills again behind every return, panic and
+    /// early exit. When each of those calls started its own full window, an unconfirmed exit cost
+    /// three consecutive [`REAP_BOUND`] waits, and the seat's advertised `deadline + 2 *
+    /// REAP_BOUND` — which allows ONE reap window and ONE end-of-file window — was understated by
+    /// the retries, on exactly the path where the numbers matter. The time already spent waiting
+    /// for THIS child is therefore accumulated and charged against the same budget, so the second
+    /// and third attempts re-send the signal, poll the exit ONCE, and return what they find.
+    /// Repeated attempts change the certainty of the outcome, never the bound.
     pub fn kill_and_reap(&mut self) -> Result<Duration, ExecutorError> {
         let started = Instant::now();
         if self.reaped {
@@ -646,18 +702,23 @@ impl KillableChild {
         loop {
             match child.try_wait() {
                 Ok(Some(_status)) => {
+                    self.spent_reaping += started.elapsed();
                     self.reaped = true;
                     return Ok(started.elapsed());
                 }
                 Ok(None) => {
-                    if started.elapsed() >= REAP_BOUND {
-                        return Err(ExecutorError::Unreaped {
-                            waited: started.elapsed(),
-                        });
+                    // Against the CHILD's budget, not this call's elapsed time. An exhausted budget
+                    // means this attempt has already polled the exit once above and found it
+                    // absent, which is the whole of what a further wait could add.
+                    let waited = self.spent_reaping + started.elapsed();
+                    if waited >= REAP_BOUND {
+                        self.spent_reaping = waited;
+                        return Err(ExecutorError::Unreaped { waited });
                     }
                     std::thread::sleep(Duration::from_millis(2));
                 }
                 Err(error) => {
+                    self.spent_reaping += started.elapsed();
                     // NOT `Protocol`: an unknown exit must not be able to wear a name the release
                     // rule lets through. See [`ExecutorError::WaitFailed`].
                     return Err(ExecutorError::WaitFailed {
@@ -699,7 +760,31 @@ impl Drop for KillableChild {
 /// refused there, where it can still be reported, rather than discovered by the reader after the
 /// bytes are already in the pipe.
 pub fn encode_frame<T: Serialize>(frame: &T) -> std::io::Result<String> {
-    let mut line = serde_json::to_string(frame)
+    // CAPPED DURING SERIALIZATION, not after it. Checking `line.len()` against the cap once
+    // `to_string` had returned meant the complete value was materialized first: the cap bounded
+    // what this parent would WRITE, and bounded nothing about the work and the allocation it did to
+    // find out. That matters here and not only in general — encoding runs SYNCHRONOUSLY on the
+    // supervisor thread, between the waits the deadline is enforced in, so an oversized value would
+    // have been an unbounded phase inside a module whose whole claim is bounded ones. Serializing
+    // into a sink that stops at the cap makes the worst case a fixed [`MAX_FRAME_BYTES`] of work
+    // regardless of how large the value is.
+    let mut sink = CappedLine {
+        bytes: Vec::new(),
+        capped: false,
+    };
+    if let Err(error) = serde_json::to_writer(&mut sink, frame) {
+        if sink.capped {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "refusing to write a frame over this protocol's {MAX_FRAME_BYTES}-byte cap; \
+                     encoding was stopped AT the cap rather than completed and measured"
+                ),
+            ));
+        }
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+    }
+    let mut line = String::from_utf8(sink.bytes)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     if line.len() > MAX_FRAME_BYTES {
         return Err(std::io::Error::new(
@@ -712,6 +797,35 @@ pub fn encode_frame<T: Serialize>(frame: &T) -> std::io::Result<String> {
     }
     line.push('\n');
     Ok(line)
+}
+
+/// A `Write` sink that accepts at most [`MAX_FRAME_BYTES`] and then refuses, so an over-cap frame
+/// is abandoned mid-encode instead of being built and measured.
+struct CappedLine {
+    /// Bytes, not a `String`: a single `write` may land inside a multi-byte character, and a lossy
+    /// per-chunk conversion would change the length being measured against the cap.
+    bytes: Vec<u8>,
+    /// Set when a write was refused for the cap, so the caller can tell that stop apart from a
+    /// serializer fault without inspecting an error string.
+    capped: bool,
+}
+
+impl Write for CappedLine {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.bytes.len() + buf.len() > MAX_FRAME_BYTES {
+            self.capped = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "frame exceeds this protocol's cap",
+            ));
+        }
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 pub fn write_frame<W: Write, T: Serialize>(out: &mut W, frame: &T) -> std::io::Result<()> {
@@ -1044,6 +1158,69 @@ fn relay_stderr(stream: std::process::ChildStderr) {
     });
 }
 
+/// ONE next-ask deadline, shared by every wait in a delivery.
+///
+/// Slicing each wait at [`CANCELLATION_POLL`] *independently* is not the bound it looks like. After
+/// an ask at `t0`, a frame/mint/write sequence that finishes at `t0 + 49ms` is not a timeout, so no
+/// arm re-asks; the next wait then starts a FULL fresh 50 ms slice and the owner is not observed
+/// until `t0 + 99ms`. Nested mint and ACK waits made it worse: each began its own full slice with
+/// no knowledge of when the last ask happened, so progressing execution — not a stall — could run
+/// several slices between observations. The interval was a property of each individual wait, and
+/// the claim was about the delivery.
+///
+/// This makes it one clock. Every wait is cut at `next_ask`, whoever is waiting, and every ask
+/// re-arms `next_ask` from the moment of the ask. A wait that returns early does not earn its
+/// successor a fresh slice.
+///
+/// WHAT THIS BOUNDS, EXACTLY: no wait in a delivery blocks past `next_ask`. The interval between
+/// two authority observations is therefore [`CANCELLATION_POLL`] plus the SYNCHRONOUS parent work
+/// that runs between one wait returning and the next ask — frame decode, the encode/allocate of the
+/// next frame, and the spawn on the first pass. That work is not interruptible from this thread and
+/// is NOT covered by this clock; it is bounded only by the progressing-phase allowance documented
+/// on [`CANCELLATION_POLL`]. The honest statement is "no wait outlives the shared next ask", not
+/// "the owner is observed every 50 ms of wall clock".
+struct PollClock {
+    next_ask: Instant,
+}
+
+impl PollClock {
+    /// Arm the first interval from now. The delivery has just asked — the caller checked authority
+    /// before spawning — so the first ask is due one full interval from here, not immediately.
+    fn armed_now() -> Self {
+        Self {
+            next_ask: Instant::now() + CANCELLATION_POLL,
+        }
+    }
+
+    /// Ask the owner if the shared deadline has arrived, and re-arm from the ask itself.
+    ///
+    /// Re-arming from `Instant::now()` AFTER the call, rather than from `next_ask`, means a slow
+    /// authority backend cannot make the parent ask in a tight loop to "catch up" on intervals it
+    /// spent inside the check.
+    fn ask_if_due(&mut self, authority: &crate::git_transport::AuthorityCheck) -> Result<(), String> {
+        if Instant::now() >= self.next_ask {
+            authority()?;
+            self.observed();
+        }
+        Ok(())
+    }
+
+    /// Record an authority observation made by the caller — the child's own `Check`, or an arm that
+    /// asked directly. Answering the child and asking the owner are the same call, so it counts.
+    fn observed(&mut self) {
+        self.next_ask = Instant::now() + CANCELLATION_POLL;
+    }
+
+    /// The longest this wait may block: never past the shared next ask, never past `left`.
+    ///
+    /// A zero slice is deliberate rather than guarded against. If the ask is already due the wait
+    /// returns immediately and the next `ask_if_due` performs it; a floor here would let a wait
+    /// outlive the deadline it exists to enforce, which is the exact overshoot being fixed.
+    fn slice(&self, left: Duration) -> Duration {
+        left.min(self.next_ask.saturating_duration_since(Instant::now()))
+    }
+}
+
 fn drive(
     writer: &mut Writer,
     frames: &Receiver<std::io::Result<Option<ToParent>>>,
@@ -1058,7 +1235,7 @@ fn drive(
     let mut mints: u32 = 0;
     // When the owner was last asked. The caller checked authority immediately before the spawn, so
     // the interval starts there rather than at an epoch that would force a redundant first ask.
-    let mut last_asked = Instant::now();
+    let mut poll_clock = PollClock::armed_now();
 
     loop {
         let now = Instant::now();
@@ -1083,12 +1260,13 @@ fn drive(
         //
         // Asking on ELAPSED TIME instead makes the interval a property of the parent's clock, which
         // is what was claimed. Traffic can no longer outrun it.
-        if last_asked.elapsed() >= CANCELLATION_POLL {
-            if let Err(why) = authority() {
-                let reap = child.kill_and_reap()?;
-                return Err(ExecutorError::Revoked { why, reap });
-            }
-            last_asked = Instant::now();
+        //
+        // The check is now against a SHARED next-ask deadline rather than this loop's own elapsed
+        // time, so a wait that returned early somewhere below does not buy the next one a fresh
+        // full interval.
+        if let Err(why) = poll_clock.ask_if_due(authority) {
+            let reap = child.kill_and_reap()?;
+            return Err(ExecutorError::Revoked { why, reap });
         }
         // The one job, written INSIDE the deadline rather than before the first check of it. A
         // child that never reads its stdin used to park this thread here, before any phase this
@@ -1131,13 +1309,14 @@ fn drive(
                 child,
                 "writing the push request",
                 authority,
+                &mut poll_clock,
             )?;
             continue;
         }
         // Bounded by the cancellation poll, not only by the deadline: see [`CANCELLATION_POLL`].
         // Every wait in this loop is short enough that the owner is re-asked while the child works,
         // rather than only when the clock runs out.
-        let poll = left.min(CANCELLATION_POLL);
+        let poll = poll_clock.slice(left);
         match frames.recv_timeout(poll) {
             Ok(Ok(Some(ToParent::Hello { version, .. }))) => {
                 if version != PROTOCOL_VERSION {
@@ -1208,7 +1387,13 @@ fn drive(
                         let reap = child.kill_and_reap()?;
                         return Err(ExecutorError::Killed { after, reap });
                     };
-                    let slice = left_for_mint.min(CANCELLATION_POLL);
+                    // Cut at the SHARED next ask, not at a fresh full interval of this wait's own.
+                    // A mint entered 40 ms after the last ask gets 10 ms, not 50.
+                    if let Err(why) = poll_clock.ask_if_due(authority) {
+                        let reap = child.kill_and_reap()?;
+                        return Err(ExecutorError::Revoked { why, reap });
+                    }
+                    let slice = poll_clock.slice(left_for_mint);
                     match answer_rx.recv_timeout(slice) {
                         Ok(Ok(header)) => {
                             break ToChild::Minted {
@@ -1227,7 +1412,7 @@ fn drive(
                                 let reap = child.kill_and_reap()?;
                                 return Err(ExecutorError::Revoked { why, reap });
                             }
-                            last_asked = Instant::now();
+                            poll_clock.observed();
                         }
                         // The signer did not answer inside this delivery's own deadline (or died
                         // trying). The work is stopped the same way any other overrun is stopped.
@@ -1245,6 +1430,7 @@ fn drive(
                     child,
                     "answering a mint request",
                     authority,
+                    &mut poll_clock,
                 )?;
             }
             Ok(Ok(Some(ToParent::Check { phase }))) => {
@@ -1265,7 +1451,7 @@ fn drive(
                 // frequently from making the parent ask more often than its own poll, while the
                 // elapsed-time check above keeps one that checks constantly from making it ask
                 // less.
-                last_asked = Instant::now();
+                poll_clock.observed();
                 stalled_write(
                     writer,
                     &ToChild::Authority {
@@ -1275,6 +1461,7 @@ fn drive(
                     child,
                     "answering an authority check",
                     authority,
+                    &mut poll_clock,
                 )?;
                 // ANSWERED, THEN ENDED. Telling the child its leg is refused is not the same as
                 // ending the delivery, and this arm used to do only the first: a child that kept
@@ -1348,7 +1535,7 @@ fn drive(
                         let reap = child.kill_and_reap()?;
                         return Err(ExecutorError::Revoked { why, reap });
                     }
-                    last_asked = Instant::now();
+                    poll_clock.observed();
                     continue;
                 }
                 let overrun = Instant::now().saturating_duration_since(deadline);
@@ -1379,6 +1566,11 @@ fn drive(
 ///    arrived during it was not acted on until the clock ran out. The wait is now sliced, and the
 ///    owner is asked on every slice — so the write leg has the same revocation bound the frame loop
 ///    claims, instead of being the one place the claim did not hold.
+/// 3. Those slices used to be a full [`CANCELLATION_POLL`] each, measured from the moment this
+///    function was entered and unaware of when the owner was last asked. A write begun 45 ms after
+///    an ask therefore waited until 95 ms past it. It now shares the caller's [`PollClock`], so the
+///    first slice is only what is left of the current interval, and an ask made in here is visible
+///    to the drive loop when the write returns.
 fn stalled_write(
     writer: &mut Writer,
     frame: &ToChild,
@@ -1386,6 +1578,7 @@ fn stalled_write(
     child: &mut KillableChild,
     what: &str,
     authority: &crate::git_transport::AuthorityCheck,
+    poll_clock: &mut PollClock,
 ) -> Result<(), ExecutorError> {
     if let Err(WriteStall::Failed(why)) = writer.send_frame(frame) {
         // Reap BEFORE reporting. A write error used to return straight out of `drive` past a
@@ -1400,7 +1593,11 @@ fn stalled_write(
             let reap = child.kill_and_reap()?;
             return Err(ExecutorError::Killed { after, reap });
         };
-        let slice = left.min(CANCELLATION_POLL);
+        if let Err(why) = poll_clock.ask_if_due(authority) {
+            let reap = child.kill_and_reap()?;
+            return Err(ExecutorError::Revoked { why, reap });
+        }
+        let slice = poll_clock.slice(left);
         match writer.await_ack(slice) {
             Ok(()) => return Ok(()),
             Err(WriteStall::TimedOut) => {
@@ -1409,6 +1606,7 @@ fn stalled_write(
                         let reap = child.kill_and_reap()?;
                         return Err(ExecutorError::Revoked { why, reap });
                     }
+                    poll_clock.observed();
                     continue;
                 }
                 let after = Instant::now().saturating_duration_since(deadline);
