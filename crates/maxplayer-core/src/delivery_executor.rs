@@ -151,10 +151,33 @@
 //! # What is deliberately NOT claimed
 //!
 //! Not an unconditional wall-clock guarantee. Not protection against a wedged filesystem. Not a
-//! bound on a machine whose scheduler has stopped running this process. The honest claim is:
-//! *within the deadline plus the reap bound, in every state the kernel lets a process leave, the
-//! delivery's local work has stopped and the seat is free; in the states it does not, the seat stays
-//! held and says so.*
+//! bound on a machine whose scheduler has stopped running this process.
+//!
+//! And not `deadline + REAP_BOUND` for the SEAT. That sentence used to stand here and it was
+//! wider than the code: releasing the seat needs two separate windows, not one. The kill and the
+//! confirmed exit are bounded by [`REAP_BOUND`]; observing end of file on the child's stdout is a
+//! SECOND window of up to [`REAP_BOUND`] which starts after the reap, because a descriptor that
+//! something else inherited stays open after the process we killed is gone. Stating one bound for
+//! two consecutive waits understated the worst case by a whole reap bound.
+//!
+//! The claims that hold, each said only as wide as it is:
+//!
+//! * **The child.** Within `deadline + REAP_BOUND` the child process has been killed and its exit
+//!   confirmed, or the executor says it could not confirm it and the seat stays held.
+//! * **The seat.** Within `deadline + 2 * REAP_BOUND` the turn has been handed on, or it is
+//!   retained for the life of this process with the reason named
+//!   ([`ExecutorError::Unreaped`], [`ExecutorError::CleanupUnbounded`],
+//!   [`ExecutorError::CleanupUnobserved`], [`ExecutorError::WaitFailed`]).
+//! * **Not claimed at all:** that every process which inherited the child's stdout has stopped.
+//!   The executor kills the child's process group and then asks whether the pipe closed; if it did
+//!   not, that is reported as an unknown and the seat is kept, which is the whole of the answer.
+//!   Anything that escaped the group is outside what this module can establish.
+//!
+//! Revocation is bounded separately and by the parent's own clock: while the child runs, the owner
+//! is re-asked at least every [`CANCELLATION_POLL`] — through the frame wait, through a write the
+//! child has not acknowledged, and through a mint whose reply the signer is holding. It does not
+//! depend on the child being quiet, and a child that floods the parent with frames cannot postpone
+//! it.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -964,9 +987,13 @@ impl Writer {
         }
     }
 
-    /// Write one frame, or report that the write did not COMPLETE inside `left`. A timeout here is
-    /// not an error about the frame: it is a stalled parent phase, and the caller kills on it.
-    fn write(&mut self, frame: &ToChild, left: Duration) -> Result<(), WriteStall> {
+    /// Hand one frame to the writer thread. Encoding happens HERE, before any wait is sized, so the
+    /// time it costs is the parent's and not silently added to what the child is allowed.
+    ///
+    /// Split from [`Self::await_ack`] on purpose: this call and the wait for the acknowledgement are
+    /// two phases, and sizing the second from a duration measured before the first is exactly how a
+    /// bound drifts. The caller measures again between them.
+    fn send_frame(&mut self, frame: &ToChild) -> Result<(), WriteStall> {
         let line = encode_frame(frame).map_err(|error| WriteStall::Failed(error.to_string()))?;
         let Some(lines) = self.lines.as_ref() else {
             return Err(WriteStall::Failed("the writer is closed".to_owned()));
@@ -976,7 +1003,14 @@ impl Writer {
                 "the delivery push child's stdin is closed".to_owned(),
             ));
         }
-        match self.acks.recv_timeout(left) {
+        Ok(())
+    }
+
+    /// Wait up to `slice` for the writer thread to say the frame is gone. [`WriteStall::TimedOut`]
+    /// means only "not yet within this slice" — the caller decides whether that slice was a
+    /// cancellation tick or the end of the deadline.
+    fn await_ack(&mut self, slice: Duration) -> Result<(), WriteStall> {
+        match self.acks.recv_timeout(slice) {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => Err(WriteStall::Failed(error.to_string())),
             Err(RecvTimeoutError::Disconnected) => Err(WriteStall::Failed(
@@ -1022,6 +1056,9 @@ fn drive(
     let mut said_hello = false;
     let mut sent_request = false;
     let mut mints: u32 = 0;
+    // When the owner was last asked. The caller checked authority immediately before the spawn, so
+    // the interval starts there rather than at an epoch that would force a redundant first ask.
+    let mut last_asked = Instant::now();
 
     loop {
         let now = Instant::now();
@@ -1034,6 +1071,25 @@ fn drive(
                 reap,
             });
         };
+        // THE POLL IS A CLOCK, NOT A CONSEQUENCE OF SILENCE.
+        //
+        // Revocation used to be acted on in exactly one place: the arm that runs when no frame
+        // arrived within the slice. That made the whole "the owner is re-asked every
+        // CANCELLATION_POLL" claim conditional on the child being QUIET. A child that kept the
+        // parent busy — authority checks in a loop, or any other frame faster than the slice — was
+        // never a timeout, so the owner was never re-asked, and the delivery ran to its deadline no
+        // matter when authority ended. The bound held for well-behaved children and failed for
+        // exactly the ones it exists for.
+        //
+        // Asking on ELAPSED TIME instead makes the interval a property of the parent's clock, which
+        // is what was claimed. Traffic can no longer outrun it.
+        if last_asked.elapsed() >= CANCELLATION_POLL {
+            if let Err(why) = authority() {
+                let reap = child.kill_and_reap()?;
+                return Err(ExecutorError::Revoked { why, reap });
+            }
+            last_asked = Instant::now();
+        }
         // The one job, written INSIDE the deadline rather than before the first check of it. A
         // child that never reads its stdin used to park this thread here, before any phase this
         // loop bounds, with the kill unreachable behind it.
@@ -1048,16 +1104,33 @@ fn drive(
             // duration is a ceiling the child can never exceed, and the absolute instant is what
             // makes the pipe transit the child's cost instead of a free extension. The child takes
             // whichever is smaller. See [`PushRequest::deadline_unix_ms`].
+            //
+            // THE CLONE HAPPENS FIRST, and the clock is read after it. It used to be the other way
+            // round: `left` was measured at the top of the loop, the request was then cloned, and
+            // the absolute stamp was computed as a FRESH wall-clock now plus that already-stale
+            // duration. Copying the request is parent work, and adding a duration measured before
+            // it to an instant measured after it handed the child exactly that copy time as extra
+            // life. Both fields now come from one pair of readings taken here, with nothing but the
+            // arithmetic between them.
             let mut request = request.clone();
-            request.budget_ms = u64::try_from(left.as_millis()).unwrap_or(u64::MAX);
-            request.deadline_unix_ms = now_unix_ms().saturating_add(request.budget_ms);
+            let at = Instant::now();
+            let at_ms = now_unix_ms();
+            let Some(remaining) = deadline.checked_duration_since(at) else {
+                let reap = child.kill_and_reap()?;
+                return Err(ExecutorError::Killed {
+                    after: at.saturating_duration_since(deadline),
+                    reap,
+                });
+            };
+            request.budget_ms = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
+            request.deadline_unix_ms = at_ms.saturating_add(request.budget_ms);
             stalled_write(
                 writer,
                 &ToChild::Push(request),
-                left,
                 deadline,
                 child,
                 "writing the push request",
+                authority,
             )?;
             continue;
         }
@@ -1110,46 +1183,68 @@ fn drive(
                 // being held, must not be able to stop the parent from issuing the kill. The
                 // abandoned thread carries no lock of ours and is bounded by the minter's own push
                 // deadline; the private key never leaves the actor either way.
-                let Some(left_for_mint) = deadline.checked_duration_since(Instant::now()) else {
-                    let after = Instant::now().saturating_duration_since(deadline);
-                    let reap = child.kill_and_reap()?;
-                    return Err(ExecutorError::Killed { after, reap });
-                };
                 let (answered, answer_rx) = channel();
                 let minter = std::sync::Arc::clone(mint);
                 let target = destination.clone();
                 std::thread::spawn(move || {
                     let _ = answered.send(minter(&target));
                 });
-                let answer = match answer_rx.recv_timeout(left_for_mint) {
-                    Ok(Ok(header)) => ToChild::Minted {
-                        header: Some(header),
-                        refused: None,
-                    },
-                    Ok(Err(refused)) => ToChild::Minted {
-                        header: None,
-                        refused: Some(refused),
-                    },
-                    // The signer did not answer inside this delivery's own deadline (or died
-                    // trying). The work is stopped the same way any other overrun is stopped.
-                    Err(_) => {
-                        let after = Instant::now().saturating_duration_since(deadline);
+                // WAITED FOR IN SLICES, so a held signer reply is not also a hole in the revocation
+                // bound. This used to be one `recv_timeout` for the whole remaining deadline: a
+                // signer that answered slowly — the realistic case, since a mint is a round trip
+                // into an actor that can be busy or saturated — meant the owner was not asked again
+                // until the clock ran out, however long that was. The mint is the longest wait in
+                // the protocol and it was the one wait nobody polled through.
+                //
+                // Revoked DURING the mint is the case that matters: the thread minting is
+                // abandoned, and whatever it eventually produces is dropped on this side of the
+                // pipe. A token for a delivery whose owner is gone is never written to the child,
+                // so it never reaches the wire — which is the property the post-mint check states
+                // and this is what makes it hold while the mint is still outstanding.
+                let answer = loop {
+                    let now = Instant::now();
+                    let Some(left_for_mint) = deadline.checked_duration_since(now) else {
+                        let after = now.saturating_duration_since(deadline);
                         let reap = child.kill_and_reap()?;
                         return Err(ExecutorError::Killed { after, reap });
+                    };
+                    let slice = left_for_mint.min(CANCELLATION_POLL);
+                    match answer_rx.recv_timeout(slice) {
+                        Ok(Ok(header)) => {
+                            break ToChild::Minted {
+                                header: Some(header),
+                                refused: None,
+                            }
+                        }
+                        Ok(Err(refused)) => {
+                            break ToChild::Minted {
+                                header: None,
+                                refused: Some(refused),
+                            }
+                        }
+                        Err(RecvTimeoutError::Timeout) if slice < left_for_mint => {
+                            if let Err(why) = authority() {
+                                let reap = child.kill_and_reap()?;
+                                return Err(ExecutorError::Revoked { why, reap });
+                            }
+                            last_asked = Instant::now();
+                        }
+                        // The signer did not answer inside this delivery's own deadline (or died
+                        // trying). The work is stopped the same way any other overrun is stopped.
+                        Err(_) => {
+                            let after = Instant::now().saturating_duration_since(deadline);
+                            let reap = child.kill_and_reap()?;
+                            return Err(ExecutorError::Killed { after, reap });
+                        }
                     }
-                };
-                let Some(left_to_answer) = deadline.checked_duration_since(Instant::now()) else {
-                    let after = Instant::now().saturating_duration_since(deadline);
-                    let reap = child.kill_and_reap()?;
-                    return Err(ExecutorError::Killed { after, reap });
                 };
                 stalled_write(
                     writer,
                     &answer,
-                    left_to_answer,
                     deadline,
                     child,
                     "answering a mint request",
+                    authority,
                 )?;
             }
             Ok(Ok(Some(ToParent::Check { phase }))) => {
@@ -1165,19 +1260,32 @@ fn drive(
                 let refused = authority()
                     .err()
                     .map(|ended| format!("{ended} (at {phase})"));
-                let Some(left_to_answer) = deadline.checked_duration_since(Instant::now()) else {
-                    let after = Instant::now().saturating_duration_since(deadline);
-                    let reap = child.kill_and_reap()?;
-                    return Err(ExecutorError::Killed { after, reap });
-                };
+                // This IS an ask, so it restarts the interval. Answering the child's question and
+                // asking the owner are the same call; counting it keeps a child that checks
+                // frequently from making the parent ask more often than its own poll, while the
+                // elapsed-time check above keeps one that checks constantly from making it ask
+                // less.
+                last_asked = Instant::now();
                 stalled_write(
                     writer,
-                    &ToChild::Authority { refused },
-                    left_to_answer,
+                    &ToChild::Authority {
+                        refused: refused.clone(),
+                    },
                     deadline,
                     child,
                     "answering an authority check",
+                    authority,
                 )?;
+                // ANSWERED, THEN ENDED. Telling the child its leg is refused is not the same as
+                // ending the delivery, and this arm used to do only the first: a child that kept
+                // asking was told "no" every time and went on running until the deadline. The
+                // refusal goes out first — the child is owed a current answer — and then this
+                // delivery stops, with the child killed and its exit confirmed, because authority
+                // ending is the end of the work and not a property of one leg.
+                if let Some(why) = refused {
+                    let reap = child.kill_and_reap()?;
+                    return Err(ExecutorError::Revoked { why, reap });
+                }
             }
             Ok(Ok(Some(ToParent::Done { oid, error }))) => {
                 // The child says it is finished; that is not the same as being gone. Reap before
@@ -1236,6 +1344,7 @@ fn drive(
                         let reap = child.kill_and_reap()?;
                         return Err(ExecutorError::Revoked { why, reap });
                     }
+                    last_asked = Instant::now();
                     continue;
                 }
                 let overrun = Instant::now().saturating_duration_since(deadline);
@@ -1251,26 +1360,61 @@ fn drive(
 
 /// One parent write, with the deadline on it and the kill behind it. A write that does not complete
 /// in time is the same overrun as any other, and is stopped the same way.
+/// Write one frame to the child within the delivery's absolute deadline, re-asking the owner every
+/// [`CANCELLATION_POLL`] while the write is outstanding.
+///
+/// Two things this fixes, and both were real holes rather than tidiness:
+///
+/// 1. The wait used to be sized by a duration measured at the top of the drive loop — before the
+///    frame was encoded and handed over. Encoding is parent work; charging it to nobody meant the
+///    acknowledgement could be waited for past the deadline it was supposed to sit inside. The
+///    remaining time is now recomputed from `deadline` AFTER the frame is on its way, and again on
+///    every slice, so no phase is paid for out of a duration measured before it started.
+/// 2. The wait used to be one uninterrupted block of the whole remaining deadline. A child that
+///    never drains its stdin parked the parent here for the entire budget, and a revocation that
+///    arrived during it was not acted on until the clock ran out. The wait is now sliced, and the
+///    owner is asked on every slice — so the write leg has the same revocation bound the frame loop
+///    claims, instead of being the one place the claim did not hold.
 fn stalled_write(
     writer: &mut Writer,
     frame: &ToChild,
-    left: Duration,
     deadline: Instant,
     child: &mut KillableChild,
     what: &str,
+    authority: &crate::git_transport::AuthorityCheck,
 ) -> Result<(), ExecutorError> {
-    match writer.write(frame, left) {
-        Ok(()) => Ok(()),
-        Err(WriteStall::TimedOut) => {
-            let after = Instant::now().saturating_duration_since(deadline);
+    if let Err(WriteStall::Failed(why)) = writer.send_frame(frame) {
+        // Reap BEFORE reporting. A write error used to return straight out of `drive` past a
+        // still-live child, leaving the kill to a `Drop` whose failure nobody could return.
+        child.kill_and_reap()?;
+        return Err(ExecutorError::Protocol(format!("{what}: {why}")));
+    }
+    loop {
+        let now = Instant::now();
+        let Some(left) = deadline.checked_duration_since(now) else {
+            let after = now.saturating_duration_since(deadline);
             let reap = child.kill_and_reap()?;
-            Err(ExecutorError::Killed { after, reap })
-        }
-        Err(WriteStall::Failed(why)) => {
-            // Reap BEFORE reporting. A write error used to return straight out of `drive` past a
-            // still-live child, leaving the kill to a `Drop` whose failure nobody could return.
-            child.kill_and_reap()?;
-            Err(ExecutorError::Protocol(format!("{what}: {why}")))
+            return Err(ExecutorError::Killed { after, reap });
+        };
+        let slice = left.min(CANCELLATION_POLL);
+        match writer.await_ack(slice) {
+            Ok(()) => return Ok(()),
+            Err(WriteStall::TimedOut) => {
+                if slice < left {
+                    if let Err(why) = authority() {
+                        let reap = child.kill_and_reap()?;
+                        return Err(ExecutorError::Revoked { why, reap });
+                    }
+                    continue;
+                }
+                let after = Instant::now().saturating_duration_since(deadline);
+                let reap = child.kill_and_reap()?;
+                return Err(ExecutorError::Killed { after, reap });
+            }
+            Err(WriteStall::Failed(why)) => {
+                child.kill_and_reap()?;
+                return Err(ExecutorError::Protocol(format!("{what}: {why}")));
+            }
         }
     }
 }
