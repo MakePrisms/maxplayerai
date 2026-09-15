@@ -14,7 +14,7 @@ and gives the rung in parentheses, so you never have to memorize a number.
 | --- | --- | --- |
 | **Public** (rung 1) | The tool needs no credential, so it is installed in the job's container image and the job calls it directly. | Handled, but manual. |
 | **Direct token** (rung 2) | The job is handed a short-lived, job-scoped token the vendor can revoke or bind to job-close, so a leak is bounded and the job calls the vendor itself. | Handled, but manual, and its safe delivery is the deferred Proxy swap. |
-| **Proxy swap** (rung 3) | The job holds a placeholder credential and the host-side credential proxy swaps the real one into the outgoing request header, so the secret never enters the container. | Handled by configuration (`[[sandbox.mcp_tools]]`); accepted against GitHub, 2026-09-14. |
+| **Proxy swap** (rung 3) | The job holds a placeholder credential. The host-side credential proxy swaps the real one into the outgoing `Authorization` header, for the vendor host only. The host never hands the secret to the container. | Handled by configuration (`[[sandbox.mcp_tools]]`); accepted against GitHub, 2026-09-14; review round 2 fixes 2026-09-15. |
 | **Holder** (rung 4) | A persistent supervisor logs the real tool in one time and holds the session, exposing it to each job over a private socket while the credential and local files stay on the holder's side. | Handled and automated, and wired into the seller daemon (`[[sandbox.held_tools]]`, several tools per seat); proved live through the daemon code on 2026-09-14. |
 | **Dedicated machine** (rung 5) | For a login bound to a specific machine or hardware licence, the tool runs on a dedicated isolated machine rather than in the job container. | Not handled; deferred. |
 
@@ -32,8 +32,9 @@ way it does.
    exfiltrate a reusable secret. A short lifetime bounds the damage; it does not remove it. An
    expiring stolen token is not harmless.
 2. **Proxy swap.** The job holds a per-job placeholder. The proxy swaps the real credential in at
-   egress, only for an allowlisted host, and only for the life of the job. The job never holds the
-   real credential, and job-close-binding is enforced by the proxy, not by the vendor.
+   egress, only in the `Authorization` header, only for the vendor's host, and only for the life of
+   the job. The host never hands the job the real credential, and job-close-binding is enforced by
+   the proxy, not by the vendor. The residual path is the vendor itself: see the third point below.
 3. **Proxy swap plus a trusted operation filter (the Holder shape).** The job holds nothing that
    authenticates the vendor, its direct egress to the vendor is blocked, and a trusted mediator holds
    the credential and exposes only the allowed operations.
@@ -41,9 +42,18 @@ way it does.
 The Holder is form 3 for a local CLI: the holder holds the login, the job reaches it over a socket,
 and the holder validates each operation and confines file access.
 
-## Two things the proxy does NOT do
+## Three things the proxy does NOT do
 
 State these plainly, because a reader assumes more than the proxy gives.
+
+- **The proxy does not read the vendor's response for an encoded credential.** It scrubs the exact
+  bytes of the real value from the response stream. A vendor that reflects a request header into a
+  response body in another encoding (a JSON `\u` escape, base64) returns the real value in a form
+  the scrubber does not see. Review round 2 (2026-09-15) reproduced this with a synthetic vendor
+  that reflected a custom header. The fix scopes the swap: for an MCP tool the proxy substitutes the
+  placeholder in the `Authorization` header only, and a placeholder in any other header goes to the
+  vendor as the job wrote it. The residual risk is a vendor that reflects its own `Authorization`
+  header into a body. Do not onboard such a vendor on this route.
 
 - **The proxy does not constrain the operations or resources inside the vendor.** It allowlists the
   destination host and swaps auth. A job whose request reaches the allowlisted host with the
@@ -69,7 +79,8 @@ Built and green against synthetic fakes:
   and an optional `transport` (`stdio`, the default, or `http`). `McpToolConfig` in
   `crates/maxplayer-core/src/home.rs`.
 - **Wiring.** `seller_exec` reads the credential per job, mints a placeholder (`mxp-mcp-…`),
-  registers `(placeholder → real, upstream)` on the real proxy, and puts one MCP server entry on the
+  registers `(placeholder → real, upstream)` on the real proxy with the swap scoped to the
+  `Authorization` header (`HeaderScope::authorization`), and puts one MCP server entry on the
   agent's session. Both launch paths carry it: the host agent launch, and the container-delivery
   launch through `Phase1Inputs.mcp_servers`. A seat without the table is unchanged. The seller boot
   line names each tool, its route, and whether its credential file reads.

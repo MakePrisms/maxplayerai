@@ -6,11 +6,12 @@ findings, and the plan for the production integration that remains.
 
 Author: Petar's local agent, 2026-09-10.
 
-**Current state:** sections 10 and 11 — the Proxy swap route is coded, tested, and accepted against
+**Current state:** sections 10 to 12 — the Proxy swap route is coded, tested, and accepted against
 GitHub (2026-09-14); the Holder route is wired into the daemon and proved live through the daemon
 code (2026-09-14). The branch is pushed to `MakePrisms/maxplayerai` and under review as pull request
-#1004 (https://github.com/MakePrisms/maxplayerai/pull/1004), merged with `main` at `1569010`. Read
-sections 10 and 11 first if you are resuming.
+#1004 (https://github.com/MakePrisms/maxplayerai/pull/1004), merged with `main` at `1569010`. The
+first review round (Codex, 2026-09-15) returned eleven findings; section 12 records each one and its
+fix. Read sections 10 to 12 first if you are resuming.
 
 ## 1. What changed since `a0cc31d`
 
@@ -375,3 +376,64 @@ What remains, stated plainly: real-vendor acceptance of a real CLI inside a sell
 per vendor; and the review of pull request #1004. Petar gave the go to push and open it on 2026-09-14.
 `origin` (the `maxy-player` fork) refused the push — read access only — so the canonical repository
 `MakePrisms/maxplayerai` is the `upstream` remote and the pull request's home.
+
+## 12. Review round 2 — the Codex review of pull request #1004 (2026-09-15)
+
+Petar forwarded the review prompt from section 11 to a Codex agent. The verdict was "request
+changes" with eleven findings. Petar asked whether I agree and, if so, to fix them. I agree with all
+eleven. Two of them (2 and 1's proxy half) are defects the branch inherited from the credential proxy
+(`#647`) and exposed through the generic MCP route. The table names each finding, the fix, and the
+test that proves it.
+
+| # | Severity | Finding | Fix | Proof |
+| --- | --- | --- | --- | --- |
+| 1 | DENY | The proxy substituted the placeholder in EVERY header. A vendor that reflects a custom header into a body with `\u` escapes returned the credential past the byte scrubber. | `JobCredential.substitute_in: HeaderScope`. An MCP tool registers with `HeaderScope::authorization()`: the placeholder is recognized and substituted in `Authorization` only; any other header goes out as written; a placeholder only outside the scope is `NoKnownPlaceholder` (502). Env and file credentials keep `HeaderScope::Any`, the behavior they had. The docs now state the residual risk: a vendor that reflects its own `Authorization` header. | `credential_proxy`: `a_scoped_placeholder_is_substituted_only_in_its_own_header`, `a_scoped_placeholder_outside_its_header_identifies_nothing`, `a_scope_that_names_no_header_is_refused_at_registration`; `seller_exec::mcp_tool_tests::the_job_gets_the_tool_through_the_swap_and_never_the_credential` (the stub vendor records a reflected header and sees the placeholder). |
+| 2 | MUST-FIX | The redirect predicate compared authorities only: `https` to `http` on one host was approved, and `:443` equalled `:80`. | `allows_paired_redirect` compares ORIGINS: scheme, lowercased host, effective port (`origin_of`). `same_authority` no longer equates two different explicit ports. | `a_redirect_that_changes_the_scheme_or_the_port_is_refused`, `origins_parse_scheme_host_and_effective_port`, `an_explicit_default_port_matches_the_bare_host_but_not_another_port`; the existing redirect tests still pass. |
+| 3 | MUST-FIX | A holder connection resolved its job id through the table at call time, so a connection held across detach and re-attach of the same id used the NEW directory. | `tool-holderd`: an immutable `Attachment` instance per attach; the accept loop binds each connection to the instance; every call checks the instance's `stop` before validation, before the tool runs, and before each publish; a live id cannot be attached again. | `tests/attachment_binding.rs` (real daemon, fake vendor): `an_old_connection_is_refused_after_the_same_job_id_is_attached_elsewhere`, `attaching_a_live_job_id_is_refused`, `a_detach_while_the_tool_runs_publishes_nothing`. Against the `HEAD` daemon the first test fails as the reviewer described. |
+| 4 | MUST-FIX | A job-planted FIFO at an input or output name blocked a holder thread in `open`; an output FIFO could receive bytes after detach. | `safeio`: both opens add `O_NONBLOCK`; the held descriptor is `fstat`ed and must be a regular file before any read, before truncation (`set_len(0)` after the check), and before use; `ENXIO`, `EOPNOTSUPP`, `EISDIR` map to `NotARegularFile`. Connections per attachment are bounded (16); a job connection idles out in 30 s and a detached one ends. | `safeio::tests` (six, with `mkfifo`): the FIFO cases return at once and write nothing; `attachment_binding`: `a_fifo_planted_as_input_is_refused_at_once`, `a_fifo_planted_as_output_is_refused_and_receives_nothing`, `connections_over_the_bound_get_one_error_line_and_are_closed`. |
+| 5 | MUST-FIX | A start that failed after `docker run` (the subpath probe, the status wait) returned before any guard owned the container: an enrolled holder stayed running with no owner. | `HeldTool::start` arms a `StartGuard` before the first `docker` call and runs the rest in `start_owned`. A failure removes the container and the runtime volume on the async path; a cancellation removes them from the guard's drop. The state volume stays. | The unit tests cover the pure parts; the live rerun below covers the happy path. The failure path is by construction: every `?` in `start_owned` returns into the `Err` arm of `start`. |
+| 6 | MUST-FIX | `shutdown` set `stopped` and `detach` set `detached` BEFORE the docker call, so a failure disabled the drop fallback and `shutdown` reported a stop that did not happen. | Both set their flag only after a confirmed result: `remove_container` is `Ok` only when the container is gone (removed, or absent); `detach` is `Ok` on the holder's confirmation or its "no such attached job". Both return `Result` and the daemon logs an `Err`. | Type-level: the flag stores follow the `?`. `run.rs` handles every `Result` (five sites). |
+| 7 | MUST-FIX | Every `docker` call ran `Command::output()` with no deadline; a hung `docker exec` held boot or a job forever. | `run_bounded`: spawn, drain both pipes on threads, poll `try_wait`, kill and reap at the deadline; per-class deadlines (query 20 s, control 30 s, run 120 s, remove 60 s). The `Drop` fallbacks run through it too. | `a_bounded_docker_call_is_killed_at_its_deadline`. |
+| 8 | MUST-FIX | The HTTP bridge read a response to EOF before emitting anything and read stdin only between responses, so a server request sent mid-stream could never be answered. | `mcp-http-bridge` rewritten: a worker thread per stdin message; `http::request_streaming` and `SseSplitter` emit each JSON-RPC message when its event completes; stdin is read while a stream is open; a stdin line is classified (request, notification, response) and a response's `202` with an empty body draws no error line. `vendor-mcp --server-request` and the kit's `swap-proxy` test double stream too. | `proxy_swap_suite`: `the_bridge_relays_a_server_request_mid_stream_and_posts_the_answer_while_the_stream_is_open`, `the_bridge_serves_two_requests_at_once_and_each_reply_carries_its_own_id`; the six earlier suite tests pass on the new path. Limit: no `GET` stream for unsolicited server messages (documented in the binary). |
+| 9 | SHOULD-FIX | `mode = "launcher"` accepted both tool tables and then served no tool. | `SandboxPolicy::from_config` refuses a non-empty `mcp_tools` or `held_tools` under launcher mode. | `mcp_tool_tests::launcher_mode_refuses_both_tool_tables`. |
+| 10 | SHOULD-FIX | A boot removed only the configured holders' stale containers; a renamed or removed tool's holder from a killed daemon stayed. | `reconcile_stale_holders(seat, configured)` at boot (docker seats): `docker ps -a --filter label=maxplayer.held-tool.seat=<seat>`, remove every holder not named by the config and its runtime volume, keep state volumes. | `stale_holders_are_this_seats_unconfigured_holders_and_nothing_else` (the pure selection). |
+| 11 | SHOULD-FIX | The GitHub evidence README credited the redacted diagnostics capture as proof of the credential's absence; the redactor removes the value before that scan. | The README separates the RAW observations (`docker inspect` before cleanup, the docker argv, the session entry, the MCP transcript) from the redacted capture, and names the reflection limit. Live test A now reads `docker logs` of the job container raw, before the redacting capture, and asserts absence there. | The README text; the rerun below. |
+
+### Reruns on 2026-09-15, on the fixed tree and the rebuilt images
+
+- `cargo test -p maxplayer-tool-kit --locked`: 74 pass (was 52). `cargo test -p maxplayer-core`:
+  449 / 498 / 1564 / 1629 pass across the four feature rows (was 449 / 498 / 1555 / 1619). The CLI
+  rows: 161 of 162 and 199 of 200; the one failure in each is
+  `doctor::tests::sandbox_image_check_is_wired_into_the_boot_gate`, and its cause is now known and
+  is not the branch: Docker Desktop's credential helper (`docker-credential-desktop get`) hangs on
+  this machine, so `docker manifest inspect` never returns. The same test passes when the docker
+  client runs with an anonymous config that names no credential store.
+- Both images were rebuilt from this tree: `maxplayer-tool-kit:demo` (the new `tool-holderd` and
+  `safeio`) and `maxplayer-sandbox:tools` (the new `mcp-http-bridge`). The builds needed the
+  anonymous docker config for the same reason.
+- The Holder live proof with two tools
+  (`held_tool::live_tests::live_two_tools_serve_two_jobs_on_one_enrolment_each_and_a_restart_resumes_them`,
+  contained, network `maxplayer-jobs`) passed on the new lifecycle code: two enrolments, two jobs,
+  a restart that resumed both logins, confirmed shutdowns.
+- The GitHub acceptance of the Proxy swap route
+  (`mcp_tool_tests::live_a_the_bridge_in_the_sandbox_image_reaches_the_real_vendor_through_the_swap`,
+  contained) passed with the streaming bridge: `initialize`, `tools/list`, `get_me` → `pmilic021`,
+  a file read; the placeholder refused at GitHub and at the proxy; job end revoked it; and the new
+  raw `docker logs` read carried no token. The run's files were scanned for the token: none carries
+  it. The agent-turn live tests (`live_b`, `live_a_real_agent_turn…`) were not rerun; each spends a
+  model turn, and neither the launch path nor the ACP wire shape changed in this round.
+
+What stays open after this round, stated plainly:
+
+- The residual path of finding 1 is the vendor: a vendor that reflects its `Authorization` header
+  into a body. The proxy does not read bodies. The routing doc and the skill say not to onboard such a
+  vendor. Env and file credentials keep the any-header scope they had; a change there is a separate
+  decision, since a forwarded agent credential rides a vendor-specific header.
+- A detach does not kill a tool run in flight; the publish step refuses afterwards.
+- The bridge opens no `GET` stream. A server message that does not ride on a response to a client
+  request is not received.
+- The holder's connection bound (16) and idle timeout (30 s) are constants; the idle path has no test.
+- A cancelled `attach` future still completes its `docker exec` on the blocking pool (bounded now);
+  the endpoint it would have produced is not detached by anyone. The daemon never cancels an attach
+  except at shutdown, which removes the holder.
+

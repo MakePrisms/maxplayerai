@@ -23,11 +23,16 @@ it, and GitHub itself as the oracle.
 1. **The tool works through the swap.** GitHub's own server (`github-mcp-server`) answered every
    call. It authenticates nothing without the real token (measured: `401` with no bearer), so a
    `200` is GitHub's word that the real token arrived — swapped in by the proxy at egress.
-2. **The credential never entered the container.** `a-container-inspect.json` is `docker inspect`
-   of the job container: its environment carries only the git identity and the image's own
-   variables; its command carries the placeholder. The diagnostics capture (`a-diagnostics-*`,
-   `b-diagnostics-*`) is what the real cleanup path saved. The tests assert the token's absence
-   from all of it, and from the MCP transcript and the agent's reply.
+2. **The host handed the container no credential.** The RAW observations, none of them redacted:
+   `a-container-inspect.json` is `docker inspect` of the job container, read before cleanup (its
+   environment carries only the git identity and the image's own variables; its command carries
+   the placeholder); the docker argv the launch built; the session entry; and the MCP transcript
+   the test drove over the container's stdio. The test asserts the token's absence from each of
+   these. The diagnostics capture (`a-diagnostics-*`, `b-diagnostics-*`) is what the real cleanup
+   path saved, and that path REDACTS every real value the launch held. The token's absence there
+   proves the redactor, not the boundary. Review round 2 (2026-09-15) made this distinction; the
+   test now also reads `docker logs` of the job container raw, before the redacting capture, and
+   asserts the token's absence there (`a-container-logs-raw.txt` in a rerun).
 3. **The placeholder is worthless outside the job.** Sent straight to GitHub it gets `400` (GitHub
    answers `400` to a bearer that is not shaped like one of its tokens, `401` to a missing or
    GitHub-shaped bad one). An unknown placeholder at the proxy gets `502` with no substitution.
@@ -68,10 +73,26 @@ MAXPLAYER_MCP_LIVE_NETWORK=maxplayer-jobs MAXPLAYER_MCP_LIVE_PROXY_PORTS=49310-4
   cargo test -p maxplayer-core --features wallet,acp --lib -- --ignored --nocapture mcp_tool_tests::live_b
 ```
 
+## Rerun after review round 2 (2026-09-15)
+
+Run A was rerun, contained, on the tree that carries the review fixes (the swap scoped to the
+`Authorization` header, the origin-exact redirect rule, the streaming bridge) and on a sandbox image
+rebuilt from it. It passed: the same dialogue, the same refusals, the same revocation, and the new
+raw `docker logs` assertion. The run's files are not added to this bundle; the facts are recorded in
+`docs/handoff/CONTINUATION-2026-09-10.md`, section 12.
+
 ## Limits
 
 - One vendor, one credential shape (a static header-borne token). A vendor whose credential is not
   static, or not header-borne, is not covered.
+- The proxy scrubs the exact bytes of the token from the response stream and reads nothing else. A
+  vendor that reflects a request header into a body in another encoding is not caught by that
+  scrubber. Since 2026-09-15 the swap is scoped to the `Authorization` header, so a job cannot
+  choose the reflected header; GitHub does not reflect `Authorization`. This bundle does not prove
+  that for any other vendor.
+- For run B the container's environment and command come from the same `prepare_launch` and
+  `launch` code that run A inspected raw. Run B's own raw view is the ACP wire in
+  `b-diagnostics-logs.txt`, which the redacting capture saved.
 - The read-only endpoint and the read-only token together bound what a job can do. The proxy itself
   constrains the destination host, not the operations; that is the scope fork in doc 10, unchanged.
 - Run B is one agent turn with one tool call. It proves the harness maps the session entry and

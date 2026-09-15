@@ -266,15 +266,25 @@ Invariants the wiring enforces. Keep them true in any change.
 
 1. The host reads the credential per job and registers it on the proxy with one upstream: the
    scheme and host of `url`.
-2. The proxy substitutes in header values only, never in the body or the path.
+2. The proxy substitutes in header values only, never in the body or the path. For an MCP tool the
+   swap is scoped to the `Authorization` header. A placeholder in any other header goes to the
+   vendor as the job wrote it, and a placeholder that appears only outside `Authorization` is
+   refused at the proxy.
 3. An unreadable credential file fails the launch before any proxy listens. No fallback puts the
    real value in the container.
 4. Job end drops the proxy, which revokes the placeholder, open connections included.
+5. A redirect is followed only to the same origin: scheme, host and port. A redirect from `https`
+   to `http` on the same host is refused.
+6. The proxy does not read the response body for an encoded credential. A vendor that reflects its
+   `Authorization` header into a body can return the real value in an encoding the byte scrubber
+   does not see. Do not onboard such a vendor on this route.
 
 How to test, synthetically, both halves:
 
 - `cargo test -p maxplayer-tool-kit` — the bridge against a fake proxy and a fake vendor
-  (`tests/proxy_swap_suite.rs`), with SSE, a session id, chunked framing and notifications.
+  (`tests/proxy_swap_suite.rs`), with SSE, a session id, chunked framing, notifications, two
+  requests in flight at once, and a server request sent mid-stream that the bridge answers while
+  the stream is open.
 - `cargo test -p maxplayer-core --features wallet,acp mcp_tool` — the config, the session entry,
   and the real proxy against a stub vendor (`seller_exec::mcp_tool_tests`).
 

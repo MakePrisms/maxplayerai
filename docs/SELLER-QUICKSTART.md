@@ -850,16 +850,19 @@ Known limits of this mode:
 
 ### Offer a vendor MCP server to jobs — the Proxy swap (`[[sandbox.mcp_tools]]`)
 
-A docker seat can offer a vendor-hosted MCP server (GitHub's remote MCP, for example) to its jobs
-without the vendor credential ever entering the container. Per job, the host reads the credential
+A docker seat can offer a vendor-hosted MCP server (GitHub's remote MCP, for example) to its jobs.
+The host never hands the vendor credential to the container. Per job, the host reads the credential
 from a file you name, mints a placeholder, and registers the pair on the credential proxy. The job's
 agent gets an MCP server entry that carries only the placeholder and the proxy's address. The proxy
-swaps the real credential in at egress, for the vendor's host only, for the life of the job only. A
-leaked placeholder is worthless: the vendor rejects it, and the proxy forgets it at job end.
+swaps the real credential in at egress, in the `Authorization` header only, for the vendor's host
+only, for the life of the job only. A leaked placeholder is worthless: the vendor rejects it, and the
+proxy forgets it at job end.
 
 Scope the credential at the vendor. The proxy constrains the destination, not the operations, so a
 broad credential stays broad behind it. For GitHub: a fine-grained personal access token, read-only,
-on one repository.
+on one repository. The proxy also does not read the vendor's response body. A vendor that reflects
+its `Authorization` header into a response body can return the real value in an encoding the proxy
+does not scrub. Do not offer such a vendor on this route.
 
 ```toml
 [sandbox]
