@@ -373,9 +373,16 @@ impl RetainedOwner {
     ///
     /// Per name, exactly one of three daemon observations, and a query that fails is none of them:
     ///  * `inspect` finds it: it LANDED. Remove it and confirm it gone; only then is it discharged.
-    ///  * `inspect` says absent AND the daemon's event log since the request shows a container under
-    ///    this exact name: it landed and something already removed it. Discharged, and said so.
-    ///  * Anything else: still owed. Absence alone is what the previous version mistook for proof.
+    ///  * `inspect` says absent AND the daemon's event log since the request shows a COMPLETED
+    ///    lifecycle under this exact name — a `create` and a `destroy` for the SAME container id,
+    ///    and no id created under the name that lacks its `destroy` — AND a second `inspect`, taken
+    ///    AFTER the event query, still says absent. Then it landed and is already gone. Discharged.
+    ///  * Anything else: still owed. Absence alone is what the first version mistook for proof, and
+    ///    "any event under the name" is what the second did: an inspect that says absent, a landing
+    ///    a moment later and an event log that then shows that landing's `create` is a LIVE
+    ///    container, and the previous version discharged it on exactly that evidence. A `create`
+    ///    without its `destroy` now keeps the name owed; the next attempt finds it present and
+    ///    removes it.
     fn watch_for_landing(self, issued: std::time::SystemTime) -> Custody {
         let mut still_owed = Vec::new();
         for name in &self.names {
@@ -394,13 +401,32 @@ impl RetainedOwner {
                         still_owed.push(name.clone());
                     }
                 }
-                Some(true) => match landed_since(&self.client, name, issued) {
-                    Some(true) => eprintln!(
-                        "sandbox: the daemon's event log shows {name} was created after its \
-                         unanswered request and is now gone — discharged on that observation"
-                    ),
-                    Some(false) | None => still_owed.push(name.clone()),
-                },
+                Some(true) => {
+                    let lifecycle = lifecycle_since(&self.client, name, issued, self.bounds.confirm);
+                    // The order of these three observations is the evidence: absent, then the
+                    // daemon's record that what was created under this name has ALSO been destroyed,
+                    // then absent AGAIN after that record was read. A landing between the first
+                    // inspect and the event query shows up as a `create` with no `destroy` and is
+                    // retained; a landing after the event query shows up in the second inspect.
+                    let completed_and_gone = lifecycle == Some(Lifecycle::Completed)
+                        && container_is_absent(&self.client, name) == Some(true);
+                    if completed_and_gone {
+                        eprintln!(
+                            "sandbox: the daemon's event log shows the container created under \
+                             {name} after its unanswered request was also destroyed, and it is \
+                             absent again after that record — discharged on that observation"
+                        );
+                    } else {
+                        if lifecycle == Some(Lifecycle::Landed) {
+                            eprintln!(
+                                "sandbox: {name} was created after its unanswered request and the \
+                                 daemon has NOT recorded its destruction — it is live or its end is \
+                                 unknown, so it stays owed and the next attempt removes it"
+                            );
+                        }
+                        still_owed.push(name.clone());
+                    }
+                }
                 None => still_owed.push(name.clone()),
             }
         }
@@ -444,9 +470,20 @@ fn retained_watch(create: UnansweredCreate, bounds: FenceBounds) -> RetainedOwne
 ///
 /// What wakes it: its own schedule (the earliest `due` among what it holds), and every adoption.
 /// Nothing else has to remember it exists.
+///
+/// Its thread is started when the first fence reports to it — at ESTABLISH time, while the process
+/// is creating a holder, not at the exhaustion moment when a destructor hands work over — and it
+/// parks when idle rather than exiting, so the spawn happens once. When there is no thread anyway
+/// (the spawn failed), progress does not wait for a future adoption: every cleanup event in the
+/// process — a create settling, a fence or a holder being destroyed, another adoption — retries the
+/// spawn and, failing that, runs one due attempt inline on the thread that raised the event.
 struct CleanupSupervisor {
     state: std::sync::Mutex<SupervisorState>,
     changed: std::sync::Condvar,
+    /// Test-only: make every thread spawn fail, so the no-thread path can be driven deterministically
+    /// rather than by exhausting the process's thread limit.
+    #[cfg(test)]
+    refuse_threads: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for CleanupSupervisor {
@@ -504,6 +541,8 @@ impl CleanupSupervisor {
         std::sync::Arc::new(Self {
             state: std::sync::Mutex::new(SupervisorState::default()),
             changed: std::sync::Condvar::new(),
+            #[cfg(test)]
+            refuse_threads: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -515,55 +554,110 @@ impl CleanupSupervisor {
     fn adopt(self: &std::sync::Arc<Self>, owner: RetainedOwner) {
         let names = owner.names.join(", ");
         let kind = owner.owed.label();
-        let needs_worker = {
+        {
             let mut state = self.lock();
             state.queued.push(ScheduledOwner {
                 owner,
                 due: std::time::Instant::now(),
                 failures: 0,
             });
-            let needs_worker = !state.worker_alive;
-            state.worker_alive = true;
-            needs_worker
-        };
+        }
         self.changed.notify_all();
         eprintln!(
             "sandbox: the cleanup supervisor now owns {names} ({kind}) and will retry on a schedule \
              until the daemon confirms it settled"
         );
+        self.poke();
+    }
+
+    /// Make sure a worker thread exists, if one can. Called when a fence is created — at establish
+    /// time — so the spawn happens while the process is building, not while it is tearing down.
+    fn ensure_worker(self: &std::sync::Arc<Self>) {
+        let claimed = {
+            let mut state = self.lock();
+            if state.worker_alive {
+                false
+            } else {
+                state.worker_alive = true;
+                true
+            }
+        };
+        if !claimed {
+            return;
+        }
+        if let Err(error) = self.spawn_worker() {
+            self.lock().worker_alive = false;
+            eprintln!(
+                "sandbox: could not start the cleanup supervisor thread ({error}) — scheduled \
+                 cleanup will be driven inline from cleanup events until a thread can be started"
+            );
+        }
+    }
+
+    /// Drive owed work forward from ANY cleanup event, without depending on a future adoption.
+    ///
+    /// With a worker alive this is a wake, which is free. Without one — the spawn failed at every
+    /// earlier opportunity — this retries the spawn, and if that fails too it runs ONE due attempt
+    /// inline on the calling thread, bounded like every attempt is. The supervisor's queue therefore
+    /// makes progress on the process's own cleanup activity: every create that settles, every fence
+    /// and holder destroyed, every adoption. What it does NOT promise, and this is named: with no
+    /// thread ever available and no further cleanup activity in the process, the next attempt waits
+    /// for the next such event. That is the residual, and it is bounded by the process's own life.
+    fn poke(self: &std::sync::Arc<Self>) {
+        let needs_worker = {
+            let mut state = self.lock();
+            if state.queued.is_empty() || state.worker_alive {
+                false
+            } else {
+                state.worker_alive = true;
+                true
+            }
+        };
+        self.changed.notify_all();
         if !needs_worker {
             return;
         }
-        let serving = std::sync::Arc::clone(self);
-        if let Err(error) = std::thread::Builder::new()
-            .name("mx-cleanup-supervisor".to_owned())
-            .spawn(move || serving.serve())
-        {
+        if let Err(error) = self.spawn_worker() {
             // No thread means nothing is scheduled, and saying "adopted" would be a lie. One attempt
-            // runs inline right now so the obligation is at least acted on; it stays queued, and the
-            // next adoption tries again to start the worker.
+            // runs inline right now so the obligation is at least acted on; it stays queued, and
+            // EVERY later cleanup event retries the thread and runs the next due attempt.
             self.lock().worker_alive = false;
             eprintln!(
-                "sandbox: could not start the cleanup supervisor thread ({error}) — running one \
-                 attempt inline; {names} stays queued and the next adoption retries the thread"
+                "sandbox: could not start the cleanup supervisor thread ({error}) — running one due \
+                 attempt inline; the queue is kept and every later cleanup event drives it"
             );
             self.run_one_due_inline();
         }
     }
 
-    /// The worker: run whatever is due, sleep until the next due time, exit when nothing is owed.
+    fn spawn_worker(self: &std::sync::Arc<Self>) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self.refuse_threads.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(std::io::Error::other("thread spawn refused by the test"));
+        }
+        let serving = std::sync::Arc::clone(self);
+        std::thread::Builder::new()
+            .name("mx-cleanup-supervisor".to_owned())
+            .spawn(move || serving.serve())
+            .map(|_| ())
+    }
+
+    /// The worker: run whatever is due, sleep until the next due time, park while nothing is owed.
+    ///
+    /// It does not exit when the queue empties. Exiting made every later adoption a fresh spawn —
+    /// at exactly the moment the process is tearing something down — and a spawn that fails there
+    /// is what leaves work with no thread. One thread for the process's life is the cheaper trade.
     fn serve(self: std::sync::Arc<Self>) {
         loop {
             let next = {
                 let mut state = self.lock();
                 loop {
                     if state.queued.is_empty() {
-                        // Nothing owed. The flag is cleared under the SAME guard that observed the
-                        // empty queue, so an adoption racing this exit sees it and starts a new one.
-                        state.worker_alive = false;
-                        drop(state);
-                        self.changed.notify_all();
-                        return;
+                        state = self
+                            .changed
+                            .wait(state)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        continue;
                     }
                     let now = std::time::Instant::now();
                     let (index, due) = state
@@ -657,6 +751,52 @@ impl CleanupSupervisor {
         self.outstanding().iter().any(|owed| owed.names.iter().any(|owned| owned == name))
     }
 
+    /// Test-only: whether a worker thread is believed alive.
+    #[cfg(test)]
+    fn has_worker(&self) -> bool {
+        self.lock().worker_alive
+    }
+
+    /// Test-only: make every later thread spawn fail.
+    #[cfg(test)]
+    fn refuse_threads(&self) {
+        self.refuse_threads.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test-only: block until the earliest queued attempt is due, or the bound expires.
+    #[cfg(test)]
+    fn wait_until_something_is_due(&self, bound: std::time::Duration) -> bool {
+        let started = std::time::Instant::now();
+        loop {
+            let earliest = self.lock().queued.iter().map(|scheduled| scheduled.due).min();
+            match earliest {
+                None => return false,
+                Some(due) if due <= std::time::Instant::now() => return true,
+                Some(due) => {
+                    if started.elapsed() >= bound {
+                        return false;
+                    }
+                    std::thread::sleep((due - std::time::Instant::now()).min(bound));
+                }
+            }
+        }
+    }
+
+    /// Test-only: block until `name` is owned (queued or mid-attempt), or the bound expires.
+    #[cfg(test)]
+    fn wait_until_owns(&self, name: &str, bound: std::time::Duration) -> bool {
+        self.wait_for(bound, |state| {
+            state.running.iter().any(|owned| owned == name)
+                || state.queued.iter().any(|scheduled| scheduled.owner.names.iter().any(|owned| owned == name))
+        })
+    }
+
+    /// Test-only: block until an attempt over `name` is RUNNING, or the bound expires.
+    #[cfg(test)]
+    fn wait_until_running(&self, name: &str, bound: std::time::Duration) -> bool {
+        self.wait_for(bound, |state| state.running.iter().any(|owned| owned == name))
+    }
+
     /// Block until nothing is owed, or the bound expires. Returns whether it is idle.
     ///
     /// Synchronised on the supervisor's own state changes, so a test waits for the fact rather than
@@ -697,6 +837,9 @@ impl CleanupSupervisor {
 impl CreationFence {
     /// A fence that hands what it cannot hold to `supervisor`.
     fn supervised_by(supervisor: &std::sync::Arc<CleanupSupervisor>, bounds: FenceBounds) -> Self {
+        // The supervisor's thread is started HERE, while a holder is being established, so that the
+        // one spawn this process needs happens at build time rather than at a destructor.
+        supervisor.ensure_worker();
         Self {
             in_flight: std::sync::Mutex::new(0),
             settled: std::sync::Condvar::new(),
@@ -911,6 +1054,9 @@ impl Drop for CreationTicket {
         if !owners.is_empty() {
             self.fence.run_and_keep_if_still_owed(owners);
         }
+        // A create settling is a cleanup event: if the supervisor holds work and has no thread, this
+        // is one of the moments that drives it — so its queue never waits on a future adoption.
+        self.fence.supervisor.poke();
     }
 }
 
@@ -966,6 +1112,8 @@ impl Drop for CreationFence {
         if !unanswered.is_empty() {
             self.watch_unanswered(unanswered);
         }
+        // A fence being destroyed is a cleanup event too. See `CleanupSupervisor::poke`.
+        self.supervisor.poke();
     }
 }
 
@@ -999,6 +1147,25 @@ impl NetnsHolder {
             name,
             sidecars: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             creation: std::sync::Arc::new(CreationFence::default()),
+            client,
+            bounds,
+        }
+    }
+
+    /// Test-only: the SAME holder as [`Self::adopt_bounded`] — same fields, same `Drop` — whose fence
+    /// reports to a supervisor the test owns, so what the production destructor hands over can be
+    /// asserted on rather than read out of the process-wide supervisor's log.
+    #[cfg(test)]
+    fn adopt_supervised(
+        name: String,
+        client: DockerCli,
+        bounds: FenceBounds,
+        supervisor: &std::sync::Arc<CleanupSupervisor>,
+    ) -> Self {
+        Self {
+            name,
+            sidecars: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            creation: std::sync::Arc::new(CreationFence::supervised_by(supervisor, bounds)),
             client,
             bounds,
         }
@@ -1225,7 +1392,33 @@ impl Drop for NetnsHolder {
         if self.creation.wait_until_settled(self.bounds.fast) {
             // Ordinary path: nothing was in flight, or it finished while we waited. `docker rm`
             // returning success here IS the daemon's answer, so no second question is asked.
-            cleanup.sweep();
+            //
+            // A removal the daemon REFUSED is not answered by a log line. This path used to sweep,
+            // print "LEAKED" for whatever refused, and return — the one path every completed job
+            // takes, and the one path that bypassed the supervisor entirely: with nothing in flight
+            // there was no retained owner and no unanswered create, so the fence that followed this
+            // holder to destruction adopted nothing. A refused holder or joiner was lost while the
+            // process went on living. What refuses here now goes INTO live ownership: the supervisor
+            // removes and confirms it on a schedule, for as long as the process runs. Non-blocking,
+            // so `Drop` stays the ~100 ms it always was.
+            let refused = cleanup.sweep();
+            if !refused.is_empty() {
+                eprintln!(
+                    "sandbox: {} refused removal in netns holder {}'s ordinary teardown — NOT \
+                     released: the cleanup supervisor owns these names from here and keeps retrying \
+                     while this process lives",
+                    refused.join(", "),
+                    self.name
+                );
+                self.creation.supervisor.adopt(retained_removal(
+                    self.name.clone(),
+                    refused,
+                    self.client.clone(),
+                    self.bounds,
+                ));
+            }
+            // A holder being destroyed is a cleanup event. See `CleanupSupervisor::poke`.
+            self.creation.supervisor.poke();
             return;
         }
         // Delayed path. The create is STILL running, and this is the case the previous version got
@@ -1288,7 +1481,11 @@ struct HolderCleanup {
 impl HolderCleanup {
     /// Remove the joiners, then the holder. Sidecars first: a joiner still running pins the
     /// namespace the holder is being torn down to release.
-    fn sweep(&self) {
+    ///
+    /// Returns every name whose removal the daemon REFUSED (or did not answer), in removal order, so
+    /// the caller can keep owning them. Logging a refusal was never the same as owning it.
+    fn sweep(&self) -> Vec<String> {
+        let mut refused = Vec::new();
         for joiner in &self.joiners {
             if let Err(error) = NetnsHolder::force_remove(&self.client, joiner) {
                 eprintln!(
@@ -1296,15 +1493,18 @@ impl HolderCleanup {
                      — the namespace may still be pinned by it",
                     self.name
                 );
+                refused.push(joiner.clone());
             }
         }
         if let Err(error) = NetnsHolder::force_remove(&self.client, &self.name) {
             eprintln!(
-                "sandbox: could not remove netns holder {}: {error} — this holder is LEAKED, not \
-                 destroyed; the boot reaper is the only remaining backstop",
+                "sandbox: could not remove netns holder {}: {error} — not destroyed; it stays owed \
+                 to whoever called this sweep",
                 self.name
             );
+            refused.push(self.name.clone());
         }
+        refused
     }
 
     /// Ask the daemon, repeatedly, whether EVERY container this owner is responsible for is gone —
@@ -2165,7 +2365,10 @@ fn run_bounded_blocking(
         // what such a descendant withholds. Draining on this thread therefore put an UNBOUNDED wait
         // directly after the bounded one, which is the hole this replaces: the drains run on their
         // own threads and are collected against the same budget as everything above.
-        let (drained_tx, drained_rx) = std::sync::mpsc::channel::<(&'static str, Vec<u8>)>();
+        // Each reader sends its RESULT, not a buffer: a read that failed is an output this process
+        // did not get, and it is recorded as unknown rather than as "the client said nothing".
+        let (drained_tx, drained_rx) =
+            std::sync::mpsc::channel::<(&'static str, std::io::Result<Vec<u8>>)>();
         let mut pending: Vec<&'static str> = Vec::new();
         // Each drain takes its OWN ticket, for the same reason the writer does: a descendant can
         // hold these endpoints open long past the channel timeout below, and a reader still blocked
@@ -2180,8 +2383,8 @@ fn run_bounded_blocking(
             std::thread::spawn(move || {
                 let _ticket = ticket;
                 let mut buffer = Vec::new();
-                let _ = pipe.read_to_end(&mut buffer);
-                let _ = tx.send(("stdout", buffer));
+                let outcome = pipe.read_to_end(&mut buffer).map(|_| buffer);
+                let _ = tx.send(("stdout", outcome));
             });
         }
         if let Some(mut pipe) = child.stderr.take() {
@@ -2191,29 +2394,65 @@ fn run_bounded_blocking(
             std::thread::spawn(move || {
                 let _ticket = ticket;
                 let mut buffer = Vec::new();
-                let _ = pipe.read_to_end(&mut buffer);
-                let _ = tx.send(("stderr", buffer));
+                let outcome = pipe.read_to_end(&mut buffer).map(|_| buffer);
+                let _ = tx.send(("stderr", outcome));
             });
         }
         drop(drained_tx);
         let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
+        // `None` until stderr is read TO EOF WITHOUT ERROR. A stream still held by a descendant, or
+        // a read that failed, leaves this unknown — and an unknown stderr is never read as "the
+        // daemon refused".
+        let mut stderr_read: Option<Vec<u8>> = None;
         while !pending.is_empty() {
             match drained_rx.recv_timeout(remaining()) {
-                Ok((which, buffer)) => {
+                Ok((which, outcome)) => {
                     pending.retain(|name| *name != which);
-                    if which == "stdout" {
-                        stdout = buffer;
-                    } else {
-                        stderr = buffer;
+                    match (which, outcome) {
+                        ("stdout", Ok(buffer)) => stdout = buffer,
+                        ("stdout", Err(error)) => {
+                            eprintln!("sandbox: could not read `{program}` stdout: {error}");
+                        }
+                        (_, Ok(buffer)) => stderr_read = Some(buffer),
+                        (_, Err(error)) => {
+                            eprintln!(
+                                "sandbox: could not read `{program}` stderr: {error} — its answer, \
+                                 if it gave one, is unknown to this process"
+                            );
+                        }
                     }
                 }
                 Err(_) => break,
             }
         }
-        let done = std::process::Output { status, stdout, stderr };
+        let stderr_known = stderr_read
+            .as_deref()
+            .map(|bytes| String::from_utf8_lossy(bytes).trim().to_owned());
+        let done = std::process::Output {
+            status,
+            stdout,
+            stderr: stderr_read.clone().unwrap_or_default(),
+        };
         let stdout = String::from_utf8_lossy(&done.stdout).trim().to_owned();
-        let stderr = String::from_utf8_lossy(&done.stderr).trim().to_owned();
+        let stderr = stderr_known.clone().unwrap_or_default();
+        // CLASSIFIED HERE, before any early return below, and once. The client has ended; whether
+        // the daemon ANSWERED it — accepted, or refused — is decided from positive proof only: exit
+        // 0, the daemon's own refusal text in a stderr this process read to EOF, or a `run` whose
+        // exit code is the contained command's. Everything else — a signal, a client-side exit with
+        // no daemon text, a stderr still held by a descendant, a failed read — is an outcome this
+        // process does not know, and the name is recorded as unanswered so absence is not taken as
+        // proof for it. The previous flow returned on a pending drain BEFORE reaching its
+        // classification, so a reaped client whose pipe a descendant held was never recorded at all,
+        // and it recognised only eight stderr substrings as "lost the daemon", reading every other
+        // text as a refusal.
+        let answered = daemon_answered(
+            args.first().map(String::as_str),
+            done.status.code(),
+            stderr_known.as_deref(),
+        );
+        if !answered {
+            note_unanswered(&creates);
+        }
         // A half-written plan is a sidecar that acted on a truncated instruction, so the write's own
         // failure is reported -- but only when the child itself did not already fail, because the
         // child's exit code names the refusal more precisely than a broken pipe does. Waited on with
@@ -2261,20 +2500,47 @@ fn run_bounded_blocking(
                 Err(error) => Err(error),
             },
             // The sidecar's codes are an interface; pass them through in the message so the caller's
-            // error names WHICH refusal happened rather than "it failed".
+            // error names WHICH refusal happened rather than "it failed". Whether the daemon
+            // answered was decided above, before the drain check, from positive proof.
             Some(code) => {
-                // A nonzero exit that names a LOST CONNECTION is the daemon not answering, not the
-                // daemon refusing: the request may be applied after the client gave up on it.
-                if client_lost_the_daemon(&stderr) {
-                    note_unanswered(&creates);
-                }
                 Err(format!("exit {code}: {}", if stderr.is_empty() { &stdout } else { &stderr }))
             }
-            None => {
-                note_unanswered(&creates);
-                Err("killed by a signal".to_string())
-            }
+            None => Err("killed by a signal".to_string()),
         }
+    }
+}
+
+/// Whether a docker client that has ENDED was, on positive evidence, ANSWERED by the daemon —
+/// accepted or refused — so that its request is settled and absence afterwards means absence.
+///
+/// Positive proof only, and exactly these three:
+///  * exit 0: the daemon accepted; for `run --detach` it answered with the id.
+///  * a stderr this process read to EOF that carries the daemon's own refusal text
+///    (`Error response from daemon`): the request reached the daemon and was refused, or ran and
+///    left something the ordinary remove-and-confirm path owns.
+///  * a `run` whose exit code is not the CLI's own 125: the contained command ran (126/127 are
+///    "cannot invoke"/"not found" for a container that WAS created and the rest are the command's
+///    own codes), so the container existed and `--rm` or the holder's cleanup owns it.
+///
+/// Everything else is UNKNOWN and returns `false`: a signal, a client-side 125 with no daemon text,
+/// a stderr not read to EOF (`None`), an empty stderr, or any error text at all that is not the
+/// daemon's. The version this replaces recognised eight client-side substrings as "lost the daemon"
+/// and treated every other text as a refusal — an inference from a list, in the direction that
+/// releases custody. The cost of the positive rule is named: a client-side argument error (exit 125,
+/// `docker: invalid reference format`) is now watched like an unanswered create, one bounded inspect
+/// per scheduled attempt for the life of the process, because the event log cannot say "no request
+/// was ever made" any more than it can say "that request will never be applied".
+#[cfg(feature = "acp")]
+fn daemon_answered(verb: Option<&str>, code: Option<i32>, stderr: Option<&str>) -> bool {
+    match code {
+        Some(0) => true,
+        Some(code) => {
+            let daemon_spoke =
+                stderr.is_some_and(|text| text.contains("Error response from daemon"));
+            let command_ran = verb == Some("run") && code != 125;
+            daemon_spoke || command_ran
+        }
+        None => false,
     }
 }
 
@@ -2298,25 +2564,6 @@ fn container_named_by(args: &[String]) -> Option<String> {
         }
     }
     None
-}
-
-/// Whether a docker client's failure text says it LOST THE DAEMON rather than that the daemon
-/// refused. These are the client-side signatures of a request whose outcome is unknown. This is a
-/// heuristic over error text and is named as one: a signature not listed here is treated as a
-/// refusal, which is the conservative side only when the daemon really did answer.
-#[cfg(feature = "acp")]
-fn client_lost_the_daemon(stderr: &str) -> bool {
-    const LOST: [&str; 8] = [
-        "error during connect",
-        "unexpected EOF",
-        "connection reset",
-        "broken pipe",
-        "context deadline exceeded",
-        "i/o timeout",
-        "Cannot connect to the Docker daemon",
-        "request canceled",
-    ];
-    LOST.iter().any(|signature| stderr.contains(signature))
 }
 
 /// A unique name for one temporary container joined to `holder`'s namespace.
@@ -2475,25 +2722,59 @@ fn container_is_absent(client: &DockerCli, name: &str) -> Option<bool> {
     }
 }
 
-/// Ask the daemon's own event log whether a container under EXACTLY `name` existed at any point
-/// since `issued`.
+/// What the daemon's event log says happened under one exact name since a request was issued.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lifecycle {
+    /// The daemon answered and recorded no container created under the name since the request.
+    NoRecord,
+    /// At least one container was created under the name since the request and the daemon has NOT
+    /// recorded a `destroy` for that same container id. It is live, or its end is unknown. Either
+    /// way it is not evidence that the name is finished.
+    Landed,
+    /// Every container created under the name since the request has a `destroy` recorded for the
+    /// same id, and there was at least one. The request ran its course and what it made is gone.
+    Completed,
+}
+
+/// Read the daemon's own event log for containers under EXACTLY `name` since `issued`, and say
+/// whether what was created there has ALSO been destroyed.
 ///
 /// This is the observation that lets a watched name be discharged when it is absent NOW: absence
-/// alone is what a delayed create looks like before it lands, but absence plus a create/destroy
-/// under that name in the daemon's log means the request ran its course and the container is
-/// already gone. `Some(true)` only when a line names exactly `name` — docker's `container=` filter
-/// matches prefixes, so the output is checked rather than trusted. `Some(false)` when the daemon
-/// answered and showed nothing. `None` when the daemon did not answer, which keeps custody.
+/// alone is what a delayed create looks like before it lands. The first version of this asked only
+/// "did ANY event under this name happen since the request", which a `create` alone answers yes to
+/// — so a container that landed between the caller's inspect and this query was read as finished
+/// while it was running. Lifecycle evidence is now paired BY CONTAINER ID: a `create` counts as
+/// finished only when a `destroy` for the same id follows it, and a `create` with no `destroy` under
+/// the name makes the whole answer [`Lifecycle::Landed`] whatever else the log shows. Lines are
+/// matched on the exact name field — docker's `container=` filter matches prefixes, so the output is
+/// checked rather than trusted. `None` when the daemon did not answer, or did not finish answering
+/// within `bound`, which keeps custody.
+///
+/// Bounded twice over. The child is waited on with [`NetnsHolder::REMOVE_DEADLINE`]; its stdout is
+/// read on a thread whose result is waited for with `bound`, never joined without one. A reaped
+/// client does not close a pipe a descendant inherited, and an unbounded join here ran on the ONE
+/// supervisor thread — so one held pipe stalled every name the supervisor owed, not just this one.
+/// A reader that outlives `bound` is named in the log and its answer is discarded as uncertain.
 ///
 /// Limitation, stated: the daemon's event buffer is finite, and there is no API that says "that
 /// request will never be applied". A name whose create was never delivered at all is therefore
 /// never discharged by this observation and stays watched for the life of the process, at the cost
-/// of one bounded inspect per scheduled attempt.
+/// of one bounded inspect per scheduled attempt. Identity is by exact name plus container id, not by
+/// request: a client whose answer was never read has no request id to correlate, so a container
+/// another actor created and destroyed under this exact name inside the window would read as this
+/// request's completion. Holder names are unique per job id, so that actor would have to reuse this
+/// job's name deliberately.
 #[cfg(feature = "acp")]
-fn landed_since(client: &DockerCli, name: &str, issued: std::time::SystemTime) -> Option<bool> {
+fn lifecycle_since(
+    client: &DockerCli,
+    name: &str,
+    issued: std::time::SystemTime,
+    bound: std::time::Duration,
+) -> Option<Lifecycle> {
     let since = issued.duration_since(std::time::UNIX_EPOCH).ok()?;
     let until = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?;
     let stamp = |at: std::time::Duration| format!("{}.{:09}", at.as_secs(), at.subsec_nanos());
+    let started = std::time::Instant::now();
     let mut child = std::process::Command::new(client.program())
         .args([
             "events",
@@ -2506,26 +2787,84 @@ fn landed_since(client: &DockerCli, name: &str, issued: std::time::SystemTime) -
             "--filter",
             &format!("container={name}"),
             "--format",
-            "{{.Actor.Attributes.name}}\t{{.Action}}",
+            "{{.Actor.ID}}\t{{.Actor.Attributes.name}}\t{{.Action}}",
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
         .ok()?;
     let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
+    let (read_tx, read_rx) = std::sync::mpsc::channel::<std::io::Result<Vec<u8>>>();
+    std::thread::spawn(move || {
         use std::io::Read as _;
         let mut bytes = Vec::new();
-        let _ = stdout.read_to_end(&mut bytes);
-        bytes
+        let outcome = stdout.read_to_end(&mut bytes).map(|_| bytes);
+        let _ = read_tx.send(outcome);
     });
-    let status = NetnsHolder::wait_bounded(&mut child, NetnsHolder::REMOVE_DEADLINE).ok()?;
-    let bytes = reader.join().ok()?;
+    let status = NetnsHolder::wait_bounded(&mut child, bound.min(NetnsHolder::REMOVE_DEADLINE)).ok()?;
+    let bytes = match read_rx.recv_timeout(bound.saturating_sub(started.elapsed())) {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(error)) => {
+            eprintln!("sandbox: could not read the daemon's event log for {name}: {error} — uncertain");
+            return None;
+        }
+        Err(_) => {
+            eprintln!(
+                "sandbox: the daemon's event log for {name} did not reach EOF within {bound:?} — a \
+                 descendant of the client is holding the pipe; the reading thread remains \
+                 outstanding in this process and its partial answer is DISCARDED as uncertain, so \
+                 the name stays owed and the owner moves on to its other names"
+            );
+            return None;
+        }
+    };
     if !status.success() {
+        eprintln!(
+            "sandbox: the daemon's event log for {name} could not be read ({status}) — uncertain, \
+             the name stays owed"
+        );
         return None;
     }
-    let output = String::from_utf8_lossy(&bytes);
-    Some(output.lines().any(|line| line.split('\t').next() == Some(name)))
+    Some(lifecycle_from_events(&String::from_utf8_lossy(&bytes), name))
+}
+
+/// Pair `create`/`destroy` events by container id under exactly `name`. Pure, so it is unit-tested
+/// on its own against the daemon's line format.
+#[cfg(feature = "acp")]
+fn lifecycle_from_events(output: &str, name: &str) -> Lifecycle {
+    // id -> (created since the request, destroyed since the request)
+    let mut by_id: Vec<(String, bool, bool)> = Vec::new();
+    for line in output.lines() {
+        let mut fields = line.split('\t');
+        let (Some(id), Some(actor), Some(action)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if actor != name {
+            continue;
+        }
+        let entry = match by_id.iter_mut().find(|(known, _, _)| known == id) {
+            Some(entry) => entry,
+            None => {
+                by_id.push((id.to_owned(), false, false));
+                by_id.last_mut().expect("just pushed")
+            }
+        };
+        match action {
+            "create" => entry.1 = true,
+            "destroy" => entry.2 = true,
+            _ => {}
+        }
+    }
+    // A `destroy` alone is a container created BEFORE the request, which was never this request's.
+    let created: Vec<&(String, bool, bool)> = by_id.iter().filter(|(_, created, _)| *created).collect();
+    if created.is_empty() {
+        Lifecycle::NoRecord
+    } else if created.iter().all(|(_, _, destroyed)| *destroyed) {
+        Lifecycle::Completed
+    } else {
+        Lifecycle::Landed
+    }
 }
 
 /// Establish containment for one job: measure the proxy address, create the namespace holder, install
@@ -3640,6 +3979,13 @@ case "$*" in
       echo "sha256:deadbeefcafe"
       exit 0
     fi
+    # THE RACE, made deterministic: this inspect answers ABSENT, and the container lands the instant
+    # after that answer — before any event query the caller makes next. `race-NAME` is consumed so
+    # it fires exactly once; `raced-NAME` records that it fired.
+    if [ -f "$WORK/race-$last" ]; then
+      mv "$WORK/race-$last" "$WORK/present-$last"
+      : > "$WORK/raced-$last"
+    fi
     echo "Error response from daemon: No such container" >&2
     exit 1
     ;;
@@ -3658,15 +4004,31 @@ case "$*" in
     exit 0
     ;;
   *"events --since"*)
-    # The daemon's event log: a container under NAME existed since the request if it is present now
-    # or a test recorded that it landed and has since gone (`landed-NAME`).
+    # The daemon's event log, in the production format `ID<TAB>name<TAB>action`: a container under
+    # NAME that is present now has a `create` and no `destroy`; one a test recorded as landed and
+    # since gone (`landed-NAME`) has both, for the same id. `evhang-NAME` leaves a descendant holding
+    # this query's stdout open after the client exits, as a client's child process can.
     for a in "$@"; do
       case "$a" in
         container=*)
           n="${a#container=}"
           echo "events $n" >> "$WORK/events.log"
-          if [ -f "$WORK/present-$n" ] || [ -f "$WORK/landed-$n" ]; then
-            printf '%s\tcreate\n' "$n"
+          if [ -f "$WORK/evhang-$n" ]; then
+            ( sleep 3 ) &
+            exit 0
+          fi
+          if [ -f "$WORK/present-$n" ]; then
+            printf 'deadbeefcafe\t%s\tcreate\n' "$n"
+          fi
+          if [ -f "$WORK/landed-$n" ]; then
+            printf 'feedfacef00d\t%s\tcreate\nfeedfacef00d\t%s\tdestroy\n' "$n" "$n"
+          fi
+          # THE OTHER RACE, made deterministic: a container lands the instant after this event query
+          # answered — before the caller's next inspect. Consumed so it fires once; `raced-after-
+          # events-NAME` records that it did.
+          if [ -f "$WORK/land-after-events-$n" ]; then
+            mv "$WORK/land-after-events-$n" "$WORK/present-$n"
+            : > "$WORK/raced-after-events-$n"
           fi
           ;;
       esac
@@ -4496,8 +4858,412 @@ exit 0
         assert_eq!(owned(&["create", "--name=y", "alpine"]), Some("y".to_owned()));
         assert_eq!(owned(&["run", "--rm", "alpine"]), None);
         assert_eq!(owned(&["rm", "--force", "--volumes", "--name"]), None);
-        assert!(client_lost_the_daemon("error during connect: Post \"http://%2Fvar%2Frun%2Fdocker.sock/v1.47/containers/create\": EOF"));
-        assert!(!client_lost_the_daemon("Error response from daemon: Conflict. The container name is already in use"));
+    }
+
+    /// F2: A CLIENT THAT ENDED IS "ANSWERED" ON POSITIVE PROOF ONLY. No list of lost-connection
+    /// strings decides it, and text nobody listed is NOT a refusal.
+    ///
+    /// The version this replaces recognised eight substrings as "lost the daemon" and read every
+    /// other nonzero stderr as the daemon refusing. A new client version's wording, a proxy's error,
+    /// a truncated line — anything off the list — released custody over a request that may have been
+    /// applied. Every row below that is not one of the three proofs must come back `false`.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn a_client_that_ended_is_answered_on_positive_proof_only_never_by_whitelist_inference() {
+        let run = Some("run");
+        let create = Some("create");
+        let daemon = "docker: Error response from daemon: Conflict. The container name is already in use";
+        let lost = "error during connect: Post \"http://%2Fvar%2Frun%2Fdocker.sock/v1.47/containers/create\": EOF";
+        let unlisted = "docker: dial unix /var/run/docker.sock: connect: the client wrote this in a wording nobody listed";
+
+        // The three proofs.
+        assert!(daemon_answered(run, Some(0), None), "exit 0 is the daemon's acceptance");
+        assert!(daemon_answered(run, Some(0), Some("")), "exit 0 with an empty stderr too");
+        assert!(daemon_answered(run, Some(125), Some(daemon)), "the daemon's own refusal text");
+        assert!(daemon_answered(create, Some(125), Some(daemon)), "for `create` as well");
+        assert!(daemon_answered(run, Some(1), None), "the contained command ran and exited 1");
+        assert!(daemon_answered(run, Some(127), Some("")), "126/127: the container WAS created");
+
+        // Everything else is unknown — including text that is not on any list.
+        assert!(!daemon_answered(run, Some(125), Some(lost)), "a lost connection is unknown");
+        assert!(
+            !daemon_answered(run, Some(125), Some(unlisted)),
+            "text that matches no known signature was read as a REFUSAL: that is inference from a \
+             whitelist, in the direction that releases custody"
+        );
+        assert!(!daemon_answered(run, Some(125), Some("")), "exit 125 that said nothing");
+        assert!(!daemon_answered(run, Some(125), None), "exit 125 with stderr never read to EOF");
+        assert!(!daemon_answered(create, Some(1), None), "`create` has no contained command to exit 1");
+        assert!(!daemon_answered(create, Some(1), Some(unlisted)));
+        assert!(!daemon_answered(run, None, Some(daemon)), "a signal ends the client, not the request");
+        assert!(!daemon_answered(create, None, None));
+    }
+
+    /// F1: LIFECYCLE EVIDENCE IS PAIRED BY CONTAINER ID under the exact name. A `create` without its
+    /// `destroy` is a live container, whatever else the log shows.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn lifecycle_evidence_pairs_create_and_destroy_by_container_id_under_the_exact_name() {
+        use Lifecycle::{Completed, Landed, NoRecord};
+        let name = "mx-netns-job";
+        assert_eq!(lifecycle_from_events("", name), NoRecord);
+        assert_eq!(lifecycle_from_events("aaa\tmx-netns-job\tcreate\n", name), Landed);
+        assert_eq!(
+            lifecycle_from_events("aaa\tmx-netns-job\tcreate\naaa\tmx-netns-job\tstart\n", name),
+            Landed,
+            "start is not an end"
+        );
+        assert_eq!(
+            lifecycle_from_events(
+                "aaa\tmx-netns-job\tcreate\naaa\tmx-netns-job\tdie\naaa\tmx-netns-job\tdestroy\n",
+                name
+            ),
+            Completed
+        );
+        assert_eq!(
+            lifecycle_from_events(
+                "aaa\tmx-netns-job\tcreate\naaa\tmx-netns-job\tdestroy\nbbb\tmx-netns-job\tcreate\n",
+                name
+            ),
+            Landed,
+            "one finished lifecycle does not excuse a second container still live under the name"
+        );
+        assert_eq!(
+            lifecycle_from_events("aaa\tmx-netns-job\tcreate\nbbb\tmx-netns-job\tdestroy\n", name),
+            Landed,
+            "a destroy of a DIFFERENT id does not end this one"
+        );
+        assert_eq!(
+            lifecycle_from_events("ccc\tmx-netns-job\tdestroy\n", name),
+            NoRecord,
+            "a destroy alone is a container created before the request, never this request's"
+        );
+        assert_eq!(
+            lifecycle_from_events("aaa\tmx-netns-job-2\tcreate\naaa\tmx-netns-job-2\tdestroy\n", name),
+            NoRecord,
+            "the filter matches prefixes; the name field is checked exactly"
+        );
+    }
+
+    // ---- Round-2 gates: F1..F4 ------------------------------------------------------------------
+
+    /// F1: ABSENT INSPECT, THEN A LANDING, THEN AN EVENT — and the live container is NOT discharged.
+    ///
+    /// The stand-in makes the race deterministic: the watch's inspect answers absent and the container
+    /// lands the instant after (`race-NAME` becomes `present-NAME` inside that inspect). The event
+    /// query the watch makes next therefore shows a `create` under the name — exactly the evidence
+    /// the previous version discharged on, over a running container. Here the name must stay owed
+    /// through that attempt, and the NEXT attempt must find the container present, remove it and
+    /// confirm it gone. The claim is on container state and the fixture's own record of the race
+    /// having fired, not on a log line.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn an_absent_inspect_then_a_landing_then_an_event_does_not_discharge_a_live_container() {
+        let work = stand_in_work_dir("landing-race");
+        let script = stand_in_docker(&work, "sleep 5");
+        let client = DockerCli::stand_in(&script);
+        let supervisor = CleanupSupervisor::new();
+        let fence = std::sync::Arc::new(CreationFence::supervised_by(&supervisor, quick_bounds()));
+
+        // Armed BEFORE the watch can run: the very first inspect is the one that races.
+        std::fs::write(work.join("race-holder-race"), "").expect("race marker");
+        let ticket = fence.begin();
+        issue_unanswered_create(&client, &fence, "holder-race");
+        drop(ticket);
+
+        // Attempt 1 has run: absent → landing → event. The race fired, and the container is present.
+        assert!(supervisor.wait_until_attempts_at_least(1, std::time::Duration::from_secs(10)));
+        assert!(work.join("raced-holder-race").exists(), "the fixture's race never fired");
+        let discharged_live = !supervisor.owns("holder-race") && work.join("present-holder-race").exists();
+        assert!(
+            !discharged_live,
+            "the watch DISCHARGED holder-race on an event that showed a create with no destroy: the \
+             container is present, and nothing owns it. This is the landing race the watch exists for."
+        );
+        assert!(supervisor.owns("holder-race"), "kept owed after the ambiguous event");
+
+        // Attempt 2 finds it present, removes it and confirms it gone.
+        assert!(
+            supervisor.wait_until_idle(std::time::Duration::from_secs(10)),
+            "the landed container was never reconciled: {:?}",
+            supervisor.outstanding()
+        );
+        assert!(!work.join("present-holder-race").exists(), "the landed container is STILL PRESENT");
+        assert_eq!(rm_log_count(&work, "holder-race"), 1, "removed exactly once, by the watch");
+        // ORDER, from the fixture's own record: the racing inspect preceded the event query.
+        let log = std::fs::read_to_string(work.join("events.log")).unwrap_or_default();
+        let first_inspect = log.find("inspect holder-race").expect("an inspect ran");
+        let first_events = log.find("events holder-race").expect("an event query ran");
+        assert!(first_inspect < first_events, "the inspect did not precede the event query:\n{log}");
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// F1: A LANDING BETWEEN THE EVENT QUERY AND THE CONFIRMING INSPECT does not discharge either.
+    ///
+    /// The mirror of the race above. The event log reads COMPLETE — an earlier container under the
+    /// name was created and destroyed — and a new one lands the instant after that answer. Discharge
+    /// requires a fresh absent inspect AFTER the completed record; that inspect finds the container,
+    /// the name stays owed, and the next attempt removes it. Without the ordered final absence, a
+    /// complete-looking record over a live container is a discharge.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn a_landing_between_the_event_query_and_the_confirming_inspect_does_not_discharge() {
+        let work = stand_in_work_dir("landing-after-events");
+        let script = stand_in_docker(&work, "sleep 5");
+        let client = DockerCli::stand_in(&script);
+        let supervisor = CleanupSupervisor::new();
+        let fence = std::sync::Arc::new(CreationFence::supervised_by(&supervisor, quick_bounds()));
+
+        // An earlier container under the name came and went; the new one lands right after the
+        // event query answers.
+        std::fs::write(work.join("landed-holder-late"), "").expect("event record");
+        std::fs::write(work.join("land-after-events-holder-late"), "").expect("race marker");
+        let ticket = fence.begin();
+        issue_unanswered_create(&client, &fence, "holder-late");
+        drop(ticket);
+
+        assert!(supervisor.wait_until_attempts_at_least(1, std::time::Duration::from_secs(10)));
+        assert!(work.join("raced-after-events-holder-late").exists(), "the fixture's race never fired");
+        let discharged_live = !supervisor.owns("holder-late") && work.join("present-holder-late").exists();
+        assert!(
+            !discharged_live,
+            "the watch DISCHARGED holder-late on a complete-looking record without a fresh absent \
+             inspect after it: the container is present, and nothing owns it."
+        );
+        assert!(supervisor.owns("holder-late"), "kept owed after the record");
+        assert!(
+            supervisor.wait_until_idle(std::time::Duration::from_secs(10)),
+            "the landed container was never reconciled: {:?}",
+            supervisor.outstanding()
+        );
+        assert!(!work.join("present-holder-late").exists(), "the landed container is STILL PRESENT");
+        assert_eq!(rm_log_count(&work, "holder-late"), 1, "removed exactly once, by the watch");
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// F2: A REAPED CLIENT WHOSE STDERR A DESCENDANT HOLDS IS RECORDED AS UNANSWERED before release.
+    ///
+    /// The client exits 125 at once, having started a descendant that keeps its stderr open past
+    /// the bound. The flow ends on the pending drain — and the previous version returned there,
+    /// BEFORE its exit-code classification, so this create was never recorded and an absent inspect
+    /// ended the story. Here the name must be owned by the supervisor once the drain's own ticket
+    /// releases and the fence settles.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn a_reaped_client_whose_stderr_a_descendant_holds_is_recorded_as_unanswered() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let work = stand_in_work_dir("held-stderr");
+        let script = work.join("docker");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n( : > \"{}/holding\"; sleep 5 ) >/dev/null &\nexit 125\n",
+                work.to_string_lossy()
+            ),
+        )
+        .expect("write stand-in");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let client = DockerCli::stand_in(&script);
+        let supervisor = CleanupSupervisor::new();
+        let fence = std::sync::Arc::new(CreationFence::supervised_by(&supervisor, quick_bounds()));
+
+        let ticket = fence.begin();
+        let mut child_exited = false;
+        let outcome = run_bounded_blocking(
+            &client,
+            vec![
+                "docker".to_owned(),
+                "run".to_owned(),
+                "--detach".to_owned(),
+                "--name".to_owned(),
+                "holder-held".to_owned(),
+                "alpine".to_owned(),
+            ],
+            None,
+            std::time::Duration::from_secs(2),
+            std::time::Instant::now(),
+            Some(&fence),
+            &mut child_exited,
+        );
+        assert!(child_exited, "the client was killed rather than reaped: the fixture did not reach the drain branch");
+        assert!(work.join("holding").exists(), "the descendant never announced it held the pipe");
+        let error = outcome.expect_err("an output never read to EOF is not a result");
+        assert!(error.contains("did not reach EOF"), "ended on a different branch: {error}");
+        drop(ticket);
+
+        // The drain's ticket holds the fence until the descendant lets go; THEN it settles and the
+        // unanswered record becomes a watch. If no record was made, nothing is ever owned.
+        assert!(
+            supervisor.wait_until_owns("holder-held", std::time::Duration::from_secs(10)),
+            "a client reaped with exit 125 and a stderr this process never read was NOT recorded \
+             as unanswered — the drain-pending return came before classification: {:?}",
+            supervisor.outstanding()
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// F3a: A FAILED SUPERVISOR-THREAD SPAWN STILL MAKES SCHEDULED PROGRESS, without a future adoption.
+    ///
+    /// Every spawn is refused. The obligation is adopted (one inline attempt, refused by the daemon),
+    /// and then NOTHING is adopted again. Progress must come from the process's own cleanup events:
+    /// here a create settling on a fence that reports to this supervisor. Each such event runs the
+    /// next due attempt inline; when the daemon accepts, the name is removed and confirmed.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn a_failed_supervisor_thread_spawn_still_makes_scheduled_progress_without_another_adoption() {
+        let work = stand_in_work_dir("no-thread");
+        let script = stand_in_docker(&work, "");
+        std::fs::write(work.join("present-holder-nt"), "").expect("marker");
+        std::fs::write(work.join("rmfail-holder-nt"), "").expect("marker");
+        let client = DockerCli::stand_in(&script);
+        let supervisor = CleanupSupervisor::new();
+        supervisor.refuse_threads();
+        let fence = std::sync::Arc::new(CreationFence::supervised_by(&supervisor, quick_bounds()));
+        assert!(!supervisor.has_worker(), "the refused spawn was recorded as a live worker");
+
+        supervisor.adopt(retained_removal(
+            "holder-nt".to_owned(),
+            vec!["holder-nt".to_owned()],
+            client.clone(),
+            quick_bounds(),
+        ));
+        assert!(!supervisor.has_worker());
+        assert!(supervisor.wait_until_attempts_at_least(1, std::time::Duration::ZERO), "no inline attempt ran on adoption");
+        assert!(supervisor.owns("holder-nt"), "the refused removal was not kept");
+        assert_eq!(rm_log_count(&work, "holder-nt"), 1);
+
+        // NO FURTHER ADOPTION. A create settles on a fence reporting here — a cleanup event.
+        assert!(supervisor.wait_until_something_is_due(std::time::Duration::from_secs(5)));
+        drop(fence.begin());
+        assert!(
+            supervisor.wait_until_attempts_at_least(2, std::time::Duration::ZERO),
+            "with no thread, the queued attempt did not run on a cleanup event: the queue sat \
+             waiting for a future adoption that never came"
+        );
+        assert_eq!(rm_log_count(&work, "holder-nt"), 2);
+        assert!(supervisor.owns("holder-nt"));
+
+        // The daemon accepts. The next cleanup event discharges it.
+        std::fs::remove_file(work.join("rmfail-holder-nt")).expect("clear refusal");
+        assert!(supervisor.wait_until_something_is_due(std::time::Duration::from_secs(5)));
+        drop(fence.begin());
+        assert!(supervisor.wait_until_idle(std::time::Duration::ZERO), "still owed after acceptance: {:?}", supervisor.outstanding());
+        assert!(!work.join("present-holder-nt").exists(), "STILL PRESENT");
+        assert!(!supervisor.has_worker(), "a thread appeared although every spawn was refused");
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// F3b: A DESCENDANT HOLDING THE EVENT PIPE DOES NOT STALL ANOTHER OWED NAME.
+    ///
+    /// A watched name's event query leaves a descendant holding stdout for 3s. The supervisor also
+    /// owes a plain removal of another name. The event reader used to be joined without a bound on
+    /// the ONE supervisor thread, so the other name waited out the descendant. Now the watch gives up
+    /// on the reader at the owner's confirm bound (300ms here), keeps its name as uncertain, and the
+    /// other name is removed and confirmed well inside the descendant's hold.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn a_descendant_holding_the_event_pipe_does_not_stall_another_owed_name() {
+        let work = stand_in_work_dir("event-pipe-held");
+        let script = stand_in_docker(&work, "sleep 5");
+        let client = DockerCli::stand_in(&script);
+        std::fs::write(work.join("evhang-holder-eh"), "").expect("marker");
+        std::fs::write(work.join("present-other-eh"), "").expect("marker");
+        let supervisor = CleanupSupervisor::new();
+        let fence = std::sync::Arc::new(CreationFence::supervised_by(&supervisor, quick_bounds()));
+
+        let ticket = fence.begin();
+        issue_unanswered_create(&client, &fence, "holder-eh");
+        drop(ticket);
+        // The watch is mid-attempt, blocked on the held pipe, when the other name arrives.
+        assert!(supervisor.wait_until_running("holder-eh", std::time::Duration::from_secs(10)));
+        let adopted_at = std::time::Instant::now();
+        supervisor.adopt(retained_removal(
+            "other-eh".to_owned(),
+            vec!["other-eh".to_owned()],
+            client.clone(),
+            quick_bounds(),
+        ));
+
+        let discharged = supervisor.wait_for(std::time::Duration::from_millis(1500), |state| {
+            !state.running.iter().any(|name| name == "other-eh")
+                && !state.queued.iter().any(|s| s.owner.names.iter().any(|name| name == "other-eh"))
+        });
+        let took = adopted_at.elapsed();
+        assert!(
+            discharged,
+            "other-eh was still owed {took:?} after adoption: the single worker was stalled by a \
+             descendant holding another name's event pipe ({:?})",
+            supervisor.outstanding()
+        );
+        assert!(!work.join("present-other-eh").exists(), "other-eh is STILL PRESENT");
+        assert!(supervisor.owns("holder-eh"), "the uncertain event answer released the watched name");
+
+        // The pipe is released and the daemon's log shows the lifecycle complete: the watch ends.
+        std::fs::remove_file(work.join("evhang-holder-eh")).expect("clear hang");
+        std::fs::write(work.join("landed-holder-eh"), "").expect("event record");
+        assert!(supervisor.wait_until_idle(std::time::Duration::from_secs(10)), "{:?}", supervisor.outstanding());
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// F4: THE ORDINARY, SETTLED `NetnsHolder::drop` ROUTES REFUSED REMOVALS INTO LIVE OWNERSHIP.
+    ///
+    /// The actual production destructor — not a helper — on a holder with nothing in flight, whose
+    /// holder AND joiner refuse removal. The previous fast path swept, printed LEAKED and returned;
+    /// the fence destroyed a moment later held nothing to hand over. Here the supervisor must own both
+    /// names the instant `drop` returns, keep attempting, and discharge them when the daemon accepts.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn a_refused_removal_in_the_ordinary_settled_holder_drop_is_owned_by_the_supervisor() {
+        let work = stand_in_work_dir("fast-drop-refused");
+        let script = stand_in_docker(&work, "");
+        for name in ["holder-fd", "joiner-fd"] {
+            std::fs::write(work.join(format!("present-{name}")), "").expect("marker");
+            std::fs::write(work.join(format!("rmfail-{name}")), "").expect("marker");
+        }
+        let supervisor = CleanupSupervisor::new();
+        let holder = NetnsHolder::adopt_supervised(
+            "holder-fd".to_owned(),
+            DockerCli::stand_in(&script),
+            quick_bounds(),
+            &supervisor,
+        );
+        holder.sidecars.lock().expect("registry").push("joiner-fd".to_owned());
+        assert!(holder.creation.wait_until_settled(std::time::Duration::ZERO), "nothing is in flight");
+
+        drop(holder); // THE PRODUCTION DESTRUCTOR, ordinary path.
+
+        assert!(
+            supervisor.owns("holder-fd") && supervisor.owns("joiner-fd"),
+            "the settled fast path swept, logged and returned: nobody owns the refused names {:?}",
+            supervisor.outstanding()
+        );
+        assert!(supervisor.wait_until_attempts_at_least(2, std::time::Duration::from_secs(10)));
+        assert!(rm_log_count(&work, "holder-fd") >= 2 && rm_log_count(&work, "joiner-fd") >= 2);
+        assert!(work.join("present-holder-fd").exists() && work.join("present-joiner-fd").exists());
+
+        for name in ["holder-fd", "joiner-fd"] {
+            std::fs::remove_file(work.join(format!("rmfail-{name}"))).expect("clear refusal");
+        }
+        assert!(supervisor.wait_until_idle(std::time::Duration::from_secs(10)), "{:?}", supervisor.outstanding());
+        assert!(!work.join("present-holder-fd").exists(), "the holder is STILL PRESENT");
+        assert!(!work.join("present-joiner-fd").exists(), "the joiner is STILL PRESENT");
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// F4: the holder `establish` builds reports to the PROCESS supervisor — the one the test above
+    /// drives by substitution is the same object in production, not a test-only route.
+    #[test]
+    fn a_production_holders_fence_reports_to_the_process_supervisor() {
+        let holder = NetnsHolder::adopt_bounded(
+            "holder-process-sup".to_owned(),
+            DockerCli::stand_in(std::path::Path::new("/nonexistent/docker-never-run")),
+            quick_bounds(),
+        );
+        assert!(std::sync::Arc::ptr_eq(&holder.creation.supervisor, CleanupSupervisor::process()));
+        // Not dropped: its destructor would run `docker rm` against a program that does not exist,
+        // and the refusal would then be owed by the PROCESS supervisor for the rest of this test
+        // binary's life — a real obligation this test has no daemon to settle.
+        std::mem::forget(holder);
     }
 
     // ---- Live gates: the same paths against the real daemon on the approved VM -----------------
@@ -4579,10 +5345,15 @@ exit 0
             assert_eq!(container_is_absent(&client, &name), Some(false), "it did not land");
         } else {
             // The daemon applied the request after all and the watch already removed it: that is the
-            // other legitimate branch, and the event log must show the container existed.
+            // other legitimate branch, and the event log must show the container existed and is gone.
             assert_eq!(
-                landed_since(&client, &name, std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
-                Some(true)
+                lifecycle_since(
+                    &client,
+                    &name,
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(1),
+                    std::time::Duration::from_secs(10),
+                ),
+                Some(Lifecycle::Completed)
             );
         }
 
@@ -4645,6 +5416,117 @@ exit 0
         drop(fence);
 
         assert!(supervisor.owns(&name), "after the fence died nobody owned {name}");
+        assert!(supervisor.wait_until_attempts_at_least(2, std::time::Duration::from_secs(60)));
+        assert!(supervisor.owns(&name));
+        assert_eq!(container_is_absent(&client, &name), Some(false), "the real container is gone early");
+
+        std::fs::remove_file(work.join("rmfail")).expect("the daemon accepts again");
+        let idle = supervisor.wait_until_idle(std::time::Duration::from_secs(120));
+        let absent = container_is_absent(&client, &name);
+        live_rm(&name);
+        let _ = std::fs::remove_dir_all(&work);
+        assert!(idle, "still owed after removals were accepted: {:?}", supervisor.outstanding());
+        assert_eq!(absent, Some(true), "the real daemon still has {name}");
+    }
+
+    /// LIVE (F1): the real daemon's event log, read in the production format, tells a container that
+    /// LANDED and is still there from one whose lifecycle COMPLETED — and a name with no record.
+    ///
+    /// This is the evidence the watch discharges on. Against the real daemon: no record before the
+    /// create; `Landed` (a create with no destroy under the exact name) while the container runs —
+    /// the state in which the previous version discharged; `Completed` only after the daemon
+    /// destroyed it. The ids and actions are the daemon's, not a fixture's.
+    #[cfg(feature = "acp")]
+    #[test]
+    #[ignore = "needs a real docker daemon"]
+    fn live_lifecycle_evidence_tells_a_landed_container_from_a_completed_one() {
+        let client = DockerCli::system();
+        let name = format!("mx-live-lifecycle-{}", std::process::id());
+        live_rm(&name);
+        let issued = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
+        let bound = std::time::Duration::from_secs(10);
+        assert_eq!(lifecycle_since(&client, &name, issued, bound), Some(Lifecycle::NoRecord));
+
+        let created = std::process::Command::new("docker")
+            .args(["run", "--detach", "--name", &name, &live_image(), "sleep", "300"])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("docker run");
+        assert!(created.success());
+        assert_eq!(container_is_absent(&client, &name), Some(false));
+        let while_running = lifecycle_since(&client, &name, issued, bound);
+        live_rm(&name);
+        assert_eq!(
+            while_running,
+            Some(Lifecycle::Landed),
+            "a running container's record must read as LANDED, never as complete"
+        );
+        // Removed. `docker rm --force` destroys asynchronously from the client's return, so the
+        // record is polled for a bounded time before the claim is made.
+        let started = std::time::Instant::now();
+        let after_removal = loop {
+            let lifecycle = lifecycle_since(&client, &name, issued, bound);
+            if lifecycle == Some(Lifecycle::Completed) || started.elapsed() > std::time::Duration::from_secs(30) {
+                break lifecycle;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        };
+        assert_eq!(container_is_absent(&client, &name), Some(true));
+        assert_eq!(after_removal, Some(Lifecycle::Completed), "destroyed, yet the record does not read complete");
+    }
+
+    /// LIVE (F4): the ORDINARY, SETTLED `NetnsHolder::drop` on a real container whose removal the
+    /// client refuses hands the name to the supervisor, which removes it when the daemon accepts.
+    ///
+    /// The production destructor, not a helper: nothing in flight, so the fast path runs. The refusal
+    /// is injected at the client (wrapper fails `rm` while `rmfail` exists); the container, every
+    /// inspect and the final removal are the real daemon's.
+    #[cfg(feature = "acp")]
+    #[test]
+    #[ignore = "needs a real docker daemon"]
+    fn live_the_ordinary_settled_holder_drop_hands_a_refused_removal_to_the_supervisor() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let work = stand_in_work_dir("live-fast-drop");
+        let wrapper = work.join("docker");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = rm ] && [ -f \"{0}/rmfail\" ]; then\n  echo \"Error response \
+                 from daemon: cannot remove container (injected at the client)\" >&2\n  exit 1\nfi\n\
+                 exec docker \"$@\"\n",
+                work.to_string_lossy()
+            ),
+        )
+        .expect("wrapper");
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        std::fs::write(work.join("rmfail"), "").expect("refusal marker");
+        let client = DockerCli::stand_in(&wrapper);
+        let name = format!("mx-live-fastdrop-{}", std::process::id());
+        live_rm(&name);
+        let created = std::process::Command::new("docker")
+            .args(["run", "--detach", "--name", &name, &live_image(), "sleep", "300"])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("docker run");
+        assert!(created.success());
+
+        let supervisor = CleanupSupervisor::new();
+        let holder = NetnsHolder::adopt_supervised(
+            name.clone(),
+            client.clone(),
+            FenceBounds {
+                confirm: std::time::Duration::from_secs(1),
+                retain: std::time::Duration::from_secs(1),
+                reschedule: std::time::Duration::from_millis(200),
+                ..quick_bounds()
+            },
+            &supervisor,
+        );
+        assert!(holder.creation.wait_until_settled(std::time::Duration::ZERO), "nothing is in flight");
+
+        drop(holder); // THE PRODUCTION DESTRUCTOR, ordinary settled path.
+
+        assert!(supervisor.owns(&name), "the settled drop swept, logged and returned: nobody owns {name}");
         assert!(supervisor.wait_until_attempts_at_least(2, std::time::Duration::from_secs(60)));
         assert!(supervisor.owns(&name));
         assert_eq!(container_is_absent(&client, &name), Some(false), "the real container is gone early");
