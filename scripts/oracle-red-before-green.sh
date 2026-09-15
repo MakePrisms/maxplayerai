@@ -39,6 +39,15 @@
 #       this test: the stop could have been the signer giving up rather than the executor stopping
 #       the delivery"), which is the gate noticing that the mutation had destroyed its premise.
 #
+#   R3-1a  an_exit_confirmation_is_withheld_until_cleanup_is_established   (lib unit test)
+#       MUTANT: the confirmation is taken at the reap again, without asking whether the delivery's
+#       pipe has been cleaned up. This is the review's PRIMARY finding restored in one line, and it
+#       is the exact condition the test's first assertion names.
+#
+#   R3-1b  a_watchdog_reap_that_times_out_is_charged_against_the_bound          (lib unit test)
+#       MUTANT: the timeout path returns without charging, as it did before. The reap still runs
+#       and still gives up on time; what it stops doing is paying for the window it used.
+#
 #   T3  delivery_push_wire_abort_polled_through_reap
 #       CONTROL: the abort is not issued, and nothing else about the run changes.
 #
@@ -153,6 +162,37 @@ run_mutant "T3/C-NO-ABORT" "$wire_abort_gate" \
   a_pack_upload_whose_task_is_aborted_never_overlaps_a_second_delivery_polled_through_the_reap \
   an_advertisement_whose_task_is_aborted_never_overlaps_a_second_delivery_polled_through_the_reap
 
+echo "== R3-1a: the confirmation is published at the reap, before cleanup =="
+suite=(cargo test -p maxplayer-core --all-features --locked --lib
+       -- --exact delivery_executor::tests::an_exit_confirmation_is_withheld_until_cleanup_is_established)
+run_mutant "R3-1a/M-PUBLISH-AT-REAP" "$executor" \
+'            let confirm = if self.cleanup_established {
+                self.confirm.take()
+            } else {
+                None
+            };
+            return (outcome, confirm);' '            return (outcome, self.confirm.take());' \
+  1 \
+  "the seat was released at the reap, while the delivery" \
+  "$logs/r3-1a-publish-at-reap.log" \
+  delivery_executor::tests::an_exit_confirmation_is_withheld_until_cleanup_is_established
+
+echo "== R3-1b: the timed-out reap goes uncharged =="
+suite=(cargo test -p maxplayer-core --all-features --locked --lib
+       -- --exact delivery_executor::tests::a_watchdog_reap_that_times_out_is_charged_against_the_bound)
+run_mutant "R3-1b/M-UNCHARGED-TIMEOUT" "$executor" \
+'                if started.elapsed() >= budget {
+                    // UNCONFIRMED, AND CHARGED. The seat keeps the turn; see `kill_and_reap`.
+                    charge(started);
+                    return;
+                }' '                if started.elapsed() >= budget {
+                    return;
+                }' \
+  1 \
+  "charged nothing" \
+  "$logs/r3-1b-uncharged-timeout.log" \
+  delivery_executor::tests::a_watchdog_reap_that_times_out_is_charged_against_the_bound
+
 echo "== CONTROL: all three gates, unmutated =="
 restore_targets
 receipt ""
@@ -168,4 +208,10 @@ for gate in delivery_push_local_packing_stall \
   expect_green "CONTROL/$gate" "$logs/control-$gate.log"
 done
 
-echo "all three gates went red for their named reason and are green unmutated; receipts: $receipts"
+suite=(cargo test -p maxplayer-core --all-features --locked --lib
+       -- --exact delivery_executor::tests::an_exit_confirmation_is_withheld_until_cleanup_is_established
+          delivery_executor::tests::a_watchdog_reap_that_times_out_is_charged_against_the_bound)
+receipt "  -- delivery_executor lib: exit-confirmation cleanup gate and reap charging"
+expect_green "CONTROL/r3-item1-lib" "$logs/control-r3-item1-lib.log"
+
+echo "all five mutants went red for their named reason and are green unmutated; receipts: $receipts"

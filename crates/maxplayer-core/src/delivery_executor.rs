@@ -652,6 +652,67 @@ fn reap_window_left(spent: Duration) -> Duration {
     REAP_BOUND.saturating_sub(spent)
 }
 
+/// The reap the deadline watchdog owes after its own kill, extracted so the accounting it performs
+/// can be driven directly by a test rather than only through a spawned thread and a real deadline.
+///
+/// Charges the SAME [`REAP_BOUND`] budget the supervisor charges, and publishes ONLY on an actual
+/// reported exit: a budget that runs out leaves the exit unknown and the seat retained.
+fn reap_after_watchdog_kill(guard: &std::sync::Arc<std::sync::Mutex<ExitGuard>>) {
+    let started = Instant::now();
+    // EVERY EXIT FROM THIS LOOP IS CHARGED, not just the one that found an exit.
+    //
+    // A wait that ended in a timeout, or in an error, spent exactly the same seat time as one that
+    // ended in a reported exit. Charging only the success left the two failing paths free: the
+    // supervisor's own reap then re-read a budget this thread had already spent, so the same
+    // [`REAP_BOUND`] could be spent twice over and the seat's stated sum no longer bounded the
+    // time actually spent. The failed reap is the path most likely to run the budget out, so it is
+    // the one that least may go uncharged.
+    //
+    // Charged once, on the way out, rather than per iteration: `budget` is read from the same
+    // counter, so charging inside the loop would shrink the window while it was being measured
+    // against and end the wait early.
+    let charge = |started: Instant| {
+        let spent = started.elapsed();
+        if let Ok(mut state) = guard.lock() {
+            state.spent_reaping += spent;
+        }
+    };
+    loop {
+        let (outcome, confirm, budget) = {
+            let Ok(mut state) = guard.lock() else { return };
+            let (outcome, confirm) = state.observe_exit();
+            let budget = reap_window_left(state.spent_reaping);
+            (outcome, confirm, budget)
+        };
+        if let Some(confirm) = confirm {
+            charge(started);
+            confirm();
+            return;
+        }
+        match outcome {
+            // Observed. Publication may still be owed to the pump, which holds the other fact.
+            Ok(Some(_)) => {
+                charge(started);
+                return;
+            }
+            Ok(None) => {
+                if started.elapsed() >= budget {
+                    // UNCONFIRMED, AND CHARGED. The seat keeps the turn; see `kill_and_reap`.
+                    charge(started);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            // An unknown exit must never be published as a confirmed one — and the time this
+            // thread spent discovering that it was unknown is still time the seat waited.
+            Err(_) => {
+                charge(started);
+                return;
+            }
+        }
+    }
+}
+
 /// **This process observed the delivery's exit.** Handed to [`KillableChild`] by the seat, and
 /// fired from whichever thread actually saw the kernel report the exit.
 ///
@@ -663,6 +724,30 @@ fn reap_window_left(spent: Duration) -> Duration {
 /// without an answer all leave it unfired, because each of those is an UNKNOWN exit and the seat's
 /// rule for an unknown exit is to retain.
 pub type ExitConfirmation = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+/// The pump thread's end of the cleanup fact: the one call that says this delivery's pipe is
+/// finished, and publishes the seat's confirmation if the exit was already observed.
+#[derive(Clone)]
+pub struct CleanupSink {
+    guard: std::sync::Arc<std::sync::Mutex<ExitGuard>>,
+}
+
+impl CleanupSink {
+    /// Called ONLY on an observed EOF. A read that failed and a parent that stopped listening say
+    /// nothing about who still holds the write end, so neither establishes cleanup and both leave
+    /// the seat retained.
+    pub fn establish(&self) {
+        let confirm = {
+            let Ok(mut state) = self.guard.lock() else {
+                return;
+            };
+            state.establish_cleanup()
+        };
+        if let Some(confirm) = confirm {
+            confirm();
+        }
+    }
+}
 
 /// A spawned child that **cannot be forgotten**. Dropping it kills the process group and waits for
 /// the exit; there is no path out of this module that leaves a delivery packing behind us.
@@ -718,6 +803,15 @@ struct ExitGuard {
     spent_reaping: Duration,
     /// The seat's confirmation sink, taken by whichever thread observes the exit.
     confirm: Option<ExitConfirmation>,
+    /// True once this delivery's stdout pipe has been observed to END — the kernel returned zero to
+    /// the pump, which it does only when the last holder of the write end has let go.
+    ///
+    /// Reaping the child and cleaning up after it are TWO facts, and the seat needs both. A child
+    /// that leaves a descendant behind is reaped at once while that descendant keeps the pipe and
+    /// keeps running, so a confirmation published at the reap hands the seat on while a process
+    /// from this delivery is still alive. `CleanupUnbounded` and `CleanupUnobserved` are reported
+    /// far too late to take back a lock that has already been dropped.
+    cleanup_established: bool,
 }
 
 impl ExitGuard {
@@ -759,13 +853,31 @@ impl ExitGuard {
         };
         let outcome = child.try_wait();
         if matches!(outcome, Ok(Some(_))) {
-            // Reaped and disarmed in the same critical section, as before — plus the confirmation,
-            // which is now published from here rather than from the supervisor's return path.
+            // Reaped and disarmed in the same critical section, as before. The confirmation is
+            // taken here ONLY if the pipe has already been observed to end; otherwise it stays in
+            // the guard for `establish_cleanup` to take, because the exit alone does not say that
+            // nothing from this delivery still holds the descriptor.
             self.disarmed = true;
             self.reaped = true;
-            return (outcome, self.confirm.take());
+            let confirm = if self.cleanup_established {
+                self.confirm.take()
+            } else {
+                None
+            };
+            return (outcome, confirm);
         }
         (outcome, None)
+    }
+
+    /// Record that the pipe reached EOF, and take the confirmation if the exit is already observed.
+    ///
+    /// The SECOND of the two facts to arrive is the one that publishes, whichever it happens to be.
+    fn establish_cleanup(&mut self) -> Option<ExitConfirmation> {
+        self.cleanup_established = true;
+        if self.reaped {
+            return self.confirm.take();
+        }
+        None
     }
 }
 
@@ -799,6 +911,7 @@ impl KillableChild {
                 reaped: false,
                 spent_reaping: Duration::ZERO,
                 confirm: None,
+                cleanup_established: false,
             })),
             watchdog_fired: std::sync::Arc::new(AtomicBool::new(false)),
         })
@@ -901,35 +1014,7 @@ impl KillableChild {
             // promised, and it publishes ONLY on an actual reported exit. A budget that runs out
             // leaves the exit unknown and the seat retained, which is the outcome an unconfirmed
             // child is supposed to have.
-            let started = Instant::now();
-            loop {
-                let (outcome, confirm, budget) = {
-                    let Ok(mut state) = guard.lock() else { return };
-                    let (outcome, confirm) = state.observe_exit();
-                    let budget = reap_window_left(state.spent_reaping);
-                    if matches!(outcome, Ok(Some(_))) {
-                        state.spent_reaping += started.elapsed();
-                    }
-                    (outcome, confirm, budget)
-                };
-                if let Some(confirm) = confirm {
-                    confirm();
-                    return;
-                }
-                match outcome {
-                    // Someone else observed it and has already published. Nothing owed here.
-                    Ok(Some(_)) => return,
-                    Ok(None) => {
-                        if started.elapsed() >= budget {
-                            // UNCONFIRMED. The seat keeps the turn; see `kill_and_reap`.
-                            return;
-                        }
-                        std::thread::sleep(Duration::from_millis(2));
-                    }
-                    // An unknown exit must never be published as a confirmed one.
-                    Err(_) => return,
-                }
-            }
+            reap_after_watchdog_kill(&guard);
         });
     }
 
@@ -1084,6 +1169,17 @@ impl KillableChild {
     }
 
     /// True once the kernel has reported this child's exit status — to EITHER reaper.
+    /// A handle the PUMP thread uses to report that the child's pipe reached EOF.
+    ///
+    /// Handed to the thread that observes the descriptor, not to the supervisor, for the same
+    /// reason the reap was: a fact the seat depends on may not be routed through a caller that can
+    /// stall. See [`CleanupSink::establish`].
+    pub fn cleanup_sink(&self) -> CleanupSink {
+        CleanupSink {
+            guard: std::sync::Arc::clone(&self.guard),
+        }
+    }
+
     pub fn is_reaped(&self) -> bool {
         self.guard
             .lock()
@@ -1260,6 +1356,7 @@ fn pump<R: std::io::Read + Send + 'static>(
     stream: R,
     sink: SyncSender<std::io::Result<Option<ToParent>>>,
     end: std::sync::Arc<std::sync::Mutex<Option<PumpEnd>>>,
+    cleanup: Option<CleanupSink>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stream);
@@ -1281,6 +1378,13 @@ fn pump<R: std::io::Read + Send + 'static>(
                 break reason;
             }
         };
+        // EOF, AND ONLY EOF, ESTABLISHES CLEANUP — reported from this thread, before the handle is
+        // dropped, so the seat does not wait on a supervisor that may never come back to ask.
+        if matches!(reason, PumpEnd::Eof) {
+            if let Some(cleanup) = &cleanup {
+                cleanup.establish();
+            }
+        }
         if let Ok(mut slot) = end.lock() {
             *slot = Some(reason);
         }
@@ -1350,7 +1454,12 @@ pub fn run_push_in_child_confirming(
     }
     let (sink, frames) = sync_channel(MAX_QUEUED_FRAMES);
     let pump_end = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let pump = pump(stdout, sink, std::sync::Arc::clone(&pump_end));
+    let pump = pump(
+        stdout,
+        sink,
+        std::sync::Arc::clone(&pump_end),
+        Some(child.cleanup_sink()),
+    );
     let mut writer = Writer::spawn(stdin);
 
     let outcome = drive(
@@ -2308,6 +2417,102 @@ pub fn minted_answer(header: Option<String>, refused: Option<String>) -> Result<
 mod tests {
     use super::*;
 
+    /// **THE SEAT IS NOT FREE AT THE REAP. IT IS FREE WHEN THE DELIVERY IS ALSO CLEANED UP.**
+    ///
+    /// Reaping says the child is gone. It does not say that nothing from this delivery still holds
+    /// the pipe: a child that leaves a descendant behind is reaped immediately while that
+    /// descendant keeps the write end and keeps running. Publishing at the reap therefore handed
+    /// the seat to the next delivery while a process from this one was still alive, and the
+    /// cleanup errors that notice it are raised far too late to take a released seat back.
+    ///
+    /// So the confirmation is owed TWO facts and is published by whichever arrives second.
+    #[test]
+    fn an_exit_confirmation_is_withheld_until_cleanup_is_established() {
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = std::sync::Arc::clone(&fired);
+        let mut child = KillableChild::spawn(Path::new("/bin/sh"), &["-c", "sleep 30"])
+            .expect("spawn a child to reap");
+        child.publish_confirmed_exit_to(std::sync::Arc::new(move || {
+            sink.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        child.kill_and_reap().expect("a live child must be reapable");
+        assert!(child.is_reaped(), "the child was not confirmed gone");
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            0,
+            "the seat was released at the reap, while the delivery's pipe was still open"
+        );
+
+        // The pump reports EOF. That is the second fact, so this is the call that publishes.
+        child.cleanup_sink().establish();
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            1,
+            "the seat was never released once BOTH the exit and the cleanup were observed"
+        );
+
+        // Publication is once and once only, whichever order the two facts arrive in.
+        child.cleanup_sink().establish();
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            1,
+            "the confirmation was published more than once"
+        );
+    }
+
+    /// **A REAP THAT RAN OUT OF BUDGET SPENT THE SEAT'S TIME JUST AS SURELY AS ONE THAT SUCCEEDED.**
+    ///
+    /// The watchdog's own reap charged [`REAP_BOUND`] only when it observed an exit. The timeout
+    /// and error paths returned without charging anything, so the supervisor's later reap read a
+    /// budget this thread had already spent and was free to spend it again — the bound the seat is
+    /// stated in stopped bounding the time actually spent, on exactly the path (a reap that fails)
+    /// where the wait is longest.
+    ///
+    /// Driven with the budget nearly exhausted, so the test costs the remainder and not the whole
+    /// window.
+    #[test]
+    fn a_watchdog_reap_that_times_out_is_charged_against_the_bound() {
+        let mut child = KillableChild::spawn(Path::new("/bin/sh"), &["-c", "sleep 30"])
+            .expect("spawn a child that will not exit on its own");
+        let already_spent = REAP_BOUND - Duration::from_millis(150);
+        {
+            let mut state = child.guard.lock().expect("guard");
+            state.spent_reaping = already_spent;
+        }
+
+        // The child is deliberately NOT killed, so this reap can only end in the timeout path.
+        let waited = Instant::now();
+        reap_after_watchdog_kill(&child.guard);
+        let waited = waited.elapsed();
+
+        let spent = child.spent_reaping();
+        assert!(
+            spent > already_spent,
+            "a reap that waited {waited:?} and gave up charged nothing: \
+             spent_reaping is still {spent:?}"
+        );
+        assert!(
+            spent >= REAP_BOUND,
+            "the exhausted budget reads as {spent:?}, under the {REAP_BOUND:?} it spent, so a \
+             later reap may spend the same window again"
+        );
+        assert_eq!(
+            reap_window_left(spent),
+            Duration::ZERO,
+            "a spent budget must leave no window behind"
+        );
+
+        // The exhausted budget is the POINT of this test, and it makes the supervisor's own reap
+        // fail closed (`Unreaped`) exactly as an overspent window should. Restore a window purely
+        // so this test cleans up the process it started.
+        {
+            let mut state = child.guard.lock().expect("guard");
+            state.spent_reaping = Duration::ZERO;
+        }
+        child.kill_and_reap().expect("clean up the test child");
+    }
+
     /// **A WRITE THAT FAILED BECAUSE WE KILLED THE CHILD IS A STOP, NOT A PROTOCOL FAULT.**
     ///
     /// Every write to a child this process has just killed fails with `EPIPE`, so the broken pipe
@@ -2828,7 +3033,8 @@ mod tests {
         };
         let (sink, frames) = sync_channel(MAX_QUEUED_FRAMES);
         let end = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let reader = pump(pipe, sink, std::sync::Arc::clone(&end));
+        // No child behind this pipe, so there is no cleanup fact to establish.
+        let reader = pump(pipe, sink, std::sync::Arc::clone(&end), None);
 
         let malformed = frames
             .recv_timeout(Duration::from_secs(5))
