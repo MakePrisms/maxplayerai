@@ -25,6 +25,7 @@
 //! the same contract `delivery_executor` documents. Measured on whatever host runs them.
 
 #![cfg(unix)]
+#![cfg(feature = "git-delivery")]
 
 use std::path::PathBuf;
 use std::sync::Arc;
