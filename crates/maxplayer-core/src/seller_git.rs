@@ -1202,7 +1202,14 @@ pub async fn neutralize_then_push_in_child_off_runtime(
             // A remote that takes no authorization is a remote the child must never ask about; the
             // proxy below refuses anyway, so the two agree.
             authenticated: mint.is_some(),
+            // Both are restamped together at the write, inside the deadline; these are only the
+            // initial values. They are stamped consistently even here, so that an unstamped field
+            // is never a value with a meaning of its own — a zero absolute deadline is simply an
+            // expired one, which fails safe rather than opening a "not set" bypass.
             budget_ms: u64::try_from(lifetime.remaining().as_millis()).unwrap_or(u64::MAX),
+            deadline_unix_ms: crate::delivery_executor::now_unix_ms().saturating_add(
+                u64::try_from(lifetime.remaining().as_millis()).unwrap_or(u64::MAX),
+            ),
         };
         // The absolute deadline this delivery has always had. It is the parent's, not the child's:
         // the child is not trusted to bound itself, which is the entire reason it is a child.

@@ -71,6 +71,17 @@ fn supervise_within(
     answer.recv_timeout(patience)
 }
 
+/// The parent stamps a remaining duration AND the same deadline as an absolute wall-clock instant,
+/// so the child can charge the pipe transit to itself. Tests that build a request by hand stamp
+/// both from one moment, exactly as the parent does.
+fn unix_ms_from_now(budget_ms: u64) -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+        .saturating_add(budget_ms)
+}
+
 fn request_with_branch(branch: String) -> PushRequest {
     PushRequest {
         workdir: std::env::temp_dir(),
@@ -79,6 +90,7 @@ fn request_with_branch(branch: String) -> PushRequest {
         gated_oid: "0".repeat(40),
         authenticated: false,
         budget_ms: 1_000,
+        deadline_unix_ms: unix_ms_from_now(1_000),
     }
 }
 
@@ -220,6 +232,7 @@ fn an_oversized_frame_is_refused_by_the_writer_not_discovered_by_the_reader() {
         gated_oid: "0".repeat(40),
         authenticated: false,
         budget_ms: 1,
+        deadline_unix_ms: unix_ms_from_now(1),
     })
     .expect_err("a frame over the cap must not be written");
     assert_eq!(refused.kind(), std::io::ErrorKind::InvalidData);
@@ -231,6 +244,7 @@ fn an_oversized_frame_is_refused_by_the_writer_not_discovered_by_the_reader() {
         gated_oid: "0".repeat(40),
         authenticated: false,
         budget_ms: 1,
+        deadline_unix_ms: unix_ms_from_now(1),
     })
     .expect("an ordinary frame is written");
     assert!(accepted.ends_with('\n'), "frames are newline-delimited");

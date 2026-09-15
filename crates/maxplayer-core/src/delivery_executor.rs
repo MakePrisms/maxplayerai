@@ -119,10 +119,13 @@
 //!   by that signal, is not waited for, and is not claimed to be gone; step 12's EOF wait is what
 //!   notices one still holding the stdout pipe, and even that only while it holds it.
 //! - **The child's own budget is the parent's remaining time at the instant the request is
-//!   written**, and the child starts that clock when it reads the frame. The pipe transit between
-//!   those two moments is budget the child gets and the parent has already spent. It is small and it
-//!   is real; the parent's kill is what actually bounds the child, and the budget is what lets the
-//!   child refuse to start work it cannot finish.
+//!   written, minus the pipe transit.** The parent stamps both a remaining duration and the same
+//!   deadline as an absolute wall-clock instant; the child subtracts its own `now` from the second
+//!   and takes whichever of the two is smaller. The transit between the parent's write and the
+//!   child's read is therefore charged to the child instead of granted to it, and a wall clock
+//!   stepped backward cannot lift the child past the duration ceiling. What is NOT claimed: this is
+//!   one host's clock, not a synchronised one, and the budget is still only what lets the child
+//!   refuse work it cannot finish — the parent's kill is what actually bounds it.
 //! - **The parent waits for the actual exit.** A pid stays a zombie until it is reaped; we always
 //!   reap, so the turn is never returned to a pid that still exists.
 //!
@@ -360,7 +363,43 @@ pub struct PushRequest {
     pub authenticated: bool,
     /// What is left of the delivery's absolute work deadline at the moment the request is written.
     /// Sent as a duration rather than an instant because `Instant` has no meaning across processes.
+    ///
+    /// This is a CEILING, not the budget. On its own it hands the child the pipe transit for free:
+    /// the child starts counting when it READS, and everything between the parent's write and that
+    /// read is time the parent has already spent. [`Self::deadline_unix_ms`] is what removes that.
     pub budget_ms: u64,
+    /// The same deadline as an absolute wall-clock instant — UNIX epoch milliseconds — stamped at
+    /// the same moment `budget_ms` is measured.
+    ///
+    /// `Instant` has no meaning across processes, but parent and child are the same host and read
+    /// the same clock, so this one does: the child subtracts its OWN `now` and the pipe transit is
+    /// accounted for rather than granted. The child takes the MINIMUM of this and `budget_ms`, so a
+    /// wall clock stepped BACKWARD between the two reads cannot extend the child past the ceiling;
+    /// a forward step only shortens it. Neither replaces the parent's kill.
+    pub deadline_unix_ms: u64,
+}
+
+/// Wall-clock `now` in UNIX epoch milliseconds, saturating rather than panicking on a clock before
+/// the epoch. Used only for the cross-process deadline, never for measuring an interval.
+pub(crate) fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// How long the CHILD may run, decided at the instant it reads the request.
+///
+/// The whole point is the `min`. `budget_ms` alone restarts the clock at the read, so the pipe
+/// transit — the parent's write, the scheduler, the child's read — was time the parent had spent
+/// and the child was handed anyway. The absolute deadline removes exactly that interval, because
+/// both processes read one host clock. Keeping the duration as a ceiling is what makes a wall clock
+/// stepped BACKWARD between the two reads unable to extend the child; a forward step only shortens
+/// it, which fails safe. Neither is the real bound: the parent's kill is.
+pub(crate) fn child_budget(request: &PushRequest, now_ms: u64) -> Duration {
+    let by_ceiling = request.budget_ms;
+    let by_clock = request.deadline_unix_ms.saturating_sub(now_ms);
+    Duration::from_millis(by_ceiling.min(by_clock))
 }
 
 #[derive(Debug)]
@@ -1003,11 +1042,15 @@ fn drive(
             // The budget is measured HERE, at the write, not when the request was built. It is the
             // parent's remaining time handed across as a duration, and every millisecond spent
             // between building the request and writing it — the spawn, the fork/exec, the
-            // handshake — used to be given back to the child as budget it never had. The child
-            // still starts this clock when it READS the frame, so the pipe transit is unaccounted
-            // for; that residue is named in the module header rather than claimed away.
+            // handshake — used to be given back to the child as budget it never had.
+            //
+            // Both fields are stamped from the SAME moment, and they are not redundant: the
+            // duration is a ceiling the child can never exceed, and the absolute instant is what
+            // makes the pipe transit the child's cost instead of a free extension. The child takes
+            // whichever is smaller. See [`PushRequest::deadline_unix_ms`].
             let mut request = request.clone();
             request.budget_ms = u64::try_from(left.as_millis()).unwrap_or(u64::MAX);
+            request.deadline_unix_ms = now_unix_ms().saturating_add(request.budget_ms);
             stalled_write(
                 writer,
                 &ToChild::Push(request),
@@ -1310,12 +1353,13 @@ where
 {
     use std::sync::{Arc, Mutex};
 
-    // This child's OWN deadline, derived from the budget the parent sent. The parent's deadline is
-    // an `Instant` in another process and means nothing here; without this the child had no clock
-    // at all and `budget_ms` was a field nobody read. It does not replace the parent's kill — the
-    // child is still not trusted to bound itself — it is what makes the transport's own pre-wire
-    // gates real on this side instead of `None`.
-    let deadline = Instant::now() + Duration::from_millis(request.budget_ms);
+    // This child's OWN deadline, derived from what the parent sent. The parent's `Instant` means
+    // nothing here; without this the child had no clock at all and `budget_ms` was a field nobody
+    // read. It is taken NOW, at the read, and [`child_budget`] subtracts the pipe transit from it
+    // rather than granting it. It does not replace the parent's kill — the child is still not
+    // trusted to bound itself — it is what makes the transport's own pre-wire gates real on this
+    // side instead of `None`.
+    let deadline = Instant::now() + child_budget(request, now_unix_ms());
     let lifetime: crate::git_transport::AuthorityCheck = Arc::new(move || {
         if Instant::now() >= deadline {
             return Err(
@@ -1446,6 +1490,63 @@ pub fn minted_answer(header: Option<String>, refused: Option<String>) -> Result<
 mod tests {
     use super::*;
 
+    /// The child's two bounds, and the rule that picks between them.
+    ///
+    /// The end-to-end consequence of the ABSOLUTE bound — a child that read its request too late
+    /// opening no connection at all — is gated behaviourally against a real listener in
+    /// `tests/delivery_push_transit_budget.rs`. What is gated here is the other half, which that
+    /// harness cannot reach: a wall clock that steps BACKWARD between the parent's stamp and the
+    /// child's read makes the absolute deadline the LARGER of the two, and the duration ceiling has
+    /// to be what binds. This is the actual function the child calls, with the actual request type.
+    #[test]
+    fn the_child_takes_whichever_of_its_two_bounds_is_smaller() {
+        let mut request = PushRequest {
+            workdir: PathBuf::from("/tmp/delivery"),
+            remote_url: "https://relay.example/repo.git".to_owned(),
+            branch: "job-1".to_owned(),
+            gated_oid: "0".repeat(40),
+            authenticated: false,
+            budget_ms: 0,
+            deadline_unix_ms: 0,
+        };
+        let stamped = 1_000_000_000_000u64;
+
+        // The ordinary case: stamped together, read instantly. The two agree.
+        request.budget_ms = 30_000;
+        request.deadline_unix_ms = stamped + 30_000;
+        assert_eq!(
+            child_budget(&request, stamped),
+            Duration::from_millis(30_000),
+            "a request read at the instant it was stamped gets what the parent measured"
+        );
+
+        // The transit: 5s passed between the write and the read. That is the parent's spend, and
+        // the child must not be given it back.
+        assert_eq!(
+            child_budget(&request, stamped + 5_000),
+            Duration::from_millis(25_000),
+            "the pipe transit is charged to the child, not granted to it"
+        );
+
+        // Read after the deadline: nothing left, and nothing negative.
+        assert_eq!(
+            child_budget(&request, stamped + 31_000),
+            Duration::ZERO,
+            "a deadline already spent leaves zero budget, not a wrapped one"
+        );
+
+        // THE CEILING. A clock stepped an hour backward between stamp and read puts the absolute
+        // deadline an hour away. The duration is what stops the child taking it.
+        request.budget_ms = 500;
+        request.deadline_unix_ms = stamped + 3_600_000;
+        assert_eq!(
+            child_budget(&request, stamped),
+            Duration::from_millis(500),
+            "a wall clock that steps backward must never buy a delivery more time than the parent \
+             measured"
+        );
+    }
+
     #[test]
     fn a_frame_round_trips_through_the_pipe_encoding() {
         let request = PushRequest {
@@ -1455,6 +1556,7 @@ mod tests {
             gated_oid: "0".repeat(40),
             authenticated: true,
             budget_ms: 150_000,
+            deadline_unix_ms: now_unix_ms().saturating_add(150_000),
         };
         let mut wire = Vec::new();
         write_frame(&mut wire, &ToChild::Push(request.clone())).expect("write");

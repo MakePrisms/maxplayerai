@@ -133,7 +133,15 @@ fn a_push_request_crosses_the_pipe_and_its_outcome_comes_back() {
         // No mint may be asked for: an unauthenticated remote that asks to sign is a protocol
         // violation the parent kills for, and this test pins that the child does not ask.
         authenticated: false,
+        // The parent stamps a remaining duration AND the same deadline as an absolute wall-clock
+        // instant, from one moment, so the child charges the pipe transit to itself rather than
+        // restarting its clock at the read. Stamped the same way here.
         budget_ms: 5_000,
+        deadline_unix_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0)
+            .saturating_add(5_000),
     });
     let mut frame = serde_json::to_string(&request).expect("encode");
     frame.push('\n');
