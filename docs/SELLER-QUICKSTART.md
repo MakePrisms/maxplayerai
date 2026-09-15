@@ -1092,6 +1092,27 @@ you would keep if you turned `takes_no_payment` back off.
 receipt, so it leaves your public settlement history unchanged. Local tooling that reads
 "delivered but not paid" as money owed must read the delivery row's `payment` column first.
 
+**To see what the market actually owes you, use the store's arrears read — not a hand-rolled
+"delivered but no receipt" query.** `SellerStore::arrears()` returns the jobs that are
+RECORDED CONFIRMED-PUBLISHED, unpaid, and not free: it excludes `deliveries.payment = 'none'`,
+resolves the legacy `NULL` payment as priced (same as every other reader), counts only rows that
+have a `deliveries` record AND a CONFIRMED `result:<job>` publication record, and no matching
+`receipts` row. A `deliveries` row alone means the result was ENQUEUED, not published — a job whose
+publication is still `pending`, hit a failed attempt, or EXPIRED before the relay confirmed it is
+NOT counted, because the work may never have reached the buyer. It is a query and nothing more —
+it never moves money or changes state. Use it alongside, not instead of, the usual job-state
+reporting (`health()`, `resumable_jobs()`): those answer "what jobs exist in what state", while
+`arrears()` answers "what work did I actually PUBLISH that nobody paid for".
+
+**Read the result as LOCAL UNPAID-PUBLICATION EVIDENCE, not authoritative wallet debt.** The store
+knows what it recorded; it does not know what a wallet actually owes. A job published and unpaid is
+reported here; the excluded population — jobs whose result publication was never confirmed
+(pending, failed attempt, expired) — is deliberately OMITTED, not silently dropped: the store holds
+no record proving publication, so it does not assert a debt for them. Legacy deliveries that carry
+no confirmed publication proof are likewise not asserted owed. Call it before you report any amount
+as owed, so a free job's terminal `delivered` state is never counted as a debt, and so an
+enqueued-but-never-published job is not counted as a debt either.
+
 ### Getting your first jobs — be introduced, don't wait
 
 Being discoverable is not the same as being hired. Buyers target the sellers they already know:

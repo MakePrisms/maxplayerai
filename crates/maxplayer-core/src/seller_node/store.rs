@@ -142,6 +142,32 @@ impl JobFeeAccrual {
     }
 }
 
+/// One seller-store job the market owes money for — qualified by RECORDED CONFIRMED RESULT
+/// PUBLICATION, not mere enqueue. A `deliveries` row means the result was ENQUEUED for
+/// publication, not that it reached the world; only where the store holds a CONFIRMED
+/// `result:{job_id}` outbox record (`state = 'confirmed'`) do we treat the work as actually
+/// published. The row is therefore **local unpaid-publication evidence**, not authoritative wallet
+/// debt: the store knows what it recorded, not what a wallet owes.
+///
+/// It must also be UNPAID (no `receipts` row resolves it) and not a free job
+/// (`deliveries.payment != 'none'`; legacy NULL resolves PRICED). This is the supported read for
+/// "what have I published and not been paid for?" — the query operator arrears tooling should call
+/// rather than hand-rolling `delivered AND no receipt`, which forgets `deliveries.payment` and
+/// counts every ENQUEUED (not confirmed-published) job's terminal `delivered` state as a debt.
+///
+/// Returned by [`SellerStore::arrears`]. `deliveries.job_id` is the PRIMARY KEY, `receipts` is
+/// probed with an anti-join, and the publication check is a correlated EXISTS over the UNIQUE
+/// `nostr_event_outbox.dedup_key`, so the result is 1:1 with delivery rows — the query cannot fan
+/// out and invent debt that was never owed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArrearsJob {
+    pub job_id: String,
+    /// The delivery record's own reference (`deliveries.result_ref`), the seller-authored snapshot
+    /// that was published.
+    pub result_ref: String,
+    pub delivered_at_unix: i64,
+}
+
 /// Lifecycle of one remittance attempt. `Planned` and `Spending` are the two states under which
 /// money may be moving — together the one in-flight row: at most ONE row may be in flight at a time
 /// (enforced by a partial unique index AND by [`SellerStore::plan_remittance`]), which is what makes
@@ -1903,6 +1929,67 @@ impl SellerStore {
             .optional()?
             .is_some();
         Ok(found)
+    }
+
+    /// Jobs the market owes money for — actually PUBLISHED (recorded confirmed result
+    /// publication) AND unpaid AND not free — the supported seller-store arrears read. The result
+    /// is **local unpaid-publication evidence**, not authoritative wallet debt. This is what
+    /// operator arrears tooling should call instead of hand-rolling "delivered but no receipt",
+    /// which cannot see `deliveries.payment` and would count every enqueued job's terminal
+    /// `delivered` state as a debt.
+    ///
+    /// Rules (issue #975, revised R2):
+    /// - The job must have a RECORDED CONFIRMED result publication: a `nostr_event_outbox` row with
+    ///   `dedup_key = 'result:<job_id>'` and `state = 'confirmed'`. A `deliveries` row alone means
+    ///   ENQUEUED, not published — so a job whose result was only enqueued (still `pending`, a
+    ///   failed attempt, or EXPIRED-unpublished) is NOT reported, because the work may never have
+    ///   reached the world and the debt may never have been incurred.
+    /// - `deliveries.payment = 'none'` is EXCLUDED — a free job is not owed money.
+    /// - `payment = 'sat'` AND the legacy `NULL` both resolve PRICED (`payment_mode_from_column`'s
+    ///   fail-closed default). A legacy row is reported ONLY when it also carries confirmed
+    ///   publication proof; a legacy delivery WITHOUT publication proof is NOT asserted owed.
+    /// - Only rows with a `deliveries` row, a confirmed result publication, and NO `receipts` row
+    ///   (unpaid) count. Confirmed-and-paid, non-delivered, and enqueued-but-unconfirmed jobs are
+    ///   excluded.
+    ///
+    /// Disclosure of the omitted population: the store deliberately does not report jobs whose
+    /// result publication was never confirmed (pending, failed attempt, or expired). These may or
+    /// may not have reached the buyer; the store holds no record proving publication, so it does
+    /// not assert a debt for them. A job that is enqueued but unconfirmed is therefore ABSENT from
+    /// this read — that absence is intentional, not an omission.
+    ///
+    /// Cardinality: the join is `deliveries` (whose `job_id` is the PRIMARY KEY, so one row per job)
+    /// anti-joined against `receipts` via `NOT EXISTS` on the same `job_id` key, and the publication
+    /// check is a correlated EXISTS over the UNIQUE `nostr_event_outbox.dedup_key`. `receipts` and
+    /// the outbox are only tested for EXISTENCE and never joined through to the output, so a single
+    /// published unpaid job appears at most once regardless of how many receipt or outbox rows it
+    /// has. The anti-join therefore cannot fan out: one published unpaid job yields exactly one
+    /// [`ArrearsJob`].
+    ///
+    /// A query and nothing more — nothing here moves money, changes state, or writes a row.
+    pub fn arrears(&self) -> Result<Vec<ArrearsJob>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT d.job_id, d.result_ref, d.delivered_at_unix
+             FROM deliveries d
+             WHERE (d.payment IS NULL OR d.payment != 'none')
+               AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.job_id = d.job_id)
+               AND EXISTS (SELECT 1 FROM nostr_event_outbox o
+                           WHERE o.dedup_key = 'result:' || d.job_id AND o.state = 'confirmed')
+             ORDER BY d.delivered_at_unix ASC, d.job_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ArrearsJob {
+                job_id: row.get(0)?,
+                result_ref: row.get(1)?,
+                delivered_at_unix: row.get(2)?,
+            })
+        })?;
+        let mut jobs = Vec::new();
+        for row in rows {
+            jobs.push(row?);
+        }
+        Ok(jobs)
     }
 
     /// What the platform fee has come to: the all-time total, how much of it is remitted /
@@ -5401,6 +5488,502 @@ mod free_lane_tests {
             "no new terminal state was added — deliveries.payment carries the fact instead: {ddl}"
         );
         drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- seller-store arrears query (issue #975) ---------------------------------------------
+
+    /// Drive a job through the real write path to a CONFIRMED-PUBLISHED delivery. `mode` is the
+    /// payment mode the offer and delivery are journaled under (`Sat` for paid, `None` for free).
+    /// After `deliver_and_enqueue` lands the `result:{job}` outbox row in `pending`, this marks it
+    /// CONFIRMED via the same `mark_confirmed` path the publisher uses — so the fixture is proof of
+    /// published work, not merely enqueue. (R2 F1 lesson: a fixture that only enqueues cannot tell
+    /// the published case from the unpublished one.)
+    fn deliver(store: &SellerStore, job: &str, mode: PaymentMode) {
+        store.record_offer(&offer_row(job, mode), 1).expect("record offer");
+        store
+            .claim_and_enqueue(
+                job,
+                job,
+                if mode.is_free() { None } else { Some("creqA") },
+                &wire_draft(crate::gateway::JOB_CLAIM_KIND),
+                1,
+                9_999,
+                1,
+            )
+            .expect("claim");
+        store.record_award(&format!("award-{job}"), job, &"b".repeat(64), 2).expect("award");
+        assert!(
+            store
+                .deliver_and_enqueue(
+                    job,
+                    "ref",
+                    mode,
+                    &wire_draft(crate::gateway::JOB_RESULT_KIND),
+                    3,
+                    9_999,
+                    3,
+                )
+                .expect("deliver"),
+            "{job} must deliver"
+        );
+        confirm_result(store, job);
+    }
+
+    /// Confirm the `result:{job}` outbox row the way the publisher does: find the pending row and
+    /// call `mark_confirmed` on it. Panics if there is no such pending row (a fixture bug).
+    /// (Discovery uses `now=8_000` because `pending_outbox` only returns rows with
+    /// `expires_at_unix > now`; our rows expire at 9_999, so they are pending across 8_000.)
+    fn confirm_result(store: &SellerStore, job: &str) {
+        let pending = store.pending_outbox(8_000).expect("pending");
+        let row = pending
+            .iter()
+            .find(|item| item.dedup_key == format!("result:{job}"))
+            .unwrap_or_else(|| panic!("result:{job} must be pending before confirm"));
+        store
+            .mark_confirmed(row.id, &format!("evt-{job}"), 9_999)
+            .expect("confirm");
+    }
+
+    /// Drive a job to a DELIVERED-but-UNCONFIRMED state (enqueue only): the result was produced and
+    /// handed to the outbox, but publication has NOT been confirmed. Used for the lifecycle cases
+    /// the R1 review flagged as wrongly reported (pending, failed attempt, expired-unpublished).
+    fn deliver_unconfirmed(store: &SellerStore, job: &str, mode: PaymentMode) {
+        store.record_offer(&offer_row(job, mode), 1).expect("record offer");
+        store
+            .claim_and_enqueue(
+                job,
+                job,
+                if mode.is_free() { None } else { Some("creqA") },
+                &wire_draft(crate::gateway::JOB_CLAIM_KIND),
+                1,
+                9_999,
+                1,
+            )
+            .expect("claim");
+        store.record_award(&format!("award-{job}"), job, &"b".repeat(64), 2).expect("award");
+        assert!(
+            store
+                .deliver_and_enqueue(
+                    job,
+                    "ref",
+                    mode,
+                    &wire_draft(crate::gateway::JOB_RESULT_KIND),
+                    3,
+                    9_999,
+                    3,
+                )
+                .expect("deliver"),
+            "{job} must deliver"
+        );
+    }
+
+    /// Mark the `result:{job}` outbox row EXPIRED the way the real publisher does after the retry
+    /// window closes: call `expire_outbox`, which flips every still-`pending` row whose
+    /// `expires_at_unix <= now` to `expired`. Publication was never confirmed. (We controlled the
+    /// row's `expires_at_unix` in `deliver_unconfirmed` so this is exactly the row we mean.)
+    fn expire_pending_result(store: &SellerStore, job: &str) {
+        let before = store.pending_outbox(8_000).expect("pending");
+        assert!(
+            before.iter().any(|i| i.dedup_key == format!("result:{job}")),
+            "result:{job} must be pending before expire"
+        );
+        // `expire_outbox` flips every still-pending row whose `expires_at_unix <= now`. Our rows
+        // expire at 9_999, so `now=9_999` expires them. (Discovery uses 8_000 because
+        // `pending_outbox` only returns rows with `expires_at_unix > now`.)
+        let expired = store.expire_outbox(9_999).expect("expire");
+        let after = store.pending_outbox(8_000).expect("pending");
+        assert!(
+            after.iter().all(|i| i.dedup_key != format!("result:{job}")),
+            "result:{job} must be gone from pending after expire"
+        );
+        assert!(expired >= 1, "expire_outbox must have expired a row");
+    }
+
+    /// Settle a delivered PRICED job the only way the store does: a real receipt write that marks
+    /// `jobs.state = 'paid'`.
+    fn settle(store: &SellerStore, job: &str) {
+        store
+            .collect_receipt(
+                &format!("receipt-{job}"),
+                job,
+                21,
+                ReceiptFees { mint_fee_sats: 1, fee_bps: 1000, fee_sats: 2 },
+                4,
+            )
+            .expect("collect");
+    }
+
+    /// The job_ids the supported arrears method reports, in the order it reports them.
+    fn arrears_ids(store: &SellerStore) -> Vec<String> {
+        store
+            .arrears()
+            .expect("arrears")
+            .into_iter()
+            .map(|a| a.job_id)
+            .collect()
+    }
+
+    /// Insert a LEGACY delivery row that was actually CONFIRMED-PUBLISHED: a priced job delivered
+    /// BEFORE `deliveries.payment` existed, so `payment` is NULL and every reader must resolve it
+    /// to PRICED, never free. Because R2 only reports jobs with RECORDED confirmed publication
+    /// proof, this also writes a CONFIRMED `result:{job}` outbox row — the legacy row carries the
+    /// proof it needs to be asserted owed.
+    fn legacy_delivery(path: &std::path::Path, job: &str) {
+        let conn = Connection::open(path).expect("reopen raw");
+        conn.execute(
+            "INSERT INTO jobs (job_id, offer_id, state, created_at_unix, updated_at_unix)
+             VALUES (?1, ?2, 'delivered', 1, 1)",
+            params![job, format!("offer-{job}")],
+        )
+        .expect("insert legacy job");
+        conn.execute(
+            "INSERT INTO deliveries (job_id, result_ref, delivered_at_unix, payment)
+             VALUES (?1, 'legacy-ref', 1, NULL)",
+            [job],
+        )
+        .expect("insert legacy delivery");
+        conn.execute(
+            "INSERT INTO nostr_event_outbox
+                (dedup_key, draft_json, created_at_unix, state, attempts,
+                 expires_at_unix, published_event_id, updated_at_unix)
+             VALUES (?1, '{}', 1, 'confirmed', 1, 9999, ?2, 1)",
+            params![format!("result:{job}"), format!("legacy-evt-{job}")],
+        )
+        .expect("insert confirmed publication proof");
+        drop(conn);
+    }
+
+    /// Insert a LEGACY delivery row WITHOUT publication proof: a priced job delivered before
+    /// `deliveries.payment` existed (payment NULL = PRICED) whose result publication was NEVER
+    /// confirmed. Under R2 this must NOT be asserted owed — there is no recorded proof the work
+    /// reached the world, so the "debt" may never have been incurred.
+    fn legacy_delivery_unconfirmed(path: &std::path::Path, job: &str) {
+        let conn = Connection::open(path).expect("reopen raw");
+        conn.execute(
+            "INSERT INTO jobs (job_id, offer_id, state, created_at_unix, updated_at_unix)
+             VALUES (?1, ?2, 'delivered', 1, 1)",
+            params![job, format!("offer-{job}")],
+        )
+        .expect("insert legacy job");
+        conn.execute(
+            "INSERT INTO deliveries (job_id, result_ref, delivered_at_unix, payment)
+             VALUES (?1, 'legacy-ref-unconfirmed', 1, NULL)",
+            [job],
+        )
+        .expect("insert legacy delivery");
+        // NO outbox row: no recorded publication proof. The legacy delivery is deliberately not
+        // asserted owed.
+        drop(conn);
+    }
+
+    /// A FREE job is delivered but never owed money — `payment='none'` must keep it out of arrears.
+    ///
+    /// NON-VACUOUS: if the query forgot the `payment` filter and counted every delivered-unpaid
+    /// row as owed, the free job would appear here and the set would shift; if it wrongly excluded
+    /// ALL unpaid rows, the priced job would vanish. Both are caught by the exact-set assertion.
+    #[test]
+    fn arrears_excludes_free_jobs() {
+        let path = temp_db("arrears-free");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        deliver(&store, "free-job", PaymentMode::None);
+        deliver(&store, "priced-job", PaymentMode::Sat);
+        assert_eq!(
+            arrears_ids(&store),
+            vec!["priced-job".to_owned()],
+            "only the priced delivered-unpaid job is owed; the free job is not debt"
+        );
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A LEGACY `payment = NULL` delivery is a priced job (the fail-closed default), so it counts.
+    ///
+    /// NON-VACUOUS: if a reader resolved NULL as free (or as anything to exclude), the legacy job
+    /// would disappear from the result and the exact-set assertion would fail.
+    #[test]
+    fn arrears_includes_legacy_null_as_priced() {
+        let path = temp_db("arrears-legacy");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        deliver(&store, "priced-job", PaymentMode::Sat);
+        legacy_delivery(&path, "legacy-job");
+        assert_eq!(
+            arrears_ids(&store),
+            vec!["legacy-job".to_owned(), "priced-job".to_owned()],
+            "legacy NULL and explicit 'sat' both resolve PRICED and both count"
+        );
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A delivered job that HAS a receipt is paid — not arrears.
+    ///
+    /// NON-VACUOUS: if the query dropped the anti-join against `receipts` (or forgot to exclude
+    /// paid), the settled job would appear as owed and the exact-set assertion would fail.
+    #[test]
+    fn arrears_excludes_paid_jobs() {
+        let path = temp_db("arrears-paid");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        deliver(&store, "paid-job", PaymentMode::Sat);
+        settle(&store, "paid-job");
+        deliver(&store, "unpaid-job", PaymentMode::Sat);
+        assert_eq!(
+            arrears_ids(&store),
+            vec!["unpaid-job".to_owned()],
+            "the settled job is excluded; only the delivered-unpaid job is owed"
+        );
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A job that never reached an actual delivery is not owed money at all.
+    ///
+    /// NON-VACUOUS: the method is anchored on the `deliveries` table, so a claimed/awarded job with
+    /// no delivery row (and thus no publication) cannot be reported as an unpaid delivery. If the
+    /// method instead walked `jobs` and treated any non-`paid` terminal state as owed, this awarded
+    /// job would leak in and the exact-set assertion would fail.
+    #[test]
+    fn arrears_excludes_non_delivered_jobs() {
+        let path = temp_db("arrears-nondelivered");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        // A job claimed and awarded but never delivered — no `deliveries` row exists.
+        store.record_offer(&offer_row("not-delivered", PaymentMode::Sat), 1).expect("record offer");
+        store
+            .claim_and_enqueue(
+                "not-delivered",
+                "not-delivered",
+                Some("creq"),
+                &wire_draft(crate::gateway::JOB_CLAIM_KIND),
+                1,
+                9_999,
+                1,
+            )
+            .expect("claim");
+        store.record_award("award-not-delivered", "not-delivered", &"b".repeat(64), 2).expect("award");
+        deliver(&store, "delivered-job", PaymentMode::Sat);
+        assert_eq!(
+            arrears_ids(&store),
+            vec!["delivered-job".to_owned()],
+            "an awarded-but-never-delivered job owes nothing"
+        );
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Mixed rows return EXACT IDs and counts.
+    #[test]
+    fn arrears_mixed_rows_return_exact_ids_and_counts() {
+        let path = temp_db("arrears-mixed");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        deliver(&store, "free-job", PaymentMode::None);
+        deliver(&store, "priced-unpaid", PaymentMode::Sat);
+        legacy_delivery(&path, "legacy-unpaid");
+        deliver(&store, "priced-paid", PaymentMode::Sat);
+        settle(&store, "priced-paid");
+        store.record_offer(&offer_row("never-delivered", PaymentMode::Sat), 1).expect("record offer");
+        store
+            .claim_and_enqueue(
+                "never-delivered",
+                "never-delivered",
+                Some("creq"),
+                &wire_draft(crate::gateway::JOB_CLAIM_KIND),
+                1,
+                9_999,
+                1,
+            )
+            .expect("claim");
+        store.record_award("award-never", "never-delivered", &"b".repeat(64), 2).expect("award");
+
+        let ids = arrears_ids(&store);
+        assert_eq!(
+            ids,
+            vec!["legacy-unpaid".to_owned(), "priced-unpaid".to_owned()],
+            "exactly the delivered, unpaid, priced rows — free, paid and never-delivered excluded"
+        );
+        assert_eq!(ids.len(), 2, "exact count of owed jobs");
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The anti-join cannot fan out: a single delivered unpaid job yields exactly ONE row even when
+    /// other jobs carry MULTIPLE receipt rows, and `deliveries.job_id` being a PRIMARY KEY means one
+    /// delivery row per job.
+    ///
+    /// NON-VACUOUS: a naive cross `JOIN deliveries x receipts` would emit one output row per
+    /// (delivery × receipt) pair — so a delivered job sitting next to several receipts on other jobs
+    /// would be repeated and the count would inflate. The exact single-entry assertion catches that.
+    #[test]
+    fn arrears_does_not_fan_out_on_receipts() {
+        let path = temp_db("arrears-cardinality");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        deliver(&store, "owed-job", PaymentMode::Sat);
+        // Several rows on OTHER jobs (a legacy/edge store could hold more than one receipt per job);
+        // none reference owed-job, so a loose join must not multiply owed-job out.
+        let conn = store.lock().expect("lock");
+        for i in 0..3 {
+            conn.execute(
+                "INSERT INTO receipts (receipt_id, job_id, amount_sats, received_at_unix)
+                 VALUES (?1, ?2, 21, 5)",
+                params![format!("receipt-{i}"), format!("other-job-{i}")],
+            )
+            .expect("insert receipt");
+        }
+        drop(conn);
+        let ids = arrears_ids(&store);
+        assert_eq!(
+            ids,
+            vec!["owed-job".to_owned()],
+            "one delivered unpaid job is reported exactly once, however many receipt rows sit beside it"
+        );
+        assert_eq!(ids.len(), 1, "count equals distinct owed jobs, not delivery x receipts");
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// R2 F1 lifecycle — PENDING (enqueued-but-not-yet-published): a priced job whose result was
+    /// produced and handed to the outbox but whose publication is still `pending`. It is NOT owed:
+    /// a delivery row means ENQUEUED, not published, so no debt is asserted until the relay
+    /// confirms the result reached the world.
+    ///
+    /// NON-VACUOUS: this is precisely the defect R1 flagged. If the query treated enqueue as
+    /// proof (the old behaviour), this job would be reported owed and the exact-set assertion
+    /// would fail. The fixture only enqueues — it cannot tell the bug from the fix unless the
+    /// query is corrected, which is the point.
+    #[test]
+    fn arrears_excludes_pending_unpublished_result() {
+        let path = temp_db("arrears-pending");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        deliver_unconfirmed(&store, "pending-unpublished", PaymentMode::Sat);
+        deliver(&store, "confirmed", PaymentMode::Sat);
+        assert_eq!(
+            arrears_ids(&store),
+            vec!["confirmed".to_owned()],
+            "a pending-unpublished result is not owed; only the confirmed-published job is"
+        );
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// R2 F1 lifecycle — FAILED ATTEMPT: the publisher tried to send the result and recorded a
+    /// failed attempt (the row stays `pending`, `attempts` bumped, retry pending). Publication was
+    /// never confirmed, so the job is NOT owed.
+    ///
+    /// NON-VACUOUS: if the query ignored the outbox and only looked at `deliveries` + `receipts`,
+    /// this job would be reported owed. The exact-set assertion catches that.
+    #[test]
+    fn arrears_excludes_failed_attempt_unpublished_result() {
+        let path = temp_db("arrears-failed-attempt");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        deliver_unconfirmed(&store, "failed-attempt", PaymentMode::Sat);
+        // Simulate a failed send attempt: the row stays pending, attempts bumped via record_attempt.
+        let row = store
+            .pending_outbox(8_000)
+            .expect("pending")
+            .into_iter()
+            .find(|i| i.dedup_key == "result:failed-attempt")
+            .expect("pending row");
+        store.record_attempt(row.id, 8_000).expect("record attempt");
+        let updated = store.outbox_row("result:failed-attempt").expect("row").expect("exists");
+        assert_eq!(updated.0, "pending", "attempt leaves the row pending");
+        deliver(&store, "confirmed", PaymentMode::Sat);
+        assert_eq!(
+            arrears_ids(&store),
+            vec!["confirmed".to_owned()],
+            "a failed-attempt (still pending) result is not owed; only confirmed is"
+        );
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// R2 F1 lifecycle — EXPIRED-UNPUBLISHED: the relay retry window closed and the publisher gave
+    /// up; the outbox row is `expired` and publication was NEVER confirmed. The job is NOT owed.
+    ///
+    /// NON-VACUOUS: this is the strongest R1 counterexample — the delivery row persists and no
+    /// receipt exists, yet publication never happened. If the query treated enqueue as proof, this
+    /// job would be reported owed forever.
+    #[test]
+    fn arrears_excludes_expired_unpublished_result() {
+        let path = temp_db("arrears-expired");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        deliver_unconfirmed(&store, "expired-unpublished", PaymentMode::Sat);
+        expire_pending_result(&store, "expired-unpublished");
+        // Confirm the row is now expired, not pending.
+        assert_eq!(
+            store.outbox_row("result:expired-unpublished").expect("row").expect("exists").0,
+            "expired",
+            "expire_outbox must have flipped the row to expired"
+        );
+        deliver(&store, "confirmed", PaymentMode::Sat);
+        assert_eq!(
+            arrears_ids(&store),
+            vec!["confirmed".to_owned()],
+            "an expired-unpublished result is not owed; only confirmed is"
+        );
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// R2 F1 — CONFIRMED INCLUDED: a priced job whose result publication is recorded CONFIRMED is
+    /// owed. This is the positive case that must appear in arrears.
+    #[test]
+    fn arrears_includes_confirmed_result() {
+        let path = temp_db("arrears-confirmed");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        deliver(&store, "confirmed-job", PaymentMode::Sat);
+        assert_eq!(
+            arrears_ids(&store),
+            vec!["confirmed-job".to_owned()],
+            "a confirmed-published unpaid priced job is owed"
+        );
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// R2 — a CONFIRMED FREE job stays EXCLUDED: even with publication proof, `payment='none'`
+    /// means not a debt. This preserves the already-accepted rule under the new publication gate.
+    #[test]
+    fn arrears_excludes_confirmed_free_job() {
+        let path = temp_db("arrears-confirmed-free");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        deliver(&store, "free-job", PaymentMode::None);
+        deliver(&store, "priced-job", PaymentMode::Sat);
+        assert_eq!(
+            arrears_ids(&store),
+            vec!["priced-job".to_owned()],
+            "a confirmed free job is still not a debt"
+        );
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// R2 — a LEGACY delivery (payment NULL = PRICED) WITHOUT recorded publication proof is NOT
+    /// asserted owed. The old fixture only enqueued (the R1 defect); this one has NO outbox row at
+    /// all, so there is no recorded proof the work reached the world — the "debt" may never have
+    /// been incurred, and R2 requires we not assert it.
+    #[test]
+    fn arrears_excludes_legacy_unconfirmed() {
+        let path = temp_db("arrears-legacy-unconfirmed");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        legacy_delivery_unconfirmed(&path, "legacy-unpublished");
+        legacy_delivery(&path, "legacy-confirmed");
+        assert_eq!(
+            arrears_ids(&store),
+            vec!["legacy-confirmed".to_owned()],
+            "a legacy delivery WITHOUT publication proof is not asserted owed; only the confirmed one is"
+        );
+        drop(store);
         let _ = std::fs::remove_file(&path);
     }
 }
