@@ -1051,6 +1051,16 @@ impl ChildCustody {
         self.armed = true;
     }
 
+    /// Somewhere for the child's OBSERVED exit to go that is not this thread's return path.
+    ///
+    /// `release` below is the ordinary way the seat hears about an exit, and it is reachable only
+    /// by returning from the push. This is the same news, publishable by whichever thread actually
+    /// watched the child go — including the deadline watchdog, when this one is stalled somewhere
+    /// between arming that child and hearing about it.
+    fn exit_publisher(&self) -> Option<crate::delivery_turn::ExitPublisher> {
+        self.work.as_ref().map(|running| running.exit_publisher())
+    }
+
     /// The child's exit was confirmed. Hand the turn on.
     ///
     /// PUBLISHED BEFORE THE DROP, not after: `confirm_exit` is what tells the seat's custody
@@ -1271,8 +1281,15 @@ pub async fn neutralize_then_push_in_child_off_runtime(
         // seat on. Everything the guard protected before — a panic in the supervisor, a panic in the
         // minter — happens after this point, because all of it happens inside the call below.
         custody.arm();
-        let outcome =
-            crate::delivery_executor::run_push_in_child(&program, &request, deadline, proxy, live);
+        // Handed over BEFORE the push starts: from here the seat can learn this child has exited
+        // without this thread being the one to tell it. See `ChildCustody::exit_publisher`.
+        let confirm = custody.exit_publisher().map(|publisher| {
+            std::sync::Arc::new(move || publisher.publish_confirmed_exit())
+                as crate::delivery_executor::ExitConfirmation
+        });
+        let outcome = crate::delivery_executor::run_push_in_child_confirming(
+            &program, &request, deadline, proxy, live, confirm,
+        );
         // ONE release site, and a rule rather than a judgement at it. See [`turn_after_child_push`].
         match turn_after_child_push(&outcome) {
             crate::delivery_executor::Exclusion::Release => {

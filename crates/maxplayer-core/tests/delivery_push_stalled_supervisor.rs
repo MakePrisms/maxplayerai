@@ -32,7 +32,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use maxplayer_core::delivery_executor::{
-    Exclusion, PushRequest, REAP_BOUND, run_push_in_child,
+    Exclusion, ExitConfirmation, PushRequest, REAP_BOUND, WATCHDOG_TICK, run_push_in_child,
+    run_push_in_child_confirming,
 };
 use maxplayer_core::delivery_turn::{
     CUSTODY_TICK, CustodyHandoff, TurnRelease, delivery_turn,
@@ -117,6 +118,17 @@ const SCHEDULING_ALLOWANCE: Duration = Duration::from_millis(750);
 
 fn seat_handoff_bound() -> Duration {
     REAP_BOUND * 2 + CUSTODY_TICK + SCHEDULING_ALLOWANCE
+}
+
+/// **T-S6's bound: the watchdog's own terms, ONE reap window, one custody tick.**
+///
+/// Tighter than [`seat_handoff_bound`] on purpose. In T-S6 the supervisor never reaps at all, so
+/// the executor's second window — the one its normalization pass may spend — is never entered: the
+/// watchdog signals at `deadline + WATCHDOG_TICK + w`, reaps what it signalled inside one
+/// [`REAP_BOUND`], and the bailiff completes the handoff one [`CUSTODY_TICK`] later. Asserting the
+/// looser bound there would let a regression that reintroduced a second window pass.
+fn stalled_executor_bound() -> Duration {
+    WATCHDOG_TICK + REAP_BOUND + CUSTODY_TICK + SCHEDULING_ALLOWANCE
 }
 
 /// **T-S1. The defect, end to end: A stops, the supervisor never does, B still gets the seat.**
@@ -405,4 +417,110 @@ fn a_supervisor_inside_a_shared_state_section_is_not_fenced_out_from_under_itsel
         "a fenced supervisor must be refused the section, not allowed into a seat that is now B's"
     );
     assert!(control.is_fenced());
+}
+
+/// The owner's authority check, ENTERED AND NEVER LEFT.
+///
+/// This is the stall itself, and it is the production shape of one: `AuthorityCheck` is a caller
+/// supplied closure that the executor calls on its own thread, between waits, after the watchdog is
+/// armed. A backend that stops answering is a parked executor thread, and nothing in the executor
+/// can interrupt it.
+fn never_answers(entered: Arc<AtomicBool>) -> AuthorityCheck {
+    Arc::new(move || {
+        entered.store(true, Ordering::SeqCst);
+        loop {
+            std::thread::sleep(Duration::from_secs(3600));
+        }
+    })
+}
+
+/// **T-S6. THE STALLED SYNCHRONOUS EXECUTOR — the case the bailiff alone could not answer.**
+///
+/// The five tests above stall the ASYNC supervisor: the work itself progresses, reaches a confirmed
+/// exit, and only the awaiting side never finishes. That is half the problem. This is the other
+/// half, and it was the one still open: the thread stalled here is the SYNCHRONOUS executor, parked
+/// inside the owner's authority check after the watchdog was armed and before any reap.
+///
+/// It matters because `try_wait` — the only call that can turn a kill into a CONFIRMED exit — used
+/// to be reachable from that thread and no other. So the watchdog could stop this child exactly on
+/// time and the seat would still wait forever: the kill was independent of the stall, the
+/// confirmation was not, and the bailiff refuses without a confirmation. A punctual kill and a
+/// blocked lane is not a fixed stop.
+///
+/// Here the executor NEVER RETURNS — asserted, not assumed — and the seat still comes back, because
+/// the watchdog reaps what it killed and publishes the exit itself.
+///
+/// What this test does NOT do is relax anything: the handoff still requires an exit this process
+/// OBSERVED. `a_signal_without_a_confirmed_exit_does_not_hand_custody_on` and
+/// `a_passed_deadline_alone_does_not_hand_custody_on` pin that from the other side, and both still
+/// pass against this change.
+#[test]
+fn a_stalled_executor_that_never_returns_does_not_hold_the_seat() {
+    let released = Arc::new(AtomicBool::new(false));
+    let budget_ms = 400;
+    let deadline = Instant::now() + Duration::from_millis(budget_ms);
+    let (control, turn) = delivery_turn(Token(Arc::clone(&released)), deadline);
+
+    let watch = control.custody_bailiff().arm(deadline, CUSTODY_PATIENCE);
+
+    // Proof that the stall is where this test says it is, and that the executor never came back.
+    let entered_authority = Arc::new(AtomicBool::new(false));
+    let executor_returned = Arc::new(AtomicBool::new(false));
+
+    let program = deaf_child();
+    let authority = never_answers(Arc::clone(&entered_authority));
+    let returned = Arc::clone(&executor_returned);
+    // DETACHED: this thread is never joined, because it never finishes. That is the condition under
+    // test, not a leak the test is tolerating.
+    std::thread::spawn(move || {
+        let running = turn.begin().expect("the turn is ours");
+        // Built exactly as the production release site builds it, from the work's own handle.
+        let publisher = running.exit_publisher();
+        let confirm: ExitConfirmation = Arc::new(move || publisher.publish_confirmed_exit());
+        let _outcome = run_push_in_child_confirming(
+            &program,
+            &request(budget_ms),
+            deadline,
+            no_mint(),
+            authority,
+            Some(confirm),
+        );
+        // Not reached while the authority check is parked. If it ever is, the test below says so.
+        returned.store(true, Ordering::SeqCst);
+        drop(running);
+    });
+
+    let handoff = watch
+        .wait(CUSTODY_PATIENCE)
+        .expect("the bailiff must answer within its patience");
+    let took = Instant::now().saturating_duration_since(deadline);
+
+    assert!(
+        entered_authority.load(Ordering::SeqCst),
+        "the executor never reached the authority check, so this run did not stall where the test \
+         claims and proves nothing about a stalled executor"
+    );
+    assert!(
+        !executor_returned.load(Ordering::SeqCst),
+        "the executor RETURNED; then the ordinary release path was available and this test measured \
+         the old route, not an independent confirmation"
+    );
+    assert_eq!(
+        handoff,
+        CustodyHandoff::HandedOn,
+        "the child was killed and reaped; the seat must not wait on a supervisor that never returns"
+    );
+    assert!(
+        released.load(Ordering::SeqCst),
+        "the exclusion token must be back before the executor is"
+    );
+    assert!(
+        !control.holds_ownership(),
+        "the turn still holds the token, so the next delivery is still waiting on a stalled executor"
+    );
+    assert!(
+        took <= stalled_executor_bound(),
+        "the seat came back {took:?} after the deadline; the stated bound is {:?}",
+        stalled_executor_bound()
+    );
 }

@@ -652,36 +652,72 @@ fn reap_window_left(spent: Duration) -> Duration {
     REAP_BOUND.saturating_sub(spent)
 }
 
+/// **This process observed the delivery's exit.** Handed to [`KillableChild`] by the seat, and
+/// fired from whichever thread actually saw the kernel report the exit.
+///
+/// It is a callback rather than a direct call into the turn because the confirmation has to be
+/// publishable from a thread that owns none of the delivery's state — the deadline watchdog — and
+/// this module must not have to know what a turn is in order to let it.
+///
+/// FIRED ONLY FROM AN OBSERVED EXIT. A signal issued, a deadline passed, and a reap budget spent
+/// without an answer all leave it unfired, because each of those is an UNKNOWN exit and the seat's
+/// rule for an unknown exit is to retain.
+pub type ExitConfirmation = std::sync::Arc<dyn Fn() + Send + Sync>;
+
 /// A spawned child that **cannot be forgotten**. Dropping it kills the process group and waits for
 /// the exit; there is no path out of this module that leaves a delivery packing behind us.
+///
+/// The child handle itself lives in [`ExitGuard`], not here: see that type for why the supervisor
+/// is no longer the only thread that can confirm an exit.
 pub struct KillableChild {
-    child: Option<Child>,
     pid: i32,
-    reaped: bool,
-    /// Time already spent waiting for THIS child's exit, across every `kill_and_reap` call made on
-    /// it. [`REAP_BOUND`] is charged against this total rather than against one call, so the
-    /// retries on the failing path cannot multiply the advertised window. See `kill_and_reap`.
-    spent_reaping: Duration,
-    /// Shared with the deadline watchdog. See [`ExitGuard`].
+    /// Shared with the deadline watchdog, and the owner of the child handle. See [`ExitGuard`].
     guard: std::sync::Arc<std::sync::Mutex<ExitGuard>>,
     /// Set by the watchdog when IT issued the kill, for the operator line and for tests that need
     /// to know which side stopped the child.
     watchdog_fired: std::sync::Arc<AtomicBool>,
 }
 
-/// The interlock between the supervisor and the deadline watchdog.
+/// The interlock between the supervisor and the deadline watchdog — and the OWNER of the child.
 ///
 /// A pid is only safe to signal until it has been reaped; afterwards the number can be reused by an
 /// unrelated process, and a late `SIGKILL` would land on a stranger. Both sides therefore go
-/// through this mutex: the supervisor only calls `try_wait` while holding it and sets `disarmed` in
-/// the same critical section as a successful reap, and the watchdog only signals while holding it
-/// and only when `disarmed` is still false. There is no window between "the kernel reaped the pid"
-/// and "the watchdog knows", because the two are one locked section.
+/// through this mutex: a `try_wait` only happens while holding it and sets `disarmed` in the same
+/// critical section as a successful reap, and the watchdog only signals while holding it and only
+/// when `disarmed` is still false. There is no window between "the kernel reaped the pid" and "the
+/// watchdog knows", because the two are one locked section.
+///
+/// # Why the child handle moved in here
+///
+/// It used to live on [`KillableChild`], which is owned by the supervisor's stack. That made
+/// `Child::try_wait` — the ONLY call that can turn a kill into a confirmed exit — reachable from
+/// exactly one thread: the synchronous executor. The watchdog could stop a child on time and still
+/// leave the seat blocked forever, because a supervisor stalled anywhere between arming and its
+/// reap (cloning the request, calling the owner's authority check) never got to the `try_wait`, and
+/// the seat's rule requires an OBSERVED exit before it hands on. The kill was independent of that
+/// stall and the confirmation was not.
+///
+/// Behind this mutex the handle belongs to whichever thread reaches it first. The supervisor still
+/// reaps on its normal path; the watchdog reaps when it had to kill. The same guard that already
+/// made a late signal impossible is what makes two reapers safe, and `confirm` fires exactly once
+/// because it is TAKEN by the observer.
 struct ExitGuard {
     pid: i32,
     /// True once this pid has been reaped, or once the child is otherwise known finished. A
     /// disarmed guard never signals again.
     disarmed: bool,
+    /// The spawned child. `None` once it has been taken for a wait that consumed it, or when this
+    /// guard never had one.
+    child: Option<Child>,
+    /// True once the kernel has reported this child's exit to this process.
+    reaped: bool,
+    /// Time already spent waiting for THIS child's exit, across every reap attempt made on it by
+    /// EITHER thread. [`REAP_BOUND`] is charged against this total rather than against one call, so
+    /// the retries on the failing path cannot multiply the advertised window — and so the watchdog
+    /// reaping cannot buy a second window the seat was never promised. See `kill_and_reap`.
+    spent_reaping: Duration,
+    /// The seat's confirmation sink, taken by whichever thread observes the exit.
+    confirm: Option<ExitConfirmation>,
 }
 
 impl ExitGuard {
@@ -699,6 +735,37 @@ impl ExitGuard {
             libc::kill(self.pid, libc::SIGKILL);
         }
         true
+    }
+
+    /// ONE poll of the child's exit, under this guard, from whichever thread holds it.
+    ///
+    /// Returns the poll's outcome and — only when the kernel actually reported an exit — the seat's
+    /// confirmation sink, TAKEN so that it can fire exactly once no matter how many threads poll.
+    ///
+    /// The sink is returned rather than called here on purpose: firing it runs seat code that takes
+    /// the turn's own locks, and this executor must never hold its child guard across a foreign
+    /// callback. Every caller fires it after releasing this lock.
+    fn observe_exit(
+        &mut self,
+    ) -> (
+        std::io::Result<Option<std::process::ExitStatus>>,
+        Option<ExitConfirmation>,
+    ) {
+        let Some(child) = self.child.as_mut() else {
+            // No handle: nothing this guard can observe, and nothing it may claim. `disarmed` stops
+            // the signalling, but the exit stays UNCONFIRMED and the sink stays unfired.
+            self.disarmed = true;
+            return (Ok(None), None);
+        };
+        let outcome = child.try_wait();
+        if matches!(outcome, Ok(Some(_))) {
+            // Reaped and disarmed in the same critical section, as before — plus the confirmation,
+            // which is now published from here rather than from the supervisor's return path.
+            self.disarmed = true;
+            self.reaped = true;
+            return (outcome, self.confirm.take());
+        }
+        (outcome, None)
     }
 }
 
@@ -724,16 +791,34 @@ impl KillableChild {
             .map_err(|error| ExecutorError::Spawn(format!("{}: {error}", program.display())))?;
         let pid = child.id() as i32;
         Ok(Self {
-            child: Some(child),
             pid,
-            reaped: false,
-            spent_reaping: Duration::ZERO,
             guard: std::sync::Arc::new(std::sync::Mutex::new(ExitGuard {
                 pid,
                 disarmed: false,
+                child: Some(child),
+                reaped: false,
+                spent_reaping: Duration::ZERO,
+                confirm: None,
             })),
             watchdog_fired: std::sync::Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Give this child's OBSERVED exit somewhere to go that is not the supervisor's return value.
+    ///
+    /// Install before arming. Whichever thread first sees the kernel report this child's exit fires
+    /// `confirm` — the supervisor on its ordinary path, or the deadline watchdog when the
+    /// supervisor never got there. It fires at most once.
+    ///
+    /// This is the seat's independence from a stalled synchronous executor, and it is deliberately
+    /// narrow: it publishes an exit this process WATCHED happen. It is not reachable from a
+    /// deadline, from a signal, or from a caller that gave up.
+    pub fn publish_confirmed_exit_to(&self, confirm: ExitConfirmation) {
+        let mut state = self
+            .guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.confirm = Some(confirm);
     }
 
     /// Hand this child's absolute deadline to a thread of its own.
@@ -782,9 +867,68 @@ impl KillableChild {
             }
             // The deadline has passed. Signal under the lock, so this cannot race a reap that is
             // happening right now and land on a recycled pid.
-            let Ok(state) = guard.lock() else { return };
-            if state.kill_if_armed() {
-                fired.store(true, Ordering::SeqCst);
+            {
+                let Ok(mut state) = guard.lock() else { return };
+                if state.kill_if_armed() {
+                    fired.store(true, Ordering::SeqCst);
+                }
+                // Poll once while we already hold the lock: a child that was killed before the
+                // supervisor ever wrote to it is usually already gone by now.
+                let (outcome, confirm) = state.observe_exit();
+                drop(state);
+                if let Some(confirm) = confirm {
+                    confirm();
+                    return;
+                }
+                if !matches!(outcome, Ok(None)) {
+                    // Reaped by the other side, or an error that makes this exit UNKNOWN. Either
+                    // way there is nothing further this thread may claim.
+                    return;
+                }
+            }
+            // THE KILL IS NOT THE CONFIRMATION, AND THIS THREAD NOW OWNS BOTH.
+            //
+            // Signalling on time never made the seat safe to hand on: the seat's rule is that this
+            // process must have OBSERVED the exit, and the only call that observes it is a
+            // `try_wait` on the child handle. While that handle lived on the supervisor's stack,
+            // this thread could stop a delivery punctually and still leave the seat blocked for as
+            // long as the supervisor stalled — in its request clone, in the owner's authority check,
+            // anywhere between arming and its own reap. The kill was independent of the supervisor
+            // and the confirmation was not, so the seat's bound was still the supervisor's latency.
+            //
+            // So this thread reaps what it killed. It charges the SAME [`REAP_BOUND`] budget the
+            // supervisor charges, so confirming from here cannot buy a window the seat was never
+            // promised, and it publishes ONLY on an actual reported exit. A budget that runs out
+            // leaves the exit unknown and the seat retained, which is the outcome an unconfirmed
+            // child is supposed to have.
+            let started = Instant::now();
+            loop {
+                let (outcome, confirm, budget) = {
+                    let Ok(mut state) = guard.lock() else { return };
+                    let (outcome, confirm) = state.observe_exit();
+                    let budget = reap_window_left(state.spent_reaping);
+                    if matches!(outcome, Ok(Some(_))) {
+                        state.spent_reaping += started.elapsed();
+                    }
+                    (outcome, confirm, budget)
+                };
+                if let Some(confirm) = confirm {
+                    confirm();
+                    return;
+                }
+                match outcome {
+                    // Someone else observed it and has already published. Nothing owed here.
+                    Ok(Some(_)) => return,
+                    Ok(None) => {
+                        if started.elapsed() >= budget {
+                            // UNCONFIRMED. The seat keeps the turn; see `kill_and_reap`.
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    // An unknown exit must never be published as a confirmed one.
+                    Err(_) => return,
+                }
             }
         });
     }
@@ -798,18 +942,17 @@ impl KillableChild {
     ///
     /// Reaping and disarming must be indivisible: between them the pid is free for the kernel to
     /// reuse, and a watchdog that signalled in that window would kill an unrelated process.
+    /// The seat's confirmation is fired AFTER this releases the guard, never under it.
     fn guarded_try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        let mut state = self
-            .guard
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(child) = self.child.as_mut() else {
-            state.disarmed = true;
-            return Ok(None);
+        let (outcome, confirm) = {
+            let mut state = self
+                .guard
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.observe_exit()
         };
-        let outcome = child.try_wait();
-        if matches!(outcome, Ok(Some(_))) {
-            state.disarmed = true;
+        if let Some(confirm) = confirm {
+            confirm();
         }
         outcome
     }
@@ -818,16 +961,25 @@ impl KillableChild {
         self.pid
     }
 
+    /// Take one of the child's pipe handles from under the guard.
+    fn take_pipe<T>(&mut self, take: impl FnOnce(&mut Child) -> Option<T>) -> Option<T> {
+        let mut state = self
+            .guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.child.as_mut().and_then(take)
+    }
+
     pub fn stdin(&mut self) -> Option<std::process::ChildStdin> {
-        self.child.as_mut().and_then(|child| child.stdin.take())
+        self.take_pipe(|child| child.stdin.take())
     }
 
     pub fn stdout(&mut self) -> Option<std::process::ChildStdout> {
-        self.child.as_mut().and_then(|child| child.stdout.take())
+        self.take_pipe(|child| child.stdout.take())
     }
 
     pub fn stderr(&mut self) -> Option<std::process::ChildStderr> {
-        self.child.as_mut().and_then(|child| child.stderr.take())
+        self.take_pipe(|child| child.stderr.take())
     }
 
     /// `SIGKILL` to the process GROUP, then wait for the actual exit.
@@ -847,9 +999,6 @@ impl KillableChild {
     /// Repeated attempts change the certainty of the outcome, never the bound.
     pub fn kill_and_reap(&mut self) -> Result<Duration, ExecutorError> {
         let started = Instant::now();
-        if self.reaped {
-            return Ok(Duration::ZERO);
-        }
         {
             // The GROUP, not the pid: a descendant that outlived its parent would otherwise keep
             // packing with nobody watching. Negative pid is the group. An ESRCH here means the
@@ -862,10 +1011,13 @@ impl KillableChild {
                 .guard
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.reaped {
+                return Ok(Duration::ZERO);
+            }
             state.kill_if_armed();
-        }
-        if self.child.is_none() {
-            return Ok(started.elapsed());
+            if state.child.is_none() {
+                return Ok(started.elapsed());
+            }
         }
         // Poll rather than block: a blocking `wait` on a child in uninterruptible sleep never
         // returns, and "we cannot confirm the exit" is an outcome this executor must be able to
@@ -873,23 +1025,45 @@ impl KillableChild {
         loop {
             match self.guarded_try_wait() {
                 Ok(Some(_status)) => {
-                    self.spent_reaping += started.elapsed();
-                    self.reaped = true;
+                    let mut state = self
+                        .guard
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state.spent_reaping += started.elapsed();
                     return Ok(started.elapsed());
                 }
                 Ok(None) => {
                     // Against the CHILD's budget, not this call's elapsed time. An exhausted budget
                     // means this attempt has already polled the exit once above and found it
                     // absent, which is the whole of what a further wait could add.
-                    let waited = self.spent_reaping + started.elapsed();
-                    if started.elapsed() >= reap_window_left(self.spent_reaping) {
-                        self.spent_reaping = waited;
+                    //
+                    // The budget lives on the guard because the watchdog charges the same one.
+                    let (waited, budget) = {
+                        let state = self
+                            .guard
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        (
+                            state.spent_reaping + started.elapsed(),
+                            reap_window_left(state.spent_reaping),
+                        )
+                    };
+                    if started.elapsed() >= budget {
+                        let mut state = self
+                            .guard
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        state.spent_reaping = waited;
                         return Err(ExecutorError::Unreaped { waited });
                     }
                     std::thread::sleep(Duration::from_millis(2));
                 }
                 Err(error) => {
-                    self.spent_reaping += started.elapsed();
+                    let mut state = self
+                        .guard
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state.spent_reaping += started.elapsed();
                     // NOT `Protocol`: an unknown exit must not be able to wear a name the release
                     // rule lets through. See [`ExecutorError::WaitFailed`].
                     return Err(ExecutorError::WaitFailed {
@@ -900,15 +1074,18 @@ impl KillableChild {
         }
     }
 
-    /// True once the kernel has reported this child's exit status.
+    /// True once the kernel has reported this child's exit status — to EITHER reaper.
     pub fn is_reaped(&self) -> bool {
-        self.reaped
+        self.guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .reaped
     }
 }
 
 impl Drop for KillableChild {
     fn drop(&mut self) {
-        if self.reaped {
+        if self.is_reaped() {
             return;
         }
         // The same kill and the same wait as every other path, so success, error, panic and early
@@ -1115,7 +1292,33 @@ pub fn run_push_in_child(
     mint: crate::git_transport::AuthMinter,
     authority: crate::git_transport::AuthorityCheck,
 ) -> Result<String, ExecutorError> {
+    run_push_in_child_confirming(program, request, deadline, mint, authority, None)
+}
+
+/// As [`run_push_in_child`], plus somewhere for the child's OBSERVED exit to go that does not
+/// depend on this function returning.
+///
+/// THE CONFIRMATION IS THE POINT. Everything this function does between arming and its reap is
+/// synchronous supervisor work — cloning the request, asking the owner's authority check, encoding
+/// a frame — and a thread stalled in any of it never reaches the `try_wait` that turns a kill into
+/// a confirmed exit. The deadline watchdog already made the KILL independent of that stall. Handing
+/// it `on_confirmed_exit` makes the CONFIRMATION independent of it too, so a seat waiting on this
+/// delivery is bounded by the child's deadline and reap rather than by where this thread happens to
+/// be. See [`KillableChild::publish_confirmed_exit_to`].
+pub fn run_push_in_child_confirming(
+    program: &Path,
+    request: &PushRequest,
+    deadline: Instant,
+    mint: crate::git_transport::AuthMinter,
+    authority: crate::git_transport::AuthorityCheck,
+    on_confirmed_exit: Option<ExitConfirmation>,
+) -> Result<String, ExecutorError> {
     let mut child = KillableChild::spawn(program, &[CHILD_SUBCOMMAND])?;
+    // INSTALLED BEFORE ARMING, so there is no instant at which the watchdog could reap this child
+    // and find nowhere to report it.
+    if let Some(confirm) = on_confirmed_exit {
+        child.publish_confirmed_exit_to(confirm);
+    }
     // ARMED HERE, AT THE EARLIEST INSTANT A PID EXISTS — before the pipes are taken, before the
     // pump and writer threads exist, and before `drive` is entered.
     //

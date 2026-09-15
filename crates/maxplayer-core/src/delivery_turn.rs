@@ -585,6 +585,61 @@ impl RunningWork {
     pub fn confirm_exit(&self) {
         self.turn.exit_confirmed.store(true, Ordering::SeqCst);
     }
+
+    /// A handle that can publish this work's confirmed exit **from a thread that is not running
+    /// this work** — and that owns no other part of the delivery.
+    ///
+    /// Hand it to whatever can observe the exit independently of the supervisor. Nothing else about
+    /// the turn is reachable through it: it cannot cancel, cannot extend a deadline, cannot enter a
+    /// section, and cannot release a seat by itself.
+    pub fn exit_publisher(&self) -> ExitPublisher {
+        ExitPublisher {
+            turn: Arc::clone(&self.turn),
+        }
+    }
+}
+
+/// Publishes BOTH halves of "this delivery is over and we watched it end", for a delivery whose
+/// supervisor may never come back to say so.
+///
+/// # Why both halves, and why that is not an early release
+///
+/// The seat hands on when the work has ENDED and the exit was CONFIRMED. Both used to be published
+/// by the same statement on the same stack — [`RunningWork`]'s drop ends the work, and the release
+/// site confirms the exit just before it — so a supervisor that never returned published NEITHER,
+/// and a child that had been stopped punctually and reaped still left the seat blocked for as long
+/// as that supervisor stalled. Confirming the exit alone would not have fixed it: the bailiff
+/// requires ENDED too, and ENDED was equally behind the stalled return.
+///
+/// So this publishes both, and it is sound because of WHO may hold it and WHEN they may fire it:
+/// the only caller is the exit observer, and it fires only after the kernel has reported the
+/// child's exit to this process. At that instant the delivery's work is over in the only sense the
+/// seat's exclusion is about — the process that was touching the seat's workdir is gone, and this
+/// process watched it go. What remains on the stalled supervisor's stack is reporting, not
+/// delivery: it holds no child, and the one call that could start another on this turn already
+/// happened, once, before the child it is still waiting to hear about.
+///
+/// It is NOT a deadline, NOT a signal, and NOT a caller giving up. Each of those leaves the exit
+/// unknown, and an unknown exit still retains the seat for the life of this process.
+#[derive(Clone)]
+pub struct ExitPublisher {
+    turn: Arc<Turn>,
+}
+
+impl ExitPublisher {
+    /// **This process observed the delivery's exit.**
+    ///
+    /// Idempotent, and safe to race with the ordinary release path: `end_now` only acts on the
+    /// transition into `ENDED`, and the release it may trigger takes the ownership slot, so the
+    /// supervisor arriving late with the same news changes nothing.
+    ///
+    /// The confirmation is stored BEFORE the work is ended, for the same reason the ordinary path
+    /// confirms before it drops: ending is what can make a release happen, and a release must never
+    /// observe an ended turn whose confirmation has not landed yet.
+    pub fn publish_confirmed_exit(&self) {
+        self.turn.exit_confirmed.store(true, Ordering::SeqCst);
+        self.turn.end_now();
+    }
 }
 
 impl Drop for RunningWork {
