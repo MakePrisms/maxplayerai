@@ -29,7 +29,7 @@
 //! `crate::seller_node::run::DELIVERY_DRAIN_BOUND`. That is a bound on the WORK, not on an HTTP
 //! request and not on the caller's patience.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -86,9 +86,22 @@ struct Turn {
     /// The supervising side has finished with the turn: it returned, timed out, was cancelled at an
     /// await, or was dropped. It is NOT "the work stopped".
     supervisor_done: AtomicBool,
+    /// How many shared-state sections the supervising side currently has OPEN, or [`FENCED`] once
+    /// the supervisor has been excluded and may open no more. See [`Turn::fence_supervisor`].
+    supervisor_sections: AtomicUsize,
+    /// THIS PROCESS OBSERVED THE DELIVERY'S EXIT. Published by the work, at the one place that
+    /// knows: [`RunningWork::confirm_exit`]. A signal issued, a deadline passed and a caller that
+    /// gave up all leave it false, which is why the bailiff below cannot act on any of them.
+    exit_confirmed: AtomicBool,
     deadline: Instant,
     ownership: Mutex<Option<Box<dyn Send>>>,
 }
+
+/// The value of [`Turn::supervisor_sections`] that means "fenced": the supervising side is excluded
+/// from shared state permanently, and no further section may be opened. `usize::MAX` rather than a
+/// second flag so that opening a section and fencing are ONE compare-and-swap on ONE word — there is
+/// no instant at which a supervisor is entering while the bailiff believes it is out.
+const FENCED: usize = usize::MAX;
 
 impl std::fmt::Debug for Turn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -119,6 +132,61 @@ impl Turn {
         {
             self.release_ownership();
         }
+    }
+
+    /// Open a shared-state section for the supervising side, unless it has been fenced.
+    ///
+    /// A plain `fetch_add` would be wrong: it would succeed against a fenced word and then the
+    /// count would never mean anything again. The loop re-reads and refuses `FENCED` explicitly.
+    fn enter_section(&self) -> Result<(), Fenced> {
+        let mut current = self.supervisor_sections.load(Ordering::SeqCst);
+        loop {
+            if current == FENCED {
+                return Err(Fenced);
+            }
+            match self.supervisor_sections.compare_exchange(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(seen) => current = seen,
+            }
+        }
+    }
+
+    fn leave_section(&self) {
+        let mut current = self.supervisor_sections.load(Ordering::SeqCst);
+        loop {
+            // A fenced word is never decremented: the fence is only ever taken from ZERO, so no
+            // section can be open across one, and a stale guard must not turn `FENCED` into a count.
+            if current == FENCED || current == 0 {
+                return;
+            }
+            match self.supervisor_sections.compare_exchange(
+                current,
+                current - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return,
+                Err(seen) => current = seen,
+            }
+        }
+    }
+
+    /// Exclude the supervising side from shared state, IF it is not inside a section right now.
+    ///
+    /// This is the whole of what makes a handoff safe without the supervisor's cooperation: after it
+    /// succeeds the supervisor cannot enter shared state again ([`Turn::enter_section`] refuses),
+    /// so the seat can be given to the next delivery even though the supervisor never came back.
+    /// It is NOT a way to interrupt a supervisor that is already inside one — that case is reported
+    /// and custody is retained.
+    fn fence_supervisor(&self) -> bool {
+        self.supervisor_sections
+            .compare_exchange(0, FENCED, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
     }
 
     fn release_ownership(&self) {
@@ -166,6 +234,8 @@ pub fn delivery_turn<O: Send + 'static>(
         state: AtomicU8::new(PENDING),
         cancelled: AtomicBool::new(false),
         supervisor_done: AtomicBool::new(false),
+        supervisor_sections: AtomicUsize::new(0),
+        exit_confirmed: AtomicBool::new(false),
         deadline,
         ownership: Mutex::new(Some(Box::new(ownership))),
     });
@@ -225,6 +295,194 @@ impl TurnControl {
             Ok(slot) => slot.is_some(),
             Err(poisoned) => poisoned.into_inner().is_some(),
         }
+    }
+
+    /// Declare that the supervising side is about to touch state the turn EXCLUDES, and hold that
+    /// declaration open until the returned guard drops.
+    ///
+    /// Everything the supervisor does between taking the turn and handing it back is one of two
+    /// things: work that touches the seat (the workdir, the remote, the delivery's own files), or
+    /// waiting. Only the first can overlap the next delivery, and only the first has to be waited
+    /// for. Wrapping it makes that distinction a fact the [`CustodyBailiff`] can read instead of an
+    /// assumption it has to make — and makes the SAFE default the one that costs a stall: a
+    /// supervisor inside a section is never fenced.
+    ///
+    /// Refused once the turn has been fenced: by then the seat may already be the next delivery's,
+    /// and a supervisor that discovers this must stop rather than proceed.
+    pub fn enter_shared_state(&self) -> Result<SupervisorSection, Fenced> {
+        self.turn.enter_section()?;
+        Ok(SupervisorSection {
+            turn: Arc::clone(&self.turn),
+        })
+    }
+
+    /// A handle that can complete the handoff WITHOUT this supervisor — see [`CustodyBailiff`].
+    pub fn custody_bailiff(&self) -> CustodyBailiff {
+        CustodyBailiff {
+            turn: Arc::clone(&self.turn),
+        }
+    }
+
+    /// True once the supervising side has been excluded from shared state by the bailiff.
+    pub fn is_fenced(&self) -> bool {
+        self.turn.supervisor_sections.load(Ordering::SeqCst) == FENCED
+    }
+}
+
+/// The supervising side is refused: it has been fenced out of this turn's shared state, so the seat
+/// it is holding may already belong to the next delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fenced;
+
+impl std::fmt::Display for Fenced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("this delivery's supervisor has been fenced out of the seat it was holding")
+    }
+}
+
+impl std::error::Error for Fenced {}
+
+/// An OPEN declaration that the supervising side is inside shared state. Dropping it closes the
+/// declaration — on return, on unwind, on cancellation — which is the only form that holds for a
+/// supervisor that is about to stop being reliable.
+pub struct SupervisorSection {
+    turn: Arc<Turn>,
+}
+
+impl Drop for SupervisorSection {
+    fn drop(&mut self) {
+        self.turn.leave_section();
+    }
+}
+
+/// How often [`CustodyBailiff::arm`] re-asks whether the handoff has become safe.
+///
+/// It is not a timeout and not a retry interval: it bounds only how long a turn that HAS become
+/// safe to hand on waits for the bailiff to notice. It is the single term this lane adds to the
+/// executor's own numbers.
+pub const CUSTODY_TICK: Duration = Duration::from_millis(25);
+
+/// What the bailiff found when it asked whether the seat could move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustodyHandoff {
+    /// The supervisor was fenced out of shared state and the turn was handed on. The next delivery
+    /// may begin.
+    HandedOn,
+    /// The turn was already free — the ordinary path completed, and there was nothing to do.
+    AlreadyFree,
+    /// The work has not stopped. **A passed deadline is not a stopped delivery**, so this is what a
+    /// clock alone gets.
+    WorkStillRunning,
+    /// The work stopped, but this process never observed the delivery's exit. **A signal issued is
+    /// not an exit confirmed**, so custody is RETAINED — the same answer
+    /// `crate::delivery_executor::exclusion_after_reap` gives an unreaped child.
+    ExitUnconfirmed,
+    /// The supervisor is inside a declared shared-state section. It cannot be fenced out from under
+    /// itself, so custody is retained until it leaves.
+    SupervisorInSharedState,
+}
+
+/// **THE HANDOFF, INDEPENDENT OF THE SUPERVISOR.**
+///
+/// The turn is released when both halves are published: the work stopped, and the supervising side
+/// is finished. The second half used to have exactly one publisher — [`TurnControl::end`], reached
+/// from the supervisor's own stack — so a supervisor that never got there held the seat for as long
+/// as it stalled. That term is the `S` in `delivery_executor`'s bounds, and it has no number: a task
+/// starved by its runtime, parked on a call that never answers, or descheduled indefinitely is
+/// bounded by nothing this process controls.
+///
+/// This is the other publisher, and it runs on neither side. It may hand the seat on ONLY when all
+/// three of these hold, and it re-checks all three every time it is asked:
+///
+/// 1. **the work stopped** — not "its deadline passed", not "it was signalled";
+/// 2. **this process observed the exit** ([`RunningWork::confirm_exit`]) — an unconfirmed exit
+///    retains the seat exactly as it always did;
+/// 3. **the supervisor is not inside a declared shared-state section** — and it is fenced out of
+///    entering one in the same compare-and-swap that reads it, so there is no window.
+///
+/// What that buys: from the delivery's absolute deadline, the seat moves within the executor's own
+/// published terms for reaching a confirmed exit plus one [`CUSTODY_TICK`]. No term of that sum is
+/// the supervisor's latency. What it deliberately does NOT buy: a supervisor stalled INSIDE shared
+/// state still holds the seat — that is the no-overlap rule, and it costs liveness on purpose.
+#[derive(Clone)]
+pub struct CustodyBailiff {
+    turn: Arc<Turn>,
+}
+
+impl CustodyBailiff {
+    /// Ask once. Cheap, lock-free apart from the ownership slot, and safe to call from any thread.
+    pub fn attempt_handoff(&self) -> CustodyHandoff {
+        let held = match self.turn.ownership.lock() {
+            Ok(slot) => slot.is_some(),
+            Err(poisoned) => poisoned.into_inner().is_some(),
+        };
+        if !held {
+            return CustodyHandoff::AlreadyFree;
+        }
+        if self.turn.state.load(Ordering::SeqCst) != ENDED {
+            return CustodyHandoff::WorkStillRunning;
+        }
+        if !self.turn.exit_confirmed.load(Ordering::SeqCst) {
+            return CustodyHandoff::ExitUnconfirmed;
+        }
+        if !self.turn.fence_supervisor() {
+            return CustodyHandoff::SupervisorInSharedState;
+        }
+        // Published only now, and only here: the supervisor can no longer touch what the turn
+        // excludes, which is the whole of what `supervisor_done` ever meant to the release rule.
+        self.turn.supervisor_done.store(true, Ordering::SeqCst);
+        self.turn.maybe_release();
+        CustodyHandoff::HandedOn
+    }
+
+    /// Give this turn a thread of its own that asks until the answer is a handoff.
+    ///
+    /// It sleeps to `deadline` first — before it there is nothing to do, because work that has not
+    /// reached its deadline is work whose supervisor is not yet late — then re-asks every
+    /// [`CUSTODY_TICK`] for at most `patience`. `patience` is the window in which it will report at
+    /// all; it is NOT permission to release late, and it never relaxes the three conditions.
+    ///
+    /// It holds no part of the supervisor's state and calls nothing the supervisor owns, so where
+    /// the supervisor is does not appear in when this thread runs.
+    pub fn arm(self, deadline: Instant, patience: Duration) -> CustodyWatch {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                std::thread::sleep(left.min(CUSTODY_TICK));
+            }
+            let giving_up_at = Instant::now() + patience;
+            let mut last = self.attempt_handoff();
+            while !matches!(
+                last,
+                CustodyHandoff::HandedOn | CustodyHandoff::AlreadyFree
+            ) && Instant::now() < giving_up_at
+            {
+                std::thread::sleep(CUSTODY_TICK);
+                last = self.attempt_handoff();
+            }
+            // A closed receiver means the caller stopped listening, which is not this thread's
+            // problem: the handoff has already happened or already been refused.
+            let _ = tx.send(last);
+        });
+        CustodyWatch { outcome: rx }
+    }
+}
+
+/// What an armed [`CustodyBailiff`] concluded. Dropping it does not stop the bailiff — custody is
+/// not contingent on anyone watching.
+pub struct CustodyWatch {
+    outcome: std::sync::mpsc::Receiver<CustodyHandoff>,
+}
+
+impl CustodyWatch {
+    /// Block for at most `within` for the bailiff's conclusion. `None` means it has not concluded,
+    /// which is not the same as a refusal.
+    pub fn wait(&self, within: Duration) -> Option<CustodyHandoff> {
+        self.outcome.recv_timeout(within).ok()
     }
 }
 
@@ -314,6 +572,18 @@ impl RunningWork {
     /// signer call) rather than poll it.
     pub fn deadline(&self) -> Instant {
         self.turn.deadline
+    }
+
+    /// **THIS PROCESS OBSERVED THE DELIVERY'S EXIT.** Published by the work, on the thread that
+    /// observed it, at the one site that can tell the difference: a kill was issued AND the kernel
+    /// reported the exit (`crate::delivery_executor::exclusion_after_reap` said `Release`).
+    ///
+    /// Nothing else may call it. Dropping [`RunningWork`] without it is the unconfirmed-exit path,
+    /// and it retains: the ordinary release still needs the supervisor, and the [`CustodyBailiff`]
+    /// refuses. That is deliberate — the bailiff exists to remove a stalled SUPERVISOR from the
+    /// bound, never to weaken what an unknown child costs.
+    pub fn confirm_exit(&self) {
+        self.turn.exit_confirmed.store(true, Ordering::SeqCst);
     }
 }
 

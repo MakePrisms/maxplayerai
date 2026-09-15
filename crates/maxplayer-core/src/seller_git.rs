@@ -1052,8 +1052,17 @@ impl ChildCustody {
     }
 
     /// The child's exit was confirmed. Hand the turn on.
+    ///
+    /// PUBLISHED BEFORE THE DROP, not after: `confirm_exit` is what tells the seat's custody
+    /// bailiff that this process observed the exit, and the bailiff may act the instant the work's
+    /// half lands. Confirming afterwards would leave a window in which the work had ended with no
+    /// confirmation on record — which reads as an unconfirmed exit, the one state that must never
+    /// be produced by a delivery that in fact ended cleanly.
     fn release(mut self) {
-        drop(self.work.take());
+        if let Some(running) = self.work.take() {
+            running.confirm_exit();
+            drop(running);
+        }
     }
 }
 

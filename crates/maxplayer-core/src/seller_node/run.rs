@@ -1768,6 +1768,27 @@ pub const DELIVERY_DRAIN_BOUND: Duration = Duration::from_secs(
     DELIVERY_PUSH_TIMEOUT.as_secs() + crate::git_transport::DEFAULT_HTTP_LEG_TIMEOUT.as_secs(),
 );
 
+/// How long this seat's [`crate::delivery_turn::CustodyBailiff`] keeps asking whether the handoff
+/// has become safe, after a delivery's deadline has passed.
+///
+/// It is a REPORTING window, not a release permission: the bailiff's three conditions are re-checked
+/// on every tick inside it and never relaxed at the end of it. Sized against the executor's own
+/// worst case for reaching a confirmed exit — two `delivery_executor::REAP_BOUND` windows, one for
+/// the reap and one for end of file on the child's stdout — with a third window of slack, so that a
+/// loaded host reports a late handoff rather than a missing one.
+pub const DELIVERY_CUSTODY_PATIENCE: Duration =
+    Duration::from_secs(3 * crate::delivery_executor::REAP_BOUND.as_secs());
+
+/// The custody window must cover the executor's own worst case for reaching a confirmed exit, or
+/// the bailiff would stop asking while the answer was still on its way and report a refusal it had
+/// not earned. Fails the BUILD if either number moves out from under the other.
+const _: () = assert!(
+    DELIVERY_CUSTODY_PATIENCE.as_secs() > 2 * crate::delivery_executor::REAP_BOUND.as_secs(),
+    "delivery custody patience: the bailiff must keep asking for longer than the executor's worst \
+     case for reaching a confirmed exit (reap + end of file), or a late confirmation is reported \
+     as a refusal"
+);
+
 /// The drain bound is the sum of the two clocks it is made of, and it is FINITE. A future edit that
 /// makes either clock unbounded, or that stops the sum from covering the whole-operation deadline,
 /// fails the BUILD rather than silently unbounding how long one delivery can hold the seat's turn.
@@ -1881,7 +1902,23 @@ where
     // The guard is moved INTO the turn: from here on no copy of the seat's exclusion lives on this
     // side of the operation, so nothing that happens to this task can release it early.
     let (control, turn) = crate::delivery_turn::delivery_turn(guard, deadline);
+    // AND NOTHING THAT HAPPENS TO THIS TASK CAN HOLD IT LATE EITHER. The release rule needs both
+    // halves published, and this side's half had exactly one publisher: the `end` below, on this
+    // stack. A task starved, parked or descheduled never reaches it, and the seat waited for as
+    // long as that took — the unbounded `S` term in `delivery_executor`'s bounds. The bailiff is a
+    // second publisher that runs on neither side and that may act only on a CONFIRMED exit with the
+    // supervisor outside shared state; dropping the watch does not stop it, which is the point.
+    let _custody = control
+        .custody_bailiff()
+        .arm(deadline, DELIVERY_CUSTODY_PATIENCE);
+    // Everything this side does with the seat, declared. It is short and it is all of it: assembling
+    // the delivery's future. What follows the section is waiting, and waiting is what the bailiff is
+    // allowed to fence. A refusal here is unreachable — fencing needs work that has ENDED, and the
+    // work has not begun — but a custody answer may never arrive as a panic in the delivery arm, so
+    // it is carried rather than unwrapped.
+    let section = control.enter_shared_state().ok();
     let work = push(turn);
+    drop(section);
     match tokio::time::timeout(timeout, work).await {
         Ok(Ok(oid)) => Ok(oid),
         Ok(Err(error)) => Err(DeliveryPushErr::Push(error)),
