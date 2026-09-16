@@ -1,3 +1,89 @@
+## v0.5.9
+
+Every delivery push now mints its authorization at the request it is sent on, and a contained job
+under gVisor is handed a resolver it can actually reach. Both are on for a seat that upgrades
+without changing its config.
+
+### The delivery push authorizes each leg, and asks nothing back (#994)
+
+A git push is several requests — the ref advertisement, the pack POST, any attempt after those —
+and libgit2 opens a fresh stream for each. Until now one token minted when the job was picked up
+had to cover all of them, and it was at its oldest exactly when the relay finally checked it.
+
+The push is now handed a minter rather than a header: `HttpStream::send` calls it immediately
+before each request leaves, passing the destination it is about to contact. Every wire request
+carries its own fresh NIP-98 token scoped to this job's ref. **Nothing about relay policy or token
+expiry changes** — the tokens are simply younger when they arrive. Signing stays inside the signer
+actor; the seller key never leaves it, and both legs of the blocking bridge are bounded, so a
+stalled signer surfaces as a failed leg instead of parking the thread holding the delivery lock.
+
+The minter is shown the destination and compares it against the transport's own `same_destination`,
+so a leg aimed anywhere but the remote this job was told to deliver to cannot obtain a token at all.
+
+**The post-push remote read-back is gone**, along with `attest_remote_branch` and
+`check_remote_attestation`. The per-ref status report is now the only accepted answer:
+`require_status_report` treats an empty report, a report for somebody else's ref, a rejection, a
+contradictory report, and extra refs as failures. Silence is not acceptance.
+
+Three further refusals ship with it:
+
+- **No followed redirect.** A 3xx is a destination nothing authorized, and reqwest keeps the
+  Authorization header across a same-origin hop while 307/308 replays the body. Both transport
+  clients now follow nothing, and a 3xx fails the leg naming the destination that *was* authorized.
+- **No hidden replay.** reqwest can replay a request it believes was never processed (HTTP/2
+  GOAWAY, REFUSED_STREAM) from below `HttpStream::send`, so the minter was never asked and the
+  first attempt's token went out again. Both blocking clients now carry `reqwest::retry::never()`.
+- **Authority ends when the delivery's turn ends.** The authority flag is re-checked inside
+  `HttpStream::send` after the mint, with nothing between the answer and the send, and
+  `PushAuthority` revokes on `Drop`, which covers cancellation, early return and panic.
+
+The evidence runs the production article — two awarded jobs, the real `serialized_bounded_push`,
+the seat's one delivery lock, the real signer actor, and a real HTTPS git remote recording the exact
+Authorization bytes of every request — and asserts four distinct tokens, each naming its own job's
+ref, and exactly two requests per push, which is the read-back's absence stated as an assertion.
+
+### Contained jobs get a resolver they can reach (#995)
+
+Under gVisor a contained job's lookups went to docker's embedded resolver at 127.0.0.11, which the
+sandbox terminates in its own network stack: every lookup failed `EAI_AGAIN` while the identical
+container under runc resolved. `--dns` cannot fix it, so the job is handed a real resolver file and
+its egress policy opens port 53 to exactly the addresses in that file.
+
+- Resolvers are discovered from `[sandbox] dns_servers`, else the host's own upstreams
+  (`resolv.conf`, then `resolvectl` for a systemd stub). Loopback and the cloud metadata endpoint
+  are refused with a named reason.
+- One udp and one tcp ACCEPT per resolver, pinned to that host address (/32, /128) on port 53 only,
+  below the metadata DROP and above the range DROPs. The readback now proves each rule's address,
+  protocol, port and position rather than counting ACCEPTs.
+- Resolvers are resolved once before the namespace exists; the same value renders the file and the
+  exceptions, and the file is mounted read-only at `/etc/resolv.conf`.
+
+**No rule was removed, no deny widened, no protection relaxed.** `maxplayer doctor` now reports the
+canonical resolver plan a launch installs, and marks the unconfigured case as an explicit
+unverified discovery floor rather than a certified plan.
+
+### Also
+
+- The Muse layer of the buyer path ships as a published skill, source-checked against this tree
+  (#990).
+- `.gitignore` additions (#987).
+
+### Worth knowing
+
+- **A containment finding was recorded, not repaired.** A live gate bound to `runsc` and proving
+  what it ran under shows that a gVisor payload passes through host netfilter rules that runc
+  denies: a private address inside the `172.16.0.0/12` DROP is reachable, and so is a non-53 port
+  on the resolver. The rules render, verify and install correctly. The candidate mechanism — gVisor
+  terminating the network stack in user space — is written down as a hypothesis, not a proof, and
+  a fix is a change to how containment is enforced for that runtime.
+- **The cancellation / lock-bound issue is DEFERRED** and not addressed in this release
+  (tracked in thread 1547960593204650058).
+- This release carries no claim of a full-scope review PASS, and live post-fix delivery has not
+  been proven: the delivery-push work is covered by offline gates against real HTTP/2 and HTTPS
+  fixtures, not against a production relay.
+- The DNS runtime gates are Linux-only and `#[ignore]`d; they are not run by CI.
+- No CI job compiles `crates/buzz`, so the relay code in this release was never built by CI.
+
 ## v0.5.8
 
 A seller node now charges a 10% platform fee and pays it automatically, and a docker seat delivers from inside its container. Both are on for a seat that upgrades without changing its config.
