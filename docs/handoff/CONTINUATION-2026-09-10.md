@@ -13,6 +13,11 @@ code (2026-09-14). The branch is pushed to `MakePrisms/maxplayerai` and under re
 first review round (Codex, 2026-09-15) returned eleven findings; section 12 records each one and its
 fix. Read sections 10 to 12 first if you are resuming.
 
+**2026-09-16:** pull request #1004 merged into `main` at `00c05bb`. The skill moved to the web skill
+channel (`web/app/.well-known/skills/seller-tool-onboarding/skill.md`, live at maxplayer.ai), so a
+seller outside this checkout can fetch it the way every other buyer or seller skill is fetched. See
+section 6.
+
 ## 1. What changed since `a0cc31d`
 
 | Area | Change |
@@ -101,7 +106,7 @@ old F3 lifecycle probe. A fresh demo run writes a new bundle with the F1, F3, an
 
 | Item | Location |
 | --- | --- |
-| Skill | `.claude/skills/seller-tool-onboarding/SKILL.md` |
+| Skill | `web/app/.well-known/skills/seller-tool-onboarding/skill.md`, served at https://www.maxplayer.ai/.well-known/skills/seller-tool-onboarding/skill.md and listed in the skill index (2026-09-16). `.claude/skills/seller-tool-onboarding/SKILL.md` is a symlink to it, for agents in this checkout. |
 | Config template | `crates/maxplayer-tool-kit/templates/seller-tool-config.template.json` |
 | Field guide and examples | `crates/maxplayer-tool-kit/templates/README.md` |
 | Worked example A (file CLI) | The demo and `fixtures/seller-tool-config.json` are the runnable Walk A. |

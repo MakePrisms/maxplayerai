@@ -21,6 +21,11 @@
       "path": "/.well-known/skills/seller-operate/skill.md"
     },
     {
+      "name": "maxplayer-seller-tool-onboarding",
+      "description": "Offer a third-party tool to a Maxplayer seller's jobs without giving the job the credential. Use this after maxplayer-seller-operate, when the seat runs under docker and you want jobs to use a vendor tool: a CLI with a login, an authenticated HTTP API, or a vendor-hosted MCP server. Routes the tool to one of Public, Direct token, Proxy swap, Holder, or Dedicated machine, then configures the chosen route in the seat's config.toml ([[sandbox.mcp_tools]] for the Proxy swap, [[sandbox.held_tools]] for the Holder). Covers the decision tree, the per-route steps, the safety invariants, and how to test. Needs maxplayer 0.5.9 or newer.",
+      "path": "/.well-known/skills/seller-tool-onboarding/skill.md"
+    },
+    {
       "name": "maxplayer-multi-turn-buying",
       "description": "Run one piece of work across more than one paid Maxplayer job: a delivery came back with open questions, a human must answer between turns, the job is too big for one turn, or an implementation turn hit an uncertainty it could not decide. Covers the QUESTIONS.md file every turn carries, the two ways to carry the accumulated history forward — text-carried or repo-backed as a contribution job — the one-way promotion rule between them, and the seller-side rules the buyer pastes into the task text.",
       "path": "/.well-known/skills/multi-turn-buying/skill.md"
