@@ -202,10 +202,11 @@ version, the npm manifests, the payload pins and the release notes; the artifact
 binary's own `--version` line and build stamp. So it is invoked
 `./scripts/verify-release-version.sh <version> <path-to-binary>` — both call sites in CI and the
 release job pass a path, and the version without a leading `v`. A run with no binary path is a
-refusal, not a pass: to check the tree alone, ask for it with
-`./scripts/verify-release-version.sh <version> --tree-only`, which prints a loud `ARTIFACT ARM NOT
-RUN` line and a `PASS (TREE ONLY)` summary. Before that, a missing path silently skipped the artifact
-arm and still printed `PASS: everything states <version>` with exit 0.
+refusal, not a pass: to check the tree alone, ask for it by name with
+`./scripts/verify-release-version.sh <version> --no-artifacts` — the same opt-out flag
+`verify-release-surface.sh` takes, printing the same `ok: skipping the built-artifact check
+(--no-artifacts) — …` line and closing with `PASS (NO ARTIFACTS)`. Before that, a missing path
+silently skipped the artifact arm and still printed `PASS: everything states <version>` with exit 0.
 
 The trusted-publisher entry is the step no check can make: it lives on npmjs.com, needs an org admin,
 and must exist BEFORE the tag. Without it the publish job fails on that package — loudly, which is

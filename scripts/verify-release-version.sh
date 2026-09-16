@@ -31,28 +31,33 @@
 # artifact arm used to be skipped whenever no binary path was supplied — and the run still printed
 # `PASS: everything states <version>` and exited 0. A gate whose teeth are absent must not read as a
 # full pass, so a binary path is now REQUIRED unless the caller opts out in writing with
-# `--tree-only`, and the final line always names the arms that actually ran.
+# `--no-artifacts`, and the final line always names the arms that actually ran.
+#
+# The flag is `--no-artifacts`, spelled and printed the way `verify-release-surface.sh` already
+# spells and prints it — same opt-out name, same `ok: skipping the built-artifact check
+# (--no-artifacts) — …` line — so one house style covers both release gates and a reader who knows
+# one knows the other.
 #
 # Usage:
-#   ./scripts/verify-release-version.sh <version> <path-to-binary>   # both arms (releases, CI)
-#   ./scripts/verify-release-version.sh <version> --tree-only        # tree arm only, says so loudly
+#   ./scripts/verify-release-version.sh <version> <path-to-binary>     # both arms (releases, CI)
+#   ./scripts/verify-release-version.sh <version> --no-artifacts       # tree arm only, and says so
 #     e.g. ./scripts/verify-release-version.sh 0.1.0 result/bin/maxplayer
-#          ./scripts/verify-release-version.sh 0.1.0 --tree-only
+#          ./scripts/verify-release-version.sh 0.1.0 --no-artifacts
 #
 # Pass the version WITHOUT a leading `v` — the workflow strips it from the tag.
 
 set -euo pipefail
 
-USAGE="usage: verify-release-version.sh <version> <path-to-binary> | verify-release-version.sh <version> --tree-only"
+USAGE="usage: verify-release-version.sh <version> <path-to-binary|--no-artifacts>"
 
 die() { echo "verify-release-version: $*" >&2; exit 1; }
 
 VERSION=""
 BINARY=""
-TREE_ONLY=0
+NO_ARTIFACTS=0
 for arg in "$@"; do
     case "$arg" in
-        --tree-only) TREE_ONLY=1 ;;
+        --no-artifacts) NO_ARTIFACTS=1 ;;
         -h|--help)   echo "$USAGE"; exit 0 ;;
         -*)          die "unknown option '$arg' — $USAGE" ;;
         *)
@@ -71,11 +76,11 @@ esac
 
 # Fail closed on a missing artifact rather than skipping its arm: a run that inspected no binary
 # proves nothing about the thing being shipped, and must not be mistakable for a full pass.
-if [ -n "$BINARY" ] && [ "$TREE_ONLY" -eq 1 ]; then
-    die "--tree-only was given together with the binary path '$BINARY' — pick one: check the artifact, or declare in writing that you are not checking it"
+if [ -n "$BINARY" ] && [ "$NO_ARTIFACTS" -eq 1 ]; then
+    die "--no-artifacts was given together with the binary path '$BINARY' — pick one: check the artifact, or declare in writing that you are not checking it"
 fi
-if [ -z "$BINARY" ] && [ "$TREE_ONLY" -eq 0 ]; then
-    die "the ARTIFACT arm did not run: no path to a built binary was given, so nothing here would have checked that the artifact reports $VERSION or carries a resolvable build stamp. Pass the binary — $USAGE — or opt out explicitly with --tree-only, which passes while naming the arm it skipped"
+if [ -z "$BINARY" ] && [ "$NO_ARTIFACTS" -eq 0 ]; then
+    die "the ARTIFACT arm did not run: no path to a built binary was given, so nothing here would have checked that the artifact reports $VERSION or carries a resolvable build stamp. Pass the binary — $USAGE — or opt out explicitly with --no-artifacts, which passes while naming the arm it skipped"
 fi
 [ -f Cargo.toml ] || die "run from the repo root (Cargo.toml missing)"
 
@@ -205,12 +210,17 @@ if [ -n "$BINARY" ]; then
     [ "$stamp_sha" = "$head_sha" ] \
         || die "the artifact was built from $stamp_sha but this tree is at $head_sha — the binary and the source being packaged are different commits"
     echo "ok: build stamp $stamp_sha resolves to a commit and is this tree's HEAD"
+else
+    # The skip is printed, never silent, and in the same words `verify-release-surface.sh` uses for
+    # its own `--no-artifacts` opt-out — the reader of either gate's log sees one house style.
+    echo "ok: skipping the built-artifact check (--no-artifacts) — holding the tree-stated version only; nothing here binds a built artifact to $VERSION or to this commit"
 fi
 
+# The summary states which arms ran, so a reader does not have to infer it from the exit code — the
+# inference that let a 4-line run and a 7-line run both read as `PASS: everything states <version>`.
 TREE_ARM="tree (crate version, npm manifests, payload pins, release notes)"
 if [ -n "$BINARY" ]; then
-    echo "PASS: everything states $VERSION — arms run: $TREE_ARM + artifact ($BINARY)"
+    echo "PASS: everything states $VERSION — arms run: $TREE_ARM + built artifact ($BINARY)"
 else
-    echo "!! ARTIFACT ARM NOT RUN (--tree-only): no binary was inspected — nothing here says the built artifact reports $VERSION or carries a build stamp resolving to this commit"
-    echo "PASS (TREE ONLY): the tree states $VERSION — arms run: $TREE_ARM; artifact arm NOT RUN"
+    echo "PASS (NO ARTIFACTS): the tree states $VERSION — arms run: $TREE_ARM; the built-artifact check did NOT run (--no-artifacts)"
 fi
