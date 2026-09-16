@@ -3935,6 +3935,153 @@ mod tests {
         assert_ne!(job_argv, probe_argv);
     }
 
+    /// A REAL SELLER DEADLINE REACHES A REAL CONTAINER'S LABEL, AND DECIDES A REAL SWEEP.
+    ///
+    /// #996 R3/3 asked for exactly this, and the module did not have it. The unit test
+    /// `sandbox_netns::tests::the_production_deadline_reaches_the_container_and_decides_the_sweep`
+    /// builds the stamp BY HAND and feeds it to a hand-written listing, so it would still pass if
+    /// this call site stopped carrying the deadline altogether — it tests the arithmetic, not the
+    /// wiring. This drives the product's own path end to end: [`prepare_launch`] →
+    /// [`crate::sandbox_netns::launch_cleanup_stamp`] → `docker run --label` →
+    /// [`crate::sandbox_netns::list_owned_argv`] → [`crate::sandbox_netns::parse_owned_listing`]
+    /// → [`crate::sandbox_netns::partition_owned`], and reads the stamp back out of the container
+    /// a real daemon actually created.
+    ///
+    /// **The mutation control that makes it worth running:** the job lifetime (60s) and the job
+    /// deadline (+24h) are far apart ON PURPOSE, so replacing `job_deadline_unix` with `None` at
+    /// the production call site moves the recorded stamp by nearly a day and reds the stamp
+    /// assertion. A green that cannot go red is decoration.
+    ///
+    /// `#[ignore]` rather than an env-var early return, for the reason the probe test above states:
+    /// a test that returns early when its precondition is missing reports as PASSED.
+    #[cfg(feature = "acp")]
+    #[tokio::test]
+    #[ignore = "live: needs a docker daemon, MAXPLAYER_HOLDER_IMAGE and the netfilter sidecar image"]
+    async fn a_seller_deadline_reaches_the_daemon_label_and_decides_the_sweep() {
+        use crate::sandbox_netns::{
+            cleanup_after_unix, list_owned_argv, parse_owned_listing, partition_owned, ROLE_HOLDER,
+        };
+
+        fn docker(args: &[&str]) -> (bool, String) {
+            let out = std::process::Command::new("docker")
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("docker must be runnable");
+            (
+                out.status.success(),
+                String::from_utf8_lossy(&out.stdout).trim().to_owned(),
+            )
+        }
+
+        let image = std::env::var("MAXPLAYER_HOLDER_IMAGE").expect(
+            "set MAXPLAYER_HOLDER_IMAGE to a job image — this test measures a real container and \
+             has nothing to say without one",
+        );
+        // This run's OWN seat and network, so nothing it lists, asserts on, or removes can belong
+        // to another run on the same daemon.
+        let seat = "9e".repeat(32);
+        let identity = DeliveryAgentIdentity::for_seller(&seat);
+        let tag = format!("mx996-e2e-{}", std::process::id());
+        let (created, _) = docker(&["network", "create", &tag]);
+        assert!(created, "could not create the test network {tag}");
+
+        // The workdir's last component IS the job id the launch derives its container names from.
+        let workdir = std::env::temp_dir().join(&tag);
+        std::fs::create_dir_all(&workdir).expect("a workdir");
+        let job_id = job_id_of(&workdir);
+
+        let policy = SandboxPolicy::docker(DockerPolicy {
+            image,
+            forward_env: Vec::new(),
+            runtime: std::env::var("MAXPLAYER_RUNSC_RUNTIME").ok(),
+            network: Some(tag.clone()),
+            proxy_ports: None,
+            file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
+            container_delivery: None,
+        });
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock")
+            .as_secs();
+        let deadline = now + 86_400;
+        let lifetime = Duration::from_secs(60);
+
+        let prepared = prepare_launch(
+            &["sh".to_owned()],
+            &policy,
+            &workdir,
+            &identity,
+            lifetime,
+            Some(deadline),
+        )
+        .await
+        .expect("containment must establish");
+
+        // Read the labels back through the PRODUCTION listing argv, never a hand-written docker ps.
+        let argv = list_owned_argv(&seat);
+        let listed = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .output()
+            .expect("docker ps must run");
+        let owned = parse_owned_listing(&String::from_utf8_lossy(&listed.stdout));
+        assert!(
+            !owned.is_empty(),
+            "the launch's containers must be visible to the production listing argv"
+        );
+
+        let expected = cleanup_after_unix(deadline);
+        let if_dropped = cleanup_after_unix(now + lifetime.as_secs());
+        for container in &owned {
+            assert_eq!(
+                container.cleanup_after,
+                Some(expected),
+                "the daemon recorded a stamp that is not this job's deadline plus the grace; \
+                 {if_dropped} would mean the call site stopped carrying Some(deadline)"
+            );
+        }
+
+        // Per-role provenance, asserted on labels a real daemon wrote rather than on a fixture.
+        let holder = owned
+            .iter()
+            .find(|container| container.role.as_deref() == Some(ROLE_HOLDER))
+            .expect("the launch created a holder");
+        assert_eq!(
+            holder.holder_job.as_deref(),
+            Some(job_id.as_str()),
+            "a production holder names its job in the holder column"
+        );
+        assert_eq!(
+            holder.helper_job, None,
+            "and never wears the helper label — the shape the sweep must read per role"
+        );
+
+        // The decision itself, from those same records: kept inside the deadline, swept past it.
+        let inside = partition_owned(&owned, &seat, deadline);
+        assert!(
+            !inside.removable.contains(&holder.id),
+            "a holder inside its job's deadline is never removable: {inside:?}"
+        );
+        assert!(
+            !inside.skipped.iter().any(|(id, _)| id == &holder.id),
+            "and it is readable, not refused: {inside:?}"
+        );
+        let past = partition_owned(&owned, &seat, expected);
+        assert!(
+            past.removable.contains(&holder.id),
+            "past the deadline plus the grace the holder is swept: {past:?}"
+        );
+
+        drop(prepared);
+        for container in &owned {
+            let _ = docker(&["rm", "--force", &container.id]);
+        }
+        let _ = docker(&["network", "rm", &tag]);
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
     // The honest false, measured in a REAL container rather than argued from a Dockerfile.
     //
     // `#[ignore]` rather than an env-var early-return: a test that returns early when its
