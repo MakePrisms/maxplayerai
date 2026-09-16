@@ -1371,8 +1371,22 @@ fn pump<R: std::io::Read + Send + 'static>(
                 Err(error) if error.kind() == std::io::ErrorKind::InvalidData => None,
                 Err(error) => Some(PumpEnd::ReadFailed(error.to_string())),
             };
+            // PUBLISHED ON THE OBSERVATION, NOT AFTER THE QUEUE. The read that just returned zero
+            // bytes IS the end of that pipe; the fact is complete right here. Publishing it after
+            // `sink.send` put a BLOCKING send into a bounded queue in front of the custody handoff,
+            // so a parent that was not draining -- busy minting, or simply not back yet -- held the
+            // cleanup half of this seat's confirmation for as long as it stayed away, and the
+            // cleanup bound then reported that delay as a delivery that failed to clean up.
+            if matches!(stop, Some(PumpEnd::Eof)) {
+                if let Some(cleanup) = &cleanup {
+                    cleanup.establish();
+                }
+            }
             if sink.send(frame).is_err() {
-                break PumpEnd::ParentStopped;
+                // An observed EOF is the stronger fact about the descriptor and it stands. The
+                // parent going away AFTERWARDS says nothing about who still holds the write end,
+                // and it must not downgrade an end this thread already watched the kernel report.
+                break stop.unwrap_or(PumpEnd::ParentStopped);
             }
             if let Some(reason) = stop {
                 break reason;
@@ -2940,6 +2954,80 @@ mod tests {
         assert!(
             refused.is_err(),
             "a frame past the cap must be refused, not read into memory this process never bounded"
+        );
+    }
+
+    /// **EOF IS PUBLISHED BY THE THREAD THAT OBSERVED IT, NOT AT THE PARENT'S APPETITE FOR FRAMES.**
+    ///
+    /// The pump establishes `PumpEnd::Eof` from a read that returned zero bytes -- the fact exists
+    /// the moment that read returns. It then used to `sink.send` the final marker BEFORE telling
+    /// anyone, and that send is a BLOCKING send on a bounded queue. With the queue full at the
+    /// instant the pipe ends, the pump parks in `send`, so the cleanup half of the seat's
+    /// confirmation is not published until the PARENT comes back and drains. Custody handoff then
+    /// waits on the receiver, and the cleanup bound is merely what reports the delay afterwards.
+    ///
+    /// The oracle is scheduling-independent rather than timing-lucky: the queue is filled to
+    /// capacity and NOT ONE frame is taken before the observation below, so a publication seen here
+    /// can only mean publication no longer depends on a receive happening first.
+    #[test]
+    fn cleanup_is_published_on_the_observed_eof_and_not_after_the_parent_drains() {
+        // Exactly enough unparseable lines to fill the queue. A parse error is a message about the
+        // CHILD, not about the descriptor, so the pump forwards it and keeps reading: it occupies a
+        // slot without ending the thread. The cursor then runs out, and THAT zero-byte read is the
+        // EOF under test.
+        let mut bytes = Vec::new();
+        for _ in 0..MAX_QUEUED_FRAMES {
+            bytes.extend_from_slice(b"x\n");
+        }
+        let reader = std::io::Cursor::new(bytes);
+
+        let published_at = std::sync::Arc::new(std::sync::Mutex::new(None::<Instant>));
+        let stamp = std::sync::Arc::clone(&published_at);
+        let guard = std::sync::Arc::new(std::sync::Mutex::new(ExitGuard {
+            pid: 0,
+            disarmed: true,
+            child: None,
+            // Already reaped: the exit is the OTHER fact the confirmation is owed, so cleanup is the
+            // only one outstanding and the confirmation fires the instant it lands.
+            reaped: true,
+            spent_reaping: Duration::ZERO,
+            confirm: Some(std::sync::Arc::new(move || {
+                let mut slot = stamp.lock().expect("publication stamp");
+                if slot.is_none() {
+                    *slot = Some(Instant::now());
+                }
+            })),
+            cleanup_established: false,
+        }));
+        let cleanup = CleanupSink {
+            guard: std::sync::Arc::clone(&guard),
+        };
+
+        let (sink, frames) = sync_channel::<std::io::Result<Option<ToParent>>>(MAX_QUEUED_FRAMES);
+        let end = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let began = Instant::now();
+        let handle = pump(reader, sink, std::sync::Arc::clone(&end), Some(cleanup));
+
+        // THE RECEIVER IS STALLED ON PURPOSE, and not one frame is taken before the read below.
+        const STALL: Duration = Duration::from_millis(1500);
+        const PUBLISH_BOUND: Duration = Duration::from_millis(750);
+        std::thread::sleep(STALL);
+        let seen = *published_at.lock().expect("publication stamp");
+
+        // Drained and joined AFTER the observation, so the pump can finish either way and this test
+        // never leaves a parked thread behind.
+        while frames.recv_timeout(REAP_BOUND).is_ok() {}
+        let _ = handle.join();
+
+        let seen = seen.expect(
+            "the pipe ended while the queue was full and NOTHING was published: the cleanup half of \
+             the confirmation was still waiting for this parent to drain a bounded queue",
+        );
+        let took = seen.saturating_duration_since(began);
+        assert!(
+            took < PUBLISH_BOUND,
+            "cleanup was published {took:?} after the pump started, past the {PUBLISH_BOUND:?} \
+             bound: publication is still paced by the receiver rather than by the observed EOF"
         );
     }
 
