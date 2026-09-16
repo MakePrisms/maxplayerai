@@ -644,6 +644,31 @@ pub async fn reconcile_stale_holders(seat: &str, configured: &[String]) -> Resul
     Ok(removed)
 }
 
+/// What one `holderctl attach` call established.
+#[derive(Debug, PartialEq, Eq)]
+enum AttachAnswer {
+    /// The holder attached the job; `stdout` is its reply document.
+    Attached(String),
+    /// The holder answered and refused (a duplicate id, a bad root). Nothing was attached by this
+    /// call, and an attachment the refusal names is someone else's: nothing to take back.
+    Refused(String),
+    /// The call did not complete: killed at its deadline, or `docker` itself failed. Whether the
+    /// holder attached the job is unknown, so the caller takes it back, best effort.
+    Unknown(String),
+}
+
+/// Classify the outcome of the `docker exec … holderctl attach` call.
+fn attach_answer(outcome: Result<(i32, String, String), String>) -> AttachAnswer {
+    match outcome {
+        Ok((0, stdout, _)) => AttachAnswer::Attached(stdout),
+        Ok((code, stdout, stderr)) => AttachAnswer::Refused(format!(
+            "holderctl exited {code}: {}",
+            if stderr.is_empty() { stdout } else { stderr }
+        )),
+        Err(why) => AttachAnswer::Unknown(why),
+    }
+}
+
 /// The seat's held tool: a running holder container the daemon owns for its whole life.
 ///
 /// Dropping it removes the container (blocking, bounded, like `NetnsHolder`), unless
@@ -879,20 +904,27 @@ impl HeldTool {
             }
         });
         let attached = owner
-            .docker_ok(
+            .docker(
                 holderctl_argv(&self.names.container, &["attach", "--job-id", job_id, "--job-root", &job_root]),
                 DOCKER_CONTROL_TIMEOUT,
             )
             .await;
         owner.disarm();
-        let stdout = match attached {
-            Ok(stdout) => stdout,
-            Err(error) => {
-                // A killed `docker exec` does not stop the `holderctl` it started: the attach may
-                // have landed anyway. Best effort, so a later attach of this id is not refused as
-                // live; a holder that never attached it answers "no such attached job".
+        let stdout = match attach_answer(attached) {
+            AttachAnswer::Attached(stdout) => stdout,
+            AttachAnswer::Refused(why) => {
+                // The holder answered and refused: nothing was attached by this call. The
+                // refusal of a DUPLICATE id names an attachment that exists and belongs to
+                // someone else; it is preserved, not detached.
+                return Err(format!("[sandbox] held_tool: attach {job_id} failed: {why}"));
+            }
+            AttachAnswer::Unknown(why) => {
+                // The call did not complete (killed at its deadline, or `docker` itself failed).
+                // A killed `docker exec` does not stop the `holderctl` it started, so the attach
+                // may have landed anyway. Best effort, so a later attach of this id is not refused
+                // as live; a holder that never attached it answers "no such attached job".
                 let _ = docker(detach_argv, DOCKER_CONTROL_TIMEOUT).await;
-                return Err(format!("[sandbox] held_tool: attach {job_id} failed: {error}"));
+                return Err(format!("[sandbox] held_tool: attach {job_id} failed: {why}"));
             }
         };
         let reply: Value = serde_json::from_str(stdout.trim())
@@ -1267,6 +1299,20 @@ mod tests {
         let _ = owner.docker(vec!["sh".into(), "-c".into(), "exit 3".into()], Duration::from_secs(5)).await;
         drop(owner);
         assert_eq!(cleaned.load(Ordering::SeqCst), 1, "an armed owner whose call ended cleans up at the drop");
+    }
+
+    /// A refusal the holder answered (the duplicate id above all) attached nothing and names an
+    /// attachment that is someone else's; only a call that did not complete is unknown.
+    #[test]
+    fn an_attach_the_holder_refused_is_not_taken_back_but_an_unknown_one_is() {
+        assert_eq!(
+            attach_answer(Ok((0, "{\"socket\": \"/run/maxplayer-holder/jobs/j1/job.sock\"}".into(), String::new()))),
+            AttachAnswer::Attached("{\"socket\": \"/run/maxplayer-holder/jobs/j1/job.sock\"}".into())
+        );
+        let duplicate = attach_answer(Ok((1, String::new(), "holderctl: job \"j1\" is already attached; detach it first".into())));
+        assert!(matches!(&duplicate, AttachAnswer::Refused(why) if why.contains("already attached")), "{duplicate:?}");
+        let killed = attach_answer(Err("`docker exec …` did not finish within 30s and was killed".into()));
+        assert!(matches!(killed, AttachAnswer::Unknown(_)));
     }
 
     #[test]
