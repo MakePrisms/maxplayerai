@@ -72,8 +72,9 @@ one that fits it. **A seat that declares neither key is unchanged.**
   credential proxy (#647) swaps the real credential into the `Authorization` header at egress, for
   the vendor's host only, for the life of the job, and the job reaches a vendor-hosted MCP server
   through `mcp-http-bridge`, now installed in the sandbox image. The docker alias pinhole opens only
-  when an MCP server entry names it, and the launch capture redactor knows every real credential
-  value a launch holds.
+  for a job outside namespace containment, and only when that job's environment or one of its MCP
+  server entries references the alias; the launch capture redactor knows every real credential value
+  a launch holds.
 - **Holder** (`[[sandbox.held_tools]]`). The daemon runs one persistent holder container per declared
   tool — `tool-holderd` from the new `maxplayer-tool-kit` crate, plus the vendor's own CLI. The
   holder enrols once and resumes its login across restarts. Each job gets its own Unix socket per
@@ -109,8 +110,8 @@ difference is the reason to read this paragraph:
   does not claim one.
 
 The live tests are `#[ignore]`d and configured by environment — `seller_exec::mcp_tool_tests::live_*`
-and `held_tool::live_tests::live_*` — and each bundle under `evidence/` carries a README stating
-what it proves and its limits.
+and `held_tool::live_tests::live_*` — and each of this feature's three bundles under `evidence/`
+(the `20260914T…` directories) carries a README stating what it proves and its limits.
 
 Two limits ship with the feature. The Holder route needs Docker Engine 26 or newer for the volume
 subpath mount, and a seat too old for it fails its boot line rather than every awarded job. The
