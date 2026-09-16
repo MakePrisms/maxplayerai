@@ -1,0 +1,9 @@
+{
+  "detached": true,
+  "health": {
+    "state": "healthy"
+  },
+  "job_id": "job-a",
+  "note": "job ended; the tool was not logged out and no session was closed",
+  "tool_still_enrolled": true
+}

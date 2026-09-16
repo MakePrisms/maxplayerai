@@ -1,0 +1,18 @@
+--- what this container can see ---
+/run/holder:
+total 8
+drwx------ 2 root root 4096 Sep  9 22:01 .
+drwxr-xr-x 1 root root 4096 Sep  9 21:58 ..
+srw------- 1 root root    0 Sep  9 22:01 job.sock
+
+/work:
+total 16
+drwxr-xr-x 2 root root 4096 Sep  9 22:01 .
+drwxr-xr-x 1 root root 4096 Sep  9 22:01 ..
+-rw-r--r-- 1 root root   17 Sep  9 22:01 input.txt
+-rw-r--r-- 1 root root   17 Sep  9 22:01 out.txt
+--- credential paths ---
+ls: cannot access '/run/secrets': No such file or directory
+--- search for a session token ---
+NO_TOKEN_FOUND
+--- the secret search runs separately, see job-a-secret-search.txt ---

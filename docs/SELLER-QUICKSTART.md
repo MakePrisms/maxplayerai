@@ -848,6 +848,89 @@ Known limits of this mode:
 - The usage and model metadata on the result come from the container's report. Metering at the
   credential proxy is a follow-up.
 
+### Offer a vendor MCP server to jobs — the Proxy swap (`[[sandbox.mcp_tools]]`)
+
+A docker seat can offer a vendor-hosted MCP server (GitHub's remote MCP, for example) to its jobs.
+The host never hands the vendor credential to the container. Per job, the host reads the credential
+from a file you name, mints a placeholder, and registers the pair on the credential proxy. The job's
+agent gets an MCP server entry that carries only the placeholder and the proxy's address. The proxy
+swaps the real credential in at egress, in the `Authorization` header only, for the vendor's host
+only, for the life of the job only. A leaked placeholder is worthless: the vendor rejects it, and the
+proxy forgets it at job end.
+
+Scope the credential at the vendor. The proxy constrains the destination, not the operations, so a
+broad credential stays broad behind it. For GitHub: a fine-grained personal access token, read-only,
+on one repository. The proxy also does not read the vendor's response body. A vendor that reflects
+its `Authorization` header into a response body can return the real value in an encoding the proxy
+does not scrub. Do not offer such a vendor on this route.
+
+```toml
+[sandbox]
+mode = "docker"
+network = "maxplayer-jobs"
+proxy_port_range = "9100-9199"      # required with network: the pinhole is how the job reaches the proxy
+
+[[sandbox.mcp_tools]]
+name = "github"                                      # the MCP server name the agent sees
+url = "https://api.githubcopilot.com/mcp/readonly"   # the vendor's MCP endpoint; GitHub's read-only one
+credential = { path = "/home/seller/.config/maxplayer/github-mcp.json", field = "token" }
+# transport = "stdio"                                # default: the bridge in the image. "http" only for claude
+```
+
+Prefer a vendor endpoint that itself limits the operations when the token is read-only: GitHub's
+`/mcp/readonly` lists only read tools. The endpoint bounds the operations, the token bounds the
+permissions, the proxy bounds the destination.
+
+The credential file is JSON with one top-level string field, mode `0600`, owned by the daemon's
+user: `{"token": "github_pat_…"}`. Use an absolute path. Never put the credential in `config.toml`
+or on a command line. The seller boot line reports each tool:
+
+```text
+seller node: [sandbox] mcp_tools: github -> https://api.githubcopilot.com/mcp/readonly through the credential proxy (stdio bridge); credential file /home/seller/.config/maxplayer/github-mcp.json reads
+```
+
+A line that says `UNREADABLE` means every job would fail to reach the tool; fix the file first. A
+credential file that cannot be read at job time fails that job before any proxy listens — nothing
+falls back to putting the real value in the container.
+
+Status: accepted against GitHub's remote MCP server on 2026-09-14, through the real proxy, the
+sandbox image, and a real agent turn; the bundle is `evidence/20260914T085619Z-github-proxy-swap/`. See
+`docs/specs/seller-tool-onboarding/10-routing-and-options.md`. Another vendor is another
+acceptance run.
+
+### Hold vendor CLIs for jobs — the Holder (`[[sandbox.held_tools]]`)
+
+A docker seat can hold vendor CLIs logged in, each in its own persistent holder container the
+daemon starts at boot and stops at shutdown, and offer the operations you declare to every job over
+a per-job Unix socket per tool. The credential and the login live in the holder; a job gets its own
+socket per tool and the declared operations, nothing else. Each login persists in its holder's
+state volume across restarts, so a tool enrols once. The kit is `crates/maxplayer-tool-kit`; its
+`templates/README.md` says how to declare the operations. Repeat the table per tool.
+
+```toml
+[[sandbox.held_tools]]
+server_name = "figma"                                 # the agent sees mcp__figma__<operation>
+image = "my-figma-holder:latest"                      # tool-holderd + holderctl + the vendor CLI
+config = "/home/seller/.config/maxplayer/figma-offering.json"      # the offering
+credential_file = "/home/seller/.config/maxplayer/figma-cred.json" # host file; mounted read-only into this holder only
+# network = "maxplayer-tools"                         # the holder must reach the vendor
+# required = false                                    # true: refuse to boot or run a job without it
+
+[[sandbox.held_tools]]
+server_name = "jira"
+image = "my-jira-holder:latest"
+config = "/home/seller/.config/maxplayer/jira-offering.json"
+credential_file = "/home/seller/.config/maxplayer/jira-cred.json"
+```
+
+`server_name` must be unique across `held_tools` and `mcp_tools`; it names the holder container and
+the job's socket directory `/run/holder/<server_name>`. Needs Docker Engine 26 or newer (the socket
+reaches the job through a volume subpath mount; boot probes for it). One boot line per tool says
+`HEALTHY, enrolled` on the first boot and `HEALTHY, resumed the persisted login` after; `UNHEALTHY`
+names the vendor's answer. Proved live through the daemon code with two tools against the kit's fake
+vendors on 2026-09-14 (`evidence/20260914T103608Z-holder-route-two-tools/`); a real vendor CLI is its own acceptance run. Proved live through the daemon code against the kit's fake vendor on 2026-09-14
+(`evidence/20260914T095551Z-holder-route/`); a real vendor CLI is its own acceptance run.
+
 ### `launcher` mode — only if this box cannot run docker
 
 The launcher below is `bwrap` (bubblewrap), and it is not present on a stock box. Install it before

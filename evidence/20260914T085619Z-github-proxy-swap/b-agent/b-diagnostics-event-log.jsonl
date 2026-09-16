@@ -1,0 +1,6 @@
+{"v":1,"seq":0,"ts":1789376202378,"payload":{"type":"driver.ready","data":{"runtime_id":"docker"}}}
+{"v":1,"seq":1,"ts":1789376202379,"payload":{"type":"job.execution_changed","data":{"job_id":"seller-1bd9442828ef7187","status":"queued"}}}
+{"v":1,"seq":2,"ts":1789376202379,"payload":{"type":"job.execution_changed","data":{"job_id":"seller-1bd9442828ef7187","status":"running"}}}
+{"v":1,"seq":3,"ts":1789376208865,"payload":{"type":"agent.message","data":{"job_id":"seller-1bd9442828ef7187","text":"login"}}}
+{"v":1,"seq":4,"ts":1789376208866,"payload":{"type":"agent.message","data":{"job_id":"seller-1bd9442828ef7187","text":"=pmilic021"}}}
+{"v":1,"seq":5,"ts":1789376208866,"payload":{"type":"job.execution_changed","data":{"job_id":"seller-1bd9442828ef7187","status":"completed"}}}

@@ -1,0 +1,22 @@
+{
+  "seller_id": "seller-demo-01",
+  "offering": "Text transformation (upper/lower/reverse) over files the buyer's job supplies",
+  "vendor_base_url": "http://127.0.0.1:8080",
+  "operations": [
+    {
+      "name": "transform-file",
+      "description": "Transform a text file from this job's directory and write the result back into it.",
+      "subcommand": "transform",
+      "params": [
+        { "name": "input", "flag": "--in", "kind": { "type": "job_input_file" } },
+        { "name": "output", "flag": "--out", "kind": { "type": "job_output_file" } },
+        {
+          "name": "mode",
+          "flag": "--mode",
+          "kind": { "type": "choice", "choices": ["upper", "lower", "reverse"] }
+        }
+      ],
+      "max_output_bytes": 262144
+    }
+  ]
+}

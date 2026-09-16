@@ -1,0 +1,26 @@
+{
+  "acceptance": "B - a real claude-agent-acp turn in the sandbox image, vendor tool on the session",
+  "agent_reply": "login=pmilic021",
+  "credential_absent_from": [
+    "agent reply",
+    "run log",
+    "diagnostics capture (inspect, logs, event log)",
+    "workdir"
+  ],
+  "expected_login": "pmilic021",
+  "image": "maxplayer-sandbox:mcp-bridge",
+  "last_agent_message": "=pmilic021",
+  "network": "maxplayer-jobs",
+  "tool_call_on_the_acp_wire": true,
+  "usage": {
+    "cache_read_tokens": 120826,
+    "cache_write_tokens": 292,
+    "cost": null,
+    "input_tokens": 4,
+    "model": "claude-sonnet-5",
+    "output_tokens": 129,
+    "reasoning_tokens": null
+  },
+  "vendor_answer_on_the_acp_wire": true,
+  "vendor_url": "https://api.githubcopilot.com/mcp/readonly"
+}
