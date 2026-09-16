@@ -1499,12 +1499,59 @@ pub struct OwnedContainer {
     /// **A removal criterion, as of #996.** It was previously parsed and then ignored, which let the
     /// sweep act on any container wearing this seat's label whatever it was.
     pub role: Option<String>,
-    /// Parsed [`HELPER_JOB_LABEL`] — the job whose deadline [`OwnedContainer::cleanup_after`] was
-    /// derived from; `None` when absent or empty.
+    /// Raw [`HELPER_JOB_LABEL`] column — the job a HELPER names; `None` when absent or empty.
     ///
-    /// **Also a removal criterion.** A container that cannot name its job cannot be shown to have
-    /// outlived one, and the stamp alone is then just a number with no provenance.
-    pub job: Option<String>,
+    /// **Held as read, never merged with the holder column.** Which column is authoritative is a
+    /// function of the row's role, so the two are carried separately and resolved by
+    /// [`OwnedContainer::resolve_job`].
+    pub helper_job: Option<String>,
+    /// Raw [`HOLDER_LABEL`] column — the job a HOLDER names; `None` when absent or empty.
+    ///
+    /// **Also a removal criterion**, through [`OwnedContainer::resolve_job`]. A container that
+    /// cannot name its job cannot be shown to have outlived one, and the stamp alone is then just a
+    /// number with no provenance.
+    pub holder_job: Option<String>,
+}
+
+impl OwnedContainer {
+    /// The job this container belongs to, read from the column ITS ROLE writes — or why it cannot
+    /// be read.
+    ///
+    /// **Resolution is per role, and the other role's column is never a fallback (#996 R3/3).** A
+    /// holder names its job in [`HOLDER_LABEL`] and never wears [`HELPER_JOB_LABEL`]; a helper does
+    /// the reverse. Trying one column and falling back to the other — `field().or_else(|| field())`
+    /// — accepted two shapes no production writer emits. A row carrying two DIFFERENT job ids was
+    /// accepted on whichever column came first, the disagreement discarded before any gate could
+    /// see it; and a job sitting in the other role's column read as valid provenance. Both describe
+    /// a container this module cannot attribute to a job, and an unattributable container is
+    /// precisely what the skip report exists to surface.
+    ///
+    /// Both columns present and AGREEING is not a defect: per-role resolution returns the same job
+    /// either way, so there is nothing the row fails to say. Only disagreement is refused.
+    ///
+    /// Refusals are returned, never dropped: [`partition_owned`] carries each into
+    /// [`OwnedSelection::skipped`] beside `MissingJob` and `UnreadableStamp`.
+    fn resolve_job(&self) -> Result<&str, SkipReason> {
+        let (own_role_column, other_role_column) = match self.role.as_deref() {
+            Some(ROLE_HOLDER) => (self.holder_job.as_deref(), self.helper_job.as_deref()),
+            Some(ROLE_HELPER) => (self.helper_job.as_deref(), self.holder_job.as_deref()),
+            // Unreachable from `partition_owned`, which refuses an unknown role first. Total here
+            // so the method can never be read as "any role resolves to something".
+            role => return Err(SkipReason::UnknownRole(role.map(str::to_owned))),
+        };
+        match (own_role_column, other_role_column) {
+            (Some(job), Some(other)) if job != other => Err(SkipReason::ConflictingJobs {
+                own_role: job.to_owned(),
+                other_role: other.to_owned(),
+            }),
+            (Some(job), _) => Ok(job),
+            (None, Some(misplaced)) => Err(SkipReason::JobInWrongColumn {
+                role: self.role.clone().unwrap_or_default(),
+                job: misplaced.to_owned(),
+            }),
+            (None, None) => Err(SkipReason::MissingJob),
+        }
+    }
 }
 
 /// Parse `docker ps --format '{{.ID}}\t{{.Label …}}…'` output into one record per container.
@@ -1528,17 +1575,21 @@ pub fn parse_owned_listing(stdout: &str) -> Vec<OwnedContainer> {
             let seat = field(&mut fields);
             let cleanup_after = field(&mut fields).and_then(|value| value.parse::<u64>().ok());
             let role = field(&mut fields);
-            // A helper names its job in HELPER_JOB_LABEL; a holder names the same job in
-            // HOLDER_LABEL and never carries the helper label at all. Reading only the helper
-            // label made every production holder parse as jobless, which the removal gate then
-            // refused forever as `MissingJob` — the leak this sweep exists to close.
-            let job = field(&mut fields).or_else(|| field(&mut fields));
+            // Each job column is read into its OWN field, in listing order, and collapsed nowhere
+            // here. Reading only the helper label made every production holder parse as jobless
+            // (the leak this sweep exists to close); collapsing the two with `or_else` then let a
+            // present helper column short-circuit the holder column, which accepted rows naming two
+            // different jobs and rows whose job sat in the wrong-role column. Role decides which
+            // column speaks — see [`OwnedContainer::resolve_job`].
+            let helper_job = field(&mut fields);
+            let holder_job = field(&mut fields);
             OwnedContainer {
                 id,
                 seat,
                 cleanup_after,
                 role,
-                job,
+                helper_job,
+                holder_job,
             }
         })
         .filter(|container| !container.id.is_empty())
@@ -1583,6 +1634,23 @@ pub enum SkipReason {
     UnknownRole(Option<String>),
     /// No job label: the container cannot be tied to a job whose deadline could have passed.
     MissingJob,
+    /// BOTH job columns name a job and they DISAGREE. The row cannot say which job its stamp was
+    /// derived from, so it names none: removing it would act on a job identity nothing establishes.
+    ConflictingJobs {
+        /// What the row's own role column said.
+        own_role: String,
+        /// What the other role's column said instead.
+        other_role: String,
+    },
+    /// The only job id sits in the column belonging to the OTHER role — a helper's column on a
+    /// holder row, or the reverse. No production writer emits that, so the row's provenance is
+    /// unknown and its stamp unattributable.
+    JobInWrongColumn {
+        /// The role the row declared.
+        role: String,
+        /// The job id found in the wrong column, for the operator.
+        job: String,
+    },
     /// The cleanup stamp is absent, empty, or not a unix second.
     UnreadableStamp,
 }
@@ -1594,6 +1662,18 @@ impl std::fmt::Display for SkipReason {
             Self::UnknownRole(Some(role)) => write!(f, "unrecognised role {role:?}"),
             Self::UnknownRole(None) => write!(f, "role label absent"),
             Self::MissingJob => write!(f, "job label absent"),
+            Self::ConflictingJobs {
+                own_role,
+                other_role,
+            } => write!(
+                f,
+                "job labels disagree: this role's column says {own_role:?}, the other role's says \
+                 {other_role:?}"
+            ),
+            Self::JobInWrongColumn { role, job } => write!(
+                f,
+                "job {job:?} sits in the wrong-role column for a {role:?} — no launch writes that"
+            ),
             Self::UnreadableStamp => write!(f, "cleanup stamp absent or unparseable"),
         }
     }
@@ -1655,10 +1735,10 @@ pub fn partition_owned(containers: &[OwnedContainer], seat: &str, now_unix: u64)
             ));
             continue;
         }
-        if container.job.is_none() {
-            selection
-                .skipped
-                .push((container.id.clone(), SkipReason::MissingJob));
+        // Per role, and reported rather than dropped: a row naming two different jobs, or naming
+        // one in the other role's column, is refused here with the reason the operator needs.
+        if let Err(reason) = container.resolve_job() {
+            selection.skipped.push((container.id.clone(), reason));
             continue;
         }
         let Some(after) = container.cleanup_after else {
@@ -3951,10 +4031,20 @@ exit 0
         let mut out = String::new();
         for (id, seat, cleanup_after, role) in rows {
             // Every container this module creates carries a job label, so the default fixture does
-            // too. A row that needs the job ABSENT or a field malformed is written with
-            // `write_raw_listing`, which states the whole line.
+            // too — IN THE COLUMN ITS OWN ROLE WRITES. A holder names its job in `HOLDER_LABEL` and
+            // never wears the helper label; a helper does the reverse. Writing every row's job into
+            // the helper column (this fixture before #996 R3/3) gave holder rows a shape no
+            // production launch emits, and that is precisely how the wrong-role hole stayed
+            // invisible to these tests while a real holder went unswept. A row that needs the job
+            // ABSENT or a field malformed is written with `write_raw_listing`, which states the
+            // whole line.
+            let (helper_job, holder_job) = if *role == ROLE_HELPER {
+                (format!("job-{id}"), String::new())
+            } else {
+                (String::new(), format!("job-{id}"))
+            };
             out.push_str(&format!(
-                "{id}\t{seat}\t{cleanup_after}\t{role}\tjob-{id}\n"
+                "{id}\t{seat}\t{cleanup_after}\t{role}\t{helper_job}\t{holder_job}\n"
             ));
         }
         std::fs::write(work.join("listing.tsv"), out).expect("listing");
@@ -4006,7 +4096,8 @@ exit 0
             seat: Some(seat_b()),
             cleanup_after: Some(stamp),
             role: Some(ROLE_HOLDER.to_owned()),
-            job: Some("job-c1".to_owned()),
+            helper_job: None,
+            holder_job: Some("job-c1".to_owned()),
         }];
         assert!(
             expired_owned(&owned, &seat_b(), stamp - 1).is_empty(),
@@ -4032,14 +4123,16 @@ exit 0
                 seat: Some(seat_b()),
                 cleanup_after: Some(short),
                 role: Some(ROLE_HOLDER.to_owned()),
-                job: Some("short".to_owned()),
+                helper_job: None,
+                holder_job: Some("short".to_owned()),
             },
             OwnedContainer {
                 id: "long-job".to_owned(),
                 seat: Some(seat_b()),
                 cleanup_after: Some(long),
                 role: Some(ROLE_HOLDER.to_owned()),
-                job: Some("long".to_owned()),
+                helper_job: None,
+                holder_job: Some("long".to_owned()),
             },
         ];
         let now = short + 1;
@@ -4079,7 +4172,8 @@ exit 0
             seat: Some(seat_b()),
             cleanup_after: Some(1),
             role: Some(ROLE_HOLDER.to_owned()),
-            job: Some("job-ours".to_owned()),
+            helper_job: None,
+            holder_job: Some("job-ours".to_owned()),
         }];
         assert!(
             expired_owned(&stamped, "   ", u64::MAX).is_empty(),
@@ -4097,13 +4191,13 @@ exit 0
     fn a_container_the_sweep_cannot_validate_is_refused_and_reported() {
         let stamp = 1_000_u64;
         let listing = format!(
-            "good\t{seat}\t{stamp}\t{ROLE_HOLDER}\tjob-1\n\
-             no-role\t{seat}\t{stamp}\t\tjob-2\n\
-             odd-role\t{seat}\t{stamp}\tinterloper\tjob-3\n\
-             no-job\t{seat}\t{stamp}\t{ROLE_HELPER}\t\n\
-             bad-stamp\t{seat}\tnot-a-number\t{ROLE_HOLDER}\tjob-4\n\
-             no-seat\t\t{stamp}\t{ROLE_HOLDER}\tjob-5\n\
-             stranger\tffff\t{stamp}\t{ROLE_HOLDER}\tjob-6\n",
+            "good\t{seat}\t{stamp}\t{ROLE_HOLDER}\t\tjob-1\n\
+             no-role\t{seat}\t{stamp}\t\tjob-2\t\n\
+             odd-role\t{seat}\t{stamp}\tinterloper\tjob-3\t\n\
+             no-job\t{seat}\t{stamp}\t{ROLE_HELPER}\t\t\n\
+             bad-stamp\t{seat}\tnot-a-number\t{ROLE_HOLDER}\t\tjob-4\n\
+             no-seat\t\t{stamp}\t{ROLE_HOLDER}\t\tjob-5\n\
+             stranger\tffff\t{stamp}\t{ROLE_HOLDER}\t\tjob-6\n",
             seat = seat_b()
         );
         let owned = parse_owned_listing(&listing);
@@ -4161,12 +4255,20 @@ exit 0
         );
         let owned = parse_owned_listing(&listing);
         assert_eq!(
-            owned[0].job.as_deref(),
+            owned[0].resolve_job().ok(),
             Some("job-live"),
             "a holder's job is read from its own label, not from a helper label it never wears"
         );
-        assert_eq!(owned[1].job.as_deref(), Some("job-live"), "a helper still names its own job");
-        assert_eq!(owned[2].job, None, "a container naming no job in EITHER label names none");
+        assert_eq!(
+            owned[1].resolve_job().ok(),
+            Some("job-live"),
+            "a helper still names its own job"
+        );
+        assert_eq!(
+            owned[2].resolve_job().err(),
+            Some(SkipReason::MissingJob),
+            "a container naming no job in EITHER column names none"
+        );
 
         let selection = partition_owned(&owned, &seat, u64::MAX);
         assert!(
@@ -4181,6 +4283,157 @@ exit 0
             selection.skipped,
             vec![("jobless".to_owned(), SkipReason::MissingJob)],
             "absence is still never permission: the row naming no job at all is the only refusal"
+        );
+    }
+
+    /// A ROW WHOSE TWO JOB COLUMNS DISAGREE NAMES NO JOB, AND IS REPORTED RATHER THAN REMOVED.
+    ///
+    /// The R3/3 remaining FAIL. `field(&mut fields).or_else(|| field(&mut fields))` returned
+    /// whichever column happened to be populated FIRST, so
+    /// `id<TAB>seat<TAB>1<TAB>holder<TAB>job-A<TAB>job-B` was accepted on `job-A` — the HELPER's
+    /// column — and removed at `now >= 1`, while the holder's own column naming a DIFFERENT job was
+    /// never read. A container whose own labels contradict each other cannot be attributed to any
+    /// job, and the contradiction will not age out: it has to be refused AND shown, or it is a
+    /// removal nobody authorised justified by metadata nobody can trust.
+    #[test]
+    fn a_row_whose_job_columns_disagree_is_skipped_and_reported() {
+        let seat = sweep_seat("conflict");
+        // Column order is `list_owned_argv`'s: id, seat, cleanup-after, role, helper-job, holder-job.
+        let listing = format!(
+            "two-jobs-holder\t{seat}\t1\t{ROLE_HOLDER}\tjob-A\tjob-B\n\
+             two-jobs-helper\t{seat}\t1\t{ROLE_HELPER}\tjob-A\tjob-B\n"
+        );
+        let owned = parse_owned_listing(&listing);
+        assert_eq!(
+            owned[0].resolve_job().err(),
+            Some(SkipReason::ConflictingJobs {
+                own_role: "job-B".to_owned(),
+                other_role: "job-A".to_owned(),
+            }),
+            "a holder resolves from its own column, and a disagreeing helper column refuses the row"
+        );
+        assert_eq!(
+            owned[1].resolve_job().err(),
+            Some(SkipReason::ConflictingJobs {
+                own_role: "job-A".to_owned(),
+                other_role: "job-B".to_owned(),
+            }),
+            "and a helper the same way round — the refusal is symmetric, not holder-only"
+        );
+
+        // `u64::MAX` is far past the stamp: without the refusal, both rows would be REMOVED here.
+        let selection = partition_owned(&owned, &seat, u64::MAX);
+        assert!(
+            selection.removable.is_empty(),
+            "a container whose labels contradict each other is never removable: {selection:?}"
+        );
+        let reported: std::collections::BTreeMap<_, _> = selection
+            .skipped
+            .iter()
+            .map(|(id, reason)| (id.clone(), reason.to_string()))
+            .collect();
+        assert_eq!(
+            reported.len(),
+            2,
+            "both rows are carried out to the operator, not silently dropped: {reported:?}"
+        );
+        assert!(
+            reported["two-jobs-holder"].contains("job-A")
+                && reported["two-jobs-holder"].contains("job-B"),
+            "the reason names BOTH job ids that disagree, so the operator can see which: {reported:?}"
+        );
+    }
+
+    /// A JOB SITTING IN THE OTHER ROLE'S COLUMN IS NOT PROVENANCE.
+    ///
+    /// The second half of the same FAIL: a helper carrying only [`HOLDER_LABEL`], or a holder
+    /// carrying only [`HELPER_JOB_LABEL`], was read as valid because the fallback did not care
+    /// which column answered. No launch in this module writes either shape — [`holder_argv`] writes
+    /// the holder label and [`helper_label_args`] the helper label — so a row like this came from
+    /// something that is not one of our launches, and its stamp cannot be attributed to a job of
+    /// ours. Refused and reported, for the same reason as a conflict.
+    #[test]
+    fn a_job_in_the_wrong_role_column_is_skipped_and_reported() {
+        let seat = sweep_seat("misplaced");
+        let listing = format!(
+            "holder-with-helper-job\t{seat}\t1\t{ROLE_HOLDER}\tjob-x\t\n\
+             helper-with-holder-job\t{seat}\t1\t{ROLE_HELPER}\t\tjob-y\n"
+        );
+        let owned = parse_owned_listing(&listing);
+        assert_eq!(
+            owned[0].resolve_job().err(),
+            Some(SkipReason::JobInWrongColumn {
+                role: ROLE_HOLDER.to_owned(),
+                job: "job-x".to_owned(),
+            }),
+            "a holder does not inherit a job from the helper column it never wears"
+        );
+        assert_eq!(
+            owned[1].resolve_job().err(),
+            Some(SkipReason::JobInWrongColumn {
+                role: ROLE_HELPER.to_owned(),
+                job: "job-y".to_owned(),
+            }),
+            "nor a helper from the holder column"
+        );
+
+        let selection = partition_owned(&owned, &seat, u64::MAX);
+        assert!(
+            selection.removable.is_empty(),
+            "neither misplaced row is removable however long past its stamp: {selection:?}"
+        );
+        let reported: std::collections::BTreeMap<_, _> = selection
+            .skipped
+            .iter()
+            .map(|(id, reason)| (id.clone(), reason.to_string()))
+            .collect();
+        assert_eq!(reported.len(), 2, "both are reported: {reported:?}");
+        assert!(
+            reported["holder-with-helper-job"].contains("job-x"),
+            "the reason carries the job id actually found, for the operator: {reported:?}"
+        );
+    }
+
+    /// THE CONTROL THAT KEEPS THE TWO REFUSALS ABOVE HONEST: EVERY PRODUCTION SHAPE STILL RESOLVES.
+    ///
+    /// A gate that refused every row would pass both tests above and close the sweep entirely —
+    /// which is the failure mode this whole change exists to fix. So the two shapes production
+    /// actually writes must still parse and still be removable, and columns that AGREE are not a
+    /// contradiction: per-role resolution returns the same job either way.
+    #[test]
+    fn each_role_still_resolves_the_job_from_its_own_column() {
+        let seat = sweep_seat("per-role-ok");
+        let listing = format!(
+            "holder\t{seat}\t1\t{ROLE_HOLDER}\t\tjob-h\n\
+             helper\t{seat}\t1\t{ROLE_HELPER}\tjob-p\t\n\
+             agreeing\t{seat}\t1\t{ROLE_HOLDER}\tjob-same\tjob-same\n"
+        );
+        let owned = parse_owned_listing(&listing);
+        assert_eq!(
+            owned[0].resolve_job().ok(),
+            Some("job-h"),
+            "the production holder shape: job in HOLDER_LABEL, helper column empty"
+        );
+        assert_eq!(
+            owned[1].resolve_job().ok(),
+            Some("job-p"),
+            "the production helper shape: job in HELPER_JOB_LABEL, holder column empty"
+        );
+        assert_eq!(
+            owned[2].resolve_job().ok(),
+            Some("job-same"),
+            "columns that agree say one thing, and a row is not refused for saying it twice"
+        );
+
+        let selection = partition_owned(&owned, &seat, u64::MAX);
+        assert_eq!(
+            selection.removable.len(),
+            3,
+            "all three resolve, so all three are removable past their stamp: {selection:?}"
+        );
+        assert!(
+            selection.skipped.is_empty(),
+            "and nothing is refused: {selection:?}"
         );
     }
 
@@ -4328,7 +4581,7 @@ exit 0
 
         // …and what docker would report for that container is what the sweep judges.
         let listing = format!(
-            "deadbeef\t{}\t{cleanup_after}\t{ROLE_HOLDER}\tjob-1\n",
+            "deadbeef\t{}\t{cleanup_after}\t{ROLE_HOLDER}\t\tjob-1\n",
             seat_b()
         );
         let owned = parse_owned_listing(&listing);
@@ -4683,10 +4936,10 @@ exit 0
         write_raw_listing(
             &work,
             &format!(
-                "good\t{seat}\t1000\t{ROLE_HOLDER}\tjob-1\n\
-                 bad-stamp\t{seat}\tnot-a-number\t{ROLE_HOLDER}\tjob-2\n\
-                 no-job\t{seat}\t1000\t{ROLE_HELPER}\t\n\
-                 odd-role\t{seat}\t1000\tinterloper\tjob-3\n"
+                "good\t{seat}\t1000\t{ROLE_HOLDER}\t\tjob-1\n\
+                 bad-stamp\t{seat}\tnot-a-number\t{ROLE_HOLDER}\t\tjob-2\n\
+                 no-job\t{seat}\t1000\t{ROLE_HELPER}\t\t\n\
+                 odd-role\t{seat}\t1000\tinterloper\tjob-3\t\n"
             ),
         );
 
