@@ -454,6 +454,25 @@ and returned eight new findings on the fixes themselves. I agree with all eight.
   GitHub acceptance of the Proxy swap route (run A, contained) passed again on them; the token is
   in none of the run's files. The agent-turn live tests were not rerun (each spends a model turn).
 
+### Review round 4 — green light with one follow-up (2026-09-16)
+
+The reviewer verified `5ed3b08` (78 kit tests, 13 holder tests, and its own publication,
+cancellation, cleanup, pipe, idle-timeout and bridge reproductions) and gave a green light "once CI
+passes", with one non-blocking follow-up: the attach error path ran its best-effort detach for
+EVERY failure, so a duplicate attach the holder refused ("already attached; detach it first")
+detached the attachment that already existed. `attach_answer` now classifies the call: attached
+(exit 0), refused (a non-zero exit: nothing was attached by this call, nothing to take back), or
+unknown (killed at its deadline, or `docker` failed), and only the unknown case detaches. Test:
+`an_attach_the_holder_refused_is_not_taken_back_but_an_unknown_one_is`. No normal daemon path
+issues a duplicate attach.
+
+CI on `5ed3b08`: every job passed except "Money-path tests", where
+`seller_node::run::tests::a_losing_open_pool_claimant_releases_its_slot_when_it_sees_the_award`
+failed at its 5 s relay pump ("the winner must claim the open-pool offer", `run.rs:12928`, a test
+from 2026-08-06 that the branch does not touch); 1577 other tests in that row passed. The reviewer
+ran the test alone in release and it passed. The rule the reviewer set, and the right one: do not
+merge while that check is red; a local pass does not clear GitHub's failed check.
+
 What stays open after this round, stated plainly:
 
 - The residual path of finding 1 is the vendor: a vendor that reflects its `Authorization` header
