@@ -2,7 +2,8 @@
 
 Every delivery push now mints its authorization at the request it is sent on, and a contained job
 under gVisor is handed a resolver it can actually reach. Both are on for a seat that upgrades
-without changing its config.
+without changing its config. A seller can also offer a third-party tool to its jobs without the
+credential entering a job container — that one is opt-in, on new config keys.
 
 ### The delivery push authorizes each leg, and asks nothing back (#994)
 
@@ -61,6 +62,61 @@ its egress policy opens port 53 to exactly the addresses in that file.
 **No rule was removed, no deny widened, no protection relaxed.** `maxplayer doctor` now reports the
 canonical resolver plan a launch installs, and marks the unconfigured case as an explicit
 unverified discovery floor rather than a certified plan.
+
+### A seller can offer a third-party tool without the credential entering the job (#1004)
+
+Two automated routes ship on new config under `[sandbox]`, and a skill routes a seller's tool to the
+one that fits it. **A seat that declares neither key is unchanged.**
+
+- **Proxy swap** (`[[sandbox.mcp_tools]]`). The job holds a per-job placeholder. The existing
+  credential proxy (#647) swaps the real credential into the `Authorization` header at egress, for
+  the vendor's host only, for the life of the job, and the job reaches a vendor-hosted MCP server
+  through `mcp-http-bridge`, now installed in the sandbox image. The docker alias pinhole opens only
+  when an MCP server entry names it, and the launch capture redactor knows every real credential
+  value a launch holds.
+- **Holder** (`[[sandbox.held_tools]]`). The daemon runs one persistent holder container per declared
+  tool — `tool-holderd` from the new `maxplayer-tool-kit` crate, plus the vendor's own CLI. The
+  holder enrols once and resumes its login across restarts. Each job gets its own Unix socket per
+  tool, mounted as a volume subpath and reached through `tool-mcp-bridge --socket …`; job end
+  detaches the socket and the tool stays enrolled.
+
+**Public** and **Direct token** stay manual setup, with the steps in the skill. **Dedicated machine**
+and **Browser login** are not supported at this moment: the skill says so and stops. The routing
+decision tree is `docs/specs/seller-tool-onboarding/10-routing-and-options.md`; the skill is
+`.claude/skills/seller-tool-onboarding/SKILL.md`.
+
+`driver/acp.rs` now carries `McpServer` as the ACP wire shape the adapters actually read — a stdio
+entry with no `type` key, or an `http` entry.
+
+**What is live validation here, and what is not.** The two are not interchangeable, and the
+difference is the reason to read this paragraph:
+
+- **Proxy swap — validated live against a third party.** Accepted on 2026-09-14 against GitHub's
+  remote MCP server, through the real proxy, a real sandbox launch and a real `claude-agent-acp`
+  turn. The token owner's login came back from GitHub; the token was absent from everything the
+  container received; the placeholder sent straight to GitHub got `400`, and an unknown placeholder
+  at the proxy got `502` with no substitution; the per-job placeholders were revoked at job end.
+  The credential was a fine-grained read-only token limited to public repositories, on a read-only
+  endpoint — that pair, not the proxy, is what bounded the job.
+- **Holder — a live run of the mechanism, with the kit's fakes standing in for the vendor.** On
+  2026-09-14, through the daemon code, two holders enrolled once each, one job drove both through
+  their own sockets, a contained job ran, a restart resumed both logins, and a real
+  `claude-agent-acp` turn called both tools. **No real vendor CLI was exercised**: the vendors and
+  the CLI in that run are the test doubles shipped in the kit, so a real vendor CLI inside a
+  seller-built holder image remains its own acceptance run, per vendor.
+- **Source-level only.** The routing tree, the manual-setup steps, and the unsupported-route prints
+  are written decisions checked by reading this tree. No run stands behind them, and this section
+  does not claim one.
+
+The live tests are `#[ignore]`d and configured by environment — `seller_exec::mcp_tool_tests::live_*`
+and `held_tool::live_tests::live_*` — and each bundle under `evidence/` carries a README stating
+what it proves and its limits.
+
+Two limits ship with the feature. The Holder route needs Docker Engine 26 or newer for the volume
+subpath mount, and a seat too old for it fails its boot line rather than every awarded job. The
+proxy constrains the destination host, not the operations, so a broad credential behind the Proxy
+swap still needs a trusted operation filter, which is not built; each holder holds one credential
+for one vendor.
 
 ### Also
 
