@@ -25,23 +25,58 @@
 # and is not — and it is why `(unknown)` fails a release closed here even though the binary is
 # allowed to print it from a build path that genuinely had no git to read.
 #
+# ── Which arms ran is part of the result (#1007 follow-up) ───────────────────────────────────────
+# This script has two arms: the TREE checks (crate version, npm manifests, payload pins, release
+# notes) and the ARTIFACT check (the built binary's own `--version` line and build stamp). The
+# artifact arm used to be skipped whenever no binary path was supplied — and the run still printed
+# `PASS: everything states <version>` and exited 0. A gate whose teeth are absent must not read as a
+# full pass, so a binary path is now REQUIRED unless the caller opts out in writing with
+# `--tree-only`, and the final line always names the arms that actually ran.
+#
 # Usage:
-#   ./scripts/verify-release-version.sh <version> [path-to-binary]
+#   ./scripts/verify-release-version.sh <version> <path-to-binary>   # both arms (releases, CI)
+#   ./scripts/verify-release-version.sh <version> --tree-only        # tree arm only, says so loudly
 #     e.g. ./scripts/verify-release-version.sh 0.1.0 result/bin/maxplayer
+#          ./scripts/verify-release-version.sh 0.1.0 --tree-only
 #
 # Pass the version WITHOUT a leading `v` — the workflow strips it from the tag.
 
 set -euo pipefail
 
-VERSION="${1:-}"
-BINARY="${2:-}"
+USAGE="usage: verify-release-version.sh <version> <path-to-binary> | verify-release-version.sh <version> --tree-only"
 
 die() { echo "verify-release-version: $*" >&2; exit 1; }
 
-[ -n "$VERSION" ] || die "usage: verify-release-version.sh <version> [path-to-binary]"
+VERSION=""
+BINARY=""
+TREE_ONLY=0
+for arg in "$@"; do
+    case "$arg" in
+        --tree-only) TREE_ONLY=1 ;;
+        -h|--help)   echo "$USAGE"; exit 0 ;;
+        -*)          die "unknown option '$arg' — $USAGE" ;;
+        *)
+            if [ -z "$VERSION" ]; then VERSION="$arg"
+            elif [ -z "$BINARY" ]; then BINARY="$arg"
+            else die "unexpected extra argument '$arg' — $USAGE"
+            fi
+            ;;
+    esac
+done
+
+[ -n "$VERSION" ] || die "$USAGE"
 case "$VERSION" in
     v*) die "pass the version without a leading 'v' (got '$VERSION')" ;;
 esac
+
+# Fail closed on a missing artifact rather than skipping its arm: a run that inspected no binary
+# proves nothing about the thing being shipped, and must not be mistakable for a full pass.
+if [ -n "$BINARY" ] && [ "$TREE_ONLY" -eq 1 ]; then
+    die "--tree-only was given together with the binary path '$BINARY' — pick one: check the artifact, or declare in writing that you are not checking it"
+fi
+if [ -z "$BINARY" ] && [ "$TREE_ONLY" -eq 0 ]; then
+    die "the ARTIFACT arm did not run: no path to a built binary was given, so nothing here would have checked that the artifact reports $VERSION or carries a resolvable build stamp. Pass the binary — $USAGE — or opt out explicitly with --tree-only, which passes while naming the arm it skipped"
+fi
 [ -f Cargo.toml ] || die "run from the repo root (Cargo.toml missing)"
 
 # Fail closed on the tools rather than skipping a check: a version check that silently did not run
@@ -172,4 +207,10 @@ if [ -n "$BINARY" ]; then
     echo "ok: build stamp $stamp_sha resolves to a commit and is this tree's HEAD"
 fi
 
-echo "PASS: everything states $VERSION"
+TREE_ARM="tree (crate version, npm manifests, payload pins, release notes)"
+if [ -n "$BINARY" ]; then
+    echo "PASS: everything states $VERSION — arms run: $TREE_ARM + artifact ($BINARY)"
+else
+    echo "!! ARTIFACT ARM NOT RUN (--tree-only): no binary was inspected — nothing here says the built artifact reports $VERSION or carries a build stamp resolving to this commit"
+    echo "PASS (TREE ONLY): the tree states $VERSION — arms run: $TREE_ARM; artifact arm NOT RUN"
+fi
