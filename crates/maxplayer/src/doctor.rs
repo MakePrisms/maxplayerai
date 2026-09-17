@@ -9,10 +9,24 @@ use std::io::Write;
 const SUCCESS: i32 = 0;
 const FAILURE: i32 = 1;
 
-/// One check outcome. `Warn` is advisory (does not fail the exit); `Fail` does.
+/// One check outcome. `Warn` is advisory (does not fail the exit); `Fail` does. `Skip` is neither a
+/// finding nor a clean bill of health.
+///
+/// **Why `Skip` is its own status and not a `Pass` with apologetic prose (#1015).** A check that
+/// inspected nothing has NOT passed, and the distinction is load-bearing for exactly the checks that
+/// refuse to guess: `check_harness_credential_permissions` reports on a directory it resolves, and
+/// when it cannot resolve one there is no evidence either way. Rendering that as PASS tells an
+/// operator a surface was measured and found sound when it was never looked at — the #715 failure
+/// mode. Rendering it as WARN is what #1015 reported: a finding-shaped line with nothing to act on,
+/// which trains operators to ignore the check that WILL one day carry a real finding. `Skip` says
+/// "not applicable / not verified" out loud, so neither misreading is available.
+///
+/// Like `Warn`, `Skip` never fails the exit and never blocks boot — [`exit_code`] and
+/// [`readiness_ok`] gate on `Fail` alone. It is a REPORTING distinction, not a severity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Status {
     Pass,
+    Skip,
     Warn,
     Fail,
 }
@@ -21,6 +35,7 @@ impl Status {
     fn label(self) -> &'static str {
         match self {
             Status::Pass => "PASS",
+            Status::Skip => "SKIP",
             Status::Warn => "WARN",
             Status::Fail => "FAIL",
         }
@@ -76,6 +91,17 @@ impl Check {
         Self::new(name, Status::Warn, detail, Some(hint.into()))
     }
 
+    /// This check did not run against anything: NOT APPLICABLE to this configuration, or applicable
+    /// but UNVERIFIABLE from here. The second argument is a `why:` note, not a `fix:` hint — a skip
+    /// has nothing for the operator to repair, and phrasing it as a remedy is how #1015's circular
+    /// "fix the agent preset check first" arose on seats where that check had just PASSed.
+    ///
+    /// Use this ONLY when no evidence was gathered. A check that inspected a real surface and found
+    /// it sound is a `pass`; one that found a problem is a `warn` or a `fail`.
+    fn skip(name: &str, detail: impl Into<String>, why: impl Into<String>) -> Self {
+        Self::new(name, Status::Skip, detail, Some(why.into()))
+    }
+
     fn fail(name: &str, detail: impl Into<String>, hint: impl Into<String>) -> Self {
         Self::new(name, Status::Fail, detail, Some(hint.into()))
     }
@@ -110,6 +136,9 @@ impl Check {
     fn render(&self) -> String {
         let base = format!("{:<4} {} — {}", self.status.label(), self.name, self.detail);
         match &self.hint {
+            // A skip's note explains why there was nothing to measure; it is never a remedy, so it
+            // is never labelled `fix:` (#1015).
+            Some(note) if self.status == Status::Skip => format!("{base} (why: {note})"),
             Some(hint) if self.status != Status::Pass => format!("{base} (fix: {hint})"),
             _ => base,
         }
@@ -202,9 +231,13 @@ fn run_readiness_with_retry(
         }
         if readiness_ok(&results) {
             let warns = results.iter().filter(|c| c.status == Status::Warn).count();
+            // Skips are counted SEPARATELY from warnings and never folded into them: the whole point
+            // of the status is that "nothing was measured" must not read as either a finding or a
+            // clean result (#1015).
+            let skips = results.iter().filter(|c| c.status == Status::Skip).count();
             let _ = writeln!(
                 out,
-                "readiness OK — {} check(s), {warns} warning(s); starting seller",
+                "readiness OK — {} check(s), {warns} warning(s), {skips} not applicable/not verified; starting seller",
                 results.len()
             );
             return Ok(());
@@ -1972,28 +2005,88 @@ mod checks {
         seller: Option<SellerConfig>,
         presets: BTreeMap<String, AgentPresetConfig>,
         user_home: Option<std::path::PathBuf>,
+        host: AdapterHost,
     ) -> Check {
         let Some(seller) = seller else {
-            return Check::warn(
+            // The agent preset check already WARNs on this exact condition from the same config. A
+            // second warning adds no information and gives the operator two lines to chase for one
+            // cause, so this reports what it is: nothing to inspect (#1015).
+            return Check::skip(
                 HARNESS_CREDS_CHECK,
-                "no [seller] section configured — cannot resolve a harness credential directory",
-                "run `maxplayer seller --agent <claude|cursor|codex> --rate-sats <n>` once to configure; doctor will not guess a harness",
+                "no [seller] section configured — no harness, so no credential directory to inspect",
+                "run `maxplayer seller --agent <claude|cursor|codex> --rate-sats <n>` once to configure a harness; the agent preset check reports this same cause",
             );
         };
-        let resolved = match seller_agents::resolve(&seller, &presets, AdapterHost::Host) {
+        // ⛔ RESOLVE WITH THE CALLER'S `host`, NEVER A HARDCODED `AdapterHost::Host` (#1015).
+        //
+        // This check and `check_agent_registry` are documented to be the same resolve on the same
+        // config, and they must therefore be the same resolve INPUTS. Hardcoding `Host` here while
+        // `build_checks` derived `AdapterHost::for_sandbox` for the preset check is what made doctor
+        // contradict itself in a single run: on a `mode = "docker"` seat the preset check resolved
+        // `Container` (argv0 kept bare for the image's PATH, host PATH never consulted) and PASSed,
+        // while this one resolved `Host`, found no adapter on the host PATH — correctly, the adapters
+        // are baked into the sandbox image, not installed host-side — and WARNed "harness registry
+        // did not resolve", pointing the operator at the check that had just passed. Every docker
+        // seat hit it, including fully working ones.
+        //
+        // Passing `host` through fixes the contradiction. It does NOT make host-side inspection
+        // meaningful under docker — see the `Container` arm below, which is why threading the
+        // parameter is only half the fix.
+        let resolved = match seller_agents::resolve(&seller, &presets, host) {
             Ok(resolved) => resolved,
-            Err(_) => {
-                return Check::warn(
+            Err(error) => {
+                // Same inputs as the preset check now, so this arm means the preset check FAILed too
+                // and has already told the operator what to repair. Carry the real resolver error
+                // instead of a cross-reference: a reader of this line learns the cause here, and the
+                // remedy never again names a check that passed.
+                return Check::skip(
                     HARNESS_CREDS_CHECK,
-                    "harness registry did not resolve — cannot inspect a credential directory",
-                    "fix the agent preset check first; doctor will not guess a harness credential path",
+                    format!(
+                        "harness registry did not resolve ({error}) — no harness, so nothing was inspected"
+                    ),
+                    "set [seller] agents = [\"claude\", …] (or agent_command) and install the harness adapter; doctor will not guess a harness credential path",
                 );
             }
         };
-        let Some(user_home) = user_home else {
-            return Check::warn(
+        // Docker seats: the host credential directory is NOT the surface in use, so do not measure it.
+        //
+        // Under `[sandbox] mode = "docker"` the job container inherits nothing from the host —
+        // docs/SELLER-QUICKSTART.md §"An environment credential does not cross the container
+        // boundary" — and the harness reaches its model through the daemon's OWN environment or the
+        // #647 credential proxy. `$HOME/.claude` on the host may be stale, may belong to a different
+        // account than the daemon's service user, or may not exist at all on a seat that has never
+        // run a harness outside the cage; none of those facts say anything about the credential the
+        // jobs actually use.
+        //
+        // So the modes diverge HERE, after a resolve that is now identical in both:
+        //   - `Host`      — the adapter runs on this machine, `$HOME/<dir>` IS the credential it
+        //                   reads, and group/other write on it steers a real harness. Inspect it.
+        //   - `Container` — the adapter runs in the image. There is no host path whose permissions
+        //                   bear on the job's credential. Report that and inspect nothing.
+        //
+        // ⛔ Do not "improve" this into a PASS, and do not fall through to the host inspection to get
+        // a green line. A PASS here would claim a docker seat's harness credential was measured and
+        // found sound on the strength of a directory the container cannot read — #715's
+        // inspected-the-wrong-directory-and-passed defect, arrived at from the container side.
+        if matches!(host, AdapterHost::Container) {
+            return Check::skip(
                 HARNESS_CREDS_CHECK,
-                "HOME is unset — cannot resolve a harness credential directory",
+                format!(
+                    "[sandbox] mode = \"docker\": {} run inside the sandbox image, which inherits no host credential — \
+                     host $HOME credential directories are not the surface in use, so none were inspected. \
+                     This check reports on host directory permissions ONLY; it makes no statement about the \
+                     credential these jobs actually use (daemon environment / credential proxy), and it does \
+                     not inspect the host files [sandbox.codex_chatgpt] or [[sandbox.file_credentials]] read \
+                     when those are configured",
+                    describe_registry(&resolved.registry)
+                ),
+                "a docker seat's model credential comes from the daemon's own environment or the credential proxy — see \"An environment credential does not cross the container boundary\" in docs/SELLER-QUICKSTART.md",
+            );
+        }
+        let Some(user_home) = user_home else {
+            return Check::skip(
+                HARNESS_CREDS_CHECK,
+                "HOME is unset — cannot resolve a harness credential directory, so none was inspected",
                 "set HOME so doctor can inspect $HOME/.claude (or .cursor / .codex); doctor will not guess a path",
             );
         };
@@ -2028,9 +2121,9 @@ mod checks {
             groups.push((label, dirs));
         }
         if groups.is_empty() && unresolvable.is_empty() {
-            return Check::warn(
+            return Check::skip(
                 HARNESS_CREDS_CHECK,
-                "no harness to inspect — cannot resolve a credential directory",
+                "no harness to inspect — cannot resolve a credential directory, so none was inspected",
                 "doctor will not guess a harness credential path",
             );
         }
@@ -2135,20 +2228,29 @@ mod checks {
             );
         }
         if too_open.is_empty() {
-            let mut detail = format!(
-                "cannot resolve a credential directory for {} — not inspected (doctor will not guess a path)",
-                unresolvable.join(", ")
-            );
-            if !unlinked.is_empty() {
-                detail.push_str(&format!(
-                    "; also no credential directory exists for {} — that harness is not linked to an account",
-                    unlinked.join(", ")
-                ));
+            // Unresolvable labels alone are not a finding — nothing was measured and nothing is
+            // wrong, which is a skip (#1015). But an unlinked harness IS a finding (the pre-advertise
+            // probe will fail on it), so a set carrying one stays a WARN and keeps its remedy; only
+            // the unresolvable note rides along. Downgrading that to a skip would bury a real
+            // finding behind a not-applicable label — the inverse of the defect this issue is about.
+            if unlinked.is_empty() {
+                return Check::skip(
+                    HARNESS_CREDS_CHECK,
+                    format!(
+                        "cannot resolve a credential directory for {} — not inspected (doctor will not guess a path)",
+                        unresolvable.join(", ")
+                    ),
+                    "use a named preset (claude|cursor|codex) to inspect that harness's credential directory; a raw --agent-argv hatch and unknown labels have no known path",
+                );
             }
             return Check::warn(
                 HARNESS_CREDS_CHECK,
-                detail,
-                "use a named preset (claude|cursor|codex) to inspect that harness's credential directory; a raw --agent-argv hatch and unknown labels have no known path",
+                format!(
+                    "no credential directory exists for {} — that harness is not linked to an account, so the pre-advertise probe will fail and the seat will not advertise; also cannot resolve a credential directory for {} — not inspected (doctor will not guess a path)",
+                    unlinked.join(", "),
+                    unresolvable.join(", ")
+                ),
+                "link the account as the seller service user, then re-run doctor — see \"Link your model account\" in docs/SELLER-QUICKSTART.md",
             );
         }
         let mut detail = format!(
@@ -2433,6 +2535,10 @@ fn build_checks(
             seller_for_creds,
             custom_agents_for_creds,
             user_home,
+            // The SAME `AdapterHost` the agent preset check resolves with. Both checks are
+            // documented to be one resolve on one config; #1015 is what happened when only one of
+            // them was told where the adapter runs.
+            agent_host,
         )
     }));
     checks
@@ -2503,9 +2609,12 @@ fn run_doctor(
         let _ = writeln!(out, "{}", result.render());
     }
     let code = exit_code(&results);
+    let skips = results.iter().filter(|c| c.status == Status::Skip).count();
+    // Name the skipped checks in the summary so a reader who scrolled past the SKIP lines still sees
+    // that part of the report measured nothing, rather than counting the run as fully green (#1015).
     let _ = writeln!(
         out,
-        "\n{} check(s), exit {code}",
+        "\n{} check(s), {skips} not applicable/not verified, exit {code}",
         results.len()
     );
     code
@@ -4988,6 +5097,7 @@ mod tests {
             Some(seller),
             presets,
             Some(home),
+            maxplayer_core::agent_presets::AdapterHost::Host,
         );
         assert_ne!(
             check.status,
@@ -5048,6 +5158,7 @@ mod tests {
             Some(seller),
             presets,
             Some(home.clone()),
+            maxplayer_core::agent_presets::AdapterHost::Host,
         );
         let rendered = check.render();
         let _ = std::fs::remove_dir_all(&home);
@@ -5081,11 +5192,22 @@ mod tests {
             Some(seller),
             std::collections::BTreeMap::new(),
             Some(std::path::PathBuf::from("/home/seat")),
+            maxplayer_core::agent_presets::AdapterHost::Host,
         );
+        // SKIP, not WARN (#1015): nothing was measured and nothing is wrong. The property this test
+        // defends is unchanged and is asserted below — the line must SAY it could not resolve and
+        // must name no guessed path. What must never happen is `Pass`, which would claim an
+        // inspection that did not occur.
         assert_eq!(
             check.status,
-            Status::Warn,
-            "an unresolvable hatch must be a WARN, not a silent pass: {}",
+            Status::Skip,
+            "an unresolvable hatch measured nothing, so it is a SKIP — never a silent pass: {}",
+            check.render()
+        );
+        assert_ne!(
+            check.status,
+            Status::Pass,
+            "an unresolvable hatch must never read as a clean credential check: {}",
             check.render()
         );
         let rendered = check.render();
@@ -5124,8 +5246,10 @@ mod tests {
             Some(seller),
             presets,
             Some(std::path::PathBuf::from("/home/seat")),
+            maxplayer_core::agent_presets::AdapterHost::Host,
         );
-        assert_eq!(check.status, Status::Warn, "{}", check.render());
+        // SKIP since #1015 — an unknown label has no known credential path, so nothing was measured.
+        assert_eq!(check.status, Status::Skip, "{}", check.render());
         let rendered = check.render();
         assert!(rendered.contains("grok"), "must name the unresolvable harness: {rendered}");
         assert!(
@@ -5134,8 +5258,12 @@ mod tests {
         );
     }
 
-    /// No [seller] / no HOME / registry refusal: each is a named cannot-resolve WARN, never a
-    /// guessed path and never a silent skip.
+    /// No [seller] / no HOME / registry refusal: each is a NAMED cannot-resolve `Skip` — never a
+    /// guessed path, and never a silent skip either. "Silent" is the word that matters: since #1015
+    /// these are `Status::Skip` rather than `Status::Warn`, and the test holds the line that made
+    /// them WARNs in the first place by asserting each one still says WHAT it could not resolve and
+    /// still refuses to read as a pass. A skip that printed nothing, or that rendered `PASS`, is the
+    /// regression this guards.
     #[cfg(feature = "wallet")]
     #[test]
     fn harness_credential_check_carries_absence_rather_than_inventing_a_path() {
@@ -5143,17 +5271,24 @@ mod tests {
             None,
             std::collections::BTreeMap::new(),
             Some(std::path::PathBuf::from("/home/seat")),
+            maxplayer_core::agent_presets::AdapterHost::Host,
         );
-        assert_eq!(none.status, Status::Warn, "{}", none.render());
-        assert!(none.detail.contains("cannot resolve"), "{}", none.render());
+        assert_eq!(none.status, Status::Skip, "{}", none.render());
+        assert!(none.detail.contains("no [seller] section"), "{}", none.render());
+        assert!(
+            none.render().starts_with("SKIP"),
+            "an absent cause must be visible in the report, not swallowed: {}",
+            none.render()
+        );
 
         let seller = seller_for_agents(vec!["claude".into()], vec!["ignored".into()]);
         let no_home = checks::check_harness_credential_permissions(
             Some(seller.clone()),
             claude_preset_table(),
             None,
+            maxplayer_core::agent_presets::AdapterHost::Host,
         );
-        assert_eq!(no_home.status, Status::Warn, "{}", no_home.render());
+        assert_eq!(no_home.status, Status::Skip, "{}", no_home.render());
         assert!(
             no_home.detail.contains("HOME") && no_home.detail.contains("cannot resolve"),
             "{}",
@@ -5167,13 +5302,22 @@ mod tests {
             )),
             std::collections::BTreeMap::new(),
             Some(std::path::PathBuf::from("/home/seat")),
+            maxplayer_core::agent_presets::AdapterHost::Host,
         );
-        assert_eq!(refused.status, Status::Warn, "{}", refused.render());
+        assert_eq!(refused.status, Status::Skip, "{}", refused.render());
         assert!(
             refused.detail.contains("cannot inspect") || refused.detail.contains("did not resolve"),
             "{}",
             refused.render()
         );
+        for check in [&none, &no_home, &refused] {
+            assert_ne!(
+                check.status,
+                Status::Pass,
+                "a check that inspected nothing must never render as a clean result: {}",
+                check.render()
+            );
+        }
     }
 
     // The mask is 0o022 (group/other WRITE), not 0o077 (any group/other access). A 0755 directory
@@ -5200,6 +5344,7 @@ mod tests {
                 Some(seller.clone()),
                 presets.clone(),
                 Some(user_home.clone()),
+                maxplayer_core::agent_presets::AdapterHost::Host,
             )
         };
 
@@ -5304,7 +5449,12 @@ mod tests {
             Some(seller),
             claude_preset_table(),
             Some(base.clone()),
+            maxplayer_core::agent_presets::AdapterHost::Host,
         );
+        // Still a WARN after #1015, and deliberately so: this is a real finding about a real,
+        // RESOLVED path — the harness is not linked to an account, so the pre-advertise probe will
+        // fail and the seat will not advertise. #1015 moved the not-applicable outcomes to
+        // `Status::Skip`; sweeping this one along would hide a finding behind the new label.
         assert_eq!(
             check.status,
             Status::Warn,
@@ -5319,8 +5469,235 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// #1015, THE DEFECT ITSELF: one doctor run must not PASS the agent preset check and WARN the
+    /// credential check about a registry that "did not resolve", with a remedy naming the check that
+    /// just passed.
+    ///
+    /// The seat modelled here is the one from the field report: `[sandbox] mode = "docker"` (hence
+    /// `AdapterHost::Container`) and a BUILT-IN preset with no `[agents]` override, so resolution
+    /// runs the real built-in resolver rather than short-circuiting on a custom argv. Under
+    /// `Container` that resolver keeps argv0 bare for the image's PATH and never consults the host,
+    /// so the preset check PASSes on any machine — including CI, where `claude-agent-acp` is absent.
+    ///
+    /// RED-PROVE on the base: the credential check hardcoded `AdapterHost::Host`, so on a host
+    /// without the adapter it took the Err arm and returned exactly the reported WARN + circular
+    /// remedy — `assert_eq!(Status::Skip)` and the two `!contains` assertions all go red. On a host
+    /// that DOES have the adapter on PATH the base instead inspected host `$HOME` and WARNed
+    /// "not linked to an account" for a temp home with no `.claude`, so the status assertion goes
+    /// red there too. The test cannot pass on the base either way.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn docker_seat_does_not_get_a_pass_and_a_did_not_resolve_warn_in_one_run() {
+        let base = std::env::temp_dir().join(format!(
+            "mp-harness-creds-1015-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).expect("mk user home");
+        let seller = seller_for_agents(vec!["claude".into()], vec!["ignored".into()]);
+        // No `[agents]` override: the built-in resolver runs, which is what makes Host and Container
+        // diverge at all. A custom preset returns its argv for either host and would not exercise it.
+        let presets = std::collections::BTreeMap::new();
+        let container = maxplayer_core::agent_presets::AdapterHost::Container;
+
+        let preset = checks::check_agent_registry(Some(seller.clone()), presets.clone(), container);
+        let creds = checks::check_harness_credential_permissions(
+            Some(seller),
+            presets,
+            Some(base.clone()),
+            container,
+        );
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(
+            preset.status,
+            Status::Pass,
+            "a docker seat resolves its adapter in the image, so the preset check passes: {}",
+            preset.render()
+        );
+        assert_eq!(
+            creds.status,
+            Status::Skip,
+            "the credential check has no host surface to measure on a docker seat, so it skips — \
+             it must neither WARN about a registry that resolved nor PASS on a path the container \
+             cannot read: {}",
+            creds.render()
+        );
+        let rendered = creds.render();
+        assert!(
+            !rendered.contains("fix the agent preset check first"),
+            "the remedy must never point at a check that passed (#1015): {rendered}"
+        );
+        assert!(
+            !rendered.contains("did not resolve"),
+            "the registry DID resolve for this seat — the line must not claim otherwise: {rendered}"
+        );
+        assert!(
+            rendered.contains("docker"),
+            "the skip must name the reason it is not applicable: {rendered}"
+        );
+    }
+
+    /// The two checks must be the SAME resolve on the SAME inputs, for every host — the invariant
+    /// whose breach was #1015. Asserted as a property over both `AdapterHost` values rather than as
+    /// one scenario: whenever the preset check reports a resolved registry, the credential check must
+    /// not report an unresolved one, and vice versa.
+    ///
+    /// RED-PROVE on the base: the `Container` iteration reproduces the contradiction directly on any
+    /// machine without `claude-agent-acp` on PATH.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn both_checks_agree_about_whether_the_registry_resolved() {
+        let base = std::env::temp_dir().join(format!(
+            "mp-harness-creds-agree-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).expect("mk user home");
+        let seller = seller_for_agents(vec!["claude".into()], vec!["ignored".into()]);
+        for host in [
+            maxplayer_core::agent_presets::AdapterHost::Host,
+            maxplayer_core::agent_presets::AdapterHost::Container,
+        ] {
+            let presets = std::collections::BTreeMap::new();
+            let preset =
+                checks::check_agent_registry(Some(seller.clone()), presets.clone(), host);
+            let creds = checks::check_harness_credential_permissions(
+                Some(seller.clone()),
+                presets,
+                Some(base.clone()),
+                host,
+            );
+            let preset_resolved = preset.status != Status::Fail;
+            let creds_says_unresolved = creds.detail.contains("did not resolve");
+            assert!(
+                !(preset_resolved && creds_says_unresolved),
+                "{host:?}: the preset check resolved the registry while the credential check claimed \
+                 it did not — the two must pass identical inputs to seller_agents::resolve (#1015)\n  \
+                 {}\n  {}",
+                preset.render(),
+                creds.render()
+            );
+            assert!(
+                !creds.render().contains("fix the agent preset check first"),
+                "{host:?}: circular remedy: {}",
+                creds.render()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A docker seat must not be measured against host credential directories AT ALL — not even to
+    /// collect a finding. The same 0777 `~/.claude` that is a real WARN for a host-executor seat is
+    /// irrelevant to a docker seat, whose container cannot read it.
+    ///
+    /// This is the pair that proves the divergence is deliberate rather than a silenced check: one
+    /// directory, two hosts, two different and individually correct verdicts. RED-PROVE in BOTH
+    /// directions — make the docker arm inspect host paths and the `Skip`/`!contains` assertions go
+    /// red; silence the check for everyone and the `Host` WARN goes red.
+    #[cfg(all(unix, feature = "wallet"))]
+    #[test]
+    fn a_docker_seat_does_not_inspect_host_credential_directories_but_a_host_seat_still_does() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!(
+            "mp-harness-creds-1015-docker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let claude_dir = base.join(".claude");
+        std::fs::create_dir_all(&claude_dir).expect("mk .claude");
+        std::fs::set_permissions(&claude_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let seller = seller_for_agents(vec!["claude".into()], vec!["ignored".into()]);
+        // A custom preset, so BOTH hosts resolve and the only variable left is where the adapter
+        // runs — isolating the inspection decision from the resolution one.
+        let presets = claude_preset_table();
+
+        let host_seat = checks::check_harness_credential_permissions(
+            Some(seller.clone()),
+            presets.clone(),
+            Some(base.clone()),
+            maxplayer_core::agent_presets::AdapterHost::Host,
+        );
+        let docker_seat = checks::check_harness_credential_permissions(
+            Some(seller),
+            presets,
+            Some(base.clone()),
+            maxplayer_core::agent_presets::AdapterHost::Container,
+        );
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(
+            host_seat.status,
+            Status::Warn,
+            "a host-executor seat reads this very directory, so a world-writable one is a real \
+             finding and must still WARN: {}",
+            host_seat.render()
+        );
+        assert!(
+            host_seat.detail.contains(&claude_dir.display().to_string()),
+            "the finding must name the path: {}",
+            host_seat.render()
+        );
+        assert_eq!(
+            docker_seat.status,
+            Status::Skip,
+            "a docker seat's jobs cannot read this directory, so its permissions are not a finding \
+             about that seat: {}",
+            docker_seat.render()
+        );
+        assert!(
+            !docker_seat.detail.contains(&claude_dir.display().to_string()),
+            "the skip must not name a path it did not inspect: {}",
+            docker_seat.render()
+        );
+        assert!(
+            !docker_seat.render().contains("(fix:"),
+            "a skip has nothing to repair, so it carries a `why:` note and never a `fix:` remedy: {}",
+            docker_seat.render()
+        );
+    }
+
+    /// `Status::Skip` is a REPORTING distinction, never a severity one: it must be visibly distinct
+    /// from PASS in the output, and must not change the exit code or the boot gate.
+    ///
+    /// RED-PROVE: make `skip` an alias for `pass` and the label/`why:` assertions go red; make it
+    /// blocking and the `exit_code`/`readiness_ok` assertions go red.
+    #[test]
+    fn a_skip_is_reported_distinctly_and_blocks_nothing() {
+        let skipped = Check::skip("example", "nothing to inspect", "not applicable here");
+        let rendered = skipped.render();
+        assert!(rendered.starts_with("SKIP"), "{rendered}");
+        assert!(
+            rendered.contains("(why: not applicable here)"),
+            "a skip explains itself; it does not prescribe a repair: {rendered}"
+        );
+        assert!(
+            !rendered.contains("(fix:"),
+            "a skip must never be phrased as a remedy — that is how #1015 read: {rendered}"
+        );
+        assert_ne!(skipped.status, Status::Pass, "a skip is not a pass");
+        assert_ne!(skipped.status, Status::Warn, "a skip is not a finding");
+
+        let results = vec![Check::pass("ok", "fine"), skipped];
+        assert_eq!(exit_code(&results), SUCCESS, "a skip must not fail the exit");
+        assert!(readiness_ok(&results), "a skip must not block boot");
+    }
+
     // RED-PROVE (wiring): drop the `check_harness_credential_permissions` push from `build_checks`
     // and this goes red — no boot-gate result names the unlabelled hatch as unresolvable.
+    //
+    // The expected status is `Skip` since #1015: an unlabelled hatch has no known credential path, so
+    // the check measures nothing. The wiring property under test is unchanged — the gate must still
+    // RUN this check and still SAY what it could not resolve.
     #[cfg(feature = "wallet")]
     #[test]
     fn harness_credential_check_is_wired_into_the_boot_gate() {
@@ -5345,10 +5722,10 @@ mod tests {
         assert!(
             results.iter().any(|c| {
                 c.name == "harness credential permissions"
-                    && c.status == Status::Warn
+                    && c.status == Status::Skip
                     && (c.detail.contains("cannot resolve") || c.detail.contains("will not guess") || c.detail.contains("no preset label"))
             }),
-            "build_checks must run the harness credential check and WARN on an unlabelled hatch; got: {:?}",
+            "build_checks must run the harness credential check and SKIP, saying so, on an unlabelled hatch; got: {:?}",
             results.iter().map(Check::render).collect::<Vec<_>>()
         );
 
