@@ -70,6 +70,18 @@ fn fixture(dir: &Path, body: &str) -> PathBuf {
 
 const HELLO: &str = r#"printf '{"t":"Hello","version":1,"argv":[],"env":{}}\n'"#;
 
+/// What the CHILD is allowed for coming up, kept OUT of the budget whose bound is being measured —
+/// the same allowance, for the same reason, as `delivery_push_production_child::CHILD_STARTUP`.
+///
+/// Every deadline in this file is fixed BEFORE its child exists, because that is the executor's
+/// arming contract. So a shell that is slow to reach its first line spends the delivery's budget,
+/// and the watch below — 1.2 s from the moment the child is seen running — used to have only the
+/// budget's remainder to fit in. Once startup ate 0.8 s of a 2 s budget, the watch outlived the
+/// deadline it was watching and read the deadline's own kill as the second delivery going Ready
+/// early (gate run 7 at 53d1322, on an otherwise idle host). Every bound below is therefore stated
+/// relative to the DEADLINE, and the deadline carries this allowance in front of the budget.
+const CHILD_STARTUP: Duration = Duration::from_secs(10);
+
 fn alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
@@ -116,6 +128,10 @@ async fn a_second_delivery_is_observed_pending_until_the_held_local_phase_is_kil
     let second_state = Arc::new(AtomicU8::new(NOT_STARTED));
     let second_acquired_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
 
+    // The deadline as an INSTANT, fixed here before the child exists, with the startup allowance in
+    // front of the budget. Every bound on delivery one below is measured against it.
+    let deadline = Instant::now() + CHILD_STARTUP + budget;
+
     let first = {
         let lock = Arc::clone(&lock);
         let program = program.clone();
@@ -125,7 +141,7 @@ async fn a_second_delivery_is_observed_pending_until_the_held_local_phase_is_kil
             let outcome = serialized_bounded_push(
                 &lock,
                 generous,
-                Instant::now() + budget,
+                deadline,
                 move |turn| async move {
                     neutralize_then_push_in_child_off_runtime(
                         program,
@@ -227,9 +243,19 @@ async fn a_second_delivery_is_observed_pending_until_the_held_local_phase_is_kil
         }
         other => panic!("delivery one must be killed at its deadline, not awaited: {other:?}"),
     }
+    // THE BOUND, AGAINST THE DEADLINE. Not before it — the kill is the deadline's doing, not an
+    // early give-up — and within the executor's two windows after it: the reap, and end of file on
+    // the child's stdout. Startup happens before the deadline and is deliberately not bounded here.
     assert!(
-        held >= budget && held < budget + Duration::from_secs(5),
-        "delivery one held the seat for {held:?}, outside its budget {budget:?} + reap bound"
+        returned >= deadline,
+        "delivery one returned {:?} before the deadline it was given",
+        deadline.saturating_duration_since(returned)
+    );
+    assert!(
+        returned.saturating_duration_since(deadline) < 2 * REAP_BOUND,
+        "delivery one held the seat for {:?} past its deadline, beyond the reap and end-of-file \
+         windows this executor states",
+        returned.saturating_duration_since(deadline)
     );
     assert!(
         !alive(wedged_pid),
@@ -252,13 +278,15 @@ async fn a_second_delivery_is_observed_pending_until_the_held_local_phase_is_kil
     // the claim: how long the wedged delivery actually held the seat against its stated budget, and
     // how long the handover to the delivery that was waiting for it actually took.
     eprintln!(
-        "MEASURED budget={:?} held={:?} overrun={:?} handover={:?} samples_pending={} reap_bound={:?}",
+        "MEASURED budget={:?} startup_allowance={:?} held={:?} past_deadline={:?} handover={:?} \
+         samples_pending={} reap_bound={:?}",
         budget,
+        CHILD_STARTUP,
         held,
-        held.saturating_sub(budget),
+        returned.saturating_duration_since(deadline),
         acquired_at.saturating_duration_since(returned),
         samples,
-        Duration::from_secs(5),
+        REAP_BOUND,
     );
     assert!(
         acquired_at >= returned,
@@ -442,8 +470,10 @@ async fn an_aborted_delivery_task_does_not_hand_the_seat_on_while_its_child_stil
     let generous = Duration::from_secs(30);
     // THE ORIGINAL DEADLINE AS AN INSTANT, taken out here rather than inside the task. What
     // discriminates prompt abort cleanup from deadline cleanup is the time that was still LEFT on
-    // this deadline when the abort happened, and that needs the deadline itself.
-    let deadline = Instant::now() + budget;
+    // this deadline when the abort happened, and that needs the deadline itself. The startup
+    // allowance sits in front of the budget here too, so a slow shell cannot spend the remainder
+    // the discrimination is measured against.
+    let deadline = Instant::now() + CHILD_STARTUP + budget;
 
     // EVERY ASK THE EXECUTOR MAKES ABOUT THIS DELIVERY'S AUTHORITY, TIMESTAMPED. The closure never
     // refuses — this is an abort, not a revocation, and only the turn may end the work — so what it
