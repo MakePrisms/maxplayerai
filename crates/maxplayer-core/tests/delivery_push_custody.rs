@@ -10,6 +10,8 @@
 //! whatever host runs them and claim nothing about a host they did not run on.
 
 #![cfg(unix)]
+// Gated like its siblings: the executor, the transport and `libc` exist only with `git-delivery`.
+#![cfg(feature = "git-delivery")]
 
 use std::path::PathBuf;
 use std::sync::Arc;

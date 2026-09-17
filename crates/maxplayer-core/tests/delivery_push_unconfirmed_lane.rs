@@ -13,6 +13,8 @@
 //! Platform: POSIX (the executor's `SIGKILL`/`waitpid` contract). Measured on the host that ran it.
 
 #![cfg(unix)]
+// Gated like its siblings: the executor, the transport and `libc` exist only with `git-delivery`.
+#![cfg(feature = "git-delivery")]
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
