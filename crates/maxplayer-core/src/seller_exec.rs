@@ -3948,9 +3948,20 @@ mod tests {
     /// a real daemon actually created.
     ///
     /// **The mutation control that makes it worth running:** the job lifetime (60s) and the job
-    /// deadline (+24h) are far apart ON PURPOSE, so replacing `job_deadline_unix` with `None` at
-    /// the production call site moves the recorded stamp by nearly a day and reds the stamp
-    /// assertion. A green that cannot go red is decoration.
+    /// deadline (+24h) are far apart ON PURPOSE, so dropping the deadline moves the recorded
+    /// stamp by nearly a day and reds the stamp assertion. A green that cannot go red is
+    /// decoration.
+    ///
+    /// **Which call site this guards — precisely, because the earlier wording did not.** This
+    /// test enters at [`prepare_launch`] with a deadline it constructs ITSELF, so it guards the
+    /// `launch_cleanup_stamp` argument at the `prepare_launch` end and nothing upstream of it.
+    /// It does NOT guard the forwarding edge inside [`run_agent_job_with_env`], where a real
+    /// seller deadline actually crosses into the launch as `timeout.deadline_unix()`: replacing
+    /// THAT argument with `None` leaves this test green, because this test supplies the very
+    /// value the mutation removes. Calling it "the production call site", singular, is how the
+    /// bypassed caller went unnoticed. The sibling below
+    /// (`a_seller_deadline_crosses_run_agent_job_with_env_into_the_daemon_label`) covers that
+    /// edge; both are kept, because they fail for different reasons.
     ///
     /// `#[ignore]` rather than an env-var early return, for the reason the probe test above states:
     /// a test that returns early when its precondition is missing reports as PASSED.
@@ -3962,33 +3973,21 @@ mod tests {
             cleanup_after_unix, list_owned_argv, parse_owned_listing, partition_owned, ROLE_HOLDER,
         };
 
-        fn docker(args: &[&str]) -> (bool, String) {
-            let out = std::process::Command::new("docker")
-                .args(args)
-                .stdin(std::process::Stdio::null())
-                .output()
-                .expect("docker must be runnable");
-            (
-                out.status.success(),
-                String::from_utf8_lossy(&out.stdout).trim().to_owned(),
-            )
-        }
-
         let image = std::env::var("MAXPLAYER_HOLDER_IMAGE").expect(
             "set MAXPLAYER_HOLDER_IMAGE to a job image — this test measures a real container and \
              has nothing to say without one",
         );
-        // This run's OWN seat and network, so nothing it lists, asserts on, or removes can belong
-        // to another run on the same daemon.
-        let seat = "9e".repeat(32);
+        // A seat THIS INVOCATION alone owns, and a scope that releases what it created even when
+        // an assertion panics. The shared constant that stood here made `list_owned_argv(&seat)`
+        // match every concurrent run on the daemon, so two runs with a same-second deadline could
+        // assert on — and then force-remove — each other's containers.
+        let scope = LiveScope::new("e2e");
+        let seat = scope.seat.clone();
         let identity = DeliveryAgentIdentity::for_seller(&seat);
-        let tag = format!("mx996-e2e-{}", std::process::id());
-        let (created, _) = docker(&["network", "create", &tag]);
-        assert!(created, "could not create the test network {tag}");
+        let tag = scope.network.clone();
 
         // The workdir's last component IS the job id the launch derives its container names from.
-        let workdir = std::env::temp_dir().join(&tag);
-        std::fs::create_dir_all(&workdir).expect("a workdir");
+        let workdir = scope.workdir.clone();
         let job_id = job_id_of(&workdir);
 
         let policy = SandboxPolicy::docker(DockerPolicy {
@@ -4075,11 +4074,243 @@ mod tests {
         );
 
         drop(prepared);
-        for container in &owned {
-            let _ = docker(&["rm", "--force", &container.id]);
+        // Containers, network and workdir are released by `scope` on the way out — including on
+        // the panic paths above, which this trailing block never reached.
+    }
+
+    /// Everything one live launch owns on the daemon, released on the way out.
+    ///
+    /// The seat is the isolation boundary: `list_owned_argv` selects BY SEAT, so a seat this
+    /// invocation alone owns is what stops two concurrent runs from listing, asserting on, and
+    /// then force-removing each other's containers. Teardown lives in `Drop` because a trailing
+    /// block of `docker rm` calls is skipped entirely when an assertion panics — which is the
+    /// path a failing test takes, and therefore the path that most needs to clean up.
+    #[cfg(feature = "acp")]
+    struct LiveScope {
+        seat: String,
+        network: String,
+        workdir: std::path::PathBuf,
+    }
+
+    #[cfg(feature = "acp")]
+    static LIVE_SCOPE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    #[cfg(feature = "acp")]
+    impl LiveScope {
+        fn docker(args: &[&str]) -> (bool, String) {
+            let out = std::process::Command::new("docker")
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("docker must be runnable");
+            (
+                out.status.success(),
+                String::from_utf8_lossy(&out.stdout).trim().to_owned(),
+            )
         }
-        let _ = docker(&["network", "rm", &tag]);
-        let _ = std::fs::remove_dir_all(&workdir);
+
+        /// 64 hex characters — the shape of a real seat — but unique to this invocation. The pid
+        /// alone repeats across hosts and after wrap, so the wall clock and a process-local
+        /// counter are mixed in; two tests in one binary must not collide either.
+        fn new(kind: &str) -> Self {
+            let since = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("a clock");
+            let seat = format!(
+                "{:016x}{:016x}{:016x}{:016x}",
+                std::process::id(),
+                since.as_secs(),
+                since.subsec_nanos(),
+                LIVE_SCOPE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            );
+            let network = format!("mx996-{kind}-{}", &seat[..24]);
+            let (created, _) = Self::docker(&["network", "create", &network]);
+            assert!(created, "could not create the test network {network}");
+            let workdir = std::env::temp_dir().join(&network);
+            std::fs::create_dir_all(&workdir).expect("a workdir");
+            Self {
+                seat,
+                network,
+                workdir,
+            }
+        }
+    }
+
+    #[cfg(feature = "acp")]
+    impl Drop for LiveScope {
+        fn drop(&mut self) {
+            // Re-listed at teardown under THIS run's seat rather than reusing whatever vector the
+            // test happened to assert on, so a container created after those assertions is still
+            // removed, and nothing outside this seat ever is.
+            let argv = crate::sandbox_netns::list_owned_argv(&self.seat);
+            if let Ok(listed) = std::process::Command::new(&argv[0]).args(&argv[1..]).output() {
+                let owned =
+                    crate::sandbox_netns::parse_owned_listing(&String::from_utf8_lossy(&listed.stdout));
+                for container in &owned {
+                    let _ = Self::docker(&["rm", "--force", &container.id]);
+                }
+            }
+            let _ = Self::docker(&["network", "rm", &self.network]);
+            let _ = std::fs::remove_dir_all(&self.workdir);
+        }
+    }
+
+    /// The ordered edge — the one the test above does NOT reach.
+    ///
+    /// A seller's deadline does not begin at [`prepare_launch`]. It arrives at
+    /// [`run_agent_job_with_env`] inside an [`AgentRunTimeout::JobDeadline`] and is forwarded from
+    /// there as `timeout.deadline_unix()`. That forwarding argument is the wiring a regression
+    /// would break, and a test that enters at `prepare_launch` with its own `Some(deadline)`
+    /// cannot see it break, because it supplies the value the mutation removes.
+    ///
+    /// So this enters at `run_agent_job_with_env` — the same function
+    /// `delivery_orchestrator.rs` calls in production — and reads the labels a real daemon wrote
+    /// through the production listing, parser and selection.
+    ///
+    /// **Why it observes mid-flight.** The containment is released when the run ends, so the
+    /// labels must be read while the call is still in progress. `sh` never speaks ACP, so the
+    /// call is going to fail; that failure is immaterial and deliberately unasserted, because
+    /// containment is established BEFORE the agent handshake. Asserting on the run's result here
+    /// would only prove `sh` is not an ACP agent.
+    ///
+    /// **Mutation control:** replace `timeout.deadline_unix()` with `None` at the
+    /// `prepare_launch` call inside `run_agent_job_with_env`. The remaining window (60s) and the
+    /// deadline (+24h) are a day apart, so the recorded stamp moves by nearly a day and the stamp
+    /// assertion reds.
+    #[cfg(feature = "acp")]
+    #[tokio::test]
+    #[ignore = "live: needs a docker daemon, MAXPLAYER_HOLDER_IMAGE and the netfilter sidecar image"]
+    async fn a_seller_deadline_crosses_run_agent_job_with_env_into_the_daemon_label() {
+        use crate::sandbox_netns::{
+            cleanup_after_unix, list_owned_argv, parse_owned_listing, partition_owned, ROLE_HOLDER,
+        };
+
+        let image = std::env::var("MAXPLAYER_HOLDER_IMAGE").expect(
+            "set MAXPLAYER_HOLDER_IMAGE to a job image — this test measures a real container and \
+             has nothing to say without one",
+        );
+        let scope = LiveScope::new("edge");
+        let seat = scope.seat.clone();
+        let workdir = scope.workdir.clone();
+        let job_id = job_id_of(&workdir);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock")
+            .as_secs();
+        let deadline = now + 86_400;
+        let remaining = Duration::from_secs(60);
+
+        let task_image = image.clone();
+        let task_network = scope.network.clone();
+        let task_seat = seat.clone();
+        let task_workdir = workdir.clone();
+        // The production launch future is NOT `Send`: `engine::run_job` takes
+        // `sink: &mut dyn FnMut(RunEvent<'_>)`, so `tokio::spawn` will not accept it. Drive it on
+        // its own thread with a current-thread runtime — the same construction the orchestrator
+        // uses. Only plain owned values cross the boundary; the future is created and driven
+        // entirely over there, which is what makes the non-`Send` sink a non-issue.
+        let runner = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a current-thread runtime");
+            runtime.block_on(async move {
+                let policy = SandboxPolicy::docker(DockerPolicy {
+                    image: task_image,
+                    forward_env: Vec::new(),
+                    runtime: std::env::var("MAXPLAYER_RUNSC_RUNTIME").ok(),
+                    network: Some(task_network),
+                    proxy_ports: None,
+                    file_credentials: Vec::new(),
+                    dns_servers: Vec::new(),
+                    container_delivery: None,
+                });
+                let identity = DeliveryAgentIdentity::for_seller(&task_seat);
+                // EXACTLY what the orchestrator hands it: the remaining window AND the absolute
+                // second the job ends at. Nothing on this path passes a deadline to
+                // `prepare_launch` directly — that is the whole point of entering here.
+                let timeout = AgentRunTimeout::JobDeadline {
+                    remaining,
+                    deadline_unix: deadline,
+                };
+                run_agent_job_with_env(
+                    &["sh".to_owned()],
+                    &policy,
+                    "",
+                    &task_workdir,
+                    &identity,
+                    timeout,
+                    None,
+                )
+                .await
+            })
+        });
+
+        let argv = list_owned_argv(&seat);
+        let mut owned = Vec::new();
+        for _ in 0..240 {
+            let listed = std::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .output()
+                .expect("docker ps must run");
+            owned = parse_owned_listing(&String::from_utf8_lossy(&listed.stdout));
+            if !owned.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        assert!(
+            !owned.is_empty(),
+            "run_agent_job_with_env must have created containers visible to the production \
+             listing argv under this run's own seat"
+        );
+
+        let expected = cleanup_after_unix(deadline);
+        let if_dropped = cleanup_after_unix(now + remaining.as_secs());
+        assert_ne!(
+            expected, if_dropped,
+            "the control only means something while the two stamps differ"
+        );
+        for container in &owned {
+            assert_eq!(
+                container.cleanup_after,
+                Some(expected),
+                "the daemon recorded a stamp that is not this job's deadline plus the grace; \
+                 {if_dropped} would mean run_agent_job_with_env stopped forwarding \
+                 timeout.deadline_unix() into prepare_launch"
+            );
+        }
+
+        let holder = owned
+            .iter()
+            .find(|container| container.role.as_deref() == Some(ROLE_HOLDER))
+            .expect("the launch created a holder");
+        assert_eq!(
+            holder.holder_job.as_deref(),
+            Some(job_id.as_str()),
+            "a production holder names its job in the holder column"
+        );
+        assert_eq!(
+            holder.helper_job, None,
+            "and never wears the helper label — the shape the sweep must read per role"
+        );
+
+        let inside = partition_owned(&owned, &seat, deadline);
+        assert!(
+            !inside.removable.contains(&holder.id),
+            "a holder inside its job's deadline is never removable: {inside:?}"
+        );
+        let past = partition_owned(&owned, &seat, expected);
+        assert!(
+            past.removable.contains(&holder.id),
+            "past the deadline plus the grace the holder is swept: {past:?}"
+        );
+
+        // Bounded by the run's own 60s window, and `sh` fails the ACP handshake well before that.
+        // Joined rather than detached, so the launch cannot still be creating containers while
+        // `scope` is tearing them down.
+        let _ = runner.join();
     }
 
     // The honest false, measured in a REAL container rather than argued from a Dockerfile.
