@@ -18,6 +18,8 @@
 //! The signing key stays in the actor the parent calls. Both halves of that sentence are load
 //! bearing and neither is weakened by the other.
 
+mod wedge;
+
 use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -86,11 +88,12 @@ async fn poll_once<F: Future>(mut future: Pin<&mut F>) -> Poll<F::Output> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_second_delivery_is_observed_pending_until_the_held_local_phase_is_killed_and_reaped() {
     let dir = scratch("pending");
+    let hold = wedge::wedge(&dir);
     let pidfile = dir.join("child.pid");
     let program = fixture(
         &dir,
         &format!(
-            "trap '' TERM\necho $$ > {}\n{HELLO}\nwhile :; do sleep 0.05; done\n",
+            "trap '' TERM\necho $$ > {}\n{HELLO}\n{hold}",
             pidfile.display()
         ),
     );
@@ -396,12 +399,13 @@ async fn wait_for_running_child(pidfile: &std::path::Path, bound: Duration) -> O
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn an_aborted_delivery_task_does_not_hand_the_seat_on_while_its_child_still_runs() {
     let dir = scratch("aborted");
+    let hold = wedge::wedge(&dir);
     let pidfile = dir.join("child.pid");
     // Ignores TERM and never speaks again: only the executor's kill-and-reap ends this.
     let program = fixture(
         &dir,
         &format!(
-            "trap '' TERM\necho $$ > {}\n{HELLO}\nwhile :; do sleep 0.05; done\n",
+            "trap '' TERM\necho $$ > {}\n{HELLO}\n{hold}",
             pidfile.display()
         ),
     );

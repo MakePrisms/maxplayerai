@@ -13,6 +13,8 @@
 
 #![cfg(feature = "git-delivery")]
 
+mod wedge;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -137,11 +139,12 @@ impl Drop for Token {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_local_phase_that_refuses_to_stop_is_ended_at_the_deadline_and_its_exit_is_confirmed() {
     let dir = scratch("refuses");
+    let hold = wedge::wedge(&dir);
     let pidfile = dir.join("child.pid");
     let program = fixture(
         &dir,
         &format!(
-            "trap '' TERM\necho $$ > {}\n{HELLO}\nwhile :; do sleep 0.05; done\n",
+            "trap '' TERM\necho $$ > {}\n{HELLO}\n{hold}",
             pidfile.display()
         ),
     );
@@ -261,11 +264,12 @@ async fn a_push_that_finishes_returns_its_oid_and_hands_the_turn_back() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revoked_delivery_never_spawns_a_child() {
     let dir = scratch("revoked");
+    let hold = wedge::wedge(&dir);
     let pidfile = dir.join("child.pid");
     let program = fixture(
         &dir,
         &format!(
-            "echo $$ > {}\n{HELLO}\nwhile :; do sleep 0.05; done\n",
+            "echo $$ > {}\n{HELLO}\n{hold}",
             pidfile.display()
         ),
     );
@@ -441,11 +445,12 @@ async fn authority_that_ends_during_the_mint_keeps_the_token_on_this_side_of_the
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unauthenticated_remote_cannot_obtain_a_token_by_asking() {
     let dir = scratch("unauth");
+    let hold = wedge::wedge(&dir);
     let pidfile = dir.join("child.pid");
     let program = fixture(
         &dir,
         &format!(
-            "echo $$ > {}\n{HELLO}\nIFS= read -r _request\nprintf '{{\"t\":\"Mint\",\"destination\":\"https://relay.example.invalid/seller.git\"}}\\n'\nwhile :; do sleep 0.05; done\n",
+            "echo $$ > {}\n{HELLO}\nIFS= read -r _request\nprintf '{{\"t\":\"Mint\",\"destination\":\"https://relay.example.invalid/seller.git\"}}\\n'\n{hold}",
             pidfile.display()
         ),
     );
@@ -505,13 +510,14 @@ async fn an_unauthenticated_remote_cannot_obtain_a_token_by_asking() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_signer_whose_reply_never_comes_cannot_stop_the_deadline_from_landing() {
     let dir = scratch("heldsigner");
+    let hold = wedge::wedge(&dir);
     let pidfile = dir.join("child.pid");
     // The child says hello, asks to mint, and then waits for an answer that will never arrive. It
     // ignores TERM, so only the kill can end it.
     let program = fixture(
         &dir,
         &format!(
-            "trap '' TERM\necho $$ > {}\n{HELLO}\nprintf '{{\"t\":\"Mint\",\"destination\":\"https://relay.example.invalid/seller.git\"}}\\n'\nwhile :; do sleep 0.05; done\n",
+            "trap '' TERM\necho $$ > {}\n{HELLO}\nprintf '{{\"t\":\"Mint\",\"destination\":\"https://relay.example.invalid/seller.git\"}}\\n'\n{hold}",
             pidfile.display()
         ),
     );
@@ -714,12 +720,13 @@ async fn a_child_that_reports_an_oid_nobody_gated_is_a_protocol_fault() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authority_that_ends_at_the_mint_and_stays_ended_stops_the_delivery_not_just_the_leg() {
     let dir = scratch("late-revoke-persistent");
+    let hold = wedge::wedge(&dir);
     let answer = dir.join("answer.json");
     let pidfile = dir.join("child.pid");
     let program = fixture(
         &dir,
         &format!(
-            "trap '' TERM\necho $$ > {}\n{HELLO}\nIFS= read -r _request\nprintf '{{\"t\":\"Mint\",\"destination\":\"https://relay.example.invalid/seller.git\"}}\\n'\nIFS= read -r line\nprintf '%s' \"$line\" > {}\nwhile :; do sleep 0.05; done\n",
+            "trap '' TERM\necho $$ > {}\n{HELLO}\nIFS= read -r _request\nprintf '{{\"t\":\"Mint\",\"destination\":\"https://relay.example.invalid/seller.git\"}}\\n'\nIFS= read -r line\nprintf '%s' \"$line\" > {}\n{hold}",
             pidfile.display(),
             answer.display()
         ),

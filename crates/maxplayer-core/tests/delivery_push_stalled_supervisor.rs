@@ -27,6 +27,8 @@
 #![cfg(unix)]
 #![cfg(feature = "git-delivery")]
 
+mod wedge;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -71,7 +73,8 @@ fn deaf_child() -> PathBuf {
     ));
     std::fs::create_dir_all(&dir).expect("fixture dir");
     let path = dir.join("child.sh");
-    std::fs::write(&path, "#!/bin/sh\nwhile true; do sleep 1; done\n").expect("fixture script");
+    // One process, wedged on a FIFO: a group kill has exactly one member to reach. See `wedge`.
+    std::fs::write(&path, format!("#!/bin/sh\n{}", wedge::wedge(&dir))).expect("fixture script");
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     path

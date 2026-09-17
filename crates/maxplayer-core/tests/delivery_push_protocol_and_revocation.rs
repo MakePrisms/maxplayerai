@@ -17,6 +17,8 @@
 
 #![cfg(feature = "git-delivery")]
 
+mod wedge;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -134,13 +136,14 @@ fn message(outcome: &Result<String, SellerGitError>) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revocation_while_the_child_works_stops_it_long_before_the_deadline() {
     let dir = scratch("revoke-mid-work");
+    let hold = wedge::wedge(&dir);
     let pidfile = dir.join("child.pid");
     // Says hello, takes the request, and then does what the delta search does: nothing this parent
     // can interrupt by asking.
     let program = fixture(
         &dir,
         &format!(
-            "echo $$ > {}\n{HELLO}\nIFS= read -r _request\nwhile :; do sleep 0.05; done\n",
+            "echo $$ > {}\n{HELLO}\nIFS= read -r _request\n{hold}",
             pidfile.display()
         ),
     );
@@ -216,11 +219,12 @@ async fn a_revocation_while_the_child_works_stops_it_long_before_the_deadline() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_child_that_says_hello_twice_is_stopped() {
     let dir = scratch("double-hello");
+    let hold = wedge::wedge(&dir);
     let pidfile = dir.join("child.pid");
     let program = fixture(
         &dir,
         &format!(
-            "echo $$ > {}\n{HELLO}\n{HELLO}\nwhile :; do sleep 0.05; done\n",
+            "echo $$ > {}\n{HELLO}\n{HELLO}\n{hold}",
             pidfile.display()
         ),
     );
@@ -243,9 +247,10 @@ async fn a_child_that_says_hello_twice_is_stopped() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_child_that_reports_a_result_before_saying_hello_is_refused() {
     let dir = scratch("done-first");
+    let hold = wedge::wedge(&dir);
     let program = fixture(
         &dir,
-        &format!("printf '{{\"t\":\"Done\",\"oid\":\"{OID}\",\"error\":null}}\\n'\nsleep 5\n"),
+        &format!("printf '{{\"t\":\"Done\",\"oid\":\"{OID}\",\"error\":null}}\\n'\n{hold}"),
     );
 
     let run = deliver(program, dir.join("workdir"), None, None, UNREACHABLE).await;
@@ -283,11 +288,12 @@ async fn a_child_that_reports_an_object_this_delivery_never_asked_for_is_refused
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_child_that_keeps_asking_for_authorizations_is_stopped_at_the_cap() {
     let dir = scratch("mint-storm");
+    let hold = wedge::wedge(&dir);
     let pidfile = dir.join("child.pid");
     let program = fixture(
         &dir,
         &format!(
-            "echo $$ > {}\n{HELLO}\nIFS= read -r _request\ni=0\nwhile [ $i -lt 40 ]; do printf '{{\"t\":\"Mint\",\"destination\":\"{REMOTE}\"}}\\n'; IFS= read -r _reply; i=$((i+1)); done\nsleep 5\n",
+            "echo $$ > {}\n{HELLO}\nIFS= read -r _request\ni=0\nwhile [ $i -lt 40 ]; do printf '{{\"t\":\"Mint\",\"destination\":\"{REMOTE}\"}}\\n'; IFS= read -r _reply; i=$((i+1)); done\n{hold}",
             pidfile.display()
         ),
     );
@@ -446,6 +452,7 @@ async fn a_revocation_during_a_flood_of_authority_checks_is_acted_on_within_the_
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revocation_while_an_unread_answer_is_stuck_in_the_pipe_is_acted_on_within_the_poll() {
     let dir = scratch("revoke-stuck-write");
+    let hold = wedge::wedge(&dir);
     let pidfile = dir.join("child.pid");
     let asking = dir.join("asking");
     // Asks without limit and reads NOTHING back. A pipe buffer is finite, so the parent's answers
@@ -455,7 +462,7 @@ async fn a_revocation_while_an_unread_answer_is_stuck_in_the_pipe_is_acted_on_wi
         &format!(
             "echo $$ > {}\n{HELLO}\nIFS= read -r _request\ntouch {}\ni=0\nwhile [ $i -lt 20000 ]; do \
              printf '{{\"t\":\"Check\",\"phase\":\"send-pack\"}}\\n'; i=$((i+1)); done\n\
-             while :; do sleep 0.05; done\n",
+             {hold}",
             pidfile.display(),
             asking.display()
         ),
@@ -522,11 +529,12 @@ async fn a_revocation_while_an_unread_answer_is_stuck_in_the_pipe_is_acted_on_wi
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_child_that_closes_its_stdout_is_at_end_of_file_but_not_yet_confirmed_gone() {
     let dir = scratch("eof-alive");
+    let hold = wedge::wedge(&dir);
     let pidfile = dir.join("child.pid");
     let program = fixture(
         &dir,
         &format!(
-            "echo $$ > {}\n{HELLO}\nIFS= read -r _request\nexec 1>&-\nwhile :; do sleep 0.05; done\n",
+            "echo $$ > {}\n{HELLO}\nIFS= read -r _request\nexec 1>&-\n{hold}",
             pidfile.display()
         ),
     );
@@ -609,6 +617,7 @@ async fn the_owner_is_observed_within_the_poll_even_when_every_wait_is_entered_l
     }
 
     let dir = scratch("poll-cadence");
+    let hold = wedge::wedge(&dir);
     let pidfile = dir.join("child.pid");
     // Sleeps 40 ms — most of one interval — and only THEN asks. Every wait the parent enters on this
     // child's behalf is entered with little of the current interval left.
@@ -620,7 +629,7 @@ async fn the_owner_is_observed_within_the_poll_even_when_every_wait_is_entered_l
              printf '{{\"t\":\"Mint\",\"destination\":\"{REMOTE}\"}}\\n'; \
              IFS= read -r _reply || exit 0; i=$((i+1)); done\n\
              printf '{{\"t\":\"Done\",\"oid\":null,\"error\":\"finished the cadence run\"}}\\n'\n\
-             sleep 5\n",
+             {hold}",
             pidfile.display()
         ),
     );
