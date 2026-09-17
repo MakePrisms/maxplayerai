@@ -118,6 +118,14 @@
 //!   none today. A descendant that left the group first (its own `setsid`/`setpgid`) is not reached
 //!   by that signal, is not waited for, and is not claimed to be gone; step 12's EOF wait is what
 //!   notices one still holding the stdout pipe, and even that only while it holds it.
+//!   A second way a descendant is missed, and it needs no `setsid`: on XNU the group kill signals a
+//!   SNAPSHOT of the members (`pgrp_iterate`, `bsd/kern/kern_proc.c`), so a descendant the child is
+//!   forking at that instant is inserted after the snapshot and never signalled; Linux re-checks
+//!   pending signals inside `copy_process` and restarts the fork, so the window is a macOS one.
+//!   Such a survivor inherits the child's stdout, and step 12 waits for it — up to that step's
+//!   whole window — before the seat moves. The shipped child forks nothing, so today this is
+//!   reachable only from a test fixture that does; `tests/wedge/mod.rs` has the measurement and
+//!   the single-process fixture that closes it.
 //! - **The child's own budget is the parent's remaining time at the instant the request is
 //!   written, minus the pipe transit.** The parent stamps both a remaining duration and the same
 //!   deadline as an absolute wall-clock instant; the child subtracts its own `now` from the second
