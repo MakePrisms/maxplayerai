@@ -4062,7 +4062,6 @@ exit 0
     /// cursor, and the second starts mid-queue for reasons nothing in its own body states. That is
     /// a property of the cursor being real state rather than a test defect to paper over — so each
     /// row takes a distinct seat, exactly as two seats on one host would.
-    #[cfg(feature = "acp")]
     fn sweep_seat(name: &str) -> String {
         let mut seat: String = name.bytes().map(|b| format!("{b:02x}")).collect();
         seat.truncate(64);
