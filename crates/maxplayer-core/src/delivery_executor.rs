@@ -150,6 +150,14 @@
 //! - **Clocks.** The deadline is `Instant` (monotonic), so it survives wall-clock jumps; it does not
 //!   survive the machine suspending mid-push, where monotonic time on some platforms does not
 //!   advance across sleep.
+//! - **An inherited stdout, on macOS.** Rust's standard library creates a child's pipes with
+//!   `pipe()` and a separate `fcntl(FD_CLOEXEC)` where there is no `pipe2`, and spawns without
+//!   `POSIX_SPAWN_CLOEXEC_DEFAULT`. A process this seller starts elsewhere at that same instant — a
+//!   job's agent, `git`, `docker` — can inherit the delivery child's stdout and hold it for its
+//!   whole life. Step 12 then waits for it, and past its bound retains the seat. Spawns from this
+//!   module are serialized against each other ([`SPAWN_LOCK`]); the rest is an ACCEPTED residual
+//!   of the darwin target, decided 2026-09-17 rather than closed, and the remedy when it fires is
+//!   a restart of the seller. Linux creates the pipe with `pipe2(O_CLOEXEC)` and has no window.
 //!
 //! **When the assumptions fail, this fails CLOSED.** If the child cannot be reaped within
 //! [`REAP_BOUND`] the turn is *not* released — the executor keeps waiting and reports the stall.
@@ -773,11 +781,16 @@ impl CleanupSink {
 ///
 /// Holding this lock across the spawn closes that window between THIS module's children: no two of
 /// them are ever created concurrently, so neither can inherit the other's pipe. What it does NOT
-/// close, and this is a residual to be named rather than hidden: any spawn elsewhere in this process
-/// — a job's agent, `git`, `docker` — that runs concurrently with a delivery child's spawn can still
-/// inherit that child's stdout, and step 12 then waits for it and, past its bound, retains the seat.
-/// Closing that needs every spawn site in the process to take this lock, or the end-of-file wait to
-/// stop treating an unrelated holder as evidence about the delivery.
+/// close: any spawn elsewhere in this process — a job's agent, `git`, `docker` — that runs
+/// concurrently with a delivery child's spawn can still inherit that child's stdout, and step 12
+/// then waits for it and, past its bound, retains the seat for the life of the process, reported as
+/// [`ExecutorError::CleanupUnbounded`].
+///
+/// ACCEPTED AS A KNOWN RESIDUAL of the darwin target, 2026-09-17. Closing it would need every spawn
+/// site in the seller to take this lock, or step 12 to stop treating an unrelated holder as evidence
+/// about the delivery, and either changes what this module promises about when the seat may move.
+/// The two spawns have to overlap within microseconds and a delivery is one spawn per job, so the
+/// event is rare; its consequence is the fail-closed one, and the remedy is a restart of the seller.
 static SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A spawned child that **cannot be forgotten**. Dropping it kills the process group and waits for
