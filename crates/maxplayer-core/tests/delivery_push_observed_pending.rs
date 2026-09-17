@@ -44,6 +44,11 @@ const NOT_STARTED: u8 = 0;
 const PENDING: u8 = 1;
 const ACQUIRED: u8 = 2;
 
+/// What the second delivery's push body found at its entry: the aborted child gone, or still there.
+/// Written only from inside that push body, so it is a fact about the instant the seat was given.
+const ENTERED_CHILD_GONE: u8 = 1;
+const ENTERED_CHILD_ALIVE: u8 = 2;
+
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 fn scratch(label: &str) -> PathBuf {
@@ -544,12 +549,19 @@ async fn wait_until_held(hold: &AskHold, bound: Duration) -> Instant {
 /// The executor asks this delivery's authority on every poll and consults the turn only after that
 /// ask has returned (`seller_git` composes the gate as authority first, lifetime second). This test
 /// passes its own authority closure — always yes, as production's `PushAuthority` is during an
-/// abort — and, once the abort is issued, HOLDS the executor's next ask open ([`AskHold`]). While
-/// the ask is held the child is alive and cannot be killed, so every `Poll::Pending` the second
-/// delivery returns in that window is a fact about a seat held by a live child. An earlier shape of
-/// this test observed the child alive and then polled, assuming the reap could not complete in
-/// between; a `try_wait` that succeeds at once and a scheduler gap both defeat that assumption, and
-/// the same gap sat in its sampling loop. Nothing here assumes a minimum cleanup duration.
+/// abort — and HOLDS the executor's next ask open ([`AskHold`]) BEFORE the abort is issued: the
+/// abort lands only once the executor is acknowledged inside the held ask, so no check that
+/// entered earlier can carry the abort to a kill and leave nothing to hold. While the ask is held
+/// the child is alive and cannot be killed, so every `Poll::Pending` the second delivery returns in
+/// that window is a fact about a seat held by a live child. An earlier shape of this test observed
+/// the child alive and then polled, assuming the reap could not complete in between; a `try_wait`
+/// that succeeds at once and a scheduler gap both defeat that assumption, and the same gap sat in
+/// its sampling loop. Nothing here assumes a minimum cleanup duration.
+///
+/// The ordering "the seat moved only after the child was gone" is witnessed at the boundary that
+/// matters: the second delivery's own push body looks for the child at the instant it is given the
+/// seat. A sampler outside cannot witness that, because its `acquired` is recorded during its own
+/// poll and so always follows its own last `alive` reading, whatever the seat did.
 ///
 /// Then the ask is released, and everything that follows is the executor's: the turn check
 /// refuses, the child is killed, its exit is confirmed, and the seat is handed on. Deadline cleanup
@@ -632,20 +644,13 @@ async fn an_aborted_delivery_task_does_not_hand_the_seat_on_while_its_child_stil
         .await
         .expect("the first delivery's child must be running before its task is aborted");
 
-    // ARM, THEN ABORT. Armed first, so that no ask can slip between the abort and the hold: from
-    // here the executor's next ask blocks before it can consult the turn, whether it arrives
-    // before or after the abort lands.
+    // ARM, AND WAIT TO BE HELD — WITH THE FIRST TASK STILL LIVE. An ask that entered before the
+    // hold was armed returns through the unarmed branch and goes on to consult the turn; had the
+    // abort already landed, that ask would kill and no later ask would ever be held. So the abort
+    // is issued only once the executor is provably inside the held ask, where the turn is not
+    // consulted until the release. Until then the turn is live, and an ask that slipped past the
+    // arming returns yes on both halves and changes nothing.
     let armed_at = ask_hold.arm();
-    first.abort();
-    let joined = first.await;
-    assert!(
-        joined.as_ref().err().is_some_and(|error| error.is_cancelled()),
-        "this gate is only meaningful if the first delivery's task was really cancelled: \
-         {joined:?}"
-    );
-
-    // THE HOLD IS TAKEN. The executor is inside this delivery's authority check and cannot kill
-    // until it is let go. How long it took to get here is the executor's poll cadence.
     let held_at = wait_until_held(&ask_hold, Duration::from_secs(20)).await;
     let armed_to_ask = held_at.saturating_duration_since(armed_at);
     assert!(
@@ -659,12 +664,44 @@ async fn an_aborted_delivery_task_does_not_hand_the_seat_on_while_its_child_stil
          the executor may end it"
     );
 
+    // THE ABORT, with the executor held. The task awaiting the delivery is destroyed while the
+    // child is alive and while the executor cannot yet act on the turn it is about to consult.
+    first.abort();
+    let joined = first.await;
+    assert!(
+        joined.as_ref().err().is_some_and(|error| error.is_cancelled()),
+        "this gate is only meaningful if the first delivery's task was really cancelled: \
+         {joined:?}"
+    );
+    assert!(
+        alive(wedged_pid),
+        "the child died between the abort and the release, while the executor was still held \
+         inside its authority check; nothing but the executor may end it"
+    );
+
     let second_state = Arc::new(AtomicU8::new(NOT_STARTED));
     let second_acquired_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+    // THE ENTRY-BOUNDARY WITNESS. Whether the aborted delivery's child still exists is checked
+    // INSIDE the second delivery's push body, at the instant the seat is given, on the task that
+    // was given it. A sampler outside cannot witness this ordering: it sees the child alive, then
+    // polls, and `acquired` is recorded during that poll, so "acquired after last seen alive"
+    // follows from the sampler's own sequence whatever the seat did. This check does not.
+    let entered_with_child_alive = Arc::new(AtomicU8::new(NOT_STARTED));
     let second = serialized_bounded_push(&lock, generous, Instant::now() + Duration::from_secs(20), {
         let state = Arc::clone(&second_state);
         let at = Arc::clone(&second_acquired_at);
+        let witness = Arc::clone(&entered_with_child_alive);
         move |turn| async move {
+            // Reached ONLY with the turn in hand: `serialized_bounded_push` builds it from the
+            // acquired guard, so this line cannot run while delivery one owns the seat.
+            witness.store(
+                if alive(wedged_pid) {
+                    ENTERED_CHILD_ALIVE
+                } else {
+                    ENTERED_CHILD_GONE
+                },
+                Ordering::SeqCst,
+            );
             at.lock().expect("clock").replace(Instant::now());
             state.store(ACQUIRED, Ordering::SeqCst);
             drop(turn);
@@ -736,20 +773,22 @@ async fn an_aborted_delivery_task_does_not_hand_the_seat_on_while_its_child_stil
     );
     assert_eq!(second_state.load(Ordering::SeqCst), ACQUIRED);
     let acquired = second_acquired_at.lock().expect("clock").expect("acquired");
-    // The child may have gone between the last observation and the handover; it is gone NOW.
+    // ORDERED, WITNESSED AT THE BOUNDARY. The push body itself looked for the child at the instant
+    // it was given the seat. A seat released before the exit was confirmed finds it there — alive,
+    // or a zombie nobody waited for, which `kill(pid, 0)` also reports.
+    assert_eq!(
+        entered_with_child_alive.load(Ordering::SeqCst),
+        ENTERED_CHILD_GONE,
+        "the second delivery entered its push body while the aborted delivery's child still existed \
+         (witness={}; last seen alive by the sampler at {last_alive_at:?}, acquired at {acquired:?})",
+        entered_with_child_alive.load(Ordering::SeqCst)
+    );
+    // And it is still gone now, as seen from outside.
     assert!(
         !alive(wedged_pid),
-        "the seat was handed on while the aborted delivery's child was still running"
+        "the aborted delivery's child exists again after the handover"
     );
     let child_gone_at = child_gone_at.unwrap_or_else(Instant::now);
-    // ORDERED, NOT MERELY EVENTUAL. An `alive` observation can only precede the reap, the release
-    // follows the reap, and the push body runs after the release: the seat moved after the child
-    // was last seen alive, whatever the sampler's cadence.
-    assert!(
-        acquired >= last_alive_at,
-        "the second delivery entered its push body at {acquired:?}, before the aborted delivery's \
-         child was last seen alive at {last_alive_at:?}"
-    );
     assert!(
         !ask_hold.expired(),
         "the hold ran out on its own safety bound; the release above is what must have let the \
