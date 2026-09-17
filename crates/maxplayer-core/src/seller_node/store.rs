@@ -681,6 +681,32 @@ pub struct Offer {
     /// row written before this column existed reads NULL ⇒ [`crate::gateway::PaymentMode::Sat`],
     /// which is correct by construction — every job recorded then was priced.
     pub payment_mode: crate::gateway::PaymentMode,
+    /// The delivery modes the buyer declared it can READ, from the offer's
+    /// `["param","accepts-delivery", …]` tag. Empty ⇒ git only.
+    ///
+    /// Journaled for the SAME reason as `requested_agent`, `output` and `payment_mode` above:
+    /// execution can be a RESTART away from the claim, and the delivering job must know whether
+    /// this buyer can read an inline answer. Unpersisted, a resumed job would fall back to
+    /// git-only and refuse an answer the buyer asked for. A row written before this column existed
+    /// reads NULL ⇒ empty ⇒ git only, which is the fail-closed direction.
+    pub accepts_delivery: Vec<String>,
+}
+
+/// Serialize the accepted-delivery modes for the `offers.accepts_delivery` column. `None` for an
+/// empty set, so a buyer that declared nothing writes NULL and reads back as git-only.
+fn accepts_delivery_to_column(modes: &[String]) -> Option<String> {
+    if modes.is_empty() {
+        return None;
+    }
+    Some(modes.join(" "))
+}
+
+/// Read the `offers.accepts_delivery` column. NULL, empty, or whitespace ⇒ empty ⇒ git only.
+fn accepts_delivery_from_column(raw: Option<String>) -> Vec<String> {
+    raw.unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
 }
 
 /// #591: the target + base a SERVED contribution job clones into its delivery workdir. The buyer's
@@ -1142,6 +1168,12 @@ impl SellerStore {
         if !Self::column_exists(conn, "offers", "payment")? {
             conn.execute_batch("ALTER TABLE offers ADD COLUMN payment TEXT;")?;
         }
+        // The buyer's accepted-delivery declaration. A store from an earlier binary reads NULL for
+        // its existing offers ⇒ empty ⇒ git only, which is the truth of those rows: no buyer could
+        // declare a mode that did not exist. Additive + idempotent, exactly like the columns above.
+        if !Self::column_exists(conn, "offers", "accepts_delivery")? {
+            conn.execute_batch("ALTER TABLE offers ADD COLUMN accepts_delivery TEXT;")?;
+        }
         if !Self::column_exists(conn, "deliveries", "payment")? {
             conn.execute_batch("ALTER TABLE deliveries ADD COLUMN payment TEXT;")?;
         }
@@ -1260,8 +1292,8 @@ impl SellerStore {
         let changed = conn.execute(
             "INSERT OR IGNORE INTO offers
                  (offer_id, buyer_pubkey, amount_sats, unit, task, deadline_unix, targeted, created_at_unix,
-                  requested_agent, output, payment)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                  requested_agent, output, payment, accepts_delivery)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 offer.offer_id,
                 offer.buyer_pubkey,
@@ -1274,6 +1306,7 @@ impl SellerStore {
                 offer.requested_agent,
                 offer.output,
                 offer.payment_mode.as_wire(),
+                accepts_delivery_to_column(&offer.accepts_delivery),
             ],
         )?;
         Ok(changed == 1)
@@ -1308,7 +1341,7 @@ impl SellerStore {
         let row = conn
             .query_row(
                 "SELECT offer_id, buyer_pubkey, amount_sats, unit, task, deadline_unix, targeted,
-                        requested_agent, output, payment
+                        requested_agent, output, payment, accepts_delivery
                  FROM offers WHERE offer_id = ?1",
                 [offer_id],
                 |row| {
@@ -1325,6 +1358,7 @@ impl SellerStore {
                         // NULL ⇒ `Sat`. Resolved HERE rather than left to the caller so no reader
                         // of this row can accidentally treat "column absent" as a third state.
                         payment_mode: payment_mode_from_column(row.get::<_, Option<String>>(9)?),
+                        accepts_delivery: accepts_delivery_from_column(row.get::<_, Option<String>>(10)?),
                     })
                 },
             )
@@ -1520,7 +1554,7 @@ impl SellerStore {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT offer_id, buyer_pubkey, amount_sats, unit, task, deadline_unix, targeted,
-                    requested_agent, output, payment
+                    requested_agent, output, payment, accepts_delivery
              FROM offers
              WHERE deadline_unix > ?1
                AND offer_id NOT IN (SELECT job_id FROM claims)",
@@ -1537,6 +1571,7 @@ impl SellerStore {
                 requested_agent: row.get(7)?,
                 output: row.get(8)?,
                 payment_mode: payment_mode_from_column(row.get::<_, Option<String>>(9)?),
+                accepts_delivery: accepts_delivery_from_column(row.get::<_, Option<String>>(10)?),
             })
         })?;
         let mut offers = Vec::new();
@@ -3126,6 +3161,7 @@ mod tests {
             targeted: true,
             requested_agent: None,
             output: Some("text/plain".to_owned()),
+            accepts_delivery: Vec::new(),
         }
     }
 
@@ -5234,6 +5270,7 @@ mod free_lane_tests {
             targeted: true,
             requested_agent: None,
             output: Some("text/plain".to_owned()),
+            accepts_delivery: Vec::new(),
             payment_mode: mode,
         }
     }

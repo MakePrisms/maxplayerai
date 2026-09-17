@@ -267,6 +267,11 @@ fn tools() -> Value {
                         "type": "boolean",
                         "description": "When true, omit p-tag (open offer). Default false."
                     },
+                    "accepts_delivery": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Delivery modes this buyer can read, posted on the offer as [\"param\",\"accepts-delivery\",<mode>,…]. DEFAULTS TO [\"inline\"], so an answer job needs nothing here: a seller may then deliver the answer in the result event itself, with no git commit, no push and no remote — and collect materializes it as answer.txt. Pass [] to accept git deliveries only, which is how every buyer behaved before this existed. A seller falls back to a git delivery whenever the agent actually wrote files."
+                    },
                     "deadline_unix": { "type": "integer", "minimum": 0 },
                     "repo": { "type": "string", "description": "Optional https git repo for delivery bind" },
                     "branch": { "type": "string" },

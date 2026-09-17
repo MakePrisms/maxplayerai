@@ -407,6 +407,10 @@ struct PostJobParams {
     seller_pubkey: Option<String>,
     #[serde(default)]
     untargeted: bool,
+    /// Delivery modes this buyer declares it can read (§6.1). Absent ⇒ the daemon's default,
+    /// which includes `inline` because this build can read one.
+    #[serde(default)]
+    accepts_delivery: Option<Vec<String>>,
     #[serde(default)]
     deadline_unix: Option<u64>,
     #[serde(default)]
@@ -548,6 +552,13 @@ async fn post_job(context: &Arc<BuyerContext>, id: Value, params: Value) -> Resp
         amount_sats: params.amount_sats,
         seller_pubkey: params.seller_pubkey,
         untargeted: params.untargeted,
+        // §6.4 — declared BY DEFAULT. This binary reads an inline result end to end: the accept
+        // path parses it, the pay path re-derives its digest before any spend, and `collect`
+        // materializes it. A caller can narrow the set, but it should not have to opt in to a
+        // capability the daemon it is talking to already has.
+        accepts_delivery: params
+            .accepts_delivery
+            .unwrap_or_else(|| vec![crate::gateway::DELIVERY_MODE_INLINE.to_owned()]),
         deadline_unix: params.deadline_unix,
         repo: params.repo,
         branch: params.branch,
@@ -5255,6 +5266,7 @@ mod tests {
 
         fn result(commit_oid: Option<String>) -> job_lifecycle::ResultView {
             job_lifecycle::ResultView {
+                inline_answer: None,
                 result_id: "r".repeat(64),
                 created_at: 2,
                 seller_pubkey: "5".repeat(64),
@@ -5294,6 +5306,8 @@ mod tests {
                 results: vec![result(Some("d".repeat(40)))],
                 live_claim_id: None,
                 accepted: Some(job_lifecycle::AcceptedBind {
+                    delivery_kind: None,
+                    inline_answer: None,
                     payment_mode: crate::gateway::PaymentMode::Sat,
                     job_id: "a".repeat(64),
                     claim_id: "c".repeat(64),
@@ -5333,6 +5347,8 @@ mod tests {
                 results: vec![result(Some("d".repeat(40)))],
                 live_claim_id: None,
                 accepted: Some(job_lifecycle::AcceptedBind {
+                    delivery_kind: None,
+                    inline_answer: None,
                     payment_mode: crate::gateway::PaymentMode::Sat,
                     job_id: "a".repeat(64),
                     claim_id: "b".repeat(64),
