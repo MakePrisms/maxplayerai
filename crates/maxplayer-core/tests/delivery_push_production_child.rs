@@ -224,9 +224,13 @@ async fn a_local_phase_that_refuses_to_stop_is_ended_at_the_deadline_and_its_exi
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_push_that_finishes_returns_its_oid_and_hands_the_turn_back() {
     let dir = scratch("finishes");
+    // Reads the request before it answers, as a real child must: a fixture that exits before the
+    // parent's request write lands turns the oid into "Broken pipe" on a fast host (Linux CI).
     let program = fixture(
         &dir,
-        &format!("{HELLO}\nprintf '{{\"t\":\"Done\",\"oid\":\"{GATED_OID}\",\"error\":null}}\\n'\n"),
+        &format!(
+            "{HELLO}\nIFS= read -r _request\nprintf '{{\"t\":\"Done\",\"oid\":\"{GATED_OID}\",\"error\":null}}\\n'\n"
+        ),
     );
     let released = Arc::new(AtomicBool::new(false));
     let (control, turn) = delivery_turn(
@@ -665,9 +669,12 @@ fn the_turn_is_released_on_a_confirmed_exit_and_on_nothing_else() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_child_that_reports_an_oid_nobody_gated_is_a_protocol_fault() {
     let dir = scratch("wrong-oid");
+    // Reads the request before it answers; see `a_push_that_finishes_returns_its_oid_and_hands_the_turn_back`.
     let program = fixture(
         &dir,
-        &format!("{HELLO}\nprintf '{{\"t\":\"Done\",\"oid\":\"abc123\",\"error\":null}}\\n'\n"),
+        &format!(
+            "{HELLO}\nIFS= read -r _request\nprintf '{{\"t\":\"Done\",\"oid\":\"abc123\",\"error\":null}}\\n'\n"
+        ),
     );
     let released = Arc::new(AtomicBool::new(false));
     let (control, turn) = delivery_turn(
