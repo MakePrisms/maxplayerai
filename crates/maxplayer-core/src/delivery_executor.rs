@@ -757,6 +757,29 @@ impl CleanupSink {
     }
 }
 
+/// Serializes every child spawn this executor performs, so that two of its spawns can never be in
+/// flight at once.
+///
+/// Rust's standard library creates a child's stdio pipes with `pipe()` followed by a separate
+/// `fcntl(FD_CLOEXEC)` on platforms without `pipe2` — macOS among them — and spawns with
+/// `posix_spawn` WITHOUT `POSIX_SPAWN_CLOEXEC_DEFAULT`. Between those two calls the new pipe ends are
+/// inheritable, and a `posix_spawn` running on another thread at that instant copies them into ITS
+/// child, where they survive the exec. That child then holds the write end of this child's stdout for
+/// its whole life, and step 12 — the wait for end of file on that pipe — waits for a process that has
+/// nothing to do with this delivery. Measured on Darwin 25.6 with cargo 1.94.1: eight children
+/// spawned at the same instant hand one of them another's stdout in 23 of 200 rounds; a test binary
+/// whose suites all start at once did exactly this and reported [`ExecutorError::CleanupUnbounded`]
+/// at 5.0 s after a child that had forked nothing was reaped.
+///
+/// Holding this lock across the spawn closes that window between THIS module's children: no two of
+/// them are ever created concurrently, so neither can inherit the other's pipe. What it does NOT
+/// close, and this is a residual to be named rather than hidden: any spawn elsewhere in this process
+/// — a job's agent, `git`, `docker` — that runs concurrently with a delivery child's spawn can still
+/// inherit that child's stdout, and step 12 then waits for it and, past its bound, retains the seat.
+/// Closing that needs every spawn site in the process to take this lock, or the end-of-file wait to
+/// stop treating an unrelated holder as evidence about the delivery.
+static SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A spawned child that **cannot be forgotten**. Dropping it kills the process group and waits for
 /// the exit; there is no path out of this module that leaves a delivery packing behind us.
 ///
@@ -906,9 +929,16 @@ impl KillableChild {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
-        let child = command
-            .spawn()
-            .map_err(|error| ExecutorError::Spawn(format!("{}: {error}", program.display())))?;
+        // UNDER THE SPAWN LOCK: the pipes are created and the process is spawned inside `spawn()`,
+        // and no other child of this module may be spawned while that happens. See [`SPAWN_LOCK`].
+        let child = {
+            let _serialized = SPAWN_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            command
+                .spawn()
+                .map_err(|error| ExecutorError::Spawn(format!("{}: {error}", program.display())))?
+        };
         let pid = child.id() as i32;
         Ok(Self {
             pid,
