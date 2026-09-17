@@ -4588,6 +4588,15 @@ mod tests {
         seat: String,
         network: String,
         workdir: std::path::PathBuf,
+        /// The launch thread, owned by the scope rather than by the test body. A panic in an
+        /// assertion unwinds past every line after it — including a trailing `join` — so a handle
+        /// the body owns is a handle that gets DETACHED at exactly the moment teardown begins.
+        /// Owned here, it is finished and joined on both paths before a single container is
+        /// removed.
+        runner: Option<std::thread::JoinHandle<()>>,
+        /// Asks a still-running launch to stop, so the unwind path does not have to wait out the
+        /// run's whole remaining window before it can tear down.
+        cancel: Option<tokio::sync::oneshot::Sender<()>>,
     }
 
     #[cfg(feature = "acp")]
@@ -4595,41 +4604,103 @@ mod tests {
 
     #[cfg(feature = "acp")]
     impl LiveScope {
+        /// Never panics. `Drop` calls this while an assertion may already be unwinding, and a
+        /// panic during an unwind ABORTS the process — destroying the very failure the test was
+        /// reporting. A spawn failure comes back as `(false, why)` for the caller to report.
         fn docker(args: &[&str]) -> (bool, String) {
-            let out = std::process::Command::new("docker")
+            match std::process::Command::new("docker")
                 .args(args)
                 .stdin(std::process::Stdio::null())
                 .output()
-                .expect("docker must be runnable");
-            (
-                out.status.success(),
-                String::from_utf8_lossy(&out.stdout).trim().to_owned(),
-            )
+            {
+                Ok(out) => {
+                    let text = if out.status.success() {
+                        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+                    } else {
+                        String::from_utf8_lossy(&out.stderr).trim().to_owned()
+                    };
+                    (out.status.success(), text)
+                }
+                Err(err) => (false, format!("could not run `docker`: {err}")),
+            }
         }
 
         /// 64 hex characters — the shape of a real seat — but unique to this invocation. The pid
         /// alone repeats across hosts and after wrap, so the wall clock and a process-local
         /// counter are mixed in; two tests in one binary must not collide either.
+        ///
+        /// The RESOURCE NAME carries its own token rather than a prefix of the seat. `&seat[..24]`
+        /// looked like it carried that entropy and did not: it is the 16 pid hex digits plus the
+        /// first 8 digits of `as_secs()`, and for a ~1.79e9 timestamp those 8 are ALL ZERO. The
+        /// name therefore collapsed to the pid, and pid reuse against leftovers reused the name.
+        /// The token below keeps the low seconds, the nanoseconds and the sequence — the fields
+        /// that actually differ between two invocations.
         fn new(kind: &str) -> Self {
             let since = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("a clock");
+            let sequence = LIVE_SCOPE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let seat = format!(
                 "{:016x}{:016x}{:016x}{:016x}",
                 std::process::id(),
                 since.as_secs(),
                 since.subsec_nanos(),
-                LIVE_SCOPE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                sequence,
             );
-            let network = format!("mx996-{kind}-{}", &seat[..24]);
-            let (created, _) = Self::docker(&["network", "create", &network]);
-            assert!(created, "could not create the test network {network}");
+            let token = format!(
+                "{:08x}{:08x}{:08x}{:04x}",
+                std::process::id(),
+                (since.as_secs() & 0xffff_ffff) as u32,
+                since.subsec_nanos(),
+                (sequence & 0xffff) as u16,
+            );
+            let network = format!("mx996-{kind}-{token}");
             let workdir = std::env::temp_dir().join(&network);
-            std::fs::create_dir_all(&workdir).expect("a workdir");
-            Self {
+
+            // OWNERSHIP FIRST. The guard holding both names exists before anything fallible runs,
+            // so there is no window in which a resource has been created and nothing is
+            // responsible for removing it: a panic below unwinds through `Drop`, which already
+            // owns the network name and the workdir path.
+            let scope = Self {
                 seat,
                 network,
                 workdir,
+                runner: None,
+                cancel: None,
+            };
+            let (created, why) = Self::docker(&["network", "create", &scope.network]);
+            assert!(
+                created,
+                "could not create the test network {}: {why}",
+                scope.network
+            );
+            std::fs::create_dir_all(&scope.workdir).expect("a workdir");
+            scope
+        }
+
+        /// Hand the launch thread to the scope. After this the thread is owned on every exit
+        /// path, including an unwind out of a failing assertion.
+        fn own_runner(
+            &mut self,
+            runner: std::thread::JoinHandle<()>,
+            cancel: tokio::sync::oneshot::Sender<()>,
+        ) {
+            self.runner = Some(runner);
+            self.cancel = Some(cancel);
+        }
+
+        /// Cancel-and-join. Idempotent, because `Drop` calls it too: the success path and the
+        /// unwind path therefore go through exactly the same ordering.
+        fn finish_runner(&mut self) {
+            if let Some(cancel) = self.cancel.take() {
+                // The receiver is gone if the launch already returned; that is a finished runner,
+                // not an error.
+                let _ = cancel.send(());
+            }
+            if let Some(runner) = self.runner.take() {
+                if runner.join().is_err() {
+                    eprintln!("live scope {}: the launch thread panicked", self.network);
+                }
             }
         }
     }
@@ -4637,19 +4708,55 @@ mod tests {
     #[cfg(feature = "acp")]
     impl Drop for LiveScope {
         fn drop(&mut self) {
-            // Re-listed at teardown under THIS run's seat rather than reusing whatever vector the
-            // test happened to assert on, so a container created after those assertions is still
-            // removed, and nothing outside this seat ever is.
-            let argv = crate::sandbox_netns::list_owned_argv(&self.seat);
-            if let Ok(listed) = std::process::Command::new(&argv[0]).args(&argv[1..]).output() {
-                let owned =
-                    crate::sandbox_netns::parse_owned_listing(&String::from_utf8_lossy(&listed.stdout));
-                for container in &owned {
-                    let _ = Self::docker(&["rm", "--force", &container.id]);
+            // ORDERING IS THE CONTRACT: the runner is cancelled and JOINED before a single
+            // removal, so a launch cannot still be creating containers while teardown removes
+            // them. On a failing assertion this is the only place that join happens.
+            self.finish_runner();
+
+            let mut failures: Vec<String> = Vec::new();
+            // Two passes. The first removes what the run created; the second catches anything
+            // that appeared while the first was still running, which a single listing misses.
+            for _ in 0..2 {
+                let argv = crate::sandbox_netns::list_owned_argv(&self.seat);
+                match std::process::Command::new(&argv[0]).args(&argv[1..]).output() {
+                    Ok(listed) => {
+                        let owned = crate::sandbox_netns::parse_owned_listing(
+                            &String::from_utf8_lossy(&listed.stdout),
+                        );
+                        if owned.is_empty() {
+                            break;
+                        }
+                        for container in &owned {
+                            let (removed, why) = Self::docker(&["rm", "--force", &container.id]);
+                            if !removed {
+                                failures.push(format!("rm {}: {why}", container.id));
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        failures.push(format!("could not list this seat's containers: {err}"));
+                        break;
+                    }
                 }
             }
-            let _ = Self::docker(&["network", "rm", &self.network]);
-            let _ = std::fs::remove_dir_all(&self.workdir);
+            let (removed, why) = Self::docker(&["network", "rm", &self.network]);
+            if !removed {
+                failures.push(format!("network rm {}: {why}", self.network));
+            }
+            if let Err(err) = std::fs::remove_dir_all(&self.workdir) {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    failures.push(format!("workdir {}: {err}", self.workdir.display()));
+                }
+            }
+            // REPORTED, never discarded — and never a panic, which during an unwind would abort
+            // the process. A silent cleanup failure is how a leak becomes somebody else's flake.
+            if !failures.is_empty() {
+                eprintln!(
+                    "live scope {} cleanup failures: {}",
+                    self.network,
+                    failures.join("; ")
+                );
+            }
         }
     }
 
@@ -4687,7 +4794,7 @@ mod tests {
             "set MAXPLAYER_HOLDER_IMAGE to a job image — this test measures a real container and \
              has nothing to say without one",
         );
-        let scope = LiveScope::new("edge");
+        let mut scope = LiveScope::new("edge");
         let seat = scope.seat.clone();
         let workdir = scope.workdir.clone();
         let job_id = job_id_of(&workdir);
@@ -4708,6 +4815,7 @@ mod tests {
         // its own thread with a current-thread runtime — the same construction the orchestrator
         // uses. Only plain owned values cross the boundary; the future is created and driven
         // entirely over there, which is what makes the non-`Send` sink a non-issue.
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
         let runner = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -4733,18 +4841,30 @@ mod tests {
                     remaining,
                     deadline_unix: deadline,
                 };
-                run_agent_job_with_env(
-                    &["sh".to_owned()],
+                // Bound rather than passed as a temporary: the future is now pinned and polled
+                // across statements, so its argv has to outlive the call expression.
+                let command = ["sh".to_owned()];
+                let launch = run_agent_job_with_env(
+                    &command,
                     &policy,
                     "",
                     &task_workdir,
                     &identity,
                     timeout,
                     None,
-                )
-                .await
+                );
+                tokio::pin!(launch);
+                // The run's own result stays immaterial and unasserted — `sh` never speaks ACP.
+                // What this adds is a way for teardown to STOP the thread promptly instead of
+                // waiting out the remaining window while it holds up cleanup.
+                tokio::select! {
+                    _ = &mut launch => {}
+                    _ = cancel_rx => {}
+                }
             })
         });
+        // From here the scope owns the thread on every exit path, including an unwind.
+        scope.own_runner(runner, cancel_tx);
 
         let argv = list_owned_argv(&seat);
         let mut owned = Vec::new();
@@ -4806,10 +4926,10 @@ mod tests {
             "past the deadline plus the grace the holder is swept: {past:?}"
         );
 
-        // Bounded by the run's own 60s window, and `sh` fails the ACP handshake well before that.
-        // Joined rather than detached, so the launch cannot still be creating containers while
-        // `scope` is tearing them down.
-        let _ = runner.join();
+        // Cancel-and-join THROUGH THE SCOPE, so the success path uses the same ordering the
+        // unwind path uses: the launch is stopped and joined before anything is torn down. When
+        // an assertion above fails this line is never reached and `Drop` performs it instead.
+        scope.finish_runner();
     }
 
     // The honest false, measured in a REAL container rather than argued from a Dockerfile.
