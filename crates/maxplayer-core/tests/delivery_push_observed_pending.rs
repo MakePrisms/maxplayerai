@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use maxplayer_core::delivery_executor::{CANCELLATION_POLL, REAP_BOUND};
+use maxplayer_core::git_transport::AuthorityCheck;
 use maxplayer_core::seller_git::{neutralize_then_push_in_child_off_runtime, SellerGitError};
 use maxplayer_core::seller_node::run::{serialized_bounded_push, DeliveryPushErr};
 
@@ -390,35 +391,67 @@ async fn wait_for_running_child(pidfile: &std::path::Path, bound: Duration) -> O
 /// killed and reaped promptly — the seat comes back in a fraction of the remaining budget rather
 /// than at the deadline. So the gate asserts both halves, and the second one is what stops this
 /// from being a test that would pass on a seat that simply leaks: the handover must happen AFTER
-/// the child is gone, and BEFORE the deadline that would otherwise have ended it.
+/// the child is gone, and the KILL must happen long BEFORE the deadline that would otherwise have
+/// ended it.
 ///
 /// Three facts are established in order: the second delivery returns `Poll::Pending` while the
 /// aborted delivery's child is still running; the abort really happened (the first task is
 /// finished, and finished as a cancellation); and the seat is handed over only after that child is
-/// confirmed gone, within the executor's own poll and reap bounds.
+/// confirmed gone, within the executor's own poll, reap and end-of-file bounds.
+///
+/// # Which instant tells abort cleanup from deadline cleanup
+///
+/// The executor acts on a dropped turn at its next authority ask, which it makes at most
+/// [`CANCELLATION_POLL`] after the previous one; the kill is issued from that ask, the exit is
+/// confirmed within [`REAP_BOUND`], and the seat moves once the child's stdout has ALSO reached end
+/// of file — a second window the executor states as up to [`REAP_BOUND`] on its own. Deadline
+/// cleanup cannot issue its kill before the deadline. So the instant that separates the two is the
+/// KILL, and it is read here from the ask that carried the refusal: the test's own authority
+/// closure is consulted on every ask, always says yes, and records when it was asked. The composed
+/// gate asks it first and the turn second, so the last recorded ask is the one whose turn check
+/// refused, and the kill follows it on the same thread with nothing in between.
+///
+/// The HANDOVER is bounded too — against the executor's full statement (poll, reap, end of file),
+/// not against a figure that leaves the end-of-file window out. This gate used to compare the
+/// handover to the remaining deadline, and read a survivor of the group kill holding the child's
+/// stdout as a late abort: the kill had been prompt, and the seat had then waited — correctly —
+/// for a process the kill never reached. See `wedge` for the race and the numbers.
+///
+/// The sampler is a witness, not a clock. It polls every millisecond for as long as the child is
+/// alive and asserts on every sample; how many samples that yields is a report of the executor's
+/// speed, not a requirement on it. Demanding five samples at a fixed cadence asserted that the
+/// abort path was SLOW enough to be watched, and failed on a host where it was not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn an_aborted_delivery_task_does_not_hand_the_seat_on_while_its_child_still_runs() {
     let dir = scratch("aborted");
     let hold = wedge::wedge(&dir);
     let pidfile = dir.join("child.pid");
-    // Ignores TERM and never speaks again: only the executor's kill-and-reap ends this.
+    // Ignores TERM and never speaks again: only the executor's kill-and-reap ends this. ONE process,
+    // so the group kill has exactly one member to reach.
     let program = fixture(
         &dir,
-        &format!(
-            "trap '' TERM\necho $$ > {}\n{HELLO}\n{hold}",
-            pidfile.display()
-        ),
+        &format!("trap '' TERM\necho $$ > {}\n{HELLO}\n{hold}", pidfile.display()),
     );
 
     let lock = Arc::new(tokio::sync::Mutex::new(()));
     let budget = Duration::from_millis(3_000);
     let generous = Duration::from_secs(30);
-    // THE ORIGINAL DEADLINE AS AN INSTANT, taken out here rather than inside the task. Comparing the
-    // handover against `budget` compares it against the WHOLE initial allowance, which ordinary
-    // deadline cleanup also satisfies once any of that allowance has been spent before the abort.
-    // What discriminates prompt abort cleanup from deadline cleanup is the time that was still LEFT
-    // on this deadline when the abort happened, and that needs the deadline itself.
+    // THE ORIGINAL DEADLINE AS AN INSTANT, taken out here rather than inside the task. What
+    // discriminates prompt abort cleanup from deadline cleanup is the time that was still LEFT on
+    // this deadline when the abort happened, and that needs the deadline itself.
     let deadline = Instant::now() + budget;
+
+    // EVERY ASK THE EXECUTOR MAKES ABOUT THIS DELIVERY'S AUTHORITY, TIMESTAMPED. The closure never
+    // refuses — this is an abort, not a revocation, and only the turn may end the work — so what it
+    // records is WHEN the executor looked. Its last entry is the ask whose turn check refused.
+    let asks: Arc<Mutex<Vec<Instant>>> = Arc::new(Mutex::new(Vec::new()));
+    let authority: AuthorityCheck = {
+        let asks = Arc::clone(&asks);
+        Arc::new(move || {
+            asks.lock().expect("asks").push(Instant::now());
+            Ok(())
+        })
+    };
 
     let first = {
         let lock = Arc::clone(&lock);
@@ -437,7 +470,7 @@ async fn an_aborted_delivery_task_does_not_hand_the_seat_on_while_its_child_stil
                         "delivery/one".to_owned(),
                         "0123456789012345678901234567890123456789".to_owned(),
                         None,
-                        None,
+                        Some(authority),
                         turn,
                     )
                     .await
@@ -479,16 +512,22 @@ async fn an_aborted_delivery_task_does_not_hand_the_seat_on_while_its_child_stil
     });
     tokio::pin!(second);
 
+    // OBSERVED PENDING WHILE THE CHILD IS ALIVE. The child was alive at the assertion above, a few
+    // microseconds ago, and its exit can only be confirmed by a reap that polls at 2 ms; this first
+    // poll therefore lands while the seat is held by a live child, however fast the executor is.
     assert!(
         poll_once(second.as_mut()).await.is_pending(),
         "a second delivery was admitted to a seat whose aborted predecessor's child is still alive"
     );
     second_state.store(PENDING, Ordering::SeqCst);
+    let mut samples = 1usize;
 
-    // Watch it wait, for as long as the aborted delivery's child is still running.
-    let mut samples = 0usize;
+    // Watch it wait, for as long as the aborted delivery's child is still running. Sampled at 1 ms
+    // because the window is SHORT and that is the finding: the executor acts on the dropped control
+    // within its cancellation poll, so the child does not survive the abort for long.
     let mut last_alive_at = Instant::now();
     while alive(wedged_pid) && Instant::now() < deadline {
+        last_alive_at = Instant::now();
         assert!(
             poll_once(second.as_mut()).await.is_pending(),
             "the second delivery became ready while the aborted delivery's child was still alive"
@@ -498,19 +537,17 @@ async fn an_aborted_delivery_task_does_not_hand_the_seat_on_while_its_child_stil
             PENDING,
             "the second delivery's push body ran while the aborted delivery's child was alive"
         );
-        last_alive_at = Instant::now();
         samples += 1;
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
-    // Sampled at 5ms because the window is SHORT and that is the finding: the executor acts on the
-    // dropped control within its cancellation poll, so the child does not survive the abort for
-    // long. A sample rate chosen to make this window look big would be measuring the sampler.
+    let child_gone_at = Instant::now();
     assert!(
-        samples >= 5,
-        "too few observed Poll::Pending returns to call it observed: {samples}"
+        !alive(wedged_pid),
+        "the aborted delivery's child was still alive at the delivery's ORIGINAL DEADLINE; the \
+         dropped turn control was never acted on"
     );
 
-    // The work the abort could not stop ended on its own deadline, and only then did the seat move.
+    // The seat moves only now: after the child is gone, and never before.
     let second_outcome = second.await;
     assert_eq!(
         second_outcome.expect("the seat must come back once the abandoned child is reaped"),
@@ -526,40 +563,79 @@ async fn an_aborted_delivery_task_does_not_hand_the_seat_on_while_its_child_stil
         "the second delivery entered its push body at {acquired:?}, before the aborted delivery's \
          child was last seen alive at {last_alive_at:?}"
     );
+
+    // THE KILL, READ FROM THE ASK THAT CARRIED IT.
+    let asks = asks.lock().expect("asks").clone();
+    let last_ask = asks
+        .iter()
+        .copied()
+        .max()
+        .expect("the executor asked about this delivery's authority at least once");
+    assert!(
+        last_ask > aborted_at,
+        "the executor never asked about this delivery again after the abort, so whatever killed the \
+         child was not the abort being acted on"
+    );
+    let kill_after = last_ask.saturating_duration_since(aborted_at);
+    let stopped_after = child_gone_at.saturating_duration_since(aborted_at);
     let handover = acquired.saturating_duration_since(aborted_at);
     // What was actually still owed to this delivery when its task was aborted. Deadline cleanup
-    // cannot beat this number; abort cleanup must.
+    // cannot issue its kill before this has elapsed; abort cleanup must issue it long before.
     let remaining_at_abort = deadline.saturating_duration_since(aborted_at);
+
+    // THE NUMBERS, PRINTED. `cargo test ... -- --nocapture` reproduces the measurement rather than
+    // the claim.
     eprintln!(
-        "MEASURED abort_to_handover={handover:?} remaining_at_abort={remaining_at_abort:?}          budget={budget:?} samples_pending={samples}"
+        "MEASURED abort_to_refusing_ask={kill_after:?} abort_to_child_gone={stopped_after:?} \
+         abort_to_handover={handover:?} remaining_at_abort={remaining_at_abort:?} budget={budget:?} \
+         samples_pending={samples} asks={}",
+        asks.len()
     );
-    // AND THE SEAT DID NOT WAIT OUT THE CLOCK. An abort that left the child to be stopped by its
-    // deadline would still satisfy everything above; it would also mean a cancelled request parks
-    // the seller's only delivery seat for the whole budget. The dropped turn control is acted on
-    // within the executor's own poll, and the reap follows inside its own bound.
+
+    // THE ABORT WAS ACTED ON AT THE POLL, NOT AT THE DEADLINE. The refusing ask is the kill; the
+    // executor states one [`CANCELLATION_POLL`] between asks, and the second of slack is for a
+    // blocking thread that has to be scheduled to make it. Both halves are asserted: against the
+    // stated bound, and — the discriminator — against what the delivery still had, by a margin.
+    // Half is not arbitrary: deadline cleanup cannot kill before `remaining_at_abort` has elapsed,
+    // so anything near it is indistinguishable and this gate refuses to call it.
     assert!(
-        handover < CANCELLATION_POLL + REAP_BOUND + Duration::from_secs(2),
-        "the seat took {handover:?} to come back after an abort, past the poll and reap bounds          this executor states"
+        kill_after < CANCELLATION_POLL + Duration::from_secs(1),
+        "the executor asked about this delivery {kill_after:?} after the abort, past the \
+         {CANCELLATION_POLL:?} poll it states; the dropped turn control was not acted on at the poll"
     );
-    // AGAINST THE REMAINING DEADLINE, NOT THE WHOLE BUDGET. `handover < budget` was not the
-    // discriminator it read as: the abort happens after the child is up, so some of the budget is
-    // already gone by then, and a seat released by ORDINARY DEADLINE CLEANUP hands over in
-    // `remaining_at_abort + reap` — which can be comfortably under the full initial budget. The
-    // comparison that separates the two is against what was still owed at the moment of the abort.
+    assert!(
+        kill_after * 2 < remaining_at_abort,
+        "the kill came {kill_after:?} after the abort with {remaining_at_abort:?} still left on the \
+         original deadline; at that margin this gate cannot tell abort cleanup from deadline cleanup"
+    );
+    assert!(
+        child_gone_at < deadline,
+        "the child was still alive at the original deadline; deadline cleanup, not the abort, is \
+         what ended it. kill_after={kill_after:?} remaining_at_abort={remaining_at_abort:?}"
+    );
+    // THE EXIT WAS CONFIRMED INSIDE THE REAP BOUND. The child is one process, killed from the ask
+    // above; the reap that confirms it is budgeted at [`REAP_BOUND`], and an unconfirmed exit
+    // would have retained the seat instead of handing it on.
+    assert!(
+        child_gone_at.saturating_duration_since(last_ask) < REAP_BOUND,
+        "the child was seen gone only {:?} after the kill, past the {REAP_BOUND:?} reap bound",
+        child_gone_at.saturating_duration_since(last_ask)
+    );
+    // THE SEAT CAME BACK INSIDE THE EXECUTOR'S FULL STATEMENT: one poll to see the dropped control,
+    // one reap window for the exit, one for end of file on the child's stdout, and slack for the
+    // threads that carry those facts to be scheduled.
+    assert!(
+        handover < CANCELLATION_POLL + 2 * REAP_BOUND + Duration::from_secs(2),
+        "the seat took {handover:?} to come back after an abort, past the poll, reap and end-of-file \
+         bounds this executor states"
+    );
+    // AND BEFORE THE DEADLINE. The fixture is one process, so its stdout closes with its exit and the
+    // end-of-file window closes with the reap: a cancelled request does not park the seller's only
+    // delivery seat for the rest of its budget.
     assert!(
         acquired < deadline,
-        "the seat came back at or after this delivery's ORIGINAL DEADLINE, which is what ordinary          deadline cleanup does; an abort must release it earlier. handover={handover:?}          remaining_at_abort={remaining_at_abort:?}"
-    );
-    assert!(
-        handover < remaining_at_abort,
-        "the handover took {handover:?} with {remaining_at_abort:?} still left on the original          deadline; that is deadline cleanup wearing an abort's name"
-    );
-    // And by a MARGIN, so a deadline that happened to fall moments after the abort cannot pass for
-    // one. Half is not arbitrary: the abort path is bounded by the cancellation poll plus the reap,
-    // while deadline cleanup cannot start before the deadline, so anything near `remaining_at_abort`
-    // is indistinguishable and this gate refuses to call it.
-    assert!(
-        handover * 2 < remaining_at_abort,
-        "the handover ({handover:?}) is not clearly shorter than the {remaining_at_abort:?} the          delivery still had; at that margin this gate cannot tell abort cleanup from deadline cleanup"
+        "the seat came back at or after this delivery's ORIGINAL DEADLINE, which is what ordinary \
+         deadline cleanup does; an abort must release it earlier. handover={handover:?} \
+         remaining_at_abort={remaining_at_abort:?}"
     );
 }
