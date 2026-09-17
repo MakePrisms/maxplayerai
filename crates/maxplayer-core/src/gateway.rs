@@ -183,6 +183,21 @@ impl EventDraft {
     }
 }
 
+/// Param name for the buyer's accepted delivery modes, emitted as
+/// `["param", "accepts-delivery", <mode>, …]` on the OFFER.
+///
+/// ABSENT MEANS GIT-ONLY. A buyer that never heard of inline delivery emits no tag, so a seller
+/// reading the offer cannot conclude it may answer inline, and every offer posted before this
+/// existed stays byte-identical. The declaration is therefore fail-closed by construction: a seller
+/// sends inline only where the buyer said, on the signed offer, that it can read one.
+pub const ACCEPTS_DELIVERY_PARAM: &str = "accepts-delivery";
+
+/// Wire label for git delivery — a tree pushed to a remote, named by repo/branch/commit.
+pub const DELIVERY_MODE_GIT: &str = "git";
+
+/// Wire label for inline delivery — the answer carried in the result event's own content.
+pub const DELIVERY_MODE_INLINE: &str = "inline";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OfferDraft {
     pub task: String,
@@ -207,6 +222,9 @@ pub struct OfferDraft {
     /// How this job settles (§1.1). [`PaymentMode::Sat`] — the default — emits NO tag at all, so a
     /// priced offer stays byte-identical to one built before the free lane existed.
     pub payment_mode: PaymentMode,
+    /// Delivery modes this buyer can READ, as `["param", "accepts-delivery", …]`. Empty ⇒ no tag,
+    /// which every reader must treat as git-only — see [`ACCEPTS_DELIVERY_PARAM`].
+    pub accepts_delivery: Vec<String>,
 }
 
 impl OfferDraft {
@@ -228,6 +246,7 @@ impl OfferDraft {
             requested_model: None,
             required_capabilities: Vec::new(),
             payment_mode: PaymentMode::Sat,
+            accepts_delivery: Vec::new(),
         }
     }
 
@@ -248,6 +267,7 @@ impl OfferDraft {
             requested_model: None,
             required_capabilities: Vec::new(),
             payment_mode: PaymentMode::Sat,
+            accepts_delivery: Vec::new(),
         }
     }
 
@@ -315,6 +335,25 @@ impl OfferDraft {
         self
     }
 
+    /// Declare the delivery modes this buyer can read. Values are trimmed and de-duplicated;
+    /// an empty result emits no tag, which every reader treats as git-only.
+    pub fn accepting_delivery<I, V>(mut self, modes: I) -> Self
+    where
+        I: IntoIterator<Item = V>,
+        V: AsRef<str>,
+    {
+        let mut kept: Vec<String> = Vec::new();
+        for mode in modes {
+            let stated = mode.as_ref().trim();
+            if stated.is_empty() || kept.iter().any(|seen| seen == stated) {
+                continue;
+            }
+            kept.push(stated.to_owned());
+        }
+        self.accepts_delivery = kept;
+        self
+    }
+
     pub fn to_event_draft(&self) -> EventDraft {
         // The offer does not name a mint — the seller authors the accepted mint(s) in its claim
         // `creq`, so there is no `["mint", …]` tag here.
@@ -352,6 +391,14 @@ impl OfferDraft {
         if !self.required_capabilities.is_empty() {
             let mut values = vec!["param".to_owned(), crate::heartbeat::CAPABILITY_PARAM.to_owned()];
             values.extend(self.required_capabilities.iter().cloned());
+            tags.push(TagSpec(values));
+        }
+        // The accepted-delivery declaration, emitted ONLY when the buyer names a mode, for the
+        // same reason as the two blocks above: an offer that declares nothing stays byte-identical
+        // to one posted before inline delivery existed, and a seller reading it sees git-only.
+        if !self.accepts_delivery.is_empty() {
+            let mut values = vec!["param".to_owned(), ACCEPTS_DELIVERY_PARAM.to_owned()];
+            values.extend(self.accepts_delivery.iter().cloned());
             tags.push(TagSpec(values));
         }
         // §1.1 — the payment-mode param, emitted ONLY for the free mode. `Sat` states itself by
@@ -393,11 +440,25 @@ pub struct ParsedOffer {
     /// direction and the reason there is no version bump.
     #[serde(default)]
     pub payment_mode: PaymentMode,
+    /// Delivery modes this buyer declared it can READ, from
+    /// `["param","accepts-delivery", …]`. Empty ⇒ git only — see [`ACCEPTS_DELIVERY_PARAM`].
+    /// `serde(default)` so an offer stored before this existed loads as git-only, which is the
+    /// fail-closed direction and the reason there is no version bump.
+    #[serde(default)]
+    pub accepts_delivery: Vec<String>,
 }
 
 impl ParsedOffer {
     pub fn is_targeted(&self) -> bool {
         self.seller_pubkey.is_some()
+    }
+
+    /// True when this buyer said it can read an inline answer. A seller MUST gate on this before
+    /// it delivers one: a buyer that never declared the mode cannot verify or materialize it.
+    pub fn accepts_inline_delivery(&self) -> bool {
+        self.accepts_delivery
+            .iter()
+            .any(|mode| mode == DELIVERY_MODE_INLINE)
     }
 
     pub fn seller_matches(&self, seller_pubkey: &str) -> bool {
@@ -598,6 +659,7 @@ pub fn parse_offer(event: &EventDraft) -> Result<ParsedOffer, OfferParseError> {
             crate::heartbeat::HARNESS_MODEL_PARAM,
         )),
         required_capabilities: param_values(&event.tags, crate::heartbeat::CAPABILITY_PARAM),
+        accepts_delivery: param_values(&event.tags, ACCEPTS_DELIVERY_PARAM),
         // §1.1. Absent ⇒ `Sat`, so every offer already on the wire keeps parsing as PAID. The
         // `amount` tag above is deliberately untouched: a free offer still carries
         // `["amount","0","sat"]`, and `payment=none` is what makes that `0` mean "no payment leg
@@ -957,6 +1019,126 @@ pub fn git_result_draft(
         }),
         exec_metadata,
     )
+}
+
+/// True when the OFFER declares that this buyer can read `mode` deliveries.
+///
+/// FAIL-CLOSED: an offer with no `["param","accepts-delivery",…]` tag accepts git only, so this
+/// returns `false` for every other mode. A seller MUST gate an inline delivery on this.
+pub fn offer_accepts_delivery_mode(tags: &[TagSpec], mode: &str) -> bool {
+    if mode == DELIVERY_MODE_GIT {
+        return true;
+    }
+    param_values(tags, ACCEPTS_DELIVERY_PARAM)
+        .iter()
+        .any(|declared| declared == mode)
+}
+
+/// Kind-result draft for an INLINE delivery: the answer travels in the event's own content and
+/// there is no git object anywhere, so no `repo`/`branch`/`commit` tag is emitted.
+///
+/// §6.4 requires those three only alongside `["delivery","git"]`, so this shape is valid v1. The
+/// binding a git delivery gets from the commit oid is carried here by the co-signed preimage
+/// instead: [`crate::receipt::DeliveryKind::Inline`] over
+/// [`crate::receipt::result_content_hash_hex`] of this same content.
+pub fn inline_result_draft(
+    offer_id: &str,
+    buyer_pubkey: &str,
+    output: &str,
+    amount_sats: u64,
+    job_hash: &str,
+    seller_signature: &str,
+    answer: impl Into<String>,
+    exec_metadata: &[TagSpec],
+) -> EventDraft {
+    let mut tags = vec![
+        TagSpec::new(["e", offer_id, "", "root"]),
+        TagSpec::new(["p", buyer_pubkey]),
+        TagSpec::new(["delivery", DELIVERY_MODE_INLINE]),
+        TagSpec::new(["output", output]),
+        TagSpec::new(["amount", &amount_sats.to_string(), "sat"]),
+        TagSpec::new(["job-hash", job_hash]),
+        TagSpec::new(["sig", "seller", seller_signature]),
+    ];
+    // exec-metadata (seller-claimed, unsigned — sig/seller does NOT cover it), same as the git shape.
+    tags.extend(exec_metadata.iter().cloned());
+    tags.push(maxplayer_tag());
+    tags.push(version_tag());
+    EventDraft::new(JOB_RESULT_KIND, tags, answer)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InlineResultParseError {
+    WrongKind(u16),
+    MissingTag(&'static str),
+    /// Namespace guard: a result event without the `["t","maxplayer"]` tag.
+    MissingMaxplayerTag,
+    UnsupportedDelivery(String),
+    /// `delivery=inline` arriving with a git locator tag. The two shapes are exclusive: a reader
+    /// that tolerated both could be steered to verify one and materialize the other.
+    GitTagOnInline(&'static str),
+    /// An inline delivery whose content is empty. This is the inline analogue of the empty tree —
+    /// the node refuses it before publish, and the buyer refuses it again here.
+    EmptyContent,
+}
+
+impl fmt::Display for InlineResultParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WrongKind(kind) => write!(f, "expected kind {JOB_RESULT_KIND}, got {kind}"),
+            Self::MissingTag(tag) => write!(f, "missing required inline result tag {tag}"),
+            Self::MissingMaxplayerTag => write!(f, "missing t=maxplayer tag"),
+            Self::UnsupportedDelivery(delivery) => {
+                write!(f, "unsupported result delivery {delivery:?}")
+            }
+            Self::GitTagOnInline(tag) => {
+                write!(f, "inline delivery carries git tag {tag}")
+            }
+            Self::EmptyContent => write!(f, "inline delivery carries no answer"),
+        }
+    }
+}
+
+impl std::error::Error for InlineResultParseError {}
+
+/// Parses the buyer-visible answer carried by an INLINE result event.
+///
+/// Returns the answer exactly as delivered. The caller still verifies the co-signature over
+/// [`crate::receipt::result_content_hash_hex`] of it — this function proves the SHAPE, never the
+/// binding.
+pub fn parse_inline_result_delivery(
+    event: &EventDraft,
+) -> Result<String, InlineResultParseError> {
+    if event.kind != JOB_RESULT_KIND {
+        return Err(InlineResultParseError::WrongKind(event.kind));
+    }
+    if !has_tag_value(&event.tags, "t", MAXPLAYER_TAG) {
+        return Err(InlineResultParseError::MissingMaxplayerTag);
+    }
+    let delivery = first_tag_value(&event.tags, "delivery")
+        .ok_or(InlineResultParseError::MissingTag("delivery"))?;
+    if delivery != DELIVERY_MODE_INLINE {
+        return Err(InlineResultParseError::UnsupportedDelivery(
+            delivery.to_owned(),
+        ));
+    }
+    for git_tag in ["repo", "branch", "commit"] {
+        if first_tag_value(&event.tags, git_tag).is_some() {
+            let named = match git_tag {
+                "repo" => "repo",
+                "branch" => "branch",
+                _ => "commit",
+            };
+            return Err(InlineResultParseError::GitTagOnInline(named));
+        }
+    }
+    if first_tag_value(&event.tags, "job-hash").is_none() {
+        return Err(InlineResultParseError::MissingTag("job-hash"));
+    }
+    if event.content.trim().is_empty() {
+        return Err(InlineResultParseError::EmptyContent);
+    }
+    Ok(event.content.clone())
 }
 
 /// The protocol-v1 §10 feedback reason-code vocabulary. A `FEEDBACK` carries the code as an
@@ -1556,6 +1738,7 @@ mod tests {
             parse_offer(&draft).expect("parse offer"),
             ParsedOffer {
                 payment_mode: crate::gateway::PaymentMode::Sat,
+                accepts_delivery: Vec::new(),
                 task: "summarize".into(),
                 output: "application/json".into(),
                 amount: 3,
@@ -2236,5 +2419,131 @@ mod free_lane_tests {
         // And the version is untouched: a free offer speaks v1, so a v1 reader parses it.
         assert!(draft.tags.contains(&TagSpec::new(["v", PROTOCOL_VERSION])));
         assert_eq!(PROTOCOL_VERSION, "1", "the free lane ships with NO wire version bump");
+    }
+}
+
+#[cfg(test)]
+mod inline_delivery_tests {
+    use super::*;
+
+    // ── Inline delivery (answer jobs) ──────────────────────────────────────────────────────────
+
+    fn inline_offer() -> OfferDraft {
+        OfferDraft::untargeted("list the dotnet CLIs on your PATH", "text/plain", 2, 1_800_000_000)
+            .accepting_delivery([DELIVERY_MODE_INLINE])
+    }
+
+    /// The declaration is OPT-IN on the wire: an offer that names no mode emits no tag at all, so
+    /// an offer posted before inline delivery existed stays byte-identical to one posted now.
+    #[test]
+    fn an_offer_that_declares_nothing_emits_no_accepts_delivery_tag_and_reads_as_git_only() {
+        let draft = OfferDraft::untargeted("task", "text/plain", 2, 1_800_000_000).to_event_draft();
+        assert!(
+            !draft
+                .tags
+                .iter()
+                .any(|tag| tag.0.get(1).map(String::as_str) == Some(ACCEPTS_DELIVERY_PARAM)),
+            "an undeclared offer must carry no accepts-delivery tag: {:?}",
+            draft.tags
+        );
+        let parsed = parse_offer(&draft).expect("parses");
+        assert!(parsed.accepts_delivery.is_empty());
+        assert!(
+            !parsed.accepts_inline_delivery(),
+            "absent MUST read as git-only — this is the fail-closed direction"
+        );
+        assert!(
+            !offer_accepts_delivery_mode(&draft.tags, DELIVERY_MODE_INLINE),
+            "a seller reading an undeclared offer must not conclude it may answer inline"
+        );
+        assert!(
+            offer_accepts_delivery_mode(&draft.tags, DELIVERY_MODE_GIT),
+            "git needs no declaration — it is the mode every buyer can already read"
+        );
+    }
+
+    #[test]
+    fn a_declaring_offer_round_trips_the_mode_through_parse() {
+        let draft = inline_offer().to_event_draft();
+        let parsed = parse_offer(&draft).expect("parses");
+        assert_eq!(parsed.accepts_delivery, vec![DELIVERY_MODE_INLINE.to_owned()]);
+        assert!(parsed.accepts_inline_delivery());
+        assert!(offer_accepts_delivery_mode(&draft.tags, DELIVERY_MODE_INLINE));
+    }
+
+    /// §6.4: `repo`/`branch`/`commit` are required only alongside `["delivery","git"]`, so an
+    /// inline result carries none of them and is still a valid v1 result.
+    #[test]
+    fn an_inline_result_carries_the_answer_and_no_git_locator() {
+        let draft = inline_result_draft(
+            "offer-1",
+            "buyer-pubkey",
+            "text/plain",
+            2,
+            "job-hash-1",
+            "seller-sig",
+            "dotnet 10.0.401 at /usr/local/bin/dotnet",
+            &[],
+        );
+        assert!(draft.tags.contains(&TagSpec::new(["delivery", DELIVERY_MODE_INLINE])));
+        for absent in ["repo", "branch", "commit"] {
+            assert!(
+                first_tag_value(&draft.tags, absent).is_none(),
+                "an inline result must not carry {absent}"
+            );
+        }
+        // The tags a buyer settles on are present, exactly as on the git shape.
+        assert!(draft.tags.contains(&TagSpec::new(["job-hash", "job-hash-1"])));
+        assert!(draft.tags.contains(&TagSpec::new(["amount", "2", "sat"])));
+        assert!(draft.tags.contains(&TagSpec::new(["sig", "seller", "seller-sig"])));
+        assert_eq!(
+            parse_inline_result_delivery(&draft).expect("parses"),
+            "dotnet 10.0.401 at /usr/local/bin/dotnet"
+        );
+    }
+
+    /// The inline analogue of the empty tree. A quota-dead agent emits no message, so there is
+    /// nothing to publish — and the buyer refuses the same shape again on arrival.
+    #[test]
+    fn an_inline_result_with_no_answer_is_refused() {
+        let draft = inline_result_draft(
+            "offer-1", "buyer-pubkey", "text/plain", 2, "job-hash-1", "seller-sig", "   \n ", &[],
+        );
+        assert_eq!(
+            parse_inline_result_delivery(&draft),
+            Err(InlineResultParseError::EmptyContent)
+        );
+    }
+
+    /// The two delivery shapes are exclusive. A reader that tolerated both could be steered to
+    /// verify one and materialize the other.
+    #[test]
+    fn a_git_result_is_not_readable_as_inline_and_a_mixed_shape_is_refused() {
+        let git = git_result_draft(
+            "offer-1", "buyer-pubkey", "https://relay.test/git/s/r.git", "maxplayer/abcd1234",
+            &"d".repeat(40), 2, "job-hash-1", "seller-sig", "delivery commit", &[],
+        );
+        assert_eq!(
+            parse_inline_result_delivery(&git),
+            Err(InlineResultParseError::UnsupportedDelivery("git".to_owned()))
+        );
+
+        let mut mixed = inline_result_draft(
+            "offer-1", "buyer-pubkey", "text/plain", 2, "job-hash-1", "seller-sig", "answer", &[],
+        );
+        mixed.tags.push(TagSpec::new(["commit", &"d".repeat(40)]));
+        assert_eq!(
+            parse_inline_result_delivery(&mixed),
+            Err(InlineResultParseError::GitTagOnInline("commit"))
+        );
+    }
+
+    /// The signed kind is what keeps the two integrity hashes apart: both slots are hex digests,
+    /// and only `delivery_kind` says which preimage a digest is a digest OF.
+    #[test]
+    fn the_inline_delivery_kind_has_its_own_wire_label() {
+        use crate::receipt::DeliveryKind;
+        assert_eq!(DeliveryKind::Inline.as_str(), "inline");
+        assert_ne!(DeliveryKind::Inline.as_str(), DeliveryKind::Fork.as_str());
     }
 }

@@ -15,14 +15,19 @@ pub const RECEIPT_PREIMAGE_DOMAIN: &str = "maxplayer/v1/receipt-preimage";
 /// exec-metadata is folded into the co-signature (the default today — see the type doc).
 pub const EXEC_METADATA_COMMITMENT_EMPTY: &str = "none";
 
-/// Delivered git object kind bound (non-forgeably) into the co-signed receipt preimage.
+/// Delivered object kind bound (non-forgeably) into the co-signed receipt preimage.
 ///
 /// In the preimage the kind is a signed field, so an unsigned path cannot be flipped to
-/// reinterpret the same 40-hex as a different object kind. Live delivery is fork-only.
+/// reinterpret the same integrity hash as a different object kind. That property is the reason
+/// [`Inline`](Self::Inline) is safe to add beside [`Fork`](Self::Fork): both slots carry a 64-hex
+/// digest, and only the signed kind says which preimage it is a digest OF.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeliveryKind {
-    /// Fork-tip `commit_oid` (git delivery — the only live kind).
+    /// Fork-tip `commit_oid` (git delivery).
     Fork,
+    /// Inline answer carried in the result event's own content, with no git object anywhere.
+    /// `delivery_integrity_hash` is then [`result_content_hash_hex`] over that content.
+    Inline,
 }
 
 impl DeliveryKind {
@@ -30,6 +35,7 @@ impl DeliveryKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Fork => "fork",
+            Self::Inline => "inline",
         }
     }
 }

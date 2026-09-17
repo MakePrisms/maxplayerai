@@ -454,12 +454,20 @@ reject a lifecycle event that lacks it.
 | `["param","harness_model", model]` | 0..1 | no | Requires one model; needs `agent` |
 | `["param","capability", token, ...]` | 0..1 | no | Requires every listed capability token |
 | `["param","payment","none"]` | 0..1 | no | This job has NO payment leg. Absent means `sat` |
+| `["param","accepts-delivery", mode, ...]` | 0..1 | no | Delivery modes this buyer can READ. Absent means `git` only |
 | `["delivery","git"]` | 0..1 | no | Delivery binding mode |
 | `["repo", locator]` | 0..1 | no | Bound delivery remote |
 | `["branch", name]` | 0..1 | no | Bound delivery branch |
 
 The `delivery`, `repo`, and `branch` tags bind delivery as one group. If the offer uses any of them,
 it MUST carry all three. A reader MUST reject a partial group.
+
+`["param","accepts-delivery", …]` is a different axis from that group: the group binds WHERE a git
+delivery goes, and this parameter states which delivery modes the buyer can read at all. **Absent
+MUST be read as `git` only.** A buyer that never heard of another mode emits no tag, so an offer
+posted before this parameter existed is byte-identical to one that declares nothing, and a seller
+reading either one cannot conclude it may deliver anything but git. The declaration is therefore
+fail-closed by construction, and a seller MUST gate a non-git delivery on it (§6.4).
 
 #### 6.1.1 The payment mode
 
@@ -616,6 +624,15 @@ its own signed offer stated (the both-ends rule, §6.1.1).
 | `["metadata_trust","seller-claimed"]` | 0..1 | no | Marks the block above as unverified |
 
 If the result carries `["delivery","git"]`, it MUST also carry `repo`, `branch`, and `commit`.
+
+`["delivery","inline"]` names the other mode: the deliverable is the event's own `content`, and
+there is no git object anywhere. An inline result MUST NOT carry `repo`, `branch`, or `commit` —
+the two shapes are exclusive, so a reader steered to verify one can never materialize the other. A
+reader MUST refuse an inline result whose `content` is empty.
+
+A seller MUST NOT deliver inline unless the offer declared the mode (§6.1). A buyer that declared
+nothing can only read git, so an undeclared inline delivery is unreadable by the party paying for
+it.
 
 The execution metadata block is what the seller reports about its own run. Nothing verifies it. A
 reader MUST NOT treat it as proof that a given harness or model ran.
@@ -781,8 +798,20 @@ MUST NOT write that output to an ignored path.
 
 ### 8.2 Execution sentinel
 
-Every delivery MUST carry an execution sentinel at the reserved path
+Every **tree** delivery MUST carry an execution sentinel at the reserved path
 `MAXPLAYER_EXECUTION_SENTINEL`, inside the delivered tree.
+
+An inline delivery (§6.4) has no tree, so it carries no sentinel and the `no_sentinel` refusal does
+not apply to it. Nothing is weakened by that: the sentinel exists to tie a tree — which arrives
+through a remote, detached from the event announcing it — back to this job and to the node that
+snapshotted it. An inline answer arrives inside the result event itself, already bound to the job by
+the `job-hash`, `e`-root and `sig/seller` tags §6.4 requires on every result, and the co-signed
+preimage binds its content hash under `delivery_kind = inline`. The tree's binding problem does not
+exist for it.
+
+The empty-tree refusal has an exact inline analogue, and it is stated in §6.4: an inline delivery
+with empty `content` is refused. That is the same guarantee — the node observed nothing — applied to
+the artifact that actually exists.
 
 The sentinel is a structured execution manifest. It is not a transcript, and it MUST NOT carry the
 agent conversation.

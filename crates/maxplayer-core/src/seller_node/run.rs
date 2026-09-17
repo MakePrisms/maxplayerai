@@ -2071,6 +2071,11 @@ fn offer_row(job_id: &str, buyer_pubkey: &str, offer: &ParsedOffer) -> super::st
         // job eventually writes must state the mode the OFFER was posted under, and execution can
         // be a restart away from here.
         payment_mode: offer.payment_mode,
+        // The buyer's accepted-delivery declaration, journaled for exactly the same reason: the
+        // delivering job decides between a git push and an inline answer from THIS, and that
+        // decision can be a restart away from here. Dropped, every resumed job would fall back to
+        // git-only and refuse an answer the buyer said it could read.
+        accepts_delivery: offer.accepts_delivery.clone(),
     }
 }
 
@@ -4689,6 +4694,7 @@ impl SellerNodeRunner {
                 task: row.task.clone(),
                 output: String::new(),
                 payment_mode: row.payment_mode,
+                accepts_delivery: row.accepts_delivery.clone(),
                 amount: row.amount_sats,
                 unit: row.unit.clone(),
                 deadline_unix: row.deadline_unix as u64,
@@ -7535,6 +7541,110 @@ impl SellerNodeRunner {
             self.agents
                 .record_model(harness, usage.as_ref().and_then(|u| u.model.clone()));
 
+            // ── Inline delivery (§6.4) ─────────────────────────────────────────────────────────
+            // An ANSWER job has nothing to commit. Its deliverable is the agent's reply, and the
+            // snapshot below would refuse the empty tree that reply leaves behind — correctly, by
+            // the execution-observed gate, which cannot tell "the agent did nothing" from "the
+            // agent answered instead of writing". So when the BUYER declared it can read an inline
+            // result, and the agent actually said something, the answer IS the delivery: no
+            // snapshot, no commit, no push, no remote.
+            //
+            // The declaration is the whole gate, and it is fail-closed: an offer that declares
+            // nothing accepts git only (§6.1), so this arm cannot fire on a buyer that could not
+            // verify what it received. A job that wrote files still takes the git path below —
+            // this is a mode for answers, not a shortcut around delivery.
+            if offer
+                .accepts_delivery
+                .iter()
+                .any(|mode| mode == gateway::DELIVERY_MODE_INLINE)
+            {
+                if let Some(answer) = report
+                    .last_agent_message
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|answer| !answer.is_empty())
+                {
+                    let preimage = delivery_receipt_preimage(
+                        job_id,
+                        &offer.task,
+                        offer.amount_sats,
+                        &offer.buyer_pubkey,
+                        &seller_pubkey,
+                        // The inline analogue of the delivered commit oid: the digest of the answer
+                        // this very result carries. Both slots are hex; `delivery_kind` right below
+                        // is the SIGNED field that says which one this is, so no unsigned path can
+                        // re-read an answer digest as a commit.
+                        &crate::receipt::result_content_hash_hex(answer),
+                        crate::receipt::DeliveryKind::Inline.as_str(),
+                        creq_terms(&stored_creq),
+                    );
+                    let seller_sig = match self
+                        .node
+                        .signer()
+                        .sign_receipt_hash(preimage.digest_hex())
+                        .await
+                    {
+                        Ok(Ok(sig)) => sig,
+                        Ok(Err(error)) => {
+                            opline!("seller node execute fail job_id={job_id}: inline receipt sign refused ({error})");
+                            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+                            return;
+                        }
+                        Err(error) => {
+                            opline!("seller node execute fail job_id={job_id}: signer actor gone ({error})");
+                            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+                            return;
+                        }
+                    };
+                    let exec_metadata = seller_exec_metadata(
+                        &agent_command,
+                        agent_label.as_deref(),
+                        wall_time_ms,
+                        usage.as_ref(),
+                    );
+                    let draft = gateway::inline_result_draft(
+                        job_id,
+                        &offer.buyer_pubkey,
+                        // The buyer's declared output type. A row written before that column
+                        // existed states none, and text/plain is the shape an answer takes.
+                        offer.output.as_deref().unwrap_or("text/plain"),
+                        offer.amount_sats,
+                        &preimage.job_hash,
+                        &seller_sig,
+                        answer,
+                        &exec_metadata,
+                    );
+                    let now = now_unix();
+                    // `result_ref` records WHAT was delivered. For git that is the commit; here it
+                    // is the answer digest the co-signature binds, so the journal names the same
+                    // artifact the buyer will verify.
+                    match self.node.store().deliver_and_enqueue(
+                        job_id,
+                        &preimage.delivery_integrity_hash,
+                        offer.payment_mode,
+                        &draft,
+                        now,
+                        now + RESULT_PUBLISH_WINDOW_SECS,
+                        now,
+                    ) {
+                        Ok(true) => opline!(
+                            "seller node delivered job_id={job_id} inline bytes={} result enqueued",
+                            answer.len()
+                        ),
+                        Ok(false) => opline!(
+                            "seller node execute job_id={job_id}: delivery already journaled (dedup no-op)"
+                        ),
+                        Err(error) => {
+                            opline!("seller node execute fail job_id={job_id}: deliver journal failed ({error})");
+                            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+                            return;
+                        }
+                    }
+                    self.drain().await;
+                    return;
+                }
+            }
+
             // Snapshot the agent's final workdir tree into ONE delivery commit at the stored author date.
             // §19: the snapshot writes the execution sentinel into the delivered tree, seeded from this
             // job's job_hash (replay-resistant; the buyer holds the same value on its accept-bind). When
@@ -8533,6 +8643,10 @@ impl SellerNodeRunner {
             // but the mode is carried from the stored row rather than assumed, so a free job that
             // somehow reached here is judged as free, not as paid.
             payment_mode: offer.payment_mode,
+            // Carried from the stored row for the same reason as the mode above: this
+            // reconstruction is what the rest of the path reads, so a dropped field is a field
+            // that does not exist for the job.
+            accepts_delivery: offer.accepts_delivery.clone(),
             amount: offer.amount_sats,
             unit: offer.unit.clone(),
             deadline_unix: offer.deadline_unix.max(0) as u64,
@@ -9560,6 +9674,7 @@ mod tests {
     fn offer(amount: u64, targeted_to: Option<&str>, deadline_unix: u64) -> ParsedOffer {
         ParsedOffer {
             payment_mode: crate::gateway::PaymentMode::Sat,
+            accepts_delivery: Vec::new(),
             task: "do the thing".to_owned(),
             output: String::new(),
             amount,
@@ -11132,6 +11247,7 @@ mod tests {
                         targeted: true,
                         requested_agent: Some("codex".to_owned()),
                         output: Some("text/plain".to_owned()),
+                        accepts_delivery: Vec::new(),
                     },
                     1,
                 )
@@ -13382,6 +13498,7 @@ mod tests {
                     targeted: true,
                     requested_agent: None,
                     output: Some("text/plain".to_owned()),
+                    accepts_delivery: Vec::new(),
                 },
                 now,
             )
@@ -14399,6 +14516,7 @@ mod tests {
                     targeted: true,
                     requested_agent: None,
                     output: Some("text/plain".to_owned()),
+                    accepts_delivery: Vec::new(),
                 },
                 1,
             )
@@ -14437,6 +14555,7 @@ mod tests {
                     targeted: false,
                     requested_agent: None,
                     output: Some("text/plain".to_owned()),
+                    accepts_delivery: Vec::new(),
                 },
                 1,
             )
@@ -14554,6 +14673,7 @@ mod tests {
                             targeted: true,
                             requested_agent: None,
                             output: Some("text/plain".to_owned()),
+                            accepts_delivery: Vec::new(),
                         },
                         1,
                     )
