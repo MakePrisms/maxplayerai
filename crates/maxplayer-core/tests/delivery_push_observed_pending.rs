@@ -18,6 +18,10 @@
 //! The signing key stays in the actor the parent calls. Both halves of that sentence are load
 //! bearing and neither is weakened by the other.
 
+// Gated like its siblings: everything below needs `seller_node` and the delivery executor, which
+// exist only with the `wallet` feature (and `libc`, which comes with it).
+#![cfg(feature = "wallet")]
+
 mod wedge;
 
 use std::future::Future;
