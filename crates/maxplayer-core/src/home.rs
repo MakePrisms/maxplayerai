@@ -656,6 +656,27 @@ pub struct SandboxConfig {
     /// placeholder-and-substitute mechanism cover it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub file_credentials: Vec<FileCredential>,
+    /// `docker` mode: vendor-hosted MCP servers this seat offers to its jobs through the #647
+    /// proxy — the Proxy swap route of the seller-tool onboarding
+    /// (`docs/specs/seller-tool-onboarding/10-routing-and-options.md`). Empty ⇒ no such tool, which
+    /// is the shipped behaviour.
+    ///
+    /// The vendor credential never enters the container. Per job the host reads it from the named
+    /// file, mints a placeholder, registers the pair on the proxy, and hands the job an MCP server
+    /// entry that carries only the placeholder and the proxy's address. See [`McpToolConfig`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_tools: Vec<McpToolConfig>,
+    /// `docker` mode: the vendor CLIs this seat holds logged in, each in its own persistent holder
+    /// container, and offers to every job over a per-job Unix socket per tool — the Holder route of
+    /// the seller-tool onboarding (`docs/specs/seller-tool-onboarding/10-routing-and-options.md`;
+    /// the kit is `crates/maxplayer-tool-kit`). Empty ⇒ no held tool, the shipped behaviour.
+    ///
+    /// The credential and the vendor's login state live in the holder container, never in a job
+    /// container. A job gets exactly two things from each holder: its own socket for that tool, and
+    /// the operations the seller declared. Each entry's `server_name` is what the agent sees, and it
+    /// must be unique across this list and `mcp_tools`. See [`HeldToolConfig`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held_tools: Vec<HeldToolConfig>,
     /// `docker` mode: use a host Codex ChatGPT session through the per-job proxy.
     ///
     /// The auth file stays on the host. The container receives only per-job placeholders through the
@@ -763,6 +784,126 @@ pub struct CodexChatgptConfig {
     /// Absolute path to the Codex `auth.json` file. The file is read before each run and is never
     /// mounted into the job container.
     pub auth_file: PathBuf,
+}
+
+/// One vendor-hosted MCP server a docker seat offers to its jobs through the credential proxy — the
+/// Proxy swap route (`docs/specs/seller-tool-onboarding/10-routing-and-options.md`).
+///
+/// The job never holds the vendor credential. Per job the host reads the real value from
+/// `credential`, mints a placeholder, and registers `(placeholder → real, upstream)` on the #647
+/// proxy. The job's MCP client speaks to the proxy with the placeholder in its `Authorization:
+/// Bearer` header; the proxy swaps the real value in at egress, only for this vendor's host, only
+/// for the life of the job. A leaked placeholder is worthless: the vendor rejects it directly, and
+/// the proxy forgets it when the job ends.
+///
+/// The proxy constrains the DESTINATION, not the operations. A credential the vendor scoped to the
+/// job's resources (a read-only fine-grained token on one repository) is safe behind it; a broad
+/// credential is not, and nothing here narrows it. Scope the credential at the vendor.
+///
+/// `deny_unknown_fields`, like every `[sandbox]` table: a misspelled key is a config error at boot,
+/// not a tool that silently never appears.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpToolConfig {
+    /// The MCP server name the agent sees (`mcpServers[].name`). ASCII letters, digits, `_` and
+    /// `-` only; unique across the list. Checked in
+    /// [`crate::seller_exec::SandboxPolicy::from_config`].
+    pub name: String,
+    /// The vendor's MCP endpoint, scheme and host included (e.g.
+    /// `https://api.githubcopilot.com/mcp/`). Its scheme + authority is the ONE upstream the
+    /// credential may be substituted for; its path is what the job's client posts to, through the
+    /// proxy. `http://` is accepted for a test double on loopback and nothing else.
+    pub url: String,
+    /// Where the real credential lives on the host, and which JSON field holds it. The same two
+    /// fields as [`FileCredential`], read by the same code, per job. The file is never mounted into
+    /// the container.
+    pub credential: CredentialFile,
+    /// How the job's agent reaches the proxy. Omitted ⇒ [`McpToolTransport::Stdio`].
+    #[serde(default)]
+    pub transport: McpToolTransport,
+}
+
+/// One vendor CLI a docker seat holds logged in for its jobs — the Holder route
+/// (`[[sandbox.held_tools]]`).
+///
+/// The seller daemon runs ONE holder container per entry for the daemon's whole life: `tool-holderd`
+/// from `crates/maxplayer-tool-kit`, plus the vendor's own CLI, in an image the seller builds. The
+/// holder enrols once at boot (or resumes the login it persisted in its state volume), then serves
+/// the seller-declared operations to each job over that job's own Unix socket. A job's agent reaches
+/// it through `tool-mcp-bridge`, baked into the sandbox image. Job end detaches the socket; the tool
+/// stays enrolled. Daemon stop takes the tool away; nothing else does. Several entries mean several
+/// holders, each with its own image, credential, login and volumes; a job gets one socket per tool,
+/// mounted at `/run/holder/<server_name>`.
+///
+/// What never enters a job container: this credential file, the holder's state volume (the vendor
+/// login), and the holder's runtime volume beyond the one `jobs/<job>` directory that holds the
+/// job's socket. Every path here is a HOST path and is refused unless absolute, for the same reason
+/// [`FileCredential::path`] gives.
+///
+/// Needs Docker Engine 26 or newer: the per-job socket reaches the job through a volume subpath
+/// mount, which is what lets one long-lived holder serve jobs that did not exist when it started.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeldToolConfig {
+    /// The MCP server name the agent sees (`mcp__<server_name>__<operation>` in Claude Code). ASCII
+    /// letters, digits, `_` and `-`; unique across `held_tools` and `mcp_tools`. It also names the
+    /// holder container and its volumes, and the job's socket directory `/run/holder/<server_name>`.
+    pub server_name: String,
+    /// The holder image: `tool-holderd`, `holderctl` and the vendor CLI on `PATH`, built by the
+    /// seller (`FROM` the kit image, or with its binaries copied in). The kit's own demo image
+    /// (`crates/maxplayer-tool-kit/docker/Dockerfile`) is the reference.
+    pub image: String,
+    /// Host path to the seller-tool config JSON — the offering: the operations, their parameters,
+    /// the vendor base URL. Mounted read-only into the holder. See
+    /// `crates/maxplayer-tool-kit/templates/README.md`.
+    pub config: PathBuf,
+    /// Host path to the vendor credential the holder enrols with. Mounted read-only into the holder
+    /// container ONLY; a job container never sees it.
+    pub credential_file: PathBuf,
+    /// Overrides the config JSON's `vendor_base_url` (e.g. to point a test seat at a fake vendor).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor_base_url: Option<String>,
+    /// The vendor CLI inside the holder image, when it is not `vendor-cli` on `PATH`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor_cli: Option<String>,
+    /// The docker network the holder joins, so it can reach the vendor. Omitted ⇒ the daemon
+    /// default. The holder is the seller's trusted component; it is NOT egress-contained the way a
+    /// job is, because it has to reach the vendor by design.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    /// Refuse to boot when the holder cannot start or enrol, and refuse a job when it cannot be
+    /// attached. Default false: the seat boots and logs the tool as unavailable, and a job runs
+    /// without it — the same posture a vendor outage would give.
+    #[serde(default)]
+    pub required: bool,
+}
+
+/// A host file holding one credential in a top-level JSON string field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialFile {
+    /// ABSOLUTE host path. A relative path is refused rather than resolved, for the reason
+    /// [`FileCredential::path`] gives.
+    pub path: PathBuf,
+    /// The top-level JSON field holding the credential (e.g. `token`). Only this field is read.
+    pub field: String,
+}
+
+/// How a job's agent reaches a proxied vendor MCP server ([`McpToolConfig::transport`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpToolTransport {
+    /// The agent spawns `mcp-http-bridge`, baked into the sandbox image, as a stdio MCP server. The
+    /// bridge posts each JSON-RPC message to the proxy over HTTP with the placeholder as its bearer.
+    /// Works with every ACP harness that supports a stdio MCP server, which is all of them. The
+    /// default.
+    #[default]
+    Stdio,
+    /// The agent's own Streamable-HTTP MCP client connects to the proxy URL directly, with the
+    /// placeholder in an `Authorization` header the session config names. No bridge process.
+    /// `claude-agent-acp` maps this ACP shape (measured on 0.67.0); a harness that does not map it
+    /// gets no tool at all, so use this only where that is known.
+    Http,
 }
 
 /// One credential the proxy reads from a host file (#852).
@@ -2196,6 +2337,30 @@ fn documented_config_toml(config: &MaxplayerConfig) -> Result<String, HomeError>
 #   # image = "maxplayer-sandbox:latest" # LOCAL DEV: your locally-built tag (default GHCR ref is unpublished for dev)
 #   # forward_env = ["MY_AGENT_TOKEN"] # extra env names, atop the built-in auth allowlist
 #
+# Proxy swap - offer a vendor-hosted MCP server to jobs. The credential stays
+# on the host; the job holds a per-job placeholder that only the proxy can
+# redeem. Scope the credential AT THE VENDOR (read-only, one repository): the
+# proxy constrains the destination, not the operations. Repeat the table for
+# each tool. Docs: docs/specs/seller-tool-onboarding/10-routing-and-options.md
+#   [[sandbox.mcp_tools]]
+#   name = "github"                                      # the MCP server name the agent sees
+#   url = "https://api.githubcopilot.com/mcp/readonly"   # the vendor's MCP endpoint; GitHub's read-only one
+#   credential = { path = "/ABSOLUTE/path/github-mcp.json", field = "token" }  # host file, never mounted
+#   # transport = "stdio"                                # default; "http" only for a harness that maps it (claude)
+#
+# Holder - hold vendor CLIs logged in, each in its own persistent container, and
+# offer the operations you declare to every job over a per-job socket per tool.
+# The credential and the login stay in the holder; a job gets a socket and nothing
+# else. Build each holder image from the kit (crates/maxplayer-tool-kit) with the
+# vendor CLI inside. Repeat the table per tool; server_name must be unique. Needs
+# Docker Engine 26+. Docs: the kit's templates/README.md
+#   [[sandbox.held_tools]]
+#   server_name = "figma"                                 # the MCP server name the agent sees; names the holder too
+#   image = "my-figma-holder:latest"                      # tool-holderd + holderctl + the vendor CLI
+#   config = "/ABSOLUTE/path/figma-offering.json"         # the offering (operations, params, vendor URL)
+#   credential_file = "/ABSOLUTE/path/figma-cred.json"    # host file, mounted read-only into the holder only
+#   # required = false                                    # true: refuse to boot/run without the tool
+#
 # Option B - docker on macOS. Docker Desktop cannot load runsc, so OMIT the
 # runtime line; the platform VM is the boundary. Otherwise identical to A.
 #   [sandbox]
@@ -2769,6 +2934,15 @@ mod tests {
             "must show the Linux gVisor runtime line"
         );
         assert!(rendered.contains("macOS"), "must call out the macOS difference (omit runtime)");
+        // The Proxy swap example: an operator meets `[[sandbox.mcp_tools]]` here first.
+        assert!(
+            rendered.contains("[[sandbox.mcp_tools]]"),
+            "must show how to offer a vendor MCP server through the proxy"
+        );
+        assert!(
+            rendered.contains("[[sandbox.held_tools]]"),
+            "must show how to hold a vendor CLI in a holder container"
+        );
     }
 
     #[test]
@@ -3548,6 +3722,163 @@ mod tests {
         assert_eq!(cred.legs.len(), 1);
         assert_eq!(cred.legs[0].endpoint_args, vec!["--agent-endpoint".to_owned()]);
         assert_eq!(cred.legs[0].upstream, "https://agentn.global.api5.cursor.sh");
+    }
+
+    // ---- [[sandbox.mcp_tools]] — the Proxy swap route's config surface ---------------------------
+
+    #[test]
+    fn an_mcp_tool_parses_and_defaults_to_the_stdio_bridge() {
+        let config = parse_config_toml(
+            r#"
+            relay_url = "r"
+            per_job_budget_sats = 1
+            [sandbox]
+            mode = "docker"
+            [[sandbox.mcp_tools]]
+            name = "github"
+            url = "https://api.githubcopilot.com/mcp/"
+            credential = { path = "/home/seller/.config/maxplayer/github-mcp.json", field = "token" }
+            "#,
+        )
+        .expect("a proxied MCP tool must parse");
+        let sandbox = config.sandbox.expect("[sandbox] present");
+        assert_eq!(sandbox.mcp_tools.len(), 1);
+        let tool = &sandbox.mcp_tools[0];
+        assert_eq!(tool.name, "github");
+        assert_eq!(tool.url, "https://api.githubcopilot.com/mcp/");
+        assert_eq!(
+            tool.credential.path,
+            PathBuf::from("/home/seller/.config/maxplayer/github-mcp.json")
+        );
+        assert_eq!(tool.credential.field, "token");
+        assert_eq!(tool.transport, McpToolTransport::Stdio, "omitted transport is the bridge");
+    }
+
+    #[test]
+    fn an_mcp_tool_can_select_the_http_transport() {
+        let tool: McpToolConfig = toml::from_str(
+            r#"
+            name = "github"
+            url = "https://api.githubcopilot.com/mcp/"
+            transport = "http"
+            [credential]
+            path = "/abs/github-mcp.json"
+            field = "token"
+            "#,
+        )
+        .expect("the http transport must parse");
+        assert_eq!(tool.transport, McpToolTransport::Http);
+    }
+
+    // A misspelled key must be a config error, not a tool that never appears. Both tables are
+    // `deny_unknown_fields`.
+    #[test]
+    fn an_mcp_tool_with_an_unknown_key_is_refused() {
+        for (label, body) in [
+            (
+                "top-level typo",
+                r#"
+                name = "github"
+                url = "https://api.githubcopilot.com/mcp/"
+                credentials = { path = "/abs/x.json", field = "token" }
+                "#,
+            ),
+            (
+                "credential typo",
+                r#"
+                name = "github"
+                url = "https://api.githubcopilot.com/mcp/"
+                credential = { path = "/abs/x.json", feild = "token" }
+                "#,
+            ),
+        ] {
+            let error = toml::from_str::<McpToolConfig>(body)
+                .expect_err(&format!("{label}: an unknown key must be refused"));
+            assert!(
+                error.to_string().contains("unknown field"),
+                "{label}: the error must name the unknown field, got: {error}"
+            );
+        }
+    }
+
+    // A `[sandbox]` written before this field existed parses to an empty list, so no seat changes
+    // behaviour on upgrade.
+    #[test]
+    fn a_sandbox_without_mcp_tools_parses_to_none_offered() {
+        let config = parse_config_toml(
+            "relay_url = 'r'\nper_job_budget_sats = 1\n[sandbox]\nmode = \"docker\"\n",
+        )
+        .expect("a pre-mcp_tools sandbox must parse unchanged");
+        assert!(config.sandbox.expect("[sandbox] present").mcp_tools.is_empty());
+    }
+
+    // ---- [[sandbox.held_tools]] — the Holder route's config surface -------------------------------
+
+    #[test]
+    fn held_tools_parse_as_a_list_and_default_their_optional_fields() {
+        let config = parse_config_toml(
+            r#"
+            relay_url = "r"
+            per_job_budget_sats = 1
+            [sandbox]
+            mode = "docker"
+            [[sandbox.held_tools]]
+            server_name = "figma"
+            image = "my-figma-holder:latest"
+            config = "/etc/maxplayer/figma-offering.json"
+            credential_file = "/home/seller/.config/maxplayer/figma-cred.json"
+            [[sandbox.held_tools]]
+            server_name = "jira"
+            image = "my-jira-holder:latest"
+            config = "/etc/maxplayer/jira-offering.json"
+            credential_file = "/home/seller/.config/maxplayer/jira-cred.json"
+            required = true
+            "#,
+        )
+        .expect("held tools must parse");
+        let held = config.sandbox.expect("[sandbox]").held_tools;
+        assert_eq!(held.len(), 2);
+        assert_eq!(held[0].server_name, "figma");
+        assert_eq!(held[0].image, "my-figma-holder:latest");
+        assert_eq!(held[0].config, PathBuf::from("/etc/maxplayer/figma-offering.json"));
+        assert_eq!(held[0].vendor_base_url, None);
+        assert_eq!(held[0].vendor_cli, None);
+        assert_eq!(held[0].network, None);
+        assert!(!held[0].required, "a held tool is optional unless the seat says otherwise");
+        assert_eq!(held[1].server_name, "jira");
+        assert!(held[1].required);
+    }
+
+    #[test]
+    fn a_held_tool_without_a_server_name_or_with_an_unknown_key_is_refused() {
+        let error = toml::from_str::<HeldToolConfig>(
+            r#"
+            image = "my-holder:latest"
+            config = "/abs/c.json"
+            credential_file = "/abs/cred.json"
+            "#,
+        )
+        .expect_err("the server name is required");
+        assert!(error.to_string().contains("server_name"), "{error}");
+        let error = toml::from_str::<HeldToolConfig>(
+            r#"
+            server_name = "figma"
+            image = "my-holder:latest"
+            config = "/abs/c.json"
+            credential = "/abs/cred.json"
+            "#,
+        )
+        .expect_err("a misspelled key must be refused, not ignored");
+        assert!(error.to_string().contains("unknown field"), "{error}");
+    }
+
+    #[test]
+    fn a_sandbox_without_held_tools_parses_to_an_empty_list() {
+        let config = parse_config_toml(
+            "relay_url = 'r'\nper_job_budget_sats = 1\n[sandbox]\nmode = \"docker\"\n",
+        )
+        .expect("a pre-held_tools sandbox must parse unchanged");
+        assert!(config.sandbox.expect("[sandbox]").held_tools.is_empty());
     }
 
     #[test]

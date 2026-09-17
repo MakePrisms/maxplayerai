@@ -9,9 +9,10 @@ use std::fmt::{self, Display};
 pub use crate::event::RuntimeId;
 
 pub use acp::{
-    Artifact, Caps, ContentBlock, ExtMethod, Initialize, InitializeResult, McpServer,
-    PermissionOutcome, PermissionRequest, PromptTurn, SessionConfig, SessionId, SessionUpdate,
-    StopReason, UpdateStream,
+    Artifact, Caps, ContentBlock, EnvVariable, ExtMethod, HttpTransport, Initialize,
+    InitializeResult, McpServer, McpServerHttp, McpServerStdio, PermissionOutcome,
+    PermissionRequest, PromptTurn, SessionConfig, SessionId, SessionUpdate, StopReason,
+    UpdateStream,
 };
 #[cfg(feature = "acp")]
 pub use acp_driver::{AcpDriver, AgentCommand};

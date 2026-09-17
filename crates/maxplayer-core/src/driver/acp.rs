@@ -52,10 +52,90 @@ pub struct SessionConfig {
     pub env: Vec<(String, String)>,
 }
 
+/// One MCP server for the session (ACP `session/new` → `mcpServers[]`). Two wire shapes, and the
+/// difference between them is the `type` key:
+///
+/// * [`Self::Stdio`] carries NO `type` key. The adapter the sandbox image bakes (`claude-agent-acp`
+///   0.67.0, `dist/acp-agent.js`, the `mcpServers` loop in `newSession`) treats an entry without
+///   `type` as a stdio server, and an entry with any `type` other than `http`/`sse` as unknown — it
+///   DROPS that entry. So a stdio entry must never say `type: "stdio"`; the absence is the tag.
+/// * [`Self::Http`] carries `type: "http"`, a `url`, and `headers`.
+///
+/// Both shapes are read off that adapter's own mapping code, not guessed from the spec text. The
+/// seller's job path attached no MCP server at all before the Proxy swap route, so the old
+/// `{ name, command: [...] }` shape here was never on a wire; it did not match what any adapter
+/// reads and is gone.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-pub struct McpServer {
+#[serde(untagged)]
+pub enum McpServer {
+    Stdio(McpServerStdio),
+    Http(McpServerHttp),
+}
+
+impl McpServer {
+    /// The server name the agent addresses tools under, whichever shape it is.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Stdio(server) => &server.name,
+            Self::Http(server) => &server.name,
+        }
+    }
+
+    /// Whether any value this entry hands the agent — the command, an argument, an env value, the
+    /// URL, a header value — contains `needle`. The sandbox launch asks this about the proxy's
+    /// docker alias to decide whether the container needs that alias resolved.
+    pub fn references(&self, needle: &str) -> bool {
+        match self {
+            Self::Stdio(server) => {
+                server.command.contains(needle)
+                    || server.args.iter().any(|arg| arg.contains(needle))
+                    || server.env.iter().any(|pair| pair.value.contains(needle))
+            }
+            Self::Http(server) => {
+                server.url.contains(needle) || server.headers.iter().any(|pair| pair.value.contains(needle))
+            }
+        }
+    }
+}
+
+/// A stdio MCP server: the agent spawns `command args…` with `env` added to the child's
+/// environment and speaks JSON-RPC over its stdin/stdout.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct McpServerStdio {
     pub name: String,
-    pub command: Vec<String>,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: Vec<EnvVariable>,
+}
+
+/// A Streamable-HTTP MCP server the agent's own MCP client connects to at `url`, sending `headers`
+/// on every request.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct McpServerHttp {
+    /// Always `"http"`. A field rather than a serde tag so the stdio variant can carry NO `type`
+    /// key at all (see [`McpServer`]).
+    #[serde(rename = "type")]
+    pub transport: HttpTransport,
+    pub name: String,
+    pub url: String,
+    #[serde(default)]
+    pub headers: Vec<EnvVariable>,
+}
+
+/// The one value [`McpServerHttp::transport`] takes.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HttpTransport {
+    Http,
+}
+
+/// A `{ name, value }` pair, the ACP encoding of one environment variable or one HTTP header.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct EnvVariable {
+    pub name: String,
+    pub value: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -455,5 +535,82 @@ mod usage_tests {
         assert_eq!(usage.input_tokens, Some(5));
         assert_eq!(usage.output_tokens, Some(3));
         assert_eq!(usage.total_tokens(), Some(8));
+    }
+}
+
+#[cfg(test)]
+mod mcp_server_wire_tests {
+    use super::*;
+    use serde_json::json;
+
+    // The adapter drops a stdio entry that carries a `type` key (`claude-agent-acp` 0.67.0 reads
+    // `"type" in server` before anything else), so the stdio shape must serialize with none.
+    #[test]
+    fn a_stdio_server_serializes_with_no_type_key() {
+        let server = McpServer::Stdio(McpServerStdio {
+            name: "github".into(),
+            command: "/usr/local/bin/mcp-http-bridge".into(),
+            args: vec!["--proxy-url".into(), "http://host.docker.internal:9100".into()],
+            env: vec![EnvVariable {
+                name: "TOOL_PLACEHOLDER".into(),
+                value: "ph".into(),
+            }],
+        });
+        let wire = serde_json::to_value(&server).expect("encode");
+        assert_eq!(
+            wire,
+            json!({
+                "name": "github",
+                "command": "/usr/local/bin/mcp-http-bridge",
+                "args": ["--proxy-url", "http://host.docker.internal:9100"],
+                "env": [{"name": "TOOL_PLACEHOLDER", "value": "ph"}]
+            })
+        );
+        assert!(wire.get("type").is_none(), "a type key makes the adapter drop the entry");
+        let back: McpServer = serde_json::from_value(wire).expect("decode");
+        assert_eq!(back, server);
+    }
+
+    #[test]
+    fn an_http_server_serializes_with_type_http() {
+        let server = McpServer::Http(McpServerHttp {
+            transport: HttpTransport::Http,
+            name: "github".into(),
+            url: "http://host.docker.internal:9100/mcp/".into(),
+            headers: vec![EnvVariable {
+                name: "Authorization".into(),
+                value: "Bearer ph".into(),
+            }],
+        });
+        let wire = serde_json::to_value(&server).expect("encode");
+        assert_eq!(
+            wire,
+            json!({
+                "type": "http",
+                "name": "github",
+                "url": "http://host.docker.internal:9100/mcp/",
+                "headers": [{"name": "Authorization", "value": "Bearer ph"}]
+            })
+        );
+        let back: McpServer = serde_json::from_value(wire).expect("decode");
+        assert_eq!(back, server);
+    }
+
+    // The session config puts the list under the camelCase key the adapter reads.
+    #[test]
+    fn the_session_config_carries_the_servers_under_mcp_servers() {
+        let cfg = SessionConfig {
+            cwd: "/work".into(),
+            mcp_servers: vec![McpServer::Stdio(McpServerStdio {
+                name: "t".into(),
+                command: "c".into(),
+                args: Vec::new(),
+                env: Vec::new(),
+            })],
+            env: Vec::new(),
+        };
+        let wire = serde_json::to_value(&cfg).expect("encode");
+        assert_eq!(wire["mcpServers"][0]["name"], json!("t"));
+        assert_eq!(wire["mcpServers"][0]["args"], json!([]));
     }
 }

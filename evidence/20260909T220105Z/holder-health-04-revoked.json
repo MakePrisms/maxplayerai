@@ -1,0 +1,7 @@
+{
+  "health": {
+    "detail": "vendor rejected the stored session",
+    "state": "unhealthy"
+  },
+  "healthy": false
+}

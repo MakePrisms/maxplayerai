@@ -5,6 +5,7 @@ members = [
     "crates/maxplayer-evals",
     "crates/maxplayer",
     "crates/maxplayer-relay-write-policy",
+    "crates/maxplayer-tool-kit",
 ]
 # maxplayer-desktop pulls egui's native deps (wayland/x11/fontconfig); keep it out of
 # default builds so headless boxes and CI don't inherit them. Build with -p maxplayer-desktop.
@@ -13,6 +14,7 @@ default-members = [
     "crates/maxplayer-evals",
     "crates/maxplayer",
     "crates/maxplayer-relay-write-policy",
+    "crates/maxplayer-tool-kit",
 ]
 resolver = "3"
 

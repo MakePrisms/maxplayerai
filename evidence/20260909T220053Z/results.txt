@@ -1,0 +1,33 @@
+run-id: 20260909T220053Z
+image:  maxplayer-tool-kit:demo
+vendor observable from host at http://127.0.0.1:32768
+PASS  vendor_login_count_before_holder                     0
+PASS  holder_healthy_at_start                              contains "healthy": true
+PASS  vendor_login_count_after_enrolment                   1
+PASS  job_a_mcp_initialize                                 contains "protocolVersion":"2024-11-05"
+PASS  job_a_mcp_tools_list                                 contains "transform-file"
+PASS  job_a_mcp_call_ok                                    contains "isError":false
+PASS  job_a_output                                         FIRST JOB PAYLOAD
+PASS  credential_absent_from_job_container                 NOT_FOUND
+PASS  holder_state_absent_from_job_container               contains No such file or directory
+PASS  cross_job_absolute_path_refused                      contains "code":1003
+PASS  detach_reports_tool_still_enrolled                   contains "tool_still_enrolled": true
+PASS  job_b_mcp_call_ok                                    contains "isError":false
+PASS  job_b_output                                         daolyap boj dnoces
+PASS  operation_list_identical_for_both_jobs               "tools":[{"description":"Transform a text file from this job's directory and write the result back into it.","inputSchema":{"additionalProperties":false,"properties":{"input":{"description":"path relative to this job's own directory","type":"string"},"mode":{"enum":["upper","lower","reverse"]
+PASS  vendor_transform_count_after_two_jobs                2
+PASS  vendor_login_count_after_two_jobs                    1
+PASS  vendor_auth_failures_after_two_jobs                  0
+PASS  restart_resumed_existing_session                     contains "resumed_existing_session": true
+PASS  restart_enrollments_this_process_zero                contains "enrollments_this_process": 0
+PASS  vendor_login_count_after_restart                     1
+PASS  unhealthy_exit_code_nonzero                          1
+PASS  unhealthy_state_visible                              contains unhealthy
+PASS  unhealthy_reason_visible                             contains rejected the stored session
+PASS  reenrolment_restores_health                          contains "healthy"
+PASS  vendor_login_count_after_reenrolment                 2
+PASS  tool_unavailable_once_daemon_stops                   contains holder endpoint unavailable
+PASS  vendor_login_count_after_daemon_restart              2
+
+checks passed: 27   failed: 0
+evidence: /Users/forge/forge/v2/wt/w-seller-tool-onboarding-r2/evidence/20260909T220053Z

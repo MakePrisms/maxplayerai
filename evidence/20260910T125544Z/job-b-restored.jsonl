@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":1,"result":{"content":[{"text":"wrote 16 bytes to /run/holder/staging/job-b-0/out-0","type":"text"}],"isError":false,"operation":"transform-file","outputs":[{"bytes":16,"path":"out.txt"}]}}

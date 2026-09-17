@@ -1,0 +1,35 @@
+{
+  "tools": [
+    {
+      "description": "Transform a text file from this job's directory and write the result back into it.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "input": {
+            "description": "path relative to this job's own directory",
+            "type": "string"
+          },
+          "mode": {
+            "enum": [
+              "upper",
+              "lower",
+              "reverse"
+            ],
+            "type": "string"
+          },
+          "output": {
+            "description": "output path relative to this job's own directory",
+            "type": "string"
+          }
+        },
+        "required": [
+          "input",
+          "output",
+          "mode"
+        ],
+        "type": "object"
+      },
+      "name": "transform-file"
+    }
+  ]
+}

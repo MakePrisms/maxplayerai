@@ -1,0 +1,39 @@
+{
+  "acceptance": "a real claude-agent-acp turn used TWO held tools, each through its own tool-mcp-bridge over its own socket",
+  "last_agent_message": "done",
+  "out_a": "AGENT PAYLOAD",
+  "out_b": "daolyap tnega",
+  "tool_calls_on_the_acp_wire": [
+    "mcp__text-a__transform-file",
+    "mcp__text-b__transform-file"
+  ],
+  "tools": [
+    "text-a",
+    "text-b"
+  ],
+  "usage": {
+    "cache_read_tokens": 96441,
+    "cache_write_tokens": 48467,
+    "cost": null,
+    "input_tokens": 6,
+    "model": "claude-sonnet-5",
+    "output_tokens": 245,
+    "reasoning_tokens": null
+  },
+  "vendor_stats": [
+    {
+      "auth_failures": 0,
+      "health_count": 1,
+      "live_tokens": 1,
+      "login_count": 1,
+      "transform_count": 1
+    },
+    {
+      "auth_failures": 0,
+      "health_count": 1,
+      "live_tokens": 1,
+      "login_count": 1,
+      "transform_count": 1
+    }
+  ]
+}

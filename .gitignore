@@ -16,6 +16,18 @@
 # admitted .scratch/ into the spike tree)
 .scratch/
 *.jsonl
+# Evidence bundles are the exception: the raw MCP request/response captures ARE the evidence,
+# and a summary PASS line is not a substitute for the observation it summarises. Without this
+# exception the *.jsonl rule above silently dropped every transcript the demo recorded
+# (advisor F4). Sanitised by construction — no credential value passes through these surfaces.
+!evidence/**/*.jsonl
+
+# The host-side credential scan (advisor F1) writes a multi-MB tar of the captured job-container
+# filesystem, plus its stderr. The scan SUMMARY (evidence/**/job-*-fs-scan*.txt) and the
+# transcript hashes in manifest.json are the evidence; the raw tar is a large intermediate. Keep
+# it out of the repository.
+evidence/**/*.tar
+evidence/**/*.tar.err
 
 # Environment / secrets
 .env

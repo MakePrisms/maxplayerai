@@ -1,0 +1,5 @@
+scanned: job A container filesystem (/work, /run/holder, /etc/maxplayer, /usr/local/bin)
+archive_bytes: 2723840
+files_in_archive: 12
+secret_in_container_env: no (container received no secret; scan is host-side)
+files_containing_secret: 0

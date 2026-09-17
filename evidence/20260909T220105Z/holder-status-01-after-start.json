@@ -1,0 +1,16 @@
+{
+  "attached_jobs": [],
+  "calls_served": 0,
+  "enrollments_this_process": 1,
+  "health": {
+    "state": "healthy"
+  },
+  "healthy": true,
+  "offering": "Text transformation (upper/lower/reverse) over files the buyer's job supplies",
+  "operations": [
+    "transform-file"
+  ],
+  "resumed_existing_session": false,
+  "seller_id": "seller-demo-01",
+  "uptime_secs": 0
+}

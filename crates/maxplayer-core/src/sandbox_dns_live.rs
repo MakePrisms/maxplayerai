@@ -241,6 +241,8 @@ fn config_on(network: &str, dns_servers: Vec<String>) -> SandboxConfig {
         proxy_port_range: None,
         file_credentials: Vec::new(),
         dns_servers,
+        mcp_tools: Vec::new(),
+        held_tools: Vec::new(),
         codex_chatgpt: None,
         container_delivery: None,
         container_delivery_token: None,
@@ -450,6 +452,7 @@ async fn contained_delivery(
             + 600,
         max_agent_attempts: 1,
         agent_env_names: prepared.env.iter().map(|(key, _)| key.clone()).collect(),
+        mcp_servers: prepared.mcp_servers.clone(),
         relay_url: remote.to_owned(),
         // A non-relay https remote takes no header — the same arm the host selects.
         push_token: orch::PushTokenSource::None,
@@ -567,6 +570,14 @@ fn run_delivery(
     env: &[(String, String)],
     mounts: &[(std::path::PathBuf, String)],
 ) -> (bool, String, String) {
+    // The launch takes typed mounts now; these are all host bind mounts.
+    let mounts: Vec<crate::seller_exec::ExtraMount> = mounts
+        .iter()
+        .map(|(host, container)| crate::seller_exec::ExtraMount::Bind {
+            host: host.clone(),
+            container: container.clone(),
+        })
+        .collect();
     let launch = policy
         .launch_with_mounts(
             command,
@@ -577,8 +588,9 @@ fn run_delivery(
                 gid: prepared_gid,
                 netns,
                 resolv_conf: resolv,
+                mcp_servers: &[],
             },
-            mounts,
+            &mounts,
         )
         .expect("the policy must build a launch");
     let out = Command::new(&launch.program)
@@ -660,6 +672,7 @@ fn run_payload(policy: &SandboxPolicy, prepared_uid: u32, prepared_gid: u32, wor
                 gid: prepared_gid,
                 netns,
                 resolv_conf: resolv,
+                mcp_servers: &[],
             },
         )
         .expect("the policy must build a launch");

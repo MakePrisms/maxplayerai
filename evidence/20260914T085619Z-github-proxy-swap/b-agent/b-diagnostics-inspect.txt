@@ -1,0 +1,1 @@
+status=exited exit_code=0 oom_killed=false error="" started_at=2026-09-14T08:56:42.198618092Z finished_at=2026-09-14T08:56:48.889473054Z network_mode=container:11855b647a00b9c5ccf134a2f15e591478696c63cd49e5d1a74d4e7d6767fa59 image=maxplayer-sandbox:mcp-bridge

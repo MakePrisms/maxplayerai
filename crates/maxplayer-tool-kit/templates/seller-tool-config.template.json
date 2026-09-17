@@ -1,0 +1,19 @@
+{
+  "seller_id": "REPLACE-with-your-seller-id",
+  "offering": "REPLACE-with-a-one-line description of what this offering does",
+  "vendor_base_url": "http://REPLACE-vendor-host:PORT",
+  "operations": [
+    {
+      "name": "REPLACE-operation-name",
+      "description": "REPLACE-with-what this operation does, for the tools/list schema",
+      "subcommand": "REPLACE-vendor-cli-subcommand",
+      "params": [
+        { "name": "input",  "flag": "--in",   "kind": { "type": "job_input_file" } },
+        { "name": "output", "flag": "--out",  "kind": { "type": "job_output_file" } },
+        { "name": "mode",   "flag": "--mode", "kind": { "type": "choice", "choices": ["REPLACE-choice-a", "REPLACE-choice-b"] } },
+        { "name": "label",  "flag": "--label", "kind": { "type": "text", "max_len": 64 } }
+      ],
+      "max_output_bytes": 262144
+    }
+  ]
+}

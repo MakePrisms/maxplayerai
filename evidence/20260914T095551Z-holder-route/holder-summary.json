@@ -1,0 +1,46 @@
+{
+  "acceptance": "Holder route through the real daemon code: HeldTool::start/attach/shutdown, prepare_launch, launch_with_mounts, cleanup capture",
+  "boot_line_after_restart": "seller node: [sandbox] held_tool: maxplayer-tool-kit:demo in container maxplayer-held-tool-eeeeeeeeeeeeeeee is HEALTHY, resumed the persisted login (no new enrolment); jobs see it as MCP server `seller-tool` over a per-job socket",
+  "boot_line_first_start": "seller node: [sandbox] held_tool: maxplayer-tool-kit:demo in container maxplayer-held-tool-eeeeeeeeeeeeeeee is HEALTHY, enrolled (1 login this start); jobs see it as MCP server `seller-tool` over a per-job socket",
+  "credential_absent_from": [
+    "docker argv",
+    "docker inspect (both jobs)",
+    "MCP transcripts",
+    "diagnostics capture"
+  ],
+  "escape_attempt_reply": {
+    "error": {
+      "code": 1003,
+      "message": "input: '.' and '..' components are not accepted"
+    },
+    "id": 4,
+    "jsonrpc": "2.0"
+  },
+  "holder_image": "maxplayer-tool-kit:demo",
+  "job_a_mounts": [
+    {
+      "Destination": "/work",
+      "Name": null,
+      "RW": true,
+      "Source": "/var/folders/9q/w4l4c_qn38n62q8_2pt8ql7m0000gn/T/maxplayer-held-tool-live-69658-1789380080527264000/seller-jobs/job-a-held-live",
+      "Type": "bind"
+    },
+    {
+      "Destination": "/run/holder",
+      "Name": "maxplayer-held-tool-runtime-eeeeeeeeeeeeeeee",
+      "RW": true,
+      "Source": "/var/lib/docker/volumes/maxplayer-held-tool-runtime-eeeeeeeeeeeeeeee/_data",
+      "Type": "volume"
+    }
+  ],
+  "job_b_network_mode": "container:fedf80ff1ee5b6ebc12c425bffd9f511e52c6c7d0367855bbc0fa882e4e1dd24",
+  "sandbox_image": "maxplayer-sandbox:tools",
+  "tools_identical_for_both_jobs": true,
+  "vendor_stats_final": {
+    "auth_failures": 0,
+    "health_count": 2,
+    "live_tokens": 1,
+    "login_count": 1,
+    "transform_count": 3
+  }
+}

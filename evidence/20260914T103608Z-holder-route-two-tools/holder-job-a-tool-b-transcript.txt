@@ -1,0 +1,2 @@
+-> {"id":1,"jsonrpc":"2.0","method":"tools/call","params":{"arguments":{"input":"input.txt","mode":"reverse","output":"out-b.txt"},"name":"transform-file"}}
+<- {"jsonrpc":"2.0","id":1,"result":{"content":[{"text":"wrote 17 bytes to /run/maxplayer-holder/staging/job-a-held-live-0/out-0","type":"text"}],"isError":false,"operation":"transform-file","outputs":[{"bytes":17,"path":"out-b.txt"}]}}

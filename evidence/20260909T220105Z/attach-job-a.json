@@ -1,0 +1,6 @@
+{
+  "job_id": "job-a",
+  "job_root": "/srv/jobs/job-a",
+  "note": "addressing and isolation only; no grant, no entitlement, no expiry",
+  "socket": "/run/holder/jobs/job-a/job.sock"
+}

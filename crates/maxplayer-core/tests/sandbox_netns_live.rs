@@ -637,6 +637,9 @@ fn a_job_launched_through_the_policy_is_contained_and_an_uncontained_one_is_not(
         // This test measures egress, so no file-sourced credential: one would add a second reason
         // for the contained launch to differ from its control.
         file_credentials: Vec::new(),
+        // And no proxied vendor tool, for the same reason.
+        mcp_tools: Vec::new(),
+        held_tools: Vec::new(),
         // No resolver either: the launch under test is compared against a control, and a resolver
         // mount would differ between the two for a reason this test is not measuring.
         dns_servers: Vec::new(),
@@ -682,6 +685,7 @@ fn a_job_launched_through_the_policy_is_contained_and_an_uncontained_one_is_not(
                 uid: 0,
                 gid: 0,
                 netns: None,
+                mcp_servers: &[],
                 resolv_conf: None,
             },
         )
@@ -707,6 +711,7 @@ fn a_job_launched_through_the_policy_is_contained_and_an_uncontained_one_is_not(
                 uid: 0,
                 gid: 0,
                 netns: Some(&canary.fixture.holder),
+                mcp_servers: &[],
                 resolv_conf: None,
             },
         )
