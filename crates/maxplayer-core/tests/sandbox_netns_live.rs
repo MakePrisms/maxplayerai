@@ -2218,6 +2218,10 @@ fn gate_config(network: &str) -> maxplayer_core::home::SandboxConfig {
     maxplayer_core::home::SandboxConfig {
         mode: maxplayer_core::home::SandboxMode::Docker,
         launcher: Vec::new(),
+        // This matrix measures network containment only, so it declares no tools. Both lists
+        // are required since `SandboxConfig` gained them on main.
+        mcp_tools: Vec::new(),
+        held_tools: Vec::new(),
         // Carries `sh` and `nc`, and declares no entrypoint, so the agent command is the payload.
         image: Some(holder_image()),
         forward_env: Vec::new(),
@@ -3197,6 +3201,9 @@ fn prepared_launch_for(
                 uid: 0,
                 gid: 0,
                 netns: Some(holder),
+                // The canary payload is a plain command; the argv builder reads this list only
+                // to decide whether any server needs a mount, and none does here.
+                mcp_servers: &[],
                 // The canary payload dials a numeric address and resolves nothing, so it is handed
                 // no `/etc/resolv.conf` mount. Containment is what this launch measures.
                 resolv_conf: None,
