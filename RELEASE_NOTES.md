@@ -1,3 +1,60 @@
+## v0.5.10
+
+A seller's delivery lock is now bounded by the lifetime of the push *work*, not by the patience of
+whatever async arm started it. A caller that times out no longer hands the seat to the next delivery
+while bytes from the old one are still on the wire, and a revoked push stops at the next boundary
+instead of doing its local work when the slot comes free. Nothing about relay policy, token expiry
+or the per-leg authorization from v0.5.9 changes.
+
+### The delivery turn is bounded by the work, not by its caller (#1006)
+
+The seat's delivery lock was released when the future that started the push finished. Three things
+followed from that. A push revoked while parked on a blocking thread still occupied the turn, and
+still performed its local work once the thread woke. Queued and pre-HTTP work honoured neither
+cancellation nor a deadline. And an async supervisor cancelled at an await took the lock guard with
+it while its own blocking thread was still mid-upload, which let the next delivery open a second
+`git-receive-pack` against the same remote.
+
+The turn is now handed back only when **both** sides are done with it: the work has actually stopped
+(or provably never started), **and** the supervising arm has left the excluded section. Either
+condition alone has been a bug — supervisor-alone was the original defect, and work-alone is its
+mirror. A caller's timeout does not free the seat for live work: it revokes, declares its own side
+finished, and returns `TimedOut`.
+
+New `crates/maxplayer-core/src/delivery_turn.rs` carries the exclusion token itself — the lock's
+owned guard, moved in, so a dying supervisor cannot take exclusion with it — plus an absolute
+deadline fixed when the turn is created. `begin()` is queue admission on the blocking thread, and
+`RunningWork` is dropped on the thread that did the work. `seller_git` composes one gate for the
+transport: the delivery's authority first, the turn's lifetime second.
+
+That gate is asked at queue admission, before the push-config rewrite, before pack generation, at
+pack negotiation, before the mint so a dead delivery never joins the signer queue, again after the
+mint because the queue wait is exactly where a turn dies unnoticed, on every buffered pack chunk,
+and before every wire request.
+
+The drain bound is stated as a constant rather than inferred:
+`DELIVERY_DRAIN_BOUND = DELIVERY_PUSH_TIMEOUT + DEFAULT_HTTP_LEG_TIMEOUT` = 150s + 120s = 270s, with
+a build-time assertion on the sum and a test pinning the literal. It is not an HTTP timeout — it is
+the work's absolute deadline, checked at every boundary above, plus the one in-flight leg whose
+bytes cannot be recalled.
+
+One span stays outside that guarantee and is documented rather than hidden: libgit2's delta search
+discards its cancellation answer, so it is bounded by the delivery's object list rather than by a
+clock. It is measured from its true start and an overrun is reported with the number;
+`UNINTERRUPTIBLE_DELTA_BUDGET = 5s` is what that span is expected to fit in, held finite and
+strictly inside the work deadline by a second compile-time assertion. A hard bound there needs a
+killable executor — the local phase in a child process, the deadline enforced by a signal — which is
+an architectural change, written down instead of smuggled in.
+
+The tests run the real signer actor, the real transport and a real HTTPS git fixture, with no sleep
+used as scheduling proof: the fixture parks a chosen request and announces it, and ordering is read
+off one journal. They cover cancellation before dispatch (`.git/config` byte-identical, no mint, no
+dial), cancellation during the signer queue wait with the mint parked inside the round trip,
+cancellation mid-flight with the advertisement held at the server, and a real GET and POST across a
+caller timeout — the POST held open at the relay while the arm that started it times out, a second
+real delivery launched into that window and proved pending on acquisition, landing its ref only
+after the abandoned upload stops. Peak concurrency stays 1 throughout.
+
 ## v0.5.9
 
 Every delivery push now mints its authorization at the request it is sent on, and a contained job
