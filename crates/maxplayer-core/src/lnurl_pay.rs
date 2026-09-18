@@ -702,7 +702,7 @@ mod tests {
     use std::cell::RefCell;
 
     fn address() -> LightningAddress {
-        LightningAddress::parse("maxplayer@agi.cash").expect("valid")
+        LightningAddress::parse("maxplayer@strike.me").expect("valid")
     }
 
     fn pay_request_json(callback: &str, min: &str, max: &str) -> Vec<u8> {
@@ -715,13 +715,13 @@ mod tests {
     fn good_pay_request() -> PayRequest {
         parse_pay_request(
             &pay_request_json(
-                r#""https://agi.cash/lnurlp/maxplayer/callback""#,
+                r#""https://strike.me/lnurlp/maxplayer/callback""#,
                 "1000",
                 "1000000000",
             ),
             &address(),
         )
-        .expect("the measured agi.cash answer parses")
+        .expect("the measured answer parses")
     }
 
     // ---- the address ----
@@ -729,15 +729,15 @@ mod tests {
     #[test]
     fn address_parses_user_at_host_and_builds_the_https_well_known_url() {
         let address = address();
-        assert_eq!((address.user(), address.host()), ("maxplayer", "agi.cash"));
+        assert_eq!((address.user(), address.host()), ("maxplayer", "strike.me"));
         assert_eq!(
             address.well_known_url().as_str(),
-            "https://agi.cash/.well-known/lnurlp/maxplayer"
+            "https://strike.me/.well-known/lnurlp/maxplayer"
         );
-        assert_eq!(address.to_string(), "maxplayer@agi.cash");
+        assert_eq!(address.to_string(), "maxplayer@strike.me");
         // Host is case-insensitive and lower-cased; user is kept.
-        let mixed = LightningAddress::parse("Max.player_1@AGI.Cash").expect("valid");
-        assert_eq!((mixed.user(), mixed.host()), ("Max.player_1", "agi.cash"));
+        let mixed = LightningAddress::parse("Max.player_1@STRIKE.Me").expect("valid");
+        assert_eq!((mixed.user(), mixed.host()), ("Max.player_1", "strike.me"));
     }
 
     #[test]
@@ -745,18 +745,18 @@ mod tests {
         for bad in [
             "",
             "maxplayer",
-            "@agi.cash",
+            "@strike.me",
             "maxplayer@",
-            "max@player@agi.cash",
-            "max player@agi.cash",
-            "maxplayer@agi cash",
-            "maxplayer@agi..cash",
-            "maxplayer@.agi.cash",
-            "maxplayer@agi.cash/",
-            "maxplayer@agi.cash:443",
-            "maxplayer@agi.cash?x=1",
-            "max/player@agi.cash",
-            "https://agi.cash/.well-known/lnurlp/maxplayer",
+            "max@player@strike.me",
+            "max player@strike.me",
+            "maxplayer@strike me",
+            "maxplayer@strike..me",
+            "maxplayer@.strike.me",
+            "maxplayer@strike.me/",
+            "maxplayer@strike.me:443",
+            "maxplayer@strike.me?x=1",
+            "max/player@strike.me",
+            "https://strike.me/.well-known/lnurlp/maxplayer",
         ] {
             assert!(
                 matches!(
@@ -800,7 +800,7 @@ mod tests {
         assert_eq!(msat_to_sats_floor(1999), 1);
         assert_eq!(msat_to_sats_floor(1_000_000_000), 1_000_000);
 
-        // The measured agi.cash bounds: 1000 msat = 1 sat, 1_000_000_000 msat = 1_000_000 sats.
+        // The fixture bounds (measured on the original host): 1000 msat = 1 sat, 1_000_000_000 msat = 1_000_000 sats.
         let pay = good_pay_request();
         assert_eq!(pay.min_sendable_sats(), 1);
         assert_eq!(pay.max_sendable_sats(), 1_000_000);
@@ -816,17 +816,17 @@ mod tests {
         let url = pay.invoice_url(21).expect("21 sats is in range");
         assert_eq!(
             url.as_str(),
-            "https://agi.cash/lnurlp/maxplayer/callback?amount=21000"
+            "https://strike.me/lnurlp/maxplayer/callback?amount=21000"
         );
         // An existing query string is extended, not clobbered.
         let with_query = parse_pay_request(
-            &pay_request_json(r#""https://agi.cash/cb?u=maxplayer""#, "1000", "2000"),
+            &pay_request_json(r#""https://strike.me/cb?u=maxplayer""#, "1000", "2000"),
             &address(),
         )
         .expect("valid");
         assert_eq!(
             with_query.invoice_url(2).expect("in range").as_str(),
-            "https://agi.cash/cb?u=maxplayer&amount=2000"
+            "https://strike.me/cb?u=maxplayer&amount=2000"
         );
     }
 
@@ -862,7 +862,7 @@ mod tests {
         );
         assert_eq!(
             parse_pay_request(
-                br#"{"tag":"withdrawRequest","callback":"https://agi.cash/cb","minSendable":1000,"maxSendable":2000}"#,
+                br#"{"tag":"withdrawRequest","callback":"https://strike.me/cb","minSendable":1000,"maxSendable":2000}"#,
                 &address()
             ),
             Err(LnurlError::WrongTag {
@@ -871,7 +871,7 @@ mod tests {
         );
         assert_eq!(
             parse_pay_request(
-                br#"{"callback":"https://agi.cash/cb","minSendable":1000,"maxSendable":2000}"#,
+                br#"{"callback":"https://strike.me/cb","minSendable":1000,"maxSendable":2000}"#,
                 &address()
             ),
             Err(LnurlError::WrongTag { found: None })
@@ -879,7 +879,7 @@ mod tests {
         // Case matters: "PayRequest" is not the LUD-06 tag.
         assert!(matches!(
             parse_pay_request(
-                br#"{"tag":"PayRequest","callback":"https://agi.cash/cb","minSendable":1000,"maxSendable":2000}"#,
+                br#"{"tag":"PayRequest","callback":"https://strike.me/cb","minSendable":1000,"maxSendable":2000}"#,
                 &address()
             ),
             Err(LnurlError::WrongTag { .. })
@@ -900,7 +900,7 @@ mod tests {
                 |e| matches!(e, LnurlError::CallbackNotAbsolute { .. }),
             ),
             (
-                r#"{"tag":"payRequest","callback":"agi.cash/cb","minSendable":1000,"maxSendable":2000}"#,
+                r#"{"tag":"payRequest","callback":"strike.me/cb","minSendable":1000,"maxSendable":2000}"#,
                 |e| matches!(e, LnurlError::CallbackNotAbsolute { .. }),
             ),
             (
@@ -908,7 +908,7 @@ mod tests {
                 |e| matches!(e, LnurlError::CallbackNotAbsolute { .. }),
             ),
             (
-                r#"{"tag":"payRequest","callback":"http://agi.cash/cb","minSendable":1000,"maxSendable":2000}"#,
+                r#"{"tag":"payRequest","callback":"http://strike.me/cb","minSendable":1000,"maxSendable":2000}"#,
                 |e| matches!(e, LnurlError::CallbackNotHttps { .. }),
             ),
             (
@@ -917,16 +917,16 @@ mod tests {
                     matches!(
                         e,
                         LnurlError::CallbackHostMismatch { expected, found }
-                            if expected == "agi.cash" && found == "evil.example"
+                            if expected == "strike.me" && found == "evil.example"
                     )
                 },
             ),
             (
-                r#"{"tag":"payRequest","callback":"https://agi.cash.evil.example/cb","minSendable":1000,"maxSendable":2000}"#,
+                r#"{"tag":"payRequest","callback":"https://strike.me.evil.example/cb","minSendable":1000,"maxSendable":2000}"#,
                 |e| matches!(e, LnurlError::CallbackHostMismatch { .. }),
             ),
             (
-                r#"{"tag":"payRequest","callback":"https://user:pw@agi.cash/cb","minSendable":1000,"maxSendable":2000}"#,
+                r#"{"tag":"payRequest","callback":"https://user:pw@strike.me/cb","minSendable":1000,"maxSendable":2000}"#,
                 |e| matches!(e, LnurlError::CallbackHasCredentials { .. }),
             ),
         ];
@@ -937,7 +937,7 @@ mod tests {
         }
         // A callback on the same host with a different case is the same host.
         assert!(parse_pay_request(
-            br#"{"tag":"payRequest","callback":"https://AGI.cash/cb","minSendable":1000,"maxSendable":2000}"#,
+            br#"{"tag":"payRequest","callback":"https://STRIKE.me/cb","minSendable":1000,"maxSendable":2000}"#,
             &address()
         )
         .is_ok());
@@ -969,9 +969,9 @@ mod tests {
         for bad in junk {
             for field in ["minSendable", "maxSendable"] {
                 let body = if field == "minSendable" {
-                    pay_request_json(r#""https://agi.cash/cb""#, bad, "2000")
+                    pay_request_json(r#""https://strike.me/cb""#, bad, "2000")
                 } else {
-                    pay_request_json(r#""https://agi.cash/cb""#, "1000", bad)
+                    pay_request_json(r#""https://strike.me/cb""#, "1000", bad)
                 };
                 let result = parse_pay_request(&body, &address());
                 assert!(
@@ -982,7 +982,7 @@ mod tests {
         }
         // Shapes that are not even JSON (leading zero, hex, trailing junk) fail at the JSON layer.
         for bad in ["01000", "0x3e8", "1000junk", "+1000", "1_000"] {
-            let body = pay_request_json(r#""https://agi.cash/cb""#, bad, "2000");
+            let body = pay_request_json(r#""https://strike.me/cb""#, bad, "2000");
             assert!(
                 matches!(
                     parse_pay_request(&body, &address()),
@@ -994,7 +994,7 @@ mod tests {
         // Missing fields are refused too, not defaulted.
         assert!(matches!(
             parse_pay_request(
-                br#"{"tag":"payRequest","callback":"https://agi.cash/cb","maxSendable":2000}"#,
+                br#"{"tag":"payRequest","callback":"https://strike.me/cb","maxSendable":2000}"#,
                 &address()
             ),
             Err(LnurlError::AmountNotInteger {
@@ -1004,7 +1004,7 @@ mod tests {
         ));
         assert!(matches!(
             parse_pay_request(
-                br#"{"tag":"payRequest","callback":"https://agi.cash/cb","minSendable":1000}"#,
+                br#"{"tag":"payRequest","callback":"https://strike.me/cb","minSendable":1000}"#,
                 &address()
             ),
             Err(LnurlError::AmountNotInteger {
@@ -1015,7 +1015,7 @@ mod tests {
         // Exactly u64::MAX is an integer and is accepted as a maximum.
         assert!(
             parse_pay_request(
-                &pay_request_json(r#""https://agi.cash/cb""#, "1000", "18446744073709551615"),
+                &pay_request_json(r#""https://strike.me/cb""#, "1000", "18446744073709551615"),
                 &address()
             )
             .is_ok()
@@ -1026,7 +1026,7 @@ mod tests {
     fn pay_request_refuses_zero_or_inverted_bounds_and_out_of_range_amounts() {
         assert_eq!(
             parse_pay_request(
-                &pay_request_json(r#""https://agi.cash/cb""#, "0", "2000"),
+                &pay_request_json(r#""https://strike.me/cb""#, "0", "2000"),
                 &address()
             ),
             Err(LnurlError::BoundsInvalid {
@@ -1036,7 +1036,7 @@ mod tests {
         );
         assert_eq!(
             parse_pay_request(
-                &pay_request_json(r#""https://agi.cash/cb""#, "3000", "2000"),
+                &pay_request_json(r#""https://strike.me/cb""#, "3000", "2000"),
                 &address()
             ),
             Err(LnurlError::BoundsInvalid {
@@ -1045,7 +1045,7 @@ mod tests {
             })
         );
         let pay = parse_pay_request(
-            &pay_request_json(r#""https://agi.cash/cb""#, "1500", "5000"),
+            &pay_request_json(r#""https://strike.me/cb""#, "1500", "5000"),
             &address(),
         )
         .expect("valid");
@@ -1083,7 +1083,7 @@ mod tests {
     // ---- invoice response parsing ----
 
     fn callback() -> Url {
-        Url::parse("https://agi.cash/cb?amount=21000").unwrap()
+        Url::parse("https://strike.me/cb?amount=21000").unwrap()
     }
 
     #[test]
@@ -1198,16 +1198,16 @@ mod tests {
         let bolt11 = signed_bolt11(Some(21_000), b"seed-d", Duration::ZERO);
         let fetch = Scripted::new(vec![
             (
-                "https://agi.cash/.well-known/lnurlp/maxplayer",
+                "https://strike.me/.well-known/lnurlp/maxplayer",
                 200,
                 pay_request_json(
-                    r#""https://agi.cash/lnurlp/maxplayer/callback""#,
+                    r#""https://strike.me/lnurlp/maxplayer/callback""#,
                     "1000",
                     "1000000000",
                 ),
             ),
             (
-                "https://agi.cash/lnurlp/maxplayer/callback?amount=21000",
+                "https://strike.me/lnurlp/maxplayer/callback?amount=21000",
                 200,
                 format!(r#"{{"pr":"{bolt11}","routes":[]}}"#).into_bytes(),
             ),
@@ -1219,22 +1219,22 @@ mod tests {
         assert_eq!(
             *fetch.seen.borrow(),
             vec![
-                "https://agi.cash/.well-known/lnurlp/maxplayer".to_owned(),
-                "https://agi.cash/lnurlp/maxplayer/callback?amount=21000".to_owned(),
+                "https://strike.me/.well-known/lnurlp/maxplayer".to_owned(),
+                "https://strike.me/lnurlp/maxplayer/callback?amount=21000".to_owned(),
             ]
         );
 
         // A 302 (redirects are never followed) and a 500 are both refused as non-200.
         for status in [302u16, 404, 500] {
             let fetch = Scripted::new(vec![(
-                "https://agi.cash/.well-known/lnurlp/maxplayer",
+                "https://strike.me/.well-known/lnurlp/maxplayer",
                 status,
                 b"whatever".to_vec(),
             )]);
             assert_eq!(
                 fetch_pay_request(&fetch, &address()),
                 Err(LnurlError::HttpStatus {
-                    url: "https://agi.cash/.well-known/lnurlp/maxplayer".into(),
+                    url: "https://strike.me/.well-known/lnurlp/maxplayer".into(),
                     status
                 })
             );
@@ -1265,7 +1265,7 @@ mod tests {
         }
         let fetch = Permissive(RefCell::new(0));
         let pay = PayRequest {
-            callback: Url::parse("http://agi.cash/cb").unwrap(),
+            callback: Url::parse("http://strike.me/cb").unwrap(),
             min_sendable_msat: 1000,
             max_sendable_msat: 2000,
         };
