@@ -3754,6 +3754,50 @@ mod tests {
         );
     }
 
+    // A literal fixture at the documented MAX_REQUEST_BODY_BYTES ceiling (32 MiB), NOT derived
+    // from the constant. Exactly 32 MiB must be an accepted capacity: if the limit is lowered
+    // below 32 MiB, the proxy refuses this exact-size body (413) and the test fails; a legitimate
+    // raise keeps 32 MiB accepted and the test stays green (issue #933 property 2).
+    #[tokio::test]
+    async fn a_declared_body_of_32_mib_is_accepted() {
+        let (stub_addr, stub) = spawn_stub("UPSTREAM_OK").await;
+        let upstream = format!("http://{stub_addr}");
+        let engine = Arc::new(ProxyEngine::new([authority_of(&upstream).unwrap()]));
+        let placeholder = mint_anthropic_placeholder();
+        engine
+            .register(JobCredential {
+                placeholder: placeholder.clone(),
+                real: REAL.to_owned(),
+                upstreams: vec![upstream.clone()],
+            })
+            .unwrap();
+        let proxy = start(Arc::clone(&engine), None).await.unwrap();
+        let port = proxy.local_addr().port();
+
+        // Distinctive bytes so a truncation cannot be mistaken for success. 32 MiB, literal.
+        let big = vec![b'z'; 32 * 1024 * 1024];
+        let response = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .header("x-api-key", &placeholder)
+            .body(big.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            200,
+            "a body of exactly 32 MiB must be accepted, not refused"
+        );
+
+        let seen = stub.await.unwrap();
+        assert_eq!(
+            seen.body.len(),
+            big.len(),
+            "the upstream must receive every byte of an exactly-at-cap body"
+        );
+        assert_eq!(seen.api_key.as_deref(), Some(REAL));
+    }
+
     // The backstop for a body whose length is NOT declared: a chunked stream cannot be judged from its
     // headers, so the cap has to be enforced as the bytes arrive. The request fails mid-flight, which
     // is a `502` rather than a `413` because the upstream request is already open by then — the cap

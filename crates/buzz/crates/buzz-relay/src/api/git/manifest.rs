@@ -468,6 +468,26 @@ mod tests {
     }
 
     #[test]
+    fn validate_pack_and_ref_count_at_limit_are_accepted() {
+        // Literal fixtures at the documented MAX_MANIFEST_PACKS (128) and
+        // MAX_MANIFEST_REFS (10_000), NOT derived from the constants. Exactly the
+        // documented count must be an accepted capacity: if either bound is
+        // lowered, the corresponding at-limit fixture is refused and the test
+        // fails; a legitimate raise keeps them accepted and the test stays green
+        // (issue #933 property 2).
+        let mut at = sample();
+        at.packs = (0..128).map(|i| format!("packs/{i:064x}")).collect();
+        at.validate().expect("exactly 128 packs must validate");
+
+        let mut refs_at = sample();
+        refs_at.refs.clear();
+        for i in 0..10_000 {
+            refs_at.refs.insert(format!("refs/heads/r{i}"), "a".repeat(40));
+        }
+        refs_at.validate().expect("exactly 10_000 refs must validate");
+    }
+
+    #[test]
     fn validate_accepts_no_parent() {
         let mut m = sample();
         m.parent = None;
