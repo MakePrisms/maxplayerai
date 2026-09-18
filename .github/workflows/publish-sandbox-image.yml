@@ -229,10 +229,17 @@ jobs:
           set -euo pipefail
           echo "arch=${PLATFORM##*/}" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout the released ref
+      # The COMMIT `plan` resolved, NOT the event's tag. A tag is mutable: re-resolving
+      # `github.event.release.tag_name` / `inputs.tag` here would let an authorized tag update between
+      # plan and these builds — or between the two architecture legs — compile different source while
+      # both legs still carried the commit stamp plan recorded, so the two halves of one manifest list
+      # need not come from one tree. Before this workflow was split across runners, the build and the
+      # stamp shared a single checkout; binding both legs to plan's immutable commit is what restores
+      # that property. `plan` keeps the event/tag resolution, which is where it belongs.
+      - name: Checkout the planned commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+          ref: ${{ needs.plan.outputs.commit }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -336,8 +343,14 @@ jobs:
           path: /tmp/digests
           pattern: digests-*
 
+      # The version pin is load-bearing. `imagetools create --metadata-file` — the flag that lets this
+      # job keep the identity it just created rather than re-resolving a mutable tag — first shipped in
+      # buildx v0.32.0 and is absent in v0.31.0. Leaving the version to whatever the runner image
+      # happens to carry would make the identity binding below depend on the runner image.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          version: v0.37.1
 
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -350,16 +363,31 @@ jobs:
       # are the two digests just built. Both architectures are REQUIRED: publishing a "multi-platform"
       # tag that silently lists one platform is the failure this job exists to prevent, so a missing
       # digest artifact is a hard error rather than a one-architecture manifest.
+      # `--metadata-file` retains the descriptor of the manifest list THIS RUN created. That retained
+      # digest is what the next step verifies and records, so the created, the verified and the
+      # published identity are one object. Resolving the version tag again afterwards would instead
+      # re-read whatever that tag points at by then, which need not be this run's work.
       - name: Create the manifest lists
+        id: create
         env:
           TAGS: ${{ needs.plan.outputs.tags }}
           NETFILTER_TAGS: ${{ needs.plan.outputs.netfilter_tags }}
         run: |
           set -euo pipefail
+          # Fail loudly rather than degrade to a tag re-resolve if this buildx cannot report what it
+          # created. A silent fallback is exactly what would reopen the identity gap.
+          if ! docker buildx imagetools create --help 2>&1 | grep -q -- '--metadata-file'; then
+            echo "this runner's buildx cannot record the created manifest descriptor (no --metadata-file); refusing to fall back to re-resolving a mutable tag" >&2
+            docker buildx version >&2
+            exit 1
+          fi
+
           create_manifest() {
             image_ref="$1"
             tag_list="$2"
             artifact_prefix="$3"
+            metadata_file="$4"
+            digest_file_out="$5"
 
             tag_args=()
             IFS=',' read -r -a tag_items <<< "$tag_list"
@@ -377,12 +405,26 @@ jobs:
               source_args+=("${image_ref}@${digest}")
             done
 
-            echo "creating ${image_ref} from ${source_args[*]}"
-            docker buildx imagetools create "${tag_args[@]}" "${source_args[@]}"
+            echo "creating ${image_ref} from ${source_args[*]}" >&2
+            docker buildx imagetools create --metadata-file "$metadata_file" "${tag_args[@]}" "${source_args[@]}"
+
+            # buildx records the created index under `containerimage.descriptor`; its `.digest` is the
+            # identity of the manifest list this run just pushed.
+            created="$(jq -r '.["containerimage.descriptor"].digest // empty' "$metadata_file")"
+            case "$created" in
+              sha256:*) ;;
+              *) echo "imagetools create reported no usable descriptor digest for ${image_ref}" >&2; exit 1 ;;
+            esac
+            printf '%s\n' "$created" > "$digest_file_out"
           }
 
-          create_manifest "${REGISTRY}/${IMAGE_NAME}"           "$TAGS"           sandbox
-          create_manifest "${REGISTRY}/${NETFILTER_IMAGE_NAME}" "$NETFILTER_TAGS" netfilter
+          mkdir -p /tmp/created
+          create_manifest "${REGISTRY}/${IMAGE_NAME}"           "$TAGS"           sandbox   /tmp/created/sandbox.json   /tmp/created/sandbox.digest
+          create_manifest "${REGISTRY}/${NETFILTER_IMAGE_NAME}" "$NETFILTER_TAGS" netfilter /tmp/created/netfilter.json /tmp/created/netfilter.digest
+
+          # Handed to the next step as step outputs, read from files — not captured off stdout.
+          echo "digest=$(cat /tmp/created/sandbox.digest)"             >> "$GITHUB_OUTPUT"
+          echo "netfilter_digest=$(cat /tmp/created/netfilter.digest)" >> "$GITHUB_OUTPUT"
 
       # Record the multi-arch manifest digest so a buyer can verify exactly which bytes ran. Seats still
       # reference the image by version tag (above); this is the separate verification handle from ADR §4.
@@ -393,32 +435,40 @@ jobs:
       # most reason to pin. Recording only the sandbox digest left the privileged image as the single
       # artifact without an ADR §4 verifiable handle.
       # The read-back is also the end-to-end assertion that this workflow's whole point held: the
-      # published tag is inspected from the registry and must list BOTH platforms. If emulation is ever
-      # reintroduced, or a leg is dropped from the matrix, this fails instead of shipping a tag that a
-      # seat on the missing architecture cannot pull.
+      # manifest list THIS RUN created is inspected from the registry and must list BOTH platforms. If
+      # emulation is ever reintroduced, or a leg is dropped from the matrix, this fails instead of
+      # shipping an image a seat on the missing architecture cannot pull.
       - name: Verify both platforms and record image digests
         id: record
         env:
           VERSION: ${{ needs.plan.outputs.version }}
+          DIGEST: ${{ steps.create.outputs.digest }}
+          NETFILTER_DIGEST: ${{ steps.create.outputs.netfilter_digest }}
         run: |
           set -euo pipefail
-          inspect_digest() {
+          # Inspect BY THE DIGEST THIS RUN CREATED, never by the version tag. Another authorized run
+          # publishing the same version can move that tag between the create above and this read, and
+          # the platform assertion cannot catch it because the other run's manifest also lists both
+          # architectures — so verifying the tag could bless one image while the summary recorded
+          # another. A digest is immutable, so what is verified and what is recorded are the same
+          # object by construction.
+          verify_platforms() {
             image_ref="$1"
-            inspected="$(docker buildx imagetools inspect "${image_ref}:${VERSION}")"
+            digest="$2"
+            inspected="$(docker buildx imagetools inspect "${image_ref}@${digest}")"
             printf '%s\n' "$inspected" >&2
             for platform in linux/amd64 linux/arm64; do
               printf '%s\n' "$inspected" | grep -q "$platform" || {
-                echo "${image_ref}:${VERSION} does not list ${platform} — the manifest list is not multi-platform" >&2
+                echo "${image_ref}@${digest} does not list ${platform} — the manifest list is not multi-platform" >&2
                 exit 1
               }
             done
-            docker buildx imagetools inspect "${image_ref}:${VERSION}" --format '{{json .Manifest}}' | jq -r '.digest'
           }
 
-          DIGEST="$(inspect_digest "${REGISTRY}/${IMAGE_NAME}")"
-          NETFILTER_DIGEST="$(inspect_digest "${REGISTRY}/${NETFILTER_IMAGE_NAME}")"
           [ -n "$DIGEST" ] || { echo "the sandbox manifest list produced no digest" >&2; exit 1; }
           [ -n "$NETFILTER_DIGEST" ] || { echo "the netfilter manifest list produced no digest" >&2; exit 1; }
+          verify_platforms "${REGISTRY}/${IMAGE_NAME}"           "$DIGEST"
+          verify_platforms "${REGISTRY}/${NETFILTER_IMAGE_NAME}" "$NETFILTER_DIGEST"
 
           ref="${REGISTRY}/${IMAGE_NAME}:${VERSION}"
           pin="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
