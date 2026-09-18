@@ -184,7 +184,18 @@ impl std::error::Error for ProbeRunError {}
 /// while a probe that cannot answer inside its own health-check limit still fails the probe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentRunTimeout {
-    JobDeadline(Duration),
+    /// A real job: the window still remaining, AND the absolute unix second it ends at.
+    ///
+    /// **Both, deliberately.** The remaining window is what the run is bounded by; the absolute
+    /// deadline is what any durable artefact of the run — notably a container's cleanup stamp — must
+    /// be derived from. Reconstructing the second from the first at some later instant (#996 F3)
+    /// makes it a function of whatever the wall clock said then, which is exactly the property a
+    /// deadline must not have.
+    JobDeadline {
+        remaining: Duration,
+        deadline_unix: u64,
+    },
+    /// A harness probe, which has no job and therefore no job deadline — only its own limit.
     HarnessProbe(Duration),
 }
 
@@ -192,7 +203,19 @@ impl AgentRunTimeout {
     #[cfg(feature = "acp")]
     fn duration(self) -> Duration {
         match self {
-            Self::JobDeadline(duration) | Self::HarnessProbe(duration) => duration,
+            Self::JobDeadline { remaining, .. } | Self::HarnessProbe(remaining) => remaining,
+        }
+    }
+
+    /// The absolute deadline this run is bounded by, when it is a job's.
+    ///
+    /// `None` for a harness probe: there is no job deadline to carry, and inventing one from the
+    /// probe's limit would be the same reconstruction this exists to avoid.
+    #[cfg(feature = "acp")]
+    fn deadline_unix(self) -> Option<u64> {
+        match self {
+            Self::JobDeadline { deadline_unix, .. } => Some(deadline_unix),
+            Self::HarnessProbe(_) => None,
         }
     }
 }
@@ -1963,7 +1986,7 @@ pub enum CleanupPolicy {
 /// an abandoned probe container leaks exactly the same way.
 pub fn cleanup_policy(timeout: AgentRunTimeout) -> CleanupPolicy {
     match timeout {
-        AgentRunTimeout::JobDeadline(_) => CleanupPolicy::CaptureThenRemove,
+        AgentRunTimeout::JobDeadline { .. } => CleanupPolicy::CaptureThenRemove,
         AgentRunTimeout::HarnessProbe(_) => CleanupPolicy::RemoveOnly,
     }
 }
@@ -2672,7 +2695,15 @@ pub async fn run_agent_job_in_env(
     use crate::event::JobId;
     use crate::log::EventLog;
 
-    let prepared = prepare_launch(agent_command, policy, workdir, identity, timeout.duration()).await?;
+    let prepared = prepare_launch(
+        agent_command,
+        policy,
+        workdir,
+        identity,
+        timeout.duration(),
+        timeout.deadline_unix(),
+    )
+    .await?;
     let mut session_mcp_servers = prepared.mcp_servers.clone();
     session_mcp_servers.extend(attachments.mcp_servers);
     let job = JobLaunch {
@@ -2808,6 +2839,7 @@ pub(crate) async fn prepare_launch(
     workdir: &Path,
     identity: &DeliveryAgentIdentity,
     job_lifetime: Duration,
+    job_deadline_unix: Option<u64>,
 ) -> Result<PreparedLaunch, ExecError> {
     // Run the container/process as the seller's own uid/gid so a docker bind-mount's output is owned
     // by the seller and the delivery snapshot can read it. Ignored by the host executors.
@@ -2878,6 +2910,29 @@ pub(crate) async fn prepare_launch(
                 ))
             })?;
             job_resolv_conf = Some(resolv_path);
+            // The expiry this job's containers will be judged by: **the job's own absolute
+            // deadline**, carried down from the call site that chose it, with `cleanup_after_unix`
+            // adding the grace on top.
+            //
+            // It is NOT reconstructed as `now + remaining`. That reconstruction (#996 F3) read a
+            // fresh wall clock at create time, which made the stamp a measurement rather than a
+            // restatement: any backward clock step between the caller computing the remaining
+            // window and this create being issued lands the stamp EARLIER than the deadline the job
+            // is actually running under, and the sweep then removes a container out from under a
+            // job still inside its own deadline. Carrying the absolute value takes the clock out of
+            // the derivation altogether, so the stamp cannot be shortened by one.
+            //
+            // The `None` arm is reached only where there is no job deadline to carry — a harness
+            // probe, whose containers belong to no job. There the old derivation is still the best
+            // available, and an unreadable clock still yields `u64::MAX`, which is never swept,
+            // because an unreadable clock must not be able to date a live container into the past.
+            let cleanup_after = crate::sandbox_netns::launch_cleanup_stamp(
+                job_deadline_unix,
+                job_lifetime.as_secs(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(u64::MAX, |since| since.as_secs()),
+            );
             let established = crate::sandbox_netns::establish(
                 network,
                 image,
@@ -2892,6 +2947,7 @@ pub(crate) async fn prepare_launch(
                 policy.proxy_ports(),
                 true,
                 resolvers.addresses().to_vec(),
+                cleanup_after,
             )
             .await
             // Fail the job rather than run it uncontained. The whole point of moving containment into
@@ -2984,6 +3040,62 @@ pub(crate) async fn prepare_launch(
     })
 }
 
+/// Run the **production** preparation and launch construction for one job, hand the resulting argv
+/// to `run_payload`, and tear everything down afterwards.
+///
+/// This is the entrypoint the live containment gate goes through, and it exists because the
+/// alternative failed review: a gate that creates its own holder and installs its own plan proves
+/// those filters *can* be installed while saying nothing about whether a real job is launched with
+/// them. Here the same [`prepare_launch`] a seat calls establishes containment, the same
+/// [`SandboxPolicy::launch`] builds the argv, and `netns` is wired from `holder_name` exactly as
+/// [`run_agent_job_with_env`] wires it — one code path, exercised rather than re-implemented.
+///
+/// `run_payload` receives the argv to execute and the holder name, and its return value is passed
+/// back. The containment guard lives across the call and is dropped **after** it returns, so a
+/// caller that measures cleanup can compare what it saw during the call with what survives after.
+///
+/// `#[doc(hidden)]`: this is reachable so an integration test can exercise the real path, not an
+/// interface for callers. Production code calls `run_agent_job*`.
+#[cfg(feature = "acp")]
+#[doc(hidden)]
+pub async fn with_prepared_launch<R>(
+    agent_command: &[String],
+    policy: &SandboxPolicy,
+    workdir: &Path,
+    identity: &DeliveryAgentIdentity,
+    job_lifetime: Duration,
+    job_deadline_unix: Option<u64>,
+    run_payload: impl FnOnce(&AgentLaunch, Option<&str>) -> R,
+) -> Result<R, ExecError> {
+    let prepared = prepare_launch(
+        agent_command,
+        policy,
+        workdir,
+        identity,
+        job_lifetime,
+        job_deadline_unix,
+    )
+    .await?;
+    let job = JobLaunch {
+        workdir,
+        env: &prepared.env,
+        uid: prepared.uid,
+        gid: prepared.gid,
+        netns: prepared.holder_name.as_deref(),
+        // The resolver the contained job is handed, exactly as `run_agent_job` hands it over
+        // (see the production call site). Omitting it here would launch the live containment legs
+        // with no `/etc/resolv.conf` mount while production launches with one, so the gates would
+        // measure a job that cannot resolve and call it contained.
+        resolv_conf: prepared.resolv_conf.as_deref(),
+    mcp_servers: &prepared.mcp_servers,
+    };
+    let launch = policy.launch(&prepared.effective_command, &job)?;
+    let outcome = run_payload(&launch, prepared.holder_name.as_deref());
+    // `prepared` drops here: proxy first, then the namespace, in the declared field order.
+    drop(prepared);
+    Ok(outcome)
+}
+
 /// Without the `acp` feature there is no containment path to prepare — fail closed.
 #[cfg(not(feature = "acp"))]
 pub(crate) async fn prepare_launch(
@@ -2992,6 +3104,7 @@ pub(crate) async fn prepare_launch(
     _workdir: &Path,
     _identity: &DeliveryAgentIdentity,
     _job_lifetime: Duration,
+    _job_deadline_unix: Option<u64>,
 ) -> Result<PreparedLaunch, ExecError> {
     Err(ExecError::AcpRequired)
 }
@@ -3841,7 +3954,7 @@ fn classify_run_error(error: crate::engine::EngineError, timeout: AgentRunTimeou
     match (error, timeout) {
         (
             crate::engine::EngineError::Driver(crate::driver::DriverError::ResponseTimeout { .. }),
-            AgentRunTimeout::JobDeadline(_),
+            AgentRunTimeout::JobDeadline { .. },
         ) => ExecError::DeadlineExceeded,
         (error, _) => ExecError::Agent(error.to_string()),
     }
@@ -4317,6 +4430,645 @@ mod tests {
         );
         // And the only difference really is the command, so the assertion above is not vacuous.
         assert_ne!(job_argv, probe_argv);
+    }
+
+    /// A REAL SELLER DEADLINE REACHES A REAL CONTAINER'S LABEL, AND DECIDES A REAL SWEEP.
+    ///
+    /// #996 R3/3 asked for exactly this, and the module did not have it. The unit test
+    /// `sandbox_netns::tests::the_production_deadline_reaches_the_container_and_decides_the_sweep`
+    /// builds the stamp BY HAND and feeds it to a hand-written listing, so it would still pass if
+    /// this call site stopped carrying the deadline altogether — it tests the arithmetic, not the
+    /// wiring. This drives the product's own path end to end: [`prepare_launch`] →
+    /// [`crate::sandbox_netns::launch_cleanup_stamp`] → `docker run --label` →
+    /// [`crate::sandbox_netns::list_owned_argv`] → [`crate::sandbox_netns::parse_owned_listing`]
+    /// → [`crate::sandbox_netns::partition_owned`], and reads the stamp back out of the container
+    /// a real daemon actually created.
+    ///
+    /// **The mutation control that makes it worth running:** the job lifetime (60s) and the job
+    /// deadline (+24h) are far apart ON PURPOSE, so dropping the deadline moves the recorded
+    /// stamp by nearly a day and reds the stamp assertion. A green that cannot go red is
+    /// decoration.
+    ///
+    /// **Which call site this guards — precisely, because the earlier wording did not.** This
+    /// test enters at [`prepare_launch`] with a deadline it constructs ITSELF, so it guards the
+    /// `launch_cleanup_stamp` argument at the `prepare_launch` end and nothing upstream of it.
+    /// It does NOT guard the forwarding edge inside [`run_agent_job_with_env`], where a real
+    /// seller deadline actually crosses into the launch as `timeout.deadline_unix()`: replacing
+    /// THAT argument with `None` leaves this test green, because this test supplies the very
+    /// value the mutation removes. Calling it "the production call site", singular, is how the
+    /// bypassed caller went unnoticed. The sibling below
+    /// (`a_seller_deadline_crosses_run_agent_job_with_env_into_the_daemon_label`) covers that
+    /// edge; both are kept, because they fail for different reasons.
+    ///
+    /// `#[ignore]` rather than an env-var early return, for the reason the probe test above states:
+    /// a test that returns early when its precondition is missing reports as PASSED.
+    #[cfg(feature = "acp")]
+    #[tokio::test]
+    #[ignore = "live: needs a docker daemon, MAXPLAYER_HOLDER_IMAGE and the netfilter sidecar image"]
+    async fn a_seller_deadline_reaches_the_daemon_label_and_decides_the_sweep() {
+        use crate::sandbox_netns::{
+            cleanup_after_unix, list_owned_argv, parse_owned_listing, partition_owned, ROLE_HOLDER,
+        };
+
+        let image = std::env::var("MAXPLAYER_HOLDER_IMAGE").expect(
+            "set MAXPLAYER_HOLDER_IMAGE to a job image — this test measures a real container and \
+             has nothing to say without one",
+        );
+        // A seat THIS INVOCATION alone owns, and a scope that releases what it created even when
+        // an assertion panics. The shared constant that stood here made `list_owned_argv(&seat)`
+        // match every concurrent run on the daemon, so two runs with a same-second deadline could
+        // assert on — and then force-remove — each other's containers.
+        let scope = LiveScope::new("e2e");
+        let seat = scope.seat.clone();
+        let identity = DeliveryAgentIdentity::for_seller(&seat);
+        let tag = scope.network.clone();
+
+        // The workdir's last component IS the job id the launch derives its container names from.
+        let workdir = scope.workdir.clone();
+        let job_id = job_id_of(&workdir);
+
+        let policy = SandboxPolicy::docker(DockerPolicy {
+            image,
+            forward_env: Vec::new(),
+            runtime: std::env::var("MAXPLAYER_RUNSC_RUNTIME").ok(),
+            network: Some(tag.clone()),
+            proxy_ports: None,
+            file_credentials: Vec::new(),
+            dns_servers: Vec::new(),
+            container_delivery: None,
+        mcp_tools: Vec::new(),
+        });
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock")
+            .as_secs();
+        let deadline = now + 86_400;
+        let lifetime = Duration::from_secs(60);
+
+        let prepared = prepare_launch(
+            &["sh".to_owned()],
+            &policy,
+            &workdir,
+            &identity,
+            lifetime,
+            Some(deadline),
+        )
+        .await
+        .expect("containment must establish");
+
+        // Read the labels back through the PRODUCTION listing argv, never a hand-written docker ps.
+        let argv = list_owned_argv(&seat);
+        let listed = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .output()
+            .expect("docker ps must run");
+        let owned = parse_owned_listing(&String::from_utf8_lossy(&listed.stdout));
+        assert!(
+            !owned.is_empty(),
+            "the launch's containers must be visible to the production listing argv"
+        );
+
+        let expected = cleanup_after_unix(deadline);
+        let if_dropped = cleanup_after_unix(now + lifetime.as_secs());
+        for container in &owned {
+            assert_eq!(
+                container.cleanup_after,
+                Some(expected),
+                "the daemon recorded a stamp that is not this job's deadline plus the grace; \
+                 {if_dropped} would mean the call site stopped carrying Some(deadline)"
+            );
+        }
+
+        // Per-role provenance, asserted on labels a real daemon wrote rather than on a fixture.
+        let holder = owned
+            .iter()
+            .find(|container| container.role.as_deref() == Some(ROLE_HOLDER))
+            .expect("the launch created a holder");
+        assert_eq!(
+            holder.holder_job.as_deref(),
+            Some(job_id.as_str()),
+            "a production holder names its job in the holder column"
+        );
+        assert_eq!(
+            holder.helper_job, None,
+            "and never wears the helper label — the shape the sweep must read per role"
+        );
+
+        // The decision itself, from those same records: kept inside the deadline, swept past it.
+        let inside = partition_owned(&owned, &seat, deadline);
+        assert!(
+            !inside.removable.contains(&holder.id),
+            "a holder inside its job's deadline is never removable: {inside:?}"
+        );
+        assert!(
+            !inside.skipped.iter().any(|(id, _)| id == &holder.id),
+            "and it is readable, not refused: {inside:?}"
+        );
+        let past = partition_owned(&owned, &seat, expected);
+        assert!(
+            past.removable.contains(&holder.id),
+            "past the deadline plus the grace the holder is swept: {past:?}"
+        );
+
+        drop(prepared);
+        // Containers, network and workdir are released by `scope` on the way out — including on
+        // the panic paths above, which this trailing block never reached.
+    }
+
+    /// Everything one live launch owns on the daemon, released on the way out.
+    ///
+    /// The seat is the isolation boundary: `list_owned_argv` selects BY SEAT, so a seat this
+    /// invocation alone owns is what stops two concurrent runs from listing, asserting on, and
+    /// then force-removing each other's containers. Teardown lives in `Drop` because a trailing
+    /// block of `docker rm` calls is skipped entirely when an assertion panics — which is the
+    /// path a failing test takes, and therefore the path that most needs to clean up.
+    #[cfg(feature = "acp")]
+    /// What this invocation actually DID to a named resource.
+    ///
+    /// A name is not ownership. The guard holds both names from its first instant — that is what
+    /// closes the orphan window — but holding a name says nothing about whether this invocation
+    /// created the thing it names. Teardown that deletes by name alone will, after a failed
+    /// create, happily remove a resource that already belonged to somebody else.
+    ///
+    /// `Uncertain` is the honest third state: the attempt ran and its outcome could not be
+    /// established. It is REPORTED and never deleted, because deleting on a guess is exactly the
+    /// failure this distinction exists to prevent.
+    #[cfg(feature = "acp")]
+    #[derive(Clone, Copy)]
+    enum Held {
+        /// Named only. Nothing was created, so there is nothing to remove.
+        Proposed,
+        /// This invocation created it and saw it succeed. Teardown owns it.
+        Acquired,
+        /// The attempt ran and the result is not established. Report, never delete.
+        Uncertain,
+    }
+
+    /// The three outcomes a docker invocation really has.
+    ///
+    /// Collapsing "the command ran and said no" into "docker could not be run" is what lets a
+    /// failed observation be read as a fact about the world. Teardown has to tell them apart.
+    #[cfg(feature = "acp")]
+    enum Ran {
+        /// Exited zero; payload is trimmed stdout.
+        Ok(String),
+        /// Ran and exited nonzero; payload is the diagnostic.
+        Failed(String),
+        /// Never ran at all; payload is why not.
+        Unavailable(String),
+    }
+
+    #[cfg(feature = "acp")]
+    struct LiveScope {
+        seat: String,
+        network: String,
+        workdir: std::path::PathBuf,
+        /// Whether THIS invocation created the docker network named above.
+        network_state: Held,
+        /// Whether THIS invocation created the workdir named above.
+        workdir_state: Held,
+        /// The launch thread, owned by the scope rather than by the test body. A panic in an
+        /// assertion unwinds past every line after it — including a trailing `join` — so a handle
+        /// the body owns is a handle that gets DETACHED at exactly the moment teardown begins.
+        /// Owned here, it is finished and joined on both paths before a single container is
+        /// removed.
+        runner: Option<std::thread::JoinHandle<()>>,
+        /// Asks a still-running launch to stop, so the unwind path does not have to wait out the
+        /// run's whole remaining window before it can tear down.
+        cancel: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    #[cfg(feature = "acp")]
+    static LIVE_SCOPE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    #[cfg(feature = "acp")]
+    impl LiveScope {
+        /// Teardown's only reporting primitive.
+        ///
+        /// `eprintln!` PANICS if the write fails — documented behaviour, including a nonblocking
+        /// stderr returning `WouldBlock`. Reached from `Drop`, that panic either skips the cleanup
+        /// that follows it or double-panics during an assertion unwind and ABORTS the process,
+        /// destroying the very failure the test was reporting. Best-effort by construction.
+        fn report(line: &str) {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "{line}");
+        }
+
+        /// Never panics. `Drop` calls this while an assertion may already be unwinding.
+        ///
+        /// The three-way result is the point: a nonzero exit means docker answered and refused,
+        /// while a spawn error means docker never ran. Those license different conclusions about
+        /// what exists, so they are not flattened into one boolean.
+        fn docker(args: &[&str]) -> Ran {
+            match std::process::Command::new("docker")
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .output()
+            {
+                Ok(out) if out.status.success() => {
+                    Ran::Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+                }
+                Ok(out) => {
+                    let code = out
+                        .status
+                        .code()
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "signal".to_owned());
+                    Ran::Failed(format!(
+                        "exit {code}: {}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    ))
+                }
+                Err(err) => Ran::Unavailable(format!("could not run `docker`: {err}")),
+            }
+        }
+
+        /// 64 hex characters — the shape of a real seat — but unique to this invocation. The pid
+        /// alone repeats across hosts and after wrap, so the wall clock and a process-local
+        /// counter are mixed in; two tests in one binary must not collide either.
+        ///
+        /// The RESOURCE NAME carries its own token rather than a prefix of the seat. `&seat[..24]`
+        /// looked like it carried that entropy and did not: it is the 16 pid hex digits plus the
+        /// first 8 digits of `as_secs()`, and for a ~1.79e9 timestamp those 8 are ALL ZERO. The
+        /// name therefore collapsed to the pid, and pid reuse against leftovers reused the name.
+        /// The token below keeps the low seconds, the nanoseconds and the sequence — the fields
+        /// that actually differ between two invocations.
+        fn new(kind: &str) -> Self {
+            let since = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("a clock");
+            let sequence = LIVE_SCOPE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let seat = format!(
+                "{:016x}{:016x}{:016x}{:016x}",
+                std::process::id(),
+                since.as_secs(),
+                since.subsec_nanos(),
+                sequence,
+            );
+            let token = format!(
+                "{:08x}{:08x}{:08x}{:04x}",
+                std::process::id(),
+                (since.as_secs() & 0xffff_ffff) as u32,
+                since.subsec_nanos(),
+                (sequence & 0xffff) as u16,
+            );
+            let network = format!("mx996-{kind}-{token}");
+            let workdir = std::env::temp_dir().join(&network);
+
+            // OWNERSHIP FIRST, but ownership is STATE, not a name. The guard exists before
+            // anything fallible runs, so no resource is ever created with nobody responsible for
+            // it; each resource is then marked acquired only when this invocation has SEEN it
+            // created. A panic below unwinds through `Drop`, which removes exactly what was
+            // acquired and reports the rest.
+            let mut scope = Self {
+                seat,
+                network,
+                workdir,
+                network_state: Held::Proposed,
+                workdir_state: Held::Proposed,
+                runner: None,
+                cancel: None,
+            };
+
+            match Self::docker(&["network", "create", &scope.network]) {
+                Ran::Ok(_) => scope.network_state = Held::Acquired,
+                Ran::Failed(why) => {
+                    // docker answered and refused. An exit code alone cannot rule out a partial
+                    // create, so the name is UNCERTAIN: teardown reports it and deletes nothing.
+                    scope.network_state = Held::Uncertain;
+                    panic!("could not create the test network {}: {why}", scope.network);
+                }
+                Ran::Unavailable(why) => {
+                    // docker never ran, so nothing was created and the name stays PROPOSED.
+                    panic!("could not create the test network {}: {why}", scope.network);
+                }
+            }
+
+            // `create_dir_all` accepts an existing directory, which would let a path this
+            // invocation did NOT create be torn down as if it had. `create_dir` fails with
+            // `AlreadyExists` instead, so ownership is decided by this call rather than by
+            // whatever happens to be on the filesystem.
+            match std::fs::create_dir(&scope.workdir) {
+                Ok(()) => scope.workdir_state = Held::Acquired,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Not ours: left PROPOSED so teardown never removes it. The network above IS
+                    // ours, and its cleanup still runs on the way out of this panic.
+                    panic!(
+                        "the workdir {} already exists and was not created by this invocation",
+                        scope.workdir.display()
+                    );
+                }
+                Err(err) => {
+                    scope.workdir_state = Held::Uncertain;
+                    panic!("could not create the workdir {}: {err}", scope.workdir.display());
+                }
+            }
+
+            scope
+        }
+
+        /// Hand the launch thread to the scope. After this the thread is owned on every exit
+        /// path, including an unwind out of a failing assertion.
+        fn own_runner(
+            &mut self,
+            runner: std::thread::JoinHandle<()>,
+            cancel: tokio::sync::oneshot::Sender<()>,
+        ) {
+            self.runner = Some(runner);
+            self.cancel = Some(cancel);
+        }
+
+        /// Cancel-and-join. Idempotent, because `Drop` calls it too: the success path and the
+        /// unwind path therefore go through exactly the same ordering.
+        fn finish_runner(&mut self) {
+            if let Some(cancel) = self.cancel.take() {
+                // The receiver is gone if the launch already returned; that is a finished runner,
+                // not an error.
+                let _ = cancel.send(());
+            }
+            if let Some(runner) = self.runner.take() {
+                if runner.join().is_err() {
+                    // Fallible write: reporting the panic must not skip the cleanup that follows.
+                    Self::report(&format!(
+                        "live scope {}: the launch thread panicked",
+                        self.network
+                    ));
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "acp")]
+    impl Drop for LiveScope {
+        fn drop(&mut self) {
+            // ORDERING IS THE CONTRACT: the runner is cancelled and JOINED before a single
+            // removal, so a launch cannot still be creating containers while teardown removes
+            // them. On a failing assertion this is the only place that join happens.
+            self.finish_runner();
+
+            let mut failures: Vec<String> = Vec::new();
+            // Two passes. The first removes what the run created; the second catches anything
+            // that appeared while the first was still running, which a single listing misses.
+            for _ in 0..2 {
+                let argv = crate::sandbox_netns::list_owned_argv(&self.seat);
+                match std::process::Command::new(&argv[0]).args(&argv[1..]).output() {
+                    Ok(listed) if listed.status.success() => {
+                        let owned = crate::sandbox_netns::parse_owned_listing(
+                            &String::from_utf8_lossy(&listed.stdout),
+                        );
+                        if owned.is_empty() {
+                            break;
+                        }
+                        for container in &owned {
+                            match Self::docker(&["rm", "--force", &container.id]) {
+                                Ran::Ok(_) => {}
+                                Ran::Failed(why) | Ran::Unavailable(why) => {
+                                    failures.push(format!("rm {}: {why}", container.id));
+                                }
+                            }
+                        }
+                    }
+                    Ok(listed) => {
+                        // A FAILED OBSERVATION IS NOT AN EMPTY SET. `docker ps` exiting nonzero
+                        // with empty stdout parses as "this seat owns nothing"; concluding that
+                        // turns a broken instrument into a clean bill of health. Keep the status
+                        // and stderr, report them, and stop — without claiming anything is absent.
+                        let code = listed
+                            .status
+                            .code()
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "signal".to_owned());
+                        failures.push(format!(
+                            "could not list this seat's containers: exit {code}: {} \
+                             (ownership UNKNOWN, not empty)",
+                            String::from_utf8_lossy(&listed.stderr).trim()
+                        ));
+                        break;
+                    }
+                    Err(err) => {
+                        failures.push(format!(
+                            "could not list this seat's containers: {err} \
+                             (ownership UNKNOWN, not empty)"
+                        ));
+                        break;
+                    }
+                }
+            }
+
+            // ONLY WHAT THIS INVOCATION ACQUIRED. After a failed create the name is not ours, and
+            // removing by name would delete a resource somebody else owns.
+            match self.network_state {
+                Held::Acquired => match Self::docker(&["network", "rm", &self.network]) {
+                    Ran::Ok(_) => {}
+                    Ran::Failed(why) | Ran::Unavailable(why) => {
+                        failures.push(format!("network rm {}: {why}", self.network));
+                    }
+                },
+                Held::Uncertain => failures.push(format!(
+                    "network {}: creation outcome unverified; left in place, NOT removed",
+                    self.network
+                )),
+                Held::Proposed => {}
+            }
+
+            match self.workdir_state {
+                Held::Acquired => {
+                    if let Err(err) = std::fs::remove_dir_all(&self.workdir) {
+                        if err.kind() != std::io::ErrorKind::NotFound {
+                            failures.push(format!("workdir {}: {err}", self.workdir.display()));
+                        }
+                    }
+                }
+                Held::Uncertain => failures.push(format!(
+                    "workdir {}: creation outcome unverified; left in place, NOT removed",
+                    self.workdir.display()
+                )),
+                Held::Proposed => {}
+            }
+
+            // REPORTED, never discarded, and never via a macro that panics on a failed write.
+            // A silent cleanup failure is how a leak becomes somebody else's flake.
+            if !failures.is_empty() {
+                Self::report(&format!(
+                    "live scope {} cleanup failures: {}",
+                    self.network,
+                    failures.join("; ")
+                ));
+            }
+        }
+    }
+
+    /// The ordered edge — the one the test above does NOT reach.
+    ///
+    /// A seller's deadline does not begin at [`prepare_launch`]. It arrives at
+    /// [`run_agent_job_with_env`] inside an [`AgentRunTimeout::JobDeadline`] and is forwarded from
+    /// there as `timeout.deadline_unix()`. That forwarding argument is the wiring a regression
+    /// would break, and a test that enters at `prepare_launch` with its own `Some(deadline)`
+    /// cannot see it break, because it supplies the value the mutation removes.
+    ///
+    /// So this enters at `run_agent_job_with_env` — the same function
+    /// `delivery_orchestrator.rs` calls in production — and reads the labels a real daemon wrote
+    /// through the production listing, parser and selection.
+    ///
+    /// **Why it observes mid-flight.** The containment is released when the run ends, so the
+    /// labels must be read while the call is still in progress. `sh` never speaks ACP, so the
+    /// call is going to fail; that failure is immaterial and deliberately unasserted, because
+    /// containment is established BEFORE the agent handshake. Asserting on the run's result here
+    /// would only prove `sh` is not an ACP agent.
+    ///
+    /// **Mutation control:** replace `timeout.deadline_unix()` with `None` at the
+    /// `prepare_launch` call inside `run_agent_job_with_env`. The remaining window (60s) and the
+    /// deadline (+24h) are a day apart, so the recorded stamp moves by nearly a day and the stamp
+    /// assertion reds.
+    #[cfg(feature = "acp")]
+    #[tokio::test]
+    #[ignore = "live: needs a docker daemon, MAXPLAYER_HOLDER_IMAGE and the netfilter sidecar image"]
+    async fn a_seller_deadline_crosses_run_agent_job_with_env_into_the_daemon_label() {
+        use crate::sandbox_netns::{
+            cleanup_after_unix, list_owned_argv, parse_owned_listing, partition_owned, ROLE_HOLDER,
+        };
+
+        let image = std::env::var("MAXPLAYER_HOLDER_IMAGE").expect(
+            "set MAXPLAYER_HOLDER_IMAGE to a job image — this test measures a real container and \
+             has nothing to say without one",
+        );
+        let mut scope = LiveScope::new("edge");
+        let seat = scope.seat.clone();
+        let workdir = scope.workdir.clone();
+        let job_id = job_id_of(&workdir);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock")
+            .as_secs();
+        let deadline = now + 86_400;
+        let remaining = Duration::from_secs(60);
+
+        let task_image = image.clone();
+        let task_network = scope.network.clone();
+        let task_seat = seat.clone();
+        let task_workdir = workdir.clone();
+        // The production launch future is NOT `Send`: `engine::run_job` takes
+        // `sink: &mut dyn FnMut(RunEvent<'_>)`, so `tokio::spawn` will not accept it. Drive it on
+        // its own thread with a current-thread runtime — the same construction the orchestrator
+        // uses. Only plain owned values cross the boundary; the future is created and driven
+        // entirely over there, which is what makes the non-`Send` sink a non-issue.
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let runner = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a current-thread runtime");
+            runtime.block_on(async move {
+                let policy = SandboxPolicy::docker(DockerPolicy {
+                    image: task_image,
+                    forward_env: Vec::new(),
+                    runtime: std::env::var("MAXPLAYER_RUNSC_RUNTIME").ok(),
+                    network: Some(task_network),
+                    proxy_ports: None,
+                    file_credentials: Vec::new(),
+                    dns_servers: Vec::new(),
+                    container_delivery: None,
+                mcp_tools: Vec::new(),
+                });
+                let identity = DeliveryAgentIdentity::for_seller(&task_seat);
+                // EXACTLY what the orchestrator hands it: the remaining window AND the absolute
+                // second the job ends at. Nothing on this path passes a deadline to
+                // `prepare_launch` directly — that is the whole point of entering here.
+                let timeout = AgentRunTimeout::JobDeadline {
+                    remaining,
+                    deadline_unix: deadline,
+                };
+                // Bound rather than passed as a temporary: the future is now pinned and polled
+                // across statements, so its argv has to outlive the call expression.
+                let command = ["sh".to_owned()];
+                let launch = run_agent_job_with_env(
+                    &command,
+                    &policy,
+                    "",
+                    &task_workdir,
+                    &identity,
+                    timeout,
+                    None,
+                );
+                tokio::pin!(launch);
+                // The run's own result stays immaterial and unasserted — `sh` never speaks ACP.
+                // What this adds is a way for teardown to STOP the thread promptly instead of
+                // waiting out the remaining window while it holds up cleanup.
+                tokio::select! {
+                    _ = &mut launch => {}
+                    _ = cancel_rx => {}
+                }
+            })
+        });
+        // From here the scope owns the thread on every exit path, including an unwind.
+        scope.own_runner(runner, cancel_tx);
+
+        let argv = list_owned_argv(&seat);
+        let mut owned = Vec::new();
+        for _ in 0..240 {
+            let listed = std::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .output()
+                .expect("docker ps must run");
+            owned = parse_owned_listing(&String::from_utf8_lossy(&listed.stdout));
+            if !owned.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        assert!(
+            !owned.is_empty(),
+            "run_agent_job_with_env must have created containers visible to the production \
+             listing argv under this run's own seat"
+        );
+
+        let expected = cleanup_after_unix(deadline);
+        let if_dropped = cleanup_after_unix(now + remaining.as_secs());
+        assert_ne!(
+            expected, if_dropped,
+            "the control only means something while the two stamps differ"
+        );
+        for container in &owned {
+            assert_eq!(
+                container.cleanup_after,
+                Some(expected),
+                "the daemon recorded a stamp that is not this job's deadline plus the grace; \
+                 {if_dropped} would mean run_agent_job_with_env stopped forwarding \
+                 timeout.deadline_unix() into prepare_launch"
+            );
+        }
+
+        let holder = owned
+            .iter()
+            .find(|container| container.role.as_deref() == Some(ROLE_HOLDER))
+            .expect("the launch created a holder");
+        assert_eq!(
+            holder.holder_job.as_deref(),
+            Some(job_id.as_str()),
+            "a production holder names its job in the holder column"
+        );
+        assert_eq!(
+            holder.helper_job, None,
+            "and never wears the helper label — the shape the sweep must read per role"
+        );
+
+        let inside = partition_owned(&owned, &seat, deadline);
+        assert!(
+            !inside.removable.contains(&holder.id),
+            "a holder inside its job's deadline is never removable: {inside:?}"
+        );
+        let past = partition_owned(&owned, &seat, expected);
+        assert!(
+            past.removable.contains(&holder.id),
+            "past the deadline plus the grace the holder is swept: {past:?}"
+        );
+
+        // Cancel-and-join THROUGH THE SCOPE, so the success path uses the same ordering the
+        // unwind path uses: the launch is stopped and joined before anything is torn down. When
+        // an assertion above fails this line is never reached and `Drop` performs it instead.
+        scope.finish_runner();
     }
 
     // The honest false, measured in a REAL container rather than argued from a Dockerfile.
@@ -5417,7 +6169,10 @@ mod tests {
     #[test]
     fn an_awarded_job_captures_on_both_a_successful_and_a_failed_exit() {
         assert_eq!(
-            cleanup_policy(AgentRunTimeout::JobDeadline(Duration::from_secs(60))),
+            cleanup_policy(AgentRunTimeout::JobDeadline {
+                remaining: Duration::from_secs(60),
+                deadline_unix: 1_000
+            }),
             CleanupPolicy::CaptureThenRemove,
             "an awarded job's diagnostics are the ones a refund argument gets made from"
         );
@@ -7216,7 +7971,10 @@ mod tests {
 
         let deadline = classify_run_error(
             EngineError::Driver(DriverError::ResponseTimeout { request_id: 3 }),
-            AgentRunTimeout::JobDeadline(Duration::from_secs(60)),
+            AgentRunTimeout::JobDeadline {
+                remaining: Duration::from_secs(60),
+                deadline_unix: 1_000,
+            },
         );
         assert!(matches!(deadline, ExecError::DeadlineExceeded));
         assert_eq!(
@@ -7946,7 +8704,10 @@ mod tests {
             "task",
             Path::new("."),
             &identity,
-            AgentRunTimeout::JobDeadline(Duration::from_secs(1)),
+            AgentRunTimeout::JobDeadline {
+                remaining: Duration::from_secs(1),
+                deadline_unix: 1_000,
+            },
         )
         .await
         .expect_err("acp required");
@@ -8914,6 +9675,8 @@ mod mcp_tool_tests {
             &workdir,
             &identity,
             Duration::from_secs(300),
+            // A credential-bridge preparation, not a job: no deadline to stamp.
+            None,
         )
         .await
         .expect("prepare the launch");
@@ -9168,7 +9931,16 @@ mod mcp_tool_tests {
             prompt,
             &workdir,
             &identity,
-            AgentRunTimeout::JobDeadline(Duration::from_secs(420)),
+            AgentRunTimeout::JobDeadline {
+                remaining: Duration::from_secs(420),
+                // The absolute second this window ends at, taken HERE at construction — the
+                // one instant at which `now + remaining` IS the deadline rather than a guess.
+                deadline_unix: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("a clock")
+                    .as_secs()
+                    + 420,
+            },
         )
         .await
         .expect("the agent turn completes");

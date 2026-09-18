@@ -38,11 +38,25 @@ FROM alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943
 # `iptables` provides BOTH iptables and ip6tables. The policy denies the v6 LAN-equivalents as well,
 # and an image with only the v4 binary would fail those rules at apply time rather than silently skip
 # them — but there is no reason to rely on that.
-RUN apk add --no-cache iptables \
+#
+# `iproute2` provides `tc` and `ip`, and they are as load-bearing as iptables is. A gVisor payload
+# writes its packets straight onto the namespace's veth without traversing the host's `OUTPUT` chain,
+# so the iptables plan alone contains a `runc` job and lets a `runsc` one through — measured, both
+# families, TCP. The egress filter that closes that hole lives on the veth itself, and `tc` is the
+# only tool that installs it. `ip` is here for the link enumeration the daemon validates the
+# interface's identity from; both are read back by a separate container.
+#
+# The `test -x` assertions are the gate, not the `apk add`: a base image that moved `tc` into a
+# subpackage would otherwise produce an image that builds clean and cannot filter, and the first
+# thing that noticed would be a job running uncontained.
+RUN apk add --no-cache iptables iproute2 \
     && test -x /usr/sbin/iptables \
-    && test -x /usr/sbin/ip6tables
+    && test -x /usr/sbin/ip6tables \
+    && test -x /sbin/tc \
+    && test -x /sbin/ip
 
 COPY apply-policy.sh /usr/local/bin/apply-policy
-RUN chmod 0755 /usr/local/bin/apply-policy
+COPY apply-iface.sh /usr/local/bin/apply-iface
+RUN chmod 0755 /usr/local/bin/apply-policy /usr/local/bin/apply-iface
 
 ENTRYPOINT ["/usr/local/bin/apply-policy"]

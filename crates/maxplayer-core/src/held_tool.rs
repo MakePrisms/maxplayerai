@@ -1701,7 +1701,7 @@ mod live_tests {
         let McpServer::Stdio(entry) = &attachments.mcp_servers[drive] else { panic!("stdio entries") };
         let mut command = vec![entry.command.clone()];
         command.extend(entry.args.iter().cloned());
-        let prepared = prepare_launch(&command, &policy, &workdir, &identity, Duration::from_secs(120))
+        let prepared = prepare_launch(&command, &policy, &workdir, &identity, Duration::from_secs(120), None)
             .await
             .expect("prepare the launch");
         let mut servers = prepared.mcp_servers.clone();
@@ -1970,7 +1970,16 @@ mod live_tests {
                 prompt,
                 &workdir,
                 &identity,
-                crate::seller_exec::AgentRunTimeout::JobDeadline(Duration::from_secs(420)),
+                crate::seller_exec::AgentRunTimeout::JobDeadline {
+                    remaining: Duration::from_secs(420),
+                    // The absolute second this window ends at, taken HERE at construction — the
+                    // one instant at which `now + remaining` IS the deadline rather than a guess.
+                    deadline_unix: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("a clock")
+                        .as_secs()
+                        + 420,
+                },
                 None,
                 attachments,
             )

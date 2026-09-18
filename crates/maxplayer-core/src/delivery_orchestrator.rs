@@ -583,7 +583,10 @@ fn drive_acp_agent(
                 &inputs.prompt,
                 workdir,
                 &identity,
-                AgentRunTimeout::JobDeadline(timeout),
+                AgentRunTimeout::JobDeadline {
+                    remaining: timeout,
+                    deadline_unix: inputs.deadline_unix,
+                },
                 Some(env.clone()),
                 // Servers only: the HOST mounted this container, so there is nothing to mount here.
                 JobAttachments { mcp_servers: inputs.mcp_servers.clone(), extra_mounts: Vec::new() },
