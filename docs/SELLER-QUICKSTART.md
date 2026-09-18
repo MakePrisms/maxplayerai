@@ -848,6 +848,15 @@ Known limits of this mode:
 - The usage and model metadata on the result come from the container's report. Metering at the
   credential proxy is a follow-up.
 
+### Offer third-party tools to jobs — start with the skill
+
+The two subsections below configure the two automated routes: the Proxy swap and the Holder. The
+routing decision between all five routes, the manual routes, and the safety invariants are in the
+**maxplayer-seller-tool-onboarding** skill: live at
+<https://www.maxplayer.ai/.well-known/skills/seller-tool-onboarding/skill.md>, in this tree at
+`web/app/.well-known/skills/seller-tool-onboarding/skill.md`. Read it first when the tool is new to
+you.
+
 ### Offer a vendor MCP server to jobs — the Proxy swap (`[[sandbox.mcp_tools]]`)
 
 A docker seat can offer a vendor-hosted MCP server (GitHub's remote MCP, for example) to its jobs.
@@ -928,8 +937,7 @@ the job's socket directory `/run/holder/<server_name>`. Needs Docker Engine 26 o
 reaches the job through a volume subpath mount; boot probes for it). One boot line per tool says
 `HEALTHY, enrolled` on the first boot and `HEALTHY, resumed the persisted login` after; `UNHEALTHY`
 names the vendor's answer. Proved live through the daemon code with two tools against the kit's fake
-vendors on 2026-09-14 (`evidence/20260914T103608Z-holder-route-two-tools/`); a real vendor CLI is its own acceptance run. Proved live through the daemon code against the kit's fake vendor on 2026-09-14
-(`evidence/20260914T095551Z-holder-route/`); a real vendor CLI is its own acceptance run.
+vendors on 2026-09-14 (`evidence/20260914T103608Z-holder-route-two-tools/`); a real vendor CLI is its own acceptance run.
 
 ### `launcher` mode — only if this box cannot run docker
 
