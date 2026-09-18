@@ -16,6 +16,7 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// `job-class` tag value marking a contribution offer. Absent ⇒ from-scratch (back-compat).
@@ -35,6 +36,11 @@ pub const TAG_TARGET_REPO: &str = "target-repo";
 pub const TAG_BASE: &str = "base";
 pub const TAG_ACCEPTS: &str = "accepts";
 pub const TAG_FORK_REF: &str = "fork-ref";
+/// Per-job path scope tags (#957), additive like the other contribution tags; a from-scratch offer
+/// carries none so its bytes are unchanged. Each maps to one axis of [`JobPathScope`].
+pub const TAG_SCOPE_ALLOWED: &str = "scope-allowed";
+pub const TAG_SCOPE_FORBIDDEN: &str = "scope-forbidden";
+pub const TAG_SCOPE_MAX_DIFF: &str = "scope-max-diff";
 /// `["sig","seller-contribution",<hex>]` — the tuple schnorr signature label. Distinct from the
 /// `["sig","seller",..]` receipt cosig so both ride the same result without ambiguity.
 pub const SIG_SELLER_CONTRIBUTION: &str = "seller-contribution";
@@ -203,6 +209,10 @@ pub struct ContributionOffer {
     pub base: ContributionBase,
     /// Positional multi-value `accepts` (v1 = `["fork"]`).
     pub accepts: Vec<String>,
+    /// Optional per-job path scope (#957). `None` ⇒ no per-job constraint (from-scratch offer or a
+    /// pre-#957 offer); the home policy applies unchanged at `authorize_pay`. This is carried on the
+    /// offer only when the buyer authored scope tags; a from-scratch offer carries none.
+    pub scope: Option<JobPathScope>,
 }
 
 impl ContributionOffer {
@@ -266,6 +276,28 @@ pub struct ChangedPath {
     pub bytes: u64,
 }
 
+/// Optional per-job path scope a buyer attaches to a contribution offer (#957). Each axis is
+/// `Option` so that ABSENT (`None`) means "no per-job constraint on this axis — the home policy
+/// applies unchanged" (a missing field is NOT a restriction and must not widen anything).
+///
+/// This rides the same wire chain as the contribution pins: post → offer tags → buyer accept →
+/// `authorize_pay`. It is ALWAYS only-tightening relative to the home config; see
+/// [`ContentPolicy::with_job_scope`]. Malformed / overflowed values are refused at post, never
+/// silently dropped to "no restriction".
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct JobPathScope {
+    /// Allowlist prefixes. `Some(vec)` is a REAL constraint: an empty vec means NO allowed prefix,
+    /// so the merged policy DENIES ALL — never read as "unrestricted". `None` ⇒ no per-job
+    /// allowlist (home applies unchanged).
+    pub allowed_paths: Option<Vec<String>>,
+    /// Forbidden prefixes, UNIONED with the home forbid list. `Some(empty)` ⇒ no additional
+    /// forbids (home forbids still apply). `None` ⇒ none.
+    pub forbidden_paths: Option<Vec<String>>,
+    /// Max summed-churn bytes, MIN'd with the home cap. `Some(0)` caps any positive churn.
+    /// `None` ⇒ no per-job cap (home cap applies unchanged).
+    pub max_diff_bytes: Option<u64>,
+}
+
 /// Buyer-side content policy hook (MUST-5). The FLOOR (default) refuses only EMPTY diffs; it is
 /// **not** a quality gate — an in-scope-but-worthless diff can still pass (quality-judging is
 /// deferred to the payment-and-reputation chapter). Path-scope lives here (the offer table has NO
@@ -279,6 +311,10 @@ pub struct ContentPolicy {
     pub forbidden_paths: Vec<String>,
     /// Refuse when the summed churn exceeds this many bytes. `None` ⇒ no size cap.
     pub max_diff_bytes: Option<u64>,
+    /// True ⇒ refuse every non-empty diff regardless of paths (DISJOINT allowlists). This is the
+    /// only way deny-all is represented: it is NEVER encoded as an empty `allowed_paths` (which
+    /// reads as "allow all") — that inversion is exactly what #957 prevents.
+    pub deny_all: bool,
 }
 
 impl ContentPolicy {
@@ -287,12 +323,77 @@ impl ContentPolicy {
         Self::default()
     }
 
+    /// A policy that denies every non-empty diff (DISJOINT allowlists). Refuses `DeniedAll`.
+    pub fn deny_all() -> Self {
+        Self {
+            allowed_paths: Vec::new(),
+            forbidden_paths: Vec::new(),
+            max_diff_bytes: None,
+            deny_all: true,
+        }
+    }
+
+    /// Home-only-tightens merge with a per-job scope (#957). The returned policy is exactly the
+    /// home policy with the job's constraints layered on top, and it can only ever be equal or
+    /// NARROWER — a job can never widen what the home allows. Semantics:
+    /// - **allowed: prefix-aware INTERSECTION** — a path must match a home allow-prefix AND a job
+    ///   allow-prefix. Narrower wins. DISJOINT allowlists ⇒ [`ContentPolicy::deny_all`] (deny-all is
+    ///   never empty==unrestricted).
+    /// - **forbidden: UNION** — anything either side forbids stays forbidden.
+    /// - **max bytes: MIN** — the smaller cap wins (`None` = no cap).
+    /// - **absent job field ⇒ home unchanged** on that axis.
+    pub fn with_job_scope(&self, job: &JobPathScope) -> ContentPolicy {
+        // allowed: prefix-aware intersection.
+        let mut allowed = self.allowed_paths.clone();
+        if let Some(job_allowed) = &job.allowed_paths {
+            if job_allowed.is_empty() {
+                // Present-but-empty job allowlist = NO allowed prefix ⇒ deny all. Never "unrestricted".
+                return Self::deny_all();
+            }
+            if allowed.is_empty() {
+                // Home is the floor (allow all) ⇒ the job's list is the effective allowlist.
+                allowed = job_allowed.clone();
+            } else {
+                let inter = allowed_intersection(&allowed, job_allowed);
+                if inter.is_empty() {
+                    return Self::deny_all();
+                }
+                allowed = inter;
+            }
+        }
+        // forbidden: union.
+        let mut forbidden = self.forbidden_paths.clone();
+        if let Some(job_forbidden) = &job.forbidden_paths {
+            for f in job_forbidden {
+                if !forbidden.contains(f) {
+                    forbidden.push(f.clone());
+                }
+            }
+        }
+        // max bytes: min (None = no cap = unbounded).
+        let max_diff_bytes = match (self.max_diff_bytes, job.max_diff_bytes) {
+            (Some(h), Some(j)) => Some(h.min(j)),
+            (Some(h), None) => Some(h),
+            (None, Some(j)) => Some(j),
+            (None, None) => None,
+        };
+        ContentPolicy {
+            allowed_paths: allowed,
+            forbidden_paths: forbidden,
+            max_diff_bytes,
+            deny_all: false,
+        }
+    }
+
     /// Evaluate a fork-vs-base diff against the policy. Fail-closed: empty / out-of-scope /
-    /// forbidden / too-large ⇒ refuse. `changed` is the set of changed paths (never trusted from
-    /// the seller — computed by the buyer in the store).
+    /// forbidden / too-large / deny-all ⇒ refuse. `changed` is the set of changed paths (never
+    /// trusted from the seller — computed by the buyer in the store).
     pub fn evaluate(&self, changed: &[ChangedPath]) -> Result<(), ContentRefusal> {
         if changed.is_empty() {
             return Err(ContentRefusal::Empty);
+        }
+        if self.deny_all {
+            return Err(ContentRefusal::DeniedAll);
         }
         for entry in changed {
             if self
@@ -334,6 +435,41 @@ fn path_matches(path: &str, prefix: &str) -> bool {
     path == prefix || path.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('/'))
 }
 
+/// The set of prefixes whose path region lies under BOTH `a` and `b` (prefix-aware intersection).
+/// Two prefixes overlap only when one is a path-prefix of the other; the overlap region is the
+/// deeper one. This is sound: every path in an overlap region matches both `a` and `b`, and no path
+/// outside the resulting set can match both `a` and `b` when the two do not nest.
+fn overlap_prefix(a: &str, b: &str) -> Option<String> {
+    let a_matches_b = path_matches(b, a); // a is a path-prefix of b
+    let b_matches_a = path_matches(a, b); // b is a path-prefix of a
+    if a_matches_b && b_matches_a {
+        return Some(a.to_owned()); // equal
+    }
+    if a_matches_b {
+        return Some(b.to_owned()); // a ⊂ b ⇒ deeper b
+    }
+    if b_matches_a {
+        return Some(a.to_owned()); // b ⊂ a ⇒ deeper a
+    }
+    None
+}
+
+/// Prefix-aware intersection of two allowed-prefix lists: a path is allowed only if it matches a
+/// home prefix AND a job prefix. Returns the set of maximal overlapping regions.
+fn allowed_intersection(home: &[String], job: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for h in home {
+        for j in job {
+            if let Some(prefix) = overlap_prefix(h, j)
+                && !out.contains(&prefix)
+            {
+                out.push(prefix);
+            }
+        }
+    }
+    out
+}
+
 /// Why the content gate refused (all fail-closed, pre-pay).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ContentRefusal {
@@ -345,6 +481,8 @@ pub enum ContentRefusal {
     OutOfScope { path: String },
     /// Summed churn exceeds the buyer's max-diff-size cap.
     TooLarge { total: u64, cap: u64 },
+    /// The policy denies all (disjoint allowlists): no path is in scope.
+    DeniedAll,
 }
 
 impl fmt::Display for ContentRefusal {
@@ -361,6 +499,9 @@ impl fmt::Display for ContentRefusal {
             Self::TooLarge { total, cap } => write!(
                 f,
                 "contribution diff {total} bytes exceeds max-diff-size {cap} (content policy)"
+            ),
+            Self::DeniedAll => f.write_str(
+                "contribution path allowlists are disjoint — no path is in scope (deny all)",
             ),
         }
     }
@@ -422,7 +563,7 @@ pub fn is_contribution_tags(tags: &[TagSpec]) -> bool {
 }
 
 /// Additive contribution tags for a offer-kind offer OR a result-kind result echo:
-/// `job-class`, `target-repo`, `base`, `accepts…`.
+/// `job-class`, `target-repo`, `base`, `accepts…`, and (when present) the per-job path-scope tags.
 pub fn contribution_offer_tags(offer: &ContributionOffer) -> Vec<TagSpec> {
     let mut tags = vec![
         TagSpec::new([TAG_JOB_CLASS, JOB_CLASS_CONTRIBUTION]),
@@ -432,6 +573,24 @@ pub fn contribution_offer_tags(offer: &ContributionOffer) -> Vec<TagSpec> {
     let mut accepts = vec![TAG_ACCEPTS.to_owned()];
     accepts.extend(offer.accepts.iter().cloned());
     tags.push(TagSpec(accepts));
+    if let Some(scope) = &offer.scope {
+        if let Some(allowed) = &scope.allowed_paths {
+            let mut row = vec![TAG_SCOPE_ALLOWED.to_owned()];
+            row.extend(allowed.iter().cloned());
+            tags.push(TagSpec(row));
+        }
+        if let Some(forbidden) = &scope.forbidden_paths {
+            let mut row = vec![TAG_SCOPE_FORBIDDEN.to_owned()];
+            row.extend(forbidden.iter().cloned());
+            tags.push(TagSpec(row));
+        }
+        if let Some(max_diff) = scope.max_diff_bytes {
+            tags.push(TagSpec::new([
+                TAG_SCOPE_MAX_DIFF,
+                &max_diff.to_string(),
+            ]));
+        }
+    }
     tags
 }
 
@@ -469,10 +628,73 @@ pub fn parse_contribution_offer(
             "v1 supports only accepts=fork; offer accepts {accepts:?}"
         )));
     }
+    // Per-job path scope (#957). FAIL-CLOSED: a malformed / overflowed scope tag is REFUSED here
+    // (never silently dropped to "no restriction"), because a scope on a contribution offer is a
+    // security tightening a seller must not be able to strip by corrupting a tag.
+    let scope = parse_job_path_scope(tags)?;
     Ok(Some(ContributionOffer {
         target,
         base,
         accepts,
+        scope,
+    }))
+}
+
+/// Parse the optional per-job path-scope tags (#957). `Ok(None)` when NONE of the three scope tags
+/// is present (a pre-#957 / from-scratch offer ⇒ home policy applies unchanged). FAIL-CLOSED:
+/// - A present-but-empty `scope-allowed` row is REFUSED — an empty allowlist must never be read as
+///   "allow all", it is a DISJOINT deny-all, and the only sound encoding is the explicit deny-all
+///   at merge time. We refuse it at parse so a buyer's own mis-posted value cannot silently flip to
+///   unrestricted on the seller's or buyer's read side.
+/// - An UNPARSEABLE `scope-max-diff` (not a u64) is REFUSED, never treated as no-cap.
+/// - A `scope-forbidden` row with no values is accepted as "no additional forbids".
+pub fn parse_job_path_scope(
+    tags: &[TagSpec],
+) -> Result<Option<JobPathScope>, ContributionError> {
+    let allowed_row = tag_row(tags, TAG_SCOPE_ALLOWED);
+    let forbidden_row = tag_row(tags, TAG_SCOPE_FORBIDDEN);
+    let max_diff_row = tag_row(tags, TAG_SCOPE_MAX_DIFF);
+    if allowed_row.is_none() && forbidden_row.is_none() && max_diff_row.is_none() {
+        return Ok(None);
+    }
+    let allowed_paths = match allowed_row {
+        None => None,
+        Some(row) => {
+            let vals = row[1..].to_vec();
+            if vals.is_empty() {
+                return Err(ContributionError::MalformedOffer(
+                    "scope-allowed tag is present but empty — an empty allowlist is a disjoint \
+                     deny-all, never \"allow all\"; refuse the ambiguous value".into(),
+                ));
+            }
+            Some(vals)
+        }
+    };
+    let forbidden_paths = forbidden_row.map(|row| row[1..].to_vec());
+    // `max_diff_bytes` may legitimately be 0 (cap any churn). Absent ⇒ None.
+    let max_diff_bytes = match max_diff_row {
+        None => None,
+        Some(row) => {
+            let value = row
+                .get(1)
+                .ok_or_else(|| {
+                    ContributionError::MalformedOffer(
+                        "scope-max-diff tag missing its value".into(),
+                    )
+                })?
+                .parse::<u64>()
+                .map_err(|_| {
+                    ContributionError::MalformedOffer(
+                        "scope-max-diff value is not a non-negative integer".into(),
+                    )
+                })?;
+            Some(value)
+        }
+    };
+    Ok(Some(JobPathScope {
+        allowed_paths,
+        forbidden_paths,
+        max_diff_bytes,
     }))
 }
 
@@ -601,6 +823,7 @@ pub fn seller_contribution_result_parts(
         target: target.clone(),
         base,
         accepts: vec![ACCEPTS_FORK.to_owned()],
+        scope: None,
     };
     let tuple = AuthorshipTuple {
         job_id: job_id.to_owned(),
@@ -766,6 +989,7 @@ mod tests {
             allowed_paths: vec!["src".into(), "docs/".into()],
             forbidden_paths: vec!["src/secrets".into()],
             max_diff_bytes: Some(100),
+            deny_all: false,
         };
         // in-scope, under cap → pass
         assert!(policy
@@ -794,17 +1018,209 @@ mod tests {
     }
 
     #[test]
+    fn job_scope_absent_leaves_home_policy_unchanged() {
+        let policy = ContentPolicy {
+            allowed_paths: vec!["src".into()],
+            forbidden_paths: vec!["src/secrets".into()],
+            max_diff_bytes: Some(100),
+            deny_all: false,
+        };
+        // A fully-absent job scope must be a byte-identical no-op (older behavior preserved).
+        let merged = policy.with_job_scope(&JobPathScope::default());
+        assert_eq!(merged, policy);
+        // And it stays REFUSING exactly what home refused (cannot loosen, even trivially).
+        assert!(merged
+            .evaluate(&[ChangedPath { path: "tests/x.rs".into(), bytes: 1 }])
+            .is_err());
+        assert!(merged
+            .evaluate(&[ChangedPath { path: "src/lib.rs".into(), bytes: 1 }])
+            .is_ok());
+    }
+
+    #[test]
+    fn job_scope_widens_nothing_but_narrows_to_deny_all_on_disjoint() {
+        // Home allows only `src`. A job that forbids `src` entirely leaves NOTHING in scope: the
+        // merged policy must DENY ALL, never read the empty intersection as "allow all".
+        let policy = ContentPolicy {
+            allowed_paths: vec!["src".into()],
+            forbidden_paths: Vec::new(),
+            max_diff_bytes: None,
+            deny_all: false,
+        };
+        let merged = policy.with_job_scope(&JobPathScope {
+            allowed_paths: Some(vec!["src".into(), "docs".into()]),
+            forbidden_paths: None,
+            max_diff_bytes: None,
+        });
+        // Intersection of `src` ∩ (`src`|`docs`) = `src`, so a src path still passes…
+        assert!(merged
+            .evaluate(&[ChangedPath { path: "src/lib.rs".into(), bytes: 1 }])
+            .is_ok());
+        // …and a docs path (in the job allowlist but NOT in home) is refused — home cannot be widened.
+        assert!(matches!(
+            merged.evaluate(&[ChangedPath { path: "docs/x.md".into(), bytes: 1 }]),
+            Err(ContentRefusal::OutOfScope { .. })
+        ));
+
+        // DISJOINT: home=`src`, job allowlist=`docs`. No allowed region ⇒ deny-all.
+        let disjoint = policy.with_job_scope(&JobPathScope {
+            allowed_paths: Some(vec!["docs".into()]),
+            forbidden_paths: None,
+            max_diff_bytes: None,
+        });
+        assert!(disjoint.deny_all, "disjoint allowlists must be an explicit deny_all");
+        assert!(matches!(
+            disjoint.evaluate(&[ChangedPath { path: "src/lib.rs".into(), bytes: 1 }]),
+            Err(ContentRefusal::DeniedAll)
+        ));
+        // deny_all refuses even a path that would otherwise be in home's allowlist.
+        assert!(matches!(
+            disjoint.evaluate(&[ChangedPath { path: "docs/x.md".into(), bytes: 1 }]),
+            Err(ContentRefusal::DeniedAll)
+        ));
+    }
+
+    #[test]
+    fn job_scope_present_but_empty_allowlist_is_deny_all_never_unrestricted() {
+        // A PRESENT-but-empty job allowlist is the one value that must never be read as "allow all".
+        let policy = ContentPolicy::floor(); // home = allow all
+        let merged = policy.with_job_scope(&JobPathScope {
+            allowed_paths: Some(Vec::new()),
+            forbidden_paths: None,
+            max_diff_bytes: None,
+        });
+        assert!(merged.deny_all, "empty present allowlist must be deny_all");
+        assert!(matches!(
+            merged.evaluate(&[ChangedPath { path: "anything.rs".into(), bytes: 1 }]),
+            Err(ContentRefusal::DeniedAll)
+        ));
+        // Sanity: the FLOOR itself still allows (so deny_all is a real, distinct state).
+        assert!(policy
+            .evaluate(&[ChangedPath { path: "anything.rs".into(), bytes: 1 }])
+            .is_ok());
+    }
+
+    #[test]
+    fn job_scope_tightens_forbid_union_and_max_min() {
+        let policy = ContentPolicy {
+            allowed_paths: vec!["src".into()],
+            forbidden_paths: vec!["src/secrets".into()],
+            max_diff_bytes: Some(1000),
+            deny_all: false,
+        };
+        let merged = policy.with_job_scope(&JobPathScope {
+            allowed_paths: None,
+            forbidden_paths: Some(vec!["src/gen".into()]),
+            max_diff_bytes: Some(50),
+        });
+        // Forbidden UNION: both the home and the job forbid list hold.
+        assert!(matches!(
+            merged.evaluate(&[ChangedPath { path: "src/secrets/key".into(), bytes: 1 }]),
+            Err(ContentRefusal::Forbidden { .. })
+        ));
+        assert!(matches!(
+            merged.evaluate(&[ChangedPath { path: "src/gen/out.rs".into(), bytes: 1 }]),
+            Err(ContentRefusal::Forbidden { .. })
+        ));
+        // Max bytes MIN: the job's 50 cap wins over home's 1000.
+        assert!(matches!(
+            merged.evaluate(&[ChangedPath { path: "src/lib.rs".into(), bytes: 51 }]),
+            Err(ContentRefusal::TooLarge { .. })
+        ));
+        // in-scope, under the joined cap → pass.
+        assert!(merged
+            .evaluate(&[ChangedPath { path: "src/lib.rs".into(), bytes: 40 }])
+            .is_ok());
+    }
+
+    #[test]
+    fn job_scope_cannot_widen_home_forbid_or_cap() {
+        // The job tries to RE-open a forbidden path and RAISE the cap. Home-only-tightens means
+        // neither is honored: the stricter home values hold.
+        let policy = ContentPolicy {
+            allowed_paths: Vec::new(),
+            forbidden_paths: vec!["src/secrets".into()],
+            max_diff_bytes: Some(100),
+            deny_all: false,
+        };
+        let merged = policy.with_job_scope(&JobPathScope {
+            allowed_paths: None,
+            forbidden_paths: Some(Vec::new()), // tries to clear the forbid — home forbids hold
+            max_diff_bytes: Some(100_000),     // tries to raise the cap — home cap holds
+        });
+        assert!(matches!(
+            merged.evaluate(&[ChangedPath { path: "src/secrets/key".into(), bytes: 1 }]),
+            Err(ContentRefusal::Forbidden { .. })
+        ));
+        assert!(matches!(
+            merged.evaluate(&[ChangedPath { path: "src/big.rs".into(), bytes: 101 }]),
+            Err(ContentRefusal::TooLarge { .. })
+        ));
+    }
+
+    #[test]
     fn offer_tags_round_trip_through_parse() {
         let offer = ContributionOffer {
             target: pin(),
             base: ContributionBase::new("main", "a".repeat(40)).unwrap(),
             accepts: vec![ACCEPTS_FORK.to_owned()],
+            scope: None,
         };
         let tags = contribution_offer_tags(&offer);
         assert!(is_contribution_tags(&tags));
         let parsed = parse_contribution_offer(&tags).expect("parse ok").expect("is contribution");
         assert_eq!(parsed, offer);
         assert!(parsed.accepts_fork());
+    }
+
+    #[test]
+    fn scope_tags_round_trip_through_parse() {
+        let offer = ContributionOffer {
+            target: pin(),
+            base: ContributionBase::new("main", "a".repeat(40)).unwrap(),
+            accepts: vec![ACCEPTS_FORK.to_owned()],
+            scope: Some(JobPathScope {
+                allowed_paths: Some(vec!["src".into(), "docs/".into()]),
+                forbidden_paths: Some(vec!["src/secrets".into()]),
+                max_diff_bytes: Some(4096),
+            }),
+        };
+        let tags = contribution_offer_tags(&offer);
+        assert!(is_contribution_tags(&tags));
+        let parsed = parse_contribution_offer(&tags)
+            .expect("parse ok")
+            .expect("is contribution");
+        assert_eq!(parsed.scope, Some(offer.scope.clone().unwrap()));
+        assert_eq!(parsed, offer);
+    }
+
+    #[test]
+    fn malformed_scope_tag_is_refused_not_silently_dropped() {
+        // A scope tag encodes across the round trip; strip one VALUE so the row is present but the
+        // allowlist is empty. `parse_job_path_scope` must REFUSE (never silently drop to "no scope"),
+        // because a buyer's mis-posted empty allowlist is a disjoint deny-all and must not read as
+        // unrestricted anywhere downstream.
+        let offer = ContributionOffer {
+            target: pin(),
+            base: ContributionBase::new("main", "a".repeat(40)).unwrap(),
+            accepts: vec![ACCEPTS_FORK.to_owned()],
+            scope: None,
+        };
+        let mut tags = contribution_offer_tags(&offer);
+        // Emulate a corrupted empty `scope-allowed` row.
+        tags.push(TagSpec::new([TAG_SCOPE_ALLOWED]));
+        let err = parse_contribution_offer(&tags).expect_err("empty allowlist must refuse");
+        assert!(matches!(err, ContributionError::MalformedOffer(_)), "got {err}");
+
+        // A non-integer max-diff must refuse too, not become no-cap.
+        let tags2 = [
+            TagSpec::new([TAG_JOB_CLASS, JOB_CLASS_CONTRIBUTION]),
+            TagSpec::new([TAG_SCOPE_MAX_DIFF, "not-a-number"]),
+        ];
+        assert!(matches!(
+            parse_job_path_scope(&tags2),
+            Err(ContributionError::MalformedOffer(_))
+        ));
     }
 
     #[cfg(feature = "gateway")]
@@ -834,6 +1250,7 @@ mod tests {
             target: pin(),
             base: ContributionBase::new("main", "a".repeat(40)).unwrap(),
             accepts: vec![ACCEPTS_FORK.to_owned()],
+            scope: None,
         };
         let tags = contribution_result_tags(&offer, &sig);
         let (echo, parsed_sig) = parse_contribution_result_echo(&tags)
@@ -968,6 +1385,7 @@ mod tests {
             target: pin(),
             base: ContributionBase::new("main", "a".repeat(40)).unwrap(),
             accepts: vec![ACCEPTS_FORK.to_owned()],
+            scope: None,
         };
         contribution_offer_tags(&offer)
     }

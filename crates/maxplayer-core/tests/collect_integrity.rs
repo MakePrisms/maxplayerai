@@ -25,8 +25,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Once;
 
 use git_http_fixture::GitHttpAuthServer;
+use maxplayer_core::authorize_pay::{
+    authorize_pay_async, AuthorizePayError, AuthorizePayRequest, ContributionPayBinds, JobClass,
+};
 use maxplayer_core::budget::BudgetGate;
 use maxplayer_core::collect::{collect_async, CollectError, CollectRequest};
+use maxplayer_core::contribution::JobPathScope;
+use maxplayer_core::gateway::PaymentMode;
 use maxplayer_core::home;
 use maxplayer_core::job_lifecycle::AcceptedBind;
 use maxplayer_core::receipt::{ReceiptPreimage, DeliveryKind, EXEC_METADATA_COMMITMENT_EMPTY};
@@ -835,5 +840,173 @@ async fn collect_refuses_dead_mint_at_preflight_before_the_budget_reserve() {
         "must be bounded (no park), took {elapsed:?}"
     );
 
+    let _ = fs::remove_dir_all(&root);
+}
+
+// ── #957 per-job path scope — driven through the REAL pay path (zero mock spend) ─────────────
+//
+// Drives `authorize_pay_async` itself (not just the in-crate verifier) against a real HTTPS
+// fixture, so a per-job scope refusal is proven at the exact pre-pay seam a contribution pays
+// through, BEFORE any mock spend (`gate.spent()==0`, no journal). A POSITIVE in-scope control
+// proves the gate discriminates: an in-scope fork clears the content gate and is instead refused
+// at the later seller-cosig seam, NOT at content.
+fn make_contribution_repo(label: &str, change_path: &str) -> (PathBuf, String, String) {
+    // main carries a base commit; branch `contribution` adds a single commit touching
+    // `change_path`, so tip-match pins the fork tip and the base-from-pin pins the base commit.
+    let dir = temp(label);
+    fs::create_dir_all(&dir).expect("contrib dir");
+    git_in(&dir, &["init", "--initial-branch=main"]);
+    git_in(&dir, &["config", "user.name", "Contributor"]);
+    git_in(&dir, &["config", "user.email", "contrib@example.invalid"]);
+    fs::write(dir.join("README.md"), "base\n").expect("write base");
+    git_in(&dir, &["add", "-A"]);
+    git_in(&dir, &["commit", "-m", "base"]);
+    let base_oid = git_stdout(&dir, &["rev-parse", "HEAD"]);
+    git_in(&dir, &["checkout", "-b", "contribution"]);
+    let path = dir.join(change_path);
+    fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    fs::write(&path, "agent work\n").expect("write change");
+    git_in(&dir, &["add", "-A"]);
+    git_in(&dir, &["commit", "-m", "contribution"]);
+    let fork_tip = git_stdout(&dir, &["rev-parse", "HEAD"]);
+    (dir, base_oid, fork_tip)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn authorize_pay_scope_refuses_out_of_scope_with_zero_spend() {
+    init_test_env();
+    let (dir, base_oid, fork_tip) = make_contribution_repo("scope-out", "other/x.rs");
+    let mount = format!("/git/{}/repo.git", "ab".repeat(32));
+    let server = GitHttpAuthServer::spawn(&dir, &mount);
+    let repo_url = server.repo_url();
+
+    let root = temp("home-scope");
+    let _ = fs::remove_dir_all(&root);
+    let home = home::bootstrap(&root).expect("home");
+    let pubkey_hex = home::public_key_hex(&home).expect("pubkey");
+    let mut gate = BudgetGate::from_home(&home).expect("gate");
+
+    let request = AuthorizePayRequest {
+        payment_mode: PaymentMode::Sat,
+        job_id: "a".repeat(64),
+        result_id: "d".repeat(64),
+        job_class: JobClass::Contribution,
+        // tip-match: hash == advertised fork tip.
+        delivery_integrity_hash: fork_tip.clone(),
+        job_hash: "bb".repeat(32),
+        seller_pubkey: pubkey_hex.clone(),
+        amount_sats: 2,
+        repo: repo_url.clone(),
+        branch: "contribution".into(),
+        commit_oid: fork_tip.clone(),
+        // Never reached: the content gate refuses BEFORE the cosig seam, so an empty signature is
+        // fine for the negative leg. The refusal must be about scope, not a cosig defect.
+        seller_signature: String::new(),
+        creq_hash: None,
+        accepted_mints: Vec::new(),
+        realized_mint: None,
+        contribution: Some(ContributionPayBinds {
+            target_owner_pubkey: "aa".repeat(32),
+            target_clone_url: repo_url.clone(),
+            base_branch: "main".into(),
+            base_oid: base_oid.clone(),
+            tuple_signature: String::new(),
+            // Per-job allowlist narrows home (floor) to `src`; the diff touches `other/`.
+            scope: Some(JobPathScope {
+                allowed_paths: Some(vec!["src".into()]),
+                forbidden_paths: None,
+                max_diff_bytes: None,
+            }),
+        }),
+    };
+
+    let err = authorize_pay_async(&home, &mut gate, request)
+        .await
+        .expect_err("out-of-scope contribution must refuse");
+    // The refusal is a DELIVERY/content refusal (the scope gate), not a later-seam defect.
+    assert!(
+        matches!(err, AuthorizePayError::Delivery(_)),
+        "must refuse at the delivery/content gate, got {err}"
+    );
+    // THE BRIEF'S TOOTH: the refusal fired BEFORE any mock spend.
+    assert_eq!(gate.spent(), 0, "an out-of-scope refusal must burn ZERO spend");
+    assert_eq!(
+        BudgetGate::from_home(&home::bootstrap(&root).expect("reload")).expect("reload").spent(),
+        0,
+        "durable spent must stay 0 after a scope refusal"
+    );
+    assert!(!root.join("payment-journal").exists(), "no payment journal on a scope refusal");
+
+    drop(server);
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn authorize_pay_scope_in_scope_clears_content_gate_and_is_refused_later() {
+    // POSITIVE SPEND-PATH CONTROL: the same pay path with an IN-SCOPE fork (change under `src/`)
+    // clears the content gate and is instead refused at the LATER seller-cosig seam (empty sig),
+    // proving the negative leg above was refused FOR SCOPE and not because the harness never
+    // reached a content decision. Still zero spend (the cosig seam is also pre-budget).
+    init_test_env();
+    let (dir, base_oid, fork_tip) = make_contribution_repo("scope-in", "src/ok.rs");
+    let mount = format!("/git/{}/repo.git", "cd".repeat(32));
+    let server = GitHttpAuthServer::spawn(&dir, &mount);
+    let repo_url = server.repo_url();
+
+    let root = temp("home-scope-in");
+    let _ = fs::remove_dir_all(&root);
+    let home = home::bootstrap(&root).expect("home");
+    let pubkey_hex = home::public_key_hex(&home).expect("pubkey");
+    let mut gate = BudgetGate::from_home(&home).expect("gate");
+
+    let request = AuthorizePayRequest {
+        payment_mode: PaymentMode::Sat,
+        job_id: "a".repeat(64),
+        result_id: "d".repeat(64),
+        job_class: JobClass::Contribution,
+        delivery_integrity_hash: fork_tip.clone(),
+        job_hash: "bb".repeat(32),
+        seller_pubkey: pubkey_hex.clone(),
+        amount_sats: 2,
+        repo: repo_url.clone(),
+        branch: "contribution".into(),
+        commit_oid: fork_tip.clone(),
+        seller_signature: String::new(),
+        creq_hash: None,
+        accepted_mints: Vec::new(),
+        realized_mint: None,
+        contribution: Some(ContributionPayBinds {
+            target_owner_pubkey: "aa".repeat(32),
+            target_clone_url: repo_url.clone(),
+            base_branch: "main".into(),
+            base_oid: base_oid.clone(),
+            tuple_signature: String::new(),
+            // In-scope: the diff touches `src/ok.rs`, inside the `src` allowlist.
+            scope: Some(JobPathScope {
+                allowed_paths: Some(vec!["src".into()]),
+                forbidden_paths: None,
+                max_diff_bytes: None,
+            }),
+        }),
+    };
+
+    let err = authorize_pay_async(&home, &mut gate, request)
+        .await
+        .expect_err("in-scope with an empty seller sig must still refuse, but at the cosig seam");
+    // If content had refused (scope), this would be a Delivery error. It must NOT be: the in-scope
+    // fork got past the content gate and was refused only by the later cosig seam.
+    assert!(
+        !matches!(err, AuthorizePayError::Delivery(_)),
+        "the in-scope fork must clear the content gate; got a delivery/content refusal: {err}"
+    );
+    assert!(
+        matches!(err, AuthorizePayError::CosigRefused(_)),
+        "in-scope must be refused at the later cosig seam (empty sig), got {err}"
+    );
+    assert_eq!(gate.spent(), 0, "a pre-budget cosig refusal must burn ZERO spend");
+
+    drop(server);
+    let _ = fs::remove_dir_all(&dir);
     let _ = fs::remove_dir_all(&root);
 }

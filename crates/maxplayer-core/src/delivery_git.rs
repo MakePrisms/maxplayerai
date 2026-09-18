@@ -1393,6 +1393,76 @@ mod contribution_tests {
             .expect("in-scope must pass");
     }
 
+    // ── Per-job path scope (#957) through the REAL verify: refusal + positive control ────────
+    #[test]
+    fn job_path_scope_gate_refuses_out_of_scope_and_passes_in_scope() {
+        // Home policy allows everything (floor); the PER-JOB scope narrows it to `src`. A diff that
+        // touches only `other/` is outside the merged allowlist and must be REFUSED; a diff that
+        // touches `src/` passes. Exercises the real store fetch + base-from-pin + content gate, with
+        // the per-job scope layered on top of home via with_job_scope.
+        let home_policy = ContentPolicy::floor();
+        let job_scope = crate::contribution::JobPathScope {
+            allowed_paths: Some(vec!["src".into()]),
+            forbidden_paths: None,
+            max_diff_bytes: None,
+        };
+        let merged = home_policy.with_job_scope(&job_scope);
+
+        // Negative: out-of-scope refuses before any spend (the gate runs pre-pay in authorize_pay).
+        let fx = scenario(1, "other/x.rs");
+        let mut v = GitDeliveryVerifier::new(&fx.store);
+        let err = v
+            .contribution_verify(
+                &fork_delivery(&fx),
+                fx.target_git.to_str().unwrap(),
+                "main",
+                &fx.base_oid,
+                &merged,
+            )
+            .expect_err("per-job out-of-scope must refuse");
+        assert!(matches!(err, DeliveryError::ContentRefused(_)), "got {err}");
+
+        // Positive control: an identical contribution touching a path under the job allowlist passes.
+        let fx2 = scenario(1, "src/ok.rs");
+        let mut v2 = GitDeliveryVerifier::new(&fx2.store);
+        v2.contribution_verify(
+            &fork_delivery(&fx2),
+            fx2.target_git.to_str().unwrap(),
+            "main",
+            &fx2.base_oid,
+            &merged,
+        )
+        .expect("in-scope per-job contribution must pass");
+    }
+
+    #[test]
+    fn job_path_scope_gate_disjoint_allowlist_denies_all_even_against_floor() {
+        // Home floor allows all; the per-job allowlist is DISJOINT from nothing — an empty present
+        // allowlist is a disjoint deny-all, so even against the floor the merged policy refuses
+        // every path (never reads as "allow all", the #957 invariant).
+        let home_policy = ContentPolicy::floor();
+        let job_scope = crate::contribution::JobPathScope {
+            allowed_paths: Some(Vec::new()),
+            forbidden_paths: None,
+            max_diff_bytes: None,
+        };
+        let merged = home_policy.with_job_scope(&job_scope);
+        assert!(merged.deny_all, "empty present allowlist must be an explicit deny_all");
+
+        let fx = scenario(1, "src/ok.rs");
+        let mut v = GitDeliveryVerifier::new(&fx.store);
+        let err = v
+            .contribution_verify(
+                &fork_delivery(&fx),
+                fx.target_git.to_str().unwrap(),
+                "main",
+                &fx.base_oid,
+                &merged,
+            )
+            .expect_err("disjoint allowlist must deny all");
+        assert!(matches!(err, DeliveryError::ContentRefused(_)), "got {err}");
+    }
+
     // ── Retention (the STRAND-PROOF): after verify, the object is in the buyer store; the
     //    fork moving/deleting cannot strand the buyer — merge succeeds from the retained local oid. ─
     #[test]

@@ -125,6 +125,10 @@ pub struct ContributionSpec {
     pub base_branch: String,
     pub base_oid: String,
     pub accepts: Option<Vec<String>>,
+    /// Optional per-job path scope (#957). `None` ⇒ no per-job constraint (home policy applies
+    /// unchanged at `authorize_pay`). The scope cannot be WIDER than home — home-only-tightens
+    /// is enforced at merge time. Absent is back-compat.
+    pub scope: Option<crate::contribution::JobPathScope>,
 }
 
 /// Outcome of a successful `post_job`.
@@ -275,6 +279,9 @@ pub struct ContributionOfferView {
     pub base_branch: String,
     pub base_oid: String,
     pub accepts: Vec<String>,
+    /// Optional per-job path scope (#957), as the buyer authored it. `None` ⇒ no per-job constraint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<crate::contribution::JobPathScope>,
 }
 
 /// Serializable view of a seller result's contribution echo + authorship signature.
@@ -447,6 +454,9 @@ pub struct AcceptedContribution {
     pub base_oid: String,
     pub tuple_signature: String,
     pub store_ref: String,
+    /// Optional per-job path scope (#957), threaded from the buyer's signed offer (authority).
+    /// `None` ⇒ home policy applies unchanged at `authorize_pay`.
+    pub scope: Option<crate::contribution::JobPathScope>,
 }
 
 /// Inputs for accepting a seller claim (and binding the matching result).
@@ -862,6 +872,7 @@ fn contribution_offer_from_spec(
         target,
         base,
         accepts,
+        scope: spec.scope.clone(),
     })
 }
 
@@ -1867,6 +1878,8 @@ fn resolve_accepted_contribution(
         base_oid: offer_contribution.base_oid.clone(),
         tuple_signature: echo.tuple_signature.clone(),
         store_ref: crate::delivery_git::PayPathDeliveryVerifier::store_ref_for(commit_oid),
+        // Scope authority is also the offer (buyer-signed), never the echo.
+        scope: offer_contribution.scope.clone(),
     }))
 }
 
@@ -2025,6 +2038,8 @@ pub fn authorize_request_from_bind(
                 base_branch: c.base_branch.clone(),
                 base_oid: c.base_oid.clone(),
                 tuple_signature: c.tuple_signature.clone(),
+                // Thread the per-job path scope (#957) so authorize_pay can merge it home-only-tightens.
+                scope: c.scope.clone(),
             }
         }),
         // Thread the sealed mode so the §2.5 entry guard can refuse a free bind. A legacy bind
@@ -2093,6 +2108,7 @@ pub fn fill_explicit_request_from_bind(
                 base_branch: c.base_branch.clone(),
                 base_oid: c.base_oid.clone(),
                 tuple_signature: c.tuple_signature.clone(),
+                scope: c.scope.clone(),
             }
         });
     }
@@ -3084,6 +3100,7 @@ fn contribution_offer_view(tags: &[TagSpec]) -> Option<ContributionOfferView> {
             base_branch: offer.base.branch().to_owned(),
             base_oid: offer.base.oid().to_owned(),
             accepts: offer.accepts,
+            scope: offer.scope,
         }),
         _ => None,
     }
@@ -5161,6 +5178,7 @@ mod tests {
                 base_branch: base_branch.to_owned(),
                 base_oid: base_oid.to_owned(),
                 accepts: vec!["fork".into()],
+                scope: None,
             }),
             requested_agent: None,
             requested_harness_family: None,
@@ -5287,6 +5305,7 @@ mod tests {
                 base_oid: "77".repeat(20),
                 tuple_signature: "cafe".into(),
                 store_ref: "refs/maxplayer/deliveries/eeee".into(),
+                scope: None,
             }),
         };
         let req = authorize_request_from_bind(&bind, 1, bind.commit_oid.clone()).expect("ok");
@@ -5311,6 +5330,7 @@ mod tests {
             .unwrap(),
             base: crate::contribution::ContributionBase::new("main", "77".repeat(20)).unwrap(),
             accepts: vec!["fork".into()],
+            scope: None,
         };
         let tags = crate::contribution::contribution_offer_tags(&offer);
         let view = contribution_offer_view(&tags).expect("parsed");
@@ -5339,6 +5359,7 @@ mod tests {
             base_branch: branch.into(),
             base_oid: oid.into(),
             accepts,
+            scope: None,
         }
     }
 

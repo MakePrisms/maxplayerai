@@ -107,6 +107,9 @@ pub struct ContributionPayBinds {
     pub base_oid: String,
     /// Seller schnorr signature (hex) over the signed-result authorship tuple (`sig/seller-contribution`).
     pub tuple_signature: String,
+    /// Optional per-job path scope (#957), threaded from the buyer's signed offer. `None` ⇒ home
+    /// policy applies unchanged; `Some(..)` is merged home-only-tightens at verify time.
+    pub scope: Option<crate::contribution::JobPathScope>,
 }
 
 /// Successful composed pay outcome (state + attempt id + spent accounting).
@@ -395,7 +398,13 @@ pub async fn authorize_pay_async(
         let base_oid = CommitOid::parse(binds.base_oid.clone())
             .map_err(|error| AuthorizePayError::Input(format!("contribution base_oid: {error}")))?;
         let fork = delivery.clone();
-        let policy = contribution_policy(home);
+        // Home-only-tightens: the per-job scope (#957) is merged INTO the home content policy, so a
+        // job can only ever NARROW what the home allows — never widen it. Absent scope ⇒ home unchanged.
+        let policy = if let Some(scope) = &binds.scope {
+            contribution_policy(home).with_job_scope(scope)
+        } else {
+            contribution_policy(home)
+        };
         verifier
             .verify_contribution(
                 &fork,
@@ -831,6 +840,7 @@ fn contribution_policy(home: &MaxplayerHome) -> crate::contribution::ContentPoli
             allowed_paths: cfg.allowed_paths.clone(),
             forbidden_paths: cfg.forbidden_paths.clone(),
             max_diff_bytes: cfg.max_diff_bytes,
+            deny_all: false,
         },
         None => crate::contribution::ContentPolicy::floor(),
     }
