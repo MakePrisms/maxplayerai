@@ -56,6 +56,11 @@ pub enum SellerGitError {
     /// chose, so the push path refuses before it opens the repository. See
     /// [`assert_plain_repo_layout`].
     Layout(String),
+    /// The delivery this work belonged to was cancelled, or its absolute deadline passed, BEFORE
+    /// this phase of the work ran. Distinct from [`Self::Io`] because nothing failed: the operation
+    /// refused to do more work for an owner that is gone, which is what bounds how long it can hold
+    /// the seat's delivery turn. See [`crate::delivery_turn`].
+    Cancelled(String),
 }
 
 impl std::fmt::Display for SellerGitError {
@@ -66,6 +71,9 @@ impl std::fmt::Display for SellerGitError {
             Self::CommandFailed(op) => write!(f, "seller git {op} failed"),
             Self::AuthFailed(message) => write!(f, "seller git auth failed: {message}"),
             Self::Io(message) => write!(f, "seller git io error: {message}"),
+            Self::Cancelled(message) => {
+                write!(f, "seller git delivery work ended: {message}")
+            }
             Self::NoExecutionObserved(message) => {
                 write!(f, "seller git no execution observed: {message}")
             }
@@ -223,7 +231,8 @@ fn checkout_base_branch(
 ) -> Result<(), SellerGitError> {
     let repo =
         Repository::open(workdir).map_err(|error| SellerGitError::Io(format!("open: {error}")))?;
-    let oid = Oid::from_str(base_oid).map_err(|_| SellerGitError::CommandFailed("checkout-base"))?;
+    let oid =
+        Oid::from_str(base_oid).map_err(|_| SellerGitError::CommandFailed("checkout-base"))?;
     let commit = repo
         .find_commit(oid)
         .map_err(|_| SellerGitError::CommandFailed("checkout-base"))?;
@@ -511,6 +520,7 @@ pub fn push_branch_with_header(
         gated_oid,
         header.map(git_transport::static_auth),
         None,
+        None,
     )
 }
 
@@ -528,13 +538,14 @@ pub fn push_branch_with_minter(
     gated_oid: &str,
     mint: Option<git_transport::AuthMinter>,
     authority: Option<git_transport::AuthorityCheck>,
+    lifetime: Option<git_transport::AuthorityCheck>,
 ) -> Result<String, SellerGitError> {
     assert_allowed_repo_locator(remote_url)?;
     if branch.trim().is_empty() {
         return Err(SellerGitError::Io("branch must be non-empty".into()));
     }
     let oid = git_transport::push_branch_with_minter(
-        workdir, remote_url, branch, gated_oid, mint, authority,
+        workdir, remote_url, branch, gated_oid, mint, authority, lifetime,
     )?;
     eprintln!("seller push path=inprocess remote={remote_url} branch={branch} ok");
     Ok(oid)
@@ -665,10 +676,8 @@ pub async fn push_branch_with_header_off_runtime(
     gated_oid: String,
     header: Option<String>,
 ) -> Result<String, SellerGitError> {
-    off_runtime(move || {
-        push_branch_with_header(&workdir, &remote_url, &branch, &gated_oid, header)
-    })
-    .await
+    off_runtime(move || push_branch_with_header(&workdir, &remote_url, &branch, &gated_oid, header))
+        .await
 }
 
 /// Refuse a job workdir whose repository layout would make libgit2 read state from outside
@@ -904,6 +913,16 @@ pub fn neutralize_push_config(workdir: &Path) -> Result<(), SellerGitError> {
 /// request is transmitted (see [`git_transport::AuthorityCheck`]). The blocking thread this runs on
 /// OUTLIVES the future that spawned it — dropping the future does not stop the thread — so the
 /// thread has to find out for itself that its owner is gone.
+///
+/// `turn` is this delivery's exclusive turn at the seat's delivery remote, and it is MOVED onto the
+/// blocking thread below. Two things follow, and both are the point:
+///
+/// - the turn is handed back by the thread that does the work, when the work actually stops — not by
+///   the async task that dispatched it, which a cancelled caller or a shutting-down runtime can take
+///   away while the blocking thread is still uploading; and
+/// - a delivery revoked while its closure was still QUEUED for a blocking slot never runs at all,
+///   and hands its turn back immediately instead of holding it until some unrelated blocking work
+///   finishes (see [`crate::delivery_turn`]).
 pub async fn neutralize_then_push_off_runtime(
     workdir: PathBuf,
     remote_url: String,
@@ -911,22 +930,432 @@ pub async fn neutralize_then_push_off_runtime(
     gated_oid: String,
     mint: Option<git_transport::AuthMinter>,
     authority: Option<git_transport::AuthorityCheck>,
+    turn: crate::delivery_turn::DeliveryTurn,
 ) -> Result<String, SellerGitError> {
-    off_runtime(move || {
+    off_runtime_holding_the_turn(turn, move |work| {
+        // Phase boundary: the config rewrite is local and short, but a delivery revoked before it
+        // must not touch the workdir at all.
+        work.check().map_err(|ended| {
+            SellerGitError::Cancelled(format!("before neutralizing config: {ended}"))
+        })?;
         neutralize_push_config(&workdir)?;
-        push_branch_with_minter(&workdir, &remote_url, &branch, &gated_oid, mint, authority)
+        // Phase boundary: everything after this is pack generation and the wire.
+        work.check()
+            .map_err(|ended| SellerGitError::Cancelled(format!("before pushing: {ended}")))?;
+        // The gate the transport asks at every phase boundary answers TWO questions in one, in
+        // this order: is this delivery still entitled to send at all (its own authority, ended by
+        // the delivery arm's `Drop`), and is this work still inside its turn and its absolute
+        // deadline. Composing them here is what makes a phase refusal name the reason that came
+        // first, and keeps one gate to plumb instead of two at every boundary.
+        let work_gate = {
+            let authority = authority.clone();
+            let work = work.checker();
+            let gate: git_transport::AuthorityCheck = std::sync::Arc::new(move || {
+                if let Some(authority) = &authority {
+                    authority()?;
+                }
+                work()
+            });
+            gate
+        };
+        push_branch_with_minter(
+            &workdir,
+            &remote_url,
+            &branch,
+            &gated_oid,
+            mint,
+            authority,
+            Some(work_gate),
+        )
     })
     .await
 }
 
+/// Whether a finished delivery-push child permits this seat's turn to be released.
+///
+/// The fail-closed rule in one place, so it is a rule that can be tested rather than a judgement
+/// repeated at each arm of a match. **Unknown exit is treated as still running.**
+///
+/// - [`ExecutorError::Unreaped`] RETAINS the turn: a kill was issued and the exit was not observed,
+///   so as far as this process can establish, a push may still be running against this seat's one
+///   delivery remote.
+/// - [`ExecutorError::CleanupUnbounded`] RETAINS for the same reason at one remove: the child was
+///   reaped, but the write end of its pipe was still held afterwards, which can only mean something
+///   that inherited it escaped the process group we killed. The process we named is gone; the work
+///   is not demonstrably over.
+/// - [`ExecutorError::CleanupUnobserved`] RETAINS: the child was reaped, but this process never saw
+///   end of file on its stdout — the reader stopped for some other reason. A reader that stopped is
+///   not a pipe that closed, and the difference between those two is the difference between an
+///   observation and an assumption.
+/// - [`ExecutorError::Killed`] RELEASES, and that is not an exception to the rule: the executor
+///   constructs it only after a reap the kernel completed, and it carries the measured kill-to-exit
+///   time. A deadline breach whose reap did not complete is `Unreaped`, not `Killed`.
+/// - [`ExecutorError::Revoked`] RELEASES for the same reason: the owner went away, the child was
+///   killed for it, and the kernel confirmed the exit before the variant was built.
+/// - Every other outcome — success, a push failure, a protocol violation, a child that never started
+///   — has an exit the executor already confirmed, or no child at all.
+pub fn turn_after_child_push(
+    outcome: &Result<String, crate::delivery_executor::ExecutorError>,
+) -> crate::delivery_executor::Exclusion {
+    use crate::delivery_executor::{Exclusion, ExecutorError};
+    match outcome {
+        Err(
+            ExecutorError::Unreaped { .. }
+            | ExecutorError::CleanupUnbounded { .. }
+            | ExecutorError::CleanupUnobserved { .. }
+            | ExecutorError::WaitFailed { .. },
+        ) => Exclusion::Retain,
+        Ok(_)
+        | Err(
+            ExecutorError::Killed { .. }
+            | ExecutorError::Revoked { .. }
+            | ExecutorError::Spawn(_)
+            | ExecutorError::Protocol(_)
+            | ExecutorError::Push(_),
+        ) => Exclusion::Release,
+    }
+}
+
+/// Custody of the delivery turn across a path that can UNWIND.
+///
+/// `RunningWork`'s own `Drop` hands the turn back, which is right for every caller whose work is
+/// over when its stack is. It is wrong for this one: a panic in the supervisor or the minter used
+/// to unwind straight through it and free the seat while a child process that nobody had reaped was
+/// still holding the workdir and the remote. Here the DEFAULT is retention, and release is the
+/// explicit act — taken only where a confirmed exit was observed.
+/// **Retention is what an unknown child costs, so it starts when there could BE one.** The guard
+/// used to retain from the moment it was built, which was before the spawn: a delivery revoked, or
+/// expired, between taking the turn and starting a process therefore closed this seat's delivery
+/// lane for the life of the process — permanently, over a child that was never created. Retaining
+/// for an unknown child is custody; retaining for a child nobody spawned is just a lost seat.
+///
+/// So there are two states, and [`Self::arm`] is the moment between them: before it, this process
+/// knows there is no child and a drop RELEASES; after it, a child may exist and a drop RETAINS.
+struct ChildCustody {
+    work: Option<crate::delivery_turn::RunningWork>,
+    /// True once a child spawn is about to be attempted — i.e. once this process can no longer say
+    /// from its own knowledge that no delivery process exists.
+    armed: bool,
+}
+
+impl ChildCustody {
+    fn hold(running: crate::delivery_turn::RunningWork) -> Self {
+        Self {
+            work: Some(running),
+            armed: false,
+        }
+    }
+
+    /// About to start a child. From here an unwind retains.
+    fn arm(&mut self) {
+        self.armed = true;
+    }
+
+    /// Somewhere for the child's OBSERVED exit to go that is not this thread's return path.
+    ///
+    /// `release` below is the ordinary way the seat hears about an exit, and it is reachable only
+    /// by returning from the push. This is the same news, publishable by whichever thread actually
+    /// watched the child go — including the deadline watchdog, when this one is stalled somewhere
+    /// between arming that child and hearing about it.
+    fn exit_publisher(&self) -> Option<crate::delivery_turn::ExitPublisher> {
+        self.work.as_ref().map(|running| running.exit_publisher())
+    }
+
+    /// The child's exit was confirmed. Hand the turn on.
+    ///
+    /// PUBLISHED BEFORE THE DROP, not after: `confirm_exit` is what tells the seat's custody
+    /// bailiff that this process observed the exit, and the bailiff may act the instant the work's
+    /// half lands. Confirming afterwards would leave a window in which the work had ended with no
+    /// confirmation on record — which reads as an unconfirmed exit, the one state that must never
+    /// be produced by a delivery that in fact ended cleanly.
+    fn release(mut self) {
+        if let Some(running) = self.work.take() {
+            running.confirm_exit();
+            drop(running);
+        }
+    }
+}
+
+impl Drop for ChildCustody {
+    /// Reached on every path that is NOT an explicit release — including an unwind.
+    ///
+    /// Armed: FAIL CLOSED — the turn is never handed back, for the life of this process.
+    /// Not armed: this process knows no child was started, so the turn goes back the ordinary way.
+    /// The two are not the same answer to the same question, and answering the second with the
+    /// first is how a refusal became a permanent loss of this seat.
+    fn drop(&mut self) {
+        if let Some(running) = self.work.take() {
+            if self.armed {
+                std::mem::forget(running);
+            }
+        }
+    }
+}
+
+/// How a child-push failure reaches the delivery arm. Kept beside the rule above because the two
+/// answer different questions about the same outcome — what happens to the TURN, and what the caller
+/// is TOLD — and a reader who finds one should find the other.
+fn push_error_to_seller_git_error(
+    error: crate::delivery_executor::ExecutorError,
+) -> SellerGitError {
+    use crate::delivery_executor::ExecutorError;
+    match error {
+        // Nothing failed: the owner is gone, or its deadline passed, and the work was stopped. The
+        // numbers are kept because they are the evidence the bound held.
+        ExecutorError::Killed { after, reap } => SellerGitError::Cancelled(format!(
+            "the delivery push passed its deadline by {}ms and its child was killed; the kernel \
+             confirmed the exit {}ms later",
+            after.as_millis(),
+            reap.as_millis()
+        )),
+        ExecutorError::Unreaped { waited } => SellerGitError::Io(format!(
+            "delivery push child did not exit {}ms after SIGKILL; this seat's delivery turn is \
+             retained for the life of this process rather than handed to a second delivery while \
+             the first may still be packing",
+            waited.as_millis()
+        )),
+        // The owner went away while the child was running. Cancelled, not failed — and separate
+        // from the deadline case above because saying "passed its deadline" about a revocation is
+        // telling the caller something that did not happen.
+        ExecutorError::Revoked { why, reap } => SellerGitError::Cancelled(format!(
+            "the delivery push was revoked while its child was running ({why}); the child was \
+             killed and the kernel confirmed the exit {}ms later",
+            reap.as_millis()
+        )),
+        // Same family as `Unreaped`, and deliberately NOT `Transport`: nothing on the wire failed.
+        // This is a custody answer — we cannot say the local phase is over — and it reads as one.
+        error @ ExecutorError::CleanupUnbounded { .. } => SellerGitError::Io(error.to_string()),
+        // A custody answer too: the child was reaped, but end of file on its stdout was never
+        // observed, so who still holds that pipe is unknown.
+        error @ ExecutorError::CleanupUnobserved { .. } => SellerGitError::Io(error.to_string()),
+        // Also a custody answer, and also not a transport one: the kernel would not tell us whether
+        // the child is gone.
+        error @ ExecutorError::WaitFailed { .. } => SellerGitError::Io(error.to_string()),
+        error @ ExecutorError::Spawn(_) => SellerGitError::Io(error.to_string()),
+        error => SellerGitError::Transport(error.to_string()),
+    }
+}
+
+/// Off-runtime: the delivery push, run **in a killable child process**, holding this delivery's turn
+/// until that child has ACTUALLY EXITED.
+///
+/// This is the production path. [`neutralize_then_push_off_runtime`] does the same two steps in
+/// THIS process, where the local phase cannot be interrupted: libgit2's delta search refuses the one
+/// cancellation answer it is offered (`pack-objects.c:979`), so a revoked delivery whose thread is
+/// inside it keeps the seat's delivery turn until it finishes on its own. Moving that phase behind a
+/// process boundary replaces cooperation with `SIGKILL`, which cannot be caught, blocked or ignored.
+///
+/// What crosses the boundary, and what does not: the child gets a workdir, a remote, a branch, the
+/// gated oid and what is left of the budget. It gets **no key and no token** — not on argv, not in
+/// the environment. When the transport needs an `Authorization` header the child ASKS, and the
+/// answer is minted HERE by `mint`, the caller's existing per-request minter, with the seller key
+/// still confined to the signer actor.
+///
+/// `authority` is asked twice per leg, and the second ask is the point: after the mint returned and
+/// **before the header is written to the pipe**. A token for a leg this delivery no longer owns
+/// therefore never reaches the child at all, which is the same guarantee the in-process path gets
+/// from asking again before transmitting.
+///
+/// **The turn is released only on a confirmed exit — or a confirmed non-start.** If the child was
+/// killed and did not exit inside [`crate::delivery_executor::REAP_BOUND`], this delivery's turn is
+/// RETAINED for the life of this process rather than handed to a second delivery while the first may
+/// still be packing. That is a deliberate loss of liveness on this seat, and it is named rather than
+/// recovered from. A delivery refused BEFORE any child was spawned is the opposite case and is
+/// treated as one: there is no unknown process, so the turn is handed back and the next delivery can
+/// take it.
+#[allow(clippy::too_many_arguments)]
+pub async fn neutralize_then_push_in_child_off_runtime(
+    program: PathBuf,
+    workdir: PathBuf,
+    remote_url: String,
+    branch: String,
+    gated_oid: String,
+    mint: Option<git_transport::AuthMinter>,
+    authority: Option<git_transport::AuthorityCheck>,
+    turn: crate::delivery_turn::DeliveryTurn,
+) -> Result<String, SellerGitError> {
+    use crate::delivery_executor::PushRequest;
+
+    match tokio::task::spawn_blocking(move || {
+        // THE CONSUMER of the unconfirmed-exit counter, on the production path, before any new
+        // delivery work starts. `Drop` has nobody to return an error to; a child it could not
+        // confirm dead is recorded there and refused HERE, which is what makes that counter a
+        // custody mechanism rather than a statistic. Never decremented: one unconfirmed child
+        // closes this process's delivery lane for the life of the process.
+        let unconfirmed = crate::delivery_executor::unconfirmed_children();
+        if unconfirmed > 0 {
+            return Err(SellerGitError::Io(format!(
+                "{unconfirmed} earlier delivery push child(ren) could not be confirmed to have \
+                 exited; this process will not start another delivery push while work that was \
+                 never observed to stop may still hold this seat's workdir and remote"
+            )));
+        }
+        let running = turn
+            .begin()
+            .map_err(|ended| SellerGitError::Cancelled(format!("at dispatch: {ended}")))?;
+        let lifetime = running.lifetime();
+        // The turn is held by a guard from here — but NOT yet a retaining one. Until the spawn
+        // there is no child, and a `?` out of the two checks below returns through this guard's
+        // drop. Retaining there closed the seat's delivery lane permanently every time a delivery
+        // was cancelled in this window: a refusal with no child to justify it. See [`ChildCustody`].
+        let mut custody = ChildCustody::hold(running);
+        // Phase boundary: everything after this point is a process that has to be killed to be
+        // stopped, so a delivery already revoked never gets one spawned for it. A refusal HERE is a
+        // confirmed-no-child refusal, and the turn goes back for the next delivery to take.
+        if let Some(authority) = &authority {
+            authority().map_err(|ended| {
+                SellerGitError::Cancelled(format!(
+                    "before spawning the delivery push child: {ended}"
+                ))
+            })?;
+        }
+        lifetime.check().map_err(|ended| {
+            SellerGitError::Cancelled(format!("before spawning the delivery push child: {ended}"))
+        })?;
+
+        let request = PushRequest {
+            workdir,
+            remote_url,
+            branch,
+            gated_oid,
+            // A remote that takes no authorization is a remote the child must never ask about; the
+            // proxy below refuses anyway, so the two agree.
+            authenticated: mint.is_some(),
+            // Both are restamped together at the write, inside the deadline; these are only the
+            // initial values. They are stamped consistently even here, so that an unstamped field
+            // is never a value with a meaning of its own — a zero absolute deadline is simply an
+            // expired one, which fails safe rather than opening a "not set" bypass.
+            budget_ms: u64::try_from(lifetime.remaining().as_millis()).unwrap_or(u64::MAX),
+            deadline_unix_ms: crate::delivery_executor::now_unix_ms().saturating_add(
+                u64::try_from(lifetime.remaining().as_millis()).unwrap_or(u64::MAX),
+            ),
+        };
+        // The absolute deadline this delivery has always had. It is the parent's, not the child's:
+        // the child is not trusted to bound itself, which is the entire reason it is a child.
+        let deadline = lifetime.deadline();
+        // What the CHILD asks the parent, across the pipe, immediately before it transmits. The
+        // same two questions the proxy below asks before it hands a token over, asked again at the
+        // only moment that bounds the wire: the one the child is at. Cloned here, ahead of the
+        // proxy, because both gates ask the same two sources.
+        let gate_authority = authority.clone();
+        let gate_lifetime = lifetime.clone();
+        let live: crate::git_transport::AuthorityCheck =
+            std::sync::Arc::new(move || -> Result<(), String> {
+                if let Some(authority) = &gate_authority {
+                    authority()?;
+                }
+                gate_lifetime.check().map_err(|ended| ended.to_string())
+            });
+        // Behind an `Arc` because the parent now runs this OFF its drive thread: the signer can
+        // block, and a parent blocked in the signer is a parent that cannot issue the kill. The
+        // TOKEN it returns does cross the pipe to the child — that is the point of the round trip.
+        // The PRIVATE KEY does not: it stays in the signer actor this closure calls, on this side.
+        let proxy: crate::git_transport::AuthMinter =
+            std::sync::Arc::new(move |destination: &str| -> Result<String, String> {
+                if let Some(authority) = &authority {
+                    authority()
+                        .map_err(|ended| format!("{ended}; refusing to authorize another leg"))?;
+                }
+                lifetime
+                    .check()
+                    .map_err(|ended| format!("{ended}; refusing to authorize another leg"))?;
+                let minter = mint.as_ref().ok_or_else(|| {
+                    "this delivery's remote takes no authorization; refusing to mint one".to_owned()
+                })?;
+                let header = minter(destination)?;
+                // Asked AGAIN, after the mint and before the header crosses the pipe. The mint is a
+                // call into the signer actor and it can block; the answer can change while it does,
+                // and a header that is never written is a header the child cannot transmit.
+                if let Some(authority) = &authority {
+                    authority().map_err(|ended| {
+                        format!("{ended}; the token minted for this leg will not be handed over")
+                    })?;
+                }
+                lifetime.check().map_err(|ended| {
+                    format!("{ended}; the token minted for this leg will not be handed over")
+                })?;
+                Ok(header)
+            });
+
+        // ARMED: the next statement can create a process, so from here an unwind must not hand this
+        // seat on. Everything the guard protected before — a panic in the supervisor, a panic in the
+        // minter — happens after this point, because all of it happens inside the call below.
+        custody.arm();
+        // Handed over BEFORE the push starts: from here the seat can learn this child has exited
+        // without this thread being the one to tell it. See `ChildCustody::exit_publisher`.
+        let confirm = custody.exit_publisher().map(|publisher| {
+            std::sync::Arc::new(move || publisher.publish_confirmed_exit())
+                as crate::delivery_executor::ExitConfirmation
+        });
+        let outcome = crate::delivery_executor::run_push_in_child_confirming(
+            &program, &request, deadline, proxy, live, confirm,
+        );
+        // ONE release site, and a rule rather than a judgement at it. See [`turn_after_child_push`].
+        match turn_after_child_push(&outcome) {
+            crate::delivery_executor::Exclusion::Release => {
+                // Released HERE, on this thread, after the child has exited and been reaped.
+                custody.release();
+            }
+            crate::delivery_executor::Exclusion::Retain => {
+                // FAIL CLOSED: the guard's drop retains, for the life of this process.
+                drop(custody);
+            }
+        }
+        outcome.map_err(push_error_to_seller_git_error)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => Err(SellerGitError::Io(format!(
+            "blocking git task did not complete: {error}"
+        ))),
+    }
+}
+
 /// Run one blocking git operation on a blocking thread. A panic inside libgit2 surfaces as an error
-/// rather than taking the caller down.
+/// rather than taking the caller down. For the delivery push — the one operation that owns the
+/// seat's delivery turn — see [`off_runtime_holding_the_turn`].
 async fn off_runtime<T, F>(operation: F) -> Result<T, SellerGitError>
 where
     F: FnOnce() -> Result<T, SellerGitError> + Send + 'static,
     T: Send + 'static,
 {
     match tokio::task::spawn_blocking(operation).await {
+        Ok(result) => result,
+        Err(error) => Err(SellerGitError::Io(format!(
+            "blocking git task did not complete: {error}"
+        ))),
+    }
+}
+
+/// Run one blocking git operation on a blocking thread, holding `turn` for exactly as long as that
+/// operation actually runs. A panic inside libgit2 surfaces as an error rather than taking the
+/// caller down. [`off_runtime`] is the same dispatch for operations that own no delivery turn.
+///
+/// The turn is moved INTO the closure, so it is dropped on the blocking thread when the operation
+/// returns — the one lifetime boundary that cannot disappear underneath started blocking work.
+/// [`crate::delivery_turn::DeliveryTurn::begin`] is the first thing the closure does: a revoked or
+/// expired delivery is refused at queue admission, having done nothing.
+async fn off_runtime_holding_the_turn<T, F>(
+    turn: crate::delivery_turn::DeliveryTurn,
+    operation: F,
+) -> Result<T, SellerGitError>
+where
+    F: FnOnce(&crate::delivery_turn::WorkLifetime) -> Result<T, SellerGitError> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(move || {
+        let running = turn
+            .begin()
+            .map_err(|ended| SellerGitError::Cancelled(format!("at dispatch: {ended}")))?;
+        let lifetime = running.lifetime();
+        let outcome = operation(&lifetime);
+        // `running` drops HERE, on this thread, when the work has really stopped.
+        drop(running);
+        outcome
+    })
+    .await
+    {
         Ok(result) => result,
         Err(error) => Err(SellerGitError::Io(format!(
             "blocking git task did not complete: {error}"
@@ -942,6 +1371,164 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    /// A delivery turn, and the control that can see whether it came back.
+    fn a_turn() -> (
+        crate::delivery_turn::TurnControl,
+        crate::delivery_turn::DeliveryTurn,
+    ) {
+        crate::delivery_turn::delivery_turn(
+            (),
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        )
+    }
+
+    /// A REVOCATION IS NOT A DEADLINE BREACH — asserted on the TYPED variants, at the one place
+    /// that turns them into prose.
+    ///
+    /// The integration gates can only read `SellerGitError`, so all they can say about which of the
+    /// two stops happened is what the sentence says. That is a string assertion standing in for a
+    /// type, and it holds only while this mapping keeps them apart. So pin the mapping itself:
+    /// `Killed` and `Revoked` both mean the work stopped and the seat comes back, both arrive as
+    /// `Cancelled`, and the ONE thing that must never blur is which of the two it was.
+    ///
+    /// A future edit that folds the two arms together — the obvious simplification, since they
+    /// produce the same variant — fails here rather than silently making every revocation report a
+    /// deadline the delivery never reached.
+    #[test]
+    fn a_revocation_and_a_deadline_are_told_apart_where_the_type_becomes_a_sentence() {
+        let reap = std::time::Duration::from_millis(7);
+        let deadline = push_error_to_seller_git_error(
+            crate::delivery_executor::ExecutorError::Killed {
+                after: std::time::Duration::from_millis(11),
+                reap,
+            },
+        );
+        let revoked = push_error_to_seller_git_error(
+            crate::delivery_executor::ExecutorError::Revoked {
+                why: "the owner went away".to_owned(),
+                reap,
+            },
+        );
+
+        // Both are stops, not failures: an `Io` here would be a custody answer and would retain.
+        assert!(
+            matches!(deadline, SellerGitError::Cancelled(_)),
+            "a killed delivery must be cancelled, not failed: {deadline}"
+        );
+        assert!(
+            matches!(revoked, SellerGitError::Cancelled(_)),
+            "a revoked delivery must be cancelled, not failed: {revoked}"
+        );
+
+        let deadline = deadline.to_string();
+        let revoked = revoked.to_string();
+        assert_ne!(
+            deadline, revoked,
+            "a revocation and a deadline breach reached the caller as the same sentence, so \
+             nothing downstream can tell them apart"
+        );
+        assert!(
+            revoked.contains("revoked") && !revoked.contains("deadline"),
+            "a revocation must not be reported as a deadline breach: {revoked}"
+        );
+        assert!(
+            deadline.contains("deadline"),
+            "a deadline breach must say so: {deadline}"
+        );
+        // The reap measurement survives the mapping in both: it is the evidence the bound held.
+        assert!(
+            revoked.contains("7ms") && deadline.contains("7ms"),
+            "the confirmed-exit measurement was dropped on the way to the caller"
+        );
+    }
+
+    /// An UNWIND ONCE A CHILD MAY EXIST must not hand this seat on.
+    ///
+    /// `RunningWork`'s own `Drop` releases, which is right for work whose life is its stack. It was
+    /// wrong here: a panic in the supervisor or in the minter unwound straight through it and freed
+    /// the seat while a child process nobody had reaped still held the workdir and the remote.
+    ///
+    /// ARMED is what makes the difference, and this test is the armed half. `arm()` is called
+    /// immediately before the spawn, i.e. at the exact point this process stops being able to say
+    /// from its own knowledge that no delivery process exists. From there an unwind is an UNKNOWN,
+    /// and the only safe answer to an unknown child is to keep the seat.
+    #[test]
+    fn a_panic_after_the_custody_is_armed_keeps_the_turn() {
+        let (control, turn) = a_turn();
+        let running = turn.begin().expect("the turn begins");
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut custody = ChildCustody::hold(running);
+            // The spawn is about to happen; from this line on a child may exist.
+            custody.arm();
+            panic!("the supervisor died holding a child");
+        }));
+        assert!(panicked.is_err(), "this test is about an unwind");
+        assert!(
+            !control.work_ended(),
+            "the work was never observed to stop, so the turn must NOT have been handed back"
+        );
+        // Even the supervisor giving up does not free the seat: the work is still RUNNING as far as
+        // this process can establish, and that is the state a panic must leave behind.
+        assert_eq!(
+            control.end(),
+            crate::delivery_turn::TurnRelease::StillRunning
+        );
+        assert!(
+            control.holds_ownership(),
+            "exclusion must still be held by the delivery whose child was never confirmed dead"
+        );
+    }
+
+    /// THE UNARMED HALF, and the reason `arm` exists at all.
+    ///
+    /// The guard used to retain unconditionally, which read as caution and was not: a delivery
+    /// refused between `begin()` and the spawn — no child, nothing to reap, nothing on the wire —
+    /// took this seat with it for the life of the process. "We cannot say whether a child exists"
+    /// and "we know none does" are different facts, and answering the second with the first turns
+    /// an ordinary refusal into a permanently dead seat.
+    ///
+    /// So before `arm`, an unwind releases the ordinary way.
+    #[test]
+    fn a_panic_before_any_child_could_exist_hands_the_turn_back() {
+        let (control, turn) = a_turn();
+        let running = turn.begin().expect("the turn begins");
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _custody = ChildCustody::hold(running);
+            panic!("the supervisor died before it ever tried to spawn");
+        }));
+        assert!(panicked.is_err(), "this test is about an unwind");
+        assert!(
+            control.work_ended(),
+            "no child could exist yet, so this seat must go back rather than be stranded"
+        );
+        control.end();
+        assert!(
+            !control.holds_ownership(),
+            "exclusion was retained over a delivery that never started a child"
+        );
+    }
+
+    /// The other half of the same rule: a confirmed exit DOES hand the turn on. A guard that never
+    /// releases is not custody, it is a deadlock.
+    #[test]
+    fn an_explicit_release_after_a_confirmed_exit_hands_the_turn_on() {
+        let (control, turn) = a_turn();
+        let running = turn.begin().expect("the turn begins");
+        ChildCustody::hold(running).release();
+        assert!(control.work_ended(), "a released turn is an ended turn");
+        // Exclusion itself is handed back when BOTH sides are done with it; the supervisor's own
+        // end is the second half, and after it the token is free — which is what a panic must not
+        // be able to produce.
+        assert_eq!(
+            control.end(),
+            crate::delivery_turn::TurnRelease::AlreadyEnded
+        );
+        assert!(
+            !control.holds_ownership(),
+            "exclusion goes back to the seat once the child's exit was confirmed"
+        );
+    }
 
     fn temp(label: &str) -> std::path::PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
@@ -1040,8 +1627,11 @@ mod tests {
 
     #[test]
     fn preflight_push_probe_fails_closed_on_unreachable_https_remote() {
-        let err = preflight_push_probe("https://maxplayer-preflight.invalid/git/owner/repo.git", None)
-            .expect_err("unreachable remote must fail closed");
+        let err = preflight_push_probe(
+            "https://maxplayer-preflight.invalid/git/owner/repo.git",
+            None,
+        )
+        .expect_err("unreachable remote must fail closed");
         assert!(
             matches!(
                 err,
@@ -1076,12 +1666,8 @@ mod tests {
         let tree = repo
             .find_tree(index.write_tree().expect("tree"))
             .expect("find tree");
-        let sig = Signature::new(
-            "s",
-            "s@example.invalid",
-            &git2::Time::new(1_700_000_000, 0),
-        )
-        .expect("sig");
+        let sig = Signature::new("s", "s@example.invalid", &git2::Time::new(1_700_000_000, 0))
+            .expect("sig");
         repo.commit(Some("refs/heads/job"), &sig, &sig, "delivery", &tree, &[])
             .expect("commit");
         (root, workdir)
@@ -1159,7 +1745,11 @@ mod tests {
         let (root, workdir) = plain_repo("layout-gitfile");
         let real = root.join("real-gitdir");
         fs::rename(workdir.join(".git"), &real).expect("move git dir");
-        fs::write(workdir.join(".git"), format!("gitdir: {}\n", real.display())).expect("gitfile");
+        fs::write(
+            workdir.join(".git"),
+            format!("gitdir: {}\n", real.display()),
+        )
+        .expect("gitfile");
         assert!(
             Repository::open(&workdir).is_ok(),
             "fixture: libgit2 follows the gitfile"
@@ -1282,7 +1872,10 @@ mod tests {
         // gated open refuses instead of searching.
         let sub = workdir.join("sub");
         fs::create_dir_all(&sub).expect("subdir");
-        assert!(Repository::discover(&sub).is_ok(), "fixture: discover walks up");
+        assert!(
+            Repository::discover(&sub).is_ok(),
+            "fixture: discover walks up"
+        );
         assert!(matches!(
             open_plain_workdir_repo(&sub),
             Err(SellerGitError::Layout(_))
@@ -1396,8 +1989,10 @@ mod snapshot_tests {
 
     fn workdir(label: &str) -> PathBuf {
         let id = SEQ.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir()
-            .join(format!("maxplayer-snapshot-{label}-{}-{id}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "maxplayer-snapshot-{label}-{}-{id}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("mkdir workdir");
         dir
@@ -1481,7 +2076,8 @@ mod snapshot_tests {
     fn commit(dir: &Path, oid: &str) -> git2::Commit<'static> {
         // Leak the repo so the returned commit's lifetime is convenient in asserts.
         let repo = Box::leak(Box::new(Repository::open(dir).expect("open")));
-        repo.find_commit(Oid::from_str(oid).unwrap()).expect("commit")
+        repo.find_commit(Oid::from_str(oid).unwrap())
+            .expect("commit")
     }
 
     // ── Field case: agent edits, never commits — the daemon snapshots the workdir ──────────────
@@ -1492,12 +2088,22 @@ mod snapshot_tests {
         write(&dir, "src/feature.rs", "agent work, never committed\n");
         let id = identity();
 
-        let oid = snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "maxplayer delivery: task")
-            .expect("snapshot");
+        let oid = snapshot_delivery(
+            &dir,
+            &id,
+            Some(&base),
+            "maxplayer/job",
+            "maxplayer delivery: task",
+        )
+        .expect("snapshot");
 
         let c = commit(&dir, &oid);
         assert_eq!(c.parent_count(), 1, "delivery is one commit on top of base");
-        assert_eq!(c.parent_id(0).unwrap().to_string(), base, "parented on the pinned base");
+        assert_eq!(
+            c.parent_id(0).unwrap().to_string(),
+            base,
+            "parented on the pinned base"
+        );
         assert_eq!(c.author().email(), Some(id.email.as_str()));
         assert_eq!(c.committer().email(), Some(id.email.as_str()));
         assert!(tree_paths(&dir, &oid).contains(&"src/feature.rs".to_owned()));
@@ -1541,12 +2147,18 @@ mod snapshot_tests {
         // second tip). Same base commit on both passes, so the parent is fixed.
         let oid_a2 = snapshot_delivery_at(&dir, &id, Some(&base), "maxplayer/job", "msg", DATE)
             .expect("snapshot a2");
-        assert_eq!(oid_a, oid_a2, "same inputs + journaled date ⇒ identical delivery commit oid");
+        assert_eq!(
+            oid_a, oid_a2,
+            "same inputs + journaled date ⇒ identical delivery commit oid"
+        );
 
         // And the date is genuinely folded into the oid: a different date ⇒ a different commit.
         let oid_b = snapshot_delivery_at(&dir, &id, Some(&base), "maxplayer/job", "msg", DATE + 1)
             .expect("snapshot b");
-        assert_ne!(oid_a, oid_b, "a different authored-at must change the delivery oid");
+        assert_ne!(
+            oid_a, oid_b,
+            "a different authored-at must change the delivery oid"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1559,17 +2171,34 @@ mod snapshot_tests {
         // Agent makes two scratch commits under a foreign identity.
         write(&dir, "a.rs", "one\n");
         git(&dir, ["add", "-A"]);
-        run_env(&dir, ["commit", "-m", "scratch 1"], Some(("Claude", "c@anthropic.invalid")));
+        run_env(
+            &dir,
+            ["commit", "-m", "scratch 1"],
+            Some(("Claude", "c@anthropic.invalid")),
+        );
         write(&dir, "b.rs", "two\n");
         git(&dir, ["add", "-A"]);
-        run_env(&dir, ["commit", "-m", "scratch 2"], Some(("Claude", "c@anthropic.invalid")));
+        run_env(
+            &dir,
+            ["commit", "-m", "scratch 2"],
+            Some(("Claude", "c@anthropic.invalid")),
+        );
         let id = identity();
 
-        let oid = snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
+        let oid =
+            snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
 
         let c = commit(&dir, &oid);
-        assert_eq!(c.parent_id(0).unwrap().to_string(), base, "parented on base, not the scratch tip");
-        assert_eq!(c.author().email(), Some(id.email.as_str()), "delivery identity, not the agent's");
+        assert_eq!(
+            c.parent_id(0).unwrap().to_string(),
+            base,
+            "parented on base, not the scratch tip"
+        );
+        assert_eq!(
+            c.author().email(),
+            Some(id.email.as_str()),
+            "delivery identity, not the agent's"
+        );
         // Exactly one commit between base and the delivery tip.
         let repo = Repository::open(&dir).unwrap();
         let mut walk = repo.revwalk().unwrap();
@@ -1593,7 +2222,11 @@ mod snapshot_tests {
         let oid = snapshot_delivery(&dir, &id, None, "maxplayer/job", "msg").expect("snapshot");
 
         let c = commit(&dir, &oid);
-        assert_eq!(c.parent_count(), 0, "from-scratch delivery is a root commit");
+        assert_eq!(
+            c.parent_count(),
+            0,
+            "from-scratch delivery is a root commit"
+        );
         assert_eq!(c.author().email(), Some(id.email.as_str()));
         assert!(tree_paths(&dir, &oid).contains(&"out.rs".to_owned()));
         let _ = fs::remove_dir_all(&dir);
@@ -1650,7 +2283,10 @@ mod snapshot_tests {
             paths.contains(&crate::delivery_sentinel::SENTINEL_FILE.to_owned()),
             "the sentinel rides at its well-known path in the delivered tree"
         );
-        assert!(paths.contains(&"out.rs".to_owned()), "and the real work rides too");
+        assert!(
+            paths.contains(&"out.rs".to_owned()),
+            "and the real work rides too"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1756,7 +2392,11 @@ mod snapshot_tests {
         );
         // And concretely: exactly the one deliverable at its exact byte size (the transcript is gone).
         assert_eq!(actual_files, 1, "only answer.txt should be delivered");
-        assert_eq!(actual_bytes, answer.len() as u64, "at answer.txt's exact byte size");
+        assert_eq!(
+            actual_bytes,
+            answer.len() as u64,
+            "at answer.txt's exact byte size"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1783,7 +2423,8 @@ mod snapshot_tests {
         let dir = workdir("empty-scratch");
         let id = identity();
         init_empty_delivery_workdir(&dir, &id).expect("init");
-        let err = snapshot_delivery(&dir, &id, None, "maxplayer/job", "msg").expect_err("must refuse");
+        let err =
+            snapshot_delivery(&dir, &id, None, "maxplayer/job", "msg").expect_err("must refuse");
         assert!(
             matches!(err, SellerGitError::NoExecutionObserved(_)),
             "an empty from-scratch tree is a no-execution refusal (maps to no_sentinel), got: {err}"
@@ -1802,11 +2443,15 @@ mod snapshot_tests {
         write(&dir, "real.rs", "delivered\n");
         let id = identity();
 
-        let oid = snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
+        let oid =
+            snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
 
         let paths = tree_paths(&dir, &oid);
         assert!(paths.contains(&"real.rs".to_owned()));
-        assert!(!paths.contains(&"secret.txt".to_owned()), "ignored file must not be delivered");
+        assert!(
+            !paths.contains(&"secret.txt".to_owned()),
+            "ignored file must not be delivered"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1818,10 +2463,14 @@ mod snapshot_tests {
         write(&dir, "work.rs", "work\n");
         let id = identity();
 
-        let oid = snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
+        let oid =
+            snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
 
         for path in tree_paths(&dir, &oid) {
-            assert!(!path.starts_with(".git/") && path != ".git", "git internals leaked: {path}");
+            assert!(
+                !path.starts_with(".git/") && path != ".git",
+                "git internals leaked: {path}"
+            );
         }
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1836,7 +2485,8 @@ mod snapshot_tests {
         write(&dir, "work.rs", "work\n");
         let id = identity();
 
-        let oid = snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
+        let oid =
+            snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
 
         assert!(
             !commit(&dir, &oid).raw_header().unwrap().contains("gpgsig"),
@@ -1871,7 +2521,8 @@ mod snapshot_tests {
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
         let id = identity();
 
-        let oid = snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
+        let oid =
+            snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
 
         let repo = Repository::open(&dir).unwrap();
         let entry = repo
@@ -1881,7 +2532,11 @@ mod snapshot_tests {
             .unwrap()
             .get_path(Path::new("run.sh"))
             .unwrap();
-        assert_eq!(entry.filemode(), 0o100755, "executable bit must be preserved");
+        assert_eq!(
+            entry.filemode(),
+            0o100755,
+            "executable bit must be preserved"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1895,10 +2550,14 @@ mod snapshot_tests {
         write(&dir, "new.rs", "replacement\n");
         let id = identity();
 
-        let oid = snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
+        let oid =
+            snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
 
         let paths = tree_paths(&dir, &oid);
-        assert!(!paths.contains(&"README.md".to_owned()), "deleted file must not be delivered");
+        assert!(
+            !paths.contains(&"README.md".to_owned()),
+            "deleted file must not be delivered"
+        );
         assert!(paths.contains(&"new.rs".to_owned()));
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1915,7 +2574,9 @@ mod snapshot_tests {
         let mut index = repo.index().expect("index");
         index.add_path(Path::new("README.md")).expect("add");
         index.write().expect("index write");
-        let tree = repo.find_tree(index.write_tree().expect("wt")).expect("tree");
+        let tree = repo
+            .find_tree(index.write_tree().expect("wt"))
+            .expect("tree");
         let sig = Signature::now("Upstream", "u@u.invalid").expect("sig");
         let base = repo
             .commit(Some("HEAD"), &sig, &sig, "base", &tree, &[])
@@ -1940,11 +2601,16 @@ mod snapshot_tests {
         // Agent left scratch commits AND uncommitted edits — the daemon ignores all of it.
         write(&dir, "feature.rs", "impl\n");
         git(&dir, ["add", "-A"]);
-        run_env(&dir, ["commit", "-m", "scratch"], Some(("Claude", "c@anthropic.invalid")));
+        run_env(
+            &dir,
+            ["commit", "-m", "scratch"],
+            Some(("Claude", "c@anthropic.invalid")),
+        );
         write(&dir, "extra.rs", "more, uncommitted\n");
         let id = identity();
 
-        let oid = snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
+        let oid =
+            snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
 
         let remote = workdir("e2e-remote.git");
         git(&remote, ["init", "--bare", "--initial-branch=main"]);

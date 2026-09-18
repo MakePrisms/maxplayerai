@@ -2564,15 +2564,18 @@ dependencies = [
 
 [[package]]
 name = "maxplayer"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "cashu",
  "cdk",
  "cdk-sqlite",
  "git2",
+ "libc",
  "maxplayer-core",
  "nostr-sdk",
+ "rcgen",
  "rusqlite",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",
@@ -2580,7 +2583,7 @@ dependencies = [
 
 [[package]]
 name = "maxplayer-core"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2618,7 +2621,7 @@ dependencies = [
 
 [[package]]
 name = "maxplayer-desktop"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "eframe",
  "maxplayer-core",
@@ -2627,7 +2630,7 @@ dependencies = [
 
 [[package]]
 name = "maxplayer-evals"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "maxplayer-core",
  "serde",
@@ -2636,7 +2639,7 @@ dependencies = [
 
 [[package]]
 name = "maxplayer-relay-write-policy"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "serde",
  "serde_json",
@@ -3679,6 +3682,7 @@ version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
 dependencies = [
+ "pem",
  "ring",
  "rustls-pki-types",
  "time",
