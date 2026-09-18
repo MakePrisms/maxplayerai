@@ -32,7 +32,7 @@ Every maxplayer-owned event carries two tags:
 A reader MUST reject a maxplayer-owned event that lacks either tag. A reader MUST reject an event
 whose `v` is not `1`. A reader MUST ignore tags it does not recognize.
 
-The maxplayer-owned kinds are `3400` through `3407` and `30340`. Kinds `0`, `1059`, and `30617` are
+The maxplayer-owned kinds are `3400` through `3409` and `30340`. Kinds `0`, `1059`, and `30617` are
 borrowed from other specifications. They do not carry `["t","maxplayer"]`, and a reader MUST ignore
 `t` on them.
 
@@ -52,6 +52,11 @@ Cardinality `0..N` means the tag MAY repeat.
 A new fact MUST ship as a new tag, or as a new optional field on an understood artifact. A change
 that cannot take that form is a new major.
 
+The optional review extension also adds independent event kinds 3408 and 3409.
+They do not alter the interpretation or settlement authority of existing kinds.
+Clients must explicitly implement the review extension; legacy clients do not
+provide its checks. See [execution reviews](execution-reviews.md).
+
 ## 3. Event Kinds
 
 | Kind | Name | Author | Purpose |
@@ -68,6 +73,8 @@ that cannot take that form is a new major.
 | `3405` | Award | buyer | Selection of one claim |
 | `3406` | Accept | buyer | Pay authorisation for one result |
 | `3407` | Reject | buyer | Refusal of one delivered commit |
+| `3408` | Review | configured reviewer | Signed execution-safety assessment |
+| `3409` | Review request | buyer or seller | Request an assessment of an exact subject |
 
 `AWARD` selects a claim before work starts. `ACCEPT` authorises payment after delivery. They are
 separate kinds.
