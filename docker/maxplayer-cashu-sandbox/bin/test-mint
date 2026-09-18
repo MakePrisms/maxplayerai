@@ -1,0 +1,264 @@
+#!/bin/sh
+# test-mint — start/stop/reset the sandbox-local fakewallet test mint.
+#
+# Worthless test ecash, loopback only. Reproducible: `reset` returns the mint to a known-empty
+# state, `start` is idempotent, and nothing here touches a seller config or any host path.
+#
+# PRIVATE STATE LIVES OUTSIDE THE DELIVERED WORKDIR (advisor F3). The seller bind-mounts the HOST
+# job workdir at /work (seller_exec.rs:843-849) and stages every nonignored file under it for
+# delivery (seller_git.rs:335-354, whose only built-in exclusion is seller-run.jsonl). State kept
+# under /work would therefore be handed to a buyer AND would survive `docker rm`, because removing
+# a container does not delete a bind-mounted host directory. So the default root is
+# /var/lib/cashu-test-state — container-local, world-writable, disposable with the container, and
+# retained across a mint-process restart.
+#
+# The seed is a throwaway BIP-39 mnemonic generated at reset into a 0600 file and passed to
+# cdk-mintd with --seed-file. It is never echoed, never an argument, never in this image.
+
+set -eu
+
+STATE_ROOT="${TEST_MINT_STATE_ROOT:-/var/lib/cashu-test-state}"
+WORK="${TEST_MINT_WORK_DIR:-${STATE_ROOT}/mint}"
+HOST="${TEST_MINT_HOST:-127.0.0.1}"
+PORT="${TEST_MINT_PORT:-8085}"
+URL="http://${HOST}:${PORT}/"
+TEMPLATE="${TEST_MINT_TEMPLATE:-/opt/cashu/test-mint.config.toml}"
+# The delivered workdir, only ever READ here, to prove state is not inside it.
+DELIVERY_DIR="${TEST_MINT_DELIVERY_DIR:-/work}"
+
+CONFIG="${WORK}/config.toml"
+SEED="${WORK}/seed"
+PIDFILE="${WORK}/mintd.pid"
+LOG="${WORK}/mintd.log"
+
+# Containment is the point of this rig, so it is enforced here rather than documented.
+assert_loopback_host() {
+    case "$1" in
+        127.0.0.1|::1|localhost) return 0 ;;
+        *)
+            echo "test-mint: refusing to bind '$1': loopback only (127.0.0.1, ::1)" >&2
+            exit 2
+            ;;
+    esac
+}
+assert_loopback_host "${HOST}"
+
+# ...and enforced on the RENDERED CONFIG too, not only on $TEST_MINT_HOST (advisor N1). An existing
+# or hand-edited config.toml is reused as-is by design, so the bind address that will actually take
+# effect is the one in the file. Refuse to start on a non-loopback listen_host whatever produced it.
+assert_config_loopback() {
+    [ -s "${CONFIG}" ] || return 0
+    listen=$(sed -n 's/^[[:space:]]*listen_host[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' "${CONFIG}" | head -n 1)
+    if [ -n "${listen}" ]; then
+        assert_loopback_host "${listen}"
+    fi
+}
+
+# State must not be inside the delivered workdir. Checked at every start, because
+# TEST_MINT_WORK_DIR is an override and a wrong value here is exactly the defect F3 named.
+assert_state_not_delivered() {
+    case "${WORK}/" in
+        "${DELIVERY_DIR}"/*)
+            echo "test-mint: refusing to put private mint state at ${WORK}: that is inside the delivered workdir ${DELIVERY_DIR}" >&2
+            echo "test-mint: the seed, database and logs would be staged into the job deliverable." >&2
+            exit 2
+            ;;
+    esac
+}
+assert_state_not_delivered
+
+is_running() {
+    [ -f "${PIDFILE}" ] || return 1
+    pid=$(cat "${PIDFILE}" 2>/dev/null || echo "")
+    [ -n "${pid}" ] || return 1
+    kill -0 "${pid}" 2>/dev/null
+}
+
+# node is in the base image (node:22-bookworm-slim); curl is not. /v1/info is the NUT-06 mint info
+# endpoint, so a 200 here means the mint is actually serving the protocol, not merely listening.
+probe() {
+    node -e '
+        const url = process.argv[1];
+        fetch(url, { signal: AbortSignal.timeout(2000) })
+            .then(r => r.ok ? r.text().then(t => { process.stdout.write(t); process.exit(0); })
+                            : process.exit(1))
+            .catch(() => process.exit(1));
+    ' "http://${HOST}:${PORT}/v1/info" 2>/dev/null
+}
+
+ensure_state() {
+    mkdir -p "${WORK}"
+    if [ ! -s "${SEED}" ]; then
+        old_umask=$(umask)
+        umask 077
+        test-mint-seed > "${SEED}"
+        umask "${old_umask}"
+        chmod 0600 "${SEED}"
+    fi
+    if [ ! -s "${CONFIG}" ]; then
+        sed -e "s|__MINT_URL__|${URL}|g" \
+            -e "s|__LISTEN_HOST__|${HOST}|g" \
+            -e "s|__LISTEN_PORT__|${PORT}|g" \
+            "${TEMPLATE}" > "${CONFIG}"
+    fi
+    assert_config_loopback
+}
+
+cmd_start() {
+    if is_running; then
+        echo "test-mint: already running (pid $(cat "${PIDFILE}")) at ${URL}"
+        return 0
+    fi
+    ensure_state
+    cdk-mintd --work-dir "${WORK}" --config "${CONFIG}" --seed-file "${SEED}" \
+        >> "${LOG}" 2>&1 &
+    echo $! > "${PIDFILE}"
+
+    i=0
+    while [ "${i}" -lt 60 ]; do
+        if probe >/dev/null; then
+            echo "test-mint: up at ${URL} (pid $(cat "${PIDFILE}"), state ${WORK})"
+            return 0
+        fi
+        if ! is_running; then
+            echo "test-mint: mintd exited during startup; last log lines:" >&2
+            tail -n 20 "${LOG}" >&2 || true
+            return 1
+        fi
+        i=$((i + 1))
+        sleep 1
+    done
+    echo "test-mint: timed out after 60s waiting for ${URL}v1/info; last log lines:" >&2
+    tail -n 20 "${LOG}" >&2 || true
+    return 1
+}
+
+cmd_stop() {
+    if ! is_running; then
+        rm -f "${PIDFILE}"
+        echo "test-mint: not running"
+        return 0
+    fi
+    pid=$(cat "${PIDFILE}")
+    kill "${pid}" 2>/dev/null || true
+    i=0
+    while [ "${i}" -lt 20 ] && kill -0 "${pid}" 2>/dev/null; do
+        i=$((i + 1))
+        sleep 1
+    done
+    kill -9 "${pid}" 2>/dev/null || true
+    rm -f "${PIDFILE}"
+    echo "test-mint: stopped (pid ${pid})"
+}
+
+# restart keeps the database and the seed: that is the "recovery/restart without lost or duplicate
+# balance" case. reset throws both away and is the between-runs clean slate.
+cmd_restart() {
+    cmd_stop
+    cmd_start
+}
+
+cmd_reset() {
+    cmd_stop >/dev/null 2>&1 || true
+    # Bounded on purpose: only the resolved state dir, which has already been proven to sit outside
+    # the delivered workdir. `reset` refusing a path it does not own is cheaper than explaining a
+    # deleted deliverable (advisor N3).
+    case "${WORK}" in
+        /|/work|/work/*|/opt|/opt/*|/usr|/usr/*|"")
+            echo "test-mint: refusing to reset '${WORK}'" >&2
+            exit 2
+            ;;
+    esac
+    rm -rf "${WORK}"
+    echo "test-mint: reset (removed ${WORK})"
+}
+
+cmd_status() {
+    if is_running && probe >/dev/null; then
+        echo "test-mint: healthy at ${URL} (pid $(cat "${PIDFILE}"))"
+        return 0
+    fi
+    if is_running; then
+        echo "test-mint: process alive (pid $(cat "${PIDFILE}")) but ${URL}v1/info is not answering"
+        return 1
+    fi
+    echo "test-mint: not running"
+    return 1
+}
+
+# The F3 evidence command: prints where private state lives, proves it is outside the delivered
+# workdir, and lists whatever the mint has contributed to that workdir (which must be nothing).
+cmd_isolation() {
+    echo "state root:      ${STATE_ROOT}"
+    echo "mint state dir:  ${WORK}"
+    echo "delivered dir:   ${DELIVERY_DIR}"
+    printf 'state inside delivered dir: '
+    case "${WORK}/" in
+        "${DELIVERY_DIR}"/*) echo "YES — THIS IS A DEFECT"; rc=1 ;;
+        *) echo "no"; rc=0 ;;
+    esac
+    if [ -d "${WORK}" ]; then
+        echo "state contents (names and sizes only, no values):"
+        find "${WORK}" -maxdepth 1 -mindepth 1 -exec sh -c 'printf "  %s %s bytes\n" "$(basename "$1")" "$(wc -c < "$1" 2>/dev/null || echo dir)"' _ {} \;
+        printf 'seed mode: '
+        [ -f "${SEED}" ] && stat -c '%a' "${SEED}" || echo "(no seed yet)"
+    else
+        echo "state dir does not exist yet"
+    fi
+    if [ -d "${DELIVERY_DIR}" ]; then
+        echo "delivered dir entries matching test-mint state:"
+        found=$(find "${DELIVERY_DIR}" -maxdepth 2 \
+            \( -name '.test-mint' -o -name 'mintd.log' -o -name 'seed' -o -name 'cdk-mintd.sqlite*' \) \
+            2>/dev/null || true)
+        if [ -z "${found}" ]; then
+            echo "  none"
+        else
+            echo "${found}" | sed 's/^/  FOUND: /'
+            rc=1
+        fi
+    else
+        echo "delivered dir ${DELIVERY_DIR} not present (standalone run, no bind mount)"
+    fi
+    return "${rc}"
+}
+
+case "${1:-help}" in
+    start)     cmd_start ;;
+    stop)      cmd_stop ;;
+    restart)   cmd_restart ;;
+    reset)     cmd_reset ;;
+    status)    cmd_status ;;
+    isolation) cmd_isolation ;;
+    info)      probe || { echo "test-mint: no answer at ${URL}v1/info" >&2; exit 1; } ;;
+    invoice)   shift; test-mint-invoice "$@" ;;
+    url)       echo "${URL}" ;;
+    state)     echo "${WORK}" ;;
+    logs)      tail -n "${2:-50}" "${LOG}" ;;
+    help|--help|-h)
+        cat <<EOF
+test-mint — sandbox-local fakewallet mint (worthless test ecash, loopback only)
+
+  start        start the mint, wait until /v1/info answers
+  stop         stop the mint, keep the database
+  restart      stop then start, keeping database and seed (restart-recovery case)
+  reset        stop and delete ${WORK} entirely (clean slate)
+  status       exit 0 only if the mint is serving /v1/info
+  isolation    prove private state sits OUTSIDE the delivered workdir; exit 0 only if it does
+  info         print the NUT-06 mint info document
+  invoice N [fail]   print a BOLT11 the mint will settle, or refuse with 'fail'
+  url          print the mint URL
+  state        print the private state directory
+  logs [n]     last n lines of the mint log (default 50)
+
+Environment: TEST_MINT_STATE_ROOT (default /var/lib/cashu-test-state), TEST_MINT_WORK_DIR
+(default \$TEST_MINT_STATE_ROOT/mint — MUST be outside the delivered workdir), TEST_MINT_HOST
+(loopback only), TEST_MINT_PORT (default 8085), TEST_MINT_DELIVERY_DIR (default /work).
+
+This mint must never be added to a seller's accepted_mints.
+EOF
+        ;;
+    *)
+        echo "test-mint: unknown command '$1' (try: test-mint help)" >&2
+        exit 64
+        ;;
+esac

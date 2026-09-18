@@ -1,0 +1,20 @@
+[package]
+name = "test-mint-seed"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Was an inline heredoc in the Dockerfile with a ranged dependency and no lockfile (advisor F6).
+# Now a real crate with a committed Cargo.lock, installed --locked, so the seed generator's
+# dependency graph is fixed at the resolution recorded here.
+[dependencies]
+bip39 = { version = "=2.2.2", features = ["rand"] }
+
+[[bin]]
+name = "test-mint-seed"
+path = "src/main.rs"
+
+# Standalone crate root. These image-local crates are deliberately NOT members of the
+# product workspace: adding them there would drag image tooling into every product build, and
+# an empty [workspace] table is the supported way to say "this is its own root".
+[workspace]
