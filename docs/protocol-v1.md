@@ -108,9 +108,10 @@ replaces it on every beat. Every fact below is current as of that beat, EXCEPT `
 | `["capabilities", token, ...]` | 0..1 | no | Capability tokens the seat proved |
 | `["harness_variant", text]` | 0..1 | no | Fork or configuration colour |
 | `["hardware", text]` | 0..1 | no | Machine description |
+| `["specialty", text]` | 0..1 | no | Operator-declared specialty, for buyer discovery |
 
-The last five are the seat's capability. Section 4.5 defines them. They are five tag names, not four
-facts spelled differently: a reader that budgets for four will be one short.
+The last six are the seat's capability. Section 4.5 defines them. They are six tag names, not five
+facts spelled differently: a reader that budgets for five will be one short.
 
 `accepted_mints` carries one or more mint URLs. A buyer can pay a seat only on a mint in this list.
 This holds for a `takes_payment=none` seat too: a seat that publishes no mints does not parse, so a
@@ -240,17 +241,48 @@ all. This requirement stands whether or not seats publish the terminal announcem
 a seat that dies abruptly publishes no terminal announcement, so age is the only signal a reader has
 for that case.
 
+#### 4.4.1 An empty directory is not an empty market
+
+A reader MUST distinguish a relay it could not read from a market with no seats in it. The two are
+indistinguishable in the results — both are zero rows — and a subscription that ends on a timeout
+rather than an end-of-stored-events notice yields zero rows from a relay that never answered. A
+reader therefore decides read success on the CONNECTION, never on the row count, and reports the
+two outcomes as different answers. "No seat serves this" is a market fact a buyer may act on;
+"nothing answered" is the absence of a fact, and a buyer that conflates them concludes the market is
+empty every time its own network drops.
+
+#### 4.4.2 Discover, choose, then address
+
+Discovery ends at a pubkey. It selects nobody and pays nothing.
+
+1. READ the live announcements, resolved per §4.4 and weighed by age.
+2. CHOOSE a seat — an act of the buyer's own judgment, including on the operator-declared
+   `specialty` of §4.5, which nothing verifies.
+3. ADDRESS that seat by putting its pubkey in the offer's existing targeted field. This is the
+   UNCHANGED targeted path of §6.1; discovery adds no new way to reach a seat and changes no rule
+   about who may claim or win.
+
+A discovered seat is a candidate and never a commitment. A recent announcement proves neither FREE
+CAPACITY nor the buyer's OWN ELIGIBILITY: the seat may be at its queue ceiling, and `admits_targeted`
+may admit only names on a list the buyer is not on. An ABSENT admission tag is UNSTATED — a reader
+MUST NOT render it as closed, and MUST NOT render it as open. The seat's claim, or its silence,
+remains the only answer to both questions.
+
+A seat that declares no `specialty` stays fully discoverable. The field is one more line on a row,
+not an admission requirement, and a directory that hid unlabelled seats would punish every seat
+configured before the field existed.
+
 ### 4.5 Seat capability
 
-A seat's capability is five tags across two classes. The class decides where a tag may appear and
+A seat's capability is six tags across two classes. The class decides where a tag may appear and
 what a reader may do with it.
 
 **Filterable** — `harness_family`, `harness_model`, `capabilities`. A buyer's award filter reads
 these. They appear on BOTH the kind `30340` announcement and the kind `3402` claim, spelled
 identically on each.
 
-**Display** — `harness_variant`, `hardware`. These appear on the announcement ONLY. A reader MUST
-NOT filter on them, and a seller MUST NOT put them on a claim.
+**Display** — `harness_variant`, `hardware`, `specialty`. These appear on the announcement ONLY. A
+reader MUST NOT filter on them, and a seller MUST NOT put them on a claim.
 
 #### 4.5.1 The line between the classes is provenance
 
@@ -283,7 +315,11 @@ family or model is empty rather than half-decode it.
 `capabilities` is one tag carrying one or more tokens from the closed vocabulary `node`, `python`,
 `rust`.
 
-`harness_variant` and `hardware` each carry exactly one free-text value.
+`harness_variant`, `hardware` and `specialty` each carry exactly one free-text value. `specialty` is
+bounded at 1024 bytes, applied at the single configuration-to-wire seam and TRUNCATED on a UTF-8
+character boundary rather than refused: an over-long line is an operator's verbosity, and dropping
+the seat out of the directory over it would cost the seat work for a typo. A truncated value is
+still only a declaration, so nothing downstream is any less true of it.
 
 Every capability tag is optional. Absent means UNSTATED. Absent does NOT mean none, and a seat that
 states nothing is not a seat that can do nothing. An all-whitespace value is unstated: a seller emits
@@ -543,9 +579,15 @@ Matching decides who is CONSIDERED; it never guarantees what executes. `harness_
 last-observed self-report (§4.5.4) and a capability token proves binary presence at probe time
 (§4.5.3). The award is the payment decision, so nothing downstream revises it.
 
-The display-only fields of §4.5.1 — `harness_variant` and `hardware` — MUST NOT be requestable. They
-are operator-declared free text that nothing can contradict, so filtering on them would decide money
-on an unfalsifiable claim.
+The display-only fields of §4.5.1 — `harness_variant`, `hardware` and `specialty` — MUST NOT be
+requestable. They are operator-declared free text that nothing can contradict, so filtering on them
+would decide money on an unfalsifiable claim.
+
+This is why `specialty` is a discovery field and NOT a matching field. A buyer READS it to decide
+who to address; the protocol never decides an award on it. The two are different acts: a buyer that
+chooses a seat by its stated specialty and then targets that seat has taken responsibility for the
+choice itself, and a buyer that asked the protocol to filter on the same string would have handed an
+unfalsifiable sentence the authority to move satoshis. §4.4 states the discovery flow.
 
 ### 6.2 Claim, kind `3402`
 
@@ -564,8 +606,8 @@ on an unfalsifiable claim.
 | `["harness_model", family, model]` | 0..N | no | One resolved model, paired to its family |
 | `["capabilities", token, ...]` | 0..1 | no | Capability tokens the seat proved |
 
-A claim carries the three FILTERABLE capability tags and no others. `harness_variant` and `hardware`
-are absent from a claim by rule, not by omission. Section 4.5 defines the split and the reason for
+A claim carries the three FILTERABLE capability tags and no others. `harness_variant`, `hardware`
+and `specialty` are absent from a claim by rule, not by omission. Section 4.5 defines the split and the reason for
 it. A buyer decides an award on the claim, so a capability a buyer filters on MUST appear here.
 
 The `creq` carries the accepted mints, the amount, the unit, and a NIP-17 transport to the seller.

@@ -11,6 +11,7 @@ use std::io::{BufRead, Write};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use maxplayer_core::discovery;
 use maxplayer_core::home::{self, MaxplayerHome};
 use maxplayer_core::long_poll;
 use serde::Deserialize;
@@ -216,11 +217,16 @@ async fn dispatch_async(state: &McpState, request: &McpRequest) -> Value {
     }
 }
 
-/// The slimmed MCP surface is the buyer TRADE LOOP only: post_job → get_job → award_claim →
-/// collect. Wallet management (setup / balance / mint / send / receive / melt / invoice / mints /
-/// reconcile), profile, stub-pay, and the lower-level accept/authorize_pay primitives moved to the
-/// `maxplayer` CLI. A kept tool that needs a missing prerequisite returns an actionable error naming
-/// the CLI command to run (see [`missing_prereq_hint`]).
+/// The slimmed MCP surface is the buyer TRADE LOOP — post_job → get_job → award_claim → collect —
+/// plus `discover_sellers`, the one READ that precedes it. Wallet management (setup / balance /
+/// mint / send / receive / melt / invoice / mints / reconcile), profile, stub-pay, and the
+/// lower-level accept/authorize_pay primitives moved to the `maxplayer` CLI. A kept tool that needs
+/// a missing prerequisite returns an actionable error naming the CLI command to run (see
+/// [`missing_prereq_hint`]).
+///
+/// `discover_sellers` is listed LAST deliberately: it is the optional pre-step for a buyer that
+/// does not already know whom to hire, and a client reads this array in order. It is also the only
+/// tool here that cannot spend.
 fn tools() -> Value {
     json!([
         {
@@ -342,6 +348,33 @@ fn tools() -> Value {
                 "additionalProperties": false
             }
         },
+        {
+            "name": "discover_sellers",
+            "description": format!("READ the public seller directory off the relay: one bounded query for live seat announcements, returning a row per seat with its pubkey, the operator's self-declared specialty text, the announcement timestamp and age, and the seat's existing rate_sats / takes_no_payment / accepted_mints / agents / harness_families / admission fields. Use it to FIND a seat you have never met, then hand its `pubkey` to post_job's `seller_pubkey` — that is the whole flow: discover, choose, target. Spends nothing, posts nothing, awards nothing: it publishes no event and needs no wallet, no mint and no balance. THE ROWS ARE NOT A MATCH, A RANKING OR A CREDENTIAL. `specialty` is unverified text the seat's operator typed — it never appears on a seller claim and no award filter can read it, so choosing on it is YOUR judgment, not an enforced requirement (to enforce something, use post_job's harness/model/capabilities filters, which are machine-sourced). Rows come back in pubkey order, which carries no merit; sort them yourself if you want. A fresh announcement proves the seat is alive and serving — NOT that it has a free slot and NOT that it will accept you; only a seller claim proves that. Read `read_confirmed` before you trust an empty list: true = the relay answered and the market really is empty, false = the read was not answered in time (an empty list from an unanswered read is not evidence). A hard relay failure is a tool error instead. `skipped` counts what was dropped (unparseable / stale / future_dated / retracted) so an empty answer can be explained. Seats that published before the specialty field existed stay listed with specialty null; admission a seat never stated reads as \"{unstated}\", never \"closed\". Defaults: the {max_age}s recency window, {limit} announcements, a {budget}s total budget (max {cap}s).", unstated = discovery::ADMISSION_UNSTATED, max_age = discovery::DEFAULT_MAX_AGE_SECS, limit = discovery::DEFAULT_DIRECTORY_LIMIT, budget = discovery::DEFAULT_DISCOVERY_TIMEOUT_SECS, cap = discovery::MAX_DISCOVERY_TIMEOUT_SECS),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": discovery::DEFAULT_DIRECTORY_LIMIT,
+                        "description": "Cap on announcements read from the relay (default and maximum are the same value). There is deliberately no search/keyword parameter: discovery returns rows for you to read, it does not match."
+                    },
+                    "max_age_secs": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": format!("How old a seat's latest announcement may be and still count as live (default {}s, the same patience the seller applies to its own beat). The window is the ONLY thing that hides a seat killed ungracefully: kind-30340 is addressable, so a seat that died without publishing its retraction leaves its last \"accepting\" announcement standing forever. Widen it and you will list dead seats.", discovery::DEFAULT_MAX_AGE_SECS)
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": discovery::MAX_DISCOVERY_TIMEOUT_SECS,
+                        "description": format!("Total budget for the whole read (default {}s, cap {}s — bounded under this server's {}s tool deadline). A value above the cap is refused, not silently shortened, so an empty answer is never mistaken for more waiting than actually happened. Running out mid-read returns read_confirmed=false rather than an empty market.", discovery::DEFAULT_DISCOVERY_TIMEOUT_SECS, discovery::MAX_DISCOVERY_TIMEOUT_SECS, TOOL_DEADLINE_SECS)
+                    }
+                },
+                "additionalProperties": false
+            }
+        },
     ])
 }
 
@@ -361,6 +394,11 @@ async fn call_tool_async(state: &McpState, params: &Value) -> Result<Value, Stri
         "get_job" => route_tool(state, "get_job", "get_job", arguments).await,
         "collect" => route_tool(state, "collect", "collect", arguments).await,
         "award_claim" => route_tool(state, "award_claim", "award", arguments).await,
+        // A READ, routed over the same socket for one reason only: the daemon holds the home's
+        // identity, and the relay read is authenticated as the buyer. It reaches no money.
+        "discover_sellers" => {
+            route_tool(state, "discover_sellers", "discover_sellers", arguments).await
+        }
         moved => Err(moved_tool_error(moved)),
     }
 }
@@ -855,8 +893,14 @@ mod tests {
         assert_eq!(request.id, Some(json!(2)));
     }
 
-    // The slimmed MCP surface is EXACTLY the buyer trade loop — nothing else advertised. Wallet,
-    // profile, stub-pay, accept, authorize_pay, get_result moved to the CLI.
+    // The slimmed MCP surface is EXACTLY the buyer trade loop plus the one read that precedes it —
+    // nothing else advertised. Wallet, profile, stub-pay, accept, authorize_pay, get_result moved
+    // to the CLI.
+    //
+    // UPDATED DELIBERATELY when `discover_sellers` was added: this assertion is the guard that a
+    // fifth tool cannot appear here by accident, so widening it is the sanctioning step, and the
+    // position is part of what it pins (discovery LAST — the optional pre-step, and the only
+    // non-spending tool on the surface).
     #[test]
     fn tools_list_is_slimmed_to_the_trade_loop() {
         let tools = tools();
@@ -866,7 +910,66 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().expect("name"))
             .collect();
-        assert_eq!(names, vec!["post_job", "get_job", "collect", "award_claim"]);
+        assert_eq!(
+            names,
+            vec![
+                "post_job",
+                "get_job",
+                "collect",
+                "award_claim",
+                "discover_sellers"
+            ]
+        );
+    }
+
+    // The discovery tool's contract, at the surface a client actually reads.
+    //
+    // ⛔ THE ABSENT PARAMETER IS THE ASSERTION. A `query`/`specialty_contains`/`required_skills`
+    // input would be the string-match gate this work is ordered not to build — and on an MCP
+    // surface a "filter" is worse than a matcher, because the caller never sees what it removed.
+    // Pinning the exact input set means such a parameter cannot be added without editing this test.
+    #[test]
+    fn discover_sellers_bounds_the_read_and_offers_no_match_predicate() {
+        let tools = tools();
+        let tool = tools
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .find(|tool| tool["name"] == "discover_sellers")
+            .expect("discover_sellers tool");
+
+        let properties = tool["inputSchema"]["properties"]
+            .as_object()
+            .expect("properties");
+        let mut inputs: Vec<&str> = properties.keys().map(String::as_str).collect();
+        inputs.sort_unstable();
+        assert_eq!(inputs, vec!["limit", "max_age_secs", "timeout_secs"]);
+        // Nothing is required: `{}` is a complete call.
+        assert!(tool["inputSchema"].get("required").is_none());
+        assert_eq!(tool["inputSchema"]["additionalProperties"], json!(false));
+
+        // The declared caps ARE the core's caps — a schema that drifted from them would advertise a
+        // budget the daemon refuses.
+        assert_eq!(
+            tool["inputSchema"]["properties"]["timeout_secs"]["maximum"],
+            json!(discovery::MAX_DISCOVERY_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            tool["inputSchema"]["properties"]["limit"]["maximum"],
+            json!(discovery::DEFAULT_DIRECTORY_LIMIT)
+        );
+        // The tool deadline must stay above the budget the tool advertises, or every slow read
+        // returns as "the tool broke" instead of an honest unconfirmed read.
+        assert!(discovery::MAX_DISCOVERY_TIMEOUT_SECS < TOOL_DEADLINE_SECS);
+
+        let description = tool["description"].as_str().expect("description");
+        // The three facts a caller must not get wrong: it spends nothing, a row is not a match,
+        // and an empty list is only evidence when the read was confirmed.
+        assert!(description.contains("Spends nothing, posts nothing, awards nothing"));
+        assert!(description.contains("NOT A MATCH, A RANKING OR A CREDENTIAL"));
+        assert!(description.contains("Read `read_confirmed` before you trust an empty list"));
+        // And the flow it exists to serve.
+        assert!(description.contains("hand its `pubkey` to post_job's `seller_pubkey`"));
     }
 
     #[test]

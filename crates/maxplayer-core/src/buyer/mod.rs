@@ -381,6 +381,7 @@ async fn dispatch(context: &Arc<BuyerContext>, request: Request) -> Response {
         "status" | "health" => status(context, id).await,
         "post_job" => post_job(context, id, request.params).await,
         "get_job" => get_job(context, id, request.params).await,
+        "discover_sellers" => discover_sellers(context, id, request.params).await,
         "award" => award(context, id, request.params).await,
         "collect" => collect(context, id, request.params).await,
         "accept_claim" | "authorize_pay" => Response::err(
@@ -526,19 +527,33 @@ fn post_job_kind(params: &PostJobParams) -> Result<JobKind, String> {
 /// CLI/MCP use), record its auto-award intent, and spawn the background auto-award task — the
 /// daemon-drives-the-award half of the 2-call trade loop (post_job → collect). No reservation is
 /// taken at post — funds are reserved at award.
-async fn post_job(context: &Arc<BuyerContext>, id: Value, params: Value) -> Response {
-    let params: PostJobParams = match serde_json::from_value(params) {
-        Ok(params) => params,
-        Err(error) => return Response::err(id, CODE_METHOD_NOT_FOUND, format!("post_job params: {error}")),
-    };
-    let job = match post_job_kind(&params) {
-        Ok(job) => job,
-        Err(message) => return Response::err(id, CODE_METHOD_NOT_FOUND, message),
-    };
-    let payment_mode = match post_job_payment_mode(params.payment.as_deref(), params.amount_sats) {
-        Ok(mode) => mode,
-        Err(message) => return Response::err(id, CODE_METHOD_NOT_FOUND, message),
-    };
+/// The `post_job` RPC body, mapped — the request the lifecycle will be handed, plus the three
+/// values the daemon keeps for its auto-award intent.
+///
+/// A named result rather than a tuple because [`map_post_job_params`] is the boundary a caller
+/// hands a discovered pubkey to, and "which field did the seller end up in" is the whole question
+/// at that boundary.
+pub struct PostJobMapping {
+    pub request: PostJobRequest,
+    pub max_sats: u64,
+    pub harness: Option<String>,
+    pub model: Option<String>,
+}
+
+/// Map a `post_job` RPC body to a [`PostJobRequest`], with NO daemon, relay, wallet or money.
+///
+/// Lifted out of the RPC handler so this boundary can be exercised on its own. It is the mapping a
+/// buyer's pubkey actually travels through: the MCP `post_job` tool routes here, so a value that
+/// `OfferDraft` would accept but this rejects is a value no user can post with. Discovery ends at a
+/// pubkey precisely so it can be handed in here, which is why the handoff is asserted through this
+/// function rather than around it.
+///
+/// Errors are the RPC's own strings, unchanged, so the handler's replies read exactly as before.
+pub fn map_post_job_params(params: Value) -> Result<PostJobMapping, String> {
+    let params: PostJobParams =
+        serde_json::from_value(params).map_err(|error| format!("post_job params: {error}"))?;
+    let job = post_job_kind(&params)?;
+    let payment_mode = post_job_payment_mode(params.payment.as_deref(), params.amount_sats)?;
     let max_sats = params.max_sats.unwrap_or(params.amount_sats);
     let harness = params.harness.clone();
     let model = params.model.clone();
@@ -567,6 +582,24 @@ async fn post_job(context: &Arc<BuyerContext>, id: Value, params: Value) -> Resp
         // read alone would make free jobs postable and — because `authorize_pay_async` refuses a
         // free bind — uncollectable.
         payment_mode,
+    };
+    Ok(PostJobMapping {
+        request,
+        max_sats,
+        harness,
+        model,
+    })
+}
+
+async fn post_job(context: &Arc<BuyerContext>, id: Value, params: Value) -> Response {
+    let PostJobMapping {
+        request,
+        max_sats,
+        harness,
+        model,
+    } = match map_post_job_params(params) {
+        Ok(mapping) => mapping,
+        Err(message) => return Response::err(id, CODE_METHOD_NOT_FOUND, message),
     };
     match job_lifecycle::post_job_async(&context.home, request).await {
         Ok(outcome) => {
@@ -718,6 +751,116 @@ async fn get_job(context: &BuyerContext, id: Value, params: Value) -> Response {
             Response::ok(id, json!(GetJobResponse { view, awarded, awarded_delivery_pending }))
         }
         Err(error) => Response::err(id, CODE_INTERNAL, error.to_string()),
+    }
+}
+
+/// Params for the `discover_sellers` RPC. Every field is optional and every default is the shipped
+/// discovery rule, so `{}` is the whole call.
+///
+/// ⛔ **THERE IS NO QUERY FIELD, AND ITS ABSENCE IS THE DESIGN.** No `specialty_contains`, no
+/// keyword, no required-skill list: a server-side text predicate over seller-declared prose is the
+/// string-match gate this slice is explicitly ordered not to build, and shipping it as a *filter*
+/// would make it a de-facto matcher the moment a caller trusted the shortlist it returned. The
+/// three parameters here bound the READ (how many, how fresh, how long to wait); the choosing is
+/// the caller's, over rows it can see.
+#[derive(Debug, Deserialize)]
+struct DiscoverSellersParams {
+    /// Cap on announcements requested from the relay. Defaults to
+    /// [`crate::discovery::DEFAULT_DIRECTORY_LIMIT`].
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Recency window in seconds. Defaults to [`crate::discovery::DEFAULT_MAX_AGE_SECS`].
+    #[serde(default)]
+    max_age_secs: Option<u64>,
+    /// Total budget for the read in seconds. Defaults to
+    /// [`crate::discovery::DEFAULT_DISCOVERY_TIMEOUT_SECS`], capped at
+    /// [`crate::discovery::MAX_DISCOVERY_TIMEOUT_SECS`].
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+/// Refuse an out-of-range `discover_sellers` bound at the RPC boundary, before any relay work.
+///
+/// Zero is refused on all three rather than read as "no limit": an unbounded read has no place on a
+/// surface whose caller holds a deadline, and a zero recency window admits nothing, so a caller
+/// that sent it wants an answer this call cannot give. Refusing beats a silent substitution the
+/// caller would then mistake for evidence.
+fn discover_sellers_bounds_error(params: &DiscoverSellersParams) -> Option<String> {
+    if params.limit == Some(0) {
+        return Some(
+            "limit=0 is refused (it would mean an unbounded relay read on a deadline-bound call); \
+             omit limit for the default or pass a positive value"
+                .to_owned(),
+        );
+    }
+    if let Some(limit) = params.limit {
+        if limit > crate::discovery::DEFAULT_DIRECTORY_LIMIT {
+            return Some(format!(
+                "limit={limit} exceeds the directory read cap of {}; omit limit for the default",
+                crate::discovery::DEFAULT_DIRECTORY_LIMIT
+            ));
+        }
+    }
+    if params.max_age_secs == Some(0) {
+        return Some(
+            "max_age_secs=0 is refused: no beat can be zero seconds old, so it would report an \
+             empty market as a fact; omit it for the default window"
+                .to_owned(),
+        );
+    }
+    match params.timeout_secs {
+        Some(0) => Some(
+            "timeout_secs=0 is refused: a read with no budget cannot confirm anything; omit it \
+             for the default"
+                .to_owned(),
+        ),
+        Some(secs) if secs > crate::discovery::MAX_DISCOVERY_TIMEOUT_SECS => Some(format!(
+            "timeout_secs={secs} exceeds the discovery cap of {}s (bounded under the MCP tool \
+             deadline); omit timeout_secs for the default or pass a value <= {}",
+            crate::discovery::MAX_DISCOVERY_TIMEOUT_SECS,
+            crate::discovery::MAX_DISCOVERY_TIMEOUT_SECS,
+        )),
+        _ => None,
+    }
+}
+
+/// Read the public seat directory — **a READ, and the only money-free RPC on this surface besides
+/// `status`**. It takes no `money_lock`, opens no wallet, touches no reservation ledger and
+/// publishes no event; the whole of it is [`crate::discovery::fetch_directory_async`] plus the
+/// clock. Relay failure surfaces as an error and an unanswered read as `read_confirmed: false`, so
+/// no caller can read either as "the market is empty" (see [`crate::discovery::DiscoveryError`]).
+async fn discover_sellers(context: &BuyerContext, id: Value, params: Value) -> Response {
+    let params: DiscoverSellersParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => {
+            return Response::err(
+                id,
+                CODE_METHOD_NOT_FOUND,
+                format!("discover_sellers params: {error}"),
+            );
+        }
+    };
+    if let Some(error) = discover_sellers_bounds_error(&params) {
+        return Response::err(id, CODE_METHOD_NOT_FOUND, error);
+    }
+    // The reader's clock, taken once here so every row's `age_secs` is measured against the same
+    // instant the recency rule used.
+    let now_unix = u64::try_from(now_unix()).unwrap_or(0);
+    let mut policy = crate::discovery::DirectoryPolicy::at(now_unix);
+    if let Some(max_age_secs) = params.max_age_secs {
+        policy.max_age_secs = max_age_secs;
+    }
+    let limit = params
+        .limit
+        .unwrap_or(crate::discovery::DEFAULT_DIRECTORY_LIMIT);
+    let budget = Duration::from_secs(
+        params
+            .timeout_secs
+            .unwrap_or(crate::discovery::DEFAULT_DISCOVERY_TIMEOUT_SECS),
+    );
+    match crate::discovery::fetch_directory_async(&context.home, policy, limit, budget).await {
+        Ok(directory) => Response::ok(id, json!(directory)),
+        Err(error) => Response::err(id, CODE_INTERNAL, format!("discover_sellers: {error}")),
     }
 }
 
@@ -6502,5 +6645,113 @@ mod tests {
             "a PAID collect still reports the total, and reports the one the pay path returned"
         );
         assert_eq!(paid["amount_sats"], 21);
+    }
+
+    // ── discover_sellers: the read-only directory RPC ────────────────────────────────────────
+    //
+    // The relay leg is covered offline in `crate::discovery`; what belongs HERE is the RPC
+    // boundary — the params it accepts, the bounds it refuses before any relay work, and the shape
+    // its answer serialises to.
+
+    /// The params a caller sends, through the REAL deserializer.
+    fn discover_params(body: Value) -> Result<DiscoverSellersParams, String> {
+        serde_json::from_value(body).map_err(|error| error.to_string())
+    }
+
+    // `{}` is a complete call: every bound has a shipped default, so a caller that wants the
+    // shipped rules sends nothing. Unknown/absent fields must not force a caller to state them.
+    #[test]
+    fn an_empty_discover_sellers_body_takes_every_shipped_default() {
+        let params = discover_params(json!({})).expect("empty body is valid");
+        assert_eq!(params.limit, None);
+        assert_eq!(params.max_age_secs, None);
+        assert_eq!(params.timeout_secs, None);
+        assert_eq!(discover_sellers_bounds_error(&params), None);
+    }
+
+    // Every bound is refused OUT OF RANGE rather than clamped, and the refusal happens before a
+    // socket is opened. A silently-clamped 60s budget would hand the caller a 10s empty answer it
+    // would read as sixty seconds of evidence — the one failure mode this whole module exists to
+    // prevent.
+    #[test]
+    fn an_out_of_range_discover_sellers_bound_is_refused_not_clamped() {
+        let over_budget = discover_params(json!({ "timeout_secs": 60 })).expect("parses");
+        let error = discover_sellers_bounds_error(&over_budget).expect("refused");
+        assert!(
+            error.contains(&format!(
+                "exceeds the discovery cap of {}s",
+                crate::discovery::MAX_DISCOVERY_TIMEOUT_SECS
+            )),
+            "the refusal must name the cap: {error}"
+        );
+
+        let over_limit = discover_params(json!({
+            "limit": crate::discovery::DEFAULT_DIRECTORY_LIMIT + 1
+        }))
+        .expect("parses");
+        assert!(
+            discover_sellers_bounds_error(&over_limit)
+                .expect("refused")
+                .contains("exceeds the directory read cap"),
+        );
+
+        // Zero on any bound is a request this call cannot honour, so it is named rather than
+        // reinterpreted as "no limit" / "no window" / "no wait".
+        for body in [
+            json!({ "limit": 0 }),
+            json!({ "max_age_secs": 0 }),
+            json!({ "timeout_secs": 0 }),
+        ] {
+            let params = discover_params(body.clone()).expect("parses");
+            assert!(
+                discover_sellers_bounds_error(&params).is_some(),
+                "zero must be refused: {body}"
+            );
+        }
+
+        // At the caps, and inside them, nothing is refused.
+        let at_caps = discover_params(json!({
+            "limit": crate::discovery::DEFAULT_DIRECTORY_LIMIT,
+            "max_age_secs": 60,
+            "timeout_secs": crate::discovery::MAX_DISCOVERY_TIMEOUT_SECS
+        }))
+        .expect("parses");
+        assert_eq!(discover_sellers_bounds_error(&at_caps), None);
+    }
+
+    // ⛔ NO MATCH PREDICATE ON THE RPC EITHER. The MCP schema refuses unknown inputs, but the
+    // daemon is reachable directly over the socket, so the absence has to hold here too: a
+    // `specialty_contains` a caller could send would be the string-match gate, and serde would
+    // accept the field silently if this ever grew one.
+    #[test]
+    fn the_discover_sellers_rpc_offers_no_specialty_predicate() {
+        let params = discover_params(json!({
+            "specialty_contains": "rust",
+            "required_skills": ["rust"],
+            "query": "rust"
+        }))
+        .expect("unknown fields are ignored, not honoured");
+        // Every bound stayed default: nothing in that body reached a filter.
+        assert_eq!(params.limit, None);
+        assert_eq!(params.max_age_secs, None);
+        assert_eq!(params.timeout_secs, None);
+        assert_eq!(discover_sellers_bounds_error(&params), None);
+    }
+
+    // The wire shape of an answer: the caller must be able to tell an answered-empty market from an
+    // unanswered read, and `read_confirmed` is the only field that says so.
+    #[test]
+    fn a_directory_answer_serialises_its_confirmation_flag() {
+        let confirmed = json!(crate::discovery::SellerDirectory::empty_confirmed());
+        assert_eq!(confirmed["read_confirmed"], json!(true));
+        assert_eq!(confirmed["sellers"], json!([]));
+        assert_eq!(confirmed["events_read"], json!(0));
+
+        let unverified = json!(crate::discovery::SellerDirectory::unverified());
+        assert_eq!(unverified["read_confirmed"], json!(false));
+        assert_eq!(
+            unverified["sellers"], confirmed["sellers"],
+            "the two differ ONLY in the flag — which is why the flag has to be read"
+        );
     }
 }

@@ -297,6 +297,45 @@ pub const ADMITS_TARGETED_TAG: &str = "admits_targeted";
 /// allowed to be arbitrary text at all, and a test names the filter surface to keep it true.
 pub const HARDWARE_TAG: &str = "hardware";
 
+/// Wire tag carrying the seat's own description of what it SPECIALISES in — free text, single
+/// value, e.g. `"Rust async runtimes and tokio internals"`. This is what lets a buyer who has
+/// never met a seat read what it says it is for.
+///
+/// ⛔ **SELLER-DECLARED, NOT VERIFIED — AND THEREFORE NEVER FILTERED.** It joins
+/// [`HARDWARE_TAG`] and [`HARNESS_VARIANT_TAG`] in the display-only half of [`SeatCapability`],
+/// which is not a convenience: the provenance rule there is *filterable ⟺ machine-sourced*, and
+/// nothing the daemon can run measures whether a seat is good at Rust. A buyer commits sats at
+/// award, so a field the operator typed must not be able to gate that award — which is why this
+/// rides the kind-30340 beat ALONE and is absent from [`SeatCapability::filterable_tags`], hence
+/// absent from every kind-3402 claim.
+///
+/// A buyer READS this and decides for itself. Discovery hands the text to a human or an agent;
+/// the choice of who to hire stays a buyer act, and it targets the discovered pubkey through the
+/// posting path that already existed. There is deliberately no string-match gate anywhere: a
+/// substring test against operator-typed text would be a competence assertion the protocol
+/// cannot back, and it would reward keyword-stuffing over the one signal that costs something
+/// (a seat that claims, delivers, and gets paid).
+///
+/// Absent means UNSTATED, never "generalist" — a seat that predates this tag, and a seat whose
+/// operator declined to describe it, are the same state on the wire and both stay discoverable.
+///
+/// Bounded at [`SPECIALTY_MAX_BYTES`]; see that constant for what happens to a longer value.
+pub const SPECIALTY_TAG: &str = "specialty";
+
+/// Upper bound (bytes, UTF-8) on a [`SPECIALTY_TAG`] value. One bounded text field, not a token
+/// taxonomy: a controlled vocabulary would need a registry, a versioning story, and an answer for
+/// every specialty nobody thought to enumerate, and it would still be operator-typed.
+///
+/// **A longer value is TRUNCATED on a char boundary, never refused.** Both directions of that
+/// choice matter. Refusing at config would brick a seat's boot over cosmetic text; refusing at
+/// parse would drop the whole beat and make an over-talkative seat invisible — a seat that is
+/// perfectly able to work would vanish from the market for a description that is too long. So the
+/// FIELD degrades and the SEAT survives, and the same bound is applied by the emitter and the
+/// reader alike (see [`bounded_specialty`]) so a reader can never render more than a seat could
+/// have published. Truncating on a char boundary rather than a byte one is what keeps the result
+/// valid UTF-8 for a multi-byte description.
+pub const SPECIALTY_MAX_BYTES: usize = 1024;
+
 /// The capability a seat advertises (#784), as ONE object rather than five loose fields.
 ///
 /// It exists to make the split structural instead of remembered. #784 has two kinds of field:
@@ -305,9 +344,9 @@ pub const HARDWARE_TAG: &str = "hardware";
 ///   reads these off the CLAIM, so they appear on the kind-3402 claim as well as the kind-30340
 ///   beat, and must be spelled identically on both. [`Self::filterable_tags`] is that single
 ///   spelling.
-/// - **Display-only** — `harness_variant`, `hardware`. Colour for a human or a seat directory. They
-///   go on the beat alone, because the award decision never reads them, and putting them on every
-///   claim would be weight with no reader.
+/// - **Display-only** — `harness_variant`, `hardware`, `specialty`. Colour for a human or a seat
+///   directory. They go on the beat alone, because the award decision never reads them, and putting
+///   them on every claim would be weight with no reader.
 ///
 /// ## The line between them is PROVENANCE
 ///
@@ -315,7 +354,7 @@ pub const HARDWARE_TAG: &str = "hardware";
 /// buyer commits sats at award and an operator-typed claim has nothing to contradict it. Each
 /// filterable field earns its place by being measured: `harness_family` from the dispatchable
 /// roster, `harness_model` from the harness handshake, `capabilities` from a probe of the job
-/// execution environment. The display-only two are operator-declared, which is exactly why they are
+/// execution environment. The display-only ones are operator-declared, which is exactly why they are
 /// harmless — nothing pays out on them.
 ///
 /// Enum-binding is NOT what buys this. Enum-binding solves canonicalisation — that `rust` and `Rust`
@@ -344,6 +383,10 @@ pub struct SeatCapability {
     pub harness_variant: Option<String>,
     /// Free-text machine colour. Never filtered — see [`HARDWARE_TAG`].
     pub hardware: Option<String>,
+    /// The seat's own description of what it specialises in, bounded at
+    /// [`SPECIALTY_MAX_BYTES`]. Seller-declared and never verified, therefore never filtered —
+    /// see [`SPECIALTY_TAG`]. `None` ⇒ unstated, which is not a claim to be a generalist.
+    pub specialty: Option<String>,
 }
 
 impl SeatCapability {
@@ -419,7 +462,7 @@ impl SeatCapability {
     /// prevent, and the read side is worth no less. Every consumer — the seat directory, the buyer's
     /// claim parse, the award filter — goes through here.
     ///
-    /// Reading all five off ANY event is deliberate, including a claim, which carries no display
+    /// Reading every field off ANY event is deliberate, including a claim, which carries no display
     /// fields: those simply come back `None`. Absent means unstated, so there is nothing to
     /// special-case per event kind, and no place for a per-kind rule to be applied inconsistently.
     pub fn from_tags(tags: &[TagSpec]) -> Self {
@@ -429,6 +472,7 @@ impl SeatCapability {
             capabilities: capabilities_from_tags(tags),
             harness_variant: harness_variant_from_tags(tags),
             hardware: hardware_from_tags(tags),
+            specialty: specialty_from_tags(tags),
         }
     }
 
@@ -451,6 +495,7 @@ impl SeatCapability {
         [
             harness_variant_tag(self.harness_variant.as_deref()),
             hardware_tag(self.hardware.as_deref()),
+            specialty_tag(self.specialty.as_deref()),
         ]
         .into_iter()
         .flatten()
@@ -754,6 +799,51 @@ pub fn hardware_tag(hardware: Option<&str>) -> Option<TagSpec> {
 /// reasons from.
 pub fn hardware_from_tags(tags: &[TagSpec]) -> Option<String> {
     first_tag_value(tags, HARDWARE_TAG).and_then(stated)
+}
+
+/// One specialty value, normalized to the "stated or absent" contract AND bounded to
+/// [`SPECIALTY_MAX_BYTES`]. `None` when nothing survives trimming.
+///
+/// ⚠ **THE EMITTER AND THE READER BOTH CALL THIS, and that is the point.** A bound applied only at
+/// emit would leave a reader rendering whatever arbitrary length a foreign seat published; a bound
+/// applied only at read would let this build publish a value its own reader then silently shortens.
+/// Applying it in one function on both sides means what a reader shows is always something a seat
+/// could have published.
+///
+/// Truncation walks BACK to a char boundary, so a description ending mid-codepoint loses that
+/// codepoint rather than yielding invalid UTF-8. The result is therefore at most
+/// [`SPECIALTY_MAX_BYTES`] bytes and may be shorter by up to three.
+pub fn bounded_specialty(value: Option<&str>) -> Option<String> {
+    let declared = stated(value?)?;
+    if declared.len() <= SPECIALTY_MAX_BYTES {
+        return Some(declared);
+    }
+    let mut end = SPECIALTY_MAX_BYTES;
+    while end > 0 && !declared.is_char_boundary(end) {
+        end -= 1;
+    }
+    // Trim again: the cut can expose trailing whitespace that was interior before it.
+    let truncated = declared[..end].trim_end();
+    (!truncated.is_empty()).then(|| truncated.to_owned())
+}
+
+/// The `["specialty", text]` tag, or `None` for a seat that describes itself as nothing.
+///
+/// Beat-only and never filtered — see [`SPECIALTY_TAG`]. Bounded by [`bounded_specialty`], so an
+/// operator who pastes an essay into `[seat] specialty` publishes a valid beat carrying its
+/// leading 1024 bytes rather than a beat a relay might refuse.
+pub fn specialty_tag(specialty: Option<&str>) -> Option<TagSpec> {
+    bounded_specialty(specialty).map(|value| TagSpec::new([SPECIALTY_TAG, &value]))
+}
+
+/// Read the `["specialty", text]` value off a seat announcement's tags. Absent ⇒ `None`, which is
+/// UNSTATED: a seat too old to carry the tag and a seat whose operator wrote no description are
+/// the same state here, and both remain discoverable.
+///
+/// Bounded on the way in by [`bounded_specialty`] — a foreign seat's oversized value is shortened
+/// by the reader, never a reason to reject the beat (see [`SPECIALTY_MAX_BYTES`]).
+pub fn specialty_from_tags(tags: &[TagSpec]) -> Option<String> {
+    bounded_specialty(first_tag_value(tags, SPECIALTY_TAG))
 }
 
 /// The `["admits_pool", …]` and `["admits_targeted", …]` tags for a stated admission policy.
@@ -1513,7 +1603,7 @@ mod tests {
     /// The **PRESENT** row: the exact tag set of a beat that states EVERY #784 field.
     ///
     /// This is the one that goes red when a tag is added, renamed or dropped, because its input
-    /// states all five names. Its sibling above states none, so between them a tag cannot appear
+    /// states every name. Its sibling above states none, so between them a tag cannot appear
     /// without being declared here nor vanish without failing there. **One row alone cannot tell a
     /// working emitter from a fixture that populates nothing** — the same argument
     /// `capability::probe_capabilities`'s own `a_stock_image_with_no_toolchain_advertises_nothing`
@@ -1547,14 +1637,16 @@ mod tests {
                 "harness_variant",
                 "queue_depth",
                 "rate",
+                "specialty",
                 "t",
                 "v",
             ]
         );
 
         // The denominator, stated rather than left to be counted off the list above: 8 pre-#784 tags
-        // (7 plus `agents`) and 6 capability tags, because `full_capability` carries two models.
-        assert_eq!(event.tags.len(), 14, "14 tags, 13 distinct names: {:?}", tag_names(&event));
+        // (7 plus `agents`) and 7 capability tags — 6 from #784 (`full_capability` carries two
+        // models) plus the display-only `specialty`.
+        assert_eq!(event.tags.len(), 15, "15 tags, 14 distinct names: {:?}", tag_names(&event));
         assert_eq!(
             tag_names(&event).iter().filter(|name| **name == HARNESS_MODEL_TAG).count(),
             2,
@@ -2108,6 +2200,7 @@ mod tests {
             capabilities: vec!["rust".to_owned(), "node".to_owned()],
             harness_variant: Some("my-fork".to_owned()),
             hardware: Some("mac studio, 64GB".to_owned()),
+            specialty: Some("Rust async runtimes and tokio internals".to_owned()),
         }
     }
 
@@ -2376,7 +2469,7 @@ mod tests {
         let written = full_capability();
         let mut tags = written.filterable_tags();
         tags.extend(written.display_tags());
-        assert_eq!(tags.len(), 6, "denominator: 4 filterable + 2 display: {tags:?}");
+        assert_eq!(tags.len(), 7, "denominator: 4 filterable + 3 display: {tags:?}");
 
         assert_eq!(SeatCapability::from_tags(&tags), written);
     }
@@ -2463,6 +2556,115 @@ mod tests {
             "hardware is display colour; the award decision never reads it, so it must not ride every claim"
         );
         assert_eq!(harness_variant_from_tags(&claim.tags), None);
+        assert_eq!(
+            specialty_from_tags(&beat.tags).as_deref(),
+            Some("Rust async runtimes and tokio internals")
+        );
+        assert_eq!(
+            specialty_from_tags(&claim.tags),
+            None,
+            "a specialty is seller-declared and unverified, so it must not reach the event the \
+             award filter reads — that is the whole reason it is allowed to be free text"
+        );
+    }
+
+    #[test]
+    fn a_specialty_is_unreachable_from_the_filterable_surface() {
+        // The structural guarantee behind "no string-match claim gate": there is no path from a
+        // declared specialty to anything a buyer's award predicate consults. Asserted against the
+        // ONE function that DEFINES the filterable surface, so it survives new fields.
+        let capability = SeatCapability {
+            specialty: Some("Rust async runtimes".to_owned()),
+            ..SeatCapability::default()
+        };
+        assert!(
+            capability.filterable_tags().is_empty(),
+            "an operator-typed specialty must expose nothing filterable"
+        );
+        assert_eq!(
+            capability.display_tags().len(),
+            1,
+            "it must still ride the beat — otherwise no buyer can discover the seat by reading it"
+        );
+    }
+
+    #[test]
+    fn an_oversized_specialty_is_truncated_on_a_char_boundary_and_the_beat_survives() {
+        // A multi-byte description whose cut lands mid-codepoint. Truncation must walk BACK to a
+        // boundary: slicing on the byte index would panic, and refusing the value outright would
+        // take a working seat off the market over cosmetic text.
+        let essay = "é".repeat(SPECIALTY_MAX_BYTES); // 2 bytes each ⇒ 2× the bound
+        let capability = SeatCapability {
+            specialty: Some(essay),
+            ..SeatCapability::default()
+        };
+        let beat = draft(true, 0, 5)
+            .with_capability(capability)
+            .to_event_draft();
+        let parsed =
+            parse_heartbeat(&beat).expect("an over-long description must not lose the beat");
+        let carried = parsed
+            .capability
+            .specialty
+            .expect("the description is shortened, not dropped");
+        assert!(
+            carried.len() <= SPECIALTY_MAX_BYTES,
+            "published {} bytes, bound is {SPECIALTY_MAX_BYTES}",
+            carried.len()
+        );
+        assert_eq!(
+            carried.len(),
+            SPECIALTY_MAX_BYTES,
+            "the cut must take the largest whole-codepoint prefix that fits, not a smaller one"
+        );
+        assert!(
+            carried.chars().all(|c| c == 'é'),
+            "the result must stay valid UTF-8 é's"
+        );
+    }
+
+    #[test]
+    fn a_blank_or_absent_specialty_is_unstated_and_the_seat_stays_discoverable() {
+        // Three ways to say nothing, one state. The legacy case is the third: a beat published by a
+        // seat that predates the tag must parse, and must not read as a claim to be a generalist.
+        assert_eq!(bounded_specialty(None), None);
+        assert_eq!(bounded_specialty(Some("   \t ")), None);
+        let legacy = draft(true, 0, 5)
+            .with_agents(vec!["claude".to_owned()])
+            .to_event_draft();
+        assert!(
+            !legacy
+                .tags
+                .iter()
+                .any(|tag| tag.0.first().map(String::as_str) == Some(SPECIALTY_TAG)),
+            "a seat that states no specialty must emit no tag at all"
+        );
+        let parsed = parse_heartbeat(&legacy).expect("a legacy announcement stays parseable");
+        assert_eq!(parsed.capability.specialty, None);
+        assert!(
+            parsed.accepting && !parsed.accepted_mints.is_empty(),
+            "and it stays a usable, discoverable seat: {parsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_specialty_read_off_a_foreign_beat_is_trimmed_and_bounded_by_the_reader() {
+        // The reader applies the same bound as the emitter, because a beat can be written by
+        // anything. Padding a value that no operator typed would render as present-and-blank.
+        let padded = [TagSpec::new([SPECIALTY_TAG, "  Rust async runtimes  "])];
+        assert_eq!(
+            specialty_from_tags(&padded).as_deref(),
+            Some("Rust async runtimes")
+        );
+        let oversized = [TagSpec::new([
+            SPECIALTY_TAG,
+            &"x".repeat(SPECIALTY_MAX_BYTES + 500),
+        ])];
+        assert_eq!(
+            specialty_from_tags(&oversized).map(|value| value.len()),
+            Some(SPECIALTY_MAX_BYTES),
+            "a reader must never render more than a seat could have published"
+        );
     }
 
     #[test]
