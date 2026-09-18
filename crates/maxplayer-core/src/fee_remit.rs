@@ -3093,7 +3093,7 @@ pub(crate) mod test_support {
         }
 
         fn pay_request(&mut self, address: &LightningAddress) -> Result<PayRequest, String> {
-            assert_eq!(address.to_string(), "maxplayer@agi.cash");
+            assert_eq!(address.to_string(), "maxplayer@strike.me");
             self.pay_requests += 1;
             if let Some(error) = &self.pay_request_error {
                 return Err(error.clone());
@@ -3716,14 +3716,14 @@ mod tests {
         for needle in [
             "Recent attempts: none journaled yet",
             "Accrued platform fee: 15 sats all-time — 0 sats remitted, 15 sats unremitted",
-            "Destination: maxplayer@agi.cash (LNURL-pay; accepts 1 to 1000000 sats)",
+            "Destination: maxplayer@strike.me (LNURL-pay; accepts 1 to 1000000 sats)",
             "unremitted platform fee (gross): 15 sats",
             "mint melt fee reserve (bounds the Lightning fee): 2 sats — taken out of the gross, never on top",
-            "invoice amount (maxplayer@agi.cash receives): 13 sats",
+            "invoice amount (maxplayer@strike.me receives): 13 sats",
             "leaves your wallet: at most 15 sats (≤ 15)",
             "mint: https://mint.example (melt quote quote-lnbc-fake-13-2)",
             "invoice payment hash: hash-13-2",
-            "DRY RUN — nothing moved. Re-run with --confirm to pay 13 sats to maxplayer@agi.cash.",
+            "DRY RUN — nothing moved. Re-run with --confirm to pay 13 sats to maxplayer@strike.me.",
         ] {
             assert!(out.contains(needle), "missing {needle:?} in:\n{out}");
         }
@@ -3777,7 +3777,7 @@ mod tests {
             "PAID — remittance hash-13-2 settled",
             "gross discharged: 15 sats",
             "melt fee taken by the mint: 1 sats",
-            "net paid to maxplayer@agi.cash: 13 sats",
+            "net paid to maxplayer@strike.me: 13 sats",
             "stays in your wallet (unused reserve): 1 sats",
             "wallet balance now: 1000 sats at https://mint.example",
             "receipts discharged: 2",
@@ -3797,7 +3797,7 @@ mod tests {
             (15, Some(1), 13)
         );
         assert_eq!(
-            row.destination, "maxplayer@agi.cash",
+            row.destination, "maxplayer@strike.me",
             "the literal paid is journaled"
         );
         assert_eq!(
@@ -3835,7 +3835,7 @@ mod tests {
         );
         assert_eq!(
             attempts[0].detail,
-            "paid 13 sats to maxplayer@agi.cash (melt fee 1 sats)"
+            "paid 13 sats to maxplayer@strike.me (melt fee 1 sats)"
         );
 
         // Idempotent: a second --confirm finds nothing unremitted, touches no network, pays nothing,
@@ -3852,7 +3852,7 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("unix 100: operator (--confirm) attempt saw 15 sats unremitted — PAID: paid 13 sats to maxplayer@agi.cash (melt fee 1 sats) [remittance hash-13-2]"),
+            out.contains("unix 100: operator (--confirm) attempt saw 15 sats unremitted — PAID: paid 13 sats to maxplayer@strike.me (melt fee 1 sats) [remittance hash-13-2]"),
             "the command prints the journaled attempts:\n{out}"
         );
         assert_eq!(
@@ -3902,7 +3902,7 @@ mod tests {
         );
         assert_eq!(fake.melts, vec!["lnbc-fake-10-1".to_owned()]);
         assert!(
-            out.contains("net paid to maxplayer@agi.cash: 10 sats"),
+            out.contains("net paid to maxplayer@strike.me: 10 sats"),
             "{out}"
         );
         assert!(
@@ -4171,13 +4171,13 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("Reconciling in-flight remittance hash-9-2 (planned at unix 100 by fake-owner, lease until unix 400: 9 sats to maxplayer@agi.cash, gross 10 sats)"),
+            out.contains("Reconciling in-flight remittance hash-9-2 (planned at unix 100 by fake-owner, lease until unix 400: 9 sats to maxplayer@strike.me, gross 10 sats)"),
             "{out}"
         );
         // Addendum 10 §3: the reserve bounds the LIGHTNING fee, not the inclusive melt fee (which
         // includes the actual proof input fee and was not observed on a quote paid by another run).
         assert!(
-            out.contains("reports melt quote paid-quote-lnbc-fake-9-2 PAID — recorded as settled by reconciliation: 9 sats reached maxplayer@agi.cash; Lightning fee at most 1 sats (the quote's reserve); the inclusive melt fee (Lightning + actual proof input fee) is recorded as not observed — the mint reports PAID, not what it kept"),
+            out.contains("reports melt quote paid-quote-lnbc-fake-9-2 PAID — recorded as settled by reconciliation: 9 sats reached maxplayer@strike.me; Lightning fee at most 1 sats (the quote's reserve); the inclusive melt fee (Lightning + actual proof input fee) is recorded as not observed — the mint reports PAID, not what it kept"),
             "{out}"
         );
         assert!(
@@ -5185,7 +5185,7 @@ mod tests {
         let (outcome, out) = run_remit(&store, &mut fake, RemitTrigger::Command, 100);
         assert!(is_paid(&outcome), "{out}");
         assert!(
-            out.contains("invoice amount (maxplayer@agi.cash receives): 12 sats"),
+            out.contains("invoice amount (maxplayer@strike.me receives): 12 sats"),
             "{out}"
         );
         assert!(
@@ -5341,7 +5341,7 @@ mod tests {
         // Planned on the estimate (12), re-planned on the live reserve (15): ONE re-plan line, no
         // refusal, no warning.
         assert!(
-            out.contains("invoice amount (maxplayer@agi.cash receives): 12 sats"),
+            out.contains("invoice amount (maxplayer@strike.me receives): 12 sats"),
             "{out}"
         );
         assert_eq!(
@@ -5365,7 +5365,7 @@ mod tests {
             "bound to melt quote paid-quote-lnbc-fake-15-3",
             "melt fee taken by the mint: 3 sats (quote paid-quote-lnbc-fake-15-3 reserved 0 sats;",
             "actual debit: 19 sats = net + melt fee + swap fee",
-            "net paid to maxplayer@agi.cash: 15 sats",
+            "net paid to maxplayer@strike.me: 15 sats",
             "receipts discharged: 2",
         ] {
             assert!(out.contains(needle), "missing {needle:?} in:\n{out}");
@@ -5474,7 +5474,7 @@ mod tests {
             other => panic!("expected Paid, got {other:?}\n{out}"),
         }
         assert!(
-            out.contains("invoice amount (maxplayer@agi.cash receives): 13 sats"),
+            out.contains("invoice amount (maxplayer@strike.me receives): 13 sats"),
             "{out}"
         );
         assert!(
@@ -5489,7 +5489,7 @@ mod tests {
             "melt fee taken by the mint: 5 sats (quote paid-quote-lnbc-fake-13-2 reserved 2 sats; ceiling 19 sats held at the moment of spending; this is the SDK's fee_paid = Lightning fee + actual proof input fee)",
             "estimated proof input fee (prepared): 4 sats — replaced by the actual fee inside the melt fee above, not added again; swap fee (charged at swap): 1 sats",
             "actual debit: 19 sats = net + melt fee + swap fee",
-            "net paid to maxplayer@agi.cash: 13 sats",
+            "net paid to maxplayer@strike.me: 13 sats",
             "receipts discharged: 2",
         ] {
             assert!(out.contains(needle), "missing {needle:?} in:\n{out}");
@@ -5597,12 +5597,12 @@ mod tests {
         }
         assert!(!out.contains("REFUSED"), "{out}");
         assert!(
-            out.contains("invoice amount (maxplayer@agi.cash receives): 1 sats"),
+            out.contains("invoice amount (maxplayer@strike.me receives): 1 sats"),
             "{out}"
         );
         for needle in [
             "actual debit: 3 sats = net + melt fee + swap fee",
-            "net paid to maxplayer@agi.cash: 1 sats",
+            "net paid to maxplayer@strike.me: 1 sats",
             "receipts discharged: 2",
         ] {
             assert!(out.contains(needle), "missing {needle:?} in:\n{out}");
@@ -5705,12 +5705,12 @@ mod tests {
         }
         assert!(!out.contains("REFUSED"), "{out}");
         assert!(
-            out.contains("invoice amount (maxplayer@agi.cash receives): 1 sats"),
+            out.contains("invoice amount (maxplayer@strike.me receives): 1 sats"),
             "{out}"
         );
         for needle in [
             "actual debit: 8 sats = net + melt fee + swap fee",
-            "net paid to maxplayer@agi.cash: 1 sats",
+            "net paid to maxplayer@strike.me: 1 sats",
             "receipts discharged: 2",
         ] {
             assert!(out.contains(needle), "missing {needle:?} in:\n{out}");
@@ -6006,10 +6006,10 @@ mod tests {
         for needle in [
             "unremitted platform fee (gross): 20 sats",
             "mint melt fee reserve (bounds the Lightning fee): 2 sats — taken out of the gross, never on top",
-            "invoice amount (maxplayer@agi.cash receives): 13 sats",
+            "invoice amount (maxplayer@strike.me receives): 13 sats",
             "leaves your wallet: at most 19 sats (≤ 20); unused reserve returns as change",
             "expected proof fees (SDK estimate, bounded exactly at payment): 5 sats = estimated proof input fee 4 sats + swap fee 1 sats; actual proof input fee the SDK recomputes on the swapped proofs: 3 sats ⇒ worst case 19 sats leaves the wallet (≤ 20) = invoice 13 + reserve 2 (bounds the Lightning fee) + actual proof input fee 3 + swap fee 1; the inclusive melt fee (Lightning + actual proof input fee) is known only at payment",
-            "DRY RUN — nothing moved. Re-run with --confirm to pay 13 sats to maxplayer@agi.cash.",
+            "DRY RUN — nothing moved. Re-run with --confirm to pay 13 sats to maxplayer@strike.me.",
         ] {
             assert!(out.contains(needle), "missing {needle:?} in:\n{out}");
         }

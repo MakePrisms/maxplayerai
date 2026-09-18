@@ -55,6 +55,13 @@ caller timeout — the POST held open at the relay while the arm that started it
 real delivery launched into that window and proved pending on acquisition, landing its ref only
 after the abandoned upload stops. Peak concurrency stays 1 throughout.
 
+### The platform fee destination moves to `maxplayer@strike.me`
+
+`PLATFORM_FEE_ADDRESS` is now `maxplayer@strike.me`; it was `maxplayer@agi.cash`. The address is
+still a compiled-in constant with no config key, environment variable or flag, for the reason given
+in v0.5.9. Nothing about the rate or the remit path changes. Remittances already journaled carry the
+literal they paid, so history written against the old address stays readable as it was.
+
 ## v0.5.9
 
 Every delivery push now mints its authorization at the request it is sent on, and a contained job

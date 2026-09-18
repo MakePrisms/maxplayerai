@@ -3985,7 +3985,7 @@ mod tests {
             gross_sats: gross,
             net_sats: net,
             melt_fee_reserve_sats: gross.saturating_sub(net),
-            destination: "maxplayer@agi.cash".to_owned(),
+            destination: "maxplayer@strike.me".to_owned(),
             bolt11: format!("lnbc-test-{hash}"),
             melt_quote_id: Some(format!("quote-{hash}")),
         }
@@ -4127,7 +4127,7 @@ mod tests {
         assert_eq!(planned.payment_hash, "h1");
         assert_eq!((planned.gross_sats, planned.net_sats), (15, 14));
         assert_eq!(planned.melt_fee_sats, None);
-        assert_eq!(planned.destination, "maxplayer@agi.cash");
+        assert_eq!(planned.destination, "maxplayer@strike.me");
         assert_eq!(planned.melt_quote_id, Some("quote-h1".to_owned()));
         assert_eq!(planned.bolt11, "lnbc-test-h1");
         assert_eq!(planned.receipts, 3);
@@ -4505,8 +4505,8 @@ mod tests {
                      settled_at_unix INTEGER
                  );
                  CREATE UNIQUE INDEX fee_remittances_one_planned ON fee_remittances (state) WHERE state = 'planned';
-                 INSERT INTO fee_remittances VALUES ('v10-settled', 10, 1, 9, 'maxplayer@agi.cash', 'q1', 'v10-settled', 'ln1', 'settled', 3, 4);
-                 INSERT INTO fee_remittances VALUES ('v10-planned', 5, NULL, 4, 'maxplayer@agi.cash', 'q2', 'v10-planned', 'ln2', 'planned', 5, NULL);",
+                 INSERT INTO fee_remittances VALUES ('v10-settled', 10, 1, 9, 'maxplayer@strike.me', 'q1', 'v10-settled', 'ln1', 'settled', 3, 4);
+                 INSERT INTO fee_remittances VALUES ('v10-planned', 5, NULL, 4, 'maxplayer@strike.me', 'q2', 'v10-planned', 'ln2', 'planned', 5, NULL);",
             )
             .expect("v10 schema");
         }
@@ -4969,7 +4969,7 @@ mod tests {
                      settled_by      TEXT
                  );
                  CREATE UNIQUE INDEX fee_remittances_one_planned ON fee_remittances (state) WHERE state = 'planned';
-                 INSERT INTO fee_remittances VALUES ('v11-planned', 5, NULL, 4, 'maxplayer@agi.cash', 'q2', 'v11-planned', 'ln2', 'planned', 100, NULL, 'proc-old', 400, 1, NULL);",
+                 INSERT INTO fee_remittances VALUES ('v11-planned', 5, NULL, 4, 'maxplayer@strike.me', 'q2', 'v11-planned', 'ln2', 'planned', 100, NULL, 'proc-old', 400, 1, NULL);",
             )
             .expect("v11 schema");
         }
@@ -5072,7 +5072,7 @@ mod tests {
                      spending_since_unix INTEGER
                  );
                  CREATE UNIQUE INDEX fee_remittances_one_planned ON fee_remittances (state) WHERE state = 'planned';
-                 INSERT INTO fee_remittances VALUES ('v12-spending', 5, NULL, 4, 'maxplayer@agi.cash', 'q-est', 'v12-spending', 'ln3', 'planned', 100, NULL, 'proc-v12', 400, 1, NULL, 150);",
+                 INSERT INTO fee_remittances VALUES ('v12-spending', 5, NULL, 4, 'maxplayer@strike.me', 'q-est', 'v12-spending', 'ln3', 'planned', 100, NULL, 'proc-v12', 400, 1, NULL, 150);",
             )
             .expect("v12 schema");
         }

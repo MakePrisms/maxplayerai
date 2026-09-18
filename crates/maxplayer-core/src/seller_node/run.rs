@@ -16840,7 +16840,7 @@ mod tests {
         let line = &lines[0];
         assert!(line.contains("agi.cash: dns failure"), "the error: {line}");
         assert!(
-            line.contains("destination maxplayer@agi.cash"),
+            line.contains("destination maxplayer@strike.me"),
             "the destination: {line}"
         );
         assert!(
