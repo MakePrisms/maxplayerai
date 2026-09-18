@@ -10,16 +10,46 @@ name: Publish sandbox image
 # working exactly as today. Pointing the default ref at the published image, layered agent images, and a
 # doctor present-or-pullable check are later phases.
 #
+# ONE RUNNER PER ARCHITECTURE, THEN MERGE THE MANIFEST — why this file has three jobs:
+#   This workflow used to build both platforms in a single job on an amd64 runner, emulating the arm64
+#   half. Emulating a Rust release build is the dominant cost of the entire Release pipeline: in run
+#   35279020046 (v0.5.10) the emulated `[linux/arm64 builder 4/4] cargo build` took 6,664.8 s (111 min)
+#   against 821.2 s (14 min) for the native amd64 build of the same crate — 8.1× slower — and the image
+#   job alone ran 118 min of a 127 min release. Run 35097736399 (v0.5.9) shows the same shape
+#   (6,825.4 s vs 857.3 s, 161 min total).
+#   So each platform is now built on a runner of its own architecture — `ubuntu-latest` for
+#   linux/amd64 and `ubuntu-24.04-arm` for linux/arm64, the same native arm64 runner the release
+#   matrix already uses in `.github/release-platforms.json` — each leg pushes an image by DIGEST
+#   only, and a final job merges the two digests into one multi-platform manifest list per image
+#   with `docker buildx imagetools create`. This is Docker's documented "distribute build across
+#   runners" pattern. No emulation remains in this file. The two legs run in parallel, so the image
+#   job is bounded by the slower native build (~15 min) rather than by the emulated one.
+#
+#   What this does NOT buy: a warm cargo cache. The Dockerfile's cargo caches are
+#   `RUN --mount=type=cache` mounts, and `cache-to: type=gha,mode=max` exports LAYERS, not cache
+#   mounts — so the registry and target directories start empty on every run, exactly as before this
+#   change. Measured: the v0.5.10 build imported its gha cache manifest and produced zero CACHED
+#   steps, because `COPY . .` precedes the build and the source changes every release. Every build
+#   here is therefore a COLD build; the win claimed above is native-vs-emulated only. Making the
+#   cargo cache real, or not compiling Rust inside Docker at all, are separate changes.
+#
+#   How a maintainer proves this workflow works end to end: see VERIFICATION at the bottom of this
+#   comment block.
+#
 # TAGS vs DIGEST (both, deliberately — #792 / ADR §4):
 #   * A seat REFERENCES the image by VERSION TAG. We push `:<release-tag>` (e.g. `:v0.4.2`, matching the
 #     git/release tag this repo already publishes) and, for a non-prerelease, `:latest`.
 #   * VERIFIABLE DELIVERY wants the exact bytes that ran to be identifiable, which a moving tag cannot
-#     give. So we ALSO capture build-push-action's `outputs.digest` and record it (job summary + job
-#     output). Seats still pull by tag; the digest is the verification handle. These coexist — the tag
-#     is how you ask for the image, the digest is how you prove which one you got.
+#     give. So we ALSO capture the digest and record it (job summary + job output). Seats still pull by
+#     tag; the digest is the verification handle. These coexist — the tag is how you ask for the image,
+#     the digest is how you prove which one you got. The digest recorded is the MANIFEST LIST's digest,
+#     produced by the merge job — the handle that resolves to both architectures, which is what a seat
+#     pulling by tag actually gets. The per-architecture digests are an implementation detail of the
+#     merge and are not published as the pin.
 #
 # CREDENTIAL: the workflow's own GITHUB_TOKEN (no PAT, no org secret), scoped by the job-level
-# `packages: write`. Pattern copied from MakePrisms/cdk .github/workflows/docker-publish.yml.
+# `packages: write`. Pattern copied from MakePrisms/cdk .github/workflows/docker-publish.yml. Only the
+# two jobs that write to the registry ask for it; the tag-resolving job stays read-only.
 #
 # HOW THIS RUNS, and why `workflow_call` is the primary path:
 #   `release: published` alone does NOT work for a tagged release, and the failure is silent. A tag
@@ -34,6 +64,14 @@ name: Publish sandbox image
 #   The other two triggers stay for the cases where they do work: `release: published` covers a
 #   release a PERSON publishes (a human actor is not the GITHUB_TOKEN), and `workflow_dispatch` is
 #   the manual escape hatch.
+#
+# VERIFICATION (a maintainer, on a branch, before trusting this): run this workflow by
+# `workflow_dispatch` against a throwaway prerelease tag — a dispatch never moves `:latest`, so a
+# stable pointer cannot be damaged by the test — then confirm the published tag resolves to BOTH
+# platforms with `docker buildx imagetools inspect ghcr.io/makeprisms/maxplayer-sandbox:<that tag>`,
+# and delete the throwaway package version afterwards. The merge job asserts the same two-platform
+# property itself and fails if either architecture is missing, so a green run is already evidence;
+# the manual inspect is the independent check.
 
 on:
   # Called by release.yml on a tag push — the primary path (see above).
@@ -52,24 +90,33 @@ on:
         required: true
         type: string
 
-# Read-only default; the one job that needs to write to the registry asks for it itself.
+# Read-only default; the jobs that need to write to the registry ask for it themselves.
 permissions:
   contents: read
 
 jobs:
-  build-and-push:
-    name: Build and push (linux/amd64, linux/arm64)
+  # ── 1. Resolve what we are publishing, once ───────────────────────────────────────────────────
+  # Split out of the build so the two architecture legs cannot disagree about the version, the tag
+  # set or the commit stamp: they read one job's outputs instead of each re-deriving them.
+  plan:
+    name: Determine image tags
     runs-on: ubuntu-latest
+    # No registry write here — this job only reads the repo to resolve tags.
     permissions:
       contents: read
-      packages: write
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tags: ${{ steps.meta.outputs.tags }}
+      netfilter_tags: ${{ steps.meta.outputs.netfilter_tags }}
+      commit: ${{ steps.meta.outputs.commit }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
     env:
       REGISTRY: ghcr.io
       IMAGE_NAME: makeprisms/maxplayer-sandbox
       # The containment sidecar (#797) ships on the SAME version as the sandbox image and from the
-      # same job, deliberately. A seat pins both by version, and a version that published one but not
-      # the other cannot start a contained job at all — the launch fails closed, which is correct but
-      # bricks the seat. Publishing them together is what makes that pair impossible to break.
+      # same workflow, deliberately. A seat pins both by version, and a version that published one but
+      # not the other cannot start a contained job at all — the launch fails closed, which is correct
+      # but bricks the seat. Publishing them together is what makes that pair impossible to break.
       NETFILTER_IMAGE_NAME: makeprisms/maxplayer-netfilter
     steps:
       # Check out the ref being released so the Dockerfile (and its pinned adapters) is exactly the one
@@ -81,7 +128,7 @@ jobs:
 
       # Resolve the version tag and decide whether :latest moves. A prerelease (or any manual dispatch)
       # publishes the version tag ALONE, leaving :latest pointing at the last stable image — mirroring
-      # the npm publish job, which keeps `latest` stable and ships prereleases under `rc`.
+      # the npm job, which keeps `latest` stable and ships prereleases under `rc`.
       - name: Determine image tags
         id: meta
         run: |
@@ -132,21 +179,67 @@ jobs:
           # The commit the checkout above resolved, for the binary's `--version` stamp (#818). The
           # Dockerfile's builder stage has no .git to read (.dockerignore strips it), so the caller
           # states the commit. After the checkout, `git rev-parse HEAD` is the released ref in all
-          # three trigger shapes.
+          # three trigger shapes. Resolved ONCE here so both architecture legs stamp the same commit.
           commit="$(git rev-parse HEAD)"
 
           echo "version=$version"               >> "$GITHUB_OUTPUT"
           echo "tags=$tags"                     >> "$GITHUB_OUTPUT"
           echo "netfilter_tags=$netfilter_tags" >> "$GITHUB_OUTPUT"
           echo "commit=$commit"                 >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease"         >> "$GITHUB_OUTPUT"
           echo "Building $version (prerelease=$prerelease) from commit $commit"
           echo "Tags: $tags"
           echo "Netfilter tags: $netfilter_tags"
 
-      # QEMU so the amd64 runner can also emit the linux/arm64 layer (Apple Silicon Macs run linux
-      # containers). No native arm runner is configured for this job, so the cross-build needs it.
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+  # ── 2. One leg per architecture, on a runner of that architecture ─────────────────────────────
+  # Each leg pushes BOTH images by digest only — no tag is written here. Tags are applied once, by
+  # the merge job, to the manifest list: a tag must never point at a single-architecture image, not
+  # even briefly, or a seat on the other architecture would pull something it cannot run.
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      # Both legs run to completion: if one architecture fails, the other's log is still wanted to
+      # tell "this platform is broken" apart from "the build is broken". Nothing is tagged until the
+      # merge job, which needs both, so a half-finished matrix publishes no usable reference.
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          # GitHub's native arm64 runner — already this repo's linux-arm64 builder in
+          # `.github/release-platforms.json`.
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_NAME: makeprisms/maxplayer-sandbox
+      NETFILTER_IMAGE_NAME: makeprisms/maxplayer-netfilter
+    steps:
+      # `linux/amd64` -> `amd64`: the short name used for this leg's cache scopes and artifact names.
+      - name: Name this leg's architecture
+        id: arch
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          echo "arch=${PLATFORM##*/}" >> "$GITHUB_OUTPUT"
+
+      # The COMMIT `plan` resolved, NOT the event's tag. A tag is mutable: re-resolving
+      # `github.event.release.tag_name` / `inputs.tag` here would let an authorized tag update between
+      # plan and these builds — or between the two architecture legs — compile different source while
+      # both legs still carried the commit stamp plan recorded, so the two halves of one manifest list
+      # need not come from one tree. Before this workflow was split across runners, the build and the
+      # stamp shared a single checkout; binding both legs to plan's immutable commit is what restores
+      # that property. `plan` keeps the event/tag resolution, which is where it belongs.
+      - name: Checkout the planned commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.commit }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -159,35 +252,179 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # The context is the repo root and the Dockerfile is named explicitly: the builder stage compiles
-      # the `maxplayer` binary from the workspace. NOTE: the arm64 half of this step runs a full Rust
-      # release build under QEMU, which is many times slower than a native build. The cargo cache
-      # mounts in the Dockerfile are not layers, so `type=gha` does not carry them between runs.
-      - name: Build and push
+      # the `maxplayer` binary from the workspace. This runs ONE platform, natively — the whole point
+      # of the matrix. `push-by-digest=true` publishes the image without a tag and returns its digest;
+      # the merge job turns the two digests into the tagged manifest list.
+      # Cache scopes are per image AND per architecture: a shared scope would have the two legs
+      # overwrite each other's manifest, and the arm64 leg would import amd64 layers it cannot use.
+      - name: Build and push the sandbox image by digest
         id: build
         uses: docker/build-push-action@v5
         with:
           context: .
           file: docker/maxplayer-sandbox/Dockerfile
           build-args: |
-            MAXPLAYER_BUILD_COMMIT=${{ steps.meta.outputs.commit }}
-          push: true
-          platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.meta.outputs.tags }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            MAXPLAYER_BUILD_COMMIT=${{ needs.plan.outputs.commit }}
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=sandbox-${{ steps.arch.outputs.arch }}
+          cache-to: type=gha,mode=max,scope=sandbox-${{ steps.arch.outputs.arch }}
 
-      # The containment sidecar. Same platforms as the sandbox image: it joins the job's namespace, so
-      # it runs wherever the job runs, including an arm64 Mac's linux VM.
-      - name: Build and push the containment sidecar
+      # The containment sidecar. Same architectures as the sandbox image: it joins the job's namespace,
+      # so it runs wherever the job runs, including an arm64 Mac's linux VM.
+      - name: Build and push the containment sidecar by digest
         id: build_netfilter
         uses: docker/build-push-action@v5
         with:
           context: docker/maxplayer-netfilter
-          push: true
-          platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.meta.outputs.netfilter_tags }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.NETFILTER_IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=netfilter-${{ steps.arch.outputs.arch }}
+          cache-to: type=gha,mode=max,scope=netfilter-${{ steps.arch.outputs.arch }}
+
+      # Hand each digest to the merge job as a file. Failing on an empty digest here rather than
+      # passing a blank on is deliberate: a blank would reach `imagetools create` as a malformed
+      # reference and fail with a much less obvious message, one job later.
+      - name: Write the digests out
+        env:
+          SANDBOX_DIGEST: ${{ steps.build.outputs.digest }}
+          NETFILTER_DIGEST: ${{ steps.build_netfilter.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [ -n "$SANDBOX_DIGEST" ] || { echo "the sandbox build produced no digest" >&2; exit 1; }
+          # A missing digest for the NET_ADMIN-carrying image is exactly the one that must not pass
+          # silently.
+          [ -n "$NETFILTER_DIGEST" ] || { echo "the netfilter build produced no digest" >&2; exit 1; }
+          mkdir -p /tmp/digests/sandbox /tmp/digests/netfilter
+          echo "$SANDBOX_DIGEST"   > /tmp/digests/sandbox/digest
+          echo "$NETFILTER_DIGEST" > /tmp/digests/netfilter/digest
+          echo "sandbox ${{ matrix.platform }} -> $SANDBOX_DIGEST"
+          echo "netfilter ${{ matrix.platform }} -> $NETFILTER_DIGEST"
+
+      # `retention-days: 1`: these are a handoff between two jobs of one run, not an artifact anyone
+      # downloads later. The durable handles are the manifest-list digests in the run summary.
+      - name: Upload the sandbox digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-sandbox-${{ steps.arch.outputs.arch }}
+          path: /tmp/digests/sandbox/digest
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload the netfilter digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-netfilter-${{ steps.arch.outputs.arch }}
+          path: /tmp/digests/netfilter/digest
+          if-no-files-found: error
+          retention-days: 1
+
+  # ── 3. Merge the per-architecture digests into one manifest list per image ────────────────────
+  # This is the job that makes the version tag mean "both architectures", and the only job that
+  # writes a tag at all.
+  merge:
+    name: Merge manifests and record digests
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.record.outputs.digest }}
+      netfilter_digest: ${{ steps.record.outputs.netfilter_digest }}
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_NAME: makeprisms/maxplayer-sandbox
+      NETFILTER_IMAGE_NAME: makeprisms/maxplayer-netfilter
+    steps:
+      - name: Download the per-architecture digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+
+      # The version pin is load-bearing. `imagetools create --metadata-file` — the flag that lets this
+      # job keep the identity it just created rather than re-resolving a mutable tag — first shipped in
+      # buildx v0.32.0 and is absent in v0.31.0. Leaving the version to whatever the runner image
+      # happens to carry would make the identity binding below depend on the runner image.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: v0.37.1
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `imagetools create` applies every tag from the plan job to a new manifest list whose members
+      # are the two digests just built. Both architectures are REQUIRED: publishing a "multi-platform"
+      # tag that silently lists one platform is the failure this job exists to prevent, so a missing
+      # digest artifact is a hard error rather than a one-architecture manifest.
+      # `--metadata-file` retains the descriptor of the manifest list THIS RUN created. That retained
+      # digest is what the next step verifies and records, so the created, the verified and the
+      # published identity are one object. Resolving the version tag again afterwards would instead
+      # re-read whatever that tag points at by then, which need not be this run's work.
+      - name: Create the manifest lists
+        id: create
+        env:
+          TAGS: ${{ needs.plan.outputs.tags }}
+          NETFILTER_TAGS: ${{ needs.plan.outputs.netfilter_tags }}
+        run: |
+          set -euo pipefail
+          # Fail loudly rather than degrade to a tag re-resolve if this buildx cannot report what it
+          # created. A silent fallback is exactly what would reopen the identity gap.
+          if ! docker buildx imagetools create --help 2>&1 | grep -q -- '--metadata-file'; then
+            echo "this runner's buildx cannot record the created manifest descriptor (no --metadata-file); refusing to fall back to re-resolving a mutable tag" >&2
+            docker buildx version >&2
+            exit 1
+          fi
+
+          create_manifest() {
+            image_ref="$1"
+            tag_list="$2"
+            artifact_prefix="$3"
+            metadata_file="$4"
+            digest_file_out="$5"
+
+            tag_args=()
+            IFS=',' read -r -a tag_items <<< "$tag_list"
+            for tag_item in "${tag_items[@]}"; do
+              [ -n "$tag_item" ] || continue
+              tag_args+=(-t "$tag_item")
+            done
+            [ "${#tag_args[@]}" -gt 0 ] || { echo "no tags resolved for ${image_ref}" >&2; exit 1; }
+
+            source_args=()
+            for arch in amd64 arm64; do
+              digest_file="/tmp/digests/digests-${artifact_prefix}-${arch}/digest"
+              [ -s "$digest_file" ] || { echo "no digest artifact for ${artifact_prefix} on ${arch} — refusing to publish a manifest list that is missing an architecture" >&2; exit 1; }
+              digest="$(tr -d '[:space:]' < "$digest_file")"
+              source_args+=("${image_ref}@${digest}")
+            done
+
+            echo "creating ${image_ref} from ${source_args[*]}" >&2
+            docker buildx imagetools create --metadata-file "$metadata_file" "${tag_args[@]}" "${source_args[@]}"
+
+            # buildx records the created index under `containerimage.descriptor`; its `.digest` is the
+            # identity of the manifest list this run just pushed.
+            created="$(jq -r '.["containerimage.descriptor"].digest // empty' "$metadata_file")"
+            case "$created" in
+              sha256:*) ;;
+              *) echo "imagetools create reported no usable descriptor digest for ${image_ref}" >&2; exit 1 ;;
+            esac
+            printf '%s\n' "$created" > "$digest_file_out"
+          }
+
+          mkdir -p /tmp/created
+          create_manifest "${REGISTRY}/${IMAGE_NAME}"           "$TAGS"           sandbox   /tmp/created/sandbox.json   /tmp/created/sandbox.digest
+          create_manifest "${REGISTRY}/${NETFILTER_IMAGE_NAME}" "$NETFILTER_TAGS" netfilter /tmp/created/netfilter.json /tmp/created/netfilter.digest
+
+          # Handed to the next step as step outputs, read from files — not captured off stdout.
+          echo "digest=$(cat /tmp/created/sandbox.digest)"             >> "$GITHUB_OUTPUT"
+          echo "netfilter_digest=$(cat /tmp/created/netfilter.digest)" >> "$GITHUB_OUTPUT"
 
       # Record the multi-arch manifest digest so a buyer can verify exactly which bytes ran. Seats still
       # reference the image by version tag (above); this is the separate verification handle from ADR §4.
@@ -197,17 +434,42 @@ jobs:
       # job's namespace, so it is the most privilege-bearing artifact we ship and the one a buyer has
       # most reason to pin. Recording only the sandbox digest left the privileged image as the single
       # artifact without an ADR §4 verifiable handle.
-      - name: Record image digests
+      # The read-back is also the end-to-end assertion that this workflow's whole point held: the
+      # manifest list THIS RUN created is inspected from the registry and must list BOTH platforms. If
+      # emulation is ever reintroduced, or a leg is dropped from the matrix, this fails instead of
+      # shipping an image a seat on the missing architecture cannot pull.
+      - name: Verify both platforms and record image digests
+        id: record
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-          NETFILTER_DIGEST: ${{ steps.build_netfilter.outputs.digest }}
-          VERSION: ${{ steps.meta.outputs.version }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          DIGEST: ${{ steps.create.outputs.digest }}
+          NETFILTER_DIGEST: ${{ steps.create.outputs.netfilter_digest }}
         run: |
           set -euo pipefail
-          [ -n "$DIGEST" ] || { echo "the sandbox build produced no digest" >&2; exit 1; }
-          # Failing here rather than recording a blank is deliberate: a missing digest for the
-          # NET_ADMIN-carrying image is exactly the one that must not pass silently.
-          [ -n "$NETFILTER_DIGEST" ] || { echo "the netfilter build produced no digest" >&2; exit 1; }
+          # Inspect BY THE DIGEST THIS RUN CREATED, never by the version tag. Another authorized run
+          # publishing the same version can move that tag between the create above and this read, and
+          # the platform assertion cannot catch it because the other run's manifest also lists both
+          # architectures — so verifying the tag could bless one image while the summary recorded
+          # another. A digest is immutable, so what is verified and what is recorded are the same
+          # object by construction.
+          verify_platforms() {
+            image_ref="$1"
+            digest="$2"
+            inspected="$(docker buildx imagetools inspect "${image_ref}@${digest}")"
+            printf '%s\n' "$inspected" >&2
+            for platform in linux/amd64 linux/arm64; do
+              printf '%s\n' "$inspected" | grep -q "$platform" || {
+                echo "${image_ref}@${digest} does not list ${platform} — the manifest list is not multi-platform" >&2
+                exit 1
+              }
+            done
+          }
+
+          [ -n "$DIGEST" ] || { echo "the sandbox manifest list produced no digest" >&2; exit 1; }
+          [ -n "$NETFILTER_DIGEST" ] || { echo "the netfilter manifest list produced no digest" >&2; exit 1; }
+          verify_platforms "${REGISTRY}/${IMAGE_NAME}"           "$DIGEST"
+          verify_platforms "${REGISTRY}/${NETFILTER_IMAGE_NAME}" "$NETFILTER_DIGEST"
+
           ref="${REGISTRY}/${IMAGE_NAME}:${VERSION}"
           pin="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
           netfilter_ref="${REGISTRY}/${NETFILTER_IMAGE_NAME}:${VERSION}"
