@@ -15,14 +15,19 @@ pub const RECEIPT_PREIMAGE_DOMAIN: &str = "maxplayer/v1/receipt-preimage";
 /// exec-metadata is folded into the co-signature (the default today — see the type doc).
 pub const EXEC_METADATA_COMMITMENT_EMPTY: &str = "none";
 
-/// Delivered git object kind bound (non-forgeably) into the co-signed receipt preimage.
+/// Delivered object kind bound (non-forgeably) into the co-signed receipt preimage.
 ///
 /// In the preimage the kind is a signed field, so an unsigned path cannot be flipped to
-/// reinterpret the same 40-hex as a different object kind. Live delivery is fork-only.
+/// reinterpret the same integrity hash as a different object kind. That property is the reason
+/// [`Inline`](Self::Inline) is safe to add beside [`Fork`](Self::Fork): both slots carry a 64-hex
+/// digest, and only the signed kind says which preimage it is a digest OF.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeliveryKind {
-    /// Fork-tip `commit_oid` (git delivery — the only live kind).
+    /// Fork-tip `commit_oid` (git delivery).
     Fork,
+    /// Inline answer carried in the result event's own content, with no git object anywhere.
+    /// `delivery_integrity_hash` is then [`result_content_hash_hex`] over that content.
+    Inline,
 }
 
 impl DeliveryKind {
@@ -30,6 +35,7 @@ impl DeliveryKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Fork => "fork",
+            Self::Inline => "inline",
         }
     }
 }
@@ -141,6 +147,67 @@ pub fn exec_metadata_commitment(tags: &[Vec<String>]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// §6.4 — the two ends of an INLINE trade must co-sign the same bytes. The seller builds its
+    /// preimage at delivery (`seller_node::run::delivery_receipt_preimage`) and the buyer rebuilds
+    /// it at the pre-pay seam (`authorize_pay::receipt_preimage_for`); if one field maps
+    /// differently the co-signature check refuses and the job cannot settle. This asserts the
+    /// mapping agrees field for field, for the inline shape specifically.
+    #[test]
+    fn an_inline_trade_builds_the_same_preimage_on_both_sides() {
+        let answer = "Europe/Zagreb";
+        let job_hash = "ab".repeat(32);
+        let job_id = "cd".repeat(32);
+        let buyer = "11".repeat(32);
+        let seller = "22".repeat(32);
+
+        // Seller side: the digest is of the answer it is about to publish.
+        let seller_side = ReceiptPreimage {
+            job_hash: job_hash.clone(),
+            offer_id: job_id.clone(),
+            amount: 2,
+            unit: "sat".to_owned(),
+            buyer_pubkey: buyer.clone(),
+            seller_pubkey: seller.clone(),
+            delivery_integrity_hash: result_content_hash_hex(answer),
+            delivery_kind: DeliveryKind::Inline.as_str().to_owned(),
+            exec_metadata_commitment: EXEC_METADATA_COMMITMENT_EMPTY.to_owned(),
+            creq_hash: None,
+        };
+
+        // Buyer side: the digest is RE-DERIVED from the answer it received, never copied from the
+        // seller's testimony. Equal digests are the whole point of the check.
+        let buyer_side = ReceiptPreimage {
+            job_hash,
+            offer_id: job_id,
+            amount: 2,
+            unit: "sat".to_owned(),
+            buyer_pubkey: buyer,
+            seller_pubkey: seller,
+            delivery_integrity_hash: result_content_hash_hex(answer),
+            delivery_kind: DeliveryKind::Inline.as_str().to_owned(),
+            exec_metadata_commitment: EXEC_METADATA_COMMITMENT_EMPTY.to_owned(),
+            creq_hash: None,
+        };
+
+        assert_eq!(seller_side.digest_hex(), buyer_side.digest_hex());
+
+        // And a tampered answer does NOT produce the co-signed digest, which is what makes the
+        // buyer's re-derivation a check rather than a formality.
+        let tampered = ReceiptPreimage {
+            delivery_integrity_hash: result_content_hash_hex("America/New_York"),
+            ..buyer_side.clone()
+        };
+        assert_ne!(tampered.digest_hex(), seller_side.digest_hex());
+
+        // The signed KIND is load-bearing: the same digest under `fork` is a different preimage,
+        // so an answer digest can never be replayed as a commit oid.
+        let as_fork = ReceiptPreimage {
+            delivery_kind: DeliveryKind::Fork.as_str().to_owned(),
+            ..buyer_side
+        };
+        assert_ne!(as_fork.digest_hex(), seller_side.digest_hex());
+    }
 
     #[test]
     fn result_content_hash_is_sha256_hex_of_result_content() {
