@@ -1,3 +1,19 @@
+## v0.5.11
+
+### The platform fee destination moves to `maxplayer@strike.me`
+
+`PLATFORM_FEE_ADDRESS` is now `maxplayer@strike.me`. Every release through v0.5.10 remitted to
+`maxplayer@agi.cash`; a binary built from this version and later pays Strike. The address is still a
+compiled-in constant with no config key, environment variable or flag, for the reason given under
+v0.5.8 (*The platform fee is charged, and now paid*): a seller-editable destination would let a
+seller pay the fee to itself.
+
+The rate and the Rust remit path are unchanged. What does change is the live ceiling the LNURL-pay
+endpoint advertises: Strike answers `minSendable` 1 sat and `maxSendable` 16,000,000 sats where the
+previous host advertised 1 to 1,000,000 sats, so an accrued balance between one and sixteen million
+sats that was previously refused as above the maximum becomes payable. Remittances already journaled
+carry the literal they paid, so history written against the old address stays readable as it was.
+
 ## v0.5.10
 
 A seller's delivery lock is now bounded by the lifetime of the push *work*, not by the patience of
@@ -54,13 +70,6 @@ cancellation mid-flight with the advertisement held at the server, and a real GE
 caller timeout — the POST held open at the relay while the arm that started it times out, a second
 real delivery launched into that window and proved pending on acquisition, landing its ref only
 after the abandoned upload stops. Peak concurrency stays 1 throughout.
-
-### The platform fee destination moves to `maxplayer@strike.me`
-
-`PLATFORM_FEE_ADDRESS` is now `maxplayer@strike.me`, replacing the address shipped in v0.5.9. It is
-still a compiled-in constant with no config key, environment variable or flag, for the reason given
-in v0.5.9. Nothing about the rate or the remit path changes. Remittances already journaled carry the
-literal they paid, so history written against the old address stays readable as it was.
 
 ## v0.5.9
 
@@ -211,7 +220,7 @@ A seller node now charges a 10% platform fee and pays it automatically, and a do
 
 ### The platform fee is charged, and now paid (#973, #979)
 
-The product takes 10% of the offer amount — the price the buyer paid — on every payment a seller collects. The rate is compiled in, and so is the destination: the Lightning address `maxplayer@strike.me`. There is no config key, environment variable or flag for either. A seller-editable destination would let a seller pay the fee to itself.
+The product takes 10% of the offer amount — the price the buyer paid — on every payment a seller collects. The rate is compiled in, and so is the destination: the Lightning address `maxplayer@agi.cash`. There is no config key, environment variable or flag for either. A seller-editable destination would let a seller pay the fee to itself.
 
 Two stages ship together. Collecting a payment journals what the fee comes to, and `maxplayer seller fees` prints it per job beside what the buyer paid, the mint fee, and what you keep. Then the node pays it: once a receipt is journaled new, a thread of its own resolves the destination over LNURL-pay and melts the accrued balance out of the seller's ecash. A balance under the destination's minimum accumulates instead of paying — the expected steady state for small jobs, not an error.
 

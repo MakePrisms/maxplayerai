@@ -48,8 +48,8 @@
 pub const PLATFORM_FEE_BPS: u32 = 1000;
 
 /// The Lightning address (LUD-16, `user@host`) the accrued platform fee is remitted to. Ordered by
-/// Josip (real-sats authority), 2026-09-07. This constant is the whole specification of where the
-/// fee goes:
+/// Josip (real-sats authority), 2026-09-07, as `maxplayer@agi.cash`; moved to `maxplayer@strike.me`
+/// on 2026-09-18 (PR #1026). This constant is the whole specification of where the fee goes:
 ///
 /// - It is set by the product, here, and **not by the seller**. There is no config key, no env
 ///   override and no CLI flag, deliberately: the seller runs this binary, and the seller is the
