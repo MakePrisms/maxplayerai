@@ -405,7 +405,7 @@ jobs:
           inspect_digest() {
             image_ref="$1"
             inspected="$(docker buildx imagetools inspect "${image_ref}:${VERSION}")"
-            printf '%s\n' "$inspected"
+            printf '%s\n' "$inspected" >&2
             for platform in linux/amd64 linux/arm64; do
               printf '%s\n' "$inspected" | grep -q "$platform" || {
                 echo "${image_ref}:${VERSION} does not list ${platform} — the manifest list is not multi-platform" >&2
