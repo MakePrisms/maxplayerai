@@ -3099,7 +3099,7 @@ pub(crate) mod test_support {
                 return Err(error.clone());
             }
             Ok(PayRequest {
-                callback: Url::parse("https://agi.cash/cb").unwrap(),
+                callback: Url::parse("https://strike.me/cb").unwrap(),
                 min_sendable_msat: self.min_msat,
                 max_sendable_msat: self.max_msat,
             })
@@ -4508,16 +4508,16 @@ mod tests {
     fn best_effort_catches_a_failed_attempt_and_leaves_the_balance_intact() {
         let (store, root) = store_with_fees("best-effort-fails", &[10]);
         let mut fake = Fake::new(|_| 1);
-        fake.pay_request_error = Some("agi.cash: connection refused".to_owned());
+        fake.pay_request_error = Some("strike.me: connection refused".to_owned());
         let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 100);
         assert_eq!(
             report.outcome,
-            Err("agi.cash: connection refused".to_owned())
+            Err("strike.me: connection refused".to_owned())
         );
         assert!(!report.is_quiet());
         assert_eq!(
             report.summary(),
-            "attempt FAILED (agi.cash: connection refused); the balance stays unremitted and the node retries with backoff while it runs"
+            "attempt FAILED (strike.me: connection refused); the balance stays unremitted and the node retries with backoff while it runs"
         );
         assert!(
             report.is_failure(),
@@ -4537,7 +4537,7 @@ mod tests {
         assert_eq!(attempts[0].trigger, RemitAttemptTrigger::Collect);
         assert_eq!(attempts[0].outcome, RemitAttemptOutcome::Failed);
         assert_eq!(attempts[0].unremitted_sats, 10);
-        assert_eq!(attempts[0].detail, "agi.cash: connection refused");
+        assert_eq!(attempts[0].detail, "strike.me: connection refused");
 
         // The next attempt (a collect here; the retry tick is the other trigger) succeeds: the whole
         // balance, old and new, is paid once.

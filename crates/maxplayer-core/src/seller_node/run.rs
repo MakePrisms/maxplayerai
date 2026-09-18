@@ -15720,9 +15720,9 @@ mod tests {
 
         // Attempt 1: the LNURL host is down. Nothing propagates; nothing moves.
         let mut fake = Fake::new(|_| 1);
-        fake.pay_request_error = Some("agi.cash: dns failure".to_owned());
+        fake.pay_request_error = Some("strike.me: dns failure".to_owned());
         let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 5001);
-        assert_eq!(report.outcome, Err("agi.cash: dns failure".to_owned()));
+        assert_eq!(report.outcome, Err("strike.me: dns failure".to_owned()));
         assert!(fake.melts.is_empty());
 
         // Attempt 2: the mint refuses the melt after the plan is journaled and the fence admitted
@@ -15769,7 +15769,7 @@ mod tests {
                 .iter()
                 .all(|a| a.outcome == RemitAttemptOutcome::Failed)
         );
-        assert_eq!(attempts[1].detail, "agi.cash: dns failure");
+        assert_eq!(attempts[1].detail, "strike.me: dns failure");
         assert!(
             attempts[0]
                 .detail
@@ -16818,9 +16818,9 @@ mod tests {
             )
             .expect("collect");
         let mut fake = Fake::new(|_| 1);
-        fake.pay_request_error = Some("agi.cash: dns failure".to_owned());
+        fake.pay_request_error = Some("strike.me: dns failure".to_owned());
         let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 100);
-        assert_eq!(report.outcome, Err("agi.cash: dns failure".to_owned()));
+        assert_eq!(report.outcome, Err("strike.me: dns failure".to_owned()));
         assert!(
             !report.lines.is_empty(),
             "the attempt printed its balance before the host failed: {report:?}"
@@ -16838,7 +16838,7 @@ mod tests {
         assert_eq!(volume, RemitLogVolume::Normal);
         assert_eq!(lines.len(), 1, "one line for the first failure: {lines:#?}");
         let line = &lines[0];
-        assert!(line.contains("agi.cash: dns failure"), "the error: {line}");
+        assert!(line.contains("strike.me: dns failure"), "the error: {line}");
         assert!(
             line.contains("destination maxplayer@strike.me"),
             "the destination: {line}"

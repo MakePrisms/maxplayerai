@@ -57,7 +57,7 @@ after the abandoned upload stops. Peak concurrency stays 1 throughout.
 
 ### The platform fee destination moves to `maxplayer@strike.me`
 
-`PLATFORM_FEE_ADDRESS` is now `maxplayer@strike.me`; it was `maxplayer@agi.cash`. The address is
+`PLATFORM_FEE_ADDRESS` is now `maxplayer@strike.me`, replacing the address shipped in v0.5.9. It is
 still a compiled-in constant with no config key, environment variable or flag, for the reason given
 in v0.5.9. Nothing about the rate or the remit path changes. Remittances already journaled carry the
 literal they paid, so history written against the old address stays readable as it was.
@@ -211,7 +211,7 @@ A seller node now charges a 10% platform fee and pays it automatically, and a do
 
 ### The platform fee is charged, and now paid (#973, #979)
 
-The product takes 10% of the offer amount — the price the buyer paid — on every payment a seller collects. The rate is compiled in, and so is the destination: the Lightning address `maxplayer@agi.cash`. There is no config key, environment variable or flag for either. A seller-editable destination would let a seller pay the fee to itself.
+The product takes 10% of the offer amount — the price the buyer paid — on every payment a seller collects. The rate is compiled in, and so is the destination: the Lightning address `maxplayer@strike.me`. There is no config key, environment variable or flag for either. A seller-editable destination would let a seller pay the fee to itself.
 
 Two stages ship together. Collecting a payment journals what the fee comes to, and `maxplayer seller fees` prints it per job beside what the buyer paid, the mint fee, and what you keep. Then the node pays it: once a receipt is journaled new, a thread of its own resolves the destination over LNURL-pay and melts the accrued balance out of the seller's ecash. A balance under the destination's minimum accumulates instead of paying — the expected steady state for small jobs, not an error.
 
