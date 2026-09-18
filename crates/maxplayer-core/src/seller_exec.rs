@@ -4584,10 +4584,50 @@ mod tests {
     /// block of `docker rm` calls is skipped entirely when an assertion panics — which is the
     /// path a failing test takes, and therefore the path that most needs to clean up.
     #[cfg(feature = "acp")]
+    /// What this invocation actually DID to a named resource.
+    ///
+    /// A name is not ownership. The guard holds both names from its first instant — that is what
+    /// closes the orphan window — but holding a name says nothing about whether this invocation
+    /// created the thing it names. Teardown that deletes by name alone will, after a failed
+    /// create, happily remove a resource that already belonged to somebody else.
+    ///
+    /// `Uncertain` is the honest third state: the attempt ran and its outcome could not be
+    /// established. It is REPORTED and never deleted, because deleting on a guess is exactly the
+    /// failure this distinction exists to prevent.
+    #[cfg(feature = "acp")]
+    #[derive(Clone, Copy)]
+    enum Held {
+        /// Named only. Nothing was created, so there is nothing to remove.
+        Proposed,
+        /// This invocation created it and saw it succeed. Teardown owns it.
+        Acquired,
+        /// The attempt ran and the result is not established. Report, never delete.
+        Uncertain,
+    }
+
+    /// The three outcomes a docker invocation really has.
+    ///
+    /// Collapsing "the command ran and said no" into "docker could not be run" is what lets a
+    /// failed observation be read as a fact about the world. Teardown has to tell them apart.
+    #[cfg(feature = "acp")]
+    enum Ran {
+        /// Exited zero; payload is trimmed stdout.
+        Ok(String),
+        /// Ran and exited nonzero; payload is the diagnostic.
+        Failed(String),
+        /// Never ran at all; payload is why not.
+        Unavailable(String),
+    }
+
+    #[cfg(feature = "acp")]
     struct LiveScope {
         seat: String,
         network: String,
         workdir: std::path::PathBuf,
+        /// Whether THIS invocation created the docker network named above.
+        network_state: Held,
+        /// Whether THIS invocation created the workdir named above.
+        workdir_state: Held,
         /// The launch thread, owned by the scope rather than by the test body. A panic in an
         /// assertion unwinds past every line after it — including a trailing `join` — so a handle
         /// the body owns is a handle that gets DETACHED at exactly the moment teardown begins.
@@ -4604,24 +4644,43 @@ mod tests {
 
     #[cfg(feature = "acp")]
     impl LiveScope {
-        /// Never panics. `Drop` calls this while an assertion may already be unwinding, and a
-        /// panic during an unwind ABORTS the process — destroying the very failure the test was
-        /// reporting. A spawn failure comes back as `(false, why)` for the caller to report.
-        fn docker(args: &[&str]) -> (bool, String) {
+        /// Teardown's only reporting primitive.
+        ///
+        /// `eprintln!` PANICS if the write fails — documented behaviour, including a nonblocking
+        /// stderr returning `WouldBlock`. Reached from `Drop`, that panic either skips the cleanup
+        /// that follows it or double-panics during an assertion unwind and ABORTS the process,
+        /// destroying the very failure the test was reporting. Best-effort by construction.
+        fn report(line: &str) {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "{line}");
+        }
+
+        /// Never panics. `Drop` calls this while an assertion may already be unwinding.
+        ///
+        /// The three-way result is the point: a nonzero exit means docker answered and refused,
+        /// while a spawn error means docker never ran. Those license different conclusions about
+        /// what exists, so they are not flattened into one boolean.
+        fn docker(args: &[&str]) -> Ran {
             match std::process::Command::new("docker")
                 .args(args)
                 .stdin(std::process::Stdio::null())
                 .output()
             {
-                Ok(out) => {
-                    let text = if out.status.success() {
-                        String::from_utf8_lossy(&out.stdout).trim().to_owned()
-                    } else {
-                        String::from_utf8_lossy(&out.stderr).trim().to_owned()
-                    };
-                    (out.status.success(), text)
+                Ok(out) if out.status.success() => {
+                    Ran::Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
                 }
-                Err(err) => (false, format!("could not run `docker`: {err}")),
+                Ok(out) => {
+                    let code = out
+                        .status
+                        .code()
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "signal".to_owned());
+                    Ran::Failed(format!(
+                        "exit {code}: {}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    ))
+                }
+                Err(err) => Ran::Unavailable(format!("could not run `docker`: {err}")),
             }
         }
 
@@ -4657,24 +4716,55 @@ mod tests {
             let network = format!("mx996-{kind}-{token}");
             let workdir = std::env::temp_dir().join(&network);
 
-            // OWNERSHIP FIRST. The guard holding both names exists before anything fallible runs,
-            // so there is no window in which a resource has been created and nothing is
-            // responsible for removing it: a panic below unwinds through `Drop`, which already
-            // owns the network name and the workdir path.
-            let scope = Self {
+            // OWNERSHIP FIRST, but ownership is STATE, not a name. The guard exists before
+            // anything fallible runs, so no resource is ever created with nobody responsible for
+            // it; each resource is then marked acquired only when this invocation has SEEN it
+            // created. A panic below unwinds through `Drop`, which removes exactly what was
+            // acquired and reports the rest.
+            let mut scope = Self {
                 seat,
                 network,
                 workdir,
+                network_state: Held::Proposed,
+                workdir_state: Held::Proposed,
                 runner: None,
                 cancel: None,
             };
-            let (created, why) = Self::docker(&["network", "create", &scope.network]);
-            assert!(
-                created,
-                "could not create the test network {}: {why}",
-                scope.network
-            );
-            std::fs::create_dir_all(&scope.workdir).expect("a workdir");
+
+            match Self::docker(&["network", "create", &scope.network]) {
+                Ran::Ok(_) => scope.network_state = Held::Acquired,
+                Ran::Failed(why) => {
+                    // docker answered and refused. An exit code alone cannot rule out a partial
+                    // create, so the name is UNCERTAIN: teardown reports it and deletes nothing.
+                    scope.network_state = Held::Uncertain;
+                    panic!("could not create the test network {}: {why}", scope.network);
+                }
+                Ran::Unavailable(why) => {
+                    // docker never ran, so nothing was created and the name stays PROPOSED.
+                    panic!("could not create the test network {}: {why}", scope.network);
+                }
+            }
+
+            // `create_dir_all` accepts an existing directory, which would let a path this
+            // invocation did NOT create be torn down as if it had. `create_dir` fails with
+            // `AlreadyExists` instead, so ownership is decided by this call rather than by
+            // whatever happens to be on the filesystem.
+            match std::fs::create_dir(&scope.workdir) {
+                Ok(()) => scope.workdir_state = Held::Acquired,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Not ours: left PROPOSED so teardown never removes it. The network above IS
+                    // ours, and its cleanup still runs on the way out of this panic.
+                    panic!(
+                        "the workdir {} already exists and was not created by this invocation",
+                        scope.workdir.display()
+                    );
+                }
+                Err(err) => {
+                    scope.workdir_state = Held::Uncertain;
+                    panic!("could not create the workdir {}: {err}", scope.workdir.display());
+                }
+            }
+
             scope
         }
 
@@ -4699,7 +4789,11 @@ mod tests {
             }
             if let Some(runner) = self.runner.take() {
                 if runner.join().is_err() {
-                    eprintln!("live scope {}: the launch thread panicked", self.network);
+                    // Fallible write: reporting the panic must not skip the cleanup that follows.
+                    Self::report(&format!(
+                        "live scope {}: the launch thread panicked",
+                        self.network
+                    ));
                 }
             }
         }
@@ -4719,7 +4813,7 @@ mod tests {
             for _ in 0..2 {
                 let argv = crate::sandbox_netns::list_owned_argv(&self.seat);
                 match std::process::Command::new(&argv[0]).args(&argv[1..]).output() {
-                    Ok(listed) => {
+                    Ok(listed) if listed.status.success() => {
                         let owned = crate::sandbox_netns::parse_owned_listing(
                             &String::from_utf8_lossy(&listed.stdout),
                         );
@@ -4727,35 +4821,80 @@ mod tests {
                             break;
                         }
                         for container in &owned {
-                            let (removed, why) = Self::docker(&["rm", "--force", &container.id]);
-                            if !removed {
-                                failures.push(format!("rm {}: {why}", container.id));
+                            match Self::docker(&["rm", "--force", &container.id]) {
+                                Ran::Ok(_) => {}
+                                Ran::Failed(why) | Ran::Unavailable(why) => {
+                                    failures.push(format!("rm {}: {why}", container.id));
+                                }
                             }
                         }
                     }
+                    Ok(listed) => {
+                        // A FAILED OBSERVATION IS NOT AN EMPTY SET. `docker ps` exiting nonzero
+                        // with empty stdout parses as "this seat owns nothing"; concluding that
+                        // turns a broken instrument into a clean bill of health. Keep the status
+                        // and stderr, report them, and stop — without claiming anything is absent.
+                        let code = listed
+                            .status
+                            .code()
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "signal".to_owned());
+                        failures.push(format!(
+                            "could not list this seat's containers: exit {code}: {} \
+                             (ownership UNKNOWN, not empty)",
+                            String::from_utf8_lossy(&listed.stderr).trim()
+                        ));
+                        break;
+                    }
                     Err(err) => {
-                        failures.push(format!("could not list this seat's containers: {err}"));
+                        failures.push(format!(
+                            "could not list this seat's containers: {err} \
+                             (ownership UNKNOWN, not empty)"
+                        ));
                         break;
                     }
                 }
             }
-            let (removed, why) = Self::docker(&["network", "rm", &self.network]);
-            if !removed {
-                failures.push(format!("network rm {}: {why}", self.network));
+
+            // ONLY WHAT THIS INVOCATION ACQUIRED. After a failed create the name is not ours, and
+            // removing by name would delete a resource somebody else owns.
+            match self.network_state {
+                Held::Acquired => match Self::docker(&["network", "rm", &self.network]) {
+                    Ran::Ok(_) => {}
+                    Ran::Failed(why) | Ran::Unavailable(why) => {
+                        failures.push(format!("network rm {}: {why}", self.network));
+                    }
+                },
+                Held::Uncertain => failures.push(format!(
+                    "network {}: creation outcome unverified; left in place, NOT removed",
+                    self.network
+                )),
+                Held::Proposed => {}
             }
-            if let Err(err) = std::fs::remove_dir_all(&self.workdir) {
-                if err.kind() != std::io::ErrorKind::NotFound {
-                    failures.push(format!("workdir {}: {err}", self.workdir.display()));
+
+            match self.workdir_state {
+                Held::Acquired => {
+                    if let Err(err) = std::fs::remove_dir_all(&self.workdir) {
+                        if err.kind() != std::io::ErrorKind::NotFound {
+                            failures.push(format!("workdir {}: {err}", self.workdir.display()));
+                        }
+                    }
                 }
+                Held::Uncertain => failures.push(format!(
+                    "workdir {}: creation outcome unverified; left in place, NOT removed",
+                    self.workdir.display()
+                )),
+                Held::Proposed => {}
             }
-            // REPORTED, never discarded — and never a panic, which during an unwind would abort
-            // the process. A silent cleanup failure is how a leak becomes somebody else's flake.
+
+            // REPORTED, never discarded, and never via a macro that panics on a failed write.
+            // A silent cleanup failure is how a leak becomes somebody else's flake.
             if !failures.is_empty() {
-                eprintln!(
+                Self::report(&format!(
                     "live scope {} cleanup failures: {}",
                     self.network,
                     failures.join("; ")
-                );
+                ));
             }
         }
     }
