@@ -16,7 +16,7 @@ fix. Read sections 10 to 12 first if you are resuming.
 **2026-09-16:** pull request #1004 merged into `main` at `00c05bb`. The skill moved to the web skill
 channel (`web/app/.well-known/skills/seller-tool-onboarding/skill.md`, live at maxplayer.ai), so a
 seller outside this checkout can fetch it the way every other buyer or seller skill is fetched. See
-section 6.
+section 6. The work shipped in v0.5.9 (2026-09-16) and v0.5.10 (2026-09-17).
 
 ## 1. What changed since `a0cc31d`
 
