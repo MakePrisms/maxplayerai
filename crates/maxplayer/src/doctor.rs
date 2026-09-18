@@ -1735,6 +1735,122 @@ mod checks {
         )
     }
 
+    // ---- Seller memory: the MEMORY.md index every job prompt starts with ----
+
+    const SELLER_MEMORY_CHECK: &str = "seller memory";
+
+    /// What the check saw when it looked for the seat's memory index. Wraps
+    /// [`IndexState`](maxplayer_core::seller_memory::IndexState) with the two cases the inspector
+    /// cannot express — injection switched off, and an index that exists but would not read — so
+    /// [`fold_seller_memory`] is total over everything the check can observe, and every verdict's
+    /// wording is testable without touching the filesystem.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) enum MemoryIndexProbe {
+        /// `[seller_memory] memory_enabled = false`: the index is never consulted, so its state is
+        /// nobody's concern here.
+        Disabled,
+        /// The inspector answered.
+        Inspected(maxplayer_core::seller_memory::IndexState),
+        /// `MEMORY.md` exists and `read_to_string` on it failed (permissions, not UTF-8, a directory
+        /// wearing the name). Carries the error text.
+        Unreadable(String),
+    }
+
+    /// The seat's `MEMORY.md` index is inlined into every job prompt at start, so a seat that thinks
+    /// it is specialized may be a generalist without anyone noticing: an over-budget index is
+    /// TRUNCATED per job (the head that fits, plus a marker), an absent or empty one injects nothing.
+    /// Boot says the over-budget case once in its scroll; this is where the operator asks on demand
+    /// and gets every state, including the quiet ones.
+    ///
+    /// Advisory throughout — never a FAIL. Memory is a quality lever, not a money-path or
+    /// containment invariant, and nearly every seat has no memory dir at all: turning those red
+    /// would be noise. READ-ONLY, like every consumer of the index: this must never create
+    /// `memory/` or anything in it (see `seller_node::run::job_memory_section`).
+    pub(super) fn check_seller_memory(memory_enabled: bool, memory_dir: &Path) -> Check {
+        let index_path = memory_dir.join(maxplayer_core::seller_memory::MEMORY_INDEX_FILE);
+        if !memory_enabled {
+            return fold_seller_memory(&index_path, MemoryIndexProbe::Disabled);
+        }
+        let probe = match maxplayer_core::seller_memory::inspect_index(memory_dir) {
+            Ok(state) => MemoryIndexProbe::Inspected(state),
+            Err(error) => MemoryIndexProbe::Unreadable(error.to_string()),
+        };
+        fold_seller_memory(&index_path, probe)
+    }
+
+    /// Turn a [`MemoryIndexProbe`] into a Check. Pure, so each verdict — and the byte figures the
+    /// PASS and over-budget WARN carry — is assertable without a real home.
+    pub(super) fn fold_seller_memory(index_path: &Path, probe: MemoryIndexProbe) -> Check {
+        use maxplayer_core::seller_memory::{IndexState, MAX_MEMORY_INDEX_BYTES};
+        let index = index_path.display();
+        match probe {
+            MemoryIndexProbe::Disabled => Check::pass(
+                SELLER_MEMORY_CHECK,
+                "memory injection is off (`[seller_memory] memory_enabled = false`); MEMORY.md is \
+                 not consulted",
+            ),
+            // The state of nearly every seat; a seat that never asked for memory has nothing to fix.
+            MemoryIndexProbe::Inspected(IndexState::NoMemoryDir) => Check::pass(
+                SELLER_MEMORY_CHECK,
+                "no memory dir; jobs run without seat memory",
+            ),
+            // A dir without an index is a seat that STARTED to specialize and stopped — the operator
+            // (or the retro turn) meant for something to be here, so say that nothing is.
+            MemoryIndexProbe::Inspected(IndexState::NoIndex) => Check::warn(
+                SELLER_MEMORY_CHECK,
+                "memory dir exists but has no MEMORY.md — every job prompt injects nothing",
+                format!(
+                    "write the index at {index}, or remove the memory dir if the seat is meant to \
+                     run without one"
+                ),
+            ),
+            MemoryIndexProbe::Inspected(IndexState::Empty) => Check::warn(
+                SELLER_MEMORY_CHECK,
+                format!("MEMORY.md at {index} is empty — every job prompt injects nothing"),
+                "put the distilled index in MEMORY.md, or remove the memory dir if the seat is meant \
+                 to run without one",
+            ),
+            MemoryIndexProbe::Inspected(state @ IndexState::Fits { bytes }) => {
+                // `headroom_bytes` is Some for every Fits by construction; the fallback is never hit
+                // and exists only so this arm cannot panic if the enum grows.
+                let headroom = state.headroom_bytes().unwrap_or(0);
+                Check::pass(
+                    SELLER_MEMORY_CHECK,
+                    format!(
+                        "MEMORY.md at {index} is {bytes} bytes, injected whole; {headroom} bytes of \
+                         headroom under the {MAX_MEMORY_INDEX_BYTES}-byte injection budget"
+                    ),
+                )
+            }
+            // Same wording as the boot siren in `seller_node::run::memory_index_budget_warning`,
+            // because the operator following that siren's "doctor reports this too" must find the
+            // same fact here, not a differently phrased one.
+            MemoryIndexProbe::Inspected(IndexState::OverBudget { bytes }) => Check::warn(
+                SELLER_MEMORY_CHECK,
+                format!(
+                    "MEMORY.md at {index} is {bytes} bytes, over the {MAX_MEMORY_INDEX_BYTES}-byte \
+                     injection budget — every job prompt gets a TRUNCATED copy (the head that fits, \
+                     plus a marker) and the tail is dropped"
+                ),
+                format!(
+                    "shorten MEMORY.md itself to under {MAX_MEMORY_INDEX_BYTES} bytes; under a \
+                     container policy the topic files it links are outside the job's mount \
+                     namespace, so this file's own content is all that loads"
+                ),
+            ),
+            // WARN, not FAIL: the job path degrades to no-memory and never fails on this, and the
+            // check learned nothing about the index's content — only that it could not read it.
+            MemoryIndexProbe::Unreadable(error) => Check::warn(
+                SELLER_MEMORY_CHECK,
+                format!(
+                    "MEMORY.md at {index} exists but could not be read ({error}); jobs run without \
+                     memory until it is readable"
+                ),
+                format!("make {index} a readable UTF-8 file owned by the seat's user"),
+            ),
+        }
+    }
+
     /// Containment, for a seat strangers can reach — which means executing code they posted.
     /// `check_sandbox_launcher` above answers "does the launcher resolve", a property one layer out
     /// from this one: bubblewrap resolves on Ubuntu 24.04 and then fails at spawn on the AppArmor
@@ -2358,6 +2474,10 @@ fn build_checks(
     // Home/wallet perms are verified against the SAME resolved home the rest of the gate inspects.
     let perms_home_root = home.root.clone();
     let perms_wallet_dir = home.wallet_dir.clone();
+    // The memory index is read from the SAME resolved home boot reads it from (`job_memory_section`
+    // and the boot siren both go through `seller_memory::memory_dir(&home.root)`).
+    let memory_enabled = home.config.seller_memory.memory_enabled;
+    let memory_dir = maxplayer_core::seller_memory::memory_dir(&home.root);
     // Harness credentials live under the operator $HOME, not the seat home. Empty HOME is
     // carried as None — never guessed as a relative `.claude`.
     let user_home = user_home_dir();
@@ -2421,6 +2541,12 @@ fn build_checks(
     // opposite questions — containment asks how dangerous an incoming job is, this asks whether any
     // can arrive — and a seat with no way in is silently healthy on every other check here.
     checks.push(Box::new(move || checks::check_seat_reachability(exposure)));
+    // What every job prompt starts with. An over-budget MEMORY.md is truncated per job, an absent or
+    // empty one injects nothing, and either way the seat quietly runs as a generalist — boot sirens
+    // only the over-budget case, this reports every state. Advisory; never blocks boot.
+    checks.push(Box::new(move || {
+        checks::check_seller_memory(memory_enabled, &memory_dir)
+    }));
     // Verifies the owner-only invariant `home::bootstrap` enforces at creation hasn't drifted (#473):
     // WARN for a seat only its named buyers reach, FAIL for one strangers reach.
     checks.push(Box::new(move || {
@@ -4667,6 +4793,260 @@ mod tests {
                 .any(|c| c.status == Status::Fail
                     && c.detail.contains("definitely-not-a-real-binary-xyz")),
             "build_checks must run the sandbox launcher check and FAIL on a bogus launcher; got: {:?}",
+            results.iter().map(Check::render).collect::<Vec<_>>()
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // ---- Seller memory: every state of the MEMORY.md index, and the boot-gate wiring ----
+
+    /// A fresh scratch dir for one seller-memory test; the caller removes it.
+    fn seller_memory_scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "maxplayer-doctor-seller-memory-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    // PASS with the figures an operator needs: the index's byte size AND the headroom left under the
+    // budget, so "how much more can I write" is answered without reading source.
+    #[test]
+    fn doctor_seller_memory_passes_with_bytes_and_headroom() {
+        use maxplayer_core::seller_memory::{MAX_MEMORY_INDEX_BYTES, MEMORY_INDEX_FILE};
+        let home = seller_memory_scratch("fits");
+        let memory_dir = maxplayer_core::seller_memory::memory_dir(&home);
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        let index = "# MEMORY\n- [rust](rust.md) — prefers edition 2021\n";
+        std::fs::write(memory_dir.join(MEMORY_INDEX_FILE), index).unwrap();
+
+        let check = checks::check_seller_memory(true, &memory_dir);
+        assert_eq!(check.status, Status::Pass, "{}", check.render());
+        assert_eq!(check.name, "seller memory");
+        assert!(
+            check.detail.contains(&format!("is {} bytes", index.len())),
+            "PASS must state the index size; got: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains(&format!(
+                "{} bytes of headroom",
+                MAX_MEMORY_INDEX_BYTES - index.len()
+            )),
+            "PASS must state the headroom under the budget; got: {}",
+            check.detail
+        );
+        assert!(
+            check
+                .detail
+                .contains(&format!("{MAX_MEMORY_INDEX_BYTES}-byte")),
+            "PASS must name the budget; got: {}",
+            check.detail
+        );
+        assert!(
+            !check.render().contains("fix:"),
+            "a PASS carries no fix hint"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // WARN (never FAIL) on an over-budget index: names the real size, the budget, and that every job
+    // prompt gets a TRUNCATED copy — the same fact the boot siren points the operator here for.
+    #[test]
+    fn doctor_seller_memory_warns_over_budget_with_truncation_wording() {
+        use maxplayer_core::seller_memory::{MAX_MEMORY_INDEX_BYTES, MEMORY_INDEX_FILE};
+        let home = seller_memory_scratch("over");
+        let memory_dir = maxplayer_core::seller_memory::memory_dir(&home);
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        let over = MAX_MEMORY_INDEX_BYTES + 1;
+        let mut index = "x".repeat(over - 1);
+        index.push('\n');
+        assert_eq!(index.len(), over);
+        std::fs::write(memory_dir.join(MEMORY_INDEX_FILE), &index).unwrap();
+
+        let check = checks::check_seller_memory(true, &memory_dir);
+        assert_eq!(
+            check.status,
+            Status::Warn,
+            "over budget is advisory: {}",
+            check.render()
+        );
+        assert!(
+            check.detail.contains(&format!("is {over} bytes")),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check
+                .detail
+                .contains(&format!("over the {MAX_MEMORY_INDEX_BYTES}-byte")),
+            "{}",
+            check.detail
+        );
+        assert!(check.detail.contains("TRUNCATED"), "{}", check.detail);
+        let rendered = check.render();
+        assert!(rendered.contains("(fix: shorten MEMORY.md"), "{rendered}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // WARN when the seat started to specialize and stopped: a memory dir with no MEMORY.md, or an
+    // empty one. Both inject nothing, and both say so with the path to write.
+    #[test]
+    fn doctor_seller_memory_warns_on_missing_or_empty_index_in_an_existing_dir() {
+        use maxplayer_core::seller_memory::MEMORY_INDEX_FILE;
+        let home = seller_memory_scratch("noindex");
+        let memory_dir = maxplayer_core::seller_memory::memory_dir(&home);
+        std::fs::create_dir_all(&memory_dir).unwrap();
+
+        let no_index = checks::check_seller_memory(true, &memory_dir);
+        assert_eq!(no_index.status, Status::Warn, "{}", no_index.render());
+        assert!(
+            no_index.detail.contains("has no MEMORY.md"),
+            "{}",
+            no_index.detail
+        );
+        assert!(
+            no_index.detail.contains("injects nothing"),
+            "{}",
+            no_index.detail
+        );
+        assert!(
+            no_index
+                .render()
+                .contains(&memory_dir.join(MEMORY_INDEX_FILE).display().to_string()),
+            "the fix must name where to write the index: {}",
+            no_index.render()
+        );
+
+        std::fs::write(memory_dir.join(MEMORY_INDEX_FILE), "  \n\n\t\n").unwrap();
+        let empty = checks::check_seller_memory(true, &memory_dir);
+        assert_eq!(empty.status, Status::Warn, "{}", empty.render());
+        assert!(empty.detail.contains("is empty"), "{}", empty.detail);
+        assert!(empty.detail.contains("injects nothing"), "{}", empty.detail);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // PASS, quietly, for the two states that are nobody's problem: injection switched off, and the
+    // state of nearly every seat — no memory dir at all. Neither may nag, and neither may CREATE the
+    // dir: the check is read-only like every other consumer of the index.
+    #[test]
+    fn doctor_seller_memory_is_quiet_when_disabled_or_without_a_memory_dir() {
+        let home = seller_memory_scratch("quiet");
+        let memory_dir = maxplayer_core::seller_memory::memory_dir(&home);
+        assert!(!memory_dir.exists());
+
+        let no_dir = checks::check_seller_memory(true, &memory_dir);
+        assert_eq!(no_dir.status, Status::Pass, "{}", no_dir.render());
+        assert!(no_dir.detail.contains("no memory dir"), "{}", no_dir.detail);
+        assert!(!memory_dir.exists(), "the check must never create memory/");
+
+        // Disabled wins over whatever is on disk: plant an over-budget index and it is not consulted.
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        std::fs::write(
+            memory_dir.join(maxplayer_core::seller_memory::MEMORY_INDEX_FILE),
+            "y".repeat(maxplayer_core::seller_memory::MAX_MEMORY_INDEX_BYTES + 10),
+        )
+        .unwrap();
+        let disabled = checks::check_seller_memory(false, &memory_dir);
+        assert_eq!(disabled.status, Status::Pass, "{}", disabled.render());
+        assert!(
+            disabled.detail.contains("memory_enabled = false"),
+            "{}",
+            disabled.detail
+        );
+        assert!(
+            !disabled.detail.contains("bytes"),
+            "disabled must not report on-disk figures"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // WARN, not FAIL, when MEMORY.md exists but will not read — here a DIRECTORY wearing the name,
+    // which fails `read_to_string` on every platform without a chmod. The check learned nothing
+    // about the content, and the job path degrades to no-memory rather than failing, so it says so.
+    #[test]
+    fn doctor_seller_memory_warns_on_an_unreadable_index() {
+        use maxplayer_core::seller_memory::MEMORY_INDEX_FILE;
+        let home = seller_memory_scratch("unreadable");
+        let memory_dir = maxplayer_core::seller_memory::memory_dir(&home);
+        std::fs::create_dir_all(memory_dir.join(MEMORY_INDEX_FILE)).unwrap();
+
+        let check = checks::check_seller_memory(true, &memory_dir);
+        assert_eq!(check.status, Status::Warn, "{}", check.render());
+        assert!(
+            check.detail.contains("could not be read"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("jobs run without memory"),
+            "{}",
+            check.detail
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // The fold is total and pure: every probe value has a verdict and none of them is a FAIL —
+    // memory is advisory by design, and a future arm that FAILs would turn a working seat red.
+    #[test]
+    fn doctor_seller_memory_fold_never_fails() {
+        use checks::MemoryIndexProbe as P;
+        use maxplayer_core::seller_memory::IndexState as S;
+        let path = std::path::Path::new("/seat/memory/MEMORY.md");
+        for probe in [
+            P::Disabled,
+            P::Inspected(S::NoMemoryDir),
+            P::Inspected(S::NoIndex),
+            P::Inspected(S::Empty),
+            P::Inspected(S::Fits { bytes: 10 }),
+            P::Inspected(S::OverBudget { bytes: 1 << 20 }),
+            P::Unreadable("permission denied".into()),
+        ] {
+            let check = checks::fold_seller_memory(path, probe.clone());
+            assert_ne!(
+                check.status,
+                Status::Fail,
+                "{probe:?} must stay advisory: {}",
+                check.render()
+            );
+            assert_eq!(check.name, "seller memory");
+        }
+    }
+
+    // RED-PROVE (wiring): the seller memory check must be part of the boot-gate registry, or an
+    // operator running `maxplayer doctor` on a seat whose index is truncated every job sees nothing.
+    // Plant an over-budget MEMORY.md in a bootstrapped home and a "seller memory" WARN naming the
+    // real byte count must come out of `build_checks`. Drop the push → red. Network-free the same way
+    // the launcher wiring test is: unparseable relay_url, no mints.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn seller_memory_check_is_wired_into_the_boot_gate() {
+        use maxplayer_core::seller_memory::{MAX_MEMORY_INDEX_BYTES, MEMORY_INDEX_FILE};
+        let tmp = seller_memory_scratch("wiring");
+        let mut home = resolve_doctor_home(Some(tmp.clone())).expect("bootstrap the home");
+        home.config.relay_url = "not-a-relay-url".into();
+        home.config.accepted_mints = Vec::new();
+        assert!(
+            home.config.seller_memory.memory_enabled,
+            "memory injection defaults on"
+        );
+        let memory_dir = maxplayer_core::seller_memory::memory_dir(&home.root);
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        let over = MAX_MEMORY_INDEX_BYTES + 7;
+        std::fs::write(memory_dir.join(MEMORY_INDEX_FILE), "z".repeat(over)).unwrap();
+
+        let results = run_checks(build_checks(&home, false));
+        assert!(
+            results.iter().any(|c| c.name == "seller memory"
+                && c.status == Status::Warn
+                && c.detail.contains(&format!("is {over} bytes"))),
+            "build_checks must run the seller memory check and WARN with the byte count; got: {:?}",
             results.iter().map(Check::render).collect::<Vec<_>>()
         );
 

@@ -22,8 +22,9 @@
 //!       `the_golden_invariant_holds_no_memory_is_byte_identical` FAIL; the other three pass.
 //!   - make `job_memory_section` ignore `memory_enabled`
 //!     ⇒ `a_disabled_config_injects_nothing` FAILS alone.
-//!   - make `job_memory_section` propagate the `InvalidData` error instead of degrading
-//!     ⇒ `an_over_budget_index_degrades_instead_of_blocking_the_job` FAILS alone (it panics).
+//!   - make `read_on_start` drop (or refuse) an over-budget index instead of truncating it
+//!     ⇒ `an_over_budget_index_degrades_instead_of_blocking_the_job` FAILS alone (no head, no
+//!       marker in the prompt); make it inject the file whole ⇒ FAILS alone (over budget).
 //!   - `None => format!("{base}\n\n")` in `compose_agent_prompt`'s `match memory_section`
 //!     ⇒ `the_golden_invariant_holds_no_memory_is_byte_identical` FAILS alone.
 //!
@@ -33,7 +34,10 @@
 //! fixed, then re-measured red.
 
 use maxplayer_core::home::SellerMemoryConfig;
-use maxplayer_core::seller_memory::{MAX_MEMORY_INDEX_BYTES, MEMORY_INDEX_FILE, memory_dir};
+use maxplayer_core::seller_memory::{
+    DEFAULT_READ_ON_START_TEMPLATE, MAX_MEMORY_INDEX_BYTES, MEMORY_INDEX_FILE, memory_dir,
+    truncation_marker,
+};
 use maxplayer_core::seller_node::run::{job_memory_section, job_prompt};
 use maxplayer_core::seller_node::store::Offer;
 
@@ -188,35 +192,69 @@ fn a_disabled_config_injects_nothing() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// THE SEAM MUST NEVER BLOCK A JOB. An index over `MAX_MEMORY_INDEX_BYTES` is REFUSED with
-/// `InvalidData` by `read_on_start_section` — deliberately, so a runaway file cannot bloat every
-/// prompt. That refusal is an `io::Error`, and an error on this path must NOT propagate: the job
-/// would otherwise fail over diagnostic context that never feeds the pay gate, the journal or the
-/// receipt bind. It degrades to a normal, memory-free job instead.
+/// THE SEAM MUST NEVER BLOCK A JOB. An index over `MAX_MEMORY_INDEX_BYTES` is TRUNCATED by
+/// `read_on_start` — the head that fits, plus a marker line saying the tail was dropped — so a
+/// runaway file cannot bloat every prompt, and a specialized seat is no longer silently degraded
+/// to a generalist over one byte. Nothing on this path may propagate as an error: the job would
+/// otherwise fail over diagnostic context that never feeds the pay gate, the journal or the receipt
+/// bind. The job runs, and its prompt CONTAINS the surviving head of the index and the marker.
 #[test]
 fn an_over_budget_index_degrades_instead_of_blocking_the_job() {
-    let runaway = "x".repeat(MAX_MEMORY_INDEX_BYTES + 1);
+    // One byte over, as a MULTI-LINE file: the brand line up top is what must survive the cut.
+    let brand = "Acme brand: always set headings in Söhne, never centre body copy.";
+    let mut runaway = format!("# Memory\n\n{brand}\n");
+    let mut n = 0usize;
+    while runaway.len() < MAX_MEMORY_INDEX_BYTES + 1 {
+        runaway.push_str(&format!(
+            "- lesson {n:06}: keep the buyer's task the subject of the reply\n"
+        ));
+        n += 1;
+    }
+    runaway.truncate(MAX_MEMORY_INDEX_BYTES + 1); // ASCII filler ⇒ safe to cut anywhere
+    assert_eq!(runaway.len(), MAX_MEMORY_INDEX_BYTES + 1);
     let root = home_with_index("over-budget", &runaway);
 
-    // Control: one byte under the bound DOES inject, so the refusal below is the size bound doing
-    // its job and not the read silently failing for some unrelated reason.
+    // Control: one byte under the bound injects WHOLE, with no marker, so the marker below is the
+    // size bound doing its job and not something every index gets.
     let ok_root = home_with_index("at-budget", &"y".repeat(MAX_MEMORY_INDEX_BYTES - 1));
+    let whole = job_memory_section(&ok_root, &SellerMemoryConfig::default())
+        .expect("control: an index just under the bound must still be injected");
     assert!(
-        job_memory_section(&ok_root, &SellerMemoryConfig::default()).is_some(),
-        "control: an index just under the bound must still be injected"
+        !whole.contains(&truncation_marker(0, 0)[..30]),
+        "control: an index under the bound carries no truncation marker"
     );
 
-    // No panic, no error type — just no memory.
-    let section = job_memory_section(&root, &SellerMemoryConfig::default());
-    assert_eq!(
-        section, None,
-        "an over-budget index degrades to no memory rather than failing the job"
+    // No panic, no error type — and no longer no memory: the head reaches the job.
+    let section = job_memory_section(&root, &SellerMemoryConfig::default())
+        .expect("an over-budget index is truncated and STILL injected, never dropped");
+    let prompt = job_prompt(&offer(), GIT_REMOTE, DEADLINE, Some(section.as_str()));
+    assert!(
+        prompt.contains(brand),
+        "the surviving head of the index must reach the agent: {prompt}"
     );
-    // And the job it would have run is exactly the job that runs today.
-    assert_eq!(
-        job_prompt(&offer(), GIT_REMOTE, DEADLINE, section.as_deref()),
-        job_prompt(&offer(), GIT_REMOTE, DEADLINE, None),
-        "the degraded job is byte-identical to a normal memory-free job"
+    assert!(
+        prompt.contains("[maxplayer: MEMORY.md truncated to the"),
+        "the agent must be told it is reading a fragment: {prompt}"
+    );
+    assert!(
+        prompt.contains(&(MAX_MEMORY_INDEX_BYTES + 1).to_string()),
+        "the marker names the file's real size: {prompt}"
+    );
+    // The memory-off prompt is still the byte-for-byte prefix: truncation only APPENDS less.
+    let baseline = job_prompt(&offer(), GIT_REMOTE, DEADLINE, None);
+    assert!(
+        prompt.starts_with(&baseline),
+        "the job is the normal job plus a (shorter) memory section"
+    );
+    // And the injected index text itself is within budget: the section is framing + index, so it is
+    // bounded by the budget plus the default framing's own bytes (the template text and the memory
+    // dir path it substitutes in).
+    let framing =
+        DEFAULT_READ_ON_START_TEMPLATE.len() + memory_dir(&root).display().to_string().len();
+    assert!(
+        section.len() <= MAX_MEMORY_INDEX_BYTES + framing,
+        "truncated section is {} bytes; budget {MAX_MEMORY_INDEX_BYTES} + framing {framing}",
+        section.len()
     );
 
     let _ = std::fs::remove_dir_all(&ok_root);
