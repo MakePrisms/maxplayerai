@@ -3980,6 +3980,58 @@ exit 0
         dir
     }
 
+    /// A [`stand_in_docker`] create delay that PARKS until the test writes `$WORK/release`.
+    ///
+    /// The cancellation tests need the create to still be in flight when the future awaiting it is
+    /// dropped. A `sleep 1` gave that only as long as the test got scheduled inside the second,
+    /// which a loaded CI runner does not promise (#1027). A create that waits for the test cannot
+    /// finish ahead of it, whatever the runner is doing.
+    ///
+    /// What the gate rules out is the create ENDING early — `establish_with` awaits it, so no
+    /// `Ok` and no post-create `Err` can arrive before the release. What it does not rule out is a
+    /// failure AHEAD of the create (the probe, or the blocking pool refusing the spawn); those
+    /// still end `establish` early, and [`wait_for_the_create_to_start`] names them.
+    #[cfg(feature = "acp")]
+    const GATED_CREATE: &str = r#"while [ ! -e "$WORK/release" ]; do sleep 0.01; done"#;
+
+    /// Drive `establishing` until the stand-in has written its `creating` marker, so a drop that
+    /// follows lands mid-create.
+    ///
+    /// The `select!` here is the one #1027 was about. `select!` favours its first arm, and the
+    /// create runs on a blocking thread that does not need this task to be polled, so a starved
+    /// task can wake with `establishing` already ready. That is why the marker is checked AGAIN
+    /// before panicking: with a gated create it cannot be present — the create cannot have
+    /// finished — so its presence would mean the gate did not hold, and its absence means
+    /// something ahead of the create failed. Both are real failures and both are named with the
+    /// outcome, rather than reported as a bare "cannot finish" that says nothing.
+    #[cfg(feature = "acp")]
+    async fn wait_for_the_create_to_start<F>(
+        establishing: &mut std::pin::Pin<Box<F>>,
+        marker: &std::path::Path,
+    ) where
+        F: std::future::Future<Output = Result<Containment, String>>,
+    {
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !marker.exists() {
+            tokio::select! {
+                outcome = establishing.as_mut() => {
+                    if marker.exists() {
+                        panic!(
+                            "establish finished after its create started but before this loop \
+                             saw the marker — the gated create was not parked: {outcome:?}"
+                        );
+                    }
+                    panic!(
+                        "establish finished before its create began — something ahead of the \
+                         create failed: {outcome:?}"
+                    );
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
+            }
+            assert!(std::time::Instant::now() < give_up, "the create never started");
+        }
+    }
+
     /// A world the expiry sweep can be run against: `docker ps` answers from a listing file, and
     /// `docker rm` edits that same file.
     ///
@@ -5809,11 +5861,24 @@ exit 0
     /// Two assertions, and both are needed: cleanup must OUTLAST the create (otherwise the removal
     /// it issued named nothing), and it must actually name the holder (otherwise it waited and then
     /// removed nothing).
+    ///
+    /// The create is GATED, not timed (#1027). An earlier version had the stand-in `sleep 1` and
+    /// asserted the cancellation took at least 700 ms — a stopwatch, and one whose start was found
+    /// by polling for the `creating` marker under a `select!` against the establish future. That
+    /// select is the flake: the create runs on a blocking thread and does not need the test task to
+    /// be polled, so a test task starved on a loaded runner could wake with BOTH arms ready, and
+    /// `select!` favours the first — a `panic!` that discarded the outcome, so CI reported
+    /// "establish cannot finish" with no account of what finished or why. Here the stand-in's
+    /// create parks on a `release` file that only this test writes, and it writes it only after
+    /// cleanup has been asked to run — so the create cannot end before the cancellation begins,
+    /// and "outlasts" becomes an ORDERING in the stand-in's own event log (`rm` after
+    /// `create-end`) rather than a duration. See [`GATED_CREATE`] for what the gate does and does
+    /// not rule out.
     #[cfg(feature = "acp")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_cancelled_establish_outlasts_its_create_and_removes_the_holder() {
         let work = stand_in_work_dir("cancel");
-        let script = stand_in_docker(&work, "sleep 1");
+        let script = stand_in_docker(&work, GATED_CREATE);
 
         // Bound to the test, not to the call expression: the future below outlives the statement
         // that builds it, so the client it borrows has to as well.
@@ -5838,24 +5903,58 @@ exit 0
         // Cancel on the CREATE ITSELF, not on a stopwatch. A fixed deadline raced the probe and
         // cancelled before the create had begun, which measures nothing: the marker is written by
         // the stand-in as the create starts, so the drop below always lands mid-create.
-        let marker = work.join("creating");
-        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !marker.exists() {
-            tokio::select! {
-                _ = establishing.as_mut() => panic!("establish cannot finish against this client"),
-                _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
-            }
-            assert!(std::time::Instant::now() < give_up, "the create never started");
-        }
+        wait_for_the_create_to_start(&mut establishing, &work.join("creating")).await;
 
-        let started = std::time::Instant::now();
-        drop(establishing); // the cancellation under test; the holder's cleanup runs in here
-        let elapsed = started.elapsed();
+        // The cancellation under test. With `FenceBounds::production()`, `fast` is 30s, so the
+        // drop below BLOCKS in `wait_until_settled` for the parked create rather than handing off
+        // to a retained owner (the handoff path is the sibling test's) — which is why the release
+        // has to come from another thread, and why `drop` returning is itself evidence: a cleanup
+        // that removes ahead of the create returns at once, and its `rm` lands ahead of
+        // `create-end` in the event log; one that waits cannot return until the release is
+        // written.
+        //
+        // The 200 ms is the window in which a broken cleanup gets to prove itself wrong: nothing
+        // this test does before the release can end the create, so a cleanup that returned inside
+        // it did not wait. It is a window, not a guarantee — if this thread were descheduled for
+        // longer than that between the spawn and entering the drop, the create would be released
+        // before cleanup looked at it and the run would pass without having exercised the wait.
+        // That direction cannot produce a false failure, and the ordering assertion below still
+        // holds against a cleanup that removed early.
+        let release = work.join("release");
+        let events = work.join("events.log");
+        let releasing = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let released_at = std::time::Instant::now();
+            std::fs::write(&release, b"").expect("release the gated create");
+            released_at
+        });
+        drop(establishing); // the holder's cleanup runs in here
+        let cancelled_at = std::time::Instant::now();
+        let released_at = releasing.join().expect("the releasing thread");
 
         assert!(
-            elapsed >= std::time::Duration::from_millis(700),
-            "cancellation returned in {elapsed:?}, while the create it had to outlast was still \
-             running: the container arrives afterwards with nobody holding it"
+            cancelled_at >= released_at,
+            "cancellation returned before the create it had to outlast was released: the \
+             container arrives afterwards with nobody holding it"
+        );
+
+        // The load-bearing ordering: cleanup's `rm` must follow the stand-in's own `create-end`.
+        let log = std::fs::read_to_string(&events).expect("the stand-in recorded its calls");
+        let lines: Vec<&str> = log.lines().collect();
+        let create_end = lines
+            .iter()
+            .position(|line| line.trim() == "create-end")
+            .expect("the create ran to completion once released");
+        let removed = lines
+            .iter()
+            .position(|line| line.starts_with("rm ") && line.contains("cancelled-establish"))
+            .expect("a cancelled establish must remove the holder it created");
+        assert!(
+            removed > create_end,
+            "cleanup removed the holder at step {removed} but the create only settled at step \
+             {create_end}: the remove was issued ahead of a live create, which docker answers \
+             \"No such container\" and cleanup then treats as done — the container lands afterwards \
+             unowned. Event log:\n{log}"
         );
 
         let removed = std::fs::read_to_string(work.join("rm.log")).unwrap_or_default();
@@ -5887,7 +5986,10 @@ exit 0
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cleanup_that_outwaits_its_bound_removes_only_after_the_create_settles() {
         let work = stand_in_work_dir("late");
-        let script = stand_in_docker(&work, "sleep 1");
+        // Gated as in the cancel test above (#1027): `fast` below is 50 ms, so the drop hands off
+        // to a retained owner well before the release at 200 ms, and the create is still in flight
+        // when it does — by construction rather than by a `sleep 1` outrunning the scheduler.
+        let script = stand_in_docker(&work, GATED_CREATE);
         let client = DockerCli::stand_in(&script);
         // `fast` expires mid-create; `max` is generous enough that the owner waits the create out.
         let bounds = FenceBounds {
@@ -5915,16 +6017,16 @@ exit 0
         ));
 
         // Cancel on the create itself, so the drop below always lands while it is in flight.
-        let marker = work.join("creating");
-        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !marker.exists() {
-            tokio::select! {
-                _ = establishing.as_mut() => panic!("establish cannot finish against this client"),
-                _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
-            }
-            assert!(std::time::Instant::now() < give_up, "the create never started");
-        }
+        wait_for_the_create_to_start(&mut establishing, &work.join("creating")).await;
+        // The drop returns at `fast` with the create still parked; the release lands afterwards,
+        // on the create's own schedule, and the retained owner has to outlast it.
+        let release = work.join("release");
+        let releasing = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            std::fs::write(&release, b"").expect("release the gated create");
+        });
         drop(establishing);
+        releasing.join().expect("the releasing thread");
 
         // The owner runs past this scope, so the removal is awaited here rather than assumed.
         let events = work.join("events.log");
