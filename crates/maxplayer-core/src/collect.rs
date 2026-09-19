@@ -749,6 +749,8 @@ mod tests {
         relay.run().await.expect("relay run");
         let relay_url = relay.url().await.to_string();
         home.config.relay_url = relay_url.clone();
+        // Isolate the existing payment-signature refusal from reviewer availability.
+        home.config.review.buyer_delivery = false;
 
         let buyer =
             Keys::parse(&home::read_secret_key_hex(&home).expect("buyer secret")).expect("buyer keys");

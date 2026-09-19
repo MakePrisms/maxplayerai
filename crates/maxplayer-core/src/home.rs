@@ -1624,6 +1624,9 @@ pub fn default_hop_fee_buffer_multiplier() -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MaxplayerConfig {
+    /// Optional execution-safety review; enabled unless explicitly skipped.
+    #[serde(default)]
+    pub review: crate::review::ReviewConfig,
     /// Open-market relay. Absent in the file ⇒ the built-in [`DEFAULT_RELAY_URL`].
     #[serde(default = "default_relay_url")]
     pub relay_url: String,
@@ -1827,6 +1830,7 @@ impl MaxplayerConfig {
 impl Default for MaxplayerConfig {
     fn default() -> Self {
         Self {
+            review: crate::review::ReviewConfig::default(),
             relay_url: DEFAULT_RELAY_URL.to_owned(),
             accepted_mints: default_accepted_mints(),
             per_job_budget_sats: DEFAULT_PER_JOB_BUDGET_SATS,
@@ -2091,9 +2095,11 @@ pub(crate) fn parse_config_toml(raw: &str) -> Result<MaxplayerConfig, HomeError>
     // LOAD-BEARING: Table -> try_into preserves dotted field-path attribution on value errors.
     // Do not replace it with toml::from_str::<MaxplayerConfig>: the document deserializer sets
     // span/raw context, suppressing the `in `<field>`` annotation the #381 test relies on.
-    table
+    let config: MaxplayerConfig = table
         .try_into()
-        .map_err(|error| HomeError::Config(format!("config.toml: {error}")))
+        .map_err(|error| HomeError::Config(format!("config.toml: {error}")))?;
+    config.review.validate().map_err(HomeError::Config)?;
+    Ok(config)
 }
 
 /// `MAXPLAYER_`-prefixed environment variables that are operational/test seams, **not**
@@ -2220,6 +2226,7 @@ fn reserved_namespace_hint(message: String, env_keys: &[String]) -> String {
 }
 
 fn write_config(path: &Path, config: &MaxplayerConfig) -> Result<(), HomeError> {
+    config.review.validate().map_err(HomeError::Config)?;
     let raw = toml::to_string_pretty(config)
         .map_err(|error| HomeError::Config(error.to_string()))?;
     // Crash-atomic rewrite: config.toml holds money-adjacent state (budget caps, accepted mints), so

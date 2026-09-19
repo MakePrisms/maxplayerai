@@ -40,6 +40,10 @@ pub const JOB_AWARD_KIND: u16 = 3405;
 pub const JOB_ACCEPT_KIND: u16 = 3406;
 /// Buyer-authored terminal rejection of a specific delivered commit.
 pub const JOB_REJECT_KIND: u16 = 3407;
+/// Reviewer-signed execution-safety classification.
+pub const REVIEW_KIND: u16 = 3408;
+/// Buyer/seller request for a review.
+pub const REVIEW_REQUEST_KIND: u16 = 3409;
 /// Addressable seller liveness heartbeat, `d="maxplayer-seller"`. Must stay in the NIP-01
 /// parameterized-replaceable range `30000`–`39999`, hence `30340` (not a `34xx` value).
 pub const SELLER_HEARTBEAT_KIND: u16 = 30340;

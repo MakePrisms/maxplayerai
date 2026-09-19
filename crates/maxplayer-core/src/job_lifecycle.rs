@@ -1309,6 +1309,16 @@ pub async fn accept_claim_async(
 
     let result = select_result(&view.results, &claim.seller_pubkey, request.result_id.as_deref())?;
 
+    // Do not impose a new condition on an already accepted payment obligation.
+    let review_subject = crate::review::Subject {
+        offer: request.job_id.clone(), event: result.result_id.clone(),
+        kind: crate::kinds::JOB_RESULT_KIND, commit: result.commit_oid.clone(),
+    };
+    let review_id = if load_accepted_bind(home, &request.job_id)?.is_none() {
+        crate::review::check_buyer(home, &keys, &review_subject, &claim.seller_pubkey)
+            .await.map_err(JobLifecycleError::Input)?
+    } else { None };
+
     // Finding W: hold a per-job advisory lock across the single-settlement check→durable-bind-write
     // so two concurrent accepts for DIFFERENT results of one job cannot both observe "no bind" and
     // both write (the unlocked TOCTOU that would let two distinct AttemptIds each become payable).
@@ -1316,6 +1326,10 @@ pub async fn accept_claim_async(
     // THIS job releases. Held until the function returns (past the pending + finalized bind writes),
     // so the loser re-reads the winner's bind and refuses at `assert_single_settlement`.
     let _job_lock = acquire_job_lock(home, &request.job_id)?;
+    if let Some(id) = review_id {
+        crate::review::record_pass(home, &review_subject, &id).map_err(JobLifecycleError::Input)?;
+    }
+
 
     // Issue #93: refuse a missing/empty seller co-signature BEFORE any durable bind write so an
     // incomplete result never occupies the single-settlement slot. A later result (or re-publish)
