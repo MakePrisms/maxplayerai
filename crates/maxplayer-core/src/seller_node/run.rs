@@ -2383,6 +2383,10 @@ fn offer_row(job_id: &str, buyer_pubkey: &str, offer: &ParsedOffer) -> super::st
         // job eventually writes must state the mode the OFFER was posted under, and execution can
         // be a restart away from here.
         payment_mode: offer.payment_mode,
+        // Journaled for the same reason as the mode above: the delivering job reads it, and
+        // execution can be a restart away from here. Dropped, a resumed job would fall back to
+        // git-only and refuse an answer the buyer said it could read.
+        accepts_delivery: offer.accepts_delivery.clone(),
     }
 }
 
@@ -5145,6 +5149,7 @@ impl SellerNodeRunner {
                 task: row.task.clone(),
                 output: String::new(),
                 payment_mode: row.payment_mode,
+                accepts_delivery: row.accepts_delivery.clone(),
                 amount: row.amount_sats,
                 unit: row.unit.clone(),
                 deadline_unix: row.deadline_unix as u64,
@@ -7902,6 +7907,11 @@ impl SellerNodeRunner {
                         from_scratch: true,
                         ..
                     } = &failure
+                        // The same capability gate as the host arm; see there.
+                        && offer
+                            .accepts_delivery
+                            .iter()
+                            .any(|mode| mode == gateway::DELIVERY_MODE_INLINE)
                         && let Some(answer) = crate::engine::marked_inline_answer(message)
                     {
                         if let Some(quoted) = quoted_agent_message(Some(message)) {
@@ -8131,6 +8141,15 @@ impl SellerNodeRunner {
                         // A contribution descends from a pinned base, so it can never settle
                         // inline. `base_oid` is what marks one.
                         && base_oid.is_none()
+                        // The buyer must have said it can READ one. Absent ⇒ git only (§6.1), so
+                        // this arm can never send an answer to a buyer that would not recognise
+                        // it as a delivery at all — which is a job that dies at the deadline with
+                        // the work done and nothing published to say so. Fail-closed by
+                        // construction: an offer from an older buyer carries no tag.
+                        && offer
+                            .accepts_delivery
+                            .iter()
+                            .any(|mode| mode == gateway::DELIVERY_MODE_INLINE)
                         && let Some(answer) = report
                             .last_agent_message
                             .as_deref()
@@ -9316,6 +9335,7 @@ impl SellerNodeRunner {
             // but the mode is carried from the stored row rather than assumed, so a free job that
             // somehow reached here is judged as free, not as paid.
             payment_mode: offer.payment_mode,
+            accepts_delivery: offer.accepts_delivery.clone(),
             amount: offer.amount_sats,
             unit: offer.unit.clone(),
             deadline_unix: offer.deadline_unix.max(0) as u64,
@@ -10342,6 +10362,7 @@ mod tests {
 
     fn offer(amount: u64, targeted_to: Option<&str>, deadline_unix: u64) -> ParsedOffer {
         ParsedOffer {
+            accepts_delivery: Vec::new(),
             payment_mode: crate::gateway::PaymentMode::Sat,
             task: "do the thing".to_owned(),
             output: String::new(),
@@ -11404,6 +11425,7 @@ mod tests {
 
     fn free_offer(targeted_to: Option<&str>) -> ParsedOffer {
         ParsedOffer {
+            accepts_delivery: Vec::new(),
             payment_mode: crate::gateway::PaymentMode::None,
             ..offer(0, targeted_to, NOW + 600)
         }
@@ -11905,6 +11927,7 @@ mod tests {
             store
                 .record_offer(
                     &Offer {
+                        accepts_delivery: Vec::new(),
                         payment_mode: crate::gateway::PaymentMode::Sat,
                         offer_id: job.clone(),
                         buyer_pubkey: buyer.clone(),
@@ -14155,6 +14178,7 @@ mod tests {
         store
             .record_offer(
                 &crate::seller_node::store::Offer {
+                    accepts_delivery: Vec::new(),
                     payment_mode: crate::gateway::PaymentMode::Sat,
                     offer_id: job_id.to_owned(),
                     buyer_pubkey: buyer_hex.to_owned(),
@@ -15172,6 +15196,7 @@ mod tests {
         store
             .record_offer(
                 &Offer {
+                    accepts_delivery: Vec::new(),
                     payment_mode: crate::gateway::PaymentMode::Sat,
                     offer_id: job.to_owned(),
                     buyer_pubkey: buyer.to_owned(),
@@ -15210,6 +15235,7 @@ mod tests {
         store
             .record_offer(
                 &Offer {
+                    accepts_delivery: Vec::new(),
                     payment_mode: crate::gateway::PaymentMode::Sat,
                     offer_id: job.to_owned(),
                     buyer_pubkey: buyer.to_owned(),
@@ -15327,6 +15353,7 @@ mod tests {
                 store
                     .record_offer(
                         &Offer {
+                            accepts_delivery: Vec::new(),
                             payment_mode: crate::gateway::PaymentMode::Sat,
                             offer_id: job.to_owned(),
                             buyer_pubkey: buyer.clone(),

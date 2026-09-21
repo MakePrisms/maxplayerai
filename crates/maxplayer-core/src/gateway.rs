@@ -183,6 +183,15 @@ impl EventDraft {
     }
 }
 
+/// Param name for the buyer's accepted delivery modes, emitted as
+/// `["param", "accepts-delivery", <mode>, …]` on the OFFER.
+///
+/// ABSENT MEANS GIT-ONLY. A buyer that never heard of inline delivery emits no tag, so a seller
+/// reading the offer cannot conclude it may answer inline, and every offer posted before this
+/// existed stays byte-identical. The declaration is therefore fail-closed by construction: a seller
+/// sends inline only where the buyer said, on the signed offer, that it can read one.
+pub const ACCEPTS_DELIVERY_PARAM: &str = "accepts-delivery";
+
 /// Wire label for git delivery — a tree pushed to a remote, named by repo/branch/commit.
 pub const DELIVERY_MODE_GIT: &str = "git";
 
@@ -213,6 +222,9 @@ pub struct OfferDraft {
     /// How this job settles (§1.1). [`PaymentMode::Sat`] — the default — emits NO tag at all, so a
     /// priced offer stays byte-identical to one built before the free lane existed.
     pub payment_mode: PaymentMode,
+    /// Delivery modes this buyer can READ, as `["param", "accepts-delivery", …]`. Empty ⇒ no tag,
+    /// which every reader must treat as git-only — see [`ACCEPTS_DELIVERY_PARAM`].
+    pub accepts_delivery: Vec<String>,
 }
 
 impl OfferDraft {
@@ -234,6 +246,7 @@ impl OfferDraft {
             requested_model: None,
             required_capabilities: Vec::new(),
             payment_mode: PaymentMode::Sat,
+            accepts_delivery: Vec::new(),
         }
     }
 
@@ -254,6 +267,7 @@ impl OfferDraft {
             requested_model: None,
             required_capabilities: Vec::new(),
             payment_mode: PaymentMode::Sat,
+            accepts_delivery: Vec::new(),
         }
     }
 
@@ -321,6 +335,25 @@ impl OfferDraft {
         self
     }
 
+    /// Declare the delivery modes this buyer can read. Values are trimmed and de-duplicated;
+    /// an empty result emits no tag, which every reader treats as git-only.
+    pub fn accepting_delivery<I, V>(mut self, modes: I) -> Self
+    where
+        I: IntoIterator<Item = V>,
+        V: AsRef<str>,
+    {
+        let mut kept: Vec<String> = Vec::new();
+        for mode in modes {
+            let stated = mode.as_ref().trim();
+            if stated.is_empty() || kept.iter().any(|seen| seen == stated) {
+                continue;
+            }
+            kept.push(stated.to_owned());
+        }
+        self.accepts_delivery = kept;
+        self
+    }
+
     pub fn to_event_draft(&self) -> EventDraft {
         // The offer does not name a mint — the seller authors the accepted mint(s) in its claim
         // `creq`, so there is no `["mint", …]` tag here.
@@ -358,6 +391,14 @@ impl OfferDraft {
         if !self.required_capabilities.is_empty() {
             let mut values = vec!["param".to_owned(), crate::heartbeat::CAPABILITY_PARAM.to_owned()];
             values.extend(self.required_capabilities.iter().cloned());
+            tags.push(TagSpec(values));
+        }
+        // The accepted-delivery declaration, emitted ONLY when the buyer names a mode, for the
+        // same reason as the two blocks above: an offer that declares nothing stays byte-identical
+        // to one posted before inline delivery existed, and a seller reading it sees git-only.
+        if !self.accepts_delivery.is_empty() {
+            let mut values = vec!["param".to_owned(), ACCEPTS_DELIVERY_PARAM.to_owned()];
+            values.extend(self.accepts_delivery.iter().cloned());
             tags.push(TagSpec(values));
         }
         // §1.1 — the payment-mode param, emitted ONLY for the free mode. `Sat` states itself by
@@ -399,11 +440,25 @@ pub struct ParsedOffer {
     /// direction and the reason there is no version bump.
     #[serde(default)]
     pub payment_mode: PaymentMode,
+    /// Delivery modes this buyer declared it can READ, from
+    /// `["param","accepts-delivery", …]`. Empty ⇒ git only — see [`ACCEPTS_DELIVERY_PARAM`].
+    /// `serde(default)` so an offer stored before this existed loads as git-only, which is the
+    /// fail-closed direction and the reason there is no version bump.
+    #[serde(default)]
+    pub accepts_delivery: Vec<String>,
 }
 
 impl ParsedOffer {
     pub fn is_targeted(&self) -> bool {
         self.seller_pubkey.is_some()
+    }
+
+    /// True when this buyer said it can read an inline answer. A seller MUST gate on this before
+    /// it delivers one: a buyer that never declared the mode cannot verify or materialize it.
+    pub fn accepts_inline_delivery(&self) -> bool {
+        self.accepts_delivery
+            .iter()
+            .any(|mode| mode == DELIVERY_MODE_INLINE)
     }
 
     pub fn seller_matches(&self, seller_pubkey: &str) -> bool {
@@ -604,6 +659,7 @@ pub fn parse_offer(event: &EventDraft) -> Result<ParsedOffer, OfferParseError> {
             crate::heartbeat::HARNESS_MODEL_PARAM,
         )),
         required_capabilities: param_values(&event.tags, crate::heartbeat::CAPABILITY_PARAM),
+        accepts_delivery: param_values(&event.tags, ACCEPTS_DELIVERY_PARAM),
         // §1.1. Absent ⇒ `Sat`, so every offer already on the wire keeps parsing as PAID. The
         // `amount` tag above is deliberately untouched: a free offer still carries
         // `["amount","0","sat"]`, and `payment=none` is what makes that `0` mean "no payment leg
@@ -963,6 +1019,19 @@ pub fn git_result_draft(
         }),
         exec_metadata,
     )
+}
+
+/// True when the OFFER declares that this buyer can read `mode` deliveries.
+///
+/// FAIL-CLOSED: an offer with no `["param","accepts-delivery",…]` tag accepts git only, so this
+/// returns `false` for every other mode. A seller MUST gate an inline delivery on this.
+pub fn offer_accepts_delivery_mode(tags: &[TagSpec], mode: &str) -> bool {
+    if mode == DELIVERY_MODE_GIT {
+        return true;
+    }
+    param_values(tags, ACCEPTS_DELIVERY_PARAM)
+        .iter()
+        .any(|declared| declared == mode)
 }
 
 /// Kind-result draft for an INLINE delivery: the answer travels in the event's own content and
@@ -1669,6 +1738,7 @@ mod tests {
             parse_offer(&draft).expect("parse offer"),
             ParsedOffer {
                 payment_mode: crate::gateway::PaymentMode::Sat,
+                accepts_delivery: Vec::new(),
                 task: "summarize".into(),
                 output: "application/json".into(),
                 amount: 3,
@@ -2357,6 +2427,49 @@ mod inline_delivery_tests {
     use super::*;
 
     // ── Inline delivery (answer jobs) ──────────────────────────────────────────────────────────
+
+    fn inline_offer() -> OfferDraft {
+        OfferDraft::untargeted("list the dotnet CLIs on your PATH", "text/plain", 2, 1_800_000_000)
+            .accepting_delivery([DELIVERY_MODE_INLINE])
+    }
+
+    /// The declaration is OPT-IN on the wire: an offer that names no mode emits no tag at all, so
+    /// an offer posted before inline delivery existed stays byte-identical to one posted now.
+    #[test]
+    fn an_offer_that_declares_nothing_emits_no_accepts_delivery_tag_and_reads_as_git_only() {
+        let draft = OfferDraft::untargeted("task", "text/plain", 2, 1_800_000_000).to_event_draft();
+        assert!(
+            !draft
+                .tags
+                .iter()
+                .any(|tag| tag.0.get(1).map(String::as_str) == Some(ACCEPTS_DELIVERY_PARAM)),
+            "an undeclared offer must carry no accepts-delivery tag: {:?}",
+            draft.tags
+        );
+        let parsed = parse_offer(&draft).expect("parses");
+        assert!(parsed.accepts_delivery.is_empty());
+        assert!(
+            !parsed.accepts_inline_delivery(),
+            "absent MUST read as git-only — this is the fail-closed direction"
+        );
+        assert!(
+            !offer_accepts_delivery_mode(&draft.tags, DELIVERY_MODE_INLINE),
+            "a seller reading an undeclared offer must not conclude it may answer inline"
+        );
+        assert!(
+            offer_accepts_delivery_mode(&draft.tags, DELIVERY_MODE_GIT),
+            "git needs no declaration — it is the mode every buyer can already read"
+        );
+    }
+
+    #[test]
+    fn a_declaring_offer_round_trips_the_mode_through_parse() {
+        let draft = inline_offer().to_event_draft();
+        let parsed = parse_offer(&draft).expect("parses");
+        assert_eq!(parsed.accepts_delivery, vec![DELIVERY_MODE_INLINE.to_owned()]);
+        assert!(parsed.accepts_inline_delivery());
+        assert!(offer_accepts_delivery_mode(&draft.tags, DELIVERY_MODE_INLINE));
+    }
 
     /// §6.4: `repo`/`branch`/`commit` are required only alongside `["delivery","git"]`, so an
     /// inline result carries none of them and is still a valid v1 result.

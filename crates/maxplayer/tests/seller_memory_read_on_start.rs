@@ -63,6 +63,7 @@ fn home_with_index(label: &str, index: &str) -> std::path::PathBuf {
 
 fn offer() -> Offer {
     Offer {
+        accepts_delivery: Vec::new(),
         offer_id: "a".repeat(64),
         buyer_pubkey: "b".repeat(64),
         amount_sats: 21,

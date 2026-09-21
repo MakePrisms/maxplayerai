@@ -454,12 +454,28 @@ reject a lifecycle event that lacks it.
 | `["param","harness_model", model]` | 0..1 | no | Requires one model; needs `agent` |
 | `["param","capability", token, ...]` | 0..1 | no | Requires every listed capability token |
 | `["param","payment","none"]` | 0..1 | no | This job has NO payment leg. Absent means `sat` |
+| `["param","accepts-delivery", mode, ...]` | 0..1 | no | Delivery modes this buyer can READ. Absent means `git` only |
 | `["delivery","git"]` | 0..1 | no | Delivery binding mode |
 | `["repo", locator]` | 0..1 | no | Bound delivery remote |
 | `["branch", name]` | 0..1 | no | Bound delivery branch |
 
 The `delivery`, `repo`, and `branch` tags bind delivery as one group. If the offer uses any of them,
 it MUST carry all three. A reader MUST reject a partial group.
+
+`["param","accepts-delivery", …]` states which delivery modes the buyer can READ. **Absent MUST be
+read as `git` only.** A buyer that never heard of another mode emits no tag, so an offer posted
+before this parameter existed is byte-identical to one that declares nothing, and a seller reading
+either cannot conclude it may deliver anything but git. A seller MUST NOT deliver a non-git mode
+that the offer did not declare.
+
+It is a CAPABILITY filter and nothing more. It says what this buyer could verify and materialize if
+it were sent one. Whether a given job's reply actually IS the deliverable is decided on the seller,
+by the work and the §8.3 marker. Both gates must pass.
+
+Without this parameter the mode would be the seller's decision alone, and a seller has no other
+signal for what the buyer can read. An inline result sent to a buyer that cannot read one is worse
+than a refusal: that buyer counts nothing as delivered, publishes no complaint, and lets the job
+expire while the answer sits published and unpaid.
 
 #### 6.1.1 The payment mode
 
@@ -628,6 +644,7 @@ ignored files among them — are not in that tree and are not delivered.
 
 A seller MAY deliver inline only when ALL of these hold:
 
+- the offer declared `inline` in `["param","accepts-delivery", …]` (§6.1);
 - the job is from-scratch — a contribution descends from a pinned base, so it can never settle
   inline and MUST be refused;
 - the snapshot found nothing to deliver; and

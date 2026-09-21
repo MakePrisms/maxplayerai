@@ -94,6 +94,18 @@ pub struct PostJobRequest {
     /// [`crate::capability::CAPABILITIES`]; the posting path refuses the request otherwise, before
     /// any event is signed.
     pub required_capabilities: Vec<String>,
+    /// Delivery modes this buyer can READ, declared on the offer as
+    /// `["param","accepts-delivery", …]` (§6.1). Empty ⇒ no tag ⇒ git only, and the offer is
+    /// byte-identical to one posted before inline delivery existed.
+    ///
+    /// This is a CAPABILITY filter, not the mode decision. It says what this buyer could verify
+    /// and materialize if it were sent one; whether an answer IS the deliverable is decided by
+    /// the work and the §8.3 marker, on the seller. Both gates are required.
+    ///
+    /// The MCP surface defaults it to `inline`, because a buyer running this build genuinely can
+    /// read one. Declaring a mode this binary could not read is the only way to get it wrong,
+    /// which is why the default is set at the surface that knows what the binary supports.
+    pub accepts_delivery: Vec<String>,
     /// How this job settles (§1.1). [`PaymentMode::Sat`] — the default — is a priced job and every
     /// money gate runs as it always did.
     ///
@@ -772,7 +784,8 @@ fn build_offer_draft(
         request.requested_harness_family.as_deref(),
         request.requested_model.as_deref(),
         &request.required_capabilities,
-    );
+    )
+    .accepting_delivery(&request.accepts_delivery);
 
     // #897 — TWO GATES, on the NORMALIZED request rather than the raw one. Validating what was handed
     // in would refuse a padded `" rust "` for a defect the builder just fixed, and would pass a value
@@ -4862,6 +4875,7 @@ mod tests {
         let err = post_job(
             &home,
             PostJobRequest {
+                accepts_delivery: Vec::new(),
                 payment_mode: crate::gateway::PaymentMode::Sat,
                 task: "t".into(),
                 output: "text/plain".into(),
@@ -5054,6 +5068,7 @@ mod tests {
         let posted = post_job_async(
             &home,
             PostJobRequest {
+                accepts_delivery: Vec::new(),
                 payment_mode: crate::gateway::PaymentMode::Sat,
                 task: "wake on arrival".into(),
                 output: "text/plain".into(),
@@ -5148,6 +5163,7 @@ mod tests {
         let posted = post_job_async(
             &home,
             PostJobRequest {
+                accepts_delivery: Vec::new(),
                 payment_mode: crate::gateway::PaymentMode::Sat,
                 task: "test display-name opt-in".into(),
                 output: "text/plain".into(),
@@ -5211,6 +5227,7 @@ mod tests {
         let err = post_job(
             &home,
             PostJobRequest {
+                accepts_delivery: Vec::new(),
                 payment_mode: crate::gateway::PaymentMode::Sat,
                 task: "t".into(),
                 output: "text/plain".into(),
@@ -5653,6 +5670,7 @@ mod tests {
         accepts: Option<Vec<String>>,
     ) -> PostJobRequest {
         PostJobRequest {
+            accepts_delivery: Vec::new(),
             payment_mode: crate::gateway::PaymentMode::Sat,
             task: "t".into(),
             output: "text/plain".into(),
@@ -5727,6 +5745,7 @@ mod tests {
         capabilities: &[&str],
     ) -> PostJobRequest {
         PostJobRequest {
+            accepts_delivery: Vec::new(),
             payment_mode: crate::gateway::PaymentMode::Sat,
             task: "t".into(),
             output: "text/plain".into(),
@@ -5887,6 +5906,7 @@ mod tests {
     fn post_job_from_scratch_emits_byte_identical_tags() {
         // No contribution params ⇒ Ok(None) ⇒ built tags are byte-identical to the bare offer.
         let request = PostJobRequest {
+            accepts_delivery: Vec::new(),
             payment_mode: crate::gateway::PaymentMode::Sat,
             task: "t".into(),
             output: "text/plain".into(),
@@ -6095,6 +6115,7 @@ mod tests {
         let err = post_job_async(
             &home,
             PostJobRequest {
+                accepts_delivery: Vec::new(),
                 payment_mode: crate::gateway::PaymentMode::Sat,
                 task: "t".into(),
                 output: "text/plain".into(),
@@ -6553,6 +6574,7 @@ mod free_lane_tests {
 
     fn post_request(amount_sats: u64, payment_mode: PaymentMode) -> PostJobRequest {
         PostJobRequest {
+            accepts_delivery: Vec::new(),
             payment_mode,
             task: "t".into(),
             output: "text/plain".into(),
