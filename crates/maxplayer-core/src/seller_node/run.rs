@@ -3498,7 +3498,11 @@ fn flaky_harness_reason(attempts: usize, agent_message: Option<&str>) -> String 
 /// The CONTAINER path already caps the agent's message at this size when it writes its outcome
 /// ([`crate::delivery_orchestrator::OUTCOME_TEXT_MAX_BYTES`]), so the two delivery paths agree on
 /// what an answer may weigh, and a relay is never handed an unbounded event this seller minted.
-const INLINE_ANSWER_MAX_BYTES: usize = crate::delivery_orchestrator::OUTCOME_TEXT_MAX_BYTES;
+pub const INLINE_ANSWER_MAX_BYTES: usize = crate::delivery_orchestrator::OUTCOME_TEXT_MAX_BYTES
+    // The container bounds the WHOLE message, and the agent is told to prepend the marker line —
+    // so an answer sized to the raw cap makes the message exceed it and be cut. The limit stated
+    // to the agent, and enforced here, is the cap MINUS the line it was told to add.
+    - (crate::engine::INLINE_ANSWER_MARKER.len() + 1);
 
 /// The refusal reason for the UNRUNNABLE launcher/exec shape.
 ///
@@ -9098,9 +9102,34 @@ impl SellerNodeRunner {
                 self.drop_harness(harness, harness_fault_for(&error));
                 (ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK)
             }
-            Fail::NoSentinel { detail, .. } => {
-                opline!("seller node execute fail job_id={job_id}: delivery refused no_sentinel — {detail}");
-                self.drop_harness(harness, Some(ExecutionFailure::Harness(Fault::Unproven)));
+            Fail::NoSentinel {
+                detail,
+                last_agent_message,
+                ..
+            } => {
+                // A harness that produced a MARKED answer proved itself, whatever stopped that
+                // answer from being delivered. It is struck only when the turn proved nothing —
+                // which is what `no_sentinel` is for. Striking it for an answer that was merely
+                // too long, or for an outcome this host could not authenticate, takes a working
+                // seat out of the pool for a fault it did not have.
+                // THE MARKER, and only the marker. `message_truncated` must not stand in for it:
+                // a quota-dead harness whose vendor error string runs past the cap is truncated
+                // too, and treating that as an answer leaves a dead seat in the pool taking jobs.
+                // Truncation cannot hide the marker — it is the first line, and the cut is at the
+                // end — so the marker survives every message this arm can see.
+                let answered = last_agent_message
+                    .as_deref()
+                    .and_then(crate::engine::marked_inline_answer)
+                    .is_some();
+                if answered {
+                    opline!(
+                        "seller node execute fail job_id={job_id}: delivery refused no_sentinel — \
+                         {detail} (the agent answered, so the harness is not struck)"
+                    );
+                } else {
+                    opline!("seller node execute fail job_id={job_id}: delivery refused no_sentinel — {detail}");
+                    self.drop_harness(harness, Some(ExecutionFailure::Harness(Fault::Unproven)));
+                }
                 (ReasonCode::NoSentinel, NO_SENTINEL_FEEDBACK)
             }
             Fail::Snapshot(detail) => {

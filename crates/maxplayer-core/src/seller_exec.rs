@@ -2321,7 +2321,8 @@ pub fn compose_agent_prompt(
              then delivers that answer to the buyer as the deliverable. Without that first line, \
              only files on disk are delivered.",
             marker = crate::engine::INLINE_ANSWER_MARKER,
-            answer_limit = crate::delivery_orchestrator::OUTCOME_TEXT_MAX_BYTES,
+            // The cap the seller enforces, which already allows for the marker line above.
+            answer_limit = crate::seller_node::run::INLINE_ANSWER_MAX_BYTES,
         )
     } else {
         String::new()

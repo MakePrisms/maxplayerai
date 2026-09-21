@@ -432,7 +432,7 @@ pub fn run_phase1_entry_with(
     inputs_path: &Path,
     container_env: impl Fn(&str) -> Option<String>,
     run_agent: impl FnOnce(&Phase1Inputs, &Path) -> Result<AgentOutcome, OrchestratorError>,
-    reap: impl FnOnce() -> Result<(), OrchestratorError>,
+    reap: impl Fn() -> Result<(), OrchestratorError>,
 ) -> Result<Phase1Output, OrchestratorError> {
     assert_delivery_container(container_env)?;
     let inputs = read_json::<Phase1Inputs>(inputs_path)?;
@@ -442,12 +442,29 @@ pub fn run_phase1_entry_with(
 
     let started = std::time::Instant::now();
     let mut agent: Option<AgentOutcome> = None;
-    let result = deliver_in_container(&inputs, &mut agent, run_agent, reap);
+    let result = deliver_in_container(&inputs, &mut agent, run_agent, &reap);
+    // REAP ON EVERY EXIT, not only the delivered one, and BEFORE anything is written.
+    //
+    // The delivered path reaps inside `deliver_in_container`; every refusal path used to return
+    // without reaping, and that did not matter while no refusal could be paid. §6.4 changed it:
+    // an empty-tree refusal now carries the text an inline delivery is minted from. Written while
+    // survivors are alive, that file is shared with processes running as this uid which can read
+    // it and write it back — so a nonce placed there authenticates nothing at all. The survivor
+    // reads the nonce out of the file and re-uses it verbatim.
+    //
+    // The reap is therefore what makes the nonce mean anything, and the nonce is stamped ONLY
+    // when the reap proved this process is the sole writer. A host that finds no nonce refuses to
+    // mint a delivery from the file, which is the fail-closed direction.
+    // Reap only. The delivered path also CLEARS the mount, before it writes its own marker;
+    // clearing again here would delete that marker, which is the file the host authenticates a
+    // delivery with — and a refused push leaves a legitimate marker too. Clearing is not what the
+    // nonce needs anyway: `write_outcome` replaces the outcome file, so a planted one is
+    // overwritten. What the nonce needs is that nothing is alive to read it back out.
+    let sole_writer = reap().is_ok();
     let mut outcome = Phase1Outcome::from_result(&result, agent, started.elapsed());
-    // Stamped HERE and nowhere else: this is the only scope that still holds the nonce, and the
-    // inputs file carrying it was deleted before the agent existed. The host checks it before it
-    // will mint a delivery from anything in this file.
-    outcome.handoff_nonce = Some(inputs.handoff_nonce.clone());
+    if sole_writer {
+        outcome.handoff_nonce = Some(inputs.handoff_nonce.clone());
+    }
     if let Err(error) = write_outcome(&inputs.out_dir, &outcome) {
         eprintln!("sandbox orchestrator: could not write the outcome file: {error}");
     }
@@ -480,7 +497,7 @@ fn deliver_in_container(
     inputs: &Phase1Inputs,
     agent: &mut Option<AgentOutcome>,
     run_agent: impl FnOnce(&Phase1Inputs, &Path) -> Result<AgentOutcome, OrchestratorError>,
-    reap: impl FnOnce() -> Result<(), OrchestratorError>,
+    reap: impl Fn() -> Result<(), OrchestratorError>,
 ) -> Result<Phase1Output, OrchestratorError> {
     let identity = DeliveryAgentIdentity::for_seller(&inputs.seller_pubkey_hex);
     let base = inputs.base.as_ref().map(|b| Phase1Base {

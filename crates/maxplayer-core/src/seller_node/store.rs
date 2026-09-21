@@ -707,21 +707,27 @@ fn accepts_delivery_to_column(modes: &[String]) -> Option<String> {
     serde_json::to_string(modes).ok()
 }
 
-/// Read the `offers.accepts_delivery` column. NULL, empty, or unreadable ⇒ empty ⇒ git only.
+/// Read the `offers.accepts_delivery` column. Anything that is not JSON ⇒ empty ⇒ git only.
 ///
-/// A row written by an earlier binary holds the space-joined form. It is read back with a split,
-/// which is exact for every mode name this protocol has ever defined (none contains a space) and
-/// fail-closed for anything else: the worst a legacy row can do is name modes that no reader
-/// recognises. New rows are JSON and round-trip exactly.
+/// ⛔ A NON-JSON ROW IS DISCARDED, not split. The space-joined form an earlier binary wrote cannot
+/// be decoded without guessing: the one stored value `"git inline"` is either the two modes
+/// `["git", "inline"]` or the single unrecognised mode `["git inline"]`, and those differ by
+/// exactly the capability at stake. Splitting picks the generous reading, which lets a crafted
+/// offer buy itself an inline declaration by surviving an upgrade.
+///
+/// Discarding costs nothing real: inline delivery has never shipped, so no row written by an
+/// earlier binary can hold a legitimate `inline` declaration, and a row read as empty is read as
+/// git-only — which is what every one of those rows meant. New rows are JSON and round-trip
+/// exactly.
 fn accepts_delivery_from_column(raw: Option<String>) -> Vec<String> {
     let Some(raw) = raw else {
         return Vec::new();
     };
     let trimmed = raw.trim();
-    if trimmed.starts_with('[') {
-        return serde_json::from_str::<Vec<String>>(trimmed).unwrap_or_default();
+    if !trimmed.starts_with('[') {
+        return Vec::new();
     }
-    trimmed.split_whitespace().map(str::to_owned).collect()
+    serde_json::from_str::<Vec<String>>(trimmed).unwrap_or_default()
 }
 
 /// #591: the target + base a SERVED contribution job clones into its delivery workdir. The buyer's
@@ -3199,6 +3205,39 @@ mod tests {
 
     fn result() -> EventDraft {
         wire_draft(crate::gateway::JOB_RESULT_KIND)
+    }
+
+    /// ⛔ A LEGACY ROW MUST NOT GAIN A CAPABILITY ACROSS AN UPGRADE. The space-joined form an
+    /// earlier binary wrote is ambiguous exactly where it matters: `"git inline"` is either two
+    /// modes or one unrecognised one, and splitting picks the reading that grants inline. Inline
+    /// delivery never shipped, so no such row can hold a legitimate declaration — discarding is
+    /// both safe and correct.
+    ///
+    /// Bite (measured): restore the whitespace split and this goes red.
+    #[test]
+    fn a_legacy_space_joined_row_reads_as_git_only() {
+        let (store, path) = fresh_store("accepts-delivery-legacy");
+        let offer = sample_offer("job-legacy-row");
+        store.record_offer(&offer, 1).expect("record offer");
+        // Write the pre-upgrade encoding straight into the column.
+        let conn = Connection::open(&path).expect("reopen");
+        conn.execute(
+            "UPDATE offers SET accepts_delivery = ?1 WHERE offer_id = ?2",
+            rusqlite::params!["git inline", offer.offer_id],
+        )
+        .expect("plant the legacy row");
+        drop(conn);
+
+        let back = store
+            .offer_row(&offer.offer_id)
+            .expect("read")
+            .expect("present");
+        assert!(
+            back.accepts_delivery.is_empty(),
+            "a row an earlier binary wrote must read as git-only, never as an inline declaration: \
+             {:?}",
+            back.accepts_delivery
+        );
     }
 
     /// ⛔ THE ENCODING MUST NOT INVENT A CAPABILITY. A single declared mode `"git inline"` is ONE
