@@ -603,10 +603,10 @@ its own signed offer stated (the both-ends rule, §6.1.1).
 | `["sig","seller", sig]` | 1 | yes | Seller pre-pay signature |
 | `["t","maxplayer"]` | 1 | yes | Namespace |
 | `["v","1"]` | 1 | yes | Protocol major |
-| `["delivery","git"]` | 0..1 | no | Delivery mode |
-| `["repo", locator]` | 0..1 | no | Delivery remote |
-| `["branch", name]` | 0..1 | no | Delivery branch |
-| `["commit", oid]` | 0..1 | no | Delivered git object |
+| `["delivery", mode]` | 0..1 | no | Delivery mode: `git` or `inline` |
+| `["repo", locator]` | 0..1 | no | Delivery remote; `git` only |
+| `["branch", name]` | 0..1 | no | Delivery branch; `git` only |
+| `["commit", oid]` | 0..1 | no | Delivered git object; `git` only |
 | `["harness", id]` | 0..1 | no | Harness the seller says it ran |
 | `["model", name]` | 0..1 | no | Model the seller says it used |
 | `["wall_time", n, "ms"]` | 0..1 | no | Wall time the seller reports |
@@ -623,9 +623,17 @@ the two shapes are exclusive, so a reader steered to verify one can never materi
 reader MUST refuse an inline result whose `content` is empty.
 
 The delivery mode is decided by the WORK, not by a declaration on the offer. A seller MUST deliver
-git whenever the job wrote files. It MAY deliver inline only when the job wrote no files and the
-agent produced a reply. An empty tree and an empty reply together are not a delivery at all, and
-the seller MUST refuse (§7.1).
+git whenever the snapshot of the job's working tree is non-empty. Files the tree does not track —
+ignored files among them — are not in that tree and are not delivered.
+
+A seller MAY deliver inline only when BOTH hold:
+
+- the snapshot found nothing to deliver, and
+- the agent marked an answer in its final message.
+
+The marker is the inline counterpart of §8.2, and §8.3 states it. Without it the seller MUST refuse
+with `no_sentinel` (§7.1). An empty tree with unmarked text is the shape of an exhausted plan, an
+unreachable model host and a declined task alike, and none of those is a deliverable.
 
 The execution metadata block is what the seller reports about its own run. Nothing verifies it. A
 reader MUST NOT treat it as proof that a given harness or model ran.
@@ -813,6 +821,28 @@ A sentinel proves that execution happened in this workdir. It proves nothing abo
 work, and it never stands in for acceptance.
 
 A delivery that carries no sentinel MUST be refused with `no_sentinel`.
+
+### 8.3 The inline answer marker
+
+An inline delivery (§6.4) has no tree, so §8.2 cannot speak for it. This section is what does.
+
+A seller MUST NOT deliver inline unless the agent's final message begins with a line carrying
+exactly `MAXPLAYER-ANSWER-V1` and nothing else. The answer is the remainder of that message,
+trimmed. An empty remainder is not an answer.
+
+The marker answers the question §8.2 answers for a tree: **did this job's work actually happen?**
+A completed turn does not answer it. An exhausted plan, an unreachable model host and an idle model
+all end a turn normally, leave the tree empty, and explain themselves in ordinary assistant text. A
+seller that read any such text as an answer would publish a vendor error string as a deliverable and
+ask to be paid for it.
+
+The marker is an opt-in for SUCCESS and carries no failure value. Every unmarked outcome — an error
+string, a declined task, a clarifying question, silence — takes the refusal path unchanged. The
+marker can turn a reply that would have been discarded into a delivery; it MUST NOT be able to turn
+a non-delivery into a payment.
+
+A reader MUST NOT treat the marker as proof of correctness. It proves that this job's prompt reached
+a model that answered it, which is what §8.2 proves for a tree, and no more.
 
 ## 9. Verification Checks
 

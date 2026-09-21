@@ -232,6 +232,43 @@ fn content_block_text(block: &ContentBlock) -> Option<String> {
     }
 }
 
+/// The line an agent MUST put first in its final message to deliver an ANSWER inline.
+///
+/// An answer job has no tree, so it has no execution sentinel (§8.2) and nothing else in the turn
+/// separates "here is your answer" from "my plan is exhausted". Both are a completed turn, an empty
+/// workdir, and some text. The marker is what the agent OPTS IN with, and it is the whole gate: a
+/// reply without it is never delivered and never paid.
+///
+/// It is deliberately an opt-in for success, not a status code with a failure value. A failure
+/// value would be a refusal instruction in the prompt, which #685 withholds on purpose — a
+/// self-declared refusal that the money seam does not yet handle is a refusal that gets PAID. Under
+/// an opt-in, every unmarked outcome (a vendor error string, a refusal, a clarifying question, an
+/// idle model) takes the existing refusal path unchanged. The failure direction stays the safe one.
+pub const INLINE_ANSWER_MARKER: &str = "MAXPLAYER-ANSWER-V1";
+
+/// The answer an agent marked for inline delivery, or `None` when it marked none.
+///
+/// The marker must be the FIRST non-blank line, alone on that line. First, because a marker the
+/// agent could bury anywhere is one a quoted task description or a pasted log can forge by
+/// accident. Alone, because a line that carries the marker AND prose is ambiguous about where the
+/// answer starts, and the digest the buyer re-derives is over exactly these bytes.
+///
+/// The answer is everything after that line, trimmed. An empty remainder is `None`: a marker with
+/// nothing behind it is not an answer, and §6.4 refuses an empty inline delivery anyway.
+pub fn marked_inline_answer(message: &str) -> Option<&str> {
+    let text = message.trim_start();
+    let rest = text.strip_prefix(INLINE_ANSWER_MARKER)?;
+    // The marker must END the line — `MAXPLAYER-ANSWER-V1-DRAFT` is not this marker.
+    let rest = match rest.find('\n') {
+        Some(newline) if rest[..newline].trim().is_empty() => &rest[newline + 1..],
+        // No newline at all: the message is the bare marker, so there is no answer behind it.
+        None if rest.trim().is_empty() => return None,
+        _ => return None,
+    };
+    let answer = rest.trim();
+    (!answer.is_empty()).then_some(answer)
+}
+
 /// The agent's own account of a turn, accumulated from the sink [`run_job`] already calls for every
 /// update.
 ///
@@ -245,19 +282,53 @@ fn content_block_text(block: &ContentBlock) -> Option<String> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AgentMessageCapture {
     last: Option<String>,
+    /// Chunks of the message currently being streamed, not yet closed by a boundary.
+    pending: String,
 }
 
 impl AgentMessageCapture {
-    /// Retains `event`'s text when it carries any, so the LAST message the agent sent wins.
+    /// Retains the agent's last complete MESSAGE, so the last one it sent wins.
+    ///
+    /// A message arrives one of two ways. `AgentMessage` carries a whole one. `AgentMessageChunk`
+    /// carries a FRAGMENT, and a harness is free to split one message across as many as it likes —
+    /// measured in this repo, a Claude harness sent `login=pmilic021` as `login` then `=pmilic021`.
+    /// So a chunk is accumulated, never retained on its own: retaining it would make the captured
+    /// "message" the last fragment, which is a different string from what the agent said.
+    ///
+    /// Any other update closes the run of chunks. An agent streams its text, then calls a tool; the
+    /// text after that call is a new message, not a continuation. `TurnEnded` closes the last one.
     ///
     /// Whitespace-only text is not an account of anything and must not displace a real message;
-    /// agents routinely close a turn with a bare newline chunk.
+    /// agents routinely close a turn with a bare newline chunk. That test is applied to the
+    /// assembled message, NOT to each chunk — a blank chunk inside a message is part of it.
     pub(crate) fn observe(&mut self, event: RunEvent<'_>) {
-        if let RunEvent::Update(update) = event
-            && let Some(text) = update_text(update)
-            && !text.trim().is_empty()
-        {
-            self.last = Some(text);
+        let RunEvent::Update(update) = event else {
+            return;
+        };
+        match update {
+            SessionUpdate::AgentMessageChunk(block) => {
+                if let Some(text) = content_block_text(block) {
+                    self.pending.push_str(&text);
+                }
+            }
+            SessionUpdate::AgentMessage(_) => {
+                // A whole message of its own: close whatever was streaming, then take this one.
+                self.close_pending();
+                if let Some(text) = update_text(update)
+                    && !text.trim().is_empty()
+                {
+                    self.last = Some(text);
+                }
+            }
+            _ => self.close_pending(),
+        }
+    }
+
+    /// Promote the accumulated chunks to the last message, if they amount to one.
+    fn close_pending(&mut self) {
+        let assembled = std::mem::take(&mut self.pending);
+        if !assembled.trim().is_empty() {
+            self.last = Some(assembled);
         }
     }
 
@@ -265,7 +336,10 @@ impl AgentMessageCapture {
     ///
     /// `None` is a positive claim — the agent said nothing — and a caller must not render it as an
     /// unknown, because a capture that silently failed to fill would be indistinguishable from it.
-    pub(crate) fn into_last_message(self) -> Option<String> {
+    pub(crate) fn into_last_message(mut self) -> Option<String> {
+        // A turn can end without a terminal update reaching us (a dropped stream, a harness that
+        // never sends `TurnEnded`), so the last run of chunks is closed here too.
+        self.close_pending();
         self.last
     }
 }
@@ -282,7 +356,8 @@ mod tests {
         StopReason, UsageMetadata,
     };
     use crate::engine::{
-        AgentMessageCapture, EngineError, RunEvent, RunOutcome, RunParams, run_job,
+        AgentMessageCapture, EngineError, INLINE_ANSWER_MARKER, RunEvent, RunOutcome, RunParams,
+        marked_inline_answer, run_job,
     };
     use crate::event::{ArtifactId, Event, JobExecutionStatus, JobId, RuntimeId};
     use crate::log::EventLog;
@@ -593,6 +668,112 @@ mod tests {
     /// model" while its text said "blocked egress".
     const BLOCKED_HOST_MESSAGE: &str =
         "Error: RetriableError: [unavailable] getaddrinfo EAI_AGAIN agentn.global.api5.cursor.sh";
+
+    /// ⛔ A harness is free to split ONE message across many chunks, and they do: this repo
+    /// records a Claude harness sending `login=pmilic021` as `login` then `=pmilic021`
+    /// (`evidence/20260914T085619Z-github-proxy-swap`). A capture that retained the last CHUNK
+    /// would report `=pmilic021` as the agent's message — and under inline delivery (§6.4) that
+    /// fragment is what the buyer pays for, with both ends agreeing on the digest of the wrong
+    /// bytes. The assembled message is the only correct answer.
+    #[test]
+    fn streamed_chunks_assemble_into_one_message() {
+        let chunk =
+            |text: &str| SessionUpdate::AgentMessageChunk(ContentBlock::Text { text: text.into() });
+        let mut capture = AgentMessageCapture::default();
+        for update in [&chunk("login"), &chunk("=pmilic021")] {
+            capture.observe(RunEvent::Update(update));
+        }
+        capture.observe(RunEvent::Update(&SessionUpdate::TurnEnded(
+            StopReason::Completed,
+        )));
+        assert_eq!(
+            capture.into_last_message().as_deref(),
+            Some("login=pmilic021"),
+            "chunks of one message must assemble, not overwrite each other"
+        );
+    }
+
+    /// A blank chunk INSIDE a message is part of it — the whitespace test belongs to the assembled
+    /// message, not to each fragment. Applied per chunk it would drop the space in `a b`.
+    #[test]
+    fn a_blank_chunk_inside_a_message_is_kept() {
+        let chunk =
+            |text: &str| SessionUpdate::AgentMessageChunk(ContentBlock::Text { text: text.into() });
+        let mut capture = AgentMessageCapture::default();
+        for update in [&chunk("a"), &chunk(" "), &chunk("b")] {
+            capture.observe(RunEvent::Update(update));
+        }
+        assert_eq!(capture.into_last_message().as_deref(), Some("a b"));
+    }
+
+    /// A tool call ends the message that was streaming. Text after it is a NEW message, and the
+    /// last one wins — otherwise every turn would report one message glued together end to end.
+    #[test]
+    fn a_tool_call_closes_the_streaming_message() {
+        let chunk =
+            |text: &str| SessionUpdate::AgentMessageChunk(ContentBlock::Text { text: text.into() });
+        let tool = SessionUpdate::ToolCall {
+            id: "1".into(),
+            name: "bash".into(),
+            input: serde_json::Value::Null,
+        };
+        let mut capture = AgentMessageCapture::default();
+        for update in [&chunk("looking"), &tool, &chunk("done")] {
+            capture.observe(RunEvent::Update(update));
+        }
+        assert_eq!(capture.into_last_message().as_deref(), Some("done"));
+    }
+
+    /// §6.4 — the marker is an OPT-IN, and everything unmarked stays out of inline delivery. The
+    /// vendor error string is the case that matters: it is what a quota-dead harness returns, and
+    /// reading it as an answer is paying for a broken seat.
+    #[test]
+    fn only_a_marked_message_yields_an_inline_answer() {
+        assert_eq!(
+            marked_inline_answer(&format!("{INLINE_ANSWER_MARKER}\nEurope/Zagreb")),
+            Some("Europe/Zagreb")
+        );
+        assert_eq!(
+            marked_inline_answer(&format!("  \n{INLINE_ANSWER_MARKER}\n\nEurope/Zagreb\n")),
+            Some("Europe/Zagreb"),
+            "leading blank lines and trailing whitespace are not part of the answer"
+        );
+        assert_eq!(
+            marked_inline_answer(BLOCKED_HOST_MESSAGE),
+            None,
+            "a vendor error string is not an answer"
+        );
+        assert_eq!(
+            marked_inline_answer("Upgrade your plan to continue"),
+            None,
+            "an exhausted-plan notice is not an answer"
+        );
+        assert_eq!(
+            marked_inline_answer("I cannot do this without network access"),
+            None,
+            "a refusal is not an answer — it takes the refusal path unchanged"
+        );
+        assert_eq!(
+            marked_inline_answer(INLINE_ANSWER_MARKER),
+            None,
+            "the bare marker delivers nothing"
+        );
+        assert_eq!(
+            marked_inline_answer(&format!("{INLINE_ANSWER_MARKER}\n   \n")),
+            None,
+            "a marker with only whitespace behind it delivers nothing"
+        );
+        assert_eq!(
+            marked_inline_answer(&format!("{INLINE_ANSWER_MARKER}-DRAFT\nx")),
+            None,
+            "the marker must be alone on its line, not a prefix of a longer token"
+        );
+        assert_eq!(
+            marked_inline_answer(&format!("here you go:\n{INLINE_ANSWER_MARKER}\nx")),
+            None,
+            "a marker buried below the first line is one a pasted log could forge"
+        );
+    }
 
     #[test]
     fn the_capture_keeps_the_agents_last_non_empty_message() {

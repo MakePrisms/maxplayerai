@@ -2972,8 +2972,19 @@ enum ContainerDeliveryFailure {
     Setup(String),
     /// The agent run failed inside the container; the `ExecError` shape drives `harness_fault_for`.
     Agent(ExecError),
-    /// The gate saw no execution. `no_sentinel`, harness unproven.
-    NoSentinel(String),
+    /// The gate saw no execution. `no_sentinel`, harness unproven — UNLESS the agent marked an
+    /// answer, which is an answer job rather than a dead harness. The message is carried so the
+    /// caller can make that distinction; on the host path the same decision reads
+    /// `report.last_agent_message` directly.
+    NoSentinel {
+        detail: String,
+        last_agent_message: Option<String>,
+        /// Usage and elapsed time the container reported, carried for the same reason as the
+        /// message: an inline delivery off this arm publishes a metadata block, and a block built
+        /// from defaults would state a wall time of zero as if it were measured.
+        usage: Option<crate::driver::UsageMetadata>,
+        wall_time_ms: u64,
+    },
     /// The snapshot failed otherwise. `execution_failed`, harness unproven.
     Snapshot(String),
     /// Token refused or absent, push failed, oid unreadable, tamper evidence. `delivery_failed`.
@@ -3453,6 +3464,25 @@ fn flaky_harness_reason(attempts: usize, agent_message: Option<&str>) -> String 
              of them is ruled out by the turn completing)"
         ),
     }
+}
+
+/// Bound an inline answer to the size the CONTAINER path already bounds it to.
+///
+/// The container writes the agent's message through a 4 KiB cap
+/// ([`crate::delivery_orchestrator::OUTCOME_TEXT_MAX_BYTES`]) before the host ever sees it. The host driver has no such
+/// cap, so without this the same answer job would have two different size limits depending on the
+/// seat's delivery mode, and the host one would be "whatever the agent felt like" — published to a
+/// relay, stored in every buyer bind, and retried by the outbox for a day if the relay refuses it.
+fn inline_answer_within_bound(answer: &str) -> &str {
+    let max = crate::delivery_orchestrator::OUTCOME_TEXT_MAX_BYTES;
+    if answer.len() <= max {
+        return answer;
+    }
+    let mut end = max;
+    while end > 0 && !answer.is_char_boundary(end) {
+        end -= 1;
+    }
+    &answer[..end]
 }
 
 /// The refusal reason for the UNRUNNABLE launcher/exec shape.
@@ -7859,6 +7889,41 @@ impl SellerNodeRunner {
                     )
                 }
                 Err(failure) => {
+                    // ── Inline delivery (§6.4), container path ───────────────────────────────
+                    // The same two conditions as the host arm below, read off the container's
+                    // reported outcome: the gate saw an empty tree, and the agent marked an
+                    // answer. Without this the mode would depend on the SEAT — the identical
+                    // answer job delivers on a launcher seat and is refused on a docker one — and
+                    // docker with a non-root uid is the default (#981), so the common seat would
+                    // be the one that cannot do it.
+                    //
+                    // A contribution never reaches here: `deliver_via_container` is the
+                    // from-scratch path, and `base_oid` is `None` for all of it.
+                    if let ContainerDeliveryFailure::NoSentinel {
+                        last_agent_message: Some(message),
+                        usage,
+                        wall_time_ms,
+                        ..
+                    } = &failure
+                        && let Some(answer) = crate::engine::marked_inline_answer(message)
+                    {
+                        let exec_metadata = seller_exec_metadata(
+                            &agent_command,
+                            agent_label.as_deref(),
+                            *wall_time_ms,
+                            usage.as_ref(),
+                        );
+                        self.deliver_inline(
+                            job_id,
+                            &offer,
+                            &seller_pubkey,
+                            &stored_creq,
+                            answer,
+                            &exec_metadata,
+                        )
+                        .await;
+                        return;
+                    }
                     self.fail_container_delivery(job_id, &offer.buyer_pubkey, harness, failure)
                         .await;
                     return;
@@ -8037,16 +8102,22 @@ impl SellerNodeRunner {
                 Ok(oid) => oid,
                 Err(error) => {
                     // ── Inline delivery (§6.4) ───────────────────────────────────────────
-                    // The snapshot refused an empty or base-identical tree. That refusal is the
-                    // one signal which separates "the agent wrote nothing" from "the agent wrote
-                    // something", and the git path above already trusts it. So the WORK decides
-                    // the delivery mode. No declaration on the offer decides it.
+                    // The snapshot refused an empty or base-identical tree, so the job left no
+                    // files. TWO conditions have to hold before that becomes a delivery, and
+                    // neither is "the agent said something".
                     //
-                    // An answer job arrives here with a reply and no files, and that reply is the
-                    // deliverable: no snapshot, no commit, no push, no remote. A job that wrote
-                    // files never reaches this arm, because its snapshot succeeded. A quota-dead
-                    // harness reaches it and says nothing, so it falls through to the refusal
-                    // below. The agent's reply is the discriminator between the two.
+                    // The tree gate, first: it is the signal the git path already trusts, and it
+                    // is what keeps a job that WROTE files on the git path — such a job never
+                    // reaches this arm, because its snapshot succeeded.
+                    //
+                    // The marker, second, and it is the one that matters. An empty tree plus some
+                    // text is exactly what a quota-dead harness, an unreachable model host and a
+                    // declining agent all produce; `AgentRunReport` and `flaky_harness_reason`
+                    // both say so, and the 2026-08-21 incident is why they say it. Treating any
+                    // non-empty reply as an answer would pay for every one of those. So the agent
+                    // must OPT IN with [`engine::INLINE_ANSWER_MARKER`], which only a model that
+                    // read this job's prompt can emit. Everything unmarked falls through to the
+                    // refusal below, harness strike included.
                     if matches!(&error, seller_git::SellerGitError::NoExecutionObserved(_))
                         // A contribution descends from a pinned base, so it can never settle
                         // inline. `base_oid` is what marks one.
@@ -8054,88 +8125,27 @@ impl SellerNodeRunner {
                         && let Some(answer) = report
                             .last_agent_message
                             .as_deref()
-                            .map(str::trim)
-                            .filter(|answer| !answer.is_empty())
+                            .and_then(crate::engine::marked_inline_answer)
+                            .map(inline_answer_within_bound)
                     {
-                        let preimage = delivery_receipt_preimage(
-                            job_id,
-                            &offer.task,
-                            offer.amount_sats,
-                            &offer.buyer_pubkey,
-                            &seller_pubkey,
-                            // The inline analogue of the delivered commit oid: the digest of the answer
-                            // this very result carries. Both slots are hex; `delivery_kind` right below
-                            // is the SIGNED field that says which one this is, so no unsigned path can
-                            // re-read an answer digest as a commit.
-                            &crate::receipt::result_content_hash_hex(answer),
-                            crate::receipt::DeliveryKind::Inline.as_str(),
-                            creq_terms(&stored_creq),
-                        );
-                        let seller_sig = match self
-                            .node
-                            .signer()
-                            .sign_receipt_hash(preimage.digest_hex())
-                            .await
-                        {
-                            Ok(Ok(sig)) => sig,
-                            Ok(Err(error)) => {
-                                opline!("seller node execute fail job_id={job_id}: inline receipt sign refused ({error})");
-                                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
-                                return;
-                            }
-                            Err(error) => {
-                                opline!("seller node execute fail job_id={job_id}: signer actor gone ({error})");
-                                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
-                                return;
-                            }
-                        };
                         let exec_metadata = seller_exec_metadata(
                             &agent_command,
                             agent_label.as_deref(),
                             wall_time_ms,
                             usage.as_ref(),
                         );
-                        let draft = gateway::inline_result_draft(
+                        self.deliver_inline(
                             job_id,
-                            &offer.buyer_pubkey,
-                            // The buyer's declared output type. A row written before that column
-                            // existed states none, and text/plain is the shape an answer takes.
-                            offer.output.as_deref().unwrap_or("text/plain"),
-                            offer.amount_sats,
-                            &preimage.job_hash,
-                            &seller_sig,
+                            &offer,
+                            &seller_pubkey,
+                            &stored_creq,
                             answer,
                             &exec_metadata,
-                        );
-                        let now = now_unix();
-                        // `result_ref` records WHAT was delivered. For git that is the commit; here it
-                        // is the answer digest the co-signature binds, so the journal names the same
-                        // artifact the buyer will verify.
-                        match self.node.store().deliver_and_enqueue(
-                            job_id,
-                            &preimage.delivery_integrity_hash,
-                            offer.payment_mode,
-                            &draft,
-                            now,
-                            now + RESULT_PUBLISH_WINDOW_SECS,
-                            now,
-                        ) {
-                            Ok(true) => opline!(
-                                "seller node delivered job_id={job_id} inline bytes={} result enqueued",
-                                answer.len()
-                            ),
-                            Ok(false) => opline!(
-                                "seller node execute job_id={job_id}: delivery already journaled (dedup no-op)"
-                            ),
-                            Err(error) => {
-                                opline!("seller node execute fail job_id={job_id}: deliver journal failed ({error})");
-                                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
-                                return;
-                            }
-                        }
-                        self.drain().await;
+                        )
+                        .await;
                         return;
                     }
+
                     // Harness-attributable: the agent returned success having left nothing to deliver.
                     // This is the site that fires on a quota-dead harness — its turn "completes", so the
                     // agent-run arm above sees no error at all — which is why the trigger cannot live at
@@ -8817,7 +8827,17 @@ impl SellerNodeRunner {
             orch::Phase1Status::AgentFailed => Err(Fail::Agent(ExecError::Agent(detail))),
             orch::Phase1Status::AgentUnavailable => Err(Fail::Agent(ExecError::Config(detail))),
             orch::Phase1Status::DeadlineExceeded => Err(Fail::Agent(ExecError::DeadlineExceeded)),
-            orch::Phase1Status::NoSentinel => Err(Fail::NoSentinel(detail)),
+            orch::Phase1Status::NoSentinel => {
+                let agent = outcome.agent.unwrap_or_default();
+                Err(Fail::NoSentinel {
+                    detail,
+                    // The container already bounded this at `OUTCOME_TEXT_MAX_BYTES` when it wrote
+                    // the outcome file, so the host path's own bound is a no-op on this branch.
+                    last_agent_message: agent.last_agent_message,
+                    usage: agent.usage,
+                    wall_time_ms: started.elapsed().as_millis() as u64,
+                })
+            }
             orch::Phase1Status::SnapshotFailed => Err(Fail::Snapshot(detail)),
             orch::Phase1Status::TokenUnavailable
             | orch::Phase1Status::PushFailed
@@ -8852,6 +8872,121 @@ impl SellerNodeRunner {
 
     /// Fail a container-delivered job with the SAME feedback reason codes and harness attribution the
     /// host path emits for the equivalent failure, so a buyer cannot tell the two paths apart.
+    /// Publish an agent's marked answer as an INLINE delivery (§6.4), and journal it.
+    ///
+    /// Shared by the host and the container delivery paths. Both reach the same place — the
+    /// snapshot refused an empty tree and the agent marked an answer — and a second copy of the
+    /// co-signing would be a second chance for the two ends to disagree about the preimage.
+    ///
+    /// The caller has already decided this IS an inline delivery. Every failure here is a delivery
+    /// failure: it is reported with `FEEDBACK` on the spot, so the caller only has to return.
+    async fn deliver_inline(
+        &self,
+        job_id: &str,
+        offer: &super::store::Offer,
+        seller_pubkey: &str,
+        stored_creq: &str,
+        answer: &str,
+        exec_metadata: &[gateway::TagSpec],
+    ) {
+        let preimage = delivery_receipt_preimage(
+            job_id,
+            &offer.task,
+            offer.amount_sats,
+            &offer.buyer_pubkey,
+            seller_pubkey,
+            // The inline analogue of the delivered commit oid: the digest of the answer this very
+            // result carries. Both slots are hex; `delivery_kind` right below is the SIGNED field
+            // that says which one this is, so no unsigned path can re-read an answer digest as a
+            // commit.
+            &crate::receipt::result_content_hash_hex(answer),
+            crate::receipt::DeliveryKind::Inline.as_str(),
+            creq_terms(stored_creq),
+        );
+        let seller_sig = match self
+            .node
+            .signer()
+            .sign_receipt_hash(preimage.digest_hex())
+            .await
+        {
+            Ok(Ok(sig)) => sig,
+            Ok(Err(error)) => {
+                opline!(
+                    "seller node execute fail job_id={job_id}: inline receipt sign refused ({error})"
+                );
+                self.fail_job_with_feedback(
+                    job_id,
+                    &offer.buyer_pubkey,
+                    ReasonCode::DeliveryFailed,
+                    DELIVERY_FAILURE_FEEDBACK,
+                    None,
+                )
+                .await;
+                return;
+            }
+            Err(error) => {
+                opline!("seller node execute fail job_id={job_id}: signer actor gone ({error})");
+                self.fail_job_with_feedback(
+                    job_id,
+                    &offer.buyer_pubkey,
+                    ReasonCode::DeliveryFailed,
+                    DELIVERY_FAILURE_FEEDBACK,
+                    None,
+                )
+                .await;
+                return;
+            }
+        };
+        let draft = gateway::inline_result_draft(
+            job_id,
+            &offer.buyer_pubkey,
+            // The buyer's declared output type. A row written before that column existed states
+            // none, and text/plain is the shape an answer takes.
+            offer.output.as_deref().unwrap_or("text/plain"),
+            offer.amount_sats,
+            &preimage.job_hash,
+            &seller_sig,
+            answer,
+            exec_metadata,
+        );
+        let now = now_unix();
+        // `result_ref` records WHAT was delivered. For git that is the commit; here it is the
+        // answer digest the co-signature binds, so the journal names the same artifact the buyer
+        // will verify.
+        match self.node.store().deliver_and_enqueue(
+            job_id,
+            &preimage.delivery_integrity_hash,
+            offer.payment_mode,
+            &draft,
+            now,
+            now + RESULT_PUBLISH_WINDOW_SECS,
+            now,
+        ) {
+            Ok(true) => opline!(
+                "seller node delivered job_id={job_id} inline bytes={} result enqueued",
+                answer.len()
+            ),
+            Ok(false) => opline!(
+                "seller node execute job_id={job_id}: delivery already journaled (dedup no-op)"
+            ),
+            Err(error) => {
+                opline!(
+                    "seller node execute fail job_id={job_id}: deliver journal failed ({error})"
+                );
+                self.fail_job_with_feedback(
+                    job_id,
+                    &offer.buyer_pubkey,
+                    ReasonCode::DeliveryFailed,
+                    DELIVERY_FAILURE_FEEDBACK,
+                    None,
+                )
+                .await;
+                return;
+            }
+        }
+        self.drain().await;
+    }
+
     async fn fail_container_delivery(
         &self,
         job_id: &str,
@@ -8870,7 +9005,7 @@ impl SellerNodeRunner {
                 self.drop_harness(harness, harness_fault_for(&error));
                 (ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK)
             }
-            Fail::NoSentinel(detail) => {
+            Fail::NoSentinel { detail, .. } => {
                 opline!("seller node execute fail job_id={job_id}: delivery refused no_sentinel — {detail}");
                 self.drop_harness(harness, Some(ExecutionFailure::Harness(Fault::Unproven)));
                 (ReasonCode::NoSentinel, NO_SENTINEL_FEEDBACK)

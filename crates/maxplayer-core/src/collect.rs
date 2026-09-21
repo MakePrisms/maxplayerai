@@ -188,7 +188,14 @@ pub async fn collect_async(
         let files = match bind.inline_answer.as_deref() {
             // An inline delivery has nothing to fetch: the answer is on the bind.
             Some(answer) if bind_is_inline(&bind) => {
-                materialize_inline_delivery(answer, &dest).map_err(CollectError::Materialize)?
+                let files = materialize_inline_delivery(answer, &dest)
+                    .map_err(CollectError::Materialize)?;
+                // §7.0 — the record is the artifact, never the silence. `collect_free` writes it
+                // on the git arm, and this arm does not go through `collect_free`, so it writes
+                // its own. Without it a completed free inline trade leaves no buyer-side trace
+                // that it ever happened.
+                write_free_collect_record(home, &bind, &dest, &files)?;
+                files
             }
             _ => collect_free(home, &bind, &dest)?,
         };

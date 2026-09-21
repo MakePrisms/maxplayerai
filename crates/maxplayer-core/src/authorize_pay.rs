@@ -821,9 +821,22 @@ pub async fn complete_recovered_locked_async(
     let receipt_relay = home.config.relay_url.clone();
     let seller_hex = seller_nostr.to_hex();
     let seller_signature = request.seller_signature.clone();
-    // Live delivery is fork-only ([`DeliveryKind::Fork`]); the receipt preimage the seller signed at
-    // delivery used that kind, so completion reconstructs byte-identical bytes.
-    let delivery_kind = DeliveryKind::Fork;
+    // The kind is READ FROM THE BIND, never assumed. The seller signed the receipt preimage under
+    // the kind it delivered with, and `delivery_kind` is a covered field — so a completion that
+    // guessed `Fork` for an inline job would rebuild different bytes, fail the seller's schnorr
+    // check at the receipt leg, and raise a forged-receipt alarm naming the seller for a fault
+    // that is entirely ours. A bind written before inline delivery existed carries no kind and is
+    // a fork, which is true of every one of them.
+    let delivery_kind = match crate::job_lifecycle::load_accepted_bind(home, &request.job_id)
+        .ok()
+        .flatten()
+        .as_ref()
+        .and_then(|bind| bind.delivery_kind.clone())
+        .as_deref()
+    {
+        Some(kind) if kind == DeliveryKind::Inline.as_str() => DeliveryKind::Inline,
+        _ => DeliveryKind::Fork,
+    };
 
     let wallet = buyer_fund::open_wallet_at_mint_async(home, &wallet_open_mint_url(home, &terms))
         .await?;

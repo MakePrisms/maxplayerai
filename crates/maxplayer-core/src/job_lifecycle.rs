@@ -1696,10 +1696,10 @@ fn select_deliverable_claim(
     let delivered = view
         .results
         .iter()
-        .any(|result| result.seller_pubkey == awarded.seller_pubkey && result.commit_oid.is_some());
+        .any(|result| result.seller_pubkey == awarded.seller_pubkey && result.has_delivery());
     if !delivered {
         return Err(JobLifecycleError::NotFound(format!(
-            "collect: the awarded seller for job {} has not delivered a git result yet — wait for \
+            "collect: the awarded seller for job {} has not delivered a result yet — wait for \
              delivery (get_job wait_for=result) before collecting",
             view.job_id
         )));
@@ -1730,7 +1730,7 @@ pub(crate) fn awarded_delivery_pending(
     }
     view.results
         .iter()
-        .any(|result| result.seller_pubkey == seller_pubkey && result.commit_oid.is_some())
+        .any(|result| result.seller_pubkey == seller_pubkey && result.has_delivery())
 }
 
 /// Accept-time contribution resolution. Authority is the buyer's SIGNED OFFER:
@@ -2270,7 +2270,7 @@ fn now_unix() -> u64 {
 fn delivery_pay_deadline(results: &[ResultView], seller_pubkey: &str) -> Option<u64> {
     results
         .iter()
-        .filter(|result| result.seller_pubkey == seller_pubkey && result.commit_oid.is_some())
+        .filter(|result| result.seller_pubkey == seller_pubkey && result.has_delivery())
         .map(|result| result.created_at)
         .max()
         .map(|created_at| created_at.saturating_add(DELIVERY_PAY_WINDOW_SECS))
@@ -2759,10 +2759,17 @@ fn offer_read_answered(offer_present: bool, offer_probe_confirmed: bool) -> bool
     offer_present || offer_probe_confirmed
 }
 
-/// Read one job's offer + claims + results from the relay, with claim liveness derived
-/// against `now` (a `processing` claim past the offer deadline is EXPIRED, not live). Exposed
-/// `pub(crate)` so the seller daemon can run the backfill money-safety pre-claim check
-/// (already-delivered / live-claimed-by-another) without duplicating the relay read.
+impl ResultView {
+    /// True when this result actually DELIVERED something (§6.4), whatever the mode.
+    ///
+    /// A git result carries a commit; an inline result carries the answer and no commit. Every
+    /// "has the seller delivered?" question must ask THIS, never `commit_oid.is_some()` — that
+    /// test reads an inline delivery as nothing at all, and the buyer then waits out the deadline
+    /// on work that was published and is sitting there to be paid for.
+    pub fn has_delivery(&self) -> bool {
+        self.commit_oid.is_some() || self.inline_answer.is_some()
+    }
+}
 
 /// Build one [`ResultView`] from a published RESULT event.
 ///
@@ -2806,6 +2813,10 @@ fn result_view_from_event(
     }
 }
 
+/// Read one job's offer + claims + results from the relay, with claim liveness derived
+/// against `now` (a `processing` claim past the offer deadline is EXPIRED, not live). Exposed
+/// `pub(crate)` so the seller daemon can run the backfill money-safety pre-claim check
+/// (already-delivered / live-claimed-by-another) without duplicating the relay read.
 pub(crate) async fn fetch_job_view_async(
     home: &MaxplayerHome,
     keys: &nostr_sdk::Keys,
@@ -3115,10 +3126,10 @@ fn select_result<'a>(
     }
     results
         .iter()
-        .find(|result| result.seller_pubkey == seller_pubkey && result.commit_oid.is_some())
+        .find(|result| result.seller_pubkey == seller_pubkey && result.has_delivery())
         .ok_or_else(|| {
             JobLifecycleError::NotFound(format!(
-                "no git result from seller {seller_pubkey} for this job"
+                "no delivered result from seller {seller_pubkey} for this job"
             ))
         })
 }
@@ -5358,6 +5369,63 @@ mod tests {
         assert_eq!(
             resolve_accepted_contribution(&offer, &result, &"ee".repeat(20)).expect("ok"),
             None
+        );
+    }
+
+    /// §6.4 — every "has the seller delivered?" predicate reads `has_delivery`, so an inline
+    /// result counts. Keyed on `commit_oid` alone, the buyer's automated path reads a published
+    /// inline delivery as nothing: `collect` and the daemon watcher refuse with NotFound, the
+    /// claim expires at the offer deadline, and the reservation unwinds on work already done.
+    #[test]
+    fn a_result_counts_as_delivered_in_either_mode() {
+        let answer = "Europe/Zagreb";
+        let inline = result_view_from_event(
+            "cc".repeat(32),
+            1,
+            "dd".repeat(32),
+            &crate::gateway::inline_result_draft(
+                &"aa".repeat(32),
+                &"bb".repeat(32),
+                "text/plain",
+                2,
+                &"ff".repeat(32),
+                &"ab".repeat(32),
+                answer,
+                &[],
+            ),
+        );
+        assert!(inline.commit_oid.is_none(), "an inline result binds no commit");
+        assert!(inline.has_delivery(), "an inline answer IS a delivery");
+
+        let commit = "77".repeat(20);
+        let git = result_view_from_event(
+            "cc".repeat(32),
+            1,
+            "dd".repeat(32),
+            &crate::gateway::result_draft(
+                &"aa".repeat(32),
+                &"bb".repeat(32),
+                "text/plain",
+                2,
+                &"ff".repeat(32),
+                &"ab".repeat(32),
+                "delivered",
+                Some(crate::gateway::GitResultTags {
+                    repo: "https://example.invalid/r.git",
+                    branch: "maxplayer/aabbccdd",
+                    commit_sha: &commit,
+                }),
+                &[],
+            ),
+        );
+        assert!(git.has_delivery(), "a git result is a delivery as it always was");
+
+        let mut nothing = git.clone();
+        nothing.commit_oid = None;
+        nothing.inline_answer = None;
+        assert!(
+            !nothing.has_delivery(),
+            "a result that delivered neither must not read as delivered"
         );
     }
 

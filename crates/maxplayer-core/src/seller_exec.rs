@@ -2276,6 +2276,12 @@ where
 /// quarantining the harness — or writes a refusal note that mints a sentinel and gets PAID, so
 /// inviting one before the pre-money seam handles it means paying for refusals. The test below
 /// asserts that ABSENCE, so it cannot be reintroduced by accident.
+///
+/// The ANSWER JOBS line is not a refusal instruction and does not weaken that. It states how to
+/// mark a SUCCESS — [`crate::engine::INLINE_ANSWER_MARKER`] — and says nothing about declining.
+/// Every unmarked outcome, a refusal among them, keeps the exact path it has today. The marker can
+/// only turn a reply that would have been discarded into a delivery; it can never turn a refusal
+/// into a payment, which is the direction #685 is guarding.
 pub fn compose_agent_prompt(
     task: &str,
     git_remote: &str,
@@ -2336,7 +2342,14 @@ pub fn compose_agent_prompt(
          - You do NOT need to commit or push, and you are NOT handed any credentials. Committing \
          is harmless, but it is the directory CONTENTS that are delivered, not your commits.\n\
          - Files excluded by .gitignore are NOT delivered, so never ignore your own deliverable.\n\
-         Anything you only print to the console is not delivered."
+         Anything you only print to the console is not delivered.\n\
+         ANSWER JOBS: when the task asks you for information and you leave NO files on disk, put \
+         this exact line first in your final message, alone on its line:\n\
+         {marker}\n\
+         and put your answer on the lines after it. The daemon then delivers that answer to the \
+         buyer as the deliverable. Without that first line, only files on disk are delivered, so \
+         a job that leaves neither files nor a marked answer delivers nothing.",
+        marker = crate::engine::INLINE_ANSWER_MARKER,
     );
     // Read-on-start: when memory is enabled the rendered index section is appended. When `None`
     // (memory_enabled=false, or no non-empty index) the output is byte-IDENTICAL to the
@@ -8198,6 +8211,24 @@ mod tests {
                 "must not invite refusal (found {banned:?}): {a}"
             );
         }
+    }
+
+    // TOOTH (§6.4) — the inline-answer MARKER reaches the hired agent, as the exact token the
+    // seller matches on.
+    //
+    // The marker is the whole gate on inline delivery: a reply without it is never delivered and
+    // never paid. So an agent that is never told the token cannot be paid for an answer at all,
+    // and the feature is silently dead. Asserting the constant (not a copy of its text) is what
+    // keeps the prompt and the matcher from drifting apart.
+    //
+    // Bite (measured): drop the ANSWER JOBS block from `compose_agent_prompt` and this goes red.
+    #[test]
+    fn the_inline_answer_marker_reaches_the_prompt() {
+        let prompt = compose_agent_prompt("t", "r", 1_000, None, None);
+        assert!(
+            prompt.contains(crate::engine::INLINE_ANSWER_MARKER),
+            "the agent must be told the exact marker the seller matches on: {prompt}"
+        );
     }
 
     // TOOTH (#686) — the buyer's DECLARED OUTPUT TYPE reaches the hired agent, as a VALUE.
