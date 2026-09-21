@@ -2312,7 +2312,10 @@ pub fn compose_agent_prompt(
     // never sees this and behaves exactly as it does today.
     let answer_section = if accepts_inline {
         format!(
-            "ANSWER JOBS: when the task asks you for information and you leave NO files on disk, \
+            // Leads with its OWN newline. The prompt must end where its last sentence ends when
+            // this section is absent — `seller_memory_read_on_start` anchors the memory invariant
+            // on exactly that, and a separator left behind by an empty section breaks it.
+            "\nANSWER JOBS: when the task asks you for information and you leave NO files on disk, \
              put this exact line first in your final message, alone on its line:\n\
              {marker}\n\
              and put your answer on the lines after it, as plain text with no code fence around \
@@ -2365,8 +2368,7 @@ pub fn compose_agent_prompt(
          - You do NOT need to commit or push, and you are NOT handed any credentials. Committing \
          is harmless, but it is the directory CONTENTS that are delivered, not your commits.\n\
          - Files excluded by .gitignore are NOT delivered, so never ignore your own deliverable.\n\
-         Anything you only print to the console is not delivered.\n\
-         {answer_section}",
+         Anything you only print to the console is not delivered.{answer_section}",
     );
     // Read-on-start: when memory is enabled the rendered index section is appended. When `None`
     // (memory_enabled=false, or no non-empty index) the output is byte-IDENTICAL to the
