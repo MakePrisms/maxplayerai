@@ -828,14 +828,28 @@ pub async fn complete_recovered_locked_async(
     // that is entirely ours. A bind written before inline delivery existed carries no kind and is
     // a fork, which is true of every one of them.
     let delivery_kind = match crate::job_lifecycle::load_accepted_bind(home, &request.job_id)
-        .ok()
-        .flatten()
+        .map_err(|error| {
+            // NOT swallowed. A read error here would silently resolve to `Fork`, publish a receipt
+            // the seller's signature cannot cover, and raise the forged-receipt alarm this very
+            // change exists to prevent — with the seller named for our own IO failure.
+            AuthorizePayError::Input(format!(
+                "cannot read the accepted bind for job {} to learn its delivery kind: {error}",
+                request.job_id
+            ))
+        })?
         .as_ref()
         .and_then(|bind| bind.delivery_kind.clone())
         .as_deref()
     {
         Some(kind) if kind == DeliveryKind::Inline.as_str() => DeliveryKind::Inline,
-        _ => DeliveryKind::Fork,
+        Some(_) => DeliveryKind::Fork,
+        // No bind, or one written before inline delivery existed. The hash itself says which:
+        // `DeliveryIntegrityHash::from_hex` admits 40 hex (a commit oid) or 64 (an answer digest)
+        // and nothing else, so the length is an exact discriminator rather than a guess.
+        None => match request.delivery_integrity_hash.len() {
+            64 => DeliveryKind::Inline,
+            _ => DeliveryKind::Fork,
+        },
     };
 
     let wallet = buyer_fund::open_wallet_at_mint_async(home, &wallet_open_mint_url(home, &terms))

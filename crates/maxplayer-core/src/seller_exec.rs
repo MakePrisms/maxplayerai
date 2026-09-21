@@ -2346,9 +2346,13 @@ pub fn compose_agent_prompt(
          ANSWER JOBS: when the task asks you for information and you leave NO files on disk, put \
          this exact line first in your final message, alone on its line:\n\
          {marker}\n\
-         and put your answer on the lines after it. The daemon then delivers that answer to the \
-         buyer as the deliverable. Without that first line, only files on disk are delivered, so \
-         a job that leaves neither files nor a marked answer delivers nothing.",
+         and put your answer on the lines after it, as plain text with no code fence around the \
+         whole reply. Keep the answer under {answer_limit} bytes; a longer one cannot be \
+         delivered. The daemon then delivers that answer to the buyer as the deliverable. Without \
+         that first line, only files on disk are delivered, so a job that leaves neither files \
+         nor a marked answer delivers nothing. When the answer would be longer than that, write \
+         it to a file instead and leave it on disk.",
+        answer_limit = crate::delivery_orchestrator::OUTCOME_TEXT_MAX_BYTES,
         marker = crate::engine::INLINE_ANSWER_MARKER,
     );
     // Read-on-start: when memory is enabled the rendered index section is appended. When `None`

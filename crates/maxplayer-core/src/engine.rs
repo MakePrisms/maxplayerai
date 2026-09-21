@@ -242,29 +242,50 @@ fn content_block_text(block: &ContentBlock) -> Option<String> {
 /// It is deliberately an opt-in for success, not a status code with a failure value. A failure
 /// value would be a refusal instruction in the prompt, which #685 withholds on purpose — a
 /// self-declared refusal that the money seam does not yet handle is a refusal that gets PAID. Under
-/// an opt-in, every unmarked outcome (a vendor error string, a refusal, a clarifying question, an
-/// idle model) takes the existing refusal path unchanged. The failure direction stays the safe one.
+/// an opt-in, every UNMARKED outcome (a vendor error string, a turn that said nothing, a decline
+/// the model did not mark) takes the existing refusal path unchanged.
+///
+/// ⚠️ WHAT IT DOES NOT DO. A model that marks an answer and then writes "I could not determine
+/// this" is paid, and no gate here can tell that from a real answer without judging the content.
+/// The marker proves that this job's prompt reached a model which answered it — the same thing
+/// §8.2 proves for a tree, and no more. Paying for a well-formed but worthless deliverable is
+/// #511, and git delivery has it equally: a committed REFUSAL.md mints a sentinel and settles.
 pub const INLINE_ANSWER_MARKER: &str = "MAXPLAYER-ANSWER-V1";
 
 /// The answer an agent marked for inline delivery, or `None` when it marked none.
 ///
-/// The marker must be the FIRST non-blank line, alone on that line. First, because a marker the
-/// agent could bury anywhere is one a quoted task description or a pasted log can forge by
-/// accident. Alone, because a line that carries the marker AND prose is ambiguous about where the
-/// answer starts, and the digest the buyer re-derives is over exactly these bytes.
+/// The marker must be on the FIRST non-blank line and be the only WORD on it. First, because a
+/// marker the agent could bury anywhere is one a quoted task description or a pasted log can forge
+/// by accident.
+///
+/// Markdown decoration around the token is accepted — `` `MARKER` ``, `**MARKER**`, `# MARKER`, a
+/// trailing colon. A model told to emit an exact line routinely formats it, and every such reply is
+/// a correct answer that would otherwise be refused, cost the seller its fee, AND strike a healthy
+/// harness. The gate exists to separate an answer from a dead harness, not to test formatting
+/// obedience. Nothing is weakened: the decoration characters cannot make an unmarked message
+/// marked.
 ///
 /// The answer is everything after that line, trimmed. An empty remainder is `None`: a marker with
 /// nothing behind it is not an answer, and §6.4 refuses an empty inline delivery anyway.
 pub fn marked_inline_answer(message: &str) -> Option<&str> {
     let text = message.trim_start();
-    let rest = text.strip_prefix(INLINE_ANSWER_MARKER)?;
-    // The marker must END the line — `MAXPLAYER-ANSWER-V1-DRAFT` is not this marker.
-    let rest = match rest.find('\n') {
-        Some(newline) if rest[..newline].trim().is_empty() => &rest[newline + 1..],
-        // No newline at all: the message is the bare marker, so there is no answer behind it.
-        None if rest.trim().is_empty() => return None,
-        _ => return None,
+    // A fenced first line (```), which some models wrap the whole reply in, is stepped over.
+    let text = match text.strip_prefix("```") {
+        Some(rest) => rest.split_once('\n').map(|(_, body)| body)?.trim_start(),
+        None => text,
     };
+    let (first, rest) = match text.split_once('\n') {
+        Some((first, rest)) => (first, rest),
+        // No newline at all: the whole message is one line, so there is nothing behind the marker.
+        None => return None,
+    };
+    // Strip the decoration a model reaches for, then require what is left to BE the marker.
+    let bare = first.trim().trim_start_matches('#').trim();
+    let bare = bare.trim_matches(|c| c == '`' || c == '*' || c == '_').trim();
+    let bare = bare.strip_suffix(':').unwrap_or(bare).trim();
+    if bare != INLINE_ANSWER_MARKER {
+        return None;
+    }
     let answer = rest.trim();
     (!answer.is_empty()).then_some(answer)
 }
@@ -768,6 +789,29 @@ mod tests {
             None,
             "the marker must be alone on its line, not a prefix of a longer token"
         );
+        assert_eq!(
+            marked_inline_answer(&format!("{INLINE_ANSWER_MARKER} and then some\nx")),
+            None,
+            "prose on the marker line is not a marker"
+        );
+
+        // A model told to emit an exact line formats it. Each of these is a CORRECT answer, and
+        // refusing it costs the seller its fee and strikes a healthy harness for nothing.
+        for decorated in [
+            format!("`{INLINE_ANSWER_MARKER}`\nEurope/Zagreb"),
+            format!("**{INLINE_ANSWER_MARKER}**\nEurope/Zagreb"),
+            format!("# {INLINE_ANSWER_MARKER}\nEurope/Zagreb"),
+            format!("{INLINE_ANSWER_MARKER}:\nEurope/Zagreb"),
+            format!("{INLINE_ANSWER_MARKER}\r\nEurope/Zagreb"),
+            format!("   {INLINE_ANSWER_MARKER}   \nEurope/Zagreb"),
+            format!("```\n{INLINE_ANSWER_MARKER}\nEurope/Zagreb"),
+        ] {
+            assert_eq!(
+                marked_inline_answer(&decorated),
+                Some("Europe/Zagreb"),
+                "decoration around the token must not lose the answer: {decorated:?}"
+            );
+        }
         assert_eq!(
             marked_inline_answer(&format!("here you go:\n{INLINE_ANSWER_MARKER}\nx")),
             None,

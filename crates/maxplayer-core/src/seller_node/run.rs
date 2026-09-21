@@ -2984,6 +2984,11 @@ enum ContainerDeliveryFailure {
         /// from defaults would state a wall time of zero as if it were measured.
         usage: Option<crate::driver::UsageMetadata>,
         wall_time_ms: u64,
+        /// Whether this job was from-scratch. A contribution descends from a pinned base and can
+        /// never settle inline, and the container path SERVES contributions — it reads the pin and
+        /// hands the orchestrator a base — so the inline arm needs this to make the same decision
+        /// the host arm makes from `base_oid`.
+        from_scratch: bool,
     },
     /// The snapshot failed otherwise. `execution_failed`, harness unproven.
     Snapshot(String),
@@ -3466,24 +3471,12 @@ fn flaky_harness_reason(attempts: usize, agent_message: Option<&str>) -> String 
     }
 }
 
-/// Bound an inline answer to the size the CONTAINER path already bounds it to.
+/// The largest inline answer this seller will deliver.
 ///
-/// The container writes the agent's message through a 4 KiB cap
-/// ([`crate::delivery_orchestrator::OUTCOME_TEXT_MAX_BYTES`]) before the host ever sees it. The host driver has no such
-/// cap, so without this the same answer job would have two different size limits depending on the
-/// seat's delivery mode, and the host one would be "whatever the agent felt like" — published to a
-/// relay, stored in every buyer bind, and retried by the outbox for a day if the relay refuses it.
-fn inline_answer_within_bound(answer: &str) -> &str {
-    let max = crate::delivery_orchestrator::OUTCOME_TEXT_MAX_BYTES;
-    if answer.len() <= max {
-        return answer;
-    }
-    let mut end = max;
-    while end > 0 && !answer.is_char_boundary(end) {
-        end -= 1;
-    }
-    &answer[..end]
-}
+/// The CONTAINER path already caps the agent's message at this size when it writes its outcome
+/// ([`crate::delivery_orchestrator::OUTCOME_TEXT_MAX_BYTES`]), so the two delivery paths agree on
+/// what an answer may weigh, and a relay is never handed an unbounded event this seller minted.
+const INLINE_ANSWER_MAX_BYTES: usize = crate::delivery_orchestrator::OUTCOME_TEXT_MAX_BYTES;
 
 /// The refusal reason for the UNRUNNABLE launcher/exec shape.
 ///
@@ -7897,16 +7890,32 @@ impl SellerNodeRunner {
                     // docker with a non-root uid is the default (#981), so the common seat would
                     // be the one that cannot do it.
                     //
-                    // A contribution never reaches here: `deliver_via_container` is the
-                    // from-scratch path, and `base_oid` is `None` for all of it.
+                    // A contribution descends from a pinned base and can never settle inline, so
+                    // `from_scratch` is required here exactly as `base_oid.is_none()` is on the
+                    // host arm. The container path DOES serve contributions: it reads the pin and
+                    // hands the orchestrator a base, and the gate refuses a tree identical to that
+                    // base with the same `NoExecutionObserved` an empty tree gets.
                     if let ContainerDeliveryFailure::NoSentinel {
                         last_agent_message: Some(message),
                         usage,
                         wall_time_ms,
+                        from_scratch: true,
                         ..
                     } = &failure
                         && let Some(answer) = crate::engine::marked_inline_answer(message)
                     {
+                        if let Some(quoted) = quoted_agent_message(Some(message)) {
+                            opline!(
+                                "seller node execute job_id={job_id} agent last message: {quoted}"
+                            );
+                        }
+                        // #784 — a real run is the freshest evidence of the model, and an inline
+                        // delivery is a real run. Skipped, an answer-only harness on a container
+                        // seat advertises its boot-probe model for the life of the process.
+                        self.agents.record_model(
+                            harness,
+                            usage.as_ref().and_then(|u| u.model.clone()),
+                        );
                         let exec_metadata = seller_exec_metadata(
                             &agent_command,
                             agent_label.as_deref(),
@@ -8126,7 +8135,6 @@ impl SellerNodeRunner {
                             .last_agent_message
                             .as_deref()
                             .and_then(crate::engine::marked_inline_answer)
-                            .map(inline_answer_within_bound)
                     {
                         let exec_metadata = seller_exec_metadata(
                             &agent_command,
@@ -8577,6 +8585,7 @@ impl SellerNodeRunner {
 
         let mut session_servers = prepared.mcp_servers.clone();
         session_servers.extend(attachments.mcp_servers.iter().cloned());
+        let base_is_none = base.is_none();
         let inputs = orch::Phase1Inputs {
             job_hash,
             seller_pubkey_hex: identity.seller_pubkey_hex().to_owned(),
@@ -8751,7 +8760,18 @@ impl SellerNodeRunner {
 
         let result = match exit {
             Ok(status) => {
-                self.classify_container_outcome(job_id, &io_dir, status, marker.as_ref(), &branch, started)
+                self.classify_container_outcome(
+                    job_id,
+                    &io_dir,
+                    status,
+                    marker.as_ref(),
+                    &branch,
+                    started,
+                    // The base the orchestrator was handed: `None` is from-scratch, `Some` is a
+                    // contribution clone. Read here, where it is a fact of THIS delivery, rather
+                    // than re-derived from the pin in the classifier.
+                    base_is_none,
+                )
             }
             Err(failure) => Err(failure),
         };
@@ -8779,6 +8799,7 @@ impl SellerNodeRunner {
         marker: Option<&crate::delivery_orchestrator::AgentDoneMarker>,
         branch: &str,
         started: Instant,
+        from_scratch: bool,
     ) -> Result<ContainerDelivery, ContainerDeliveryFailure> {
         use crate::delivery_orchestrator as orch;
         use ContainerDeliveryFailure as Fail;
@@ -8831,6 +8852,7 @@ impl SellerNodeRunner {
                 let agent = outcome.agent.unwrap_or_default();
                 Err(Fail::NoSentinel {
                     detail,
+                    from_scratch,
                     // The container already bounded this at `OUTCOME_TEXT_MAX_BYTES` when it wrote
                     // the outcome file, so the host path's own bound is a no-op on this branch.
                     last_agent_message: agent.last_agent_message,
@@ -8870,8 +8892,6 @@ impl SellerNodeRunner {
         }
     }
 
-    /// Fail a container-delivered job with the SAME feedback reason codes and harness attribution the
-    /// host path emits for the equivalent failure, so a buyer cannot tell the two paths apart.
     /// Publish an agent's marked answer as an INLINE delivery (§6.4), and journal it.
     ///
     /// Shared by the host and the container delivery paths. Both reach the same place — the
@@ -8889,6 +8909,27 @@ impl SellerNodeRunner {
         answer: &str,
         exec_metadata: &[gateway::TagSpec],
     ) {
+        // REFUSED, never cut. Truncating here would publish half a sentence, co-sign it, and ask
+        // the buyer to pay the full price for it — the buyer cannot tell a cut answer from a
+        // complete one, because the digest is of whatever the seller sent. So an over-long answer
+        // is a delivery this seller cannot make, and it says so. `delivery_failed` rather than
+        // `no_sentinel`: the agent ran and answered, so the harness is healthy and is not struck.
+        if answer.len() > INLINE_ANSWER_MAX_BYTES {
+            opline!(
+                "seller node execute fail job_id={job_id}: inline answer is {} bytes, over the \
+                 {INLINE_ANSWER_MAX_BYTES}-byte limit — refusing rather than delivering a cut answer",
+                answer.len()
+            );
+            self.fail_job_with_feedback(
+                job_id,
+                &offer.buyer_pubkey,
+                ReasonCode::DeliveryFailed,
+                DELIVERY_FAILURE_FEEDBACK,
+                None,
+            )
+            .await;
+            return;
+        }
         let preimage = delivery_receipt_preimage(
             job_id,
             &offer.task,
@@ -8987,6 +9028,8 @@ impl SellerNodeRunner {
         self.drain().await;
     }
 
+    /// Fail a container-delivered job with the SAME feedback reason codes and harness attribution the
+    /// host path emits for the equivalent failure, so a buyer cannot tell the two paths apart.
     async fn fail_container_delivery(
         &self,
         job_id: &str,

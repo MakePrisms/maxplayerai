@@ -1355,6 +1355,22 @@ pub async fn accept_claim_async(
         &result.result_id,
     )?;
 
+    // §6.4 — a contribution can NEVER settle inline: it descends from a pinned base, and the
+    // deliverable is the tree that descends from it. Refused HERE, before the bind write, rather
+    // than at the pay seam: a bind occupies the job's single settlement slot (asserted just
+    // above), so an inline bind on a contribution offer would publish an ACCEPT, take the only
+    // slot, and then refuse every pay attempt forever with nothing able to replace it.
+    if result.inline_answer.is_some()
+        && (offer.contribution.is_some()
+            || offer.job_class.as_deref() == Some(crate::contribution::JOB_CLASS_CONTRIBUTION))
+    {
+        return Err(JobLifecycleError::Input(
+            "this offer is job-class=contribution, and a contribution cannot be delivered inline \
+             — refusing to bind an inline result to it"
+                .into(),
+        ));
+    }
+
     // §6.4 — the delivery mode decides what this bind settles on. An inline result has no remote
     // and no commit: its integrity hash is the digest of the answer it carries, and that is what
     // the seller co-signed under `delivery_kind = inline`.
@@ -1926,7 +1942,31 @@ pub fn load_accepted_bind(
         .map_err(|error| JobLifecycleError::Io(error.to_string()))?;
     let bind: AcceptedBind = serde_json::from_str(&raw)
         .map_err(|error| JobLifecycleError::Io(format!("accept bind parse: {error}")))?;
+    // §6.4 — `inline_answer` and `delivery_kind` state the SAME fact, and different readers ask
+    // different ones: the pay path routes on the answer, `collect` and the completion path route
+    // on the kind. A bind where they disagree pays down one route and materializes down the
+    // other, AFTER the spend. The accept arm writes both together, so a disagreement is a
+    // corrupt or hand-edited bind — refused here, once, rather than half-honoured by each reader.
+    if bind.inline_answer.is_some() != bind_is_inline_kind(bind.delivery_kind.as_deref()) {
+        return Err(JobLifecycleError::Io(format!(
+            "accept bind for job {job_id} disagrees with itself: inline_answer is {} but \
+             delivery_kind is {:?} — refusing to read a bind whose delivery mode is ambiguous",
+            if bind.inline_answer.is_some() {
+                "present"
+            } else {
+                "absent"
+            },
+            bind.delivery_kind.as_deref().unwrap_or("absent"),
+        )));
+    }
     Ok(Some(bind))
+}
+
+/// True when this `delivery_kind` names an INLINE delivery. `None` is a bind written before inline
+/// delivery existed, which every reader resolves to a fork — the fail-closed direction, and true
+/// of all of them.
+pub(crate) fn bind_is_inline_kind(delivery_kind: Option<&str>) -> bool {
+    delivery_kind == Some(crate::receipt::DeliveryKind::Inline.as_str())
 }
 
 /// Refuse authorize_pay fields that disagree with a recorded accept-bind.

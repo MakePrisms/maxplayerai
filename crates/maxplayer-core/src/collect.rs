@@ -463,7 +463,7 @@ pub fn results_dest(
 /// True when this bind settles an INLINE delivery (§6.4). A bind written before inline delivery
 /// existed carries no kind and is a git delivery — the fail-closed reading, and true of all of them.
 pub fn bind_is_inline(bind: &AcceptedBind) -> bool {
-    bind.delivery_kind.as_deref() == Some(crate::receipt::DeliveryKind::Inline.as_str())
+    crate::job_lifecycle::bind_is_inline_kind(bind.delivery_kind.as_deref())
 }
 
 /// The file an inline answer is materialized as, under `results/<job_id>/`.

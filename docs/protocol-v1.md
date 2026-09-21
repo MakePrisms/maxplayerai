@@ -626,10 +626,14 @@ The delivery mode is decided by the WORK, not by a declaration on the offer. A s
 git whenever the snapshot of the job's working tree is non-empty. Files the tree does not track —
 ignored files among them — are not in that tree and are not delivered.
 
-A seller MAY deliver inline only when BOTH hold:
+A seller MAY deliver inline only when ALL of these hold:
 
-- the snapshot found nothing to deliver, and
-- the agent marked an answer in its final message.
+- the job is from-scratch — a contribution descends from a pinned base, so it can never settle
+  inline and MUST be refused;
+- the snapshot found nothing to deliver; and
+- the agent marked an answer in its final message (§8.3).
+
+A buyer MUST refuse to bind an inline result to a `contribution`-class offer.
 
 The marker is the inline counterpart of §8.2, and §8.3 states it. Without it the seller MUST refuse
 with `no_sentinel` (§7.1). An empty tree with unmarked text is the shape of an exhausted plan, an
@@ -826,9 +830,18 @@ A delivery that carries no sentinel MUST be refused with `no_sentinel`.
 
 An inline delivery (§6.4) has no tree, so §8.2 cannot speak for it. This section is what does.
 
-A seller MUST NOT deliver inline unless the agent's final message begins with a line carrying
-exactly `MAXPLAYER-ANSWER-V1` and nothing else. The answer is the remainder of that message,
-trimmed. An empty remainder is not an answer.
+A seller MUST NOT deliver inline unless the agent's final message begins with a line whose only
+word is `MAXPLAYER-ANSWER-V1`. The answer is the remainder of that message, trimmed. An empty
+remainder is not an answer.
+
+A reader MAY accept Markdown decoration around the token on that line — backticks, emphasis, a
+leading `#`, a trailing colon, an opening code fence above it. A model told to emit an exact line
+routinely formats it, and refusing a decorated marker refuses a correct answer, costs the seller
+its fee, and strikes a healthy harness. Decoration cannot make an unmarked message marked.
+
+An inline answer is bounded. A seller MUST refuse to deliver an answer above its own limit rather
+than truncate one: a reader cannot tell a cut answer from a whole one, because the digest covers
+whatever was sent.
 
 The marker answers the question §8.2 answers for a tree: **did this job's work actually happen?**
 A completed turn does not answer it. An exhausted plan, an unreachable model host and an idle model
@@ -836,13 +849,15 @@ all end a turn normally, leave the tree empty, and explain themselves in ordinar
 seller that read any such text as an answer would publish a vendor error string as a deliverable and
 ask to be paid for it.
 
-The marker is an opt-in for SUCCESS and carries no failure value. Every unmarked outcome — an error
-string, a declined task, a clarifying question, silence — takes the refusal path unchanged. The
-marker can turn a reply that would have been discarded into a delivery; it MUST NOT be able to turn
-a non-delivery into a payment.
+The marker is an opt-in for SUCCESS and carries no failure value. Every UNMARKED outcome — an error
+string, a turn that said nothing, a decline the model did not mark — takes the refusal path
+unchanged.
 
-A reader MUST NOT treat the marker as proof of correctness. It proves that this job's prompt reached
-a model that answered it, which is what §8.2 proves for a tree, and no more.
+A reader MUST NOT treat the marker as proof of correctness, and MUST NOT treat it as proof that the
+task was done. A model that marks an answer and then writes that it could not determine one is
+paid. The marker proves only that this job's prompt reached a model which answered it — what §8.2
+proves for a tree, and no more. A tree delivery has the same limit: a committed refusal note mints
+a sentinel and settles.
 
 ## 9. Verification Checks
 
