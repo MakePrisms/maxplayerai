@@ -94,15 +94,6 @@ pub struct PostJobRequest {
     /// [`crate::capability::CAPABILITIES`]; the posting path refuses the request otherwise, before
     /// any event is signed.
     pub required_capabilities: Vec<String>,
-    /// Delivery modes this buyer can READ, declared on the offer as
-    /// `["param","accepts-delivery", …]` (§6.1). Empty ⇒ no tag ⇒ git only, and the offer is
-    /// byte-identical to one posted before inline delivery existed.
-    ///
-    /// The MCP surface defaults this to `inline`, because a buyer running this build genuinely can
-    /// read one: `collect` materializes it and the pay path verifies it. Declaring a mode this
-    /// binary could not read is the only way to get this wrong, which is why the default is set at
-    /// the surface that knows what the binary supports and never inferred deeper down.
-    pub accepts_delivery: Vec<String>,
     /// How this job settles (§1.1). [`PaymentMode::Sat`] — the default — is a priced job and every
     /// money gate runs as it always did.
     ///
@@ -781,8 +772,7 @@ fn build_offer_draft(
         request.requested_harness_family.as_deref(),
         request.requested_model.as_deref(),
         &request.required_capabilities,
-    )
-    .accepting_delivery(&request.accepts_delivery);
+    );
 
     // #897 — TWO GATES, on the NORMALIZED request rather than the raw one. Validating what was handed
     // in would refuse a padded `" rust "` for a defect the builder just fixed, and would pass a value
@@ -2774,6 +2764,48 @@ fn offer_read_answered(offer_present: bool, offer_probe_confirmed: bool) -> bool
 /// `pub(crate)` so the seller daemon can run the backfill money-safety pre-claim check
 /// (already-delivered / live-claimed-by-another) without duplicating the relay read.
 
+/// Build one [`ResultView`] from a published RESULT event.
+///
+/// Extracted from the view loop so the delivery split has a seam a test can reach: `accept` reads
+/// the answer off THIS view, so an inline answer dropped here is an inline delivery that cannot be
+/// accepted at all.
+fn result_view_from_event(
+    result_id: String,
+    created_at: u64,
+    seller_pubkey: String,
+    draft: &EventDraft,
+) -> ResultView {
+    let delivery = parse_git_result_delivery(draft).ok();
+    // Exclusive with `delivery` by construction: `parse_inline_result_delivery` refuses a
+    // result carrying any git locator tag, and the git parser refuses `delivery=inline`.
+    let inline_answer = crate::gateway::parse_inline_result_delivery(draft).ok();
+    let amount_sats = first_tag(&draft.tags, "amount")
+        .and_then(|tag| tag.0.get(1))
+        .and_then(|value| value.parse().ok());
+    let (harness, model) = result_attribution(&draft.tags);
+    ResultView {
+        // Threaded, not dropped: `accept_claim_async` reads the answer off this view to build the
+        // bind. Pinned to `None`, every inline result takes the git arm of the accept split and
+        // fails on the `repo` tag an inline result does not carry.
+        inline_answer,
+        result_id,
+        created_at,
+        seller_pubkey,
+        display_name: None,
+        job_hash: first_tag_value(&draft.tags, "job-hash").map(str::to_owned),
+        repo: delivery.as_ref().map(|d| d.repo().to_owned()),
+        branch: delivery.as_ref().map(|d| d.branch().to_owned()),
+        commit_oid: delivery
+            .as_ref()
+            .map(|d| d.commit_oid().as_str().to_owned()),
+        amount_sats,
+        seller_signature: sig_seller_value(&draft.tags),
+        harness,
+        model,
+        contribution: contribution_result_view(&draft.tags),
+    }
+}
+
 pub(crate) async fn fetch_job_view_async(
     home: &MaxplayerHome,
     keys: &nostr_sdk::Keys,
@@ -2953,33 +2985,12 @@ pub(crate) async fn fetch_job_view_async(
 
     let mut results = Vec::new();
     for event in result_events {
-        let draft = event_to_draft(&event);
-        let delivery = parse_git_result_delivery(&draft).ok();
-        // Exclusive with `delivery` by construction: `parse_inline_result_delivery` refuses a
-        // result carrying any git locator tag, and the git parser refuses `delivery=inline`.
-        let inline_answer = crate::gateway::parse_inline_result_delivery(&draft).ok();
-        let amount_sats = first_tag(&draft.tags, "amount")
-            .and_then(|tag| tag.0.get(1))
-            .and_then(|value| value.parse().ok());
-        let (harness, model) = result_attribution(&draft.tags);
-        results.push(ResultView {
-            inline_answer: None,
-            result_id: event.id.to_hex(),
-            created_at: event.created_at.as_secs(),
-            seller_pubkey: event.pubkey.to_hex(),
-            display_name: None,
-            job_hash: first_tag_value(&draft.tags, "job-hash").map(str::to_owned),
-            repo: delivery.as_ref().map(|d| d.repo().to_owned()),
-            branch: delivery.as_ref().map(|d| d.branch().to_owned()),
-            commit_oid: delivery
-                .as_ref()
-                .map(|d| d.commit_oid().as_str().to_owned()),
-            amount_sats,
-            seller_signature: sig_seller_value(&draft.tags),
-            harness,
-            model,
-            contribution: contribution_result_view(&draft.tags),
-        });
+        results.push(result_view_from_event(
+            event.id.to_hex(),
+            event.created_at.as_secs(),
+            event.pubkey.to_hex(),
+            &event_to_draft(&event),
+        ));
     }
     results.sort_by_key(|r| std::cmp::Reverse(r.created_at));
 
@@ -4800,7 +4811,6 @@ mod tests {
         let err = post_job(
             &home,
             PostJobRequest {
-                accepts_delivery: Vec::new(),
                 payment_mode: crate::gateway::PaymentMode::Sat,
                 task: "t".into(),
                 output: "text/plain".into(),
@@ -4993,7 +5003,6 @@ mod tests {
         let posted = post_job_async(
             &home,
             PostJobRequest {
-                accepts_delivery: Vec::new(),
                 payment_mode: crate::gateway::PaymentMode::Sat,
                 task: "wake on arrival".into(),
                 output: "text/plain".into(),
@@ -5088,7 +5097,6 @@ mod tests {
         let posted = post_job_async(
             &home,
             PostJobRequest {
-                accepts_delivery: Vec::new(),
                 payment_mode: crate::gateway::PaymentMode::Sat,
                 task: "test display-name opt-in".into(),
                 output: "text/plain".into(),
@@ -5152,7 +5160,6 @@ mod tests {
         let err = post_job(
             &home,
             PostJobRequest {
-                accepts_delivery: Vec::new(),
                 payment_mode: crate::gateway::PaymentMode::Sat,
                 task: "t".into(),
                 output: "text/plain".into(),
@@ -5354,6 +5361,54 @@ mod tests {
         );
     }
 
+    /// §6.4 — the accept path reads the answer off the RESULT VIEW, so the view must carry it.
+    /// A view that drops it sends every inline result down the git arm of the accept split, where
+    /// it fails on the `repo` tag an inline result does not carry.
+    #[test]
+    fn the_result_view_carries_an_inline_answer_and_no_git_locator() {
+        let answer = "Europe/Zagreb";
+        let draft = crate::gateway::inline_result_draft(
+            &"aa".repeat(32),
+            &"bb".repeat(32),
+            "text/plain",
+            2,
+            &"ff".repeat(32),
+            &"ab".repeat(32),
+            answer,
+            &[],
+        );
+        let view = result_view_from_event("cc".repeat(32), 1, "dd".repeat(32), &draft);
+        assert_eq!(view.inline_answer.as_deref(), Some(answer));
+        assert_eq!(view.repo, None, "an inline result binds no remote");
+        assert_eq!(view.branch, None, "an inline result binds no branch");
+        assert_eq!(view.commit_oid, None, "an inline result binds no commit");
+    }
+
+    /// A git result keeps its locator and declares no answer. The two shapes stay exclusive
+    /// through the view, which is what lets `accept` read the mode off `inline_answer` alone.
+    #[test]
+    fn the_result_view_of_a_git_result_carries_no_inline_answer() {
+        let commit = "77".repeat(20);
+        let draft = crate::gateway::result_draft(
+            &"aa".repeat(32),
+            &"bb".repeat(32),
+            "text/plain",
+            2,
+            &"ff".repeat(32),
+            &"ab".repeat(32),
+            "delivered",
+            Some(crate::gateway::GitResultTags {
+                repo: "https://example.invalid/r.git",
+                branch: "maxplayer/aabbccdd",
+                commit_sha: &commit,
+            }),
+            &[],
+        );
+        let view = result_view_from_event("cc".repeat(32), 1, "dd".repeat(32), &draft);
+        assert_eq!(view.inline_answer, None, "a git result declares no answer");
+        assert_eq!(view.commit_oid.as_deref(), Some(commit.as_str()));
+    }
+
     /// §6.4 — an inline bind settles on the digest of the answer it carries, and the pay request
     /// carries that answer so the pay path can re-derive the digest itself before any spend.
     #[test]
@@ -5490,7 +5545,6 @@ mod tests {
         accepts: Option<Vec<String>>,
     ) -> PostJobRequest {
         PostJobRequest {
-            accepts_delivery: Vec::new(),
             payment_mode: crate::gateway::PaymentMode::Sat,
             task: "t".into(),
             output: "text/plain".into(),
@@ -5565,7 +5619,6 @@ mod tests {
         capabilities: &[&str],
     ) -> PostJobRequest {
         PostJobRequest {
-            accepts_delivery: Vec::new(),
             payment_mode: crate::gateway::PaymentMode::Sat,
             task: "t".into(),
             output: "text/plain".into(),
@@ -5726,7 +5779,6 @@ mod tests {
     fn post_job_from_scratch_emits_byte_identical_tags() {
         // No contribution params ⇒ Ok(None) ⇒ built tags are byte-identical to the bare offer.
         let request = PostJobRequest {
-            accepts_delivery: Vec::new(),
             payment_mode: crate::gateway::PaymentMode::Sat,
             task: "t".into(),
             output: "text/plain".into(),
@@ -5935,7 +5987,6 @@ mod tests {
         let err = post_job_async(
             &home,
             PostJobRequest {
-                accepts_delivery: Vec::new(),
                 payment_mode: crate::gateway::PaymentMode::Sat,
                 task: "t".into(),
                 output: "text/plain".into(),
@@ -6394,7 +6445,6 @@ mod free_lane_tests {
 
     fn post_request(amount_sats: u64, payment_mode: PaymentMode) -> PostJobRequest {
         PostJobRequest {
-            accepts_delivery: Vec::new(),
             payment_mode,
             task: "t".into(),
             output: "text/plain".into(),

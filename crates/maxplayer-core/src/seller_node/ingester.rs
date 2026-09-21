@@ -137,7 +137,6 @@ mod tests {
             targeted: true,
             requested_agent: None,
             output: Some("text/plain".to_owned()),
-            accepts_delivery: Vec::new(),
         }
     }
 

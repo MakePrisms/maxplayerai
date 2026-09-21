@@ -768,7 +768,6 @@ mod tests {
     fn offer(amount: u64, seller: Option<&str>) -> ParsedOffer {
         ParsedOffer {
             payment_mode: crate::gateway::PaymentMode::Sat,
-            accepts_delivery: Vec::new(),
             task: "task".into(),
             output: "text/plain".into(),
             amount,
@@ -1434,7 +1433,6 @@ mod free_lane_tests {
     fn offer(amount: u64, mode: PaymentMode, seller: Option<&str>) -> ParsedOffer {
         ParsedOffer {
             payment_mode: mode,
-            accepts_delivery: Vec::new(),
             task: "task".into(),
             output: "text/plain".into(),
             amount,

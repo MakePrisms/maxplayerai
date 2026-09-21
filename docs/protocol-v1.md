@@ -454,20 +454,12 @@ reject a lifecycle event that lacks it.
 | `["param","harness_model", model]` | 0..1 | no | Requires one model; needs `agent` |
 | `["param","capability", token, ...]` | 0..1 | no | Requires every listed capability token |
 | `["param","payment","none"]` | 0..1 | no | This job has NO payment leg. Absent means `sat` |
-| `["param","accepts-delivery", mode, ...]` | 0..1 | no | Delivery modes this buyer can READ. Absent means `git` only |
 | `["delivery","git"]` | 0..1 | no | Delivery binding mode |
 | `["repo", locator]` | 0..1 | no | Bound delivery remote |
 | `["branch", name]` | 0..1 | no | Bound delivery branch |
 
 The `delivery`, `repo`, and `branch` tags bind delivery as one group. If the offer uses any of them,
 it MUST carry all three. A reader MUST reject a partial group.
-
-`["param","accepts-delivery", …]` is a different axis from that group: the group binds WHERE a git
-delivery goes, and this parameter states which delivery modes the buyer can read at all. **Absent
-MUST be read as `git` only.** A buyer that never heard of another mode emits no tag, so an offer
-posted before this parameter existed is byte-identical to one that declares nothing, and a seller
-reading either one cannot conclude it may deliver anything but git. The declaration is therefore
-fail-closed by construction, and a seller MUST gate a non-git delivery on it (§6.4).
 
 #### 6.1.1 The payment mode
 
@@ -630,9 +622,10 @@ there is no git object anywhere. An inline result MUST NOT carry `repo`, `branch
 the two shapes are exclusive, so a reader steered to verify one can never materialize the other. A
 reader MUST refuse an inline result whose `content` is empty.
 
-A seller MUST NOT deliver inline unless the offer declared the mode (§6.1). A buyer that declared
-nothing can only read git, so an undeclared inline delivery is unreadable by the party paying for
-it.
+The delivery mode is decided by the WORK, not by a declaration on the offer. A seller MUST deliver
+git whenever the job wrote files. It MAY deliver inline only when the job wrote no files and the
+agent produced a reply. An empty tree and an empty reply together are not a delivery at all, and
+the seller MUST refuse (§7.1).
 
 The execution metadata block is what the seller reports about its own run. Nothing verifies it. A
 reader MUST NOT treat it as proof that a given harness or model ran.
