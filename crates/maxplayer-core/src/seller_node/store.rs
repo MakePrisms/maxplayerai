@@ -3186,6 +3186,62 @@ mod tests {
         wire_draft(crate::gateway::JOB_RESULT_KIND)
     }
 
+    /// §6.1 — the buyer's accepted-delivery declaration must SURVIVE the store.
+    ///
+    /// Execution can be a restart away from the claim, and the delivering job reads this to decide
+    /// whether it may answer inline. If the write binding or the read index were wrong, the value
+    /// would come back empty, every resumed job would fall back to git-only, and an answer job
+    /// would be refused for a reason nothing names. The existing fixtures all declare NOTHING, and
+    /// empty round-trips to empty through NULL even when the plumbing is broken — so only a
+    /// NON-EMPTY value tests this at all.
+    ///
+    /// Bite (measured): change the `?12` binding or the `row.get(10)` index and this goes red,
+    /// while every other store test stays green.
+    #[test]
+    fn a_non_empty_accepts_delivery_survives_both_read_paths() {
+        let (store, _path) = fresh_store("accepts-delivery");
+        let mut offer = sample_offer("job-accepts-delivery");
+        offer.accepts_delivery = vec!["inline".to_owned()];
+        // A deadline in the future, so the awaiting-claim read returns it.
+        offer.deadline_unix = 9_000_000_000;
+        store.record_offer(&offer, 1).expect("record offer");
+
+        let by_id = store
+            .offer_row(&offer.offer_id)
+            .expect("read offer")
+            .expect("offer is present");
+        assert_eq!(
+            by_id.accepts_delivery,
+            vec!["inline".to_owned()],
+            "the declaration must survive the single-offer read"
+        );
+
+        let awaiting = store.offers_awaiting_claim(1).expect("awaiting read");
+        let found = awaiting
+            .iter()
+            .find(|row| row.offer_id == offer.offer_id)
+            .expect("the offer is awaiting a claim");
+        assert_eq!(
+            found.accepts_delivery,
+            vec!["inline".to_owned()],
+            "the declaration must survive the awaiting-claim read too — the resume path uses it"
+        );
+
+        // An offer that declares nothing reads back as git-only, which is the fail-closed
+        // direction and what every row written before this column existed says.
+        let plain = sample_offer("job-declares-nothing");
+        store.record_offer(&plain, 1).expect("record plain offer");
+        assert!(
+            store
+                .offer_row(&plain.offer_id)
+                .expect("read")
+                .expect("present")
+                .accepts_delivery
+                .is_empty(),
+            "absent MUST read as git-only"
+        );
+    }
+
     #[test]
     fn open_is_wal_and_carries_schema_and_start() {
         let (store, path) = fresh_store("wal");
