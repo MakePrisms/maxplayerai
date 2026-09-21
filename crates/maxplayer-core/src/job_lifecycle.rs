@@ -238,6 +238,13 @@ pub struct OfferView {
     /// Cosmetic kind-0 `name` for targeted `seller_pubkey` (untrusted; never replaces hex).
     pub seller_display_name: Option<String>,
     pub targeted: bool,
+    /// Delivery modes THIS buyer declared it can read, off its own signed offer
+    /// (`["param","accepts-delivery", …]`, §6.1). Empty ⇒ git only.
+    ///
+    /// The buyer must enforce its own declaration. The seller gate is the seller's promise, and a
+    /// seller that ignores it publishes an inline result the buyer never said it could read —
+    /// which would otherwise be bound, paid, and settled with the git and sentinel checks skipped.
+    pub accepts_delivery: Vec<String>,
     pub repo: Option<String>,
     pub branch: Option<String>,
     /// Raw `job-class` tag value. `Some("contribution")` ⇒ a contribution offer; absent
@@ -1367,6 +1374,20 @@ pub async fn accept_claim_async(
         &request.job_id,
         &result.result_id,
     )?;
+
+    // §6.1 — THE BUYER ENFORCES ITS OWN DECLARATION. The seller gate is a promise; this is the
+    // check. A seller that ignores the promise publishes a correctly signed inline result for an
+    // offer that permits git only, and without this the buyer binds it, skips the git fetch, the
+    // tip-match and the §8.2 sentinel — every delivery check it has — and pays. The offer is
+    // signed by this buyer, so the constraint is authenticated; nothing about the RESULT is.
+    if result.inline_answer.is_some() && !offer_accepts_inline(offer) {
+        return Err(JobLifecycleError::Input(
+            "this result is an inline delivery, but the offer did not declare \
+             [\"param\",\"accepts-delivery\",\"inline\"] — refusing to bind a mode this job \
+             never asked for"
+                .into(),
+        ));
+    }
 
     // §6.4 — a contribution can NEVER settle inline: it descends from a pinned base, and the
     // deliverable is the tree that descends from it. Refused HERE, before the bind write, rather
@@ -2812,6 +2833,15 @@ fn offer_read_answered(offer_present: bool, offer_probe_confirmed: bool) -> bool
     offer_present || offer_probe_confirmed
 }
 
+/// True when this offer declared it can read an inline delivery (§6.1). Absent ⇒ git only, which
+/// is every offer posted before the parameter existed.
+fn offer_accepts_inline(offer: &OfferView) -> bool {
+    offer
+        .accepts_delivery
+        .iter()
+        .any(|mode| mode == crate::gateway::DELIVERY_MODE_INLINE)
+}
+
 impl ResultView {
     /// True when this result actually DELIVERED something (§6.4), whatever the mode.
     ///
@@ -3012,6 +3042,10 @@ pub(crate) async fn fetch_job_view_async(
             job_class: first_tag_value(&draft.tags, crate::contribution::TAG_JOB_CLASS)
                 .map(str::to_owned),
             contribution: contribution_offer_view(&draft.tags),
+            accepts_delivery: parsed
+                .as_ref()
+                .map(|p| p.accepts_delivery.clone())
+                .unwrap_or_default(),
             requested_agent: parsed.as_ref().and_then(|p| p.requested_agent.clone()),
             requested_harness_family: parsed
                 .as_ref()
@@ -5311,6 +5345,7 @@ mod tests {
     // ── Accept-path: contribution resolution (echo-equality + fail-closed) ─────
     fn offer_view_contribution(owner: &str, url: &str, base_branch: &str, base_oid: &str) -> OfferView {
         OfferView {
+            accepts_delivery: Vec::new(),
             payment_mode: crate::gateway::PaymentMode::Sat,
             event_id: "of".repeat(16),
             created_at: 1,
@@ -5483,6 +5518,42 @@ mod tests {
         assert!(
             !nothing.has_delivery(),
             "a result that delivered neither must not read as delivered"
+        );
+    }
+
+    /// ⛔ THE BUYER ENFORCES ITS OWN DECLARATION (§6.1). The seller gate is the seller's promise;
+    /// a seller that ignores it publishes a correctly signed inline result for an offer that
+    /// permits git only. Bound, that result skips the git fetch, the tip-match and the §8.2
+    /// sentinel — every delivery check the buyer has — and settles. The offer is signed BY THIS
+    /// BUYER, so the constraint is authenticated; nothing about the result is.
+    ///
+    /// Bite (measured): drop the `offer_accepts_inline` guard and this goes red.
+    #[test]
+    fn an_inline_result_is_refused_when_the_offer_did_not_declare_inline() {
+        // A plain from-scratch offer: the contribution helper with its class cleared.
+        let plain = || {
+            let mut view =
+                offer_view_contribution(&"aa".repeat(32), "https://x/r.git", "main", &"77".repeat(20));
+            view.job_class = None;
+            view.contribution = None;
+            view
+        };
+        let git_only = plain();
+        assert!(
+            !offer_accepts_inline(&git_only),
+            "an offer that declares nothing accepts git only"
+        );
+
+        let mut declaring = plain();
+        declaring.accepts_delivery = vec![crate::gateway::DELIVERY_MODE_INLINE.to_owned()];
+        assert!(offer_accepts_inline(&declaring));
+
+        // An unknown single mode grants nothing, however it is spelled.
+        let mut crafted = plain();
+        crafted.accepts_delivery = vec!["git inline".to_owned()];
+        assert!(
+            !offer_accepts_inline(&crafted),
+            "one unrecognised mode must not read as an inline declaration"
         );
     }
 
@@ -6520,6 +6591,7 @@ mod free_lane_tests {
 
     fn offer_view(amount: u64, mode: PaymentMode) -> OfferView {
         OfferView {
+            accepts_delivery: Vec::new(),
             payment_mode: mode,
             event_id: JOB.to_owned(),
             created_at: 0,

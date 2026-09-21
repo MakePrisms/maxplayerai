@@ -2414,6 +2414,13 @@ pub fn job_prompt(
         deadline_unix,
         offer.output.as_deref(),
         memory_section,
+        // §6.1 — the agent is told how to mark an answer only when this buyer said it can read
+        // one. The offer row is the authenticated source, and it is what the delivery arm gates
+        // on, so the prompt and the gate can never disagree about whether inline is available.
+        offer
+            .accepts_delivery
+            .iter()
+            .any(|mode| mode == gateway::DELIVERY_MODE_INLINE),
     )
 }
 
@@ -2988,6 +2995,17 @@ enum ContainerDeliveryFailure {
         /// from defaults would state a wall time of zero as if it were measured.
         usage: Option<crate::driver::UsageMetadata>,
         wall_time_ms: u64,
+        /// The container CUT the message to fit its outcome file. A cut answer must never be
+        /// delivered: the buyer re-derives the digest of what it received, so the loss is
+        /// invisible to it and it pays the full price for a partial answer.
+        message_truncated: bool,
+        /// The outcome file echoed this job's hand-off nonce, so the ORCHESTRATOR wrote it.
+        ///
+        /// Only the orchestrator ever holds the nonce — the inputs file carrying it is deleted
+        /// before the agent exists. Without this an agent survivor can plant an outcome that says
+        /// `NoSentinel` and carries text of its choosing, and that text becomes a signed, paid
+        /// inline delivery off a run the harness actually failed.
+        outcome_authentic: bool,
         /// Whether this job was from-scratch. A contribution descends from a pinned base and can
         /// never settle inline, and the container path SERVES contributions — it reads the pin and
         /// hands the orchestrator a base — so the inline arm needs this to make the same decision
@@ -7905,6 +7923,12 @@ impl SellerNodeRunner {
                         usage,
                         wall_time_ms,
                         from_scratch: true,
+                        // Only an outcome the orchestrator wrote may mint a delivery.
+                        outcome_authentic: true,
+                        // A cut message is not a deliverable. The host's own length bound runs on
+                        // what the container sent, which is already under the cap, so this flag is
+                        // the only thing that can see the loss.
+                        message_truncated: false,
                         ..
                     } = &failure
                         // The same capability gate as the host arm; see there.
@@ -8790,6 +8814,7 @@ impl SellerNodeRunner {
                     // contribution clone. Read here, where it is a fact of THIS delivery, rather
                     // than re-derived from the pin in the classifier.
                     base_is_none,
+                    &nonce,
                 )
             }
             Err(failure) => Err(failure),
@@ -8819,6 +8844,7 @@ impl SellerNodeRunner {
         branch: &str,
         started: Instant,
         from_scratch: bool,
+        expected_nonce: &str,
     ) -> Result<ContainerDelivery, ContainerDeliveryFailure> {
         use crate::delivery_orchestrator as orch;
         use ContainerDeliveryFailure as Fail;
@@ -8833,6 +8859,9 @@ impl SellerNodeRunner {
             outcome.status,
             outcome.detail
         );
+        // Only the orchestrator holds the nonce; the inputs file carrying it is deleted before
+        // the agent exists. An outcome that does not echo it was not written by the orchestrator.
+        let outcome_authentic = outcome.handoff_nonce.as_deref() == Some(expected_nonce);
         let detail = outcome.detail;
         match outcome.status {
             orch::Phase1Status::Delivered => {
@@ -8872,9 +8901,11 @@ impl SellerNodeRunner {
                 Err(Fail::NoSentinel {
                     detail,
                     from_scratch,
+                    outcome_authentic,
                     // The container already bounded this at `OUTCOME_TEXT_MAX_BYTES` when it wrote
                     // the outcome file, so the host path's own bound is a no-op on this branch.
                     last_agent_message: agent.last_agent_message,
+                    message_truncated: agent.last_agent_message_truncated,
                     usage: agent.usage,
                     wall_time_ms: started.elapsed().as_millis() as u64,
                 })

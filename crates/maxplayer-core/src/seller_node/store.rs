@@ -694,19 +694,34 @@ pub struct Offer {
 
 /// Serialize the accepted-delivery modes for the `offers.accepts_delivery` column. `None` for an
 /// empty set, so a buyer that declared nothing writes NULL and reads back as git-only.
+///
+/// JSON, not a space-joined list. A space-joined list is LOSSY in the direction that grants
+/// capability: a single declared mode `"git inline"` — one value a seller must treat as one
+/// unknown mode, and therefore as no inline capability at all — round-trips through a whitespace
+/// split as the two modes `["git", "inline"]`, and the restarted job then believes the buyer
+/// declared `inline`. The encoding must not be able to invent a capability the offer never stated.
 fn accepts_delivery_to_column(modes: &[String]) -> Option<String> {
     if modes.is_empty() {
         return None;
     }
-    Some(modes.join(" "))
+    serde_json::to_string(modes).ok()
 }
 
-/// Read the `offers.accepts_delivery` column. NULL, empty, or whitespace ⇒ empty ⇒ git only.
+/// Read the `offers.accepts_delivery` column. NULL, empty, or unreadable ⇒ empty ⇒ git only.
+///
+/// A row written by an earlier binary holds the space-joined form. It is read back with a split,
+/// which is exact for every mode name this protocol has ever defined (none contains a space) and
+/// fail-closed for anything else: the worst a legacy row can do is name modes that no reader
+/// recognises. New rows are JSON and round-trip exactly.
 fn accepts_delivery_from_column(raw: Option<String>) -> Vec<String> {
-    raw.unwrap_or_default()
-        .split_whitespace()
-        .map(str::to_owned)
-        .collect()
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    let trimmed = raw.trim();
+    if trimmed.starts_with('[') {
+        return serde_json::from_str::<Vec<String>>(trimmed).unwrap_or_default();
+    }
+    trimmed.split_whitespace().map(str::to_owned).collect()
 }
 
 /// #591: the target + base a SERVED contribution job clones into its delivery workdir. The buyer's
@@ -3184,6 +3199,35 @@ mod tests {
 
     fn result() -> EventDraft {
         wire_draft(crate::gateway::JOB_RESULT_KIND)
+    }
+
+    /// ⛔ THE ENCODING MUST NOT INVENT A CAPABILITY. A single declared mode `"git inline"` is ONE
+    /// unknown mode — no reader recognises it, so it grants nothing. Space-joined and
+    /// whitespace-split, it comes back as the two modes `["git", "inline"]`, and the resumed job
+    /// then believes the buyer declared `inline`. A crafted offer would buy itself a capability
+    /// through a restart.
+    ///
+    /// Bite (measured): restore `modes.join(" ")` and this goes red.
+    #[test]
+    fn a_mode_containing_a_space_cannot_split_into_two_modes() {
+        let (store, _path) = fresh_store("accepts-delivery-lossless");
+        let mut offer = sample_offer("job-crafted-mode");
+        offer.accepts_delivery = vec!["git inline".to_owned()];
+        store.record_offer(&offer, 1).expect("record offer");
+
+        let back = store
+            .offer_row(&offer.offer_id)
+            .expect("read")
+            .expect("present");
+        assert_eq!(
+            back.accepts_delivery,
+            vec!["git inline".to_owned()],
+            "one crafted mode must stay ONE mode through the store"
+        );
+        assert!(
+            !back.accepts_delivery.iter().any(|m| m == "inline"),
+            "the store must not hand a resumed job an inline capability the offer never declared"
+        );
     }
 
     /// §6.1 — the buyer's accepted-delivery declaration must SURVIVE the store.
