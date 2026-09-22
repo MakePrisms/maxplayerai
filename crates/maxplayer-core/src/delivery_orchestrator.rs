@@ -432,7 +432,7 @@ pub fn run_phase1_entry_with(
     inputs_path: &Path,
     container_env: impl Fn(&str) -> Option<String>,
     run_agent: impl FnOnce(&Phase1Inputs, &Path) -> Result<AgentOutcome, OrchestratorError>,
-    reap: impl FnOnce() -> Result<(), OrchestratorError>,
+    reap: impl Fn() -> Result<(), OrchestratorError>,
 ) -> Result<Phase1Output, OrchestratorError> {
     assert_delivery_container(container_env)?;
     let inputs = read_json::<Phase1Inputs>(inputs_path)?;
@@ -442,8 +442,29 @@ pub fn run_phase1_entry_with(
 
     let started = std::time::Instant::now();
     let mut agent: Option<AgentOutcome> = None;
-    let result = deliver_in_container(&inputs, &mut agent, run_agent, reap);
-    let outcome = Phase1Outcome::from_result(&result, agent, started.elapsed());
+    let result = deliver_in_container(&inputs, &mut agent, run_agent, &reap);
+    // REAP ON EVERY EXIT, not only the delivered one, and BEFORE anything is written.
+    //
+    // The delivered path reaps inside `deliver_in_container`; every refusal path used to return
+    // without reaping, and that did not matter while no refusal could be paid. §6.4 changed it:
+    // an empty-tree refusal now carries the text an inline delivery is minted from. Written while
+    // survivors are alive, that file is shared with processes running as this uid which can read
+    // it and write it back — so a nonce placed there authenticates nothing at all. The survivor
+    // reads the nonce out of the file and re-uses it verbatim.
+    //
+    // The reap is therefore what makes the nonce mean anything, and the nonce is stamped ONLY
+    // when the reap proved this process is the sole writer. A host that finds no nonce refuses to
+    // mint a delivery from the file, which is the fail-closed direction.
+    // Reap only. The delivered path also CLEARS the mount, before it writes its own marker;
+    // clearing again here would delete that marker, which is the file the host authenticates a
+    // delivery with — and a refused push leaves a legitimate marker too. Clearing is not what the
+    // nonce needs anyway: `write_outcome` replaces the outcome file, so a planted one is
+    // overwritten. What the nonce needs is that nothing is alive to read it back out.
+    let sole_writer = reap().is_ok();
+    let mut outcome = Phase1Outcome::from_result(&result, agent, started.elapsed());
+    if sole_writer {
+        outcome.handoff_nonce = Some(inputs.handoff_nonce.clone());
+    }
     if let Err(error) = write_outcome(&inputs.out_dir, &outcome) {
         eprintln!("sandbox orchestrator: could not write the outcome file: {error}");
     }
@@ -476,7 +497,7 @@ fn deliver_in_container(
     inputs: &Phase1Inputs,
     agent: &mut Option<AgentOutcome>,
     run_agent: impl FnOnce(&Phase1Inputs, &Path) -> Result<AgentOutcome, OrchestratorError>,
-    reap: impl FnOnce() -> Result<(), OrchestratorError>,
+    reap: impl Fn() -> Result<(), OrchestratorError>,
 ) -> Result<Phase1Output, OrchestratorError> {
     let identity = DeliveryAgentIdentity::for_seller(&inputs.seller_pubkey_hex);
     let base = inputs.base.as_ref().map(|b| Phase1Base {
@@ -595,6 +616,8 @@ fn drive_acp_agent(
     ));
     match result {
         Ok(report) => Ok(AgentOutcome {
+            // `bound_text` sets this when it cuts; nothing is cut yet at this point.
+            last_agent_message_truncated: false,
             usage: report.usage,
             last_agent_message: report.last_agent_message,
         }),
@@ -888,6 +911,15 @@ pub struct AgentOutcome {
     pub usage: Option<crate::driver::UsageMetadata>,
     /// The agent's last non-empty message, verbatim.
     pub last_agent_message: Option<String>,
+    /// True when `last_agent_message` was CUT to fit [`OUTCOME_TEXT_MAX_BYTES`].
+    ///
+    /// The host cannot tell from the string itself, and it matters: an inline delivery (§6.4)
+    /// publishes this message as the deliverable and asks the buyer to pay for it. The buyer
+    /// re-derives the digest of what it received, so a cut answer verifies perfectly and is paid
+    /// in full. `#[serde(default)]` so an outcome written by an older container reads `false`,
+    /// which is what every such outcome meant when nothing could be paid off this field.
+    #[serde(default)]
+    pub last_agent_message_truncated: bool,
 }
 
 /// How the run ended, for the host's feedback and harness attribution. Every arm maps onto a host
@@ -933,6 +965,17 @@ pub struct Phase1Outcome {
     pub agent: Option<AgentOutcome>,
     /// Wall time of the whole container run, agent included.
     pub wall_time_ms: u64,
+    /// Echo of [`Phase1Inputs::handoff_nonce`], proving the ORCHESTRATOR wrote this outcome.
+    ///
+    /// The inputs file carrying the nonce is deleted before the agent exists, so no job process
+    /// ever learns it. The `Delivered` arm is authenticated by the agent-done marker, which
+    /// carries the same nonce; the refusal arms had nothing, which did not matter while no
+    /// refusal could be paid. §6.4 changed that: an empty-tree refusal now carries the text an
+    /// inline delivery is minted from, so a planted outcome would turn a job-controlled file into
+    /// a signed, paid deliverable. `#[serde(default)]` keeps an older container's outcome
+    /// readable; the host treats a missing nonce as unauthenticated.
+    #[serde(default)]
+    pub handoff_nonce: Option<String>,
 }
 
 impl Phase1Outcome {
@@ -943,8 +986,10 @@ impl Phase1Outcome {
         elapsed: Duration,
     ) -> Self {
         let wall_time_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+        // Stamped by `run_phase1_entry_with`, which is the only place that holds the nonce.
         let mut outcome = match result {
             Ok(output) => Self {
+                handoff_nonce: None,
                 status: Phase1Status::Delivered,
                 detail: String::new(),
                 delivery_oid: Some(output.delivery_oid.clone()),
@@ -969,6 +1014,7 @@ impl Phase1Outcome {
                     OrchestratorError::Io(_) => Phase1Status::Aborted,
                 };
                 Self {
+                    handoff_nonce: None,
                     status,
                     detail: error.to_string(),
                     delivery_oid: None,
@@ -987,12 +1033,15 @@ impl Phase1Outcome {
     /// outcome unreadable.
     fn bound_text(&mut self) {
         truncate_to_char_boundary(&mut self.detail, OUTCOME_TEXT_MAX_BYTES);
-        if let Some(message) = self
-            .agent
-            .as_mut()
-            .and_then(|agent| agent.last_agent_message.as_mut())
+        if let Some(agent) = self.agent.as_mut()
+            && let Some(message) = agent.last_agent_message.as_mut()
         {
+            let before = message.len();
             truncate_to_char_boundary(message, OUTCOME_TEXT_MAX_BYTES);
+            // RECORDED, because the cut is invisible downstream. The host's own length check runs
+            // on what arrives here, which is already under the cap — so without this flag a cut
+            // answer passes every bound the host has and is delivered as whole.
+            agent.last_agent_message_truncated = message.len() != before;
         }
     }
 }
@@ -2060,6 +2109,7 @@ mod tests {
             fs::write(workdir.join("answer.txt"), "entry agent output\n")
                 .map_err(|e| OrchestratorError::Io(e.to_string()))?;
             Ok(AgentOutcome {
+                last_agent_message_truncated: false,
                 usage: None,
                 last_agent_message: Some("done".to_owned()),
             })
@@ -2569,6 +2619,7 @@ mod tests {
                 delivery_repo_dir: PathBuf::from("/work"),
             }),
             Some(AgentOutcome {
+                last_agent_message_truncated: false,
                 usage: Some(usage.clone()),
                 last_agent_message: None,
             }),
@@ -2709,6 +2760,7 @@ mod tests {
         })
         .expect("encode marker");
         let valid_outcome = serde_json::to_string(&Phase1Outcome {
+            handoff_nonce: None,
             status: Phase1Status::Delivered,
             detail: String::new(),
             delivery_oid: Some("c".repeat(40)),
@@ -2879,6 +2931,7 @@ mod tests {
         let root = fresh_root("outcome-bound");
         let io = root.join("io");
         let agent = Some(AgentOutcome {
+            last_agent_message_truncated: false,
             usage: None,
             last_agent_message: Some("é".repeat(EXCHANGE_OUTCOME_MAX_BYTES)),
         });

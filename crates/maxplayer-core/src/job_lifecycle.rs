@@ -94,6 +94,18 @@ pub struct PostJobRequest {
     /// [`crate::capability::CAPABILITIES`]; the posting path refuses the request otherwise, before
     /// any event is signed.
     pub required_capabilities: Vec<String>,
+    /// Delivery modes this buyer can READ, declared on the offer as
+    /// `["param","accepts-delivery", …]` (§6.1). Empty ⇒ no tag ⇒ git only, and the offer is
+    /// byte-identical to one posted before inline delivery existed.
+    ///
+    /// This is a CAPABILITY filter, not the mode decision. It says what this buyer could verify
+    /// and materialize if it were sent one; whether an answer IS the deliverable is decided by
+    /// the work and the §8.3 marker, on the seller. Both gates are required.
+    ///
+    /// The MCP surface defaults it to `inline`, because a buyer running this build genuinely can
+    /// read one. Declaring a mode this binary could not read is the only way to get it wrong,
+    /// which is why the default is set at the surface that knows what the binary supports.
+    pub accepts_delivery: Vec<String>,
     /// How this job settles (§1.1). [`PaymentMode::Sat`] — the default — is a priced job and every
     /// money gate runs as it always did.
     ///
@@ -226,6 +238,13 @@ pub struct OfferView {
     /// Cosmetic kind-0 `name` for targeted `seller_pubkey` (untrusted; never replaces hex).
     pub seller_display_name: Option<String>,
     pub targeted: bool,
+    /// Delivery modes THIS buyer declared it can read, off its own signed offer
+    /// (`["param","accepts-delivery", …]`, §6.1). Empty ⇒ git only.
+    ///
+    /// The buyer must enforce its own declaration. The seller gate is the seller's promise, and a
+    /// seller that ignores it publishes an inline result the buyer never said it could read —
+    /// which would otherwise be bound, paid, and settled with the git and sentinel checks skipped.
+    pub accepts_delivery: Vec<String>,
     pub repo: Option<String>,
     pub branch: Option<String>,
     /// Raw `job-class` tag value. `Some("contribution")` ⇒ a contribution offer; absent
@@ -339,6 +358,11 @@ pub struct ResultView {
     pub repo: Option<String>,
     pub branch: Option<String>,
     pub commit_oid: Option<String>,
+    /// The answer an INLINE result carries in its own content (§6.4). `Some` iff the result is
+    /// inline, in which case `repo`/`branch`/`commit_oid` are all `None` — the two delivery shapes
+    /// are exclusive and a reader must never hold both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline_answer: Option<String>,
     pub amount_sats: Option<u64>,
     /// Seller schnorr signature (hex) from the result's `["sig","seller",..]` tag — the
     /// buyer counter-signs the same receipt preimage to co-sign the kind-3400.
@@ -367,9 +391,24 @@ pub struct AcceptedBind {
     pub claim_id: String,
     pub result_id: String,
     pub seller_pubkey: String,
+    /// The delivered artifact's INTEGRITY HASH — a 40-hex commit oid for a git delivery, or the
+    /// 64-hex answer digest for an inline one (§6.4). `delivery_kind` is the discriminator; the
+    /// two lengths differ, so an inline bind that ever reached the git path would fail
+    /// `CommitOid::parse` rather than be misread as an oid.
     pub commit_oid: String,
+    /// Empty for an inline delivery — there is no remote.
     pub repo: String,
+    /// Empty for an inline delivery — there is no branch.
     pub branch: String,
+    /// Wire label of the delivery mode this bind settles (`fork` | `inline`). `None` on a bind
+    /// written before inline delivery existed, which every reader resolves to `fork` — the
+    /// fail-closed direction, and true of every such bind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_kind: Option<String>,
+    /// The answer an inline delivery carries, recorded at accept so `collect` can materialize it
+    /// without a second read of the relay. `None` for a git delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline_answer: Option<String>,
     pub job_hash: String,
     pub amount_sats: u64,
     pub accept_event_id: String,
@@ -752,7 +791,8 @@ fn build_offer_draft(
         request.requested_harness_family.as_deref(),
         request.requested_model.as_deref(),
         &request.required_capabilities,
-    );
+    )
+    .accepting_delivery(&request.accepts_delivery);
 
     // #897 — TWO GATES, on the NORMALIZED request rather than the raw one. Validating what was handed
     // in would refuse a padded `" rust "` for a defect the builder just fixed, and would pass a value
@@ -1335,18 +1375,65 @@ pub async fn accept_claim_async(
         &result.result_id,
     )?;
 
-    let repo = result
-        .repo
-        .clone()
-        .ok_or_else(|| JobLifecycleError::Input("result missing repo".into()))?;
-    let branch = result
-        .branch
-        .clone()
-        .ok_or_else(|| JobLifecycleError::Input("result missing branch".into()))?;
-    let commit_oid = result
-        .commit_oid
-        .clone()
-        .ok_or_else(|| JobLifecycleError::Input("result missing commit_oid".into()))?;
+    // §6.1 — THE BUYER ENFORCES ITS OWN DECLARATION. The seller gate is a promise; this is the
+    // check. A seller that ignores the promise publishes a correctly signed inline result for an
+    // offer that permits git only, and without this the buyer binds it, skips the git fetch, the
+    // tip-match and the §8.2 sentinel — every delivery check it has — and pays. The offer is
+    // signed by this buyer, so the constraint is authenticated; nothing about the RESULT is.
+    if result.inline_answer.is_some() && !offer_accepts_inline(offer) {
+        return Err(JobLifecycleError::Input(
+            "this result is an inline delivery, but the offer did not declare \
+             [\"param\",\"accepts-delivery\",\"inline\"] — refusing to bind a mode this job \
+             never asked for"
+                .into(),
+        ));
+    }
+
+    // §6.4 — a contribution can NEVER settle inline: it descends from a pinned base, and the
+    // deliverable is the tree that descends from it. Refused HERE, before the bind write, rather
+    // than at the pay seam: a bind occupies the job's single settlement slot (asserted just
+    // above), so an inline bind on a contribution offer would publish an ACCEPT, take the only
+    // slot, and then refuse every pay attempt forever with nothing able to replace it.
+    if result.inline_answer.is_some()
+        && (offer.contribution.is_some()
+            || offer.job_class.as_deref() == Some(crate::contribution::JOB_CLASS_CONTRIBUTION))
+    {
+        return Err(JobLifecycleError::Input(
+            "this offer is job-class=contribution, and a contribution cannot be delivered inline \
+             — refusing to bind an inline result to it"
+                .into(),
+        ));
+    }
+
+    // §6.4 — the delivery mode decides what this bind settles on. An inline result has no remote
+    // and no commit: its integrity hash is the digest of the answer it carries, and that is what
+    // the seller co-signed under `delivery_kind = inline`.
+    let (repo, branch, commit_oid, inline_answer, delivery_kind) = match result.inline_answer.clone()
+    {
+        Some(answer) => (
+            String::new(),
+            String::new(),
+            crate::receipt::result_content_hash_hex(&answer),
+            Some(answer),
+            Some(crate::receipt::DeliveryKind::Inline.as_str().to_owned()),
+        ),
+        None => (
+            result
+                .repo
+                .clone()
+                .ok_or_else(|| JobLifecycleError::Input("result missing repo".into()))?,
+            result
+                .branch
+                .clone()
+                .ok_or_else(|| JobLifecycleError::Input("result missing branch".into()))?,
+            result
+                .commit_oid
+                .clone()
+                .ok_or_else(|| JobLifecycleError::Input("result missing commit_oid".into()))?,
+            None,
+            None,
+        ),
+    };
     // Bind the OFFER's amount (buyer-signed authority) — NEVER the seller-authored result
     // amount, which a malicious seller could inflate.
     let amount_sats = offer.amount_sats;
@@ -1403,6 +1490,8 @@ pub async fn accept_claim_async(
             commit_oid,
             repo,
             branch,
+            delivery_kind,
+            inline_answer,
             job_hash,
             amount_sats: 0,
             accept_event_id: String::new(),
@@ -1506,6 +1595,8 @@ pub async fn accept_claim_async(
         commit_oid,
         repo,
         branch,
+        delivery_kind,
+        inline_answer,
         job_hash,
         amount_sats,
         // Pending marker until the accept is published + finalized below.
@@ -1655,10 +1746,10 @@ fn select_deliverable_claim(
     let delivered = view
         .results
         .iter()
-        .any(|result| result.seller_pubkey == awarded.seller_pubkey && result.commit_oid.is_some());
+        .any(|result| result.seller_pubkey == awarded.seller_pubkey && result.has_delivery());
     if !delivered {
         return Err(JobLifecycleError::NotFound(format!(
-            "collect: the awarded seller for job {} has not delivered a git result yet — wait for \
+            "collect: the awarded seller for job {} has not delivered a result yet — wait for \
              delivery (get_job wait_for=result) before collecting",
             view.job_id
         )));
@@ -1689,7 +1780,7 @@ pub(crate) fn awarded_delivery_pending(
     }
     view.results
         .iter()
-        .any(|result| result.seller_pubkey == seller_pubkey && result.commit_oid.is_some())
+        .any(|result| result.seller_pubkey == seller_pubkey && result.has_delivery())
 }
 
 /// Accept-time contribution resolution. Authority is the buyer's SIGNED OFFER:
@@ -1885,7 +1976,31 @@ pub fn load_accepted_bind(
         .map_err(|error| JobLifecycleError::Io(error.to_string()))?;
     let bind: AcceptedBind = serde_json::from_str(&raw)
         .map_err(|error| JobLifecycleError::Io(format!("accept bind parse: {error}")))?;
+    // §6.4 — `inline_answer` and `delivery_kind` state the SAME fact, and different readers ask
+    // different ones: the pay path routes on the answer, `collect` and the completion path route
+    // on the kind. A bind where they disagree pays down one route and materializes down the
+    // other, AFTER the spend. The accept arm writes both together, so a disagreement is a
+    // corrupt or hand-edited bind — refused here, once, rather than half-honoured by each reader.
+    if bind.inline_answer.is_some() != bind_is_inline_kind(bind.delivery_kind.as_deref()) {
+        return Err(JobLifecycleError::Io(format!(
+            "accept bind for job {job_id} disagrees with itself: inline_answer is {} but \
+             delivery_kind is {:?} — refusing to read a bind whose delivery mode is ambiguous",
+            if bind.inline_answer.is_some() {
+                "present"
+            } else {
+                "absent"
+            },
+            bind.delivery_kind.as_deref().unwrap_or("absent"),
+        )));
+    }
     Ok(Some(bind))
+}
+
+/// True when this `delivery_kind` names an INLINE delivery. `None` is a bind written before inline
+/// delivery existed, which every reader resolves to a fork — the fail-closed direction, and true
+/// of all of them.
+pub(crate) fn bind_is_inline_kind(delivery_kind: Option<&str>) -> bool {
+    delivery_kind == Some(crate::receipt::DeliveryKind::Inline.as_str())
 }
 
 /// Refuse authorize_pay fields that disagree with a recorded accept-bind.
@@ -2006,6 +2121,9 @@ pub fn authorize_request_from_bind(
         repo: bind.repo.clone(),
         branch: bind.branch.clone(),
         commit_oid: bind.commit_oid.clone(),
+        // §6.4 — threaded so the pay path takes the inline route: it re-derives the digest from
+        // THIS answer instead of fetching a git object. `None` ⇒ the git path, unchanged.
+        inline_answer: bind.inline_answer.clone(),
         seller_signature: bind.seller_signature.clone(),
         // Thread the recorded creq hash so the attempt + receipt bind the seller's
         // request. `None` ⇒ a claim with no creq.
@@ -2226,7 +2344,7 @@ fn now_unix() -> u64 {
 fn delivery_pay_deadline(results: &[ResultView], seller_pubkey: &str) -> Option<u64> {
     results
         .iter()
-        .filter(|result| result.seller_pubkey == seller_pubkey && result.commit_oid.is_some())
+        .filter(|result| result.seller_pubkey == seller_pubkey && result.has_delivery())
         .map(|result| result.created_at)
         .max()
         .map(|created_at| created_at.saturating_add(DELIVERY_PAY_WINDOW_SECS))
@@ -2715,11 +2833,73 @@ fn offer_read_answered(offer_present: bool, offer_probe_confirmed: bool) -> bool
     offer_present || offer_probe_confirmed
 }
 
+/// True when this offer declared it can read an inline delivery (§6.1). Absent ⇒ git only, which
+/// is every offer posted before the parameter existed.
+fn offer_accepts_inline(offer: &OfferView) -> bool {
+    offer
+        .accepts_delivery
+        .iter()
+        .any(|mode| mode == crate::gateway::DELIVERY_MODE_INLINE)
+}
+
+impl ResultView {
+    /// True when this result actually DELIVERED something (§6.4), whatever the mode.
+    ///
+    /// A git result carries a commit; an inline result carries the answer and no commit. Every
+    /// "has the seller delivered?" question must ask THIS, never `commit_oid.is_some()` — that
+    /// test reads an inline delivery as nothing at all, and the buyer then waits out the deadline
+    /// on work that was published and is sitting there to be paid for.
+    pub fn has_delivery(&self) -> bool {
+        self.commit_oid.is_some() || self.inline_answer.is_some()
+    }
+}
+
+/// Build one [`ResultView`] from a published RESULT event.
+///
+/// Extracted from the view loop so the delivery split has a seam a test can reach: `accept` reads
+/// the answer off THIS view, so an inline answer dropped here is an inline delivery that cannot be
+/// accepted at all.
+fn result_view_from_event(
+    result_id: String,
+    created_at: u64,
+    seller_pubkey: String,
+    draft: &EventDraft,
+) -> ResultView {
+    let delivery = parse_git_result_delivery(draft).ok();
+    // Exclusive with `delivery` by construction: `parse_inline_result_delivery` refuses a
+    // result carrying any git locator tag, and the git parser refuses `delivery=inline`.
+    let inline_answer = crate::gateway::parse_inline_result_delivery(draft).ok();
+    let amount_sats = first_tag(&draft.tags, "amount")
+        .and_then(|tag| tag.0.get(1))
+        .and_then(|value| value.parse().ok());
+    let (harness, model) = result_attribution(&draft.tags);
+    ResultView {
+        // Threaded, not dropped: `accept_claim_async` reads the answer off this view to build the
+        // bind. Pinned to `None`, every inline result takes the git arm of the accept split and
+        // fails on the `repo` tag an inline result does not carry.
+        inline_answer,
+        result_id,
+        created_at,
+        seller_pubkey,
+        display_name: None,
+        job_hash: first_tag_value(&draft.tags, "job-hash").map(str::to_owned),
+        repo: delivery.as_ref().map(|d| d.repo().to_owned()),
+        branch: delivery.as_ref().map(|d| d.branch().to_owned()),
+        commit_oid: delivery
+            .as_ref()
+            .map(|d| d.commit_oid().as_str().to_owned()),
+        amount_sats,
+        seller_signature: sig_seller_value(&draft.tags),
+        harness,
+        model,
+        contribution: contribution_result_view(&draft.tags),
+    }
+}
+
 /// Read one job's offer + claims + results from the relay, with claim liveness derived
 /// against `now` (a `processing` claim past the offer deadline is EXPIRED, not live). Exposed
 /// `pub(crate)` so the seller daemon can run the backfill money-safety pre-claim check
 /// (already-delivered / live-claimed-by-another) without duplicating the relay read.
-
 pub(crate) async fn fetch_job_view_async(
     home: &MaxplayerHome,
     keys: &nostr_sdk::Keys,
@@ -2862,6 +3042,10 @@ pub(crate) async fn fetch_job_view_async(
             job_class: first_tag_value(&draft.tags, crate::contribution::TAG_JOB_CLASS)
                 .map(str::to_owned),
             contribution: contribution_offer_view(&draft.tags),
+            accepts_delivery: parsed
+                .as_ref()
+                .map(|p| p.accepts_delivery.clone())
+                .unwrap_or_default(),
             requested_agent: parsed.as_ref().and_then(|p| p.requested_agent.clone()),
             requested_harness_family: parsed
                 .as_ref()
@@ -2899,29 +3083,12 @@ pub(crate) async fn fetch_job_view_async(
 
     let mut results = Vec::new();
     for event in result_events {
-        let draft = event_to_draft(&event);
-        let delivery = parse_git_result_delivery(&draft).ok();
-        let amount_sats = first_tag(&draft.tags, "amount")
-            .and_then(|tag| tag.0.get(1))
-            .and_then(|value| value.parse().ok());
-        let (harness, model) = result_attribution(&draft.tags);
-        results.push(ResultView {
-            result_id: event.id.to_hex(),
-            created_at: event.created_at.as_secs(),
-            seller_pubkey: event.pubkey.to_hex(),
-            display_name: None,
-            job_hash: first_tag_value(&draft.tags, "job-hash").map(str::to_owned),
-            repo: delivery.as_ref().map(|d| d.repo().to_owned()),
-            branch: delivery.as_ref().map(|d| d.branch().to_owned()),
-            commit_oid: delivery
-                .as_ref()
-                .map(|d| d.commit_oid().as_str().to_owned()),
-            amount_sats,
-            seller_signature: sig_seller_value(&draft.tags),
-            harness,
-            model,
-            contribution: contribution_result_view(&draft.tags),
-        });
+        results.push(result_view_from_event(
+            event.id.to_hex(),
+            event.created_at.as_secs(),
+            event.pubkey.to_hex(),
+            &event_to_draft(&event),
+        ));
     }
     results.sort_by_key(|r| std::cmp::Reverse(r.created_at));
 
@@ -3046,10 +3213,10 @@ fn select_result<'a>(
     }
     results
         .iter()
-        .find(|result| result.seller_pubkey == seller_pubkey && result.commit_oid.is_some())
+        .find(|result| result.seller_pubkey == seller_pubkey && result.has_delivery())
         .ok_or_else(|| {
             JobLifecycleError::NotFound(format!(
-                "no git result from seller {seller_pubkey} for this job"
+                "no delivered result from seller {seller_pubkey} for this job"
             ))
         })
 }
@@ -3196,6 +3363,8 @@ mod tests {
     #[test]
     fn authorize_from_bind_refuses_amount_drift() {
         let bind = AcceptedBind {
+            delivery_kind: None,
+            inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "aa".repeat(32),
             claim_id: "bb".repeat(32),
@@ -3236,6 +3405,8 @@ mod tests {
     #[test]
     fn single_settlement_refuses_different_result_and_is_idempotent_on_same() {
         let existing = AcceptedBind {
+            delivery_kind: None,
+            inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "aa".repeat(32),
             claim_id: "bb".repeat(32),
@@ -3325,6 +3496,8 @@ mod tests {
             require_seller_signature(&Some("ab".repeat(64))).expect("valid non-empty sig accepted");
         assert_eq!(valid_sig, "ab".repeat(64));
         let bind = AcceptedBind {
+            delivery_kind: None,
+            inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: job_id.clone(),
             claim_id: "bb".repeat(32),
@@ -3378,6 +3551,8 @@ mod tests {
     #[test]
     fn explicit_and_bind_forms_build_identical_request() {
         let bind = AcceptedBind {
+            delivery_kind: None,
+            inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "2a195bece5f6".into(),
             claim_id: "0a8bbc5284e8".into(),
@@ -3407,6 +3582,7 @@ mod tests {
         // The explicit request as mcp.rs builds it, with a job_hash that DIVERGES from the bind
         // (the real-trade failure) and creq_hash/accepted_mints/seller_signature left for the fill.
         let mut explicit = crate::authorize_pay::AuthorizePayRequest {
+            inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: bind.job_id.clone(),
             result_id: bind.result_id.clone(),
@@ -3438,6 +3614,8 @@ mod tests {
     #[test]
     fn explicit_form_seals_repo_and_branch_from_bind() {
         let bind = AcceptedBind {
+            delivery_kind: None,
+            inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "2a195bece5f6".into(),
             claim_id: "0a8bbc5284e8".into(),
@@ -3460,6 +3638,7 @@ mod tests {
             contribution: None,
         };
         let mut explicit = crate::authorize_pay::AuthorizePayRequest {
+            inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: bind.job_id.clone(),
             result_id: bind.result_id.clone(),
@@ -3491,6 +3670,8 @@ mod tests {
     #[test]
     fn byte_equal_explicit_matches_bind_request() {
         let bind = AcceptedBind {
+            delivery_kind: None,
+            inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "2a195bece5f6".into(),
             claim_id: "0a8bbc5284e8".into(),
@@ -3517,6 +3698,7 @@ mod tests {
 
         // Explicit form with EVERY field byte-equal to the bind (the incident's inputs).
         let mut explicit = crate::authorize_pay::AuthorizePayRequest {
+            inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: bind.job_id.clone(),
             result_id: bind.result_id.clone(),
@@ -3554,6 +3736,8 @@ mod tests {
         let bound_mint = "https://mint.minibits.cash/Bitcoin".to_string();
         let attacker_mint = "https://evil.example/attacker".to_string();
         let bind = AcceptedBind {
+            delivery_kind: None,
+            inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "aa".repeat(32),
             claim_id: "bb".repeat(32),
@@ -3578,6 +3762,7 @@ mod tests {
             contribution: None,
         };
         let mut explicit = crate::authorize_pay::AuthorizePayRequest {
+            inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: bind.job_id.clone(),
             result_id: bind.result_id.clone(),
@@ -3662,6 +3847,8 @@ mod tests {
             CashuPublicKey::from_str(&format!("02{}", seller_nostr.to_hex())).expect("p2pk");
 
         let bind = AcceptedBind {
+            delivery_kind: None,
+            inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "job-cc".into(),
             claim_id: "bb".repeat(32),
@@ -3777,6 +3964,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let home = home::bootstrap(&root).expect("home");
         let bind = AcceptedBind {
+            delivery_kind: None,
+            inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "aa".repeat(32),
             claim_id: "bb".repeat(32),
@@ -3982,6 +4171,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let home = home::bootstrap(&root).expect("home");
         let mut bind = AcceptedBind {
+            delivery_kind: None,
+            inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "aa".repeat(32),
             claim_id: "bb".repeat(32),
@@ -4053,6 +4244,8 @@ mod tests {
         let job_id = "aa".repeat(32);
 
         let bind_for = |result_id: &str| AcceptedBind {
+            delivery_kind: None,
+            inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: job_id.clone(),
             claim_id: "bb".repeat(32),
@@ -4143,6 +4336,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let home = home::bootstrap(&root).expect("home");
         let mut bind = AcceptedBind {
+            delivery_kind: None,
+            inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "aa".repeat(32),
             claim_id: "bb".repeat(32),
@@ -4190,6 +4385,8 @@ mod tests {
     #[test]
     fn authorize_from_bind_requires_buyer_tip_match_hash() {
         let bind = AcceptedBind {
+            delivery_kind: None,
+            inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "aa".repeat(32),
             claim_id: "bb".repeat(32),
@@ -4232,6 +4429,8 @@ mod tests {
     #[test]
     fn assert_authorize_matches_bind_refuses_seller_mismatch() {
         let bind = AcceptedBind {
+            delivery_kind: None,
+            inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "aa".repeat(32),
             claim_id: "bb".repeat(32),
@@ -4261,6 +4460,7 @@ mod tests {
 
     fn result_view(result_id: &str, seller_pubkey: &str) -> ResultView {
         ResultView {
+            inline_answer: None,
             result_id: result_id.to_owned(),
             created_at: 100,
             seller_pubkey: seller_pubkey.to_owned(),
@@ -4564,6 +4764,7 @@ mod tests {
     /// `commit_oid` so [`delivery_pay_deadline`] counts it as a delivery.
     fn delivery_result(seller_pubkey: &str, created_at: u64) -> ResultView {
         ResultView {
+            inline_answer: None,
             result_id: format!("res-{created_at}"),
             created_at,
             seller_pubkey: seller_pubkey.to_owned(),
@@ -4708,6 +4909,7 @@ mod tests {
         let err = post_job(
             &home,
             PostJobRequest {
+                accepts_delivery: Vec::new(),
                 payment_mode: crate::gateway::PaymentMode::Sat,
                 task: "t".into(),
                 output: "text/plain".into(),
@@ -4900,6 +5102,7 @@ mod tests {
         let posted = post_job_async(
             &home,
             PostJobRequest {
+                accepts_delivery: Vec::new(),
                 payment_mode: crate::gateway::PaymentMode::Sat,
                 task: "wake on arrival".into(),
                 output: "text/plain".into(),
@@ -4994,6 +5197,7 @@ mod tests {
         let posted = post_job_async(
             &home,
             PostJobRequest {
+                accepts_delivery: Vec::new(),
                 payment_mode: crate::gateway::PaymentMode::Sat,
                 task: "test display-name opt-in".into(),
                 output: "text/plain".into(),
@@ -5057,6 +5261,7 @@ mod tests {
         let err = post_job(
             &home,
             PostJobRequest {
+                accepts_delivery: Vec::new(),
                 payment_mode: crate::gateway::PaymentMode::Sat,
                 task: "t".into(),
                 output: "text/plain".into(),
@@ -5140,6 +5345,7 @@ mod tests {
     // ── Accept-path: contribution resolution (echo-equality + fail-closed) ─────
     fn offer_view_contribution(owner: &str, url: &str, base_branch: &str, base_oid: &str) -> OfferView {
         OfferView {
+            accepts_delivery: Vec::new(),
             payment_mode: crate::gateway::PaymentMode::Sat,
             event_id: "of".repeat(16),
             created_at: 1,
@@ -5258,9 +5464,194 @@ mod tests {
         );
     }
 
+    /// §6.4 — every "has the seller delivered?" predicate reads `has_delivery`, so an inline
+    /// result counts. Keyed on `commit_oid` alone, the buyer's automated path reads a published
+    /// inline delivery as nothing: `collect` and the daemon watcher refuse with NotFound, the
+    /// claim expires at the offer deadline, and the reservation unwinds on work already done.
+    #[test]
+    fn a_result_counts_as_delivered_in_either_mode() {
+        let answer = "Europe/Zagreb";
+        let inline = result_view_from_event(
+            "cc".repeat(32),
+            1,
+            "dd".repeat(32),
+            &crate::gateway::inline_result_draft(
+                &"aa".repeat(32),
+                &"bb".repeat(32),
+                "text/plain",
+                2,
+                &"ff".repeat(32),
+                &"ab".repeat(32),
+                answer,
+                &[],
+            ),
+        );
+        assert!(inline.commit_oid.is_none(), "an inline result binds no commit");
+        assert!(inline.has_delivery(), "an inline answer IS a delivery");
+
+        let commit = "77".repeat(20);
+        let git = result_view_from_event(
+            "cc".repeat(32),
+            1,
+            "dd".repeat(32),
+            &crate::gateway::result_draft(
+                &"aa".repeat(32),
+                &"bb".repeat(32),
+                "text/plain",
+                2,
+                &"ff".repeat(32),
+                &"ab".repeat(32),
+                "delivered",
+                Some(crate::gateway::GitResultTags {
+                    repo: "https://example.invalid/r.git",
+                    branch: "maxplayer/aabbccdd",
+                    commit_sha: &commit,
+                }),
+                &[],
+            ),
+        );
+        assert!(git.has_delivery(), "a git result is a delivery as it always was");
+
+        let mut nothing = git.clone();
+        nothing.commit_oid = None;
+        nothing.inline_answer = None;
+        assert!(
+            !nothing.has_delivery(),
+            "a result that delivered neither must not read as delivered"
+        );
+    }
+
+    /// ⛔ THE BUYER ENFORCES ITS OWN DECLARATION (§6.1). The seller gate is the seller's promise;
+    /// a seller that ignores it publishes a correctly signed inline result for an offer that
+    /// permits git only. Bound, that result skips the git fetch, the tip-match and the §8.2
+    /// sentinel — every delivery check the buyer has — and settles. The offer is signed BY THIS
+    /// BUYER, so the constraint is authenticated; nothing about the result is.
+    ///
+    /// Bite (measured): drop the `offer_accepts_inline` guard and this goes red.
+    #[test]
+    fn an_inline_result_is_refused_when_the_offer_did_not_declare_inline() {
+        // A plain from-scratch offer: the contribution helper with its class cleared.
+        let plain = || {
+            let mut view =
+                offer_view_contribution(&"aa".repeat(32), "https://x/r.git", "main", &"77".repeat(20));
+            view.job_class = None;
+            view.contribution = None;
+            view
+        };
+        let git_only = plain();
+        assert!(
+            !offer_accepts_inline(&git_only),
+            "an offer that declares nothing accepts git only"
+        );
+
+        let mut declaring = plain();
+        declaring.accepts_delivery = vec![crate::gateway::DELIVERY_MODE_INLINE.to_owned()];
+        assert!(offer_accepts_inline(&declaring));
+
+        // An unknown single mode grants nothing, however it is spelled.
+        let mut crafted = plain();
+        crafted.accepts_delivery = vec!["git inline".to_owned()];
+        assert!(
+            !offer_accepts_inline(&crafted),
+            "one unrecognised mode must not read as an inline declaration"
+        );
+    }
+
+    /// §6.4 — the accept path reads the answer off the RESULT VIEW, so the view must carry it.
+    /// A view that drops it sends every inline result down the git arm of the accept split, where
+    /// it fails on the `repo` tag an inline result does not carry.
+    #[test]
+    fn the_result_view_carries_an_inline_answer_and_no_git_locator() {
+        let answer = "Europe/Zagreb";
+        let draft = crate::gateway::inline_result_draft(
+            &"aa".repeat(32),
+            &"bb".repeat(32),
+            "text/plain",
+            2,
+            &"ff".repeat(32),
+            &"ab".repeat(32),
+            answer,
+            &[],
+        );
+        let view = result_view_from_event("cc".repeat(32), 1, "dd".repeat(32), &draft);
+        assert_eq!(view.inline_answer.as_deref(), Some(answer));
+        assert_eq!(view.repo, None, "an inline result binds no remote");
+        assert_eq!(view.branch, None, "an inline result binds no branch");
+        assert_eq!(view.commit_oid, None, "an inline result binds no commit");
+    }
+
+    /// A git result keeps its locator and declares no answer. The two shapes stay exclusive
+    /// through the view, which is what lets `accept` read the mode off `inline_answer` alone.
+    #[test]
+    fn the_result_view_of_a_git_result_carries_no_inline_answer() {
+        let commit = "77".repeat(20);
+        let draft = crate::gateway::result_draft(
+            &"aa".repeat(32),
+            &"bb".repeat(32),
+            "text/plain",
+            2,
+            &"ff".repeat(32),
+            &"ab".repeat(32),
+            "delivered",
+            Some(crate::gateway::GitResultTags {
+                repo: "https://example.invalid/r.git",
+                branch: "maxplayer/aabbccdd",
+                commit_sha: &commit,
+            }),
+            &[],
+        );
+        let view = result_view_from_event("cc".repeat(32), 1, "dd".repeat(32), &draft);
+        assert_eq!(view.inline_answer, None, "a git result declares no answer");
+        assert_eq!(view.commit_oid.as_deref(), Some(commit.as_str()));
+    }
+
+    /// §6.4 — an inline bind settles on the digest of the answer it carries, and the pay request
+    /// carries that answer so the pay path can re-derive the digest itself before any spend.
+    #[test]
+    fn authorize_request_from_bind_threads_an_inline_answer() {
+        let answer = "Europe/Zagreb";
+        let digest = crate::receipt::result_content_hash_hex(answer);
+        let bind = AcceptedBind {
+            delivery_kind: Some(crate::receipt::DeliveryKind::Inline.as_str().to_owned()),
+            inline_answer: Some(answer.to_owned()),
+            payment_mode: crate::gateway::PaymentMode::Sat,
+            job_id: "aa".repeat(32),
+            claim_id: "bb".repeat(32),
+            result_id: "cc".repeat(32),
+            seller_pubkey: "dd".repeat(32),
+            // The integrity hash slot holds the ANSWER digest, not a commit oid.
+            commit_oid: digest.clone(),
+            // No remote and no branch: an inline delivery has neither.
+            repo: String::new(),
+            branch: String::new(),
+            job_hash: "ff".repeat(32),
+            amount_sats: 2,
+            accept_event_id: "11".repeat(32),
+            accepted_at: 1,
+            seller_signature: "ab".repeat(32),
+            creq_hash: None,
+            accepted_mints: Vec::new(),
+            funding_mint: None,
+            delivery_mint: None,
+            agent_used: None,
+            model_used: None,
+            contribution: None,
+        };
+        let req = authorize_request_from_bind(&bind, 2, digest.clone()).expect("ok");
+        assert_eq!(req.inline_answer.as_deref(), Some(answer));
+        assert_eq!(req.delivery_integrity_hash, digest);
+        assert!(req.repo.is_empty() && req.branch.is_empty());
+
+        // The tip-match gate is unchanged by the mode: a hash that is not the bound one is refused
+        // before anything else happens.
+        assert!(authorize_request_from_bind(&bind, 2, "00".repeat(32)).is_err());
+    }
+
     #[test]
     fn authorize_request_from_bind_threads_contribution() {
         let mut bind = AcceptedBind {
+            delivery_kind: None,
+            inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "aa".repeat(32),
             claim_id: "bb".repeat(32),
@@ -5350,6 +5741,7 @@ mod tests {
         accepts: Option<Vec<String>>,
     ) -> PostJobRequest {
         PostJobRequest {
+            accepts_delivery: Vec::new(),
             payment_mode: crate::gateway::PaymentMode::Sat,
             task: "t".into(),
             output: "text/plain".into(),
@@ -5424,6 +5816,7 @@ mod tests {
         capabilities: &[&str],
     ) -> PostJobRequest {
         PostJobRequest {
+            accepts_delivery: Vec::new(),
             payment_mode: crate::gateway::PaymentMode::Sat,
             task: "t".into(),
             output: "text/plain".into(),
@@ -5584,6 +5977,7 @@ mod tests {
     fn post_job_from_scratch_emits_byte_identical_tags() {
         // No contribution params ⇒ Ok(None) ⇒ built tags are byte-identical to the bare offer.
         let request = PostJobRequest {
+            accepts_delivery: Vec::new(),
             payment_mode: crate::gateway::PaymentMode::Sat,
             task: "t".into(),
             output: "text/plain".into(),
@@ -5792,6 +6186,7 @@ mod tests {
         let err = post_job_async(
             &home,
             PostJobRequest {
+                accepts_delivery: Vec::new(),
                 payment_mode: crate::gateway::PaymentMode::Sat,
                 task: "t".into(),
                 output: "text/plain".into(),
@@ -6196,6 +6591,7 @@ mod free_lane_tests {
 
     fn offer_view(amount: u64, mode: PaymentMode) -> OfferView {
         OfferView {
+            accepts_delivery: Vec::new(),
             payment_mode: mode,
             event_id: JOB.to_owned(),
             created_at: 0,
@@ -6250,6 +6646,7 @@ mod free_lane_tests {
 
     fn post_request(amount_sats: u64, payment_mode: PaymentMode) -> PostJobRequest {
         PostJobRequest {
+            accepts_delivery: Vec::new(),
             payment_mode,
             task: "t".into(),
             output: "text/plain".into(),

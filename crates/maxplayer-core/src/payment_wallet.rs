@@ -4399,6 +4399,7 @@ mod tests {
     fn offer(seller: &str) -> ParsedOffer {
         ParsedOffer {
             payment_mode: crate::gateway::PaymentMode::Sat,
+            accepts_delivery: Vec::new(),
             task: "task".into(),
             output: "text/plain".into(),
             amount: 7,

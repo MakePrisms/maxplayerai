@@ -2276,12 +2276,19 @@ where
 /// quarantining the harness — or writes a refusal note that mints a sentinel and gets PAID, so
 /// inviting one before the pre-money seam handles it means paying for refusals. The test below
 /// asserts that ABSENCE, so it cannot be reintroduced by accident.
+///
+/// The ANSWER JOBS line is not a refusal instruction and does not weaken that. It states how to
+/// mark a SUCCESS — [`crate::engine::INLINE_ANSWER_MARKER`] — and says nothing about declining.
+/// Every unmarked outcome, a refusal among them, keeps the exact path it has today. The marker can
+/// only turn a reply that would have been discarded into a delivery; it can never turn a refusal
+/// into a payment, which is the direction #685 is guarding.
 pub fn compose_agent_prompt(
     task: &str,
     git_remote: &str,
     deadline_unix: u64,
     declared_output: Option<&str>,
     memory_section: Option<&str>,
+    accepts_inline: bool,
 ) -> String {
     // #686: the buyer's `["output", …]` tag is MANDATORY on ingest and is a MIME / output type
     // (`text/plain`, `application/json`). Stating it here is the only way the hired agent learns what
@@ -2297,6 +2304,31 @@ pub fn compose_agent_prompt(
              produce the deliverable in that form. The task above wins where the two disagree.\n"
         ),
         None => String::new(),
+    };
+    // ANSWER JOBS is stated ONLY when this buyer declared it can read an inline answer (§6.1).
+    // Told to a git-only job the instruction is a trap: the agent follows it, leaves no files,
+    // and the seller then refuses its own delivery and strikes the harness for a fault the prompt
+    // caused. An offer from a build that never heard of inline delivery declares nothing, so it
+    // never sees this and behaves exactly as it does today.
+    let answer_section = if accepts_inline {
+        format!(
+            // Leads with its OWN newline. The prompt must end where its last sentence ends when
+            // this section is absent — `seller_memory_read_on_start` anchors the memory invariant
+            // on exactly that, and a separator left behind by an empty section breaks it.
+            "\nANSWER JOBS: when the task asks you for information and you leave NO files on disk, \
+             put this exact line first in your final message, alone on its line:\n\
+             {marker}\n\
+             and put your answer on the lines after it, as plain text with no code fence around \
+             the whole reply. Keep the answer under {answer_limit} bytes; a longer one cannot be \
+             delivered, so write a longer one to a file and leave it on disk instead. The daemon \
+             then delivers that answer to the buyer as the deliverable. Without that first line, \
+             only files on disk are delivered.",
+            marker = crate::engine::INLINE_ANSWER_MARKER,
+            // The cap the seller enforces, which already allows for the marker line above.
+            answer_limit = crate::seller_node::run::INLINE_ANSWER_MAX_BYTES,
+        )
+    } else {
+        String::new()
     };
     let base = format!(
         "{task}\n\n\
@@ -2336,7 +2368,7 @@ pub fn compose_agent_prompt(
          - You do NOT need to commit or push, and you are NOT handed any credentials. Committing \
          is harmless, but it is the directory CONTENTS that are delivered, not your commits.\n\
          - Files excluded by .gitignore are NOT delivered, so never ignore your own deliverable.\n\
-         Anything you only print to the console is not delivered."
+         Anything you only print to the console is not delivered.{answer_section}",
     );
     // Read-on-start: when memory is enabled the rendered index section is appended. When `None`
     // (memory_enabled=false, or no non-empty index) the output is byte-IDENTICAL to the
@@ -8066,7 +8098,7 @@ mod tests {
     #[test]
     fn composed_prompt_carries_task_and_owned_delivery_instructions() {
         let remote = "https://relay.example/git/abc.git";
-        let prompt = compose_agent_prompt("build a widget", remote, 1_800_000_123, None, None);
+        let prompt = compose_agent_prompt("build a widget", remote, 1_800_000_123, None, None, true);
         // The original task stays up front.
         assert!(prompt.starts_with("build a widget"), "task preserved: {prompt}");
         // Explicit, seller-owned delivery instructions are appended.
@@ -8112,13 +8144,14 @@ mod tests {
         let remote_b = "https://relay.example/git/bbb.git";
         // Composed WITH a declared output type (#686) so every check below — the wrap-seam
         // instruments and the refusal ban especially — covers that line too, not only the #685 text.
-        let a = compose_agent_prompt("task A", remote_a, 1_800_000_123, Some("text/plain"), None);
+        let a = compose_agent_prompt("task A", remote_a, 1_800_000_123, Some("text/plain"), None, true);
         let b = compose_agent_prompt(
             "task B",
             remote_b,
             1_900_000_456,
             Some("application/json"),
             None,
+            true,
         );
 
         // Identity, deadline and boundaries are present at all — the three things #685 adds.
@@ -8180,8 +8213,8 @@ mod tests {
         assert!(!a.contains("bbb.git"), "not the other job's remote: {a}");
 
         // The deadline VALUE reaches the text: hold every other input fixed and only it varies.
-        let early = compose_agent_prompt("t", "r", 1_000_000_001, None, None);
-        let late = compose_agent_prompt("t", "r", 1_000_000_002, None, None);
+        let early = compose_agent_prompt("t", "r", 1_000_000_001, None, None, true);
+        let late = compose_agent_prompt("t", "r", 1_000_000_002, None, None, true);
         assert_ne!(
             early, late,
             "the deadline argument must reach the prompt, not be dropped"
@@ -8200,6 +8233,24 @@ mod tests {
         }
     }
 
+    // TOOTH (§6.4) — the inline-answer MARKER reaches the hired agent, as the exact token the
+    // seller matches on.
+    //
+    // The marker is the whole gate on inline delivery: a reply without it is never delivered and
+    // never paid. So an agent that is never told the token cannot be paid for an answer at all,
+    // and the feature is silently dead. Asserting the constant (not a copy of its text) is what
+    // keeps the prompt and the matcher from drifting apart.
+    //
+    // Bite (measured): drop the ANSWER JOBS block from `compose_agent_prompt` and this goes red.
+    #[test]
+    fn the_inline_answer_marker_reaches_the_prompt() {
+        let prompt = compose_agent_prompt("t", "r", 1_000, None, None, true);
+        assert!(
+            prompt.contains(crate::engine::INLINE_ANSWER_MARKER),
+            "the agent must be told the exact marker the seller matches on: {prompt}"
+        );
+    }
+
     // TOOTH (#686) — the buyer's DECLARED OUTPUT TYPE reaches the hired agent, as a VALUE.
     //
     // The offer's `output` tag is mandatory on ingest and is a MIME / output type, but until this
@@ -8212,8 +8263,8 @@ mod tests {
     // `{output_section}` from the format string, and this test goes red on the first assertion.
     #[test]
     fn the_declared_output_type_reaches_the_prompt_and_absence_states_nothing() {
-        let json = compose_agent_prompt("t", "r", 1_000, Some("application/json"), None);
-        let plain = compose_agent_prompt("t", "r", 1_000, Some("text/plain"), None);
+        let json = compose_agent_prompt("t", "r", 1_000, Some("application/json"), None, true);
+        let plain = compose_agent_prompt("t", "r", 1_000, Some("text/plain"), None, true);
 
         assert!(
             json.contains("application/json"),
@@ -8242,7 +8293,7 @@ mod tests {
 
         // ABSENT ⇒ SILENT, byte-for-byte. An offer recorded before the column existed declares no
         // output type, and stating a default would put a fact in the prompt no buyer ever gave.
-        let absent = compose_agent_prompt("t", "r", 1_000, None, None);
+        let absent = compose_agent_prompt("t", "r", 1_000, None, None, true);
         assert!(
             !absent.contains("DECLARED OUTPUT TYPE"),
             "no declared type ⇒ nothing stated: {absent}"
@@ -8250,7 +8301,7 @@ mod tests {
         // Blank is absence too (a whitespace-only tag value states nothing), so it lands on the
         // very same bytes rather than on an empty "DECLARED OUTPUT TYPE: ." line.
         assert_eq!(
-            compose_agent_prompt("t", "r", 1_000, Some("   "), None),
+            compose_agent_prompt("t", "r", 1_000, Some("   "), None, true),
             absent,
             "a blank output type states nothing, exactly as an absent one does"
         );
@@ -8277,7 +8328,7 @@ mod tests {
     // Bite: drop the BOUNDARIES bullet, and the first assertion goes red.
     #[test]
     fn preamble_warns_off_self_matching_process_waiters() {
-        let prompt = compose_agent_prompt("t", "r", 1_000, None, None);
+        let prompt = compose_agent_prompt("t", "r", 1_000, None, None, true);
         let boundaries = prompt
             .split("BOUNDARIES:\n")
             .nth(1)

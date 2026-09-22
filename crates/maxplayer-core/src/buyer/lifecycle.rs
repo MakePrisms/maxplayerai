@@ -1595,6 +1595,7 @@ mod tests {
 
     fn offer_view(job_id: &str, amount: u64) -> OfferView {
         OfferView {
+            accepts_delivery: Vec::new(),
             payment_mode: crate::gateway::PaymentMode::Sat,
             event_id: job_id.to_owned(),
             created_at: 0,
@@ -4635,6 +4636,7 @@ mod free_lane_tests {
 
     fn offer_view(amount: u64, mode: PaymentMode) -> OfferView {
         OfferView {
+            accepts_delivery: Vec::new(),
             payment_mode: mode,
             event_id: JOB.to_owned(),
             created_at: 0,

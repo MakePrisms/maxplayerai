@@ -681,6 +681,53 @@ pub struct Offer {
     /// row written before this column existed reads NULL ⇒ [`crate::gateway::PaymentMode::Sat`],
     /// which is correct by construction — every job recorded then was priced.
     pub payment_mode: crate::gateway::PaymentMode,
+    /// The delivery modes the buyer declared it can READ, from the offer's
+    /// `["param","accepts-delivery", …]` tag. Empty ⇒ git only.
+    ///
+    /// Journaled for the SAME reason as `requested_agent`, `output` and `payment_mode` above:
+    /// execution can be a RESTART away from the claim, and the delivering job must know whether
+    /// this buyer can read an inline answer. Unpersisted, a resumed job would fall back to
+    /// git-only and refuse an answer the buyer asked for. A row written before this column existed
+    /// reads NULL ⇒ empty ⇒ git only, which is the fail-closed direction.
+    pub accepts_delivery: Vec<String>,
+}
+
+/// Serialize the accepted-delivery modes for the `offers.accepts_delivery` column. `None` for an
+/// empty set, so a buyer that declared nothing writes NULL and reads back as git-only.
+///
+/// JSON, not a space-joined list. A space-joined list is LOSSY in the direction that grants
+/// capability: a single declared mode `"git inline"` — one value a seller must treat as one
+/// unknown mode, and therefore as no inline capability at all — round-trips through a whitespace
+/// split as the two modes `["git", "inline"]`, and the restarted job then believes the buyer
+/// declared `inline`. The encoding must not be able to invent a capability the offer never stated.
+fn accepts_delivery_to_column(modes: &[String]) -> Option<String> {
+    if modes.is_empty() {
+        return None;
+    }
+    serde_json::to_string(modes).ok()
+}
+
+/// Read the `offers.accepts_delivery` column. Anything that is not JSON ⇒ empty ⇒ git only.
+///
+/// ⛔ A NON-JSON ROW IS DISCARDED, not split. The space-joined form an earlier binary wrote cannot
+/// be decoded without guessing: the one stored value `"git inline"` is either the two modes
+/// `["git", "inline"]` or the single unrecognised mode `["git inline"]`, and those differ by
+/// exactly the capability at stake. Splitting picks the generous reading, which lets a crafted
+/// offer buy itself an inline declaration by surviving an upgrade.
+///
+/// Discarding costs nothing real: inline delivery has never shipped, so no row written by an
+/// earlier binary can hold a legitimate `inline` declaration, and a row read as empty is read as
+/// git-only — which is what every one of those rows meant. New rows are JSON and round-trip
+/// exactly.
+fn accepts_delivery_from_column(raw: Option<String>) -> Vec<String> {
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    let trimmed = raw.trim();
+    if !trimmed.starts_with('[') {
+        return Vec::new();
+    }
+    serde_json::from_str::<Vec<String>>(trimmed).unwrap_or_default()
 }
 
 /// #591: the target + base a SERVED contribution job clones into its delivery workdir. The buyer's
@@ -1142,6 +1189,12 @@ impl SellerStore {
         if !Self::column_exists(conn, "offers", "payment")? {
             conn.execute_batch("ALTER TABLE offers ADD COLUMN payment TEXT;")?;
         }
+        // The buyer's accepted-delivery declaration. A store from an earlier binary reads NULL for
+        // its existing offers ⇒ empty ⇒ git only, which is the truth of those rows: no buyer could
+        // declare a mode that did not exist. Additive + idempotent, exactly like the columns above.
+        if !Self::column_exists(conn, "offers", "accepts_delivery")? {
+            conn.execute_batch("ALTER TABLE offers ADD COLUMN accepts_delivery TEXT;")?;
+        }
         if !Self::column_exists(conn, "deliveries", "payment")? {
             conn.execute_batch("ALTER TABLE deliveries ADD COLUMN payment TEXT;")?;
         }
@@ -1260,8 +1313,8 @@ impl SellerStore {
         let changed = conn.execute(
             "INSERT OR IGNORE INTO offers
                  (offer_id, buyer_pubkey, amount_sats, unit, task, deadline_unix, targeted, created_at_unix,
-                  requested_agent, output, payment)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                  requested_agent, output, payment, accepts_delivery)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 offer.offer_id,
                 offer.buyer_pubkey,
@@ -1274,6 +1327,7 @@ impl SellerStore {
                 offer.requested_agent,
                 offer.output,
                 offer.payment_mode.as_wire(),
+                accepts_delivery_to_column(&offer.accepts_delivery),
             ],
         )?;
         Ok(changed == 1)
@@ -1308,7 +1362,7 @@ impl SellerStore {
         let row = conn
             .query_row(
                 "SELECT offer_id, buyer_pubkey, amount_sats, unit, task, deadline_unix, targeted,
-                        requested_agent, output, payment
+                        requested_agent, output, payment, accepts_delivery
                  FROM offers WHERE offer_id = ?1",
                 [offer_id],
                 |row| {
@@ -1325,6 +1379,7 @@ impl SellerStore {
                         // NULL ⇒ `Sat`. Resolved HERE rather than left to the caller so no reader
                         // of this row can accidentally treat "column absent" as a third state.
                         payment_mode: payment_mode_from_column(row.get::<_, Option<String>>(9)?),
+                        accepts_delivery: accepts_delivery_from_column(row.get::<_, Option<String>>(10)?),
                     })
                 },
             )
@@ -1520,7 +1575,7 @@ impl SellerStore {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT offer_id, buyer_pubkey, amount_sats, unit, task, deadline_unix, targeted,
-                    requested_agent, output, payment
+                    requested_agent, output, payment, accepts_delivery
              FROM offers
              WHERE deadline_unix > ?1
                AND offer_id NOT IN (SELECT job_id FROM claims)",
@@ -1537,6 +1592,7 @@ impl SellerStore {
                 requested_agent: row.get(7)?,
                 output: row.get(8)?,
                 payment_mode: payment_mode_from_column(row.get::<_, Option<String>>(9)?),
+                accepts_delivery: accepts_delivery_from_column(row.get::<_, Option<String>>(10)?),
             })
         })?;
         let mut offers = Vec::new();
@@ -3126,6 +3182,7 @@ mod tests {
             targeted: true,
             requested_agent: None,
             output: Some("text/plain".to_owned()),
+            accepts_delivery: Vec::new(),
         }
     }
 
@@ -3148,6 +3205,124 @@ mod tests {
 
     fn result() -> EventDraft {
         wire_draft(crate::gateway::JOB_RESULT_KIND)
+    }
+
+    /// ⛔ A LEGACY ROW MUST NOT GAIN A CAPABILITY ACROSS AN UPGRADE. The space-joined form an
+    /// earlier binary wrote is ambiguous exactly where it matters: `"git inline"` is either two
+    /// modes or one unrecognised one, and splitting picks the reading that grants inline. Inline
+    /// delivery never shipped, so no such row can hold a legitimate declaration — discarding is
+    /// both safe and correct.
+    ///
+    /// Bite (measured): restore the whitespace split and this goes red.
+    #[test]
+    fn a_legacy_space_joined_row_reads_as_git_only() {
+        let (store, path) = fresh_store("accepts-delivery-legacy");
+        let offer = sample_offer("job-legacy-row");
+        store.record_offer(&offer, 1).expect("record offer");
+        // Write the pre-upgrade encoding straight into the column.
+        let conn = Connection::open(&path).expect("reopen");
+        conn.execute(
+            "UPDATE offers SET accepts_delivery = ?1 WHERE offer_id = ?2",
+            rusqlite::params!["git inline", offer.offer_id],
+        )
+        .expect("plant the legacy row");
+        drop(conn);
+
+        let back = store
+            .offer_row(&offer.offer_id)
+            .expect("read")
+            .expect("present");
+        assert!(
+            back.accepts_delivery.is_empty(),
+            "a row an earlier binary wrote must read as git-only, never as an inline declaration: \
+             {:?}",
+            back.accepts_delivery
+        );
+    }
+
+    /// ⛔ THE ENCODING MUST NOT INVENT A CAPABILITY. A single declared mode `"git inline"` is ONE
+    /// unknown mode — no reader recognises it, so it grants nothing. Space-joined and
+    /// whitespace-split, it comes back as the two modes `["git", "inline"]`, and the resumed job
+    /// then believes the buyer declared `inline`. A crafted offer would buy itself a capability
+    /// through a restart.
+    ///
+    /// Bite (measured): restore `modes.join(" ")` and this goes red.
+    #[test]
+    fn a_mode_containing_a_space_cannot_split_into_two_modes() {
+        let (store, _path) = fresh_store("accepts-delivery-lossless");
+        let mut offer = sample_offer("job-crafted-mode");
+        offer.accepts_delivery = vec!["git inline".to_owned()];
+        store.record_offer(&offer, 1).expect("record offer");
+
+        let back = store
+            .offer_row(&offer.offer_id)
+            .expect("read")
+            .expect("present");
+        assert_eq!(
+            back.accepts_delivery,
+            vec!["git inline".to_owned()],
+            "one crafted mode must stay ONE mode through the store"
+        );
+        assert!(
+            !back.accepts_delivery.iter().any(|m| m == "inline"),
+            "the store must not hand a resumed job an inline capability the offer never declared"
+        );
+    }
+
+    /// §6.1 — the buyer's accepted-delivery declaration must SURVIVE the store.
+    ///
+    /// Execution can be a restart away from the claim, and the delivering job reads this to decide
+    /// whether it may answer inline. If the write binding or the read index were wrong, the value
+    /// would come back empty, every resumed job would fall back to git-only, and an answer job
+    /// would be refused for a reason nothing names. The existing fixtures all declare NOTHING, and
+    /// empty round-trips to empty through NULL even when the plumbing is broken — so only a
+    /// NON-EMPTY value tests this at all.
+    ///
+    /// Bite (measured): change the `?12` binding or the `row.get(10)` index and this goes red,
+    /// while every other store test stays green.
+    #[test]
+    fn a_non_empty_accepts_delivery_survives_both_read_paths() {
+        let (store, _path) = fresh_store("accepts-delivery");
+        let mut offer = sample_offer("job-accepts-delivery");
+        offer.accepts_delivery = vec!["inline".to_owned()];
+        // A deadline in the future, so the awaiting-claim read returns it.
+        offer.deadline_unix = 9_000_000_000;
+        store.record_offer(&offer, 1).expect("record offer");
+
+        let by_id = store
+            .offer_row(&offer.offer_id)
+            .expect("read offer")
+            .expect("offer is present");
+        assert_eq!(
+            by_id.accepts_delivery,
+            vec!["inline".to_owned()],
+            "the declaration must survive the single-offer read"
+        );
+
+        let awaiting = store.offers_awaiting_claim(1).expect("awaiting read");
+        let found = awaiting
+            .iter()
+            .find(|row| row.offer_id == offer.offer_id)
+            .expect("the offer is awaiting a claim");
+        assert_eq!(
+            found.accepts_delivery,
+            vec!["inline".to_owned()],
+            "the declaration must survive the awaiting-claim read too — the resume path uses it"
+        );
+
+        // An offer that declares nothing reads back as git-only, which is the fail-closed
+        // direction and what every row written before this column existed says.
+        let plain = sample_offer("job-declares-nothing");
+        store.record_offer(&plain, 1).expect("record plain offer");
+        assert!(
+            store
+                .offer_row(&plain.offer_id)
+                .expect("read")
+                .expect("present")
+                .accepts_delivery
+                .is_empty(),
+            "absent MUST read as git-only"
+        );
     }
 
     #[test]
@@ -5234,6 +5409,7 @@ mod free_lane_tests {
             targeted: true,
             requested_agent: None,
             output: Some("text/plain".to_owned()),
+            accepts_delivery: Vec::new(),
             payment_mode: mode,
         }
     }

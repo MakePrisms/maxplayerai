@@ -454,12 +454,28 @@ reject a lifecycle event that lacks it.
 | `["param","harness_model", model]` | 0..1 | no | Requires one model; needs `agent` |
 | `["param","capability", token, ...]` | 0..1 | no | Requires every listed capability token |
 | `["param","payment","none"]` | 0..1 | no | This job has NO payment leg. Absent means `sat` |
+| `["param","accepts-delivery", mode, ...]` | 0..1 | no | Delivery modes this buyer can READ. Absent means `git` only |
 | `["delivery","git"]` | 0..1 | no | Delivery binding mode |
 | `["repo", locator]` | 0..1 | no | Bound delivery remote |
 | `["branch", name]` | 0..1 | no | Bound delivery branch |
 
 The `delivery`, `repo`, and `branch` tags bind delivery as one group. If the offer uses any of them,
 it MUST carry all three. A reader MUST reject a partial group.
+
+`["param","accepts-delivery", …]` states which delivery modes the buyer can READ. **Absent MUST be
+read as `git` only.** A buyer that never heard of another mode emits no tag, so an offer posted
+before this parameter existed is byte-identical to one that declares nothing, and a seller reading
+either cannot conclude it may deliver anything but git. A seller MUST NOT deliver a non-git mode
+that the offer did not declare.
+
+It is a CAPABILITY filter and nothing more. It says what this buyer could verify and materialize if
+it were sent one. Whether a given job's reply actually IS the deliverable is decided on the seller,
+by the work and the §8.3 marker. Both gates must pass.
+
+Without this parameter the mode would be the seller's decision alone, and a seller has no other
+signal for what the buyer can read. An inline result sent to a buyer that cannot read one is worse
+than a refusal: that buyer counts nothing as delivered, publishes no complaint, and lets the job
+expire while the answer sits published and unpaid.
 
 #### 6.1.1 The payment mode
 
@@ -603,10 +619,10 @@ its own signed offer stated (the both-ends rule, §6.1.1).
 | `["sig","seller", sig]` | 1 | yes | Seller pre-pay signature |
 | `["t","maxplayer"]` | 1 | yes | Namespace |
 | `["v","1"]` | 1 | yes | Protocol major |
-| `["delivery","git"]` | 0..1 | no | Delivery mode |
-| `["repo", locator]` | 0..1 | no | Delivery remote |
-| `["branch", name]` | 0..1 | no | Delivery branch |
-| `["commit", oid]` | 0..1 | no | Delivered git object |
+| `["delivery", mode]` | 0..1 | no | Delivery mode: `git` or `inline` |
+| `["repo", locator]` | 0..1 | no | Delivery remote; `git` only |
+| `["branch", name]` | 0..1 | no | Delivery branch; `git` only |
+| `["commit", oid]` | 0..1 | no | Delivered git object; `git` only |
 | `["harness", id]` | 0..1 | no | Harness the seller says it ran |
 | `["model", name]` | 0..1 | no | Model the seller says it used |
 | `["wall_time", n, "ms"]` | 0..1 | no | Wall time the seller reports |
@@ -616,6 +632,29 @@ its own signed offer stated (the both-ends rule, §6.1.1).
 | `["metadata_trust","seller-claimed"]` | 0..1 | no | Marks the block above as unverified |
 
 If the result carries `["delivery","git"]`, it MUST also carry `repo`, `branch`, and `commit`.
+
+`["delivery","inline"]` names the other mode: the deliverable is the event's own `content`, and
+there is no git object anywhere. An inline result MUST NOT carry `repo`, `branch`, or `commit` —
+the two shapes are exclusive, so a reader steered to verify one can never materialize the other. A
+reader MUST refuse an inline result whose `content` is empty.
+
+The delivery mode is decided by the WORK, not by a declaration on the offer. A seller MUST deliver
+git whenever the snapshot of the job's working tree is non-empty. Files the tree does not track —
+ignored files among them — are not in that tree and are not delivered.
+
+A seller MAY deliver inline only when ALL of these hold:
+
+- the offer declared `inline` in `["param","accepts-delivery", …]` (§6.1);
+- the job is from-scratch — a contribution descends from a pinned base, so it can never settle
+  inline and MUST be refused;
+- the snapshot found nothing to deliver; and
+- the agent marked an answer in its final message (§8.3).
+
+A buyer MUST refuse to bind an inline result to a `contribution`-class offer.
+
+The marker is the inline counterpart of §8.2, and §8.3 states it. Without it the seller MUST refuse
+with `no_sentinel` (§7.1). An empty tree with unmarked text is the shape of an exhausted plan, an
+unreachable model host and a declined task alike, and none of those is a deliverable.
 
 The execution metadata block is what the seller reports about its own run. Nothing verifies it. A
 reader MUST NOT treat it as proof that a given harness or model ran.
@@ -781,8 +820,20 @@ MUST NOT write that output to an ignored path.
 
 ### 8.2 Execution sentinel
 
-Every delivery MUST carry an execution sentinel at the reserved path
+Every **tree** delivery MUST carry an execution sentinel at the reserved path
 `MAXPLAYER_EXECUTION_SENTINEL`, inside the delivered tree.
+
+An inline delivery (§6.4) has no tree, so it carries no sentinel and the `no_sentinel` refusal does
+not apply to it. Nothing is weakened by that: the sentinel exists to tie a tree — which arrives
+through a remote, detached from the event announcing it — back to this job and to the node that
+snapshotted it. An inline answer arrives inside the result event itself, already bound to the job by
+the `job-hash`, `e`-root and `sig/seller` tags §6.4 requires on every result, and the co-signed
+preimage binds its content hash under `delivery_kind = inline`. The tree's binding problem does not
+exist for it.
+
+The empty-tree refusal has an exact inline analogue, and it is stated in §6.4: an inline delivery
+with empty `content` is refused. That is the same guarantee — the node observed nothing — applied to
+the artifact that actually exists.
 
 The sentinel is a structured execution manifest. It is not a transcript, and it MUST NOT carry the
 agent conversation.
@@ -791,6 +842,39 @@ A sentinel proves that execution happened in this workdir. It proves nothing abo
 work, and it never stands in for acceptance.
 
 A delivery that carries no sentinel MUST be refused with `no_sentinel`.
+
+### 8.3 The inline answer marker
+
+An inline delivery (§6.4) has no tree, so §8.2 cannot speak for it. This section is what does.
+
+A seller MUST NOT deliver inline unless the agent's final message begins with a line whose only
+word is `MAXPLAYER-ANSWER-V1`. The answer is the remainder of that message, trimmed. An empty
+remainder is not an answer.
+
+A reader MAY accept Markdown decoration around the token on that line — backticks, emphasis, a
+leading `#`, a trailing colon, an opening code fence above it. A model told to emit an exact line
+routinely formats it, and refusing a decorated marker refuses a correct answer, costs the seller
+its fee, and strikes a healthy harness. Decoration cannot make an unmarked message marked.
+
+An inline answer is bounded. A seller MUST refuse to deliver an answer above its own limit rather
+than truncate one: a reader cannot tell a cut answer from a whole one, because the digest covers
+whatever was sent.
+
+The marker answers the question §8.2 answers for a tree: **did this job's work actually happen?**
+A completed turn does not answer it. An exhausted plan, an unreachable model host and an idle model
+all end a turn normally, leave the tree empty, and explain themselves in ordinary assistant text. A
+seller that read any such text as an answer would publish a vendor error string as a deliverable and
+ask to be paid for it.
+
+The marker is an opt-in for SUCCESS and carries no failure value. Every UNMARKED outcome — an error
+string, a turn that said nothing, a decline the model did not mark — takes the refusal path
+unchanged.
+
+A reader MUST NOT treat the marker as proof of correctness, and MUST NOT treat it as proof that the
+task was done. A model that marks an answer and then writes that it could not determine one is
+paid. The marker proves only that this job's prompt reached a model which answered it — what §8.2
+proves for a tree, and no more. A tree delivery has the same limit: a committed refusal note mints
+a sentinel and settles.
 
 ## 9. Verification Checks
 

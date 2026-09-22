@@ -2383,6 +2383,10 @@ fn offer_row(job_id: &str, buyer_pubkey: &str, offer: &ParsedOffer) -> super::st
         // job eventually writes must state the mode the OFFER was posted under, and execution can
         // be a restart away from here.
         payment_mode: offer.payment_mode,
+        // Journaled for the same reason as the mode above: the delivering job reads it, and
+        // execution can be a restart away from here. Dropped, a resumed job would fall back to
+        // git-only and refuse an answer the buyer said it could read.
+        accepts_delivery: offer.accepts_delivery.clone(),
     }
 }
 
@@ -2410,6 +2414,13 @@ pub fn job_prompt(
         deadline_unix,
         offer.output.as_deref(),
         memory_section,
+        // §6.1 — the agent is told how to mark an answer only when this buyer said it can read
+        // one. The offer row is the authenticated source, and it is what the delivery arm gates
+        // on, so the prompt and the gate can never disagree about whether inline is available.
+        offer
+            .accepts_delivery
+            .iter()
+            .any(|mode| mode == gateway::DELIVERY_MODE_INLINE),
     )
 }
 
@@ -2972,8 +2983,35 @@ enum ContainerDeliveryFailure {
     Setup(String),
     /// The agent run failed inside the container; the `ExecError` shape drives `harness_fault_for`.
     Agent(ExecError),
-    /// The gate saw no execution. `no_sentinel`, harness unproven.
-    NoSentinel(String),
+    /// The gate saw no execution. `no_sentinel`, harness unproven — UNLESS the agent marked an
+    /// answer, which is an answer job rather than a dead harness. The message is carried so the
+    /// caller can make that distinction; on the host path the same decision reads
+    /// `report.last_agent_message` directly.
+    NoSentinel {
+        detail: String,
+        last_agent_message: Option<String>,
+        /// Usage and elapsed time the container reported, carried for the same reason as the
+        /// message: an inline delivery off this arm publishes a metadata block, and a block built
+        /// from defaults would state a wall time of zero as if it were measured.
+        usage: Option<crate::driver::UsageMetadata>,
+        wall_time_ms: u64,
+        /// The container CUT the message to fit its outcome file. A cut answer must never be
+        /// delivered: the buyer re-derives the digest of what it received, so the loss is
+        /// invisible to it and it pays the full price for a partial answer.
+        message_truncated: bool,
+        /// The outcome file echoed this job's hand-off nonce, so the ORCHESTRATOR wrote it.
+        ///
+        /// Only the orchestrator ever holds the nonce — the inputs file carrying it is deleted
+        /// before the agent exists. Without this an agent survivor can plant an outcome that says
+        /// `NoSentinel` and carries text of its choosing, and that text becomes a signed, paid
+        /// inline delivery off a run the harness actually failed.
+        outcome_authentic: bool,
+        /// Whether this job was from-scratch. A contribution descends from a pinned base and can
+        /// never settle inline, and the container path SERVES contributions — it reads the pin and
+        /// hands the orchestrator a base — so the inline arm needs this to make the same decision
+        /// the host arm makes from `base_oid`.
+        from_scratch: bool,
+    },
     /// The snapshot failed otherwise. `execution_failed`, harness unproven.
     Snapshot(String),
     /// Token refused or absent, push failed, oid unreadable, tamper evidence. `delivery_failed`.
@@ -3454,6 +3492,17 @@ fn flaky_harness_reason(attempts: usize, agent_message: Option<&str>) -> String 
         ),
     }
 }
+
+/// The largest inline answer this seller will deliver.
+///
+/// The CONTAINER path already caps the agent's message at this size when it writes its outcome
+/// ([`crate::delivery_orchestrator::OUTCOME_TEXT_MAX_BYTES`]), so the two delivery paths agree on
+/// what an answer may weigh, and a relay is never handed an unbounded event this seller minted.
+pub const INLINE_ANSWER_MAX_BYTES: usize = crate::delivery_orchestrator::OUTCOME_TEXT_MAX_BYTES
+    // The container bounds the WHOLE message, and the agent is told to prepend the marker line —
+    // so an answer sized to the raw cap makes the message exceed it and be cut. The limit stated
+    // to the agent, and enforced here, is the cap MINUS the line it was told to add.
+    - (crate::engine::INLINE_ANSWER_MARKER.len() + 1);
 
 /// The refusal reason for the UNRUNNABLE launcher/exec shape.
 ///
@@ -5122,6 +5171,7 @@ impl SellerNodeRunner {
                 task: row.task.clone(),
                 output: String::new(),
                 payment_mode: row.payment_mode,
+                accepts_delivery: row.accepts_delivery.clone(),
                 amount: row.amount_sats,
                 unit: row.unit.clone(),
                 deadline_unix: row.deadline_unix as u64,
@@ -7859,6 +7909,68 @@ impl SellerNodeRunner {
                     )
                 }
                 Err(failure) => {
+                    // ── Inline delivery (§6.4), container path ───────────────────────────────
+                    // The same two conditions as the host arm below, read off the container's
+                    // reported outcome: the gate saw an empty tree, and the agent marked an
+                    // answer. Without this the mode would depend on the SEAT — the identical
+                    // answer job delivers on a launcher seat and is refused on a docker one — and
+                    // docker with a non-root uid is the default (#981), so the common seat would
+                    // be the one that cannot do it.
+                    //
+                    // A contribution descends from a pinned base and can never settle inline, so
+                    // `from_scratch` is required here exactly as `base_oid.is_none()` is on the
+                    // host arm. The container path DOES serve contributions: it reads the pin and
+                    // hands the orchestrator a base, and the gate refuses a tree identical to that
+                    // base with the same `NoExecutionObserved` an empty tree gets.
+                    if let ContainerDeliveryFailure::NoSentinel {
+                        last_agent_message: Some(message),
+                        usage,
+                        wall_time_ms,
+                        from_scratch: true,
+                        // Only an outcome the orchestrator wrote may mint a delivery.
+                        outcome_authentic: true,
+                        // A cut message is not a deliverable. The host's own length bound runs on
+                        // what the container sent, which is already under the cap, so this flag is
+                        // the only thing that can see the loss.
+                        message_truncated: false,
+                        ..
+                    } = &failure
+                        // The same capability gate as the host arm; see there.
+                        && offer
+                            .accepts_delivery
+                            .iter()
+                            .any(|mode| mode == gateway::DELIVERY_MODE_INLINE)
+                        && let Some(answer) = crate::engine::marked_inline_answer(message)
+                    {
+                        if let Some(quoted) = quoted_agent_message(Some(message)) {
+                            opline!(
+                                "seller node execute job_id={job_id} agent last message: {quoted}"
+                            );
+                        }
+                        // #784 — a real run is the freshest evidence of the model, and an inline
+                        // delivery is a real run. Skipped, an answer-only harness on a container
+                        // seat advertises its boot-probe model for the life of the process.
+                        self.agents.record_model(
+                            harness,
+                            usage.as_ref().and_then(|u| u.model.clone()),
+                        );
+                        let exec_metadata = seller_exec_metadata(
+                            &agent_command,
+                            agent_label.as_deref(),
+                            *wall_time_ms,
+                            usage.as_ref(),
+                        );
+                        self.deliver_inline(
+                            job_id,
+                            &offer,
+                            &seller_pubkey,
+                            &stored_creq,
+                            answer,
+                            &exec_metadata,
+                        )
+                        .await;
+                        return;
+                    }
                     self.fail_container_delivery(job_id, &offer.buyer_pubkey, harness, failure)
                         .await;
                     return;
@@ -8025,7 +8137,8 @@ impl SellerNodeRunner {
                 // #616: parent the delivery commit on the base the workdir was provisioned at. A
                 // contribution (Some(base_oid)) then descends from base_oid by construction; the buyer's
                 // descendant gate refuses a commit that doesn't. From-scratch (None) stays a root commit.
-                base_oid,
+                // Cloned, not moved: the inline arm below reads it to refuse a contribution.
+                base_oid.clone(),
                 branch.clone(),
                 message,
                 author_date,
@@ -8035,6 +8148,59 @@ impl SellerNodeRunner {
             {
                 Ok(oid) => oid,
                 Err(error) => {
+                    // ── Inline delivery (§6.4) ───────────────────────────────────────────
+                    // The snapshot refused an empty or base-identical tree, so the job left no
+                    // files. TWO conditions have to hold before that becomes a delivery, and
+                    // neither is "the agent said something".
+                    //
+                    // The tree gate, first: it is the signal the git path already trusts, and it
+                    // is what keeps a job that WROTE files on the git path — such a job never
+                    // reaches this arm, because its snapshot succeeded.
+                    //
+                    // The marker, second, and it is the one that matters. An empty tree plus some
+                    // text is exactly what a quota-dead harness, an unreachable model host and a
+                    // declining agent all produce; `AgentRunReport` and `flaky_harness_reason`
+                    // both say so, and the 2026-08-21 incident is why they say it. Treating any
+                    // non-empty reply as an answer would pay for every one of those. So the agent
+                    // must OPT IN with [`engine::INLINE_ANSWER_MARKER`], which only a model that
+                    // read this job's prompt can emit. Everything unmarked falls through to the
+                    // refusal below, harness strike included.
+                    if matches!(&error, seller_git::SellerGitError::NoExecutionObserved(_))
+                        // A contribution descends from a pinned base, so it can never settle
+                        // inline. `base_oid` is what marks one.
+                        && base_oid.is_none()
+                        // The buyer must have said it can READ one. Absent ⇒ git only (§6.1), so
+                        // this arm can never send an answer to a buyer that would not recognise
+                        // it as a delivery at all — which is a job that dies at the deadline with
+                        // the work done and nothing published to say so. Fail-closed by
+                        // construction: an offer from an older buyer carries no tag.
+                        && offer
+                            .accepts_delivery
+                            .iter()
+                            .any(|mode| mode == gateway::DELIVERY_MODE_INLINE)
+                        && let Some(answer) = report
+                            .last_agent_message
+                            .as_deref()
+                            .and_then(crate::engine::marked_inline_answer)
+                    {
+                        let exec_metadata = seller_exec_metadata(
+                            &agent_command,
+                            agent_label.as_deref(),
+                            wall_time_ms,
+                            usage.as_ref(),
+                        );
+                        self.deliver_inline(
+                            job_id,
+                            &offer,
+                            &seller_pubkey,
+                            &stored_creq,
+                            answer,
+                            &exec_metadata,
+                        )
+                        .await;
+                        return;
+                    }
+
                     // Harness-attributable: the agent returned success having left nothing to deliver.
                     // This is the site that fires on a quota-dead harness — its turn "completes", so the
                     // agent-run arm above sees no error at all — which is why the trigger cannot live at
@@ -8466,6 +8632,7 @@ impl SellerNodeRunner {
 
         let mut session_servers = prepared.mcp_servers.clone();
         session_servers.extend(attachments.mcp_servers.iter().cloned());
+        let base_is_none = base.is_none();
         let inputs = orch::Phase1Inputs {
             job_hash,
             seller_pubkey_hex: identity.seller_pubkey_hex().to_owned(),
@@ -8640,7 +8807,19 @@ impl SellerNodeRunner {
 
         let result = match exit {
             Ok(status) => {
-                self.classify_container_outcome(job_id, &io_dir, status, marker.as_ref(), &branch, started)
+                self.classify_container_outcome(
+                    job_id,
+                    &io_dir,
+                    status,
+                    marker.as_ref(),
+                    &branch,
+                    started,
+                    // The base the orchestrator was handed: `None` is from-scratch, `Some` is a
+                    // contribution clone. Read here, where it is a fact of THIS delivery, rather
+                    // than re-derived from the pin in the classifier.
+                    base_is_none,
+                    &nonce,
+                )
             }
             Err(failure) => Err(failure),
         };
@@ -8668,6 +8847,8 @@ impl SellerNodeRunner {
         marker: Option<&crate::delivery_orchestrator::AgentDoneMarker>,
         branch: &str,
         started: Instant,
+        from_scratch: bool,
+        expected_nonce: &str,
     ) -> Result<ContainerDelivery, ContainerDeliveryFailure> {
         use crate::delivery_orchestrator as orch;
         use ContainerDeliveryFailure as Fail;
@@ -8682,6 +8863,9 @@ impl SellerNodeRunner {
             outcome.status,
             outcome.detail
         );
+        // Only the orchestrator holds the nonce; the inputs file carrying it is deleted before
+        // the agent exists. An outcome that does not echo it was not written by the orchestrator.
+        let outcome_authentic = outcome.handoff_nonce.as_deref() == Some(expected_nonce);
         let detail = outcome.detail;
         match outcome.status {
             orch::Phase1Status::Delivered => {
@@ -8716,7 +8900,20 @@ impl SellerNodeRunner {
             orch::Phase1Status::AgentFailed => Err(Fail::Agent(ExecError::Agent(detail))),
             orch::Phase1Status::AgentUnavailable => Err(Fail::Agent(ExecError::Config(detail))),
             orch::Phase1Status::DeadlineExceeded => Err(Fail::Agent(ExecError::DeadlineExceeded)),
-            orch::Phase1Status::NoSentinel => Err(Fail::NoSentinel(detail)),
+            orch::Phase1Status::NoSentinel => {
+                let agent = outcome.agent.unwrap_or_default();
+                Err(Fail::NoSentinel {
+                    detail,
+                    from_scratch,
+                    outcome_authentic,
+                    // The container already bounded this at `OUTCOME_TEXT_MAX_BYTES` when it wrote
+                    // the outcome file, so the host path's own bound is a no-op on this branch.
+                    last_agent_message: agent.last_agent_message,
+                    message_truncated: agent.last_agent_message_truncated,
+                    usage: agent.usage,
+                    wall_time_ms: started.elapsed().as_millis() as u64,
+                })
+            }
             orch::Phase1Status::SnapshotFailed => Err(Fail::Snapshot(detail)),
             orch::Phase1Status::TokenUnavailable
             | orch::Phase1Status::PushFailed
@@ -8749,6 +8946,142 @@ impl SellerNodeRunner {
         }
     }
 
+    /// Publish an agent's marked answer as an INLINE delivery (§6.4), and journal it.
+    ///
+    /// Shared by the host and the container delivery paths. Both reach the same place — the
+    /// snapshot refused an empty tree and the agent marked an answer — and a second copy of the
+    /// co-signing would be a second chance for the two ends to disagree about the preimage.
+    ///
+    /// The caller has already decided this IS an inline delivery. Every failure here is a delivery
+    /// failure: it is reported with `FEEDBACK` on the spot, so the caller only has to return.
+    async fn deliver_inline(
+        &self,
+        job_id: &str,
+        offer: &super::store::Offer,
+        seller_pubkey: &str,
+        stored_creq: &str,
+        answer: &str,
+        exec_metadata: &[gateway::TagSpec],
+    ) {
+        // REFUSED, never cut. Truncating here would publish half a sentence, co-sign it, and ask
+        // the buyer to pay the full price for it — the buyer cannot tell a cut answer from a
+        // complete one, because the digest is of whatever the seller sent. So an over-long answer
+        // is a delivery this seller cannot make, and it says so. `delivery_failed` rather than
+        // `no_sentinel`: the agent ran and answered, so the harness is healthy and is not struck.
+        if answer.len() > INLINE_ANSWER_MAX_BYTES {
+            opline!(
+                "seller node execute fail job_id={job_id}: inline answer is {} bytes, over the \
+                 {INLINE_ANSWER_MAX_BYTES}-byte limit — refusing rather than delivering a cut answer",
+                answer.len()
+            );
+            self.fail_job_with_feedback(
+                job_id,
+                &offer.buyer_pubkey,
+                ReasonCode::DeliveryFailed,
+                DELIVERY_FAILURE_FEEDBACK,
+                None,
+            )
+            .await;
+            return;
+        }
+        let preimage = delivery_receipt_preimage(
+            job_id,
+            &offer.task,
+            offer.amount_sats,
+            &offer.buyer_pubkey,
+            seller_pubkey,
+            // The inline analogue of the delivered commit oid: the digest of the answer this very
+            // result carries. Both slots are hex; `delivery_kind` right below is the SIGNED field
+            // that says which one this is, so no unsigned path can re-read an answer digest as a
+            // commit.
+            &crate::receipt::result_content_hash_hex(answer),
+            crate::receipt::DeliveryKind::Inline.as_str(),
+            creq_terms(stored_creq),
+        );
+        let seller_sig = match self
+            .node
+            .signer()
+            .sign_receipt_hash(preimage.digest_hex())
+            .await
+        {
+            Ok(Ok(sig)) => sig,
+            Ok(Err(error)) => {
+                opline!(
+                    "seller node execute fail job_id={job_id}: inline receipt sign refused ({error})"
+                );
+                self.fail_job_with_feedback(
+                    job_id,
+                    &offer.buyer_pubkey,
+                    ReasonCode::DeliveryFailed,
+                    DELIVERY_FAILURE_FEEDBACK,
+                    None,
+                )
+                .await;
+                return;
+            }
+            Err(error) => {
+                opline!("seller node execute fail job_id={job_id}: signer actor gone ({error})");
+                self.fail_job_with_feedback(
+                    job_id,
+                    &offer.buyer_pubkey,
+                    ReasonCode::DeliveryFailed,
+                    DELIVERY_FAILURE_FEEDBACK,
+                    None,
+                )
+                .await;
+                return;
+            }
+        };
+        let draft = gateway::inline_result_draft(
+            job_id,
+            &offer.buyer_pubkey,
+            // The buyer's declared output type. A row written before that column existed states
+            // none, and text/plain is the shape an answer takes.
+            offer.output.as_deref().unwrap_or("text/plain"),
+            offer.amount_sats,
+            &preimage.job_hash,
+            &seller_sig,
+            answer,
+            exec_metadata,
+        );
+        let now = now_unix();
+        // `result_ref` records WHAT was delivered. For git that is the commit; here it is the
+        // answer digest the co-signature binds, so the journal names the same artifact the buyer
+        // will verify.
+        match self.node.store().deliver_and_enqueue(
+            job_id,
+            &preimage.delivery_integrity_hash,
+            offer.payment_mode,
+            &draft,
+            now,
+            now + RESULT_PUBLISH_WINDOW_SECS,
+            now,
+        ) {
+            Ok(true) => opline!(
+                "seller node delivered job_id={job_id} inline bytes={} result enqueued",
+                answer.len()
+            ),
+            Ok(false) => opline!(
+                "seller node execute job_id={job_id}: delivery already journaled (dedup no-op)"
+            ),
+            Err(error) => {
+                opline!(
+                    "seller node execute fail job_id={job_id}: deliver journal failed ({error})"
+                );
+                self.fail_job_with_feedback(
+                    job_id,
+                    &offer.buyer_pubkey,
+                    ReasonCode::DeliveryFailed,
+                    DELIVERY_FAILURE_FEEDBACK,
+                    None,
+                )
+                .await;
+                return;
+            }
+        }
+        self.drain().await;
+    }
+
     /// Fail a container-delivered job with the SAME feedback reason codes and harness attribution the
     /// host path emits for the equivalent failure, so a buyer cannot tell the two paths apart.
     async fn fail_container_delivery(
@@ -8769,9 +9102,34 @@ impl SellerNodeRunner {
                 self.drop_harness(harness, harness_fault_for(&error));
                 (ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK)
             }
-            Fail::NoSentinel(detail) => {
-                opline!("seller node execute fail job_id={job_id}: delivery refused no_sentinel — {detail}");
-                self.drop_harness(harness, Some(ExecutionFailure::Harness(Fault::Unproven)));
+            Fail::NoSentinel {
+                detail,
+                last_agent_message,
+                ..
+            } => {
+                // A harness that produced a MARKED answer proved itself, whatever stopped that
+                // answer from being delivered. It is struck only when the turn proved nothing —
+                // which is what `no_sentinel` is for. Striking it for an answer that was merely
+                // too long, or for an outcome this host could not authenticate, takes a working
+                // seat out of the pool for a fault it did not have.
+                // THE MARKER, and only the marker. `message_truncated` must not stand in for it:
+                // a quota-dead harness whose vendor error string runs past the cap is truncated
+                // too, and treating that as an answer leaves a dead seat in the pool taking jobs.
+                // Truncation cannot hide the marker — it is the first line, and the cut is at the
+                // end — so the marker survives every message this arm can see.
+                let answered = last_agent_message
+                    .as_deref()
+                    .and_then(crate::engine::marked_inline_answer)
+                    .is_some();
+                if answered {
+                    opline!(
+                        "seller node execute fail job_id={job_id}: delivery refused no_sentinel — \
+                         {detail} (the agent answered, so the harness is not struck)"
+                    );
+                } else {
+                    opline!("seller node execute fail job_id={job_id}: delivery refused no_sentinel — {detail}");
+                    self.drop_harness(harness, Some(ExecutionFailure::Harness(Fault::Unproven)));
+                }
                 (ReasonCode::NoSentinel, NO_SENTINEL_FEEDBACK)
             }
             Fail::Snapshot(detail) => {
@@ -9037,6 +9395,7 @@ impl SellerNodeRunner {
             // but the mode is carried from the stored row rather than assumed, so a free job that
             // somehow reached here is judged as free, not as paid.
             payment_mode: offer.payment_mode,
+            accepts_delivery: offer.accepts_delivery.clone(),
             amount: offer.amount_sats,
             unit: offer.unit.clone(),
             deadline_unix: offer.deadline_unix.max(0) as u64,
@@ -10063,6 +10422,7 @@ mod tests {
 
     fn offer(amount: u64, targeted_to: Option<&str>, deadline_unix: u64) -> ParsedOffer {
         ParsedOffer {
+            accepts_delivery: Vec::new(),
             payment_mode: crate::gateway::PaymentMode::Sat,
             task: "do the thing".to_owned(),
             output: String::new(),
@@ -11125,6 +11485,7 @@ mod tests {
 
     fn free_offer(targeted_to: Option<&str>) -> ParsedOffer {
         ParsedOffer {
+            accepts_delivery: Vec::new(),
             payment_mode: crate::gateway::PaymentMode::None,
             ..offer(0, targeted_to, NOW + 600)
         }
@@ -11626,6 +11987,7 @@ mod tests {
             store
                 .record_offer(
                     &Offer {
+                        accepts_delivery: Vec::new(),
                         payment_mode: crate::gateway::PaymentMode::Sat,
                         offer_id: job.clone(),
                         buyer_pubkey: buyer.clone(),
@@ -13876,6 +14238,7 @@ mod tests {
         store
             .record_offer(
                 &crate::seller_node::store::Offer {
+                    accepts_delivery: Vec::new(),
                     payment_mode: crate::gateway::PaymentMode::Sat,
                     offer_id: job_id.to_owned(),
                     buyer_pubkey: buyer_hex.to_owned(),
@@ -14893,6 +15256,7 @@ mod tests {
         store
             .record_offer(
                 &Offer {
+                    accepts_delivery: Vec::new(),
                     payment_mode: crate::gateway::PaymentMode::Sat,
                     offer_id: job.to_owned(),
                     buyer_pubkey: buyer.to_owned(),
@@ -14931,6 +15295,7 @@ mod tests {
         store
             .record_offer(
                 &Offer {
+                    accepts_delivery: Vec::new(),
                     payment_mode: crate::gateway::PaymentMode::Sat,
                     offer_id: job.to_owned(),
                     buyer_pubkey: buyer.to_owned(),
@@ -15048,6 +15413,7 @@ mod tests {
                 store
                     .record_offer(
                         &Offer {
+                            accepts_delivery: Vec::new(),
                             payment_mode: crate::gateway::PaymentMode::Sat,
                             offer_id: job.to_owned(),
                             buyer_pubkey: buyer.clone(),
