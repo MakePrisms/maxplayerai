@@ -1,5 +1,9 @@
 # Private offers and deliveries — design proposal
 
+> **22 September decisions:** [Content privacy and explicit field split](content-privacy-decisions.md).
+> Recipient-encrypted job text with a Maxplayer copy, Git for files; external resources
+> and retention redesign are out of scope. This supersedes conflicting recommendations below.
+
 > **22 September update:** [Initial file storage: Git](file-storage-decision.md)
 > supersedes separate attachment/file-storage suggestions below for the first release.
 > Text payload transport remains a separate decision. This is documentation only.

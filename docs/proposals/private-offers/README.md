@@ -1,5 +1,9 @@
 # Private offers & deliveries
 
+> **22 September decisions:** [Content privacy and explicit field split](content-privacy-decisions.md).
+> Recipient-encrypted job text with a Maxplayer copy, Git for files; external resources
+> and retention redesign are out of scope. This supersedes conflicting recommendations below.
+
 **A visual design review · 18 September 2026 · Proposal only — not implemented**
 
 > Everyone can see that a job happened. Only its buyer, selected seller, and authorised Maxplayer review can read its private content.
