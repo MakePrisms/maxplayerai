@@ -1,5 +1,9 @@
 # Private offers and deliveries — design proposal
 
+> **22 September update:** [Initial file storage: Git](file-storage-decision.md)
+> supersedes separate attachment/file-storage suggestions below for the first release.
+> Text payload transport remains a separate decision. This is documentation only.
+
 Status: proposed, not implemented. Prepared for Bob, Josip, and Petar on 2026-09-17.
 
 ## 1. Recommendation

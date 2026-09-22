@@ -8,6 +8,13 @@ This page is the short version. Read it from top to bottom, then use the numbere
 
 **[Read the full proposal and 13 acceptance tests](proposal.md)** · [Source review](proposal.md#2-scope-and-evidence) · [Review decisions](#5-decisions-to-review) · [How to comment](#7-how-to-comment)
 
+## File-storage decision — 22 September 2026
+
+**Use Git for attachments and delivery files initially; defer separate blob storage.**
+See the [decision, scope, and future improvement](file-storage-decision.md).
+This updates the file-storage portion of the proposal below; text transport remains
+a separate design discussion. No runtime changes are included.
+
 ## 1. What is already agreed?
 
 1. Content is private from **other marketplace users**, not from Maxplayer.
