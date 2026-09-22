@@ -15,6 +15,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
 
@@ -36,11 +37,22 @@ fn still_ours() -> AuthorityCheck {
     Arc::new(|| Ok(()))
 }
 
+/// Names one fixture directory. A COUNTER, not a clock.
+///
+/// ⛔ This used to read `Instant::now().elapsed().as_nanos()`, which measures the time since an
+/// instant created on that same line — a handful of nanoseconds, and frequently 0. Measured:
+/// `84, 41, 42, 0, 0, 0`. The process id is shared by every test in the binary and cargo runs them
+/// on parallel threads, so two calls collided on one directory and therefore on one `child.sh`:
+/// one test's `fs::write` still held the file open for writing while another `exec`d it, and Linux
+/// answers that with ETXTBSY. Observed on CI as
+/// `spawn: Spawn("/tmp/mp-custody-30387-50/child.sh: Text file busy (os error 26)")`.
+static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
 fn shell_child(script: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "mp-custody-{}-{}",
         std::process::id(),
-        Instant::now().elapsed().as_nanos()
+        NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).expect("fixture dir");
     let path = dir.join("child.sh");
