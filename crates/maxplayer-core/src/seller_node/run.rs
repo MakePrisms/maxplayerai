@@ -6765,15 +6765,45 @@ impl SellerNodeRunner {
     /// offer can never double-claim — the same property the restart backfill relies on.
     fn offer_review_ready(&self, job_id: &str, buyer: &str) -> Result<bool, String> {
         let home = self.node.home();
-        if !home.config.review.enabled(crate::kinds::JOB_OFFER_KIND, buyer)? { return Ok(true); }
-        let mut checks = self.review_checks.lock().map_err(|_| "review: state lock failed")?;
+        if !home
+            .config
+            .review
+            .enabled(crate::kinds::JOB_OFFER_KIND, buyer)?
+        {
+            let subject = crate::review::Subject {
+                offer: job_id.to_owned(),
+                event: job_id.to_owned(),
+                kind: JOB_OFFER_KIND,
+                commit: None,
+            };
+            crate::review::state::write(
+                &home.root,
+                &subject,
+                "disabled",
+                &format!("explicit local skip for counterparty public key {buyer}"),
+            )?;
+            return Ok(true);
+        }
+        let mut checks = self
+            .review_checks
+            .lock()
+            .map_err(|_| "review: state lock failed")?;
+        if crate::review::state::take_retry(&home.root, job_id) {
+            if matches!(checks.get(job_id), Some(Some(Err(_)))) {
+                checks.remove(job_id);
+            }
+        }
         if let Some(value) = checks.get(job_id) {
             return match value {
                 None => Ok(false),
                 Some(Ok(review_id)) => {
                     if let Some(id) = review_id {
-                        let subject = crate::review::Subject { offer: job_id.to_owned(), event: job_id.to_owned(),
-                            kind: crate::kinds::JOB_OFFER_KIND, commit: None };
+                        let subject = crate::review::Subject {
+                            offer: job_id.to_owned(),
+                            event: job_id.to_owned(),
+                            kind: crate::kinds::JOB_OFFER_KIND,
+                            commit: None,
+                        };
                         crate::review::record_pass(home, &subject, id)?;
                     }
                     Ok(true)
@@ -6781,7 +6811,34 @@ impl SellerNodeRunner {
                 Some(Err(e)) => Err(e.clone()),
             };
         }
-        if checks.len() >= 256 { return Err("review: queue full; restart to retry".into()); }
+        if checks.len() >= 256 {
+            // Only live unclaimed offers need this cache; successful claimed/expired entries
+            // must not exhaust the review queue over a long-running seller session.
+            let live = self
+                .node
+                .store()
+                .offers_awaiting_claim(now_unix())
+                .map_err(|_| "review: cannot prune queue")?;
+            let ids: std::collections::BTreeSet<_> =
+                live.iter().map(|row| row.offer_id.as_str()).collect();
+            checks.retain(|id, value| value.is_none() || ids.contains(id.as_str()));
+        }
+        if checks.len() >= 256 {
+            return Err("review: queue full; wait for pending offers to finish or expire".into());
+        }
+        let subject = crate::review::Subject {
+            offer: job_id.to_owned(),
+            event: job_id.to_owned(),
+            kind: JOB_OFFER_KIND,
+            commit: None,
+        };
+        crate::review::state::write(
+            &home.root,
+            &subject,
+            "pending",
+            "Waiting for signed execution review",
+        )?;
+        let status_root = home.root.clone();
         checks.insert(job_id.to_owned(), None);
         let state = self.review_checks.clone();
         let client = self.client.clone();
@@ -6790,12 +6847,31 @@ impl SellerNodeRunner {
         let buyer = buyer.to_owned();
         let job = job_id.to_owned();
         tokio::spawn(async move {
-            let subject = crate::review::Subject { offer: job.clone(), event: job.clone(),
-                kind: crate::kinds::JOB_OFFER_KIND, commit: None };
+            let subject = crate::review::Subject {
+                offer: job.clone(),
+                event: job.clone(),
+                kind: crate::kinds::JOB_OFFER_KIND,
+                commit: None,
+            };
             let result = crate::review::wire::check(
-                &crate::review::wire::RelayTransport { client: &client, relay: &relay },
-                &config, &relay, &subject, &buyer, false).await;
-            if let Ok(mut checks) = state.lock() { checks.insert(job, Some(result)); }
+                &crate::review::wire::RelayTransport {
+                    client: &client,
+                    relay: &relay,
+                },
+                &config,
+                &relay,
+                &subject,
+                &buyer,
+                false,
+            )
+            .await;
+            let result = match crate::review::state::completed(&status_root, &subject, &result) {
+                Ok(()) => result,
+                Err(e) => Err(e),
+            };
+            if let Ok(mut checks) = state.lock() {
+                checks.insert(job, Some(result));
+            }
         });
         Ok(false)
     }
@@ -6893,7 +6969,8 @@ impl SellerNodeRunner {
                 return;
             }
             Err(error) => {
-                opline!("seller node review blocked id={job_id}: {error}");
+                self.capacity_skip_pending.store(true, std::sync::atomic::Ordering::Relaxed);
+                opline!("seller node review blocked id={job_id}: {error}; inspect: maxplayer review status {job_id}; retry: maxplayer review retry {job_id}");
                 return;
             }
         }
@@ -12723,12 +12800,25 @@ mod tests {
         publisher.relay(&url).await.unwrap().wait_for_connection(Duration::from_secs(2)).await;
         let local = tokio::task::LocalSet::new();
         local.run_until(async {
-            for (task, unsafe_p) in [("ordinary task", 0.1), ("context theft fixture", 0.9)] {
+            for (task, unsafe_p, retry_after_timeout) in [("ordinary task", 0.1, false), ("context theft fixture", 0.9, false), ("late review", 0.1, true)] {
                 let draft = crate::gateway::OfferDraft::untargeted(task, "", 100, now_unix() as u64 + 600).to_event_draft();
                 let offer = crate::gateway::nostr::event_builder(&draft).unwrap().sign_with_keys(&buyer).unwrap();
                 let id = offer.id.to_hex();
                 runner.on_offer(&offer).await;
                 assert!(runner.node.store().claim_row_state(&id).unwrap().is_none());
+                if retry_after_timeout {
+                    tokio::time::timeout(Duration::from_secs(6), async {
+                        loop {
+                            if runner.review_checks.lock().unwrap().get(&id).is_some_and(|r| r.is_some()) { break; }
+                            tokio::task::yield_now().await;
+                        }
+                    }).await.unwrap();
+                    let status = crate::review::state::read(&runner.node.home().root, &id).unwrap();
+                    assert_eq!(status.state, "error");
+                    assert!(status.detail.contains("timeout"));
+                    crate::review::state::retry(&runner.node.home().root, &id).unwrap();
+                    assert!(!runner.offer_review_ready(&id, &buyer.public_key().to_hex()).unwrap());
+                }
                 let subject = crate::review::Subject { offer: id.clone(), event: id.clone(), kind: JOB_OFFER_KIND, commit: None };
                 let review = crate::review::Review { schema: 1, subject,
                     input_sha256: crate::review::input_digest(task.as_bytes()), status: "ok".into(), error_code: None,

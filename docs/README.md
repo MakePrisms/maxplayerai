@@ -31,3 +31,5 @@ server and on the wallet/profile CLI so both drive the same buyer.
 ## Reference
 
 - [`../AGENTS.md`](../AGENTS.md) — cross-harness repository orientation for agents and operators.
+
+- [Execution-safety reviews](execution-reviews.md): reviewer worker, client settings, retry/status commands, and release prerequisites.

@@ -1,38 +1,23 @@
-# Execution-safety reviews (mock-stage implementation)
+# Execution-safety reviews
 
-This branch implements the signed review contract and client checks. It does not
-install a production reviewer, call Jev, choose a calibrated shipping threshold,
-or make the platform ready for deployment. Keep the PR in draft until integration
-and deployment sequencing are complete.
+Implementation PR #1022 extends proposal #1021. This branch now contains the public
+review worker, TypeSafe adapter, signed client gates, operator recovery, and local
+integration tests. **It is not yet approved for production deployment.** No paid
+classifier evaluation or default-threshold calibration has been performed.
 
-## Decisions
+## What runs where
 
-1. Extend the existing Maxplayer kind block with `REVIEW` 3408 and `REVIEW_REQUEST`
-   3409. Both carry namespace `maxplayer` and major `1`. This is a documented optional
-   extension, not a silent change to legacy client behavior. The NIP event table
-   and the nostr-protocol registry-of-kinds schema contain no entry for these numbers
-   (checked 2026-09-18); this is not a global allocation guarantee.
-2. Pin a reviewer public key per exact relay URL in local configuration. A review
-   cannot appoint its own signer. A relay owner supplies the key out of band. Do not
-   use trust-on-first-use or a seller's signature as reviewer authority.
-3. The first classifier ID is `execution-safety`, version `1`. It assesses attempts
-   to compromise the receiving buyer/seller environment. Harmful intent is separate.
-4. Bound input to 128 KiB including serialized JSON, and at most 256 files. Sort UTF-8
-   paths, include their exact text with the immutable subject binding, serialize using
-   the shared input builder, and SHA-256 those bytes. Reject unsupported binary data,
-   duplicate/traversal paths and oversize input; do not truncate.
-5. Main currently supports encrypted payment messages, not a private-job content
-   transport. A private review must return an explicit unsupported-transport error
-   before any public request. Private job support is deferred to the private-wire
-   implementation; no plaintext fallback is permitted. The current live offer/result
-   callers process public protocol events only.
+- Buyer/seller clients request `REVIEW_REQUEST` (3409), verify `REVIEW` (3408), and
+  apply their own unsafe-probability threshold. A skip affects only that client.
+- The relay owner runs `maxplayer review serve reviewer.json`. The worker fetches
+  signed public subjects from that one configured relay, reads existing local bare
+  Git stores, calls TypeSafe, persists a signed terminal result, and publishes it.
+- The worker uses the provider's existing HTTP API, not custom model inference.
+  API contract: <https://docs.typesafe.ai/introduction/quickstart>.
+- Clients never receive provider credentials. Review signatures do not replace
+  Git verification, claim/award eligibility, payment signatures, budgets, or pay-once.
 
-## Configuration and migration
-
-Review defaults to enabled, including when a configuration file has no review table.
-Without a reviewer key, new claims/acceptances stop with an explicit error. Deploy
-an actual reviewer and distribute its key before enabling this branch in production.
-Existing accepted payment obligations retain the existing recovery path.
+## Client settings
 
 ```toml
 [review]
@@ -44,82 +29,166 @@ reject_at_or_above_ppm = 500000
 timeout_seconds = 30
 
 [review.reviewers]
-"wss://relay.example" = "<64-character-lowercase-hex-reviewer-key>"
+"wss://relay.example" = "<64-character-lowercase-hex-reviewer-public-key>"
 ```
 
-The threshold uses integer millionths to avoid configuration rounding. `500000`
-means 0.50 and is an uncalibrated mock-stage value, not a final shipping decision.
-Set `seller_offer=false` or `buyer_delivery=false` to skip that party's review.
-Public-key lists support trusted counterparties. Restart after configuration changes.
-No provider credential is stored here.
+`500000` means unsafe probability >= 0.50 blocks. This remains **uncalibrated**, not
+an evidence-backed shipping threshold. No reviewer key is learned from a response.
+Without a configured key, default-enabled reviews stop new claims/acceptances with
+an explicit error. Distribute keys and deploy the reviewer before enabling clients.
+Changing configuration still requires restarting the client/daemon.
 
-## Wire contract
+Explicit skips use the role flags or public-key lists, never display names. Local
+status records identify the subject and explain configuration/counterparty skips.
+A pass also records reviewer identity, event ID, and effective policy in
+`reviews/<subject-id>.json`. These local records are audit evidence, not substitutes
+for verifying signed reviews on the next check.
 
-The request is signed by the requesting buyer or seller. Tags contain `t=maxplayer`,
-`v=1`, the root offer (`e` with `root`), exact subject (`e` with `reply`), reviewer `p`,
-and `classifier=execution-safety,1`. JSON content contains `offer`, `event`, `kind`,
-and `commit`. Offers use their own event ID for both references and a null commit.
-Results use the exact result ID and advertised git object ID.
+## Timeouts and actual retry actions
 
-The reviewer validates the request and source signatures and authorization, obtains
-only the bounded immutable input, calls its selected classifier, and signs a REVIEW.
-The provider service and git snapshot acquisition are not part of this mock stage.
-The reviewer must never execute submitted scripts to acquire review input.
+A client wait defaults to 30 seconds. **A timeout ends that review wait, not the job.**
+It does not claim, accept, reject, pay, bypass the check, or extend job deadlines.
 
-REVIEW carries the same root and subject tags. JSON contains `schema=1`, the exact
-`subject`, `input_sha256`, `status`, `results`, and `error_code`. Each result contains
-`classifier`, `version`, `label`, and `probabilities`. The required classifier supplies
-`safe` and `unsafe`, finite values in [0,1], summing to one within 0.000001. The label
-must be a maximal probability. Unknown optional classifiers do not influence this
-classifier. Duplicate IDs, unsupported required versions, and missing results fail.
+Seller:
 
-An error has `status=error`, empty results and a nonempty error code. It is never a
-safe assessment. No raw provider errors, submitted content, or secrets appear in errors.
+```sh
+maxplayer review status <offer-id> --home /path/to/seller-home
+maxplayer review retry <offer-id> --home /path/to/seller-home
+```
 
-Clients validate the signature, pinned author, exact root/subject tags, schema and
-probabilities. Conflicting trusted results block. The unsafe probability is compared
-with the local threshold, inclusively. Provider confidence is not used as probability.
+The retry command writes an explicit local retry ticket. The running seller consumes
+it on its existing reconsideration tick, clears only that offer's failed check, and
+requests/checks the review again. It does not restart the daemon or reserve a slot
+while the review is pending. The offer must still be eligible; expired/claimed offers
+cannot be revived by a review retry. A policy refusal/conflict is not an availability
+retry. The command does not reroll unsafe results.
 
-## Client integration
+Buyer: repeat the same `collect` MCP call/CLI command or explicit `accept` command
+for the same job/result. Do not post a new job or ask the seller to redeliver unchanged
+content. `maxplayer review status <result-id>` shows the local review state.
+The error itself explains this recovery path. The automatic buyer settlement watcher
+holds a failed review instead of repeatedly initiating paid checks. An explicit
+collect retries; a new RESULT from the awarded seller starts a new review. Accepted
+payment obligations are never held by this local review status.
 
-1. Seller: after recording the offer but before claim creation, start a bounded
-   review task outside the main event loop. The existing reconsideration tick revisits
-   pending offers. There is no slot or invoice reservation while waiting for review.
-   Terminal failures remain blocked for this daemon session; restart is the explicit
-   retry mechanism in this stage. The in-memory task map is bounded at 256 subjects.
-2. Seller execution: check again before starting or resuming the agent. This also
-   covers work that predates the new claim check. It does not reopen delivered jobs.
-3. Buyer: check the selected delivery before creating the acceptance bind or publishing
-   ACCEPT. Both explicit acceptance and collect's implicit acceptance use this path.
-   A retry of an already accepted job retains settlement recovery, not a new decision.
-4. Save successful review ID, subject, reviewer and effective threshold in a local
-   `reviews/<subject-id>.json` audit record before the action. This record is not itself
-   trusted as a replacement for signed review verification.
-5. The review wait is bounded by configuration and publishes at most one request per
-   check. A missing result times out. Explicit buyer retry or seller restart can reuse
-   a later result. A cached provider error requests another assessment but keeps the
-   current action blocked. Later successful assessments supersede availability errors,
-   not conflicting successful classifications. Conflicting classifications require
-   reviewer/operator resolution, not repeated attempts to obtain a passing result.
+`get_job` returns `review_status`. It reviews the newest delivery from the awarded
+seller before exposing its content to the agent. Failed or unselected deliveries
+retain identifying metadata but withhold inline answers, repository/branch strings,
+agent/model strings, and contribution metadata. Collect independently checks the
+selected result before acceptance. Already-accepted obligations keep payment recovery;
+review changes do not retroactively cancel a payment obligation.
 
-The classifier does not replace sandboxing, git integrity checks, award ownership,
-budgets, or payment signatures. Review-before-accept does not protect an application
-that runs returned content itself before calling accept. Buyer agent/MCP exposure
-must be checked before release so unreviewed content remains data, never instructions.
+## Relay-owner worker
 
-## Verification
+Example `reviewer.json` (paths are operator-managed; no credentials in this file):
 
-The test transport supplies real signed fixture events without external requests.
-Cases cover cached and requested results, timeout/retry, skip, trust lists, private
-transport refusal, threshold equality, invalid distributions, optional classifiers,
-forged signatures, changed content, and bounded deterministic inputs. No mock is
-available as a production provider fallback.
+```json
+{
+  "relay": "wss://relay.example",
+  "signer_file": "/run/secrets/reviewer-signing-key",
+  "provider_key_file": "/run/secrets/typesafe-api-key",
+  "database": "/var/lib/maxplayer-review/reviews.sqlite",
+  "model": "jev-latest",
+  "repositories": {
+    "https://relay.example/git/<owner>/<repo>.git": "/existing/job-store/<repo>.git"
+  }
+}
+```
 
-## Remaining release work
+Secret files must be regular owner-private files (0600 or stricter). Provision a
+dedicated signer and distribute its **public** key to clients. Never put credentials
+in command arguments, public events, logs, or this repository. The database parent
+must exist and be writable. Run the service under an operator-managed supervisor.
+Only map **public job repositories**; private jobs are not supported yet.
 
-1. Live reviewer service, immutable git snapshot collection, and Jev integration.
-2. Private-wire integration and operator handling of conflicting classifications.
-3. Full buyer content-exposure audit and protection before user-agent consumption.
-4. Labeled classifier evaluation, approved paid-testing cap, and calibrated default.
+```sh
+maxplayer review serve /etc/maxplayer/reviewer.json
+```
 
-No automatic merge or production deployment is authorized by this implementation.
+The repository mapping is deliberate: an untrusted result cannot make the reviewer
+fetch an arbitrary URL, access the network internally, or read an arbitrary path.
+The initial worker must be colocated with the existing bare job store (or have a
+read-only mount of it). An unmapped/inaccessible repository produces an error. It
+does not download and persist another source-content copy. Arbitrary third-party
+Git hosting is not supported by this initial acquisition adapter.
+
+The worker verifies request signatures, reviewer binding, namespace/version, exact
+subject, freshness, source signatures, offer/result linkage, and requester access.
+Open public offers can be requested by prospective sellers; targeted offers restrict
+requests to the buyer/target. Delivery requests require the buyer or result author.
+Requests are limited per signed requester (10/minute, bounded identity table).
+Relay-level admission controls are still needed against identity churn.
+
+## Provider retries, deduplication, and crashes
+
+The worker has a 30-second processing budget including input acquisition. It makes
+**at most three provider attempts total**: initial call plus two retries. Only
+transport failures, HTTP 408/429, and server errors are transient. Other HTTP errors,
+invalid JSON/probabilities, and oversized responses stop immediately. Redirects and
+hidden HTTP retries are disabled. Backoff honors numeric `Retry-After`; date-form or
+invalid values conservatively end the window rather than retry sooner than requested.
+
+The client clock and service clock are independent: queuing/network delay can make a
+result arrive after the client times out. The service finishes its bounded attempt,
+stores/publishes the result, and an explicit client retry can reuse it. It never
+resumes an expired job merely because a review passed.
+
+The single worker serializes queued requests. Equivalent requests reuse the persisted
+signed event, keyed by exact provider-input digest, classifier version, and reviewer.
+A process lock prevents two workers from spending against the same database.
+Successful results (including unsafe ones) are immutable and reused. Errors are
+reused for duplicate request IDs; a new explicit request can retry availability
+failures. Request nonces make explicit retries distinct even within one second.
+A client retry waits for a fresh response instead of immediately returning an old
+cached provider error.
+
+Persistence occurs before publication. A restart can therefore republish the same
+terminal event without another provider call. **A crash during the provider call is
+indeterminate**: the database retains an in-flight marker and returns
+`provider_outcome_unknown` rather than silently billing again. Operator investigation
+is required for that case. Exactly-once billing cannot be guaranteed across an
+external API without provider idempotency. Conflicting trusted successful results
+block; no automatic retry seeks a more permissive probability.
+
+## Exact input and coverage
+
+Canonical JSON contains the subject, full verified offer, full verified result when
+present, and a sorted path manifest. Each manifest item contains a SHA-256 byte hash
+and exact UTF-8 text. Git data comes from the advertised immutable commit, not branch
+HEAD or a worktree. No hooks, scripts, build steps, filters, or delivered code run.
+Inline deliveries are supported only when the offer declares inline support and the
+RESULT passes the existing inline parser; their signed event ID binds the text.
+
+Limits: 128 KiB source JSON and serialized provider request, 256 files, 4096 tree entries, 4096-byte paths, 16 KiB
+provider/review response. Symlinks, submodules, non-UTF-8 paths/content, binary blobs,
+inaccessible objects, and incomplete/oversized input fail closed. No truncation.
+The input digest covers **the actual serialized provider request**, including the
+classifier instructions and requested model, not only the file list. The returned
+model identity is recorded in the signed `provider` tag. `jev-latest` is an alias,
+not pinned weights; configure a pinned provider model for reproducible evaluation.
+
+The required classifier is `execution-safety`, version `1` (this draft has not
+shipped). Unknown optional classifiers do not influence it; duplicates, unsupported
+versions, invalid probability distributions, or wrong subject/signature fail closed.
+A safe classification is not a correctness guarantee, malware/dependency scan, or
+execution sandbox. General harmful intent is a separate future classifier.
+
+## Private jobs and remaining release gates
+
+Private-job content transport is not implemented on current upstream. The client
+rejects private requests before any public fallback. This branch does not invent a
+second transport or publish private roots/metadata. Integrating private review with
+the shared private-wire design remains a **blocking external dependency**.
+
+Before production rollout:
+
+1. Integrate and exercise the shared private-job transport before claiming private support.
+2. Follow the [evaluation runbook](evaluations/execution-safety.md) and run labeled TypeSafe evaluation with explicitly approved spend and private credential
+   provisioning; choose thresholds from measured false-positive/false-negative rates.
+3. Provision the live reviewer signer/provider and relay kind admission, map the public
+   Git store, verify live round-trips, and sequence client rollout. Local fixtures are not
+   proof of production relay configuration or classifier quality.
+4. Exercise operator recovery for indeterminate provider outcomes and conflicting reviews.
+
+No merge, paid calls, production configuration changes, or deployment are performed
+merely by building this branch.

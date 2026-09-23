@@ -1,5 +1,9 @@
 //! Optional execution-safety reviews. Probability is not payment authority.
-//! No live classifier or production mock is installed by this module.
+//! Relay service and client gates share the signed immutable review contract.
+#[cfg(feature = "wallet")]
+pub mod service;
+#[cfg(feature = "wallet")]
+pub mod state;
 use crate::gateway::{EventDraft, MAXPLAYER_TAG, PROTOCOL_VERSION, TagSpec};
 use crate::kinds::{JOB_OFFER_KIND, JOB_RESULT_KIND, REVIEW_KIND, REVIEW_REQUEST_KIND};
 use serde::{Deserialize, Serialize};
@@ -90,7 +94,7 @@ impl Subject {
         match self.kind {
             JOB_OFFER_KIND if self.offer == self.event && self.commit.is_none() => Ok(()),
             JOB_RESULT_KIND
-                if self.commit.as_ref().is_some_and(|c| {
+                if self.commit.as_ref().is_none_or(|c| {
                     (c.len() == 40 || c.len() == 64)
                         && c.bytes()
                             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -209,6 +213,9 @@ pub fn request_draft(subject: &Subject, reviewer: &str) -> Result<EventDraft, St
     let mut t = tags(subject);
     t.push(TagSpec::new(["p", reviewer]));
     t.push(TagSpec::new(["classifier", CLASSIFIER, CLASSIFIER_VERSION]));
+    let mut nonce = [0u8; 16];
+    getrandom::fill(&mut nonce).map_err(|_| "review: random source unavailable")?;
+    t.push(TagSpec::new(["request_nonce", &hex::encode(nonce)]));
     Ok(EventDraft::new(
         REVIEW_REQUEST_KIND,
         t,
@@ -394,8 +401,10 @@ pub mod wire {
             .get(relay)
             .ok_or("review: configure a reviewer key for this relay, or explicitly skip review")?;
         let key = PublicKey::from_hex(reviewer).map_err(|_| "review: invalid reviewer key")?;
+        let mut last_error: Option<String> = None;
         let future = async {
             let mut requested = false;
+            let mut prior_errors = std::collections::BTreeSet::new();
             loop {
                 let events = transport.fetch(subject, &key).await?;
                 let mut accepted: Option<(Review, String)> = None;
@@ -407,7 +416,13 @@ pub mod wire {
                     let r = verify(&event, &key, subject)?;
                     // Availability errors do not revoke an immutable successful assessment.
                     if r.status == "error" {
-                        provider_error = r.error_code.clone();
+                        last_error = r.error_code.clone();
+                        if !prior_errors.contains(&event.id) {
+                            provider_error = r.error_code.clone();
+                        }
+                        if !requested {
+                            prior_errors.insert(event.id);
+                        }
                         continue;
                     }
                     if let Some((previous, _)) = &accepted {
@@ -431,10 +446,13 @@ pub mod wire {
                 }
                 if let Some(code) = provider_error {
                     // A deliberate new check requests recovery; never invent a safe result.
-                    if !requested {
-                        transport.request(request_draft(subject, reviewer)?).await?;
+                    if requested {
+                        return Err(format!(
+                            "review: reviewer error ({code}); next step blocked; explicit retry available"
+                        ));
                     }
-                    return Err(format!("review: reviewer error ({code}); retry requested"));
+                    // An old error is not a response to this new attempt. Request once below
+                    // and wait for a new signed result instead of returning the stale error.
                 }
                 if !requested {
                     transport.request(request_draft(subject, reviewer)?).await?;
@@ -448,7 +466,12 @@ pub mod wire {
             future,
         )
         .await
-        .map_err(|_| "review: timeout; next step blocked; retry available".to_string())?
+        .map_err(|_| match last_error {
+            Some(code) => format!(
+                "review: timeout; last reviewer error ({code}); next step blocked; retry available"
+            ),
+            None => "review: timeout; next step blocked; retry available".to_string(),
+        })?
     }
 }
 
@@ -460,6 +483,12 @@ pub async fn check_buyer(
     counterparty: &str,
 ) -> Result<Option<String>, String> {
     if !home.config.review.enabled(subject.kind, counterparty)? {
+        state::write(
+            &home.root,
+            subject,
+            "disabled",
+            &format!("explicit local skip for counterparty public key {counterparty}"),
+        )?;
         return Ok(None);
     }
     // Validate trust before opening a connection.
@@ -478,6 +507,12 @@ pub async fn check_buyer(
         .await
         .map_err(|e| e.to_string())?;
     client.connect().await;
+    state::write(
+        &home.root,
+        subject,
+        "pending",
+        "Waiting for signed execution review",
+    )?;
     let result = wire::check(
         &wire::RelayTransport {
             client: &client,
@@ -491,7 +526,9 @@ pub async fn check_buyer(
     )
     .await;
     client.disconnect().await;
+    state::completed(&home.root, subject, &result)?;
     result
+        .map_err(|e| format!("{e}; retry the same collect or accept operation (no new job needed)"))
 }
 
 #[cfg(all(test, feature = "gateway"))]
@@ -580,6 +617,21 @@ mod tests {
             1,
             "cached review must avoid another request"
         );
+    }
+    #[tokio::test(start_paused = true)]
+    async fn review_retry_waits_for_recovery_instead_of_returning_old_error() {
+        let keys = Keys::generate();
+        let mut error = answer(0.1);
+        error.status = "error".into();
+        error.results.clear();
+        error.error_code = Some("provider_timeout".into());
+        let passed = signed(&answer(0.1), &keys);
+        let m = mock(vec![signed(&error, &keys)], vec![passed.clone()]);
+        assert_eq!(
+            check(&m, &config(&keys)).await.unwrap(),
+            Some(passed.id.to_hex())
+        );
+        assert_eq!(m.requests.load(Ordering::SeqCst), 1);
     }
     #[tokio::test(start_paused = true)]
     async fn timeout_blocks_and_an_explicit_retry_can_recover() {
@@ -854,4 +906,78 @@ pub fn record_pass(
     let bytes = serde_json::to_vec(&evidence).map_err(|e| e.to_string())?;
     crate::durable::write_atomic(&dir, &dir.join(format!("{}.json", subject.event)), &bytes)
         .map_err(|e| format!("review: evidence write: {e}"))
+}
+
+/// Agent-facing read boundary. Failed/unreviewed delivery payloads never enter an MCP
+/// agent context. Review only the newest result from the awarded seller per read; other
+/// results remain metadata-only. Acceptance still independently verifies the signed result.
+#[cfg(feature = "wallet")]
+pub async fn protect_job_view(
+    home: &crate::home::MaxplayerHome,
+    view: &mut crate::job_lifecycle::JobView,
+    awarded_seller: Option<&str>,
+) -> BTreeMap<String, String> {
+    let mut states = BTreeMap::new();
+    let keys = crate::home::read_secret_key_hex(home)
+        .ok()
+        .and_then(|s| nostr_sdk::Keys::parse(&s).ok());
+    let mut attempted = false;
+    for result in &mut view.results {
+        let subject = Subject {
+            offer: view.job_id.clone(),
+            event: result.result_id.clone(),
+            kind: JOB_RESULT_KIND,
+            commit: result.commit_oid.clone(),
+        };
+        let enabled = home
+            .config
+            .review
+            .enabled(JOB_RESULT_KIND, &result.seller_pubkey);
+        if enabled == Ok(false) {
+            states.insert(result.result_id.clone(), "disabled".into());
+            continue;
+        }
+        let decision = if !attempted && awarded_seller == Some(result.seller_pubkey.as_str()) {
+            attempted = true;
+            match &keys {
+                Some(keys) => check_buyer(home, keys, &subject, &result.seller_pubkey).await,
+                None => Err("review: local key unavailable".into()),
+            }
+        } else {
+            Err("review: delivery content withheld; collect the selected delivery to request its review".into())
+        };
+        match decision {
+            Ok(_) => {
+                states.insert(result.result_id.clone(), "passed".into());
+            }
+            Err(error) => {
+                states.insert(result.result_id.clone(), error);
+                result.inline_answer = None;
+                result.job_hash = None;
+                result.seller_signature = None;
+                result.repo = None;
+                result.branch = None;
+                result.harness = None;
+                result.model = None;
+                result.contribution = None;
+                result.display_name = None;
+            }
+        }
+    }
+    // Accepted bind can itself contain the inline answer / repo strings. A prior acceptance
+    // preserves payment recovery, not permission to expose unreviewed text to an agent.
+    if let Some(bind) = &mut view.accepted {
+        if !matches!(
+            states.get(&bind.result_id).map(String::as_str),
+            Some("passed" | "disabled")
+        ) {
+            bind.inline_answer = None;
+            bind.repo.clear();
+            bind.branch.clear();
+            bind.agent_used = None;
+            bind.model_used = None;
+            bind.contribution = None;
+        }
+    }
+    states
 }
