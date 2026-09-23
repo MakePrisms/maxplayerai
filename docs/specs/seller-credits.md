@@ -40,6 +40,7 @@ issuance can pay a real Maxplayer job. Nothing here migrates it or keeps compati
 17. Accepting a mint is not operating it; many sellers can accept one mint.
 18. Transport is separate from backing: `nostr://` says nothing about Lightning.
 19. Keep changes to current Maxplayer behavior minimal (17:13).
+20. A listed `nostr://` mint is allowed under the same `allow_real_mints` rule as `https://` (17:28).
 
 ## 1. What changes in core, and what doesn't
 
