@@ -133,8 +133,9 @@ result arrive after the client times out. The service finishes its bounded attem
 stores/publishes the result, and an explicit client retry can reuse it. It never
 resumes an expired job merely because a review passed.
 
-The single worker serializes queued requests. Equivalent requests reuse the persisted
-signed event, keyed by exact provider-input digest, classifier version, and reviewer.
+A bounded intake queue deduplicates active subjects before the single worker processes
+them. Concurrent requests share both successful and failed attempts. Later equivalent
+requests reuse the persisted signed event, keyed by exact provider-input digest, classifier version, and reviewer.
 A process lock prevents two workers from spending against the same database.
 Successful results (including unsafe ones) are immutable and reused. Errors are
 reused for duplicate request IDs; a new explicit request can retry availability

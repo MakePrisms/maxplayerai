@@ -589,6 +589,37 @@ pub async fn run(config: ServiceConfig) -> Result<(), String> {
     run_worker(config, keys, provider).await
 }
 
+/// Intake reserves a subject BEFORE queueing it, independently of the provider wait.
+/// The worker has fixed reviewer/classifier/model configuration and verified immutable
+/// subjects, so equivalent live requests share the same future, including errors.
+struct Flight {
+    key: String,
+    registry: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
+}
+impl Flight {
+    fn reserve(
+        registry: &std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
+        subject: &Subject,
+    ) -> Option<Self> {
+        let key = serde_json::to_string(subject).ok()?;
+        let mut active = registry.lock().ok()?;
+        if !active.insert(key.clone()) {
+            return None;
+        }
+        Some(Self {
+            key,
+            registry: registry.clone(),
+        })
+    }
+}
+impl Drop for Flight {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.registry.lock() {
+            active.remove(&self.key);
+        }
+    }
+}
+
 async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Result<(), String> {
     let store = Store::open(&config.database)?;
     let client = Client::new(keys.clone());
@@ -609,16 +640,40 @@ async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Re
         )
         .await
         .map_err(|_| "relay_subscribe")?;
+    let (sender, mut inbox) = tokio::sync::mpsc::channel(256);
+    let flights = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+    let reviewer = keys.public_key();
+    // JoinSet aborts intake on all worker exit paths, including publication errors.
+    let mut intake = tokio::task::JoinSet::new();
+    intake.spawn(async move {
+        loop {
+            let notification = match notifications.recv().await {
+                Ok(n) => n,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            };
+            let RelayPoolNotification::Event { event: request, .. } = notification else {
+                continue;
+            };
+            let Ok(subject) = validate_request(&request, &reviewer) else {
+                continue;
+            };
+            let Some(flight) = Flight::reserve(&flights, &subject) else {
+                continue;
+            };
+            // A full queue drops the reservation too. Clients remain blocked and can retry.
+            if sender.try_send((flight, request, subject)).is_err() {
+                continue;
+            }
+        }
+    });
     loop {
-        let notification = tokio::select! {
+        let next = tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
-            notification = notifications.recv() => match notification { Ok(n)=>n, Err(tokio::sync::broadcast::error::RecvError::Lagged(_))=>continue, Err(_)=>break }
+            request = inbox.recv() => request,
         };
-        let RelayPoolNotification::Event { event: request, .. } = notification else {
-            continue;
-        };
-        let Ok(subject) = validate_request(&request, &keys.public_key()) else {
-            continue;
+        let Some((_flight, request, subject)) = next else {
+            break;
         };
         if store
             .admit(&request.pubkey.to_hex(), Timestamp::now().as_secs())
@@ -1081,5 +1136,43 @@ mod snapshot_tests {
             "unauthorized_request"
         );
         client.disconnect().await;
+    }
+}
+
+#[cfg(test)]
+mod concurrent_tests {
+    use super::*;
+    #[tokio::test]
+    async fn concurrent_review_requests_share_failure_and_explicit_later_retry_is_allowed() {
+        let registry =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+        let subject = Subject {
+            offer: "a".repeat(64),
+            event: "a".repeat(64),
+            kind: JOB_OFFER_KIND,
+            commit: None,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let first = Flight::reserve(&registry, &subject).unwrap();
+        assert!(tx.send(first).await.is_ok());
+        assert!(
+            Flight::reserve(&registry, &subject).is_none(),
+            "queued work is shared"
+        );
+        let in_progress = rx.recv().await.unwrap();
+        assert!(
+            Flight::reserve(&registry, &subject).is_none(),
+            "provider work is shared even before its outcome is known"
+        );
+        // Same lifetime as the worker's error publication path: the reservation is held
+        // through publication and dropped on continue, not just for successful assessments.
+        let error = error_review(&subject, input_digest(b"input"), "provider_timeout");
+        assert_eq!(error.status, "error");
+        assert!(Flight::reserve(&registry, &subject).is_none());
+        drop(in_progress);
+        assert!(
+            Flight::reserve(&registry, &subject).is_some(),
+            "a later explicit request may retry availability"
+        );
     }
 }
