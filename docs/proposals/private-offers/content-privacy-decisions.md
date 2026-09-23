@@ -58,16 +58,15 @@ Inspected upstream commit `135e4ea0bd5330f7ab0272d501aa83a718edc777`:
 - **Public network UI:** `web/network/js/parse.js` extracts the offer task from the
   `i` tag and feedback text from event content. Private producers must omit plaintext;
   the public UI must handle encrypted/private content without presenting it as text.
-- **Episode/telemetry definitions:** `crates/maxplayer-core/src/episode.rs` defines
-  `offer_task` in `episodes.jsonl`; `telemetry.rs` defines forwarding a full episode to
-  an optional sink command and mirror file. This inspection does not establish that
-  these capture/emission paths are wired into every current seller job. If used for
-  private jobs, they must not forward plaintext to public/shared destinations.
-  Local storage by an authorised participant is not itself a privacy violation.
-- **Seller memory:** `seller_memory.rs` defines episode/transcript distillation and
-  `MEMORY.md` injection. `seller_node/run.rs` calls `job_memory_section` for job prompts.
-  Cross-job reuse of private facts would be a disclosure route; the distillation
-  template alone is not proof of an active automatic distillation path or an actual leak.
+- **Episode/telemetry definitions (clarified 23 September):** `episode.rs` defines a
+  per-job diagnostic record (including task, outcome, usage) and JSONL storage;
+  `telemetry.rs` defines forwarding that record to a configured command/mirror.
+  A repository-wide call-site search found constructors/emission in tests, plus
+  desktop episode-reading support, but no production seller capture/emission call
+  sites. Do not treat module comments as proof of an active logging pipeline.
+  This is not an established blocker for private jobs.
+- **Seller memory — out of scope:** Petar explicitly excluded this on 23 September
+  as an existing main-branch concern, not part of this privacy effort.
 - **Git pack cache:** `crates/buzz/crates/buzz-relay/src/api/git/pack_cache.rs` stores
   immutable pack/index pairs; `hydrate.rs` builds temporary repositories from them.
   Job authorization must still constrain the served repository/object set on cache
@@ -79,3 +78,15 @@ Inspected upstream commit `135e4ea0bd5330f7ab0272d501aa83a718edc777`:
 
 These are bounded implementation checks, not a generic logs/caches/backups workstream
 or a claim that any of these mechanisms currently leaks private jobs.
+
+### Pack-cache example (hypothetical, not a discovered vulnerability)
+
+A pack is Git's compressed bundle of objects (file contents, trees, commits).
+The relay keeps verified pack/index pairs locally to avoid fetching them from
+object storage repeatedly. A shared internal cache is compatible with private repos.
+
+A bug would occur if Alice's authorised fetch populated a cache, then Bob's
+unauthorised request for Alice's repo were served from that cache without checking
+Bob's repository permission. The required test is simply: warm Alice's cache, then
+verify Bob is denied. Permission checks must apply regardless of cache hit/miss.
+This example is not evidence that the present implementation bypasses authorization.
