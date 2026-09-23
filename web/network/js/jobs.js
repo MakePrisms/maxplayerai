@@ -154,6 +154,7 @@ export function jobFromGroup(g, profiles = new Map(), now = nowSeconds()) {
     buyer: offer ? party(offer.pubkey, profiles) : null,
     sellers: [...sellerKeys].map((pk) => party(pk, profiles)),
     task: offer?.offer?.task ?? null,
+    executionVisibility: offer?.offer?.execution_visibility ?? null,
     job_class: offer?.offer?.job_class ?? null,
     amount_sats: amountSats,
     paid_sats: paidSats || null,

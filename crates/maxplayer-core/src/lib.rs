@@ -199,3 +199,6 @@ pub use log::{EventLog, LogError, ReadError, Replay};
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
+
+#[cfg(feature = "gateway")]
+pub mod private_content;

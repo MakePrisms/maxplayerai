@@ -144,7 +144,7 @@
             src = ./crates/buzz;
             # cargoHash of buzz's full vendored dep set (crates.io + the 2 public git sources:
             # rust-s3/aws-creds build dep + mesh-llm dev-deps). Recompute if crates/buzz/Cargo.lock changes.
-            cargoHash = "sha256-C6rquKLY2I2QMRmH9+x4sh5+Eejitjfm8+XdtOaxhi4=";
+            cargoHash = "sha256-xvrX4w1KC4TlU7+h+k9vJnwiDNpNaP+pYma6H29gaTQ=";
             cargoBuildFlags = [
               "-p"
               "buzz-relay"

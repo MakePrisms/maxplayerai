@@ -566,3 +566,18 @@ assert.equal(orphanRow.input_tokens, null);
 assert.equal(orphanRow.output_tokens, null);
 
 console.log("ok — parse/store suite passed");
+
+// Privacy presentation is inherited from the offer; opaque IDs are not summaries.
+const privateOffer = (extra) => ok({
+  id: "a".repeat(64), pubkey: "b".repeat(64), kind: OFFER, created_at: 100,
+  tags: [["v", "2"], ["visibility", "private"], ...extra], content: "",
+}).offer;
+const targetedPrivate = privateOffer([["discovery", "targeted"], ["p", "c".repeat(64)], ["i", "must not become a summary"]]);
+assert.equal(targetedPrivate.task, "Private task");
+assert.equal(targetedPrivate.discovery_visibility, "private");
+assert.equal(targetedPrivate.execution_visibility, "private");
+const openPrivate = privateOffer([["discovery", "open"], ["i", JSON.stringify({schema: "maxplayer.public-task.v2", text: "Intentionally public task", requested_output: "text/plain", dispatch: {}})]]);
+assert.equal(openPrivate.task, "Intentionally public task");
+assert.equal(openPrivate.discovery_visibility, "public");
+assert.equal(openPrivate.execution_visibility, "private");
+assert.equal(privateOffer([["discovery", "open"], ["i", "not public task JSON"]]).task, "Public task unavailable");
