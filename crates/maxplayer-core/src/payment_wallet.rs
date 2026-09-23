@@ -34,6 +34,56 @@ const ATTEMPT_METADATA: &str = "mobee_attempt_id";
 /// past the 15s MCP tool deadline; we bound each such leg and refuse fast instead.
 pub const MINT_TOUCH_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Bound for a pay-path leg that may PUBLISH a state-changing mint request (`prepare_send`,
+/// `confirm`). `https://`: [`MINT_TOUCH_TIMEOUT`], unchanged. `nostr://`: longer than the
+/// connector's whole reply window, so the connector returns its own ambiguous `Error::Timeout` and
+/// the future is never dropped while its signed request is still valid on the relays. Dropping it
+/// at 5s while the request stayed executable for ~60s let recovery unspend inputs the mint could
+/// still take (PR #1034 review).
+pub(crate) fn mint_mutation_timeout(mint_url: &cdk::mint_url::MintUrl) -> Duration {
+    if crate::mint_wire::is_nostr_scheme(&mint_url.to_string()) {
+        crate::nostr_mint::DEFAULT_WINDOW + crate::nostr_mint::OUTER_MARGIN
+    } else {
+        MINT_TOUCH_TIMEOUT
+    }
+}
+
+/// [`BRIDGE_RECV_TIMEOUT`] for this mint: a `nostr://` worker's legs are bounded by
+/// [`mint_mutation_timeout`], so the bridge ceiling grows with them and stays above their sum.
+fn bridge_recv_timeout(mint_url: &cdk::mint_url::MintUrl) -> Duration {
+    if crate::mint_wire::is_nostr_scheme(&mint_url.to_string()) {
+        BRIDGE_RECV_TIMEOUT + 2 * mint_mutation_timeout(mint_url)
+    } else {
+        BRIDGE_RECV_TIMEOUT
+    }
+}
+
+/// Unix second after which a `nostr://` request published under a saga last updated at
+/// `updated_at` can no longer be executed (see [`crate::nostr_mint::REQUEST_SETTLE`]).
+pub(crate) fn nostr_saga_settles_at(updated_at: u64) -> u64 {
+    updated_at.saturating_add(crate::nostr_mint::REQUEST_SETTLE.as_secs())
+}
+
+/// `Some(refusal)` when `saga` is on a `nostr://` mint and a request it published may still be
+/// executed. Recovery then leaves it untouched: unspending its inputs on an "all Unspent" NUT-07
+/// answer, or dropping its swap row, is only safe once that request can no longer land.
+fn nostr_request_may_be_live(
+    wallet: &Wallet,
+    saga: &cdk::wallet::types::WalletSaga,
+) -> Option<String> {
+    if !crate::mint_wire::is_nostr_scheme(&wallet.mint_url.to_string()) {
+        return None;
+    }
+    let settles_at = nostr_saga_settles_at(saga.updated_at);
+    let now = cashu::util::unix_time();
+    (now < settles_at).then(|| {
+        format!(
+            "nostr:// request may still be executed by the mint; left in place until unix {settles_at} ({}s)",
+            settles_at - now
+        )
+    })
+}
+
 /// Reason code surfaced when a dead mint blocks the post-time dust guard.
 pub const MINT_UNREACHABLE_POST: &str = "mint_unreachable";
 
@@ -311,8 +361,9 @@ impl<'a> CdkBuyerMint<'a> {
         // `force_swap` branch, whose mint HTTP cdk leaves un-timed; a stalled mint here would otherwise
         // park the worker (and, through the bridge, the caller) forever (#387). On timeout we fail
         // closed: no `prepared`, no proofs committed, no money moved.
+        let mutation_bound = mint_mutation_timeout(&self.wallet.mint_url);
         let prepared = match tokio::time::timeout(
-            MINT_TOUCH_TIMEOUT,
+            mutation_bound,
             self.wallet.prepare_send(terms.amount, options),
         )
         .await
@@ -322,7 +373,7 @@ impl<'a> CdkBuyerMint<'a> {
                 return Err(mint_unreachable(
                     self.wallet,
                     MINT_UNREACHABLE_PAY,
-                    format!("prepare_send exceeded {MINT_TOUCH_TIMEOUT:?}"),
+                    format!("prepare_send exceeded {mutation_bound:?}"),
                 ));
             }
         };
@@ -340,7 +391,9 @@ impl<'a> CdkBuyerMint<'a> {
         // closed and return NO token, so no money reaches the seller this run. A ProofsReserved left
         // mid-swap is compensated exactly as a definitive confirm failure is — the ATTEMPT_METADATA tag
         // lets the next recover/reconcile map it, so a later retry never double-spends.
-        let token = match tokio::time::timeout(MINT_TOUCH_TIMEOUT, prepared.confirm(None)).await {
+        // For a nostr:// mint the bound outlasts the connector's window (see mint_mutation_timeout),
+        // so this arm is reached only past a request that can no longer be executed.
+        let token = match tokio::time::timeout(mutation_bound, prepared.confirm(None)).await {
             Ok(Ok(token)) => token,
             Ok(Err(error)) => {
                 // Definitive confirm failure should leave no residual ProofsReserved
@@ -351,7 +404,7 @@ impl<'a> CdkBuyerMint<'a> {
                 return Err(mint_unreachable(
                     self.wallet,
                     MINT_UNREACHABLE_PAY,
-                    format!("confirm exceeded {MINT_TOUCH_TIMEOUT:?}"),
+                    format!("confirm exceeded {mutation_bound:?}"),
                 ));
             }
         };
@@ -842,6 +895,17 @@ pub async fn retire_eligible_incomplete_sagas(
     }
 
     for saga in incomplete {
+        // A nostr:// request stays executable on the relays until its `exp`: leave the sagas whose
+        // inputs it could still spend (ProofsReserved send, any swap) until it cannot. The NUT-07
+        // check below then runs after that point, so "all Unspent" is final.
+        if matches!(
+            saga.state,
+            WalletSagaState::Send(SendSagaState::ProofsReserved) | WalletSagaState::Swap(_)
+        ) && let Some(refusal) = nostr_request_may_be_live(wallet, &saga)
+        {
+            report.unresolved.push(format!("{}: {refusal}", saga.id));
+            continue;
+        }
         match &saga.state {
             WalletSagaState::Send(SendSagaState::ProofsReserved) => {
                 if saga_has_confirmed_outgoing_tx(wallet, &saga).await? {
@@ -1314,6 +1378,17 @@ async fn resolve_one_swap_saga(
                     .into(),
             ));
         }
+        // nostr://: a send's `confirm` swaps with ProofReservation::Skip, so ITS swap row binds no
+        // proofs while the inputs stay reserved on the send saga. While such a send is incomplete
+        // this "orphan" may be the only record of the outputs of a swap the mint executed; keep it.
+        if crate::mint_wire::is_nostr_scheme(&wallet.mint_url.to_string())
+            && wallet_has_incomplete_proofs_reserved_send(wallet).await?
+        {
+            return Err(PaymentWalletError::Reconcile(
+                "swap-saga resolve refused: empty-reserved nostr:// swap while a ProofsReserved send is incomplete (may be its swap; leave wedged-safer)"
+                    .into(),
+            ));
+        }
         drop_never_bound_swap_orphan(wallet, saga).await?;
         return Ok(());
     }
@@ -1333,6 +1408,24 @@ async fn resolve_one_swap_saga(
         }
     }
     Ok(())
+}
+
+async fn wallet_has_incomplete_proofs_reserved_send(
+    wallet: &Wallet,
+) -> Result<bool, PaymentWalletError> {
+    Ok(wallet
+        .localstore
+        .get_incomplete_sagas()
+        .await
+        .map_err(wallet_error)?
+        .iter()
+        .any(|saga| {
+            saga.mint_url == wallet.mint_url
+                && matches!(
+                    saga.state,
+                    WalletSagaState::Send(SendSagaState::ProofsReserved)
+                )
+        }))
 }
 
 /// Drop a Swap saga that bound nothing and recorded nothing: no reserved proofs
@@ -1885,6 +1978,7 @@ impl<R> CdkPaymentEffects<R> {
             .enable_all()
             .build()
             .map_err(wallet_error)?;
+        let recv_timeout = bridge_recv_timeout(&wallet.mint_url);
         let (commands, mut requests) = tokio::sync::mpsc::channel(1);
         let worker = thread::Builder::new()
             .name("maxplayer-payment-wallet".into())
@@ -1969,7 +2063,7 @@ impl<R> CdkPaymentEffects<R> {
             commands: Some(commands),
             worker: Some(worker),
             receipt,
-            recv_timeout: BRIDGE_RECV_TIMEOUT,
+            recv_timeout,
         })
     }
 
@@ -3085,6 +3179,142 @@ mod tests {
 
         let report2 = retire_eligible_incomplete_sagas(&wallet).await.unwrap();
         assert_eq!(report2.retired, 0);
+    }
+
+    const NOSTR_MINT: &str =
+        "nostr://npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d";
+
+    /// A nostr:// wallet holding one Send(ProofsReserved) saga (reserved Unspent proof) plus, when
+    /// `with_orphan_swap`, an empty-reserved Swap(SwapRequested) row — the shape a send `confirm`
+    /// leaves when its swap request is still out on the relays. The connector answers NUT-07
+    /// "all Unspent" (the answer that must NOT be trusted before the request can no longer land).
+    async fn nostr_reserved_send_wallet(updated_at: u64, with_orphan_swap: bool) -> Wallet {
+        let seller = secret_key(1).public_key();
+        let proof = p2pk_proof(7, seller);
+        let proof_y = proof.y().unwrap();
+        let store = Arc::new(cdk_sqlite::wallet::memory::empty().await.unwrap());
+        let info =
+            ProofInfo::new(proof, mint(NOSTR_MINT), State::Unspent, CurrencyUnit::Sat).unwrap();
+        let saga_id = uuid::Uuid::now_v7();
+        store.update_proofs(vec![info], vec![]).await.unwrap();
+        store.reserve_proofs(vec![proof_y], &saga_id).await.unwrap();
+        let mut saga = WalletSaga::new(
+            saga_id,
+            WalletSagaState::Send(SendSagaState::ProofsReserved),
+            Amount::from(7),
+            mint(NOSTR_MINT),
+            CurrencyUnit::Sat,
+            cdk::wallet::types::OperationData::Send(cdk::wallet::types::SendOperationData {
+                amount: Amount::from(7),
+                memo: None,
+                counter_start: None,
+                counter_end: None,
+                token: None,
+                proofs: None,
+            }),
+        );
+        saga.updated_at = updated_at;
+        store.add_saga(saga).await.unwrap();
+        if with_orphan_swap {
+            let mut swap = WalletSaga::new(
+                uuid::Uuid::now_v7(),
+                WalletSagaState::Swap(cdk::wallet::types::SwapSagaState::SwapRequested),
+                Amount::ZERO,
+                mint(NOSTR_MINT),
+                CurrencyUnit::Sat,
+                cdk::wallet::types::OperationData::Swap(cdk::wallet::types::SwapOperationData {
+                    input_amount: Amount::from(7),
+                    output_amount: Amount::from(7),
+                    counter_start: Some(0),
+                    counter_end: Some(1),
+                    blinded_messages: None,
+                }),
+            );
+            swap.updated_at = updated_at;
+            store.add_saga(swap).await.unwrap();
+        }
+        let connector = Arc::new(BaseHttpClient::with_transport(
+            mint(NOSTR_MINT),
+            CheckStateTransport::new(cashu::CheckStateResponse {
+                states: vec![ProofState::from((proof_y, State::Unspent))],
+            }),
+            None,
+        ));
+        WalletBuilder::new()
+            .mint_url(mint(NOSTR_MINT))
+            .unit(CurrencyUnit::Sat)
+            .localstore(store)
+            .seed([11; 64])
+            .shared_client(connector)
+            .use_http_subscription()
+            .build()
+            .unwrap()
+    }
+
+    async fn reserved_unspent_count(wallet: &Wallet) -> (usize, usize) {
+        let reserved = wallet
+            .localstore
+            .get_proofs(None, None, Some(vec![State::Reserved]), None)
+            .await
+            .unwrap()
+            .len();
+        let sagas = wallet.localstore.get_incomplete_sagas().await.unwrap().len();
+        (reserved, sagas)
+    }
+
+    #[tokio::test]
+    async fn nostr_reserved_send_is_not_unspent_while_its_request_may_still_land() {
+        // PR #1034 review: "all Unspent" from NUT-07 is not final while a signed nostr:// swap
+        // request is still executable. Recovery must leave both the send and its swap row alone.
+        let wallet = nostr_reserved_send_wallet(cashu::util::unix_time(), true).await;
+        let report = retire_eligible_incomplete_sagas(&wallet).await.unwrap();
+        assert_eq!(report.retired, 0);
+        assert_eq!(report.swap_rolled_back, 0);
+        assert_eq!(report.unresolved.len(), 2, "{:?}", report.unresolved);
+        assert!(report.unresolved.iter().all(|r| r.contains("may still be executed")));
+        assert_eq!(reserved_unspent_count(&wallet).await, (1, 2), "nothing unspent, nothing dropped");
+    }
+
+    #[tokio::test]
+    async fn nostr_reserved_send_retires_once_its_request_can_no_longer_land() {
+        let settled = cashu::util::unix_time() - crate::nostr_mint::REQUEST_SETTLE.as_secs() - 1;
+        let wallet = nostr_reserved_send_wallet(settled, false).await;
+        let report = retire_eligible_incomplete_sagas(&wallet).await.unwrap();
+        assert_eq!(report.retired, 1, "{:?}", report.unresolved);
+        assert_eq!(reserved_unspent_count(&wallet).await, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn nostr_empty_swap_row_is_kept_while_a_reserved_send_is_incomplete() {
+        // Past the settle window the send may still be refused (e.g. inputs Spent); its
+        // empty-reserved swap row is then the only record of the swap's outputs. Keep it.
+        let settled = cashu::util::unix_time() - crate::nostr_mint::REQUEST_SETTLE.as_secs() - 1;
+        let wallet = nostr_reserved_send_wallet(settled, true).await;
+        let sagas = wallet.localstore.get_incomplete_sagas().await.unwrap();
+        let swap = sagas
+            .iter()
+            .find(|s| matches!(s.state, WalletSagaState::Swap(_)))
+            .unwrap()
+            .clone();
+        let mut report = RetireReport::default();
+        let refusal = resolve_one_swap_saga(&wallet, &swap, &mut report).await.expect_err("kept");
+        assert!(refusal.to_string().contains("ProofsReserved send is incomplete"), "{refusal}");
+        assert!(wallet.localstore.get_saga(&swap.id).await.unwrap().is_some());
+    }
+
+    #[test]
+    fn nostr_mutation_bound_outlasts_the_connector_window_https_unchanged() {
+        let nostr = mint(NOSTR_MINT);
+        assert!(mint_mutation_timeout(&nostr) > crate::nostr_mint::DEFAULT_WINDOW);
+        assert!(bridge_recv_timeout(&nostr) > 2 * mint_mutation_timeout(&nostr));
+        assert!(
+            crate::nostr_mint::REQUEST_SETTLE
+                > 2 * crate::nostr_mint::DEFAULT_WINDOW + crate::nostr_mint::OUTER_MARGIN,
+            "settle covers prepare bound + request exp"
+        );
+        let https = mint(MINT);
+        assert_eq!(mint_mutation_timeout(&https), MINT_TOUCH_TIMEOUT);
+        assert_eq!(bridge_recv_timeout(&https), BRIDGE_RECV_TIMEOUT);
     }
 
     #[tokio::test]

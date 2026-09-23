@@ -330,6 +330,19 @@ async fn nostr_mint_no_reply_is_an_ambiguous_timeout_after_the_window() {
     assert!(started.elapsed() < Duration::from_secs(6));
     let seen = mint.seen.lock().unwrap();
     assert!(seen.deliveries.len() >= 2, "re-sent within the window");
+    // PR #1034 review: `exp` is when the connector stops waiting, never later. A 1.5s window
+    // floors to 1s; allow one second of wall-clock boundary.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    for (_, request) in &seen.deliveries {
+        assert!(
+            request.exp <= now + 1,
+            "exp {} outlives the wait (now {now})",
+            request.exp
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

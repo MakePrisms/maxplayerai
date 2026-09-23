@@ -10,6 +10,12 @@
 //!   event id>]`, NIP-44 v2 content to the client, signed by the mint key. Plaintext is a
 //!   [`Response`]: `{"v":1,"id":…,"ok":<NUT JSON>}` or `{"v":1,"id":…,"err":{"code":…,"detail":…}}`.
 //!
+//! **Replays (the mint's obligation).** A wallet re-sends the IDENTICAL signed event when a reply is
+//! lost. The mint MUST answer a request id it already executed with the ORIGINAL reply, never with
+//! the NUT error the re-execution would produce (e.g. 11001 token already spent): the wallet treats
+//! such an error as definitive and releases inputs the mint already took. A mint MUST NOT execute a
+//! request whose `exp` has passed; the wallet sets `exp` to the moment it stops waiting.
+//!
 //! Both kinds are in the ephemeral range, so a well-behaved relay forwards them and stores nothing.
 //! No collision with [`crate::kinds`] (3400–3407, 30340).
 //!

@@ -55,8 +55,19 @@ pub const DEFAULT_WINDOW: Duration = Duration::from_secs(30);
 pub const DEFAULT_RESEND_EVERY: Duration = Duration::from_secs(5);
 /// How long to wait for at least one relay connection before failing the request.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// Slack added to `exp` past the window, so the mint never refuses a request we still wait on.
-const EXP_SLACK_SECS: u64 = 30;
+/// Extra room an OUTER bound (the pay path's per-leg timeout) must leave past [`DEFAULT_WINDOW`], so
+/// the connector always returns its own ambiguous `Error::Timeout` instead of being dropped while
+/// its signed request is still valid. Covers the bounded relay disconnect after the window.
+pub const OUTER_MARGIN: Duration = Duration::from_secs(10);
+/// How long after a wallet saga's last update a `nostr://` request it may have published can still
+/// be executed by the mint. Recovery must not unspend or forget that saga's inputs before then.
+///
+/// Bound: a pay leg starts its request at most `DEFAULT_WINDOW + OUTER_MARGIN` after the saga write
+/// (the bounded `prepare_send`), and the request's `exp` is at most `DEFAULT_WINDOW` after that.
+/// Five minutes is well above that sum and absorbs wallet/mint clock skew.
+pub const REQUEST_SETTLE: Duration = Duration::from_secs(300);
+/// Bound on the relay disconnect after a request, so it cannot stretch past [`OUTER_MARGIN`].
+const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The relays a wallet uses for a `nostr://` mint: the home's own `relay_url`, then
 /// [`FALLBACK_RELAYS`], without duplicates.
@@ -189,13 +200,19 @@ impl NostrMintConnector {
     }
 
     /// Send one request and return the mint's `ok` JSON, or the mapped error.
+    ///
+    /// The whole call, relay connect included, ends at `deadline = start + window`. The request's
+    /// `exp` is `floor(start) + floor(window)`, never later than that deadline: once the connector
+    /// stops waiting, a compliant mint can no longer execute the request (spec §3.1). Nothing past
+    /// the deadline is awaited except a bounded disconnect.
     pub async fn call_raw(&self, operation: &str, body: Value) -> Result<Value, Error> {
+        let deadline = Instant::now() + self.window;
         let request = Request {
             v: PROTOCOL_VERSION,
-            id: random_id(),
+            id: random_id()?,
             op: operation.to_owned(),
             body,
-            exp: unix_now() + self.window.as_secs() + EXP_SLACK_SECS,
+            exp: unix_now() + self.window.as_secs(),
         };
         let plaintext = serde_json::to_string(&request)
             .map_err(|error| Error::Custom(format!("encode {operation} request: {error}")))?;
@@ -224,14 +241,16 @@ impl NostrMintConnector {
             let _ = client.add_relay(relay.as_str()).await;
         }
         client.connect().await;
-        client.wait_for_connection(self.connect_timeout).await;
+        client
+            .wait_for_connection(self.connect_timeout.min(remaining(deadline)))
+            .await;
         let connected = client
             .relays()
             .await
             .values()
             .any(|relay| relay.is_connected());
         if !connected {
-            client.disconnect().await;
+            disconnect(&client).await;
             // Same class as an unreachable HTTPS mint today (connection refused): ambiguous.
             return Err(Error::HttpError(
                 None,
@@ -249,9 +268,8 @@ impl NostrMintConnector {
             .pubkey(keys.public_key())
             .author(self.mint_pk)
             .since(Timestamp::now() - Duration::from_secs(10));
-        let _ = client.subscribe(filter, None).await;
+        let _ = tokio::time::timeout(remaining(deadline), client.subscribe(filter, None)).await;
 
-        let deadline = Instant::now() + self.window;
         let mut next_send = Instant::now();
         let outcome = loop {
             let now = Instant::now();
@@ -259,8 +277,9 @@ impl NostrMintConnector {
                 break Err(Error::Timeout);
             }
             if now >= next_send {
-                // A publish error is not a result; keep waiting and re-send.
-                let _ = client.send_event(&event).await;
+                // A publish error is not a result; keep waiting and re-send. Bounded by the deadline
+                // so a slow relay OK cannot carry the call past `exp`.
+                let _ = tokio::time::timeout(remaining(deadline), client.send_event(&event)).await;
                 next_send = Instant::now() + self.resend_every;
             }
             let wait = next_send
@@ -281,7 +300,7 @@ impl NostrMintConnector {
                 Ok(Ok(_)) => continue,
             }
         };
-        client.disconnect().await;
+        disconnect(&client).await;
         outcome
     }
 
@@ -343,10 +362,21 @@ pub fn map_error(error: ErrorBody) -> Error {
     }
 }
 
-fn random_id() -> String {
+/// Time left until `deadline` (zero once it has passed).
+fn remaining(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
+
+async fn disconnect(client: &Client) {
+    let _ = tokio::time::timeout(DISCONNECT_TIMEOUT, client.disconnect()).await;
+}
+
+/// A fresh request id. An OS RNG failure is an ambiguous error before anything is published, never
+/// a panic inside the payment worker.
+fn random_id() -> Result<String, Error> {
     let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).expect("os randomness");
-    hex::encode(bytes)
+    getrandom::fill(&mut bytes).map_err(|error| Error::Custom(format!("request id: {error}")))?;
+    Ok(hex::encode(bytes))
 }
 
 fn unix_now() -> u64 {
