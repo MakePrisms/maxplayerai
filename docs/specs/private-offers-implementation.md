@@ -25,6 +25,7 @@ The existing buyer/seller trade loop still publishes protocol v1. No private pos
   disabled; identity signing remains in the existing seller signer actor.
 - Client input snapshots and manifest verification use libgit2 objects, not checkout/hooks or
   submodule recursion. Materialization admits only verified regular files into a new directory.
+- HTTP router integration tests use disposable PostgreSQL/Redis and a local object-store fixture. They verify buyer/seller/service reads, outsider denial before object-store access after authorized warm reads, anonymous denial despite generic public-read mode, fail-closed flag disablement, and provisioning method/payload/replay checks.
 - Public observatory placeholders distinguish targeted-private tasks from intentionally public
   open-pool tasks with private execution/delivery.
 

@@ -65,3 +65,6 @@ pub fn git_policy_router(state: Arc<AppState>) -> Router {
         .layer(middleware::from_fn(require_localhost))
         .with_state(state)
 }
+
+#[cfg(test)]
+mod private_jobs_http_tests;
