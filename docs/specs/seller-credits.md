@@ -105,7 +105,7 @@ relay.maxplayer.ai already passes them (tested, §6). No collision with `kinds.r
 ### 3.2 Operations
 
 The connector implements the whole CDK `MintConnector` trait, so any NUT op a mint serves works.
-The local-issue backend serves `info` (06), `keys`/`keyset`/`keysets` (01/02), `swap` (03),
+Swap is the only operation that moves credits. The local-issue backend serves `info` (06), `keys`/`keyset`/`keysets` (01/02), `swap` (03),
 `checkstate` (07) and `restore` (09). It refuses mint and melt (04/05) with `unsupported`, and
 `info` doesn't advertise them. Issuance is never on the wire.
 
@@ -139,7 +139,9 @@ The local-issue backend serves `info` (06), `keys`/`keyset`/`keysets` (01/02), `
 
 1. **Core: `nostr://` transport.** Connector factory, Nostr connector with re-send, allow-list,
    fallback relays picked. Tested against an in-process relay (`nostr-relay-builder`, already a
-   dev-dependency) and a test mint in dev-dependencies. No behavior change for `https://`.
+   dev-dependency) and a scripted mint responder, so core gains no cdk `mint` dependency and its CI
+   needs no `protoc`. The real CDK mint over relays is tested in stage 2. No behavior change for
+   `https://`.
 2. **`maxplayer-mint`.** `init`, `run`, `issue`, idempotent swap replay, rate cap, CI job.
 3. **End to end.** Seller A runs `maxplayer-mint`, seller B accepts A's mint, a buyer holds only A's
    credits. B does a job, is paid in A's credits and pays its fee in real sats from its Lightning
