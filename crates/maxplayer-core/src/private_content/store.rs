@@ -67,6 +67,18 @@ impl ContentStore {
                 author TEXT NOT NULL, job TEXT NOT NULL, id TEXT NOT NULL,
                 envelope TEXT NOT NULL, expires_at INTEGER NOT NULL,
                 PRIMARY KEY(author,job,id));
+            CREATE TABLE IF NOT EXISTS content_intents (
+                key TEXT PRIMARY KEY, envelope TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS content_prepared (
+                job TEXT NOT NULL, id TEXT NOT NULL, author TEXT NOT NULL, envelope TEXT NOT NULL,
+                PRIMARY KEY(job,id,author));
+            CREATE TABLE IF NOT EXISTS content_selection (
+                offer TEXT PRIMARY KEY, claim TEXT NOT NULL, award TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS content_events (
+                id TEXT PRIMARY KEY, root TEXT NOT NULL, event TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS content_events_root ON content_events(root);
+            CREATE TABLE IF NOT EXISTS content_scan (
+                recipient TEXT PRIMARY KEY, next_start INTEGER NOT NULL, through INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS content_cursor (
                 recipient TEXT PRIMARY KEY, received_at INTEGER NOT NULL);",
         )
@@ -98,6 +110,32 @@ impl ContentStore {
             return Err(Error("job id already bound to another offer"));
         }
         tx.commit().map_err(db_error)
+    }
+    /// Open discovery has no encrypted task, but its exact signed OFFER still
+    /// belongs in the durable outbox before the first send.
+    pub fn enqueue_open_offer(
+        &mut self,
+        offer: &Event,
+        service: &str,
+        host: &super::wire::HostPolicy,
+    ) -> Result<()> {
+        let tags = super::wire::validate_private(offer, host)?;
+        if offer.kind.as_u16() != 3401 || tags.get("discovery") != Some("open") {
+            return Err(Error("not an open discovery offer"));
+        }
+        self.remember_event(offer, offer, &offer.pubkey.to_hex(), service, host)?;
+        self.db
+            .execute(
+                "INSERT OR IGNORE INTO content_carriers(id,author,job,event) VALUES(?1,?2,?3,?4)",
+                params![
+                    offer.id.to_hex(),
+                    offer.pubkey.to_hex(),
+                    tags.required("job")?,
+                    offer.as_json()
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
     }
     pub fn enqueue(&mut self, content: &PreparedContent, expected: &Binding<'_>) -> Result<()> {
         self.enqueue_inner(content, expected, None)
@@ -180,6 +218,306 @@ impl ContentStore {
             .map_err(db_error)?;
         }
         tx.commit().map_err(db_error)
+    }
+    /// Pin signed public evidence for a trade this local participant is following.
+    /// Syntax is checked here; callers still validate the entire chain on every use.
+    /// Never use cached presence as proof of an award or content availability.
+    pub fn remember_event(
+        &mut self,
+        event: &Event,
+        offer: &Event,
+        recipient: &str,
+        service: &str,
+        host: &super::wire::HostPolicy,
+    ) -> Result<()> {
+        let o = super::wire::validate_private(offer, host)?;
+        let e = super::wire::validate_private(event, host)?;
+        super::require_hex(recipient, 32)?;
+        super::require_hex(service, 32)?;
+        let root = offer.id.to_hex();
+        if offer.kind.as_u16() != 3401
+            || e.get("job") != o.get("job")
+            || (event.id != offer.id && e.get("root") != Some(root.as_str()))
+            || (o.get("discovery") == Some("targeted")
+                && recipient != service
+                && recipient != offer.pubkey.to_hex()
+                && !o.participants.contains(recipient))
+        {
+            return Err(Error("event evidence is outside local trade scope"));
+        }
+        self.reserve_offer(&offer.pubkey.to_hex(), o.required("job")?, &root)?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        let count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM content_events WHERE root=?1",
+                [&root],
+                |r| r.get(0),
+            )
+            .map_err(db_error)?;
+        let known: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM content_events WHERE id=?1)",
+                [event.id.to_hex()],
+                |r| r.get(0),
+            )
+            .map_err(db_error)?;
+        if !known && count >= 2048 {
+            return Err(Error("trade evidence cache full"));
+        }
+        for item in [offer, event] {
+            tx.execute(
+                "INSERT OR IGNORE INTO content_events(id,root,event) VALUES(?1,?2,?3)",
+                params![item.id.to_hex(), root, item.as_json()],
+            )
+            .map_err(db_error)?;
+        }
+        tx.commit().map_err(db_error)
+    }
+    /// Public v2 evidence lives in its own database; this only caches signed
+    /// events. Every use revalidates the full selection chain.
+    pub fn remember_public(&mut self, offer: &Event, event: &Event) -> Result<()> {
+        super::public_v2::validate_offer(offer)?;
+        if event.id != offer.id {
+            super::public_v2::validate_child(offer, event)?;
+        }
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        let count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM content_events WHERE root=?1",
+                [offer.id.to_hex()],
+                |r| r.get(0),
+            )
+            .map_err(db_error)?;
+        let known: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM content_events WHERE id=?1)",
+                [event.id.to_hex()],
+                |r| r.get(0),
+            )
+            .map_err(db_error)?;
+        if !known && count >= 2048 {
+            return Err(Error("public trade evidence cache full"));
+        }
+        for item in [offer, event] {
+            tx.execute(
+                "INSERT OR IGNORE INTO content_events VALUES(?1,?2,?3)",
+                params![item.id.to_hex(), offer.id.to_hex(), item.as_json()],
+            )
+            .map_err(db_error)?;
+        }
+        tx.commit().map_err(db_error)
+    }
+    pub fn select_public(&mut self, offer: &Event, claim: &Event, award: &Event) -> Result<()> {
+        super::public_v2::validate_selection(offer, claim, award)?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO content_selection VALUES(?1,?2,?3)",
+            params![offer.id.to_hex(), claim.id.to_hex(), award.id.to_hex()],
+        )
+        .map_err(db_error)?;
+        let ids: (String, String) = tx
+            .query_row(
+                "SELECT claim,award FROM content_selection WHERE offer=?1",
+                [offer.id.to_hex()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(db_error)?;
+        if ids != (claim.id.to_hex(), award.id.to_hex()) {
+            return Err(Error("public trade already selected"));
+        }
+        tx.commit().map_err(db_error)
+    }
+    /// Signed but NOT necessarily chain-authorized evidence. Resolve exact references
+    /// and validate selection/content binding before execution, display or settlement.
+    pub fn event(&self, id: &str) -> Result<Option<Event>> {
+        super::require_hex(id, 32)?;
+        let json: Option<String> = self
+            .db
+            .query_row("SELECT event FROM content_events WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()
+            .map_err(db_error)?;
+        let event = json
+            .map(|json| super::wire::parse_signed(&json))
+            .transpose()?;
+        if event.as_ref().is_some_and(|event| event.id.to_hex() != id) {
+            return Err(Error("stored event identity mismatch"));
+        }
+        Ok(event)
+    }
+    /// Retrieve locally authored immutable bytes for restart/retry. This is not an
+    /// inbox accessor and cannot make somebody else's unverified content executable.
+    pub fn authored(&self, job: &str, id: &str, author: &str) -> Result<Option<PreparedContent>> {
+        let json: Option<String> = self
+            .db
+            .query_row(
+                "SELECT envelope FROM content_records WHERE job=?1 AND id=?2 AND author=?3 UNION SELECT envelope FROM content_prepared WHERE job=?1 AND id=?2 AND author=?3",
+                params![job, id, author],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        json.map(|json| PreparedContent::decode(&json)).transpose()
+    }
+    pub fn offer_for_job(&self, buyer: &str, job: &str) -> Result<Option<Event>> {
+        let id: Option<String> = self
+            .db
+            .query_row(
+                "SELECT offer FROM content_offers WHERE buyer=?1 AND job=?2",
+                params![buyer, job],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        match id {
+            Some(id) => self.event(&id),
+            None => Ok(None),
+        }
+    }
+    /// The selected chain is immutable locally just as it is at the private Git host.
+    /// Evidence inserts may survive a crash; only this final transaction admits execution.
+    pub fn remember_selection(
+        &mut self,
+        offer: &Event,
+        claim: &Event,
+        award: &Event,
+        recipient: &str,
+        service: &str,
+        host: &super::wire::HostPolicy,
+    ) -> Result<()> {
+        super::lifecycle::validate_selection(offer, claim, award, host)?;
+        if recipient != offer.pubkey.to_hex()
+            && recipient != claim.pubkey.to_hex()
+            && recipient != service
+        {
+            return Err(Error("not a selected trade participant"));
+        }
+        for event in [offer, claim, award] {
+            self.remember_event(event, offer, recipient, service, host)?;
+        }
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO content_selection VALUES(?1,?2,?3)",
+            params![offer.id.to_hex(), claim.id.to_hex(), award.id.to_hex()],
+        )
+        .map_err(db_error)?;
+        let ids: (String, String) = tx
+            .query_row(
+                "SELECT claim,award FROM content_selection WHERE offer=?1",
+                [offer.id.to_hex()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(db_error)?;
+        if ids != (claim.id.to_hex(), award.id.to_hex()) {
+            return Err(Error("trade already has a different selection"));
+        }
+        tx.commit().map_err(db_error)
+    }
+    pub fn selection(&self, offer: &str) -> Result<Option<(Event, Event)>> {
+        let ids: Option<(String, String)> = self
+            .db
+            .query_row(
+                "SELECT claim,award FROM content_selection WHERE offer=?1",
+                [offer],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(db_error)?;
+        match ids {
+            None => Ok(None),
+            Some((claim, award)) => Ok(Some((
+                self.event(&claim)?
+                    .ok_or(Error("selected claim evidence missing"))?,
+                self.event(&award)?
+                    .ok_or(Error("selected award evidence missing"))?,
+            ))),
+        }
+    }
+    /// Allocate the immutable nonce/body once, before computing a result cosignature.
+    /// A restart with changed answer/context is a conflict, not a new message under
+    /// the existing delivery intent. It must become a separately authorized revision.
+    pub fn prepare_once(
+        &mut self,
+        key: &str,
+        mut body: super::ContentBody,
+    ) -> Result<PreparedContent> {
+        if key.is_empty() || key.len() > 256 {
+            return Err(Error("invalid content intent key"));
+        }
+        body.validate()?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        let old: Option<String> = tx
+            .query_row(
+                "SELECT envelope FROM content_intents WHERE key=?1",
+                [key],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        let content = if let Some(old) = old {
+            let content = PreparedContent::decode(&old)?;
+            body.message_id = content.body().message_id.clone();
+            if &body != content.body() {
+                return Err(Error("content intent changed after preparation"));
+            }
+            content
+        } else {
+            let content = PreparedContent::new(body)?;
+            tx.execute(
+                "INSERT INTO content_intents VALUES(?1,?2)",
+                params![key, content.envelope()],
+            )
+            .map_err(db_error)?;
+            content
+        };
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT envelope FROM content_prepared WHERE job=?1 AND id=?2 AND author=?3",
+                params![
+                    content.body().job_id,
+                    content.body().message_id,
+                    content.body().author
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        if existing
+            .as_deref()
+            .is_some_and(|bytes| bytes != content.envelope())
+        {
+            return Err(Error(
+                "prepared content identity reused with different bytes",
+            ));
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO content_prepared VALUES(?1,?2,?3,?4)",
+            params![
+                content.body().job_id,
+                content.body().message_id,
+                content.body().author,
+                content.envelope()
+            ],
+        )
+        .map_err(db_error)?;
+        tx.commit().map_err(db_error)?;
+        Ok(content)
     }
     pub fn pending_carriers(&self, author: &str, limit: usize) -> Result<Vec<Event>> {
         super::require_hex(author, 32)?;
@@ -379,6 +717,52 @@ impl ContentStore {
     }
     /// Advance only after a complete bounded backfill interval reached EOSE. Receiving
     /// one new live event must not jump past older wrappers not yet downloaded.
+    /// An incomplete scan resumes without re-applying overlap on every batch.
+    /// Otherwise high-rate histories can consume every query budget on the same
+    /// overlap forever and never reach newly arrived content.
+    pub fn scan_window(&mut self, recipient: &str, now: u64) -> Result<(u64, u64)> {
+        super::require_hex(recipient, 32)?;
+        let old: Option<(u64, u64)> = self
+            .db
+            .query_row(
+                "SELECT next_start,through FROM content_scan WHERE recipient=?1",
+                [recipient],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(db_error)?;
+        if let Some(window) = old {
+            return Ok(window);
+        }
+        let start = self.receive_since(recipient)?;
+        self.db
+            .execute(
+                "INSERT INTO content_scan VALUES(?1,?2,?3)",
+                params![recipient, start, now],
+            )
+            .map_err(db_error)?;
+        Ok((start, now))
+    }
+    pub fn scan_progress(&mut self, recipient: &str, through: u64) -> Result<()> {
+        // Called only after a complete EOSE interval has been staged durably.
+        self.complete_backfill(recipient, through)?;
+        self.db
+            .execute(
+                "UPDATE content_scan SET next_start=?2 WHERE recipient=?1",
+                params![recipient, through.saturating_add(1)],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+    pub fn scan_finished(&mut self, recipient: &str) -> Result<()> {
+        self.db
+            .execute(
+                "DELETE FROM content_scan WHERE recipient=?1 AND next_start>through",
+                [recipient],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
     pub fn complete_backfill(&mut self, recipient: &str, through: u64) -> Result<()> {
         super::require_hex(recipient, 32)?;
         self.db.execute("INSERT INTO content_cursor VALUES(?1,?2) ON CONFLICT(recipient) DO UPDATE SET received_at=MAX(received_at,excluded.received_at)",params![recipient,through.min(i64::MAX as u64)]).map_err(db_error)?;

@@ -9,10 +9,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct InputFile {
     pub source: PathBuf,
     pub path: String,
 }
+#[derive(Clone)]
 pub struct InputSnapshot {
     pub reference: String,
     pub commit_oid: String,

@@ -418,6 +418,7 @@ fn independent_python_vectors_pin_body_commitment_job_and_paid_free_receipt_byte
     );
     for vector in v["receipts"].as_array().unwrap() {
         let receipt = crate::receipt::ReceiptPreimage {
+            protocol: crate::receipt::ReceiptProtocol::V2,
             job_hash: v["job_hash"].as_str().unwrap().into(),
             offer_id: v["offer_id"].as_str().unwrap().into(),
             amount: 100,
@@ -912,4 +913,548 @@ fn free_offer_cannot_carry_a_price_and_claim_details_are_not_a_candidate_pitch()
     assert!(PreparedContent::new(claim.clone()).is_err());
     claim.text.clear();
     PreparedContent::new(claim).unwrap();
+}
+
+#[test]
+fn execution_offer_never_substitutes_missing_private_task_or_filters() {
+    let mut task = body();
+    task.dispatch = Some(Dispatch {
+        agent: Some("private-preset".into()),
+        harness_family: Some("codex".into()),
+        harness_model: Some("private-model".into()),
+        capabilities: Some(vec!["rust".into()]),
+    });
+    task.requested_output = Some("application/vnd.private-result".into());
+    let p = PreparedContent::new(task).unwrap();
+    let mut tags = offer_tags(&p);
+    tags.push(vec![
+        "param".into(),
+        "harness_family".into(),
+        "codex".into(),
+    ]);
+    tags.push(vec!["param".into(), "capability".into(), "rust".into()]);
+    let event = sign(3401, tags, 1);
+    let recipient = keys(2).public_key().to_hex();
+    let service = keys(3).public_key().to_hex();
+    assert!(lifecycle::resolve_offer(&event, None, &recipient, &service, &host()).is_err());
+    assert!(
+        lifecycle::resolve_offer(
+            &event,
+            Some(&p),
+            &keys(4).public_key().to_hex(),
+            &service,
+            &host()
+        )
+        .is_err()
+    );
+    let resolved =
+        lifecycle::resolve_offer(&event, Some(&p), &recipient, &service, &host()).unwrap();
+    assert_eq!(resolved.offer.task, p.body().text);
+    assert_eq!(resolved.offer.output, "application/vnd.private-result");
+    assert_eq!(
+        resolved.offer.requested_agent.as_deref(),
+        Some("private-preset")
+    );
+    assert_eq!(
+        resolved.offer.requested_model.as_deref(),
+        Some("private-model")
+    );
+    assert_eq!(resolved.offer.required_capabilities, ["rust"]);
+    assert!(!event.as_json().contains("private-model"));
+    assert!(!event.as_json().contains("private-preset"));
+}
+
+#[cfg(feature = "wallet")]
+#[test]
+fn private_evidence_survives_restart_without_becoming_verified_content() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("content.sqlite");
+    let p = PreparedContent::new(body()).unwrap();
+    let event = sign(3401, offer_tags(&p), 1);
+    let service = keys(3).public_key().to_hex();
+    {
+        let mut db = store::ContentStore::open(&path).unwrap();
+        assert!(
+            db.remember_event(
+                &event,
+                &event,
+                &keys(4).public_key().to_hex(),
+                &service,
+                &host()
+            )
+            .is_err()
+        );
+        db.remember_event(
+            &event,
+            &event,
+            &keys(2).public_key().to_hex(),
+            &service,
+            &host(),
+        )
+        .unwrap();
+    }
+    let db = store::ContentStore::open(&path).unwrap();
+    assert_eq!(db.event(&event.id.to_hex()).unwrap().unwrap(), event);
+    assert!(
+        db.get(&p.body().job_id, &p.body().message_id)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[cfg(feature = "wallet")]
+#[test]
+fn input_preflight_counts_orphan_objects_not_just_current_snapshot() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = git2::Repository::init_bare(temp.path()).unwrap();
+    repositories::check_objects(&repo).unwrap();
+    repo.blob(&vec![0; MAX_FILE_BYTES as usize + 1]).unwrap();
+    assert!(repositories::check_objects(&repo).is_err());
+}
+
+#[test]
+fn visibility_never_falls_back_to_public_when_private_is_unavailable() {
+    let home = crate::home::MaxplayerHome {
+        root: "unused".into(),
+        config: crate::home::MaxplayerConfig::default(),
+        key_path: "unused".into(),
+        wallet_dir: "unused".into(),
+        key_created: false,
+    };
+    assert!(runtime::requested_visibility(&home, None).is_err());
+    assert!(runtime::requested_visibility(&home, Some(wire::Visibility::Private)).is_err());
+    assert_eq!(
+        runtime::requested_visibility(&home, Some(wire::Visibility::Public)).unwrap(),
+        wire::Visibility::Public
+    );
+    let mut home = home;
+    home.config.privacy.private_content_v2 = true;
+    home.config.privacy.private_job_repos = true;
+    home.config.privacy.private_jobs = true;
+    assert!(
+        runtime::requested_visibility(&home, None).is_err(),
+        "configured service and host are mandatory"
+    );
+    home.config.privacy.service_pubkey = Some(keys(3).public_key().to_hex());
+    home.config.privacy.git_base = Some("https://git.example/git/".into());
+    assert_eq!(
+        runtime::requested_visibility(&home, None).unwrap(),
+        wire::Visibility::Private
+    );
+    home.config.privacy.default_visibility = "public".into();
+    assert_eq!(
+        runtime::requested_visibility(&home, None).unwrap(),
+        wire::Visibility::Public
+    );
+    home.config.privacy.git_base = Some("https://untrusted:credential@git.example/git/".into());
+    assert!(runtime::requested_visibility(&home, Some(wire::Visibility::Private)).is_err());
+}
+
+#[cfg(feature = "wallet")]
+#[test]
+fn inline_signing_intent_retains_nonce_and_refuses_changed_answer_after_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("content.sqlite");
+    let mut b = body();
+    b.kind = ContentType::Answer;
+    b.offer_id = Some("34".repeat(32));
+    b.award_id = Some("35".repeat(32));
+    b.dispatch = None;
+    b.requested_output = None;
+    let initial = {
+        let mut db = store::ContentStore::open(&path).unwrap();
+        db.prepare_once("inline:offer", b.clone()).unwrap()
+    };
+    let mut db = store::ContentStore::open(&path).unwrap();
+    b.message_id = random_id().unwrap();
+    let resumed = db.prepare_once("inline:offer", b.clone()).unwrap();
+    assert_eq!(resumed.envelope(), initial.envelope());
+    assert_eq!(resumed.commitment(), initial.commitment());
+    b.text.push_str("changed");
+    assert!(db.prepare_once("inline:offer", b).is_err());
+}
+
+#[cfg(feature = "wallet")]
+#[test]
+fn private_intent_cannot_reuse_content_identity_under_another_key() {
+    let mut db = store::ContentStore::in_memory().unwrap();
+    let original = db.prepare_once("first", body()).unwrap();
+    let mut changed = original.body().clone();
+    changed.text.push_str("replacement");
+    assert!(db.prepare_once("second", changed.clone()).is_err());
+    assert_eq!(
+        db.authored(&changed.job_id, &changed.message_id, &changed.author)
+            .unwrap()
+            .unwrap()
+            .envelope(),
+        original.envelope()
+    );
+    // A refused insert rolls back its intent too, so the key is not poisoned.
+    changed.message_id = random_id().unwrap();
+    assert!(db.prepare_once("second", changed).is_ok());
+}
+
+#[cfg(feature = "wallet")]
+#[test]
+fn existing_claim_award_and_result_builders_project_to_closed_private_carriers() {
+    use crate::gateway;
+    let buyer = keys(1);
+    let seller = keys(2);
+    let service = keys(3).public_key().to_hex();
+    let job = "33".repeat(32);
+    let offer = builders::prepare_offer(
+        &buyer,
+        &gateway::OfferDraft::new(
+            "private task",
+            "text/markdown",
+            0,
+            2000000000,
+            seller.public_key().to_hex(),
+        )
+        .with_payment_mode(gateway::PaymentMode::None)
+        .accepting_delivery(["inline"]),
+        builders::OfferOptions {
+            visibility: wire::Visibility::Private,
+            category: wire::Output::Text,
+            service: &service,
+            job_id: &job,
+            attachments: vec![],
+            contribution: None,
+        },
+        &host(),
+    )
+    .unwrap()
+    .event;
+    let local = gateway::claim_draft(
+        &offer.id.to_hex(),
+        &buyer.public_key().to_hex(),
+        &seller.public_key().to_hex(),
+        gateway::ClaimPayment::None,
+        &["codex".into()],
+        &crate::heartbeat::SeatCapability::default(),
+    );
+    let claim = builders::sign(
+        &seller,
+        carriers::project(&offer, &local, None, None, &host()).unwrap(),
+    )
+    .unwrap();
+    let local = gateway::award_draft(
+        &offer.id.to_hex(),
+        &claim.id.to_hex(),
+        &buyer.public_key().to_hex(),
+        &seller.public_key().to_hex(),
+    );
+    let award = builders::sign(
+        &buyer,
+        carriers::project(&offer, &local, None, None, &host()).unwrap(),
+    )
+    .unwrap();
+    lifecycle::validate_selection(&offer, &claim, &award, &host()).unwrap();
+    let prepared = carriers::prepare_content(
+        &offer,
+        Some(&claim),
+        Some(&award),
+        &seller.public_key().to_hex(),
+        &service,
+        ContentType::Answer,
+        "ANSWER CANARY".into(),
+        None,
+        &host(),
+    )
+    .unwrap();
+    let local = gateway::inline_result_draft(
+        &offer.id.to_hex(),
+        &buyer.public_key().to_hex(),
+        "text/markdown",
+        0,
+        &job_hash(&offer.id.to_hex()).unwrap(),
+        &"11".repeat(64),
+        "ANSWER CANARY",
+        &[gateway::TagSpec::new(["model", "MODEL CANARY"])],
+    );
+    assert!(carriers::project(&offer, &local, Some(&award), None, &host()).is_err());
+    let result = builders::sign(
+        &seller,
+        carriers::project(&offer, &local, Some(&award), Some(&prepared), &host()).unwrap(),
+    )
+    .unwrap();
+    lifecycle::validate_result(&offer, &claim, &award, &result, &host()).unwrap();
+    wire::bind_content(
+        &prepared,
+        &result,
+        &offer,
+        Some(&award),
+        Some(&claim),
+        None,
+        &service,
+        &host(),
+    )
+    .unwrap();
+    assert!(!result.as_json().contains("CANARY"));
+    let mut db = store::ContentStore::in_memory().unwrap();
+    db.remember_selection(
+        &offer,
+        &claim,
+        &award,
+        &seller.public_key().to_hex(),
+        &service,
+        &host(),
+    )
+    .unwrap();
+    let selected = db.selection(&offer.id.to_hex()).unwrap().unwrap();
+    assert_eq!(selected, (claim, award));
+}
+
+#[cfg(feature = "wallet")]
+#[test]
+fn interrupted_backfill_progress_survives_restart_without_overlap_starvation() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("content.sqlite");
+    let recipient = keys(2).public_key().to_hex();
+    let mut store = store::ContentStore::open(&path).unwrap();
+    assert_eq!(store.scan_window(&recipient, 1000).unwrap(), (0, 1000));
+    store.scan_progress(&recipient, 10).unwrap();
+    drop(store);
+    let mut store = store::ContentStore::open(&path).unwrap();
+    assert_eq!(store.scan_window(&recipient, 1100).unwrap(), (11, 1000));
+    assert_eq!(
+        store.receive_since(&recipient).unwrap(),
+        0,
+        "normal overlap would restart at zero"
+    );
+    store.scan_finished(&recipient).unwrap();
+    assert_eq!(
+        store.scan_window(&recipient, 1100).unwrap(),
+        (11, 1000),
+        "incomplete scan cannot be cleared"
+    );
+    store.scan_progress(&recipient, 1000).unwrap();
+    store.scan_finished(&recipient).unwrap();
+    let (start, end) = store.scan_window(&recipient, 1100).unwrap();
+    assert!(
+        start < 1000,
+        "a completed catch-up starts a new overlapping scan"
+    );
+    assert_eq!(end, 1100);
+}
+
+#[cfg(feature = "wallet")]
+#[test]
+fn private_input_baseline_is_not_agent_execution_and_full_ref_is_preserved() {
+    use crate::seller_git;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source.txt");
+    std::fs::write(&path, "PRIVATE INPUT").unwrap();
+    let cache = dir.path().join("cache");
+    let repo = git2::Repository::init_bare(&cache).unwrap();
+    let snapshot = inputs::prepare(
+        &repo,
+        &"01".repeat(32),
+        &[inputs::InputFile {
+            source: path,
+            path: "input.txt".into(),
+        }],
+    )
+    .unwrap();
+    repo.config()
+        .unwrap()
+        .set_str("core.hooksPath", "/untrusted/hooks")
+        .unwrap();
+    let workdir = dir.path().join("work");
+    let identity = seller_git::DeliveryAgentIdentity::for_seller(&keys(2).public_key().to_hex());
+    let branch = format!("refs/heads/delivery/{}", "02".repeat(32));
+    seller_git::init_verified_input_workdir(
+        &workdir,
+        &identity,
+        &cache,
+        &snapshot.commit_oid,
+        &branch,
+    )
+    .unwrap();
+    let imported = git2::Repository::open(&workdir).unwrap();
+    assert!(
+        imported
+            .config()
+            .unwrap()
+            .get_string("core.hooksPath")
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read_to_string(workdir.join("input.txt")).unwrap(),
+        "PRIVATE INPUT"
+    );
+    let job_hash = job_hash(&"02".repeat(32)).unwrap();
+    assert!(matches!(
+        seller_git::snapshot_delivery_at(
+            &workdir,
+            &identity,
+            Some(&snapshot.commit_oid),
+            &branch,
+            "delivery",
+            100,
+            &job_hash
+        ),
+        Err(seller_git::SellerGitError::NoExecutionObserved(_))
+    ));
+    std::fs::write(workdir.join("answer.txt"), "real new output").unwrap();
+    let commit = seller_git::snapshot_delivery_at(
+        &workdir,
+        &identity,
+        Some(&snapshot.commit_oid),
+        &branch,
+        "delivery",
+        100,
+        &job_hash,
+    )
+    .unwrap();
+    assert_eq!(imported.refname_to_id(&branch).unwrap().to_string(), commit);
+    assert_eq!(
+        imported
+            .find_commit(git2::Oid::from_str(&commit).unwrap())
+            .unwrap()
+            .parent_id(0)
+            .unwrap()
+            .to_string(),
+        snapshot.commit_oid
+    );
+}
+
+#[cfg(feature = "wallet")]
+#[tokio::test]
+async fn private_four_identity_targeted_and_open_lifecycle_reorders_and_resumes() {
+    use nostr_sdk::secp256k1::Message;
+    for (targeted, paid) in [(true, false), (false, false), (true, true), (false, true)] {
+        let (e, request, buyer, policy) = evidence::inline_fixture_with_payment(targeted, paid);
+        let seller = Keys::parse(&format!("{:064x}", 2)).unwrap();
+        let service = Keys::parse(&format!("{:064x}", 3)).unwrap();
+        let outsider = Keys::parse(&format!("{:064x}", 4)).unwrap();
+        let task = e
+            .task_envelope
+            .as_deref()
+            .map(PreparedContent::decode)
+            .transpose()
+            .unwrap();
+        let answer = PreparedContent::decode(e.answer_envelope.as_deref().unwrap()).unwrap();
+        let verified = e
+            .validate_request(&request, &buyer.public_key().to_hex(), &policy)
+            .unwrap();
+        let authority = crate::payment::ReceiptAuthority {
+            buyer: buyer.public_key(),
+            seller: seller.public_key(),
+        };
+        authority
+            .verify_seller_prepay_cosig(&verified.preimage, &request.seller_signature, None)
+            .unwrap();
+        // Verify paid/free receipt bytes without reaching a mint or minting ecash.
+        // The service receives content, never the payment token.
+        assert_eq!(verified.preimage.creq_hash.is_some(), paid);
+        if paid {
+            let mut wrong = request.clone();
+            wrong.accepted_mints = vec!["https://other.example".into()];
+            assert!(
+                e.validate_request(&wrong, &buyer.public_key().to_hex(), &policy)
+                    .is_err()
+            );
+            let mut wrong = request.clone();
+            wrong.creq_hash = Some("ab".repeat(32));
+            assert!(
+                e.validate_request(&wrong, &buyer.public_key().to_hex(), &policy)
+                    .is_err()
+            );
+        }
+        let digest = verified.preimage.digest_bytes();
+        let buyer_sig = buyer.sign_schnorr(&Message::from_digest(digest));
+        let public =
+            nostr_sdk::secp256k1::XOnlyPublicKey::from_slice(&buyer.public_key().to_bytes())
+                .unwrap();
+        assert!(
+            nostr_sdk::secp256k1::Secp256k1::verification_only()
+                .verify_schnorr(&buyer_sig, &Message::from_digest(digest), &public)
+                .is_ok()
+        );
+        assert_eq!(task.is_some(), targeted);
+        assert!(!e.result.as_json().contains(&answer.body().text));
+        if targeted {
+            assert!(!e.offer.as_json().contains("private task"));
+        } else {
+            assert!(e.offer.as_json().contains("deliberately public discovery"));
+        }
+        for (content, carrier, author) in task
+            .iter()
+            .map(|t| (t, &e.offer, &buyer))
+            .chain(std::iter::once((&answer, &e.result, &seller)))
+        {
+            let signed = store::SignedContext {
+                carrier,
+                offer: &e.offer,
+                claim: if carrier.kind.as_u16() == 3401 {
+                    None
+                } else {
+                    Some(&e.claim)
+                },
+                award: if carrier.kind.as_u16() == 3401 {
+                    None
+                } else {
+                    Some(&e.award)
+                },
+                result: None,
+                service: &policy.service,
+                host: &policy.host,
+            };
+            for recipient in [&buyer, &seller, &service] {
+                let wrap =
+                    transport::wrap(author, recipient.public_key(), content.envelope().into())
+                        .await
+                        .unwrap();
+                assert!(transport::unwrap_content(&outsider, &wrap).await.is_err());
+                let received = transport::unwrap_content(recipient, &wrap).await.unwrap();
+                assert_eq!(received.envelope(), content.envelope());
+                for content_first in [true, false] {
+                    let tmp = tempfile::tempdir().unwrap();
+                    let path = tmp.path().join("inbox.sqlite");
+                    let mut db = store::ContentStore::open(&path).unwrap();
+                    if content_first {
+                        db.stage(&received, &recipient.public_key().to_hex(), 100)
+                            .unwrap();
+                    } else {
+                        db.remember_event(
+                            carrier,
+                            &e.offer,
+                            &recipient.public_key().to_hex(),
+                            &policy.service,
+                            &policy.host,
+                        )
+                        .unwrap();
+                    }
+                    drop(db);
+                    let mut resumed = store::ContentStore::open(&path).unwrap();
+                    assert!(
+                        resumed
+                            .get(&content.body().job_id, &content.body().message_id)
+                            .unwrap()
+                            .is_none(),
+                        "cached evidence is not verified plaintext"
+                    );
+                    resumed
+                        .receive_signed(&received, &signed, &recipient.public_key().to_hex(), 101)
+                        .unwrap();
+                    let saved = resumed
+                        .get(&content.body().job_id, &content.body().message_id)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(saved.envelope(), content.envelope());
+                    assert!(
+                        resumed
+                            .receive_signed(
+                                &received,
+                                &signed,
+                                &outsider.public_key().to_hex(),
+                                101
+                            )
+                            .is_err()
+                    );
+                }
+            }
+        }
+    }
 }

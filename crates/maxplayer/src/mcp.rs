@@ -263,6 +263,19 @@ fn tools() -> Value {
                         "type": "string",
                         "description": "Targeted seller hex pubkey (documented default)"
                     },
+                    "output_category": {"type":"string", "enum":["text","code","image","audio","video","data","archive","other"], "description":"Public coarse category; required for private jobs. The original output type stays in private task content."},
+                    "visibility": {
+                        "type": "string", "enum": ["private", "public"],
+                        "description": "Private keeps targeted tasks and subsequent content private. For an open-pool job, the initial task is public even with private visibility; subsequent execution and delivery are private. Public makes the whole job public."
+                    },
+                    "inputs": {
+                        "type": "array",
+                        "items": { "type": "object", "additionalProperties": false, "properties": {
+                            "source": {"type":"string", "description":"Local regular file to snapshot"},
+                            "path": {"type":"string", "description":"Relative path in the job input snapshot"}
+                        }, "required": ["source", "path"] },
+                        "description": "Required input files, snapshotted before posting. Requires a targeted private job; no post-award input upload."
+                    },
                     "untargeted": {
                         "type": "boolean",
                         "description": "When true, omit p-tag (open offer). Default false."

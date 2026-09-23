@@ -389,6 +389,8 @@ pub struct JobLaunch<'a> {
 /// would hand a job every other job's socket. `volume-subpath` needs Docker Engine 26 or newer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExtraMount {
+    /// A verified input cache; the job may read but never alter the host baseline.
+    ReadOnlyBind { host: PathBuf, container: String },
     /// `-v <host>:<container>`, read-write.
     Bind { host: PathBuf, container: String },
     /// `--mount type=volume,src=<volume>,dst=<container>,volume-subpath=<subpath>`, read-write.
@@ -399,6 +401,7 @@ impl ExtraMount {
     /// The docker argv fragment for this mount.
     pub fn argv(&self) -> Vec<String> {
         match self {
+            Self::ReadOnlyBind { host, container } => vec!["-v".into(), format!("{}:{container}:ro", host.display())],
             Self::Bind { host, container } => {
                 vec!["-v".into(), format!("{}:{container}", host.display())]
             }

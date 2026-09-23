@@ -38,6 +38,30 @@ pub fn write_atomic(dir: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
     sync_dir(dir)
 }
 
+/// Same crash ordering for private plaintext, with restrictive permissions before
+/// the first byte is written (including a pre-existing temporary sibling).
+#[cfg(feature = "wallet")]
+pub fn write_private_atomic(dir: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
+    fs::create_dir_all(dir)?;
+    let tmp = path.with_extension("tmp");
+    let mut options = OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)] {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(&tmp)?;
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&tmp, path)?;
+    sync_dir(dir)
+}
+
 /// `fsync` a directory so a just-completed `rename`/create within it survives power-loss.
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()

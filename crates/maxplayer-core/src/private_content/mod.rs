@@ -17,3 +17,22 @@ pub mod store;
 mod tests;
 pub mod transport;
 pub mod wire;
+pub mod runtime;
+
+pub mod lifecycle;
+
+#[cfg(feature="wallet")]
+pub mod repositories;
+
+pub mod carriers;
+
+#[cfg(feature="wallet")]
+pub mod channel;
+
+pub mod evidence;
+
+#[cfg(feature="wallet")]
+pub mod posting;
+
+#[cfg(feature="wallet")]
+pub mod public_v2;

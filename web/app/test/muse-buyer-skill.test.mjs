@@ -443,10 +443,14 @@ function toolSchema(name) {
   const schemaAt = source.indexOf('"inputSchema"', start);
   assert.notEqual(schemaAt, -1, `${name} declares no inputSchema`);
   const schema = braceBlock(source, source.indexOf("{", schemaAt));
-  const required = /"required":\s*\[([^\]]*)\]/.exec(schema);
   const propertiesAt = schema.indexOf('"properties"');
   assert.notEqual(propertiesAt, -1, `${name} declares no properties`);
   const propertiesBlock = braceBlock(schema, schema.indexOf("{", propertiesAt));
+  // Nested input objects have their own required fields. They are not required
+  // top-level tool arguments; remove the whole properties subtree before reading.
+  const propertiesStart = schema.indexOf("{", propertiesAt);
+  const rootOnly = schema.slice(0, propertiesStart) + schema.slice(propertiesStart + propertiesBlock.length);
+  const required = /"required":\s*\[([^\]]*)\]/.exec(rootOnly);
   const properties = new Map();
   // Walk the top level of the properties object, key by key.
   const keyPattern = /"([a-z_]+)":\s*\{/g;
@@ -484,6 +488,13 @@ function toolSchema(name) {
       : [],
   };
 }
+
+test("nested input manifest requirements do not become tool-level requirements", () => {
+  const schema = toolSchema("post_job");
+  assert(schema.required.includes("task"));
+  assert(!schema.required.includes("source"));
+  assert(!schema.required.includes("path"));
+});
 
 /** Check one argument object against a declared schema; returns a list of problems. */
 function schemaProblems(tool, args) {

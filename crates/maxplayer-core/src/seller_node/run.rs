@@ -834,6 +834,7 @@ fn delivery_receipt_preimage(
     stored_creq: Option<&str>,
 ) -> ReceiptPreimage {
     ReceiptPreimage {
+        protocol: crate::receipt::ReceiptProtocol::V1,
         job_hash: job_hash_for_offer(job_id, task, amount),
         offer_id: job_id.to_owned(),
         amount,
@@ -2599,7 +2600,14 @@ async fn provision_delivery_workdir(
     let pin = store
         .contribution_pin(job_id)
         .map_err(|error| seller_git::SellerGitError::Io(format!("contribution pin read failed: {error}")))?;
-    let base_oid = match plan_delivery_workdir(pin, job_id) {
+    let private = super::privacy::execution(home, identity.seller_pubkey_hex(), job_id)
+        .map_err(|e| seller_git::SellerGitError::Io(e.to_string()))?;
+    let base_oid = if let Some((cache, oid)) = private.as_ref().and_then(|p| p.baseline.as_ref()) {
+        let (cache, oid, dir, who, branch) = (cache.clone(), oid.clone(), workdir.clone(), identity.clone(), private.as_ref().unwrap().branch.clone());
+        tokio::task::spawn_blocking(move || {
+            seller_git::init_verified_input_workdir(&dir, &who, &cache, &oid, &branch).map(|_| oid)
+        }).await.map_err(|_| seller_git::SellerGitError::Io("private input worker unavailable".into()))??
+    } else { match plan_delivery_workdir(pin, job_id) {
         DeliveryWorkdirPlan::Empty => {
             seller_git::init_empty_delivery_workdir_off_runtime(workdir, identity).await?;
             // From-scratch: no pinned base ⇒ the delivery is a root commit (snapshot base_oid = None).
@@ -2623,7 +2631,7 @@ async fn provision_delivery_workdir(
             .await?;
             base_oid
         }
-    };
+    } };
 
     let store = store.clone();
     let checks_workdir = workdir.clone();
@@ -4313,6 +4321,7 @@ pub struct SellerNodeRunner {
     /// Outcome of the boot NIP-42 handshake, which seeds the run loop's view of whether the current
     /// socket is authenticated. `NoChallenge` is not authentication.
     boot_auth: AuthWait,
+    private_authenticated: Arc<std::sync::atomic::AtomicBool>,
     /// The harnesses this node is serving with. Resolved once at boot, then narrowed at RUNTIME as
     /// harnesses fail: every claim decision, every advertisement, and every dispatch reads THIS —
     /// never the config, and never the boot registry directly — so what the node advertises is what
@@ -4768,7 +4777,8 @@ impl SellerNodeRunner {
                 Err(error) => return Err(NodeError::Relay(format!("NIP-42 auth: {error}"))),
             };
 
-        let publisher = RelayPublisher::new(node.signer().clone(), client.clone(), &relay_url);
+        let private_authenticated = Arc::new(std::sync::atomic::AtomicBool::new(matches!(boot_auth, AuthWait::Authenticated)));
+        let publisher = RelayPublisher::new(node.signer().clone(), client.clone(), &relay_url).with_home(node.home().clone()).with_auth(private_authenticated.clone());
 
         // Execution-slot admission from config: `slots` (default 1 = serial) and the claim-lapse
         // timeout (default when unset). A node with no `[seller]` block never claims, so its slot
@@ -4797,6 +4807,7 @@ impl SellerNodeRunner {
             relay_url,
             seller_pubkey,
             boot_auth,
+            private_authenticated,
             agents,
             held_tools,
             slots,
@@ -5994,6 +6005,7 @@ impl SellerNodeRunner {
                     match relay_event {
                         Ok(RelayNotification::Authenticated) => {
                             nip42_authed = true;
+                            self.private_authenticated.store(true, std::sync::atomic::Ordering::Relaxed);
                             last_authenticated_at = tokio::time::Instant::now();
                             // A newly authenticated session earns a fresh retry budget: the budget
                             // exists to bound retries WITHIN a session, not to spend one forever.
@@ -6042,15 +6054,16 @@ impl SellerNodeRunner {
                                 ),
                             }
                         }
-                        Ok(RelayNotification::AuthenticationFailed) => nip42_authed = false,
+                        Ok(RelayNotification::AuthenticationFailed) => { nip42_authed = false; self.private_authenticated.store(false, std::sync::atomic::Ordering::Relaxed); },
                         // A socket that went away takes its NIP-42 state with it — whatever comes
                         // back starts unauthenticated.
                         Ok(RelayNotification::RelayStatus { status })
                             if status != nostr_sdk::prelude::RelayStatus::Connected =>
                         {
                             nip42_authed = false;
+                            self.private_authenticated.store(false, std::sync::atomic::Ordering::Relaxed);
                         }
-                        Ok(RelayNotification::Shutdown) => nip42_authed = false,
+                        Ok(RelayNotification::Shutdown) => { nip42_authed = false; self.private_authenticated.store(false, std::sync::atomic::Ordering::Relaxed); },
                         Ok(_) => {}
                         // Lagging this stream costs only auth-state precision, and both stale
                         // readings are bounded (see the declaration). Never go deaf over it.
@@ -6091,11 +6104,23 @@ impl SellerNodeRunner {
                 .tags
                 .push(gateway::TagSpec::new(["reason_detail", reason_detail]));
         }
+        let draft = match super::privacy::project(self.node.home(), &self.seller_pubkey.to_hex(), offer_id, draft, None) {
+            Ok(draft) => draft,
+            Err(e) => { opline!("seller private feedback not prepared: {e}"); return false; }
+        };
+        let private = super::privacy::is_private(&draft);
         match self.node.signer().sign(draft, now_unix()).await {
             Ok(Ok(signed)) => {
                 use nostr_sdk::JsonUtil as _;
                 match nostr_sdk::Event::from_json(&signed.json) {
-                    Ok(feedback) => match self.client.send_event_to([&self.relay_url], &feedback).await {
+                    Ok(feedback) => {
+                        if private {
+                            if !self.private_authenticated.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+                            if let Err(e) = super::privacy::record_publication(self.node.home(), &self.seller_pubkey.to_hex(), &feedback) {
+                                opline!("seller private feedback not persisted: {e}"); return false;
+                            }
+                        }
+                        match self.client.send_event_to([&self.relay_url], &feedback).await {
                         Ok(_) => {
                             opline!(
                                 "seller node buyer feedback surfaced: offer={offer_id} reason_code={} reason={reason}",
@@ -6109,6 +6134,7 @@ impl SellerNodeRunner {
                             );
                             false
                         }
+                    }
                     },
                     Err(error) => {
                         opline!("seller node buyer feedback encode failed (continuing): {error}");
@@ -6187,6 +6213,7 @@ impl SellerNodeRunner {
     /// external supervision has — a parked process satisfies pid-presence, so absence of failures is
     /// not evidence of health. Do not make it conditional to reduce noise.
     async fn run_wrap_backfill(&self) {
+        self.sync_private_content(true).await;
         self.report_status();
         let since = match resolve_backfill_since(
             self.node.store().last_receipt_unix(),
@@ -6639,7 +6666,35 @@ impl SellerNodeRunner {
             return;
         };
         let draft = event_to_draft(event);
-        let offer = match parse_offer(&draft) {
+        let private = if super::privacy::is_private(&draft) {
+            let resolved = (|| {
+                let mut ctx = crate::private_content::channel::ContentContext::open(self.node.home(), &self.seller_pubkey.to_hex())?;
+                crate::private_content::wire::validate_private(event, &ctx.policy.host)?;
+                self.node.store().mark_private_offer(&event.id.to_hex())
+                    .map_err(|_| crate::private_content::Error("private classification persistence failed"))?;
+                ctx.resolve_offer(event, now_unix().max(0) as u64)
+            })();
+            match resolved {
+                Ok(offer) => Some(offer),
+                Err(e) => { opline!("seller private offer pending id={}: {e}", event.id); return; }
+            }
+        } else { None };
+        if crate::private_content::public_v2::is_public(event) {
+            let remembered = crate::private_content::public_v2::Context::open(self.node.home())
+                .and_then(|mut ctx| ctx.remember(event,event));
+            if let Err(e) = remembered { opline!("seller public v2 offer refused id={}: {e}",event.id); return; }
+            if let Err(e)=self.node.store().mark_public_v2_offer(&event.id.to_hex()) {
+                opline!("seller public protocol marker failed id={}: {e}",event.id);return;
+            }
+        }
+        // Input staging is pre-claim. A missing input never becomes an empty job.
+        if let Some(resolved) = &private {
+            if let Err(e) = super::privacy::preflight(self.node.home(), self.node.signer(), event, resolved).await {
+                opline!("seller private inputs unavailable id={}: {e}", event.id); return;
+            }
+        }
+        let offer = if let Some(resolved) = &private { resolved.offer.clone() } else {
+        match parse_offer(&draft) {
             Ok(offer) => offer,
             Err(error) => {
                 opline!(
@@ -6649,13 +6704,23 @@ impl SellerNodeRunner {
                 );
                 return;
             }
+        }
         };
         // Contribution offers are gated by the operator's `[seller] contribution_enabled` flag
         // (default on): served when enabled, refused when the operator turns them off, and a
         // malformed contribution is refused either way (never run as from-scratch). #591: a served
         // contribution's pin is captured HERE — the only site with the offer tags — and persisted at
         // claim, so execute clones the target at base_oid instead of an empty workdir.
-        let contribution = match contribution_serve_gate(&draft.tags, seller.contribution_enabled) {
+        let contribution = if let Some(resolved) = &private {
+            match &resolved.contribution {
+                Some(pin) if seller.contribution_enabled => match super::privacy::contribution(pin) {
+                    Ok(pin) => Some(pin), Err(e) => { opline!("seller private contribution refused: {e}"); return; }
+                },
+                Some(_) => return,
+                None => None,
+            }
+        } else {
+        match contribution_serve_gate(&draft.tags, seller.contribution_enabled) {
             ContributionServeGate::NotContribution => None,
             ContributionServeGate::Serve => {
                 opline!("seller node serving contribution offer id={}", event.id);
@@ -6674,6 +6739,7 @@ impl SellerNodeRunner {
                 opline!("seller node offer skip id={}: malformed contribution ({error})", event.id);
                 return;
             }
+        }
         };
 
         let seller_pubkey = self.seller_pubkey.to_hex();
@@ -7023,6 +7089,16 @@ impl SellerNodeRunner {
             // make this the one site whose capability came from somewhere other than the config.
             &roster.capability(&self.node.home().config.seat),
         );
+        let chosen = offer.requested_agent.as_ref().or_else(|| roster.names.first()).cloned();
+        let capability = roster.capability(&self.node.home().config.seat);
+        let family = chosen.as_deref().and_then(crate::agent_presets::harness_family_for_preset).map(str::to_owned);
+        let model = family.as_ref().and_then(|f| capability.models.iter().find(|m| &m.family == f)).map(|m| m.model.clone());
+        let dispatch = crate::private_content::Dispatch { agent: chosen, harness_family: family,
+            harness_model: model, capabilities: (!capability.capabilities.is_empty()).then_some(capability.capabilities) };
+        let claim = match super::privacy::project(self.node.home(), seller_pubkey, job_id, claim, Some(dispatch)) {
+            Ok(claim) => claim,
+            Err(e) => { opline!("seller private claim refused job_id={job_id}: {e}"); return; }
+        };
         // Reserve-at-claim: a fully loaded node has no free slot and simply does not claim, which is
         // how it stays invisible to the market. The gate is consulted only here on the event loop,
         // never concurrently with itself, so two offers can never both take the last slot.
@@ -7434,6 +7510,24 @@ impl SellerNodeRunner {
         let award_author = event.pubkey.to_hex();
         match match_award(&award.claim_id, our_claim_id.as_deref(), &award_author, &buyer) {
             AwardMatch::Execute => {
+                let private = async {
+                    let Some((mut ctx, offer)) = super::privacy::known(self.node.home(), &self.seller_pubkey.to_hex(), &job_id)? else {
+                        if super::privacy::is_private(&draft) { return Err(crate::private_content::Error("private award context missing")); }
+                        if let Some((mut public,offer)) = crate::private_content::public_v2::known(self.node.home(),&job_id)? {
+                            let claim=public.store.event(&award.claim_id)?.ok_or(crate::private_content::Error("public awarded claim missing"))?;
+                            public.select(&offer,&claim,event)?;
+                        }
+                        return Ok(());
+                    };
+                    let claim = ctx.store.event(&award.claim_id)?.ok_or(crate::private_content::Error("private awarded claim missing"))?;
+                    ctx.select(&offer, &claim, event)?;
+                    let provision = crate::private_content::hosting::ProvisionRequest::new(&offer, Some(&claim), Some(event), &ctx.policy.host)?;
+                    let auth = self.node.signer().private_provision_auth(&provision).await
+                        .map_err(|_| crate::private_content::Error("private provision signer unavailable"))??;
+                    provision.send(&auth).await
+                }.await;
+                if let Err(e) = private { opline!("seller private award pending job_id={job_id}: {e}"); return; }
+
                 match self
                     .node
                     .store()
@@ -7923,11 +8017,16 @@ impl SellerNodeRunner {
 
         // RunAgent: a genuinely mid-flight award with a live deadline — it now needs its seller config
         // and full offer facts to execute.
-        let Some(seller) = self.node.home().config.seller.clone() else {
+        let Some(mut seller) = self.node.home().config.seller.clone() else {
             opline!("seller node execute skip job_id={job_id}: no [seller] config");
             self.fail_job(job_id).await;
             return;
         };
+        let private_execution = match super::privacy::execution(self.node.home(), &self.seller_pubkey.to_hex(), job_id) {
+            Ok(execution) => execution,
+            Err(e) => { opline!("seller private execution refused job_id={job_id}: {e}"); return; }
+        };
+        if let Some(private) = &private_execution { seller.git_remote = private.remote.clone(); }
         // `offer` was read tolerantly above (for the deadline); its true absence fails the job here.
         let Some(offer) = offer else {
             opline!("seller node execute fail job_id={job_id}: offer facts missing");
@@ -8268,7 +8367,8 @@ impl SellerNodeRunner {
             // — the snapshot refuses `NoExecutionObserved` and writes no sentinel, which is mapped here to
             // the `no_sentinel` refusal so the buyer learns delivery was refused for want of a sentinel
             // (distinct from a crash). The gate, not an unconditional write, is the check.
-            let branch = format!("maxplayer/{}", &job_id[..8.min(job_id.len())]);
+            let branch = private_execution.as_ref().map(|p| p.branch.clone())
+                .unwrap_or_else(|| format!("maxplayer/{}", &job_id[..8.min(job_id.len())]));
             // Single source for the delivery ref. The branch-scoped push token (below) is minted for
             // THIS refname, and the push refspec `push_branch_with_header` builds is
             // `<gated oid>:refs/heads/{branch}` — the destination derives from `branch`, so the token
@@ -8276,7 +8376,10 @@ impl SellerNodeRunner {
             // scope be fully qualified (`refs/heads/…`); a bare branch name is rejected.
             let push_ref = crate::git_transport::delivery_ref(&branch);
             let message = delivery_message(&offer.task);
-            let job_hash = job_hash_for_offer(job_id, &offer.task, offer.amount_sats);
+            let job_hash = match private_execution.as_ref().map(|p| Ok(p.job_hash.clone()))
+                .unwrap_or_else(|| crate::private_content::public_v2::execution_hash(self.node.home(),job_id,&offer.task,offer.amount_sats)) {
+                Ok(hash)=>hash, Err(e)=>{ opline!("seller job binding unavailable job_id={job_id}: {e}"); return; }
+            };
             // The gated commit. The push below sends THIS object and reads the remote back against
             // it, so the delivered commit is the one the gate produced, whatever the local branch
             // says at push time (C6).
@@ -8317,7 +8420,7 @@ impl SellerNodeRunner {
                     if matches!(&error, seller_git::SellerGitError::NoExecutionObserved(_))
                         // A contribution descends from a pinned base, so it can never settle
                         // inline. `base_oid` is what marks one.
-                        && base_oid.is_none()
+                        && private_execution.as_ref().map(|p| !p.contribution).unwrap_or(base_oid.is_none())
                         // The buyer must have said it can READ one. Absent ⇒ git only (§6.1), so
                         // this arm can never send an answer to a buyer that would not recognise
                         // it as a delivery at all — which is a job that dies at the deadline with
@@ -8538,7 +8641,7 @@ impl SellerNodeRunner {
                 return;
             }
         };
-        let preimage = delivery_receipt_preimage(
+        let mut preimage = delivery_receipt_preimage(
             job_id,
             &offer.task,
             offer.amount_sats,
@@ -8548,6 +8651,11 @@ impl SellerNodeRunner {
             delivery_kind.as_str(),
             creq_terms(&stored_creq),
         );
+        if let Err(e) = super::privacy::bind_receipt(self.node.home(), &self.seller_pubkey.to_hex(), job_id, &mut preimage, None) {
+            opline!("seller private receipt preparation refused job_id={job_id}: {e}");
+            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+            return;
+        }
         let seller_sig = match self.node.signer().sign_receipt_hash(preimage.digest_hex()).await {
             Ok(Ok(sig)) => sig,
             Ok(Err(error)) => {
@@ -8609,6 +8717,10 @@ impl SellerNodeRunner {
         // Journal the delivery + enqueue the result in one transaction. Idempotent: a resumed job
         // that already delivered re-enqueues nothing (invariant 2 — no divergent double-publish).
         let now = now_unix();
+        let draft = match super::privacy::project(self.node.home(), &self.seller_pubkey.to_hex(), job_id, draft, None) {
+            Ok(draft) => draft,
+            Err(e) => { opline!("seller private result preparation refused job_id={job_id}: {e}"); return; }
+        };
         match self.node.store().deliver_and_enqueue(
             job_id,
             &commit,
@@ -8694,18 +8806,23 @@ impl SellerNodeRunner {
             return Err(Fail::Setup("container delivery is not enabled for this seat".into()));
         };
 
+        let private_execution = super::privacy::execution(self.node.home(), &self.seller_pubkey.to_hex(), job_id)
+            .map_err(|e| Fail::Setup(e.to_string()))?;
         // The delivery facts, exactly as the host path computes them. The base is PLANNED from the
         // stored pin, not provisioned: the clone runs inside the container (`run_phase1`).
-        let branch = format!("maxplayer/{}", &job_id[..8.min(job_id.len())]);
+        let branch = private_execution.as_ref().map(|p| p.branch.clone())
+                .unwrap_or_else(|| format!("maxplayer/{}", &job_id[..8.min(job_id.len())]));
         let push_ref = crate::git_transport::delivery_ref(&branch);
         let message = delivery_message(&offer.task);
-        let job_hash = job_hash_for_offer(job_id, &offer.task, offer.amount_sats);
+        let job_hash = private_execution.as_ref().map(|p| Ok(p.job_hash.clone()))
+            .unwrap_or_else(|| crate::private_content::public_v2::execution_hash(self.node.home(),job_id,&offer.task,offer.amount_sats))
+            .map_err(|e| Fail::Setup(e.to_string()))?;
         let pin = self
             .node
             .store()
             .contribution_pin(job_id)
             .map_err(|error| Fail::Setup(format!("contribution pin read failed ({error})")))?;
-        let base = match plan_delivery_workdir(pin, job_id) {
+        let mut base = match plan_delivery_workdir(pin, job_id) {
             DeliveryWorkdirPlan::Empty => None,
             DeliveryWorkdirPlan::ContributionClone {
                 clone_url,
@@ -8719,6 +8836,9 @@ impl SellerNodeRunner {
             }),
         };
 
+        if let Some((_, oid)) = private_execution.as_ref().and_then(|p| p.baseline.as_ref()) {
+            base = Some(orch::Phase1BaseOwned { clone_url: orch::PRIVATE_INPUT_CACHE_DIR.into(), branch: "input-baseline".into(), oid: oid.clone() });
+        }
         // The bind sources must exist before docker sees them: a missing source is created
         // root-owned and the container's uid cannot write it. The workdir is EMPTY here — no git.
         std::fs::create_dir_all(workdir)
@@ -8781,7 +8901,7 @@ impl SellerNodeRunner {
 
         let mut session_servers = prepared.mcp_servers.clone();
         session_servers.extend(attachments.mcp_servers.iter().cloned());
-        let base_is_none = base.is_none();
+        let base_is_none = private_execution.as_ref().map(|p| !p.contribution).unwrap_or(base.is_none());
         let inputs = orch::Phase1Inputs {
             job_hash,
             seller_pubkey_hex: identity.seller_pubkey_hex().to_owned(),
@@ -8842,6 +8962,9 @@ impl SellerNodeRunner {
             host: io_dir.clone(),
             container: orch::CONTAINER_EXCHANGE_DIR.to_owned(),
         }];
+        if let Some((cache, _)) = private_execution.as_ref().and_then(|p| p.baseline.as_ref()) {
+            mounts.push(ExtraMount::ReadOnlyBind { host: cache.clone(), container: orch::PRIVATE_INPUT_CACHE_DIR.into() });
+        }
         mounts.extend(attachments.extra_mounts.iter().cloned());
         let launch = sandbox
             .launch_with_mounts(&orchestrator, &job, &mounts)
@@ -9133,7 +9256,7 @@ impl SellerNodeRunner {
             .await;
             return;
         }
-        let preimage = delivery_receipt_preimage(
+        let mut preimage = delivery_receipt_preimage(
             job_id,
             &offer.task,
             offer.amount_sats,
@@ -9147,6 +9270,11 @@ impl SellerNodeRunner {
             crate::receipt::DeliveryKind::Inline.as_str(),
             creq_terms(stored_creq),
         );
+        if let Err(e) = super::privacy::bind_receipt(self.node.home(), &self.seller_pubkey.to_hex(), job_id, &mut preimage, Some(answer)) {
+            opline!("seller private receipt preparation refused job_id={job_id}: {e}");
+            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+            return;
+        }
         let seller_sig = match self
             .node
             .signer()
@@ -9197,6 +9325,10 @@ impl SellerNodeRunner {
         // `result_ref` records WHAT was delivered. For git that is the commit; here it is the
         // answer digest the co-signature binds, so the journal names the same artifact the buyer
         // will verify.
+        let draft = match super::privacy::project(self.node.home(), &self.seller_pubkey.to_hex(), job_id, draft, None) {
+            Ok(draft) => draft,
+            Err(e) => { opline!("seller private result preparation refused job_id={job_id}: {e}"); return; }
+        };
         match self.node.store().deliver_and_enqueue(
             job_id,
             &preimage.delivery_integrity_hash,
@@ -9312,11 +9444,16 @@ impl SellerNodeRunner {
     /// degraded (no agent ran this pass) and rides only as UNSIGNED result tags — it is not in the
     /// signed digest, so its absence cannot make the buyer reject the receipt.
     async fn finalize_pushed_delivery(&self, job_id: &str, commit: &str) {
-        let Some(seller) = self.node.home().config.seller.clone() else {
+        let Some(mut seller) = self.node.home().config.seller.clone() else {
             opline!("seller node finalize skip job_id={job_id}: no [seller] config");
             self.fail_job(job_id).await;
             return;
         };
+        let private_execution = match super::privacy::execution(self.node.home(), &self.seller_pubkey.to_hex(), job_id) {
+            Ok(execution) => execution,
+            Err(e) => { opline!("seller private finalize refused job_id={job_id}: {e}"); return; }
+        };
+        if let Some(private) = &private_execution { seller.git_remote = private.remote.clone(); }
         let offer = match self.node.store().offer_row(job_id) {
             Ok(Some(offer)) => offer,
             _ => {
@@ -9334,7 +9471,7 @@ impl SellerNodeRunner {
             }
         };
         let seller_pubkey = self.seller_pubkey.to_hex();
-        let branch = format!("maxplayer/{}", &job_id[..8.min(job_id.len())]);
+        let branch = private_execution.as_ref().map(|p| p.branch.clone()).unwrap_or_else(|| format!("maxplayer/{}", &job_id[..8.min(job_id.len())]));
         let delivery_kind = match seller_delivery_kind(&seller.git_remote, &branch, commit) {
             Ok(kind) => kind,
             Err(error) => {
@@ -9343,7 +9480,7 @@ impl SellerNodeRunner {
                 return;
             }
         };
-        let preimage = delivery_receipt_preimage(
+        let mut preimage = delivery_receipt_preimage(
             job_id,
             &offer.task,
             offer.amount_sats,
@@ -9353,6 +9490,11 @@ impl SellerNodeRunner {
             delivery_kind.as_str(),
             creq_terms(&stored_creq),
         );
+        if let Err(e) = super::privacy::bind_receipt(self.node.home(), &self.seller_pubkey.to_hex(), job_id, &mut preimage, None) {
+            opline!("seller private receipt preparation refused job_id={job_id}: {e}");
+            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
+            return;
+        }
         let seller_sig = match self.node.signer().sign_receipt_hash(preimage.digest_hex()).await {
             Ok(Ok(sig)) => sig,
             Ok(Err(error)) => {
@@ -9403,6 +9545,10 @@ impl SellerNodeRunner {
             }
         }
         let now = now_unix();
+        let draft = match super::privacy::project(self.node.home(), &self.seller_pubkey.to_hex(), job_id, draft, None) {
+            Ok(draft) => draft,
+            Err(e) => { opline!("seller private result preparation refused job_id={job_id}: {e}"); return; }
+        };
         match self.node.store().deliver_and_enqueue(
             job_id,
             commit,
@@ -9435,6 +9581,23 @@ impl SellerNodeRunner {
     /// collection from the breadcrumb), and only then record the receipt (deduped by the wrap id, so
     /// a replayed wrap credits the job at most once). Every refusal is logged with a named reason.
     async fn on_gift_wrap(&self, event: &nostr_sdk::Event) {
+        if self.node.home().config.privacy.private_content_v2 {
+            if let Ok(Ok(content)) = self.node.signer().unwrap_private_content(event.clone()).await {
+                let received = (|| {
+                    let mut ctx = crate::private_content::channel::ContentContext::open(self.node.home(), &self.seller_pubkey.to_hex())?;
+                    ctx.stage(&content, now_unix().max(0) as u64)?;
+                    if content.body().kind == crate::private_content::ContentType::Task {
+                        ctx.store.offer_for_job(&content.body().author, &content.body().job_id)
+                    } else { Ok(None) }
+                })();
+                match received {
+                    Ok(Some(offer)) => self.on_offer(&offer).await,
+                    Ok(None) => {},
+                    Err(e) => opline!("seller private content not staged: {e}"),
+                }
+                return;
+            }
+        }
         let event_id = event.id.to_hex();
         // Log EVERY wrap seen — silence must mean "no wraps", never "lost money".
         opline!("seller node wrap seen event={event_id}");
@@ -9899,6 +10062,19 @@ impl SellerNodeRunner {
             .await;
     }
 
+    async fn sync_private_content(&self, backfill: bool) {
+        if !self.node.home().config.privacy.private_content_v2
+            || !self.private_authenticated.load(std::sync::atomic::Ordering::Relaxed) { return; }
+        let result = async {
+            let mut ctx = crate::private_content::channel::ContentContext::open(self.node.home(), &self.seller_pubkey.to_hex())?;
+            let mut transport = crate::private_content::session::AuthenticatedContentRelay::shared(self.client.clone(), &self.relay_url, AuthWait::Authenticated).await?;
+            crate::private_content::session::flush_actor(&mut ctx.store, self.node.signer(), &mut transport, 64).await?;
+            if backfill { transport.backfill_actor(&mut ctx.store, self.node.signer(), now_unix().max(0) as u64).await?; }
+            Ok::<_, crate::private_content::Error>(())
+        }.await;
+        if let Err(e) = result { opline!("seller private content retry pending: {e}"); }
+    }
+
     /// One outbox drain pass over the shared authenticated client. Log-and-continue: a publish
     /// failure leaves the row pending for the next tick (never wedges the loop).
     async fn drain(&self) {
@@ -9911,6 +10087,7 @@ impl SellerNodeRunner {
             Ok(_) => {}
             Err(error) => opline!("seller node outbox drain error (continuing): {error}"),
         }
+        self.sync_private_content(false).await;
     }
 }
 
@@ -15758,7 +15935,7 @@ mod tests {
         let stored = store.job_creq(&job).expect("read").expect("present");
         assert_eq!(stored, creq_a, "the stored creq is the claim-time creq");
 
-        let preimage = delivery_receipt_preimage(
+        let mut preimage = delivery_receipt_preimage(
             &job,
             "build a widget",
             21,

@@ -8,7 +8,8 @@ pub fn canonical_json(p: &ReceiptPreimage) -> Result<String> {
     for id in [&p.job_hash, &p.offer_id, &p.buyer_pubkey, &p.seller_pubkey] {
         require_hex(id, 32)?;
     }
-    if p.unit != "sat"
+    if p.protocol != crate::receipt::ReceiptProtocol::V2
+        || p.unit != "sat"
         || p.exec_metadata_commitment != "none"
         || p.job_hash != super::job_hash(&p.offer_id)?
     {

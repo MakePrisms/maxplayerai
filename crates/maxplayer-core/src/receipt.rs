@@ -10,6 +10,23 @@ pub fn result_content_hash_hex(content: &str) -> String {
 /// Domain separator for the co-signed receipt preimage (distinct from the receipt H-tuple
 /// domain above so the two hashes can never collide).
 pub const RECEIPT_PREIMAGE_DOMAIN: &str = "maxplayer/v1/receipt-preimage";
+pub const RECEIPT_PREIMAGE_DOMAIN_V2: &str = "maxplayer/v2/receipt-preimage";
+
+/// Explicitly retained with local evidence; never inferred from artifact hash length.
+/// V1 is only for pre-cutover journals. New private trades always use V2.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReceiptProtocol {
+    #[default]
+    V1,
+    V2,
+}
+impl ReceiptProtocol {
+    fn is_v1(&self) -> bool { *self == Self::V1 }
+    fn domain(self) -> &'static str {
+        match self { Self::V1 => RECEIPT_PREIMAGE_DOMAIN, Self::V2 => RECEIPT_PREIMAGE_DOMAIN_V2 }
+    }
+}
 
 /// Marker committed in [`ReceiptPreimage::exec_metadata_commitment`] when no
 /// exec-metadata is folded into the co-signature (the default today — see the type doc).
@@ -65,6 +82,8 @@ impl DeliveryKind {
 ///   additive, never a retraction).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReceiptPreimage {
+    #[serde(default, skip_serializing_if = "ReceiptProtocol::is_v1")]
+    pub protocol: ReceiptProtocol,
     pub job_hash: String,
     pub offer_id: String,
     pub amount: u64,
@@ -91,7 +110,7 @@ impl ReceiptPreimage {
     /// Canonical JSON array (domain-prefixed, fixed field order) — the signed bytes.
     pub fn canonical_json(&self) -> String {
         let mut fields = vec![
-            serde_json::json!(RECEIPT_PREIMAGE_DOMAIN),
+            serde_json::json!(self.protocol.domain()),
             serde_json::json!(self.job_hash),
             serde_json::json!(self.offer_id),
             serde_json::json!(self.amount),
@@ -163,6 +182,7 @@ mod tests {
 
         // Seller side: the digest is of the answer it is about to publish.
         let seller_side = ReceiptPreimage {
+            protocol: crate::receipt::ReceiptProtocol::V1,
             job_hash: job_hash.clone(),
             offer_id: job_id.clone(),
             amount: 2,
@@ -178,6 +198,7 @@ mod tests {
         // Buyer side: the digest is RE-DERIVED from the answer it received, never copied from the
         // seller's testimony. Equal digests are the whole point of the check.
         let buyer_side = ReceiptPreimage {
+            protocol: ReceiptProtocol::V1,
             job_hash,
             offer_id: job_id,
             amount: 2,
@@ -219,6 +240,7 @@ mod tests {
 
     fn preimage() -> ReceiptPreimage {
         ReceiptPreimage {
+            protocol: crate::receipt::ReceiptProtocol::V1,
             job_hash: "aa".repeat(32),
             offer_id: "offer".into(),
             amount: 7,

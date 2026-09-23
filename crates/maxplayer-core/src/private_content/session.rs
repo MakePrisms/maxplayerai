@@ -69,6 +69,7 @@ pub async fn flush<S: ContentSender>(
 pub struct AuthenticatedContentRelay {
     client: Client,
     relay: Relay,
+    owns_connection: bool,
 }
 impl AuthenticatedContentRelay {
     pub async fn connect(keys: &Keys, url: &str) -> Result<Self> {
@@ -92,10 +93,32 @@ impl AuthenticatedContentRelay {
             client.disconnect().await;
             return Err(Error("content relay authentication required"));
         }
-        Ok(Self { client, relay })
+        Ok(Self {
+            client,
+            relay,
+            owns_connection: true,
+        })
+    }
+    /// Attach to the seller's existing connection only after its live connection
+    /// state has observed NIP-42 authentication. No new signer/key copy is created.
+    pub async fn shared(client: Client, url: &str, authentication: AuthWait) -> Result<Self> {
+        if authentication != AuthWait::Authenticated {
+            return Err(Error("content relay authentication required"));
+        }
+        let relay = client
+            .relay(url)
+            .await
+            .map_err(|_| Error("content relay unavailable"))?;
+        Ok(Self {
+            client,
+            relay,
+            owns_connection: false,
+        })
     }
     pub async fn disconnect(self) {
-        self.client.disconnect().await;
+        if self.owns_connection {
+            self.client.disconnect().await;
+        }
     }
 
     /// Fetch a complete interval, including author self-copies. The Message lane is
@@ -135,9 +158,42 @@ impl AuthenticatedContentRelay {
         keys: &Keys,
         through: u64,
     ) -> Result<usize> {
-        let recipient = keys.public_key().to_hex();
-        let start = db.receive_since(&recipient)?;
+        self.backfill_using(db, keys.public_key(), through, |event| async move {
+            super::transport::unwrap_content(keys, &event).await
+        })
+        .await
+    }
+    pub async fn backfill_actor(
+        &self,
+        db: &mut ContentStore,
+        signer: &crate::seller_node::signer::SignerHandle,
+        through: u64,
+    ) -> Result<usize> {
+        let recipient = PublicKey::from_hex(signer.public_key_hex())
+            .map_err(|_| Error("invalid content recipient"))?;
+        self.backfill_using(db, recipient, through, |event| async move {
+            signer
+                .unwrap_private_content(event)
+                .await
+                .map_err(|_| Error("content signer unavailable"))?
+        })
+        .await
+    }
+    async fn backfill_using<F, Fut>(
+        &self,
+        db: &mut ContentStore,
+        recipient_key: PublicKey,
+        through: u64,
+        unwrap: F,
+    ) -> Result<usize>
+    where
+        F: Fn(Event) -> Fut,
+        Fut: Future<Output = Result<super::PreparedContent>>,
+    {
+        let recipient = recipient_key.to_hex();
+        let (start, through) = db.scan_window(&recipient, through)?;
         if start > through {
+            db.scan_finished(&recipient)?;
             return Ok(0);
         }
         let mut ranges = vec![(start, through)];
@@ -146,7 +202,7 @@ impl AuthenticatedContentRelay {
             let Some((start, end)) = ranges.pop() else {
                 break;
             };
-            let events = self.window(keys.public_key(), start, end).await?;
+            let events = self.window(recipient_key, start, end).await?;
             if events.len() == WINDOW_LIMIT {
                 if start == end {
                     return Err(Error("content backfill timestamp saturated"));
@@ -157,12 +213,13 @@ impl AuthenticatedContentRelay {
                 continue;
             }
             for event in events {
-                if let Ok(content) = super::transport::unwrap_content(keys, &event).await {
+                if let Ok(content) = unwrap(event).await {
                     staged += usize::from(db.stage(&content, &recipient, through)?);
                 }
             }
-            db.complete_backfill(&recipient, end)?;
+            db.scan_progress(&recipient, end)?;
         }
+        db.scan_finished(&recipient)?;
         Ok(staged)
     }
 }
@@ -268,4 +325,55 @@ mod tests {
                 .is_empty()
         );
     }
+}
+
+/// Seller equivalent of `flush`, with all content signing inside the existing actor.
+pub async fn flush_actor<S: ContentSender>(
+    db: &mut ContentStore,
+    signer: &crate::seller_node::signer::SignerHandle,
+    sender: &mut S,
+    limit: usize,
+) -> Result<FlushReport> {
+    let mut report = FlushReport::default();
+    let deadline = tokio::time::Instant::now() + IO_TIMEOUT;
+    for copy in db.pending(signer.public_key_hex(), limit.min(64))? {
+        let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) else {
+            report.pending += 1;
+            continue;
+        };
+        let accepted = tokio::time::timeout(remaining, async {
+            let event = signer
+                .wrap_private_content(copy.content.clone(), copy.recipient.clone())
+                .await
+                .map_err(|_| Error("content signer unavailable"))??;
+            sender.send(event).await
+        })
+        .await;
+        if matches!(accepted, Ok(Ok(()))) {
+            db.relay_accepted(
+                &copy.content.body().job_id,
+                &copy.content.body().message_id,
+                &copy.recipient,
+            )?;
+            report.accepted += 1;
+        } else {
+            report.pending += 1;
+        }
+    }
+    for event in db.pending_carriers(signer.public_key_hex(), limit.min(64))? {
+        let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) else {
+            report.pending += 1;
+            continue;
+        };
+        if matches!(
+            tokio::time::timeout(remaining, sender.send(event.clone())).await,
+            Ok(Ok(()))
+        ) {
+            db.carrier_accepted(&event)?;
+            report.accepted += 1;
+        } else {
+            report.pending += 1;
+        }
+    }
+    Ok(report)
 }

@@ -46,6 +46,7 @@ pub enum JobClass {
 /// Inputs for the authorize_pay composed path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthorizePayRequest {
+    pub private_evidence: Option<crate::private_content::evidence::PrivateEvidence>,
     pub job_id: String,
     pub result_id: String,
     /// Buyer-derived job class (from the signed offer). Sealing input: `Contribution` with
@@ -306,6 +307,22 @@ pub async fn authorize_pay_async(
             request.job_id
         )));
     }
+    // V2 authority is the exact signed result + envelope retained before ACCEPT,
+    // not mutable relay views or a caller's reconstructed plaintext digest.
+    let private_receipt = request.private_evidence.as_ref().map(|evidence| {
+        let policy = crate::private_content::runtime::Policy::for_evidence(home, evidence)
+            .map_err(|e| AuthorizePayError::Input(e.to_string()))?;
+        let secret = home::read_secret_key_hex(home)
+            .map_err(|e| AuthorizePayError::Home(e.to_string()))?;
+        let buyer = Keys::parse(&secret).map_err(|_| AuthorizePayError::Home("buyer key invalid".into()))?.public_key();
+        let verified = evidence.validate_request(&request, &buyer.to_hex(), &policy)
+            .map_err(|e| AuthorizePayError::Input(e.to_string()))?;
+        Ok::<_, AuthorizePayError>(PrivateReceipt {
+            preimage: verified.preimage,
+            evidence: evidence.clone(),
+            policy,
+        })
+    }).transpose()?;
     if request.delivery_integrity_hash.trim().is_empty() {
         return Err(AuthorizePayError::Input(
             "delivery_integrity_hash is required (buyer tip-match); never auto-filled from claim/result oid".into(),
@@ -366,7 +383,8 @@ pub async fn authorize_pay_async(
     // am about to pay for the one the signature covers?" — asked of the artifact that exists here.
     let (delivery, delivery_kind) = match request.inline_answer.as_deref() {
         Some(answer) => {
-            let derived = crate::receipt::result_content_hash_hex(answer);
+            let derived = private_receipt.as_ref().map(|p| p.preimage.delivery_integrity_hash.clone())
+                .unwrap_or_else(|| crate::receipt::result_content_hash_hex(answer));
             if derived != request.delivery_integrity_hash {
                 return Err(AuthorizePayError::Input(format!(
                     "inline answer digest {derived} does not match the accepted delivery_integrity_hash {} — refusing with zero spend",
@@ -466,8 +484,8 @@ pub async fn authorize_pay_async(
     // SAME seam ALSO verifies the seller's signed-result authorship tuple (one seam, more binds).
     // Fail-closed here ⇒ ZERO spend: no `authorize_then_attempt`, no lock/mint/send, no receipt,
     // no journal record.
-    let prepay_preimage =
-        receipt_preimage_for(&key, &buyer_nostr.to_hex(), &seller_hex, delivery_kind);
+    let prepay_preimage = receipt_preimage_bound(&key, &buyer_nostr.to_hex(), &seller_hex, delivery_kind, private_receipt.as_ref())
+        .map_err(|e| AuthorizePayError::Input(e.to_string()))?;
     let contribution_bind = contribution_cosig
         .as_ref()
         .map(|(digest, sig)| crate::payment::ContributionCosig {
@@ -591,6 +609,7 @@ pub async fn authorize_pay_async(
                 &seller_signature,
                 delivery_kind,
                 key,
+                private_receipt.as_ref(),
             )
         },
     )
@@ -827,7 +846,7 @@ pub async fn complete_recovered_locked_async(
     // check at the receipt leg, and raise a forged-receipt alarm naming the seller for a fault
     // that is entirely ours. A bind written before inline delivery existed carries no kind and is
     // a fork, which is true of every one of them.
-    let delivery_kind = match crate::job_lifecycle::load_accepted_bind(home, &request.job_id)
+    let accepted_bind = crate::job_lifecycle::load_accepted_bind(home, &request.job_id)
         .map_err(|error| {
             // NOT swallowed. A read error here would silently resolve to `Fork`, publish a receipt
             // the seller's signature cannot cover, and raise the forged-receipt alarm this very
@@ -836,9 +855,22 @@ pub async fn complete_recovered_locked_async(
                 "cannot read the accepted bind for job {} to learn its delivery kind: {error}",
                 request.job_id
             ))
-        })?
-        .as_ref()
-        .and_then(|bind| bind.delivery_kind.clone())
+        })?;
+    let private_receipt = accepted_bind.as_ref().and_then(|b| b.private_evidence.as_ref()).map(|evidence| {
+        let bind = accepted_bind.as_ref().expect("evidence came from bind");
+        let sealed = crate::job_lifecycle::authorize_request_from_bind(bind, bind.amount_sats, bind.commit_oid.clone())
+            .map_err(|e| AuthorizePayError::Input(e.to_string()))?;
+        let policy = crate::private_content::runtime::Policy::for_evidence(home, evidence)
+            .map_err(|e| AuthorizePayError::Input(e.to_string()))?;
+        let verified = evidence.validate_request(&sealed, &keys.public_key().to_hex(), &policy)
+            .map_err(|e| AuthorizePayError::Input(e.to_string()))?;
+        if request.result_id != bind.result_id || request.seller_signature != bind.seller_signature
+            || request.accepted_mints != bind.accepted_mints || request.realized_mint != bind.funding_mint {
+            return Err(AuthorizePayError::Input("completion differs from private accepted bind".into()));
+        }
+        Ok(PrivateReceipt { preimage: verified.preimage, evidence: evidence.clone(), policy })
+    }).transpose()?;
+    let delivery_kind = match accepted_bind.as_ref().and_then(|bind| bind.delivery_kind.clone())
         .as_deref()
     {
         Some(kind) if kind == DeliveryKind::Inline.as_str() => DeliveryKind::Inline,
@@ -851,6 +883,13 @@ pub async fn complete_recovered_locked_async(
             _ => DeliveryKind::Fork,
         },
     };
+
+    if private_receipt.is_some() {
+        let preimage = receipt_preimage_bound(&key, &keys.public_key().to_hex(), &seller_hex, delivery_kind, private_receipt.as_ref())
+            .map_err(|e| AuthorizePayError::Input(e.to_string()))?;
+        authority.verify_seller_prepay_cosig(&preimage, &seller_signature, None)
+            .map_err(AuthorizePayError::Payment)?;
+    }
 
     let wallet = buyer_fund::open_wallet_at_mint_async(home, &wallet_open_mint_url(home, &terms))
         .await?;
@@ -866,6 +905,7 @@ pub async fn complete_recovered_locked_async(
                 &seller_signature,
                 delivery_kind,
                 key,
+                private_receipt.as_ref(),
             )
         },
     )
@@ -891,7 +931,7 @@ pub async fn complete_recovered_locked_async(
 
 /// Resolve the buyer's content policy hook from `[contribution]` config, or the
 /// FLOOR (refuse only empty diffs) when unconfigured. Buyer-side; never seller-influenced.
-fn contribution_policy(home: &MaxplayerHome) -> crate::contribution::ContentPolicy {
+pub(crate) fn contribution_policy(home: &MaxplayerHome) -> crate::contribution::ContentPolicy {
     match &home.config.contribution {
         Some(cfg) => crate::contribution::ContentPolicy {
             allowed_paths: cfg.allowed_paths.clone(),
@@ -1065,6 +1105,7 @@ fn receipt_preimage_for(
     delivery_kind: DeliveryKind,
 ) -> ReceiptPreimage {
     ReceiptPreimage {
+        protocol: crate::receipt::ReceiptProtocol::V1,
         job_hash: key.job_hash.as_str().to_owned(),
         offer_id: key.job_id.as_str().to_owned(),
         amount: key.amount.to_u64(),
@@ -1091,6 +1132,31 @@ fn receipt_preimage_for(
 /// per publish attempt (see [`receipt_created_at`]). Empty `relay_success` is enforced
 /// fail-closed by [`ReceiptAuthority::verify`]; recovery re-runs this publish (a fresh
 /// id each attempt — verify-irrelevant, never a re-sent payment).
+struct PrivateReceipt {
+    preimage: ReceiptPreimage,
+    evidence: crate::private_content::evidence::PrivateEvidence,
+    policy: crate::private_content::runtime::Policy,
+}
+
+/// The payment key still uses the OFFER id; routing ids never become spend keys.
+/// Recheck all receipt fields against that key both before spend and on publication.
+fn receipt_preimage_bound(
+    key: &PaymentKey,
+    buyer: &str,
+    seller: &str,
+    kind: DeliveryKind,
+    private: Option<&PrivateReceipt>,
+) -> Result<ReceiptPreimage, EffectError> {
+    let mut computed = receipt_preimage_for(key, buyer, seller, kind);
+    if let Some(private) = private {
+        computed.protocol = crate::receipt::ReceiptProtocol::V2;
+        if computed != private.preimage || key.result_id.as_str() != private.evidence.result.id.to_hex() {
+            return Err(EffectError::new("payment key differs from immutable private result"));
+        }
+    }
+    Ok(computed)
+}
+
 fn build_and_publish_receipt(
     buyer_keys: &Keys,
     relay_url: &str,
@@ -1098,6 +1164,7 @@ fn build_and_publish_receipt(
     seller_signature: &str,
     delivery_kind: DeliveryKind,
     key: &PaymentKey,
+    private: Option<&PrivateReceipt>,
 ) -> Result<ReceiptEvidence, EffectError> {
     let buyer_hex = buyer_keys.public_key().to_hex();
     let mint = key.mint.to_string();
@@ -1105,7 +1172,7 @@ fn build_and_publish_receipt(
     // offer_id == job_id in this codebase (the offer event id is the job id). Built via the
     // SINGLE shared constructor the pre-pay tooth also uses, so the co-signed bytes published
     // here are byte-identical to the bytes verified before the spend (they cannot drift).
-    let preimage = receipt_preimage_for(key, &buyer_hex, seller_hex, delivery_kind);
+    let preimage = receipt_preimage_bound(key, &buyer_hex, seller_hex, delivery_kind, private)?;
     let digest = preimage.digest_bytes();
     // Buyer counter-signature (no aux-rand): a `sig/buyer` tag that is a pure function of the
     // preimage. This makes only the co-SIGNATURE deterministic — NOT the event id, which also
@@ -1136,6 +1203,11 @@ fn build_and_publish_receipt(
         // seller-claimed tags here would be cosmetic-only.
         &[],
     );
+    let draft = if let Some(private) = private {
+        crate::private_content::carriers::project(
+            &private.evidence.offer, &draft, Some(&private.evidence.award), None, &private.policy.host,
+        ).map_err(|e| EffectError::new(e.to_string()))?
+    } else { draft };
     let builder = gateway::nostr::event_builder(&draft)
         .map_err(|error| EffectError::new(format!("receipt event builder: {error}")))?;
     let event = builder
@@ -1572,6 +1644,7 @@ mod tests {
         let home = home::bootstrap(&root).expect("home");
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         let request = AuthorizePayRequest {
+            private_evidence: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "job-d2-empty".into(),
@@ -1692,6 +1765,7 @@ mod tests {
         );
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         let request = AuthorizePayRequest {
+            private_evidence: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "job-hop-fence".into(),
@@ -1742,6 +1816,7 @@ mod tests {
         let home = home::bootstrap(&root).expect("home");
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         let request = AuthorizePayRequest {
+            private_evidence: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "job-d2".into(),
@@ -1788,6 +1863,7 @@ mod tests {
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         let oid = "aa".repeat(20);
         let request = AuthorizePayRequest {
+            private_evidence: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "job-jc".into(),
@@ -1837,6 +1913,7 @@ mod tests {
             &prepay_preimage(&home, "job-ext", "result-ext", &"bb".repeat(32), &"aa".repeat(20), 2),
         );
         let request = AuthorizePayRequest {
+            private_evidence: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "job-ext".into(),
@@ -2064,6 +2141,7 @@ mod tests {
             .sign_schnorr(&Message::from_digest(preimage.digest_bytes()))
             .to_string();
         let request = AuthorizePayRequest {
+            private_evidence: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "job-forged".into(),
@@ -2123,6 +2201,7 @@ mod tests {
             .sign_schnorr(&Message::from_digest(preimage.digest_bytes()))
             .to_string();
         let request = AuthorizePayRequest {
+            private_evidence: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "job-diag".into(),
@@ -2198,6 +2277,7 @@ mod tests {
         );
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         let tampered_amount = AuthorizePayRequest {
+            private_evidence: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "job-tamper".into(),
@@ -2231,6 +2311,7 @@ mod tests {
         );
         let mut gate2 = BudgetGate::from_home(&home).expect("gate");
         let tampered_delivery = AuthorizePayRequest {
+            private_evidence: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "job-tamper2".into(),
@@ -2462,6 +2543,7 @@ mod free_lane_tests {
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         let commit = "ab".repeat(20);
         let request = AuthorizePayRequest {
+            private_evidence: None,
             inline_answer: None,
             payment_mode: PaymentMode::None,
             job_id: "free-job".into(),
@@ -2502,6 +2584,7 @@ mod free_lane_tests {
         let (root, home) = temp_home("sat-passes");
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         let request = AuthorizePayRequest {
+            private_evidence: None,
             inline_answer: None,
             payment_mode: PaymentMode::Sat,
             job_id: "paid-job".into(),

@@ -328,8 +328,36 @@ pub async fn run(home: MaxplayerHome) -> Result<(), BuyerError> {
     // Keep reconciling while we serve, so a reservation stranded by a seller that went away is
     // freed within the hour rather than at the next restart.
     spawn_reconcile_loop(context.clone());
+    spawn_private_content_worker(context.clone());
     let listener = bind_socket(&socket_path)?;
     accept_loop(listener, context).await
+}
+
+/// Recipient-copy retries outlive job completion. A delayed Maxplayer copy must
+/// not depend on someone calling get_job again or on an unsettled award existing.
+fn spawn_private_content_worker(context: Arc<BuyerContext>) {
+    if !context.home.config.privacy.private_content_v2 { return; }
+    tokio::spawn(async move {
+        let mut ticker=tokio::time::interval(Duration::from_secs(30));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let result=async {
+                use crate::private_content::{channel::ContentContext,session};
+                let keys=buyer_keys(&context.home).map_err(|_| crate::private_content::Error("buyer content signer unavailable"))?;
+                let mut content=ContentContext::open(&context.home,&keys.public_key().to_hex())?;
+                let mut relay=session::AuthenticatedContentRelay::connect(&keys,&context.home.config.relay_url).await?;
+                let result=async {
+                    session::flush(&mut content.store,&keys,&mut relay,64).await?;
+                    relay.backfill(&mut content.store,&keys,now_unix().max(0) as u64).await?;
+                    Ok::<_,crate::private_content::Error>(())
+                }.await;
+                relay.disconnect().await;
+                result
+            }.await;
+            if let Err(error)=result {crate::opline!("buyer private content retry pending: {error}");}
+        }
+    });
 }
 
 /// Accept connections and service each on its own task.
@@ -400,6 +428,12 @@ async fn dispatch(context: &Arc<BuyerContext>, request: Request) -> Response {
 /// select a contribution offer, a partial set is refused. `job_id` returned is the offer event id.
 #[derive(Debug, Deserialize)]
 struct PostJobParams {
+    #[serde(default)]
+    visibility: Option<crate::private_content::wire::Visibility>,
+    #[serde(default)]
+    output_category: Option<crate::private_content::wire::Output>,
+    #[serde(default)]
+    inputs: Vec<crate::private_content::inputs::InputFile>,
     task: String,
     output: String,
     amount_sats: u64,
@@ -547,6 +581,9 @@ async fn post_job(context: &Arc<BuyerContext>, id: Value, params: Value) -> Resp
     let harness = params.harness.clone();
     let model = params.model.clone();
     let request = PostJobRequest {
+        visibility: params.visibility,
+        output_category: params.output_category,
+        inputs: params.inputs,
         task: params.task,
         output: params.output,
         amount_sats: params.amount_sats,
@@ -5291,6 +5328,7 @@ mod tests {
 
         fn result(commit_oid: Option<String>) -> job_lifecycle::ResultView {
             job_lifecycle::ResultView {
+                private_evidence: None,
                 inline_answer: None,
                 result_id: "r".repeat(64),
                 created_at: 2,
@@ -5331,6 +5369,7 @@ mod tests {
                 results: vec![result(Some("d".repeat(40)))],
                 live_claim_id: None,
                 accepted: Some(job_lifecycle::AcceptedBind {
+                    private_evidence: None,
                     delivery_kind: None,
                     inline_answer: None,
                     payment_mode: crate::gateway::PaymentMode::Sat,
@@ -5372,6 +5411,7 @@ mod tests {
                 results: vec![result(Some("d".repeat(40)))],
                 live_claim_id: None,
                 accepted: Some(job_lifecycle::AcceptedBind {
+                    private_evidence: None,
                     delivery_kind: None,
                     inline_answer: None,
                     payment_mode: crate::gateway::PaymentMode::Sat,

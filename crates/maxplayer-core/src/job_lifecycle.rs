@@ -57,6 +57,10 @@ pub(crate) const DELIVERY_PAY_WINDOW_SECS: u64 = 7 * 24 * 3_600;
 /// Inputs for posting a offer-kind offer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PostJobRequest {
+    pub visibility: Option<crate::private_content::wire::Visibility>,
+    pub output_category: Option<crate::private_content::wire::Output>,
+    #[cfg(feature = "wallet")]
+    pub inputs: Vec<crate::private_content::inputs::InputFile>,
     pub task: String,
     pub output: String,
     pub amount_sats: u64,
@@ -204,6 +208,7 @@ pub struct JobView {
     pub claims: Vec<ClaimView>,
     pub results: Vec<ResultView>,
     pub live_claim_id: Option<String>,
+    #[serde(serialize_with="serialize_accepted_view")]
     pub accepted: Option<AcceptedBind>,
     /// True when `wait_for` was set and the wait cap hit before the condition —
     /// buyer should re-poll (PENDING), not treat as failure.
@@ -349,6 +354,8 @@ pub struct ClaimView {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ResultView {
+    #[serde(skip_serializing)]
+    pub private_evidence: Option<crate::private_content::evidence::PrivateEvidence>,
     pub result_id: String,
     pub created_at: u64,
     pub seller_pubkey: String,
@@ -387,6 +394,8 @@ pub struct ResultView {
 /// Local accept-bind recorded by [`accept_claim`] for authorize_pay.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcceptedBind {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_evidence: Option<crate::private_content::evidence::PrivateEvidence>,
     pub job_id: String,
     pub claim_id: String,
     pub result_id: String,
@@ -615,6 +624,23 @@ pub async fn post_job_async(
     home: &MaxplayerHome,
     request: PostJobRequest,
 ) -> Result<PostJobOutcome, JobLifecycleError> {
+    let visibility = crate::private_content::runtime::requested_visibility(home,request.visibility)
+        .map_err(|error|JobLifecycleError::Input(error.to_string()))?;
+    if visibility == crate::private_content::wire::Visibility::Private {
+        if request.output_category.is_none() {
+            return Err(JobLifecycleError::Input("private jobs require an explicit output_category".into()));
+        }
+        if request.repo.is_some() || request.branch.is_some() {
+            return Err(JobLifecycleError::Input("private delivery uses its per-job repository; use contribution pins for existing code".into()));
+        }
+        if request.untargeted && !request.inputs.is_empty() {
+            return Err(JobLifecycleError::Input("confidential inputs require a selected seller before posting".into()));
+        }
+    }
+    #[cfg(feature = "wallet")]
+    if visibility == crate::private_content::wire::Visibility::Public && !request.inputs.is_empty() {
+        return Err(JobLifecycleError::Input("private inputs cannot be published through the public posting path".into()));
+    }
     if request.task.trim().is_empty() {
         return Err(JobLifecycleError::Input("task must be non-empty".into()));
     }
@@ -698,8 +724,21 @@ pub async fn post_job_async(
     let draft = build_offer_draft(&request, deadline_unix, contribution.as_ref())?;
 
     let keys = buyer_keys(home)?;
-    let event_id = publish_draft_async(home, &keys, &draft).await?;
-    let job_hash = job_hash_for_offer(&event_id, &request.task, request.amount_sats);
+    if visibility == crate::private_content::wire::Visibility::Private {
+        return crate::private_content::posting::post(home, &keys, &request, &draft, contribution.as_ref()).await
+            .map_err(|e| JobLifecycleError::Input(e.to_string()));
+    }
+    let draft = crate::private_content::public_v2::offer_draft(draft)
+        .map_err(|e| JobLifecycleError::Input(e.to_string()))?;
+    let event = gateway::nostr::event_builder(&draft)
+        .map_err(|e| JobLifecycleError::Relay(e.to_string()))?.sign_with_keys(&keys)
+        .map_err(|e| JobLifecycleError::Relay(e.to_string()))?;
+    crate::private_content::public_v2::Context::open(home).and_then(|mut ctx|ctx.remember(&event,&event))
+        .map_err(|e| JobLifecycleError::Input(e.to_string()))?;
+    // Publish exactly the signed event retained locally (no second signing timestamp).
+    publish_signed_event_async(home, &keys, &event).await?;
+    let event_id = event.id.to_hex();
+    let job_hash = crate::private_content::job_hash(&event_id).map_err(|e| JobLifecycleError::Input(e.to_string()))?;
 
     Ok(PostJobOutcome {
         job_id: event_id,
@@ -1147,6 +1186,15 @@ pub async fn prepare_award_async(
         &buyer_pubkey,
         &claim.seller_pubkey,
     );
+    let mut private = crate::seller_node::privacy::known(home, &buyer_pubkey, &request.job_id)
+        .map_err(|e| JobLifecycleError::Input(e.to_string()))?;
+    let draft = if let Some((ctx, original)) = &private {
+        crate::private_content::carriers::project(original, &draft, None, None, &ctx.policy.host)
+            .map_err(|e| JobLifecycleError::Input(e.to_string()))?
+    } else {
+        crate::private_content::public_v2::project_local(home,&request.job_id,draft)
+            .map_err(|e| JobLifecycleError::Input(e.to_string()))?
+    };
     // Sign NOW: from here the event id is fixed, and only these bytes may ever carry this job's
     // award. (`sign_with_keys` stamps `created_at`, so signing at send time would mint a new id
     // per retry — the exact duplication this function exists to prevent.)
@@ -1154,6 +1202,15 @@ pub async fn prepare_award_async(
         .map_err(|error| JobLifecycleError::Relay(format!("event builder: {error}")))?
         .sign_with_keys(&keys)
         .map_err(|error| JobLifecycleError::Relay(format!("sign award: {error}")))?;
+    if let Some((ctx, original)) = &mut private {
+        let signed_claim = ctx.store.event(&request.claim_id).map_err(|e| JobLifecycleError::Input(e.to_string()))?
+            .ok_or_else(|| JobLifecycleError::Input("private claim context missing".into()))?;
+        // Retain exact authority before award publication, without adding a service ACK.
+        crate::private_content::lifecycle::validate_selection(original, &signed_claim, &event, &ctx.policy.host)
+            .map_err(|e| JobLifecycleError::Input(e.to_string()))?;
+        ctx.store.remember_event(&event, original, &buyer_pubkey, &ctx.policy.service, &ctx.policy.host)
+            .map_err(|e| JobLifecycleError::Input(e.to_string()))?;
+    }
     use nostr_sdk::JsonUtil;
     Ok(PreparedAward {
         award_event_id: event.id.to_hex(),
@@ -1358,6 +1415,17 @@ pub async fn accept_claim_async(
         crate::review::check_buyer(home, &keys, &review_subject, &claim.seller_pubkey)
             .await.map_err(JobLifecycleError::Input)?
     } else { None };
+    let private_verified = result.private_evidence.as_ref().map(|evidence| {
+        let policy = crate::private_content::runtime::Policy::for_evidence(home, evidence)
+            .map_err(|e| JobLifecycleError::Input(e.to_string()))?;
+        if evidence.offer.id.to_hex() != request.job_id
+            || evidence.claim.id.to_hex() != request.claim_id
+            || evidence.result.id.to_hex() != result.result_id {
+            return Err(JobLifecycleError::Input("private result selection mismatch".into()));
+        }
+        evidence.validate(&keys.public_key().to_hex(), &policy)
+            .map_err(|e| JobLifecycleError::Input(e.to_string()))
+    }).transpose()?;
 
     // Finding W: hold a per-job advisory lock across the single-settlement check→durable-bind-write
     // so two concurrent accepts for DIFFERENT results of one job cannot both observe "no bind" and
@@ -1383,11 +1451,27 @@ pub async fn accept_claim_async(
     // result stays idempotent (the durability re-publish/finalize below rewrites the same bind).
     // TEMPORARY: the full job-scoped settlement-key refactor (which would let a job legitimately
     // re-bind a corrected result) is tracked separately; until then one settlement per job.
-    assert_single_settlement(
-        load_accepted_bind(home, &request.job_id)?.as_ref(),
-        &request.job_id,
-        &result.result_id,
-    )?;
+    let existing_bind = load_accepted_bind(home, &request.job_id)?;
+    assert_single_settlement(existing_bind.as_ref(), &request.job_id, &result.result_id)?;
+    if let Some(mut bind) = existing_bind.filter(|b| b.private_evidence.is_some()) {
+        // Never re-plan funding or replace immutable evidence on a same-result retry.
+        if bind.claim_id != request.claim_id || bind.private_evidence != result.private_evidence {
+            return Err(JobLifecycleError::Input("accepted private evidence changed".into()));
+        }
+        validate_private_bind(home, &bind)?;
+        if bind.accept_event_id.is_empty() {
+            let evidence = bind.private_evidence.as_ref().unwrap();
+            let policy = crate::private_content::runtime::Policy::for_evidence(home, evidence)
+                .map_err(|e| JobLifecycleError::Input(e.to_string()))?;
+            let draft = accept_draft(&bind.job_id, &bind.claim_id, &keys.public_key().to_hex(), &bind.seller_pubkey);
+            let draft = crate::private_content::carriers::project(&evidence.offer, &draft, Some(&evidence.award), None, &policy.host)
+                .map_err(|e| JobLifecycleError::Input(e.to_string()))?;
+            bind.accept_event_id = publish_draft_async(home, &keys, &draft).await?;
+            bind.accepted_at = now_unix();
+            write_accepted_bind(home, &bind)?;
+        }
+        return Ok(AcceptClaimOutcome { accept_event_id: bind.accept_event_id.clone(), bind });
+    }
 
     // §6.1 — THE BUYER ENFORCES ITS OWN DECLARATION. The seller gate is a promise; this is the
     // check. A seller that ignores the promise publishes a correctly signed inline result for an
@@ -1427,7 +1511,8 @@ pub async fn accept_claim_async(
         Some(answer) => (
             String::new(),
             String::new(),
-            crate::receipt::result_content_hash_hex(&answer),
+            private_verified.as_ref().map(|v| v.integrity.clone())
+                .unwrap_or_else(|| crate::receipt::result_content_hash_hex(&answer)),
             Some(answer),
             Some(crate::receipt::DeliveryKind::Inline.as_str().to_owned()),
         ),
@@ -1455,7 +1540,8 @@ pub async fn accept_claim_async(
     // result to echo it exactly; never trust the result's self-authored job-hash. The seller
     // co-signs the receipt preimage over THIS hash, so an offer-derived hash that the result
     // does not match means the result quoted a different task/amount — refuse.
-    let expected_job_hash = job_hash_for_offer(&request.job_id, &offer.task, offer.amount_sats);
+    let expected_job_hash = private_verified.as_ref().map(|v| v.preimage.job_hash.clone())
+        .unwrap_or_else(|| job_hash_for_offer(&request.job_id, &offer.task, offer.amount_sats));
     let result_job_hash = result
         .job_hash
         .clone()
@@ -1497,6 +1583,7 @@ pub async fn accept_claim_async(
         // The bind records what a free trade actually is: no amount, no creq, no mints, no funding
         // or delivery mint, and the mode that makes `authorize_pay` refuse it (§2.5).
         let mut bind = AcceptedBind {
+            private_evidence: result.private_evidence.clone(),
             job_id: request.job_id.clone(),
             claim_id: request.claim_id.clone(),
             result_id: result.result_id.clone(),
@@ -1523,14 +1610,22 @@ pub async fn accept_claim_async(
         // SAME durability ordering as the paid path below: bind first, publish second, finalize
         // third — a crash between publish and bind-write must never leave a public accepted state
         // with no local bind.
-        write_accepted_bind(home, &bind)?;
+        validate_private_bind(home, &bind)?;
+    write_accepted_bind(home, &bind)?;
+        let draft = if let Some(evidence) = &bind.private_evidence {
+            let policy = crate::private_content::runtime::Policy::for_evidence(home, evidence)
+                .map_err(|e| JobLifecycleError::Input(e.to_string()))?;
+            crate::private_content::carriers::project(&evidence.offer, &draft, Some(&evidence.award), None, &policy.host)
+                .map_err(|e| JobLifecycleError::Input(e.to_string()))?
+        } else { draft };
         let accept_event_id = publish_draft_async(home, &keys, &draft).await?;
         bind.accept_event_id = accept_event_id.clone();
         bind.accepted_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        write_accepted_bind(home, &bind)?;
+        validate_private_bind(home, &bind)?;
+    write_accepted_bind(home, &bind)?;
         return Ok(AcceptClaimOutcome {
             accept_event_id,
             bind,
@@ -1602,6 +1697,7 @@ pub async fn accept_claim_async(
     // bind carries an empty `accept_event_id` (the pay path never reads that field — it is a
     // record only), then we publish and finalize the bind with the real id + timestamp.
     let mut bind = AcceptedBind {
+        private_evidence: result.private_evidence.clone(),
         job_id: request.job_id.clone(),
         claim_id: request.claim_id.clone(),
         result_id: result.result_id.clone(),
@@ -1639,8 +1735,15 @@ pub async fn accept_claim_async(
         // Reached only through the `Sat` branch above, so this is a fact rather than a default.
         payment_mode,
     };
+    validate_private_bind(home, &bind)?;
     write_accepted_bind(home, &bind)?;
 
+    let draft = if let Some(evidence) = &bind.private_evidence {
+        let policy = crate::private_content::runtime::Policy::for_evidence(home, evidence)
+            .map_err(|e| JobLifecycleError::Input(e.to_string()))?;
+        crate::private_content::carriers::project(&evidence.offer, &draft, Some(&evidence.award), None, &policy.host)
+            .map_err(|e| JobLifecycleError::Input(e.to_string()))?
+    } else { draft };
     let accept_event_id = publish_draft_async(home, &keys, &draft).await?;
     let accepted_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1652,6 +1755,7 @@ pub async fn accept_claim_async(
     // idempotently and re-finalizes.
     bind.accept_event_id = accept_event_id.clone();
     bind.accepted_at = accepted_at;
+    validate_private_bind(home, &bind)?;
     write_accepted_bind(home, &bind)?;
 
     Ok(AcceptClaimOutcome {
@@ -1873,7 +1977,7 @@ fn verify_free_accept(offer: &OfferView, claim: &ClaimView) -> Result<PaymentMod
 /// - the accepted-mint list (`m`) is NON-EMPTY.
 ///
 /// Returns the normalized accepted-mint list (`m`) on success. Any failure REFUSES the accept.
-fn verify_accepted_claim_creq(
+pub(crate) fn verify_accepted_claim_creq(
     creq: Option<&str>,
     job_id: &str,
     offer_amount_sats: u64,
@@ -2119,6 +2223,7 @@ pub fn authorize_request_from_bind(
         )));
     }
     Ok(crate::authorize_pay::AuthorizePayRequest {
+        private_evidence: bind.private_evidence.clone(),
         job_id: bind.job_id.clone(),
         result_id: bind.result_id.clone(),
         // Sound because accept is fail-closed: a contribution-class offer with malformed pins is
@@ -2189,6 +2294,7 @@ pub fn fill_explicit_request_from_bind(
     request: &mut crate::authorize_pay::AuthorizePayRequest,
     bind: &AcceptedBind,
 ) {
+    request.private_evidence = bind.private_evidence.clone();
     request.job_hash = bind.job_hash.clone();
     // The bind is authoritative for the job class (resolved from the signed offer at accept), so
     // the explicit form matches the bind form and cannot declare a divergent class.
@@ -2230,6 +2336,39 @@ pub fn fill_explicit_request_from_bind(
     }
 }
 
+/// Recheck the immutable signed result and the seller's v2 co-signature without
+/// touching a wallet. Shared by acceptance and free collection after restart.
+pub(crate) fn validate_private_bind(home: &MaxplayerHome, bind: &AcceptedBind) -> Result<(), JobLifecycleError> {
+    let Some(evidence) = &bind.private_evidence else { return Ok(()); };
+    let policy = crate::private_content::runtime::Policy::for_evidence(home, evidence)
+        .map_err(|e| JobLifecycleError::Input(e.to_string()))?;
+    let buyer = buyer_keys(home)?.public_key();
+    let request = authorize_request_from_bind(bind, bind.amount_sats, bind.commit_oid.clone())?;
+    let verified = evidence.validate_request(&request, &buyer.to_hex(), &policy)
+        .map_err(|e| JobLifecycleError::Input(e.to_string()))?;
+    let authority = crate::payment::ReceiptAuthority {
+        buyer,
+        seller: evidence.claim.pubkey,
+    };
+    let tuple = bind.contribution.as_ref().map(|pin| {
+        Ok::<_, JobLifecycleError>(crate::contribution::AuthorshipTuple {
+            job_id: bind.job_id.clone(), seller_pubkey: bind.seller_pubkey.clone(),
+            target: crate::contribution::TargetRepoPin::new(pin.target_owner_pubkey.clone(), pin.target_clone_url.clone())
+                .map_err(|e| JobLifecycleError::Input(e.to_string()))?,
+            base_oid: pin.base_oid.clone(),
+            fork: crate::contribution::ForkRef::new(bind.repo.clone(), bind.branch.clone())
+                .map_err(|e| JobLifecycleError::Input(e.to_string()))?,
+            commit_oid: bind.commit_oid.clone(),
+        })
+    }).transpose()?;
+    let contribution_cosig = tuple.as_ref().zip(bind.contribution.as_ref()).map(|(tuple,pin)| crate::payment::ContributionCosig {
+        tuple_digest: tuple.digest_bytes(), tuple_signature_hex: &pin.tuple_signature,
+    });
+    authority.verify_seller_prepay_cosig(&verified.preimage, &bind.seller_signature, contribution_cosig)
+        .map_err(|e| JobLifecycleError::Input(e.to_string()))?;
+    Ok(())
+}
+
 fn write_accepted_bind(home: &MaxplayerHome, bind: &AcceptedBind) -> Result<(), JobLifecycleError> {
     let dir = home.root.join(JOBS_DIR);
     fs::create_dir_all(&dir).map_err(|error| JobLifecycleError::Io(error.to_string()))?;
@@ -2239,8 +2378,10 @@ fn write_accepted_bind(home: &MaxplayerHome, bind: &AcceptedBind) -> Result<(), 
     // Crash-atomic rewrite (temp → sync → rename → dir-fsync): a crash between the relay publish and
     // the bind-write can never leave a truncated/empty bind, which would let the daemon re-accept a
     // job and pay a SECOND time. Serialized per-job by `acquire_job_lock`.
-    crate::durable::write_atomic(&dir, &path, raw.as_bytes())
-        .map_err(|error| JobLifecycleError::Io(error.to_string()))
+    let written = if bind.private_evidence.is_some() {
+        crate::durable::write_private_atomic(&dir, &path, raw.as_bytes())
+    } else { crate::durable::write_atomic(&dir, &path, raw.as_bytes()) };
+    written.map_err(|error| JobLifecycleError::Io(error.to_string()))
 }
 
 fn bind_path(home: &MaxplayerHome, job_id: &str) -> PathBuf {
@@ -2306,7 +2447,7 @@ async fn publish_draft_async(
     keys: &nostr_sdk::Keys,
     draft: &EventDraft,
 ) -> Result<String, JobLifecycleError> {
-    use nostr_sdk::prelude::{Client, Kind};
+    use nostr_sdk::prelude::Kind;
 
     let builder = gateway::nostr::event_builder(draft)
         .map_err(|error| JobLifecycleError::Relay(format!("event builder: {error}")))?;
@@ -2316,6 +2457,10 @@ async fn publish_draft_async(
     // Keep Kind::Custom visible for readers of the draft path.
     let _ = Kind::Custom(draft.kind);
 
+    publish_signed_event_async(home, keys, &event).await
+}
+async fn publish_signed_event_async(home: &MaxplayerHome, keys: &nostr_sdk::Keys, event: &nostr_sdk::Event) -> Result<String, JobLifecycleError> {
+    use nostr_sdk::Client;
     let client = Client::new(keys.clone());
     client
         .add_relay(&home.config.relay_url)
@@ -2888,6 +3033,7 @@ fn result_view_from_event(
         .and_then(|value| value.parse().ok());
     let (harness, model) = result_attribution(&draft.tags);
     ResultView {
+        private_evidence: None,
         // Threaded, not dropped: `accept_claim_async` reads the answer off this view to build the
         // bind. Pinned to `None`, every inline result takes the git arm of the accept split and
         // fails on the `repo` tag an inline result does not carry.
@@ -2910,6 +3056,12 @@ fn result_view_from_event(
     }
 }
 
+fn serialize_accepted_view<S: serde::Serializer>(bind: &Option<AcceptedBind>, serializer: S) -> Result<S::Ok, S::Error> {
+    let mut view=bind.clone();
+    if let Some(bind)=&mut view {bind.private_evidence=None;}
+    serde::Serialize::serialize(&view,serializer)
+}
+
 /// Read one job's offer + claims + results from the relay, with claim liveness derived
 /// against `now` (a `processing` claim past the offer deadline is EXPIRED, not live). Exposed
 /// `pub(crate)` so the seller daemon can run the backfill money-safety pre-claim check
@@ -2926,6 +3078,18 @@ pub(crate) async fn fetch_job_view_async(
     let offer_id = EventId::from_hex(job_id)
         .map_err(|error| JobLifecycleError::Input(format!("job_id: {error}")))?;
 
+    // A locally queued private offer may not have reached the relay yet. Retry
+    // publication before any absence decision; retain its exact signed identity.
+    let mut local_private = crate::seller_node::privacy::known(home, &keys.public_key().to_hex(), job_id)
+        .map_err(|e| JobLifecycleError::Input(e.to_string()))?;
+    if let Some((ctx, _)) = &mut local_private {
+        if let Ok(mut transport) = crate::private_content::session::AuthenticatedContentRelay::connect(keys, &home.config.relay_url).await {
+            let _ = crate::private_content::session::flush(&mut ctx.store, keys, &mut transport, 64).await;
+            let refreshed = transport.backfill(&mut ctx.store, keys, now).await;
+            transport.disconnect().await;
+            refreshed.map_err(|e| JobLifecycleError::Relay(e.to_string()))?;
+        }
+    }
     let client = Client::new(keys.clone());
     // Same discipline as `award_presence_async` / `presence_of_filter`: auto-auth ON so a
     // NIP-42-gated read re-issues after the handshake, and WAIT for the socket before the first
@@ -3025,7 +3189,58 @@ pub(crate) async fn fetch_job_view_async(
         .await
         .map_err(|error| JobLifecycleError::Relay(format!("fetch results: {error}")))?;
 
+    if let Some(event) = offer_events.iter().find(|e| e.id == offer_id) {
+        let draft = event_to_draft(event);
+        if first_tag_value(&draft.tags, "visibility") == Some("private") {
+            let awards = client.fetch_events(Filter::new().kind(Kind::Custom(3405))
+                .hashtag(gateway::MAXPLAYER_TAG).event(offer_id), timeout).await
+                .map_err(|_| JobLifecycleError::Relay("private award read incomplete".into()))?;
+            client.disconnect().await;
+            let mut context = if let Some((context, _)) = local_private.take() { context } else {
+                let mut context = crate::private_content::channel::ContentContext::open(home, &keys.public_key().to_hex())
+                    .map_err(|e| JobLifecycleError::Input(e.to_string()))?;
+                let mut transport = crate::private_content::session::AuthenticatedContentRelay::connect(keys, &home.config.relay_url).await
+                    .map_err(|e| JobLifecycleError::Relay(e.to_string()))?;
+                let refreshed = async {
+                    crate::private_content::session::flush(&mut context.store, keys, &mut transport, 64).await?;
+                    transport.backfill(&mut context.store, keys, now).await
+                }.await;
+                transport.disconnect().await;
+                refreshed.map_err(|e: crate::private_content::Error| JobLifecycleError::Relay(e.to_string()))?;
+                context
+            };
+            return private_view_from_events(home, &mut context, event, feedback_events.into_iter().collect(),
+                awards.into_iter().collect(), result_events.into_iter().collect(), now);
+        }
+    }
+
+    if let Some(original)=offer_events.iter().find(|e|e.id==offer_id) {
+        if event_to_draft(original).tags.iter().any(|t|t.0.as_slice()==["v","2"])
+            && !crate::private_content::public_v2::is_public(original) {
+            client.disconnect().await;
+            return Err(JobLifecycleError::Input("invalid v2 offer visibility; refusing legacy fallback".into()));
+        }
+    }
+    let public_offer = offer_events.iter().find(|e| e.id==offer_id && crate::private_content::public_v2::is_public(e)).cloned();
+    let public_claims: Vec<_> = feedback_events.iter().cloned().collect();
+    let public_awards: Vec<_> = if public_offer.is_some() {
+        client.fetch_events(Filter::new().kind(Kind::Custom(3405)).hashtag(gateway::MAXPLAYER_TAG).event(offer_id),timeout).await
+            .map_err(|_| JobLifecycleError::Relay("public v2 award read incomplete".into()))?.into_iter().collect()
+    } else { Vec::new() };
+    if let Some(original)=&public_offer {
+        crate::private_content::public_v2::Context::open(home).and_then(|mut ctx|ctx.remember(original,original))
+            .map_err(|e|JobLifecycleError::Input(e.to_string()))?;
+    }
     client.disconnect().await;
+    if let Some((mut context, original)) = local_private {
+        if !offer_events.iter().any(|event| event.id == offer_id) {
+            let mut view = private_view_from_events(home, &mut context, &original, Vec::new(), Vec::new(), Vec::new(), now)?;
+            view.pending = true;
+            view.read_confirmed = false;
+            return Ok(view);
+        }
+    }
+
 
     let offer = offer_events.into_iter().find(|event| event.id == offer_id).map(|event| {
         let draft = event_to_draft(&event);
@@ -3077,6 +3292,11 @@ pub(crate) async fn fetch_job_view_async(
 
     let mut claims = Vec::new();
     for event in feedback_events {
+        if let Some(original)=&public_offer {
+            if crate::private_content::public_v2::validate_child(original,&event).is_err() {continue;}
+            crate::private_content::public_v2::Context::open(home).and_then(|mut ctx|ctx.remember(original,&event))
+                .map_err(|e|JobLifecycleError::Input(e.to_string()))?;
+        }
         let draft = event_to_draft(&event);
         let status = first_tag_value(&draft.tags, "status")
             .unwrap_or("")
@@ -3097,6 +3317,21 @@ pub(crate) async fn fetch_job_view_async(
 
     let mut results = Vec::new();
     for event in result_events {
+        if let Some(original)=&public_offer {
+            use crate::private_content::{public_v2 as public,evidence::PrivateEvidence};
+            let Ok(Some(award_id))=public::value(&event,"award") else {continue;};
+            let Some(award)=public_awards.iter().find(|a|a.id.to_hex()==award_id) else {continue;};
+            let Some(selected)=gateway::parse_award(&event_to_draft(award)) else {continue;};
+            let Some(claim)=public_claims.iter().find(|c|c.id.to_hex()==selected.claim_id) else {continue;};
+            let evidence=PrivateEvidence {offer:original.clone(),claim:claim.clone(),award:award.clone(),result:event.clone(),
+                task_envelope:None,answer_envelope:if public::value(&event,"delivery")==Ok(Some("inline")){Some(event.content.clone())}else{None}};
+            let Ok(verified)=public::validate_evidence(&evidence,&original.pubkey.to_hex()) else {continue;};
+            let mut view=result_view_from_event(event.id.to_hex(),event.created_at.as_secs(),event.pubkey.to_hex(),&event_to_draft(&event));
+            view.inline_answer=verified.answer;
+            view.private_evidence=Some(evidence);
+            results.push(view);
+            continue;
+        }
         results.push(result_view_from_event(
             event.id.to_hex(),
             event.created_at.as_secs(),
@@ -3126,6 +3361,122 @@ pub(crate) async fn fetch_job_view_async(
         read_confirmed,
     };
     Ok(view)
+}
+
+/// A private view is built only from authenticated content and an exact signed
+/// selection. Missing answer copies do not become empty deliverable answers.
+fn private_view_from_events(
+    home: &MaxplayerHome,
+    context: &mut crate::private_content::channel::ContentContext,
+    event: &nostr_sdk::Event,
+    feedback: Vec<nostr_sdk::Event>,
+    awards: Vec<nostr_sdk::Event>,
+    result_events: Vec<nostr_sdk::Event>,
+    now: u64,
+) -> Result<JobView, JobLifecycleError> {
+    use crate::private_content::{evidence::PrivateEvidence, wire};
+    let err = |e: crate::private_content::Error| JobLifecycleError::Input(e.to_string());
+    let resolved = context.resolve_offer(event, now).map_err(err)?;
+    let tags = wire::validate_private(event, &context.policy.host).map_err(err)?;
+    let job_id = event.id.to_hex();
+    let task_envelope = if tags.get("discovery") == Some("targeted") {
+        Some(context.accept_content(event, event, None, None, None, now).map_err(err)?.envelope().to_owned())
+    } else { None };
+    let parsed = resolved.offer;
+    let offer = OfferView {
+        event_id: job_id.clone(), created_at: event.created_at.as_secs(), author_pubkey: event.pubkey.to_hex(),
+        author_display_name: None, task: parsed.task, output: parsed.output, amount_sats: parsed.amount,
+        deadline_unix: parsed.deadline_unix, targeted: parsed.seller_pubkey.is_some(), seller_pubkey: parsed.seller_pubkey,
+        seller_display_name: None, accepts_delivery: parsed.accepts_delivery,
+        repo: tags.get("repo").map(str::to_owned), branch: tags.get("branch").map(str::to_owned),
+        job_class: tags.get("job-class").map(str::to_owned),
+        contribution: resolved.contribution.map(|c| ContributionOfferView {
+            target_owner_pubkey: c.target_owner_pubkey, target_clone_url: c.target_clone_url,
+            base_branch: c.base_branch, base_oid: c.base_oid, accepts: c.accepts,
+        }),
+        requested_agent: parsed.requested_agent, requested_harness_family: parsed.requested_harness_family,
+        requested_model: parsed.requested_model, required_capabilities: parsed.required_capabilities,
+        payment_mode: parsed.payment_mode,
+    };
+    let mut claims = Vec::new();
+    for claim in &feedback {
+        let Ok(ct) = wire::validate_private(claim, &context.policy.host) else { continue; };
+        if claim.kind.as_u16() == 3404 {
+            if ct.get("root") != Some(job_id.as_str()) || ct.get("job") != tags.get("job")
+                || !ct.participants.contains(&event.pubkey.to_hex())
+                || (offer.targeted && offer.seller_pubkey.as_deref() != Some(claim.pubkey.to_hex().as_str())) {
+                continue;
+            }
+            let selected = awards.iter().find_map(|award| {
+                let at = wire::validate_private(award, &context.policy.host).ok()?;
+                let candidate = feedback.iter().find(|candidate| Some(candidate.id.to_hex().as_str()) == at.get("claim"))?;
+                (candidate.pubkey == claim.pubkey
+                    && crate::private_content::lifecycle::validate_selection(event, candidate, award, &context.policy.host).is_ok())
+                    .then_some((candidate, award))
+            });
+            let (candidate, award) = selected.map(|(c,a)| (Some(c),Some(a))).unwrap_or_default();
+            if ct.has("content-id") && context.accept_content(claim, event, candidate, award, None, now).is_err() { continue; }
+            if matches!(ct.get("status"), Some("error" | "refusal" | "claim_released")) {
+                claims.push(claim_view_from_tags(claim.id.to_hex(), claim.created_at.as_secs(),
+                    claim.pubkey.to_hex(), "error".into(), &event_to_draft(claim).tags));
+            }
+            continue;
+        }
+        if claim.kind.as_u16() != JOB_CLAIM_KIND || ct.get("root") != Some(job_id.as_str())
+            || ct.get("job") != tags.get("job") || !ct.participants.contains(&event.pubkey.to_hex())
+            || (offer.targeted && offer.seller_pubkey.as_deref() != Some(claim.pubkey.to_hex().as_str())) { continue; }
+        let content = if ct.has("content-id") {
+            let Ok(content) = context.accept_content(claim, event, Some(claim), None, None, now) else { continue; };
+            Some(content)
+        } else { None };
+        let mut view = claim_view_from_tags(claim.id.to_hex(), claim.created_at.as_secs(), claim.pubkey.to_hex(),
+            "processing".into(), &event_to_draft(claim).tags);
+        if let Some(content) = content {
+            let d = content.body().dispatch.as_ref().ok_or_else(|| JobLifecycleError::Input("claim dispatch missing".into()))?;
+            // The encrypted dispatch is the actual selected preset/model, not a
+            // public enum substitute for a custom preset or model filter.
+            view.agents = d.agent.iter().cloned().collect();
+            view.capability.harness_families = d.harness_family.iter().cloned().collect();
+            view.capability.models = match (&d.harness_family, &d.harness_model) {
+                (Some(family), Some(model)) => vec![crate::heartbeat::HarnessModel { family: family.clone(), model: model.clone() }],
+                _ => Vec::new(),
+            };
+            view.capability.capabilities = d.capabilities.clone().unwrap_or_default();
+        }
+        let recipient = context.recipient().to_owned();
+        context.store.remember_event(claim, event, &recipient, &context.policy.service, &context.policy.host).map_err(err)?;
+        claims.push(view);
+    }
+    let mut results = Vec::new();
+    for result in result_events {
+        let Ok(rt) = wire::validate_private(&result, &context.policy.host) else { continue; };
+        let Some(award) = awards.iter().find(|a| Some(a.id.to_hex().as_str()) == rt.get("award")) else { continue; };
+        let Ok(at) = wire::validate_private(award, &context.policy.host) else { continue; };
+        let Some(claim) = feedback.iter().find(|c| Some(c.id.to_hex().as_str()) == at.get("claim")) else { continue; };
+        if crate::private_content::lifecycle::validate_result(event, claim, award, &result, &context.policy.host).is_err() { continue; }
+        let answer_envelope = if rt.has("content-id") {
+            let Ok(answer) = context.accept_content(&result, event, Some(claim), Some(award), None, now) else { continue; };
+            Some(answer.envelope().to_owned())
+        } else { None };
+        let evidence = PrivateEvidence { offer: event.clone(), claim: claim.clone(), award: award.clone(), result: result.clone(),
+            task_envelope: task_envelope.clone(), answer_envelope };
+        let Ok(verified) = evidence.validate(&event.pubkey.to_hex(), &context.policy) else { continue; };
+        context.select(event, claim, award).map_err(err)?;
+        let mut view = result_view_from_event(result.id.to_hex(), result.created_at.as_secs(), result.pubkey.to_hex(), &event_to_draft(&result));
+        view.inline_answer = verified.answer;
+        view.contribution = verified.contribution.map(|c| ContributionResultView {
+            target_owner_pubkey: c.target_owner_pubkey, target_clone_url: c.target_clone_url,
+            base_branch: c.base_branch, base_oid: c.base_oid,
+            tuple_signature: rt.get("sig:seller-contribution").unwrap_or("").into(),
+        });
+        view.private_evidence = Some(evidence);
+        results.push(view);
+    }
+    claims.sort_by_key(|c| std::cmp::Reverse(c.created_at));
+    results.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+    let live_claim_id = derive_claim_liveness(&mut claims, &results, Some(offer.deadline_unix), now);
+    Ok(JobView { job_id: job_id.clone(), offer: Some(offer), claims, results, live_claim_id,
+        accepted: load_accepted_bind(home, &job_id)?, pending: false, read_confirmed: true })
 }
 
 /// Collect hex pubkeys for cosmetic kind-0 enrichment (never for pay/targeting).
@@ -3377,6 +3728,7 @@ mod tests {
     #[test]
     fn authorize_from_bind_refuses_amount_drift() {
         let bind = AcceptedBind {
+            private_evidence: None,
             delivery_kind: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
@@ -3419,6 +3771,7 @@ mod tests {
     #[test]
     fn single_settlement_refuses_different_result_and_is_idempotent_on_same() {
         let existing = AcceptedBind {
+            private_evidence: None,
             delivery_kind: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
@@ -3510,6 +3863,7 @@ mod tests {
             require_seller_signature(&Some("ab".repeat(64))).expect("valid non-empty sig accepted");
         assert_eq!(valid_sig, "ab".repeat(64));
         let bind = AcceptedBind {
+            private_evidence: None,
             delivery_kind: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
@@ -3565,6 +3919,7 @@ mod tests {
     #[test]
     fn explicit_and_bind_forms_build_identical_request() {
         let bind = AcceptedBind {
+            private_evidence: None,
             delivery_kind: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
@@ -3596,6 +3951,7 @@ mod tests {
         // The explicit request as mcp.rs builds it, with a job_hash that DIVERGES from the bind
         // (the real-trade failure) and creq_hash/accepted_mints/seller_signature left for the fill.
         let mut explicit = crate::authorize_pay::AuthorizePayRequest {
+            private_evidence: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: bind.job_id.clone(),
@@ -3628,6 +3984,7 @@ mod tests {
     #[test]
     fn explicit_form_seals_repo_and_branch_from_bind() {
         let bind = AcceptedBind {
+            private_evidence: None,
             delivery_kind: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
@@ -3652,6 +4009,7 @@ mod tests {
             contribution: None,
         };
         let mut explicit = crate::authorize_pay::AuthorizePayRequest {
+            private_evidence: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: bind.job_id.clone(),
@@ -3684,6 +4042,7 @@ mod tests {
     #[test]
     fn byte_equal_explicit_matches_bind_request() {
         let bind = AcceptedBind {
+            private_evidence: None,
             delivery_kind: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
@@ -3712,6 +4071,7 @@ mod tests {
 
         // Explicit form with EVERY field byte-equal to the bind (the incident's inputs).
         let mut explicit = crate::authorize_pay::AuthorizePayRequest {
+            private_evidence: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: bind.job_id.clone(),
@@ -3750,6 +4110,7 @@ mod tests {
         let bound_mint = "https://mint.minibits.cash/Bitcoin".to_string();
         let attacker_mint = "https://evil.example/attacker".to_string();
         let bind = AcceptedBind {
+            private_evidence: None,
             delivery_kind: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
@@ -3776,6 +4137,7 @@ mod tests {
             contribution: None,
         };
         let mut explicit = crate::authorize_pay::AuthorizePayRequest {
+            private_evidence: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: bind.job_id.clone(),
@@ -3861,6 +4223,7 @@ mod tests {
             CashuPublicKey::from_str(&format!("02{}", seller_nostr.to_hex())).expect("p2pk");
 
         let bind = AcceptedBind {
+            private_evidence: None,
             delivery_kind: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
@@ -3978,6 +4341,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let home = home::bootstrap(&root).expect("home");
         let bind = AcceptedBind {
+            private_evidence: None,
             delivery_kind: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
@@ -4185,6 +4549,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let home = home::bootstrap(&root).expect("home");
         let mut bind = AcceptedBind {
+            private_evidence: None,
             delivery_kind: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
@@ -4258,6 +4623,7 @@ mod tests {
         let job_id = "aa".repeat(32);
 
         let bind_for = |result_id: &str| AcceptedBind {
+            private_evidence: None,
             delivery_kind: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
@@ -4350,6 +4716,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let home = home::bootstrap(&root).expect("home");
         let mut bind = AcceptedBind {
+            private_evidence: None,
             delivery_kind: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
@@ -4399,6 +4766,7 @@ mod tests {
     #[test]
     fn authorize_from_bind_requires_buyer_tip_match_hash() {
         let bind = AcceptedBind {
+            private_evidence: None,
             delivery_kind: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
@@ -4443,6 +4811,7 @@ mod tests {
     #[test]
     fn assert_authorize_matches_bind_refuses_seller_mismatch() {
         let bind = AcceptedBind {
+            private_evidence: None,
             delivery_kind: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
@@ -4474,6 +4843,7 @@ mod tests {
 
     fn result_view(result_id: &str, seller_pubkey: &str) -> ResultView {
         ResultView {
+            private_evidence: None,
             inline_answer: None,
             result_id: result_id.to_owned(),
             created_at: 100,
@@ -4778,6 +5148,7 @@ mod tests {
     /// `commit_oid` so [`delivery_pay_deadline`] counts it as a delivery.
     fn delivery_result(seller_pubkey: &str, created_at: u64) -> ResultView {
         ResultView {
+            private_evidence: None,
             inline_answer: None,
             result_id: format!("res-{created_at}"),
             created_at,
@@ -4923,6 +5294,10 @@ mod tests {
         let err = post_job(
             &home,
             PostJobRequest {
+                visibility: Some(crate::private_content::wire::Visibility::Public),
+                output_category: None,
+                #[cfg(feature = "wallet")]
+                inputs: vec![],
                 accepts_delivery: Vec::new(),
                 payment_mode: crate::gateway::PaymentMode::Sat,
                 task: "t".into(),
@@ -5116,6 +5491,10 @@ mod tests {
         let posted = post_job_async(
             &home,
             PostJobRequest {
+                visibility: Some(crate::private_content::wire::Visibility::Public),
+                output_category: None,
+                #[cfg(feature = "wallet")]
+                inputs: vec![],
                 accepts_delivery: Vec::new(),
                 payment_mode: crate::gateway::PaymentMode::Sat,
                 task: "wake on arrival".into(),
@@ -5211,6 +5590,10 @@ mod tests {
         let posted = post_job_async(
             &home,
             PostJobRequest {
+                visibility: Some(crate::private_content::wire::Visibility::Public),
+                output_category: None,
+                #[cfg(feature = "wallet")]
+                inputs: vec![],
                 accepts_delivery: Vec::new(),
                 payment_mode: crate::gateway::PaymentMode::Sat,
                 task: "test display-name opt-in".into(),
@@ -5275,6 +5658,10 @@ mod tests {
         let err = post_job(
             &home,
             PostJobRequest {
+                visibility: Some(crate::private_content::wire::Visibility::Public),
+                output_category: None,
+                #[cfg(feature = "wallet")]
+                inputs: vec![],
                 accepts_delivery: Vec::new(),
                 payment_mode: crate::gateway::PaymentMode::Sat,
                 task: "t".into(),
@@ -5626,6 +6013,7 @@ mod tests {
         let answer = "Europe/Zagreb";
         let digest = crate::receipt::result_content_hash_hex(answer);
         let bind = AcceptedBind {
+            private_evidence: None,
             delivery_kind: Some(crate::receipt::DeliveryKind::Inline.as_str().to_owned()),
             inline_answer: Some(answer.to_owned()),
             payment_mode: crate::gateway::PaymentMode::Sat,
@@ -5664,6 +6052,7 @@ mod tests {
     #[test]
     fn authorize_request_from_bind_threads_contribution() {
         let mut bind = AcceptedBind {
+            private_evidence: None,
             delivery_kind: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
@@ -5755,6 +6144,10 @@ mod tests {
         accepts: Option<Vec<String>>,
     ) -> PostJobRequest {
         PostJobRequest {
+            visibility: Some(crate::private_content::wire::Visibility::Public),
+            output_category: None,
+            #[cfg(feature = "wallet")]
+            inputs: vec![],
             accepts_delivery: Vec::new(),
             payment_mode: crate::gateway::PaymentMode::Sat,
             task: "t".into(),
@@ -5830,6 +6223,10 @@ mod tests {
         capabilities: &[&str],
     ) -> PostJobRequest {
         PostJobRequest {
+            visibility: Some(crate::private_content::wire::Visibility::Public),
+            output_category: None,
+            #[cfg(feature = "wallet")]
+            inputs: vec![],
             accepts_delivery: Vec::new(),
             payment_mode: crate::gateway::PaymentMode::Sat,
             task: "t".into(),
@@ -5991,6 +6388,10 @@ mod tests {
     fn post_job_from_scratch_emits_byte_identical_tags() {
         // No contribution params ⇒ Ok(None) ⇒ built tags are byte-identical to the bare offer.
         let request = PostJobRequest {
+            visibility: Some(crate::private_content::wire::Visibility::Public),
+            output_category: None,
+            #[cfg(feature = "wallet")]
+            inputs: vec![],
             accepts_delivery: Vec::new(),
             payment_mode: crate::gateway::PaymentMode::Sat,
             task: "t".into(),
@@ -6200,6 +6601,10 @@ mod tests {
         let err = post_job_async(
             &home,
             PostJobRequest {
+                visibility: Some(crate::private_content::wire::Visibility::Public),
+                output_category: None,
+                #[cfg(feature = "wallet")]
+                inputs: vec![],
                 accepts_delivery: Vec::new(),
                 payment_mode: crate::gateway::PaymentMode::Sat,
                 task: "t".into(),
@@ -6660,6 +7065,10 @@ mod free_lane_tests {
 
     fn post_request(amount_sats: u64, payment_mode: PaymentMode) -> PostJobRequest {
         PostJobRequest {
+            visibility: Some(crate::private_content::wire::Visibility::Public),
+            output_category: None,
+            #[cfg(feature = "wallet")]
+            inputs: vec![],
             accepts_delivery: Vec::new(),
             payment_mode,
             task: "t".into(),
@@ -6920,5 +7329,69 @@ mod review_exposure_tests {
             view.results[0].inline_answer.as_deref(),
             Some("steal the agent context")
         );
+
+#[cfg(test)]
+mod private_flow_tests {
+    use super::*;
+    use crate::private_content::{channel::ContentContext, evidence::inline_fixture, PreparedContent};
+
+    #[tokio::test]
+    async fn private_content_view_and_bind_remain_exact_across_restart_and_payment_refusal() {
+        let (evidence, request, buyer, policy) = inline_fixture();
+        let temp = tempfile::tempdir().unwrap();
+        let mut home = home::bootstrap(temp.path()).unwrap();
+        // Public deterministic test identity only, never a configured operator key.
+        std::fs::write(&home.key_path, format!("{:064x}", 1)).unwrap();
+        home.config.privacy.private_content_v2 = true;
+        home.config.privacy.private_job_repos = true;
+        home.config.privacy.private_jobs = true;
+        home.config.privacy.service_pubkey = Some(policy.service);
+        home.config.privacy.git_base = Some(policy.host.git_prefix);
+        let mut ctx = ContentContext::open(&home, &buyer.public_key().to_hex()).unwrap();
+        let now = nostr_sdk::Timestamp::now().as_secs();
+        let build = |ctx: &mut ContentContext| private_view_from_events(&home, ctx, &evidence.offer,
+            vec![evidence.claim.clone()], vec![evidence.award.clone()], vec![evidence.result.clone()], now);
+        // Answer-before-offer is staged, never interpreted as an executable task.
+        ctx.stage(&PreparedContent::decode(evidence.answer_envelope.as_ref().unwrap()).unwrap(), now).unwrap();
+        assert!(build(&mut ctx).is_err());
+        ctx.stage(&PreparedContent::decode(evidence.task_envelope.as_ref().unwrap()).unwrap(), now).unwrap();
+        let view = build(&mut ctx).unwrap();
+        assert_eq!(view.offer.as_ref().unwrap().task, "private task");
+        assert_eq!(view.results.len(), 1);
+        assert_eq!(view.results[0].inline_answer, request.inline_answer);
+        assert_eq!(view.results[0].private_evidence.as_ref(), Some(&evidence));
+        let public_view = serde_json::to_string(&view.results[0]).unwrap();
+        assert!(!public_view.contains("body_b64"), "internal signed evidence is not a presentation field");
+        let bind = AcceptedBind {
+            private_evidence: Some(evidence.clone()), job_id: request.job_id.clone(), claim_id: evidence.claim.id.to_hex(),
+            result_id: request.result_id.clone(), seller_pubkey: request.seller_pubkey.clone(), commit_oid: request.commit_oid.clone(),
+            repo: String::new(), branch: String::new(), delivery_kind: Some("inline".into()), inline_answer: request.inline_answer.clone(),
+            job_hash: request.job_hash.clone(), amount_sats: 0, accept_event_id: String::new(), accepted_at: 0,
+            seller_signature: request.seller_signature.clone(), creq_hash: None, accepted_mints: Vec::new(), funding_mint: None,
+            delivery_mint: None, agent_used: None, model_used: None, contribution: None, payment_mode: PaymentMode::None,
+        };
+        validate_private_bind(&home, &bind).unwrap();
+        write_accepted_bind(&home, &bind).unwrap();
+        drop(ctx);
+        let restored = load_accepted_bind(&home, &request.job_id).unwrap().unwrap();
+        assert_eq!(restored, bind);
+        validate_private_bind(&home, &restored).unwrap();
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(bind_path(&home, &request.job_id)).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        assert!(assert_single_settlement(Some(&restored), &request.job_id, &"44".repeat(32)).is_err());
+        let mut changed = restored.clone();
+        changed.inline_answer = Some("different answer".into());
+        assert!(validate_private_bind(&home, &changed).is_err());
+        // Drive the actual money entry, not just the evidence helper: a caller
+        // cannot turn this free signed trade into a priced one by changing its bind.
+        let mut paid = request;
+        paid.payment_mode = PaymentMode::Sat;
+        paid.amount_sats = 20;
+        let mut gate = crate::budget::BudgetGate::new(100);
+        assert!(crate::authorize_pay::authorize_pay_async(&home, &mut gate, paid).await.is_err());
+        assert!(!home.root.join("payment-journal").exists());
+        assert!(!home.wallet_dir.join("wallet.sqlite").exists());
     }
 }

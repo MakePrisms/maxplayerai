@@ -2,7 +2,7 @@
 
 Implements the reviewed [product specification](private-offers-and-deliveries.md) and
 [wire contract](private-offers-wire-v2.md). **Work in progress, not ready for deployment.**
-The existing buyer/seller trade loop still publishes protocol v1. No private posting is enabled.
+The integration branch wires targeted/open-pool private jobs and explicit public v2 jobs into the existing buyer/seller loop. All private enablement switches remain off by default; no deployment has occurred. See the [coordinated rollout guide](private-offers-rollout.md).
 
 ## Implemented building blocks
 
@@ -15,8 +15,10 @@ The existing buyer/seller trade loop still publishes protocol v1. No private pos
   reservations, conflicts/deduplication, bounded unknown-message staging, restart recovery and
   independently validated service copies. Queries require explicit EOSE before advancing cursors;
   SDK convenience fetches can return partial history on timeout and are not sufficient here.
-- V2 receipt bytes and independent Python byte/Schnorr fixtures. These do **not** yet replace the
-  existing payment-path producer/verifier; that cutover must happen together.
+- V2 receipt bytes and independent Python byte/Schnorr fixtures; immutable signed evidence and
+  exact inline envelopes now flow through accept, verification, payment, receipt, collect and
+  restart. Existing journals keep their original signature domain. Public v2 inline content uses
+  the same salted commitment, without encryption.
 - Per-job repository migration, immutable offer/award binding, primary-DB role checks before Git
   hydration (including fast/cache paths), immutable input/delivery refs, terminal write closure,
   no public ref announcements, and bounded cumulative uncompressed-object inspection before CAS.
@@ -29,18 +31,38 @@ The existing buyer/seller trade loop still publishes protocol v1. No private pos
 - Public observatory placeholders distinguish targeted-private tasks from intentionally public
   open-pool tasks with private execution/delivery.
 
-## Remaining integration (required before enablement)
+## Integrated lifecycle
 
-- Coordinated v2 producers/parsers across every lifecycle kind, including explicit public jobs.
-- Buyer/seller configuration, CLI/MCP visibility and input-file surfaces; no silent public fallback.
-- Persistent live content workers and signed-event context resolution in the buyer/seller flows.
-- Targeted task/input availability before claim; private claim capabilities; open-pool selection;
-  private execution/results/feedback/rejection; repository setup on the existing delivery path.
-- Contribution input/history handling, container delivery and new-offer follow-ups.
-- Inline salted commitment and Git OID binding through accept, verify, pay-once, receipt, collect
-  and restart. Preserve existing budget, invoice, mint, signature and result-specific bind gates.
-- End-to-end four-identity, paid/free/public, outage/reordering/restart and HTTP ACL/cache tests.
-- Service consumer deployment wiring, coordinated cutover instructions and documentation updates.
+- MCP/buyer visibility, explicit coarse output category, regular-file input manifests and persisted
+  defaults. Disabled/misconfigured private posting fails before publication, never falls public.
+- Original tasks/dispatch and bounded pinned inputs are resolved before claim. Selected private
+  repository writes are provisioned through the existing award path. Open-pool initial tasks stay
+  public; subsequent text is encrypted for buyer, selected seller and Maxplayer.
+- Seller claim/result/feedback outbox projection, signer-actor encryption, independent service
+  copy retries, authenticated EOSE backfill and restart-safe scan progress. Buyer copy retries
+  run independently of active or completed jobs.
+- Per-job host and container delivery routes, verified input baselines, contribution base imports,
+  inherited checks and isolated Git objects without source credentials/hooks/config.
+- Buyer result views require the exact signed claim/award chain and original envelope. Immutable
+  evidence, signatures, invoice/mint set, selected result and funding choice survive restart.
+  Same-result accept retries reuse the sealed funding choice.
+- Public v2 retains public Git/text behavior but shares the exact award, artifact and receipt
+  bindings. Its signed evidence has a separate local namespace from authenticated private content.
+
+## Verification and rollout gates
+
+The foundation has 1,803 core and 240 CLI regressions, 18 observatory tests, disposable PostgreSQL
+migration/ACL tests, actual HTTP authorization/replay checks and a concurrent quota/CAS test.
+The first lifecycle checkpoint passed 1,815 core tests (5 ignored); the subsequent focused run
+passed 38 tests including public-inline binding and four-identity targeted/open-pool transport,
+reordering and restart. Expanded paid/free tests and final regressions are being run on the
+integration branch; this section must not be read as validation of later untested edits.
+
+Before deployment: review the final implementation/CI, prove the assembled client/relay/service
+installation with targeted/open-pool paid/free inline/Git jobs, and validate representative
+contribution repositories against the bounded history limits. No live mint or production trade
+has been used for local verification. Service access is through its designated participant key,
+not a newly introduced reviewer role or an application ACK.
 
 ## Engineering details
 
@@ -56,8 +78,7 @@ implementation also bounds inspection to 100,000 objects, 1,000 commits and 30 s
 symlinks and submodules. These limits require representative contribution fixtures before rollout.
 The existing manifest-pointer CAS is the publication transaction: two pushes based on one parent
 cannot both publish their independently measured graphs. A loser must hydrate the winning parent
-and be measured again; failed pushes cannot make partial refs visible. This must also be proved
-in the concurrent-push integration test, not just inferred from unit quota tests.
+and be measured again; failed pushes cannot make partial refs visible. The concurrent-push integration test proves this publication/quota boundary with two overlapping 54 MiB snapshots.
 
 No READY phase, post-award buyer input handoff, application-level service ACK, paid external
 service or production probe has been introduced.
