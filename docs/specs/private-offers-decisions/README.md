@@ -72,3 +72,16 @@ Most core requirements were already represented, but the implementation PR previ
 - No mandatory Maxplayer ACK/start gate; required recipient copy and durable retries remain: §§4.2–4.3; tests 4, 7, 15. No synchronous receipt/decryption proof is claimed.
 - Wire/storage changes remain distinct from lifecycle changes: §§3, 5.3, 7.
 - [Updated flow diagram](../private-offers-flow/README.md) supersedes the earlier Discord diagram’s post-selection input boxes and proposed ACK/start gate.
+
+## Engineering resolution of independent review
+
+[Normative wire supplement](../private-offers-wire-v2.md):
+
+- §1 inherits main's lifecycle author/phase rules and maps private content onto the corresponding existing event. Follow-up work remains a new OFFER; review artifacts do not introduce a reviewer-authored lifecycle event.
+- §2 closes the private public-field schema, nested invoice fields, numeric qualifiers and enum values. Free-form dispatch/model details remain available to existing matching checks through the appropriate content path, not arbitrary public labels.
+- §3 preserves main's job-level public ACCEPT semantics, while specifying exact durable result bind, RECEIPT reply binding, v2 inline body and co-signature bytes.
+- §4 prevents reusing a routing job ID for another signed OFFER. Random routing IDs are explicitly distinct from existing offer-ID-based invoice/payment identities.
+
+These are engineering clarifications of the already approved scope, not new human decisions. Acceptance scenarios 17–19 cover the new precision. Diagram Git audience explicitly includes target read access before claim.
+
+[Review findings, corrections and final independent verdict](independent-review-resolution.md).

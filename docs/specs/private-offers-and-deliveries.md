@@ -64,6 +64,8 @@ Issue/PR preflight found the existing privacy draft (#1023), not an already inte
 
 ## 3. Public wire contract — protocol v2
 
+The [normative wire supplement](private-offers-wire-v2.md) defines the exact content-to-event mapping, closed per-kind private schemas, public-inline encoding and receipt preimage. Its precise definitions take precedence over shorthand summaries below. Main’s lifecycle authors/phases remain authoritative. No standalone follow-up/review message type is introduced.
+
 Keep the existing lifecycle `offer → claim → award → execute → result → verify → accept → pay → receipt`. No new READY, input-handoff or service-ACK event/state is introduced. This does **not** mean unchanged wire compatibility: content references and private delivery binding still change.
 
 Use marketplace `["v","2"]` on all new lifecycle events, including fully public jobs; this is independent of the ACP protocol version. Update every producer/parser and version fixture together. Unsupported/missing major on a newly admitted job fails closed after cutover.
@@ -76,7 +78,7 @@ Keep OFFER/CLAIM/AWARD/RESULT/FEEDBACK/ACCEPT/REJECT/RECEIPT kinds and their aut
 - Private events have empty `content` and no task/title/free-form `i`, URL, filename, path, progress, error or summary tags. An open-pool OFFER alone carries the initial public task. An explicit public job uses the public content fields.
 - Public private-job Git locators and branch identifiers, where required for delivery verification, use only opaque repo IDs and generated ref names. No user-supplied repository name or descriptive path enters a lifecycle event.
 
-**Allowlist:** event kind/version/ID/signature/author; buyer/seller; job and lifecycle references; timestamps/deadlines; amount/currency/payment mode/mint; coarse status and enumerated reason; standardized capability/output codes; approved numeric usage; settlement signatures and delivery integrity identifiers. Every new field requires classification. Reject duplicate singleton tags, unknown private-job content-bearing fields and contradictory visibility/target combinations. Never echo untrusted input in public error strings.
+**Allowlist:** event kind/version/ID/signature/author; buyer/seller; job and lifecycle references; timestamps/deadlines; amount/currency/payment mode/mint; coarse status and enumerated reason; standardized capability/output codes; approved numeric usage; settlement signatures and delivery integrity identifiers. Every new field requires classification. Reject duplicate singleton tags, **every unlisted private-job tag/subkey**, invalid enum/lexical values and contradictory visibility/target combinations. The supplement specifies the only public fields and their exact shapes; arbitrary model/preset labels are private details, not approved public metadata. Never echo untrusted input in public error strings.
 
 Private fields include requirements, task titles, acceptance criteria, follow-ups, answers, review findings, rejection explanations, descriptive URLs, attachment manifests, filenames and Git content/history. Classifier findings use the same private transport; this spec does not add a classifier product or a public verdict format.
 
@@ -101,11 +103,13 @@ Illustrative plaintext body (placeholders are not valid hashes):
   "author": "<pubkey>",
   "recipients": ["<buyer>", "<seller>", "<Maxplayer>"],
   "text": "Private task text",
+  "requested_output": "text/plain",
+  "dispatch": {},
   "attachments": []
 }
 ```
 
-`type` is one of `task`, `followup`, `progress`, `answer`, `feedback`, `rejection`, `review`. Attachments have `repo_id`, `commit_oid`, `path`, `size_bytes`, `sha256`; all stay inside encryption. A `review` additionally requires `subject` with `offer_id` and the exact reviewed task `content_id`/`content_commitment` (or the public offer ID). A delivery review also requires `award_id`, `result_event_id`, and exactly one of `commit_oid` or inline `content_commitment`, matching that RESULT. Validate these against the participant-visible artifacts; a job ID or award ID alone does not bind a review to a delivery revision. A superseded review never becomes an assessment of a newer result automatically. These subject fields remain encrypted.
+`type` is one of `task`, `claim_details`, `progress`, `answer`, `feedback`, `rejection`, mapped to existing signed carriers/authors/phases by the [wire supplement §1](private-offers-wire-v2.md#1-mains-event-rules-remain-authoritative). Attachments have `repo_id`, `commit_oid`, `path`, `size_bytes`, `sha256`; all stay inside encryption. Review findings are attached subject-bound artifacts inside those existing content records or protected Git files, not a standalone transport event. The supplement defines pre-publication versus already-published artifact bindings without circular offer/result IDs. Follow-up work is a new offer/task, not an in-job `followup` type.
 
 A content record is immutable. Edits to non-task explanations have a fresh message ID, incremented revision and `supersedes` ID. A change to the committed task or its required input manifest requires a new offer, not a content revision that silently changes an existing claim. Reordering does not apply an edit over an unknown predecessor.
 
@@ -124,8 +128,8 @@ Receivers verify outer/seal signatures and decryption, seal author equals rumor 
 
 - Targeted task before award: buyer, targeted seller, configured Maxplayer service identity. This necessarily discloses the task to that target even if it declines.
 - Private execution: buyer, awarded seller and that same service identity, including a self-copy for the sender where applicable.
-- Discovery has public machine-readable claims; free-form candidate pitches are not introduced in this release. Unselected sellers receive no private attachments or execution messages.
-- Review/explanation messages about the job use the same three-party content channel. New audiences need a later explicit policy, not ad hoc extra `p` tags.
+- Discovery has public machine-readable claim coordination. When non-enumerated model/custom-preset details are needed, the signed claim binds encrypted `claim_details` for buyer, that claimant and Maxplayer. This preserves capability matching without publishing free-form labels. It introduces no free-form candidate-pitch feature. Candidates do not receive other candidates’ private details or the winner’s execution content.
+- Review/explanation artifacts use the applicable existing carrier’s recipient scope in the supplement (including the candidate for its own pre-award feedback). New audiences need a later explicit policy, not ad hoc extra `p` tags.
 
 Pin the service public key from trusted deployment configuration, never from an arbitrary offer. No payment token, wallet material or credential is copied to this audience.
 
@@ -170,7 +174,7 @@ Proposed minimal NIP-98 authenticated operation: `PUT /api/jobs/private/{job_id}
 - Same binding is idempotent. A conflicting award/repo binding returns `409`; it never switches access to another seller by arrival timestamp. The existing buyer selection logic still owns the single-award guarantee.
 - NIP-98 method/URL/body/replay checks apply. Every Git read/write rechecks the appropriate stored job/award permissions; creating a repo does not authorize work.
 
-There is no separate `/activate` or `/readiness` workflow in this scope. The hosting operation does not block on Maxplayer decrypting messages. Single-host database uniqueness on buyer/job/repo bindings, restricted access before award, and valid-award write authorization remain necessary storage implementation details.
+There is no separate `/activate` or `/readiness` workflow in this scope. The hosting operation does not block on Maxplayer decrypting messages. The first provisioning reserves `(tenant,buyer,job_id)` for exactly one validated signed OFFER ID/content commitment; reuse by another offer returns `409`, even before award or after closure. Client and server both enforce this—not just random ID generation. Single-host database uniqueness on buyer/job/repo bindings, restricted access before award, and valid-award write authorization remain necessary storage implementation details.
 
 Failure after AWARD never selects a replacement or duplicates work automatically. Resume the same award/task/delivery state. Material changes to task, price or required inputs need a new offer, not a silent private follow-up.
 
@@ -210,9 +214,9 @@ job_hash = SHA256(UTF8("maxplayer/job/v2\0") || offer_event_id[32])
 
 The signed OFFER already binds the amount, task or salted task commitment, visibility and random job ID. Both seller and buyer must validate that offer and private task commitment before deriving/accepting the hash. This retains a 32-byte commitment in existing receipt machinery without exposing a separate plaintext guessing oracle. Update every job-hash producer/verifier and sentinel fixture together; do not change just the seller output. A changed task/amount requires a new OFFER ID and hence a new job hash.
 
-Git RESULT retains verification-required repo/ref/commit identifiers with opaque naming. The buyer fetches the exact result commit from the authorized job repo, verifies input/base relationship and sentinel, then binds ACCEPT and payment. Do not copy task text into public commit descriptions or result summaries; full commit content stays within the private repo.
+Git RESULT retains verification-required repo/ref/commit identifiers with opaque naming. The buyer fetches the exact result commit from the authorized job repo, verifies input/base relationship and sentinel, then persists the exact result-specific local bind before publishing main’s job-level ACCEPT and executing payment. The public ACCEPT itself does not gain a result reference; the receipt already names the exact result. Do not copy task text into public commit descriptions or result summaries; full commit content stays within the private repo.
 
-Private inline answers live in the encrypted answer body, not public RESULT content. Define v2 inline delivery identity as that answer's salted `content-commitment`; buyer validates decrypted bytes against it before ACCEPT. Update the existing inline-preimage construction and verification on both sides to use this identity, preserving the rest of the existing payment/signature preimage fields. Public v2 inline answers use the same envelope/commitment formula with a public envelope, since their text is intentionally public. Keep the existing eligibility rules: no contribution inline delivery; a nonempty worktree delivers Git; marked answer required. Test that no remaining public field carries an unsalted hash of private inline text.
+Private inline answers live in the encrypted answer body, not public RESULT content. Define v2 inline delivery identity as that answer's salted `content-commitment`; buyer validates decrypted bytes against it before ACCEPT. Update the existing inline-preimage construction and verification on both sides to use this identity, using the exact v2 domain/array and the existing result-ID/mint exclusions defined in [wire supplement §3](private-offers-wire-v2.md#3-exact-delivery-and-settlement-binding). Public v2 inline answers use the same envelope/commitment formula with a public envelope, since their text is intentionally public. Keep the existing eligibility rules: no contribution inline delivery; a nonempty worktree delivers Git; marked answer required. Test that no remaining public field carries an unsalted hash of private inline text.
 
 A private verification/rejection explanation is encrypted with the service copy. Public REJECT retains its enumerated reason and result binding. Missing delivery content, unknown repo or unverifiable delivery cannot turn into ACCEPT or payment. An offline Maxplayer content consumer alone does not prevent valid buyer verification or payment. Content-copy delivery is retried independently; no service ACK is required or treated as proof of work quality.
 
@@ -220,7 +224,7 @@ A private verification/rejection explanation is encrypted with the service copy.
 
 All development flags default off. With a stage disabled, attempts to request the new private lane fail explicitly; flags never downgrade it to public. Old behavior remains only before coordinated cutover, not as an indefinite compatibility implementation.
 
-**PR1 — protocol and encrypted content** (`private_content_v2=false`): v2 typed schemas/builders/parsers; exact byte/commitment vectors; extracted envelope helper; outbox/inbox and independent Maxplayer content consumption; public field allowlist; timestamp/size/replay tests. No user-visible private posting until all stages are enabled. Target files: gateway/kinds, new content module, payment transport extraction, service consumer, schema fixtures. Failure gates: conflicting recipient copies, forged author, wrong job/award, stale wrapper, duplicate IDs, missing service copy, oversize message, no change to payment recipients.
+**PR1 — protocol and encrypted content** (`private_content_v2=false`): v2 typed schemas/builders/parsers; exact byte/commitment vectors; extracted envelope helper; outbox/inbox and independent Maxplayer content consumption; public field allowlist; timestamp/size/replay tests. Publish cross-implementation byte/signature vectors from the wire supplement. No user-visible private posting until all stages are enabled. Target files: gateway/kinds, new content module, payment transport extraction, service consumer, schema fixtures. Failure gates: conflicting recipient copies, forged author, wrong job/award, stale wrapper, duplicate IDs, missing service copy, oversize message, no change to payment recipients.
 
 **PR2 — private Git scope** (`private_job_repos=false`, requires PR1): job/ACL database migration, idempotent job-repo provisioning, read-route authorization, push hook roles, immutable refs, quotas and private announcement behavior. Target files: buzz Git transport/policy/hydration/manifest paths plus schema and API routing. Failure gates: outsider with valid relay membership; global public-read enabled; warm-cache access; arbitrary OID/cross-job traversal; stale token after closure; buyer writing delivery ref; seller rewriting inputs; conflicting award binding; crash during provisioning/award binding; concurrent quota pushes.
 
@@ -248,6 +252,10 @@ Use deterministic local relay/service/Git fixtures and at least four identities 
 14. Replacement job sees only explicitly carried inputs; old seller cannot access the new job.
 15. Unknown protocol/flags/service key or missing ACL never falls back to public/legacy. Git/relay outages use bounded existing operation retry/failure paths; an offline Maxplayer consumer alone never creates a start gate.
 16. Review of result A cannot be attached to result B, another offer/task revision, another commit, or another inline commitment. Valid re-encryption of a stale review does not bypass subject-version validation.
+
+17. Closed-schema mutations cover every public tag/subkey/value (including invoice nested fields), unknown keys, duplicate singleton/list entries, wrong carrier author/type/phase and claims with missing required private filter details.
+18. Two result events for one claim cannot swap the persisted verified delivery or produce duplicate payments after restart. ACCEPT stays publicly job-scoped; RECEIPT names the bound result, and v2 Git/inline preimages match independent byte vectors.
+19. Another signed offer cannot reuse `(tenant,buyer,job_id)` before award or after closure; repeat of the exact pinned offer is idempotent.
 
 Rollout: drain active v1 jobs; back up/migrate the existing stores under existing operational policy; deploy relay/service/schema, then buyers/sellers/UI; verify all peers advertise v2; run local/staging four-identity tests; enable the complete lane together. Existing public history stays public. Do not attempt to privatize old public Git objects or postings. No production probe is part of this docs task.
 
@@ -277,3 +285,7 @@ These do not reopen the product scope. Proposed defaults let implementation proc
 5. **Public/private UX:** `visibility` plus existing seller targeting, with explicit public-discovery wording. Default private execution is not a promise to hide an open-pool task.
 
 Recommended implementation starting point: PR1 wire-schema and commitment test vectors, followed by PR2's outsider-access tests. Enable only after PR3's complete flow passes.
+
+## 12. Independent review resolution
+
+The review of `207f38c` identified incomplete message mapping, public schema and delivery binding, plus job-ID reuse and a diagram audience ambiguity. [The wire supplement](private-offers-wire-v2.md) resolves the three schema findings and identity reuse without adding lifecycle roles/states. The diagram now explicitly distinguishes targeted read-only pre-claim access from selected-seller delivery access. Earlier source snapshots remain unchanged. [Independent re-review](private-offers-decisions/independent-review-resolution.md) by GPT-5.6-Sol approved the corrected specification with no remaining blockers found; this is documentation review, not runtime validation.

@@ -12,7 +12,7 @@
 
 - Amber: public content/metadata. Private jobs still reveal identities, lifecycle status and approved commercial/integrity metadata.
 - Purple: text encrypted in separate copies for buyer, the relevant seller, and Maxplayer.
-- Green: files in an authenticated per-job Git repository. The file bytes are not recipient-encrypted; transport is protected and serving is access-controlled.
+- Green: files in an authenticated per-job Git repository. Targeted sellers can read required inputs before claim; only the awarded seller may write deliveries. The file bytes are not recipient-encrypted; transport is protected and serving is access-controlled.
 - Gray: execution/availability rules, not another encryption mechanism.
 
 Targeted private jobs supply the complete task and required files before claim. Open-pool jobs supply a complete public task and do not wait for new private buyer inputs after award. Private progress, answers and delivery follow the selected seller. A Maxplayer copy remains mandatory, but a decryption acknowledgment is not an execution prerequisite. Existing verification/payment protection remains in place.
