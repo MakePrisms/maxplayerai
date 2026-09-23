@@ -111,8 +111,9 @@ A Maxplayer-specific extension, **not a NUT**. It's versioned so it can be propo
   swap is the same request by construction, and random for reads.
 - The client subscribes for responses **before** it publishes, on every relay, and takes the first
   valid response. The mint processes a request once no matter how many relays deliver it (§3.3).
-- **Limits:** plaintext ≤ 48 KiB, which is under the common 64 KiB relay event cap. The mint sets
-  CDK `with_limits(max_inputs, max_outputs)` to match, and wallets split larger swaps. Requests past
+- **Limits:** NIP-44 caps plaintext at 65,535 bytes. Measured (§9): a swap costs ~400 B per proof
+  each way, so 128 inputs + 128 outputs = 50.9 KB request / 40.0 KB reply; 256 does not fit. The
+  mint sets CDK `with_limits(128, 128)` and wallets split larger swaps. Requests past
   `exp` or older than 120 s are dropped unanswered.
 
 ### 3.2 Operations — the entire surface
@@ -133,14 +134,14 @@ else: it calls `Mint::process_swap_request`, `check_state`, `pubkeys` and friend
 
 ### 3.3 Reliable writes
 
-- **Mint side:** a `responses` table keyed by request `id` stores the exact response in the **same
-  transaction** as the swap commit (a CDK database transaction hook, or a wrapper that runs the swap
-  and then writes the row before replying; stage 3 picks one and tests the crash window). A
-  duplicate `id` replays the stored response and never re-executes. Rows are kept for 7 days.
-- **Wallet side:** CDK already journals swap intent and outputs before sending, and
-  `recover_incomplete_sagas` restores from them. A lost reply is recovered by re-sending the
-  identical request (same `id`, so the cached response comes back) or, failing that, by NUT-09
-  restore. The wallet never regenerates outputs for an ambiguous swap.
+- **No mint-side response cache.** CDK refuses a replayed swap (`TokenAlreadySpent` /
+  `DuplicateOutputs`) and never re-executes it; recovery goes through the wallet (below). Tested, §9.
+- **Wallet side:** CDK journals swap intent and outputs before sending. After ANY ambiguous error the
+  caller runs `recover_incomplete_sagas()`, which replays, checks proof state, and recovers the
+  outputs by NUT-09 restore. **Never re-call `receive` after an ambiguous error:** tested, that wipes
+  the pending record and only a full seed `restore()` gets the credits back.
+- **The connector must report a missing reply as `Error::Timeout` (ambiguous).** A definitive error
+  makes CDK compensate, i.e. drop the pending proofs whose inputs the mint already spent.
 - A relay `OK` is not a result. Only a signed `23411` is.
 
 ## 4. Changes to existing code
@@ -267,3 +268,19 @@ enable` refuses over an existing mint. **No HTTP call is ever made for a `nostr:
    *Default: yes.* More relays means more availability and more duplicate traffic, which §3.3
    absorbs.
 4. **Mint fees:** CDK supports an input fee (`set_unit_fee`). *Default: 0.*
+
+## 9. Pre-code test results (23 Sep 2026, CDK 0.17.2, throwaway crate)
+
+- **`nostr://` identity:** survives parse/serde, creqA/creqB, tokens, full wallet lifecycle and
+  restore (§2.1). Wallets need `use_http_subscription()`.
+- **Lost swap reply:** mint commits, reply dropped → `recover_incomplete_sagas` recovered all 300.
+  Request dropped before the mint → recovery replayed it, 300 recovered. Naive re-`receive` before
+  recovery → balance 0 until full seed `restore()`. Sender-side lost reply NOT yet exercised (the
+  test send needed no swap).
+- **Relay (relay.maxplayer.ai, fresh one-off keys, NIP-42 auto-auth):** kinds 23410/23411 accepted
+  and delivered, not stored afterwards. Round trip from this VPS: ~55 ms small, 101 ms at 16 KB,
+  200 ms at 51 KB, 219 ms at the 65 KB NIP-44 max. Echo only, one run.
+- **Build cost:** cdk `mint` feature hard-enables `cdk-signatory/grpc`, so **`protoc` is required**
+  and cannot be switched off without patching CDK. Toy binary: wallet-only 10.4 MB / 367 s cold,
+  wallet+mint 17.1 MB / 479 s (+6.3 MB, +30 crates incl. axum, tonic, prost). The mint goes behind a
+  `credits-mint` cargo feature, and devshell, CI and release add protobuf.
