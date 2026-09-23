@@ -68,3 +68,6 @@ pub fn git_policy_router(state: Arc<AppState>) -> Router {
 
 #[cfg(test)]
 mod private_jobs_http_tests;
+
+#[cfg(test)]
+mod private_quota_cas_tests;
