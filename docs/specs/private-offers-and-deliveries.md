@@ -15,6 +15,12 @@ This is a reviewable starting specification, not approval to deploy. Normative l
 
 The content/file decision records are on [the existing proposal branch](https://github.com/maxie-agent/maxplayerai/tree/1ac3fbb3f27b89fe6dd17936990af53afcf22fb8/docs/proposals/private-offers). Interpret earlier recommendations through those decisions.
 
+### 0.1 Decision preservation and precedence
+
+This PR includes **verbatim snapshots** of the [content-privacy decisions](private-offers-decisions/content-privacy-decisions.md) and [file-storage decision](private-offers-decisions/file-storage-decision.md), including their original discussion links and clarifications. [The coverage map](private-offers-decisions/README.md) maps their requirements and exclusions to this spec and its acceptance tests. These snapshots preserve the source at `1ac3fbb3f27b89fe6dd17936990af53afcf22fb8`; they are not rewritten summaries or a claim to archive every Discord message.
+
+Settled decisions take precedence over proposed engineering details. Any later change must explicitly name the affected decision and record the human decision/link; it must not silently disappear during implementation or be reclassified as an optional default. The service ACK, numeric limits and replacement-job policy remain proposals, not retroactive team decisions. Future source-note changes require an explicit reconciliation of the snapshot and coverage map.
+
 ## 1. User-visible contract
 
 Use two independent inputs, not three competing meanings of “private”:
@@ -94,7 +100,9 @@ Illustrative plaintext body (placeholders are not valid hashes):
 }
 ```
 
-`type` is one of `task`, `followup`, `progress`, `answer`, `feedback`, `rejection`, `review`. Attachments have `repo_id`, `commit_oid`, `path`, `size_bytes`, `sha256`; all stay inside encryption. A content record is immutable. Edits have a fresh message ID, incremented revision and `supersedes` ID. Reordering does not apply an edit over an unknown predecessor.
+`type` is one of `task`, `followup`, `progress`, `answer`, `feedback`, `rejection`, `review`. Attachments have `repo_id`, `commit_oid`, `path`, `size_bytes`, `sha256`; all stay inside encryption. A `review` additionally requires `subject` with `offer_id` and the exact reviewed task `content_id`/`content_commitment` (or the public offer ID). A delivery review also requires `award_id`, `result_event_id`, and exactly one of `commit_oid` or inline `content_commitment`, matching that RESULT. Validate these against the participant-visible artifacts; a job ID or award ID alone does not bind a review to a delivery revision. A superseded review never becomes an assessment of a newer result automatically. These subject fields remain encrypted.
+
+A content record is immutable. Edits have a fresh message ID, incremented revision and `supersedes` ID. Reordering does not apply an edit over an unknown predecessor.
 
 Serialize the body once as UTF-8 JSON, retaining those exact bytes. The encrypted rumor content is a JSON envelope `{schema:"maxplayer.content-envelope.v2", nonce:<64-hex>, body_b64:<base64-of-body-bytes>}`. All recipient copies carry identical envelope bytes. Compute:
 
@@ -154,6 +162,8 @@ For cancellation/replacement, proposed initial policy is a **new linked offer/jo
 
 ## 6. Git permissions, inputs and delivery
 
+Private-job Git/API transport must use HTTPS and relay transport WSS outside local test fixtures. Never forward authorization across origins on redirects.
+
 Separate repository object graph per private job; never implement privacy only by hiding branches in the shared seller repo. Existing trusted CAS/pack storage may be reused internally, but serving and traversal are scoped to the authorized repository. A known OID, locator or warm cache is not authority.
 
 - Buyer: read; append new immutable input refs `refs/heads/input/<random-id>`.
@@ -167,6 +177,8 @@ Enforce this before info-refs, upload-pack/hydration, raw-object/file/preview/ar
 Input snapshots are committed before their private manifest is sent. Buyer pins exact input commit(s); seller fetches only from the configured authorized host and validates manifests before handing files to the runner. Reject path traversal/absolute paths and materialization through symlinks; no automatic submodule/LFS/external URL fetch. External dependencies remain externally managed. Credentials do not go into Git.
 
 Contribution jobs import the buyer-authorized pinned base/history into this job scope; additional private commits never push upstream automatically. Same-seller follow-up work uses a new job and explicitly selected input snapshot/history; do not automatically mount unrelated earlier work. No seller-memory feature is added.
+
+Trusted Maxplayer backups and internal pack/CAS caches remain within the existing storage/lifecycle policy. Recipient encryption of those trusted internal file copies is not required. This introduces no backup/retention/deletion redesign, and the deployment's backup configuration is not evidence that live bucket permissions were audited. The required feature change is job-level authorization on served data, including cache hits—not an independent cache fix or a generic logs/caches/backups workstream. Unused episode/telemetry capture/emission and seller memory remain excluded (§0).
 
 **Proposed initial limits:** 10 MiB per file; 100 MiB cumulative unique uncompressed Git-object bytes per job including retained history; 1,000 files per snapshot. Count imported bases, trees/commits and inputs/deliveries against the repository cap. Reject oversized contribution bases clearly. Apply client preflight and authoritative server checks in quarantine before refs/CAS publication, with compressed-request, decompression, object-count and processing-time bounds. Concurrent pushes reserve quota transactionally; a rejected push cannot publish partial refs or consume permanent visible quota. Numeric transport/processing bounds are finalized from existing host limits in PR2 and covered by boundary tests.
 
@@ -209,7 +221,7 @@ Use deterministic local relay/service/Git fixtures and at least four identities 
 3. Fully public targeted/open modes still complete on protocol v2.
 4. Maxplayer missing/wrong copy, invalid service ACK or mismatched commitment blocks progression.
 5. Correct encrypted bytes with forged seal author, wrong job/offer/award or wrong recipient set are rejected.
-6. Public event snapshots contain none of a seeded task/title/path/URL/error/answer corpus; cover network UI, repo announcements and inline integrity tags.
+6. Public event snapshots contain none of a seeded task/title/path/URL/error/answer corpus; cover network UI, repo announcements and inline integrity tags, previous-turn context, previews, feedback, review/classifier excerpts and rejection details.
 7. Reordered wrapper/ACK/event, offline recipient, lost relay OK and process crash recover idempotently without duplicate execution or payment.
 8. Two claim/award races yield exactly one active scope; conflicting signed awards do not grant both sellers execution.
 9. Every Git read path denies outsider on cold and warm cache, global public-read enabled, direct OID and alternate ref requests.
@@ -219,6 +231,7 @@ Use deterministic local relay/service/Git fixtures and at least four identities 
 13. Private Git and inline paid delivery retain signature verification, budget limits and pay-once recovery. Free delivery never constructs a paid receipt.
 14. Replacement job sees only explicitly carried inputs; old seller cannot access the new job.
 15. Unknown protocol/flags/service key, service outage or missing ACL never falls back to public/legacy.
+16. Review of result A cannot be attached to result B, another offer/task revision, another commit, or another inline commitment. Valid re-encryption of a stale review does not bypass subject-version validation.
 
 Rollout: drain active v1 jobs; back up/migrate the existing stores under existing operational policy; deploy relay/service/schema, then buyers/sellers/UI; verify all peers advertise v2; run local/staging four-identity tests; enable the complete lane together. Existing public history stays public. Do not attempt to privatize old public Git objects or postings. No production probe is part of this docs task.
 
