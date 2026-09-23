@@ -180,6 +180,10 @@ gets `err` `unsupported`, and `info.nuts` advertises only what's served. The lis
   caller runs `recover_incomplete_sagas()`, which replays, checks proof state, and recovers the
   outputs by NUT-09 restore. **Never re-call `receive` after an ambiguous error:** tested, that wipes
   the pending record and only a full seed `restore()` gets the credits back.
+- **After recovery, check the input proofs' state with the mint** (`check_proofs_spent` on the
+  saga's inputs). Tested (§9): after a lost sender-side swap reply, recovery restores the new outputs
+  AND compensates the already-spent input back to Unspent, so the local balance reads double (1024
+  for 512) until a NUT-07 check marks the input spent. Recovery alone is not enough.
 - **The connector must report a missing reply as `Error::Timeout` (ambiguous).** A definitive error
   makes CDK compensate, i.e. drop the pending proofs whose inputs the mint already spent.
 - A relay `OK` is not a result. Only a signed `23411` is.
@@ -235,9 +239,13 @@ connector and cached per keyset:
      and holds enough, not whichever is first.
   2. **Verify the payment:** a remit counts as paid only if the melt returns a `payment_preimage`
      with `sha256(preimage) == ` the LNURL invoice's payment hash. Only the platform's Lightning
-     node knows that preimage, so a fake backend can't produce it. Missing or mismatched ⇒ the fee
-     stays owed and retries (settled input 6), and the event is logged.
-  Stage 0 must confirm minibits returns `payment_preimage` on melt before step 2 ships (§8).
+     node knows that preimage, so a fake backend can't produce it. The preimage comes from CDK's
+     `FinalizedMelt::payment_proof()`, which `wallet_ops::MeltOutcome` doesn't carry today, and on
+     reconciliation from the NUT-05 quote-state reply. CDK does not store it in the wallet DB.
+  3. **Missing or mismatched preimage ⇒ the row is HELD as unverified, never auto-retried.** The
+     mint did take the proofs, so a retry could pay twice if the payment was real. The fee stays owed
+     in the read-out, the attempt is journaled and alarmed, and `seller fees remit` shows it for the
+     operator. A healthy Lightning mint never lands here (§9).
 - **Balances** (`wallet_ops::MintBalance`) stay per mint. `wallet balance` shows each mint's
   advertised Lightning capability next to its balance, so a holder can see which balances can leave
   over Lightning. No separate credit type or total.
@@ -360,20 +368,20 @@ rate_limit = 20    # requests/second (settled input 14)
 
 Duplicate requests across relays (one swap executes). Replayed, stale, forged or wrong-key
 responses (rejected). Reply lost after commit, on both the receive and the send side
-(`recover_incomplete_sagas`, never a blind re-`receive`). Rate cap enforced (`rate_limited`,
+(`recover_incomplete_sagas` then a NUT-07 check of the inputs, never a blind re-`receive`; the
+balance must not read double). Rate cap enforced (`rate_limited`,
 definitive). Mint or wallet killed at each write boundary. Two holders spending the same proofs at
 once (one wins). All relays down (clean error, no fallback to HTTP). Oversized or malformed
 requests. Unsupported ops, including NUT-04 and NUT-05 on local-issue (refused). Fee remit never
-picks a mint without NUT-05, and a melt with a missing or wrong preimage leaves the fee owed. A
+picks a mint without NUT-05, and a melt with a missing or wrong preimage (fake-backed test mint) holds the row unverified and never retries it. After a lost sender-side swap reply, the balance never reads double. A
 mint without NUT-04/05 is never a hop source or target. `maxplayer-mint init` refuses over an
 existing mint. The default `maxplayer` build contains no cdk `mint` code and builds without
 `protoc`. **No HTTP call is ever made for a `nostr://` mint.**
 
 ## 8. Open items
 
-No product questions are open. To verify in stage 0: minibits returns `payment_preimage` on melt.
-If it doesn't, §4.3 step 2 needs another way to confirm the payment before it can ship, and step 1
-ships alone.
+No product questions are open. The stage-0 precondition is met: minibits returns a verifying
+`payment_preimage` (§9).
 
 ## 9. Pre-code test results (23 Sep 2026, CDK 0.17.2, throwaway crate)
 
@@ -381,8 +389,16 @@ ships alone.
   restore (§2.1). Wallets need `use_http_subscription()`.
 - **Lost swap reply:** mint commits, reply dropped → `recover_incomplete_sagas` recovered all 300.
   Request dropped before the mint → recovery replayed it, 300 recovered. Naive re-`receive` before
-  recovery → balance 0 until full seed `restore()`. Sender-side lost reply NOT yet exercised (the
-  test send needed no swap).
+  recovery → balance 0 until full seed `restore()`.
+- **Sender-side lost swap reply (one 512 proof, send 300, so the send must swap):** reply lost after
+  commit → confirm returns `Timeout`, recovery reports recovered=1 compensated=1 and the balance
+  reads **1024**; a NUT-07 check marks the old 512 spent and it reads 512; a resend of 300 then
+  works, total conserved at 512. Request dropped before the mint → recovery restores the 512, resend
+  works. Hence the checkstate rule in §3.3.
+- **Minibits melt preimage (live, 23 Sep 16:4x):** melted 1 sat at `mint.minibits.cash/Bitcoin`
+  (cdk-mintd 0.17.6) to `maxplayer@strike.me`. `GET /v1/melt/quote/bolt11/<id>` returned state
+  `PAID` and a `payment_preimage` whose sha256 equals the invoice payment hash (`da752e0d…7d6c`).
+  The local wallet's `melt_quote.payment_proof` stayed NULL.
 - **Relay (relay.maxplayer.ai, fresh one-off keys, NIP-42 auto-auth):** kinds 23410/23411 accepted
   and delivered, not stored afterwards. Round trip from this VPS, two runs: ~55 ms small, ~100 ms at
   16 KB, 200–214 ms at 51 KB, 219–226 ms at the 65 KB NIP-44 max. Echo only.
