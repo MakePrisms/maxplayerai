@@ -305,6 +305,18 @@ pub async fn hook_policy_check(
         }
     }
 
+    // Private job repos never inherit permissions from public repository announcements.
+    if maxplayer_private_protocol::is_hex(&req.repo_id, 32) {
+        let job = match state.db.private_job_repo(community, &req.repo_owner, &req.repo_id).await {
+            Ok(Some(job)) => job,
+            _ => return (StatusCode::FORBIDDEN, "private repository policy unavailable").into_response(),
+        };
+        if !req.ref_updates.iter().all(|r| job.can_create_ref(&req.pusher_pubkey, &r.ref_name, &r.old_oid, &r.new_oid)) {
+            return (StatusCode::FORBIDDEN, "private repository ref update denied").into_response();
+        }
+        return Json(HookCallbackResponse { allowed: true, denials: vec![] }).into_response();
+    }
+
     // 4. Validate and resolve kind:30617 for this repo.
     // Query by (community_id, kind=30617, pubkey=owner, d_tag=repo_id) to
     // prevent spoofing and keep the localhost hook callback on the same

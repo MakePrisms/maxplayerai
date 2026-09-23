@@ -2424,6 +2424,12 @@ async fn handle_git_repo_announcement(
         ));
     }
 
+    // 64-hex IDs belong exclusively to private job provisioning. A public
+    // announcement must not seed/alter their object graph or emit ref metadata.
+    if maxplayer_private_protocol::is_hex(&repo_id, 32) {
+        return Err(anyhow::anyhow!("opaque job repository namespace is reserved"));
+    }
+
     let owner_hex = hex::encode(event.pubkey.to_bytes());
 
     // The relay holds no persistent per-repo disk state: runtime reads and

@@ -74,6 +74,7 @@ function jobCard(job, isOpen, onToggle, now) {
       el("span", { class: "chev" }, [text(isOpen ? "▾" : "▸")]),
     ]),
     job.task ? el("div", { class: "job-task" }, [text(job.task)]) : null,
+    job.executionVisibility === "private" ? el("div", { class: "job-task" }, [text("Execution and delivery are private")]) : null,
   ]);
   head.addEventListener("click", () => onToggle(job.id));
   card.append(head);

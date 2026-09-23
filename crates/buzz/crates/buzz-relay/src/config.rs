@@ -193,6 +193,10 @@ pub struct Config {
     ///
     /// Default: `false` (zero behavior change). Set via `BUZZ_GIT_PUBLIC_READ=true`.
     pub git_public_read: bool,
+    /// Development flag: enable private per-job Git provisioning. Never bypasses existing ACLs.
+    pub private_job_repos: bool,
+    /// Configured private-content service reader; never obtained from a caller's event.
+    pub private_service_pubkey: Option<String>,
 
     /// When true, anonymous WebSocket REQ reads are allowed against community-global
     /// (channel-less) rows, and HTTP bridge `/query` requests skip the relay
@@ -575,6 +579,9 @@ impl Config {
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
 
+        let private_job_repos = std::env::var("MAXPLAYER_PRIVATE_JOB_REPOS")
+            .map(|v| v == "true" || v == "1").unwrap_or(false);
+        let private_service_pubkey = std::env::var("MAXPLAYER_PRIVATE_SERVICE_PUBKEY").ok();
         let open_read = std::env::var("BUZZ_OPEN_READ")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
@@ -989,6 +996,8 @@ impl Config {
             relay_operator_pubkeys,
             allow_nip_oa_auth,
             git_public_read,
+            private_job_repos,
+            private_service_pubkey,
             open_read,
             media,
             media_max_concurrent_uploads,

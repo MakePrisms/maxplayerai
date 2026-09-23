@@ -6,6 +6,7 @@
 # mobile / web clients, and CLIs are intentionally left behind. Crate files are
 # byte-verbatim from upstream so `git diff` against block/buzz stays meaningful.
 members = [
+    "crates/maxplayer-private-protocol",
     "crates/buzz-relay",
     "crates/buzz-core",
     "crates/buzz-conformance",
