@@ -5486,13 +5486,9 @@ mod tests {
     //
     // BITE: drop the `tx.send(...)` wake below and this goes red on elapsed, not on correctness.
     //
-    // NETWORK (#720): the relay here is local, but `post_job_async` resolves a fee floor at the
-    // home's mint BEFORE it publishes, and `temp_job_home` bootstraps the shipped default
-    // (mint.minibits.cash). With no network that preflight refuses `mint_unreachable` and the
-    // `.expect("post job")` below panics — the test never reaches its own subject. Not silenced:
-    // `live-mints` is ON in the money-path CI job, which has a network. See the feature's comment
-    // in Cargo.toml.
-    #[cfg(feature = "live-mints")]
+    // This subject needs only a local relay, not a mint. Use the complete signed
+    // public-v2 selection/result fixture: a legacy result attached to a v2 offer
+    // is correctly ignored, and cannot be used to exercise event readiness.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_wait_resolves_on_arrival_rather_than_on_the_safety_recheck() {
         use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
@@ -5501,35 +5497,22 @@ mod tests {
         relay.run().await.expect("relay run");
         let (root, mut home) = temp_job_home("wait-on-arrival");
         home.config.relay_url = relay.url().await.to_string();
-
-        let posted = post_job_async(
-            &home,
-            PostJobRequest {
-                visibility: Some(crate::private_content::wire::Visibility::Public),
-                output_category: None,
-                #[cfg(feature = "wallet")]
-                inputs: vec![],
-                accepts_delivery: Vec::new(),
-                payment_mode: crate::gateway::PaymentMode::Sat,
-                task: "wake on arrival".into(),
-                output: "text/plain".into(),
-                amount_sats: 2,
-                seller_pubkey: Some(nostr_sdk::Keys::generate().public_key().to_hex()),
-                untargeted: false,
-                deadline_unix: Some(now_unix() + 3_600),
-                repo: None,
-                branch: None,
-                job: JobKind::FromScratch,
-                requested_agent: None,
-                requested_harness_family: None,
-                requested_model: None,
-                required_capabilities: Vec::new(),
-            },
-        )
-        .await
-        .expect("post job");
-        let job_id = posted.job_id.clone();
-        let buyer_pubkey = buyer_keys(&home).expect("keys").public_key().to_hex();
+        let (evidence, buyer) = crate::private_content::public_v2::tests::fixture(false, false);
+        // Public deterministic fixture identities, never operator credentials.
+        std::fs::write(&home.key_path, format!("{:064x}", 1)).expect("fixture buyer");
+        let seller = nostr_sdk::Keys::parse(&format!("{:064x}", 2)).unwrap();
+        for (signer, event) in [(&buyer, &evidence.offer), (&seller, &evidence.claim), (&buyer, &evidence.award)] {
+            publish_signed_event_async(&home, signer, event).await.expect("publish v2 selection");
+        }
+        let job_id = evidence.offer.id.to_hex();
+        let legacy = crate::gateway::result_draft(
+            &job_id, &buyer.public_key().to_hex(), "text/plain", 0,
+            "legacy-job-hash", "legacy-signature", "not a v2 result", None, &[],
+        );
+        publish_draft_async(&home, &seller, &legacy).await.expect("publish legacy foil");
+        let before = fetch_job_view_async(&home, &buyer, &job_id, Duration::from_secs(5), now_unix())
+            .await.expect("initial view");
+        assert!(before.results.is_empty(), "legacy result cannot complete a v2 offer");
 
         let (tx, rx) = tokio::sync::broadcast::channel(8);
         let waiting_home = home.clone();
@@ -5553,27 +5536,16 @@ mod tests {
         // the wake and not a race with the first read.
         tokio::time::sleep(Duration::from_millis(400)).await;
 
-        let seller = nostr_sdk::Keys::generate();
-        let draft = crate::gateway::result_draft(
-            &job_id,
-            &buyer_pubkey,
-            "text/plain",
-            2,
-            "job-hash",
-            "seller-signature",
-            "delivered",
-            None,
-            &[],
-        );
-        publish_draft_async(&home, &seller, &draft)
+        publish_signed_event_async(&home, &seller, &evidence.result)
             .await
-            .expect("publish the seller result");
+            .expect("publish the selected v2 seller result");
         tx.send(wake_event(&seller, &job_id).await).expect("wake");
 
         let view = waiter.await.expect("join").expect("wait");
         let elapsed = started.elapsed();
         assert!(!view.pending, "the wait must report the job ready");
-        assert!(!view.results.is_empty(), "the delivered result must be in the view");
+        assert_eq!(view.results.len(), 1, "only the selected v2 result belongs in the view");
+        assert_eq!(view.results[0].result_id, evidence.result.id.to_hex());
         assert!(
             elapsed < SAFETY_RECHECK,
             "the wait must resolve on the EVENT, not on the {SAFETY_RECHECK:?} backstop — took \

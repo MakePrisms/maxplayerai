@@ -117,7 +117,7 @@ jobs:
   # and cannot report it. One row red, one row green, same defect.
   #
   # This row is NOT a superset of money-path and must not replace it. FIVE names run today that this
-  # row does not carry: the four `live-mints` tests, and
+  # row does not carry: the three `live-mints` tests, and
   # `seller_exec::tests::agent_run_fail_closed_without_acp_feature`, which exists only under
   # `not(feature = "acp")`. The two rows are complementary by construction, in both directions.
   #
@@ -221,14 +221,14 @@ jobs:
       # panics on drop under debug). Interim: release-only until that transport-lifecycle bug is
       # fixed (#152); the money assertions here (tip-match refusal, zero-burn, no
       # journal/materialization) hold in release.
-      # `live-mints` is ON here and NOWHERE else (#720). It carries the four tests that reach a live
-      # third-party mint over the public internet — two `job_lifecycle` post_job waits and two
+      # `live-mints` is ON here and NOWHERE else (#720). It carries the three tests that reach a live
+      # third-party mint over the public internet — one `job_lifecycle` post_job check and two
       # `payment_wallet` worker sends. They used to ride along with `wallet`, which is what made
       # `wallet` undeclarable in `.maxplayer/checks.toml` (every declared command runs with NO
       # network), and that cost the repo its whole wallet-gated suite — tests/collect_integrity.rs
       # and every seller_node test ran in zero declared commands. Splitting them off did not silence
       # them: this runner has a network, and this row is the one that runs them. Dropping the
-      # feature here is a SILENT loss of those four — nothing else names them.
+      # feature here is a SILENT loss of those three — nothing else names them.
       - name: Test maxplayer-core (money-path suite)
         run: cargo test -p maxplayer-core --release --no-default-features --features gateway,git-delivery,wallet,live-mints --locked
 

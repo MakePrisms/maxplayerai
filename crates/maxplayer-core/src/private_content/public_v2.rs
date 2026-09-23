@@ -544,14 +544,14 @@ pub fn execution_hash(home: &MaxplayerHome, id: &str, task: &str, amount: u64) -
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::private_content::{builders::sign, evidence::PrivateEvidence};
     use nostr_sdk::{Keys, secp256k1::Message};
     fn keys(n: u8) -> Keys {
         Keys::parse(&format!("{n:064x}")).unwrap()
     }
-    fn fixture(paid: bool, self_trade: bool) -> (PrivateEvidence, Keys) {
+    pub(crate) fn fixture(paid: bool, self_trade: bool) -> (PrivateEvidence, Keys) {
         let amount = if paid { 10 } else { 0 };
         let mode = if paid {
             gateway::PaymentMode::Sat
