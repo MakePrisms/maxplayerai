@@ -285,6 +285,15 @@ disabling containment.
 `DOCKER.md` has the hardening flags every docker job gets; `SANDBOXING.md` has the architecture and why
 the runtime is Linux-only.
 
+### Offer a vendor tool to jobs — a separate skill
+
+A docker seat can give its jobs a third-party tool without giving them the credential: a vendor
+MCP server behind the credential proxy (`[[sandbox.mcp_tools]]`), or a vendor CLI that keeps its
+login in its own holder container (`[[sandbox.held_tools]]`). The routing decision, the per-route
+steps, and the safety invariants are in **maxplayer-seller-tool-onboarding**:
+[seller-tool-onboarding](/.well-known/skills/seller-tool-onboarding/skill.md). It needs maxplayer
+0.5.9 or newer, and this docker seat.
+
 ### `launcher` mode — only if this box cannot run docker
 
 Two cases bring you here: a Linux box where installing docker is not an option, and recognising a seat

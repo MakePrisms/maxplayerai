@@ -1,7 +1,7 @@
 # Settlement: when money actually moves, and what to do when it half-works
 
 Read this before telling a human where their sats went. Every statement here is
-checked against maxplayer 0.5.10 source in this repository; the file paths are named
+checked against maxplayer 0.5.11 source in this repository; the file paths are named
 so you can check them yourself.
 
 ## Money can move without you
@@ -65,7 +65,7 @@ one.
 
 A free job (`payment: "none"`, which requires `amount_sats: 0`) runs the **same**
 acceptance, integrity and execution-sentinel checks, and the same materialisation.
-What it does not run is the payment leg: at 0.5.10 a free bind is routed straight
+What it does not run is the payment leg: at 0.5.11 a free bind is routed straight
 through verification and materialisation (`collect.rs`), and the response reports
 
 - `state: "none"`,

@@ -59,6 +59,10 @@ pub struct AuthorizePayRequest {
     pub repo: String,
     pub branch: String,
     pub commit_oid: String,
+    /// The answer an INLINE delivery carries (§6.4), threaded from the accept-bind. `Some` selects
+    /// the inline route: no git object is fetched, no tree is read, and the buyer's independent
+    /// commitment is re-derived from this answer rather than from a remote.
+    pub inline_answer: Option<String>,
     /// Seller schnorr signature (hex) over the receipt preimage — read from the
     /// accepted result's `sig/seller` tag. Empty ⇒ the buyer cannot co-sign a valid
     /// receipt (the receipt authority fails closed at publish).
@@ -353,12 +357,34 @@ pub async fn authorize_pay_async(
     )?;
     let attempt_id = key.attempt_id();
 
-    let commit_oid = CommitOid::parse(request.commit_oid)?;
-    // The buyer tip-match gate above stays a raw compare of `delivery_integrity_hash ==
-    // commit_oid` — routing it through the parsed oid would lowercase it and reorder the
-    // parse-vs-gate refusals, i.e. change behavior on the refuse path.
-    let delivery = GitDelivery::new(request.repo, request.branch, commit_oid)?;
-    let delivery_kind = delivery.delivery_kind();
+    // §6.4 — the delivery mode splits here, BEFORE the wallet is opened and long before the budget
+    // gate, so an inline refusal costs nothing exactly as a git one does.
+    //
+    // The inline route's independent commitment is a re-derivation, not a fetch: the buyer hashes
+    // the answer it holds and requires the digest to equal the integrity hash the seller co-signed.
+    // That is the same question `verify_pay_path_delivery` asks a git delivery — "is the artifact I
+    // am about to pay for the one the signature covers?" — asked of the artifact that exists here.
+    let (delivery, delivery_kind) = match request.inline_answer.as_deref() {
+        Some(answer) => {
+            let derived = crate::receipt::result_content_hash_hex(answer);
+            if derived != request.delivery_integrity_hash {
+                return Err(AuthorizePayError::Input(format!(
+                    "inline answer digest {derived} does not match the accepted delivery_integrity_hash {} — refusing with zero spend",
+                    request.delivery_integrity_hash
+                )));
+            }
+            (None, DeliveryKind::Inline)
+        }
+        None => {
+            let commit_oid = CommitOid::parse(request.commit_oid)?;
+            // The buyer tip-match gate above stays a raw compare of `delivery_integrity_hash ==
+            // commit_oid` — routing it through the parsed oid would lowercase it and reorder the
+            // parse-vs-gate refusals, i.e. change behavior on the refuse path.
+            let delivery = GitDelivery::new(request.repo, request.branch, commit_oid)?;
+            let kind = delivery.delivery_kind();
+            (Some(delivery), kind)
+        }
+    };
 
     let secret_hex = home::read_secret_key_hex(home)
         .map_err(|error| AuthorizePayError::Home(error.to_string()))?;
@@ -394,7 +420,13 @@ pub async fn authorize_pay_async(
     let contribution_cosig = if let Some(binds) = request.contribution.as_ref() {
         let base_oid = CommitOid::parse(binds.base_oid.clone())
             .map_err(|error| AuthorizePayError::Input(format!("contribution base_oid: {error}")))?;
-        let fork = delivery.clone();
+        // A contribution is a git class by construction (it descends from a pinned base), so the
+        // typed delivery is always present on this arm; an inline bind never carries one.
+        let fork = delivery
+            .clone()
+            .ok_or_else(|| AuthorizePayError::Input(
+                "a contribution job cannot settle an inline delivery".to_owned(),
+            ))?;
         let policy = contribution_policy(home);
         verifier
             .verify_contribution(
@@ -461,8 +493,10 @@ pub async fn authorize_pay_async(
     // committing any budget below, so a failed or hung delivery verification burns ZERO budget
     // (and does not even open the wallet). The budget append still precedes the wallet send inside
     // `run_verified` (write-before-mint), so the reconcile saga's idempotency is preserved.
-    crate::payment::verify_pay_path_delivery(&mut verifier, &delivery, &key)
-        .map_err(AuthorizePayError::Payment)?;
+    if let Some(delivery) = delivery.as_ref() {
+        crate::payment::verify_pay_path_delivery(&mut verifier, delivery, &key)
+            .map_err(AuthorizePayError::Payment)?;
+    }
 
     // THE §19 EXECUTION-SENTINEL TOOTH (from-scratch money path). The delivery the buyer just fetched
     // + tip-matched into its OWN store MUST carry this job's execution sentinel inside the delivered
@@ -472,7 +506,12 @@ pub async fn authorize_pay_async(
     // never the silence — an absent record is never read as a refusal, §7.0). Contribution deliveries
     // are gated by verify_contribution's content path and are not served by the node yet; their
     // buyer-side sentinel check is a later slice.
-    if request.job_class == JobClass::FromScratch {
+    // An inline delivery has no tree, so §8.2's sentinel does not apply to it — the spec scopes the
+    // requirement, and the `no_sentinel` refusal, to a TREE delivery. Its analogue already ran: an
+    // empty answer is refused at parse, and the digest check above bound the answer to the
+    // co-signature. `delivery.is_some()` is what keeps this arm on the git path only.
+    if request.job_class == JobClass::FromScratch && delivery.is_some() {
+        let delivery = delivery.as_ref().expect("git delivery present on this arm");
         let commit_hex = delivery.commit_oid().as_str();
         let store_ref = PayPathDeliveryVerifier::store_ref_for(commit_hex);
         // The verifier owns the store path it just fetched the delivery into (`store` was moved into
@@ -782,9 +821,36 @@ pub async fn complete_recovered_locked_async(
     let receipt_relay = home.config.relay_url.clone();
     let seller_hex = seller_nostr.to_hex();
     let seller_signature = request.seller_signature.clone();
-    // Live delivery is fork-only ([`DeliveryKind::Fork`]); the receipt preimage the seller signed at
-    // delivery used that kind, so completion reconstructs byte-identical bytes.
-    let delivery_kind = DeliveryKind::Fork;
+    // The kind is READ FROM THE BIND, never assumed. The seller signed the receipt preimage under
+    // the kind it delivered with, and `delivery_kind` is a covered field — so a completion that
+    // guessed `Fork` for an inline job would rebuild different bytes, fail the seller's schnorr
+    // check at the receipt leg, and raise a forged-receipt alarm naming the seller for a fault
+    // that is entirely ours. A bind written before inline delivery existed carries no kind and is
+    // a fork, which is true of every one of them.
+    let delivery_kind = match crate::job_lifecycle::load_accepted_bind(home, &request.job_id)
+        .map_err(|error| {
+            // NOT swallowed. A read error here would silently resolve to `Fork`, publish a receipt
+            // the seller's signature cannot cover, and raise the forged-receipt alarm this very
+            // change exists to prevent — with the seller named for our own IO failure.
+            AuthorizePayError::Input(format!(
+                "cannot read the accepted bind for job {} to learn its delivery kind: {error}",
+                request.job_id
+            ))
+        })?
+        .as_ref()
+        .and_then(|bind| bind.delivery_kind.clone())
+        .as_deref()
+    {
+        Some(kind) if kind == DeliveryKind::Inline.as_str() => DeliveryKind::Inline,
+        Some(_) => DeliveryKind::Fork,
+        // No bind, or one written before inline delivery existed. The hash itself says which:
+        // `DeliveryIntegrityHash::from_hex` admits 40 hex (a commit oid) or 64 (an answer digest)
+        // and nothing else, so the length is an exact discriminator rather than a guess.
+        None => match request.delivery_integrity_hash.len() {
+            64 => DeliveryKind::Inline,
+            _ => DeliveryKind::Fork,
+        },
+    };
 
     let wallet = buyer_fund::open_wallet_at_mint_async(home, &wallet_open_mint_url(home, &terms))
         .await?;
@@ -1506,6 +1572,7 @@ mod tests {
         let home = home::bootstrap(&root).expect("home");
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         let request = AuthorizePayRequest {
+            inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "job-d2-empty".into(),
             result_id: "result-d2".into(),
@@ -1625,6 +1692,7 @@ mod tests {
         );
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         let request = AuthorizePayRequest {
+            inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "job-hop-fence".into(),
             result_id: "result-hop-fence".into(),
@@ -1674,6 +1742,7 @@ mod tests {
         let home = home::bootstrap(&root).expect("home");
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         let request = AuthorizePayRequest {
+            inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "job-d2".into(),
             result_id: "result-d2".into(),
@@ -1719,6 +1788,7 @@ mod tests {
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         let oid = "aa".repeat(20);
         let request = AuthorizePayRequest {
+            inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "job-jc".into(),
             result_id: "result-jc".into(),
@@ -1767,6 +1837,7 @@ mod tests {
             &prepay_preimage(&home, "job-ext", "result-ext", &"bb".repeat(32), &"aa".repeat(20), 2),
         );
         let request = AuthorizePayRequest {
+            inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "job-ext".into(),
             result_id: "result-ext".into(),
@@ -1993,6 +2064,7 @@ mod tests {
             .sign_schnorr(&Message::from_digest(preimage.digest_bytes()))
             .to_string();
         let request = AuthorizePayRequest {
+            inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "job-forged".into(),
             result_id: "result-forged".into(),
@@ -2051,6 +2123,7 @@ mod tests {
             .sign_schnorr(&Message::from_digest(preimage.digest_bytes()))
             .to_string();
         let request = AuthorizePayRequest {
+            inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "job-diag".into(),
             result_id: "result-diag".into(),
@@ -2125,6 +2198,7 @@ mod tests {
         );
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         let tampered_amount = AuthorizePayRequest {
+            inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "job-tamper".into(),
             result_id: "result-tamper".into(),
@@ -2157,6 +2231,7 @@ mod tests {
         );
         let mut gate2 = BudgetGate::from_home(&home).expect("gate");
         let tampered_delivery = AuthorizePayRequest {
+            inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: "job-tamper2".into(),
             result_id: "result-tamper2".into(),
@@ -2387,6 +2462,7 @@ mod free_lane_tests {
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         let commit = "ab".repeat(20);
         let request = AuthorizePayRequest {
+            inline_answer: None,
             payment_mode: PaymentMode::None,
             job_id: "free-job".into(),
             result_id: "free-result".into(),
@@ -2426,6 +2502,7 @@ mod free_lane_tests {
         let (root, home) = temp_home("sat-passes");
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         let request = AuthorizePayRequest {
+            inline_answer: None,
             payment_mode: PaymentMode::Sat,
             job_id: "paid-job".into(),
             result_id: "paid-result".into(),

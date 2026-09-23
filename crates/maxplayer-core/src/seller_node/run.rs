@@ -2383,6 +2383,10 @@ fn offer_row(job_id: &str, buyer_pubkey: &str, offer: &ParsedOffer) -> super::st
         // job eventually writes must state the mode the OFFER was posted under, and execution can
         // be a restart away from here.
         payment_mode: offer.payment_mode,
+        // Journaled for the same reason as the mode above: the delivering job reads it, and
+        // execution can be a restart away from here. Dropped, a resumed job would fall back to
+        // git-only and refuse an answer the buyer said it could read.
+        accepts_delivery: offer.accepts_delivery.clone(),
     }
 }
 
@@ -2410,6 +2414,13 @@ pub fn job_prompt(
         deadline_unix,
         offer.output.as_deref(),
         memory_section,
+        // §6.1 — the agent is told how to mark an answer only when this buyer said it can read
+        // one. The offer row is the authenticated source, and it is what the delivery arm gates
+        // on, so the prompt and the gate can never disagree about whether inline is available.
+        offer
+            .accepts_delivery
+            .iter()
+            .any(|mode| mode == gateway::DELIVERY_MODE_INLINE),
     )
 }
 
@@ -2972,8 +2983,35 @@ enum ContainerDeliveryFailure {
     Setup(String),
     /// The agent run failed inside the container; the `ExecError` shape drives `harness_fault_for`.
     Agent(ExecError),
-    /// The gate saw no execution. `no_sentinel`, harness unproven.
-    NoSentinel(String),
+    /// The gate saw no execution. `no_sentinel`, harness unproven — UNLESS the agent marked an
+    /// answer, which is an answer job rather than a dead harness. The message is carried so the
+    /// caller can make that distinction; on the host path the same decision reads
+    /// `report.last_agent_message` directly.
+    NoSentinel {
+        detail: String,
+        last_agent_message: Option<String>,
+        /// Usage and elapsed time the container reported, carried for the same reason as the
+        /// message: an inline delivery off this arm publishes a metadata block, and a block built
+        /// from defaults would state a wall time of zero as if it were measured.
+        usage: Option<crate::driver::UsageMetadata>,
+        wall_time_ms: u64,
+        /// The container CUT the message to fit its outcome file. A cut answer must never be
+        /// delivered: the buyer re-derives the digest of what it received, so the loss is
+        /// invisible to it and it pays the full price for a partial answer.
+        message_truncated: bool,
+        /// The outcome file echoed this job's hand-off nonce, so the ORCHESTRATOR wrote it.
+        ///
+        /// Only the orchestrator ever holds the nonce — the inputs file carrying it is deleted
+        /// before the agent exists. Without this an agent survivor can plant an outcome that says
+        /// `NoSentinel` and carries text of its choosing, and that text becomes a signed, paid
+        /// inline delivery off a run the harness actually failed.
+        outcome_authentic: bool,
+        /// Whether this job was from-scratch. A contribution descends from a pinned base and can
+        /// never settle inline, and the container path SERVES contributions — it reads the pin and
+        /// hands the orchestrator a base — so the inline arm needs this to make the same decision
+        /// the host arm makes from `base_oid`.
+        from_scratch: bool,
+    },
     /// The snapshot failed otherwise. `execution_failed`, harness unproven.
     Snapshot(String),
     /// Token refused or absent, push failed, oid unreadable, tamper evidence. `delivery_failed`.
@@ -3454,6 +3492,17 @@ fn flaky_harness_reason(attempts: usize, agent_message: Option<&str>) -> String 
         ),
     }
 }
+
+/// The largest inline answer this seller will deliver.
+///
+/// The CONTAINER path already caps the agent's message at this size when it writes its outcome
+/// ([`crate::delivery_orchestrator::OUTCOME_TEXT_MAX_BYTES`]), so the two delivery paths agree on
+/// what an answer may weigh, and a relay is never handed an unbounded event this seller minted.
+pub const INLINE_ANSWER_MAX_BYTES: usize = crate::delivery_orchestrator::OUTCOME_TEXT_MAX_BYTES
+    // The container bounds the WHOLE message, and the agent is told to prepend the marker line —
+    // so an answer sized to the raw cap makes the message exceed it and be cut. The limit stated
+    // to the agent, and enforced here, is the cap MINUS the line it was told to add.
+    - (crate::engine::INLINE_ANSWER_MARKER.len() + 1);
 
 /// The refusal reason for the UNRUNNABLE launcher/exec shape.
 ///
@@ -4515,6 +4564,19 @@ pub(crate) fn rearm_deadline(
     deadline.max(boot_floor)
 }
 
+/// Clears the expiry sweep's in-flight flag when the pass ends, however it ends.
+///
+/// A `set(false)` at the end of the task body would be skipped by a panic, and the flag would then
+/// suppress every later sweep for the life of the process — the sweep would stop silently, which is
+/// exactly the failure mode the periodic design exists to avoid.
+struct SweepGuard(std::rc::Rc<std::cell::Cell<bool>>);
+
+impl Drop for SweepGuard {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
 impl SellerNodeRunner {
     /// Boot the node and connect its authenticated relay client.
     ///
@@ -4869,6 +4931,114 @@ impl SellerNodeRunner {
         self.seller_pubkey.to_hex()
     }
 
+    /// One pass of the expiry sweep: remove this seat's containers whose own cleanup stamp has
+    /// passed, and say what happened in the operator log.
+    ///
+    /// **Best-effort, never a gate, and never retried in place.** A leftover container owns a
+    /// namespace and carries no policy, so failing to remove one wastes a container rather than
+    /// opening anything — the same standing this loop already gives the boot reap. Whatever this
+    /// pass could not do is still expired on the next tick, which is why nothing here loops: the
+    /// cadence is the retry, and a docker daemon that has stopped answering must cost this loop one
+    /// bounded call rather than hold the seller's other work while it insists.
+    ///
+    /// A clock that cannot be read skips the pass entirely. Every removal decision here is a
+    /// comparison against `now`, and a `now` this process had to invent could only be wrong in the
+    /// direction that removes a live job's containers.
+    ///
+    /// **A free function, not a method, and awaited by NOBODY in the run loop.** It is spawned by
+    /// [`spawn_expiry_sweep`], so it borrows nothing from the runner and the loop's `select!` is
+    /// free to serve offers, awards and the shutdown signal while docker is still answering.
+    #[cfg(feature = "acp")]
+    async fn run_expiry_sweep(seat: &str) {
+        let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+            opline!(
+                "seller node: skipping the container expiry sweep — the system clock is before the \
+                 unix epoch, and no container can be judged expired against a time this process had \
+                 to guess"
+            );
+            return;
+        };
+        match crate::sandbox_netns::sweep_expired(seat, now.as_secs()).await {
+            Ok(report) => {
+                if !report.removed.is_empty() {
+                    opline!(
+                        "seller node: swept {} expired container(s) of this seat (past their own \
+                         job's deadline plus {}s)",
+                        report.removed.len(),
+                        crate::sandbox_netns::CLEANUP_GRACE_SECS
+                    );
+                }
+                for (container, error) in &report.failed {
+                    opline!(
+                        "seller node: could not remove expired container {container} ({error}) — \
+                         harmless now, and the next sweep will select it again"
+                    );
+                }
+                // The backlog, said out loud. "Removed 32" on a host with 400 leftovers reads as
+                // "the host is clean" unless the remainder is named with it.
+                if !report.deferred.is_empty() {
+                    opline!(
+                        "seller node: {} more expired container(s) were left for the next sweep \
+                         (this pass is bounded to {} removals and {}s of wall clock)",
+                        report.deferred.len(),
+                        crate::sandbox_netns::MAX_SWEEP_REMOVALS,
+                        crate::sandbox_netns::SWEEP_PASS_BUDGET.as_secs()
+                    );
+                }
+                // Every container the sweep REFUSED to act on, named one by one. These are the ones
+                // no later pass clears on its own: an unreadable stamp does not become readable by
+                // ageing, and a container with no job label never acquires one. A count would leave
+                // the operator unable to find them, and silence — the behaviour before #996 — made
+                // a growing pile of them look exactly like a clean host.
+                for (container, reason) in &report.skipped {
+                    opline!(
+                        "seller node: expiry sweep skipped container {container} ({reason}) — it \
+                         carries this seat's label but does not establish that removing it is \
+                         authorised, so it is left in place and named again every pass"
+                    );
+                }
+            }
+            Err(error) => opline!(
+                "seller node: the container expiry sweep could not read docker ({error}) — nothing \
+                 was removed this pass, and expired containers stay until a later one succeeds"
+            ),
+        }
+    }
+
+    /// The same entry point on a build without the docker runner, so the run loop below schedules
+    /// its tick unconditionally and only the work behind it is feature-gated.
+    #[cfg(not(feature = "acp"))]
+    #[allow(clippy::unused_async)]
+    async fn run_expiry_sweep(_seat: &str) {}
+
+    /// Start one expiry sweep pass **as its own task** and return immediately.
+    ///
+    /// **This is what keeps the sweep off the run loop's critical path.** Awaiting the pass inside
+    /// the `select!` arm would stall every other arm — offers, awards, drains, the shutdown signal
+    /// — for as long as docker took to answer, which is bounded but not short: a listing plus up to
+    /// [`crate::sandbox_netns::MAX_SWEEP_REMOVALS`] serial removals, each with its own deadline.
+    /// Spawned, the loop's own cost is the spawn.
+    ///
+    /// `in_flight` is why a slow pass cannot stack with the next tick: a tick that arrives while a
+    /// pass is still running is DROPPED, not queued, so an unreachable daemon can never accumulate
+    /// one outstanding pass per five minutes. The flag is cleared by a guard, so a pass that panics
+    /// releases it too.
+    fn spawn_expiry_sweep(seat: String, in_flight: &std::rc::Rc<std::cell::Cell<bool>>) {
+        if in_flight.get() {
+            opline!(
+                "seller node: skipping this container expiry sweep — the previous pass is still \
+                 running, and the containers it has not reached stay expired for the next one"
+            );
+            return;
+        }
+        in_flight.set(true);
+        let done = SweepGuard(std::rc::Rc::clone(in_flight));
+        tokio::task::spawn_local(async move {
+            Self::run_expiry_sweep(&seat).await;
+            drop(done);
+        });
+    }
+
     /// A handle asking this node to leave the selling role: the run loop stops, publishes its
     /// terminal `accepting=n` beat (#747), and [`Self::run`] returns `Ok(())`.
     ///
@@ -5005,6 +5175,7 @@ impl SellerNodeRunner {
                 task: row.task.clone(),
                 output: String::new(),
                 payment_mode: row.payment_mode,
+                accepts_delivery: row.accepts_delivery.clone(),
                 amount: row.amount_sats,
                 unit: row.unit.clone(),
                 deadline_unix: row.deadline_unix as u64,
@@ -5322,6 +5493,26 @@ impl SellerNodeRunner {
         }
 
         let mut drain_tick = tokio::time::interval(DRAIN_INTERVAL);
+        // The container expiry sweep rides THIS loop, for the same reason the heartbeat does: a
+        // side-thread would need its own shutdown, its own clock and its own reason to exist, and
+        // this loop already stops when the node stops.
+        //
+        // `interval` fires immediately on first poll, and here that is the point: the first sweep
+        // happens at startup. A seller that was `SIGKILL`ed mid-job, or one whose containers the
+        // daemon only materialised after it was gone, therefore rediscovers those leftovers from
+        // their own labels on the next boot with no memory of the jobs that made them — the boot
+        // reaper covers the attached-holder case, this covers everything the stamp can judge.
+        let mut sweep_tick =
+            tokio::time::interval(Duration::from_secs(crate::sandbox_netns::SWEEP_INTERVAL_SECS));
+        let sweep_seat = self.seller_pubkey();
+        // One pass at a time, for the life of the loop. See `spawn_expiry_sweep`.
+        let sweep_in_flight = std::rc::Rc::new(std::cell::Cell::new(false));
+        // Only when this node actually runs contained jobs. A seat with no sandbox network creates
+        // no holders and no helpers, and a sweep there would spend a `docker ps` every five minutes
+        // to look for containers this build never creates — on a host that may not even run docker.
+        let sweep_enabled = SandboxPolicy::from_config(self.node.home().config.sandbox.as_ref())
+            .map(|sandbox| sandbox.sandbox_network().is_some())
+            .unwrap_or(false);
         let wrap_backfill_interval_secs = resolve_wrap_backfill_interval_secs();
         let mut wrap_backfill_tick =
             tokio::time::interval(Duration::from_secs(wrap_backfill_interval_secs));
@@ -5411,6 +5602,15 @@ impl SellerNodeRunner {
                 reason = shutdown::next_request(&mut shutdown_rx) => {
                     opline!("seller node: shutdown requested ({reason}); retracting the seat and ending the loop");
                     break;
+                }
+                // Expired-container sweep. SPAWNED, never awaited here: the pass is bounded by
+                // count (`MAX_SWEEP_REMOVALS`), by call (`SWEEP_DOCKER_DEADLINE`) and by wall clock
+                // (`SWEEP_PASS_BUDGET`), but even its bounded worst case is minutes, and this loop
+                // must keep serving offers, awards and shutdown throughout. A tick that lands while
+                // the previous pass still runs is dropped rather than queued.
+                _ = sweep_tick.tick(), if sweep_enabled => {
+                    Self::spawn_expiry_sweep(sweep_seat.clone(), &sweep_in_flight);
+                    continue;
                 }
                 _ = drain_tick.tick() => {
                     self.sweep_lapsed_claims();
@@ -7781,6 +7981,68 @@ impl SellerNodeRunner {
                     )
                 }
                 Err(failure) => {
+                    // ── Inline delivery (§6.4), container path ───────────────────────────────
+                    // The same two conditions as the host arm below, read off the container's
+                    // reported outcome: the gate saw an empty tree, and the agent marked an
+                    // answer. Without this the mode would depend on the SEAT — the identical
+                    // answer job delivers on a launcher seat and is refused on a docker one — and
+                    // docker with a non-root uid is the default (#981), so the common seat would
+                    // be the one that cannot do it.
+                    //
+                    // A contribution descends from a pinned base and can never settle inline, so
+                    // `from_scratch` is required here exactly as `base_oid.is_none()` is on the
+                    // host arm. The container path DOES serve contributions: it reads the pin and
+                    // hands the orchestrator a base, and the gate refuses a tree identical to that
+                    // base with the same `NoExecutionObserved` an empty tree gets.
+                    if let ContainerDeliveryFailure::NoSentinel {
+                        last_agent_message: Some(message),
+                        usage,
+                        wall_time_ms,
+                        from_scratch: true,
+                        // Only an outcome the orchestrator wrote may mint a delivery.
+                        outcome_authentic: true,
+                        // A cut message is not a deliverable. The host's own length bound runs on
+                        // what the container sent, which is already under the cap, so this flag is
+                        // the only thing that can see the loss.
+                        message_truncated: false,
+                        ..
+                    } = &failure
+                        // The same capability gate as the host arm; see there.
+                        && offer
+                            .accepts_delivery
+                            .iter()
+                            .any(|mode| mode == gateway::DELIVERY_MODE_INLINE)
+                        && let Some(answer) = crate::engine::marked_inline_answer(message)
+                    {
+                        if let Some(quoted) = quoted_agent_message(Some(message)) {
+                            opline!(
+                                "seller node execute job_id={job_id} agent last message: {quoted}"
+                            );
+                        }
+                        // #784 — a real run is the freshest evidence of the model, and an inline
+                        // delivery is a real run. Skipped, an answer-only harness on a container
+                        // seat advertises its boot-probe model for the life of the process.
+                        self.agents.record_model(
+                            harness,
+                            usage.as_ref().and_then(|u| u.model.clone()),
+                        );
+                        let exec_metadata = seller_exec_metadata(
+                            &agent_command,
+                            agent_label.as_deref(),
+                            *wall_time_ms,
+                            usage.as_ref(),
+                        );
+                        self.deliver_inline(
+                            job_id,
+                            &offer,
+                            &seller_pubkey,
+                            &stored_creq,
+                            answer,
+                            &exec_metadata,
+                        )
+                        .await;
+                        return;
+                    }
                     self.fail_container_delivery(job_id, &offer.buyer_pubkey, harness, failure)
                         .await;
                     return;
@@ -7877,7 +8139,10 @@ impl SellerNodeRunner {
                         &prompt,
                         &workdir,
                         &identity,
-                        AgentRunTimeout::JobDeadline(job_timeout),
+                        AgentRunTimeout::JobDeadline {
+                            remaining: job_timeout,
+                            deadline_unix: deadline,
+                        },
                         None,
                         attachments.clone(),
                     )
@@ -7944,7 +8209,8 @@ impl SellerNodeRunner {
                 // #616: parent the delivery commit on the base the workdir was provisioned at. A
                 // contribution (Some(base_oid)) then descends from base_oid by construction; the buyer's
                 // descendant gate refuses a commit that doesn't. From-scratch (None) stays a root commit.
-                base_oid,
+                // Cloned, not moved: the inline arm below reads it to refuse a contribution.
+                base_oid.clone(),
                 branch.clone(),
                 message,
                 author_date,
@@ -7954,6 +8220,59 @@ impl SellerNodeRunner {
             {
                 Ok(oid) => oid,
                 Err(error) => {
+                    // ── Inline delivery (§6.4) ───────────────────────────────────────────
+                    // The snapshot refused an empty or base-identical tree, so the job left no
+                    // files. TWO conditions have to hold before that becomes a delivery, and
+                    // neither is "the agent said something".
+                    //
+                    // The tree gate, first: it is the signal the git path already trusts, and it
+                    // is what keeps a job that WROTE files on the git path — such a job never
+                    // reaches this arm, because its snapshot succeeded.
+                    //
+                    // The marker, second, and it is the one that matters. An empty tree plus some
+                    // text is exactly what a quota-dead harness, an unreachable model host and a
+                    // declining agent all produce; `AgentRunReport` and `flaky_harness_reason`
+                    // both say so, and the 2026-08-21 incident is why they say it. Treating any
+                    // non-empty reply as an answer would pay for every one of those. So the agent
+                    // must OPT IN with [`engine::INLINE_ANSWER_MARKER`], which only a model that
+                    // read this job's prompt can emit. Everything unmarked falls through to the
+                    // refusal below, harness strike included.
+                    if matches!(&error, seller_git::SellerGitError::NoExecutionObserved(_))
+                        // A contribution descends from a pinned base, so it can never settle
+                        // inline. `base_oid` is what marks one.
+                        && base_oid.is_none()
+                        // The buyer must have said it can READ one. Absent ⇒ git only (§6.1), so
+                        // this arm can never send an answer to a buyer that would not recognise
+                        // it as a delivery at all — which is a job that dies at the deadline with
+                        // the work done and nothing published to say so. Fail-closed by
+                        // construction: an offer from an older buyer carries no tag.
+                        && offer
+                            .accepts_delivery
+                            .iter()
+                            .any(|mode| mode == gateway::DELIVERY_MODE_INLINE)
+                        && let Some(answer) = report
+                            .last_agent_message
+                            .as_deref()
+                            .and_then(crate::engine::marked_inline_answer)
+                    {
+                        let exec_metadata = seller_exec_metadata(
+                            &agent_command,
+                            agent_label.as_deref(),
+                            wall_time_ms,
+                            usage.as_ref(),
+                        );
+                        self.deliver_inline(
+                            job_id,
+                            &offer,
+                            &seller_pubkey,
+                            &stored_creq,
+                            answer,
+                            &exec_metadata,
+                        )
+                        .await;
+                        return;
+                    }
+
                     // Harness-attributable: the agent returned success having left nothing to deliver.
                     // This is the site that fires on a quota-dead harness — its turn "completes", so the
                     // agent-run arm above sees no error at all — which is why the trigger cannot live at
@@ -8343,8 +8662,18 @@ impl SellerNodeRunner {
         // placeholders must outlive the push, hence the margin on the lifetime.
         let job_lifetime = unified_job_timeout(deadline, now_unix().max(0) as u64)
             + Duration::from_secs(orch::PUSH_MARGIN_SECS);
-        let prepared = prepare_launch(agent_command, &sandbox, workdir, identity, job_lifetime)
-            .await
+        let prepared = prepare_launch(
+            agent_command,
+            &sandbox,
+            workdir,
+            identity,
+            job_lifetime,
+            // This launch legitimately outlives the job deadline by the push margin, so the margin
+            // is part of ITS effective deadline — the same total `job_lifetime` is measured to, but
+            // stated absolutely rather than re-derived from a clock read at create time.
+            Some(deadline.saturating_add(orch::PUSH_MARGIN_SECS)),
+        )
+        .await
             .map_err(|error| Fail::Setup(format!("container launch preparation failed ({error})")))?;
 
         // The push token source. A public/anonymous https remote takes no header (as on the host).
@@ -8375,6 +8704,7 @@ impl SellerNodeRunner {
 
         let mut session_servers = prepared.mcp_servers.clone();
         session_servers.extend(attachments.mcp_servers.iter().cloned());
+        let base_is_none = base.is_none();
         let inputs = orch::Phase1Inputs {
             job_hash,
             seller_pubkey_hex: identity.seller_pubkey_hex().to_owned(),
@@ -8549,7 +8879,19 @@ impl SellerNodeRunner {
 
         let result = match exit {
             Ok(status) => {
-                self.classify_container_outcome(job_id, &io_dir, status, marker.as_ref(), &branch, started)
+                self.classify_container_outcome(
+                    job_id,
+                    &io_dir,
+                    status,
+                    marker.as_ref(),
+                    &branch,
+                    started,
+                    // The base the orchestrator was handed: `None` is from-scratch, `Some` is a
+                    // contribution clone. Read here, where it is a fact of THIS delivery, rather
+                    // than re-derived from the pin in the classifier.
+                    base_is_none,
+                    &nonce,
+                )
             }
             Err(failure) => Err(failure),
         };
@@ -8577,6 +8919,8 @@ impl SellerNodeRunner {
         marker: Option<&crate::delivery_orchestrator::AgentDoneMarker>,
         branch: &str,
         started: Instant,
+        from_scratch: bool,
+        expected_nonce: &str,
     ) -> Result<ContainerDelivery, ContainerDeliveryFailure> {
         use crate::delivery_orchestrator as orch;
         use ContainerDeliveryFailure as Fail;
@@ -8591,6 +8935,9 @@ impl SellerNodeRunner {
             outcome.status,
             outcome.detail
         );
+        // Only the orchestrator holds the nonce; the inputs file carrying it is deleted before
+        // the agent exists. An outcome that does not echo it was not written by the orchestrator.
+        let outcome_authentic = outcome.handoff_nonce.as_deref() == Some(expected_nonce);
         let detail = outcome.detail;
         match outcome.status {
             orch::Phase1Status::Delivered => {
@@ -8625,7 +8972,20 @@ impl SellerNodeRunner {
             orch::Phase1Status::AgentFailed => Err(Fail::Agent(ExecError::Agent(detail))),
             orch::Phase1Status::AgentUnavailable => Err(Fail::Agent(ExecError::Config(detail))),
             orch::Phase1Status::DeadlineExceeded => Err(Fail::Agent(ExecError::DeadlineExceeded)),
-            orch::Phase1Status::NoSentinel => Err(Fail::NoSentinel(detail)),
+            orch::Phase1Status::NoSentinel => {
+                let agent = outcome.agent.unwrap_or_default();
+                Err(Fail::NoSentinel {
+                    detail,
+                    from_scratch,
+                    outcome_authentic,
+                    // The container already bounded this at `OUTCOME_TEXT_MAX_BYTES` when it wrote
+                    // the outcome file, so the host path's own bound is a no-op on this branch.
+                    last_agent_message: agent.last_agent_message,
+                    message_truncated: agent.last_agent_message_truncated,
+                    usage: agent.usage,
+                    wall_time_ms: started.elapsed().as_millis() as u64,
+                })
+            }
             orch::Phase1Status::SnapshotFailed => Err(Fail::Snapshot(detail)),
             orch::Phase1Status::TokenUnavailable
             | orch::Phase1Status::PushFailed
@@ -8658,6 +9018,142 @@ impl SellerNodeRunner {
         }
     }
 
+    /// Publish an agent's marked answer as an INLINE delivery (§6.4), and journal it.
+    ///
+    /// Shared by the host and the container delivery paths. Both reach the same place — the
+    /// snapshot refused an empty tree and the agent marked an answer — and a second copy of the
+    /// co-signing would be a second chance for the two ends to disagree about the preimage.
+    ///
+    /// The caller has already decided this IS an inline delivery. Every failure here is a delivery
+    /// failure: it is reported with `FEEDBACK` on the spot, so the caller only has to return.
+    async fn deliver_inline(
+        &self,
+        job_id: &str,
+        offer: &super::store::Offer,
+        seller_pubkey: &str,
+        stored_creq: &str,
+        answer: &str,
+        exec_metadata: &[gateway::TagSpec],
+    ) {
+        // REFUSED, never cut. Truncating here would publish half a sentence, co-sign it, and ask
+        // the buyer to pay the full price for it — the buyer cannot tell a cut answer from a
+        // complete one, because the digest is of whatever the seller sent. So an over-long answer
+        // is a delivery this seller cannot make, and it says so. `delivery_failed` rather than
+        // `no_sentinel`: the agent ran and answered, so the harness is healthy and is not struck.
+        if answer.len() > INLINE_ANSWER_MAX_BYTES {
+            opline!(
+                "seller node execute fail job_id={job_id}: inline answer is {} bytes, over the \
+                 {INLINE_ANSWER_MAX_BYTES}-byte limit — refusing rather than delivering a cut answer",
+                answer.len()
+            );
+            self.fail_job_with_feedback(
+                job_id,
+                &offer.buyer_pubkey,
+                ReasonCode::DeliveryFailed,
+                DELIVERY_FAILURE_FEEDBACK,
+                None,
+            )
+            .await;
+            return;
+        }
+        let preimage = delivery_receipt_preimage(
+            job_id,
+            &offer.task,
+            offer.amount_sats,
+            &offer.buyer_pubkey,
+            seller_pubkey,
+            // The inline analogue of the delivered commit oid: the digest of the answer this very
+            // result carries. Both slots are hex; `delivery_kind` right below is the SIGNED field
+            // that says which one this is, so no unsigned path can re-read an answer digest as a
+            // commit.
+            &crate::receipt::result_content_hash_hex(answer),
+            crate::receipt::DeliveryKind::Inline.as_str(),
+            creq_terms(stored_creq),
+        );
+        let seller_sig = match self
+            .node
+            .signer()
+            .sign_receipt_hash(preimage.digest_hex())
+            .await
+        {
+            Ok(Ok(sig)) => sig,
+            Ok(Err(error)) => {
+                opline!(
+                    "seller node execute fail job_id={job_id}: inline receipt sign refused ({error})"
+                );
+                self.fail_job_with_feedback(
+                    job_id,
+                    &offer.buyer_pubkey,
+                    ReasonCode::DeliveryFailed,
+                    DELIVERY_FAILURE_FEEDBACK,
+                    None,
+                )
+                .await;
+                return;
+            }
+            Err(error) => {
+                opline!("seller node execute fail job_id={job_id}: signer actor gone ({error})");
+                self.fail_job_with_feedback(
+                    job_id,
+                    &offer.buyer_pubkey,
+                    ReasonCode::DeliveryFailed,
+                    DELIVERY_FAILURE_FEEDBACK,
+                    None,
+                )
+                .await;
+                return;
+            }
+        };
+        let draft = gateway::inline_result_draft(
+            job_id,
+            &offer.buyer_pubkey,
+            // The buyer's declared output type. A row written before that column existed states
+            // none, and text/plain is the shape an answer takes.
+            offer.output.as_deref().unwrap_or("text/plain"),
+            offer.amount_sats,
+            &preimage.job_hash,
+            &seller_sig,
+            answer,
+            exec_metadata,
+        );
+        let now = now_unix();
+        // `result_ref` records WHAT was delivered. For git that is the commit; here it is the
+        // answer digest the co-signature binds, so the journal names the same artifact the buyer
+        // will verify.
+        match self.node.store().deliver_and_enqueue(
+            job_id,
+            &preimage.delivery_integrity_hash,
+            offer.payment_mode,
+            &draft,
+            now,
+            now + RESULT_PUBLISH_WINDOW_SECS,
+            now,
+        ) {
+            Ok(true) => opline!(
+                "seller node delivered job_id={job_id} inline bytes={} result enqueued",
+                answer.len()
+            ),
+            Ok(false) => opline!(
+                "seller node execute job_id={job_id}: delivery already journaled (dedup no-op)"
+            ),
+            Err(error) => {
+                opline!(
+                    "seller node execute fail job_id={job_id}: deliver journal failed ({error})"
+                );
+                self.fail_job_with_feedback(
+                    job_id,
+                    &offer.buyer_pubkey,
+                    ReasonCode::DeliveryFailed,
+                    DELIVERY_FAILURE_FEEDBACK,
+                    None,
+                )
+                .await;
+                return;
+            }
+        }
+        self.drain().await;
+    }
+
     /// Fail a container-delivered job with the SAME feedback reason codes and harness attribution the
     /// host path emits for the equivalent failure, so a buyer cannot tell the two paths apart.
     async fn fail_container_delivery(
@@ -8678,9 +9174,34 @@ impl SellerNodeRunner {
                 self.drop_harness(harness, harness_fault_for(&error));
                 (ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK)
             }
-            Fail::NoSentinel(detail) => {
-                opline!("seller node execute fail job_id={job_id}: delivery refused no_sentinel — {detail}");
-                self.drop_harness(harness, Some(ExecutionFailure::Harness(Fault::Unproven)));
+            Fail::NoSentinel {
+                detail,
+                last_agent_message,
+                ..
+            } => {
+                // A harness that produced a MARKED answer proved itself, whatever stopped that
+                // answer from being delivered. It is struck only when the turn proved nothing —
+                // which is what `no_sentinel` is for. Striking it for an answer that was merely
+                // too long, or for an outcome this host could not authenticate, takes a working
+                // seat out of the pool for a fault it did not have.
+                // THE MARKER, and only the marker. `message_truncated` must not stand in for it:
+                // a quota-dead harness whose vendor error string runs past the cap is truncated
+                // too, and treating that as an answer leaves a dead seat in the pool taking jobs.
+                // Truncation cannot hide the marker — it is the first line, and the cut is at the
+                // end — so the marker survives every message this arm can see.
+                let answered = last_agent_message
+                    .as_deref()
+                    .and_then(crate::engine::marked_inline_answer)
+                    .is_some();
+                if answered {
+                    opline!(
+                        "seller node execute fail job_id={job_id}: delivery refused no_sentinel — \
+                         {detail} (the agent answered, so the harness is not struck)"
+                    );
+                } else {
+                    opline!("seller node execute fail job_id={job_id}: delivery refused no_sentinel — {detail}");
+                    self.drop_harness(harness, Some(ExecutionFailure::Harness(Fault::Unproven)));
+                }
                 (ReasonCode::NoSentinel, NO_SENTINEL_FEEDBACK)
             }
             Fail::Snapshot(detail) => {
@@ -8946,6 +9467,7 @@ impl SellerNodeRunner {
             // but the mode is carried from the stored row rather than assumed, so a free job that
             // somehow reached here is judged as free, not as paid.
             payment_mode: offer.payment_mode,
+            accepts_delivery: offer.accepts_delivery.clone(),
             amount: offer.amount_sats,
             unit: offer.unit.clone(),
             deadline_unix: offer.deadline_unix.max(0) as u64,
@@ -9972,6 +10494,7 @@ mod tests {
 
     fn offer(amount: u64, targeted_to: Option<&str>, deadline_unix: u64) -> ParsedOffer {
         ParsedOffer {
+            accepts_delivery: Vec::new(),
             payment_mode: crate::gateway::PaymentMode::Sat,
             task: "do the thing".to_owned(),
             output: String::new(),
@@ -11034,6 +11557,7 @@ mod tests {
 
     fn free_offer(targeted_to: Option<&str>) -> ParsedOffer {
         ParsedOffer {
+            accepts_delivery: Vec::new(),
             payment_mode: crate::gateway::PaymentMode::None,
             ..offer(0, targeted_to, NOW + 600)
         }
@@ -11535,6 +12059,7 @@ mod tests {
             store
                 .record_offer(
                     &Offer {
+                        accepts_delivery: Vec::new(),
                         payment_mode: crate::gateway::PaymentMode::Sat,
                         offer_id: job.clone(),
                         buyer_pubkey: buyer.clone(),
@@ -13845,6 +14370,7 @@ mod tests {
         store
             .record_offer(
                 &crate::seller_node::store::Offer {
+                    accepts_delivery: Vec::new(),
                     payment_mode: crate::gateway::PaymentMode::Sat,
                     offer_id: job_id.to_owned(),
                     buyer_pubkey: buyer_hex.to_owned(),
@@ -14862,6 +15388,7 @@ mod tests {
         store
             .record_offer(
                 &Offer {
+                    accepts_delivery: Vec::new(),
                     payment_mode: crate::gateway::PaymentMode::Sat,
                     offer_id: job.to_owned(),
                     buyer_pubkey: buyer.to_owned(),
@@ -14900,6 +15427,7 @@ mod tests {
         store
             .record_offer(
                 &Offer {
+                    accepts_delivery: Vec::new(),
                     payment_mode: crate::gateway::PaymentMode::Sat,
                     offer_id: job.to_owned(),
                     buyer_pubkey: buyer.to_owned(),
@@ -15017,6 +15545,7 @@ mod tests {
                 store
                     .record_offer(
                         &Offer {
+                            accepts_delivery: Vec::new(),
                             payment_mode: crate::gateway::PaymentMode::Sat,
                             offer_id: job.to_owned(),
                             buyer_pubkey: buyer.clone(),
@@ -15689,9 +16218,9 @@ mod tests {
 
         // Attempt 1: the LNURL host is down. Nothing propagates; nothing moves.
         let mut fake = Fake::new(|_| 1);
-        fake.pay_request_error = Some("agi.cash: dns failure".to_owned());
+        fake.pay_request_error = Some("strike.me: dns failure".to_owned());
         let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 5001);
-        assert_eq!(report.outcome, Err("agi.cash: dns failure".to_owned()));
+        assert_eq!(report.outcome, Err("strike.me: dns failure".to_owned()));
         assert!(fake.melts.is_empty());
 
         // Attempt 2: the mint refuses the melt after the plan is journaled and the fence admitted
@@ -15738,7 +16267,7 @@ mod tests {
                 .iter()
                 .all(|a| a.outcome == RemitAttemptOutcome::Failed)
         );
-        assert_eq!(attempts[1].detail, "agi.cash: dns failure");
+        assert_eq!(attempts[1].detail, "strike.me: dns failure");
         assert!(
             attempts[0]
                 .detail
@@ -16787,9 +17316,9 @@ mod tests {
             )
             .expect("collect");
         let mut fake = Fake::new(|_| 1);
-        fake.pay_request_error = Some("agi.cash: dns failure".to_owned());
+        fake.pay_request_error = Some("strike.me: dns failure".to_owned());
         let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 100);
-        assert_eq!(report.outcome, Err("agi.cash: dns failure".to_owned()));
+        assert_eq!(report.outcome, Err("strike.me: dns failure".to_owned()));
         assert!(
             !report.lines.is_empty(),
             "the attempt printed its balance before the host failed: {report:?}"
@@ -16807,9 +17336,9 @@ mod tests {
         assert_eq!(volume, RemitLogVolume::Normal);
         assert_eq!(lines.len(), 1, "one line for the first failure: {lines:#?}");
         let line = &lines[0];
-        assert!(line.contains("agi.cash: dns failure"), "the error: {line}");
+        assert!(line.contains("strike.me: dns failure"), "the error: {line}");
         assert!(
-            line.contains("destination maxplayer@agi.cash"),
+            line.contains("destination maxplayer@strike.me"),
             "the destination: {line}"
         );
         assert!(

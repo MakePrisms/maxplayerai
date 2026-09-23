@@ -685,7 +685,7 @@ mod tests {
                 melt_fee_sats: None,
                 melt_fee_reserve_sats: Some(1),
                 net_sats: 6,
-                destination: "maxplayer@agi.cash".to_owned(),
+                destination: "maxplayer@strike.me".to_owned(),
                 melt_quote_id: None,
                 payment_hash: "old".to_owned(),
                 bolt11: "ln-old".to_owned(),
@@ -705,7 +705,7 @@ mod tests {
                 melt_fee_sats: Some(1),
                 melt_fee_reserve_sats: Some(2),
                 net_sats: 9,
-                destination: "maxplayer@agi.cash".to_owned(),
+                destination: "maxplayer@strike.me".to_owned(),
                 melt_quote_id: Some("q".to_owned()),
                 payment_hash: "abc123".to_owned(),
                 bolt11: "ln-abc".to_owned(),
@@ -727,7 +727,7 @@ mod tests {
                 melt_fee_sats: None,
                 melt_fee_reserve_sats: Some(3),
                 net_sats: 17,
-                destination: "maxplayer@agi.cash".to_owned(),
+                destination: "maxplayer@strike.me".to_owned(),
                 melt_quote_id: Some("q-rec".to_owned()),
                 payment_hash: "rec".to_owned(),
                 bolt11: "ln-rec".to_owned(),
@@ -749,7 +749,7 @@ mod tests {
                 melt_fee_sats: None,
                 melt_fee_reserve_sats: Some(1),
                 net_sats: 3,
-                destination: "maxplayer@agi.cash".to_owned(),
+                destination: "maxplayer@strike.me".to_owned(),
                 melt_quote_id: Some("q-mid".to_owned()),
                 payment_hash: "mid".to_owned(),
                 bolt11: "ln-mid".to_owned(),
@@ -770,10 +770,10 @@ mod tests {
             "platform fee (10%): 5 sats — unremitted\n",
             "  platform fee: 15 sats accrued — 10 sats remitted, 5 sats unremitted\n",
             "Remittances:\n",
-            "  failed (no sats left; receipts released): 6 sats to maxplayer@agi.cash — gross 7 sats, melt fee not observed, invoice old, 0 receipts, planned at unix 5, resolved at unix 6\n",
-            "  settled: 9 sats to maxplayer@agi.cash — gross 10 sats, melt fee 1 sats, invoice abc123, 1 receipt, planned at unix 7, resolved at unix 8\n",
-            "  settled: 17 sats to maxplayer@agi.cash — gross 20 sats, melt fee not observed (settled by reconciliation against the mint, which reports the quote paid but not the fee it kept; at most 3 sats, the quote's reserve), invoice rec, 2 receipts, planned at unix 9, resolved at unix 10\n",
-            "  SPENDING (melt admitted, bound to melt quote q-mid-pay; resolved only by the mint's verdict on that quote — re-run remit to reconcile): 3 sats to maxplayer@agi.cash — gross 4 sats, melt fee not observed, invoice mid, 1 receipt, planned at unix 11\n",
+            "  failed (no sats left; receipts released): 6 sats to maxplayer@strike.me — gross 7 sats, melt fee not observed, invoice old, 0 receipts, planned at unix 5, resolved at unix 6\n",
+            "  settled: 9 sats to maxplayer@strike.me — gross 10 sats, melt fee 1 sats, invoice abc123, 1 receipt, planned at unix 7, resolved at unix 8\n",
+            "  settled: 17 sats to maxplayer@strike.me — gross 20 sats, melt fee not observed (settled by reconciliation against the mint, which reports the quote paid but not the fee it kept; at most 3 sats, the quote's reserve), invoice rec, 2 receipts, planned at unix 9, resolved at unix 10\n",
+            "  SPENDING (melt admitted, bound to melt quote q-mid-pay; resolved only by the mint's verdict on that quote — re-run remit to reconcile): 3 sats to maxplayer@strike.me — gross 4 sats, melt fee not observed, invoice mid, 1 receipt, planned at unix 11\n",
         ] {
             assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
         }
@@ -1185,7 +1185,7 @@ mod tests {
                         gross_sats: 15,
                         net_sats: 13,
                         melt_fee_reserve_sats: 2,
-                        destination: "maxplayer@agi.cash".to_owned(),
+                        destination: "maxplayer@strike.me".to_owned(),
                         bolt11: "lnbc-held".to_owned(),
                         melt_quote_id: None,
                     },
@@ -1248,7 +1248,7 @@ mod tests {
                 "Platform fee remittance — {store}\n\
                  Automatic remittance after each collected payment: ON ([platform_fee] auto_remit = true, the default)\n\
                  Recent attempts: none journaled yet\n\
-                 Reconciling in-flight remittance hash-held (planned at unix 100 by old-run, lease until unix {lease}: 13 sats to maxplayer@agi.cash, gross 15 sats) — SPENDING since unix 100, bound to melt quote paid-quote-never-raised: asking the mint about that quote by id\n\
+                 Reconciling in-flight remittance hash-held (planned at unix 100 by old-run, lease until unix {lease}: 13 sats to maxplayer@strike.me, gross 15 sats) — SPENDING since unix 100, bound to melt quote paid-quote-never-raised: asking the mint about that quote by id\n\
                  \x20 HELD: remittance hash-held is SPENDING (admitted by old-run at unix 100), bound to melt quote paid-quote-never-raised; this wallet holds no such melt quote; 15 sats of receipts stay pinned to it — a spending row is released by nobody and on no clock; it settles only when the mint reports that quote PAID; an operator decision, not a timeout, resolves it. REFUSED — nothing moved by this run; re-run later to reconcile.\n",
                 store = root.join(STATE_DB_FILE).display(),
                 lease = i64::MAX / 2,

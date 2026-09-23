@@ -185,7 +185,20 @@ pub async fn collect_async(
     // that could post a free job WITHOUT this branch would produce jobs that are postable and
     // uncollectable. Nothing on this branch may reintroduce that window.
     if bind.payment_mode.is_free() {
-        let files = collect_free(home, &bind, &dest)?;
+        let files = match bind.inline_answer.as_deref() {
+            // An inline delivery has nothing to fetch: the answer is on the bind.
+            Some(answer) if bind_is_inline(&bind) => {
+                let files = materialize_inline_delivery(answer, &dest)
+                    .map_err(CollectError::Materialize)?;
+                // §7.0 — the record is the artifact, never the silence. `collect_free` writes it
+                // on the git arm, and this arm does not go through `collect_free`, so it writes
+                // its own. Without it a completed free inline trade leaves no buyer-side trace
+                // that it ever happened.
+                write_free_collect_record(home, &bind, &dest, &files)?;
+                files
+            }
+            _ => collect_free(home, &bind, &dest)?,
+        };
         return Ok(CollectOutcome {
             pay: CollectPayment::Free,
             commit_oid: bind.commit_oid,
@@ -218,10 +231,20 @@ pub async fn collect_async(
 
     // 4. Materialize the paid delivery's files (read-only checkout from the buyer store). Reached
     // only after the pay above succeeded or reconciled — never on an integrity refusal.
-    let store = delivery_store_path(home);
-    let store_ref = PayPathDeliveryVerifier::store_ref_for(&bind.commit_oid);
-    let files = materialize_delivery(&store, &store_ref, &bind.commit_oid, &dest)
-        .map_err(CollectError::Materialize)?;
+    let files = match bind.inline_answer.as_deref() {
+        // Reached only after the pay above succeeded, exactly like the git arm below. The answer
+        // was bound at accept under the digest `authorize_pay` just verified the co-signature over,
+        // so writing it here materializes the artifact that was paid for.
+        Some(answer) if bind_is_inline(&bind) => {
+            materialize_inline_delivery(answer, &dest).map_err(CollectError::Materialize)?
+        }
+        _ => {
+            let store = delivery_store_path(home);
+            let store_ref = PayPathDeliveryVerifier::store_ref_for(&bind.commit_oid);
+            materialize_delivery(&store, &store_ref, &bind.commit_oid, &dest)
+                .map_err(CollectError::Materialize)?
+        }
+    };
 
     Ok(CollectOutcome {
         pay: CollectPayment::Sat(pay),
@@ -437,6 +460,26 @@ pub fn results_dest(
     }
 }
 
+/// True when this bind settles an INLINE delivery (§6.4). A bind written before inline delivery
+/// existed carries no kind and is a git delivery — the fail-closed reading, and true of all of them.
+pub fn bind_is_inline(bind: &AcceptedBind) -> bool {
+    crate::job_lifecycle::bind_is_inline_kind(bind.delivery_kind.as_deref())
+}
+
+/// The file an inline answer is materialized as, under `results/<job_id>/`.
+pub const INLINE_ANSWER_FILENAME: &str = "answer.txt";
+
+/// Write an inline delivery's answer into `dest`. The inline analogue of [`materialize_delivery`]:
+/// there is no store to open, no ref to resolve and no tree to walk — the answer arrived inside the
+/// result event and was recorded on the bind at accept, under the digest the seller co-signed.
+pub fn materialize_inline_delivery(answer: &str, dest: &Path) -> Result<Vec<String>, String> {
+    std::fs::create_dir_all(dest)
+        .map_err(|error| format!("create {}: {error}", dest.display()))?;
+    let path = dest.join(INLINE_ANSWER_FILENAME);
+    std::fs::write(&path, answer).map_err(|error| format!("write {}: {error}", path.display()))?;
+    Ok(vec![INLINE_ANSWER_FILENAME.to_owned()])
+}
+
 /// Check out the tree of `commit_oid` from the buyer store (bare repo) into `dest`, writing each
 /// blob to its path and returning the sorted relative file list. Fail-closed: any read/write error
 /// aborts (never a partial-but-reported materialization). Resolves the retention ref first, then the
@@ -643,9 +686,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// §6.4 — an inline delivery materializes from the bind alone: no store, no ref, no checkout.
+    #[test]
+    fn an_inline_delivery_materializes_its_answer_to_a_file() {
+        let dir = std::env::temp_dir().join(format!("mxp-inline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let files = materialize_inline_delivery("Europe/Zagreb", &dir).expect("materializes");
+        assert_eq!(files, vec![INLINE_ANSWER_FILENAME.to_owned()]);
+        assert_eq!(
+            std::fs::read_to_string(dir.join(INLINE_ANSWER_FILENAME)).expect("reads"),
+            "Europe/Zagreb"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A bind written before inline delivery existed carries no kind. Reading it as a GIT delivery
+    /// is the fail-closed direction and is true of every such bind.
+    #[test]
+    fn a_bind_with_no_delivery_kind_is_read_as_git() {
+        let mut bind = bind_for(&"aa".repeat(32), &"bb".repeat(32), &"cc".repeat(20));
+        assert!(!bind_is_inline(&bind), "absent kind must not read as inline");
+        bind.delivery_kind = Some("inline".to_owned());
+        assert!(bind_is_inline(&bind));
+        bind.delivery_kind = Some("fork".to_owned());
+        assert!(!bind_is_inline(&bind));
+    }
+
     // Helper: a from-scratch accept-bind pinning `commit_oid` (used by refuse-path tests).
     fn bind_for(job_id: &str, seller_hex: &str, commit_oid: &str) -> AcceptedBind {
         AcceptedBind {
+            delivery_kind: None,
+            inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
             job_id: job_id.to_owned(),
             claim_id: "c".repeat(64),

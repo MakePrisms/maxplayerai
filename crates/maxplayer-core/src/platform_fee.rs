@@ -48,8 +48,8 @@
 pub const PLATFORM_FEE_BPS: u32 = 1000;
 
 /// The Lightning address (LUD-16, `user@host`) the accrued platform fee is remitted to. Ordered by
-/// Josip (real-sats authority), 2026-09-07. This constant is the whole specification of where the
-/// fee goes:
+/// Josip (real-sats authority), 2026-09-07, as `maxplayer@agi.cash`; moved to `maxplayer@strike.me`
+/// on 2026-09-18 (PR #1026). This constant is the whole specification of where the fee goes:
 ///
 /// - It is set by the product, here, and **not by the seller**. There is no config key, no env
 ///   override and no CLI flag, deliberately: the seller runs this binary, and the seller is the
@@ -65,7 +65,7 @@ pub const PLATFORM_FEE_BPS: u32 = 1000;
 ///
 /// The proper long-term fix — an authoritatively signed platform parameter carrying the rate and the
 /// address together, so neither needs a release — is a separate, later stage.
-pub const PLATFORM_FEE_ADDRESS: &str = "maxplayer@agi.cash";
+pub const PLATFORM_FEE_ADDRESS: &str = "maxplayer@strike.me";
 
 /// Basis points in one hundred percent — the ceiling on any rate.
 pub const BPS_PER_WHOLE: u32 = 10_000;
@@ -217,11 +217,11 @@ mod tests {
     // a constant — no config surface reads or writes it (see the doc comment for why).
     #[test]
     fn the_shipped_destination_is_the_ordered_lightning_address() {
-        assert_eq!(PLATFORM_FEE_ADDRESS, "maxplayer@agi.cash");
+        assert_eq!(PLATFORM_FEE_ADDRESS, "maxplayer@strike.me");
         let (user, host) = PLATFORM_FEE_ADDRESS
             .split_once('@')
             .expect("a LUD-16 address has exactly one @");
-        assert_eq!((user, host), ("maxplayer", "agi.cash"));
+        assert_eq!((user, host), ("maxplayer", "strike.me"));
         assert!(!host.contains('@') && !host.contains('/'));
     }
 }
