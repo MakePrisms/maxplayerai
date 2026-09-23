@@ -3455,7 +3455,16 @@ fn private_view_from_events(
         let Some(claim) = feedback.iter().find(|c| Some(c.id.to_hex().as_str()) == at.get("claim")) else { continue; };
         if crate::private_content::lifecycle::validate_result(event, claim, award, &result, &context.policy.host).is_err() { continue; }
         let answer_envelope = if rt.has("content-id") {
-            let Ok(answer) = context.accept_content(&result, event, Some(claim), Some(award), None, now) else { continue; };
+            let answer = match context.accept_content(&result, event, Some(claim), Some(award), None, now) {
+                Ok(answer) => answer,
+                Err(crate::private_content::Error("private content is not yet available")) => {
+                    // The signed selected-seller result is present. Missing ciphertext
+                    // is an incomplete read, not delivery absence: reconciliation treats
+                    // relay errors conservatively and must not release its reservation.
+                    return Err(JobLifecycleError::Relay("private result content is pending; retry the read".into()));
+                }
+                Err(_) => continue,
+            };
             Some(answer.envelope().to_owned())
         } else { None };
         let evidence = PrivateEvidence { offer: event.clone(), claim: claim.clone(), award: award.clone(), result: result.clone(),
@@ -7351,6 +7360,20 @@ mod private_flow_tests {
         let now = nostr_sdk::Timestamp::now().as_secs();
         let build = |ctx: &mut ContentContext| private_view_from_events(&home, ctx, &evidence.offer,
             vec![evidence.claim.clone()], vec![evidence.award.clone()], vec![evidence.result.clone()], now);
+        // Carrier-before-body remains an incomplete read even after the offer
+        // deadline. Otherwise reconciliation would see an expired claim/no result
+        // and release reserved funds before the independently retried copy arrives.
+        let mut carrier_home=home.clone();
+        carrier_home.root=home.root.join("carrier-first");
+        std::fs::create_dir_all(&carrier_home.root).unwrap();
+        let mut carrier_first=ContentContext::open(&carrier_home,&buyer.public_key().to_hex()).unwrap();
+        carrier_first.stage(&PreparedContent::decode(evidence.task_envelope.as_ref().unwrap()).unwrap(),2_000_000_001).unwrap();
+        let incomplete=private_view_from_events(&carrier_home,&mut carrier_first,&evidence.offer,
+            vec![evidence.claim.clone()],vec![evidence.award.clone()],vec![evidence.result.clone()],2_000_000_001);
+        assert!(matches!(incomplete,Err(JobLifecycleError::Relay(_))), "missing answer cannot certify delivery absence");
+        carrier_first.stage(&PreparedContent::decode(evidence.answer_envelope.as_ref().unwrap()).unwrap(),2_000_000_001).unwrap();
+        assert_eq!(private_view_from_events(&carrier_home,&mut carrier_first,&evidence.offer,
+            vec![evidence.claim.clone()],vec![evidence.award.clone()],vec![evidence.result.clone()],2_000_000_001).unwrap().results.len(),1);
         // Answer-before-offer is staged, never interpreted as an executable task.
         ctx.stage(&PreparedContent::decode(evidence.answer_envelope.as_ref().unwrap()).unwrap(), now).unwrap();
         assert!(build(&mut ctx).is_err());

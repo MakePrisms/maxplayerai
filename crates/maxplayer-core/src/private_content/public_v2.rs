@@ -545,7 +545,13 @@ mod tests {
     fn keys(n: u8) -> Keys {
         Keys::parse(&format!("{n:064x}")).unwrap()
     }
-    fn fixture() -> (PrivateEvidence, Keys) {
+    fn fixture(paid: bool) -> (PrivateEvidence, Keys) {
+        let amount = if paid { 10 } else { 0 };
+        let mode = if paid {
+            gateway::PaymentMode::Sat
+        } else {
+            gateway::PaymentMode::None
+        };
         let buyer = keys(1);
         let seller = keys(2);
         let offer = sign(
@@ -554,17 +560,27 @@ mod tests {
                 gateway::OfferDraft::new(
                     "public task",
                     "text/plain",
-                    0,
+                    amount,
                     2_000_000_000,
                     seller.public_key().to_hex(),
                 )
-                .with_payment_mode(gateway::PaymentMode::None)
+                .with_payment_mode(mode)
                 .accepting_delivery(["inline"])
                 .to_event_draft(),
             )
             .unwrap(),
         )
         .unwrap();
+        let creq = paid.then(|| {
+            gateway::creq::build_seller_creq(
+                &offer.id.to_hex(),
+                amount,
+                "sat",
+                &["https://testnut.cashu.space".into()],
+                &seller.public_key().to_hex(),
+            )
+            .unwrap()
+        });
         let claim = sign(
             &seller,
             project(
@@ -573,7 +589,9 @@ mod tests {
                     &offer.id.to_hex(),
                     &buyer.public_key().to_hex(),
                     &seller.public_key().to_hex(),
-                    gateway::ClaimPayment::None,
+                    creq.as_deref()
+                        .map(gateway::ClaimPayment::Sat)
+                        .unwrap_or(gateway::ClaimPayment::None),
                     &[],
                     &Default::default(),
                 ),
@@ -610,14 +628,14 @@ mod tests {
             protocol: crate::receipt::ReceiptProtocol::V2,
             job_hash: super::super::job_hash(&offer.id.to_hex()).unwrap(),
             offer_id: offer.id.to_hex(),
-            amount: 0,
+            amount,
             unit: "sat".into(),
             buyer_pubkey: buyer.public_key().to_hex(),
             seller_pubkey: seller.public_key().to_hex(),
             delivery_integrity_hash: answer.commitment().into(),
             delivery_kind: "inline".into(),
             exec_metadata_commitment: "none".into(),
-            creq_hash: None,
+            creq_hash: creq.as_deref().map(gateway::creq_hash_hex),
         };
         let sig = seller
             .sign_schnorr(&Message::from_digest(p.digest_bytes()))
@@ -630,7 +648,7 @@ mod tests {
                     &offer.id.to_hex(),
                     &buyer.public_key().to_hex(),
                     "text/plain",
-                    0,
+                    amount,
                     &p.job_hash,
                     &sig,
                     "public answer\n",
@@ -656,7 +674,7 @@ mod tests {
     }
     #[test]
     fn public_v2_inline_binds_exact_public_envelope_and_signed_selection() {
-        let (e, buyer) = fixture();
+        let (e, buyer) = fixture(false);
         let verified = validate_evidence(&e, &buyer.public_key().to_hex()).unwrap();
         assert_eq!(verified.answer.as_deref(), Some("public answer\n"));
         assert_ne!(
@@ -724,8 +742,56 @@ mod tests {
         assert!(validate_evidence(&wrong_seller, &buyer.public_key().to_hex()).is_err());
     }
     #[test]
+    fn public_v2_paid_bind_pins_invoice_mints_and_result_after_restart() {
+        let (e, buyer) = fixture(true);
+        let verified = validate_evidence(&e, &buyer.public_key().to_hex()).unwrap();
+        let p = verified.preimage;
+        let request = crate::authorize_pay::AuthorizePayRequest {
+            private_evidence: Some(e.clone()),
+            job_id: e.offer.id.to_hex(),
+            result_id: e.result.id.to_hex(),
+            job_class: crate::authorize_pay::JobClass::FromScratch,
+            delivery_integrity_hash: p.delivery_integrity_hash.clone(),
+            commit_oid: p.delivery_integrity_hash.clone(),
+            job_hash: p.job_hash.clone(),
+            seller_pubkey: e.claim.pubkey.to_hex(),
+            amount_sats: p.amount,
+            repo: String::new(),
+            branch: String::new(),
+            inline_answer: verified.answer,
+            seller_signature: required(&e.result, "sig:seller").unwrap().into(),
+            creq_hash: p.creq_hash.clone(),
+            accepted_mints: vec!["https://testnut.cashu.space".into()],
+            realized_mint: Some("https://testnut.cashu.space".into()),
+            contribution: None,
+            payment_mode: gateway::PaymentMode::Sat,
+        };
+        let restored: PrivateEvidence =
+            serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
+        validate_request(&restored, &request, &buyer.public_key().to_hex()).unwrap();
+        crate::payment::ReceiptAuthority {
+            buyer: buyer.public_key(),
+            seller: e.claim.pubkey,
+        }
+        .verify_seller_prepay_cosig(&p, &request.seller_signature, None)
+        .unwrap();
+        for field in ["mint", "invoice", "result", "amount"] {
+            let mut changed = request.clone();
+            match field {
+                "mint" => changed.accepted_mints = vec!["https://other.example".into()],
+                "invoice" => changed.creq_hash = Some("aa".repeat(32)),
+                "result" => changed.result_id = "aa".repeat(32),
+                _ => changed.amount_sats += 1,
+            }
+            assert!(
+                validate_request(&restored, &changed, &buyer.public_key().to_hex()).is_err(),
+                "{field}"
+            );
+        }
+    }
+    #[test]
     fn public_v2_restart_keeps_envelope_nonce_and_selected_claim() {
-        let (e, _) = fixture();
+        let (e, _) = fixture(false);
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("public.sqlite");
         let initial = {
