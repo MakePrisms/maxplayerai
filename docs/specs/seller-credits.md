@@ -60,9 +60,15 @@ serde unchanged. TokenV4 stores the mint as that string. The handoff's warning, 
 a URL with an npub", is about pasting an npub where HTTP code expects a host. Here the scheme is
 what selects the connector, and no HTTP code ever sees a `nostr://` URL (§4.1).
 
-**Verify in stage 1:** a unit test that a `nostr://npub1…` token encodes, decodes and binds to a
-`WalletBuilder` wallet with a custom connector, and that no CDK wallet path calls `MintUrl::join`
-(which is HTTP-only) on that URL.
+**Verified 23 Sep 2026 (CDK 0.17.2, throwaway test crate, in-process connector, no HTTP):** a
+`nostr://npub1…` URL round-trips through `MintUrl` parse/Display/serde and trailing-slash/case
+normalisation, NUT-18 `creqA` and NUT-26 `creqB`, a real CDK `Mint` advertising it in `info.urls`,
+and a full sqlite-backed wallet lifecycle: issue, P2PK-locked V4 send, receive (wrong key refused),
+double-spend refused, NUT-07 state, onward transfer, wallet reopen, NUT-13 restore from seed.
+**One hard constraint found:** CDK's WebSocket subscription path (`wallet/subscription.rs:547-553`)
+joins `/v1/ws` onto the mint URL and panics (`Could not set scheme`) on `nostr://`, which hangs any
+quote/proof stream. Every `nostr://` wallet MUST be built with `WalletBuilder::use_http_subscription()`
+(poll mode, which goes through the connector), and a test must assert it.
 
 Relay hints are **not** part of the URL, since hosts can't carry them. They come from §2.2.
 
