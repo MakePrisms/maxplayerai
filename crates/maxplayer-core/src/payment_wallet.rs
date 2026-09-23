@@ -12,10 +12,8 @@ use cashu::{
     Amount, CheckStateRequest, CurrencyUnit, MintUrl, Proofs, PublicKey as CashuPublicKey,
     SecretKey, SpendingConditions, State, Token,
 };
-use cdk::wallet::{
-    HttpClient, KeysetFilter, MintConnector, ReceiveOptions, SendOptions, Wallet,
-};
 use cdk::wallet::types::{SendSagaState, TransactionDirection, WalletSagaState};
+use cdk::wallet::{HttpClient, KeysetFilter, MintConnector, ReceiveOptions, SendOptions, Wallet};
 use nostr_sdk::PublicKey as NostrPublicKey;
 
 use crate::gateway::ParsedOffer;
@@ -84,6 +82,59 @@ fn nostr_request_may_be_live(
     })
 }
 
+/// `Some(reason)` while any incomplete saga on this `nostr://` wallet (any kind: send, swap, melt,
+/// receive) may still have a request the mint can execute. `None` for `https://` wallets.
+#[cfg_attr(not(feature = "gateway"), allow(dead_code))]
+pub(crate) async fn nostr_recovery_hold(
+    wallet: &Wallet,
+) -> Result<Option<String>, PaymentWalletError> {
+    if !crate::mint_wire::is_nostr_scheme(&wallet.mint_url.to_string()) {
+        return Ok(None);
+    }
+    let live = wallet
+        .localstore
+        .get_incomplete_sagas()
+        .await
+        .map_err(wallet_error)?
+        .into_iter()
+        .filter(|saga| saga.mint_url == wallet.mint_url && saga.unit == wallet.unit)
+        .filter_map(|saga| {
+            nostr_request_may_be_live(wallet, &saga)
+                .map(|reason| format!("{} ({}): {reason}", saga.id, saga.state.state_str()))
+        })
+        .collect::<Vec<_>>();
+    Ok((!live.is_empty()).then(|| format!("cdk saga recovery held: {}", live.join("; "))))
+}
+
+/// Outcome of [`recover_incomplete_sagas_guarded`].
+#[cfg_attr(not(feature = "gateway"), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum GuardedRecovery {
+    /// cdk's recovery ran.
+    Ran,
+    /// cdk's recovery was NOT run: a `nostr://` request may still land (reason attached).
+    Held(String),
+}
+
+/// cdk's `recover_incomplete_sagas`, refused on a `nostr://` mint while any of its sagas may still
+/// have a live request. cdk's resume compensates `Send`/`Melt(ProofsReserved)` with no NUT-07 check
+/// and deletes an empty `SwapRequested` row when `/restore` finds nothing — both unsafe while the
+/// mint can still execute the signed request (PR #1034 re-review). Every caller of cdk recovery must
+/// go through this.
+#[cfg_attr(not(feature = "gateway"), allow(dead_code))]
+pub(crate) async fn recover_incomplete_sagas_guarded(
+    wallet: &Wallet,
+) -> Result<GuardedRecovery, cdk::Error> {
+    if let Some(reason) = nostr_recovery_hold(wallet)
+        .await
+        .map_err(|error| cdk::Error::Custom(error.to_string()))?
+    {
+        return Ok(GuardedRecovery::Held(reason));
+    }
+    wallet.recover_incomplete_sagas().await?;
+    Ok(GuardedRecovery::Ran)
+}
+
 /// Reason code surfaced when a dead mint blocks the post-time dust guard.
 pub const MINT_UNREACHABLE_POST: &str = "mint_unreachable";
 
@@ -101,9 +152,11 @@ pub const MINT_UNREACHABLE_KEYSETS: &str = "mint_unreachable_keysets";
 /// Last-resort ceiling on ONE buyer-worker round-trip across the synchronous bridge in
 /// [`CdkPaymentEffects::request`].
 ///
-/// Every mint-touching leg the worker runs is already bounded at [`MINT_TOUCH_TIMEOUT`]; this ceiling
-/// sits well above their worst-case sum (`4 × MINT_TOUCH_TIMEOUT`), so a worker that fails closed on
-/// its own always surfaces that specific refusal first. The bridge timeout only fires if the worker
+/// Every mint-touching leg the worker runs is already bounded — at [`MINT_TOUCH_TIMEOUT`] for
+/// reads, and at [`mint_mutation_timeout`] for the publishing legs (40s on `nostr://`, where the
+/// bridge uses [`bridge_recv_timeout`] instead). This ceiling sits above their worst-case sum, so a
+/// worker that fails closed on its own always surfaces that specific refusal first. The bridge only
+/// stops WAITING; it never cancels the worker. The bridge timeout only fires if the worker
 /// is wedged in a leg no inner bound covers — turning a would-be infinite park
 /// (MakePrisms/maxplayerai#387) into a bounded, logged, fail-closed refusal that moves no money.
 const BRIDGE_RECV_TIMEOUT: Duration = Duration::from_secs(20);
@@ -191,7 +244,11 @@ pub enum PreflightError {
 impl std::fmt::Display for PreflightError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::MintUnreachable { reason, mint, detail } => write!(
+            Self::MintUnreachable {
+                reason,
+                mint,
+                detail,
+            } => write!(
                 formatter,
                 "{reason}: mint {mint} unreachable or erroring ({detail})"
             ),
@@ -391,8 +448,9 @@ impl<'a> CdkBuyerMint<'a> {
         // closed and return NO token, so no money reaches the seller this run. A ProofsReserved left
         // mid-swap is compensated exactly as a definitive confirm failure is — the ATTEMPT_METADATA tag
         // lets the next recover/reconcile map it, so a later retry never double-spends.
-        // For a nostr:// mint the bound outlasts the connector's window (see mint_mutation_timeout),
-        // so this arm is reached only past a request that can no longer be executed.
+        // For a nostr:// mint the bound outlasts ONE connector window, but confirm makes more than one
+        // call (fetch_active_keyset before the swap), so this arm CAN fire while the swap request is
+        // still live. What makes that safe is recovery's REQUEST_SETTLE hold, not this bound.
         let token = match tokio::time::timeout(mutation_bound, prepared.confirm(None)).await {
             Ok(Ok(token)) => token,
             Ok(Err(error)) => {
@@ -559,7 +617,9 @@ impl<'a> CdkBuyerMint<'a> {
         // Decompose the reconciled token into proofs (needs the wallet's mint keysets to expand a
         // TokenV4's short keyset ids) and compute each proof Y for the NUT-07 query — the same
         // `token.proofs` + `proof.y()` calculation the send payload build and `reconcile` use.
-        let ys = token_proof_ys(self.wallet, &token).await.map_err(gate_effect)?;
+        let ys = token_proof_ys(self.wallet, &token)
+            .await
+            .map_err(gate_effect)?;
         // Non-mutating NUT-07 — NEVER `check_proofs_spent` (it deletes mint-Spent `y`s).
         let states = nut07_check_state_non_mutating(self.wallet, ys.clone())
             .await
@@ -689,11 +749,7 @@ pub(crate) fn http_502_mint() -> (String, thread::JoinHandle<()>) {
     (format!("http://{address}"), responder)
 }
 
-fn mint_unreachable(
-    wallet: &Wallet,
-    reason: &'static str,
-    detail: String,
-) -> PaymentWalletError {
+fn mint_unreachable(wallet: &Wallet, reason: &'static str, detail: String) -> PaymentWalletError {
     PaymentWalletError::MintUnreachable {
         reason,
         mint: wallet.mint_url.to_string(),
@@ -727,9 +783,9 @@ async fn mint_input_fee_bounded(
         Ok(Err(error)) if is_mint_unreachable(&error) => {
             BoundedFee::Unreachable(format!("fee query transport failure: {error}"))
         }
-        Ok(Err(error)) => {
-            BoundedFee::Failed(PaymentWalletError::Wallet(format!("fee query failed: {error}")))
-        }
+        Ok(Err(error)) => BoundedFee::Failed(PaymentWalletError::Wallet(format!(
+            "fee query failed: {error}"
+        ))),
     }
 }
 
@@ -824,10 +880,7 @@ pub async fn require_fee_safe_amount_for_post(
 }
 
 /// `amount < fee + 1` (equivalently `amount <= fee`) is economic dust.
-pub fn require_amount_covers_fee(
-    amount: Amount,
-    fee: Amount,
-) -> Result<(), PaymentWalletError> {
+pub fn require_amount_covers_fee(amount: Amount, fee: Amount) -> Result<(), PaymentWalletError> {
     if amount <= fee {
         return Err(PaymentWalletError::Policy(format!(
             "dust vs mint fee: amount={amount} fee={fee}; need amount >= fee+1"
@@ -1075,7 +1128,8 @@ async fn expand_token_proofs(wallet: &Wallet, token: &Token) -> Result<Proofs, P
 
     // Bounded like every other mint touch: this is a live fetch against a mint that may be dead,
     // and it sits on the buyer money path behind the MCP tool deadline.
-    let refresh_error = match tokio::time::timeout(MINT_TOUCH_TIMEOUT, wallet.refresh_keysets()).await
+    let refresh_error = match tokio::time::timeout(MINT_TOUCH_TIMEOUT, wallet.refresh_keysets())
+        .await
     {
         Ok(Ok(_)) => None,
         Ok(Err(error)) => Some(error.to_string()),
@@ -1527,7 +1581,8 @@ async fn rollback_swap_saga(
         ReservedInputTruth::AllUnspent
     ) {
         return Err(PaymentWalletError::Reconcile(
-            "swap-saga rollback refused: inputs no longer all-unspent before mutate (TOCTOU)".into(),
+            "swap-saga rollback refused: inputs no longer all-unspent before mutate (TOCTOU)"
+                .into(),
         ));
     }
     revert_reserved_and_delete_saga(wallet, saga).await
@@ -1733,7 +1788,9 @@ async fn retire_one_mapped_send(
         .delete_saga(&saga.id)
         .await
         .map_err(|error| {
-            PaymentWalletError::Reconcile(format!("mapped-send retire failed deleting saga: {error}"))
+            PaymentWalletError::Reconcile(format!(
+                "mapped-send retire failed deleting saga: {error}"
+            ))
         })?;
     Ok(())
 }
@@ -1815,7 +1872,9 @@ async fn complete_spent_send_saga(
         .delete_saga(&saga.id)
         .await
         .map_err(|error| {
-            PaymentWalletError::Reconcile(format!("send-saga complete failed deleting saga: {error}"))
+            PaymentWalletError::Reconcile(format!(
+                "send-saga complete failed deleting saga: {error}"
+            ))
         })
 }
 
@@ -1890,7 +1949,8 @@ enum BuyerCommand {
         /// Two layers: the OUTER `PaymentWalletError` is the shared [`CdkPaymentEffects::request`]
         /// transport channel (so this command rides the SAME bounded worker bridge as `Send` — no
         /// bespoke recv), and the INNER `Result` is the proof-gate verdict.
-        response: mpsc::SyncSender<Result<Result<LockedPayment, LockedTokenGate>, PaymentWalletError>>,
+        response:
+            mpsc::SyncSender<Result<Result<LockedPayment, LockedTokenGate>, PaymentWalletError>>,
     },
 }
 
@@ -2029,12 +2089,11 @@ impl<R> CdkPaymentEffects<R> {
                                 )
                                 .await
                                 {
-                                    Ok(payload) => payment_send
-                                        .send_payment(payload)
-                                        .await
-                                        .map_err(|error| {
+                                    Ok(payload) => {
+                                        payment_send.send_payment(payload).await.map_err(|error| {
                                             PaymentWalletError::Wallet(error.to_string())
-                                        }),
+                                        })
+                                    }
                                     Err(error) => Err(error),
                                 };
                                 let _ = response.send(result);
@@ -2081,9 +2140,9 @@ impl<R> CdkPaymentEffects<R> {
             })?;
         match result.recv_timeout(self.recv_timeout) {
             Ok(inner) => inner.map_err(|error| EffectError::new(error.to_string())),
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                Err(EffectError::new("payment wallet worker dropped its response"))
-            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(EffectError::new(
+                "payment wallet worker dropped its response",
+            )),
             // Fail closed: a worker that has not answered within the bridge ceiling is treated as
             // wedged (MakePrisms/maxplayerai#387), never awaited forever. No response means no token
             // was handed back to the caller, so no money moved.
@@ -2115,9 +2174,15 @@ impl<R> CdkPaymentEffects<R> {
             })?;
         match result.recv_timeout(self.recv_timeout) {
             Ok(Ok(fee)) => Ok(fee.to_u64()),
-            Ok(Err(PaymentWalletError::MintUnreachable { reason, mint, detail })) => {
-                Err(PreflightError::MintUnreachable { reason, mint, detail })
-            }
+            Ok(Err(PaymentWalletError::MintUnreachable {
+                reason,
+                mint,
+                detail,
+            })) => Err(PreflightError::MintUnreachable {
+                reason,
+                mint,
+                detail,
+            }),
             Ok(Err(error)) => Err(PreflightError::Other(error.to_string())),
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(PreflightError::Other(
                 "payment wallet worker dropped its response".into(),
@@ -2314,7 +2379,8 @@ impl<'a> CdkSellerReceive<'a> {
         assert_redeem_mint(&token_mint, payload_mint, accepted_mints)?;
         if token_mint != terms.mint || token.unit().as_ref() != Some(&terms.unit) {
             return Err(PaymentWalletError::Policy(
-                "wrong_mint: received token mint/unit does not match the realized creq terms".into(),
+                "wrong_mint: received token mint/unit does not match the realized creq terms"
+                    .into(),
             ));
         }
         if face != terms.amount {
@@ -2376,10 +2442,7 @@ fn require_received_amount_after_fee(
     fee: Amount,
 ) -> Result<Amount, PaymentWalletError> {
     // Journal/daemon invariants expect face (== offer.amount), not wallet net.
-    if received
-        .checked_add(fee)
-        .is_some_and(|total| total == face)
-    {
+    if received.checked_add(fee).is_some_and(|total| total == face) {
         return Ok(face);
     }
     if received > Amount::ZERO {
@@ -2410,8 +2473,8 @@ fn wallet_error(error: impl std::fmt::Display) -> PaymentWalletError {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap, HashSet};
-    use std::sync::{Arc, Mutex};
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use cashu::secret::Secret;
     use cashu::{
@@ -2425,10 +2488,10 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::gateway::ParsedOffer;
     use crate::delivery::{
         CommitOid, DeliveryError, DeliveryVerifier, GitDelivery, VerifiedDelivery,
     };
+    use crate::gateway::ParsedOffer;
     use crate::payment::{
         DeliveryIntegrityHash, JobHash, JobId, MemoryPaymentJournal, PaymentKey, PaymentService,
         PaymentState, ReceiptAuthority, ResultId,
@@ -2440,10 +2503,7 @@ mod tests {
     struct AcceptDelivery;
 
     impl DeliveryVerifier for AcceptDelivery {
-        fn verify(
-            &mut self,
-            delivery: &GitDelivery,
-        ) -> Result<VerifiedDelivery, DeliveryError> {
+        fn verify(&mut self, delivery: &GitDelivery) -> Result<VerifiedDelivery, DeliveryError> {
             VerifiedDelivery::from_fetched_tip(delivery, delivery.commit_oid().clone())
         }
     }
@@ -2621,19 +2681,11 @@ mod tests {
         let proof_y = proof.y().unwrap();
         let store = Arc::new(cdk_sqlite::wallet::memory::empty().await.unwrap());
         // Insert as Unspent; reserve_proofs requires Unspent → marks Reserved.
-        let proof_info = ProofInfo::new(
-            proof.clone(),
-            mint(MINT),
-            State::Unspent,
-            CurrencyUnit::Sat,
-        )
-        .unwrap();
+        let proof_info =
+            ProofInfo::new(proof.clone(), mint(MINT), State::Unspent, CurrencyUnit::Sat).unwrap();
         let saga_id = uuid::Uuid::now_v7();
         store.update_proofs(vec![proof_info], vec![]).await.unwrap();
-        store
-            .reserve_proofs(vec![proof_y], &saga_id)
-            .await
-            .unwrap();
+        store.reserve_proofs(vec![proof_y], &saga_id).await.unwrap();
         let saga = WalletSaga::new(
             saga_id,
             cdk::wallet::types::WalletSagaState::Send(
@@ -2742,19 +2794,11 @@ mod tests {
         let proof = p2pk_proof(7, seller);
         let proof_y = proof.y().unwrap();
         let store = Arc::new(cdk_sqlite::wallet::memory::empty().await.unwrap());
-        let proof_info = ProofInfo::new(
-            proof.clone(),
-            mint(MINT),
-            State::Unspent,
-            CurrencyUnit::Sat,
-        )
-        .unwrap();
+        let proof_info =
+            ProofInfo::new(proof.clone(), mint(MINT), State::Unspent, CurrencyUnit::Sat).unwrap();
         let saga_id = uuid::Uuid::now_v7();
         store.update_proofs(vec![proof_info], vec![]).await.unwrap();
-        store
-            .reserve_proofs(vec![proof_y], &saga_id)
-            .await
-            .unwrap();
+        store.reserve_proofs(vec![proof_y], &saga_id).await.unwrap();
         let saga = WalletSaga::new(
             saga_id,
             cdk::wallet::types::WalletSagaState::Send(
@@ -2903,19 +2947,11 @@ mod tests {
         let proof = p2pk_proof(7, seller);
         let proof_y = proof.y().unwrap();
         let store = Arc::new(cdk_sqlite::wallet::memory::empty().await.unwrap());
-        let proof_info = ProofInfo::new(
-            proof.clone(),
-            mint(MINT),
-            State::Unspent,
-            CurrencyUnit::Sat,
-        )
-        .unwrap();
+        let proof_info =
+            ProofInfo::new(proof.clone(), mint(MINT), State::Unspent, CurrencyUnit::Sat).unwrap();
         let saga_id = uuid::Uuid::now_v7();
         store.update_proofs(vec![proof_info], vec![]).await.unwrap();
-        store
-            .reserve_proofs(vec![proof_y], &saga_id)
-            .await
-            .unwrap();
+        store.reserve_proofs(vec![proof_y], &saga_id).await.unwrap();
         let saga = WalletSaga::new(
             saga_id,
             cdk::wallet::types::WalletSagaState::Send(
@@ -2950,7 +2986,11 @@ mod tests {
         (wallet, saga_id, proof_y)
     }
 
-    async fn assert_nut07_incomplete_refuses(wallet: &Wallet, saga_id: uuid::Uuid, proof_y: CashuPublicKey) {
+    async fn assert_nut07_incomplete_refuses(
+        wallet: &Wallet,
+        saga_id: uuid::Uuid,
+        proof_y: CashuPublicKey,
+    ) {
         let err = retire_eligible_incomplete_sagas(wallet)
             .await
             .expect_err("incomplete NUT-07 must refuse");
@@ -3000,11 +3040,9 @@ mod tests {
     #[tokio::test]
     async fn nut07_wrong_y_states_refuses_retire() {
         let wrong_y = p2pk_proof(3, secret_key(2).public_key()).y().unwrap();
-        let (wallet, saga_id, proof_y) = reserved_saga_with_nut07_states(
-            21,
-            vec![ProofState::from((wrong_y, State::Unspent))],
-        )
-        .await;
+        let (wallet, saga_id, proof_y) =
+            reserved_saga_with_nut07_states(21, vec![ProofState::from((wrong_y, State::Unspent))])
+                .await;
         assert_nut07_incomplete_refuses(&wallet, saga_id, proof_y).await;
     }
 
@@ -3017,10 +3055,20 @@ mod tests {
         let y_a = proof_a.y().unwrap();
         let y_b = proof_b.y().unwrap();
         let store = Arc::new(cdk_sqlite::wallet::memory::empty().await.unwrap());
-        let info_a = ProofInfo::new(proof_a.clone(), mint(MINT), State::Unspent, CurrencyUnit::Sat)
-            .unwrap();
-        let info_b = ProofInfo::new(proof_b.clone(), mint(MINT), State::Unspent, CurrencyUnit::Sat)
-            .unwrap();
+        let info_a = ProofInfo::new(
+            proof_a.clone(),
+            mint(MINT),
+            State::Unspent,
+            CurrencyUnit::Sat,
+        )
+        .unwrap();
+        let info_b = ProofInfo::new(
+            proof_b.clone(),
+            mint(MINT),
+            State::Unspent,
+            CurrencyUnit::Sat,
+        )
+        .unwrap();
         let saga_id = uuid::Uuid::now_v7();
         store
             .update_proofs(vec![info_a, info_b], vec![])
@@ -3098,9 +3146,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            unspent
-                .iter()
-                .all(|info| info.y != y_a && info.y != y_b),
+            unspent.iter().all(|info| info.y != y_a && info.y != y_b),
             "partial NUT-07 must not phantom-credit reserved proofs"
         );
     }
@@ -3112,19 +3158,11 @@ mod tests {
         let proof_y = proof.y().unwrap();
         let store = Arc::new(cdk_sqlite::wallet::memory::empty().await.unwrap());
         // Insert as Unspent; reserve_proofs requires Unspent → marks Reserved.
-        let proof_info = ProofInfo::new(
-            proof.clone(),
-            mint(MINT),
-            State::Unspent,
-            CurrencyUnit::Sat,
-        )
-        .unwrap();
+        let proof_info =
+            ProofInfo::new(proof.clone(), mint(MINT), State::Unspent, CurrencyUnit::Sat).unwrap();
         let saga_id = uuid::Uuid::now_v7();
         store.update_proofs(vec![proof_info], vec![]).await.unwrap();
-        store
-            .reserve_proofs(vec![proof_y], &saga_id)
-            .await
-            .unwrap();
+        store.reserve_proofs(vec![proof_y], &saga_id).await.unwrap();
         let saga = WalletSaga::new(
             saga_id,
             cdk::wallet::types::WalletSagaState::Send(
@@ -3258,7 +3296,12 @@ mod tests {
             .await
             .unwrap()
             .len();
-        let sagas = wallet.localstore.get_incomplete_sagas().await.unwrap().len();
+        let sagas = wallet
+            .localstore
+            .get_incomplete_sagas()
+            .await
+            .unwrap()
+            .len();
         (reserved, sagas)
     }
 
@@ -3271,8 +3314,17 @@ mod tests {
         assert_eq!(report.retired, 0);
         assert_eq!(report.swap_rolled_back, 0);
         assert_eq!(report.unresolved.len(), 2, "{:?}", report.unresolved);
-        assert!(report.unresolved.iter().all(|r| r.contains("may still be executed")));
-        assert_eq!(reserved_unspent_count(&wallet).await, (1, 2), "nothing unspent, nothing dropped");
+        assert!(
+            report
+                .unresolved
+                .iter()
+                .all(|r| r.contains("may still be executed"))
+        );
+        assert_eq!(
+            reserved_unspent_count(&wallet).await,
+            (1, 2),
+            "nothing unspent, nothing dropped"
+        );
     }
 
     #[tokio::test]
@@ -3297,9 +3349,50 @@ mod tests {
             .unwrap()
             .clone();
         let mut report = RetireReport::default();
-        let refusal = resolve_one_swap_saga(&wallet, &swap, &mut report).await.expect_err("kept");
-        assert!(refusal.to_string().contains("ProofsReserved send is incomplete"), "{refusal}");
-        assert!(wallet.localstore.get_saga(&swap.id).await.unwrap().is_some());
+        let refusal = resolve_one_swap_saga(&wallet, &swap, &mut report)
+            .await
+            .expect_err("kept");
+        assert!(
+            refusal
+                .to_string()
+                .contains("ProofsReserved send is incomplete"),
+            "{refusal}"
+        );
+        assert!(
+            wallet
+                .localstore
+                .get_saga(&swap.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn cdk_recovery_is_held_on_nostr_while_a_request_may_still_land() {
+        // PR #1034 re-review: the hop sweep's cdk recovery compensated Send(ProofsReserved) and
+        // deleted the empty SwapRequested row inside the window. The guard must not run it.
+        let wallet = nostr_reserved_send_wallet(cashu::util::unix_time(), true).await;
+        let outcome = recover_incomplete_sagas_guarded(&wallet).await.unwrap();
+        let GuardedRecovery::Held(reason) = outcome else {
+            panic!("cdk recovery ran inside the settle window");
+        };
+        assert!(
+            reason.contains("(proofs_reserved)") && reason.contains("(swap_requested)"),
+            "{reason}"
+        );
+        assert_eq!(
+            reserved_unspent_count(&wallet).await,
+            (1, 2),
+            "nothing unspent, nothing dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn cdk_recovery_hold_lifts_once_every_nostr_request_has_settled() {
+        let settled = cashu::util::unix_time() - crate::nostr_mint::REQUEST_SETTLE.as_secs() - 1;
+        let wallet = nostr_reserved_send_wallet(settled, true).await;
+        assert_eq!(nostr_recovery_hold(&wallet).await.unwrap(), None);
     }
 
     #[test]
@@ -3387,7 +3480,9 @@ mod tests {
         // Unit-level: drive a real cdk HTTP request through the bounded fee reader. This proves
         // cdk represents the raw responder as the status-bearing error the shared predicate sees.
         let (fee_mint, fee_responder) = http_502_mint();
-        let fee_store = runtime.block_on(cdk_sqlite::wallet::memory::empty()).unwrap();
+        let fee_store = runtime
+            .block_on(cdk_sqlite::wallet::memory::empty())
+            .unwrap();
         let fee_wallet = Wallet::new(
             &fee_mint,
             CurrencyUnit::Sat,
@@ -3414,7 +3509,9 @@ mod tests {
 
         // Bridge-level: prove the typed result survives preflight_fee and authorize conversion.
         let (bridge_mint, bridge_responder) = http_502_mint();
-        let bridge_store = runtime.block_on(cdk_sqlite::wallet::memory::empty()).unwrap();
+        let bridge_store = runtime
+            .block_on(cdk_sqlite::wallet::memory::empty())
+            .unwrap();
         let bridge_wallet = Wallet::new(
             &bridge_mint,
             CurrencyUnit::Sat,
@@ -3458,8 +3555,14 @@ mod tests {
             "authorize outcome must stay typed, got: {authorize}"
         );
         let line = authorize.to_string();
-        assert!(line.contains(&bridge_mint), "operator text names the mint: {line}");
-        assert!(line.contains("unreachable"), "operator text classifies the refusal: {line}");
+        assert!(
+            line.contains(&bridge_mint),
+            "operator text names the mint: {line}"
+        );
+        assert!(
+            line.contains("unreachable"),
+            "operator text classifies the refusal: {line}"
+        );
     }
 
     /// Post-time dust guard fails fast with `mint_unreachable` (not a hang / generic
@@ -3553,7 +3656,11 @@ mod tests {
         let fee = require_fee_safe_amount_for_post(&wallet, Amount::from(2))
             .await
             .expect("amount above the cached fee floor must pass via the cached fallback");
-        assert_eq!(fee, Amount::from(1), "fallback used the cached N=1 fee floor");
+        assert_eq!(
+            fee,
+            Amount::from(1),
+            "fallback used the cached N=1 fee floor"
+        );
     }
 
     #[tokio::test]
@@ -3706,7 +3813,9 @@ mod tests {
 
         // CDK receive returns net after fees (face 2 − fee 1 = 1).
         let amount = adapter
-            .receive_with(&token, &terms, &accepted(&[MINT]), &mint(MINT), |_| async { Ok(Amount::from(1)) })
+            .receive_with(&token, &terms, &accepted(&[MINT]), &mint(MINT), |_| async {
+                Ok(Amount::from(1))
+            })
             .await
             .unwrap();
 
@@ -3780,9 +3889,13 @@ mod tests {
         let adapter = CdkSellerReceive::new(&wallet, seller_key);
 
         let amount = adapter
-            .receive_with(&token, &terms, &accepted(&[MINT, MINT2]), &mint(MINT2), |_| async {
-                Ok(Amount::from(5))
-            })
+            .receive_with(
+                &token,
+                &terms,
+                &accepted(&[MINT, MINT2]),
+                &mint(MINT2),
+                |_| async { Ok(Amount::from(5)) },
+            )
             .await
             .expect("redeem at realized non-default mint must succeed");
         assert_eq!(amount, Amount::from(5));
@@ -3795,12 +3908,7 @@ mod tests {
         let keyset = transport.keyset.clone();
         let proof = signed_p2pk_proof_for_keyset(4, seller_key.public_key(), keyset.id);
         let proof_y = proof.y().unwrap();
-        let token = Token::new(
-            mint(OTHER_MINT),
-            vec![proof],
-            None,
-            CurrencyUnit::Sat,
-        );
+        let token = Token::new(mint(OTHER_MINT), vec![proof], None, CurrencyUnit::Sat);
         let swap_calls = transport.swap_calls.clone();
         let spent_ys = transport.spent_ys.clone();
         let wallet = seller_wallet_at(OTHER_MINT, transport, keyset).await;
@@ -3835,16 +3943,10 @@ mod tests {
         let keyset = transport.keyset.clone();
         let proof = signed_p2pk_proof_for_keyset(4, seller_key.public_key(), keyset.id);
         let proof_y = proof.y().unwrap();
-        let token = Token::new(
-            mint(OTHER_MINT),
-            vec![proof],
-            None,
-            CurrencyUnit::Sat,
-        );
+        let token = Token::new(mint(OTHER_MINT), vec![proof], None, CurrencyUnit::Sat);
         let swap_calls = transport.swap_calls.clone();
         let spent_ys = transport.spent_ys.clone();
-        let first_wallet =
-            seller_wallet_at(OTHER_MINT, transport.clone(), keyset.clone()).await;
+        let first_wallet = seller_wallet_at(OTHER_MINT, transport.clone(), keyset.clone()).await;
         let replay_wallet = seller_wallet_at(OTHER_MINT, transport, keyset).await;
         let terms = PaymentTerms::new(
             mint(OTHER_MINT),
@@ -3900,9 +4002,13 @@ mod tests {
         let adapter = CdkSellerReceive::new(&wallet, seller_key);
 
         let result = adapter
-            .receive_with(&token, &terms, &accepted(&[MINT, MINT2]), &mint(MINT2), |_| async {
-                Ok(Amount::from(5))
-            })
+            .receive_with(
+                &token,
+                &terms,
+                &accepted(&[MINT, MINT2]),
+                &mint(MINT2),
+                |_| async { Ok(Amount::from(5)) },
+            )
             .await;
         assert!(
             matches!(&result, Err(PaymentWalletError::Policy(msg)) if msg.contains("wallet mint")),
@@ -3927,7 +4033,9 @@ mod tests {
         let adapter = CdkSellerReceive::new(&wallet, seller_key);
 
         let result = adapter
-            .receive_with(&token, &terms, &accepted(&[MINT]), &mint(MINT), |_| async { Ok(Amount::from(2)) })
+            .receive_with(&token, &terms, &accepted(&[MINT]), &mint(MINT), |_| async {
+                Ok(Amount::from(2))
+            })
             .await;
 
         assert!(matches!(
@@ -4145,7 +4253,11 @@ mod tests {
 
         let start = std::time::Instant::now();
         let result: Result<LockedPayment, EffectError> =
-            effects.request(|response| BuyerCommand::Lock { attempt_id, terms, response });
+            effects.request(|response| BuyerCommand::Lock {
+                attempt_id,
+                terms,
+                response,
+            });
         let elapsed = start.elapsed();
 
         // Not `expect_err`: LockedPayment is intentionally not Debug (it wraps a token).
@@ -4154,8 +4266,7 @@ mod tests {
             Err(err) => err,
         };
         assert!(
-            err.to_string().contains("did not respond")
-                && err.to_string().contains("fail-closed"),
+            err.to_string().contains("did not respond") && err.to_string().contains("fail-closed"),
             "must be the bridge fail-closed refusal, got: {err}"
         );
         // Bounded at ~recv_timeout: it actually waited the timeout (not an early unrelated error) and
@@ -4227,10 +4338,19 @@ mod tests {
         let elapsed = start.elapsed();
 
         // (i) fail-closed refusal at the pre-reserve preflight (the never-answering mint).
-        assert!(preflight.is_err(), "a never-answering mint must fail the pre-reserve preflight");
-        assert!(!entered_gate, "a failed preflight must short-circuit BEFORE the budget gate");
+        assert!(
+            preflight.is_err(),
+            "a never-answering mint must fail the pre-reserve preflight"
+        );
+        assert!(
+            !entered_gate,
+            "a failed preflight must short-circuit BEFORE the budget gate"
+        );
         // (ii) bounded — no park (without the recv_timeout this line is unreachable; the test hangs).
-        assert!(elapsed < Duration::from_secs(5), "must be bounded (no park), took {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "must be bounded (no park), took {elapsed:?}"
+        );
         // (iii) ZERO SPEND — the reserve never ran, so the never-answer burns no budget.
         assert_eq!(
             gate.spent(),
@@ -4439,7 +4559,9 @@ mod tests {
         {
             Err(LockedTokenGate::Spent(_)) => {}
             Err(other) => panic!("a Spent proof must STOP with Spent, got {other:?}"),
-            Ok(_) => panic!("a Spent proof must NOT return Ok — that would resend a redeemed token"),
+            Ok(_) => {
+                panic!("a Spent proof must NOT return Ok — that would resend a redeemed token")
+            }
         }
     }
 
@@ -4529,7 +4651,11 @@ mod tests {
             .await
             .unwrap();
         store.add_keys(keyset).await.unwrap();
-        let connector = Arc::new(BaseHttpClient::with_transport(mint(mint_url), transport, None));
+        let connector = Arc::new(BaseHttpClient::with_transport(
+            mint(mint_url),
+            transport,
+            None,
+        ));
         WalletBuilder::new()
             .mint_url(mint(mint_url))
             .unit(CurrencyUnit::Sat)
@@ -4710,11 +4836,7 @@ mod tests {
         )
     }
 
-    fn signed_p2pk_proof_for_keyset(
-        amount: u64,
-        seller: PublicKey,
-        keyset_id: Id,
-    ) -> Proof {
+    fn signed_p2pk_proof_for_keyset(amount: u64, seller: PublicKey, keyset_id: Id) -> Proof {
         let secret = Secret::try_from(SpendingConditions::new_p2pk(
             seller,
             Some(Conditions::default()),
@@ -5080,11 +5202,9 @@ mod tests {
                         return Err(cdk::Error::KeysetUnknown(blinded_message.keyset_id));
                     }
                     let signing_key = self.signing_key(blinded_message.amount)?;
-                    let c = cashu::dhke::sign_message(
-                        &signing_key,
-                        &blinded_message.blinded_secret,
-                    )
-                    .map_err(|error| cdk::Error::Custom(error.to_string()))?;
+                    let c =
+                        cashu::dhke::sign_message(&signing_key, &blinded_message.blinded_secret)
+                            .map_err(|error| cdk::Error::Custom(error.to_string()))?;
                     cashu::nuts::BlindSignature::new(
                         blinded_message.amount,
                         c,
@@ -5439,12 +5559,27 @@ mod tests {
 
         let report = retire_eligible_incomplete_sagas(&wallet).await.unwrap();
 
-        assert_eq!(report.mapped_token_created, 1, "it must still be RECOGNISED as mapped");
-        assert_eq!(report.retired_mapped, 1, "and recognising it is not enough — it must be DROPPED");
-        assert!(report.unresolved.is_empty(), "unexpected refusal: {:?}", report.unresolved);
+        assert_eq!(
+            report.mapped_token_created, 1,
+            "it must still be RECOGNISED as mapped"
+        );
+        assert_eq!(
+            report.retired_mapped, 1,
+            "and recognising it is not enough — it must be DROPPED"
+        );
+        assert!(
+            report.unresolved.is_empty(),
+            "unexpected refusal: {:?}",
+            report.unresolved
+        );
         // The predicate that matters is over the artifact, not the report: the row is gone.
         assert!(
-            wallet.localstore.get_saga(&saga_id).await.unwrap().is_none(),
+            wallet
+                .localstore
+                .get_saga(&saga_id)
+                .await
+                .unwrap()
+                .is_none(),
             "the saga row must be absent after a retire — a tally is not a retirement"
         );
     }
@@ -5473,7 +5608,12 @@ mod tests {
             "a tx matching by amount but NOT saga_id must not admit a retire"
         );
         assert!(
-            wallet.localstore.get_saga(&saga_id).await.unwrap().is_some(),
+            wallet
+                .localstore
+                .get_saga(&saga_id)
+                .await
+                .unwrap()
+                .is_some(),
             "the saga must survive an amount-only match"
         );
 
@@ -5483,9 +5623,17 @@ mod tests {
         let saga_id = add_send_saga(&wallet, &[]).await;
         add_tx_for_saga(&wallet, Some(saga_id), TransactionDirection::Incoming, 0).await;
         let report = retire_eligible_incomplete_sagas(&wallet).await.unwrap();
-        assert_eq!(report.retired_mapped, 0, "an incoming tx must not admit a retire");
+        assert_eq!(
+            report.retired_mapped, 0,
+            "an incoming tx must not admit a retire"
+        );
         assert!(
-            wallet.localstore.get_saga(&saga_id).await.unwrap().is_some(),
+            wallet
+                .localstore
+                .get_saga(&saga_id)
+                .await
+                .unwrap()
+                .is_some(),
             "the saga must survive an incoming-only match"
         );
 
@@ -5498,7 +5646,12 @@ mod tests {
             "an UNMAPPED token_created saga must never reach the mapped retire"
         );
         assert!(
-            wallet.localstore.get_saga(&saga_id).await.unwrap().is_some(),
+            wallet
+                .localstore
+                .get_saga(&saga_id)
+                .await
+                .unwrap()
+                .is_some(),
             "an unmapped saga must survive for recover_unmapped_sagas to refuse over"
         );
     }
@@ -5516,15 +5669,26 @@ mod tests {
 
         let report = retire_eligible_incomplete_sagas(&wallet).await.unwrap();
 
-        assert_eq!(report.mapped_token_created, 1, "still recognised as a mapped send");
+        assert_eq!(
+            report.mapped_token_created, 1,
+            "still recognised as a mapped send"
+        );
         assert_eq!(report.retired_mapped, 0, "but it must NOT be retired");
         assert!(
-            report.unresolved.iter().any(|line| line.contains("still reserved")),
+            report
+                .unresolved
+                .iter()
+                .any(|line| line.contains("still reserved")),
             "the refusal must surface why, got: {:?}",
             report.unresolved
         );
         assert!(
-            wallet.localstore.get_saga(&saga_id).await.unwrap().is_some(),
+            wallet
+                .localstore
+                .get_saga(&saga_id)
+                .await
+                .unwrap()
+                .is_some(),
             "the saga must survive so the reserved proofs stay explained"
         );
     }
@@ -5547,7 +5711,10 @@ mod tests {
 
         let report = retire_eligible_incomplete_sagas(&wallet).await.unwrap();
 
-        assert_eq!(report.send_completed, 1, "spent inputs must complete the send");
+        assert_eq!(
+            report.send_completed, 1,
+            "spent inputs must complete the send"
+        );
         assert!(
             report.unresolved.is_empty(),
             "a resolvable saga must not be recorded unresolved: {:?}",
@@ -5602,7 +5769,10 @@ mod tests {
 
         let report = retire_eligible_incomplete_sagas(&wallet).await.unwrap();
 
-        assert_eq!(report.send_completed, 0, "an unclaimed token must not complete");
+        assert_eq!(
+            report.send_completed, 0,
+            "an unclaimed token must not complete"
+        );
         assert_eq!(
             report.unresolved.len(),
             1,
@@ -5614,7 +5784,12 @@ mod tests {
             report.unresolved[0]
         );
         assert_eq!(
-            wallet.localstore.get_incomplete_sagas().await.unwrap().len(),
+            wallet
+                .localstore
+                .get_incomplete_sagas()
+                .await
+                .unwrap()
+                .len(),
             1,
             "an unresolvable saga must survive for recover_unmapped_sagas to refuse over"
         );
@@ -5657,7 +5832,12 @@ mod tests {
             report.unresolved[0]
         );
         assert_eq!(
-            wallet.localstore.get_incomplete_sagas().await.unwrap().len(),
+            wallet
+                .localstore
+                .get_incomplete_sagas()
+                .await
+                .unwrap()
+                .len(),
             1,
             "the row must survive — dropping it would destroy the only copy of its token"
         );
@@ -5747,7 +5927,9 @@ mod tests {
         match &refused {
             Err(PaymentWalletError::Reconcile(message))
                 if message.contains("incomplete TokenCreated operation") => {}
-            other => panic!("an unresolved send saga must still block the pay path, got: {other:?}"),
+            other => {
+                panic!("an unresolved send saga must still block the pay path, got: {other:?}")
+            }
         }
     }
 
@@ -5792,8 +5974,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            ys.iter()
-                .all(|y| unspent.iter().any(|info| info.y == *y)),
+            ys.iter().all(|y| unspent.iter().any(|info| info.y == *y)),
             "rolled-back inputs must be spendable (Unspent) again"
         );
     }
@@ -5814,7 +5995,10 @@ mod tests {
         .await;
 
         let report = retire_eligible_incomplete_sagas(&wallet).await.unwrap();
-        assert_eq!(report.swap_recovered, 1, "spent inputs must complete via restore");
+        assert_eq!(
+            report.swap_recovered, 1,
+            "spent inputs must complete via restore"
+        );
         assert_eq!(report.swap_rolled_back, 0);
         assert!(
             wallet
@@ -5881,7 +6065,10 @@ mod tests {
             "expected mixed-state refuse, got: {}",
             report.unresolved[0]
         );
-        assert_eq!(report.swap_rolled_back, 0, "a mixed answer must not roll back");
+        assert_eq!(
+            report.swap_rolled_back, 0,
+            "a mixed answer must not roll back"
+        );
         assert_eq!(report.swap_recovered, 0, "a mixed answer must not complete");
         assert_eq!(
             wallet
@@ -5955,7 +6142,12 @@ mod tests {
             report.unresolved[0]
         );
         assert!(
-            wallet.localstore.get_saga(&saga_id).await.unwrap().is_some(),
+            wallet
+                .localstore
+                .get_saga(&saga_id)
+                .await
+                .unwrap()
+                .is_some(),
             "the saga must survive — this is the Spent-then-deleted fail-closed branch"
         );
 
@@ -5965,12 +6157,17 @@ mod tests {
         match &refused {
             Err(PaymentWalletError::Reconcile(message))
                 if message.contains("empty reserved set") => {}
-            other => panic!(
-                "resolver refusal must surface on the recover/daemon path, got: {other:?}"
-            ),
+            other => {
+                panic!("resolver refusal must surface on the recover/daemon path, got: {other:?}")
+            }
         }
         assert!(
-            wallet.localstore.get_saga(&saga_id).await.unwrap().is_some(),
+            wallet
+                .localstore
+                .get_saga(&saga_id)
+                .await
+                .unwrap()
+                .is_some(),
             "refuse must be sticky"
         );
     }
@@ -5996,7 +6193,12 @@ mod tests {
             report.unresolved
         );
         assert!(
-            wallet.localstore.get_saga(&saga_id).await.unwrap().is_none(),
+            wallet
+                .localstore
+                .get_saga(&saga_id)
+                .await
+                .unwrap()
+                .is_none(),
             "the orphan must still drop when the only tx names a different saga"
         );
         CdkBuyerMint::new(&wallet)
@@ -6171,7 +6373,11 @@ mod tests {
             is_unknown_short_keyset_id(&unfixed),
             "premise must fail with the keyset miss, not something else: {unfixed}"
         );
-        assert_eq!(transport.fetches(), 0, "the stale read must not touch the mint");
+        assert_eq!(
+            transport.fetches(),
+            0,
+            "the stale read must not touch the mint"
+        );
 
         let proofs = expand_token_proofs(&wallet, &token)
             .await
@@ -6263,14 +6469,10 @@ mod tests {
         let (wallet, transport) =
             rotated_keyset_wallet(&cached, vec![cached.clone(), rotated.clone()]).await;
 
-        let payload = build_nut18_payload(
-            &wallet,
-            "job-873".into(),
-            seller.to_string(),
-            token.clone(),
-        )
-        .await
-        .expect("buyer NUT-18 payload must route through the refreshing expansion");
+        let payload =
+            build_nut18_payload(&wallet, "job-873".into(), seller.to_string(), token.clone())
+                .await
+                .expect("buyer NUT-18 payload must route through the refreshing expansion");
 
         assert_eq!(payload.payload.proofs.len(), 1);
         assert_eq!(payload.payload.proofs[0].keyset_id, rotated.id);

@@ -62,9 +62,11 @@ pub const OUTER_MARGIN: Duration = Duration::from_secs(10);
 /// How long after a wallet saga's last update a `nostr://` request it may have published can still
 /// be executed by the mint. Recovery must not unspend or forget that saga's inputs before then.
 ///
-/// Bound: a pay leg starts its request at most `DEFAULT_WINDOW + OUTER_MARGIN` after the saga write
-/// (the bounded `prepare_send`), and the request's `exp` is at most `DEFAULT_WINDOW` after that.
-/// Five minutes is well above that sum and absorbs wallet/mint clock skew.
+/// Bound: the send saga is stamped at the end of `prepare_send`; the publishing `confirm` is then
+/// capped at `DEFAULT_WINDOW + OUTER_MARGIN`, and any request it starts carries an `exp` at most
+/// `DEFAULT_WINDOW` later (~70s total). The swap saga `confirm` writes is stamped just before its
+/// publish. Five minutes covers that with room for wallet/mint clock skew; a forward wallet clock
+/// step larger than the remainder during the window is not covered.
 pub const REQUEST_SETTLE: Duration = Duration::from_secs(300);
 /// Bound on the relay disconnect after a request, so it cannot stretch past [`OUTER_MARGIN`].
 const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(2);
