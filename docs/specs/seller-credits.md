@@ -34,6 +34,19 @@ compatibility with it.
 11. **Firm requirement:** no seller-hosted public endpoint of any kind. The seller only connects
     outward to relays.
 
+Second round (Bob, #credit-feature, 23 Sep 2026 16:02):
+
+12. **The mint is opt-in at build time.** The default release binary contains no mint code. Issuing
+    needs a build with the `credits-mint` cargo feature. Accepting, holding and paying with credits
+    are wallet-side and ship in the default binary.
+13. **No new announcement kind.** Mint info goes in the seller heartbeat (kind 30340) for now.
+14. **Rate cap:** about 20 requests per second per mint, tunable by the seller.
+15. **Relays:** the mint listens on the seller's relay plus one or two public relays as fallback.
+16. **Manual opt-in is enough trust for now:** a seller adds a mint by hand before accepting it.
+17. **Credit spend counts against the buyer's sat budget.**
+18. **An issuer always accepts its own credits.**
+19. **No mint fee** (`set_unit_fee` stays 0).
+
 ## 1. The model in one paragraph
 
 The issuing seller's node embeds a CDK mint engine with its own SQLite database and signing keys,
@@ -72,26 +85,23 @@ quote/proof stream. Every `nostr://` wallet MUST be built with `WalletBuilder::u
 
 Relay hints are **not** part of the URL, since hosts can't carry them. They come from §2.2.
 
-### 2.2 Mint announcement — addressable kind `30341`
+### 2.2 Mint advertisement — seller heartbeat only (settled input 13)
 
-The mint publishes, signed by its own key:
+There is no separate announcement event. The issuing seller's heartbeat (kind 30340) carries
+`["credit_mint", <npub>, <relay>…]` (§5.3). The binding is checked in both directions without a new
+kind:
 
-```
-kind 30341, d = "credit-mint"
-tags: ["relay", <wss url>]…, ["keyset", <id>]…, ["v", "1"]
-content: JSON { "name": …, "description": …, "issuer": <seller hex pubkey> }
-```
-
-- The `issuer` field plus a matching `["credit_mint", <npub>]` tag on the **seller's** heartbeat
-  (§5.3) binds the mint to the seller in both directions. A mint that claims a seller who doesn't
-  claim it back is shown as unverified.
-- Keysets are pinned here, so a connector can tell whether a mint's keys changed.
+- The heartbeat, signed by the seller key, claims the mint.
+- The mint's `info` reply (NUT-06), signed by the mint key, names its issuer's seller pubkey. A
+  heartbeat claim the mint doesn't confirm is shown as unverified.
+- Keysets are learned from the mint's `keys` reply as usual. They are not pinned in the heartbeat.
 - Keys: the mint key is **separate from the seller key**, generated at `credits enable` and stored
   `0600` at `<home>/mint/nostr.key`. The seller's identity can then rotate without orphaning
   every outstanding credit. Rotating the mint key is out of scope: its npub **is** the mint
   identity, and changing it means issuing a new mint.
 
-Kinds `23410`, `23411` and `30341` don't collide with `kinds.rs @135e4ea` (3400–3407, 30340).
+Kinds `23410` and `23411` don't collide with `kinds.rs @135e4ea` (3400–3407, 30340). Both are in the
+ephemeral range, which relay.maxplayer.ai already passes through (tested, §9).
 
 ## 3. The wire protocol — kinds `23410` (request) / `23411` (response)
 
@@ -175,7 +185,7 @@ relay denied.
 - **Balances** (`wallet_ops::MintBalance`) are already per mint. Add a `kind: lightning | credit`
   column and show two totals in `wallet balance`. Never sum them into one number.
 - **Budget gate:** credit spend counts against the buyer's sat budget like any other spend. Same
-  unit, same cap (see §8 Q1).
+  unit, same cap (settled input 17).
 
 ### 4.3 Config
 
@@ -183,8 +193,13 @@ relay denied.
 [credits]
 issue = true                       # this seller runs a mint (set by `credits enable`)
 accepted = ["nostr://npub1…", …]   # other issuers' mints this seller takes
-relays = []                        # empty ⇒ [relay_url]
+relays = []                        # empty ⇒ [relay_url] + 1–2 public fallback relays
+rate_limit = 20                    # requests/second the mint serves; over it ⇒ "rate_limited"
 ```
+
+The `rate_limited` reply is a definitive error, since the mint did not run the request. The public
+fallback relays are picked in stage 3, after checking they accept and deliver kinds 23410/23411
+with NIP-42.
 
 The seller's own mint is always accepted when `issue = true`. `accepted_mints` keeps its meaning.
 The creq and heartbeat mint lists become `accepted_mints ∪ online credit mints` (§5.2).
@@ -193,8 +208,9 @@ The creq and heartbeat mint lists become `accepted_mints ∪ online credit mints
 
 ### 5.1 Enable and issue (local only)
 
-- `maxplayer credits enable` generates the mint Nostr key, creates `<home>/mint/mint.sqlite` and a
-  seed, and publishes kind `30341`. It refuses if `<home>/mint/` already exists: never
+- `maxplayer credits enable` exists only in a `credits-mint` build (settled input 12). In the
+  default binary it prints how to get a build with the mint. It generates the mint Nostr key, creates
+  `<home>/mint/mint.sqlite` and a seed, and adds the `credit_mint` tag to the next heartbeat. It refuses if `<home>/mint/` already exists: never
   re-initialize a seed under an existing identity. It prints the backup warning (settled input 9):
   losing `<home>/mint/` makes every outstanding credit worthless, and restoring an old copy can let
   spent credits be spent again.
@@ -220,7 +236,7 @@ answers. The pending-receive breadcrumb (`append_pending_receive`, `run.rs:9458`
 
 - Issuer heartbeat (`heartbeat.rs`, kind 30340): a new `["credit_mint", <npub>, <relay>…]` tag,
   omitted when the seller doesn't issue, so existing beats are byte-identical.
-- `maxplayer mints list` reads 30340 beats plus 30341 announcements and shows each mint's npub,
+- `maxplayer mints list` reads 30340 beats, pings each advertised mint's `info`, and shows its npub,
   issuer, verified or unverified binding (§2.2), and whether it's online now.
 - `maxplayer mints add <npub>` appends to `[credits] accepted`. Nothing is added automatically.
 
@@ -238,10 +254,12 @@ answers. The pending-receive breadcrumb (`append_pending_receive`, `run.rs:9458`
 1. **Identity and fences.** `nostr://` parsing test, `mint_connector_for` with HTTP only, and the
    §4.2 fences (allow-list, crossmint exclusion, fee-remit Lightning-only, balance kind). No
    behavior change for `https://`.
-2. **Embedded mint and local issue.** Enable cdk `mint` plus cdk-sqlite mint store, `credits enable`
-   and `credits issue`. In-process only, no network.
-3. **Nostr listener and connector.** Kinds 23410/23411/30341, the response cache, and tests on the
-   in-process relay (`nostr-relay-builder`, already a dev-dependency).
+2. **Embedded mint and local issue.** A `credits-mint` cargo feature, off in the default release,
+   enabling cdk `mint` plus the cdk-sqlite mint store, `credits enable` and `credits issue`.
+   In-process only, no network. Devshell and CI add protobuf and build both with and without the
+   feature. The default release build does not need `protoc`.
+3. **Nostr listener and connector.** Kinds 23410/23411, the rate cap, the fallback relay list, and
+   tests on the in-process relay (`nostr-relay-builder`, already a dev-dependency).
 4. **Seller accept path.** `[credits] accepted`, the online gate, the heartbeat tag,
    `mints list/add`, and seller receive at a foreign credit mint.
 5. **Buyer path.** Receive, send, balances by kind, pay and award filter.
@@ -252,22 +270,18 @@ answers. The pending-receive breadcrumb (`append_pending_receive`, `run.rs:9458`
 ### 7.1 Required failure tests
 
 Duplicate requests across relays (one swap executes). Replayed, stale, forged or wrong-key
-responses (rejected). Reply lost after commit (cache replay, then restore). Mint or wallet killed at
+responses (rejected). Reply lost after commit, on both the receive and the send side
+(`recover_incomplete_sagas`, never a blind re-`receive`). Rate cap enforced. A default build contains
+no mint code. Mint or wallet killed at
 each write boundary. Two holders spending the same proofs at once (one wins). All relays down (clean
 error, no fallback). Oversized or malformed requests. Unsupported ops, including NUT-04 and NUT-05
 (refused). Fee remit never melts at a credit mint. Credits never selected for a hop. `credits
 enable` refuses over an existing mint. **No HTTP call is ever made for a `nostr://` mint.**
 
-## 8. Open questions (defaults proposed; say if you disagree)
+## 8. Open questions
 
-1. **Budget:** credit spend counts against the buyer's sat budget, since it's the same unit.
-   *Default: yes.*
-2. **Issuer self-acceptance:** an issuing seller always accepts its own mint and verifies locally.
-   *Default: yes.*
-3. **Relays:** the mint listens on the seller's `relay_url` only unless `[credits] relays` is set.
-   *Default: yes.* More relays means more availability and more duplicate traffic, which §3.3
-   absorbs.
-4. **Mint fees:** CDK supports an input fee (`set_unit_fee`). *Default: 0.*
+None. The earlier questions (budget, self-acceptance, relays, fees) were answered as settled inputs
+12–19.
 
 ## 9. Pre-code test results (23 Sep 2026, CDK 0.17.2, throwaway crate)
 
@@ -282,5 +296,5 @@ enable` refuses over an existing mint. **No HTTP call is ever made for a `nostr:
   200 ms at 51 KB, 219 ms at the 65 KB NIP-44 max. Echo only, one run.
 - **Build cost:** cdk `mint` feature hard-enables `cdk-signatory/grpc`, so **`protoc` is required**
   and cannot be switched off without patching CDK. Toy binary: wallet-only 10.4 MB / 367 s cold,
-  wallet+mint 17.1 MB / 479 s (+6.3 MB, +30 crates incl. axum, tonic, prost). The mint goes behind a
-  `credits-mint` cargo feature, and devshell, CI and release add protobuf.
+  wallet+mint 17.1 MB / 479 s (+6.3 MB, +30 crates incl. axum, tonic, prost). The mint goes behind the
+  opt-in `credits-mint` cargo feature (settled input 12), so only that build needs `protoc`.
