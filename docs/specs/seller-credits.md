@@ -242,10 +242,11 @@ connector and cached per keyset:
      node knows that preimage, so a fake backend can't produce it. The preimage comes from CDK's
      `FinalizedMelt::payment_proof()`, which `wallet_ops::MeltOutcome` doesn't carry today, and on
      reconciliation from the NUT-05 quote-state reply. CDK does not store it in the wallet DB.
-  3. **Missing or mismatched preimage ⇒ the row is HELD as unverified, never auto-retried.** The
-     mint did take the proofs, so a retry could pay twice if the payment was real. The fee stays owed
-     in the read-out, the attempt is journaled and alarmed, and `seller fees remit` shows it for the
-     operator. A healthy Lightning mint never lands here (§9).
+  3. **No new hold or retry logic.** Today `reconcile_decision` (`fee_remit.rs:788`) already holds a
+     bound `spending` row on everything but PAID, re-checks it at the start of every attempt (after
+     each sale and on the retry tick), and never re-pays it. The only change: PAID settles the row
+     only when the preimage verifies. PAID without a matching preimage is treated like any other
+     non-PAID state: held, re-checked, never re-paid. A healthy Lightning mint never lands here (§9).
 - **Balances** (`wallet_ops::MintBalance`) stay per mint. `wallet balance` shows each mint's
   advertised Lightning capability next to its balance, so a holder can see which balances can leave
   over Lightning. No separate credit type or total.
