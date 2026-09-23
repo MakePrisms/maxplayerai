@@ -236,8 +236,15 @@ answers. The pending-receive breadcrumb (`append_pending_receive`, `run.rs:9458`
 
 - Issuer heartbeat (`heartbeat.rs`, kind 30340): a new `["credit_mint", <npub>, <relay>…]` tag,
   omitted when the seller doesn't issue, so existing beats are byte-identical.
+- **Accepting is not issuing.** Many sellers can accept one credit mint. Every seller that accepts
+  it, the issuer included, lists it in `accepted_mints` exactly as it lists Lightning mints today.
+  Only the issuer carries `credit_mint`. A seller that takes a friend's credits (for example, to
+  spend later at the friend's seller) lists the friend's mint in `accepted_mints` and never in
+  `credit_mint`. A `credit_mint` tag naming a mint whose `info` names a different issuer is shown
+  as unverified.
 - `maxplayer mints list` reads 30340 beats, pings each advertised mint's `info`, and shows its npub,
-  issuer, verified or unverified binding (§2.2), and whether it's online now.
+  issuer, verified or unverified binding (§2.2), how many sellers list it in `accepted_mints`, and
+  whether it's online now.
 - `maxplayer mints add <npub>` appends to `[credits] accepted`. Nothing is added automatically.
 
 ## 6. Buyer behavior
