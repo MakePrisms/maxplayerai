@@ -1846,6 +1846,12 @@ impl<R> CdkPaymentEffects<R> {
     where
         S: PaymentSend + Send + 'static,
     {
+        if crate::mint_wire::is_nostr_scheme(&wallet.mint_url.to_string()) {
+            // A nostr:// wallet already holds its relay connector; verify through that same one.
+            // Never an HttpClient for a nostr:// mint.
+            let connector = crate::nostr_mint::SharedMintConnector(wallet.mint_connector());
+            return Self::spawn_worker(wallet, connector, payment_send, receipt);
+        }
         let connector = HttpClient::new(wallet.mint_url.clone(), None);
         Self::spawn_worker(wallet, connector, payment_send, receipt)
     }

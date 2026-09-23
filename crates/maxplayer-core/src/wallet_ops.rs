@@ -861,12 +861,13 @@ pub async fn open_wallet_async(
     let store = WalletSqliteDatabase::new(path)
         .await
         .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
-    Wallet::new(
+    crate::nostr_mint::build_wallet(
         mint_url.as_str(),
         CurrencyUnit::Sat,
         Arc::new(store),
         seed,
         None,
+        &home.config.relay_url,
     )
     .map_err(|error| WalletOpsError::Wallet(error.to_string()))
 }

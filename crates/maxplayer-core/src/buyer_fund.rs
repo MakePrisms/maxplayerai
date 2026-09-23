@@ -101,8 +101,15 @@ pub async fn open_wallet_at_mint_async(
     let store = WalletSqliteDatabase::new(path)
         .await
         .map_err(|error| FundError::Wallet(error.to_string()))?;
-    Wallet::new(mint_url, CurrencyUnit::Sat, Arc::new(store), seed, None)
-        .map_err(|error| FundError::Wallet(error.to_string()))
+    crate::nostr_mint::build_wallet(
+        mint_url,
+        CurrencyUnit::Sat,
+        Arc::new(store),
+        seed,
+        None,
+        &home.config.relay_url,
+    )
+    .map_err(|error| FundError::Wallet(error.to_string()))
 }
 
 /// Thin sync wrapper for non-async callers (CLI / tests).

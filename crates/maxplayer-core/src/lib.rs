@@ -53,6 +53,7 @@ pub mod gateway;
 pub mod heartbeat;
 pub mod home;
 pub mod kinds;
+pub mod mint_wire;
 /// LNURL-pay (LUD-06/LUD-16) resolution of a Lightning address to a bolt11 invoice, fail-closed.
 /// Used by [`fee_remit`] only; `wallet`-gated because it rides the `reqwest` client.
 #[cfg(feature = "wallet")]
@@ -77,6 +78,8 @@ pub mod payment;
 pub mod payment_send;
 #[cfg(feature = "wallet")]
 pub mod payment_wallet;
+#[cfg(feature = "wallet")]
+pub mod nostr_mint;
 /// Seller-side platform fee: the product-set rate in basis points, the fee arithmetic, and the
 /// product-set payout address. Ungated so the arithmetic builds and tests everywhere; accrued and
 /// journaled at collect, remitted by [`fee_remit`] — automatically after each collect, or by

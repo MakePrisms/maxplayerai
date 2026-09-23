@@ -81,15 +81,17 @@ pub async fn probe_relay(
     outcome
 }
 
-/// GET `{mint_url}/v1/info` (via the cdk mint client) within `timeout`. `Ok` iff the mint answers a
-/// well-formed info document — the same reachability the wallet relies on before any mint op.
-pub async fn probe_mint(mint_url: &str, timeout: Duration) -> Result<(), String> {
-    use cdk::wallet::{HttpClient, MintConnector};
+/// Fetch the mint's NUT-06 info within `timeout`: `GET {mint_url}/v1/info` for an `https://` mint,
+/// the `info` op over `relay_url` (plus the fallback relays) for a `nostr://` mint. `Ok` iff the
+/// mint answers a well-formed info document — the same reachability the wallet relies on before
+/// any mint op.
+pub async fn probe_mint(mint_url: &str, relay_url: &str, timeout: Duration) -> Result<(), String> {
     use std::str::FromStr;
 
     let url = cashu::MintUrl::from_str(mint_url.trim())
         .map_err(|error| format!("invalid mint url: {error}"))?;
-    let client = HttpClient::new(url, None);
+    let client = crate::nostr_mint::mint_connector_for(&url, relay_url)
+        .map_err(|error| format!("invalid mint url: {error}"))?;
     tokio::time::timeout(timeout, client.get_mint_info())
         .await
         .map_err(|_| format!("mint did not respond within {timeout:?}"))?
