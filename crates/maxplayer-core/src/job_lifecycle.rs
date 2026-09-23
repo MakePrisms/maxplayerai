@@ -3470,6 +3470,11 @@ fn private_view_from_events(
         let evidence = PrivateEvidence { offer: event.clone(), claim: claim.clone(), award: award.clone(), result: result.clone(),
             task_envelope: task_envelope.clone(), answer_envelope };
         let Ok(verified) = evidence.validate(&event.pubkey.to_hex(), &context.policy) else { continue; };
+        if !claims.iter().any(|candidate| candidate.claim_id == claim.id.to_hex()) {
+            // A selected result is not an expired job just because the claim's
+            // independently encrypted dispatch copy has not been recovered yet.
+            return Err(JobLifecycleError::Relay("private selected claim content is pending; retry the read".into()));
+        }
         context.select(event, claim, award).map_err(err)?;
         let mut view = result_view_from_event(result.id.to_hex(), result.created_at.as_secs(), result.pubkey.to_hex(), &event_to_draft(&result));
         view.inline_answer = verified.answer;
