@@ -64,7 +64,8 @@ Inspected upstream commit `135e4ea0bd5330f7ab0272d501aa83a718edc777`:
   A repository-wide call-site search found constructors/emission in tests, plus
   desktop episode-reading support, but no production seller capture/emission call
   sites. Do not treat module comments as proof of an active logging pipeline.
-  This is not an established blocker for private jobs.
+  Petar explicitly excluded this unused capture/emission code from the effort on
+  23 September; it is not a blocker or implementation work item.
 - **Seller memory — out of scope:** Petar explicitly excluded this on 23 September
   as an existing main-branch concern, not part of this privacy effort.
 - **Git pack cache:** `crates/buzz/crates/buzz-relay/src/api/git/pack_cache.rs` stores
@@ -90,3 +91,16 @@ unauthorised request for Alice's repo were served from that cache without checki
 Bob's repository permission. The required test is simply: warm Alice's cache, then
 verify Bob is denied. Permission checks must apply regardless of cache hit/miss.
 This example is not evidence that the present implementation bypasses authorization.
+
+### Authorization-order clarification — 23 September
+
+Source inspection of `api/git/transport.rs` at the commit above confirms that
+`GitReadAuth` runs before `upload_pack` calls `hydrate_for_read` with the pack cache.
+The extractor verifies the NIP-98 identity and enforces relay membership unless
+`git_public_read` lifts the membership requirement. There is no demonstrated
+cache-hit authorization bypass. The hypothetical example above is not a finding.
+
+The feature-specific change is to add job/repository-level buyer/seller authorization
+at this existing pre-hydration boundary. The current identity/membership checks do
+not express private-job membership. This is our hosting policy, not a Git pack-format
+bug. No independent cache redesign or cache vulnerability fix is in scope.
