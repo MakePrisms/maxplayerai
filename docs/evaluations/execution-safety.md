@@ -9,7 +9,7 @@ and attacks embedded in README/code as positive examples. Include mixed benign a
 malicious files. Labels concern execution-environment attacks, not harmful intent
 or whether the implementation is correct. Hold out a separate set for final reporting.
 
-Use the exact `review::service::provider_body` classifier and manifest builder from
+Use the exact `reviewer::provider_body` classifier and manifest builder from
 the candidate commit. Record that commit, classifier version, the input digest,
 returned model version, label, and both probabilities. Run only after provider
 credentials and a total spending cap have been approved; never place secrets or

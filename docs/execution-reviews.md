@@ -9,13 +9,20 @@ classifier evaluation or default-threshold calibration has been performed.
 
 - Buyer/seller clients request `REVIEW_REQUEST` (3409), verify `REVIEW` (3408), and
   apply their own unsafe-probability threshold. A skip affects only that client.
-- The relay owner runs `maxplayer review serve reviewer.json`. The worker fetches
+- The relay owner runs `maxplayer reviewer serve reviewer.json`. The worker fetches
   signed public subjects from that one configured relay, reads existing local bare
   Git stores, calls TypeSafe, persists a signed terminal result, and publishes it.
 - The worker uses the provider's existing HTTP API, not custom model inference.
   API contract: <https://docs.typesafe.ai/introduction/quickstart>.
 - Clients never receive provider credentials. Review signatures do not replace
   Git verification, claim/award eligibility, payment signatures, budgets, or pay-once.
+
+## Code organization
+
+- `maxplayer-core/src/review.rs`: shared review contract and buyer/seller checks.
+- `maxplayer-core/src/review/state.rs`: local client status and retry state.
+- `maxplayer-core/src/reviewer.rs`: operator worker, TypeSafe calls, input collection, and persistent caching.
+- `maxplayer review status/retry`: client recovery; `maxplayer reviewer serve`: operator service.
 
 ## Client settings
 
@@ -102,7 +109,7 @@ must exist and be writable. Run the service under an operator-managed supervisor
 Only map **public job repositories**; private jobs are not supported yet.
 
 ```sh
-maxplayer review serve /etc/maxplayer/reviewer.json
+maxplayer reviewer serve /etc/maxplayer/reviewer.json
 ```
 
 The repository mapping is deliberate: an untrusted result cannot make the reviewer

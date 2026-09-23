@@ -1,7 +1,11 @@
 //! Relay-owner review worker. Source events are fetched only from the configured relay;
 //! Git objects are read from operator-configured, existing bare job stores. No checkout,
 //! hooks, build, arbitrary-URL fetch, or second copy of private source content.
-use super::*;
+use crate::review::*;
+use crate::gateway::{MAXPLAYER_TAG, PROTOCOL_VERSION, TagSpec};
+use crate::kinds::{JOB_OFFER_KIND, JOB_RESULT_KIND, REVIEW_REQUEST_KIND};
+use serde::Deserialize;
+use std::collections::BTreeMap;
 use nostr_sdk::prelude::*;
 use serde_json::{Value, json};
 use std::{
@@ -731,7 +735,7 @@ async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Re
         );
         let event = match store.begin(&cache_key, &request.id.to_hex()) {
             Ok(Some(event)) => {
-                let review = super::wire::verify(&event, &keys.public_key(), &subject)?;
+                let review = crate::review::wire::verify(&event, &keys.public_key(), &subject)?;
                 if review.input_sha256 != digest {
                     return Err("review_store".into());
                 }
@@ -1040,10 +1044,10 @@ mod integration_tests {
             let offer=crate::gateway::nostr::event_builder(&draft).unwrap().sign_with_keys(&buyer).unwrap();client.send_event(&offer).await.unwrap();
             let subject=Subject {offer:offer.id.to_hex(),event:offer.id.to_hex(),kind:JOB_OFFER_KIND,commit:None};
             let config=ReviewConfig {reviewers:BTreeMap::from([(url.clone(),reviewer.public_key().to_hex())]),timeout_seconds:15,..Default::default()};
-            let transport=super::super::wire::RelayTransport {client:&client,relay:&url};
-            let id=super::super::wire::check(&transport,&config,&url,&subject,&buyer.public_key().to_hex(),false).await.unwrap().unwrap();
+            let transport=crate::review::wire::RelayTransport {client:&client,relay:&url};
+            let id=crate::review::wire::check(&transport,&config,&url,&subject,&buyer.public_key().to_hex(),false).await.unwrap().unwrap();
             http.await.unwrap();
-            let again=super::super::wire::check(&transport,&config,&url,&subject,&buyer.public_key().to_hex(),false).await.unwrap().unwrap();assert_eq!(id,again);
+            let again=crate::review::wire::check(&transport,&config,&url,&subject,&buyer.public_key().to_hex(),false).await.unwrap().unwrap();assert_eq!(id,again);
             let events=client.fetch_events(Filter::new().id(EventId::from_hex(&id).unwrap()),Duration::from_secs(2)).await.unwrap();let event=events.into_iter().next().unwrap();
             assert!(event.tags.iter().any(|t|t.as_slice()==["provider","typesafe","fixture-jev"]));
             assert!(!event.content.contains("ordinary work"));

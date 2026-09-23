@@ -84,6 +84,8 @@ pub mod payment_wallet;
 pub mod platform_fee;
 pub mod receipt;
 pub mod review;
+#[cfg(feature = "wallet")]
+pub mod reviewer;
 /// Shared NIP-42 relay-auth handshake, neutral to any single consumer (seller receive + buyer
 /// receipt-publish both use it).
 #[cfg(feature = "gateway")]

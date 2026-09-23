@@ -1,8 +1,6 @@
 //! Optional execution-safety reviews. Probability is not payment authority.
 //! Relay service and client gates share the signed immutable review contract.
 #[cfg(feature = "wallet")]
-pub mod service;
-#[cfg(feature = "wallet")]
 pub mod state;
 use crate::gateway::{EventDraft, MAXPLAYER_TAG, PROTOCOL_VERSION, TagSpec};
 use crate::kinds::{JOB_OFFER_KIND, JOB_RESULT_KIND, REVIEW_KIND, REVIEW_REQUEST_KIND};

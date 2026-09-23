@@ -1,6 +1,6 @@
-//! Explicit local recovery and relay-owner service entrypoints; no wallet/payment actions.
+//! Client review status and recovery; no wallet/payment actions.
 use std::io::Write;
-const USAGE: &str = "Usage:\n  maxplayer review status <subject-id> [--home <path>]\n  maxplayer review retry <offer-id> [--home <path>]\n  maxplayer review serve <config.json>\nBuyer retries: repeat the same collect or accept operation. Seller retries are picked up by the running daemon; no restart is needed.\n";
+const USAGE: &str = "Usage:\n  maxplayer review status <subject-id> [--home <path>]\n  maxplayer review retry <offer-id> [--home <path>]\nBuyer retries: repeat the same collect or accept operation. Seller retries are picked up by the running daemon; no restart is needed.\n";
 #[cfg(feature = "wallet")]
 pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     use maxplayer_core::{home, review};
@@ -10,14 +10,6 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     }
     let result = (|| -> Result<(), String> {
         match args {
-            [action, config] if action == "serve" => {
-                let config: review::service::ServiceConfig = serde_json::from_slice(
-                    &std::fs::read(config).map_err(|_| "cannot read reviewer config")?,
-                )
-                .map_err(|_| "invalid reviewer config")?;
-                let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-                runtime.block_on(review::service::run(config))
-            }
             [action, id, rest @ ..] if matches!(action.as_str(), "status" | "retry") => {
                 let root = match rest {
                     [] => home::default_home_dir().map_err(|e| e.to_string())?,
