@@ -4,6 +4,8 @@
 
 This is a reviewable starting specification, not approval to deploy. Normative language below describes the proposed implementation. Settled product requirements are in §0; engineering defaults still open to adjustment are in §11. This document supersedes conflicting implementation suggestions in [the original discussion draft, PR #1023](https://github.com/MakePrisms/maxplayerai/pull/1023), not the decisions subsequently recorded there.
 
+[Visibility flow diagram](private-offers-flow/README.md) — updated for the lifecycle-preserving scope below.
+
 ## 0. Settled inputs — not relitigated here
 
 - Bob, original discussion continued in [private-offers-and-deliveries](https://discord.com/channels/1549984743666356239/1551352631887142984), 21–22 September: privacy from other marketplace users, not from Maxplayer; lifecycle and approved metadata remain public; explicit public jobs remain available; default configuration is private.
@@ -11,6 +13,7 @@ This is a reviewable starting specification, not approval to deploy. Normative l
 - Petar, [22 September file decision](https://discord.com/channels/1549984743666356239/1551929287270203404/1551965351590502527): Git for attachments and deliveries; private per-job repositories readable by buyer, seller and Maxplayer. No separate blob service in this release.
 - Petar, parent-channel discussion, 23 September: coordinated breaking upgrade is acceptable; do not maintain parallel legacy implementations. Key/recovery and retention redesign, external-resource permission management, seller memory, and unused episode capture/emission are outside this effort.
 - Petar, [23 September open-pool decision](https://discord.com/channels/1549984743666356239/1552236596768546828/1552237747345817641): publish the initial task for discovery; after seller selection, subsequent content and delivery use the private flow. The initial task stays public. Secret-task open-pool matching is deferred.
+- Petar, [23 September scope adjustment, 13:06 UTC](https://discord.com/channels/1549984743666356239/1552254447013597214/1552305210293223466): preserve the existing lifecycle; no post-award buyer-input handoff or mandatory Maxplayer content-ACK/start gate. Open-pool tasks must be executable as offered; targeted private inputs are available before claim. Necessary privacy wire/authorization changes remain in scope. See [the recorded adjustment](private-offers-decisions/lifecycle-scope-adjustment.md). This narrows the initial open-pool implementation, not the content-privacy requirement.
 - Petar, [this implementation-spec request](https://discord.com/channels/1549984743666356239/1552254447013597214/1552254450591207515), 23 September: propose a concrete starting specification.
 
 The content/file decision records are on [the existing proposal branch](https://github.com/maxie-agent/maxplayerai/tree/1ac3fbb3f27b89fe6dd17936990af53afcf22fb8/docs/proposals/private-offers). Interpret earlier recommendations through those decisions.
@@ -19,7 +22,7 @@ The content/file decision records are on [the existing proposal branch](https://
 
 This PR includes **verbatim snapshots** of the [content-privacy decisions](private-offers-decisions/content-privacy-decisions.md) and [file-storage decision](private-offers-decisions/file-storage-decision.md), including their original discussion links and clarifications. [The coverage map](private-offers-decisions/README.md) maps their requirements and exclusions to this spec and its acceptance tests. These snapshots preserve the source at `1ac3fbb3f27b89fe6dd17936990af53afcf22fb8`; they are not rewritten summaries or a claim to archive every Discord message.
 
-Settled decisions take precedence over proposed engineering details. Any later change must explicitly name the affected decision and record the human decision/link; it must not silently disappear during implementation or be reclassified as an optional default. The service ACK, numeric limits and replacement-job policy remain proposals, not retroactive team decisions. Future source-note changes require an explicit reconciliation of the snapshot and coverage map.
+Settled decisions take precedence over proposed engineering details. Any later change must explicitly name the affected decision and record the human decision/link; it must not silently disappear during implementation or be reclassified as an optional default. Numeric limits and replacement-job policy remain proposals, not retroactive team decisions. The proposed mandatory service ACK was removed by the later scope adjustment; it is not an open initial-release requirement. Future source-note changes require an explicit reconciliation of the snapshot and coverage map.
 
 ## 1. User-visible contract
 
@@ -30,13 +33,13 @@ Use two independent inputs, not three competing meanings of “private”:
 
 Resulting behavior:
 
-1. **Private + selected target:** task and content private from posting onward. The target must be able to read the task before deciding to claim; targeting does not authorize execution.
-2. **Private + open pool:** initial task is public. Label it **“Public task · private execution and delivery”** before posting. No confidential attachments or free-form follow-ups may be published during discovery. After award, use the same execution flow as (1).
+1. **Private + selected target:** task and content private from posting onward. The target must be able to read the complete task and validate/fetch all required private inputs before deciding to claim; targeting does not authorize execution.
+2. **Private + open pool:** initial task is public. Label it **“Public task · private execution and delivery”** before posting. The complete task and all execution prerequisites must be available to candidates when they assess it. No confidential input upload or additional buyer handoff is supported after award in the initial release. Progress explanations, answers and deliveries are private after selection; execution starts from the already offered task.
 3. **Public:** task, subsequent content and delivery are public, whether targeted or open pool.
 
 CLI and MCP expose the same values and return `discovery_visibility`, `execution_visibility`, and the selected seller. MCP tool descriptions must explain that omitting `seller_pubkey` publishes the initial task even when `visibility=private`. No silent fallback from targeted-private to open-pool or public on error. A job's visibility cannot be changed in place; public re-publication requires a separate explicit job.
 
-In v1 of this feature, open-pool confidential input upload waits until seller selection. Public-task attachments are not added as a second upload mode. Public links in the initial task are already public and remain the user's externally managed resources.
+In the initial release, jobs requiring confidential buyer inputs use a targeted private offer. Open-pool tasks may reference already accessible public resources; their permissions remain externally managed. Do not introduce a new public attachment-upload mode or an award-time secret/credential handoff. Required inputs cannot be added or replaced after claim/award. Follow-up work requiring new instructions or inputs is a new offer, with those inputs available before its claim—not a new waiting state in the current job.
 
 ## 2. Reuse and code anchor
 
@@ -60,6 +63,8 @@ Code citations below were re-derived at the anchor, not copied from the earlier 
 Issue/PR preflight found the existing privacy draft (#1023), not an already integrated private-job content lane. Existing payment envelopes are useful infrastructure, not proof this feature exists. No paid dependency or service is proposed.
 
 ## 3. Public wire contract — protocol v2
+
+Keep the existing lifecycle `offer → claim → award → execute → result → verify → accept → pay → receipt`. No new READY, input-handoff or service-ACK event/state is introduced. This does **not** mean unchanged wire compatibility: content references and private delivery binding still change.
 
 Use marketplace `["v","2"]` on all new lifecycle events, including fully public jobs; this is independent of the ACP protocol version. Update every producer/parser and version fixture together. Unsupported/missing major on a newly admitted job fails closed after cutover.
 
@@ -102,7 +107,7 @@ Illustrative plaintext body (placeholders are not valid hashes):
 
 `type` is one of `task`, `followup`, `progress`, `answer`, `feedback`, `rejection`, `review`. Attachments have `repo_id`, `commit_oid`, `path`, `size_bytes`, `sha256`; all stay inside encryption. A `review` additionally requires `subject` with `offer_id` and the exact reviewed task `content_id`/`content_commitment` (or the public offer ID). A delivery review also requires `award_id`, `result_event_id`, and exactly one of `commit_oid` or inline `content_commitment`, matching that RESULT. Validate these against the participant-visible artifacts; a job ID or award ID alone does not bind a review to a delivery revision. A superseded review never becomes an assessment of a newer result automatically. These subject fields remain encrypted.
 
-A content record is immutable. Edits have a fresh message ID, incremented revision and `supersedes` ID. Reordering does not apply an edit over an unknown predecessor.
+A content record is immutable. Edits to non-task explanations have a fresh message ID, incremented revision and `supersedes` ID. A change to the committed task or its required input manifest requires a new offer, not a content revision that silently changes an existing claim. Reordering does not apply an edit over an unknown predecessor.
 
 Serialize the body once as UTF-8 JSON, retaining those exact bytes. The encrypted rumor content is a JSON envelope `{schema:"maxplayer.content-envelope.v2", nonce:<64-hex>, body_b64:<base64-of-body-bytes>}`. All recipient copies carry identical envelope bytes. Compute:
 
@@ -124,41 +129,52 @@ Receivers verify outer/seal signatures and decryption, seal author equals rumor 
 
 Pin the service public key from trusted deployment configuration, never from an arbitrary offer. No payment token, wallet material or credential is copied to this audience.
 
-A relay `OK` proves acceptance, not that the service can decrypt. Proposed small service consumer: decrypt its copy, validate the record/context and persist `(message_id, commitment, author, recipient_set)`, then send a service-authenticated kind-14 control record `maxplayer.content-ack.v2` to the participants. It includes those fields plus job/offer/award IDs and is wrapped in 1059. Control ACKs are not job-content messages and do not recursively need ACKs. This attests receipt/consistency, **not moderation approval**.
+Every outgoing private content record must generate copies from the same immutable envelope for all required recipients, including Maxplayer, and persist them together in the outbox before publishing. The common salted commitment lets each recipient independently validate the same content/version. Missing the configured service identity or omitting its copy is a local validation error, not an optional mode.
 
-Clients display/execute committed content only after both their own validated copy and the matching service ACK are present. The service cannot prove that another recipient's ciphertext decrypts; that recipient checks its own copy. Different content sent to the service and seller cannot pass the same salted commitment check. Message availability, ACKs and public events may arrive in any order; buffer boundedly without progressing prematurely.
+**No Maxplayer application-level ACK or moderation approval is required before display, claim or execution.** The service independently decrypts and validates its received copy; a temporarily offline consumer does not block the seller. Relay acceptance is not proof of service decryption, and the client must not report it as such. Durable retry state tracks unsent copies and relay failures without introducing a new job lifecycle state. Without an application-level ACK, participants cannot prove synchronously that the service received/decrypted its copy; this is the explicit tradeoff of the simplified scope, not a guarantee supplied by encryption.
+
+Recipients validate their own copies and public commitment before using content. A targeted seller must have the actual task/required inputs before claiming; a buyer must have the actual delivery before verifying/paying. These are local content prerequisites, not a new post-award handshake. Events and wrappers may arrive out of order and are buffered boundedly. The same commitment detects a divergent service copy when that copy is processed; it does not prove a malicious sender supplied any usable service copy in advance.
 
 ### 4.3 Sending, retries and relay constraints
 
 Persist the exact envelope, logical ID, recipient list and per-recipient send status in a durable outbox before transmission. Use authenticated WebSocket publishing and the existing under-180-second outer-time pattern. Rewrap after a freshness rejection/reconnect, retaining logical ID and body; do not keep retrying an expired outer event verbatim. A receive cursor must overlap the timestamp-randomization window and deduplicate logical IDs; it cannot simply query since the most recent receipt time.
 
-Persist service ACKs and receive state. A missing recipient copy/ACK is retryable `content_pending`, never permission to fall back to public content. Durable duplicate processing is idempotent across restarts; a changed body under an existing ID is rejected. The relay's existing membership/rate limits remain; add per-authenticated-sender limits for pending content and unknown-job buffers, not per-random-wrapper-key limits.
+Persist receive state and per-recipient relay publication status. Failed publication remains pending in the content outbox and is retried; it never permits public fallback. An offline Maxplayer consumer is not a start/settlement gate. Unavailable task/delivery content still prevents the action that actually needs those bytes. Durable duplicate processing is idempotent across restarts; a changed body under an existing ID is rejected. The relay's existing membership/rate limits remain; add per-authenticated-sender limits for pending content and unknown-job buffers, not per-random-wrapper-key limits.
 
 Proposed size default: 16 KiB UTF-8 body **including attachment manifest**, plus a measured serialized-envelope cap below both NIP-44 layer limits and the relay's 128 KiB outer-content cap. Test the final encoded lengths, not only raw text. Oversize records fail locally; put large text/files in Git, never silently split semantic records.
 
-## 5. Seller selection and private readiness
+## 5. Seller selection — existing lifecycle, no input handoff
 
-Do not invent a second winner-selection authority. Existing buyer auto-award/manual award logic selects one valid claim under existing capability, price and budget checks.
+Existing buyer auto-award/manual award logic selects one valid claim under existing capability, price and budget checks. A CLAIM is not selection; AWARD is the existing execution authorization. Keep the same lifecycle and restart behavior; do not add an `awaiting_private_inputs`, READY or Maxplayer-ACK stage.
 
-1. Persist selection intent under the existing per-offer award lock/transaction, including the exact signed AWARD to publish. A crash cannot generate a different competing award on retry.
-2. For targeted jobs, provision a private pre-award input repo bound to buyer, target and random job ID; target may read to assess inputs but cannot write deliveries or execute. For open-pool jobs, provision only after a winner is selected. Creation is idempotent for this job/selection intent.
-3. Publish the durable AWARD. Relay job-ACL activation validates buyer signature, root offer, winning claim and target/capability constraints. Only one award may activate this execution scope. Conflicting awards are an error, not “latest timestamp wins.”
-4. Atomically persist active job/repo binding and ACL revision at the hosting service. Stage input publication and content copies; return authenticated readiness only after activation succeeds.
-5. Seller starts only when AWARD, correct task/context, matching Maxplayer ACKs, pinned input commit(s), and authenticated repo readiness all validate. Repository readiness alone does not authorize work; AWARD alone does not prove private inputs are ready. For open-pool jobs, the private execution context references the exact public task/offer plus any unchanged-scope supplemental inputs; the public task remains the authoritative awarded task.
+### 5.1 Targeted private job
 
-Proposed NIP-98 authenticated API surface:
+1. Buyer prepares the complete task and all required input snapshots before offering the job. The repository ID is the random job ID in the buyer/tenant namespace, so input commits and their manifest can be built locally before hosting exists.
+2. Provision the job repository using the buyer-signed offer (it may be not yet published), upload the pinned inputs, then publish the offer and recipient-encrypted task copies. Input refs are bound in the committed task manifest; a published task cannot gain new required inputs under the same offer.
+3. The target decrypts/validates the offer content and fetches/validates the pinned inputs **before claiming**. Persist the offer binding and retain a job-scoped local snapshot for execution/restart. Maxplayer gets its own encrypted content copy and repo read access; no ACK is awaited.
+4. The buyer awards normally; the seller executes the already assessed task using those inputs. A restart recovers the same pinned snapshot or fails/retries the existing execution on infrastructure failure. It does not request new buyer inputs or turn the award into a new exchange.
 
-- `POST /api/jobs/private`: prepare idempotently with `{job_id, signed_offer, selection_intent_id}`; targeted preparation may carry an unpublished signed offer to avoid a provisioning/publication cycle. No arbitrary buyer key or ACL list is trusted from request fields.
-- `POST /api/jobs/private/{job_id}/activate`: `{signed_award}`; validates and returns `{repo_id, award_id, acl_revision, state:"active"}`. Repeat same award returns the same binding; conflicting award returns `409`.
-- `GET /api/jobs/private/{job_id}`: participant-authenticated readiness and opaque repo locator; unrelated users get a non-enumerating denial. States `prepared`, `active`, `closed`.
+### 5.2 Open-pool job with private execution and delivery
 
-The repo identifier is the random `job_id` within the validated buyer/tenant namespace, fixed before preparation. Initial attachment commits can therefore be built locally and referenced in the signed task manifest before the repo exists; upload follows preparation. Do not publish an attachment-ready offer or let a target claim until the declared commits are uploaded and readable. Preparation accepts the signed, not-yet-published offer; the private task ACK waits for the actual offer to be published. This avoids an offer/manifest/repository-creation cycle.
+1. Buyer publishes the complete executable task publicly. Candidates assess it as offered, including already accessible public resources. Confidential inputs, private contribution bases or a later buyer credential handoff require targeted-private instead.
+2. Sellers claim and buyer awards using the existing flow. Losing candidates get no private execution content or Git access.
+3. The winning seller starts from that public task. There is **no subsequent buyer upload, private input manifest or readiness message to wait for**. Its progress explanations, answers and delivery content use private recipient copies and a private job repo.
+4. The private output repository is provisioned idempotently as part of delivery setup using the signed offer and award. Repository authorization may retry or fail like other delivery I/O; it is not a new buyer handoff or a content-ACK start gate. Never fall back to the shared/public seller repository on failure.
 
-These are **new proposed endpoints**, not claims about existing APIs. Request-body hashing, URL/method binding and replay checks use existing NIP-98 conventions. Database uniqueness covers `(buyer, job_id)` and one active award per job; bind tenant/owner/repo together on every lookup. Multi-relay replication is not part of this change: one configured hosting authority serializes ACL activation. If it is unavailable, execution waits.
+### 5.3 Hosting operations, not new lifecycle transitions
 
-Failure after AWARD never causes a second seller to start. Recovery resumes the same award/repo/content state. Material changes to the awarded task or price need a new offer, not a silent private follow-up.
+Proposed minimal NIP-98 authenticated operation: `PUT /api/jobs/private/{job_id}` with `{signed_offer, signed_award?}` returns the opaque repo locator. This is a **new storage API**, not an already implemented endpoint or a job protocol event.
 
-For cancellation/replacement, proposed initial policy is a **new linked offer/job ID and new repo**, not in-place reassignment. Link only public-safe metadata; buyer explicitly selects content to carry forward. The previous seller loses write authority when its job closes but retains read access to the old job under existing retention policy. It gains no access to the new job. Previously downloaded/decrypted material cannot be revoked.
+- Buyer may create a targeted input repo before publication/claim using its valid signed offer. The target has read-only input access; no pre-award delivery writes.
+- A buyer or selected seller may ensure the delivery repo with a valid signed award. Validate offer buyer, claim, selected seller, target restriction, tenant and job ID. Persist the exact award binding before granting seller write access.
+- Same binding is idempotent. A conflicting award/repo binding returns `409`; it never switches access to another seller by arrival timestamp. The existing buyer selection logic still owns the single-award guarantee.
+- NIP-98 method/URL/body/replay checks apply. Every Git read/write rechecks the appropriate stored job/award permissions; creating a repo does not authorize work.
+
+There is no separate `/activate` or `/readiness` workflow in this scope. The hosting operation does not block on Maxplayer decrypting messages. Single-host database uniqueness on buyer/job/repo bindings, restricted access before award, and valid-award write authorization remain necessary storage implementation details.
+
+Failure after AWARD never selects a replacement or duplicates work automatically. Resume the same award/task/delivery state. Material changes to task, price or required inputs need a new offer, not a silent private follow-up.
+
+For cancellation/replacement, proposed initial policy is a **new linked offer/job ID and new repo**, not in-place reassignment. Link only public-safe metadata; buyer explicitly selects content to carry forward and makes it available before the next claim. The previous seller loses write authority when its job closes but retains read access to the old job under existing retention policy. It gains no access to the new job. Previously downloaded/decrypted material cannot be revoked.
 
 ## 6. Git permissions, inputs and delivery
 
@@ -166,17 +182,17 @@ Private-job Git/API transport must use HTTPS and relay transport WSS outside loc
 
 Separate repository object graph per private job; never implement privacy only by hiding branches in the shared seller repo. Existing trusted CAS/pack storage may be reused internally, but serving and traversal are scoped to the authorized repository. A known OID, locator or warm cache is not authority.
 
-- Buyer: read; append new immutable input refs `refs/heads/input/<random-id>`.
-- Targeted seller before award: read-only inputs. Selected seller after readiness: read; append immutable delivery refs `refs/heads/delivery/<random-id>` for its own award.
+- Buyer: read; create targeted input refs `refs/heads/input/<random-id>` before offer publication. Once the offer is published, freeze its input refs; no new required inputs may be appended to that job. Open-pool private repos are output storage, not a delayed buyer-input channel.
+- Targeted seller before award: read-only inputs. Selected seller with a validated award: read; append immutable delivery refs `refs/heads/delivery/<random-id>` for its own award.
 - Maxplayer configured service: read every job repository, including committed history. Runtime content-review identity has no general write grant.
 - Other sellers/members/anonymous users: no read/write access, even when global `git_public_read` is enabled.
 - All participants: no force update, delete or replacement of refs already pinned by an offer/award/result. Close disables participant writes; existing retention policy governs reads/storage.
 
 Enforce this before info-refs, upload-pack/hydration, raw-object/file/preview/archive reads and on receive-pack plus hook policy. Inventory non-smart-HTTP routes during PR2; no direct CAS/object-storage URL may bypass the gate. Private repository announcements expose at most opaque IDs and allowed coordination metadata; suppress public automatic 30618 ref listings or emit only an explicitly safe subset. Keep public repo behavior unchanged.
 
-Input snapshots are committed before their private manifest is sent. Buyer pins exact input commit(s); seller fetches only from the configured authorized host and validates manifests before handing files to the runner. Reject path traversal/absolute paths and materialization through symlinks; no automatic submodule/LFS/external URL fetch. External dependencies remain externally managed. Credentials do not go into Git.
+For targeted private offers, input snapshots are committed/uploaded before offer publication and their private manifest is part of the initial committed task. Required snapshots are fetched before claim, not after award. Buyer pins exact input commit(s); seller fetches only from the configured authorized host and validates manifests before handing files to the runner. Reject path traversal/absolute paths and materialization through symlinks; no automatic submodule/LFS/external URL fetch. External dependencies remain externally managed. Credentials do not go into Git.
 
-Contribution jobs import the buyer-authorized pinned base/history into this job scope; additional private commits never push upstream automatically. Same-seller follow-up work uses a new job and explicitly selected input snapshot/history; do not automatically mount unrelated earlier work. No seller-memory feature is added.
+Targeted contribution jobs import the buyer-authorized pinned base/history before claim. Open-pool contributions may use only bases already accessible for assessment/execution, not a later private import from the buyer; additional private commits never push upstream automatically. Same-seller follow-up work uses a new job and explicitly selected input snapshot/history; do not automatically mount unrelated earlier work. No seller-memory feature is added.
 
 Trusted Maxplayer backups and internal pack/CAS caches remain within the existing storage/lifecycle policy. Recipient encryption of those trusted internal file copies is not required. This introduces no backup/retention/deletion redesign, and the deployment's backup configuration is not evidence that live bucket permissions were audited. The required feature change is job-level authorization on served data, including cache hits—not an independent cache fix or a generic logs/caches/backups workstream. Unused episode/telemetry capture/emission and seller memory remain excluded (§0).
 
@@ -198,17 +214,17 @@ Git RESULT retains verification-required repo/ref/commit identifiers with opaque
 
 Private inline answers live in the encrypted answer body, not public RESULT content. Define v2 inline delivery identity as that answer's salted `content-commitment`; buyer validates decrypted bytes against it before ACCEPT. Update the existing inline-preimage construction and verification on both sides to use this identity, preserving the rest of the existing payment/signature preimage fields. Public v2 inline answers use the same envelope/commitment formula with a public envelope, since their text is intentionally public. Keep the existing eligibility rules: no contribution inline delivery; a nonempty worktree delivers Git; marked answer required. Test that no remaining public field carries an unsalted hash of private inline text.
 
-A private verification/rejection explanation is encrypted with the service copy. Public REJECT retains its enumerated reason and result binding. Missing content, unknown repo, revoked write authority or service outage cannot turn into ACCEPT or payment. A service ACK is never proof that the delivered work passed buyer verification.
+A private verification/rejection explanation is encrypted with the service copy. Public REJECT retains its enumerated reason and result binding. Missing delivery content, unknown repo or unverifiable delivery cannot turn into ACCEPT or payment. An offline Maxplayer content consumer alone does not prevent valid buyer verification or payment. Content-copy delivery is retried independently; no service ACK is required or treated as proof of work quality.
 
 ## 8. Three staged implementation PRs
 
 All development flags default off. With a stage disabled, attempts to request the new private lane fail explicitly; flags never downgrade it to public. Old behavior remains only before coordinated cutover, not as an indefinite compatibility implementation.
 
-**PR1 — protocol and encrypted content** (`private_content_v2=false`): v2 typed schemas/builders/parsers; exact byte/commitment vectors; extracted envelope helper; outbox/inbox and service ACK consumer; public field allowlist; timestamp/size/replay tests. No user-visible private posting until all stages are enabled. Target files: gateway/kinds, new content module, payment transport extraction, service consumer, schema fixtures. Failure gates: conflicting recipient copies, forged author, wrong job/award, stale wrapper, duplicate IDs, missing service copy, oversize message, no change to payment recipients.
+**PR1 — protocol and encrypted content** (`private_content_v2=false`): v2 typed schemas/builders/parsers; exact byte/commitment vectors; extracted envelope helper; outbox/inbox and independent Maxplayer content consumption; public field allowlist; timestamp/size/replay tests. No user-visible private posting until all stages are enabled. Target files: gateway/kinds, new content module, payment transport extraction, service consumer, schema fixtures. Failure gates: conflicting recipient copies, forged author, wrong job/award, stale wrapper, duplicate IDs, missing service copy, oversize message, no change to payment recipients.
 
-**PR2 — private Git scope** (`private_job_repos=false`, requires PR1): job/ACL database migration, prepare/activate/readiness endpoints, read-route authorization, push hook roles, immutable refs, quotas and private announcement behavior. Target files: buzz Git transport/policy/hydration/manifest paths plus schema and API routing. Failure gates: outsider with valid relay membership; global public-read enabled; warm-cache access; arbitrary OID/cross-job traversal; stale token after closure; buyer writing delivery ref; seller rewriting inputs; conflicting activation; crash between prepare/activate; concurrent quota pushes.
+**PR2 — private Git scope** (`private_job_repos=false`, requires PR1): job/ACL database migration, idempotent job-repo provisioning, read-route authorization, push hook roles, immutable refs, quotas and private announcement behavior. Target files: buzz Git transport/policy/hydration/manifest paths plus schema and API routing. Failure gates: outsider with valid relay membership; global public-read enabled; warm-cache access; arbitrary OID/cross-job traversal; stale token after closure; buyer writing delivery ref; seller rewriting inputs; conflicting award binding; crash during provisioning/award binding; concurrent quota pushes.
 
-**PR3 — end-to-end product and cutover** (`private_jobs=false`, requires PR1+PR2): CLI/MCP/config/UI, targeted pre-claim reading, open-pool transition, seller execution gate, attachments/contributions/follow-ups, new job hash and private inline verification, collect/reject/restart paths. Failure gates: two competing claims, delayed/lost messages, restart at every transition, private inline paid exactly once, Git contribution verification, free jobs with no payment, no content on public surfaces. Public-v2 regression suite is required. Remove superseded v1 runtime paths during coordinated release, update protocol docs/quickstarts and explicitly migrate user defaults to private.
+**PR3 — end-to-end product and cutover** (`private_jobs=false`, requires PR1+PR2): CLI/MCP/config/UI, targeted pre-claim reading, complete open-pool offers, unchanged award-to-execution transition, targeted pre-claim attachments/contributions and new-offer follow-ups, new job hash and private inline verification, collect/reject/restart paths. Failure gates: two competing claims, delayed/lost messages, restart at every transition, private inline paid exactly once, Git contribution verification, free jobs with no payment, no content on public surfaces. Public-v2 regression suite is required. Remove superseded v1 runtime paths during coordinated release, update protocol docs/quickstarts and explicitly migrate user defaults to private.
 
 No need to ship an interim public release between these PRs. Internal flags exist to make review/testing separable, not to expose half-private jobs.
 
@@ -216,13 +232,13 @@ No need to ship an interim public release between these PRs. Internal flags exis
 
 Use deterministic local relay/service/Git fixtures and at least four identities (buyer, seller, Maxplayer, outsider); add a second candidate for selection races. These are required future tests, **not tests run for this documentation PR**.
 
-1. Targeted offer: buyer/target/service decrypt identical task; outsider cannot; target does not execute before award.
-2. Open pool: initial task remains readable after award; only selected participants receive subsequent content; no confidential input allowed before selection.
+1. Targeted offer: buyer/target/service decrypt identical task; outsider cannot; target validates/fetches all required inputs before claim and does not execute before award. Missing task/inputs prevents claim; published inputs cannot be appended/replaced.
+2. Open pool: initial task stays public and complete; winner executes on award with no buyer-input handoff or new waiting state. Post-award input upload is unsupported; jobs needing confidential prerequisites use targeted-private. Progress/answer/delivery remains private.
 3. Fully public targeted/open modes still complete on protocol v2.
-4. Maxplayer missing/wrong copy, invalid service ACK or mismatched commitment blocks progression.
+4. Required Maxplayer copy is durably generated with every private content record; offline service consumer does not block claim/execution/settlement. Retry relay failures; service validates matching commitment when received. Missing service key/copy fails local construction, and wrong received content is rejected without claiming synchronous proof of service receipt.
 5. Correct encrypted bytes with forged seal author, wrong job/offer/award or wrong recipient set are rejected.
 6. Public event snapshots contain none of a seeded task/title/path/URL/error/answer corpus; cover network UI, repo announcements and inline integrity tags, previous-turn context, previews, feedback, review/classifier excerpts and rejection details.
-7. Reordered wrapper/ACK/event, offline recipient, lost relay OK and process crash recover idempotently without duplicate execution or payment.
+7. Reordered wrapper/event, offline recipient, lost relay OK and process crash recover idempotently without duplicate execution or payment. Restart never invents an ACK/input-handoff dependency; targeted inputs remain pinned to the original claim.
 8. Two claim/award races yield exactly one active scope; conflicting signed awards do not grant both sellers execution.
 9. Every Git read path denies outsider on cold and warm cache, global public-read enabled, direct OID and alternate ref requests.
 10. Write-role/ref rules survive scoped/unscoped tokens; stale permission is rechecked server-side; closed jobs reject pushes.
@@ -230,7 +246,7 @@ Use deterministic local relay/service/Git fixtures and at least four identities 
 12. Attachment manifest tampering, path traversal, symlink escape, wrong input commit, unexpected external fetch and contribution-base mismatch fail closed.
 13. Private Git and inline paid delivery retain signature verification, budget limits and pay-once recovery. Free delivery never constructs a paid receipt.
 14. Replacement job sees only explicitly carried inputs; old seller cannot access the new job.
-15. Unknown protocol/flags/service key, service outage or missing ACL never falls back to public/legacy.
+15. Unknown protocol/flags/service key or missing ACL never falls back to public/legacy. Git/relay outages use bounded existing operation retry/failure paths; an offline Maxplayer consumer alone never creates a start gate.
 16. Review of result A cannot be attached to result B, another offer/task revision, another commit, or another inline commitment. Valid re-encryption of a stale review does not bypass subject-version validation.
 
 Rollout: drain active v1 jobs; back up/migrate the existing stores under existing operational policy; deploy relay/service/schema, then buyers/sellers/UI; verify all peers advertise v2; run local/staging four-identity tests; enable the complete lane together. Existing public history stays public. Do not attempt to privatize old public Git objects or postings. No production probe is part of this docs task.
@@ -240,15 +256,15 @@ Rollback: disable new admissions and pause affected executions; leave the new pa
 ## 10. Self-review: fixes incorporated and remaining risks
 
 - **Envelope defaults versus relay drift:** use the existing bounded outer timestamp strategy and test encoded sizes/reconnect overlap. No claim that merely calling the library default works.
-- **“Sent a Maxplayer copy” is not proof:** service ACK plus common salted commitment and recipient-side checks. Adds service availability dependency; fail closed.
-- **Selection/ACL split-brain:** durable signed award, idempotent preparation/activation, one-host uniqueness and execution readiness gate. No reassignment by arrival order.
+- **Maxplayer copy without a handshake:** generate all recipient copies from one committed body, persist/retry them durably, validate independently on receipt. No synchronous proof of service receipt/decryption or malicious-sender copy compliance is claimed; no consumer-availability start gate.
+- **Selection/ACL consistency:** existing single-award selection; idempotent repository provisioning and exact signed-award write binding. No reassignment by arrival order, new waiting stage or post-award input handoff.
 - **Metadata leaks beyond OFFER:** sanitize all public writers, Git announcements, inline hashes and UI; authorization before hydration; no speculative cache redesign.
 - **Task hash/inline payment regression:** explicit v2 binding definitions and both-side fixture updates; review money-path changes as security-critical in PR3.
 - **Quota bypass via history/compression/races:** cumulative object accounting, quarantine and transactional reservation; imported contributions may exceed proposed limits.
-- **Spam and outage:** existing authenticated membership plus bounded pending queues; relay ACK is not content ACK. One hosting authority/service can delay private jobs. Replication is deferred.
+- **Spam and outage:** existing authenticated membership plus bounded pending queues. Relay/Git unavailability can delay their operations; offline Maxplayer consumption does not stop execution. Replication is deferred. Transport acceptance is not decryption evidence.
 - **Settled-model risks:** Maxplayer and participants can read and retain content; identities, timing, prices and approved identifiers remain public; public discovery text is irreversible; revocation cannot erase downloaded copies. This is not anonymity or privacy from Maxplayer.
 
-Validation performed for this proposal: inspected anchor code and lockfile, pinned Nostr envelope implementation, original decision records and primary NIPs; checked spec paths/citations and whitespace. No runtime code, benchmark, crypto interoperability probe, rendered diagram, live relay write or payment was performed. Implementation gates above must supply that evidence before enablement.
+Validation performed for this proposal: inspected anchor code and lockfile, pinned Nostr envelope implementation, original decision records and primary NIPs; checked spec paths/citations and whitespace. The accompanying static flow diagram was rendered and visually inspected. No runtime code, benchmark, crypto interoperability probe, live relay write or payment was performed. Implementation gates above must supply that evidence before enablement.
 
 ## 11. Open engineering defaults for review
 
@@ -256,8 +272,8 @@ These do not reopen the product scope. Proposed defaults let implementation proc
 
 1. **Limits:** 16 KiB message body, 10 MiB/file, 100 MiB cumulative job object budget, 1,000 files/snapshot. Review with representative contribution repositories before enabling; publish negotiated server ceilings to clients.
 2. **Replacement/follow-up:** a new linked job/repo, explicit input carry-forward; no automatic access to prior private history. Existing recipients keep old read access under current retention policy.
-3. **Maxplayer consistency:** lightweight receipt ACK consumer, not synchronous classifier approval. Same private content audience for explanations/reviews.
-4. **New private HTTP control API:** NIP-98 prepare/activate/readiness endpoints; same hosting service/database as Git, not a separate storage product.
+3. **Maxplayer content consumption:** independent decryption/validation with the same private content audience for explanations/reviews. Mandatory ACK/start gating is removed by §0’s later decision, not left as an implementation option.
+4. **Storage API shape:** proposed NIP-98 idempotent `PUT` to ensure a job repo and bind write permissions to an existing award; same host/database as Git. No activate/readiness handshake.
 5. **Public/private UX:** `visibility` plus existing seller targeting, with explicit public-discovery wording. Default private execution is not a promise to hide an open-pool task.
 
 Recommended implementation starting point: PR1 wire-schema and commitment test vectors, followed by PR2's outsider-access tests. Enable only after PR3's complete flow passes.

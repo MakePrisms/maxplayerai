@@ -4,6 +4,8 @@ Added following [Petar's 23 September request not to lose the prior discussion](
 
 ## Source and precedence
 
+- [Later lifecycle scope adjustment](lifecycle-scope-adjustment.md): Petar’s 23 September approval to preserve the lifecycle, remove the post-award input handoff and remove mandatory Maxplayer ACK/start gating. This is a new decision record, not an edit to the verbatim snapshots.
+
 - [Content privacy decisions](content-privacy-decisions.md): verbatim from [source](https://github.com/maxie-agent/maxplayerai/blob/1ac3fbb3f27b89fe6dd17936990af53afcf22fb8/docs/proposals/private-offers/content-privacy-decisions.md).
 - [File storage decision](file-storage-decision.md): verbatim from [source](https://github.com/maxie-agent/maxplayerai/blob/1ac3fbb3f27b89fe6dd17936990af53afcf22fb8/docs/proposals/private-offers/file-storage-decision.md).
 - [Implementation specification](../private-offers-and-deliveries.md): proposed implementation of those decisions plus the later open-pool decision cited in §0.
@@ -17,7 +19,7 @@ Settled requirements take precedence over proposed defaults. No claim that all i
 | Source requirement or clarification | Implementation coverage / acceptance gate |
 | --- | --- |
 | Same encrypted mechanism for task, follow-ups, answers, feedback, rejection and review | §3 private fields; §4.1 message types; tests 1, 4–6 |
-| Maxplayer recipient copy for every private job-content message, not implicit relay access | §4.2 recipient policy; tests 1, 4; ACK is a proposed consistency mechanism, not a settled product requirement |
+| Maxplayer recipient copy for every private job-content message, not implicit relay access | §4.2 recipient policy; tests 1, 4; mandatory ACK removed by the later scope decision; copies and independent validation remain required |
 | Maxplayer reads every private job repo; Git initially stores files/attachments | §§5–6 role and storage contract; tests 9–12 |
 | External resources, permissions and externally managed credentials excluded; links inside private messages stay private | §0 exclusions; §§3, 6 private URLs and externally managed dependencies; test 6 |
 | Existing lifecycle/retention policy; no deletion-policy redesign | §§0, 5–6, 9; trusted-backup clarification in §6 |
@@ -48,7 +50,7 @@ Settled requirements take precedence over proposed defaults. No claim that all i
 | --- | --- |
 | Git first; separate private job repo; authenticated buyer/seller/Maxplayer access | §§5–6; tests 9–12 |
 | File bytes need not be recipient-encrypted; protected transport still required | §6 trusted-storage boundary; HTTPS/WSS requirement below |
-| Input upload is new implementation work, not an existing API claim | §5 proposed endpoints; §6 input snapshots; PR2/PR3 |
+| Input upload is new implementation work, not an existing API claim | §5 proposed idempotent storage operation; §6 targeted pre-claim input snapshots; PR2/PR3 |
 | Per-file/total limits must be defined | §§6, 11 proposed limits; test 11 |
 | From-scratch snapshot versus contribution history explains Git tradeoff | Full rationale retained verbatim in file snapshot; §6 counts both inputs and imported history |
 | Quotas cover growing inputs/revisions and transfer/resource costs; Git is not resumable file upload | §6 cumulative accounting and transport limits; snapshot retains transport limitation |
@@ -60,4 +62,13 @@ Private-job Git/API connections must use HTTPS and content relay connections WSS
 
 ## Changes made after the comparison
 
-Most core requirements were already represented, but the implementation PR previously only linked to the older decision branch. This update makes those records available in the same PR, adds this coverage map and precedence rule, explicitly binds review subjects to exact artifact versions, and spells out trusted-backup/transport scope. It does not treat proposed ACKs, quotas or replacement behavior as previously approved decisions.
+Most core requirements were already represented, but the implementation PR previously only linked to the older decision branch. This update makes those records available in the same PR, adds this coverage map and precedence rule, explicitly binds review subjects to exact artifact versions, and spells out trusted-backup/transport scope. The later lifecycle decision explicitly removes mandatory ACKs and post-award input handoff; quotas and replacement behavior remain proposals.
+
+## Later scope adjustment coverage
+
+- Existing lifecycle/no new waiting or READY state: spec §§1, 3, 5; tests 1–2, 7.
+- Complete executable open-pool task; private progress/answers/delivery, but no later buyer input: §§1, 5.2; test 2.
+- Targeted private task/inputs fetched and validated before claim: §§1, 5.1, 6; tests 1, 12.
+- No mandatory Maxplayer ACK/start gate; required recipient copy and durable retries remain: §§4.2–4.3; tests 4, 7, 15. No synchronous receipt/decryption proof is claimed.
+- Wire/storage changes remain distinct from lifecycle changes: §§3, 5.3, 7.
+- [Updated flow diagram](../private-offers-flow/README.md) supersedes the earlier Discord diagram’s post-selection input boxes and proposed ACK/start gate.
