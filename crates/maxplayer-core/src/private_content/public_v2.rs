@@ -147,6 +147,12 @@ pub fn project(
     answer: Option<&PreparedContent>,
 ) -> Result<EventDraft> {
     validate_offer(offer)?;
+    // Existing self-trades can have buyer == seller. Collapse locally generated
+    // role tags before signing; remote duplicates remain invalid/ambiguous.
+    let mut participant_keys = BTreeSet::new();
+    draft.tags.retain(|t| {
+        t.first() != Some("p") || participant_keys.insert(t.value().unwrap_or("").to_owned())
+    });
     draft.tags.retain(|t| {
         !matches!(
             t.first(),
@@ -545,7 +551,7 @@ mod tests {
     fn keys(n: u8) -> Keys {
         Keys::parse(&format!("{n:064x}")).unwrap()
     }
-    fn fixture(paid: bool) -> (PrivateEvidence, Keys) {
+    fn fixture(paid: bool, self_trade: bool) -> (PrivateEvidence, Keys) {
         let amount = if paid { 10 } else { 0 };
         let mode = if paid {
             gateway::PaymentMode::Sat
@@ -553,7 +559,7 @@ mod tests {
             gateway::PaymentMode::None
         };
         let buyer = keys(1);
-        let seller = keys(2);
+        let seller = if self_trade { keys(1) } else { keys(2) };
         let offer = sign(
             &buyer,
             offer_draft(
@@ -674,7 +680,7 @@ mod tests {
     }
     #[test]
     fn public_v2_inline_binds_exact_public_envelope_and_signed_selection() {
-        let (e, buyer) = fixture(false);
+        let (e, buyer) = fixture(false, false);
         let verified = validate_evidence(&e, &buyer.public_key().to_hex()).unwrap();
         assert_eq!(verified.answer.as_deref(), Some("public answer\n"));
         assert_ne!(
@@ -742,8 +748,28 @@ mod tests {
         assert!(validate_evidence(&wrong_seller, &buyer.public_key().to_hex()).is_err());
     }
     #[test]
+    fn public_v2_preserves_existing_same_identity_trades() {
+        for paid in [false, true] {
+            let (e, buyer) = fixture(paid, true);
+            assert_eq!(e.offer.pubkey, e.claim.pubkey);
+            assert_eq!(participants(&e.claim).unwrap().len(), 1);
+            assert_eq!(participants(&e.award).unwrap().len(), 1);
+            let verified = validate_evidence(&e, &buyer.public_key().to_hex()).unwrap();
+            crate::payment::ReceiptAuthority {
+                buyer: buyer.public_key(),
+                seller: buyer.public_key(),
+            }
+            .verify_seller_prepay_cosig(
+                &verified.preimage,
+                required(&e.result, "sig:seller").unwrap(),
+                None,
+            )
+            .unwrap();
+        }
+    }
+    #[test]
     fn public_v2_paid_bind_pins_invoice_mints_and_result_after_restart() {
-        let (e, buyer) = fixture(true);
+        let (e, buyer) = fixture(true, false);
         let verified = validate_evidence(&e, &buyer.public_key().to_hex()).unwrap();
         let p = verified.preimage;
         let request = crate::authorize_pay::AuthorizePayRequest {
@@ -791,7 +817,7 @@ mod tests {
     }
     #[test]
     fn public_v2_restart_keeps_envelope_nonce_and_selected_claim() {
-        let (e, _) = fixture(false);
+        let (e, _) = fixture(false, false);
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("public.sqlite");
         let initial = {
