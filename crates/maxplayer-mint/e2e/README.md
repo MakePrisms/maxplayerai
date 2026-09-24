@@ -49,3 +49,23 @@ its Lightning mint. After B was funded, B's retry paid 8 sats to `maxplayer@stri
 Known gap: `maxplayer wallet` on B lists A's credits as `role=unconfigured` and won't send them,
 because `wallet_ops::configured_mints` is the default mint plus `extra_mints` and ignores the rest
 of `accepted_mints`. The node's receive uses `accepted_mints` and is unaffected.
+
+## Result (2026-09-24, live on relay.maxplayer.ai)
+
+Same homes, `relay_url = "wss://relay.maxplayer.ai"`, A's `mint.toml` `relays = []` (default +
+fallbacks). B restricted to `accept_offers_only_from = [<buyer>]`, no open surfaces. Every process
+ran under `strace -f -e trace=connect`.
+
+- Job `683f3ef7…` (100 credits): claimed 05:10:57, awarded and delivered inline 05:10:58, B
+  collect ok 05:11:02 (`mint_fee=0 fee_sats=10 kept=90`), fee remitted 05:11:06 (8 sats to
+  `maxplayer@strike.me` + 1-sat melt fee, real sats from minibits). Buyer collect → `Closed`.
+- Outbound connects, by process:
+  - A's sidecar: relay.maxplayer.ai, relay.ditto.pub, nostr-pub.wellorder.net (443). Nothing else.
+  - Buyer (MCP + daemon): the same three relays only. It never contacted any mint over HTTP.
+  - B: the three relays, mint.minibits.cash (its Lightning mint), strike.me (LNURL). Never A over
+    HTTP (A has no HTTP surface).
+- No process listened on a TCP port.
+
+Not done: the spec asks for outbound HTTP to be DENIED except to B's Lightning mint. This box has
+unprivileged user namespaces disabled, so I could only OBSERVE connects, not enforce a network
+policy.
