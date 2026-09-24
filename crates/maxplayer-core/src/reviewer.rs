@@ -1,13 +1,13 @@
 //! Relay-owner review worker. Source events are fetched only from the configured relay;
-//! Git objects are read from operator-configured, existing bare job stores. No checkout,
-//! hooks, build, arbitrary-URL fetch, or second copy of private source content.
-use crate::review::*;
+//! Git objects are fetched from the configured relay into disposable bare repositories.
+//! No checkout, hooks, builds, arbitrary-URL fetches, or private-job input collection.
 use crate::gateway::{MAXPLAYER_TAG, PROTOCOL_VERSION, TagSpec};
 use crate::kinds::{JOB_OFFER_KIND, JOB_RESULT_KIND, REVIEW_REQUEST_KIND};
-use serde::Deserialize;
-use std::collections::BTreeMap;
+use crate::review::*;
 use nostr_sdk::prelude::*;
+use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::{
     path::{Path, PathBuf},
     time::Duration,
@@ -347,6 +347,116 @@ pub fn git_files(path: &Path, commit: &str) -> Result<Vec<(String, Vec<u8>)>, St
     Ok(files)
 }
 
+const MAX_GIT_FETCH_BYTES: usize = 32 * 1024 * 1024;
+
+/// Accept only canonical HTTPS /git/<owner>/<repo> URLs on the configured WSS
+/// relay origin. No credentials, query, fragments, escapes, or alternate protocols.
+fn validate_git_destination(relay: &str, repo: &str) -> Result<(), String> {
+    let relay = url::Url::parse(relay).map_err(|_| "relay_configuration")?;
+    let target = url::Url::parse(repo).map_err(|_| "invalid_subject")?;
+    let parts: Vec<_> = target.path().split('/').collect();
+    if relay.scheme() != "wss"
+        || target.scheme() != "https"
+        || relay.host_str().is_none()
+        || relay.host_str() != target.host_str()
+        || relay.port_or_known_default() != target.port_or_known_default()
+        || !target.username().is_empty()
+        || target.password().is_some()
+        || target.query().is_some()
+        || target.fragment().is_some()
+        || target.as_str() != repo
+        || parts.len() != 4
+        || parts[1] != "git"
+        || parts[2..].iter().any(|p| {
+            p.is_empty()
+                || !p
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        })
+    {
+        return Err("invalid_subject".into());
+    }
+    Ok(())
+}
+
+/// Owns only a newly-created scratch directory, cleaned on success and every error.
+struct ReviewScratch(PathBuf);
+impl ReviewScratch {
+    fn new() -> Result<Self, String> {
+        let path = std::env::temp_dir().join(format!(
+            "maxplayer-review-fetch-{}",
+            Keys::generate().public_key().to_hex()
+        ));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&path).map_err(|_| "input_unavailable")?;
+        Ok(Self(path))
+    }
+}
+impl Drop for ReviewScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn inspect_fetched(
+    repo: &git2::Repository,
+    path: &Path,
+    commit: &str,
+) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let expected = git2::Oid::from_str(commit).map_err(|_| "invalid_subject")?;
+    let tip = repo
+        .find_reference("refs/review/delivery")
+        .and_then(|r| r.peel_to_commit())
+        .map_err(|_| "input_unavailable")?;
+    if tip.id() != expected {
+        return Err("input_integrity".into());
+    }
+    git_files(path, commit)
+}
+
+fn relay_git_files(
+    relay: &str,
+    url: &str,
+    branch: &str,
+    commit: &str,
+    keys: &Keys,
+    deadline: std::time::Instant,
+) -> Result<Vec<(String, Vec<u8>)>, String> {
+    validate_git_destination(relay, url)?;
+    let source = format!("refs/heads/{branch}");
+    if branch.is_empty()
+        || !git2::Reference::is_valid_name(&source)
+        || git2::Oid::from_str(commit).is_err()
+    {
+        return Err("invalid_subject".into());
+    }
+    if std::time::Instant::now() >= deadline {
+        return Err("input_unavailable".into());
+    }
+    let scratch = ReviewScratch::new()?;
+    let repo = git2::Repository::init_bare(&scratch.0).map_err(|_| "input_unavailable")?;
+    let header = crate::git_transport::nip98_authorization_header_with_keys(url, keys, None, None)
+        .map_err(|_| "input_unavailable")?;
+    crate::git_transport::fetch_review_ref(
+        &repo,
+        url,
+        &format!("+{source}:refs/review/delivery"),
+        header,
+        MAX_GIT_FETCH_BYTES,
+        deadline,
+    )
+    .map_err(|_| "input_unavailable")?;
+    if std::time::Instant::now() >= deadline {
+        return Err("input_unavailable".into());
+    }
+    inspect_fetched(&repo, &scratch.0, commit)
+}
+
 async fn fetch(client: &Client, id: &str) -> Result<Event, String> {
     let id = EventId::from_hex(id).map_err(|_| "invalid_subject")?;
     let events = client
@@ -371,6 +481,8 @@ async fn snapshot(
     config: &ServiceConfig,
     request: &Event,
     subject: &Subject,
+    keys: &Keys,
+    deadline: std::time::Instant,
 ) -> Result<Vec<u8>, String> {
     let offer = fetch(client, &subject.offer).await?;
     if offer.kind != Kind::Custom(JOB_OFFER_KIND) {
@@ -421,15 +533,21 @@ async fn snapshot(
             if singleton(&event, "commit")? != subject.commit.as_deref().unwrap() {
                 return Err("invalid_subject".into());
             }
-            let path = config
-                .repositories
-                .get(delivery.repo())
-                .ok_or("input_unavailable")?
-                .clone();
+            let path = config.repositories.get(delivery.repo()).cloned();
+            let relay = config.relay.clone();
+            let url = delivery.repo().to_owned();
+            let branch = delivery.branch().to_owned();
             let commit = subject.commit.clone().unwrap();
-            files = tokio::task::spawn_blocking(move || git_files(&path, &commit))
-                .await
-                .map_err(|_| "input_unavailable")??;
+            let keys = keys.clone();
+            files = tokio::task::spawn_blocking(move || {
+                if let Some(path) = path {
+                    git_files(&path, &commit)
+                } else {
+                    relay_git_files(&relay, &url, &branch, &commit, &keys, deadline)
+                }
+            })
+            .await
+            .map_err(|_| "input_unavailable")??;
         }
         result = Some(event);
     }
@@ -686,45 +804,54 @@ async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Re
             continue;
         }
         let deadline = tokio::time::Instant::now() + WINDOW;
-        let body =
-            match tokio::time::timeout_at(deadline, snapshot(&client, &config, &request, &subject))
-                .await
-            {
-                Ok(Ok(body)) => body,
-                outcome => {
-                    let code = match outcome {
-                        Ok(Err(e))
-                            if matches!(
-                                e.as_str(),
-                                "input_too_large"
-                                    | "unsupported_input"
-                                    | "private_transport_unavailable"
-                                    | "unauthorized_request"
-                                    | "invalid_subject"
-                                    | "input_integrity"
-                            ) =>
-                        {
-                            e
-                        }
-                        _ => "input_unavailable".into(),
-                    };
-                    if code == "unauthorized_request" {
-                        continue;
+        let body = match tokio::time::timeout_at(
+            deadline,
+            snapshot(
+                &client,
+                &config,
+                &request,
+                &subject,
+                &keys,
+                deadline.into_std(),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(body)) => body,
+            outcome => {
+                let code = match outcome {
+                    Ok(Err(e))
+                        if matches!(
+                            e.as_str(),
+                            "input_too_large"
+                                | "unsupported_input"
+                                | "private_transport_unavailable"
+                                | "unauthorized_request"
+                                | "invalid_subject"
+                                | "input_integrity"
+                        ) =>
+                    {
+                        e
                     }
-                    let event = signed(
-                        &keys,
-                        &error_review(&subject, input_digest(request.content.as_bytes()), &code),
-                        &request,
-                        None,
-                    )
-                    .await?;
-                    client
-                        .send_event(&event)
-                        .await
-                        .map_err(|_| "relay_publish")?;
+                    _ => "input_unavailable".into(),
+                };
+                if code == "unauthorized_request" {
                     continue;
                 }
-            };
+                let event = signed(
+                    &keys,
+                    &error_review(&subject, input_digest(request.content.as_bytes()), &code),
+                    &request,
+                    None,
+                )
+                .await?;
+                client
+                    .send_event(&event)
+                    .await
+                    .map_err(|_| "relay_publish")?;
+                continue;
+            }
+        };
         let digest = input_digest(&body);
         let cache_key = input_digest(
             format!(
@@ -790,6 +917,96 @@ mod tests {
     fn response(p: f64) -> Vec<u8> {
         serde_json::to_vec(&json!({"model":"jev-pinned","answers":{"safety":{"type":"choice","choice":if p>=0.5 {"unsafe"}else{"safe"},"probabilities":{"safe":1.0-p,"unsafe":p}}}})).unwrap()
     }
+    #[test]
+    fn relay_fetch_destination_is_closed_to_other_urls() {
+        let relay = "wss://relay.example";
+        assert!(
+            validate_git_destination(relay, "https://relay.example/git/owner/repo.git").is_ok()
+        );
+        for bad in [
+            "https://elsewhere.example/git/o/r.git",
+            "http://relay.example/git/o/r.git",
+            "https://relay.example:444/git/o/r.git",
+            "https://user@relay.example/git/o/r.git",
+            "https://relay.example/git/o/r.git?q=1",
+            "https://relay.example/git/o/r.git#x",
+            "https://relay.example/git/o/%2e%2e/r.git",
+            "https://relay.example/git/o/r/extra",
+            "https://relay.example/other/o/r.git",
+            "file:///tmp/repo",
+            "ext::command",
+            "https://relay.example/git/o/../r.git",
+            "https://relay.example/git/o/r.git/",
+        ] {
+            assert!(validate_git_destination(relay, bad).is_err(), "{bad}");
+        }
+        assert!(
+            validate_git_destination(
+                "wss://relay.example:8443",
+                "https://relay.example:8443/git/o/r.git"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn fetched_delivery_requires_exact_tip_and_scratch_is_removed() {
+        let scratch = ReviewScratch::new().unwrap();
+        let path = scratch.0.clone();
+        {
+            let repo = git2::Repository::init_bare(&path).unwrap();
+            assert_eq!(inspect_fetched(&repo, &path, &"a".repeat(40)).unwrap_err(), "input_unavailable");
+            let sig = git2::Signature::now("test", "test@example.test").unwrap();
+            let blob = repo.blob(b"delivered text").unwrap();
+            let mut builder = repo.treebuilder(None).unwrap();
+            builder.insert("answer.txt", blob, 0o100644).unwrap();
+            let tree_id = builder.write().unwrap();
+            let tree = repo.find_tree(tree_id).unwrap();
+            let oid = repo
+                .commit(
+                    Some("refs/review/delivery"),
+                    &sig,
+                    &sig,
+                    "delivery",
+                    &tree,
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(
+                inspect_fetched(&repo, &path, &oid.to_string()).unwrap(),
+                vec![("answer.txt".into(), b"delivered text".to_vec())]
+            );
+            assert_eq!(
+                inspect_fetched(&repo, &path, &"a".repeat(40)).unwrap_err(),
+                "input_integrity"
+            );
+            let parent = repo.find_commit(oid).unwrap();
+            repo.commit(
+                Some("refs/review/delivery"),
+                &sig,
+                &sig,
+                "moved",
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+            assert_eq!(
+                inspect_fetched(&repo, &path, &oid.to_string()).unwrap_err(),
+                "input_integrity"
+            );
+        }
+        drop(scratch);
+        assert!(!path.exists());
+        let mut failed_path = PathBuf::new();
+        let failure = (|| -> Result<(), String> {
+            let scratch = ReviewScratch::new()?;
+            failed_path = scratch.0.clone();
+            Err("fetch failed".into())
+        })();
+        assert!(failure.is_err());
+        assert!(!failed_path.exists());
+    }
+
     #[test]
     fn exact_provider_bytes_bind_instructions_model_and_input() {
         let a = provider_body(b"hello", "model-a").unwrap();
@@ -1122,9 +1339,16 @@ mod snapshot_tests {
             .unwrap()
             .sign_with_keys(&buyer)
             .unwrap();
-        let body = snapshot(&client, &config, &request, &subject)
-            .await
-            .unwrap();
+        let body = snapshot(
+            &client,
+            &config,
+            &request,
+            &subject,
+            &reviewer,
+            std::time::Instant::now() + WINDOW,
+        )
+        .await
+        .unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
         let input: Value = serde_json::from_str(value["state"].as_str().unwrap()).unwrap();
         assert_eq!(input["result"]["id"], event.id.to_hex());
@@ -1134,9 +1358,16 @@ mod snapshot_tests {
             .sign_with_keys(&stranger)
             .unwrap();
         assert_eq!(
-            snapshot(&client, &config, &foreign, &subject)
-                .await
-                .unwrap_err(),
+            snapshot(
+                &client,
+                &config,
+                &foreign,
+                &subject,
+                &reviewer,
+                std::time::Instant::now() + WINDOW
+            )
+            .await
+            .unwrap_err(),
             "unauthorized_request"
         );
         client.disconnect().await;

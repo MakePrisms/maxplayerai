@@ -10,8 +10,8 @@ classifier evaluation or default-threshold calibration has been performed.
 - Buyer/seller clients request `REVIEW_REQUEST` (3409), verify `REVIEW` (3408), and
   apply their own unsafe-probability threshold. A skip affects only that client.
 - The relay owner runs `maxplayer reviewer serve reviewer.json`. The worker fetches
-  signed public subjects from that one configured relay, reads existing local bare
-  Git stores, calls TypeSafe, persists a signed terminal result, and publishes it.
+  signed public subjects from that one configured relay, fetches Git deliveries from
+  its HTTPS Git endpoint, calls TypeSafe, persists a signed terminal result, and publishes it.
 - The worker uses the provider's existing HTTP API, not custom model inference.
   API contract: <https://docs.typesafe.ai/introduction/quickstart>.
 - Clients never receive provider credentials. Review signatures do not replace
@@ -95,10 +95,7 @@ Example `reviewer.json` (paths are operator-managed; no credentials in this file
   "signer_file": "/run/secrets/reviewer-signing-key",
   "provider_key_file": "/run/secrets/typesafe-api-key",
   "database": "/var/lib/maxplayer-review/reviews.sqlite",
-  "model": "jev-latest",
-  "repositories": {
-    "https://relay.example/git/<owner>/<repo>.git": "/existing/job-store/<repo>.git"
-  }
+  "model": "jev-latest"
 }
 ```
 
@@ -106,18 +103,37 @@ Secret files must be regular owner-private files (0600 or stricter). Provision a
 dedicated signer and distribute its **public** key to clients. Never put credentials
 in command arguments, public events, logs, or this repository. The database parent
 must exist and be writable. Run the service under an operator-managed supervisor.
-Only map **public job repositories**; private jobs are not supported yet.
+Only **public job repositories** are supported; private jobs are not supported yet.
 
 ```sh
 maxplayer reviewer serve /etc/maxplayer/reviewer.json
 ```
 
-The repository mapping is deliberate: an untrusted result cannot make the reviewer
-fetch an arbitrary URL, access the network internally, or read an arbitrary path.
-The initial worker must be colocated with the existing bare job store (or have a
-read-only mount of it). An unmapped/inaccessible repository produces an error. It
-does not download and persist another source-content copy. Arbitrary third-party
-Git hosting is not supported by this initial acquisition adapter.
+Git deliveries are fetched through the existing buyer smart-HTTP transport. A
+`wss://relay.example` configuration permits only canonical
+`https://relay.example/git/<owner>/<repo>` URLs on the same host and port.
+Credentials in URLs, queries, fragments, alternate protocols, other hosts and
+redirects are refused. The reviewer signs Git-read authentication with its own
+signing key; give that identity read access to the public job repositories.
+
+The fetch downloads only the advertised delivery branch (no tags) into a fresh,
+owner-private temporary bare repository. The fetched tip must equal the commit
+in the signed RESULT; a moved branch produces `input_integrity`, not a review of
+different content. Existing object/hash/text validation then runs without checkout,
+hooks, builds or execution. Scratch data is removed after success or failure.
+A process crash can leave scratch directories under the OS temporary directory;
+normal host temporary-file cleanup should reclaim them.
+
+Git reads share the request's 30-second deadline, with a 10-second maximum per
+HTTP leg, a 32 MiB aggregate HTTP-response cap and a 100,000-object transfer cap.
+The existing review input/file limits still apply after fetching. Inaccessible,
+missing, oversized, or timed-out fetches produce an error review, never approval.
+These bounds can reject large Git histories even when the final files are small.
+
+An optional `repositories` object still supports operator-managed exact URL-to-local
+bare-path overrides, including offline fixtures. Omit it for normal relay fetching;
+no per-repository filesystem mappings, shared disk mount, or relay storage changes
+are required. Unmapped destinations must pass the relay URL restriction above.
 
 The worker verifies request signatures, reviewer binding, namespace/version, exact
 subject, freshness, source signatures, offer/result linkage, and requester access.
