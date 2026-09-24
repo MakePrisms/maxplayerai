@@ -959,7 +959,7 @@ async fn retry_backlog_rotates_across_restart_and_does_not_starve_participants()
     assert_eq!(db.pending(&author, 256).unwrap().len(), 66);
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "wallet"))]
 #[test]
 fn content_database_rejects_symlink_without_touching_target() {
     let dir = tempfile::tempdir().unwrap();
