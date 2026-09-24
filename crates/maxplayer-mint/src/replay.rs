@@ -67,10 +67,10 @@ pub fn key(client: &PublicKey, request_id: &str) -> String {
 }
 
 /// Digest of everything the request asks for.
-pub fn digest(request: &Request) -> String {
+pub fn digest(request: &Request) -> Result<String, String> {
     let bytes = serde_json::to_vec(&(request.v, &request.op, &request.body, request.exp))
-        .unwrap_or_default();
-    hex(&Sha256::digest(bytes))
+        .map_err(|error| format!("digest request: {error}"))?;
+    Ok(hex(&Sha256::digest(bytes)))
 }
 
 pub async fn read(mint: &Mint, key: &str) -> Result<Option<Record>, String> {

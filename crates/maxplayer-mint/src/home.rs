@@ -86,6 +86,32 @@ impl MintHome {
         self.dir.join("mint.toml")
     }
 
+    /// Take the single-listener lock (`<home>/mint/run.lock`, held until the returned file is
+    /// dropped). The request log is check-then-act, so two `run` processes on one `mint.sqlite`
+    /// could both execute a duplicate and record the loser's definitive error over the winner's
+    /// success. `issue` doesn't take it: it never runs saga recovery and its journal is safe next
+    /// to a live `run`.
+    pub fn lock_run(&self) -> Result<fs::File> {
+        let path = self.dir.join("run.lock");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => Ok(file),
+            Err(fs::TryLockError::WouldBlock) => bail!(
+                "another `maxplayer-mint run` is already serving {}",
+                self.dir.display()
+            ),
+            Err(fs::TryLockError::Error(error)) => {
+                Err(error).with_context(|| format!("lock {}", path.display()))
+            }
+        }
+    }
+
     /// Create a new mint. Refuses if `<home>/mint/` exists in any form: overwriting a mint, or
     /// mixing a new key with an old database, is how credits get lost or double-spent.
     pub fn init(&self) -> Result<Keys> {
