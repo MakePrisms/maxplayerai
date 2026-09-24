@@ -5,9 +5,11 @@
 //! - [`home`]: `<home>/mint/` (Nostr key, seed, `mint.sqlite`, `mint.toml`).
 //! - [`backend`]: the cdk mint behind the transport.
 //! - [`dispatch`]: one envelope `op` → one cdk mint call.
+//! - [`replay`]: the durable request log (replay and reconcile).
 //! - [`server`]: the relay listener (kind 23410 in, 23411 out).
 
 pub mod backend;
 pub mod dispatch;
 pub mod home;
+pub mod replay;
 pub mod server;

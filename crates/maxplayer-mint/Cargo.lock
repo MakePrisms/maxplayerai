@@ -2040,6 +2040,7 @@ dependencies = [
  "anyhow",
  "bip39",
  "cdk",
+ "cdk-common",
  "cdk-sqlite",
  "getrandom 0.3.4",
  "maxplayer-core",

@@ -27,6 +27,7 @@ path = "src/main.rs"
 anyhow = "1"
 bip39 = "2.2"
 cdk = { version = "=0.17.2", default-features = false, features = ["mint"] }
+cdk-common = { version = "=0.17.2", default-features = false, features = ["mint"] }
 cdk-sqlite = { version = "=0.17.2", default-features = false, features = ["mint"] }
 getrandom = "0.3"
 # Default features only: `mint_wire` (the envelope types) needs serde and nothing else.
