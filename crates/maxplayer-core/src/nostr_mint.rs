@@ -205,9 +205,10 @@ impl NostrMintConnector {
     ///
     /// The whole call, relay connect included, ends at `deadline = start + window`. The request's
     /// `exp` is [`request_exp`] of the same start: the mint refuses from that second on, which is
-    /// never later than the deadline, so once the connector stops waiting a compliant mint (with a
-    /// clock within `MAX_CLOCK_SKEW_SECS`) can no longer execute it (spec §3.1). Nothing past the
-    /// deadline is awaited except a bounded disconnect.
+    /// never later than the deadline, so once the connector stops waiting a compliant mint with a
+    /// synchronized clock can no longer execute it (spec §3.1). A mint clock behind by up to
+    /// `MAX_CLOCK_SKEW_SECS` can still execute it until then; recovery's `REQUEST_SETTLE` hold is
+    /// what covers that. Nothing past the deadline is awaited except a bounded disconnect.
     pub async fn call_raw(&self, operation: &str, body: Value) -> Result<Value, Error> {
         let started_unix_ms = unix_now_ms();
         let deadline = Instant::now() + self.window;
@@ -384,9 +385,10 @@ fn random_id() -> Result<String, Error> {
 }
 
 /// `exp` for a request started at `started_unix_ms` with `window`: the latest whole unix second not
-/// after `start + window`. The mint refuses when `now >= exp`, so every instant it may still execute
-/// the request lies before the connector stops waiting. The connector may keep waiting up to 1s past
-/// `exp`; that direction is safe (it only hears a refusal or nothing).
+/// after `start + window`. A synchronized mint refuses when `now >= exp`, so every instant it may
+/// still execute the request lies before the connector stops waiting; a mint clock behind by up to
+/// `MAX_CLOCK_SKEW_SECS` shifts that later, which the `REQUEST_SETTLE` recovery hold covers. The
+/// connector may keep waiting up to 1s past `exp`; that direction is safe.
 pub fn request_exp(started_unix_ms: u64, window: Duration) -> u64 {
     let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
     started_unix_ms.saturating_add(window_ms) / 1000

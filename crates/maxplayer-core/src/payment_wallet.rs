@@ -83,7 +83,7 @@ fn nostr_request_may_be_live(
 }
 
 /// `Some(reason)` while any incomplete saga on this `nostr://` wallet (any kind: send, swap, melt,
-/// receive) may still have a request the mint can execute. `None` for `https://` wallets.
+/// receive, issue) may still have a request the mint can execute. `None` for `https://` wallets.
 #[cfg_attr(not(feature = "gateway"), allow(dead_code))]
 pub(crate) async fn nostr_recovery_hold(
     wallet: &Wallet,
