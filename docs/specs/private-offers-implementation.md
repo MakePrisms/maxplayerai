@@ -82,3 +82,11 @@ and be measured again; failed pushes cannot make partial refs visible. The concu
 
 No READY phase, post-award buyer input handoff, application-level service ACK, paid external
 service or production probe has been introduced.
+
+### Historical-query failure signaling
+
+Historical REQ database failures close the affected subscription with `CLOSED error:`
+and remove its connection/fan-out entries and pubsub reference. No EOSE is emitted
+for a failed history, including a failure after earlier filters returned events.
+Clients must treat that failure as retryable uncertainty, not proof of absence.
+The relay update is required before enabling the lifecycle history-completeness lane.
