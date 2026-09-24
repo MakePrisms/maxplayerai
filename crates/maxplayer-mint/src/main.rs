@@ -2,11 +2,12 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use maxplayer_mint::home::{MintHome, mint_url};
-use maxplayer_mint::{backend, server};
+use maxplayer_mint::{backend, issue, server};
 
-const USAGE: &str = "usage: maxplayer-mint <init|run>
-  init   create <home>/mint/ and print the nostr:// mint URL
-  run    serve the mint over its relays until interrupted
+const USAGE: &str = "usage: maxplayer-mint <init|run|issue [amount]>
+  init            create <home>/mint/ and print the nostr:// mint URL
+  run             serve the mint over its relays until interrupted
+  issue [amount]  finish any interrupted issue, then issue <amount> sat into a token file
 <home> is $MAXPLAYER_HOME, or ~/.maxplayer";
 
 #[tokio::main]
@@ -16,6 +17,7 @@ async fn main() -> Result<()> {
     match command.as_deref() {
         Some("init") => init(&home).await,
         Some("run") => run(&home).await,
+        Some("issue") => issue_cmd(&home, std::env::args().nth(2)).await,
         _ => {
             eprintln!("{USAGE}");
             std::process::exit(2);
@@ -49,6 +51,37 @@ async fn init(home: &MintHome) -> Result<()> {
     );
     println!("Losing it makes every credit this mint issued worthless.");
     println!("Restoring an OLD copy can let credits that were already spent be spent again.");
+    Ok(())
+}
+
+async fn issue_cmd(home: &MintHome, amount: Option<String>) -> Result<()> {
+    let amount = amount
+        .map(|a| {
+            a.parse::<u64>()
+                .with_context(|| format!("amount {a:?} is not a whole number of sat"))
+        })
+        .transpose()?;
+    let secrets = home.load().with_context(|| {
+        format!(
+            "load {} (run `maxplayer-mint init` first)",
+            home.dir().display()
+        )
+    })?;
+    let url = mint_url(&secrets.keys)?;
+    let mint = backend::build(&home.db_path(), &secrets.seed, &url).await?;
+    for done in issue::reconcile(&mint, home.dir(), &url).await? {
+        println!(
+            "Finished interrupted issue {}: {} sat in {}",
+            done.id,
+            done.amount,
+            done.file.display()
+        );
+    }
+    if let Some(amount) = amount {
+        let done = issue::issue(&mint, home.dir(), &url, amount).await?;
+        println!("Issued {} sat: {}", done.amount, done.file.display());
+        println!("That file IS the credits: anyone holding it can spend them.");
+    }
     Ok(())
 }
 
