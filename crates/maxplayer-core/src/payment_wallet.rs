@@ -3402,8 +3402,10 @@ mod tests {
         assert!(bridge_recv_timeout(&nostr) > 2 * mint_mutation_timeout(&nostr));
         assert!(
             crate::nostr_mint::REQUEST_SETTLE
-                > 2 * crate::nostr_mint::DEFAULT_WINDOW + crate::nostr_mint::OUTER_MARGIN,
-            "settle covers prepare bound + request exp"
+                > 2 * crate::nostr_mint::DEFAULT_WINDOW
+                    + crate::nostr_mint::OUTER_MARGIN
+                    + Duration::from_secs(crate::mint_wire::MAX_CLOCK_SKEW_SECS),
+            "settle covers confirm bound + request exp + max clock skew"
         );
         let https = mint(MINT);
         assert_eq!(mint_mutation_timeout(&https), MINT_TOUCH_TIMEOUT);
