@@ -167,7 +167,8 @@ Nostr identity, but connection metadata, timing and request sizes can still link
 - New crate `crates/maxplayer-mint`, its own binary, depending on cdk `mint` + the cdk-sqlite mint
   store, so it needs `protoc`. `maxplayer` doesn't depend on it; the shared envelope types live in
   `maxplayer-core` (no mint deps). CI builds it in its own job with protobuf. Not bundled with the
-  default release.
+  default release. Distributed as build-from-source for now (needs `protoc`); a release artifact
+  waits until operators outside the team want to run a mint (Bob, 24 Sep).
 - `maxplayer-mint init` creates `<home>/mint/` (key, seed, `mint.sqlite`, `mint.toml`) and prints the
   `nostr://` URL plus the line to append to `accepted_mints` (accepting sellers also run
   `wallet mints add`, §1 item 2). It refuses if `<home>/mint/` exists
@@ -193,6 +194,8 @@ Nostr identity, but connection metadata, timing and request sizes can still link
 3. **End to end.** Seller A runs `maxplayer-mint`, seller B accepts A's mint, a buyer holds only A's
    credits. B does a job, is paid in A's credits and pays its fee in real sats from its Lightning
    mint. Run behind NAT with no inbound ports and outbound HTTP denied except to B's Lightning mint.
+   (Done 24 Sep with outbound connects traced per process rather than denied; Bob: the trace is
+   enough. Result in `crates/maxplayer-mint/e2e/README.md`.)
 
 **Required tests:** a `nostr://` mint never makes an HTTP call; duplicate requests across relays
 execute once; replayed, stale, forged or wrong-key responses rejected; lost reply after commit on
