@@ -35,7 +35,10 @@ impl ContentStore {
             file.set_permissions(std::fs::Permissions::from_mode(0o600))
                 .map_err(|_| Error("cannot secure content database"))?;
         }
-        let db = Connection::open(path).map_err(db_error)?;
+        let db = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::default() | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        ).map_err(db_error)?;
         Self::initialize(db)
     }
     #[cfg(test)]
@@ -57,6 +60,8 @@ impl ContentStore {
                 relay_accepted INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(job,id,recipient),
                 FOREIGN KEY(job,id) REFERENCES content_records(job,id));
+            CREATE TABLE IF NOT EXISTS content_retry (
+                key TEXT PRIMARY KEY, sequence INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS content_offers (
                 buyer TEXT NOT NULL, job TEXT NOT NULL, offer TEXT NOT NULL,
                 PRIMARY KEY(buyer,job));
@@ -521,7 +526,7 @@ impl ContentStore {
     }
     pub fn pending_carriers(&self, author: &str, limit: usize) -> Result<Vec<Event>> {
         super::require_hex(author, 32)?;
-        let mut query=self.db.prepare("SELECT event FROM content_carriers WHERE author=?1 AND relay_accepted=0 ORDER BY rowid LIMIT ?2").map_err(db_error)?;
+        let mut query=self.db.prepare("SELECT event FROM content_carriers WHERE author=?1 AND relay_accepted=0 ORDER BY COALESCE((SELECT sequence FROM content_retry WHERE key='carrier:' || content_carriers.id),0),rowid LIMIT ?2").map_err(db_error)?;
         let rows = query
             .query_map(params![author, limit.min(256)], |r| r.get::<_, String>(0))
             .map_err(db_error)?;
@@ -544,7 +549,14 @@ impl ContentStore {
     }
     pub fn pending(&self, author: &str, limit: usize) -> Result<Vec<PendingCopy>> {
         super::require_hex(author, 32)?;
-        let mut q = self.db.prepare("SELECT r.envelope,o.recipient FROM content_outbox o JOIN content_records r USING(job,id) WHERE r.author=?1 AND o.relay_accepted=0 ORDER BY o.rowid LIMIT ?2").map_err(db_error)?;
+        let mut q = self.db.prepare("SELECT envelope,recipient FROM (
+            SELECT r.envelope,o.recipient,o.rowid AS position,
+                COALESCE(a.sequence,0) AS attempted,
+                ROW_NUMBER() OVER (PARTITION BY o.recipient ORDER BY COALESCE(a.sequence,0),o.rowid) AS turn
+            FROM content_outbox o JOIN content_records r USING(job,id)
+            LEFT JOIN content_retry a ON a.key='copy:' || o.job || ':' || o.id || ':' || o.recipient
+            WHERE r.author=?1 AND o.relay_accepted=0
+        ) ORDER BY turn,attempted,position LIMIT ?2").map_err(db_error)?;
         let rows = q
             .query_map(params![author, limit.min(256)], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
@@ -558,6 +570,22 @@ impl ContentStore {
             })
         })
         .collect()
+    }
+    /// Persist rotation BEFORE I/O, including timeouts and crashes. A failing
+    /// recipient cannot occupy every slot, nor can its oldest copy starve its peers.
+    pub fn copy_attempted(&mut self, copy: &PendingCopy) -> Result<()> {
+        self.attempted(&format!("copy:{}:{}:{}", copy.content.body().job_id,
+            copy.content.body().message_id, copy.recipient))
+    }
+    pub fn carrier_attempted(&mut self, event: &Event) -> Result<()> {
+        self.attempted(&format!("carrier:{}", event.id.to_hex()))
+    }
+    fn attempted(&mut self, key: &str) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO content_retry(key,sequence) VALUES(?1,(SELECT COALESCE(MAX(sequence),0)+1 FROM content_retry))
+             ON CONFLICT(key) DO UPDATE SET sequence=excluded.sequence", [key],
+        ).map_err(db_error)?;
+        Ok(())
     }
     /// Only relay publication success calls this. It is NOT a service-decryption acknowledgment.
     pub fn relay_accepted(&mut self, job: &str, id: &str, recipient: &str) -> Result<()> {
@@ -639,6 +667,16 @@ impl ContentStore {
             .optional()
             .map_err(db_error)?;
         value.map(|v| PreparedContent::decode(&v)).transpose()
+    }
+    /// Isolate message-level conflicts and bounded inbox admission refusals from
+    /// transport/DB failures. These unbound envelopes are not execution authority;
+    /// dropping one must not poison scans of every other job. A required carrier
+    /// whose body was not admitted remains unavailable, never an empty delivery.
+    pub fn stage_untrusted(&mut self, content: &PreparedContent, recipient: &str, now: u64) -> Result<bool> {
+        match self.stage(content, recipient, now) {
+            Err(Error("conflicting pending logical content id" | "conflicting logical content id" | "pending content inbox full")) => Ok(false),
+            other => other,
+        }
     }
     /// Buffer only AFTER transport::unwrap_content verifies author and recipient. This is
     /// not the verified inbox: get() never exposes these rows. The authenticated inner

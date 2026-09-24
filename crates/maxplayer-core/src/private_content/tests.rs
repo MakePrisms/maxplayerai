@@ -2,10 +2,10 @@ use super::*;
 use base64::Engine;
 use nostr_sdk::prelude::{JsonUtil, Keys, Timestamp};
 use sha2::Digest;
-fn keys(n: u8) -> Keys {
+pub(super) fn keys(n: u8) -> Keys {
     Keys::parse(&hex::encode([n; 32])).unwrap()
 }
-fn body() -> ContentBody {
+pub(super) fn body() -> ContentBody {
     let mut recipients = vec![
         keys(1).public_key().to_hex(),
         keys(2).public_key().to_hex(),
@@ -1457,4 +1457,82 @@ async fn private_four_identity_targeted_and_open_lifecycle_reorders_and_resumes(
             }
         }
     }
+}
+
+#[cfg(feature = "wallet")]
+#[tokio::test]
+async fn retry_backlog_rotates_across_restart_and_does_not_starve_participants() {
+    struct Sender { service: String, delivered: Vec<nostr_sdk::Event> }
+    impl session::ContentSender for Sender {
+        async fn send(&mut self, event: nostr_sdk::Event) -> Result<()> {
+            if event.tags.iter().any(|t| t.as_slice() == ["p", self.service.as_str()]) {
+                return Err(Error("service refused"));
+            }
+            self.delivered.push(event);
+            Ok(())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("content.sqlite");
+    let mut db = store::ContentStore::open(&path).unwrap();
+    for n in 0..65 {
+        let mut b = body();
+        b.message_id = format!("{n:064x}");
+        let p = PreparedContent::new(b).unwrap();
+        db.enqueue(&p, &binding(&p)).unwrap();
+        for recipient in [keys(1), keys(2)] {
+            db.relay_accepted(&p.body().job_id, &p.body().message_id, &recipient.public_key().to_hex()).unwrap();
+        }
+    }
+    let fresh = PreparedContent::new(body()).unwrap();
+    db.enqueue(&fresh, &binding(&fresh)).unwrap();
+    let author = keys(1).public_key().to_hex();
+    let first = db.pending(&author, 1).unwrap().remove(0);
+    db.copy_attempted(&first).unwrap();
+    drop(db);
+    let mut db = store::ContentStore::open(&path).unwrap();
+    assert_ne!(db.pending(&author, 1).unwrap()[0].content.body().message_id, first.content.body().message_id);
+    let mut sender = Sender { service: keys(3).public_key().to_hex(), delivered: vec![] };
+    let report = session::flush(&mut db, &keys(1), &mut sender, 64).await.unwrap();
+    assert_eq!(report.accepted, 2);
+    assert_eq!(report.pending, 62);
+    for recipient in [keys(1), keys(2)] {
+        let wrapper = sender.delivered.iter().find(|e| e.tags.iter().any(|t|
+            t.as_slice() == ["p", recipient.public_key().to_hex().as_str()])).unwrap();
+        assert_eq!(transport::unwrap_content(&recipient, wrapper).await.unwrap().envelope(), fresh.envelope());
+    }
+    assert_eq!(db.pending(&author, 256).unwrap().len(), 66);
+}
+
+#[cfg(unix)]
+#[test]
+fn content_database_rejects_symlink_without_touching_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target");
+    std::fs::write(&target, b"untouched").unwrap();
+    let link = dir.path().join("content.sqlite");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    assert!(store::ContentStore::open(&link).is_err());
+    assert_eq!(std::fs::read(target).unwrap(), b"untouched");
+}
+
+
+#[cfg(feature = "wallet")]
+#[test]
+fn unbound_inbox_conflicts_and_sender_quota_do_not_abort_other_authors() {
+    let mut db = store::ContentStore::in_memory().unwrap();
+    let recipient = keys(2).public_key().to_hex();
+    let p = PreparedContent::new(body()).unwrap();
+    assert!(db.stage_untrusted(&p, &recipient, 100).unwrap());
+    assert!(!db.stage_untrusted(&PreparedContent::new(body()).unwrap(), &recipient, 100).unwrap());
+    for n in 0..128 {
+        let mut b = body();
+        b.message_id = format!("{n:064x}");
+        let _ = db.stage_untrusted(&PreparedContent::new(b).unwrap(), &recipient, 100).unwrap();
+    }
+    let mut b = body();
+    b.author = keys(3).public_key().to_hex();
+    let other = PreparedContent::new(b).unwrap();
+    assert!(db.stage_untrusted(&other, &recipient, 100).unwrap());
+    assert_eq!(db.staged(&p.body().author, &p.body().job_id, &p.body().message_id, 100).unwrap().unwrap().envelope(), p.envelope());
 }
