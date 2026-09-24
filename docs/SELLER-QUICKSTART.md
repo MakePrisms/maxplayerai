@@ -1667,6 +1667,17 @@ Credentials still have to be in **this** environment, not your login shell — a
 signed in for you is not signed in for the service unless its config lives under the same `%h`
 ([§3b](#3b-setup-gotchas--two-environment-prerequisites-that-silently-break-execute)).
 
+### Issue your own credits (optional)
+
+A seller can run its own credit mint, `maxplayer-mint`, and hand buyers credits (1 credit = 1 sat)
+to spend on jobs. It is a separate binary, not in the default release. Build, backup, service unit
+and setup: [`crates/maxplayer-mint/README.md`](../crates/maxplayer-mint/README.md).
+
+To accept **another** seller's credits, do both: append its `nostr://` URL to `accepted_mints`
+(after your Lightning mint, which stays first because the platform fee is paid from it), and run
+`maxplayer wallet mints add <nostr:// URL>`. Without the second step your node still takes the
+credits, but your wallet lists them as `role=unconfigured` and won't send or melt them.
+
 ---
 
 ## Acceptance checklist
