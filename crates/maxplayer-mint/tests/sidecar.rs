@@ -4,6 +4,7 @@
 //! publish hand-built request events, so they can re-send the exact same event (the connector's
 //! lost-reply path), reuse an id, or send what a wallet never would.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -14,7 +15,7 @@ use cdk::Mint;
 use cdk::amount::{FeeAndAmounts, SplitTarget};
 use cdk::dhke::construct_proofs;
 use cdk::mint_url::MintUrl;
-use cdk::nuts::{CurrencyUnit, Id, PreMintSecrets, Proofs, SwapRequest, Token};
+use cdk::nuts::{CurrencyUnit, Id, PreMintSecrets, Proofs, State, SwapRequest, Token};
 use cdk::util::unix_time;
 use cdk::wallet::{ReceiveOptions, SendOptions, Wallet};
 use maxplayer_core::mint_wire::{
@@ -266,6 +267,36 @@ impl Raw {
         out
     }
 
+    /// One reply for each of `events`, which may all be in flight at once.
+    async fn collect(&mut self, events: &[Event], wait: Duration) -> HashMap<String, Response> {
+        let wanted: Vec<_> = events.iter().map(|e| e.id).collect();
+        let deadline = Instant::now() + wait;
+        let mut out = HashMap::new();
+        while out.len() < events.len() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(left, self.notifications.recv()).await {
+                Err(_) => break,
+                Ok(Ok(RelayPoolNotification::Event { event: reply, .. })) => {
+                    if reply.kind != Kind::Custom(RESPONSE_KIND) || reply.pubkey != self.mint_pk {
+                        continue;
+                    }
+                    let Some(to) = reply.tags.event_ids().find(|id| wanted.contains(id)) else {
+                        continue;
+                    };
+                    let plain =
+                        nip44::decrypt(self.keys.secret_key(), &self.mint_pk, &reply.content)
+                            .unwrap();
+                    out.insert(to.to_hex(), serde_json::from_str(&plain).unwrap());
+                }
+                Ok(_) => continue,
+            }
+        }
+        out
+    }
+
     async fn call(&mut self, event: &Event) -> Response {
         self.send(event).await;
         let mut replies = self.replies(event, 1, WAIT).await;
@@ -419,7 +450,7 @@ async fn killed_after_commit_is_answered_from_committed_state() {
     let key = replay::key(&raw.keys.public_key(), &request.id);
     let executing = Record::Executing {
         event_id: event.id.to_hex(),
-        digest: replay::digest(&request),
+        digest: replay::digest(&request).unwrap(),
     };
     replay::write(&h.mint, &key, &executing).await.unwrap();
     let committed = h.mint.process_swap_request(swap).await.unwrap();
@@ -439,7 +470,7 @@ async fn killed_before_commit_executes_on_resend() {
     let key = replay::key(&raw.keys.public_key(), &request.id);
     let executing = Record::Executing {
         event_id: event.id.to_hex(),
-        digest: replay::digest(&request),
+        digest: replay::digest(&request).unwrap(),
     };
     replay::write(&h.mint, &key, &executing).await.unwrap();
 
@@ -462,7 +493,8 @@ async fn replay_survives_restart() {
     assert_eq!(raw.call(&event).await, first);
 }
 
-/// A replay is served before the rate limiter, so it never becomes `rate_limited`.
+/// A replay is served before the rate limiter, so it never becomes `rate_limited`. The new
+/// requests go out as one burst, so the result doesn't depend on round-trip speed.
 #[tokio::test(flavor = "multi_thread")]
 async fn rate_limit_refuses_new_requests_but_not_replays() {
     let h = harness(1, 1).await;
@@ -471,19 +503,23 @@ async fn rate_limit_refuses_new_requests_but_not_replays() {
     let (_, event) = raw.request("rl-1", op::SWAP, json!(swap), exp());
     let first = raw.call(&event).await;
     ok(&first);
-    let mut limited = 0;
-    for n in 0..3 {
-        let (_, new) = raw.request(&format!("rl-k{n}"), op::KEYSETS, Value::Null, exp());
-        let reply = raw.call(&new).await;
-        if matches!(&reply.outcome, Outcome::Err(_)) {
-            assert_eq!(named(&reply), code::RATE_LIMITED);
-            limited += 1;
-        }
+    let burst: Vec<Event> = (0..6)
+        .map(|n| {
+            raw.request(&format!("rl-k{n}"), op::KEYSETS, Value::Null, exp())
+                .1
+        })
+        .collect();
+    for e in &burst {
+        raw.send(e).await;
     }
-    assert!(
-        limited > 0,
-        "a 1/s limit admitted 4 requests in well under a second"
-    );
+    let replies = raw.collect(&burst, WAIT).await;
+    assert_eq!(replies.len(), burst.len());
+    let limited = replies
+        .values()
+        .filter(|r| matches!(&r.outcome, Outcome::Err(_)))
+        .inspect(|r| assert_eq!(named(r), code::RATE_LIMITED))
+        .count();
+    assert!(limited > 0, "a 1/s limit admitted a burst of 6");
     assert_eq!(
         raw.call(&event).await,
         first,
@@ -654,4 +690,207 @@ async fn issue_interrupted_after_signing_rewrites_the_file() {
         issue::read(&h.mint, &id).await.unwrap(),
         Some(issue::Entry::Written { amount: 40, .. })
     ));
+}
+
+fn stage_executing_record(request: &Request, event: &Event) -> Record {
+    Record::Executing {
+        event_id: event.id.to_hex(),
+        digest: replay::digest(request).unwrap(),
+    }
+}
+
+async fn stage_executing(h: &Harness, raw: &Raw, request: &Request, event: &Event) -> String {
+    let key = replay::key(&raw.keys.public_key(), &request.id);
+    replay::write(&h.mint, &key, &stage_executing_record(request, event))
+        .await
+        .unwrap();
+    key
+}
+
+/// Leave the database exactly as cdk's swap leaves it when the process dies between its setup
+/// transaction and finalize: inputs Pending, outputs recorded unsigned, saga `SetupComplete`.
+async fn stage_setup_complete(mint: &Mint, swap: &SwapRequest) {
+    use cdk_common::mint::{Operation, OperationKind, Saga, SwapSagaState};
+    let amount: u64 = swap.inputs().iter().map(|p| p.amount.to_u64()).sum();
+    let id = uuid::Uuid::now_v7();
+    let operation = Operation::new(
+        id,
+        OperationKind::Swap,
+        Amount::from(amount),
+        Amount::from(amount),
+        Amount::ZERO,
+        None,
+        None,
+    );
+    let mut tx = mint.localstore().begin_transaction().await.unwrap();
+    let mut proofs = tx
+        .add_proofs(swap.inputs().clone(), None, &operation)
+        .await
+        .unwrap();
+    tx.update_proofs_state(&mut proofs, State::Pending)
+        .await
+        .unwrap();
+    tx.add_blinded_messages(None, swap.outputs(), &operation)
+        .await
+        .unwrap();
+    tx.add_saga(&Saga::new_swap(id, SwapSagaState::SetupComplete))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+}
+
+fn nut(response: &Response) -> u16 {
+    match &response.outcome {
+        Outcome::Err(ErrorBody {
+            code: ErrorCode::Nut(code),
+            ..
+        }) => *code,
+        other => panic!("expected a NUT error, got {other:?}"),
+    }
+}
+
+/// Killed inside cdk's swap (setup committed, finalize not): before a restart the re-send gets
+/// the ambiguous 11002 and stays `executing`; after the restart cdk compensates the saga and the
+/// re-send executes, once.
+#[tokio::test(flavor = "multi_thread")]
+async fn killed_mid_swap_is_compensated_on_restart_then_executes() {
+    let mut h = harness(1, 20).await;
+    let mut raw = h.raw().await;
+    let swap = swap_request(&h.mint, 11).await;
+    let (request, event) = raw.request("setup-1", op::SWAP, json!(swap), exp());
+    let key = stage_executing(&h, &raw, &request, &event).await;
+    stage_setup_complete(&h.mint, &swap).await;
+
+    assert_eq!(nut(&raw.call(&event).await), 11002);
+    assert!(matches!(
+        replay::read(&h.mint, &key).await.unwrap(),
+        Some(Record::Executing { .. })
+    ));
+
+    h.restart().await;
+    let reply = raw.call(&event).await;
+    let signatures = ok(&reply)["signatures"].as_array().unwrap().len();
+    assert_eq!(signatures, swap.outputs().len());
+    assert_eq!(raw.call(&event).await, reply);
+}
+
+/// Some outputs of an `executing` swap signed and some not: never answered as success, never
+/// recorded.
+#[tokio::test(flavor = "multi_thread")]
+async fn partially_signed_executing_swap_is_internal() {
+    let h = harness(1, 20).await;
+    let mut raw = h.raw().await;
+    let swap = swap_request(&h.mint, 3).await; // outputs 1 + 2
+    assert!(swap.outputs().len() >= 2);
+    let first = swap.outputs()[0].clone();
+    let inputs = fund(&h.mint, first.amount.to_u64()).await;
+    h.mint
+        .process_swap_request(SwapRequest::new(inputs, vec![first]))
+        .await
+        .unwrap();
+    let (request, event) = raw.request("partial-1", op::SWAP, json!(swap), exp());
+    let key = stage_executing(&h, &raw, &request, &event).await;
+    assert_eq!(named(&raw.call(&event).await), code::INTERNAL);
+    assert_eq!(named(&raw.call(&event).await), code::INTERNAL);
+    assert!(matches!(
+        replay::read(&h.mint, &key).await.unwrap(),
+        Some(Record::Executing { .. })
+    ));
+}
+
+/// `executing`, nothing signed, re-sent after `exp`: `expired` is recorded and the swap never
+/// runs, however often it is re-sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn executing_unsigned_after_exp_records_expired() {
+    let h = harness(1, 20).await;
+    let mut raw = h.raw().await;
+    let swap = swap_request(&h.mint, 6).await;
+    let (request, event) = raw.request("exp-exec", op::SWAP, json!(swap), unix_time() + 2);
+    let key = stage_executing(&h, &raw, &request, &event).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(named(&raw.call(&event).await), code::EXPIRED);
+    assert_eq!(named(&raw.call(&event).await), code::EXPIRED);
+    assert!(matches!(
+        replay::read(&h.mint, &key).await.unwrap(),
+        Some(Record::Completed { .. })
+    ));
+    // Not executed: the same swap under a fresh id still succeeds.
+    let (_, fresh) = raw.request("exp-exec-2", op::SWAP, json!(swap), exp());
+    ok(&raw.call(&fresh).await);
+}
+
+/// A definitive refusal is recorded and replayed, and it moved nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn definitive_refusal_is_recorded_and_moves_nothing() {
+    let h = harness(1, 20).await;
+    let mut raw = h.raw().await;
+    let inputs = fund(&h.mint, 10).await;
+    let keyset = active_keyset(&h.mint);
+    let unbalanced = SwapRequest::new(inputs.clone(), premint(keyset, 8).blinded_messages());
+    let (request, event) = raw.request("unbal-1", op::SWAP, json!(unbalanced), exp());
+    let first = raw.call(&event).await;
+    assert_eq!(nut(&first), 11005);
+    assert_eq!(raw.call(&event).await, first);
+    let key = replay::key(&raw.keys.public_key(), &request.id);
+    assert!(matches!(
+        replay::read(&h.mint, &key).await.unwrap(),
+        Some(Record::Completed { .. })
+    ));
+    let balanced = SwapRequest::new(inputs, premint(keyset, 10).blinded_messages());
+    let (_, good) = raw.request("unbal-2", op::SWAP, json!(balanced), exp());
+    ok(&raw.call(&good).await);
+}
+
+/// The production `issue` path: a mint that is built, not started. The issued signature rows
+/// survive the next `run`'s saga recovery, and NUT-09 restore returns exactly the journaled
+/// signatures.
+#[tokio::test(flavor = "multi_thread")]
+async fn issue_on_unstarted_mint_survives_recovery_and_restores() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("mint.sqlite");
+    let keys = Keys::generate();
+    let url = mint_url(&keys).unwrap();
+    let seed = seed();
+    backend::open(&db, &seed, &url)
+        .await
+        .unwrap()
+        .stop()
+        .await
+        .unwrap();
+
+    let built = backend::build(&db, &seed, &url).await.unwrap();
+    let id = issue::begin(&built, 25).await.unwrap();
+    issue::sign(&built, &id).await.unwrap();
+    let Some(issue::Entry::Committed {
+        outputs,
+        signatures,
+        ..
+    }) = issue::read(&built, &id).await.unwrap()
+    else {
+        panic!("not committed");
+    };
+    drop(built);
+
+    let mint = backend::open(&db, &seed, &url).await.unwrap();
+    assert_eq!(total_issued(&mint).await, 25);
+    let blinded: Vec<_> = outputs.iter().map(|o| o.blinded.clone()).collect();
+    match replay::signed_outputs(&mint, &blinded).await.unwrap() {
+        replay::Signed::All(restored) => assert_eq!(json!(restored), json!(signatures)),
+        _ => panic!("issued outputs do not restore"),
+    }
+    let done = issue::reconcile(&mint, dir.path(), &url).await.unwrap();
+    assert_eq!(done.len(), 1);
+    assert_eq!(total_issued(&mint).await, 25);
+    mint.stop().await.unwrap();
+}
+
+#[test]
+fn second_run_on_the_same_mint_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = MintHome::at(dir.path());
+    home.init().unwrap();
+    let held = home.lock_run().unwrap();
+    assert!(home.lock_run().is_err(), "a second listener got the lock");
+    drop(held);
+    home.lock_run().expect("lock released on drop");
 }

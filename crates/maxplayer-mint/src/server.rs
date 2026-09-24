@@ -11,8 +11,8 @@ use anyhow::{Context, Result};
 use cdk::Mint;
 use cdk::util::unix_time;
 use maxplayer_core::mint_wire::{
-    ErrorBody, MAX_PLAINTEXT_BYTES, Outcome, PROTOCOL_VERSION, REQUEST_KIND, RESPONSE_KIND,
-    Request, Response, code, request_expired,
+    ErrorBody, ErrorCode, MAX_PLAINTEXT_BYTES, Outcome, PROTOCOL_VERSION, REQUEST_KIND,
+    RESPONSE_KIND, Request, Response, code, request_expired,
 };
 use nostr_sdk::nips::nip44::{self, Version};
 use nostr_sdk::prelude::{
@@ -146,7 +146,13 @@ impl Server {
     /// never turned into `rate_limited`.
     async fn answer(&mut self, event: &Event, request: Request) -> Outcome {
         let key = replay::key(&event.pubkey, &request.id);
-        let digest = replay::digest(&request);
+        let digest = match replay::digest(&request) {
+            Ok(digest) => digest,
+            Err(error) => {
+                eprintln!("maxplayer-mint: {error}");
+                return failure(code::INTERNAL, "cannot digest request");
+            }
+        };
         let event_id = event.id.to_hex();
         let record = match replay::read(&self.mint, &key).await {
             Ok(record) => record,
@@ -231,6 +237,19 @@ impl Server {
                     return failure(code::RATE_LIMITED, "try again shortly");
                 }
                 let outcome = dispatch::execute(&self.mint, &request.op, request.body).await;
+                if matches!(
+                    &outcome,
+                    Outcome::Err(ErrorBody {
+                        code: ErrorCode::Nut(11002),
+                        ..
+                    })
+                ) {
+                    eprintln!(
+                        "maxplayer-mint: swap {:?}: inputs still pending (an interrupted swap was \
+                         not compensated); left executing, restart `run` to compensate it",
+                        request.id
+                    );
+                }
                 self.finish(key, event_id, digest, outcome).await
             }
         }
@@ -296,31 +315,33 @@ fn refusal(id: String, name: &str, detail: impl Into<String>) -> Response {
     }
 }
 
-/// New requests admitted per one-second window, across all clients.
+/// New requests admitted per second across all clients: a token bucket holding at most one
+/// second's worth, so two full budgets can't pass back to back across a window edge.
 struct RateLimiter {
-    per_second: u32,
-    window: Instant,
-    used: u32,
+    per_second: f64,
+    tokens: f64,
+    last: Instant,
 }
 
 impl RateLimiter {
     fn new(per_second: u32) -> Self {
+        let per_second = f64::from(per_second);
         Self {
             per_second,
-            window: Instant::now(),
-            used: 0,
+            tokens: per_second,
+            last: Instant::now(),
         }
     }
 
     fn admit(&mut self) -> bool {
-        if self.window.elapsed() >= Duration::from_secs(1) {
-            self.window = Instant::now();
-            self.used = 0;
-        }
-        if self.used >= self.per_second {
+        let now = Instant::now();
+        let refill = now.duration_since(self.last).as_secs_f64() * self.per_second;
+        self.tokens = (self.tokens + refill).min(self.per_second);
+        self.last = now;
+        if self.tokens < 1.0 {
             return false;
         }
-        self.used += 1;
+        self.tokens -= 1.0;
         true
     }
 }
