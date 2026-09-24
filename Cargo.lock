@@ -2592,6 +2592,7 @@ name = "maxplayer-core"
 version = "0.5.11"
 dependencies = [
  "async-trait",
+ "async-wsocket",
  "base64 0.22.1",
  "bytes",
  "cashu",

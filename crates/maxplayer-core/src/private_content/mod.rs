@@ -39,3 +39,6 @@ pub mod public_v2;
 
 #[cfg(feature="wallet")]
 pub mod history;
+
+#[cfg(feature="wallet")]
+pub(crate) mod history_wire;

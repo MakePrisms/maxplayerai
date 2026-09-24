@@ -66,7 +66,16 @@ impl CappedRelay {
                         let id = &value[1];
                         let filter: Filter = serde_json::from_value(value[2].clone()).unwrap();
                         let limit = filter.limit.unwrap_or(2000).min(2000);
-                        let events = &variants[selected.load(Ordering::SeqCst)];
+                        let active = selected.load(Ordering::SeqCst);
+                        let is_result = filter.kinds.as_ref().is_some_and(|kinds| kinds.contains(&Kind::Custom(crate::kinds::JOB_RESULT_KIND)));
+                        // Mode 6 fails the first result page; mode 7 fails a later
+                        // page, after the initial full page has already succeeded.
+                        if is_result && (active == 6 || (active == 7 && filter.until.is_some())) {
+                            let text = serde_json::json!(["CLOSED", id, "error: historical query failed"]).to_string();
+                            if ws.send(Message::Text(text.into())).await.is_err() { return; }
+                            continue;
+                        }
+                        let events = &variants[match active { 6 => 3, 7 => 2, _ => active }];
                         // Buzz pushes e/kind/author/time into SQL, but applies t
                         // after SQL LIMIT. Model that distinction explicitly.
                         let mut sql_filter = filter.clone();
@@ -135,6 +144,15 @@ async fn exercise_capped_history(private: bool) {
         e.award.clone(),
         e.result.clone(),
     ];
+    let mut expired = base.clone();
+    for i in 0..128 {
+        let row = EventBuilder::new(Kind::Custom(crate::kinds::JOB_RESULT_KIND), format!("expired {i}"))
+            .tags([Tag::event(e.offer.id), Tag::hashtag("maxplayer"), Tag::expiration(Timestamp::from(now + 2))])
+            .custom_created_at(Timestamp::from(now + 1)).sign_with_keys(&seller).unwrap();
+        assert!(row.created_at > e.result.created_at);
+        row.verify().unwrap();
+        expired.push(row);
+    }
     let mut outsiders = base.clone();
     let mut saturated = base.clone();
     let mut paginated = base.clone();
@@ -178,6 +196,7 @@ async fn exercise_capped_history(private: bool) {
         paginated,
         base,
         foreign_namespace,
+        expired,
     ])
     .await;
     let root = tempfile::tempdir().unwrap();
@@ -265,6 +284,23 @@ async fn exercise_capped_history(private: bool) {
         "foreign namespace page: {report:?}"
     );
     assert!(!report.released.contains(&job));
+    // Retained rows can expire AFTER storage/query and BEFORE SDK delivery.
+    // Wait for fixture expiry (real SDK uses wall clock); don't alter SDK validation.
+    while Timestamp::now().as_secs() <= now + 2 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    for mode in [5, 6, 7] {
+        relay.mode.store(mode, Ordering::SeqCst);
+        assert!(matches!(job_lifecycle::fetch_job_view_async(
+            &context.home, &buyer, &job, Duration::from_secs(20), now).await,
+            Err(job_lifecycle::JobLifecycleError::Relay(_))), "unsafe success in mode {mode}");
+        let report = reconcile_reservations(&context).await.unwrap();
+        assert!(report.kept.contains(&job), "mode {mode}: {report:?}");
+        assert!(!report.released.contains(&job), "mode {mode}: {report:?}");
+        relay.mode.store(3, Ordering::SeqCst);
+        let report = reconcile_reservations(&context).await.unwrap();
+        assert!(report.kept.contains(&job), "mode {mode} recovery: {report:?}");
+    }
     // >2,000 results spread over seconds are actually paginated, not just rejected.
     relay.mode.store(2, Ordering::SeqCst);
     let view = job_lifecycle::fetch_job_view_async(

@@ -1,15 +1,15 @@
 //! Complete lifecycle reads. SDK fetches may return partial events on timeout;
 //! exact EOSE plus unsaturated pages are required to certify the full history.
-use super::{Error, Result};
+use super::{Error, Result, history_wire::WireHistory};
 use nostr_sdk::{pool::RelayNotification, prelude::*};
 use std::{collections::BTreeMap, future::Future, time::Duration};
 
-// Below the bundled relay's 2,000-row hard cap. A supported relay must honor
+// Below the bundled database's 1,000-row default cap. A supported relay must honor
 // this requested page size; EOSE alone does not promise an uncapped history.
 const PAGE_LIMIT: usize = 128;
 const MAX_WINDOWS: usize = 32;
 
-pub async fn fetch(relay: &Relay, filter: Filter, timeout: Duration) -> Result<Vec<Event>> {
+pub(crate) async fn fetch(wire: &WireHistory, relay: &Relay, filter: Filter, timeout: Duration) -> Result<Vec<Event>> {
     let deadline = tokio::time::Instant::now() + timeout;
     // Buzz applies #t only AFTER its SQL LIMIT. Request that superset on the
     // wire, count/paginate every row, then apply the namespace filter locally.
@@ -25,7 +25,7 @@ pub async fn fetch(relay: &Relay, filter: Filter, timeout: Duration) -> Result<V
             .checked_duration_since(tokio::time::Instant::now())
             .filter(|duration| !duration.is_zero())
             .ok_or(Error("lifecycle history incomplete"))?;
-        fetch_page(relay, filter, remaining).await
+        fetch_page(wire, relay, filter, remaining).await
     })
     .await?;
     Ok(events
@@ -79,15 +79,18 @@ where
     Err(Error("lifecycle history pagination budget exhausted"))
 }
 
-async fn fetch_page(relay: &Relay, filter: Filter, timeout: Duration) -> Result<Vec<Event>> {
+async fn fetch_page(wire: &WireHistory, relay: &Relay, filter: Filter, timeout: Duration) -> Result<Vec<Event>> {
     let id = SubscriptionId::generate();
     let mut notifications = relay.notifications();
+    let page = wire.page(relay, &id);
     let result = tokio::time::timeout(timeout, async {
         relay
             .subscribe_with_id(id.clone(), filter.clone(), SubscribeOptions::default())
             .await
             .map_err(|_| Error("lifecycle subscription failed"))?;
-        collect(&mut notifications, &id, &filter).await
+        let events = collect(&mut notifications, &id, &filter).await?;
+        page.complete(events.len())?;
+        Ok(events)
     })
     .await
     .map_err(|_| Error("lifecycle history incomplete"));

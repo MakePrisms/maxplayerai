@@ -3073,7 +3073,7 @@ pub(crate) async fn fetch_job_view_async(
     timeout: Duration,
     now: u64,
 ) -> Result<JobView, JobLifecycleError> {
-    use nostr_sdk::prelude::{Client, EventId, Filter, Kind};
+    use nostr_sdk::prelude::{EventId, Filter, Kind};
 
     let offer_id = EventId::from_hex(job_id)
         .map_err(|error| JobLifecycleError::Input(format!("job_id: {error}")))?;
@@ -3090,7 +3090,7 @@ pub(crate) async fn fetch_job_view_async(
             refreshed.map_err(|e| JobLifecycleError::Relay(e.to_string()))?;
         }
     }
-    let client = Client::new(keys.clone());
+    let (client, history_wire) = crate::private_content::history_wire::WireHistory::client(keys);
     // Same discipline as `award_presence_async` / `presence_of_filter`: auto-auth ON so a
     // NIP-42-gated read re-issues after the handshake, and WAIT for the socket before the first
     // fetch — `connect()` only spawns, and a fetch racing the handshake burns its whole window and
@@ -3183,7 +3183,7 @@ pub(crate) async fn fetch_job_view_async(
     let v2_offer = offer_events.iter().find(|event| event.id == offer_id
         && crate::private_content::public_v2::value(event, "v") == Ok(Some("2")));
     let (feedback_events, result_events, v2_awards) = if let Some(offer) = v2_offer {
-        let read = fetch_v2_history(home, &relay, offer, feedback_filter, result_filter, timeout).await;
+        let read = fetch_v2_history(home, &history_wire, &relay, offer, feedback_filter, result_filter, timeout).await;
         if read.is_err() { client.disconnect().await; }
         read?
     } else {
@@ -3364,6 +3364,7 @@ pub(crate) async fn fetch_job_view_async(
 /// independent subscriptions can straddle publication of a result and its award.
 async fn fetch_v2_history(
     home: &MaxplayerHome,
+    wire: &crate::private_content::history_wire::WireHistory,
     relay: &nostr_sdk::Relay,
     offer: &nostr_sdk::Event,
     feedback_filter: nostr_sdk::Filter,
@@ -3380,7 +3381,7 @@ async fn fetch_v2_history(
     use crate::private_content::{history, public_v2 as public};
     use nostr_sdk::prelude::{EventId, Filter, Kind};
     let err = |e: crate::private_content::Error| JobLifecycleError::Relay(e.to_string());
-    let mut feedback = history::fetch(relay, feedback_filter, timeout)
+    let mut feedback = history::fetch(wire, relay, feedback_filter, timeout)
         .await
         .map_err(err)?;
     let award_filter = Filter::new()
@@ -3388,7 +3389,7 @@ async fn fetch_v2_history(
         .author(offer.pubkey)
         .hashtag(gateway::MAXPLAYER_TAG)
         .event(offer.id);
-    let mut awards = history::fetch(relay, award_filter.clone(), timeout)
+    let mut awards = history::fetch(wire, relay, award_filter.clone(), timeout)
         .await
         .map_err(err)?;
     // Locally signed/validated selection evidence survives relay pruning and
@@ -3416,7 +3417,7 @@ async fn fetch_v2_history(
     if let Some(seller) = selected_seller {
         result_filter = result_filter.author(seller);
     }
-    let results = history::fetch(relay, result_filter, timeout).await.map_err(err)?;
+    let results = history::fetch(wire, relay, result_filter, timeout).await.map_err(err)?;
     let missing: std::collections::BTreeSet<_> = results
         .iter()
         .filter(|r| {
@@ -3434,7 +3435,7 @@ async fn fetch_v2_history(
         .collect();
     if !missing.is_empty() {
         awards.extend(
-            history::fetch(relay, award_filter.ids(missing), timeout)
+            history::fetch(wire, relay, award_filter.ids(missing), timeout)
                 .await
                 .map_err(err)?,
         );
@@ -3448,7 +3449,7 @@ async fn fetch_v2_history(
     if !missing.is_empty() {
         feedback.extend(
             history::fetch(
-                relay,
+                wire, relay,
                 Filter::new()
                     .ids(missing)
                     .kind(Kind::Custom(JOB_CLAIM_KIND))
@@ -7553,7 +7554,7 @@ mod private_flow_tests {
         home.config.relay_url = fixture.url().await.to_string();
         let (public, buyer) = crate::private_content::public_v2::tests::fixture(false, false);
         let (private, _, _, _) = inline_fixture();
-        let client = Client::new(buyer.clone());
+        let (client, wire) = crate::private_content::history_wire::WireHistory::client(&buyer);
         client.add_relay(&home.config.relay_url).await.unwrap();
         client.connect().await;
         let relay = client.relay(&home.config.relay_url).await.unwrap();
@@ -7568,7 +7569,7 @@ mod private_flow_tests {
             for e in [&public, &private] {
                 let feedback = Filter::new().kinds([Kind::Custom(JOB_CLAIM_KIND), Kind::Custom(JOB_FEEDBACK_KIND)]).event(e.offer.id);
                 let results = Filter::new().kind(Kind::Custom(JOB_RESULT_KIND)).event(e.offer.id);
-                assert!(matches!(fetch_v2_history(&home, &relay, &e.offer, feedback, results, Duration::from_secs(2)).await,
+                assert!(matches!(fetch_v2_history(&home, &wire, &relay, &e.offer, feedback, results, Duration::from_secs(2)).await,
                     Err(JobLifecycleError::Relay(_))));
             }
             assert!(matches!(fetch_job_view_async(&home, &buyer, &public.offer.id.to_hex(), Duration::from_secs(2), 2_000_000_001).await,

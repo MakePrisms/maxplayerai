@@ -103,15 +103,23 @@ legacy compatibility promise, READY message, or application-level service ACK is
   preserve it with the content database.
 - V2 claim, result and award queries each require their own end-of-history response.
   EOSE terminates a response, not necessarily the full history: the bundled relay
-  caps historical results at 2,000. Lifecycle reads therefore request 128-event
-  pages (supported relays must honor that size), count matching events before
-  application rejection, and page backward. Because the relay applies the namespace
+  caps requests at 2,000 rows and the database further clamps to 1,000 by default.
+  Lifecycle reads therefore request 128-event pages (supported relays must honor
+  that size) and page backward. A bounded per-subscription transport counter checks
+  raw EVENT frames against SDK-delivered events at the exact EOSE. Expired, invalid,
+  deleted or otherwise discarded rows cause retryable unknown state rather than
+  making a full wire page appear short. Counters freeze at EOSE, exclude live
+  events, and are removed on success, error or cancellation. Because the relay applies the namespace
   `#t` filter after its database limit, these requests omit `#t` on the wire and
   apply it locally only after completing the superset scan; otherwise foreign tags
   could make a truncated response appear empty. Before crossing a timestamp they read
   its complete second separately, preserving ties. Saturated seconds, changing
   boundary rows, notification gaps, timeouts or the 32-window work budget produce
   retryable unknown state, never confirmed absence; reservations stay held.
+  Deploy the updated relay before enabling this lane: failed historical database
+  queries must remove the subscription and send `CLOSED error:`, never EOSE.
+  Old relays that return EOSE on failure are indistinguishable from honest empty
+  history; client-side counting cannot repair that server contract.
   Result filters use an offer-authenticated target or locally validated selected
   seller when available. This narrows outsider traffic but does not replace the
   completeness checks. Single-timestamp saturation remains a fail-closed availability
@@ -130,3 +138,10 @@ claim read is refused. These are local fixtures, not deployed-trade verification
 The capped-history regressions additionally cover paid public-v2 and private
 open-pool reservations: 2,000 newer outsider results, selected-seller timestamp
 saturation, pagination beyond the relay cap, and recovery after saturation clears.
+
+History-failure coverage also includes a full page of correctly signed expired
+selected-seller events discarded by the real SDK, subscription failure on the first
+and later result pages, and reservation retention/recovery in both paid visibility
+paths. A relay-handler test closes the actual SQL pool and asserts CLOSED without
+EOSE and cleanup of both subscription indexes. These tests do not exercise a
+deployed relay, live admission/rate limits or a paid trade.
