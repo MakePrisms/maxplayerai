@@ -13,8 +13,18 @@
 //! **Replays (the mint's obligation).** A wallet re-sends the IDENTICAL signed event when a reply is
 //! lost. The mint MUST answer a request id it already executed with the ORIGINAL reply, never with
 //! the NUT error the re-execution would produce (e.g. 11001 token already spent): the wallet treats
-//! such an error as definitive and releases inputs the mint already took. A mint MUST NOT execute a
-//! request whose `exp` has passed; the wallet sets `exp` to the moment it stops waiting.
+//! such an error as definitive and releases inputs the mint already took, even when the duplicate
+//! arrives after `exp`.
+//!
+//! **Expiry.** `exp` is the FIRST unix second in which the request is invalid: the mint MUST refuse
+//! it (`expired`, without executing) once its clock reads `now >= exp` ([`request_expired`]). The
+//! wallet sets `exp` no later than the moment it stops waiting. Wallet and mint clocks must agree
+//! within [`MAX_CLOCK_SKEW_SECS`]; a mint clock behind the wallet's lets a request execute after the
+//! wallet gave up.
+//!
+//! **Trust.** The mint npub authenticates the transport; it does not make relay delivery reliable
+//! or the mint honest. Per-request throwaway keys hide the Nostr identity, but relay connection
+//! metadata, timing and request sizes can still link requests.
 //!
 //! Both kinds are in the ephemeral range, so a well-behaved relay forwards them and stores nothing.
 //! No collision with [`crate::kinds`] (3400–3407, 30340).
@@ -85,6 +95,10 @@ pub mod op {
 
 /// Transport-level error codes (`err.code` as a string). A NUT error from the mint itself travels
 /// as its numeric NUT code instead (see [`ErrorCode::Nut`]).
+///
+/// The four definitive codes (`unsupported`, `rate_limited`, `bad_request`, `expired`) promise the
+/// request was NOT executed: a mint sends them only before the op reaches anything that can commit
+/// it. After that point it answers `internal` or the original cached reply.
 pub mod code {
     /// The mint does not serve this op (e.g. mint/melt on a local-issue mint). Definitive.
     pub const UNSUPPORTED: &str = "unsupported";
@@ -109,8 +123,17 @@ pub struct Request {
     pub op: String,
     /// The NUT JSON body of the operation (`null` for bodiless ops).
     pub body: serde_json::Value,
-    /// Unix seconds after which the mint must not execute this request.
+    /// First unix second in which the mint must refuse this request ([`request_expired`]).
     pub exp: u64,
+}
+
+/// Largest wallet/mint clock disagreement the protocol tolerates (both sides run NTP). The wallet's
+/// `nostr://` recovery hold is sized to cover it.
+pub const MAX_CLOCK_SKEW_SECS: u64 = 60;
+
+/// The mint's expiry rule: refuse, without executing, once `now_unix >= exp`.
+pub fn request_expired(exp: u64, now_unix: u64) -> bool {
+    now_unix >= exp
 }
 
 /// Response plaintext (NIP-44-encrypted into a kind-23411 event).
@@ -249,6 +272,14 @@ pub fn decode_npub(npub: &str) -> Option<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mint_wire_expiry_boundary_is_exclusive() {
+        // PR #1034 Cashu review: `exp` is the first INVALID second.
+        assert!(!request_expired(1_000, 999), "valid just before exp");
+        assert!(request_expired(1_000, 1_000), "refused AT exp");
+        assert!(request_expired(1_000, 1_001), "refused after exp");
+    }
 
     // x of the secp256k1 generator — a valid key. Encoded independently of nostr-sdk.
     const G_NPUB: &str = "npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d";
