@@ -177,6 +177,7 @@
       # a sibling `nixosModules.runner` (#280) then merges as its own line rather than a conflicting
       # `nixosModules` block.
       nixosModules.relay = import ./nix/relay.nix;
+      nixosModules.reviewer = import ./nix/reviewer.nix;
 
       # The launch relay as a deployable box: EC2 t3.small (x86_64) built from `nixosModules.relay`.
       # Deploy, building ON the target so nothing cross-compiles from the workstation:
@@ -193,9 +194,11 @@
         system = "x86_64-linux";
         modules = [
           self.nixosModules.relay
+          self.nixosModules.reviewer
           ./nix/relay-host.nix
           {
             services.maxplayer.relay.package = self.packages.x86_64-linux.maxplayer-relay;
+            services.maxplayer.reviewer.package = self.packages.x86_64-linux.default;
           }
         ];
       };

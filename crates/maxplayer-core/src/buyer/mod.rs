@@ -624,6 +624,7 @@ struct GetJobParams {
 /// fact and is deliberately left unchanged — award, delivery, and accept are three separate facts.
 #[derive(Serialize)]
 struct GetJobResponse {
+    review_status: std::collections::BTreeMap<String, String>,
     #[serde(flatten)]
     view: job_lifecycle::JobView,
     /// The published award for this job, present iff the buyer has committed one. Sourced from the
@@ -710,7 +711,7 @@ async fn get_job(context: &BuyerContext, id: Value, params: Value) -> Response {
     // already stale when it read it.
     let events = context.relay.subscribe_events();
     match job_lifecycle::get_job_awaiting_events_async(&context.home, request, events).await {
-        Ok(view) => {
+        Ok(mut view) => {
             // #481: enrich the relay-truth view with the buyer-LOCAL committed award. The view
             // builder has no store handle, so the lookup lives here, at the RPC boundary where
             // `context.store` is in scope. A store read error must NOT sink the whole response —
@@ -726,7 +727,8 @@ async fn get_job(context: &BuyerContext, id: Value, params: Value) -> Response {
             let awarded_delivery_pending = awarded.as_ref().is_some_and(|a| {
                 job_lifecycle::awarded_delivery_pending(&view, &a.claim_id, &a.seller_pubkey)
             });
-            Response::ok(id, json!(GetJobResponse { view, awarded, awarded_delivery_pending }))
+            let review_status = crate::review::protect_job_view(&context.home, &mut view, awarded.as_ref().map(|a| a.seller_pubkey.as_str())).await;
+            Response::ok(id, json!(GetJobResponse { view, awarded, awarded_delivery_pending, review_status }))
         }
         Err(error) => Response::err(id, CODE_INTERNAL, error.to_string()),
     }
@@ -2494,6 +2496,26 @@ async fn settle_awarded(context: &Arc<BuyerContext>, wake: Option<&nostr_sdk::Ev
         if let Some(event) = wake {
             if !job_lifecycle::event_references_job(event, &job_id) {
                 continue;
+            }
+        }
+        // A review timeout needs an explicit retry, not an unbounded sequence of paid
+        // provider calls from this background sweep. Never hold an accepted obligation.
+        let review_enabled = context.store.award_record(&job_id).ok().flatten()
+            .map(|award| context.home.config.review.enabled(crate::kinds::JOB_RESULT_KIND, &award.seller_pubkey).unwrap_or(true))
+            .unwrap_or(context.home.config.review.buyer_delivery);
+        if review_enabled && matches!(job_lifecycle::load_accepted_bind(&context.home, &job_id), Ok(None)) {
+            match crate::review::state::blocked_job(&context.home.root, &job_id) {
+                Ok(Some(status)) => {
+                    let replacement = wake.is_some_and(|event| {
+                        event.kind == nostr_sdk::Kind::Custom(crate::kinds::JOB_RESULT_KIND)
+                            && event.id.to_hex() != status.subject.event
+                            && context.store.award_record(&job_id).ok().flatten()
+                                .is_some_and(|award| award.seller_pubkey == event.pubkey.to_hex())
+                    });
+                    if !replacement { continue; }
+                }
+                Err(error) => { crate::opline!("buyer: {job_id}: {error}"); continue; }
+                Ok(None) => {}
             }
         }
         match settle_job(context, &job_id, None).await {
@@ -5190,6 +5212,7 @@ mod tests {
 
         // A committed award: JobView fields flatten to the top level and `awarded` sits beside them.
         let with_award = serde_json::to_value(GetJobResponse {
+            review_status: Default::default(),
             view: view.clone(),
             awarded: Some(AwardedView::from(record)),
             awarded_delivery_pending: false,
@@ -5204,6 +5227,7 @@ mod tests {
 
         // No award: `awarded` is omitted entirely (skip_serializing_if), never null/empty.
         let no_award = serde_json::to_value(GetJobResponse {
+            review_status: Default::default(),
             view,
             awarded: None,
             awarded_delivery_pending: false,
@@ -5226,6 +5250,7 @@ mod tests {
                 job_lifecycle::awarded_delivery_pending(&view, &a.claim_id, &a.seller_pubkey)
             });
             serde_json::to_value(GetJobResponse {
+                review_status: Default::default(),
                 view,
                 awarded,
                 awarded_delivery_pending,
@@ -5889,6 +5914,8 @@ mod tests {
         relay.run().await.expect("relay run");
         let relay_url = relay.url().await.to_string();
         home.config.relay_url = relay_url.clone();
+        // Isolate the existing payment-signature refusal from reviewer availability.
+        home.config.review.buyer_delivery = false;
 
         let buyer = Keys::parse(&crate::home::read_secret_key_hex(&home).expect("secret"))
             .expect("buyer keys");

@@ -67,6 +67,9 @@ const KIND_MOBEE_TRADE_RESULT: u32 = 3403;
 const KIND_MOBEE_TRADE_FEEDBACK: u32 = 3404;
 const KIND_MOBEE_TRADE_AWARD: u32 = 3405;
 const KIND_MOBEE_TRADE_ACCEPT: u32 = 3406;
+// Maxplayer execution reviews: signed assessments and requests (PR #1022).
+const KIND_MAXPLAYER_REVIEW: u32 = 3408;
+const KIND_MAXPLAYER_REVIEW_REQUEST: u32 = 3409;
 const KIND_MOBEE_SELLER_HEARTBEAT: u32 = 30340;
 const KIND_MOBEE_NIP89_HANDLER: u32 = 31990;
 // NIP-17 DM-relay list (standard kind 10050). Pre-allowed by mobee for future
@@ -349,14 +352,16 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         | KIND_MOBEE_JOB_FEEDBACK
         | KIND_MOBEE_JOB_RECEIPT => Ok(Scope::MessagesWrite),
         // Mobee trade path (maxplayer-core kind registry): buyer/seller trade events
-        // plus the seller liveness heartbeat — authenticated writes by mobee
-        // buyers/sellers.
+        // plus execution review requests/results and the seller liveness heartbeat.
+        // Review admission does not replace client-side reviewer signature checks.
         KIND_MOBEE_TRADE_OFFER
         | KIND_MOBEE_TRADE_CLAIM
         | KIND_MOBEE_TRADE_RESULT
         | KIND_MOBEE_TRADE_FEEDBACK
         | KIND_MOBEE_TRADE_AWARD
         | KIND_MOBEE_TRADE_ACCEPT
+        | KIND_MAXPLAYER_REVIEW
+        | KIND_MAXPLAYER_REVIEW_REQUEST
         | KIND_MOBEE_SELLER_HEARTBEAT => Ok(Scope::MessagesWrite),
         // Mobee self-describing discovery/config kinds — the NIP-89 handler
         // advertisement and the NIP-17 DM-relay list. Grouped with kind-0's
@@ -3071,6 +3076,24 @@ mod tests {
                 "kind {kind} must not require an h-tag channel scope"
             );
         }
+    }
+
+    #[test]
+    fn execution_review_kinds_require_messages_write_without_channel_scope() {
+        let dummy = make_dummy_event();
+        assert!(
+            !open_ingest_enabled(),
+            "run admission tests with BUZZ_OPEN_INGEST unset"
+        );
+        // Literal wire numbers also catch accidental drift from maxplayer-core.
+        for kind in [3408, 3409] {
+            assert_eq!(
+                required_scope_for_kind(kind, &dummy).unwrap(),
+                Scope::MessagesWrite
+            );
+            assert!(!requires_h_channel_scope(kind));
+        }
+        assert!(required_scope_for_kind(3410, &dummy).is_err());
     }
 
     #[test]

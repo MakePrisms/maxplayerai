@@ -60,7 +60,7 @@ use git2::{
     RemoteCallbacks, Repository,
 };
 
-use crate::delivery_transport::{assert_allowed_repo_locator, TransportRefuse};
+use crate::delivery_transport::{TransportRefuse, assert_allowed_repo_locator};
 
 /// Failure of an in-process git transport operation. Callers map this into their own domain
 /// error (`SellerGitError` / `DeliveryError` / `String`).
@@ -150,6 +150,7 @@ struct LegContext {
     /// When true, use the SHORT-timeout HTTP client (the buyer money-path fetch: a hung fetch must
     /// fail CLOSED before authorize_pay burns budget).
     short: bool,
+    read_budget: Option<Arc<ReadBudget>>,
     /// The exact repo-root URL the caller named. Every leg of the operation must target this URL
     /// ([`same_destination`]); a leg to any other URL is refused before a request is built.
     intended_url: String,
@@ -298,17 +299,18 @@ fn ensure_registered() -> Result<(), TransportError> {
             }
             git2::transport::register("https", |remote| {
                 let context = CONTEXT.with(|cell| cell.borrow().clone());
-                let (mint, authority, lifetime, short, intended_url) = match context {
+                let (mint, authority, lifetime, short, intended_url, read_budget) = match context {
                     Some(context) => (
                         context.mint,
                         context.authority,
                         context.lifetime,
                         context.short,
                         Some(context.intended_url),
+                        context.read_budget,
                     ),
                     // No operation context: no destination is bound, so `action` refuses every
                     // leg. Fail closed rather than send a request nobody named.
-                    None => (None, None, None, false, None),
+                    None => (None, None, None, false, None, None),
                 };
                 Transport::smart(
                     remote,
@@ -319,6 +321,7 @@ fn ensure_registered() -> Result<(), TransportError> {
                         lifetime,
                         short,
                         intended_url,
+                        read_budget,
                     },
                 )
             })
@@ -453,9 +456,9 @@ pub fn nip98_authorization_header_with_keys(
     expiration_unix: Option<i64>,
 ) -> Result<String, TransportError> {
     use base64::Engine as _;
+    use nostr_sdk::JsonUtil;
     use nostr_sdk::nips::nip98::{HttpData, HttpMethod};
     use nostr_sdk::prelude::{EventBuilder, Tag, Url};
-    use nostr_sdk::JsonUtil;
 
     let url = Url::parse(remote_url)
         .map_err(|error| TransportError::Io(format!("invalid remote url: {error}")))?;
@@ -639,9 +642,8 @@ fn silence_local_pack_abort_panics() {
 /// A refusal here is a [`TransportError::Transport`] — fail closed, nothing sent, never retried.
 fn lifetime_gate(lifetime: Option<&AuthorityCheck>, phase: &str) -> Result<(), TransportError> {
     match lifetime {
-        Some(check) => check().map_err(|ended| {
-            TransportError::Transport(format!("refusing to {phase}: {ended}"))
-        }),
+        Some(check) => check()
+            .map_err(|ended| TransportError::Transport(format!("refusing to {phase}: {ended}"))),
         None => Ok(()),
     }
 }
@@ -775,6 +777,7 @@ fn push_gated_object(
         authority,
         lifetime,
         short: false,
+        read_budget: None,
         intended_url: remote_url.to_owned(),
     };
     let pushed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -838,6 +841,73 @@ fn require_status_report(
     }
 }
 
+/// Shared response-byte/deadline budget for a bounded read, including ref advertisements.
+struct ReadBudget {
+    remaining: std::sync::atomic::AtomicUsize,
+    deadline: std::time::Instant,
+}
+impl ReadBudget {
+    fn check(&self) -> io::Result<()> {
+        if std::time::Instant::now() >= self.deadline {
+            return Err(io::Error::other("git read deadline exceeded"));
+        }
+        if self.remaining.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            return Err(io::Error::other("git read byte limit exceeded"));
+        }
+        Ok(())
+    }
+}
+
+/// Reviewer fetch: caller has validated the configured relay destination. Shares the
+/// buyer transport, but caps all response bytes, object count, and elapsed work.
+pub(crate) fn fetch_review_ref(
+    repo: &Repository,
+    remote_url: &str,
+    refspec: &str,
+    header: String,
+    max_bytes: usize,
+    deadline: std::time::Instant,
+) -> Result<(), TransportError> {
+    assert_allowed_repo_locator(remote_url)?;
+    fetch_review_ref_inner(repo, remote_url, refspec, Some(header), max_bytes, deadline)
+}
+
+fn fetch_review_ref_inner(
+    repo: &Repository,
+    remote_url: &str,
+    refspec: &str,
+    header: Option<String>,
+    max_bytes: usize,
+    deadline: std::time::Instant,
+) -> Result<(), TransportError> {
+    ensure_registered()?;
+    let budget = Arc::new(ReadBudget {
+        remaining: std::sync::atomic::AtomicUsize::new(max_bytes),
+        deadline,
+    });
+    let check = budget.clone();
+    let mut callbacks = RemoteCallbacks::new();
+    callbacks.transfer_progress(move |p| {
+        check.check().is_ok() && p.received_bytes() <= max_bytes && p.total_objects() <= 100_000
+    });
+    let mut options = FetchOptions::new();
+    options
+        .download_tags(AutotagOption::None)
+        .remote_callbacks(callbacks);
+    let mut remote = bound_remote(repo, remote_url)?;
+    let context = LegContext {
+        mint: header.map(static_auth),
+        authority: None,
+        lifetime: None,
+        short: true,
+        read_budget: Some(budget),
+        intended_url: remote_url.to_owned(),
+    };
+    with_context(context, || {
+        remote.fetch(&[refspec], Some(&mut options), None)
+    })
+}
+
 /// Fetch `refspecs` from `remote_url` into `repo` in-process. `auth` supplies NIP-98 for relay-git
 /// reads; `short_timeout` selects the fail-closed money-path client (buyer verify) vs the default
 /// long client (seller base fetch). Tags are never downloaded (mirrors `--no-tags`).
@@ -868,11 +938,10 @@ pub fn fetch_refspecs(
         authority: None,
         lifetime: None,
         short: short_timeout,
+        read_budget: None,
         intended_url: remote_url.to_owned(),
     };
-    let result = with_context(context, || {
-        remote.fetch(refspecs, Some(&mut options), None)
-    });
+    let result = with_context(context, || remote.fetch(refspecs, Some(&mut options), None));
     drop(options);
     result
 }
@@ -910,6 +979,7 @@ pub fn list_remote(
         authority: None,
         lifetime: None,
         short: false,
+        read_budget: None,
         intended_url: remote_url.to_owned(),
     };
     let heads = with_context(context, || {
@@ -963,6 +1033,7 @@ struct NostrHttp {
     authority: Option<AuthorityCheck>,
     lifetime: Option<AuthorityCheck>,
     short: bool,
+    read_budget: Option<Arc<ReadBudget>>,
     /// The repo-root URL the caller named, from the operation context. `None` when the transport was
     /// created outside any [`with_context`]; then every leg is refused.
     intended_url: Option<String>,
@@ -1024,6 +1095,7 @@ impl SmartSubtransport for NostrHttp {
             authority: self.authority.clone(),
             lifetime: self.lifetime.clone(),
             short: self.short,
+            read_budget: self.read_budget.clone(),
             url: full_url,
             // The repo ROOT this leg belongs to, kept beside the service URL: it is what the token
             // is signed over (`u`) and what the minter is shown, so the minter judges the same
@@ -1050,6 +1122,7 @@ struct HttpStream {
     authority: Option<AuthorityCheck>,
     lifetime: Option<AuthorityCheck>,
     short: bool,
+    read_budget: Option<Arc<ReadBudget>>,
     url: String,
     destination: String,
     service: &'static str,
@@ -1141,6 +1214,15 @@ impl HttpStream {
                 ))
             })?;
         }
+        if let Some(budget) = &self.read_budget {
+            budget.check()?;
+            request = request.timeout(
+                budget
+                    .deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .min(BUYER_FETCH_LEG_TIMEOUT),
+            );
+        }
         let response = request
             .send()
             .map_err(|error| io::Error::other(format!("http request: {error}")))?;
@@ -1175,7 +1257,20 @@ impl Read for HttpStream {
             self.sent = true;
         }
         match self.response.as_mut() {
-            Some(response) => response.read(buf),
+            Some(response) => {
+                if let Some(budget) = &self.read_budget {
+                    budget.check()?;
+                    let remaining = budget.remaining.load(std::sync::atomic::Ordering::Relaxed);
+                    let len = buf.len().min(remaining);
+                    let n = response.read(&mut buf[..len])?;
+                    budget
+                        .remaining
+                        .fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
+                    Ok(n)
+                } else {
+                    response.read(buf)
+                }
+            }
             None => Ok(0),
         }
     }
@@ -1515,6 +1610,128 @@ mod tests {
     }
 
     // The https subtransport builds NO request for a leg whose URL is not the bound destination.
+    #[test]
+    fn reviewer_http_read_budget_covers_body_and_deadline() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n12345678",
+                )
+                .unwrap();
+        });
+        let response = client_short().get(format!("http://{addr}")).send().unwrap();
+        let budget = Arc::new(ReadBudget {
+            remaining: std::sync::atomic::AtomicUsize::new(4),
+            deadline: std::time::Instant::now() + Duration::from_secs(5),
+        });
+        let mut stream = HttpStream {
+            mint: None,
+            authority: None,
+            lifetime: None,
+            short: true,
+            read_budget: Some(budget),
+            url: String::new(),
+            destination: String::new(),
+            service: "git-upload-pack",
+            is_post: false,
+            sent: true,
+            request_body: vec![],
+            response: Some(response),
+        };
+        let mut received = Vec::new();
+        assert!(stream.read_to_end(&mut received).is_err());
+        assert_eq!(received, b"1234");
+        server.join().unwrap();
+        let expired = ReadBudget {
+            remaining: std::sync::atomic::AtomicUsize::new(100),
+            deadline: std::time::Instant::now(),
+        };
+        assert!(expired.check().is_err());
+    }
+
+    #[test]
+    fn reviewer_bounded_fetch_transfers_objects_and_refuses_failures() {
+        let root = temp_root("reviewer-fetch");
+        let source = Repository::init_bare(root.join("source")).unwrap();
+        let sig = git2::Signature::now("test", "test@example.test").unwrap();
+        let blob = source.blob(b"review this").unwrap();
+        let mut builder = source.treebuilder(None).unwrap();
+        builder.insert("file.txt", blob, 0o100644).unwrap();
+        let tree_id = builder.write().unwrap();
+        let tree = source.find_tree(tree_id).unwrap();
+        let oid = source
+            .commit(Some("refs/heads/job"), &sig, &sig, "result", &tree, &[])
+            .unwrap();
+        let url = url::Url::from_directory_path(source.path())
+            .unwrap()
+            .to_string();
+        let deadline = || std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let target = Repository::init_bare(root.join("target")).unwrap();
+        fetch_review_ref_inner(
+            &target,
+            &url,
+            "+refs/heads/job:refs/review/delivery",
+            None,
+            1024 * 1024,
+            deadline(),
+        )
+        .unwrap();
+        assert_eq!(target.refname_to_id("refs/review/delivery").unwrap(), oid);
+        assert_eq!(target.find_blob(blob).unwrap().content(), b"review this");
+        // A missing remote ref may report fetch success; it never produces a ref.
+        // Reviewer inspection must (and does) require the fetched ref explicitly.
+        let _ = fetch_review_ref_inner(
+            &target, &url, "+refs/heads/missing:refs/review/no", None,
+            1024 * 1024, deadline(),
+        );
+        assert!(target.find_reference("refs/review/no").is_err());
+        let limited = Repository::init_bare(root.join("limited")).unwrap();
+        assert!(
+            fetch_review_ref_inner(
+                &limited,
+                &url,
+                "+refs/heads/job:refs/review/delivery",
+                None,
+                1,
+                deadline()
+            )
+            .is_err()
+        );
+        let expired = Repository::init_bare(root.join("expired")).unwrap();
+        assert!(
+            fetch_review_ref_inner(
+                &expired,
+                &url,
+                "+refs/heads/job:refs/review/delivery",
+                None,
+                1024 * 1024,
+                std::time::Instant::now()
+            )
+            .is_err()
+        );
+        // Public production entry point cannot access local paths.
+        assert!(
+            fetch_review_ref(
+                &target,
+                &url,
+                "refs/heads/job",
+                "unused".into(),
+                1024,
+                deadline()
+            )
+            .is_err()
+        );
+        drop((target, limited, expired, tree, builder));
+        drop(source);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     // Red-on-revert: remove the check at the top of `NostrHttp::action` and the leg to the other
     // host is accepted.
     #[test]
@@ -1525,6 +1742,7 @@ mod tests {
             mint: Some(static_auth("Nostr token".to_owned())),
             authority: None,
             short: false,
+            read_budget: None,
             intended_url: Some(intended.to_owned()),
         };
         assert!(
@@ -1558,6 +1776,7 @@ mod tests {
             mint: Some(static_auth("Nostr token".to_owned())),
             authority: None,
             short: false,
+            read_budget: None,
             intended_url: None,
         };
         assert!(unbound.action(intended, Service::ReceivePackLs).is_err());

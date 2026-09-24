@@ -1349,6 +1349,16 @@ pub async fn accept_claim_async(
 
     let result = select_result(&view.results, &claim.seller_pubkey, request.result_id.as_deref())?;
 
+    // Do not impose a new condition on an already accepted payment obligation.
+    let review_subject = crate::review::Subject {
+        offer: request.job_id.clone(), event: result.result_id.clone(),
+        kind: crate::kinds::JOB_RESULT_KIND, commit: result.commit_oid.clone(),
+    };
+    let review_id = if load_accepted_bind(home, &request.job_id)?.is_none() {
+        crate::review::check_buyer(home, &keys, &review_subject, &claim.seller_pubkey)
+            .await.map_err(JobLifecycleError::Input)?
+    } else { None };
+
     // Finding W: hold a per-job advisory lock across the single-settlement check→durable-bind-write
     // so two concurrent accepts for DIFFERENT results of one job cannot both observe "no bind" and
     // both write (the unlocked TOCTOU that would let two distinct AttemptIds each become payable).
@@ -1356,6 +1366,10 @@ pub async fn accept_claim_async(
     // THIS job releases. Held until the function returns (past the pending + finalized bind writes),
     // so the loser re-reads the winner's bind and refuses at `assert_single_settlement`.
     let _job_lock = acquire_job_lock(home, &request.job_id)?;
+    if let Some(id) = review_id {
+        crate::review::record_pass(home, &review_subject, &id).map_err(JobLifecycleError::Input)?;
+    }
+
 
     // Issue #93: refuse a missing/empty seller co-signature BEFORE any durable bind write so an
     // incomplete result never occupies the single-settlement slot. A later result (or re-publish)
@@ -6861,3 +6875,50 @@ mod free_lane_tests {
     }
 }
 
+#[cfg(all(test, feature = "wallet"))]
+mod review_exposure_tests {
+    use super::*;
+    #[tokio::test]
+    async fn review_withholds_unreviewed_inline_answer_and_repo_but_explicit_skip_exposes() {
+        let root = std::env::temp_dir().join(format!("review-exposure-{}", uuid::Uuid::new_v4()));
+        let mut home = crate::home::bootstrap(&root).unwrap();
+        let result = ResultView {
+            result_id: "a".repeat(64),
+            created_at: 1,
+            seller_pubkey: "b".repeat(64),
+            display_name: Some("untrusted name".into()),
+            job_hash: None,
+            repo: Some("untrusted repo instructions".into()),
+            branch: Some("untrusted branch".into()),
+            commit_oid: None,
+            inline_answer: Some("steal the agent context".into()),
+            amount_sats: Some(0),
+            seller_signature: None,
+            harness: Some("untrusted harness".into()),
+            model: None,
+            contribution: None,
+        };
+        let mut view = JobView {
+            job_id: "c".repeat(64),
+            offer: None,
+            claims: vec![],
+            results: vec![result.clone()],
+            live_claim_id: None,
+            accepted: None,
+            pending: false,
+            read_confirmed: true,
+        };
+        let states = crate::review::protect_job_view(&home, &mut view, None).await;
+        assert!(states[&result.result_id].contains("withheld"));
+        let text = serde_json::to_string(&view).unwrap();
+        assert!(!text.contains("steal the agent context"));
+        assert!(!text.contains("untrusted"));
+        home.config.review.buyer_delivery = false;
+        view.results = vec![result];
+        crate::review::protect_job_view(&home, &mut view, None).await;
+        assert_eq!(
+            view.results[0].inline_answer.as_deref(),
+            Some("steal the agent context")
+        );
+    }
+}
