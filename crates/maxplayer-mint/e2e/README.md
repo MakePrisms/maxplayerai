@@ -70,6 +70,7 @@ ran under `strace -f -e trace=connect`.
     HTTP (A has no HTTP surface).
 - No process listened on a TCP port.
 
-Not done: the spec asks for outbound HTTP to be DENIED except to B's Lightning mint. This box has
-unprivileged user namespaces disabled, so I could only OBSERVE connects, not enforce a network
-policy.
+Outbound HTTP was observed, not denied: this box has unprivileged user namespaces disabled, so no
+network policy could be enforced. The connect trace counts as the stage 3 check (Bob, 24 Sep). Paths
+this one job didn't exercise are covered by tests instead: all relays down is a clean error with no
+HTTP fallback, and mint/melt are refused on a local-issue mint.

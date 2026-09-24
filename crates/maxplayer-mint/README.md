@@ -9,6 +9,9 @@ reach it there through its `nostr://npub1…` URL.
 
 ## Build
 
+There is no prebuilt release of `maxplayer-mint` yet; build it from source (Bob, 24 Sep: revisit
+once operators outside the team want to run a mint).
+
 The mint needs `protoc` to build (Debian/Ubuntu: `sudo apt-get install -y protobuf-compiler`).
 It is its own cargo workspace, so build it by manifest path from the repo root:
 
