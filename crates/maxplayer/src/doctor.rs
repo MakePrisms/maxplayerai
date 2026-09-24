@@ -699,12 +699,12 @@ mod checks {
     /// this seller settle *anywhere*", so it BLOCKS (`Fail`) only when EVERY accepted mint is
     /// unreachable; a single mint down while another is reachable is an advisory `Warn`, never a
     /// boot-blocker. The pure verdict lives in [`fold_mint_reachability`].
-    pub(super) fn check_mints(mint_urls: Vec<String>) -> Check {
+    pub(super) fn check_mints(mint_urls: Vec<String>, relay_url: String) -> Check {
         let probes: Vec<(String, Result<(), String>)> = mint_urls
             .into_iter()
             .map(|url| {
                 let outcome = match build_runtime() {
-                    Ok(runtime) => runtime.block_on(doctor::probe_mint(&url, MINT_TIMEOUT)),
+                    Ok(runtime) => runtime.block_on(doctor::probe_mint(&url, &relay_url, MINT_TIMEOUT)),
                     Err(error) => Err(error),
                 };
                 (url, outcome.map_err(|error| error.to_string()))
@@ -2297,6 +2297,7 @@ fn build_checks(
 ) -> Vec<Box<dyn FnOnce() -> Check>> {
     let relay_url = home.config.relay_url.clone();
     let relay_url_for_token_policy = home.config.relay_url.clone();
+    let relay_url_for_mints = home.config.relay_url.clone();
     // The delivery remote is what a scoped push token is checked against, so the token-policy row
     // reads it rather than re-deriving one.
     let git_remote_for_token_policy = home
@@ -2379,7 +2380,7 @@ fn build_checks(
         )
     }));
     // One aggregate mint check across the accept-policy: "can I settle anywhere?".
-    checks.push(Box::new(move || checks::check_mints(accepted_mints)));
+    checks.push(Box::new(move || checks::check_mints(accepted_mints, relay_url_for_mints)));
     let agent_host = maxplayer_core::agent_presets::AdapterHost::for_sandbox(sandbox.as_ref());
     checks.push(Box::new(move || {
         checks::check_agent_registry(seller, custom_agents, agent_host)
