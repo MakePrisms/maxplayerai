@@ -137,9 +137,13 @@ Swap is the only operation that moves credits. The local-issue backend serves `i
 1. Verify signature, `p` tag, NIP-44 decryption, `v`, op schema, size and `exp` **before** dispatch.
 2. Deduplicate on (client pubkey, request `id`), bound to the request event id and a digest of
    `v`/`op`/`body`/`exp`. Same key with different content never executes: answer `internal` and alarm.
-3. Write an "executing → completed" record plus the exact response in the same transaction as the
-   mint state change. Duplicates (across relays, after restart, concurrent) wait for or read the
-   first execution; they never race it.
+3. Write an "executing" record before calling the mint and a "completed" record with the exact
+   response after, both in the mint's own sqlite (cdk's KV store). cdk's swap is left untouched
+   (no database wrapper). A duplicate that finds only "executing" (crash, or an ambiguous outcome)
+   is answered from what the mint committed: all outputs signed ⇒ those signatures; none ⇒ the
+   first attempt never took effect (cdk compensates an unfinished swap saga at start), so run it if
+   still valid, else `expired`; some ⇒ `internal` and alarm. Requests are handled one at a time, so
+   duplicates (across relays, after restart, concurrent) never race the first execution.
 4. Replay the original reply, successes **and** definitive failures, for at least the relay/retry/
    recovery horizon, and even after `exp`: expiry never overwrites recorded history with `expired`.
    A request first seen after `exp` is refused without executing.
