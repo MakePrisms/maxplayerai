@@ -23,7 +23,7 @@ use maxplayer_core::mint_wire::{
 use maxplayer_core::nostr_mint::build_wallet_with_relays;
 use maxplayer_mint::home::{MintHome, mint_url};
 use maxplayer_mint::replay::{self, Record};
-use maxplayer_mint::{backend, server};
+use maxplayer_mint::{backend, issue, server};
 use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
 use nostr_sdk::nips::nip44::{self, Version};
 use nostr_sdk::prelude::{
@@ -139,12 +139,7 @@ impl Harness {
 }
 
 fn active_keyset(mint: &Mint) -> Id {
-    mint.keysets()
-        .keysets
-        .into_iter()
-        .find(|k| k.active && k.unit == CurrencyUnit::Sat)
-        .expect("active sat keyset")
-        .id
+    backend::active_keyset(mint).unwrap()
 }
 
 fn premint(id: Id, amount: u64) -> PreMintSecrets {
@@ -574,4 +569,89 @@ fn init_refuses_over_an_existing_mint() {
     std::fs::write(other.path().join("mint"), b"").unwrap();
     assert!(MintHome::at(other.path()).init().is_err());
     let _: &Path = home.dir();
+}
+
+fn total_issued(mint: &Mint) -> impl std::future::Future<Output = u64> + '_ {
+    async move {
+        mint.total_issued()
+            .await
+            .unwrap()
+            .values()
+            .map(|a| a.clone().to_u64())
+            .sum()
+    }
+}
+
+async fn receive_file(h: &Harness, file: &Path) -> Amount {
+    let token = std::fs::read_to_string(file).unwrap();
+    h.wallet()
+        .await
+        .receive(token.trim(), ReceiveOptions::default())
+        .await
+        .unwrap()
+}
+
+/// `issue` writes a 0600 token a real wallet receives over the relay, and cdk records it.
+#[tokio::test(flavor = "multi_thread")]
+async fn issue_writes_a_token_a_wallet_receives() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = harness(1, 20).await;
+    let dir = tempfile::tempdir().unwrap();
+    assert!(issue::issue(&h.mint, dir.path(), &h.url, 0).await.is_err());
+    let done = issue::issue(&h.mint, dir.path(), &h.url, 100)
+        .await
+        .unwrap();
+    assert_eq!(done.amount, 100);
+    let mode = std::fs::metadata(&done.file).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+    assert_eq!(total_issued(&h.mint).await, 100);
+    assert_eq!(receive_file(&h, &done.file).await, Amount::from(100));
+    assert!(
+        issue::reconcile(&h.mint, dir.path(), &h.url)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Interrupted before anything was signed: the next run signs the SAME journaled outputs once.
+#[tokio::test(flavor = "multi_thread")]
+async fn issue_interrupted_before_signing_is_finished_once() {
+    let h = harness(1, 20).await;
+    let dir = tempfile::tempdir().unwrap();
+    let id = issue::begin(&h.mint, 77).await.unwrap();
+    assert_eq!(total_issued(&h.mint).await, 0);
+    let done = issue::reconcile(&h.mint, dir.path(), &h.url).await.unwrap();
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].id, id);
+    assert!(
+        issue::reconcile(&h.mint, dir.path(), &h.url)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(total_issued(&h.mint).await, 77, "re-issued");
+    assert_eq!(receive_file(&h, &done[0].file).await, Amount::from(77));
+}
+
+/// Interrupted after signing, before the token file: the file is rebuilt from the journal and
+/// nothing is signed again.
+#[tokio::test(flavor = "multi_thread")]
+async fn issue_interrupted_after_signing_rewrites_the_file() {
+    let h = harness(1, 20).await;
+    let dir = tempfile::tempdir().unwrap();
+    let id = issue::begin(&h.mint, 40).await.unwrap();
+    issue::sign(&h.mint, &id).await.unwrap();
+    assert!(matches!(
+        issue::read(&h.mint, &id).await.unwrap(),
+        Some(issue::Entry::Committed { .. })
+    ));
+    let done = issue::reconcile(&h.mint, dir.path(), &h.url).await.unwrap();
+    assert_eq!(done.len(), 1);
+    assert_eq!(total_issued(&h.mint).await, 40);
+    assert_eq!(receive_file(&h, &done[0].file).await, Amount::from(40));
+    assert!(matches!(
+        issue::read(&h.mint, &id).await.unwrap(),
+        Some(issue::Entry::Written { amount: 40, .. })
+    ));
 }
