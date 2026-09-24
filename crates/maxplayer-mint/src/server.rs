@@ -21,7 +21,11 @@ use nostr_sdk::prelude::{
 };
 use serde_json::Value;
 
+use cdk::nuts::{SwapRequest, SwapResponse};
+use maxplayer_core::mint_wire::op;
+
 use crate::dispatch::{self, named};
+use crate::replay::{self, Record, Signed};
 
 /// Largest NIP-44 v2 payload a [`MAX_PLAINTEXT_BYTES`] plaintext encrypts to (padded to 65,536,
 /// plus version, nonce and MAC, base64). Anything longer is dropped before decrypting.
@@ -125,18 +129,130 @@ impl Server {
                 format!("unsupported envelope version {}", request.v),
             ));
         }
-        if request_expired(request.exp, unix_time()) {
-            return Some(refusal(request.id, code::EXPIRED, "request expired"));
-        }
-        if !self.limiter.admit() {
-            return Some(refusal(request.id, code::RATE_LIMITED, "try again shortly"));
-        }
-        let outcome = dispatch::execute(&self.mint, &request.op, request.body).await;
+        let id = request.id.clone();
+        let outcome = self.answer(event, request).await;
         Some(Response {
             v: PROTOCOL_VERSION,
-            id: request.id,
+            id,
             outcome,
         })
+    }
+
+    /// Replay, reconcile or execute (spec §3.4, see [`crate::replay`]). The log is read BEFORE the
+    /// expiry check and the rate limiter, so a recorded reply is replayed even after `exp` and is
+    /// never turned into `rate_limited`.
+    async fn answer(&mut self, event: &Event, request: Request) -> Outcome {
+        let key = replay::key(&event.pubkey, &request.id);
+        let digest = replay::digest(&request);
+        let event_id = event.id.to_hex();
+        let record = match replay::read(&self.mint, &key).await {
+            Ok(record) => record,
+            Err(error) => {
+                eprintln!("maxplayer-mint: {error}");
+                return failure(code::INTERNAL, "request log unavailable");
+            }
+        };
+        match record {
+            Some(record) if !record.matches(&event_id, &digest) => {
+                eprintln!(
+                    "maxplayer-mint: ALARM: request id {:?} from {} reused with different content; not executed",
+                    request.id, event.pubkey
+                );
+                failure(code::INTERNAL, "request id reused with different content")
+            }
+            Some(Record::Completed { outcome, .. }) => outcome,
+            Some(Record::Executing { .. }) => self.reconcile(&key, event_id, digest, request).await,
+            None => {
+                if request_expired(request.exp, unix_time()) {
+                    return failure(code::EXPIRED, "request expired");
+                }
+                if !self.limiter.admit() {
+                    return failure(code::RATE_LIMITED, "try again shortly");
+                }
+                if request.op != op::SWAP {
+                    // Read-only (or refused as unsupported): a duplicate may simply run again.
+                    return dispatch::execute(&self.mint, &request.op, request.body).await;
+                }
+                let executing = Record::Executing {
+                    event_id: event_id.clone(),
+                    digest: digest.clone(),
+                };
+                if let Err(error) = replay::write(&self.mint, &key, &executing).await {
+                    eprintln!("maxplayer-mint: {error}");
+                    return failure(code::INTERNAL, "request log unavailable");
+                }
+                let outcome = dispatch::execute(&self.mint, &request.op, request.body).await;
+                self.finish(&key, event_id, digest, outcome).await
+            }
+        }
+    }
+
+    /// A swap whose first execution left no final record (crash, or an ambiguous outcome):
+    /// answer from what the mint actually committed.
+    async fn reconcile(
+        &mut self,
+        key: &str,
+        event_id: String,
+        digest: String,
+        request: Request,
+    ) -> Outcome {
+        let swap: SwapRequest = match serde_json::from_value(request.body.clone()) {
+            Ok(swap) => swap,
+            Err(_) => return failure(code::INTERNAL, "unreadable executing record"),
+        };
+        match replay::signed_outputs(&self.mint, swap.outputs()).await {
+            Err(error) => {
+                eprintln!("maxplayer-mint: {error}");
+                failure(code::INTERNAL, "cannot reconcile request")
+            }
+            Ok(Signed::All(signatures)) => {
+                match serde_json::to_value(SwapResponse::new(signatures)) {
+                    Ok(value) => self.finish(key, event_id, digest, Outcome::Ok(value)).await,
+                    Err(error) => failure(code::INTERNAL, format!("encode: {error}")),
+                }
+            }
+            Ok(Signed::Partial) => {
+                eprintln!(
+                    "maxplayer-mint: ALARM: swap {:?} is partially signed; not answered",
+                    request.id
+                );
+                failure(code::INTERNAL, "swap partially signed")
+            }
+            Ok(Signed::None) => {
+                // Nothing committed: the first attempt never took effect.
+                if request_expired(request.exp, unix_time()) {
+                    let expired = failure(code::EXPIRED, "request expired");
+                    return self.finish(key, event_id, digest, expired).await;
+                }
+                if !self.limiter.admit() {
+                    return failure(code::RATE_LIMITED, "try again shortly");
+                }
+                let outcome = dispatch::execute(&self.mint, &request.op, request.body).await;
+                self.finish(key, event_id, digest, outcome).await
+            }
+        }
+    }
+
+    /// Record a final outcome so every later duplicate gets exactly this reply.
+    async fn finish(
+        &self,
+        key: &str,
+        event_id: String,
+        digest: String,
+        outcome: Outcome,
+    ) -> Outcome {
+        if replay::settled(&outcome) {
+            let record = Record::Completed {
+                event_id,
+                digest,
+                outcome: outcome.clone(),
+            };
+            if let Err(error) = replay::write(&self.mint, key, &record).await {
+                // The reply is still right; a duplicate is reconciled from the executing record.
+                eprintln!("maxplayer-mint: {error}");
+            }
+        }
+        outcome
     }
 
     async fn reply(&self, to: &Event, response: Response) {
@@ -162,6 +278,10 @@ impl Server {
             eprintln!("maxplayer-mint: reply {} not published: {error}", to.id);
         }
     }
+}
+
+fn failure(name: &str, detail: impl Into<String>) -> Outcome {
+    Outcome::Err(named(name, detail))
 }
 
 fn refusal(id: String, name: &str, detail: impl Into<String>) -> Response {
