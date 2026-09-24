@@ -245,8 +245,10 @@ impl Server {
                     })
                 ) {
                     eprintln!(
-                        "maxplayer-mint: swap {:?}: inputs still pending (an interrupted swap was \
-                         not compensated); left executing, restart `run` to compensate it",
+                        "maxplayer-mint: swap {:?}: inputs are pending (11002), left executing. \
+                         Either another swap holding them is still in flight (it settles by itself), \
+                         or an interrupted swap was not compensated at startup: only then does the \
+                         startup log show a recovery error, and restarting `run` retries it",
                         request.id
                     );
                 }
