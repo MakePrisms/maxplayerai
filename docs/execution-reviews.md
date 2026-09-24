@@ -109,6 +109,62 @@ Only **public job repositories** are supported; private jobs are not supported y
 maxplayer reviewer serve /etc/maxplayer/reviewer.json
 ```
 
+### NixOS deployment alongside the relay
+
+The flake exports `nixosModules.reviewer` (`services.maxplayer.reviewer`). The
+existing `.#relay` host imports and enables it alongside Buzz and supplies the
+flake's Maxplayer package, which includes the wallet/reviewer feature. No separate
+manual binary install or foreground reviewer command is needed with this deployment.
+
+Before applying that deployment, provision these files on the target using your
+secure secret-provisioning method. Keep their contents out of Git, Nix expressions,
+command arguments and logs. Both source files should be root-owned, mode `0600`:
+
+- `/var/lib/secrets/maxplayer-reviewer-signing-key`: a dedicated persistent Nostr
+  secret key (raw 64-character hex or supported Nostr secret encoding), **not** a
+  `NAME=value` environment file and not the relay's own key.
+- `/var/lib/secrets/typesafe-api-key`: the raw TypeSafe API key.
+
+Distribute only the reviewer's corresponding public key to clients. Ensure this
+identity can authenticate and read public Git repositories on the relay. Do not
+rotate the signing key on every deploy; clients trust that specific identity.
+
+Deploy the reviewed revision through the existing NixOS host flow:
+
+```sh
+nixos-rebuild switch --flake .#relay --target-host root@<host> --build-host root@<host>
+```
+
+On the target, verify:
+
+```sh
+systemctl status maxplayer-reviewer.service
+journalctl -u maxplayer-reviewer.service -n 100 --no-pager
+```
+
+The unit starts on boot, after network-online and the local Buzz service, and
+restarts on failure. It does not make Buzz depend on the reviewer. Missing secret
+files cause reviewer startup to fail; no credentials or keys are auto-generated.
+After supplying or rotating credentials, restart `maxplayer-reviewer.service`.
+A running service alone is not an end-to-end proof: verify signed offer, inline,
+and Git delivery reviews with controlled clients before rolling out normal clients.
+Starting with valid credentials enables real TypeSafe calls for eligible requests.
+
+Systemd `LoadCredential` supplies read-only private copies of the two secrets to a
+dedicated dynamic service user. Only credential **paths**, never secret values, are
+written to `/run/maxplayer-reviewer/reviewer.json`. The service generates that file
+from non-secret Nix settings at startup. SQLite lives at
+`/var/lib/maxplayer-reviewer/reviews.sqlite` (including its lock/WAL files); the
+private state directory survives restarts and redeploys. Back it up consistently
+with SQLite if restoring review-cache/billing history matters; existing relay
+Postgres backups do not include it. Do not remove it as part of a normal restart.
+The unit's private temporary directory is cleaned when the service stops.
+
+To stage the host without starting reviews, set
+`services.maxplayer.reviewer.enable = false` in your deployment configuration.
+Standalone hosts importing the module must supply `package`, `relayUrl`,
+`signerFile`, and `providerKeyFile`; the module defaults to disabled.
+
 Git deliveries are fetched through the existing buyer smart-HTTP transport. A
 `wss://relay.example` configuration permits only canonical
 `https://relay.example/git/<owner>/<repo>` URLs on the same host and port.
@@ -209,8 +265,9 @@ Before production rollout:
 1. Integrate and exercise the shared private-job transport before claiming private support.
 2. Follow the [evaluation runbook](evaluations/execution-safety.md) and run labeled TypeSafe evaluation with explicitly approved spend and private credential
    provisioning; choose thresholds from measured false-positive/false-negative rates.
-3. Provision the live reviewer signer/provider and relay kind admission, map the public
-   Git store, verify live round-trips, and sequence client rollout. Local fixtures are not
+3. Provision the live reviewer signer/provider and deploy relay kind admission plus
+   the supervised reviewer service. Verify authenticated Git retrieval and live
+   round-trips, then sequence client rollout. Local fixtures are not
    proof of production relay configuration or classifier quality.
 4. Exercise operator recovery for indeterminate provider outcomes and conflicting reviews.
 

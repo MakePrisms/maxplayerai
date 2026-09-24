@@ -87,6 +87,15 @@
     };
   };
 
+  # Provision both raw secret files on the target BEFORE enabling the reviewer.
+  # Missing credentials fail only this service; they do not stop the relay.
+  services.maxplayer.reviewer = {
+    enable = true;
+    relayUrl = config.services.maxplayer.relay.relayUrl;
+    signerFile = "/var/lib/secrets/maxplayer-reviewer-signing-key";
+    providerKeyFile = "/var/lib/secrets/typesafe-api-key";
+  };
+
   # The relay binds 127.0.0.1:3000 (loopback, no public bind), so something must terminate TLS and proxy
   # wss -> the relay or it is unreachable. This is the batteries-included default, and it deliberately
   # reuses the existing nginx + ACME cert for relay.maxplayer.ai across the strfry->buzz swap — only the
