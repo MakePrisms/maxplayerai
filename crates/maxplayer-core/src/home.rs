@@ -1620,8 +1620,8 @@ pub fn default_hop_fee_buffer_multiplier() -> u64 {
     2
 }
 
-/// Development rollout switches and deployment-owned content recipient/hosting policy.
-/// These are read at startup like the rest of the home config. No keys are stored here.
+/// Private-job defaults and deployment-owned content recipient/hosting policy.
+/// These are read at startup like the rest of the home config. No private keys are stored here.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct PrivacyConfig {
@@ -1635,12 +1635,12 @@ pub struct PrivacyConfig {
 impl Default for PrivacyConfig {
     fn default() -> Self {
         Self {
-            private_content_v2: false,
-            private_job_repos: false,
-            private_jobs: false,
+            private_content_v2: true,
+            private_job_repos: true,
+            private_jobs: true,
             default_visibility: "private".into(),
-            service_pubkey: None,
-            git_base: None,
+            service_pubkey: Some(crate::private_content::DEFAULT_SERVICE_PUBKEY.into()),
+            git_base: Some(format!("{DEFAULT_RELAY_GIT_BASE}/")),
         }
     }
 }

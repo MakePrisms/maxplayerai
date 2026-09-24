@@ -1014,13 +1014,14 @@ fn input_preflight_counts_orphan_objects_not_just_current_snapshot() {
 
 #[test]
 fn visibility_never_falls_back_to_public_when_private_is_unavailable() {
-    let home = crate::home::MaxplayerHome {
+    let mut home = crate::home::MaxplayerHome {
         root: "unused".into(),
         config: crate::home::MaxplayerConfig::default(),
         key_path: "unused".into(),
         wallet_dir: "unused".into(),
         key_created: false,
     };
+    home.config.privacy.private_jobs = false;
     assert!(runtime::requested_visibility(&home, None).is_err());
     assert!(runtime::requested_visibility(&home, Some(wire::Visibility::Private)).is_err());
     assert_eq!(
@@ -1031,6 +1032,8 @@ fn visibility_never_falls_back_to_public_when_private_is_unavailable() {
     home.config.privacy.private_content_v2 = true;
     home.config.privacy.private_job_repos = true;
     home.config.privacy.private_jobs = true;
+    home.config.privacy.service_pubkey = None;
+    home.config.privacy.git_base = None;
     assert!(
         runtime::requested_visibility(&home, None).is_err(),
         "configured service and host are mandatory"
@@ -1618,4 +1621,33 @@ async fn copy_timeouts_do_not_consume_lifecycle_publication_budget() {
     let next = db.pending(&p.body().author, 1).unwrap().remove(0);
     assert_ne!((next.content.body().message_id.as_str(), next.recipient.as_str()),
         (first.content.body().message_id.as_str(), first.recipient.as_str()));
+}
+
+#[test]
+fn upgrade_privacy_defaults_preserve_explicit_operator_settings() {
+    use crate::home::{MaxplayerConfig, PrivacyConfig};
+    let legacy: MaxplayerConfig = toml::from_str("").unwrap();
+    assert!(legacy.privacy.private_content_v2);
+    assert!(legacy.privacy.private_job_repos);
+    assert!(legacy.privacy.private_jobs);
+    assert_eq!(legacy.privacy.service_pubkey.as_deref(), Some(DEFAULT_SERVICE_PUBKEY));
+    assert_eq!(legacy.privacy.git_base.as_deref(), Some("https://relay.maxplayer.ai/git/"));
+    nostr_sdk::prelude::PublicKey::from_hex(DEFAULT_SERVICE_PUBKEY).unwrap();
+    let home = crate::home::MaxplayerHome {
+        root: "unused".into(), config: legacy, key_path: "unused".into(),
+        wallet_dir: "unused".into(), key_created: false,
+    };
+    assert_eq!(runtime::requested_visibility(&home, None).unwrap(), wire::Visibility::Private);
+    let custom: PrivacyConfig = toml::from_str(r#"
+private_jobs = false
+service_pubkey = "custom-service"
+git_base = "https://custom.example/git/"
+default_visibility = "public"
+"#).unwrap();
+    assert!(!custom.private_jobs);
+    assert_eq!(custom.service_pubkey.as_deref(), Some("custom-service"));
+    assert_eq!(custom.git_base.as_deref(), Some("https://custom.example/git/"));
+    assert_eq!(custom.default_visibility, "public");
+    let roundtrip: PrivacyConfig = toml::from_str(&toml::to_string(&custom).unwrap()).unwrap();
+    assert_eq!(roundtrip, custom);
 }

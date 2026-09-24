@@ -6,8 +6,10 @@ by this document or by building the binary.
 
 ## Configuration and buyer surface
 
-All participating buyer and seller homes use the same trusted service public identity
-and HTTPS Git deployment prefix. The three switches stage the rollout together:
+Standard Maxplayer buyer/seller installations inherit the following defaults when
+configuration fields are absent. Upgrading and restarting is sufficient after the
+coordinated relay cutover; no manual config edit is needed. Explicit existing values,
+including `false` switches and `default_visibility = "public"`, are preserved.
 
 ```toml
 [privacy]
@@ -15,16 +17,23 @@ private_content_v2 = true
 private_job_repos = true
 private_jobs = true
 default_visibility = "private"
-service_pubkey = "<Maxplayer public key: 64 lowercase hex characters>"
-git_base = "https://<approved-host>/git/"
+service_pubkey = "7e6b3b0592e091fe2b5c2438d0cda5438fbcbea5236eae7e1f022d2ea2858aa7"
+git_base = "https://relay.maxplayer.ai/git/"
 ```
 
-These are **public identifiers, not secret keys**. Switches default false in this
-staging release; an unset visibility defaults private and fails clearly when the
-installation is not enabled/configured. It never silently posts publicly. A persisted
-`default_visibility = "public"` remains public; an explicit per-job visibility wins.
-The relay's private-repository provisioning switch must also be enabled at cutover.
-Turning it off subsequently blocks new provisioning; it does not expose existing repos.
+These are public identifiers, not secret keys. The relay defaults to the same service
+public key and enabled private-repository provisioning. Operators may override
+`MAXPLAYER_PRIVATE_SERVICE_PUBKEY` and `MAXPLAYER_PRIVATE_JOB_REPOS`; self-hosted
+buyer/seller installations must configure their intended service identity and Git host.
+An explicit disable or invalid configuration fails closed, never downgrading a private
+job to public. Disabling provisioning does not expose existing private repositories.
+
+The service keypair is separate from the relay identity. Its private key is retained
+in the operator's protected secret store, never in this repository or client defaults.
+A future reader requires secure runtime access to that identity; shipping its public
+key does not deploy a content consumer. Back up the secret through operator-managed
+secret-store backup procedures before production cutover; key generation alone is not
+evidence of a recoverable backup.
 
 `post_job` accepts:
 
@@ -54,14 +63,15 @@ Follow-ups are new offers with explicit input/history pins, not amendments to ol
 1. Drain existing trades and reconcile pending payments on their original versions.
    Back up participant homes and the relay database/object-store state.
 2. Apply relay schema/provisioning changes, deploy the reviewed client/relay binaries,
-   and configure the same service identity and Git route everywhere. Keep switches off
-   while validating configuration and service credentials privately.
+   and verify the matching service identity and Git route everywhere. Defaults enable
+   private jobs: explicitly set switches false in staging while validating configuration
+   and service credentials privately. Upgrade the relay before standard clients.
 3. Prove targeted and open-pool private trades with buyer, selected seller, Maxplayer,
    and an outsider. Check inline and Git delivery, paid/free settlement, restart and
    recipient-copy retry. Outsiders must not read cached or freshly hydrated private Git.
-4. Enable the switches together. Restart buyer/seller processes (configuration is
-   startup-loaded). Explicit public jobs use v2 bindings too; do not leave old producers
-   running. Old persisted receipt journals retain their original signature domain.
+4. At coordinated cutover, remove staging disable overrides or explicitly enable them.
+   Restart buyer/seller processes (configuration is startup-loaded). Explicit public jobs
+   use v2 bindings too; do not leave old producers running. Old persisted receipt journals retain their original signature domain.
 5. Monitor provisioning failures and content-copy backlogs. Never repair a missing copy
    by posting its plaintext publicly. Recipient copies retry independently; a service
    application ACK is not a prerequisite for execution or settlement.

@@ -2,7 +2,7 @@
 
 Implements the reviewed [product specification](private-offers-and-deliveries.md) and
 [wire contract](private-offers-wire-v2.md). **Work in progress, not ready for deployment.**
-The integration branch wires targeted/open-pool private jobs and explicit public v2 jobs into the existing buyer/seller loop. All private enablement switches remain off by default; no deployment has occurred. See the [coordinated rollout guide](private-offers-rollout.md).
+The integration branch wires targeted/open-pool private jobs and explicit public v2 jobs into the existing buyer/seller loop. Private enablement switches now default on with a pinned Maxplayer service identity and Git host; explicit overrides are preserved. No deployment has occurred. See the [coordinated rollout guide](private-offers-rollout.md).
 
 ## Implemented building blocks
 
@@ -69,7 +69,7 @@ not a newly introduced reviewer role or an application ACK.
 The opaque 64-lowercase-hex Git repository namespace is reserved for private jobs. Missing ACL
 records deny access rather than falling through to public hosting. Existing public object graphs
 cannot be adopted by provisioning. The default `m<seller-prefix>` public repository names are
-unaffected. The provisioning switch defaults off; disabling it never makes existing private
+unaffected. The provisioning switch defaults on; disabling it never makes existing private
 repositories public.
 
 A private push measures the entire quarantined object graph against the 100 MiB cumulative

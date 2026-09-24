@@ -222,7 +222,7 @@ A private verification/rejection explanation is encrypted with the service copy.
 
 ## 8. Three staged implementation PRs
 
-All development flags default off. With a stage disabled, attempts to request the new private lane fail explicitly; flags never downgrade it to public. Old behavior remains only before coordinated cutover, not as an indefinite compatibility implementation.
+The original development stages below used off-by-default flags. For the consolidated release, Petar requested upgrade-and-restart defaults on 24 September: private switches default on with the pinned Maxplayer service public key and Git host; explicit overrides are preserved (see the rollout guide). No deployment is implied. With a stage disabled, attempts to request the new private lane fail explicitly; flags never downgrade it to public. Old behavior remains only before coordinated cutover, not as an indefinite compatibility implementation.
 
 **PR1 — protocol and encrypted content** (`private_content_v2=false`): v2 typed schemas/builders/parsers; exact byte/commitment vectors; extracted envelope helper; outbox/inbox and independent Maxplayer content consumption; public field allowlist; timestamp/size/replay tests. Publish cross-implementation byte/signature vectors from the wire supplement. No user-visible private posting until all stages are enabled. Target files: gateway/kinds, new content module, payment transport extraction, service consumer, schema fixtures. Failure gates: conflicting recipient copies, forged author, wrong job/award, stale wrapper, duplicate IDs, missing service copy, oversize message, no change to payment recipients.
 

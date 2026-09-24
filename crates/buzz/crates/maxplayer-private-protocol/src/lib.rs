@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
+/// Maxplayer content-service public identity; the private key is held outside the repository.
+pub const DEFAULT_SERVICE_PUBKEY: &str =
+    "7e6b3b0592e091fe2b5c2438d0cda5438fbcbea5236eae7e1f022d2ea2858aa7";
+
 pub const BODY_SCHEMA: &str = "maxplayer.content.v2";
 pub const ENVELOPE_SCHEMA: &str = "maxplayer.content-envelope.v2";
 pub const MAX_BODY_BYTES: usize = 16 * 1024;

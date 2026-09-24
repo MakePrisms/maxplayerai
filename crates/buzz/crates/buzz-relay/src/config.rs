@@ -193,7 +193,7 @@ pub struct Config {
     ///
     /// Default: `false` (zero behavior change). Set via `BUZZ_GIT_PUBLIC_READ=true`.
     pub git_public_read: bool,
-    /// Development flag: enable private per-job Git provisioning. Never bypasses existing ACLs.
+    /// Enable private per-job Git provisioning (default true). Never bypasses existing ACLs.
     pub private_job_repos: bool,
     /// Configured private-content service reader; never obtained from a caller's event.
     pub private_service_pubkey: Option<String>,
@@ -580,8 +580,11 @@ impl Config {
             .unwrap_or(false);
 
         let private_job_repos = std::env::var("MAXPLAYER_PRIVATE_JOB_REPOS")
-            .map(|v| v == "true" || v == "1").unwrap_or(false);
-        let private_service_pubkey = std::env::var("MAXPLAYER_PRIVATE_SERVICE_PUBKEY").ok();
+            .map(|v| v == "true" || v == "1").unwrap_or(true);
+        let private_service_pubkey = Some(
+            std::env::var("MAXPLAYER_PRIVATE_SERVICE_PUBKEY")
+                .unwrap_or_else(|_| maxplayer_private_protocol::DEFAULT_SERVICE_PUBKEY.into()),
+        );
         let open_read = std::env::var("BUZZ_OPEN_READ")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
@@ -1035,6 +1038,31 @@ mod tests {
     // Parallel env-var mutation causes `defaults_are_valid` to see the invalid
     // value set by `invalid_bind_addr_returns_error`, causing a flaky failure.
     static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn private_defaults_and_explicit_overrides() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let names = ["MAXPLAYER_PRIVATE_JOB_REPOS", "MAXPLAYER_PRIVATE_SERVICE_PUBKEY"];
+        let saved = names.map(|name| std::env::var_os(name));
+        for name in names { std::env::remove_var(name); }
+        let default = Config::from_env();
+        std::env::set_var(names[0], "false");
+        std::env::set_var(names[1], "custom-service");
+        let custom = Config::from_env();
+        for (name, value) in names.into_iter().zip(saved) {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        let default = default.unwrap();
+        assert!(default.private_job_repos);
+        assert_eq!(default.private_service_pubkey.as_deref(),
+            Some(maxplayer_private_protocol::DEFAULT_SERVICE_PUBKEY));
+        let custom = custom.unwrap();
+        assert!(!custom.private_job_repos);
+        assert_eq!(custom.private_service_pubkey.as_deref(), Some("custom-service"));
+    }
 
     #[test]
     fn defaults_are_valid() {
