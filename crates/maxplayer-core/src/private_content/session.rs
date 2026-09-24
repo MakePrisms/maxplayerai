@@ -7,6 +7,7 @@ use nostr_sdk::{pool::RelayNotification, prelude::*};
 use std::{collections::BTreeMap, future::Future, time::Duration};
 
 const WINDOW_LIMIT: usize = 128;
+const COPY_TIMEOUT: Duration = Duration::from_secs(2);
 const IO_TIMEOUT: Duration = Duration::from_secs(20);
 pub trait ContentSender {
     fn send(&mut self, event: Event) -> impl Future<Output = Result<()>> + Send;
@@ -31,9 +32,13 @@ pub async fn flush<S: ContentSender>(
             report.pending += 1;
             continue;
         };
-        let event = copy.wrap(keys).await?;
+        db.copy_attempted(&copy)?;
+        let attempt = async {
+            let event = copy.wrap(keys).await?;
+            sender.send(event).await
+        };
         if matches!(
-            tokio::time::timeout(remaining, sender.send(event)).await,
+            tokio::time::timeout(remaining.min(COPY_TIMEOUT), attempt).await,
             Ok(Ok(()))
         ) {
             db.relay_accepted(
@@ -48,13 +53,15 @@ pub async fn flush<S: ContentSender>(
     }
     // Lifecycle publication does not await service decryption or successful service
     // delivery; failed recipient copies remain durable and are retried next round.
+    let deadline = tokio::time::Instant::now() + IO_TIMEOUT;
     for event in db.pending_carriers(&keys.public_key().to_hex(), limit.min(64))? {
         let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) else {
             report.pending += 1;
             continue;
         };
+        db.carrier_attempted(&event)?;
         if matches!(
-            tokio::time::timeout(remaining, sender.send(event.clone())).await,
+            tokio::time::timeout(remaining.min(COPY_TIMEOUT), sender.send(event.clone())).await,
             Ok(Ok(()))
         ) {
             db.carrier_accepted(&event)?;
@@ -158,7 +165,7 @@ impl AuthenticatedContentRelay {
             }
             for event in events {
                 if let Ok(content) = super::transport::unwrap_content(keys, &event).await {
-                    staged += usize::from(db.stage(&content, &recipient, through)?);
+                    staged += usize::from(db.stage_untrusted(&content, &recipient, through)?);
                 }
             }
             db.complete_backfill(&recipient, end)?;
@@ -204,15 +211,12 @@ async fn collect_window(
                 if event.kind != Kind::GiftWrap
                     || event.created_at.as_secs() < start
                     || event.created_at.as_secs() > end
-                    || event.tags.len() != 1
-                    || event.tags.iter().next() != Some(&Tag::public_key(recipient))
-                    || event.content.len() > super::transport::MAX_WRAPPER_CONTENT
+                    || !event.tags.iter().any(|tag| tag == &Tag::public_key(recipient))
                 {
-                    return Err(Error("unexpected content query event"));
+                    continue;
                 }
-                event
-                    .verify()
-                    .map_err(|_| Error("invalid content wrapper signature"))?;
+                // Application shape/domain/signatures are checked by unwrap_content.
+                // Keep foreign matches in the page count so the limit is not hidden.
                 events.insert(event.id, event.into_owned());
                 if events.len() > WINDOW_LIMIT {
                     return Err(Error("content query overflow"));
@@ -243,6 +247,169 @@ async fn collect_window(
 mod tests {
     use super::*;
     use std::borrow::Cow;
+    #[tokio::test]
+    async fn foreign_wrapper_does_not_poison_mixed_inbox_or_hide_full_page() {
+        let keys = Keys::generate();
+        let recipient = keys.public_key();
+        let id = SubscriptionId::new("mixed");
+        let (tx, mut rx) = tokio::sync::broadcast::channel(256);
+        let foreign = EventBuilder::new(Kind::GiftWrap, "unrelated app")
+            .tags([
+                Tag::public_key(recipient),
+                Tag::parse(["x", "foreign"]).unwrap(),
+            ])
+            .allow_self_tagging()
+            .sign_with_keys(&keys)
+            .unwrap();
+        let valid = super::super::PreparedContent::new(super::super::tests::body()).unwrap();
+        let recipient_keys = super::super::tests::keys(2);
+        let valid_wrapper = super::super::transport::wrap(
+            &super::super::tests::keys(1),
+            recipient_keys.public_key(),
+            valid.envelope().to_owned(),
+        )
+        .await
+        .unwrap();
+        // Separate recipient for the actual mixed mailbox fixture.
+        let foreign = EventBuilder::new(Kind::GiftWrap, &foreign.content)
+            .tags([
+                Tag::public_key(recipient_keys.public_key()),
+                Tag::parse(["x", "foreign"]).unwrap(),
+            ])
+            .sign_with_keys(&keys)
+            .unwrap();
+        for event in [foreign, valid_wrapper] {
+            tx.send(RelayNotification::Message {
+                message: RelayMessage::Event {
+                    subscription_id: Cow::Owned(id.clone()),
+                    event: Cow::Owned(event),
+                },
+            })
+            .unwrap();
+        }
+        tx.send(RelayNotification::Message {
+            message: RelayMessage::EndOfStoredEvents(Cow::Owned(id.clone())),
+        })
+        .unwrap();
+        let page = collect_window(&mut rx, &id, recipient_keys.public_key(), 0, u64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 2); // even foreign matches count against the relay limit
+        let mut accepted = Vec::new();
+        for event in page {
+            if let Ok(content) = super::super::transport::unwrap_content(&recipient_keys, &event).await
+            {
+                accepted.push(content);
+            }
+        }
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].envelope(), valid.envelope());
+        for n in 0..WINDOW_LIMIT {
+            let event = EventBuilder::new(Kind::GiftWrap, n.to_string())
+                .tags([
+                    Tag::public_key(recipient),
+                    Tag::parse(["x", "foreign"]).unwrap(),
+                ])
+                .allow_self_tagging()
+                .sign_with_keys(&keys)
+                .unwrap();
+            tx.send(RelayNotification::Message {
+                message: RelayMessage::Event {
+                    subscription_id: Cow::Owned(id.clone()),
+                    event: Cow::Owned(event),
+                },
+            })
+            .unwrap();
+        }
+        tx.send(RelayNotification::Message {
+            message: RelayMessage::EndOfStoredEvents(Cow::Owned(id.clone())),
+        })
+        .unwrap();
+        assert_eq!(
+            collect_window(&mut rx, &id, recipient, 0, u64::MAX)
+                .await
+                .unwrap()
+                .len(),
+            WINDOW_LIMIT
+        );
+    }
+    #[tokio::test]
+    async fn mixed_inbox_backfill_stages_valid_content_and_advances_only_complete_scan() {
+        use super::super::{
+            PreparedContent, store,
+            tests::{body, keys},
+        };
+        use nostr_relay_builder::prelude::{
+            LocalRelay, RelayBuilder, RelayBuilderNip42, RelayBuilderNip42Mode,
+        };
+        use nostr_sdk::prelude::*;
+        let fixture = LocalRelay::new(RelayBuilder::default().nip42(RelayBuilderNip42 {
+            mode: RelayBuilderNip42Mode::Both,
+        }));
+        fixture.run().await.unwrap();
+        let url = fixture.url().await.to_string();
+        // LocalRelay challenges lazily, unlike the deployed relay's connect-time AUTH.
+        let client = Client::new(keys(2));
+        client.automatic_authentication(true);
+        client.add_relay(&url).await.unwrap();
+        let raw = client.relay(&url).await.unwrap();
+        let mut notifications = raw.notifications();
+        client.connect().await;
+        client
+            .send_event(
+                &EventBuilder::text_note("trigger fixture auth")
+                    .sign_with_keys(&keys(2))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_for_nip42_auth(&mut notifications, IO_TIMEOUT)
+                .await
+                .unwrap(),
+            AuthWait::Authenticated
+        );
+        let mut relay = AuthenticatedContentRelay { client, relay: raw };
+        let valid = PreparedContent::new(body()).unwrap();
+        let recipient = keys(2).public_key();
+        let unrelated = EventBuilder::new(Kind::GiftWrap, "another application's payload")
+            .tags([
+                Tag::public_key(recipient),
+                Tag::parse(["x", "foreign"]).unwrap(),
+            ])
+            .sign_with_keys(&keys(4))
+            .unwrap();
+        relay.send(unrelated).await.unwrap();
+        relay
+            .send(
+                super::super::transport::wrap(&keys(1), recipient, valid.envelope().into())
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut db = store::ContentStore::in_memory().unwrap();
+        let now = Timestamp::now().as_secs();
+        assert_eq!(relay.backfill(&mut db, &keys(2), now).await.unwrap(), 1);
+        assert_eq!(
+            db.staged(
+                &valid.body().author,
+                &valid.body().job_id,
+                &valid.body().message_id,
+                now
+            )
+            .unwrap()
+            .unwrap()
+            .envelope(),
+            valid.envelope()
+        );
+        assert_eq!(
+            db.receive_since(&recipient.to_hex()).unwrap(),
+            super::super::transport::receive_since(now)
+        );
+        relay.disconnect().await;
+    }
+
     #[tokio::test]
     async fn cursor_requires_exact_eose_not_foreign_eose_or_connection_close() {
         let (tx, mut rx) = tokio::sync::broadcast::channel(4);
