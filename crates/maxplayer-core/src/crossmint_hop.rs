@@ -924,11 +924,13 @@ impl CdkHopEffects {
                 self.target.mint_url, mint_quote.id
             )));
         }
-        let (melt_quote_id, quoted_cost, cost) =
-            self.raise_melt_quote(&mint_quote.request).await?;
+        let (melt_quote_id, quoted_cost, cost) = self.raise_melt_quote(&mint_quote.request).await?;
         self.require_source_covers(quoted_cost).await?;
-        let planned_cost =
-            authorized_hop_cost(quoted_cost, cost.fee_reserve, self.hop_fee_buffer_multiplier)?;
+        let planned_cost = authorized_hop_cost(
+            quoted_cost,
+            cost.fee_reserve,
+            self.hop_fee_buffer_multiplier,
+        )?;
         Ok(HopJournal {
             attempt_id: attempt_id.to_owned(),
             source_mint: self.source.mint_url.to_string(),
@@ -1230,12 +1232,21 @@ async fn sweep_one(
     let mut effects = CdkHopEffects::open(home, &pairing.source_mint, &pairing.target_mint).await?;
     let mut recovered = Vec::new();
     for (label, wallet) in [("source", &effects.source), ("target", &effects.target)] {
-        bounded(
+        // Never plain cdk recovery: on a nostr:// mint it would unspend inputs and drop swap rows
+        // while a signed request can still land. A held mint leaves the hop unfinished (fail-closed,
+        // printed as a strand) for the next sweep.
+        let outcome = bounded(
             &format!("{label} saga recovery"),
             HOP_LEG_TIMEOUT,
-            wallet.recover_incomplete_sagas(),
+            crate::payment_wallet::recover_incomplete_sagas_guarded(wallet),
         )
         .await?;
+        if let crate::payment_wallet::GuardedRecovery::Held(reason) = outcome {
+            return Err(HopError::Mint(format!(
+                "{label} saga recovery on {}: {reason}",
+                wallet.mint_url
+            )));
+        }
         recovered.push(wallet.mint_url.to_string());
     }
     require_both_mints_recovered(&recovered, &pairing)?;
@@ -1551,7 +1562,11 @@ mod tests {
         };
         let settled =
             run_hop(&store, &mut restarted, &journal("attempt-1")).expect("the restart recovers");
-        assert_eq!(world.borrow().melts.len(), 1, "the restart must not melt again");
+        assert_eq!(
+            world.borrow().melts.len(),
+            1,
+            "the restart must not melt again"
+        );
         assert_eq!(
             settled.unused_fee_reserve_sats, 0,
             "a recovered melt has no observed fee to reconcile (fail-safe)"
