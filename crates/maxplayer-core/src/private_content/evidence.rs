@@ -227,6 +227,19 @@ pub(crate) fn inline_fixture_with_payment(
     nostr_sdk::Keys,
     Policy,
 ) {
+    inline_fixture_with_deadline(targeted, paid, 2_000_000_000)
+}
+#[cfg(all(test, feature = "wallet"))]
+pub(crate) fn inline_fixture_with_deadline(
+    targeted: bool,
+    paid: bool,
+    deadline: u64,
+) -> (
+    PrivateEvidence,
+    crate::authorize_pay::AuthorizePayRequest,
+    nostr_sdk::Keys,
+    Policy,
+) {
     let amount = if paid { 10 } else { 0 };
     let payment_mode = if paid {
         crate::gateway::PaymentMode::Sat
@@ -257,7 +270,7 @@ pub(crate) fn inline_fixture_with_payment(
                 "private task",
                 "text/markdown",
                 amount,
-                2_000_000_000,
+                deadline,
                 seller.public_key().to_hex(),
             )
         } else {
@@ -265,7 +278,7 @@ pub(crate) fn inline_fixture_with_payment(
                 "deliberately public discovery",
                 "text/markdown",
                 amount,
-                2_000_000_000,
+                deadline,
             )
         })
         .with_payment_mode(payment_mode)

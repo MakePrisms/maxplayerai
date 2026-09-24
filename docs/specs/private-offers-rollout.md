@@ -102,6 +102,20 @@ legacy compatibility promise, READY message, or application-level service ACK is
   work. Carrier retries rotate too. The SQLite retry table is added automatically;
   preserve it with the content database.
 - V2 claim, result and award queries each require their own end-of-history response.
+  EOSE terminates a response, not necessarily the full history: the bundled relay
+  caps historical results at 2,000. Lifecycle reads therefore request 128-event
+  pages (supported relays must honor that size), count matching events before
+  application rejection, and page backward. Because the relay applies the namespace
+  `#t` filter after its database limit, these requests omit `#t` on the wire and
+  apply it locally only after completing the superset scan; otherwise foreign tags
+  could make a truncated response appear empty. Before crossing a timestamp they read
+  its complete second separately, preserving ties. Saturated seconds, changing
+  boundary rows, notification gaps, timeouts or the 32-window work budget produce
+  retryable unknown state, never confirmed absence; reservations stay held.
+  Result filters use an offer-authenticated target or locally validated selected
+  seller when available. This narrows outsider traffic but does not replace the
+  completeness checks. Single-timestamp saturation remains a fail-closed availability
+  limit, not a promise of unrestricted flood resistance.
   Referenced awards and claims are fetched by exact ID; locally authenticated selection
   evidence survives relay pruning. Missing dependencies of a credible selected result
   are retryable unknown state, not proof of no delivery. Outsider result references do
@@ -113,3 +127,6 @@ Regression coverage includes a local authenticated relay mixed-inbox scan, a ret
 backlog larger than one batch across database reopen, refused lifecycle dependency
 reads with recovery, and actual buyer reservation reconciliation while a selected
 claim read is refused. These are local fixtures, not deployed-trade verification.
+The capped-history regressions additionally cover paid public-v2 and private
+open-pool reservations: 2,000 newer outsider results, selected-seller timestamp
+saturation, pagination beyond the relay cap, and recovery after saturation clears.

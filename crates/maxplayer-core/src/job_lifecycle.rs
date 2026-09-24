@@ -3367,7 +3367,7 @@ async fn fetch_v2_history(
     relay: &nostr_sdk::Relay,
     offer: &nostr_sdk::Event,
     feedback_filter: nostr_sdk::Filter,
-    result_filter: nostr_sdk::Filter,
+    mut result_filter: nostr_sdk::Filter,
     timeout: Duration,
 ) -> Result<
     (
@@ -3381,9 +3381,6 @@ async fn fetch_v2_history(
     use nostr_sdk::prelude::{EventId, Filter, Kind};
     let err = |e: crate::private_content::Error| JobLifecycleError::Relay(e.to_string());
     let mut feedback = history::fetch(relay, feedback_filter, timeout)
-        .await
-        .map_err(err)?;
-    let results = history::fetch(relay, result_filter, timeout)
         .await
         .map_err(err)?;
     let award_filter = Filter::new()
@@ -3401,9 +3398,11 @@ async fn fetch_v2_history(
     } else {
         "private-content.sqlite"
     });
+    let mut selected_seller = offer.tags.public_keys().next().copied();
     if store_path.exists() {
         let store = crate::private_content::store::ContentStore::open(&store_path).map_err(err)?;
         if let Some((claim, award)) = store.selection(&offer.id.to_hex()).map_err(err)? {
+            selected_seller = selected_seller.or(Some(claim.pubkey));
             if !feedback.iter().any(|c| c.id == claim.id) {
                 feedback.push(claim);
             }
@@ -3412,6 +3411,12 @@ async fn fetch_v2_history(
             }
         }
     }
+    // Narrow only with offer-authenticated target or locally validated selection.
+    // Pagination still handles a selected author's own full history conservatively.
+    if let Some(seller) = selected_seller {
+        result_filter = result_filter.author(seller);
+    }
+    let results = history::fetch(relay, result_filter, timeout).await.map_err(err)?;
     let missing: std::collections::BTreeSet<_> = results
         .iter()
         .filter(|r| {

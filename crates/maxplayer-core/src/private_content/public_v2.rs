@@ -552,6 +552,9 @@ pub(crate) mod tests {
         Keys::parse(&format!("{n:064x}")).unwrap()
     }
     pub(crate) fn fixture(paid: bool, self_trade: bool) -> (PrivateEvidence, Keys) {
+        fixture_deadline(paid, self_trade, 2_000_000_000)
+    }
+    pub(crate) fn fixture_deadline(paid: bool, self_trade: bool, deadline: u64) -> (PrivateEvidence, Keys) {
         let amount = if paid { 10 } else { 0 };
         let mode = if paid {
             gateway::PaymentMode::Sat
@@ -567,7 +570,7 @@ pub(crate) mod tests {
                     "public task",
                     "text/plain",
                     amount,
-                    2_000_000_000,
+                    deadline,
                     seller.public_key().to_hex(),
                 )
                 .with_payment_mode(mode)

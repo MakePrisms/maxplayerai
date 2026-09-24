@@ -68,6 +68,9 @@ use wallet_actor::WalletHandle;
 pub const CODE_REFUSED: i64 = -32002;
 /// Timeout for the daemon's relay fetches (job view / auto-award selection / reconcile liveness).
 const RELAY_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(test)]
+mod lifecycle_history_tests;
 /// How often the background auto-award task re-checks the relay for a payable claim, until one
 /// appears or the offer deadline passes. Bounded polling (no tight spin on a live-but-unpayable claim).
 const AUTO_AWARD_POLL_INTERVAL: Duration = Duration::from_secs(5);
