@@ -6904,6 +6904,9 @@ impl SellerNodeRunner {
             "pending",
             "Waiting for signed execution review",
         )?;
+        let private_request = crate::review::private::offer_request(home, &self.seller_pubkey.to_hex(), job_id)?;
+        let review_home = home.clone();
+        let review_signer = self.node.signer().clone();
         let status_root = home.root.clone();
         checks.insert(job_id.to_owned(), None);
         let state = self.review_checks.clone();
@@ -6919,7 +6922,11 @@ impl SellerNodeRunner {
                 kind: crate::kinds::JOB_OFFER_KIND,
                 commit: None,
             };
-            let result = crate::review::wire::check(
+            let result = if let Some(request) = private_request {
+                crate::review::private::check(&review_home, &client,
+                    crate::review::private::Identity::Seller(&review_signer), &request, &buyer).await
+            } else {
+                crate::review::wire::check(
                 &crate::review::wire::RelayTransport {
                     client: &client,
                     relay: &relay,
@@ -6930,7 +6937,8 @@ impl SellerNodeRunner {
                 &buyer,
                 false,
             )
-            .await;
+            .await
+            };
             let result = match crate::review::state::completed(&status_root, &subject, &result) {
                 Ok(()) => result,
                 Err(e) => Err(e),

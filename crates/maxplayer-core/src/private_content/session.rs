@@ -426,7 +426,7 @@ mod tests {
                 .unwrap(),
             AuthWait::Authenticated
         );
-        let mut relay = AuthenticatedContentRelay { client, relay: raw };
+        let mut relay = AuthenticatedContentRelay { client, relay: raw, owns_connection: true };
         let valid = PreparedContent::new(body()).unwrap();
         let recipient = keys(2).public_key();
         let unrelated = EventBuilder::new(Kind::GiftWrap, "another application's payload")
@@ -508,7 +508,8 @@ pub async fn flush_actor<S: ContentSender>(
             report.pending += 1;
             continue;
         };
-        let accepted = tokio::time::timeout(remaining, async {
+        db.copy_attempted(&copy)?;
+        let accepted = tokio::time::timeout(remaining.min(COPY_TIMEOUT), async {
             let event = signer
                 .wrap_private_content(copy.content.clone(), copy.recipient.clone())
                 .await
@@ -527,13 +528,15 @@ pub async fn flush_actor<S: ContentSender>(
             report.pending += 1;
         }
     }
+    let deadline = tokio::time::Instant::now() + IO_TIMEOUT;
     for event in db.pending_carriers(signer.public_key_hex(), limit.min(64))? {
         let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()).filter(|remaining| !remaining.is_zero()) else {
             report.pending += 1;
             continue;
         };
+        db.carrier_attempted(&event)?;
         if matches!(
-            tokio::time::timeout(remaining, sender.send(event.clone())).await,
+            tokio::time::timeout(remaining.min(COPY_TIMEOUT), sender.send(event.clone())).await,
             Ok(Ok(()))
         ) {
             db.carrier_accepted(&event)?;

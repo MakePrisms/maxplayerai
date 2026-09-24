@@ -2066,6 +2066,6 @@ pub fn fetch_bounded_objects(repo: &Repository, remote_url: &str, refs: &[&str],
     callbacks.transfer_progress(|progress| progress.received_bytes() as u64 <= crate::private_content::MAX_REPO_BYTES && progress.total_objects() <= 100_000);
     let mut options=FetchOptions::new();
     options.download_tags(AutotagOption::None).remote_callbacks(callbacks);
-    let context=LegContext {mint:header.map(static_auth),authority:None,lifetime:None,short:true,intended_url:remote_url.into()};
+    let context=LegContext {mint:header.map(static_auth),authority:None,lifetime:None,short:true,read_budget:None,intended_url:remote_url.into()};
     with_context(context,|| remote.fetch(refs,Some(&mut options),None))
 }

@@ -30,8 +30,10 @@ job to public. Disabling provisioning does not expose existing private repositor
 
 The service keypair is separate from the relay identity. Its private key is retained
 in the operator's protected secret store, never in this repository or client defaults.
-A future reader requires secure runtime access to that identity; shipping its public
-key does not deploy a content consumer. Back up the secret through operator-managed
+The execution reviewer requires secure runtime access to that identity; shipping its
+public key does not deploy a content consumer. Its reviewer trust key must match
+`privacy.service_pubkey`; private request/result/error messages use recipient-encrypted
+wrappers. See [execution reviews](../execution-reviews.md#private-jobs-and-remaining-release-gates). Back up the secret through operator-managed
 secret-store backup procedures before production cutover; key generation alone is not
 evidence of a recoverable backup.
 

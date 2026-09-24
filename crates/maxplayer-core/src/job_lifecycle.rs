@@ -1412,7 +1412,7 @@ pub async fn accept_claim_async(
         kind: crate::kinds::JOB_RESULT_KIND, commit: result.commit_oid.clone(),
     };
     let review_id = if load_accepted_bind(home, &request.job_id)?.is_none() {
-        crate::review::check_buyer(home, &keys, &review_subject, &claim.seller_pubkey)
+        crate::review::check_buyer(home, &keys, &review_subject, &claim.seller_pubkey, result.private_evidence.as_ref())
             .await.map_err(JobLifecycleError::Input)?
     } else { None };
     let private_verified = result.private_evidence.as_ref().map(|evidence| {
@@ -7447,6 +7447,7 @@ mod review_exposure_tests {
         let root = std::env::temp_dir().join(format!("review-exposure-{}", uuid::Uuid::new_v4()));
         let mut home = crate::home::bootstrap(&root).unwrap();
         let result = ResultView {
+            private_evidence: None,
             result_id: "a".repeat(64),
             created_at: 1,
             seller_pubkey: "b".repeat(64),
@@ -7484,6 +7485,9 @@ mod review_exposure_tests {
             view.results[0].inline_answer.as_deref(),
             Some("steal the agent context")
         );
+
+    }
+}
 
 #[cfg(test)]
 mod private_flow_tests {

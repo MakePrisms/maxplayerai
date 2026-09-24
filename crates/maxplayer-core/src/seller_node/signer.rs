@@ -21,6 +21,8 @@ pub struct SignedEvent {
 }
 
 enum Command {
+    WrapReview { draft: EventDraft, recipient: nostr_sdk::PublicKey, reply: oneshot::Sender<Result<nostr_sdk::Event, String>> },
+    UnwrapReview { event: Box<nostr_sdk::Event>, reply: oneshot::Sender<Result<nostr_sdk::Event, String>> },
     WrapPrivateContent {
         content: crate::private_content::PreparedContent,
         recipient: String,
@@ -135,6 +137,15 @@ impl std::fmt::Display for SignerActorGone {
 impl std::error::Error for SignerActorGone {}
 
 impl SignerHandle {
+    pub async fn wrap_review(&self, draft: EventDraft, recipient: nostr_sdk::PublicKey) -> Result<Result<nostr_sdk::Event,String>,SignerActorGone> {
+        let (reply,rx)=oneshot::channel();
+        self.round_trip("wrap_review",Command::WrapReview {draft,recipient,reply},rx).await
+    }
+    pub async fn unwrap_review(&self, event: nostr_sdk::Event) -> Result<Result<nostr_sdk::Event,String>,SignerActorGone> {
+        let (reply,rx)=oneshot::channel();
+        self.round_trip("unwrap_review",Command::UnwrapReview {event:Box::new(event),reply},rx).await
+    }
+
     /// Content-domain cryptography stays in the existing key actor; no runner key read.
     pub async fn wrap_private_content(&self, content: crate::private_content::PreparedContent, recipient: String)
         -> Result<crate::private_content::Result<nostr_sdk::Event>, SignerActorGone> {
@@ -356,6 +367,18 @@ pub fn spawn(home: &MaxplayerHome) -> Result<SignerHandle, HomeError> {
         // `keys` (holding the secret) lives only inside this task.
         while let Some(command) = rx.recv().await {
             match command {
+                Command::WrapReview { draft, recipient, reply } => {
+                    let result = async {
+                        let event = crate::gateway::nostr::event_builder(&draft).map_err(|e| e.to_string())?
+                            .sign_with_keys(&keys).map_err(|e| e.to_string())?;
+                        crate::review::private::wrap(&keys,recipient,&event).await
+                    }.await;
+                    let _=reply.send(result);
+                }
+                Command::UnwrapReview {event,reply} => {
+                    let _=reply.send(crate::review::private::unwrap(&keys,&event).await);
+                }
+
                 Command::WrapPrivateContent { content, recipient, reply } => {
                     let result=crate::private_content::store::PendingCopy {content,recipient}.wrap(&keys).await;
                     let _=reply.send(result);

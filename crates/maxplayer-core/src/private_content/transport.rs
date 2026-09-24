@@ -34,9 +34,9 @@ pub async fn wrap(keys: &Keys, recipient: PublicKey, message: String) -> Result<
         .map_err(|_| Error("could not sign private wrapper"))
 }
 
-/// Only accepts this content domain. A caller receiving shared payment gift wraps must
-/// dispatch domains independently, and must never log a failed-decode plaintext.
-pub async fn unwrap_content(keys: &Keys, event: &Event) -> Result<PreparedContent> {
+/// Authenticate the transport envelope before domain-specific decoding. Callers must
+/// dispatch domains independently and never log failed-decode plaintext.
+pub async fn unwrap_message(keys: &Keys, event: &Event) -> Result<(PublicKey, String)> {
     if event.kind != Kind::GiftWrap || event.content.len() > MAX_WRAPPER_CONTENT {
         return Err(Error("invalid private wrapper"));
     }
@@ -67,8 +67,13 @@ pub async fn unwrap_content(keys: &Keys, event: &Event) -> Result<PreparedConten
     {
         return Err(Error("wrong rumor author, kind or recipient"));
     }
-    let content = PreparedContent::decode(&rumor.content)?;
-    if content.body().author != seal.pubkey.to_hex()
+    Ok((seal.pubkey, rumor.content))
+}
+
+pub async fn unwrap_content(keys: &Keys, event: &Event) -> Result<PreparedContent> {
+    let (author, message) = unwrap_message(keys, event).await?;
+    let content = PreparedContent::decode(&message)?;
+    if content.body().author != author.to_hex()
         || !content
             .body()
             .recipients
