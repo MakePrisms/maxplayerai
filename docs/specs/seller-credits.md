@@ -168,9 +168,12 @@ Nostr identity, but connection metadata, timing and request sizes can still link
   and prints the backup warning (decision 9): losing `<home>/mint/` makes every credit worthless,
   and restoring an old copy can let spent credits be spent again.
 - `maxplayer-mint run` is the relay listener. The operator runs it (a systemd unit is documented).
-- `maxplayer-mint issue <amount>` mints proofs in-process to a local token file, through a
-  local-only CDK payment processor with no network surface. Each issue has an id and journaled
-  outputs, so an interrupted issue is reconciled, never re-issued blind.
+- `maxplayer-mint issue <amount>` mints proofs in-process to a local token file. No quote and no
+  payment processor: it signs through cdk's signatory (`Mint::blind_sign`) and stores the
+  signatures through cdk's own database API, so restore and `total_issued` see them like swap
+  outputs, and NUT-04 advertises nothing. Each issue has an id and journaled outputs (cdk KV:
+  pending → committed, in one transaction with the signature rows → written), so an interrupted
+  issue is finished with its original outputs, never re-issued blind.
 - `mint.toml`: `relays = []` (empty ⇒ relay.maxplayer.ai + fallbacks), `rate_limit = 20`.
 
 ## 5. Stages
