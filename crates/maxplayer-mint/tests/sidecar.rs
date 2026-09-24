@@ -322,6 +322,13 @@ fn named(response: &Response) -> String {
     }
 }
 
+fn detail(response: &Response) -> &str {
+    match &response.outcome {
+        Outcome::Err(error) => &error.detail,
+        Outcome::Ok(value) => panic!("expected an error, got {value}"),
+    }
+}
+
 fn exp() -> u64 {
     unix_time() + 60
 }
@@ -514,12 +521,18 @@ async fn rate_limit_refuses_new_requests_but_not_replays() {
     }
     let replies = raw.collect(&burst, WAIT).await;
     assert_eq!(replies.len(), burst.len());
-    let limited = replies
-        .values()
-        .filter(|r| matches!(&r.outcome, Outcome::Err(_)))
-        .inspect(|r| assert_eq!(named(r), code::RATE_LIMITED))
-        .count();
-    assert!(limited > 0, "a 1/s limit admitted a burst of 6");
+    // The swap just spent the bucket's only token; the burst lands well inside one second.
+    let mut admitted = 0;
+    for reply in replies.values() {
+        match &reply.outcome {
+            Outcome::Ok(_) => admitted += 1,
+            Outcome::Err(_) => assert_eq!(named(reply), code::RATE_LIMITED),
+        }
+    }
+    assert!(
+        admitted <= 1,
+        "a 1/s limit admitted {admitted} of a burst of 6"
+    );
     assert_eq!(
         raw.call(&event).await,
         first,
@@ -790,8 +803,11 @@ async fn partially_signed_executing_swap_is_internal() {
         .unwrap();
     let (request, event) = raw.request("partial-1", op::SWAP, json!(swap), exp());
     let key = stage_executing(&h, &raw, &request, &event).await;
-    assert_eq!(named(&raw.call(&event).await), code::INTERNAL);
-    assert_eq!(named(&raw.call(&event).await), code::INTERNAL);
+    for _ in 0..2 {
+        let reply = raw.call(&event).await;
+        assert_eq!(named(&reply), code::INTERNAL);
+        assert_eq!(detail(&reply), "swap partially signed");
+    }
     assert!(matches!(
         replay::read(&h.mint, &key).await.unwrap(),
         Some(Record::Executing { .. })
@@ -891,6 +907,91 @@ fn second_run_on_the_same_mint_is_refused() {
     home.init().unwrap();
     let held = home.lock_run().unwrap();
     assert!(home.lock_run().is_err(), "a second listener got the lock");
+    // No lock file to delete: the lock is on the mint directory itself.
+    let entries: Vec<_> = std::fs::read_dir(home.dir())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    for name in &entries {
+        assert_ne!(name.to_string_lossy(), "run.lock");
+    }
     drop(held);
     home.lock_run().expect("lock released on drop");
+}
+
+/// The real binary: while one `run` serves, a second `run` on the same home exits with an error
+/// instead of serving (it would hang here serving if `run` skipped the lock).
+#[tokio::test(flavor = "multi_thread")]
+async fn second_run_process_exits_while_first_serves() {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    let relay = LocalRelay::new(RelayBuilder::default());
+    relay.run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let home = MintHome::at(dir.path());
+    home.init().unwrap();
+    std::fs::write(
+        home.dir().join("mint.toml"),
+        format!("relays = [{relay_url:?}]\nrate_limit = 20\n"),
+    )
+    .unwrap();
+    let root = dir.path().to_owned();
+    tokio::task::spawn_blocking(move || {
+        let bin = env!("CARGO_BIN_EXE_maxplayer-mint");
+        let mut first = Command::new(bin)
+            .arg("run")
+            .env("MAXPLAYER_HOME", &root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stderr = first.stderr.take().unwrap();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let _ = tx.send(line);
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(line) if line.contains("serving") => break,
+                Ok(_) => continue,
+                Err(_) => {
+                    let _ = first.kill();
+                    panic!("first run never started serving");
+                }
+            }
+        }
+        let mut second = Command::new(bin)
+            .arg("run")
+            .env("MAXPLAYER_HOME", &root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if let Some(status) = second.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                let _ = second.kill();
+                let _ = second.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        let _ = first.kill();
+        let _ = first.wait();
+        let status = status.expect("second run kept running next to the first");
+        let mut err = String::new();
+        std::io::Read::read_to_string(&mut second.stderr.take().unwrap(), &mut err).unwrap();
+        assert!(!status.success());
+        assert!(err.contains("already serving"), "stderr: {err}");
+    })
+    .await
+    .unwrap();
 }
