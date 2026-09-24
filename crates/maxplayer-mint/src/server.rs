@@ -36,6 +36,7 @@ pub struct Server {
     mint: Mint,
     keys: Keys,
     client: Client,
+    notifications: tokio::sync::broadcast::Receiver<RelayPoolNotification>,
     limiter: RateLimiter,
 }
 
@@ -57,6 +58,8 @@ impl Server {
         }
         client.connect().await;
         client.wait_for_connection(Duration::from_secs(10)).await;
+        // Taken BEFORE subscribing, so a request that arrives right away isn't missed.
+        let notifications = client.notifications();
         let filter = Filter::new()
             .kind(Kind::Custom(REQUEST_KIND))
             .pubkey(keys.public_key())
@@ -66,15 +69,15 @@ impl Server {
             mint,
             keys,
             client,
+            notifications,
             limiter: RateLimiter::new(rate_limit),
         })
     }
 
     /// Serve until the relay pool closes. Requests are handled one at a time, in arrival order.
     pub async fn serve(mut self) -> Result<()> {
-        let mut notifications = self.client.notifications();
         loop {
-            let notification = match notifications.recv().await {
+            let notification = match self.notifications.recv().await {
                 Ok(notification) => notification,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     eprintln!("maxplayer-mint: fell behind, {skipped} relay messages skipped");

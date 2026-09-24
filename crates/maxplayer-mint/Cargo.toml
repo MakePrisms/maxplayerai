@@ -40,6 +40,8 @@ tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "time", "sy
 toml = "0.8"
 
 [dev-dependencies]
+cdk = { version = "=0.17.2", default-features = false, features = ["mint", "wallet"] }
+cdk-sqlite = { version = "=0.17.2", default-features = false, features = ["mint", "wallet"] }
 # The real stage-1 wallet connector, so tests drive the sidecar exactly as a buyer or seller would.
 maxplayer-core = { path = "../maxplayer-core", features = ["wallet"] }
 nostr-relay-builder = "0.44"
