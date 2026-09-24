@@ -90,3 +90,8 @@ and remove its connection/fan-out entries and pubsub reference. No EOSE is emitt
 for a failed history, including a failure after earlier filters returned events.
 Clients must treat that failure as retryable uncertainty, not proof of absence.
 The relay update is required before enabling the lifecycle history-completeness lane.
+
+Historical query results also fail closed if a stored event cannot be decoded.
+Rows consumed by LIMIT must not silently disappear during database deserialization.
+An isolated PostgreSQL regression covers a malformed newer row hiding a valid older
+event, whole-result rejection, and recovery after the malformed row is removed.
