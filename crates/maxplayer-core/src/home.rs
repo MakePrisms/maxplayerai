@@ -1802,10 +1802,14 @@ fn default_allow_real_mints() -> bool {
 /// - `allow_real_mints == false` (default safety posture): only the testnut/dev allow-list — today
 ///   that is exactly [`DEFAULT_MINT_URL`].
 /// - `allow_real_mints == true` (operator opt-in real-money switch): any well-formed `https://`
-///   mint URL. Full URL validity is re-checked downstream (`MintUrl::from_str` / `Wallet::new`);
+///   mint URL, or a well-formed `nostr://<npub>` mint URL (a Cashu mint reached over Nostr relays;
+///   see [`crate::mint_wire`]) under exactly the same rule. Full URL validity is re-checked downstream (`MintUrl::from_str` / `Wallet::new`);
 ///   this predicate only decides the POLICY (the testnut/dev allow-list vs any-https).
 pub fn mint_allowed(mint_url: &str, allow_real_mints: bool) -> bool {
     if allow_real_mints {
+        if crate::mint_wire::is_nostr_scheme(mint_url) {
+            return crate::mint_wire::is_nostr_mint_url(mint_url);
+        }
         mint_url
             .strip_prefix("https://")
             .is_some_and(|host| !host.is_empty())
@@ -3077,6 +3081,23 @@ mod tests {
             mint_allowed(d.default_mint(), d.allow_real_mints),
             "the fence must admit the shipped default mint (breaks if either default reverts)"
         );
+    }
+
+    #[test]
+    fn mint_allowed_admits_a_nostr_mint_under_the_same_real_mint_rule() {
+        // x of the secp256k1 generator, a valid npub.
+        let nostr = "nostr://npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d";
+        assert!(mint_allowed(nostr, true), "a well-formed nostr:// mint is a real mint");
+        assert!(!mint_allowed(nostr, false), "and is refused without the real-mint opt-in");
+        for bad in [
+            "nostr://",
+            "nostr://npub1notakey",
+            "NOSTR://npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d",
+            "nostr://npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d/v1",
+        ] {
+            assert!(!mint_allowed(bad, true), "{bad}");
+        }
+        assert!(mint_allowed("https://mint.example", true), "https unchanged");
     }
 
     #[test]
