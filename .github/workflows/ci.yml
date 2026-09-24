@@ -232,6 +232,30 @@ jobs:
       - name: Test maxplayer-core (money-path suite)
         run: cargo test -p maxplayer-core --release --no-default-features --features gateway,git-delivery,wallet,live-mints --locked
 
+  # The seller-credits mint sidecar (docs/specs/seller-credits.md stage 2). It is its OWN cargo
+  # workspace with its own Cargo.lock, so cdk's `mint` feature, and the `protoc` its signatory's
+  # build script needs, never reach the root build above. This is the only job that installs protoc.
+  # The guard step fails if cdk's `mint` feature ever leaks into the default `maxplayer` build.
+  maxplayer-mint:
+    name: maxplayer-mint sidecar
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/maxplayer-mint -> target
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Test maxplayer-mint
+        run: cargo test --manifest-path crates/maxplayer-mint/Cargo.toml --locked
+      - name: Default maxplayer build carries no cdk mint code
+        run: |
+          if cargo tree -p maxplayer --locked -e features -i cdk | grep -q 'cdk feature "mint"'; then
+            echo "cdk's mint feature reached the default maxplayer build" >&2
+            exit 1
+          fi
+
   # The release workflow triggers only on a tag, so no pull request ever exercises it. What CI can
   # check is that the gates keeping it from publishing are still in place — otherwise the property
   # holds only until somebody edits the file, and nothing would say so.
