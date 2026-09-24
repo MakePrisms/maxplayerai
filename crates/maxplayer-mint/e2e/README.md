@@ -26,6 +26,7 @@ MAXPLAYER_HOME=$BUYER maxplayer whoami             # bootstraps; set relay_url, 
 MAXPLAYER_HOME=$A maxplayer-mint issue 300
 MAXPLAYER_HOME=$BUYER maxplayer wallet receive "$(cat $A/mint/issued/<id>.token)"
 MAXPLAYER_HOME=$B maxplayer whoami                 # relay_url; accepted_mints = [<lightning mint>, A]
+MAXPLAYER_HOME=$B maxplayer wallet mints add <A's nostr:// URL>   # so B's wallet can spend what it earns at A
 MAXPLAYER_HOME=$B maxplayer seller --agent-argv node --agent-argv $PWD/stub-acp-agent.mjs \
   --rate-sats 100 --accept-open-targeted --unsafe-no-sandbox --skip-doctor --non-interactive \
   --git-remote https://example.invalid/b.git &
@@ -46,9 +47,12 @@ mint (`mint_fee=0 fee_sats=10 kept=90`). The buyer's payment journal went intent
 its Lightning mint. After B was funded, B's retry paid 8 sats to `maxplayer@strike.me` plus a
 1-sat melt fee.
 
-Known gap: `maxplayer wallet` on B lists A's credits as `role=unconfigured` and won't send them,
-because `wallet_ops::configured_mints` is the default mint plus `extra_mints` and ignores the rest
-of `accepted_mints`. The node's receive uses `accepted_mints` and is unaffected.
+The wallet only treats `accepted_mints[0]` plus `extra_mints` as its own mints. So a seller that
+accepts a credit mint also runs `wallet mints add <credit mint>` (step above). Without it, B's
+node still receives A's credits, but `maxplayer wallet` lists them as `role=unconfigured` and
+`send`/`melt` refuse them. This run skipped that step, which is how the gap showed up. Checked
+afterwards on this branch's binary: before `mints add`, `wallet send 5 --mint <A>` exited 2 with
+"is not configured"; after it, the row read `role=extra` and the send went through.
 
 ## Result (2026-09-24, live on relay.maxplayer.ai)
 
