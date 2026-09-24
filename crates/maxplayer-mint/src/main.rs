@@ -92,6 +92,8 @@ async fn run(home: &MintHome) -> Result<()> {
             home.dir().display()
         )
     })?;
+    // Before `open`: its startup saga recovery must not run under a listener that is serving.
+    let _lock = home.lock_run()?;
     let url = mint_url(&secrets.keys)?;
     let mint = backend::open(&home.db_path(), &secrets.seed, &url).await?;
     let relays = secrets.config.effective_relays();

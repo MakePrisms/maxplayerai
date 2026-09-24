@@ -46,3 +46,4 @@ cdk-sqlite = { version = "=0.17.2", default-features = false, features = ["mint"
 maxplayer-core = { path = "../maxplayer-core", features = ["wallet"] }
 nostr-relay-builder = "0.44"
 tempfile = "3"
+uuid = { version = "1", features = ["v7"] }

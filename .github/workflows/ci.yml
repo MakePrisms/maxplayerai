@@ -250,8 +250,11 @@ jobs:
       - name: Test maxplayer-mint
         run: cargo test --manifest-path crates/maxplayer-mint/Cargo.toml --locked
       - name: Default maxplayer build carries no cdk mint code
+        # pipefail + a captured tree: a failing `cargo tree` must turn this step red, not green.
         run: |
-          if cargo tree -p maxplayer --locked -e features -i cdk | grep -q 'cdk feature "mint"'; then
+          set -euo pipefail
+          tree="$(cargo tree -p maxplayer --locked -e features -i cdk)"
+          if grep -q 'cdk feature "mint"' <<<"$tree"; then
             echo "cdk's mint feature reached the default maxplayer build" >&2
             exit 1
           fi
