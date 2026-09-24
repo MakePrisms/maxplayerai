@@ -136,6 +136,9 @@ async fn exercise_capped_history(private: bool) {
             .unwrap();
         (e, buyer, None)
     };
+    // Signing the base chain can cross a wall-clock second under suite load.
+    // Anchor newer filler rows to the finished result, not the pre-fixture clock.
+    let now = now_unix().max(e.result.created_at.as_secs() as i64) as u64;
     let outsider = Keys::generate();
     let seller = Keys::parse(&format!("{:064x}", 2)).unwrap();
     let base = vec![

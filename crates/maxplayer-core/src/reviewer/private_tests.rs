@@ -275,6 +275,12 @@ async fn encrypted_targeted_offer_review_real_worker_and_local_provider() {
         .await;
 }
 #[tokio::test]
+async fn encrypted_open_pool_offer_review_real_worker_and_local_provider() {
+    tokio::task::LocalSet::new()
+        .run_until(scenario(false, false, false))
+        .await;
+}
+#[tokio::test]
 async fn encrypted_targeted_delivery_review_real_worker_and_local_provider() {
     tokio::task::LocalSet::new()
         .run_until(scenario(true, true, false))

@@ -1620,6 +1620,12 @@ pub fn default_hop_fee_buffer_multiplier() -> u64 {
     2
 }
 
+/// Available without gateway dependencies so offline configuration tools load the same
+/// defaults. The private-content default-loading regression checks this against the
+/// shared wire protocol's service identity.
+pub const DEFAULT_PRIVACY_SERVICE_PUBKEY: &str =
+    "7e6b3b0592e091fe2b5c2438d0cda5438fbcbea5236eae7e1f022d2ea2858aa7";
+
 /// Private-job defaults and deployment-owned content recipient/hosting policy.
 /// These are read at startup like the rest of the home config. No private keys are stored here.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1639,7 +1645,7 @@ impl Default for PrivacyConfig {
             private_job_repos: true,
             private_jobs: true,
             default_visibility: "private".into(),
-            service_pubkey: Some(crate::private_content::DEFAULT_SERVICE_PUBKEY.into()),
+            service_pubkey: Some(DEFAULT_PRIVACY_SERVICE_PUBKEY.into()),
             git_base: Some(format!("{DEFAULT_RELAY_GIT_BASE}/")),
         }
     }
