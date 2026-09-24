@@ -2042,6 +2042,7 @@ dependencies = [
  "cdk",
  "cdk-common",
  "cdk-sqlite",
+ "futures-util",
  "getrandom 0.3.4",
  "maxplayer-core",
  "nostr-relay-builder",
@@ -2051,6 +2052,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "toml",
  "uuid",
 ]
