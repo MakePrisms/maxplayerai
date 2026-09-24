@@ -54,6 +54,11 @@ issuance can pay a real Maxplayer job. Nothing here migrates it or keeps compati
 2. **Allow-list.** `home::mint_allowed` (`home.rs:1804`) admits `https://` only. Add: a well-formed
    `nostr://npub1…` is allowed when `allow_real_mints` is on, exactly like any `https://` mint. The
    manual listing in `accepted_mints` / `extra_mints` stays the opt-in, as it is for HTTPS mints.
+   A seller that accepts a credit mint lists it in both: appended to `accepted_mints` so the node
+   takes payment there, and `maxplayer wallet mints add <nostr:// URL>` so the wallet can send and
+   melt what it earns there. The wallet's own mints are `accepted_mints[0]` plus `extra_mints`;
+   without the second step the credits show `role=unconfigured` and spends are refused (found in
+   stage 3; Bob, 24 Sep: document the step, no code change).
 
 **Unchanged, and why that's fine:**
 
@@ -164,7 +169,8 @@ Nostr identity, but connection metadata, timing and request sizes can still link
   `maxplayer-core` (no mint deps). CI builds it in its own job with protobuf. Not bundled with the
   default release.
 - `maxplayer-mint init` creates `<home>/mint/` (key, seed, `mint.sqlite`, `mint.toml`) and prints the
-  `nostr://` URL plus the line to append to `accepted_mints`. It refuses if `<home>/mint/` exists
+  `nostr://` URL plus the line to append to `accepted_mints` (accepting sellers also run
+  `wallet mints add`, §1 item 2). It refuses if `<home>/mint/` exists
   and prints the backup warning (decision 9): losing `<home>/mint/` makes every credit worthless,
   and restoring an old copy can let spent credits be spent again.
 - `maxplayer-mint run` is the relay listener. The operator runs it (a systemd unit is documented).
