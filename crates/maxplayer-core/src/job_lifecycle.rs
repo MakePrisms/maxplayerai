@@ -3180,21 +3180,24 @@ pub(crate) async fn fetch_job_view_async(
         .kind(Kind::Custom(JOB_RESULT_KIND))
         .hashtag(gateway::MAXPLAYER_TAG)
         .event(offer_id);
-    let feedback_events = client
-        .fetch_events(feedback_filter, timeout)
-        .await
-        .map_err(|error| JobLifecycleError::Relay(format!("fetch feedback: {error}")))?;
-    let result_events = client
-        .fetch_events(result_filter, timeout)
-        .await
-        .map_err(|error| JobLifecycleError::Relay(format!("fetch results: {error}")))?;
+    let v2_offer = offer_events.iter().find(|event| event.id == offer_id
+        && crate::private_content::public_v2::value(event, "v") == Ok(Some("2")));
+    let (feedback_events, result_events, v2_awards) = if let Some(offer) = v2_offer {
+        let read = fetch_v2_history(home, &relay, offer, feedback_filter, result_filter, timeout).await;
+        if read.is_err() { client.disconnect().await; }
+        read?
+    } else {
+        (client.fetch_events(feedback_filter, timeout).await
+            .map_err(|error| JobLifecycleError::Relay(format!("fetch feedback: {error}")))?.into_iter().collect(),
+         client.fetch_events(result_filter, timeout).await
+            .map_err(|error| JobLifecycleError::Relay(format!("fetch results: {error}")))?.into_iter().collect(),
+         Vec::new())
+    };
 
     if let Some(event) = offer_events.iter().find(|e| e.id == offer_id) {
         let draft = event_to_draft(event);
         if first_tag_value(&draft.tags, "visibility") == Some("private") {
-            let awards = client.fetch_events(Filter::new().kind(Kind::Custom(3405))
-                .hashtag(gateway::MAXPLAYER_TAG).event(offer_id), timeout).await
-                .map_err(|_| JobLifecycleError::Relay("private award read incomplete".into()))?;
+            let awards = v2_awards;
             client.disconnect().await;
             let mut context = if let Some((context, _)) = local_private.take() { context } else {
                 let mut context = crate::private_content::channel::ContentContext::open(home, &keys.public_key().to_hex())
@@ -3223,10 +3226,7 @@ pub(crate) async fn fetch_job_view_async(
     }
     let public_offer = offer_events.iter().find(|e| e.id==offer_id && crate::private_content::public_v2::is_public(e)).cloned();
     let public_claims: Vec<_> = feedback_events.iter().cloned().collect();
-    let public_awards: Vec<_> = if public_offer.is_some() {
-        client.fetch_events(Filter::new().kind(Kind::Custom(3405)).hashtag(gateway::MAXPLAYER_TAG).event(offer_id),timeout).await
-            .map_err(|_| JobLifecycleError::Relay("public v2 award read incomplete".into()))?.into_iter().collect()
-    } else { Vec::new() };
+    let public_awards = v2_awards;
     if let Some(original)=&public_offer {
         crate::private_content::public_v2::Context::open(home).and_then(|mut ctx|ctx.remember(original,original))
             .map_err(|e|JobLifecycleError::Input(e.to_string()))?;
@@ -3319,10 +3319,7 @@ pub(crate) async fn fetch_job_view_async(
     for event in result_events {
         if let Some(original)=&public_offer {
             use crate::private_content::{public_v2 as public,evidence::PrivateEvidence};
-            let Ok(Some(award_id))=public::value(&event,"award") else {continue;};
-            let Some(award)=public_awards.iter().find(|a|a.id.to_hex()==award_id) else {continue;};
-            let Some(selected)=gateway::parse_award(&event_to_draft(award)) else {continue;};
-            let Some(claim)=public_claims.iter().find(|c|c.id.to_hex()==selected.claim_id) else {continue;};
+            let Some((claim, award)) = result_dependencies(original, &event, &public_claims, &public_awards, None)? else { continue; };
             let evidence=PrivateEvidence {offer:original.clone(),claim:claim.clone(),award:award.clone(),result:event.clone(),
                 task_envelope:None,answer_envelope:if public::value(&event,"delivery")==Ok(Some("inline")){Some(event.content.clone())}else{None}};
             let Ok(verified)=public::validate_evidence(&evidence,&original.pubkey.to_hex()) else {continue;};
@@ -3361,6 +3358,174 @@ pub(crate) async fn fetch_job_view_async(
         read_confirmed,
     };
     Ok(view)
+}
+
+/// Read every v2 dependency to its own EOSE. Then re-read referenced IDs, since
+/// independent subscriptions can straddle publication of a result and its award.
+async fn fetch_v2_history(
+    home: &MaxplayerHome,
+    relay: &nostr_sdk::Relay,
+    offer: &nostr_sdk::Event,
+    feedback_filter: nostr_sdk::Filter,
+    result_filter: nostr_sdk::Filter,
+    timeout: Duration,
+) -> Result<
+    (
+        Vec<nostr_sdk::Event>,
+        Vec<nostr_sdk::Event>,
+        Vec<nostr_sdk::Event>,
+    ),
+    JobLifecycleError,
+> {
+    use crate::private_content::{history, public_v2 as public};
+    use nostr_sdk::prelude::{EventId, Filter, Kind};
+    let err = |e: crate::private_content::Error| JobLifecycleError::Relay(e.to_string());
+    let mut feedback = history::fetch(relay, feedback_filter, timeout)
+        .await
+        .map_err(err)?;
+    let results = history::fetch(relay, result_filter, timeout)
+        .await
+        .map_err(err)?;
+    let award_filter = Filter::new()
+        .kind(Kind::Custom(JOB_AWARD_KIND))
+        .author(offer.pubkey)
+        .hashtag(gateway::MAXPLAYER_TAG)
+        .event(offer.id);
+    let mut awards = history::fetch(relay, award_filter.clone(), timeout)
+        .await
+        .map_err(err)?;
+    // Locally signed/validated selection evidence survives relay pruning and
+    // protects open-pool trades without trusting arbitrary result authors.
+    let store_path = home.root.join(if public::is_public(offer) {
+        "public-v2.sqlite"
+    } else {
+        "private-content.sqlite"
+    });
+    if store_path.exists() {
+        let store = crate::private_content::store::ContentStore::open(&store_path).map_err(err)?;
+        if let Some((claim, award)) = store.selection(&offer.id.to_hex()).map_err(err)? {
+            if !feedback.iter().any(|c| c.id == claim.id) {
+                feedback.push(claim);
+            }
+            if !awards.iter().any(|a| a.id == award.id) {
+                awards.push(award);
+            }
+        }
+    }
+    let missing: std::collections::BTreeSet<_> = results
+        .iter()
+        .filter(|r| {
+            r.verify().is_ok()
+                && public::value(r, "root") == Ok(Some(offer.id.to_hex().as_str()))
+                && public::value(r, "job") == public::value(offer, "job")
+        })
+        .filter_map(|r| {
+            public::value(r, "award")
+                .ok()
+                .flatten()
+                .and_then(|id| EventId::from_hex(id).ok())
+        })
+        .filter(|id| !awards.iter().any(|a| a.id == *id))
+        .collect();
+    if !missing.is_empty() {
+        awards.extend(
+            history::fetch(relay, award_filter.ids(missing), timeout)
+                .await
+                .map_err(err)?,
+        );
+    }
+    let missing: std::collections::BTreeSet<_> = awards
+        .iter()
+        .filter_map(|a| gateway::parse_award(&event_to_draft(a)))
+        .filter_map(|a| EventId::from_hex(&a.claim_id).ok())
+        .filter(|id| !feedback.iter().any(|c| c.id == *id))
+        .collect();
+    if !missing.is_empty() {
+        feedback.extend(
+            history::fetch(
+                relay,
+                Filter::new()
+                    .ids(missing)
+                    .kind(Kind::Custom(JOB_CLAIM_KIND))
+                    .hashtag(gateway::MAXPLAYER_TAG)
+                    .event(offer.id),
+                timeout,
+            )
+            .await
+            .map_err(err)?,
+        );
+    }
+    Ok((feedback, results, awards))
+}
+
+/// Only an authenticated buyer selection (or the targeted seller) can make a
+/// missing dependency retryable. Arbitrary outsiders cannot pin reservations by
+/// posting a result with invented references. Full evidence validation still follows.
+fn result_dependencies<'a>(
+    offer: &nostr_sdk::Event,
+    result: &nostr_sdk::Event,
+    claims: &'a [nostr_sdk::Event],
+    awards: &'a [nostr_sdk::Event],
+    host: Option<&crate::private_content::wire::HostPolicy>,
+) -> Result<Option<(&'a nostr_sdk::Event, &'a nostr_sdk::Event)>, JobLifecycleError> {
+    use crate::private_content::{public_v2 as public, wire};
+    let valid = |event: &nostr_sdk::Event| {
+        if let Some(host) = host {
+            wire::validate_private(event, host).is_ok()
+                && public::value(event, "root") == Ok(Some(offer.id.to_hex().as_str()))
+                && public::value(event, "job") == public::value(offer, "job")
+        } else {
+            public::validate_child(offer, event).is_ok()
+        }
+    };
+    if result.kind.as_u16() != JOB_RESULT_KIND
+        || !valid(result)
+        || public::value(result, "amount") != public::value(offer, "amount")
+        || public::value(result, "output") != public::value(offer, "output")
+        || public::value(result, "job-hash")
+            != Ok(Some(
+                crate::private_content::job_hash(&offer.id.to_hex())
+                    .map_err(|e| JobLifecycleError::Input(e.to_string()))?
+                    .as_str(),
+            ))
+    {
+        return Ok(None);
+    }
+    let target = offer.tags.public_keys().next().copied();
+    if target.is_some_and(|key| key != result.pubkey) {
+        return Ok(None);
+    }
+    let Ok(Some(award_id)) = public::value(result, "award") else {
+        return Ok(None);
+    };
+    if nostr_sdk::EventId::from_hex(award_id).is_err() {
+        return Ok(None);
+    }
+    let authorized_award = |award: &&nostr_sdk::Event| {
+        award.kind.as_u16() == JOB_AWARD_KIND
+            && award.pubkey == offer.pubkey
+            && valid(award)
+            && award.tags.public_keys().any(|p| *p == result.pubkey)
+            && gateway::parse_award(&event_to_draft(award)).is_some()
+    };
+    let Some(award) = awards.iter().find(|a| a.id.to_hex() == award_id) else {
+        if target == Some(result.pubkey) || awards.iter().any(|a| authorized_award(&a)) {
+            return Err(JobLifecycleError::Relay(
+                "selected result award is pending; retry the read".into(),
+            ));
+        }
+        return Ok(None);
+    };
+    if !authorized_award(&award) {
+        return Ok(None);
+    }
+    let selected = gateway::parse_award(&event_to_draft(award)).expect("checked award");
+    let Some(claim) = claims.iter().find(|c| c.id.to_hex() == selected.claim_id) else {
+        return Err(JobLifecycleError::Relay(
+            "selected result claim is pending; retry the read".into(),
+        ));
+    };
+    Ok(Some((claim, award)))
 }
 
 /// A private view is built only from authenticated content and an exact signed
@@ -3450,9 +3615,7 @@ fn private_view_from_events(
     let mut results = Vec::new();
     for result in result_events {
         let Ok(rt) = wire::validate_private(&result, &context.policy.host) else { continue; };
-        let Some(award) = awards.iter().find(|a| Some(a.id.to_hex().as_str()) == rt.get("award")) else { continue; };
-        let Ok(at) = wire::validate_private(award, &context.policy.host) else { continue; };
-        let Some(claim) = feedback.iter().find(|c| Some(c.id.to_hex().as_str()) == at.get("claim")) else { continue; };
+        let Some((claim, award)) = result_dependencies(event, &result, &feedback, &awards, Some(&context.policy.host))? else { continue; };
         if crate::private_content::lifecycle::validate_result(event, claim, award, &result, &context.policy.host).is_err() { continue; }
         let answer_envelope = if rt.has("content-id") {
             let answer = match context.accept_content(&result, event, Some(claim), Some(award), None, now) {
@@ -7320,6 +7483,98 @@ mod review_exposure_tests {
 mod private_flow_tests {
     use super::*;
     use crate::private_content::{channel::ContentContext, evidence::inline_fixture, PreparedContent};
+
+    #[test]
+    fn private_content_missing_selection_dependencies_are_unknown_not_absent() {
+        use crate::private_content::{evidence, builders, public_v2};
+        for targeted in [true, false] {
+            let (e, _, buyer, policy) = evidence::inline_fixture_for(targeted);
+            let temp = tempfile::tempdir().unwrap();
+            let mut home = home::bootstrap(temp.path()).unwrap();
+            home.config.privacy.private_content_v2 = true;
+            home.config.privacy.private_job_repos = true;
+            home.config.privacy.private_jobs = true;
+            home.config.privacy.service_pubkey = Some(policy.service.clone());
+            home.config.privacy.git_base = Some(policy.host.git_prefix.clone());
+            let mut ctx = ContentContext::open(&home, &buyer.public_key().to_hex()).unwrap();
+            let now = 2_000_000_001;
+            if let Some(task) = &e.task_envelope { ctx.stage(&PreparedContent::decode(task).unwrap(), now).unwrap(); }
+            ctx.stage(&PreparedContent::decode(e.answer_envelope.as_ref().unwrap()).unwrap(), now).unwrap();
+            let missing_claim = private_view_from_events(&home, &mut ctx, &e.offer, vec![], vec![e.award.clone()], vec![e.result.clone()], now);
+            assert!(matches!(missing_claim, Err(JobLifecycleError::Relay(_))));
+            if targeted {
+                let missing_award = private_view_from_events(&home, &mut ctx, &e.offer, vec![e.claim.clone()], vec![], vec![e.result.clone()], now);
+                assert!(matches!(missing_award, Err(JobLifecycleError::Relay(_))));
+            }
+            let outsider = nostr_sdk::Keys::generate();
+            let fake = builders::sign(&outsider, event_to_draft(&e.result)).unwrap();
+            assert!(result_dependencies(&e.offer, &fake, &[], &[], Some(&policy.host)).unwrap().is_none());
+            let view = private_view_from_events(&home, &mut ctx, &e.offer, vec![e.claim.clone()], vec![e.award.clone()], vec![e.result.clone()], now).unwrap();
+            assert_eq!(view.results.len(), 1);
+            assert_eq!(view.claims[0].status, CLAIM_STATUS_EXPIRED); // delivery pay window has elapsed
+        }
+        let (e, _) = public_v2::tests::fixture(false, false);
+        assert!(matches!(result_dependencies(&e.offer, &e.result, &[e.claim.clone()], &[], None), Err(JobLifecycleError::Relay(_))));
+        assert!(matches!(result_dependencies(&e.offer, &e.result, &[], &[e.award.clone()], None), Err(JobLifecycleError::Relay(_))));
+        assert!(result_dependencies(&e.offer, &e.result, &[e.claim.clone()], &[e.award.clone()], None).unwrap().is_some());
+        let fake = builders::sign(&nostr_sdk::Keys::generate(), event_to_draft(&e.result)).unwrap();
+        assert!(result_dependencies(&e.offer, &fake, &[], &[], None).unwrap().is_none());
+    }
+
+    #[derive(Debug)]
+    struct RefuseDependency(std::sync::Arc<std::sync::atomic::AtomicU16>);
+    impl nostr_relay_builder::prelude::QueryPolicy for RefuseDependency {
+        fn admit_query<'a>(&'a self, query: &'a nostr_sdk::Filter, _: &'a std::net::SocketAddr)
+            -> nostr_relay_builder::prelude::BoxedFuture<'a, nostr_relay_builder::prelude::PolicyResult> {
+            Box::pin(async move {
+                let kind = self.0.load(std::sync::atomic::Ordering::SeqCst);
+                if query.kinds.as_ref().is_some_and(|k| k.contains(&nostr_sdk::Kind::Custom(kind))) {
+                    nostr_relay_builder::prelude::PolicyResult::Reject("dependency unavailable".into())
+                } else { nostr_relay_builder::prelude::PolicyResult::Accept }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn private_content_refused_dependency_reads_retry_and_public_view_recovers() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_sdk::prelude::*;
+        use std::sync::{Arc, atomic::{AtomicU16, Ordering}};
+        let refused = Arc::new(AtomicU16::new(0));
+        let fixture = LocalRelay::new(RelayBuilder::default().query_policy(RefuseDependency(refused.clone())));
+        fixture.run().await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut home = home::bootstrap(temp.path()).unwrap();
+        home.config.relay_url = fixture.url().await.to_string();
+        let (public, buyer) = crate::private_content::public_v2::tests::fixture(false, false);
+        let (private, _, _, _) = inline_fixture();
+        let client = Client::new(buyer.clone());
+        client.add_relay(&home.config.relay_url).await.unwrap();
+        client.connect().await;
+        let relay = client.relay(&home.config.relay_url).await.unwrap();
+        relay.wait_for_connection(Duration::from_secs(5)).await;
+        for e in [&public, &private] {
+            for event in [&e.offer, &e.claim, &e.award, &e.result] {
+                assert!(!client.send_event(event).await.unwrap().success.is_empty());
+            }
+        }
+        for kind in [JOB_CLAIM_KIND, JOB_RESULT_KIND, JOB_AWARD_KIND] {
+            refused.store(kind, Ordering::SeqCst);
+            for e in [&public, &private] {
+                let feedback = Filter::new().kinds([Kind::Custom(JOB_CLAIM_KIND), Kind::Custom(JOB_FEEDBACK_KIND)]).event(e.offer.id);
+                let results = Filter::new().kind(Kind::Custom(JOB_RESULT_KIND)).event(e.offer.id);
+                assert!(matches!(fetch_v2_history(&home, &relay, &e.offer, feedback, results, Duration::from_secs(2)).await,
+                    Err(JobLifecycleError::Relay(_))));
+            }
+            assert!(matches!(fetch_job_view_async(&home, &buyer, &public.offer.id.to_hex(), Duration::from_secs(2), 2_000_000_001).await,
+                Err(JobLifecycleError::Relay(_))));
+        }
+        refused.store(0, Ordering::SeqCst);
+        let view = fetch_job_view_async(&home, &buyer, &public.offer.id.to_hex(), Duration::from_secs(2), 2_000_000_001).await.unwrap();
+        assert_eq!(view.results.len(), 1);
+        assert_eq!(view.claims[0].status, CLAIM_STATUS_EXPIRED); // delivery pay window has elapsed
+        client.disconnect().await;
+    }
 
     #[tokio::test]
     async fn private_content_view_and_bind_remain_exact_across_restart_and_payment_refusal() {

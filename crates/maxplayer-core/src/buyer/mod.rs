@@ -3724,6 +3724,55 @@ mod tests {
         drop(relay);
     }
 
+    #[derive(Debug)]
+    struct RefuseV2ClaimReads(Arc<std::sync::atomic::AtomicBool>);
+    impl nostr_relay_builder::prelude::QueryPolicy for RefuseV2ClaimReads {
+        fn admit_query<'a>(&'a self, query: &'a nostr_sdk::Filter, _: &'a std::net::SocketAddr)
+            -> nostr_relay_builder::prelude::BoxedFuture<'a, nostr_relay_builder::prelude::PolicyResult> {
+            Box::pin(async move {
+                if self.0.load(Ordering::SeqCst) && query.kinds.as_ref().is_some_and(|k|
+                    k.contains(&nostr_sdk::Kind::Custom(crate::kinds::JOB_CLAIM_KIND))) {
+                    nostr_relay_builder::prelude::PolicyResult::Reject("selected claim unavailable".into())
+                } else { nostr_relay_builder::prelude::PolicyResult::Accept }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn private_content_partial_selection_read_keeps_real_reservation() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_sdk::prelude::Client;
+        let refused = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let relay = LocalRelay::new(RelayBuilder::default().query_policy(RefuseV2ClaimReads(refused.clone())));
+        relay.run().await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut home = bootstrap_home(root.path()).unwrap();
+        std::fs::write(&home.key_path, format!("{:064x}", 1)).unwrap();
+        home.config.relay_url = relay.url().await.to_string();
+        home.config.buyer_reservation_floor.enabled = false;
+        let (e, keys) = crate::private_content::public_v2::tests::fixture(true, false);
+        let publisher = Client::new(keys);
+        publisher.add_relay(&home.config.relay_url).await.unwrap();
+        publisher.connect().await;
+        for event in [&e.offer, &e.claim, &e.award, &e.result] {
+            assert!(!publisher.send_event(event).await.unwrap().success.is_empty());
+        }
+        let (_lock, context, _socket) = bootstrap(home).await.unwrap();
+        let job = e.offer.id.to_hex();
+        context.store.reserve(&job, 10, 1_000, now_unix()).unwrap();
+        // No award-attempt or age-floor protection: the read itself must retain
+        // this reservation. The old pool read produced no claims/no results.
+        let report = reconcile_reservations(&context).await.unwrap();
+        assert!(report.kept.contains(&job), "{report:?}");
+        assert!(!report.released.contains(&job), "{report:?}");
+        refused.store(false, Ordering::SeqCst);
+        let view = job_lifecycle::fetch_job_view_async(&context.home, &buyer_keys(&context.home).unwrap(), &job, RELAY_TIMEOUT, now_unix() as u64).await.unwrap();
+        assert_eq!(view.results.len(), 1);
+        let report = reconcile_reservations(&context).await.unwrap();
+        assert!(report.kept.contains(&job), "{report:?}");
+        publisher.disconnect().await;
+    }
+
     // ★ #602: `fetch_job_view_async` must certify offer-ABSENCE from the OFFER read alone. The bug
     // was `read_confirmed = offer || feedback || result || probe`, so a present CLAIM certified an
     // empty offer read as absence and `drive_auto_award` terminally parked a retryable offer. Here a

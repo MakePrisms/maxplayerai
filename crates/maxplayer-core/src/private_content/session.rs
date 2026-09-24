@@ -28,7 +28,7 @@ pub async fn flush<S: ContentSender>(
     let mut report = FlushReport::default();
     let deadline = tokio::time::Instant::now() + IO_TIMEOUT;
     for copy in db.pending(&keys.public_key().to_hex(), limit.min(64))? {
-        let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) else {
+        let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()).filter(|remaining| !remaining.is_zero()) else {
             report.pending += 1;
             continue;
         };
@@ -55,7 +55,7 @@ pub async fn flush<S: ContentSender>(
     // delivery; failed recipient copies remain durable and are retried next round.
     let deadline = tokio::time::Instant::now() + IO_TIMEOUT;
     for event in db.pending_carriers(&keys.public_key().to_hex(), limit.min(64))? {
-        let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) else {
+        let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()).filter(|remaining| !remaining.is_zero()) else {
             report.pending += 1;
             continue;
         };
@@ -504,7 +504,7 @@ pub async fn flush_actor<S: ContentSender>(
     let mut report = FlushReport::default();
     let deadline = tokio::time::Instant::now() + IO_TIMEOUT;
     for copy in db.pending(signer.public_key_hex(), limit.min(64))? {
-        let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) else {
+        let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()).filter(|remaining| !remaining.is_zero()) else {
             report.pending += 1;
             continue;
         };
@@ -528,7 +528,7 @@ pub async fn flush_actor<S: ContentSender>(
         }
     }
     for event in db.pending_carriers(signer.public_key_hex(), limit.min(64))? {
-        let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) else {
+        let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()).filter(|remaining| !remaining.is_zero()) else {
             report.pending += 1;
             continue;
         };

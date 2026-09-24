@@ -1536,3 +1536,47 @@ fn unbound_inbox_conflicts_and_sender_quota_do_not_abort_other_authors() {
     assert!(db.stage_untrusted(&other, &recipient, 100).unwrap());
     assert_eq!(db.staged(&p.body().author, &p.body().job_id, &p.body().message_id, 100).unwrap().unwrap().envelope(), p.envelope());
 }
+
+#[cfg(feature = "wallet")]
+#[tokio::test(start_paused = true)]
+async fn actor_copy_timeouts_do_not_consume_lifecycle_publication_budget() {
+    struct Sender { carriers: usize }
+    impl session::ContentSender for Sender {
+        async fn send(&mut self, event: nostr_sdk::Event) -> Result<()> {
+            if event.kind == nostr_sdk::Kind::GiftWrap {
+                std::future::pending::<()>().await;
+            }
+            self.carriers += 1;
+            Ok(())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let home = crate::home::bootstrap(dir.path()).unwrap();
+    // Deterministic fixture identity, not an operator's configured key.
+    std::fs::write(&home.key_path, hex::encode([1; 32])).unwrap();
+    let signer = crate::seller_node::signer::spawn(&home).unwrap();
+    let p = PreparedContent::new(body()).unwrap();
+    let offer = sign(3401, offer_tags(&p), 1);
+    let service = keys(3).public_key().to_hex();
+    let host = host();
+    let context = store::SignedContext { carrier: &offer, offer: &offer, award: None,
+        claim: None, result: None, service: &service, host: &host };
+    let mut db = store::ContentStore::in_memory().unwrap();
+    db.enqueue_signed(&p, &context).unwrap();
+    for n in 0..10 {
+        let mut b = body();
+        b.message_id = format!("{n:064x}");
+        let extra = PreparedContent::new(b).unwrap();
+        db.enqueue(&extra, &binding(&extra)).unwrap();
+    }
+    let first = db.pending(&p.body().author, 1).unwrap().remove(0);
+    let mut sender = Sender { carriers: 0 };
+    let report = session::flush_actor(&mut db, &signer, &mut sender, 64).await.unwrap();
+    assert_eq!(report.accepted, 1);
+    assert_eq!(report.pending, 33);
+    assert_eq!(sender.carriers, 1);
+    assert!(db.pending_carriers(&p.body().author, 64).unwrap().is_empty());
+    let next = db.pending(&p.body().author, 1).unwrap().remove(0);
+    assert_ne!((next.content.body().message_id.as_str(), next.recipient.as_str()),
+        (first.content.body().message_id.as_str(), first.recipient.as_str()));
+}

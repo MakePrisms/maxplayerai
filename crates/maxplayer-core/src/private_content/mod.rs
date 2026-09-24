@@ -36,3 +36,6 @@ pub mod posting;
 
 #[cfg(feature="wallet")]
 pub mod public_v2;
+
+#[cfg(feature="wallet")]
+pub mod history;

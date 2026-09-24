@@ -86,3 +86,30 @@ Follow-ups are new offers with explicit input/history pins, not amendments to ol
 
 No retention-policy redesign, key rotation/recovery redesign, new review product,
 legacy compatibility promise, READY message, or application-level service ACK is added.
+
+## Adversarial-review corrections
+
+- Foreign or malformed gift wraps cannot abort unrelated content scans. Count all
+  matching wrappers toward page fullness before application validation, so dropping
+  an inadmissible envelope cannot hide a truncated interval. Exact EOSE, notification
+  gaps and database failures remain fail-closed. Conflicting or over-quota unbound
+  envelopes are rejected individually; required content remains unavailable until
+  a valid copy is admitted. A saturated single-timestamp interval still fails closed
+  rather than skipping potentially valid messages.
+- Recipient outboxes schedule a turn per recipient and durably rotate attempted
+  copies, including failed/timed-out attempts and restarts. Per-attempt timeouts and
+  a separate lifecycle-publication budget keep slow copies from consuming all carrier
+  work. Carrier retries rotate too. The SQLite retry table is added automatically;
+  preserve it with the content database.
+- V2 claim, result and award queries each require their own end-of-history response.
+  Referenced awards and claims are fetched by exact ID; locally authenticated selection
+  evidence survives relay pruning. Missing dependencies of a credible selected result
+  are retryable unknown state, not proof of no delivery. Outsider result references do
+  not gain authority to hold a reservation. Existing evidence/payment checks still run.
+- SQLite opens explicitly prohibit symlink following in addition to the pre-open
+  file permission check. The owner-only participant state directory remains required.
+
+Regression coverage includes a local authenticated relay mixed-inbox scan, a retry
+backlog larger than one batch across database reopen, refused lifecycle dependency
+reads with recovery, and actual buyer reservation reconciliation while a selected
+claim read is refused. These are local fixtures, not deployed-trade verification.
