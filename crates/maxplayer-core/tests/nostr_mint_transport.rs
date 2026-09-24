@@ -331,14 +331,14 @@ async fn nostr_mint_no_reply_is_an_ambiguous_timeout_after_the_window() {
     let seen = mint.seen.lock().unwrap();
     assert!(seen.deliveries.len() >= 2, "re-sent within the window");
     // PR #1034 review: `exp` is when the connector stops waiting, never later. A 1.5s window
-    // floors to 1s; allow one second of wall-clock boundary.
+    // Cashu review: by the time the connector returns, a mint applying `now >= exp` refuses it.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
     for (_, request) in &seen.deliveries {
         assert!(
-            request.exp <= now + 1,
+            mint_wire::request_expired(request.exp, now),
             "exp {} outlives the wait (now {now})",
             request.exp
         );

@@ -65,7 +65,7 @@ pub const OUTER_MARGIN: Duration = Duration::from_secs(10);
 /// Bound: the send saga is stamped at the end of `prepare_send`; the publishing `confirm` is then
 /// capped at `DEFAULT_WINDOW + OUTER_MARGIN`, and any request it starts carries an `exp` at most
 /// `DEFAULT_WINDOW` later (~70s total). The swap saga `confirm` writes is stamped just before its
-/// publish. Five minutes covers that with room for wallet/mint clock skew; a forward wallet clock
+/// publish. Five minutes covers that plus [`crate::mint_wire::MAX_CLOCK_SKEW_SECS`] (asserted in a test); a forward wallet clock
 /// step larger than the remainder during the window is not covered.
 pub const REQUEST_SETTLE: Duration = Duration::from_secs(300);
 /// Bound on the relay disconnect after a request, so it cannot stretch past [`OUTER_MARGIN`].
@@ -204,17 +204,19 @@ impl NostrMintConnector {
     /// Send one request and return the mint's `ok` JSON, or the mapped error.
     ///
     /// The whole call, relay connect included, ends at `deadline = start + window`. The request's
-    /// `exp` is `floor(start) + floor(window)`, never later than that deadline: once the connector
-    /// stops waiting, a compliant mint can no longer execute the request (spec §3.1). Nothing past
-    /// the deadline is awaited except a bounded disconnect.
+    /// `exp` is [`request_exp`] of the same start: the mint refuses from that second on, which is
+    /// never later than the deadline, so once the connector stops waiting a compliant mint (with a
+    /// clock within `MAX_CLOCK_SKEW_SECS`) can no longer execute it (spec §3.1). Nothing past the
+    /// deadline is awaited except a bounded disconnect.
     pub async fn call_raw(&self, operation: &str, body: Value) -> Result<Value, Error> {
+        let started_unix_ms = unix_now_ms();
         let deadline = Instant::now() + self.window;
         let request = Request {
             v: PROTOCOL_VERSION,
             id: random_id()?,
             op: operation.to_owned(),
             body,
-            exp: unix_now() + self.window.as_secs(),
+            exp: request_exp(started_unix_ms, self.window),
         };
         let plaintext = serde_json::to_string(&request)
             .map_err(|error| Error::Custom(format!("encode {operation} request: {error}")))?;
@@ -381,10 +383,19 @@ fn random_id() -> Result<String, Error> {
     Ok(hex::encode(bytes))
 }
 
-fn unix_now() -> u64 {
+/// `exp` for a request started at `started_unix_ms` with `window`: the latest whole unix second not
+/// after `start + window`. The mint refuses when `now >= exp`, so every instant it may still execute
+/// the request lies before the connector stops waiting. The connector may keep waiting up to 1s past
+/// `exp`; that direction is safe (it only hears a refusal or nothing).
+pub fn request_exp(started_unix_ms: u64, window: Duration) -> u64 {
+    let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
+    started_unix_ms.saturating_add(window_ms) / 1000
+}
+
+fn unix_now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
 }
 
@@ -642,5 +653,114 @@ impl MintConnector for SharedMintConnector {
     }
     async fn set_auth_wallet(&self, wallet: Option<AuthWallet>) {
         self.0.set_auth_wallet(wallet).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const G_NPUB: &str = "npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d";
+
+    fn named(name: &str) -> Error {
+        map_error(ErrorBody {
+            code: ErrorCode::Named(name.to_owned()),
+            detail: "d".into(),
+        })
+    }
+
+    fn nut(code: u16) -> Error {
+        map_error(ErrorBody {
+            code: ErrorCode::Nut(code),
+            detail: String::new(),
+        })
+    }
+
+    #[test]
+    fn nostr_error_mapping_pins_each_cdk_class() {
+        // Pinned so a cdk upgrade that reclassifies any of these fails here (PR #1034 Cashu review).
+        for (name, status) in [
+            (code::BAD_REQUEST, 400),
+            (code::EXPIRED, 400),
+            (code::UNSUPPORTED, 404),
+            (code::RATE_LIMITED, 429),
+        ] {
+            let error = named(name);
+            assert!(
+                matches!(error, Error::HttpError(Some(s), _) if s == status),
+                "{name}: {error:?}"
+            );
+            assert!(error.is_definitive_failure(), "{name} must be definitive");
+        }
+        let internal = named(code::INTERNAL);
+        assert!(
+            matches!(internal, Error::HttpError(Some(500), _)),
+            "{internal:?}"
+        );
+        assert!(!internal.is_definitive_failure(), "internal is ambiguous");
+        let unknown = named("brand_new_code");
+        assert!(
+            matches!(unknown, Error::UnknownErrorResponse(_)),
+            "{unknown:?}"
+        );
+        assert!(
+            !unknown.is_definitive_failure(),
+            "unknown codes are ambiguous"
+        );
+        let spent = nut(11001);
+        assert!(matches!(spent, Error::TokenAlreadySpent), "{spent:?}");
+        assert!(spent.is_definitive_failure());
+        let pending = nut(11002);
+        assert!(matches!(pending, Error::TokenPending), "{pending:?}");
+        assert!(!pending.is_definitive_failure());
+    }
+
+    #[tokio::test]
+    async fn nostr_oversized_request_is_a_definitive_413_before_any_relay() {
+        let connector = NostrMintConnector::new(
+            &MintUrl::from_str(&format!("nostr://{G_NPUB}")).unwrap(),
+            vec!["ws://127.0.0.1:1".to_owned()],
+        )
+        .unwrap();
+        let started = Instant::now();
+        let error = connector
+            .call_raw(op::SWAP, Value::String("x".repeat(MAX_PLAINTEXT_BYTES)))
+            .await
+            .expect_err("oversized");
+        assert!(matches!(error, Error::HttpError(Some(413), _)), "{error:?}");
+        assert!(error.is_definitive_failure());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "refused before connecting"
+        );
+    }
+
+    #[test]
+    fn nostr_request_exp_is_never_later_than_the_wait() {
+        // Start 0.2s into a second: the wait ends at …030.2, exp = …030, and the mint refuses from
+        // that second on — before the connector gives up.
+        assert_eq!(
+            request_exp(1_000_000_200, Duration::from_secs(30)),
+            1_000_030
+        );
+        assert_eq!(
+            request_exp(1_000_000_999, Duration::from_millis(1_500)),
+            1_000_002
+        );
+        for start in [
+            1_000_000_000u64,
+            1_000_000_001,
+            1_000_000_500,
+            1_000_000_999,
+        ] {
+            for window_ms in [1u64, 999, 1_000, 1_500, 30_000] {
+                let exp = request_exp(start, Duration::from_millis(window_ms));
+                assert!(exp * 1000 <= start + window_ms, "exp past the wait");
+                assert!(
+                    (exp + 1) * 1000 > start + window_ms,
+                    "exp is the latest safe second"
+                );
+            }
+        }
     }
 }
