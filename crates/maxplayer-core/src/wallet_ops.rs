@@ -48,6 +48,12 @@ pub enum WalletOpsError {
     MintPinnedDefault {
         mint_url: String,
     },
+    /// `remove_mint` refuses a mint that is configured through `accepted_mints` rather than
+    /// `extra_mints`: `mints remove` only edits `extra_mints`, and dropping an accepted mint is a
+    /// seller policy change the operator makes in config.toml.
+    MintPinnedAccepted {
+        mint_url: String,
+    },
     /// A melt run under a [`MeltCeiling`] was REFUSED before any proof was selected, prepared or
     /// spent: the quote the mint raised at payment time would take more out of the wallet than the
     /// caller's hard maximum, or quoted a different invoice amount than the caller planned. The
@@ -121,6 +127,11 @@ impl std::fmt::Display for WalletOpsError {
                 formatter,
                 "cannot remove the default mint ({mint_url}); only extra_mints are removable"
             ),
+            Self::MintPinnedAccepted { mint_url } => write!(
+                formatter,
+                "cannot remove {mint_url}: it is in accepted_mints (the mints this seller is paid at); \
+                 only extra_mints are removable. Edit accepted_mints in config.toml to stop accepting it"
+            ),
             Self::MeltExceedsCeiling {
                 mint_url,
                 quote_id,
@@ -192,7 +203,7 @@ pub struct MintBalance {
     pub mint_url: String,
     pub balance_sats: u64,
     pub is_default: bool,
-    /// Whether the mint is in this home's configured set (default + `extra_mints`). Rows with
+    /// Whether the mint is in this home's configured set (`accepted_mints` + `extra_mints`). Rows with
     /// `configured == false` are DISCOVERED — the shared wallet DB holds proofs or a registration
     /// for a mint the config no longer (or never) names. Display surfaces them (#266); accept-time
     /// source selection deliberately ignores them (see `crossmint::holds_at_least`).
@@ -757,18 +768,35 @@ impl MoneyType {
     }
 }
 
-/// Configured mints: default `mint_url` first, then opt-in `extra_mints` (deduped).
+/// Configured mints: the default (`accepted_mints[0]`) first, then the rest of `accepted_mints` in
+/// order, then opt-in `extra_mints` (deduped).
+///
+/// `accepted_mints[1..]` are here because a seller is PAID at them: the seller node redeems a
+/// buyer's token at any accepted mint, so the wallet holds money there that the operator must be
+/// able to send, melt and see as configured. Leaving them out listed a seller's own earnings as
+/// `role=unconfigured` and refused `wallet send --mint <accepted mint>`. The real-mint fence
+/// (`home::mint_allowed`) still applies to every one of them on every spend path.
 pub fn configured_mints(home: &MaxplayerHome) -> Result<Vec<String>, WalletOpsError> {
     let mut out = Vec::new();
     let default = normalize_mint_url(home.config.default_mint())?;
     out.push(default.clone());
-    for extra in &home.config.extra_mints {
-        let normalized = normalize_mint_url(extra)?;
+    let accepted_rest = home.config.accepted_mints.iter().skip(1);
+    for mint_url in accepted_rest.chain(home.config.extra_mints.iter()) {
+        let normalized = normalize_mint_url(mint_url)?;
         if !out.iter().any(|existing| existing == &normalized) {
             out.push(normalized);
         }
     }
     Ok(out)
+}
+
+/// Whether `normalized` is one of `accepted_mints[1..]` (the default is checked separately).
+fn is_non_default_accepted_mint(home: &MaxplayerHome, normalized: &str) -> bool {
+    home.config
+        .accepted_mints
+        .iter()
+        .skip(1)
+        .any(|entry| normalize_mint_url(entry).ok().as_deref() == Some(normalized))
 }
 
 fn mint_is_allowed(home: &MaxplayerHome, mint_url: &str) -> Result<String, WalletOpsError> {
@@ -926,8 +954,8 @@ async fn open_balance_store(home: &MaxplayerHome) -> Result<WalletSqliteDatabase
 }
 
 /// Balance per configured or wallet-database-discovered mint. The sqlite store is shared across
-/// every mint, and proofs legally land at mints outside the configured set (seller redemption at
-/// `accepted_mints[1..]`, cross-mint hop residue) — so the read enumerates the DB truth (proof
+/// every mint, and proofs legally land at mints outside the configured set (cross-mint hop residue,
+/// a mint later dropped from the config) — so the read enumerates the DB truth (proof
 /// table ∪ mint registrations ∪ configured set) rather than the config filter, and tags each row
 /// `configured` so callers can tell the sets apart (#266). One store open, no per-mint `Wallet`,
 /// no seed, no network, and no `mint_is_allowed` fence — that fence stays load-bearing on the
@@ -2045,7 +2073,7 @@ pub fn list_mints(home: &MaxplayerHome) -> Result<Vec<MintBalance>, WalletOpsErr
 pub fn add_mint(home: &mut MaxplayerHome, mint_url: &str) -> Result<String, WalletOpsError> {
     let normalized = normalize_mint_url(mint_url)?;
     let default = normalize_mint_url(home.config.default_mint())?;
-    if normalized == default {
+    if normalized == default || is_non_default_accepted_mint(home, &normalized) {
         return Ok(normalized);
     }
     if home
@@ -2069,6 +2097,16 @@ pub fn remove_mint(home: &mut MaxplayerHome, mint_url: &str) -> Result<(), Walle
     let default = normalize_mint_url(home.config.default_mint())?;
     if normalized == default {
         return Err(WalletOpsError::MintPinnedDefault { mint_url: default });
+    }
+    let present_in_extra = home
+        .config
+        .extra_mints
+        .iter()
+        .any(|entry| normalize_mint_url(entry).ok().as_deref() == Some(normalized.as_str()));
+    if !present_in_extra && is_non_default_accepted_mint(home, &normalized) {
+        return Err(WalletOpsError::MintPinnedAccepted {
+            mint_url: normalized,
+        });
     }
     let present = home
         .config
@@ -2641,6 +2679,99 @@ mod tests {
 
         remove_mint(&mut home, "https://example.mint.test").expect("remove");
         assert_eq!(list_mints(&home).expect("list3").len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // A seller is paid at every `accepted_mints` entry, so `accepted_mints[1..]` must be in the
+    // wallet's configured set: listed, spendable (`mint_is_allowed`), not re-added by `mints add`,
+    // and not removable by `mints remove`. Red-on-revert: the old set (default + extra_mints) makes
+    // `mint_is_allowed` refuse the second accepted mint and `list_mints` return one row.
+    #[test]
+    fn accepted_mints_beyond_the_default_are_configured() {
+        let root = temp_home("accepted-rest");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap(&root).expect("bootstrap");
+        let lightning = "https://lightning.example";
+        let credits = "https://credits.example";
+        let extra = "https://extra.example";
+        home.config.accepted_mints = vec![lightning.into(), format!("{credits}/")];
+        home.config.extra_mints = vec![extra.into(), credits.into()];
+
+        assert_eq!(
+            configured_mints(&home).expect("configured"),
+            vec![lightning.to_owned(), credits.to_owned(), extra.to_owned()],
+            "default first, then accepted_mints[1..], then extra_mints, deduped after normalizing"
+        );
+        assert_eq!(mint_is_allowed(&home, credits).expect("accepted mint allowed"), credits);
+        let listed = list_mints(&home).expect("list");
+        assert_eq!(listed.len(), 3);
+        assert!(listed[0].is_default && !listed[1].is_default && listed[1].configured);
+
+        // `mints add` of an accepted mint is a no-op: it is already configured.
+        home.config.extra_mints.clear();
+        assert_eq!(add_mint(&mut home, credits).expect("add accepted"), credits);
+        assert!(home.config.extra_mints.is_empty(), "no duplicate extra_mints entry");
+
+        // `mints remove` cannot drop it: that is an accepted_mints edit, not an extra_mints one.
+        let err = remove_mint(&mut home, credits).expect_err("accepted mint pinned");
+        assert!(matches!(&err, WalletOpsError::MintPinnedAccepted { mint_url } if mint_url == credits));
+        assert!(err.to_string().contains("accepted_mints"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // A mint in BOTH accepted_mints[1..] and extra_mints stays removable from extra_mints (the
+    // command's own list) and stays configured through accepted_mints afterwards.
+    #[test]
+    fn remove_mint_drops_the_extra_entry_of_a_mint_that_is_also_accepted() {
+        let root = temp_home("accepted-and-extra");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap(&root).expect("bootstrap");
+        let credits = "https://credits.example";
+        home::save_config(&mut home, |config| {
+            config.accepted_mints = vec!["https://lightning.example".into(), credits.into()];
+            config.extra_mints = vec![credits.into()];
+        })
+        .expect("seed config");
+        remove_mint(&mut home, credits).expect("remove the extra_mints entry");
+        assert!(home.config.extra_mints.is_empty());
+        assert!(mint_is_allowed(&home, credits).is_ok(), "still configured via accepted_mints");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // `wallet balance` / the daemon status tag a seller's earnings at accepted_mints[1..] as
+    // configured (role=extra), not role=unconfigured — what the stage-3 run showed for seller B.
+    #[tokio::test(flavor = "current_thread")]
+    async fn balances_mark_accepted_mints_beyond_the_default_configured() {
+        use cashu::secret::Secret;
+        use cashu::{Amount, Id, Proof, SecretKey, State};
+        use cdk::wallet::types::ProofInfo;
+
+        let root = temp_home("accepted-balance");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap(&root).expect("bootstrap");
+        home.config.accepted_mints =
+            vec!["https://lightning.example".into(), "https://credits.example".into()];
+        let store = WalletSqliteDatabase::new(sqlite_path(&home.wallet_dir))
+            .await
+            .expect("open on-disk wallet database");
+        let proof = Proof::new(
+            Amount::from(100),
+            Id::from_str("009a1f293253e41e").expect("keyset id"),
+            Secret::new("accepted-rest-balance"),
+            SecretKey::generate().public_key(),
+        );
+        let credits = MintUrl::from_str("https://credits.example").expect("mint URL");
+        let info = ProofInfo::new(proof, credits, State::Unspent, CurrencyUnit::Sat).expect("info");
+        store.update_proofs(vec![info], vec![]).await.expect("seed proof");
+
+        let rows = balances_async(&home).await.expect("balances");
+        let row = rows
+            .iter()
+            .find(|row| row.mint_url == "https://credits.example")
+            .expect("credits row");
+        assert_eq!(row.balance_sats, 100);
+        assert!(row.configured, "earnings at an accepted mint are configured, not discovered");
+        assert!(!row.is_default);
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -1557,7 +1557,8 @@ mint=https://mint.minibits.cash/Bitcoin role=default balance_sats=1250
 total_sats=1250
 ```
 
-The command shows every configured mint (including zero balances) and every mint where the shared
+The command shows every configured mint — every `accepted_mints` entry plus any `wallet mints add`
+extra — (including zero balances) and every mint where the shared
 wallet database holds spendable proofs. `total_sats` is the whole-wallet figure — with `--mint <url>`
 both totals cover only the mint you asked about, never the mints the filter left out. If funds exist at
 an unconfigured mint, its row has `role=unconfigured` and a separate `configured_total_sats` line

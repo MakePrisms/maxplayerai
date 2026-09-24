@@ -24,7 +24,7 @@ enum Command {
     Balance {
         reply: oneshot::Sender<Result<u64, String>>,
     },
-    /// Read the per-mint balances across ALL configured mints (default + `extra_mints`), so the
+    /// Read the per-mint balances across ALL configured mints (`accepted_mints` + `extra_mints`), so the
     /// daemon can report every mint's balance without a daemon-down CLI read (#496). Serviced in the
     /// same single slot as `Balance` — the actor queue, not SQLite locking, is the concurrency
     /// boundary — so it never overlaps a proof-changing op on the wallet.
@@ -69,7 +69,7 @@ impl WalletHandle {
         rx.await.map_err(|_| WalletActorGone)
     }
 
-    /// Per-mint balances across all configured mints (default + `extra_mints`). Serialized behind the
+    /// Per-mint balances across all configured mints (`accepted_mints` + `extra_mints`). Serialized behind the
     /// actor queue exactly like [`balance`](Self::balance), so it never overlaps a proof-changing op.
     pub async fn balances(&self) -> Result<Result<Vec<MintBalance>, String>, WalletActorGone> {
         let (reply, rx) = oneshot::channel();

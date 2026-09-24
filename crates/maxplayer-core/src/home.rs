@@ -1636,7 +1636,9 @@ pub struct MaxplayerConfig {
     ///
     /// NOTE: distinct from `extra_mints`. `accepted_mints` is the SELLER accept-policy list;
     /// `extra_mints` is the BUYER wallet's *additional allowed* mints. They are separate
-    /// fields with separate meanings and are never merged or repurposed for one another.
+    /// fields with separate meanings and are never repurposed for one another. The wallet's
+    /// configured set (`wallet_ops::configured_mints`) is their union, because a seller is paid at
+    /// every accepted mint and must be able to spend what it earned there.
     #[serde(default = "default_accepted_mints")]
     pub accepted_mints: Vec<String>,
     /// Per-job spend cap (sats) — the standing spend bound on the money path. Absent ⇒ the built-in
