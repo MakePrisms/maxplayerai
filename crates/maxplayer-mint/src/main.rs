@@ -44,6 +44,7 @@ async fn init(home: &MintHome) -> Result<()> {
     println!("Created {}", home.dir().display());
     println!("Mint URL: {url}");
     println!("Add it to accepted_mints in config.toml:  \"{url}\"");
+    println!("Then let your wallet spend what it earns there:  maxplayer wallet mints add {url}");
     println!();
     println!(
         "BACK UP {} NOW, and keep exactly one live copy.",
