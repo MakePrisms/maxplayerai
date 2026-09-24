@@ -92,13 +92,25 @@ relay.maxplayer.ai already passes them (tested, §6). No collision with `kinds.r
 
 - **Request:** kind `23410`, `["p", <mint hex>]`, NIP-44 v2 content to the mint key, signed by a
   per-session throwaway client key. Plaintext `{"v":1,"id":…,"op":…,"body":<NUT JSON>,"exp":<unix>}`.
+- **Expiry:** `exp` is the **first unix second in which the request is invalid**. The mint refuses
+  with `expired`, without executing, once `now >= exp`. The wallet computes `exp` from the same
+  start as its wait deadline, so `exp` is never later than the moment it stops waiting (it may wait
+  up to 1 s longer, which is safe). Wallet and mint clocks must agree within **60 s**
+  (`MAX_CLOCK_SKEW_SECS`); a mint clock behind the wallet's lets a request run after the wallet
+  gave up, and the wallet's 300 s recovery hold is sized to cover that bound.
+- **Definitive errors** (`unsupported`, `rate_limited`, `bad_request`, `expired`) promise the
+  request was not executed. The mint sends them only before the op reaches anything that can
+  commit it; after that it answers `internal` or the original reply.
 - **Response:** kind `23411`, `["p", <client key>]`, `["e", <request id>]`, NIP-44 to the client,
   signed by the mint key. The connector drops anything not signed by the npub in the URL. Plaintext
   `{"v":1,"id":…,"ok":<NUT JSON>}` or `{"v":1,"id":…,"err":{"code":…,"detail":…}}`.
 - The client subscribes before it publishes and takes the first valid response from any relay.
 - **Relays:** the wallet's `relay_url` plus the same one or two public fallbacks the mint uses
   (decision 15; picked in stage 1 after checking they carry these kinds with NIP-42).
-- **Size:** NIP-44 caps plaintext at 65,535 bytes; a swap costs ~400 B per proof each way (§6). The
+- **Size:** NIP-44 caps plaintext at 65,535 bytes. That is the cryptographic ceiling, not a
+  transport guarantee: relay event-size limits after encryption and event JSON are often lower, so
+  the mint uses a tested lower limit and bounds **response** size too (checked before executing,
+  from the output count); a swap costs ~400 B per proof each way (§6). The
   mint sets `with_limits(128, 128)`. A bigger swap is refused with a clear error; no splitting in v1.
 - **Rate cap:** over the limit the mint replies `err` `rate_limited`.
 
@@ -115,9 +127,31 @@ Swap is the only operation that moves credits. The local-issue backend serves `i
   then returns `Error::Timeout`.
 - **Sidecar:** a swap CDK refuses as a replay (`TokenAlreadySpent` / `DuplicateOutputs`) whose
   outputs are all already signed gets the original reply rebuilt from the mint's own stored
-  signatures (`Mint::restore`). No response cache; only the requester can unblind them.
+  signatures (`Mint::restore`), only when **every** requested output matches, in order, with the
+  same DLEQ. Stage 2 adds the durable idempotency record in §3.4, so this rebuild is a fallback.
 - Tested (§6): with a lost reply after the mint committed, both a receive and a sender-side swap
   complete normally on the re-send, with correct balances and no recovery call in the wallet.
+
+### 3.4 Mint obligations (stage 2; from the #1034 Cashu review)
+
+1. Verify signature, `p` tag, NIP-44 decryption, `v`, op schema, size and `exp` **before** dispatch.
+2. Deduplicate on (client pubkey, request `id`), bound to the request event id and a digest of
+   `v`/`op`/`body`/`exp`. Same key with different content never executes: answer `internal` and alarm.
+3. Write an "executing → completed" record plus the exact response in the same transaction as the
+   mint state change. Duplicates (across relays, after restart, concurrent) wait for or read the
+   first execution; they never race it.
+4. Replay the original reply, successes **and** definitive failures, for at least the relay/retry/
+   recovery horizon, and even after `exp`: expiry never overwrites recorded history with `expired`.
+   A request first seen after `exp` is refused without executing.
+5. Restore-based rebuild (§3.3) only when all outputs match; a partial restore is never success.
+6. Keep old keysets for redemption and restore after rotation; sign only under the requested
+   keyset, never a substituted active one; produce NUT-12 DLEQ consistently.
+7. Look up completed requests **before** rate limiting, so a replay never becomes a new
+   `rate_limited`.
+
+**Trust model.** The npub authenticates the transport; it doesn't make relay delivery reliable or
+the mint honest, and more relays add availability, not consensus. Throwaway client keys hide the
+Nostr identity, but connection metadata, timing and request sizes can still link requests.
 
 ## 4. The sidecar: `maxplayer-mint`
 
