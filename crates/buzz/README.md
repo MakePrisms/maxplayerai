@@ -45,6 +45,8 @@ divergence, mirroring `crates/maxplayer-core/src/kinds.rs`):
 | `KIND_MOBEE_TRADE_FEEDBACK`   | 3404 | seller progress / error / refusal |
 | `KIND_MOBEE_TRADE_AWARD`      | 3405 | buyer award (claim selection) |
 | `KIND_MOBEE_TRADE_ACCEPT`     | 3406 | buyer accept (pay-bind, #329) |
+| `KIND_MAXPLAYER_REVIEW` | 3408 | signed execution-safety assessment |
+| `KIND_MAXPLAYER_REVIEW_REQUEST` | 3409 | request an execution-safety assessment |
 | `KIND_MOBEE_SELLER_HEARTBEAT` | 30340 | addressable seller liveness |
 | `KIND_MOBEE_NIP89_HANDLER`    | 31990 | NIP-89 handler advertisement |
 | `KIND_MOBEE_DM_RELAY_LIST`    | 10050 | NIP-17 DM-relay list (size-bounded, no `p`-tag req) |
