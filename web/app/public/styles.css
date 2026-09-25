@@ -568,9 +568,10 @@ ol .row:hover .dot.working i, ol .row:focus-visible .dot.working i {
 .foot-word {
   margin: 34px 22px 22px; /* the same breath of room on all three sides */
   font-family: var(--display); font-style: italic; font-weight: 900; font-stretch: 125%;
-  /* sized to span the width inside the 22px side margins: the wordmark's
-     width ≈ 9.85 × its font size, so this calc fills the space exactly */
-  font-size: calc((100vw - 44px) / 10.15); line-height: 0.82;
+  /* sized to span the width inside the footer's 18px padding plus the 22px
+     side margins (80px total): the wordmark's width ≈ 9.85 × its font size,
+     so this calc fills the space exactly without running off the right edge */
+  font-size: calc((100vw - 80px) / 10.15); line-height: 0.82;
   letter-spacing: -0.01em; text-transform: uppercase;
   text-align: center; white-space: nowrap;
   /* optical centering: the italic pushes the cap line right (the M's top
