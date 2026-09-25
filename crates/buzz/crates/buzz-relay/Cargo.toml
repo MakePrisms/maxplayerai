@@ -16,6 +16,7 @@ name = "buzz-relay"
 path = "src/main.rs"
 
 [dependencies]
+maxplayer-private-protocol = { path = "../maxplayer-private-protocol" }
 buzz-core = { workspace = true }
 buzz-conformance = { workspace = true }
 buzz-db = { workspace = true }

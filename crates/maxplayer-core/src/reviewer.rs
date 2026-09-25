@@ -1,7 +1,8 @@
 //! Relay-owner review worker. Source events are fetched only from the configured relay;
 //! Git objects are fetched from the configured relay into disposable bare repositories.
-//! No checkout, hooks, builds, arbitrary-URL fetches, or private-job input collection.
-use crate::gateway::{MAXPLAYER_TAG, PROTOCOL_VERSION, TagSpec};
+//! No checkout, hooks, builds or arbitrary-URL fetches. Private review inputs and
+//! results travel only through authenticated recipient-encrypted messages.
+use crate::gateway::{MAXPLAYER_TAG, TagSpec};
 use crate::kinds::{JOB_OFFER_KIND, JOB_RESULT_KIND, REVIEW_REQUEST_KIND};
 use crate::review::*;
 use nostr_sdk::prelude::*;
@@ -23,8 +24,27 @@ pub struct ServiceConfig {
     /// Exact advertised repo URL -> existing local bare repository. Never a request path.
     #[serde(default)]
     pub repositories: BTreeMap<String, PathBuf>,
+    /// Trusted deployment policy, never accepted from a review request.
+    #[serde(default = "review_mints")]
+    pub accepted_mints: Vec<String>,
+    #[serde(default)]
+    pub private_git_base: Option<String>,
     #[serde(default = "model_default")]
     pub model: String,
+}
+fn review_mints() -> Vec<String> { vec![crate::home::DEFAULT_MINT_URL.into()] }
+fn private_policy(config: &ServiceConfig, keys: &Keys) -> Result<crate::private_content::runtime::Policy, String> {
+    let base = match &config.private_git_base {
+        Some(base) => base.clone(),
+        None => {
+            let mut url = url::Url::parse(&config.relay).map_err(|_| "relay_configuration")?;
+            if url.scheme() != "wss" { return Err("relay_configuration".into()); }
+            url.set_scheme("https").map_err(|_| "relay_configuration")?;
+            url.set_path("/git/"); url.set_query(None); url.set_fragment(None);
+            url.to_string()
+        }
+    };
+    Ok(crate::private_content::runtime::Policy { service: keys.public_key().to_hex(), host: crate::private_content::wire::HostPolicy { git_prefix: base, accepted_mints: config.accepted_mints.clone() } })
 }
 fn model_default() -> String {
     "jev-latest".into()
@@ -217,10 +237,15 @@ fn root_is(event: &Event, offer: &str) -> bool {
 }
 pub fn validate_request(request: &Event, reviewer: &PublicKey) -> Result<Subject, String> {
     request.verify().map_err(|_| "invalid_request")?;
-    if request.kind != Kind::Custom(REVIEW_REQUEST_KIND) || request.content.len() > 2048 {
+    if request.kind != Kind::Custom(REVIEW_REQUEST_KIND) || request.content.len() > 60 * 1024 {
         return Err("invalid_request".into());
     }
-    let subject: Subject = serde_json::from_str(&request.content).map_err(|_| "invalid_request")?;
+    let subject: Subject = if crate::review::private::is_private(request) {
+        serde_json::from_str::<crate::review::private::Request>(&request.content).map_err(|_| "invalid_request")?.subject
+    } else {
+        if request.content.len() > 2048 { return Err("invalid_request".into()); }
+        serde_json::from_str(&request.content).map_err(|_| "invalid_request")?
+    };
     let expected = request_draft(&subject, &reviewer.to_hex())?;
     for tag in expected.tags {
         if tag.0.first().map(String::as_str) == Some("request_nonce") {
@@ -419,6 +444,15 @@ fn inspect_fetched(
     git_files(path, commit)
 }
 
+fn review_source_ref(branch: &str) -> Result<String, String> {
+    let name = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+    let source = format!("refs/heads/{name}");
+    if name.is_empty() || !git2::Reference::is_valid_name(&source) {
+        return Err("invalid_subject".into());
+    }
+    Ok(source)
+}
+
 fn relay_git_files(
     relay: &str,
     url: &str,
@@ -428,11 +462,8 @@ fn relay_git_files(
     deadline: std::time::Instant,
 ) -> Result<Vec<(String, Vec<u8>)>, String> {
     validate_git_destination(relay, url)?;
-    let source = format!("refs/heads/{branch}");
-    if branch.is_empty()
-        || !git2::Reference::is_valid_name(&source)
-        || git2::Oid::from_str(commit).is_err()
-    {
+    let source = review_source_ref(branch)?;
+    if git2::Oid::from_str(commit).is_err() {
         return Err("invalid_subject".into());
     }
     if std::time::Instant::now() >= deadline {
@@ -471,7 +502,7 @@ async fn fetch(client: &Client, id: &str) -> Result<Event, String> {
     if event.as_json().len() > MAX_INPUT_BYTES {
         return Err("input_too_large".into());
     }
-    if singleton(&event, "t")? != MAXPLAYER_TAG || singleton(&event, "v")? != PROTOCOL_VERSION {
+    if singleton(&event, "t")? != MAXPLAYER_TAG || !matches!(singleton(&event, "v")?, "1" | "2") {
         return Err("invalid_subject".into());
     }
     Ok(event)
@@ -488,17 +519,14 @@ async fn snapshot(
     if offer.kind != Kind::Custom(JOB_OFFER_KIND) {
         return Err("invalid_subject".into());
     }
-    let parsed = crate::gateway::parse_offer(&crate::job_lifecycle::event_to_draft(&offer))
-        .map_err(|_| "invalid_subject")?;
-    // Only public protocol events are supported. Never unwrap or republish private envelopes.
-    if offer.tags.iter().any(|t| {
-        matches!(
-            t.as_slice().first().map(String::as_str),
-            Some("private" | "encrypted")
-        )
-    }) {
+    if crate::review::private::is_private(&offer) || offer.tags.iter().any(|t| matches!(t.as_slice().first().map(String::as_str), Some("private" | "encrypted"))) {
         return Err("private_transport_unavailable".into());
     }
+    let parsed = if crate::private_content::public_v2::is_public(&offer) {
+        crate::private_content::public_v2::validate_offer(&offer).map_err(|_| "invalid_subject")?
+    } else {
+        crate::gateway::parse_offer(&crate::job_lifecycle::event_to_draft(&offer)).map_err(|_| "invalid_subject")?
+    };
     if let Some(target) = &parsed.seller_pubkey {
         if request.pubkey != offer.pubkey && request.pubkey.to_hex() != *target {
             return Err("unauthorized_request".into());
@@ -582,12 +610,21 @@ impl Store {
             .read(true)
             .write(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path.with_extension("lock"))
             .map_err(|_| "review_store")?;
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err("review_service_already_running".into());
         }
-        let db = rusqlite::Connection::open(path).map_err(|_| "review_store")?;
+        // Review digests/probabilities are private too; enforce permissions even
+        // when reviewer serve is launched outside the systemd unit's umask.
+        let file = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
+            .mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path).map_err(|_| "review_store")?;
+        use std::os::unix::fs::PermissionsExt;
+        if !file.metadata().map_err(|_| "review_store")?.is_file() { return Err("review_store".into()); }
+        file.set_permissions(std::fs::Permissions::from_mode(0o600)).map_err(|_| "review_store")?;
+        let db = rusqlite::Connection::open_with_flags(path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW).map_err(|_| "review_store")?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
           CREATE TABLE IF NOT EXISTS reviews (key TEXT PRIMARY KEY, request TEXT NOT NULL, event TEXT);
           CREATE TABLE IF NOT EXISTS request_limits (requester TEXT PRIMARY KEY, window INTEGER NOT NULL, count INTEGER NOT NULL);")
@@ -689,6 +726,9 @@ async fn signed(
     model: Option<&str>,
 ) -> Result<Event, String> {
     let mut draft = review_draft(review)?;
+    if crate::review::private::is_private(request) {
+        draft.tags.push(TagSpec::new(["visibility", "private"]));
+    }
     draft
         .tags
         .push(TagSpec::new(["request", &request.id.to_hex()]));
@@ -755,9 +795,12 @@ async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Re
     client
         .subscribe(
             Filter::new()
-                .kind(Kind::Custom(REVIEW_REQUEST_KIND))
+                .kinds([Kind::Custom(REVIEW_REQUEST_KIND), Kind::GiftWrap])
                 .pubkey(keys.public_key())
-                .since(Timestamp::now()),
+                // Gift-wrap timestamps are intentionally randomized into the past.
+                // Include the transport overlap for both startup history and live filters.
+                .since(Timestamp::from(Timestamp::now().as_secs().saturating_sub(
+                    crate::private_content::transport::TIMESTAMP_TWEAK_SECS + 60))),
             None,
         )
         .await
@@ -765,6 +808,7 @@ async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Re
     let (sender, mut inbox) = tokio::sync::mpsc::channel(256);
     let flights = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
     let reviewer = keys.public_key();
+    let intake_keys = keys.clone();
     // JoinSet aborts intake on all worker exit paths, including publication errors.
     let mut intake = tokio::task::JoinSet::new();
     intake.spawn(async move {
@@ -776,6 +820,14 @@ async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Re
             };
             let RelayPoolNotification::Event { event: request, .. } = notification else {
                 continue;
+            };
+            // Never accept a plaintext private inner message on the public lane.
+            let request = if request.kind == Kind::GiftWrap {
+                let Ok(inner) = crate::review::private::unwrap(&intake_keys, &request).await else { continue; };
+                Box::new(inner)
+            } else {
+                if crate::review::private::is_private(&request) { continue; }
+                request
             };
             let Ok(subject) = validate_request(&request, &reviewer) else {
                 continue;
@@ -803,17 +855,22 @@ async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Re
         {
             continue;
         }
+        let private_request = if crate::review::private::is_private(&request) {
+            let Ok(bundle) = serde_json::from_str::<crate::review::private::Request>(&request.content) else { continue; };
+            let policy = private_policy(&config, &keys)?;
+            let Ok(recipients) = bundle.validate(&request.pubkey, &policy) else { continue; };
+            Some((bundle, policy, recipients))
+        } else { None };
         let deadline = tokio::time::Instant::now() + WINDOW;
         let body = match tokio::time::timeout_at(
             deadline,
-            snapshot(
-                &client,
-                &config,
-                &request,
-                &subject,
-                &keys,
-                deadline.into_std(),
-            ),
+            async {
+                if let Some((bundle, policy, _)) = &private_request {
+                    private_snapshot(&config, bundle, policy, &keys, deadline.into_std()).await
+                } else {
+                    snapshot(&client, &config, &request, &subject, &keys, deadline.into_std()).await
+                }
+            },
         )
         .await
         {
@@ -835,7 +892,7 @@ async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Re
                     }
                     _ => "input_unavailable".into(),
                 };
-                if code == "unauthorized_request" {
+                if code == "unauthorized_request" || code == "private_transport_unavailable" {
                     continue;
                 }
                 let event = signed(
@@ -845,10 +902,7 @@ async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Re
                     None,
                 )
                 .await?;
-                client
-                    .send_event(&event)
-                    .await
-                    .map_err(|_| "relay_publish")?;
+                publish_review(&client, &config.relay, &keys, &event, private_request.as_ref().map(|(_,_,r)| r.as_slice())).await?;
                 continue;
             }
         };
@@ -856,7 +910,7 @@ async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Re
         let cache_key = input_digest(
             format!(
                 "{}:{CLASSIFIER}:{CLASSIFIER_VERSION}:{digest}",
-                keys.public_key()
+                format!("{}:{}", keys.public_key(), if private_request.is_some() { "private" } else { "public" })
             )
             .as_bytes(),
         );
@@ -889,10 +943,7 @@ async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Re
             }
             Err(e) => return Err(e),
         };
-        client
-            .send_event(&event)
-            .await
-            .map_err(|_| "relay_publish")?;
+        publish_review(&client, &config.relay, &keys, &event, private_request.as_ref().map(|(_,_,r)| r.as_slice())).await?;
     }
     client.disconnect().await;
     Ok(())
@@ -1255,7 +1306,7 @@ mod integration_tests {
             let root=std::env::temp_dir().join(format!("review-e2e-{}",uuid::Uuid::new_v4()));std::fs::create_dir_all(&root).unwrap();
             let reviewer=Keys::generate();let buyer=Keys::generate();let client=Client::new(buyer.clone());client.add_relay(&url).await.unwrap();client.connect().await;client.wait_for_connection(Duration::from_secs(5)).await;
             let mut provider=TypeSafe::new("fixture".into()).unwrap();provider.endpoint=format!("http://{addr}");
-            let config=ServiceConfig {relay:url.clone(),signer_file:root.join("unused"),provider_key_file:root.join("unused"),database:root.join("reviews.db"),repositories:BTreeMap::new(),model:"fixture".into()};
+            let config=ServiceConfig {relay:url.clone(),signer_file:root.join("unused"),provider_key_file:root.join("unused"),database:root.join("reviews.db"),repositories:BTreeMap::new(),accepted_mints:review_mints(),private_git_base:None,model:"fixture".into()};
             let worker=tokio::task::spawn_local(run_worker(config,reviewer.clone(),provider));
             let draft=crate::gateway::OfferDraft::untargeted("ordinary work","text/plain",0,Timestamp::now().as_secs()+600).to_event_draft();
             let offer=crate::gateway::nostr::event_builder(&draft).unwrap().sign_with_keys(&buyer).unwrap();client.send_event(&offer).await.unwrap();
@@ -1332,6 +1383,8 @@ mod snapshot_tests {
             provider_key_file: PathBuf::new(),
             database: PathBuf::new(),
             repositories: BTreeMap::new(),
+            accepted_mints: review_mints(),
+            private_git_base: None,
             model: "fixture".into(),
         };
         let draft = request_draft(&subject, &reviewer.public_key().to_hex()).unwrap();
@@ -1411,3 +1464,58 @@ mod concurrent_tests {
         );
     }
 }
+
+/// Validated envelopes are supplied by an authenticated participant; the reviewer
+/// independently checks their commitments and selected lifecycle chain. Only the
+/// already-authorized content-service key can decrypt these messages or fetch Git.
+async fn private_snapshot(
+    config: &ServiceConfig,
+    bundle: &crate::review::private::Request,
+    policy: &crate::private_content::runtime::Policy,
+    keys: &Keys,
+    deadline: std::time::Instant,
+) -> Result<Vec<u8>, String> {
+    use crate::private_content as pc;
+    let task = bundle.task_envelope.as_deref().map(pc::PreparedContent::decode).transpose().map_err(|_| "invalid_subject")?;
+    let resolved = pc::lifecycle::resolve_offer(&bundle.offer, task.as_ref(), &policy.service, &policy.service, &policy.host).map_err(|_| "invalid_subject")?;
+    let mut files = Vec::new();
+    let mut answer = None;
+    if let Some(evidence) = &bundle.delivery {
+        let checked = evidence.validate(&bundle.offer.pubkey.to_hex(), policy).map_err(|_| "invalid_subject")?;
+        answer = checked.answer;
+        if let Some(commit) = &bundle.subject.commit {
+            let tags = pc::wire::validate_private(&evidence.result, &policy.host).map_err(|_| "invalid_subject")?;
+            let url = tags.required("repo").map_err(|_| "invalid_subject")?.to_owned();
+            let branch = tags.required("branch").map_err(|_| "invalid_subject")?.to_owned();
+            let relay = config.relay.clone(); let commit = commit.clone(); let keys = keys.clone();
+            let path = config.repositories.get(&url).cloned();
+            files = tokio::task::spawn_blocking(move || {
+                if let Some(path) = path { git_files(&path, &commit) }
+                else { relay_git_files(&relay, &url, &branch, &commit, &keys, deadline) }
+            }).await.map_err(|_| "input_unavailable")??;
+        }
+    }
+    input_bytes(&bundle.subject, &resolved.offer.task, files.clone())?;
+    let files: BTreeMap<_,_> = files.into_iter().map(|(p,b)| (p,json!({"sha256":input_digest(&b),"text":String::from_utf8(b).expect("validated UTF-8")}))).collect();
+    let input = serde_json::to_vec(&json!({"schema":2,"subject":bundle.subject,"task":resolved.offer.task,"answer":answer,"evidence":bundle,"files":files})).map_err(|_| "invalid_input")?;
+    if input.len() > MAX_INPUT_BYTES { return Err("input_too_large".into()); }
+    provider_body(&input, &config.model)
+}
+
+async fn publish_review(client: &Client, relay: &str, keys: &Keys, event: &Event, recipients: Option<&[String]>) -> Result<(), String> {
+    if crate::review::private::is_private(event) != recipients.is_some() { return Err("review: publication visibility mismatch".into()); }
+    if let Some(recipients) = recipients {
+        for recipient in recipients {
+            let recipient = PublicKey::from_hex(recipient).map_err(|_| "invalid_recipient")?;
+            let outer = crate::review::private::wrap(keys, recipient, event).await?;
+            client.send_event_to([relay], &outer).await.map_err(|_| "relay_publish")?;
+        }
+    } else {
+        client.send_event_to([relay], event).await.map_err(|_| "relay_publish")?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "reviewer/private_tests.rs"]
+mod private_tests;

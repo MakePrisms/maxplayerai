@@ -1308,6 +1308,17 @@ impl SellerStore {
 
     /// Record a seen offer. Idempotent: a re-seen offer id is a no-op. Returns whether a new row
     /// landed.
+    /// A private offer can never fall back to public execution if the separate
+    /// encrypted-content database is missing or damaged after restart.
+    pub(crate) fn mark_public_v2_offer(&self, id: &str) -> Result<(), StoreError> {
+        self.lock()?.execute("INSERT OR IGNORE INTO seller_meta(key,value) VALUES(?1,'1')", [format!("public-v2-offer:{id}")])?;
+        Ok(())
+    }
+    pub(crate) fn mark_private_offer(&self, id: &str) -> Result<(), StoreError> {
+        self.lock()?.execute("INSERT OR IGNORE INTO seller_meta(key,value) VALUES(?1,'1')", [format!("private-offer:{id}")])?;
+        Ok(())
+    }
+
     pub fn record_offer(&self, offer: &Offer, now_unix: i64) -> Result<bool, StoreError> {
         let conn = self.lock()?;
         let changed = conn.execute(

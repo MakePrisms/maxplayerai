@@ -228,8 +228,25 @@ function emptyUsage() {
 }
 
 function parseOffer(base) {
+  const visibility = firstTagValue(base.tags, "visibility");
+  const discovery = firstTagValue(base.tags, "discovery");
+  const privateExecution = visibility === "private";
+  let task = firstTagValue(base.tags, "i");
+  if (privateExecution) {
+    // A public observer has no decryption role. Never treat an injected i-tag,
+    // commitment, or ciphertext as a targeted-private task summary.
+    if (discovery === "open" && !firstTagValue(base.tags, "p")) {
+      const publicTask = tryParseJson(task);
+      task = publicTask?.schema === "maxplayer.public-task.v2" && typeof publicTask.text === "string"
+        ? publicTask.text : "Public task unavailable";
+    } else {
+      task = "Private task";
+    }
+  }
   return {
-    task: firstTagValue(base.tags, "i"),
+    task,
+    discovery_visibility: privateExecution && discovery !== "open" ? "private" : "public",
+    execution_visibility: privateExecution ? "private" : "public",
     amount_sats: amountSatsFromTags(base.tags),
     // A `p` tag on an offer = a targeted seller; absent = open-pool offer.
     seller: firstTagValue(base.tags, "p"),

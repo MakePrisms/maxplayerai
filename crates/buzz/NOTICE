@@ -67,7 +67,14 @@ block/buzz stays meaningful and upstream commits remain scannable/pullable.
        freshness rule and the push-time enforcement. While the cap is non-zero the git
        legs also refuse a `ref` tag that is not a valid ref name rather than reading it
        as an absent scope.
-   No other source (`.rs`) files were modified.
+
+5. Private job delivery foundations (default-off provisioning): Maxplayer-owned
+   `crates/maxplayer-private-protocol` shares closed v2 schemas with the client;
+   `buzz-db::private_jobs` and migration 0025 hold immutable tenant/buyer/job ACLs;
+   Git transport/policy/provisioning and announcement handling enforce those ACLs,
+   immutable refs and quotas. Private repositories never emit public ref-state
+   announcements. See `docs/specs/private-offers-implementation.md` in the parent
+   Maxplayer repository for rollout status and remaining integration.
 
 Vendored (the 12-crate relay build closure): buzz-relay, buzz-core,
 buzz-conformance, buzz-db, buzz-pubsub, buzz-auth, buzz-search, buzz-audit,

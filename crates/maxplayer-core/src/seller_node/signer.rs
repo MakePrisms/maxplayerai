@@ -21,6 +21,22 @@ pub struct SignedEvent {
 }
 
 enum Command {
+    WrapReview { draft: EventDraft, recipient: nostr_sdk::PublicKey, reply: oneshot::Sender<Result<nostr_sdk::Event, String>> },
+    UnwrapReview { event: Box<nostr_sdk::Event>, reply: oneshot::Sender<Result<nostr_sdk::Event, String>> },
+    WrapPrivateContent {
+        content: crate::private_content::PreparedContent,
+        recipient: String,
+        reply: oneshot::Sender<crate::private_content::Result<nostr_sdk::Event>>,
+    },
+    UnwrapPrivateContent {
+        event: Box<nostr_sdk::Event>,
+        reply: oneshot::Sender<crate::private_content::Result<crate::private_content::PreparedContent>>,
+    },
+    PrivateProvisionAuth {
+        url: String,
+        body: Vec<u8>,
+        reply: oneshot::Sender<crate::private_content::Result<String>>,
+    },
     PublicKey {
         reply: oneshot::Sender<String>,
     },
@@ -121,6 +137,31 @@ impl std::fmt::Display for SignerActorGone {
 impl std::error::Error for SignerActorGone {}
 
 impl SignerHandle {
+    pub async fn wrap_review(&self, draft: EventDraft, recipient: nostr_sdk::PublicKey) -> Result<Result<nostr_sdk::Event,String>,SignerActorGone> {
+        let (reply,rx)=oneshot::channel();
+        self.round_trip("wrap_review",Command::WrapReview {draft,recipient,reply},rx).await
+    }
+    pub async fn unwrap_review(&self, event: nostr_sdk::Event) -> Result<Result<nostr_sdk::Event,String>,SignerActorGone> {
+        let (reply,rx)=oneshot::channel();
+        self.round_trip("unwrap_review",Command::UnwrapReview {event:Box::new(event),reply},rx).await
+    }
+
+    /// Content-domain cryptography stays in the existing key actor; no runner key read.
+    pub async fn wrap_private_content(&self, content: crate::private_content::PreparedContent, recipient: String)
+        -> Result<crate::private_content::Result<nostr_sdk::Event>, SignerActorGone> {
+        let (reply,rx)=oneshot::channel();
+        self.round_trip("wrap_private_content",Command::WrapPrivateContent {content,recipient,reply},rx).await
+    }
+    pub async fn unwrap_private_content(&self, event: nostr_sdk::Event)
+        -> Result<crate::private_content::Result<crate::private_content::PreparedContent>, SignerActorGone> {
+        let (reply,rx)=oneshot::channel();
+        self.round_trip("unwrap_private_content",Command::UnwrapPrivateContent {event:Box::new(event),reply},rx).await
+    }
+    pub async fn private_provision_auth(&self, request: &crate::private_content::hosting::ProvisionRequest)
+        -> Result<crate::private_content::Result<String>, SignerActorGone> {
+        let (reply,rx)=oneshot::channel();
+        self.round_trip("private_provision_auth",Command::PrivateProvisionAuth {url:request.url().into(),body:request.body().into(),reply},rx).await
+    }
     /// The seller public key (hex), served from the cache set at spawn.
     pub fn public_key_hex(&self) -> &str {
         &self.public_key_hex
@@ -326,6 +367,28 @@ pub fn spawn(home: &MaxplayerHome) -> Result<SignerHandle, HomeError> {
         // `keys` (holding the secret) lives only inside this task.
         while let Some(command) = rx.recv().await {
             match command {
+                Command::WrapReview { draft, recipient, reply } => {
+                    let result = async {
+                        let event = crate::gateway::nostr::event_builder(&draft).map_err(|e| e.to_string())?
+                            .sign_with_keys(&keys).map_err(|e| e.to_string())?;
+                        crate::review::private::wrap(&keys,recipient,&event).await
+                    }.await;
+                    let _=reply.send(result);
+                }
+                Command::UnwrapReview {event,reply} => {
+                    let _=reply.send(crate::review::private::unwrap(&keys,&event).await);
+                }
+
+                Command::WrapPrivateContent { content, recipient, reply } => {
+                    let result=crate::private_content::store::PendingCopy {content,recipient}.wrap(&keys).await;
+                    let _=reply.send(result);
+                }
+                Command::UnwrapPrivateContent { event, reply } => {
+                    let _=reply.send(crate::private_content::transport::unwrap_content(&keys,&event).await);
+                }
+                Command::PrivateProvisionAuth {url,body,reply} => {
+                    let _=reply.send(crate::private_content::hosting::auth_header(&keys,&url,&body));
+                }
                 Command::PublicKey { reply } => {
                     let _ = reply.send(keys.public_key().to_hex());
                 }

@@ -2,6 +2,8 @@
 //! Relay service and client gates share the signed immutable review contract.
 #[cfg(feature = "wallet")]
 pub mod state;
+#[cfg(feature = "wallet")]
+pub mod private;
 use crate::gateway::{EventDraft, MAXPLAYER_TAG, PROTOCOL_VERSION, TagSpec};
 use crate::kinds::{JOB_OFFER_KIND, JOB_RESULT_KIND, REVIEW_KIND, REVIEW_REQUEST_KIND};
 use serde::{Deserialize, Serialize};
@@ -479,6 +481,7 @@ pub async fn check_buyer(
     keys: &nostr_sdk::Keys,
     subject: &Subject,
     counterparty: &str,
+    evidence: Option<&crate::private_content::evidence::PrivateEvidence>,
 ) -> Result<Option<String>, String> {
     if !home.config.review.enabled(subject.kind, counterparty)? {
         state::write(
@@ -511,7 +514,28 @@ pub async fn check_buyer(
         "pending",
         "Waiting for signed execution review",
     )?;
-    let result = wire::check(
+    let result = async {
+        // A signed source determines routing, never a caller's unverified boolean.
+        let private = if let Some(e) = evidence {
+            e.offer.verify().map_err(|_| "review: invalid source offer")?;
+            if e.offer.id.to_hex() != subject.offer || e.result.id.to_hex() != subject.event {
+                return Err("review: mismatched evidence".into());
+            }
+            private::is_private(&e.offer)
+        } else {
+            use nostr_sdk::prelude::*;
+            let rows = client.fetch_events(Filter::new().id(EventId::from_hex(&subject.offer).map_err(|_| "review: invalid offer id")?), std::time::Duration::from_secs(3))
+                .await.map_err(|_| "review: offer unavailable")?;
+            let offer = rows.into_iter().find(|e| e.id.to_hex() == subject.offer).ok_or("review: offer unavailable")?;
+            offer.verify().map_err(|_| "review: invalid source offer")?;
+            private::is_private(&offer)
+        };
+        if private {
+            let evidence = evidence.ok_or("review: private evidence unavailable; no public fallback")?;
+            let request = private::Request { subject: subject.clone(), offer: evidence.offer.clone(), task_envelope: evidence.task_envelope.clone(), delivery: Some(evidence.clone()) };
+            private::check(home, &client, private::Identity::Buyer(keys), &request, counterparty).await
+        } else {
+            wire::check(
         &wire::RelayTransport {
             client: &client,
             relay: &home.config.relay_url,
@@ -522,7 +546,9 @@ pub async fn check_buyer(
         counterparty,
         false,
     )
-    .await;
+    .await
+        }
+    }.await;
     client.disconnect().await;
     state::completed(&home.root, subject, &result)?;
     result
@@ -938,7 +964,7 @@ pub async fn protect_job_view(
         let decision = if !attempted && awarded_seller == Some(result.seller_pubkey.as_str()) {
             attempted = true;
             match &keys {
-                Some(keys) => check_buyer(home, keys, &subject, &result.seller_pubkey).await,
+                Some(keys) => check_buyer(home, keys, &subject, &result.seller_pubkey, result.private_evidence.as_ref()).await,
                 None => Err("review: local key unavailable".into()),
             }
         } else {

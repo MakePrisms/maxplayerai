@@ -2034,3 +2034,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+/// Upload a caller-owned, bounded private input snapshot. Unlike delivery workdirs,
+/// input staging is a fresh bare repository; it never executes hooks or trusts HEAD.
+#[cfg(feature="wallet")]
+pub fn push_private_input(
+    repo: &Repository, remote_url: &str, reference: &str, commit: &str, mint: AuthMinter,
+) -> Result<String, TransportError> {
+    assert_allowed_repo_locator(remote_url)?;
+    let suffix=reference.strip_prefix("refs/heads/input/").ok_or_else(||TransportError::Transport("not a private input ref".into()))?;
+    if !crate::private_content::is_hex(suffix,32) || !repo.is_bare() {
+        return Err(TransportError::Transport("invalid private input staging repository".into()));
+    }
+    ensure_registered()?;
+    push_gated_object(repo,remote_url,reference,commit,Some(mint),None,None)
+}
+
+/// Private-repository reads additionally bound transferred pack bytes and objects.
+/// Exact manifest hashes and uncompressed quotas are checked before materialization.
+#[cfg(feature="wallet")]
+pub fn fetch_private_objects(repo: &Repository, remote_url: &str, refs: &[&str], auth: &str) -> Result<(),TransportError> {
+    if header_for(remote_url,Some(auth))?.is_none() { return Err(TransportError::Auth("private fetch needs authentication".into())); }
+    fetch_bounded_objects(repo,remote_url,refs,Some(auth))
+}
+#[cfg(feature="wallet")]
+pub fn fetch_bounded_objects(repo: &Repository, remote_url: &str, refs: &[&str], auth: Option<&str>) -> Result<(),TransportError> {
+    assert_allowed_repo_locator(remote_url)?;
+    ensure_registered()?;
+    let header=header_for(remote_url,auth)?;
+    let mut remote=bound_remote(repo,remote_url)?;
+    let mut callbacks=RemoteCallbacks::new();
+    callbacks.transfer_progress(|progress| progress.received_bytes() as u64 <= crate::private_content::MAX_REPO_BYTES && progress.total_objects() <= 100_000);
+    let mut options=FetchOptions::new();
+    options.download_tags(AutotagOption::None).remote_callbacks(callbacks);
+    let context=LegContext {mint:header.map(static_auth),authority:None,lifetime:None,short:true,read_budget:None,intended_url:remote_url.into()};
+    with_context(context,|| remote.fetch(refs,Some(&mut options),None))
+}

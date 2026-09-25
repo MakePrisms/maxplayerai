@@ -68,6 +68,9 @@ use wallet_actor::WalletHandle;
 pub const CODE_REFUSED: i64 = -32002;
 /// Timeout for the daemon's relay fetches (job view / auto-award selection / reconcile liveness).
 const RELAY_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(test)]
+mod lifecycle_history_tests;
 /// How often the background auto-award task re-checks the relay for a payable claim, until one
 /// appears or the offer deadline passes. Bounded polling (no tight spin on a live-but-unpayable claim).
 const AUTO_AWARD_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -328,8 +331,36 @@ pub async fn run(home: MaxplayerHome) -> Result<(), BuyerError> {
     // Keep reconciling while we serve, so a reservation stranded by a seller that went away is
     // freed within the hour rather than at the next restart.
     spawn_reconcile_loop(context.clone());
+    spawn_private_content_worker(context.clone());
     let listener = bind_socket(&socket_path)?;
     accept_loop(listener, context).await
+}
+
+/// Recipient-copy retries outlive job completion. A delayed Maxplayer copy must
+/// not depend on someone calling get_job again or on an unsettled award existing.
+fn spawn_private_content_worker(context: Arc<BuyerContext>) {
+    if !context.home.config.privacy.private_content_v2 { return; }
+    tokio::spawn(async move {
+        let mut ticker=tokio::time::interval(Duration::from_secs(30));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let result=async {
+                use crate::private_content::{channel::ContentContext,session};
+                let keys=buyer_keys(&context.home).map_err(|_| crate::private_content::Error("buyer content signer unavailable"))?;
+                let mut content=ContentContext::open(&context.home,&keys.public_key().to_hex())?;
+                let mut relay=session::AuthenticatedContentRelay::connect(&keys,&context.home.config.relay_url).await?;
+                let result=async {
+                    session::flush(&mut content.store,&keys,&mut relay,64).await?;
+                    relay.backfill(&mut content.store,&keys,now_unix().max(0) as u64).await?;
+                    Ok::<_,crate::private_content::Error>(())
+                }.await;
+                relay.disconnect().await;
+                result
+            }.await;
+            if let Err(error)=result {crate::opline!("buyer private content retry pending: {error}");}
+        }
+    });
 }
 
 /// Accept connections and service each on its own task.
@@ -400,6 +431,12 @@ async fn dispatch(context: &Arc<BuyerContext>, request: Request) -> Response {
 /// select a contribution offer, a partial set is refused. `job_id` returned is the offer event id.
 #[derive(Debug, Deserialize)]
 struct PostJobParams {
+    #[serde(default)]
+    visibility: Option<crate::private_content::wire::Visibility>,
+    #[serde(default)]
+    output_category: Option<crate::private_content::wire::Output>,
+    #[serde(default)]
+    inputs: Vec<crate::private_content::inputs::InputFile>,
     task: String,
     output: String,
     amount_sats: u64,
@@ -547,6 +584,9 @@ async fn post_job(context: &Arc<BuyerContext>, id: Value, params: Value) -> Resp
     let harness = params.harness.clone();
     let model = params.model.clone();
     let request = PostJobRequest {
+        visibility: params.visibility,
+        output_category: params.output_category,
+        inputs: params.inputs,
         task: params.task,
         output: params.output,
         amount_sats: params.amount_sats,
@@ -3687,6 +3727,55 @@ mod tests {
         drop(relay);
     }
 
+    #[derive(Debug)]
+    struct RefuseV2ClaimReads(Arc<std::sync::atomic::AtomicBool>);
+    impl nostr_relay_builder::prelude::QueryPolicy for RefuseV2ClaimReads {
+        fn admit_query<'a>(&'a self, query: &'a nostr_sdk::Filter, _: &'a std::net::SocketAddr)
+            -> nostr_relay_builder::prelude::BoxedFuture<'a, nostr_relay_builder::prelude::PolicyResult> {
+            Box::pin(async move {
+                if self.0.load(Ordering::SeqCst) && query.kinds.as_ref().is_some_and(|k|
+                    k.contains(&nostr_sdk::Kind::Custom(crate::kinds::JOB_CLAIM_KIND))) {
+                    nostr_relay_builder::prelude::PolicyResult::Reject("selected claim unavailable".into())
+                } else { nostr_relay_builder::prelude::PolicyResult::Accept }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn private_content_partial_selection_read_keeps_real_reservation() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_sdk::prelude::Client;
+        let refused = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let relay = LocalRelay::new(RelayBuilder::default().query_policy(RefuseV2ClaimReads(refused.clone())));
+        relay.run().await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut home = bootstrap_home(root.path()).unwrap();
+        std::fs::write(&home.key_path, format!("{:064x}", 1)).unwrap();
+        home.config.relay_url = relay.url().await.to_string();
+        home.config.buyer_reservation_floor.enabled = false;
+        let (e, keys) = crate::private_content::public_v2::tests::fixture(true, false);
+        let publisher = Client::new(keys);
+        publisher.add_relay(&home.config.relay_url).await.unwrap();
+        publisher.connect().await;
+        for event in [&e.offer, &e.claim, &e.award, &e.result] {
+            assert!(!publisher.send_event(event).await.unwrap().success.is_empty());
+        }
+        let (_lock, context, _socket) = bootstrap(home).await.unwrap();
+        let job = e.offer.id.to_hex();
+        context.store.reserve(&job, 10, 1_000, now_unix()).unwrap();
+        // No award-attempt or age-floor protection: the read itself must retain
+        // this reservation. The old pool read produced no claims/no results.
+        let report = reconcile_reservations(&context).await.unwrap();
+        assert!(report.kept.contains(&job), "{report:?}");
+        assert!(!report.released.contains(&job), "{report:?}");
+        refused.store(false, Ordering::SeqCst);
+        let view = job_lifecycle::fetch_job_view_async(&context.home, &buyer_keys(&context.home).unwrap(), &job, RELAY_TIMEOUT, now_unix() as u64).await.unwrap();
+        assert_eq!(view.results.len(), 1);
+        let report = reconcile_reservations(&context).await.unwrap();
+        assert!(report.kept.contains(&job), "{report:?}");
+        publisher.disconnect().await;
+    }
+
     // ★ #602: `fetch_job_view_async` must certify offer-ABSENCE from the OFFER read alone. The bug
     // was `read_confirmed = offer || feedback || result || probe`, so a present CLAIM certified an
     // empty offer read as absence and `drive_auto_award` terminally parked a retryable offer. Here a
@@ -5291,6 +5380,7 @@ mod tests {
 
         fn result(commit_oid: Option<String>) -> job_lifecycle::ResultView {
             job_lifecycle::ResultView {
+                private_evidence: None,
                 inline_answer: None,
                 result_id: "r".repeat(64),
                 created_at: 2,
@@ -5331,6 +5421,7 @@ mod tests {
                 results: vec![result(Some("d".repeat(40)))],
                 live_claim_id: None,
                 accepted: Some(job_lifecycle::AcceptedBind {
+                    private_evidence: None,
                     delivery_kind: None,
                     inline_answer: None,
                     payment_mode: crate::gateway::PaymentMode::Sat,
@@ -5372,6 +5463,7 @@ mod tests {
                 results: vec![result(Some("d".repeat(40)))],
                 live_claim_id: None,
                 accepted: Some(job_lifecycle::AcceptedBind {
+                    private_evidence: None,
                     delivery_kind: None,
                     inline_answer: None,
                     payment_mode: crate::gateway::PaymentMode::Sat,

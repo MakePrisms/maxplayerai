@@ -185,6 +185,7 @@ pub async fn collect_async(
     // that could post a free job WITHOUT this branch would produce jobs that are postable and
     // uncollectable. Nothing on this branch may reintroduce that window.
     if bind.payment_mode.is_free() {
+        job_lifecycle::validate_private_bind(home, &bind).map_err(CollectError::Lifecycle)?;
         let files = match bind.inline_answer.as_deref() {
             // An inline delivery has nothing to fetch: the answer is on the bind.
             Some(answer) if bind_is_inline(&bind) => {
@@ -317,6 +318,14 @@ fn collect_free(
         .map_err(|error| CollectError::Integrity(format!("buyer key: {error}")))?;
     let store = delivery_store_path(home);
     let mut verifier = PayPathDeliveryVerifier::new(store.clone(), Some(secret_hex));
+
+    if bind.private_evidence.is_some() {
+        if let Some(pin) = &bind.contribution {
+            let base = CommitOid::parse(pin.base_oid.clone()).map_err(|e| CollectError::Integrity(e.to_string()))?;
+            verifier.verify_contribution(&delivery, &pin.target_clone_url, &pin.base_branch, &base,
+                &authorize_pay::contribution_policy(home)).map_err(|e| CollectError::Integrity(e.to_string()))?;
+        }
+    }
 
     // 1. THE TIP-MATCH. Same verifier, same allowlist, same fetch, same compare as the paid path —
     // only the payment that would have followed it is absent.
@@ -715,6 +724,7 @@ mod tests {
     // Helper: a from-scratch accept-bind pinning `commit_oid` (used by refuse-path tests).
     fn bind_for(job_id: &str, seller_hex: &str, commit_oid: &str) -> AcceptedBind {
         AcceptedBind {
+            private_evidence: None,
             delivery_kind: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,

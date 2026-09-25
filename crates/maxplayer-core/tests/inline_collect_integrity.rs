@@ -38,6 +38,7 @@ fn temp(label: &str) -> PathBuf {
 /// on the bind, its digest in the integrity slot, no remote and no branch, kind `inline`.
 fn inline_bind(job_id: &str, seller_pubkey: &str, answer: &str, free: bool) -> AcceptedBind {
     AcceptedBind {
+        private_evidence: None,
         delivery_kind: Some(DeliveryKind::Inline.as_str().to_owned()),
         inline_answer: Some(answer.to_owned()),
         payment_mode: if free {

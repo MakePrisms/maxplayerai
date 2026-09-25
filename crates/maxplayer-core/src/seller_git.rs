@@ -229,6 +229,7 @@ fn checkout_base_branch(
     branch: &str,
     base_oid: &str,
 ) -> Result<(), SellerGitError> {
+    let branch = branch.strip_prefix("refs/heads/").unwrap_or(branch);
     let repo =
         Repository::open(workdir).map_err(|error| SellerGitError::Io(format!("open: {error}")))?;
     let oid =
@@ -320,6 +321,7 @@ pub fn snapshot_delivery_at(
     author_date_unix: i64,
     job_hash: &str,
 ) -> Result<String, SellerGitError> {
+    let branch = branch.strip_prefix("refs/heads/").unwrap_or(branch);
     let repo = Repository::open(workdir)
         .map_err(|error| SellerGitError::Io(format!("snapshot: open workdir: {error}")))?;
 
@@ -2628,4 +2630,27 @@ mod snapshot_tests {
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&remote);
     }
+}
+
+
+/// Import only bounded objects from a pre-claim-verified local cache. This is not
+/// a remote locator path: no git config, hooks, credentials or alternate ODBs are
+/// copied into the execution workdir.
+#[cfg(feature = "wallet")]
+pub fn init_verified_input_workdir(workdir: &Path, identity: &DeliveryAgentIdentity,
+    cache: &Path, base_oid: &str, branch: &str) -> Result<(), SellerGitError> {
+    let source = Repository::open_bare(cache).map_err(|_| SellerGitError::Io("input cache unavailable".into()))?;
+    crate::private_content::repositories::check_objects(&source)
+        .map_err(|e| SellerGitError::Io(e.to_string()))?;
+    let target = init_repo_with_identity(workdir, identity)?;
+    let source_odb = source.odb().map_err(|_| SellerGitError::Io("input object store unavailable".into()))?;
+    let target_odb = target.odb().map_err(|_| SellerGitError::Io("execution object store unavailable".into()))?;
+    let mut ids = Vec::new();
+    source_odb.foreach(|id| { ids.push(*id); true }).map_err(|_| SellerGitError::Io("input objects unavailable".into()))?;
+    for id in ids {
+        let object = source_odb.read(id).map_err(|_| SellerGitError::Io("input object unavailable".into()))?;
+        let copied = target_odb.write(object.kind(), object.data()).map_err(|_| SellerGitError::Io("input object import failed".into()))?;
+        if copied != id { return Err(SellerGitError::Io("input object identity changed".into())); }
+    }
+    checkout_base_branch(workdir, branch, base_oid)
 }

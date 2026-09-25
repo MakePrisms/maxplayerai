@@ -2745,6 +2745,7 @@ mod tests {
     /// The co-signed preimage a real buyer would reconstruct from the trade facts.
     fn receipt_preimage(key: &PaymentKey) -> ReceiptPreimage {
         ReceiptPreimage {
+            protocol: crate::receipt::ReceiptProtocol::V1,
             job_hash: key.job_hash.as_str().to_owned(),
             offer_id: key.job_id.as_str().to_owned(),
             amount: key.amount.to_u64(),

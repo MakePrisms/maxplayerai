@@ -24,6 +24,8 @@ pub struct RelayPublisher {
     signer: SignerHandle,
     client: Client,
     relay_url: String,
+    home: Option<crate::home::MaxplayerHome>,
+    authenticated: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RelayPublisher {
@@ -32,11 +34,15 @@ impl RelayPublisher {
     /// site in the runner, never here.
     pub fn new(signer: SignerHandle, client: Client, relay_url: &str) -> Self {
         Self {
+            home: None,
+            authenticated: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             signer,
             client,
             relay_url: relay_url.to_owned(),
         }
     }
+    pub fn with_auth(mut self, auth: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self { self.authenticated = auth; self }
+    pub fn with_home(mut self, home: crate::home::MaxplayerHome) -> Self { self.home = Some(home); self }
 }
 
 impl EventPublisher for RelayPublisher {
@@ -49,6 +55,17 @@ impl EventPublisher for RelayPublisher {
             .await
             .map_err(|error| error.to_string())??;
         let event = Event::from_json(&signed.json).map_err(|error| format!("decode signed: {error}"))?;
+        if super::privacy::is_private(&item.draft) {
+            if !self.authenticated.load(std::sync::atomic::Ordering::Relaxed) { return Err("private publication requires authenticated relay".into()); }
+            let home = self.home.as_ref().ok_or("private publisher home unavailable")?;
+            super::privacy::record_publication(home, self.signer.public_key_hex(), &event).map_err(|e| e.to_string())?;
+            // The signed carrier and all recipient copies are durable before the first
+            // publication. Independent-copy retry is driven by the normal drain tick.
+        }
+        if crate::private_content::public_v2::is_public(&event) {
+            let home=self.home.as_ref().ok_or("public v2 publisher home unavailable")?;
+            crate::private_content::public_v2::publication(home,&event).map_err(|e|e.to_string())?;
+        }
         let output = self
             .client
             .send_event_to([self.relay_url.as_str()], &event)

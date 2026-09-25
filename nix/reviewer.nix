@@ -6,6 +6,8 @@ let
     relay = cfg.relayUrl;
     model = cfg.model;
     database = "/var/lib/maxplayer-reviewer/reviews.sqlite";
+    private_git_base = cfg.privateGitBase;
+    accepted_mints = cfg.acceptedMints;
   });
   start = pkgs.writeShellScript "maxplayer-reviewer-start" ''
     set -eu
@@ -35,9 +37,19 @@ in
       description = "WSS relay URL; Git deliveries are fetched from the corresponding HTTPS origin.";
       example = "wss://relay.maxplayer.ai";
     };
+    privateGitBase = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "Trusted private Git prefix; null uses the relay HTTPS /git/ origin.";
+    };
+    acceptedMints = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ "https://testnut.cashudevkit.org" ];
+      description = "Trusted mint allowlist for validating private lifecycle evidence; match client policy.";
+    };
     signerFile = lib.mkOption {
       type = lib.types.str;
-      description = "Absolute runtime path to the dedicated reviewer signing key, not an environment file or Nix store path.";
+      description = "Absolute runtime path to the reviewer signing key. For private jobs this must be the configured private-content service identity, not the relay key.";
     };
     providerKeyFile = lib.mkOption {
       type = lib.types.str;

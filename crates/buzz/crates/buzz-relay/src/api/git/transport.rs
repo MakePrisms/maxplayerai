@@ -20,7 +20,7 @@ use axum::{
     extract::{Path as AxumPath, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Router,
 };
 use base64::Engine;
@@ -631,6 +631,7 @@ pub async fn info_refs(
         _ => return Err((StatusCode::BAD_REQUEST, "invalid service").into_response()),
     };
     let _repo_name = validate_repo_id(&params.owner, &params.repo)?;
+    super::private_jobs::authorize(&state, &auth.tenant, &params.owner, &params.repo, &auth.pubkey.to_hex(), service == "git-receive-pack").await?;
 
     // Track C fast path: only for clone advertisement. The receive-pack
     // advertisement carries a different capability set (report-status,
@@ -874,6 +875,7 @@ pub async fn upload_pack(
     body: Body,
 ) -> Result<Response, Response> {
     let _ = validate_repo_id(&params.owner, &params.repo)?;
+    super::private_jobs::authorize(&state, &auth.tenant, &params.owner, &params.repo, &auth.pubkey.to_hex(), false).await?;
     let body = decode_git_request_body(&headers, body, UPLOAD_PACK_MAX_DECODED_BYTES);
     // Held for the whole function scope: the buffered `run_git_at` below is
     // awaited within this scope, so the git-concurrency permit bounds exactly
@@ -985,7 +987,11 @@ pub async fn receive_pack(
     body: Body,
 ) -> Result<Response, Response> {
     let repo_name = validate_repo_id(&params.owner, &params.repo)?;
-    let body = decode_git_request_body(&headers, body, state.config.git_max_pack_bytes);
+    let private_job = super::private_jobs::authorize(&state, &auth.tenant, &params.owner, &params.repo, &auth.pubkey.to_hex(), true).await?;
+    let pack_limit = if private_job.is_some() {
+        state.config.git_max_pack_bytes.min(maxplayer_private_protocol::MAX_REPO_BYTES)
+    } else { state.config.git_max_pack_bytes };
+    let body = decode_git_request_body(&headers, body, pack_limit);
     let pusher_hex = hex::encode(auth.pubkey.to_bytes());
     let _permit = acquire_git_permit(&state, "receive_pack")?;
 
@@ -1466,6 +1472,15 @@ async fn finalize_push(state: &Arc<AppState>, ctx: PushContext) -> Response {
         return response;
     }
 
+    if maxplayer_private_protocol::is_hex(&ctx.repo_id, 32) {
+        if let Err(response) = super::private_jobs::authorize(state, &ctx.tenant, &ctx.owner, &ctx.repo_id, &ctx.pusher.to_hex(), true).await {
+            return response;
+        }
+        if let Err(response) = super::private_jobs::enforce_quota(ctx.repo_handle.path()).await {
+            return response;
+        }
+    }
+
     // Step 7 (CAS). The PushContext binds `parent_state` (observed at
     // hydrate) to the CAS predicate here — no re-reading of the pointer
     // between hydrate and CAS.
@@ -1570,7 +1585,7 @@ async fn finalize_push(state: &Arc<AppState>, ctx: PushContext) -> Response {
         (Some(before), Some(after)) => before != after,
         _ => true, // first push (parent None) or impossible-shape after key → publish
     };
-    if manifest_changed {
+    if manifest_changed && !maxplayer_private_protocol::is_hex(ctx.repo.strip_suffix(".git").unwrap_or(&ctx.repo), 32) {
         let inputs = RefStateInputs {
             repo_id: &ctx.repo_id,
             head: &success.manifest.head,
@@ -1647,10 +1662,12 @@ pub fn git_router(state: Arc<AppState>) -> Router {
     let body_limit = state.config.git_max_pack_bytes as usize;
 
     Router::new()
+        .route("/api/jobs/private/{job_id}", put(super::private_jobs::provision).layer(RequestBodyLimitLayer::new(128 * 1024)))
         .route("/git/{owner}/{repo}/info/refs", get(info_refs))
         .route("/git/{owner}/{repo}/git-upload-pack", post(upload_pack))
         .route("/git/{owner}/{repo}/git-receive-pack", post(receive_pack))
         .layer(RequestBodyLimitLayer::new(body_limit))
+        .layer(axum::middleware::map_response(super::private_jobs::no_store))
         .with_state(state)
 }
 

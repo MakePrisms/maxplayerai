@@ -355,7 +355,20 @@ pub async fn handle_req(
             Ok(evs) => evs,
             Err(e) => {
                 warn!(conn_id = %conn_id, sub_id = %sub_id, "Historical query failed: {e}");
-                conn.send(RelayMessage::eose(&sub_id));
+                // A failed (possibly later) filter is not complete history.
+                // Remove the subscription before reporting failure, including
+                // its fan-out index and pubsub reference. Never send EOSE here.
+                conn.subscriptions.lock().await.remove(&sub_id);
+                if let Some(removed) = state.sub_registry.remove_subscription(conn_id, &sub_id) {
+                    state
+                        .pubsub
+                        .release_topic(&conn.tenant, topic_for_subscription(removed.channel_id))
+                        .await;
+                }
+                conn.send(RelayMessage::closed(
+                    &sub_id,
+                    "error: historical query failed",
+                ));
                 return;
             }
         };
@@ -2018,3 +2031,7 @@ mod tests {
         assert!(!result_gated_count_safe_for_pushdown(&f, &owner));
     }
 }
+
+#[cfg(test)]
+#[path = "req_failure_tests.rs"]
+mod failure_tests;

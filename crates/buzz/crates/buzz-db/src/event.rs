@@ -501,9 +501,12 @@ pub async fn query_events(pool: &PgPool, q: &EventQuery) -> Result<Vec<StoredEve
 
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        if let Some(ev) = row_to_stored_event(row)? {
-            out.push(ev);
-        }
+        // LIMIT applies to database rows, not successfully decoded events.
+        // Silently skipping a corrupt row could certify a truncated page as
+        // complete. Propagate uncertainty to the historical-query caller.
+        out.push(row_to_stored_event(row)?.ok_or_else(|| {
+            DbError::InvalidData("historical event row could not be decoded".to_owned())
+        })?);
     }
     Ok(out)
 }
@@ -2462,3 +2465,7 @@ mod tests {
         assert!(!huddle_started_content_links("not-json", channel_id));
     }
 }
+
+#[cfg(test)]
+#[path = "history_failure_tests.rs"]
+mod history_failure_tests;

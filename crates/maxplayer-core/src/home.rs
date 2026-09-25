@@ -1620,6 +1620,42 @@ pub fn default_hop_fee_buffer_multiplier() -> u64 {
     2
 }
 
+/// Available without gateway dependencies so offline configuration tools load the same
+/// defaults. The private-content default-loading regression checks this against the
+/// shared wire protocol's service identity.
+pub const DEFAULT_PRIVACY_SERVICE_PUBKEY: &str =
+    "7e6b3b0592e091fe2b5c2438d0cda5438fbcbea5236eae7e1f022d2ea2858aa7";
+
+/// Private-job defaults and deployment-owned content recipient/hosting policy.
+/// These are read at startup like the rest of the home config. No private keys are stored here.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct PrivacyConfig {
+    pub private_content_v2: bool,
+    pub private_job_repos: bool,
+    pub private_jobs: bool,
+    pub default_visibility: String,
+    pub service_pubkey: Option<String>,
+    pub git_base: Option<String>,
+}
+impl Default for PrivacyConfig {
+    fn default() -> Self {
+        Self {
+            private_content_v2: true,
+            private_job_repos: true,
+            private_jobs: true,
+            default_visibility: "private".into(),
+            service_pubkey: Some(DEFAULT_PRIVACY_SERVICE_PUBKEY.into()),
+            git_base: Some(format!("{DEFAULT_RELAY_GIT_BASE}/")),
+        }
+    }
+}
+impl PrivacyConfig {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
 /// Buyer-facing packaged config (`~/.maxplayer/config.toml`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1627,6 +1663,10 @@ pub struct MaxplayerConfig {
     /// Optional execution-safety review; enabled unless explicitly skipped.
     #[serde(default)]
     pub review: crate::review::ReviewConfig,
+    /// Coordinated v2 privacy rollout. Private admissions fail while a prerequisite
+    /// is disabled; no private request is silently published through the public lane.
+    #[serde(default, skip_serializing_if = "PrivacyConfig::is_default")]
+    pub privacy: PrivacyConfig,
     /// Open-market relay. Absent in the file ⇒ the built-in [`DEFAULT_RELAY_URL`].
     #[serde(default = "default_relay_url")]
     pub relay_url: String,
@@ -1831,6 +1871,7 @@ impl Default for MaxplayerConfig {
     fn default() -> Self {
         Self {
             review: crate::review::ReviewConfig::default(),
+            privacy: PrivacyConfig::default(),
             relay_url: DEFAULT_RELAY_URL.to_owned(),
             accepted_mints: default_accepted_mints(),
             per_job_budget_sats: DEFAULT_PER_JOB_BUDGET_SATS,

@@ -211,6 +211,8 @@ pub struct Phase1Output {
 /// inside [`seller_git::snapshot_delivery_at`] refuses an empty tree, so a quota-dead agent that
 /// wrote nothing yields [`OrchestratorError::Gate`] wrapping `NoExecutionObserved` and mints no
 /// sentinel — exactly as on the host today.
+pub const PRIVATE_INPUT_CACHE_DIR: &str = "/run/maxplayer-private-inputs";
+
 pub fn run_phase1(
     agent_workdir: &Path,
     identity: &DeliveryAgentIdentity,
@@ -225,6 +227,10 @@ pub fn run_phase1(
 
     // 1. Provision: clone the pinned base (contribution) or init an empty repo (from-scratch).
     match base {
+        #[cfg(feature = "wallet")]
+        Some(b) if b.clone_url == PRIVATE_INPUT_CACHE_DIR => seller_git::init_verified_input_workdir(
+            agent_workdir, identity, Path::new(PRIVATE_INPUT_CACHE_DIR), b.oid, delivery_branch,
+        ).map_err(OrchestratorError::Provision)?,
         Some(b) => seller_git::init_contribution_workdir(
             agent_workdir,
             identity,

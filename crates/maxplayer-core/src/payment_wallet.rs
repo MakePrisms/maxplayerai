@@ -4434,6 +4434,7 @@ mod tests {
     /// the anchored buyer/seller nostr keys) — what a real buyer publishes.
     fn cosigned_receipt(key: &PaymentKey) -> ReceiptEvidence {
         let preimage = crate::receipt::ReceiptPreimage {
+            protocol: crate::receipt::ReceiptProtocol::V1,
             job_hash: key.job_hash.as_str().to_owned(),
             offer_id: key.job_id.as_str().to_owned(),
             amount: key.amount.to_u64(),

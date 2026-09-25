@@ -177,8 +177,8 @@ pub struct NostrPaymentSend {
     keys: nostr_sdk::prelude::Keys,
 }
 
-#[cfg(feature = "gateway")]
-const GIFT_WRAP_TIMESTAMP_TWEAK_MAX_SECS: u64 = 180;
+#[cfg(all(test, feature = "gateway"))]
+const GIFT_WRAP_TIMESTAMP_TWEAK_MAX_SECS: u64 = crate::private_content::transport::TIMESTAMP_TWEAK_SECS;
 
 #[cfg(all(feature = "gateway", feature = "wallet"))]
 impl NostrPaymentSend {
@@ -262,43 +262,9 @@ async fn payment_send_gift_wrap(
     receiver: nostr_sdk::prelude::PublicKey,
     message: String,
 ) -> Result<nostr_sdk::prelude::Event, PaymentSendError> {
-    use nostr_sdk::nostr::nips::nip44;
-    use nostr_sdk::prelude::{EventBuilder, JsonUtil, Kind, Tag};
-
-    let rumor = EventBuilder::private_msg_rumor(receiver, message).build(keys.public_key());
-    let seal = EventBuilder::seal(keys, &receiver, rumor)
+    crate::private_content::transport::wrap(keys, receiver, message)
         .await
-        .map_err(|error| {
-            PaymentSendError::Transport(format!("failed to build NIP-17 seal: {error}"))
-        })?
-        .sign(keys)
-        .await
-        .map_err(|error| {
-            PaymentSendError::Transport(format!("failed to sign NIP-17 seal: {error}"))
-        })?;
-    let wrapping_keys = nostr_sdk::prelude::Keys::generate();
-    let content = nip44::encrypt(
-        wrapping_keys.secret_key(),
-        &receiver,
-        seal.as_json(),
-        nip44::Version::default(),
-    )
-    .map_err(|error| {
-        PaymentSendError::Transport(format!("failed to encrypt NIP-17 gift wrap: {error}"))
-    })?;
-
-    EventBuilder::new(Kind::GiftWrap, content)
-        .tags([Tag::public_key(receiver)])
-        .custom_created_at(fresh_gift_wrap_created_at())
-        .sign_with_keys(&wrapping_keys)
-        .map_err(|error| {
-            PaymentSendError::Transport(format!("failed to sign NIP-17 gift wrap: {error}"))
-        })
-}
-
-#[cfg(feature = "gateway")]
-fn fresh_gift_wrap_created_at() -> nostr_sdk::prelude::Timestamp {
-    nostr_sdk::prelude::Timestamp::tweaked(0..GIFT_WRAP_TIMESTAMP_TWEAK_MAX_SECS)
+        .map_err(|error| PaymentSendError::Transport(error.to_string()))
 }
 
 #[cfg(test)]
@@ -429,7 +395,7 @@ mod tests {
     #[test]
     fn gift_wrap_timestamp_tweak_stays_inside_relay_freshness_window() {
         let now = nostr_sdk::prelude::Timestamp::now();
-        let created_at = fresh_gift_wrap_created_at();
+        let created_at = crate::private_content::transport::fresh_created_at();
         assert!(created_at <= now);
         assert!(
             now.as_secs().saturating_sub(created_at.as_secs()) < GIFT_WRAP_TIMESTAMP_TWEAK_MAX_SECS

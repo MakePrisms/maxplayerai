@@ -596,7 +596,7 @@ pub fn parse_offer(event: &EventDraft) -> Result<ParsedOffer, OfferParseError> {
         return Err(OfferParseError::MissingMaxplayerTag);
     }
     let version = first_tag_value(&event.tags, "v").ok_or(OfferParseError::MissingTag("v"))?;
-    if version != PROTOCOL_VERSION {
+    if version != PROTOCOL_VERSION && version != "2" {
         return Err(OfferParseError::UnsupportedVersion(version.to_owned()));
     }
 

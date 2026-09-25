@@ -160,7 +160,7 @@ impl GitDeliveryVerifier {
             self.compact_store()?;
             let repo = self.open_store()?;
             let fetched_ref = format!("refs/maxplayer/deliveries/{}", delivery.commit_oid().as_str());
-            let refspec = format!("+refs/heads/{}:{fetched_ref}", delivery.branch());
+            let refspec = format!("+{}:{fetched_ref}", crate::git_transport::delivery_ref(delivery.branch()));
             // short_timeout=true: a hung fetch must not own the MCP stdio loop past the client
             // timeout, and must fail CLOSED before authorize_pay burns budget (verify-before-pay).
             git_transport::fetch_refspecs(&repo, delivery.repo(), &[&refspec], self.read_auth(), true)
@@ -205,7 +205,7 @@ impl GitDeliveryVerifier {
             self.compact_store()?;
             let repo = self.open_store()?;
             let fetched_ref = format!("refs/maxplayer/bases/{}", base_oid.as_str());
-            let refspec = format!("+refs/heads/{base_branch}:{fetched_ref}");
+            let refspec = format!("+{}:{fetched_ref}", crate::git_transport::delivery_ref(base_branch));
             git_transport::fetch_refspecs(&repo, base_clone_url, &[&refspec], self.read_auth(), true)
                 .map_err(|error| DeliveryError::GitCommandFailed {
                     operation: "fetch-base",
@@ -360,7 +360,7 @@ impl GitDeliveryVerifier {
 /// `git check-ref-format --branch`. Split out so the verifier method reads cleanly.
 #[allow(non_snake_case)]
 fn Reference_is_valid_branch(branch: &str) -> bool {
-    git2::Reference::is_valid_name(&format!("refs/heads/{branch}"))
+    git2::Reference::is_valid_name(&crate::git_transport::delivery_ref(branch))
 }
 
 /// Proof that a contribution fork tip is in the buyer store AND descends from the pinned base, with

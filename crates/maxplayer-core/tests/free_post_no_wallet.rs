@@ -47,6 +47,9 @@ fn wallet_store(home: &home::MaxplayerHome) -> PathBuf {
 /// A from-scratch post request in `mode`, priced at `amount_sats`.
 fn request(mode: PaymentMode, amount_sats: u64, seller_hex: &str) -> PostJobRequest {
     PostJobRequest {
+        visibility: Some(maxplayer_core::private_content::wire::Visibility::Public),
+        output_category: None,
+        inputs: vec![],
         accepts_delivery: Vec::new(),
         task: "say hello".to_owned(),
         output: "text/plain".to_owned(),

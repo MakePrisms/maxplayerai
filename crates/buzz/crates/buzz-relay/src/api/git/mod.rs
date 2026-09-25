@@ -29,6 +29,7 @@ pub mod manifest;
 pub mod manifest_event;
 pub mod pack_cache;
 pub mod policy;
+pub mod private_jobs;
 pub mod store;
 pub mod transport;
 
@@ -64,3 +65,9 @@ pub fn git_policy_router(state: Arc<AppState>) -> Router {
         .layer(middleware::from_fn(require_localhost))
         .with_state(state)
 }
+
+#[cfg(test)]
+mod private_jobs_http_tests;
+
+#[cfg(test)]
+mod private_quota_cas_tests;

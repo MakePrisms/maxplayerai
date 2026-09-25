@@ -100,6 +100,7 @@ fn make_upstream(label: &str) -> (PathBuf, String, String) {
 /// tooth PASSES and the refusal lands at the delivery tip-match, not the cosig.
 fn seller_cosig(secret_hex: &str, pubkey_hex: &str, bind: &AcceptedBind) -> String {
     let preimage = ReceiptPreimage {
+        protocol: maxplayer_core::receipt::ReceiptProtocol::V1,
         job_hash: bind.job_hash.clone(),
         offer_id: bind.job_id.clone(),
         amount: bind.amount_sats,
@@ -137,6 +138,7 @@ async fn collect_refuses_pay_when_delivered_tip_differs_from_bound_oid() {
     // lands at the tip-match. buyer == seller == the home key.
     let job_id = "a".repeat(64);
     let mut bind = AcceptedBind {
+        private_evidence: None,
         delivery_kind: None,
         inline_answer: None,
         payment_mode: maxplayer_core::gateway::PaymentMode::Sat,
@@ -259,6 +261,7 @@ fn from_scratch_bind(
     job_hash: &str,
 ) -> AcceptedBind {
     AcceptedBind {
+        private_evidence: None,
         delivery_kind: None,
         inline_answer: None,
         payment_mode: maxplayer_core::gateway::PaymentMode::Sat,
@@ -425,6 +428,7 @@ fn free_bind(
     job_hash: &str,
 ) -> AcceptedBind {
     AcceptedBind {
+        private_evidence: None,
         delivery_kind: None,
         inline_answer: None,
         payment_mode: maxplayer_core::gateway::PaymentMode::None,

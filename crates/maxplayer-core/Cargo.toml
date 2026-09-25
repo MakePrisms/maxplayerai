@@ -17,7 +17,7 @@ acp = ["tokio/sync", "tokio/time"]
 # `tokio/time` is declared here because the gateway's relay-auth window uses `tokio::time::timeout`.
 # On native it also arrives transitively through nostr-sdk, but that supplier's tokio feature
 # selection is target-conditional and does not provide it on wasm32 (issue #214).
-gateway = ["dep:nostr-sdk", "tokio/time"]
+gateway = ["dep:maxplayer-private-protocol", "dep:nostr-sdk", "dep:base64", "tokio/time"]
 # All git legs (seller push/fetch, buyer verify-fetch, ref-advertisement probes) run in-process
 # via libgit2 — NO system `git` on any product path (issue #55). Needs nostr-sdk (NIP-98 signing)
 # so it composes gateway; git2 (rustls-backed) + reqwest + base64 carry the smart-HTTP transport.
@@ -41,9 +41,9 @@ git-delivery = ["gateway", "dep:git2", "dep:reqwest", "dep:base64", "dep:libc"]
 # calls, and a reqwest async client (with `stream`, for SSE responses) forwarding to the real upstream.
 # It lives under `wallet` because `seller_exec` — the only caller — already does, so reqwest and
 # `tokio/net` are guaranteed present here.
-wallet = ["git-delivery", "gateway", "dep:cashu", "dep:cdk", "dep:cdk-sqlite", "dep:nostr-sdk", "dep:rusqlite", "dep:libc", "dep:bytes", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:futures-util", "tokio/sync", "tokio/time", "tokio/net", "tokio/io-util", "tokio/signal"]
-# TESTS ONLY, opt-in, OFF by default (issue #720). The four tests that reach a LIVE third-party mint
-# over the public internet — two in `job_lifecycle` (post_job's pre-publish fee floor resolves the
+wallet = ["dep:async-wsocket", "dep:tempfile", "dep:ciborium", "git-delivery", "gateway", "dep:cashu", "dep:cdk", "dep:cdk-sqlite", "dep:nostr-sdk", "dep:rusqlite", "dep:libc", "dep:bytes", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:futures-util", "tokio/sync", "tokio/time", "tokio/net", "tokio/io-util", "tokio/signal"]
+# TESTS ONLY, opt-in, OFF by default (issue #720). The three tests that reach a LIVE third-party mint
+# over the public internet — one in `job_lifecycle` (post_job's pre-publish fee floor resolves the
 # home's shipped minibits default) and two in `payment_wallet` (the worker's real send leg fetches
 # testnut's keysets through the wallet's own HTTP client). Nothing but test code reads this flag; it
 # enables NO product behaviour and adds NO dependency.
@@ -51,14 +51,19 @@ wallet = ["git-delivery", "gateway", "dep:cashu", "dep:cdk", "dep:cdk-sqlite", "
 # It exists so `wallet` is offline-safe. Before it, `--features wallet` could not be declared in
 # `.maxplayer/checks.toml` at all (every declared command runs under `net: denied`), which cost the
 # repo its entire wallet-gated test surface — `tests/collect_integrity.rs` and every `seller_node`
-# test ran in ZERO declared commands. Those four tests are NOT silenced: the money-path CI job in
+# test ran in ZERO declared commands. Those three tests are NOT silenced: the money-path CI job in
 # `.github/workflows/ci.yml` turns this feature ON, and that runner has a network. Run them locally
 # with `cargo test -p maxplayer-core --features wallet,live-mints` — with a network.
 live-mints = []
 test-support = []
 
 [dependencies]
+# Same transport crate as the pinned SDK; observe raw row counts before SDK filtering.
+async-wsocket = { version = "0.13.2", optional = true }
+tempfile = { version = "3", optional = true }
+maxplayer-private-protocol = { path = "../buzz/crates/maxplayer-private-protocol", optional = true }
 base64 = { workspace = true, optional = true }
+ciborium = { version = "0.2.2", optional = true }
 cashu = { version = "=0.17.2", optional = true }
 config.workspace = true
 git2 = { workspace = true, optional = true }
@@ -163,6 +168,7 @@ name = "reap_isolated_linux"
 required-features = ["wallet"]
 
 [dev-dependencies]
+tempfile = "3"
 async-trait = "0.1.89"
 cdk-sqlite = "=0.17.2"
 # An HTTP/2 client AND server, both test-only. The client half is the credential proxy's aggregate

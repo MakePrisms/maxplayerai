@@ -54,6 +54,7 @@ export interface ParsedEvent {
   amount?: number | null;
   targetSeller?: string | null;
   description?: string;
+  executionVisibility?: "public" | "private";
   outputType?: string | null;
   deadline?: number | null;
   status?: string | null;
@@ -361,6 +362,18 @@ export function parseEvent(event: RawEvent | null | undefined): ParsedEvent | nu
   return parsed;
 }
 
+/** Public observer only: private payloads are never treated as task summaries. */
+function publicTaskDescription(event: RawEvent): string {
+  const task = firstTag(event, "i") || "";
+  if (firstTag(event, "visibility") !== "private") return task;
+  if (firstTag(event, "discovery") !== "open" || firstTag(event, "p")) return "Private task";
+  try {
+    const value = JSON.parse(task);
+    return value?.schema === "maxplayer.public-task.v2" && typeof value.text === "string"
+      ? value.text : "Public task unavailable";
+  } catch { return "Public task unavailable"; }
+}
+
 function parseEventUncached(event: RawEvent): ParsedEvent | null {
 
   const base: ParsedEvent = {
@@ -383,7 +396,8 @@ function parseEventUncached(event: RawEvent): ParsedEvent | null {
                targetSeller: firstTag(event, "p"),
                // The job itself is the `i` (input) tag. Offer content is empty
                // in practice, so reading it yields a field that is never set.
-               description: firstTag(event, "i") || "",
+               description: publicTaskDescription(event),
+               executionVisibility: firstTag(event, "visibility") === "private" ? "private" : "public",
                outputType: firstTag(event, "output"),
                deadline: Number.parseInt(param(event, "deadline") ?? "", 10) || null };
     case CLAIM:

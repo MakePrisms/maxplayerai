@@ -1,6 +1,6 @@
 # Execution-safety reviews
 
-Implementation PR #1022 extends proposal #1021. This branch now contains the public
+Implementation PR #1022 extends proposal #1021. The consolidated private-jobs implementation also integrates the
 review worker, TypeSafe adapter, signed client gates, operator recovery, and local
 integration tests. **It is not yet approved for production deployment.** No paid
 classifier evaluation or default-threshold calibration has been performed.
@@ -10,8 +10,9 @@ classifier evaluation or default-threshold calibration has been performed.
 - Buyer/seller clients request `REVIEW_REQUEST` (3409), verify `REVIEW` (3408), and
   apply their own unsafe-probability threshold. A skip affects only that client.
 - The relay owner runs `maxplayer reviewer serve reviewer.json`. The worker fetches
-  signed public subjects from that one configured relay, fetches Git deliveries from
-  its HTTPS Git endpoint, calls TypeSafe, persists a signed terminal result, and publishes it.
+  signed public subjects from that configured relay (or validates signed encrypted
+  private input bundles), fetches Git deliveries from its HTTPS Git endpoint, calls
+  TypeSafe, persists a signed terminal result, and publishes it in the same privacy lane.
 - The worker uses the provider's existing HTTP API, not custom model inference.
   API contract: <https://docs.typesafe.ai/introduction/quickstart>.
 - Clients never receive provider credentials. Review signatures do not replace
@@ -103,7 +104,10 @@ Secret files must be regular owner-private files (0600 or stricter). Provision a
 dedicated signer and distribute its **public** key to clients. Never put credentials
 in command arguments, public events, logs, or this repository. The database parent
 must exist and be writable. Run the service under an operator-managed supervisor.
-Only **public job repositories** are supported; private jobs are not supported yet.
+Public and private per-job repositories are supported. Private review uses the existing
+content-service identity and repository ACL; it does not grant a new reviewer identity
+access to a private job. Configure the reviewer signer to that identity, and set the
+client reviewer trust entry to the same `privacy.service_pubkey`.
 
 ```sh
 maxplayer reviewer serve /etc/maxplayer/reviewer.json
@@ -259,14 +263,42 @@ execution sandbox. General harmful intent is a separate future classifier.
 
 ## Private jobs and remaining release gates
 
-Private-job content transport is not implemented on current upstream. The client
-rejects private requests before any public fallback. This branch does not invent a
-second transport or publish private roots/metadata. Integrating private review with
-the shared private-wire design remains a **blocking external dependency**.
+Private jobs use the existing NIP-44/NIP-59 primitive with the separate
+`maxplayer-private-review-v1` domain. REVIEW_REQUEST (3409) and REVIEW (3408) are
+signed **inner** events, never published directly for private jobs. Only kind-1059
+wrappers and recipient routing tags appear on the relay. Subject IDs, text, input
+digests, classifier results/probabilities, provider metadata and errors stay encrypted.
+Public jobs retain public review messages.
+
+Clients supply the signed offer and commitment-bound task envelope; delivery review
+also supplies the signed claim/award/result and answer envelope. The service verifies
+these bindings and requester authorization before classifier work. Private Git files
+are fetched by exact commit with the existing authenticated, bounded, no-checkout
+transport. Host/mint policy comes from deployment configuration, never the request.
+Seller keys remain in the signer actor.
+
+Set `review.reviewers[relay]` to the same identity as `privacy.service_pubkey`; the
+worker signer must be that service key, which already has content and Git access.
+A different key fails closed without adding a recipient or using public transport.
+Worker JSON accepts `private_git_base` (default: relay HTTPS `/git/` origin) and
+`accepted_mints` (default: standard mint); match the clients and relay. Systemd exposes
+`privateGitBase` and `acceptedMints`. No credentials are generated or committed here.
+
+Results and errors are encrypted separately for authorized buyer, seller/requester
+and service recipients. Retry reuses the durable signed assessment and creates fresh
+wrappers; old wrapper IDs are not required. Public requests referencing private offers
+produce no public error response. Other gift-wrap domains and public results cannot
+satisfy private reviews.
+
+Serialized private request bundles are limited to 30 KiB and inner transport messages
+to 60 KiB, with the shared ciphertext limit also enforced. Oversized inputs and
+saturated recent-response windows fail closed, without truncation or public fallback.
+This does not promise flood resistance or review of arbitrarily large repositories.
 
 Before production rollout:
 
-1. Integrate and exercise the shared private-job transport before claiming private support.
+1. Deploy coordinated private-job/reviewer versions and matching identities; exercise
+   targeted/open-pool and private Git reviews before production cutover.
 2. Follow the [evaluation runbook](evaluations/execution-safety.md) and run labeled TypeSafe evaluation with explicitly approved spend and private credential
    provisioning; choose thresholds from measured false-positive/false-negative rates.
 3. Provision the live reviewer signer/provider and deploy relay kind admission plus
