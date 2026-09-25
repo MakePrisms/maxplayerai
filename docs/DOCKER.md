@@ -16,6 +16,28 @@ git delivery runs in-process and TLS roots are bundled.
   own), and the default mint `https://mint.minibits.cash/Bitcoin` with
   `allow_real_mints = true`.
 
+## Docker Desktop network-filter compatibility
+
+Seller sandboxes automatically probe the host kernel's traffic-control classifier before
+installing the job's egress policy. `flower` remains preferred. If the kernel reports
+`TC classifier not found` (as on affected macOS Docker Desktop versions), the seller
+probes and uses `u32` instead. No Docker privilege changes or operator setting are needed;
+the existing netfilter sidecar image can run either plan.
+
+The compatibility backend supports ordinary TCP, UDP, ICMP and IPv6 neighbour discovery.
+It preserves destination restrictions, DNS exceptions and the model proxy's exact port
+range. It is intentionally **stricter** than flower: IPv4 options and fragmented packets,
+IPv6 extension headers, and other IP protocols (including encapsulation) are dropped.
+Jobs requiring those packet formats need a kernel with working flower support. Public
+HTTPS, ordinary DNS and the model-proxy connection do not require those formats.
+
+The startup log names `classifier=flower` or `classifier=u32` only after the installed
+rules have been independently read back and verified. Probe failures, unsupported rules,
+partial installation and readback mismatches still prevent the seller from advertising.
+If both classifiers fail, the error names both attempts; network containment is never
+silently disabled. Capability probes use disposable isolated namespaces, not the job's
+namespace, so fallback cannot stack rules on a partially installed policy.
+
 ## Build
 
 ```bash

@@ -2949,7 +2949,25 @@ async fn establish_with(
     let dev = egress_device(&holder, sidecar_image).await?;
     let iface = crate::sandbox_iface::IfacePlan::derive(&dev, &policy)
         .map_err(|error| format!("the egress filter plan for {dev} could not be rendered — {error}"))?;
-    let (iface_plan, iface_expected) = crate::sandbox_iface::plan_stdin(&iface);
+    // Probe outside the job namespace: a failed flower attempt must not leave a partial
+    // production plan behind. Both containers use this host's kernel and the same image.
+    use crate::sandbox_iface::{self, IfaceClassifier};
+    let flower_probe = probe_iface_classifier(&holder, sidecar_image, IfaceClassifier::Flower).await;
+    let u32_probe = if flower_probe.as_ref().err().is_some_and(|e| sandbox_iface::missing_flower(e)) {
+        Some(probe_iface_classifier(&holder, sidecar_image, IfaceClassifier::U32).await)
+    } else { None };
+    let classifier = sandbox_iface::select_classifier(flower_probe, u32_probe)?;
+    let classifier_attempts = match classifier {
+        IfaceClassifier::Flower => "flower",
+        IfaceClassifier::U32 => "flower (unavailable), then u32",
+    };
+    let u32_plan = if classifier == IfaceClassifier::U32 {
+        Some(sandbox_iface::U32Plan::derive(&iface)
+            .map_err(|error| format!("u32 egress plan unsupported: {error}"))?)
+    } else { None };
+    let (iface_plan, iface_expected) = match &u32_plan {
+        Some(plan) => plan.plan_stdin(), None => sandbox_iface::plan_stdin(&iface),
+    };
     let (iface_applied, _) = run_sidecar(
         &holder,
         "iface",
@@ -2959,7 +2977,7 @@ async fn establish_with(
     .await
     .map_err(|error| {
         format!(
-            "egress filters were not installed on {dev} — {error} (the applier's exit 6 means this \
+            "egress filters were not installed on {dev} (tried {classifier_attempts}) — {error} (the applier's exit 6 means this \
              sidecar image shipped without iproute2, so no job can be contained by this build; its \
              exit 3 means the interface is PARTIALLY filtered and the namespace is being destroyed \
              rather than retried)"
@@ -2991,11 +3009,29 @@ async fn establish_with(
     )
     .await
     .map_err(|error| format!("could not read the egress filters back from {dev} — {error}"))?;
-    iface.verify_readback(&iface_readback).map_err(|error| {
-        format!("egress filtering did not verify on {dev} after installation — {error}")
+    match &u32_plan {
+        Some(plan) => plan.verify_readback(&iface_readback),
+        None => iface.verify_readback(&iface_readback),
+    }.map_err(|error| {
+        format!("egress filtering ({classifier:?}) did not verify on {dev} after installation — {error}")
     })?;
+    eprintln!("[sandbox] egress containment verified on {dev}: classifier={}{}", classifier.name(),
+        if u32_plan.is_some() { " (compatibility mode: basic TCP/UDP/ICMP; options, fragments and encapsulation denied)" } else { "" });
 
     Ok(Containment { holder, proxy_host, egress_dev: dev })
+}
+
+#[cfg(feature = "acp")]
+async fn probe_iface_classifier(
+    holder: &NetnsHolder, image: &str, classifier: crate::sandbox_iface::IfaceClassifier,
+) -> Result<(), String> {
+    let (count, _) = run_sidecar(holder, "classifier-probe",
+        crate::sandbox_iface::classifier_probe_argv(holder.name(), image),
+        Some(crate::sandbox_iface::classifier_probe_plan(classifier))).await?;
+    if count.trim() != "2" {
+        return Err(format!("{} probe applied {count:?} steps, expected 2", classifier.name()));
+    }
+    Ok(())
 }
 
 /// Which link inside the holder's namespace the job's packets leave by — measured from the
