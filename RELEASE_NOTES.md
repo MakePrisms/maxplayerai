@@ -1,3 +1,22 @@
+## v0.6.0-rc2
+
+Second release candidate for 0.6.0. This is a prerelease for testing, not a
+replacement for stable v0.5.11. Install with `npm install -g maxplayer@rc`.
+
+### Changes since v0.6.0-rc1
+
+- Fix startup failure when reviewer configuration contains relay URL map keys (#1045).
+- Supply the deployed Maxplayer reviewer key by default for the Maxplayer relay.
+  Explicit reviewer settings, empty reviewer maps, and disabled reviews are preserved.
+- Fix the shell installer rejecting release binaries whose version includes a commit SHA.
+  Incorrect versions and malformed build stamps remain rejected.
+- Ignore dormant fallback tunnels when selecting Docker Desktop job egress (#1044).
+
+GitHub remains a prerelease, npm uses the `rc` dist-tag, and sandbox images
+use the versioned RC tag without moving stable `latest`.
+Private-job reviews still require the reviewer identity to match the configured
+private content-service identity; this candidate does not change that requirement.
+
 ## v0.6.0-rc1
 
 First release candidate for 0.6.0, based on main at `99e3c5f`.

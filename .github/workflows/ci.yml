@@ -240,6 +240,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - run: ./scripts/verify-install-version.sh
       - run: ./scripts/verify-release-workflow.sh
       # The tree-side platform surfaces — the npm payload packages, the launcher's pins and its
       # runtime resolver — held to .github/release-platforms.json on every pull request.

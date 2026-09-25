@@ -63,6 +63,20 @@ REPO="MakePrisms/maxplayerai"
 # first word this binary prints when asked for its version — asserted below, not assumed.
 BIN_NAME="maxplayer"
 
+# Accept legacy version-only output and the release build's full commit stamp.
+# Keep the version exact; arbitrary suffixes must not disguise a different build.
+version_matches() {
+    [ "$1" = "$BIN_NAME $VERSION" ] && return 0
+    _version_rest=${1#"$BIN_NAME $VERSION ("}
+    [ "$_version_rest" != "$1" ] || return 1
+    _version_stamp=${_version_rest%")"}
+    [ "$_version_stamp" != "$_version_rest" ] || return 1
+    case "$_version_stamp" in
+        *[!0-9a-f]*) return 1 ;;
+    esac
+    [ "${#_version_stamp}" -eq 40 ]
+}
+
 say()  { printf '%s\n' "$*"; }
 warn() { printf 'install.sh: %s\n' "$*" >&2; }
 die()  { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
@@ -439,7 +453,7 @@ main() {
     # wrong build: the download matched a checksum, so every layer below this one already agrees.
     reported="$("$unpacked" version 2>/dev/null)" \
         || die "the downloaded $BIN_NAME did not run on this machine — nothing has been installed"
-    [ "$reported" = "$BIN_NAME $VERSION" ] \
+    version_matches "$reported" \
         || die "the downloaded binary reports '$reported' but this is meant to be $BIN_NAME $VERSION — nothing has been installed"
 
     mkdir -p "$bin_dir" || die "could not create $bin_dir"
