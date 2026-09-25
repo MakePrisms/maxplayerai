@@ -301,6 +301,9 @@ pub struct Link {
     pub kind: Option<String>,
     pub loopback: bool,
     pub up: bool,
+    pub operstate: Option<String>,
+    /// Includes named or unreadable peers, not only numeric `@ifN` peers.
+    pub has_peer: bool,
 }
 
 /// `docker run` argv that enumerates the links inside the holder's namespace.
@@ -354,19 +357,29 @@ pub fn parse_links(stdout: &str) -> Result<Vec<Link>, String> {
             .ok_or(format!("line {at}: link record names no ifindex: {line:?}"))?;
         let name_field = head
             .next()
-            .ok_or(format!("line {at}: link record names no interface: {line:?}"))?
+            .ok_or(format!(
+                "line {at}: link record names no interface: {line:?}"
+            ))?
             .trim();
         if name_field.is_empty() {
-            return Err(format!("line {at}: link record has an empty interface name: {line:?}"));
+            return Err(format!(
+                "line {at}: link record has an empty interface name: {line:?}"
+            ));
         }
         let rest = head.next().unwrap_or_default();
         let (name, peer_index) = match name_field.split_once('@') {
             Some((name, peer)) => (
                 name.to_owned(),
-                peer.strip_prefix("if").and_then(|digits| digits.parse().ok()),
+                peer.strip_prefix("if")
+                    .and_then(|digits| digits.parse().ok()),
             ),
             None => (name_field.to_owned(), None),
         };
+        let flags = rest
+            .strip_prefix('<')
+            .and_then(|rest| rest.split_once('>'))
+            .map(|(flags, _)| flags)
+            .ok_or_else(|| format!("line {at}: link record has unreadable flags: {line:?}"))?;
         let tokens: Vec<&str> = rest.split_whitespace().collect();
         if !tokens.iter().any(|token| token.starts_with("link/")) {
             return Err(format!(
@@ -383,10 +396,14 @@ pub fn parse_links(stdout: &str) -> Result<Vec<Link>, String> {
                 .find(|kind| tokens.contains(kind))
                 .map(|kind| (*kind).to_owned()),
             loopback: tokens.iter().any(|token| *token == "link/loopback"),
-            up: rest
-                .split_once('>')
-                .map(|(flags, _)| flags.contains(",UP") || flags.contains("<UP"))
-                .unwrap_or(false),
+            up: flags.split(',').any(|flag| flag == "UP"),
+            operstate: tokens
+                .windows(2)
+                .find(|pair| pair[0] == "state")
+                .map(|pair| pair[1].to_owned()),
+            has_peer: name_field
+                .split_once('@')
+                .is_some_and(|(_, peer)| peer != "NONE"),
         });
     }
     Ok(links)
@@ -394,7 +411,27 @@ pub fn parse_links(stdout: &str) -> Result<Vec<Link>, String> {
 
 /// The link kinds `-details` may print that this module needs to recognise. A kind it does not know
 /// parses as `None`, which fails the veth check below rather than passing it.
-const LINK_KINDS: &[&str] = &["veth", "bridge", "bond", "tun", "macvlan", "ipvlan", "vlan", "dummy"];
+const LINK_KINDS: &[&str] = &[
+    "veth", "bridge", "bond", "tun", "macvlan", "ipvlan", "vlan", "dummy", "ipip", "gre", "gretap",
+    "erspan", "vti", "vti6", "sit", "ip6tnl", "ip6gre",
+];
+
+impl Link {
+    /// Linux creates dormant fallback tunnels in new namespaces when their modules are loaded
+    /// (notably in Docker Desktop's VM). They are not additional usable egress paths. The job
+    /// has no NET_ADMIN to activate them; never ignore a live, peer-attached, or unknown link.
+    fn is_inactive_fallback_tunnel(&self) -> bool {
+        matches!(
+            self.kind.as_deref(),
+            Some(
+                "ipip" | "gre" | "gretap" | "erspan" | "vti" | "vti6" | "sit" | "ip6tnl" | "ip6gre"
+            )
+        ) && !self.up
+            && self.operstate.as_deref() == Some("DOWN")
+            && !self.has_peer
+            && self.peer_index.is_none()
+    }
+}
 
 /// Choose the interface to filter, and refuse unless it is provably the job's own veth.
 ///
@@ -407,12 +444,16 @@ const LINK_KINDS: &[&str] = &["veth", "bridge", "bond", "tun", "macvlan", "ipvla
 /// which would be a host-global mutation this design forbids outright, so every ambiguity refuses.
 pub fn select_egress_link(links: &[Link]) -> Result<Link, String> {
     if links.is_empty() {
-        return Err("the namespace reported no links at all — the probe did not see a namespace"
-            .to_owned());
+        return Err(
+            "the namespace reported no links at all — the probe did not see a namespace".to_owned(),
+        );
     }
-    // A namespace holding one job has exactly two links: loopback and one veth. The host's has many,
+    // A job has loopback and one veth, plus possibly dormant kernel fallback tunnels. A host has many,
     // and `docker0` or any bridge among them is the loudest possible "this is not a job namespace".
-    if let Some(bridge) = links.iter().find(|link| link.kind.as_deref() == Some("bridge")) {
+    if let Some(bridge) = links
+        .iter()
+        .find(|link| link.kind.as_deref() == Some("bridge"))
+    {
         return Err(format!(
             "the namespace contains a bridge ({}) — this is a host or shared namespace, not a job's, \
              and nothing here may filter it",
@@ -420,12 +461,27 @@ pub fn select_egress_link(links: &[Link]) -> Result<Link, String> {
         ));
     }
     if !links.iter().any(|link| link.loopback) {
-        return Err("the namespace has no loopback link, so it is not a namespace this build made"
-            .to_owned());
+        return Err(
+            "the namespace has no loopback link, so it is not a namespace this build made"
+                .to_owned(),
+        );
     }
 
-    let candidates: Vec<&Link> = links.iter().filter(|link| !link.loopback).collect();
+    let candidates: Vec<&Link> = links
+        .iter()
+        .filter(|link| !link.loopback && !link.is_inactive_fallback_tunnel())
+        .collect();
+    let excluded = links
+        .iter()
+        .filter(|link| !link.loopback && link.is_inactive_fallback_tunnel())
+        .count();
     let [candidate] = candidates.as_slice() else {
+        if candidates.is_empty() && excluded > 0 {
+            return Err(format!(
+                "the namespace contains only loopback and {excluded} inactive kernel fallback tunnel \
+                 devices (DOWN, no UP flag, no peer); no job veth remains to filter"
+            ));
+        }
         return Err(format!(
             "expected exactly one non-loopback link in the job's namespace, found {}: {:?} — \
              filtering one of several would leave the others open",
@@ -444,13 +500,13 @@ pub fn select_egress_link(links: &[Link]) -> Result<Link, String> {
             return Err(format!(
                 "{} names no peer index, so it is not one end of a veth pair this namespace owns",
                 candidate.name
-            ))
+            ));
         }
         Some(peer) if peer == candidate.index => {
             return Err(format!(
                 "{} claims itself as its own veth peer (ifindex {peer})",
                 candidate.name
-            ))
+            ));
         }
         Some(_) => {}
     }
@@ -1241,6 +1297,132 @@ filter protocol ipv6 pref 111 flower chain 0 handle 0x1
 1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000\\    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00 promiscuity 0 minmtu 0 maxmtu 0 numtxqueues 1 numrxqueues 1 gso_max_size 65536 gso_max_segs 65535 
 107: eth0@if108: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP mode DEFAULT group default \\    link/ether 02:42:ac:11:00:02 brd ff:ff:ff:ff:ff:ff link-netnsid 0 promiscuity 0 minmtu 68 maxmtu 65535 veth numtxqueues 4 numrxqueues 4 gso_max_size 65536 gso_max_segs 65535 
 ";
+
+    // Docker Desktop/LinuxKit shape, including Ethernet-style tunnel fallback devices.
+    const FALLBACK_TUNNELS: &str = "\
+2: tunl0@NONE: <NOARP> mtu 1480 qdisc noop state DOWN mode DEFAULT group default \\    link/ipip 0.0.0.0 brd 0.0.0.0 promiscuity 0 ipip remote any local any ttl inherit
+3: gre0@NONE: <NOARP> mtu 1476 qdisc noop state DOWN mode DEFAULT group default \\    link/gre 0.0.0.0 brd 0.0.0.0 promiscuity 0 gre remote any local any ttl inherit
+4: gretap0@NONE: <BROADCAST,MULTICAST> mtu 1462 qdisc noop state DOWN mode DEFAULT group default \\    link/ether 00:00:00:00:00:00 brd ff:ff:ff:ff:ff:ff promiscuity 0 gretap remote any local any ttl inherit
+5: erspan0@NONE: <BROADCAST,MULTICAST> mtu 1450 qdisc noop state DOWN mode DEFAULT group default \\    link/ether 00:00:00:00:00:00 brd ff:ff:ff:ff:ff:ff promiscuity 0 erspan remote any local any ttl inherit
+6: ip_vti0@NONE: <NOARP> mtu 1480 qdisc noop state DOWN mode DEFAULT group default \\    link/ipip 0.0.0.0 brd 0.0.0.0 promiscuity 0 vti remote any local any
+7: ip6_vti0@NONE: <NOARP> mtu 1364 qdisc noop state DOWN mode DEFAULT group default \\    link/tunnel6 :: brd :: promiscuity 0 vti6 remote any local any
+8: sit0@NONE: <NOARP> mtu 1480 qdisc noop state DOWN mode DEFAULT group default \\    link/sit 0.0.0.0 brd 0.0.0.0 promiscuity 0 sit remote any local any ttl 64
+9: ip6tnl0@NONE: <NOARP> mtu 1452 qdisc noop state DOWN mode DEFAULT group default \\    link/tunnel6 :: brd :: promiscuity 0 ip6tnl remote any local any
+10: ip6gre0@NONE: <NOARP> mtu 1448 qdisc noop state DOWN mode DEFAULT group default \\    link/gre6 :: brd :: promiscuity 0 ip6gre remote any local any
+";
+
+    #[test]
+    fn docker_desktop_fallback_tunnels_leave_only_the_job_veth() {
+        let listing = format!("{HOLDER_LINKS}{FALLBACK_TUNNELS}");
+        let links = links_of(&listing);
+        assert_eq!(links.len(), 11);
+        assert_eq!(
+            select_egress_link(&links).unwrap(),
+            select_egress_link(&links_of(HOLDER_LINKS)).unwrap()
+        );
+        assert_eq!(
+            links_of(FALLBACK_TUNNELS)
+                .iter()
+                .map(|link| link.kind.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "ipip", "gre", "gretap", "erspan", "vti", "vti6", "sit", "ip6tnl", "ip6gre"
+            ]
+        );
+        // Recognition is by kind, never by a privileged interface-name allowlist.
+        assert!(
+            select_egress_link(&links_of(&listing.replace("gre0@NONE", "renamed@NONE"))).is_ok()
+        );
+    }
+
+    #[test]
+    fn docker_desktop_tunnels_with_up_flag_state_or_peer_are_not_excluded() {
+        for (before, after) in [
+            ("<NOARP>", "<NOARP,UP>"), // even with operstate DOWN
+            ("state DOWN", "state UP"),
+            ("state DOWN", "state UNKNOWN"),
+            ("state DOWN", ""),
+            ("@NONE", "@if42"),
+            ("@NONE", "@eth1"), // a named peer is not absence of a peer
+            ("@NONE", "@ifbroken"),
+        ] {
+            let listing = format!("{HOLDER_LINKS}{}", FALLBACK_TUNNELS.replace(before, after));
+            let error = select_egress_link(&links_of(&listing)).expect_err(after);
+            assert!(
+                error.contains("filtering one of several"),
+                "{after}: {error}"
+            );
+        }
+        let listing = format!(
+            "{HOLDER_LINKS}{}",
+            FALLBACK_TUNNELS.replace("<NOARP>", "NOARP")
+        );
+        assert!(
+            parse_links(&listing).is_err(),
+            "missing flags cannot prove a link down"
+        );
+    }
+
+    #[test]
+    fn one_active_gre_among_eight_dormant_tunnels_still_refuses() {
+        let tunnels = FALLBACK_TUNNELS.replace("3: gre0@NONE: <NOARP>", "3: gre0@NONE: <NOARP,UP>");
+        let error = select_egress_link(&links_of(&format!("{HOLDER_LINKS}{tunnels}"))).unwrap_err();
+        assert!(error.contains("found 2"), "{error}");
+        assert!(error.contains("gre0"), "{error}");
+    }
+
+    #[test]
+    fn docker_desktop_tunnels_do_not_hide_other_namespace_refusals() {
+        let listing = format!("{HOLDER_LINKS}{FALLBACK_TUNNELS}");
+        let second_veth = HOLDER_LINKS
+            .lines()
+            .nth(1)
+            .unwrap()
+            .replace("eth0@if108", "eth1@if110");
+        assert!(
+            select_egress_link(&links_of(&format!("{listing}{second_veth}\n")))
+                .unwrap_err()
+                .contains("filtering one of several")
+        );
+        for (before, after, expected) in [
+            (" veth ", " bridge ", "bridge"),
+            (" veth ", " dummy ", "not a veth"),
+            ("eth0@if108", "eth0", "no peer index"),
+            (
+                "ip6gre remote",
+                "unknown_kind remote",
+                "filtering one of several",
+            ),
+        ] {
+            assert!(
+                select_egress_link(&links_of(&listing.replace(before, after)))
+                    .unwrap_err()
+                    .contains(expected),
+                "{after}"
+            );
+        }
+        assert!(
+            select_egress_link(&links_of(
+                &listing.lines().skip(1).collect::<Vec<_>>().join("\n")
+            ))
+            .unwrap_err()
+            .contains("no loopback")
+        );
+    }
+
+    #[test]
+    fn a_namespace_with_only_fallback_tunnels_explains_the_missing_veth() {
+        let listing = format!(
+            "{}\n{FALLBACK_TUNNELS}",
+            HOLDER_LINKS.lines().next().unwrap()
+        );
+        let error = select_egress_link(&links_of(&listing)).unwrap_err();
+        assert!(
+            error.contains("9 inactive kernel fallback tunnel"),
+            "{error}"
+        );
+        assert!(error.contains("no job veth"), "{error}");
+    }
 
     /// The host's own namespace, which this must never filter: a physical interface and a bridge.
     const HOST_LINKS: &str = "\
