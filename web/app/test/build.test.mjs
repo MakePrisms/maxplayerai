@@ -91,7 +91,7 @@ test("every asset URL in shipped HTML and CSS carries the deploy stamp", () => {
   assert.match(stamp, /^[0-9a-f]{12}$/);
 
   const html = readFileSync(join(root, "dist", "index.html"), "utf8");
-  for (const page of ["index.html", "market.html"]) {
+  for (const page of ["index.html", "market.html", "sell.html"]) {
     const pageHtml = readFileSync(join(root, "dist", page), "utf8");
     for (const asset of ["styles.css", "fonts.css", "terminal.js"]) {
       assert.ok(pageHtml.includes(`./${asset}?v=${stamp}`), `${asset} is stamped in ${page}`);
@@ -151,6 +151,10 @@ test("the live market ships at /market and the homepage links it", () => {
   const home = readFileSync(join(root, "dist", "index.html"), "utf8");
   assert.ok(!home.includes('id="market"'), "the homepage carries no board");
   assert.ok(home.includes('href="/market"'), "the homepage links the live market");
+  assert.ok(home.includes('href="/sell"'), "the homepage links the seller page");
+  const sell = readFileSync(join(root, "dist", "sell.html"), "utf8");
+  assert.ok(!sell.includes('id="market"'), "the seller page carries no board");
+  assert.ok(sell.includes("follow the seller instructions"), "the seller page hands out the seller line");
   // Old #market deep links (skill.md, llms.txt, shared URLs) still land on the board.
   assert.match(home, /location\.hash === "#market"\) location\.replace\("\/market"\)/);
 });
