@@ -1624,7 +1624,7 @@ pub fn default_hop_fee_buffer_multiplier() -> u64 {
 /// defaults. The private-content default-loading regression checks this against the
 /// shared wire protocol's service identity.
 pub const DEFAULT_PRIVACY_SERVICE_PUBKEY: &str =
-    "7e6b3b0592e091fe2b5c2438d0cda5438fbcbea5236eae7e1f022d2ea2858aa7";
+    "31b18b42bcef9842c10e518834d32da2a0f8f6f8f3758124e25cc392ada1fe5c";
 
 /// Private-job defaults and deployment-owned content recipient/hosting policy.
 /// These are read at startup like the rest of the home config. No private keys are stored here.

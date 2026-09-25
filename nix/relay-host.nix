@@ -92,8 +92,8 @@
   services.maxplayer.reviewer = {
     enable = true;
     relayUrl = config.services.maxplayer.relay.relayUrl;
-    # Existing content-service key, NOT a separately generated reviewer identity.
-    # Keep the legacy credential path so existing deployments can provision in place.
+    # Existing reviewer key, reused as the shared private-content service identity.
+    # Preserve the deployed signer at this path; do not generate or replace its key.
     signerFile = "/var/lib/secrets/maxplayer-reviewer-signing-key";
     providerKeyFile = "/var/lib/secrets/typesafe-api-key";
   };
