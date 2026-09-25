@@ -33,7 +33,7 @@ serde_json = "1.0.140"
 # Layered config resolution (defaults -> file -> MAXPLAYER_* env). default-features off drops the
 # bundled format parsers (toml/yaml/json/…): the file layer is parsed by the `toml` crate we
 # already carry, and only the serde (`Config::try_from`) and `Environment` sources are used.
-config = { version = "0.15.25", default-features = false }
+config = { version = "0.15.25", default-features = false, features = ["json"] }
 # In-process seller push (libgit2, no system git). default-features off keeps the
 # `https`/`ssh` cargo features (and their openssl-sys / libssh2-sys) OUT — TLS is
 # supplied by our reqwest/rustls smart subtransport, so the build needs no openssl.
