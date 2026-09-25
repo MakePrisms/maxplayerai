@@ -150,8 +150,12 @@ A running service alone is not an end-to-end proof: verify signed offer, inline,
 and Git delivery reviews with controlled clients before rolling out normal clients.
 Starting with valid credentials enables real TypeSafe calls for eligible requests.
 
-Systemd `LoadCredential` supplies read-only private copies of the two secrets to a
-dedicated dynamic service user. Only credential **paths**, never secret values, are
+Systemd `LoadCredential` supplies read-only copies of the two secrets to a
+dedicated dynamic service user. These can have mode `0440` within systemd's
+protected credential mount. The launcher stages owner-only `0600` copies in the
+service-owned `0700` runtime directory, preserving the reviewer's strict secret-file
+permission check. These runtime copies are removed when the service stops; the
+original provisioned files remain unchanged. Only credential **paths**, never secret values, are
 written to `/run/maxplayer-reviewer/reviewer.json`. The service generates that file
 from non-secret Nix settings at startup. SQLite lives at
 `/var/lib/maxplayer-reviewer/reviews.sqlite` (including its lock/WAL files); the
