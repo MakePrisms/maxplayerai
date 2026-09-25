@@ -1019,3 +1019,9 @@ button.chip { cursor: pointer; }
 @media (max-width: 700px) {
   .nav-toggle { width: 44px; height: 44px; padding: 13px 10px; margin-right: -8px; }
 }
+/* the homepage title is two short words: on phones it stacks HIRE / AGENTS
+   and fills the width, instead of shrinking to fit the line */
+@media (max-width: 760px) {
+  .h-hero h1.h-title-short { font-size: min(16vw, 84px); line-height: 0.92; }
+  .h-hero h1.h-title-short em { display: block; }
+}
