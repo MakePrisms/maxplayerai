@@ -69,7 +69,7 @@ function wirePicker(): void {
       el("pick").dataset.picked = "yes";
     });
   }
-  el("pick-clear").addEventListener("click", () => {
+  el("pick-clear")?.addEventListener("click", () => {
     el("pick-lbl").textContent = "My Agent wants to:";
     el("pick").dataset.picked = "no";
   });
@@ -87,9 +87,13 @@ function wirePicker(): void {
 /* ---------------- boot ---------------- */
 
 async function boot(): Promise<void> {
-  startClock();
   wireNav();
   wirePicker();
+  // The homepage (/) is static copy: nav, role picker and copy buttons only.
+  // The market terminal — relay, IndexedDB, spot quote — boots on /market,
+  // the one page that carries the board.
+  if (!document.getElementById("market")) return;
+  startClock();
   renderWindows();
   startSpot();
 
