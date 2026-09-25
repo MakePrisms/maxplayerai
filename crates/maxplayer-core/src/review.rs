@@ -14,10 +14,10 @@ pub const MAX_FILES: usize = 256;
 pub const MAX_REVIEW_BYTES: usize = 16 * 1024;
 pub const CLASSIFIER: &str = "execution-safety";
 pub const CLASSIFIER_VERSION: &str = "1";
-/// Relay-owner reviewer identity, distributed with the client rather than
-/// trusted from incoming events. Applies only to the default Maxplayer relay.
-pub const DEFAULT_REVIEWER_PUBKEY: &str =
-    "31b18b42bcef9842c10e518834d32da2a0f8f6f8f3758124e25cc392ada1fe5c";
+/// The reviewer is the private-content service, not a separate identity.
+/// Keep this compatibility alias tied to the service default so public and private
+/// reviews cannot drift. Trust applies only to the default Maxplayer relay.
+pub const DEFAULT_REVIEWER_PUBKEY: &str = crate::home::DEFAULT_PRIVACY_SERVICE_PUBKEY;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]

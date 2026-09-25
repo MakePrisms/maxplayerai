@@ -36,7 +36,7 @@ Explicit reviewer maps (including an empty map), keys, skips, thresholds, and
 disabled checks are preserved; upgrading does not rewrite them. Other relays
 still require their own trusted reviewer entry and do not inherit this identity.
 
-The built-in public-review settings are:
+The built-in review settings use the same identity as the private-content service:
 
 ```toml
 [review]
@@ -48,7 +48,7 @@ reject_at_or_above_ppm = 500000
 timeout_seconds = 30
 
 [review.reviewers]
-"wss://relay.maxplayer.ai" = "31b18b42bcef9842c10e518834d32da2a0f8f6f8f3758124e25cc392ada1fe5c"
+"wss://relay.maxplayer.ai" = "7e6b3b0592e091fe2b5c2438d0cda5438fbcbea5236eae7e1f022d2ea2858aa7"
 ```
 
 `500000` means unsafe probability >= 0.50 blocks. This remains **uncalibrated**, not
@@ -57,10 +57,28 @@ Without a configured key, default-enabled reviews stop new claims/acceptances wi
 an explicit error. Distribute keys and deploy the reviewer before enabling clients.
 Changing configuration still requires restarting the client/daemon.
 
-This default does not reconfigure the private-content service: private reviews
-also require the reviewer to equal `privacy.service_pubkey` and a deployed
-compatible private review service. A public reviewer default alone does not
-establish that private integration.
+The default reviewer and `privacy.service_pubkey` are one service identity.
+The worker must hold that service's private key; matching public defaults do not
+provision it or prove a live private review. Self-hosted deployments must set both
+fields to their own service identity; custom relay trust is never inferred.
+
+### Upgrading from a separate reviewer identity
+
+1. Preserve the existing content-service key and back up the worker configuration
+   and signer securely. Do not generate another reviewer key or rotate the content
+   service: existing private jobs are encrypted to its identity.
+2. Provision the existing content-service private key as the worker's `signer_file`
+   (NixOS `services.maxplayer.reviewer.signerFile`), restart the worker, and verify
+   its public identity matches `privacy.service_pubkey`. Keep the relay key separate.
+3. Update explicit `[review.reviewers]` entries on buyers and sellers to that same
+   public identity, including clients using public jobs. Older persisted entries
+   are preserved, not silently overwritten by an upgrade. Fresh homes and omitted
+   reviewer maps use the unified default. Restart affected daemons/MCP processes.
+4. Verify a controlled private offer review, claim, delivery review and acceptance,
+   including private Git retrieval, plus a public review before broad rollout.
+
+Keep private visibility enabled. Changing defaults is not a live deployment, and
+changing client trust without switching the worker signer will block reviews.
 
 Explicit skips use the role flags or public-key lists, never display names. Local
 status records identify the subject and explain configuration/counterparty skips.
@@ -116,9 +134,9 @@ Example `reviewer.json` (paths are operator-managed; no credentials in this file
 }
 ```
 
-Secret files must be regular owner-private files (0600 or stricter). Provision a
-dedicated signer and distribute its **public** key to clients. Never put credentials
-in command arguments, public events, logs, or this repository. The database parent
+Secret files must be regular owner-private files (0600 or stricter). Provision the
+existing content-service signer and distribute its **public** key to clients. Never
+put credentials in command arguments, public events, logs, or this repository. The database parent
 must exist and be writable. Run the service under an operator-managed supervisor.
 Public and private per-job repositories are supported. Private review uses the existing
 content-service identity and repository ACL; it does not grant a new reviewer identity
@@ -140,13 +158,16 @@ Before applying that deployment, provision these files on the target using your
 secure secret-provisioning method. Keep their contents out of Git, Nix expressions,
 command arguments and logs. Both source files should be root-owned, mode `0600`:
 
-- `/var/lib/secrets/maxplayer-reviewer-signing-key`: a dedicated persistent Nostr
-  secret key (raw 64-character hex or supported Nostr secret encoding), **not** a
-  `NAME=value` environment file and not the relay's own key.
+- `/var/lib/secrets/maxplayer-reviewer-signing-key`: the **existing content-service
+  private key**, not a second reviewer identity (raw 64-character hex or supported
+  Nostr secret encoding). This legacy filename is retained for deployment compatibility;
+  `signerFile` may instead point directly at your securely provisioned service key.
+  It is **not** a `NAME=value` environment file or the relay's own key.
 - `/var/lib/secrets/typesafe-api-key`: the raw TypeSafe API key.
 
 Distribute only the reviewer's corresponding public key to clients. Ensure this
-identity can authenticate and read public Git repositories on the relay. Do not
+identity matches `privacy.service_pubkey` and can authenticate and read authorized
+private as well as public Git repositories on the relay. Do not
 rotate the signing key on every deploy; clients trust that specific identity.
 
 Deploy the reviewed revision through the existing NixOS host flow:

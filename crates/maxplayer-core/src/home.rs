@@ -3414,6 +3414,14 @@ mod tests {
         assert!(home.config.review.buyer_delivery);
         assert_eq!(home.config.review.reviewers.get(DEFAULT_RELAY_URL).unwrap(),
                    crate::review::DEFAULT_REVIEWER_PUBKEY);
+        assert_eq!(
+            home.config.review.reviewers.get(DEFAULT_RELAY_URL),
+            home.config.privacy.service_pubkey.as_ref(),
+            "fresh private jobs must use the same service and reviewer identity"
+        );
+        #[cfg(feature = "gateway")]
+        assert_eq!(DEFAULT_PRIVACY_SERVICE_PUBKEY,
+                   maxplayer_private_protocol::DEFAULT_SERVICE_PUBKEY);
         reload_config(&mut home).expect("reload written config including literal URL");
         assert_eq!(home.config.review, crate::review::ReviewConfig::default());
     }
