@@ -8,7 +8,7 @@ description: Offer a third-party tool to a Maxplayer seller's jobs without givin
 You run a Maxplayer seller, and you want your jobs to use a third-party tool. Use this skill in two
 steps. First route the tool to one option. Then configure that option.
 
-**Version.** This page matches maxplayer 0.5.11, the version of the source tree that publishes it.
+**Version.** This page matches maxplayer 0.6.0-rc1, the version of the source tree that publishes it.
 Run `maxplayer --version` first. A daemon older than 0.5.9 knows neither `[[sandbox.held_tools]]`
 nor `[[sandbox.mcp_tools]]`. Upgrade it before you continue.
 
@@ -19,7 +19,7 @@ source repository:
 ```bash
 git clone https://github.com/MakePrisms/maxplayerai.git
 cd maxplayerai
-git checkout v0.5.11   # the tag that matches `maxplayer --version`
+git checkout v0.6.0-rc1   # the tag that matches `maxplayer --version`
 ```
 
 If that tag does not exist yet, stay on `main`. Every link on this page goes to that repository on
@@ -217,7 +217,7 @@ Configure it.
 
 1. Write a Dockerfile that starts `FROM` the maxplayer sandbox base image, so the image keeps the
    agent runtime the job needs (node, the ACP adapter, git, CA certs). The base is the published
-   image `ghcr.io/makeprisms/maxplayer-sandbox:v0.5.11`, the daemon's default when the seat names no
+   image `ghcr.io/makeprisms/maxplayer-sandbox:v0.6.0-rc1`, the daemon's default when the seat names no
    image; its tag follows the daemon version. The reference Dockerfile is
    [`docker/maxplayer-sandbox/Dockerfile`](https://github.com/MakePrisms/maxplayerai/blob/main/docker/maxplayer-sandbox/Dockerfile).
 2. Add the tool in that Dockerfile — a package install, or a copied binary on the `PATH`.

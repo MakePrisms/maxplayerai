@@ -30,7 +30,7 @@ const SKILL_FILE = join(root, SKILL_PATH.slice(1));
  */
 const FLOOR = "0.5.9";
 
-const version = /^version\s*=\s*"([0-9.]+)"/m.exec(readFileSync(join(REPO, "Cargo.toml"), "utf8"))[1];
+const version = /^version\s*=\s*"(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)"/m.exec(readFileSync(join(REPO, "Cargo.toml"), "utf8"))[1];
 const page = readFileSync(SKILL_FILE, "utf8");
 const escaped = (v) => v.replace(/\./g, "\\.");
 
@@ -46,7 +46,7 @@ test("the page pins this tree's version at every site a reader acts on", () => {
 test("the page states no version other than this tree's and the fixed floor", () => {
   let checked = 0;
   page.split("\n").forEach((line, index) => {
-    for (const match of line.matchAll(/\b(\d+\.\d+\.\d+)\b/g)) {
+    for (const match of line.matchAll(/\b(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\b/g)) {
       checked += 1;
       const stated = match[1];
       assert.ok(stated === version || stated === FLOOR,

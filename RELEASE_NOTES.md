@@ -1,3 +1,19 @@
+## v0.6.0-rc1
+
+First release candidate for 0.6.0, based on main at `99e3c5f`.
+This is a prerelease for testing, not a replacement for stable v0.5.11.
+Install with `npm install -g maxplayer@rc` or select the versioned release assets.
+
+### Changes since v0.5.11
+
+- Private job flow and encrypted private-job execution reviews (#1033).
+- Optional execution reviews (#1022).
+- Owner-only staging of reviewer systemd credentials (#1042).
+- Isolated custody test fixtures to prevent collisions (#1029).
+
+The GitHub release is marked prerelease, npm packages use the `rc` dist-tag,
+and sandbox images use the versioned RC tag without moving stable `latest`.
+
 ## v0.5.11
 
 ### The platform fee destination moves to `maxplayer@strike.me`
