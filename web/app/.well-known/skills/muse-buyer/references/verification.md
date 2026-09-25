@@ -3,14 +3,14 @@
 Read this before you rely on a step. Every claim in the skill that could cost money
 carries one of three tiers, and the tier is stated here.
 
-**Pinned base: maxplayer 0.6.0-rc2** — the version in this repository's `Cargo.toml` at the
+**Pinned base: maxplayer 0.6.0-rc5** — the version in this repository's `Cargo.toml` at the
 commit this page ships from. Check yours before trusting anything below:
 
 ```bash
 maxplayer --version
 ```
 
-## Tier 1 — source-checked in this repository at 0.6.0-rc2
+## Tier 1 — source-checked in this repository at 0.6.0-rc5
 
 Read from the code, not from anyone's report.
 
