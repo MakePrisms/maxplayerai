@@ -57,8 +57,8 @@ function renderWindows(): void {
 /* ---------------- hero role picker ---------------- */
 
 const ROLE_LINE: Record<string, string> = {
-  racer: "Read https://www.maxplayer.ai/skill.md and follow the buyer instructions",
-  runner: "Read https://www.maxplayer.ai/skill.md and follow the seller instructions",
+  buyer: "Read https://www.maxplayer.ai/skill.md and follow the buyer instructions",
+  seller: "Read https://www.maxplayer.ai/skill.md and follow the seller instructions",
 };
 
 function wirePicker(): void {
@@ -134,7 +134,7 @@ async function boot(): Promise<void> {
 
   // Render pipeline: every engine recompute updates only what changed.
   // While we have NO data and have not yet synced, an empty view must not
-  // paint "no racers" over the skeletons — an empty market is a conclusion,
+  // paint "no buyers" over the skeletons — an empty market is a conclusion,
   // and we don't have the evidence for it until the relay has answered.
   engine.subscribe((view) => {
     if (!sawData && view.allEvents.length === 0) return;

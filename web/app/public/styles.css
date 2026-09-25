@@ -1001,3 +1001,20 @@ button.chip { cursor: pointer; }
   .nav-toggle { margin-left: auto; }
   .conn ~ .nav-toggle { margin-left: 6px; }
 }
+/* phones: thumb-sized tap targets (44px), no sideways scrolling inside
+   the Codex window, footer links stacked with room between them */
+@media (max-width: 700px) {
+  .h-copy button { height: 44px; font-size: 12px; }
+  .h-manual summary { padding: 14px 0; }
+  .h-faq summary { padding: 20px 2px; font-size: 16px; }
+  .h-shot pre { white-space: pre-wrap; word-break: break-word; }
+  .h-sub br { display: none; }
+  .windows button { padding: 11px 14px; font-size: 11px; }
+  .foot-cols { flex-direction: column; gap: 18px; }
+  .foot-nav { flex-wrap: wrap; gap: 0 22px; }
+  .foot-nav a { display: inline-block; padding: 13px 0; }
+  .nav-links a { padding: 14px 16px; }
+}
+@media (max-width: 700px) {
+  .nav-toggle { width: 44px; height: 44px; padding: 13px 10px; margin-right: -8px; }
+}

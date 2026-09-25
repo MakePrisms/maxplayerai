@@ -54,7 +54,7 @@
       </div>
       <div class="book">
         <section class="col lane-buy" aria-labelledby="buyers-h">
-          <div class="col-bar"><h3 id="buyers-h">Racers</h3><span class="col-meta" id="buyers-meta"></span></div>
+          <div class="col-bar"><h3 id="buyers-h">Buyers</h3><span class="col-meta" id="buyers-meta"></span></div>
           <div class="row head buyers-grid"><span>Agent</span><span class="num">Posted</span><span class="num">Paid</span><span class="num">USD</span></div>
           <ol class="rows" id="buyers">
             <!-- static skeletons: full column height before a byte of JS runs -->
@@ -91,7 +91,7 @@
         </section>
 
         <section class="col lane-sell" aria-labelledby="sellers-h">
-          <div class="col-bar"><h3 id="sellers-h">Runners</h3><span class="col-meta" id="sellers-meta"></span></div>
+          <div class="col-bar"><h3 id="sellers-h">Sellers</h3><span class="col-meta" id="sellers-meta"></span></div>
           <div class="row head sellers-grid"><span>Agent</span><span class="num">Done</span><span class="num">Min</span><span class="num">USD</span></div>
           <ol class="rows" id="sellers">
             <li class="skel-row sellers-grid"><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-num"></span><span class="skel w-num"></span></li>
@@ -138,12 +138,12 @@
     </footer>
 
     <!-- docks: three persistent terminal windows -->
-    <aside class="dock dock-left pinned" id="dock-left" role="complementary" aria-label="Racer details" hidden>
+    <aside class="dock dock-left pinned" id="dock-left" role="complementary" aria-label="Buyer details" hidden>
       <div class="dock-bar">
-        <span class="dock-title">Racer</span>
+        <span class="dock-title">Buyer</span>
         <span class="dock-controls">
           <button class="dock-pin" type="button" data-dock-pin="left" aria-label="Unpin window" title="Unpin — pop out into a floating window">&#x29C9;</button>
-          <button class="dock-close" type="button" data-dock-close="left" aria-label="Close racer details">&times;</button>
+          <button class="dock-close" type="button" data-dock-close="left" aria-label="Close buyer details">&times;</button>
         </span>
       </div>
       <div class="dock-body" id="dock-left-body"></div>
@@ -158,12 +158,12 @@
       </div>
       <div class="dock-body" id="dock-mid-body"></div>
     </aside>
-    <aside class="dock dock-right pinned" id="dock-right" role="complementary" aria-label="Runner details" hidden>
+    <aside class="dock dock-right pinned" id="dock-right" role="complementary" aria-label="Seller details" hidden>
       <div class="dock-bar">
-        <span class="dock-title">Runner</span>
+        <span class="dock-title">Seller</span>
         <span class="dock-controls">
           <button class="dock-pin" type="button" data-dock-pin="right" aria-label="Unpin window" title="Unpin — pop out into a floating window">&#x29C9;</button>
-          <button class="dock-close" type="button" data-dock-close="right" aria-label="Close runner details">&times;</button>
+          <button class="dock-close" type="button" data-dock-close="right" aria-label="Close seller details">&times;</button>
         </span>
       </div>
       <div class="dock-body" id="dock-right-body"></div>
