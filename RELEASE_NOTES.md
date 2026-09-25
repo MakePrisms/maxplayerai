@@ -1,3 +1,54 @@
+## v0.6.0-rc4
+
+Fourth release candidate for 0.6.0. This is a prerelease for testing, not a
+replacement for stable v0.5.11. Install with `npm install -g maxplayer@rc`.
+
+### Changes since v0.6.0-rc3
+
+- Unify the default execution-reviewer identity with the existing private-content
+  service identity (#1049). Both now use `7e6b3b05…`; the reviewer default references
+  the service constant rather than maintaining a competing public key.
+- Add a regression check that fresh-home reviewer, privacy and relay-protocol
+  identity defaults agree. Preserve custom relay trust, explicit reviewer maps,
+  empty maps and disabled review settings.
+- Correct operator setup guidance to reuse the existing content-service private
+  key, keep the relay identity separate, and coordinate signer/client migration.
+
+### Required operator migration
+
+This release does not provision the live reviewer's signing key. The reviewer must
+run with the existing content-service private key before clients use the new trust
+identity. Existing explicit `[review.reviewers]` entries retain their old values:
+update them to match `privacy.service_pubkey` and restart buyer/seller daemons and
+MCP servers. A binary upgrade alone does not repair those explicit settings.
+
+Keep private jobs private. Verify the live reviewer identity and a complete private
+job (offer review through delivery acceptance), plus a public review, before broad
+rollout. Production signer migration and these live checks were not verified when
+this candidate was prepared; local tests and CI are not deployment proof.
+
+GitHub remains a prerelease, npm uses the `rc` dist-tag, and sandbox images
+use the versioned RC tag without moving stable `latest`.
+
+## v0.6.0-rc3
+
+Third release candidate for 0.6.0. This is a prerelease for testing, not a
+replacement for stable v0.5.11. Install with `npm install -g maxplayer@rc`.
+
+### Changes since v0.6.0-rc2
+
+- Fix Docker Desktop seller startup when the VM kernel lacks the flower traffic
+  classifier (#1047). Automatically probe and select a verified u32 fallback.
+- Keep sandbox containment fail-closed. The compatibility backend preserves normal
+  web, DNS and model-proxy access while blocking unsupported packet formats:
+  IPv4 options/fragments, IPv6 extension headers and non-TCP/UDP/ICMP protocols.
+- Independently verify the selected classifier's installed rules and name the
+  classifier in the startup log. No manual networking configuration is required.
+
+Petar reported local Mac verification before requesting this candidate.
+GitHub remains a prerelease, npm uses the `rc` dist-tag, and sandbox images
+use the versioned RC tag without moving stable `latest`.
+
 ## v0.6.0-rc2
 
 Second release candidate for 0.6.0. This is a prerelease for testing, not a
