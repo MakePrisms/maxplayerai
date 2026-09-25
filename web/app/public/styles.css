@@ -302,7 +302,7 @@ a { color: var(--neon); }
   /* FIXED height, not max-height: the column's size must never depend on
      what's inside it — that is the no-layout-shift contract. Skeletons, empty
      states, and live rows all render inside the same box. */
-  height: calc(var(--row-h) * 11); overflow-y: auto;
+  height: calc(var(--row-h) * 22); overflow-y: auto;
   scrollbar-width: thin; scrollbar-color: var(--raise) transparent;
 }
 /* ONE row height for live rows and skeletons alike — the separator lines in
