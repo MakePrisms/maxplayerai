@@ -1,3 +1,22 @@
+## v0.6.0-rc3
+
+Third release candidate for 0.6.0. This is a prerelease for testing, not a
+replacement for stable v0.5.11. Install with `npm install -g maxplayer@rc`.
+
+### Changes since v0.6.0-rc2
+
+- Fix Docker Desktop seller startup when the VM kernel lacks the flower traffic
+  classifier (#1047). Automatically probe and select a verified u32 fallback.
+- Keep sandbox containment fail-closed. The compatibility backend preserves normal
+  web, DNS and model-proxy access while blocking unsupported packet formats:
+  IPv4 options/fragments, IPv6 extension headers and non-TCP/UDP/ICMP protocols.
+- Independently verify the selected classifier's installed rules and name the
+  classifier in the startup log. No manual networking configuration is required.
+
+Petar reported local Mac verification before requesting this candidate.
+GitHub remains a prerelease, npm uses the `rc` dist-tag, and sandbox images
+use the versioned RC tag without moving stable `latest`.
+
 ## v0.6.0-rc2
 
 Second release candidate for 0.6.0. This is a prerelease for testing, not a
