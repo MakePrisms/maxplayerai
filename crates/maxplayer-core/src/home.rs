@@ -2203,12 +2203,14 @@ fn apply_env_layer(base: &MaxplayerConfig, env: HashMap<String, String>) -> Resu
     for key in LIST_ENV_KEYS {
         environment = environment.with_list_parse_key(key);
     }
+    // Config::try_from flattens map keys into path expressions, corrupting
+    // literal keys such as reviewer URLs (':'/'/') and agent names with dots.
+    // A structured JSON source preserves those keys while the environment
+    // source still uses its intentional __-separated override paths.
+    let base_json = serde_json::to_string(base)
+        .map_err(|error| HomeError::Config(format!("MAXPLAYER_* environment layer: {error}")))?;
     config::Config::builder()
-        .add_source(
-            config::Config::try_from(base).map_err(|error| {
-                HomeError::Config(format!("MAXPLAYER_* environment layer: {error}"))
-            })?,
-        )
+        .add_source(config::File::from_str(&base_json, config::FileFormat::Json))
         .add_source(environment)
         .build()
         .map_err(|error| HomeError::Config(format!("MAXPLAYER_* environment layer: {error}")))?
@@ -3402,6 +3404,61 @@ mod tests {
             .iter()
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect()
+    }
+
+    #[test]
+    fn reviewer_defaults_bootstrap_and_reload_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut home = bootstrap(dir.path()).expect("fresh home with review defaults");
+        assert!(home.config.review.seller_offer);
+        assert!(home.config.review.buyer_delivery);
+        assert_eq!(home.config.review.reviewers.get(DEFAULT_RELAY_URL).unwrap(),
+                   crate::review::DEFAULT_REVIEWER_PUBKEY);
+        reload_config(&mut home).expect("reload written config including literal URL");
+        assert_eq!(home.config.review, crate::review::ReviewConfig::default());
+    }
+
+    #[test]
+    fn reviewer_url_keys_survive_disk_and_environment_layers() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = "wss://reviews.example:7443/relay.v1";
+        let key = "ab".repeat(32);
+        fs::write(dir.path().join(CONFIG_FILE), format!(
+            "[review]\nseller_offer = false\n[review.reviewers]\n\"{url}\" = \"{key}\"\n"
+        )).unwrap();
+        let mut home = bootstrap(dir.path()).expect("load reviewer URL from disk");
+        assert_eq!(home.config.review.reviewers.len(), 1);
+        assert_eq!(home.config.review.reviewers.get(url), Some(&key));
+        assert!(!home.config.review.seller_offer);
+        let resolved = apply_env_layer(&home.config, env(&[
+            ("MAXPLAYER_REVIEW__TIMEOUT_SECONDS", "45"),
+            ("MAXPLAYER_RELAY_URL", url),
+        ])).expect("overlay without interpreting URL as a field path");
+        assert_eq!(resolved.review.reviewers, home.config.review.reviewers);
+        assert_eq!(resolved.review.timeout_seconds, 45);
+        assert_eq!(resolved.relay_url, url);
+        reload_config(&mut home).expect("reload explicit reviewer");
+        assert_eq!(home.config.review.reviewers.get(url), Some(&key));
+    }
+
+    #[test]
+    fn reviewer_explicit_empty_and_disabled_config_remain_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = "[review]\nseller_offer = false\nbuyer_delivery = false\n[review.reviewers]\n";
+        fs::write(dir.path().join(CONFIG_FILE), raw).unwrap();
+        let home = bootstrap(dir.path()).unwrap();
+        assert!(home.config.review.reviewers.is_empty());
+        assert!(!home.config.review.seller_offer);
+        assert!(!home.config.review.buyer_delivery);
+        assert_eq!(fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap(), raw);
+    }
+
+    #[test]
+    fn reviewer_omitted_defaults_do_not_trust_custom_relays() {
+        let file = parse_config_toml("relay_url = 'wss://other.example'\n").unwrap();
+        let resolved = apply_env_layer(&file, HashMap::new()).unwrap();
+        assert_eq!(resolved.review, crate::review::ReviewConfig::default());
+        assert!(!resolved.review.reviewers.contains_key(&resolved.relay_url));
     }
 
     #[test]

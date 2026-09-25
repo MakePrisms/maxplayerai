@@ -14,6 +14,10 @@ pub const MAX_FILES: usize = 256;
 pub const MAX_REVIEW_BYTES: usize = 16 * 1024;
 pub const CLASSIFIER: &str = "execution-safety";
 pub const CLASSIFIER_VERSION: &str = "1";
+/// Relay-owner reviewer identity, distributed with the client rather than
+/// trusted from incoming events. Applies only to the default Maxplayer relay.
+pub const DEFAULT_REVIEWER_PUBKEY: &str =
+    "31b18b42bcef9842c10e518834d32da2a0f8f6f8f3758124e25cc392ada1fe5c";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -36,7 +40,10 @@ impl Default for ReviewConfig {
             buyer_delivery: true,
             skip_buyer_pubkeys: vec![],
             skip_seller_pubkeys: vec![],
-            reviewers: BTreeMap::new(),
+            reviewers: BTreeMap::from([(
+                crate::home::DEFAULT_RELAY_URL.to_owned(),
+                DEFAULT_REVIEWER_PUBKEY.to_owned(),
+            )]),
             reject_at_or_above_ppm: 500_000,
             timeout_seconds: 30,
         }

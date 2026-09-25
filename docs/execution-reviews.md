@@ -27,6 +27,17 @@ classifier evaluation or default-threshold calibration has been performed.
 
 ## Client settings
 
+Fresh buyer and seller homes enable offer/delivery reviews and include the public
+reviewer key for `wss://relay.maxplayer.ai`; no manual review configuration is
+needed for that relay. This is a public trust anchor, not a secret or a TypeSafe
+API credential. Defaults are written on first CLI/home initialization, not by the
+npm installer itself. Existing files that omit review settings inherit defaults.
+Explicit reviewer maps (including an empty map), keys, skips, thresholds, and
+disabled checks are preserved; upgrading does not rewrite them. Other relays
+still require their own trusted reviewer entry and do not inherit this identity.
+
+The built-in public-review settings are:
+
 ```toml
 [review]
 seller_offer = true
@@ -37,7 +48,7 @@ reject_at_or_above_ppm = 500000
 timeout_seconds = 30
 
 [review.reviewers]
-"wss://relay.example" = "<64-character-lowercase-hex-reviewer-public-key>"
+"wss://relay.maxplayer.ai" = "31b18b42bcef9842c10e518834d32da2a0f8f6f8f3758124e25cc392ada1fe5c"
 ```
 
 `500000` means unsafe probability >= 0.50 blocks. This remains **uncalibrated**, not
@@ -45,6 +56,11 @@ an evidence-backed shipping threshold. No reviewer key is learned from a respons
 Without a configured key, default-enabled reviews stop new claims/acceptances with
 an explicit error. Distribute keys and deploy the reviewer before enabling clients.
 Changing configuration still requires restarting the client/daemon.
+
+This default does not reconfigure the private-content service: private reviews
+also require the reviewer to equal `privacy.service_pubkey` and a deployed
+compatible private review service. A public reviewer default alone does not
+establish that private integration.
 
 Explicit skips use the role flags or public-key lists, never display names. Local
 status records identify the subject and explain configuration/counterparty skips.
