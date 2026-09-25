@@ -12,7 +12,7 @@
 //!
 //! The packets do cross one thing the host kernel owns: the **veth** the namespace is built on.
 //! Every packet leaving that namespace, from any runtime, is transmitted on that interface. So the
-//! filter goes there, as a `clsact` egress qdisc with `flower` classifiers, installed by the same
+//! filter goes there, as a `clsact` egress qdisc with `flower` (or a conservative `u32` fallback), installed by the same
 //! trusted sidecar that installs the iptables plan and before any payload exists.
 //!
 //! # Why this is not a replacement for the iptables plan
@@ -43,6 +43,10 @@
 //! never denied survives here by construction rather than by a rule.
 
 use crate::sandbox_net::{Family, NetPolicy};
+
+mod compat_u32;
+pub use compat_u32::U32Plan;
+
 
 /// The qdisc the filters attach to.
 ///
@@ -284,6 +288,46 @@ pub fn plan_stdin(plan: &IfacePlan) -> (String, usize) {
         out.push('\n');
     }
     (out, steps.len())
+}
+
+/// Classifier selection is probed in an isolated throwaway namespace, never by retrying a
+/// partially installed production plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IfaceClassifier { Flower, U32 }
+impl IfaceClassifier {
+    pub fn name(self) -> &'static str {
+        match self { Self::Flower => "flower", Self::U32 => "u32" }
+    }
+}
+pub fn missing_flower(error: &str) -> bool {
+    error.contains("TC classifier not found")
+}
+pub fn select_classifier(
+    flower: Result<(), String>, u32_probe: Option<Result<(), String>>,
+) -> Result<IfaceClassifier, String> {
+    match flower {
+        Ok(()) => Ok(IfaceClassifier::Flower),
+        Err(error) if missing_flower(&error) => match u32_probe {
+            Some(Ok(())) => Ok(IfaceClassifier::U32),
+            Some(Err(second)) => Err(format!(
+                "egress classifier probes failed (tried flower and u32): flower: {error}; u32: {second}")),
+            None => Err("flower unavailable; u32 capability has not been proved".into()),
+        },
+        Err(error) => Err(format!("egress flower probe failed; not a missing-classifier error: {error}")),
+    }
+}
+pub fn classifier_probe_plan(classifier: IfaceClassifier) -> String {
+    let selector = match classifier {
+        IfaceClassifier::Flower => "flower dst_ip 192.0.2.1/32",
+        IfaceClassifier::U32 => "u32 match u32 0xc0000201 0xffffffff at 16",
+    };
+    format!("tc qdisc add dev lo clsact\ntc filter add dev lo egress pref 1 protocol ip {selector} action drop\n")
+}
+pub fn classifier_probe_argv(holder_name: &str, image: &str) -> Vec<String> {
+    let mut argv = iface_sidecar_argv(holder_name, image);
+    let network = argv.iter().position(|arg| arg == "--network").expect("sidecar has network");
+    argv[network + 1] = "none".into();
+    argv
 }
 
 // ---------------------------------------------------------------------------------------------
