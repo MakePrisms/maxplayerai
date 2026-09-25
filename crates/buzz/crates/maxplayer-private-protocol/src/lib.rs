@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 
 /// Maxplayer content-service public identity; the private key is held outside the repository.
 pub const DEFAULT_SERVICE_PUBKEY: &str =
-    "7e6b3b0592e091fe2b5c2438d0cda5438fbcbea5236eae7e1f022d2ea2858aa7";
+    "31b18b42bcef9842c10e518834d32da2a0f8f6f8f3758124e25cc392ada1fe5c";
 
 pub const BODY_SCHEMA: &str = "maxplayer.content.v2";
 pub const ENVELOPE_SCHEMA: &str = "maxplayer.content-envelope.v2";

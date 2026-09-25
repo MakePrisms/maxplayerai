@@ -48,7 +48,7 @@ reject_at_or_above_ppm = 500000
 timeout_seconds = 30
 
 [review.reviewers]
-"wss://relay.maxplayer.ai" = "7e6b3b0592e091fe2b5c2438d0cda5438fbcbea5236eae7e1f022d2ea2858aa7"
+"wss://relay.maxplayer.ai" = "31b18b42bcef9842c10e518834d32da2a0f8f6f8f3758124e25cc392ada1fe5c"
 ```
 
 `500000` means unsafe probability >= 0.50 blocks. This remains **uncalibrated**, not
@@ -62,23 +62,31 @@ The worker must hold that service's private key; matching public defaults do not
 provision it or prove a live private review. Self-hosted deployments must set both
 fields to their own service identity; custom relay trust is never inferred.
 
-### Upgrading from a separate reviewer identity
+### Reusing the deployed reviewer identity
 
-1. Preserve the existing content-service key and back up the worker configuration
-   and signer securely. Do not generate another reviewer key or rotate the content
-   service: existing private jobs are encrypted to its identity.
-2. Provision the existing content-service private key as the worker's `signer_file`
-   (NixOS `services.maxplayer.reviewer.signerFile`), restart the worker, and verify
-   its public identity matches `privacy.service_pubkey`. Keep the relay key separate.
-3. Update explicit `[review.reviewers]` entries on buyers and sellers to that same
-   public identity, including clients using public jobs. Older persisted entries
-   are preserved, not silently overwritten by an upgrade. Fresh homes and omitted
-   reviewer maps use the unified default. Restart affected daemons/MCP processes.
-4. Verify a controlled private offer review, claim, delivery review and acceptance,
-   including private Git retrieval, plus a public review before broad rollout.
+The shared default is the existing reviewer public key `31b18b42…`. Keep its
+private key in place; do not replace it with the earlier `7e6b3b05…` content key.
 
-Keep private visibility enabled. Changing defaults is not a live deployment, and
-changing client trust without switching the worker signer will block reviews.
+1. Verify that the deployed worker's signer derives the public key shown above,
+   and make a secure, recoverable backup of that signer and the worker configuration.
+   The NixOS credential source is `/var/lib/secrets/maxplayer-reviewer-signing-key`;
+   confirm the live unit's `LoadCredential` before relying on that path.
+2. Use that same signer for any other private-content service process. Upgrade the
+   relay so its default private-repository service ACL uses the same public key;
+   update an explicit `MAXPLAYER_PRIVATE_SERVICE_PUBKEY` override if present.
+3. Set both `privacy.service_pubkey` and the Maxplayer `[review.reviewers]` entry
+   on existing buyers/sellers to the public key above. Upgrades preserve explicit
+   settings, including the earlier content key. Fresh homes and omitted settings
+   inherit the new default. Restart affected daemons/MCP processes.
+4. Verify a controlled new private offer review, claim, delivery review and
+   acceptance, including private Git retrieval, plus a public review.
+
+Changing the default does not re-encrypt existing jobs or migrate existing repository
+ACLs. Preserve the earlier content key and old job state; drain/reconcile old jobs
+under their original identity where available. A new service key cannot decrypt
+ciphertext addressed only to the earlier key. Never repair this by making jobs public.
+
+This is a default/configuration migration, not evidence of a live deployment.
 
 Explicit skips use the role flags or public-key lists, never display names. Local
 status records identify the subject and explain configuration/counterparty skips.
@@ -158,11 +166,11 @@ Before applying that deployment, provision these files on the target using your
 secure secret-provisioning method. Keep their contents out of Git, Nix expressions,
 command arguments and logs. Both source files should be root-owned, mode `0600`:
 
-- `/var/lib/secrets/maxplayer-reviewer-signing-key`: the **existing content-service
-  private key**, not a second reviewer identity (raw 64-character hex or supported
+- `/var/lib/secrets/maxplayer-reviewer-signing-key`: the **existing reviewer private
+  key, reused as the shared content-service identity** (raw 64-character hex or supported
   Nostr secret encoding). This legacy filename is retained for deployment compatibility;
   `signerFile` may instead point directly at your securely provisioned service key.
-  It is **not** a `NAME=value` environment file or the relay's own key.
+  It is **not** a `NAME=value` environment file.
 - `/var/lib/secrets/typesafe-api-key`: the raw TypeSafe API key.
 
 Distribute only the reviewer's corresponding public key to clients. Ensure this

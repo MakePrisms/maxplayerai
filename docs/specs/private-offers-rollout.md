@@ -17,7 +17,7 @@ private_content_v2 = true
 private_job_repos = true
 private_jobs = true
 default_visibility = "private"
-service_pubkey = "7e6b3b0592e091fe2b5c2438d0cda5438fbcbea5236eae7e1f022d2ea2858aa7"
+service_pubkey = "31b18b42bcef9842c10e518834d32da2a0f8f6f8f3758124e25cc392ada1fe5c"
 git_base = "https://relay.maxplayer.ai/git/"
 ```
 
@@ -28,14 +28,13 @@ buyer/seller installations must configure their intended service identity and Gi
 An explicit disable or invalid configuration fails closed, never downgrading a private
 job to public. Disabling provisioning does not expose existing private repositories.
 
-The service keypair is separate from the relay identity. Its private key is retained
-in the operator's protected secret store, never in this repository or client defaults.
-The execution reviewer requires secure runtime access to that identity; shipping its
-public key does not deploy a content consumer. Its reviewer trust key must match
-`privacy.service_pubkey`; private request/result/error messages use recipient-encrypted
-wrappers. See [execution reviews](../execution-reviews.md#private-jobs-and-remaining-release-gates). Back up the secret through operator-managed
-secret-store backup procedures before production cutover; key generation alone is not
-evidence of a recoverable backup.
+The service identity reuses the deployed reviewer's existing keypair. Its private
+key stays in the operator-managed signer file, never in the repository or client
+defaults. Keep a verified secure backup; do not generate a replacement for each
+role. Reviewer trust, `privacy.service_pubkey`, and the relay's service ACL identity
+must agree. See [identity migration](../execution-reviews.md#reusing-the-deployed-reviewer-identity)
+for explicit settings and jobs encrypted to an earlier identity. Shipping the public
+key alone does not deploy or verify a content consumer.
 
 `post_job` accepts:
 
