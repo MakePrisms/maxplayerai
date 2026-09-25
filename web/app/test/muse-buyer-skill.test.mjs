@@ -237,7 +237,7 @@ test("the operational core stays inside the 10000-character reusable-skill budge
 
 test("every version the bundle states equals this tree's version, with no stale literal", () => {
   const cargo = readFileSync(join(REPO, "Cargo.toml"), "utf8");
-  const version = /^version\s*=\s*"([0-9.]+)"/m.exec(cargo)[1];
+  const version = /^version\s*=\s*"(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)"/m.exec(cargo)[1];
   assert.match(skillText(), new RegExp(`\\b${version.replace(/\./g, "\\.")}\\b`),
     `the core must pin this tree's version (${version})`);
   // EVERY version stated anywhere in the bundle must be this tree's, unless that same
@@ -247,7 +247,7 @@ test("every version the bundle states equals this tree's version, with no stale 
   for (const file of walk(BUYER_DIR)) {
     const lines = readFileSync(file, "utf8").split("\n");
     lines.forEach((line, index) => {
-      for (const match of line.matchAll(/\b(\d+\.\d+\.\d+)\b/g)) {
+      for (const match of line.matchAll(/\b(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\b/g)) {
         const stated = match[1];
         checked += 1;
         if (stated === version) continue;
