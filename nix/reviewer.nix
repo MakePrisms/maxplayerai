@@ -10,9 +10,14 @@ let
   start = pkgs.writeShellScript "maxplayer-reviewer-start" ''
     set -eu
     umask 077
+    # LoadCredential may expose read-only 0440 files in a protected mount.
+    # The reviewer requires owner-only regular files, so stage private copies
+    # in RuntimeDirectory (0700, service-owned, removed when the unit stops).
+    ${pkgs.coreutils}/bin/install -m 0600 "$CREDENTIALS_DIRECTORY/signer" /run/maxplayer-reviewer/signer
+    ${pkgs.coreutils}/bin/install -m 0600 "$CREDENTIALS_DIRECTORY/typesafe" /run/maxplayer-reviewer/typesafe
     ${pkgs.jq}/bin/jq \
-      --arg signer "$CREDENTIALS_DIRECTORY/signer" \
-      --arg provider "$CREDENTIALS_DIRECTORY/typesafe" \
+      --arg signer /run/maxplayer-reviewer/signer \
+      --arg provider /run/maxplayer-reviewer/typesafe \
       '. + {signer_file: $signer, provider_key_file: $provider}' \
       ${settings} > /run/maxplayer-reviewer/reviewer.json
     exec ${lib.getExe cfg.package} reviewer serve /run/maxplayer-reviewer/reviewer.json
