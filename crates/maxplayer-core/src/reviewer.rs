@@ -32,8 +32,15 @@ pub struct ServiceConfig {
     #[serde(default = "model_default")]
     pub model: String,
 }
-/// The clients' shipped mint: private evidence names the mint the clients accept.
-fn review_mints() -> Vec<String> { vec![crate::home::DEFAULT_MINIBITS_MINT_URL.into()] }
+/// Every mint that a client can use by default: the real default mint, and the test
+/// mint that a seller uses when real mints are off or its config names no mint. The
+/// worker moves no money, so a wider list only accepts more valid evidence.
+fn review_mints() -> Vec<String> {
+    vec![
+        crate::home::DEFAULT_MINIBITS_MINT_URL.into(),
+        crate::home::DEFAULT_MINT_URL.into(),
+    ]
+}
 fn private_policy(config: &ServiceConfig, keys: &Keys) -> Result<crate::private_content::runtime::Policy, String> {
     let base = match &config.private_git_base {
         Some(base) => base.clone(),
@@ -268,7 +275,7 @@ pub fn validate_request(request: &Event, reviewer: &PublicKey) -> Result<Subject
     }
     let now = Timestamp::now().as_secs();
     if request.created_at.as_secs() > now + 60
-        || request.created_at.as_secs().saturating_add(300) < now
+        || request.created_at.as_secs().saturating_add(REQUEST_MAX_AGE_SECS) < now
     {
         return Err("stale_request".into());
     }
@@ -783,42 +790,102 @@ impl Drop for Flight {
     }
 }
 
-/// Stable intake subscription ids, so every re-issue replaces the same leg on the relay.
+/// The ids of the intake legs do not change, so each subscribe replaces the same leg.
 const PUBLIC_INTAKE: &str = "maxplayer-review-requests";
 const PRIVATE_INTAKE: &str = "maxplayer-review-private";
+/// The worker refuses a request that is older than this.
+const REQUEST_MAX_AGE_SECS: u64 = 300;
+/// The worker waits this long for the relay socket before the first subscribe.
+const CONNECT_WAIT: Duration = Duration::from_secs(20);
+/// The worker waits this long before it subscribes again after a relay close or a lag.
+const RESUBSCRIBE_DELAY: Duration = Duration::from_secs(3);
+/// A subscribe on this interval repairs a leg that failed without a signal.
+const INTAKE_REFRESH: Duration = Duration::from_secs(600);
+/// Anyone can publish invalid events that tag the reviewer. So the log shows at most
+/// this many drops each minute, and it counts the rest.
+const DROP_LINES_PER_MINUTE: u32 = 30;
 
-/// (Re)issue both intake legs: public kind-3409 requests, and private requests inside
-/// kind-1059 gift wraps. Separate legs keep public reviews independent of the private
-/// leg, which a `#p`-gating relay serves only after NIP-42 auth.
-async fn subscribe_intake(client: &Client, reviewer: PublicKey) -> Result<(), String> {
-    // Gift-wrap timestamps are intentionally randomized into the past.
-    // Include the transport overlap for both startup history and live filters.
-    let since = Timestamp::from(
-        Timestamp::now()
-            .as_secs()
-            .saturating_sub(crate::private_content::transport::TIMESTAMP_TWEAK_SECS + 60),
-    );
+/// Subscribe both intake legs: public kind-3409 requests, and private requests in
+/// kind-1059 gift wraps. The deployed relay lets anyone read, but it adds a REQ to live
+/// delivery only after NIP-42 auth, and it refuses an early kind-1059 REQ. So only a
+/// subscribe after auth makes a leg live.
+async fn subscribe_intake(relay: &Relay, reviewer: PublicKey) -> Result<(), String> {
+    // A request stays valid for REQUEST_MAX_AGE_SECS, and its gift wrap can show an
+    // earlier time. So the window must start before the oldest valid request.
+    use crate::private_content::transport::receive_since;
+    let now = Timestamp::now().as_secs();
+    let since = Timestamp::from(receive_since(now.saturating_sub(REQUEST_MAX_AGE_SECS)));
     for (id, kind) in [
         (PUBLIC_INTAKE, Kind::Custom(REVIEW_REQUEST_KIND)),
         (PRIVATE_INTAKE, Kind::GiftWrap),
     ] {
         let filter = Filter::new().kind(kind).pubkey(reviewer).since(since);
-        client
-            .subscribe_with_id(SubscriptionId::new(id), filter, None)
+        relay
+            .subscribe_with_id(SubscriptionId::new(id), filter, SubscribeOptions::default())
             .await
-            .map_err(|_| "relay_subscribe")?;
+            .map_err(|e| format!("{id}: {e}"))?;
     }
     Ok(())
 }
 
-/// Operators need to see why a request got no answer: a dropped request only times out
-/// on the client. Ids and pubkeys only, never request content.
+/// The kind that an intake leg carries, or `None` for another subscription. The
+/// worker's own lookups also put events on the pool stream, and they are not requests.
+fn intake_kind(subscription_id: &SubscriptionId) -> Option<Kind> {
+    match subscription_id.as_str() {
+        PUBLIC_INTAKE => Some(Kind::Custom(REVIEW_REQUEST_KIND)),
+        PRIVATE_INTAKE => Some(Kind::GiftWrap),
+        _ => None,
+    }
+}
+
+struct DropLog {
+    window: Option<std::time::Instant>,
+    lines: u32,
+    suppressed: u32,
+}
+static DROP_LOG: std::sync::Mutex<DropLog> = std::sync::Mutex::new(DropLog {
+    window: None,
+    lines: 0,
+    suppressed: 0,
+});
+
+/// Log why the worker dropped a request, because the client sees only a timeout. A
+/// public request shows its id and author. A private request shows only the code,
+/// because its gift wrap hides the id and the author.
 fn log_drop(request: &Event, code: &str) {
-    crate::opline!(
-        "reviewer: dropped request {} from {}: {code}",
-        request.id,
-        request.pubkey
-    );
+    let Ok(mut log) = DROP_LOG.lock() else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    if log
+        .window
+        .is_none_or(|start| now.duration_since(start) >= Duration::from_secs(60))
+    {
+        if log.suppressed > 0 {
+            crate::opline!(
+                "reviewer: {} more dropped requests were not logged",
+                log.suppressed
+            );
+        }
+        *log = DropLog {
+            window: Some(now),
+            lines: 0,
+            suppressed: 0,
+        };
+    }
+    if log.lines >= DROP_LINES_PER_MINUTE {
+        log.suppressed += 1;
+    } else if crate::review::private::is_private(request) {
+        log.lines += 1;
+        crate::opline!("reviewer: dropped a private request: {code}");
+    } else {
+        log.lines += 1;
+        crate::opline!(
+            "reviewer: dropped request {} from {}: {code}",
+            request.id,
+            request.pubkey
+        );
+    }
 }
 
 async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Result<(), String> {
@@ -829,43 +896,80 @@ async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Re
         .add_relay(&config.relay)
         .await
         .map_err(|_| "relay_configuration")?;
-    // `Authenticated` never reaches the pool stream, so watch the relay's own stream,
-    // taken before connect so the first completed auth cannot be missed.
-    let mut relay_notifications = client
+    let relay = client
         .relay(&config.relay)
         .await
-        .map_err(|_| "relay_configuration")?
-        .notifications();
-    client.connect().await;
+        .map_err(|_| "relay_configuration")?;
+    // Take both streams before connect. `Authenticated` comes only on the relay stream,
+    // and the watcher must not miss the first one.
+    let mut relay_notifications = relay.notifications();
     let mut notifications = client.notifications();
-    subscribe_intake(&client, keys.public_key()).await?;
-    let (sender, mut inbox) = tokio::sync::mpsc::channel(256);
-    let flights = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+    client.connect().await;
+    client.wait_for_connection(CONNECT_WAIT).await;
     let reviewer = keys.public_key();
+    if let Err(error) = subscribe_intake(&relay, reviewer).await {
+        crate::opline!("reviewer: intake subscribe at start failed: {error}");
+    }
+    let (sender, mut inbox) = tokio::sync::mpsc::channel(256);
+    // Capacity 1: new requests to subscribe again merge while one waits.
+    let (resubscribe, mut resubscribe_requests) = tokio::sync::mpsc::channel::<()>(1);
+    let flights = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
     let intake_keys = keys.clone();
-    // JoinSet aborts intake on all worker exit paths, including publication errors.
-    let mut intake = tokio::task::JoinSet::new();
-    // An open-read relay closes a `#p`-pinned kind-1059 REQ that arrives before NIP-42
-    // AUTH with `restricted:`, and nostr-sdk then deletes the subscription for good
-    // (#189). The boot REQs race the challenge, and so does every reconnect or in-place
-    // re-challenge (#429), so re-issue both legs after EVERY completed auth.
+    // The policy comes only from the configuration. A bad policy must stop only private
+    // reviews, not the worker.
+    let private = private_policy(&config, &keys);
+    // JoinSet aborts intake on all worker exit paths. Each task returns the reason it
+    // stopped, and the worker then exits with that error, so the supervisor restarts it.
+    let mut intake = tokio::task::JoinSet::<String>::new();
+    // The deployed relay sends one NIP-42 challenge on each connection. It refuses an
+    // early kind-1059 REQ with `restricted:`, and nostr-sdk then deletes that
+    // subscription (#189). It gives an early kind-3409 REQ only its history. So the
+    // watcher subscribes both legs again after each auth (#429), after a lag, after a
+    // relay close of a leg, and on a timer.
     intake.spawn({
-        let client = client.clone();
+        let relay = relay.clone();
         async move {
+            let mut refresh = tokio::time::interval(INTAKE_REFRESH);
+            refresh.tick().await;
+            // A delayed subscribe after a close or lost events. Any other subscribe
+            // covers both legs, so it also cancels the delayed one.
+            let mut delayed: Option<tokio::time::Instant> = None;
             loop {
-                match relay_notifications.recv().await {
-                    Ok(nostr_sdk::pool::RelayNotification::Authenticated) => {
-                        match subscribe_intake(&client, reviewer).await {
-                            Ok(()) => {
-                                crate::opline!("reviewer: intake subscribed after NIP-42 auth")
-                            }
-                            Err(code) => crate::opline!(
-                                "reviewer: intake re-subscribe after NIP-42 auth failed: {code}"
-                            ),
+                let (reason, quiet) = tokio::select! {
+                    notification = relay_notifications.recv() => match notification {
+                        Ok(RelayNotification::Authenticated) => ("after NIP-42 auth", false),
+                        Ok(RelayNotification::AuthenticationFailed) => {
+                            // The relay sends no second challenge on this connection. Stop,
+                            // so that the supervisor starts a new connection.
+                            crate::opline!("reviewer: NIP-42 auth failed; the worker stops");
+                            return "relay_auth_failed".to_string();
                         }
+                        Ok(RelayNotification::Shutdown) => return "relay_shutdown".to_string(),
+                        Ok(_) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            ("after lost relay notifications", false)
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            return "relay_shutdown".to_string();
+                        }
+                    },
+                    Some(()) = resubscribe_requests.recv() => {
+                        delayed.get_or_insert(tokio::time::Instant::now() + RESUBSCRIBE_DELAY);
+                        continue;
                     }
-                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(_) => break,
+                    _ = tokio::time::sleep_until(delayed.unwrap_or_else(tokio::time::Instant::now)),
+                        if delayed.is_some() => ("after a relay close or lost events", false),
+                    _ = refresh.tick() => ("on the refresh timer", true),
+                };
+                delayed = None;
+                match subscribe_intake(&relay, reviewer).await {
+                    Ok(()) if quiet => {
+                        crate::opline_verbose!("reviewer: intake subscribed {reason}")
+                    }
+                    Ok(()) => crate::opline!("reviewer: intake subscribed {reason}"),
+                    Err(error) => {
+                        crate::opline!("reviewer: intake subscribe {reason} failed: {error}")
+                    }
                 }
             }
         }
@@ -874,16 +978,43 @@ async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Re
         loop {
             let notification = match notifications.recv().await {
                 Ok(n) => n,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(_) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(lost)) => {
+                    // Lost events can be real requests. A new subscribe replays them.
+                    crate::opline!(
+                        "reviewer: lost {lost} relay events; the worker subscribes again"
+                    );
+                    let _ = resubscribe.try_send(());
+                    continue;
+                }
+                Err(_) => return "intake_stopped".to_string(),
             };
-            let RelayPoolNotification::Event { event: request, .. } = notification else {
+            let (subscription_id, request) = match notification {
+                RelayPoolNotification::Event {
+                    subscription_id,
+                    event,
+                    ..
+                } => (subscription_id, event),
+                RelayPoolNotification::Message {
+                    message:
+                        RelayMessage::Closed {
+                            subscription_id,
+                            message,
+                        },
+                    ..
+                } if intake_kind(&subscription_id).is_some() => {
+                    crate::opline!("reviewer: relay closed {subscription_id}: {message}");
+                    let _ = resubscribe.try_send(());
+                    continue;
+                }
+                _ => continue,
+            };
+            if intake_kind(&subscription_id) != Some(request.kind) {
                 continue;
-            };
+            }
             // Never accept a plaintext private inner message on the public lane.
             let request = if request.kind == Kind::GiftWrap {
                 let Ok(inner) = crate::review::private::unwrap(&intake_keys, &request).await else {
-                    // Private-content copies to the service identity land here too.
+                    // Private-content copies to the service identity also come here.
                     crate::opline_verbose!(
                         "reviewer: ignored gift wrap {} (not a review request)",
                         request.id
@@ -898,50 +1029,50 @@ async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Re
                 }
                 request
             };
-            let subject = match validate_request(&request, &reviewer) {
-                Ok(subject) => subject,
-                Err(code) => {
-                    log_drop(&request, &code);
-                    continue;
-                }
+            let Ok(subject) =
+                validate_request(&request, &reviewer).inspect_err(|code| log_drop(&request, code))
+            else {
+                continue;
             };
             let Some(flight) = Flight::reserve(&flights, &subject) else {
-                crate::opline_verbose!("reviewer: request {} already in flight", request.id);
+                crate::opline_verbose!("reviewer: a request for this subject is already in flight");
                 continue;
             };
             // A full queue drops the reservation too. Clients remain blocked and can retry.
             if let Err(full) = sender.try_send((flight, request, subject)) {
                 log_drop(&full.into_inner().1, "queue_full");
-                continue;
             }
         }
     });
     loop {
         let next = tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
+            Some(stopped) = intake.join_next() => {
+                return Err(stopped.unwrap_or_else(|_| "intake_panicked".to_string()));
+            }
             request = inbox.recv() => request,
         };
         let Some((_flight, request, subject)) = next else {
-            break;
+            return Err("intake_stopped".into());
         };
         if let Err(code) = store.admit(&request.pubkey.to_hex(), Timestamp::now().as_secs()) {
             log_drop(&request, &code);
             continue;
         }
         let private_request = if crate::review::private::is_private(&request) {
-            let Ok(bundle) =
-                serde_json::from_str::<crate::review::private::Request>(&request.content)
-            else {
-                log_drop(&request, "invalid_request");
-                continue;
-            };
-            let policy = private_policy(&config, &keys)?;
-            let recipients = match bundle.validate(&request.pubkey, &policy) {
-                Ok(recipients) => recipients,
+            let Ok(bundle) = serde_json::from_str::<crate::review::private::Request>(&request.content) else { continue; };
+            let policy = match &private {
+                Ok(policy) => policy,
                 Err(code) => {
-                    log_drop(&request, &code);
+                    log_drop(&request, code);
                     continue;
                 }
+            };
+            let Ok(recipients) = bundle
+                .validate(&request.pubkey, policy)
+                .inspect_err(|code| log_drop(&request, code))
+            else {
+                continue;
             };
             Some((bundle, policy, recipients))
         } else { None };
@@ -980,14 +1111,15 @@ async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Re
                     log_drop(&request, &code);
                     continue;
                 }
-                let event = signed(
-                    &keys,
-                    &error_review(&subject, input_digest(request.content.as_bytes()), &code),
-                    &request,
-                    None,
-                )
-                .await?;
-                publish_review(&client, &config.relay, &keys, &event, private_request.as_ref().map(|(_,_,r)| r.as_slice())).await?;
+                let error = error_review(&subject, input_digest(request.content.as_bytes()), &code);
+                match signed(&keys, &error, &request, None).await {
+                    Ok(event) => {
+                        let recipients = private_request.as_ref().map(|(_, _, r)| r.as_slice());
+                        publish_or_log(&client, &config.relay, &keys, &event, recipients, &request)
+                            .await;
+                    }
+                    Err(code) => log_drop(&request, &code),
+                }
                 continue;
             }
         };
@@ -1018,17 +1150,19 @@ async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Re
                 event
             }
             Err(code) if code == "provider_outcome_unknown" => {
-                signed(
-                    &keys,
-                    &error_review(&subject, digest, &code),
-                    &request,
-                    None,
-                )
-                .await?
+                let error = error_review(&subject, digest, &code);
+                match signed(&keys, &error, &request, None).await {
+                    Ok(event) => event,
+                    Err(code) => {
+                        log_drop(&request, &code);
+                        continue;
+                    }
+                }
             }
             Err(e) => return Err(e),
         };
-        publish_review(&client, &config.relay, &keys, &event, private_request.as_ref().map(|(_,_,r)| r.as_slice())).await?;
+        let recipients = private_request.as_ref().map(|(_, _, r)| r.as_slice());
+        publish_or_log(&client, &config.relay, &keys, &event, recipients, &request).await;
     }
     client.disconnect().await;
     Ok(())
@@ -1045,10 +1179,23 @@ mod tests {
             commit: None,
         }
     }
+    /// The NixOS module sends no `accepted_mints` by default. The worker must then accept
+    /// every mint that a client can use by default, or it drops paid private requests.
+    #[test]
+    fn worker_config_without_mints_uses_the_client_default_mints() {
+        let config: ServiceConfig = serde_json::from_str(
+            r#"{"relay":"wss://relay.example","signer_file":"/s","provider_key_file":"/p","database":"/d","private_git_base":null}"#,
+        )
+        .unwrap();
+        let mints = &config.accepted_mints;
+        assert!(mints.contains(&crate::home::DEFAULT_MINIBITS_MINT_URL.to_string()));
+        assert!(mints.contains(&crate::home::DEFAULT_MINT_URL.to_string()));
+    }
     fn temp() -> PathBuf {
         let p = std::env::temp_dir().join(format!("review-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&p).unwrap();
-        p
+        // The store opens SQLite with NOFOLLOW, and a macOS temp path has a symlink.
+        p.canonicalize().unwrap()
     }
     fn response(p: f64) -> Vec<u8> {
         serde_json::to_vec(&json!({"model":"jev-pinned","answers":{"safety":{"type":"choice","choice":if p>=0.5 {"unsafe"}else{"safe"},"probabilities":{"safe":1.0-p,"unsafe":p}}}})).unwrap()
@@ -1388,7 +1535,7 @@ mod integration_tests {
                 let body=br#"{"model":"fixture-jev","answers":{"safety":{"type":"choice","choice":"safe","probabilities":{"safe":0.99,"unsafe":0.01}}}}"#;
                 socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).as_bytes()).await.unwrap();socket.write_all(body).await.unwrap();
             });
-            let root=std::env::temp_dir().join(format!("review-e2e-{}",uuid::Uuid::new_v4()));std::fs::create_dir_all(&root).unwrap();
+            let root=std::env::temp_dir().join(format!("review-e2e-{}",uuid::Uuid::new_v4()));std::fs::create_dir_all(&root).unwrap();let root=root.canonicalize().unwrap();
             let reviewer=Keys::generate();let buyer=Keys::generate();let client=Client::new(buyer.clone());client.add_relay(&url).await.unwrap();client.connect().await;client.wait_for_connection(Duration::from_secs(5)).await;
             let mut provider=TypeSafe::new("fixture".into()).unwrap();provider.endpoint=format!("http://{addr}");
             let config=ServiceConfig {relay:url.clone(),signer_file:root.join("unused"),provider_key_file:root.join("unused"),database:root.join("reviews.db"),repositories:BTreeMap::new(),accepted_mints:review_mints(),private_git_base:None,model:"fixture".into()};
@@ -1590,15 +1737,56 @@ async fn private_snapshot(
 async fn publish_review(client: &Client, relay: &str, keys: &Keys, event: &Event, recipients: Option<&[String]>) -> Result<(), String> {
     if crate::review::private::is_private(event) != recipients.is_some() { return Err("review: publication visibility mismatch".into()); }
     if let Some(recipients) = recipients {
+        // A request can name a recipient that is not a valid key. That copy fails, but
+        // the other recipients still get their copies.
+        let mut failure = None;
         for recipient in recipients {
-            let recipient = PublicKey::from_hex(recipient).map_err(|_| "invalid_recipient")?;
-            let outer = crate::review::private::wrap(keys, recipient, event).await?;
-            client.send_event_to([relay], &outer).await.map_err(|_| "relay_publish")?;
+            let sent = async {
+                let recipient = PublicKey::from_hex(recipient).map_err(|_| "invalid_recipient")?;
+                let outer = crate::review::private::wrap(keys, recipient, event).await?;
+                let output = client
+                    .send_event_to([relay], &outer)
+                    .await
+                    .map_err(|_| "relay_publish")?;
+                log_refused(&output, "a private review copy");
+                Ok::<(), String>(())
+            }
+            .await;
+            if let Err(code) = sent {
+                failure.get_or_insert(code);
+            }
+        }
+        if let Some(code) = failure {
+            return Err(code);
         }
     } else {
-        client.send_event_to([relay], event).await.map_err(|_| "relay_publish")?;
+        let output = client.send_event_to([relay], event).await.map_err(|_| "relay_publish")?;
+        log_refused(&output, &format!("review {}", event.id));
     }
     Ok(())
+}
+
+/// Publish one review. A failure affects only this request, so log it and continue.
+async fn publish_or_log(
+    client: &Client,
+    relay: &str,
+    keys: &Keys,
+    event: &Event,
+    recipients: Option<&[String]>,
+    request: &Event,
+) {
+    if let Err(code) = publish_review(client, relay, keys, event, recipients).await {
+        log_drop(request, &code);
+    }
+}
+
+/// `send_event_to` returns `Ok` also when the relay refuses the event, so read the
+/// result of each relay. Without this line, a refused review shows only as a client
+/// timeout.
+fn log_refused(output: &Output<EventId>, what: &str) {
+    for (relay, reason) in &output.failed {
+        crate::opline!("reviewer: {relay} refused {what}: {reason}");
+    }
 }
 
 #[cfg(test)]

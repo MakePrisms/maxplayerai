@@ -16715,7 +16715,10 @@ mod tests {
     // maxplayer-relay does. The nostr-relay-builder fixture used above cannot express this: it says
     // `auth-required:`, which nostr-sdk keeps and restores by itself, so every ordering would pass.
 
-    use crate::seller_node::p_gate_relay_fixture::{PGateRelay, PublishedEvent, ReqRecord, Verdict};
+    use crate::seller_node::p_gate_relay_fixture::{
+        PGateRelay, PublishedEvent, ReqRecord, Verdict, p_gated_before_auth, permanently_removed,
+        served_authed,
+    };
 
     /// Generous enough that a slow box never flakes, short enough that a real failure fails fast.
     const FIXTURE_WAIT: Duration = Duration::from_secs(15);
@@ -16752,24 +16755,6 @@ mod tests {
             .get(&RelayUrl::parse(&runner.relay_url).expect("relay url"))
             .cloned()
             .expect("relay handle")
-    }
-
-    /// Every REQ that reached the relay before that session had completed NIP-42, on a filter the
-    /// relay p-gates. This set being non-empty IS #189.
-    fn p_gated_before_auth(reqs: &[ReqRecord]) -> Vec<&ReqRecord> {
-        reqs.iter()
-            .filter(|record| record.p_pinned && !record.authenticated)
-            .collect()
-    }
-
-    /// Every REQ the relay refused with the permanent-class prefix — each one a subscription
-    /// nostr-sdk has deleted from its registry and will never restore.
-    fn permanently_removed(reqs: &[ReqRecord]) -> Vec<&ReqRecord> {
-        reqs.iter()
-            .filter(|record| {
-                matches!(&record.verdict, Verdict::Closed(reason) if reason.starts_with("restricted:"))
-            })
-            .collect()
     }
 
     /// TOOTH #189 (a) — THE ORDERING. A recovery whose AUTH lands well after the socket does must
@@ -17738,15 +17723,6 @@ mod tests {
     /// and kind-1059 legs (what [`subscribe_all`] carries). The liveness probe is transient — it is
     /// re-issued every heartbeat and self-heals — so it is not in this set.
     const LONG_LIVED_SUBS: [&str; 3] = [OFFER_SUB_ID, AWARD_SUB_ID, WRAP_SUB_ID];
-
-    /// How many REQs for `id` the relay served (`EOSE`) on an AUTHENTICATED session — the count that
-    /// must grow after each challenge-roll for the leg to be genuinely restored (not merely re-sent
-    /// onto a stale generation and refused).
-    fn served_authed(reqs: &[ReqRecord], id: &str) -> usize {
-        reqs.iter()
-            .filter(|r| r.subscription_id == id && r.authenticated && r.verdict == Verdict::Eose)
-            .count()
-    }
 
     /// TOOTH #429 — a live-socket NIP-42 RE-CHALLENGE must not leave the money leg deaf: the daemon
     /// re-issues the long-lived subscriptions on every COMPLETED auth, re-armed per challenge-roll.

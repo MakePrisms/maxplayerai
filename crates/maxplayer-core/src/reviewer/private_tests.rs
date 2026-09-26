@@ -98,7 +98,8 @@ async fn scenario(targeted: bool, delivery: bool, provider_failure: bool) {
         delivery: delivery.then_some(evidence.clone()),
     };
     let dir = tempfile::tempdir().unwrap();
-    let mut home = crate::home::bootstrap(dir.path()).unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let mut home = crate::home::bootstrap(&root).unwrap();
     home.config.relay_url = url.clone();
     home.config.privacy.service_pubkey = Some(policy.service.clone());
     home.config.privacy.git_base = Some(policy.host.git_prefix.clone());
@@ -110,9 +111,9 @@ async fn scenario(targeted: bool, delivery: bool, provider_failure: bool) {
     home.config.review.timeout_seconds = 15;
     let config = ServiceConfig {
         relay: url.clone(),
-        signer_file: dir.path().join("unused"),
-        provider_key_file: dir.path().join("unused"),
-        database: dir.path().join("reviews.db"),
+        signer_file: root.join("unused"),
+        provider_key_file: root.join("unused"),
+        database: root.join("reviews.db"),
         repositories: BTreeMap::new(),
         accepted_mints: policy.host.accepted_mints,
         private_git_base: Some(policy.host.git_prefix),
@@ -304,7 +305,8 @@ async fn private_git_review_reads_exact_commit_and_refuses_changed_binding() {
     use crate::private_content as pc;
     let (mut evidence, _, _, policy) = pc::evidence::inline_fixture();
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("bare");
+    let root = dir.path().canonicalize().unwrap();
+    let path = root.join("bare");
     let repo = git2::Repository::init_bare(&path).unwrap();
     let blob = repo.blob(b"private git file canary").unwrap();
     let mut tree = repo.treebuilder(None).unwrap();
@@ -366,9 +368,9 @@ async fn private_git_review_reads_exact_commit_and_refuses_changed_binding() {
     request.validate(&key(1).public_key(), &policy).unwrap();
     let config = ServiceConfig {
         relay: "wss://git.example".into(),
-        signer_file: dir.path().join("unused"),
-        provider_key_file: dir.path().join("unused"),
-        database: dir.path().join("db"),
+        signer_file: root.join("unused"),
+        provider_key_file: root.join("unused"),
+        database: root.join("db"),
         repositories: BTreeMap::from([(url, path)]),
         accepted_mints: policy.host.accepted_mints.clone(),
         private_git_base: Some(policy.host.git_prefix.clone()),
@@ -417,11 +419,12 @@ async fn reviewer_public_v2_snapshot_remains_public_and_reads_exact_inline_envel
     .sign_with_keys(&buyer)
     .unwrap();
     let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
     let config = ServiceConfig {
         relay: url,
-        signer_file: dir.path().join("unused"),
-        provider_key_file: dir.path().join("unused"),
-        database: dir.path().join("db"),
+        signer_file: root.join("unused"),
+        provider_key_file: root.join("unused"),
+        database: root.join("db"),
         repositories: BTreeMap::new(),
         accepted_mints: review_mints(),
         private_git_base: None,
@@ -455,67 +458,104 @@ fn private_delivery_refs_are_not_double_prefixed() {
     }
 }
 
-/// The deployed relay reads open but `#p`-gates kind 1059: an intake REQ that arrives
-/// before NIP-42 AUTH is closed `restricted:`, and nostr-sdk deletes it for good (#189).
-/// The worker then received no review request at all, public or private. It must re-issue
-/// both intake legs after every completed auth, including an in-place re-challenge (#429).
+/// A worker on the fixture relay, with a provider that the test never reaches.
+fn intake_worker(
+    relay: &crate::seller_node::p_gate_relay_fixture::PGateRelay,
+    root: &std::path::Path,
+) -> tokio::task::JoinHandle<Result<(), String>> {
+    let config = ServiceConfig {
+        relay: relay.url(),
+        signer_file: root.join("unused"),
+        provider_key_file: root.join("unused"),
+        database: root.join("reviews.db"),
+        repositories: BTreeMap::new(),
+        accepted_mints: review_mints(),
+        private_git_base: None,
+        model: "fixture".into(),
+    };
+    let provider = TypeSafe {
+        client: reqwest::Client::new(),
+        endpoint: "http://127.0.0.1:9".into(),
+        key: "fixture-not-secret".into(),
+    };
+    tokio::task::spawn_local(run_worker(config, key(3), provider))
+}
+
+/// The deployed relay lets anyone read. Before auth, it refuses a kind-1059 REQ with
+/// `restricted:`, and nostr-sdk then deletes that subscription (#189). It serves a
+/// kind-3409 REQ, but only as history. So the worker must subscribe both legs again
+/// after auth, after an in-place re-challenge (#429), and after a relay close.
 #[tokio::test]
-async fn intake_subscriptions_recover_after_pre_auth_restricted_close_and_re_challenge() {
-    use crate::seller_node::p_gate_relay_fixture::{PGateRelay, ReqRecord, Verdict};
+async fn intake_legs_recover_after_early_refusal_re_challenge_and_close() {
+    use crate::seller_node::p_gate_relay_fixture::{PGateRelay, Verdict, served_authed};
     tokio::task::LocalSet::new()
         .run_until(async {
-            // Hold the challenge back so the boot REQs deterministically arrive before AUTH.
-            let relay = PGateRelay::start(Duration::from_millis(300)).await;
+            // Hold the challenge back, so that the first REQs always come before AUTH.
+            let relay = PGateRelay::start_open_read(Duration::from_millis(300), &[1059]).await;
             let dir = tempfile::tempdir().unwrap();
-            let config = ServiceConfig {
-                relay: relay.url(),
-                signer_file: dir.path().join("unused"),
-                provider_key_file: dir.path().join("unused"),
-                database: dir.path().join("reviews.db"),
-                repositories: BTreeMap::new(),
-                accepted_mints: review_mints(),
-                private_git_base: None,
-                model: "fixture".into(),
-            };
-            let provider = TypeSafe {
-                client: reqwest::Client::new(),
-                endpoint: "http://127.0.0.1:9".into(),
-                key: "fixture-not-secret".into(),
-            };
-            let worker = tokio::task::spawn_local(run_worker(config, key(3), provider));
-            let served_after_auth = |reqs: &[ReqRecord], id: &str| {
-                reqs.iter()
-                    .filter(|r| r.subscription_id == id && r.authenticated)
-                    .filter(|r| r.verdict == Verdict::Eose)
-                    .count()
-            };
+            let root = dir.path().canonicalize().unwrap();
+            let worker = intake_worker(&relay, &root);
             let both_served = |times: usize| {
-                move |reqs: &[ReqRecord]| {
-                    served_after_auth(reqs, PUBLIC_INTAKE) >= times
-                        && served_after_auth(reqs, PRIVATE_INTAKE) >= times
+                move |reqs: &[crate::seller_node::p_gate_relay_fixture::ReqRecord]| {
+                    served_authed(reqs, PUBLIC_INTAKE) >= times
+                        && served_authed(reqs, PRIVATE_INTAKE) >= times
                 }
             };
             assert!(
                 relay.wait_until(Duration::from_secs(5), both_served(1)).await,
-                "intake legs must be re-issued after auth: {:?}",
+                "both legs must be subscribed after auth: {:?}",
                 relay.reqs().await
             );
-            let refused_before_auth = relay.reqs_for(PRIVATE_INTAKE).await.into_iter().any(|r| {
+            let early_private = relay.reqs_for(PRIVATE_INTAKE).await.into_iter().any(|r| {
                 !r.authenticated
                     && matches!(&r.verdict, Verdict::Closed(reason) if reason.starts_with("restricted:"))
             });
-            assert!(refused_before_auth, "the fixture must reproduce the pre-auth refusal");
+            let early_public = relay
+                .reqs_for(PUBLIC_INTAKE)
+                .await
+                .into_iter()
+                .any(|r| !r.authenticated && r.verdict == Verdict::Eose);
+            assert!(early_private && early_public, "the fixture must act as the deployed relay");
 
             relay.roll_challenge(&[]).await;
             assert!(
                 relay.wait_until(Duration::from_secs(5), both_served(2)).await,
-                "intake legs must be re-issued after an in-place re-auth: {:?}",
+                "both legs must be subscribed after an in-place re-auth: {:?}",
+                relay.reqs().await
+            );
+
+            relay.close_now(PRIVATE_INTAKE, "error: database error").await;
+            assert!(
+                relay.wait_until(Duration::from_secs(10), both_served(3)).await,
+                "a leg that the relay closed must come back: {:?}",
                 relay.reqs().await
             );
             assert_eq!(relay.connections(), 1, "recovery must not need a reconnect");
             assert!(!worker.is_finished(), "review worker unexpectedly exited");
             worker.abort();
             let _ = worker.await;
+        })
+        .await;
+}
+
+/// The deployed relay sends one challenge on each connection. After a refused AUTH,
+/// neither leg can become live, so the worker must stop with an error. The supervisor
+/// then restarts it on a new connection.
+#[tokio::test]
+async fn intake_worker_stops_when_nip42_auth_fails() {
+    use crate::seller_node::p_gate_relay_fixture::PGateRelay;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let relay = PGateRelay::start_open_read(Duration::from_millis(100), &[1059]).await;
+            relay.refuse_auth();
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let worker = intake_worker(&relay, &root);
+            let stopped = tokio::time::timeout(Duration::from_secs(15), worker)
+                .await
+                .expect("the worker must stop after a refused AUTH")
+                .expect("the worker task must not panic");
+            assert_eq!(stopped, Err("relay_auth_failed".to_string()));
         })
         .await;
 }

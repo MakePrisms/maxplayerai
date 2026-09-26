@@ -2,12 +2,13 @@
 { config, lib, pkgs, ... }:
 let
   cfg = config.services.maxplayer.reviewer;
-  settings = pkgs.writeText "maxplayer-reviewer-settings.json" (builtins.toJSON {
+  settings = pkgs.writeText "maxplayer-reviewer-settings.json" (builtins.toJSON ({
     relay = cfg.relayUrl;
     model = cfg.model;
     private_git_base = cfg.privateGitBase;
+  } // lib.optionalAttrs (cfg.acceptedMints != null) {
     accepted_mints = cfg.acceptedMints;
-  });
+  }));
   start = pkgs.writeShellScript "maxplayer-reviewer-start" ''
     set -eu
     umask 077
@@ -47,11 +48,12 @@ in
       description = "Trusted private Git prefix; null uses the relay HTTPS /git/ origin.";
     };
     acceptedMints = lib.mkOption {
-      type = lib.types.listOf lib.types.str;
-      # The clients' shipped mint (home::DEFAULT_MINIBITS_MINT_URL). A mismatch makes
-      # the worker drop paid private requests, which clients see only as a timeout.
-      default = [ "https://mint.minibits.cash/Bitcoin" ];
-      description = "Trusted mint allowlist for validating private lifecycle evidence; match client policy.";
+      type = lib.types.nullOr (lib.types.listOf lib.types.str);
+      # null: the worker uses its own default, which names every mint that clients use
+      # by default. A list replaces that default. A missing seller mint makes the worker
+      # drop paid private requests, and clients then see only a timeout.
+      default = null;
+      description = "Trusted mint allowlist for validating private lifecycle evidence. null uses the worker default (the client default mints). A list replaces it; match client policy.";
     };
     signerFile = lib.mkOption {
       type = lib.types.str;

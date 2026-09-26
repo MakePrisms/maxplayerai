@@ -100,6 +100,19 @@ struct Controls {
     /// epoch, so its `#p`-pinned REQs read STALE (closed `auth-required:`) until it answers the new
     /// challenge and catches up — which is the in-place re-auth the fix re-issues its subs on.
     auth_generation: std::sync::atomic::AtomicU64,
+    /// Open-read mode (the deployed Buzz relay): before auth, the relay p-gates only these
+    /// kinds. It serves a `#p`-pinned REQ for other kinds before auth, but only as history.
+    /// `None` keeps the default rule, which refuses every `#p`-pinned REQ before auth.
+    open_read_gated_kinds: Option<Vec<u64>>,
+    /// When set, the relay answers each AUTH with `OK false`, and the socket stays
+    /// unauthenticated. The deployed relay sends no second challenge after that.
+    refuse_auth: std::sync::atomic::AtomicBool,
+}
+
+impl Controls {
+    fn auth_refused(&self) -> bool {
+        self.refuse_auth.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 /// A running fixture relay. Dropping it stops accepting new connections.
@@ -124,13 +137,27 @@ impl PGateRelay {
     /// race regardless of how fast the challenge is; holding it open makes that deterministic
     /// instead of timing-dependent, so the tooth cannot pass by being lucky.
     pub(crate) async fn start(auth_delay: Duration) -> Self {
+        Self::start_with(auth_delay, Controls::default()).await
+    }
+
+    /// Like [`Self::start`], but in the deployed relay's open-read mode: before auth, the
+    /// relay refuses a `#p`-pinned REQ only if it asks for one of `gated_kinds`.
+    pub(crate) async fn start_open_read(auth_delay: Duration, gated_kinds: &[u64]) -> Self {
+        let controls = Controls {
+            open_read_gated_kinds: Some(gated_kinds.to_vec()),
+            ..Controls::default()
+        };
+        Self::start_with(auth_delay, controls).await
+    }
+
+    async fn start_with(auth_delay: Duration, controls: Controls) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind fixture relay");
         let addr: SocketAddr = listener.local_addr().expect("fixture relay addr");
         let transcript: Arc<Mutex<Vec<ReqRecord>>> = Arc::new(Mutex::new(Vec::new()));
         let events: Arc<Mutex<Vec<PublishedEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let controls: Arc<Controls> = Arc::new(Controls::default());
+        let controls: Arc<Controls> = Arc::new(controls);
 
         let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let accept = tokio::spawn({
@@ -210,6 +237,13 @@ impl PGateRelay {
 
     pub(crate) fn url(&self) -> String {
         self.url.clone()
+    }
+
+    /// Answer every later AUTH with `OK false`.
+    pub(crate) fn refuse_auth(&self) {
+        self.controls
+            .refuse_auth
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Refuse the next `count` `REQ`s for `subscription_id` that carry an un-pinned filter — i.e. a
@@ -340,6 +374,12 @@ async fn serve_connection(
                 let Some(event) = frame.get(1) else { continue };
                 // Kind 22242 is the NIP-42 auth event. Checking it keeps the fixture honest: a client
                 // that authenticated with something else has not authenticated.
+                if controls.auth_refused() {
+                    let id = event.get("id").and_then(Value::as_str).unwrap_or_default();
+                    let refusal = json!(["OK", id, false, "restricted: not a relay member"]);
+                    send(&writer, refusal).await?;
+                    continue;
+                }
                 if event.get("kind").and_then(Value::as_u64) == Some(22242) {
                     authed_pubkey = event
                         .get("pubkey")
@@ -407,11 +447,17 @@ async fn serve_connection(
                             .auth_generation
                             .load(std::sync::atomic::Ordering::SeqCst);
 
+                let open_read_ungated = controls
+                    .open_read_gated_kinds
+                    .as_ref()
+                    .is_some_and(|gated| asks_no_gated_kind(&filters, gated));
+
                 let verdict = decide(
                     &subscription_id,
                     &pinned,
                     authed_pubkey.as_deref(),
                     stale,
+                    open_read_ungated,
                     &controls,
                 )
                 .await;
@@ -455,6 +501,7 @@ async fn decide(
     pinned: &[Option<&str>],
     authed_pubkey: Option<&str>,
     stale: bool,
+    open_read_ungated: bool,
     controls: &Controls,
 ) -> Verdict {
     let has_unpinned = pinned.iter().any(Option::is_none);
@@ -467,6 +514,12 @@ async fn decide(
         return Verdict::Closed(entry.reason);
     }
     drop(forced);
+
+    // Open read: the deployed relay serves an unauthenticated REQ for kinds that it does
+    // not p-gate, but only as history. It does not add the REQ to live delivery.
+    if open_read_ungated && authed_pubkey.is_none() {
+        return Verdict::Eose;
+    }
 
     // A `#p`-pinned REQ arriving under a STALE (re-challenged) generation is closed
     // `auth-required: not authenticated` — the OBSERVED wire contract on a live re-auth socket (field
@@ -490,6 +543,43 @@ async fn decide(
         }
     }
     Verdict::Eose
+}
+
+/// True when no filter of a REQ asks for a kind in `gated`.
+fn asks_no_gated_kind(filters: &[&Value], gated: &[u64]) -> bool {
+    let mut kinds = filters
+        .iter()
+        .filter_map(|filter| filter.get("kinds").and_then(Value::as_array))
+        .flatten()
+        .filter_map(Value::as_u64);
+    !kinds.any(|kind| gated.contains(&kind))
+}
+
+/// Every REQ that reached the relay before that session had completed NIP-42, on a filter the
+/// relay p-gates. This set being non-empty IS #189.
+pub(crate) fn p_gated_before_auth(reqs: &[ReqRecord]) -> Vec<&ReqRecord> {
+    reqs.iter()
+        .filter(|record| record.p_pinned && !record.authenticated)
+        .collect()
+}
+
+/// Every REQ the relay refused with the permanent-class prefix — each one a subscription
+/// nostr-sdk has deleted from its registry and will never restore.
+pub(crate) fn permanently_removed(reqs: &[ReqRecord]) -> Vec<&ReqRecord> {
+    reqs.iter()
+        .filter(|record| {
+            matches!(&record.verdict, Verdict::Closed(reason) if reason.starts_with("restricted:"))
+        })
+        .collect()
+}
+
+/// How many REQs for `id` the relay served (`EOSE`) on an AUTHENTICATED session — the count that
+/// must grow after each challenge-roll for the leg to be genuinely restored (not merely re-sent
+/// onto a stale generation and refused).
+pub(crate) fn served_authed(reqs: &[ReqRecord], id: &str) -> usize {
+    reqs.iter()
+        .filter(|r| r.subscription_id == id && r.authenticated && r.verdict == Verdict::Eose)
+        .count()
 }
 
 type Writer = futures_util::stream::SplitSink<
