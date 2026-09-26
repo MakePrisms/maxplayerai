@@ -1,5 +1,6 @@
 //! Real Git HTTP router + PostgreSQL ACL + Redis replay guard. Object storage is
-//! a local read-only fixture, so a forbidden request must never touch it.
+//! a local in-memory fixture that accepts only the git store's create-only writes,
+//! so a forbidden request must never touch it.
 use axum::{
     Router,
     body::Body,
@@ -116,8 +117,30 @@ async fn private_http_acl_precedes_manifest_cache_and_provision_replay_is_reject
             let accesses = accesses.clone();
             async move {
                 accesses.fetch_add(1, Ordering::SeqCst);
-                let key = req.uri().path().strip_prefix("/test/").unwrap_or("");
-                match objects.read().unwrap().get(key) {
+                let key = req
+                    .uri()
+                    .path()
+                    .strip_prefix("/test/")
+                    .unwrap_or("")
+                    .to_owned();
+                if req.method() == Method::PUT {
+                    // Provisioning seeds the empty-manifest pointer with `If-None-Match: *`.
+                    let create_only = req.headers().get("if-none-match").is_some_and(|v| v == "*");
+                    let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    let mut objects = objects.write().unwrap();
+                    if create_only && objects.contains_key(&key) {
+                        return (StatusCode::PRECONDITION_FAILED, "exists").into_response();
+                    }
+                    objects.insert(key, bytes.to_vec());
+                    return Response::builder()
+                        .status(200)
+                        .header("etag", "\"fixture\"")
+                        .body(Body::empty())
+                        .unwrap();
+                }
+                match objects.read().unwrap().get(&key) {
                     Some(bytes) => Response::builder()
                         .status(200)
                         .header("etag", "\"fixture\"")
@@ -148,6 +171,8 @@ async fn private_http_acl_precedes_manifest_cache_and_provision_replay_is_reject
     config.private_job_repos = true;
     config.private_service_pubkey = Some(service.public_key().to_hex());
     config.git_pack_cache_path = temp.path().join("cache");
+    config.git_repo_path = temp.path().join("repos");
+    std::fs::create_dir_all(&config.git_repo_path).unwrap();
     config.media.s3_endpoint = endpoint;
     config.media.s3_access_key = "public-test-key".into();
     config.media.s3_secret_key = "public-test-secret".into();
@@ -243,6 +268,33 @@ async fn private_http_acl_precedes_manifest_cache_and_provision_replay_is_reject
         .status()
         .is_success()
     );
+    // A private repo is never announced, so provisioning must seed the empty-manifest
+    // pointer that announce seeds for a public repo. Without it, the first push (the
+    // buyer's input upload) failed at the receive-pack advertisement with 404.
+    assert!(
+        objects
+            .read()
+            .unwrap()
+            .contains_key(&super::manifest::pointer_key(
+                tenant,
+                &buyer.public_key().to_hex(),
+                &job
+            )),
+        "provisioning must seed the private repository pointer"
+    );
+    for service_name in ["git-receive-pack", "git-upload-pack"] {
+        let path = format!(
+            "/git/{}/{job}/info/refs?service={service_name}",
+            buyer.public_key().to_hex()
+        );
+        let auth = token(&buyer, &base, "GET", None);
+        let response = request(&app, &host, "GET", &path, Some(&auth), vec![]).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "fresh private repository {service_name} advertisement"
+        );
+    }
     let path = format!(
         "/git/{}/{job}/info/refs?service=git-upload-pack",
         buyer.public_key().to_hex()
