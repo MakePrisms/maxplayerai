@@ -1025,3 +1025,14 @@ button.chip { cursor: pointer; }
 @media (max-width: 760px) {
   .h-hero h1.h-title-short { font-size: min(calc((100vw - 60px) / 9), 84px); white-space: nowrap; }
 }
+/* one screen per section: the hero and every section are at least as tall as
+   the visible browser window (minus the sticky nav), content centered in it.
+   svh = the small viewport on phones, so mobile browser bars never cut a
+   section off; vh is the fallback. Sections with more content than one
+   screen (e.g. the FAQ on a phone) simply grow. */
+.h-hero, .h-section {
+  min-height: calc(100vh - var(--nav-h));
+  min-height: calc(100svh - var(--nav-h));
+}
+.h-section { display: flex; flex-direction: column; justify-content: center; }
+.h-section > .h-in { width: 100%; }
