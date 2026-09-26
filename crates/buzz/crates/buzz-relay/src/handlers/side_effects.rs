@@ -2707,7 +2707,11 @@ async fn seed_manifest_pointer(
 /// handling (same empty digest → Ok), and a concurrent *pusher* that populates
 /// the pointer between our read and our seed loses the create race and is
 /// likewise treated as an already-present pointer, not an overwrite.
-async fn ensure_manifest_pointer(
+///
+/// Private job provisioning (`api::git::private_jobs::provision`) uses the same
+/// path: a private repo is never announced, so provisioning is the only place
+/// that can establish its pointer.
+pub(crate) async fn ensure_manifest_pointer(
     state: &Arc<AppState>,
     tenant: &TenantContext,
     owner_hex: &str,

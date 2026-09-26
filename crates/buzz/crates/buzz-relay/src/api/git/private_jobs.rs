@@ -248,6 +248,16 @@ pub async fn provision(
     {
         return Err((StatusCode::CONFLICT, "private repository binding conflict").into_response());
     }
+    // Announce seeds the empty-manifest pointer for a public repo; a private repo is
+    // never announced, so seed it here, after the row exists. A missing pointer reads
+    // as "repository never existed" (`info/refs` → 404), which would fail every first
+    // push. Tolerant: a repeated or award-time provision leaves an existing pointer as-is.
+    crate::handlers::side_effects::ensure_manifest_pointer(&state, &tenant, &buyer, &job_id)
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "private repository pointer seed failed");
+            unavailable()
+        })?;
     Ok(Json(
         serde_json::json!({"repo":format!("{prefix}{buyer}/{job_id}"),"job_id":job_id,"max_file_bytes":10485760,"max_repository_bytes":104857600,"max_files":1000}),
     ))
