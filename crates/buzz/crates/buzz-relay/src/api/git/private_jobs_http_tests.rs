@@ -1,6 +1,6 @@
 //! Real Git HTTP router + PostgreSQL ACL + Redis replay guard. Object storage is
-//! a local in-memory fixture that accepts only the git store's create-only writes,
-//! so a forbidden request must never touch it.
+//! a local in-memory fixture with the git store's write rules (create-only writes
+//! and `If-Match` pointer CAS), so a forbidden request must never touch it.
 use axum::{
     Router,
     body::Body,
@@ -12,16 +12,19 @@ use axum::{
 };
 use base64::Engine;
 use nostr::JsonUtil;
-use nostr::{EventBuilder, Keys, Kind, Tag};
+use nostr::{Event, EventBuilder, Keys, Kind, Tag};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
+    path::Path,
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicUsize, Ordering},
     },
 };
 use tower::ServiceExt;
+
+type Objects = Arc<RwLock<BTreeMap<String, Vec<u8>>>>;
 
 fn token(keys: &Keys, url: &str, method: &str, body: Option<&[u8]>) -> String {
     let mut tags = vec![
@@ -33,6 +36,22 @@ fn token(keys: &Keys, url: &str, method: &str, body: Option<&[u8]>) -> String {
     }
     let event = EventBuilder::new(Kind::from(27235), "")
         .tags(tags)
+        .sign_with_keys(keys)
+        .unwrap();
+    format!(
+        "Nostr {}",
+        base64::engine::general_purpose::STANDARD.encode(event.as_json())
+    )
+}
+/// Git token scoped to one ref, as the client signs an input push: the pre-receive
+/// hook then refuses every other ref, on top of the private repository rules.
+fn scoped_git_token(keys: &Keys, repo_root: &str, reference: &str) -> String {
+    let event = EventBuilder::new(Kind::from(27235), "")
+        .tags([
+            Tag::parse(["u", repo_root]).unwrap(),
+            Tag::parse(["method", "GET"]).unwrap(),
+            Tag::parse(["ref", reference]).unwrap(),
+        ])
         .sign_with_keys(keys)
         .unwrap();
     format!(
@@ -60,9 +79,139 @@ async fn request(
         .await
         .unwrap()
 }
-#[tokio::test]
-#[ignore = "requires disposable PRIVATE_JOB_TEST_DATABASE_URL and PRIVATE_JOB_TEST_REDIS_URL"]
-async fn private_http_acl_precedes_manifest_cache_and_provision_replay_is_rejected() {
+/// Run the real `git` client against the test relay: no system or user config, no
+/// prompts, the tenant's `Host` header, and an optional NIP-98 `Authorization` header.
+async fn git(dir: &Path, host: &str, auth: Option<&str>, args: &[&str]) -> std::process::Output {
+    let mut command = tokio::process::Command::new("git");
+    command
+        .current_dir(dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_AUTHOR_NAME", "buyer")
+        .env("GIT_AUTHOR_EMAIL", "buyer@example.invalid")
+        .env("GIT_COMMITTER_NAME", "buyer")
+        .env("GIT_COMMITTER_EMAIL", "buyer@example.invalid")
+        .arg("-c")
+        .arg(format!("http.extraHeader=Host: {host}"));
+    if let Some(auth) = auth {
+        command
+            .arg("-c")
+            .arg(format!("http.extraHeader=Authorization: {auth}"));
+    }
+    command.args(args).output().await.unwrap()
+}
+fn stdout(output: &std::process::Output) -> String {
+    assert!(
+        output.status.success(),
+        "git failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout.clone())
+        .unwrap()
+        .trim()
+        .to_owned()
+}
+fn etag(bytes: &[u8]) -> String {
+    format!("\"{}\"", hex::encode(Sha256::digest(bytes)))
+}
+/// In-memory S3 bucket `test`. Writes follow the git store: `If-None-Match: *` for
+/// packs, manifests and the seeded pointer, and `If-Match` for pointer CAS.
+fn object_store(objects: Objects, accesses: Arc<AtomicUsize>) -> Router {
+    Router::new().fallback(move |req: Request<Body>| {
+        let objects = objects.clone();
+        let accesses = accesses.clone();
+        async move {
+            accesses.fetch_add(1, Ordering::SeqCst);
+            let key = req
+                .uri()
+                .path()
+                .strip_prefix("/test/")
+                .unwrap_or("")
+                .to_owned();
+            if req.method() == Method::PUT {
+                let (create_only, if_match) = {
+                    let headers = req.headers();
+                    (
+                        headers.get("if-none-match").is_some_and(|v| v == "*"),
+                        headers
+                            .get("if-match")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_owned),
+                    )
+                };
+                let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let mut objects = objects.write().unwrap();
+                let current = objects.get(&key).map(|b| etag(b));
+                if (create_only && current.is_some())
+                    || if_match.is_some_and(|tag| current.as_deref() != Some(tag.as_str()))
+                {
+                    return (StatusCode::PRECONDITION_FAILED, "precondition failed")
+                        .into_response();
+                }
+                let tag = etag(&bytes);
+                objects.insert(key, bytes.to_vec());
+                return Response::builder()
+                    .status(200)
+                    .header("etag", tag)
+                    .body(Body::empty())
+                    .unwrap();
+            }
+            match objects.read().unwrap().get(&key) {
+                Some(bytes) => Response::builder()
+                    .status(200)
+                    .header("etag", etag(bytes))
+                    .header("content-length", bytes.len())
+                    .body(Body::from(if req.method() == Method::HEAD {
+                        Vec::new()
+                    } else {
+                        bytes.clone()
+                    }))
+                    .unwrap(),
+                None => (StatusCode::NOT_FOUND, "absent").into_response(),
+            }
+        }
+    })
+}
+fn private_offer(buyer: &Keys, seller: &Keys, job: &str) -> Event {
+    EventBuilder::new(Kind::from(3401), "")
+        .allow_self_tagging()
+        .tags(
+            [
+                vec!["t".into(), "maxplayer".into()],
+                vec!["v".into(), "2".into()],
+                vec!["job".into(), job.to_owned()],
+                vec!["visibility".into(), "private".into()],
+                vec!["discovery".into(), "targeted".into()],
+                vec!["output".into(), "text".into()],
+                vec!["amount".into(), "0".into(), "sat".into()],
+                vec!["param".into(), "payment".into(), "none".into()],
+                vec!["param".into(), "deadline".into(), "2000000000".into()],
+                vec!["p".into(), seller.public_key().to_hex()],
+                vec!["content-id".into(), "19".repeat(32)],
+                vec!["content-commitment".into(), "20".repeat(32)],
+            ]
+            .into_iter()
+            .map(|t: Vec<String>| Tag::parse(t).unwrap()),
+        )
+        .sign_with_keys(buyer)
+        .unwrap()
+}
+struct Harness {
+    host: String,
+    tenant: buzz_core::CommunityId,
+    state: Arc<crate::state::AppState>,
+    objects: Objects,
+    accesses: Arc<AtomicUsize>,
+    object_server: tokio::task::JoinHandle<()>,
+    _shutdown: crate::state::AuditShutdownHandle,
+    _temp: tempfile::TempDir,
+}
+/// A fresh tenant with private job repositories on. `bind_addr` must be the address
+/// of a real listener when a test pushes: the pre-receive hook calls back to it.
+async fn harness(service: &Keys, bind_addr: Option<std::net::SocketAddr>) -> Harness {
     let db_url = std::env::var("PRIVATE_JOB_TEST_DATABASE_URL")
         .expect("explicit disposable database required");
     let redis_url =
@@ -78,84 +227,9 @@ async fn private_http_acl_precedes_manifest_cache_and_provision_replay_is_reject
         .execute(&pool)
         .await
         .unwrap();
-    let tenant = buzz_core::CommunityId::from_uuid(community);
-    let buyer = Keys::generate();
-    let seller = Keys::generate();
-    let service = Keys::generate();
-    let outsider = Keys::generate();
-    let job = "17".repeat(32);
-    let base = format!("https://{host}/git/{}/{job}", buyer.public_key().to_hex());
-    let offer = EventBuilder::new(Kind::from(3401), "")
-        .allow_self_tagging()
-        .tags(
-            [
-                vec!["t".into(), "maxplayer".into()],
-                vec!["v".into(), "2".into()],
-                vec!["job".into(), job.clone()],
-                vec!["visibility".into(), "private".into()],
-                vec!["discovery".into(), "targeted".into()],
-                vec!["output".into(), "text".into()],
-                vec!["amount".into(), "0".into(), "sat".into()],
-                vec!["param".into(), "payment".into(), "none".into()],
-                vec!["param".into(), "deadline".into(), "2000000000".into()],
-                vec!["p".into(), seller.public_key().to_hex()],
-                vec!["content-id".into(), "19".repeat(32)],
-                vec!["content-commitment".into(), "20".repeat(32)],
-            ]
-            .into_iter()
-            .map(|t: Vec<String>| Tag::parse(t).unwrap()),
-        )
-        .sign_with_keys(&buyer)
-        .unwrap();
-    let objects = Arc::new(std::sync::RwLock::new(BTreeMap::<String, Vec<u8>>::new()));
+    let objects = Objects::default();
     let accesses = Arc::new(AtomicUsize::new(0));
-    let object_app = Router::new().fallback({
-        let objects = objects.clone();
-        let accesses = accesses.clone();
-        move |req: Request<Body>| {
-            let objects = objects.clone();
-            let accesses = accesses.clone();
-            async move {
-                accesses.fetch_add(1, Ordering::SeqCst);
-                let key = req
-                    .uri()
-                    .path()
-                    .strip_prefix("/test/")
-                    .unwrap_or("")
-                    .to_owned();
-                if req.method() == Method::PUT {
-                    // Provisioning seeds the empty-manifest pointer with `If-None-Match: *`.
-                    let create_only = req.headers().get("if-none-match").is_some_and(|v| v == "*");
-                    let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
-                        .await
-                        .unwrap();
-                    let mut objects = objects.write().unwrap();
-                    if create_only && objects.contains_key(&key) {
-                        return (StatusCode::PRECONDITION_FAILED, "exists").into_response();
-                    }
-                    objects.insert(key, bytes.to_vec());
-                    return Response::builder()
-                        .status(200)
-                        .header("etag", "\"fixture\"")
-                        .body(Body::empty())
-                        .unwrap();
-                }
-                match objects.read().unwrap().get(&key) {
-                    Some(bytes) => Response::builder()
-                        .status(200)
-                        .header("etag", "\"fixture\"")
-                        .header("content-length", bytes.len())
-                        .body(Body::from(if req.method() == Method::HEAD {
-                            Vec::new()
-                        } else {
-                            bytes.clone()
-                        }))
-                        .unwrap(),
-                    None => (StatusCode::NOT_FOUND, "absent").into_response(),
-                }
-            }
-        }
-    });
+    let object_app = object_store(objects.clone(), accesses.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let object_server = tokio::spawn(async move {
@@ -173,6 +247,9 @@ async fn private_http_acl_precedes_manifest_cache_and_provision_replay_is_reject
     config.git_pack_cache_path = temp.path().join("cache");
     config.git_repo_path = temp.path().join("repos");
     std::fs::create_dir_all(&config.git_repo_path).unwrap();
+    if let Some(bind_addr) = bind_addr {
+        config.bind_addr = bind_addr;
+    }
     config.media.s3_endpoint = endpoint;
     config.media.s3_access_key = "public-test-key".into();
     config.media.s3_secret_key = "public-test-secret".into();
@@ -195,7 +272,7 @@ async fn private_http_acl_precedes_manifest_cache_and_provision_replay_is_reject
         buzz_workflow::WorkflowConfig::default(),
     ));
     let media = buzz_media::MediaStorage::new(&config.media).unwrap();
-    let (state, _shutdown) = crate::state::AppState::new(
+    let (state, shutdown) = crate::state::AppState::new(
         config,
         db,
         redis,
@@ -207,7 +284,49 @@ async fn private_http_acl_precedes_manifest_cache_and_provision_replay_is_reject
         Keys::generate(),
         media,
     );
-    let state = Arc::new(state);
+    Harness {
+        host,
+        tenant: buzz_core::CommunityId::from_uuid(community),
+        state: Arc::new(state),
+        objects,
+        accesses,
+        object_server,
+        _shutdown: shutdown,
+        _temp: temp,
+    }
+}
+/// Read the manifest the repository pointer names, as the relay would.
+fn published_manifest(
+    objects: &Objects,
+    tenant: buzz_core::CommunityId,
+    owner: &str,
+    job: &str,
+) -> super::manifest::Manifest {
+    let objects = objects.read().unwrap();
+    let pointer = &objects[&super::manifest::pointer_key(tenant, owner, job)];
+    let digest = std::str::from_utf8(pointer).unwrap().trim();
+    super::manifest::Manifest::from_bytes(&objects[&format!("manifests/{digest}")]).unwrap()
+}
+#[tokio::test]
+#[ignore = "requires disposable PRIVATE_JOB_TEST_DATABASE_URL and PRIVATE_JOB_TEST_REDIS_URL"]
+async fn private_http_acl_precedes_manifest_cache_and_provision_replay_is_rejected() {
+    let buyer = Keys::generate();
+    let seller = Keys::generate();
+    let service = Keys::generate();
+    let outsider = Keys::generate();
+    let Harness {
+        host,
+        tenant,
+        state,
+        objects,
+        accesses,
+        object_server,
+        _shutdown,
+        _temp,
+    } = harness(&service, None).await;
+    let job = "17".repeat(32);
+    let base = format!("https://{host}/git/{}/{job}", buyer.public_key().to_hex());
+    let offer = private_offer(&buyer, &seller, &job);
     let app = super::transport::git_router(state.clone());
     let provision_path = format!("/api/jobs/private/{job}");
     let body = serde_json::to_vec(&serde_json::json!({"signed_offer":offer})).unwrap();
@@ -364,4 +483,103 @@ async fn private_http_acl_precedes_manifest_cache_and_provision_replay_is_reject
         StatusCode::FORBIDDEN
     );
     object_server.abort();
+}
+/// The first write into a fresh private repository, end to end with the real `git`
+/// client over real HTTP: the buyer's scoped input push passes the pre-receive hook
+/// and publishes a manifest; the targeted seller fetches the exact commit before any
+/// award; an outsider's push is refused and changes nothing.
+#[tokio::test]
+#[ignore = "requires disposable PRIVATE_JOB_TEST_DATABASE_URL and PRIVATE_JOB_TEST_REDIS_URL"]
+async fn fresh_private_repo_takes_real_input_push_and_targeted_fetch() {
+    let buyer = Keys::generate();
+    let seller = Keys::generate();
+    let service = Keys::generate();
+    let outsider = Keys::generate();
+    // The hook posts to `bind_addr`, so the relay must listen before the state exists.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let h = harness(&service, Some(addr)).await;
+    let app = super::transport::git_router(h.state.clone());
+    let served = app
+        .clone()
+        .merge(super::git_policy_router(h.state.clone()))
+        .into_make_service_with_connect_info::<std::net::SocketAddr>();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, served).await.unwrap();
+    });
+    let job = "31".repeat(32);
+    let owner = buyer.public_key().to_hex();
+    let provision_path = format!("/api/jobs/private/{job}");
+    let body = serde_json::to_vec(&serde_json::json!({
+        "signed_offer": private_offer(&buyer, &seller, &job)
+    }))
+    .unwrap();
+    let auth = token(
+        &buyer,
+        &format!("https://{}{provision_path}", h.host),
+        "PUT",
+        Some(&body),
+    );
+    let response = request(&app, &h.host, "PUT", &provision_path, Some(&auth), body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let repo_root = format!("https://{}/git/{owner}/{job}", h.host);
+    let remote = format!("http://{addr}/git/{owner}/{job}");
+    let reference = format!("refs/heads/input/{}", "32".repeat(32));
+    let work = tempfile::tempdir().unwrap();
+    let source = work.path().join("source");
+    let fetched = work.path().join("fetched");
+    for dir in [&source, &fetched] {
+        std::fs::create_dir(dir).unwrap();
+        stdout(&git(dir, &h.host, None, &["init", "-q"]).await);
+    }
+    std::fs::write(source.join("brief.txt"), "private input\n").unwrap();
+    stdout(&git(&source, &h.host, None, &["add", "brief.txt"]).await);
+    stdout(&git(&source, &h.host, None, &["commit", "-q", "-m", "input"]).await);
+    let commit = stdout(&git(&source, &h.host, None, &["rev-parse", "HEAD"]).await);
+
+    let push_auth = scoped_git_token(&buyer, &repo_root, &reference);
+    let refspec = format!("HEAD:{reference}");
+    let push = git(
+        &source,
+        &h.host,
+        Some(&push_auth),
+        &["push", &remote, &refspec],
+    )
+    .await;
+    stdout(&push);
+    let manifest = published_manifest(&h.objects, h.tenant, &owner, &job);
+    assert_eq!(manifest.refs.get(&reference), Some(&commit));
+
+    let fetch_auth = token(&seller, &repo_root, "GET", None);
+    let fetch = git(
+        &fetched,
+        &h.host,
+        Some(&fetch_auth),
+        &["fetch", "-q", &remote, &reference],
+    )
+    .await;
+    stdout(&fetch);
+    let fetched_commit = git(&fetched, &h.host, None, &["rev-parse", "FETCH_HEAD"]).await;
+    assert_eq!(stdout(&fetched_commit), commit);
+    let brief = git(&fetched, &h.host, None, &["show", "FETCH_HEAD:brief.txt"]).await;
+    assert_eq!(stdout(&brief), "private input");
+
+    let foreign = format!("refs/heads/input/{}", "33".repeat(32));
+    let outsider_auth = scoped_git_token(&outsider, &repo_root, &foreign);
+    let foreign_refspec = format!("HEAD:{foreign}");
+    let refused = git(
+        &source,
+        &h.host,
+        Some(&outsider_auth),
+        &["push", &remote, &foreign_refspec],
+    )
+    .await;
+    assert!(!refused.status.success(), "outsider push must be refused");
+    assert_eq!(
+        published_manifest(&h.objects, h.tenant, &owner, &job).refs,
+        manifest.refs
+    );
+    server.abort();
+    h.object_server.abort();
 }
