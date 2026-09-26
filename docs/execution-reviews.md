@@ -355,7 +355,9 @@ Set `review.reviewers[relay]` to the same identity as `privacy.service_pubkey`; 
 worker signer must be that service key, which already has content and Git access.
 A different key fails closed without adding a recipient or using public transport.
 Worker JSON accepts `private_git_base` (default: relay HTTPS `/git/` origin) and
-`accepted_mints` (default: standard mint); match the clients and relay. Systemd exposes
+`accepted_mints` (default: the mints that clients use by default, minibits and the
+testnut test mint). A list replaces that default, so name each mint that a seller uses.
+Systemd exposes
 `privateGitBase` and `acceptedMints`. No credentials are generated or committed here.
 
 Results and errors are encrypted separately for authorized buyer, seller/requester
