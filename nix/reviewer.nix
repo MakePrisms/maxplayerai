@@ -5,22 +5,26 @@ let
   settings = pkgs.writeText "maxplayer-reviewer-settings.json" (builtins.toJSON {
     relay = cfg.relayUrl;
     model = cfg.model;
-    database = "/var/lib/maxplayer-reviewer/reviews.sqlite";
     private_git_base = cfg.privateGitBase;
     accepted_mints = cfg.acceptedMints;
   });
   start = pkgs.writeShellScript "maxplayer-reviewer-start" ''
     set -eu
     umask 077
+    # DynamicUser makes StateDirectory a symlink into /var/lib/private.
+    # SQLite OPEN_NOFOLLOW rejects symlinks in any path component. Resolve
+    # only the trusted state directory, never the database file itself.
+    state_dir="$(${pkgs.coreutils}/bin/realpath -e /var/lib/maxplayer-reviewer)"
     # LoadCredential may expose read-only 0440 files in a protected mount.
     # The reviewer requires owner-only regular files, so stage private copies
     # in RuntimeDirectory (0700, service-owned, removed when the unit stops).
     ${pkgs.coreutils}/bin/install -m 0600 "$CREDENTIALS_DIRECTORY/signer" /run/maxplayer-reviewer/signer
     ${pkgs.coreutils}/bin/install -m 0600 "$CREDENTIALS_DIRECTORY/typesafe" /run/maxplayer-reviewer/typesafe
     ${pkgs.jq}/bin/jq \
+      --arg database "$state_dir/reviews.sqlite" \
       --arg signer /run/maxplayer-reviewer/signer \
       --arg provider /run/maxplayer-reviewer/typesafe \
-      '. + {signer_file: $signer, provider_key_file: $provider}' \
+      '. + {database: $database, signer_file: $signer, provider_key_file: $provider}' \
       ${settings} > /run/maxplayer-reviewer/reviewer.json
     exec ${lib.getExe cfg.package} reviewer serve /run/maxplayer-reviewer/reviewer.json
   '';

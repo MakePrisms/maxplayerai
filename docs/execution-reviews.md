@@ -204,7 +204,36 @@ dedicated dynamic service user. These can have mode `0440` within systemd's
 protected credential mount. The launcher stages owner-only `0600` copies in the
 service-owned `0700` runtime directory, preserving the reviewer's strict secret-file
 permission check. These runtime copies are removed when the service stops; the
-original provisioned files remain unchanged. Only credential **paths**, never secret values, are
+original provisioned files remain unchanged. The launcher resolves the existing state directory
+with `realpath -e` before composing the database filename: `DynamicUser` can make
+`/var/lib/maxplayer-reviewer` a symlink into `/var/lib/private`, which SQLite's
+`SQLITE_OPEN_NOFOLLOW` rejects. Only the directory is resolved; a symlink at the
+database filename remains rejected. This uses the same database without moving,
+resetting, or migrating state. A missing state directory fails startup.
+
+If the temporary `90-database-path-fix.conf` runtime override was installed during
+recovery, deploy the fixed revision first, then remove **only that override** so
+the service uses the new Nix-managed launcher (not the pinned temporary binary):
+
+```sh
+# As root, after the fixed nixos-rebuild switch succeeds:
+mkdir -p -m 0700 /root/maxplayer-reviewer-override-backup
+mv /run/systemd/system/maxplayer-reviewer.service.d/90-database-path-fix.conf \
+  /root/maxplayer-reviewer-override-backup/90-database-path-fix.conf
+systemctl daemon-reload
+systemctl restart maxplayer-reviewer.service
+systemctl show maxplayer-reviewer.service -p ExecStart
+systemctl --no-pager --full status maxplayer-reviewer.service
+journalctl -u maxplayer-reviewer.service --since "2 minutes ago" --no-pager
+```
+
+Confirm `ExecStart` points into `/nix/store`, the reviewer stays active without new
+`review_store` errors, and Buzz remains active. Do not use `systemctl revert`,
+which can remove unrelated overrides. Retain the runtime launcher until recovery
+is verified; the runtime workaround itself does not survive reboot. A running
+service still needs a controlled private-job round trip to prove end-to-end health.
+
+Only credential **paths**, never secret values, are
 written to `/run/maxplayer-reviewer/reviewer.json`. The service generates that file
 from non-secret Nix settings at startup. SQLite lives at
 `/var/lib/maxplayer-reviewer/reviews.sqlite` (including its lock/WAL files); the
