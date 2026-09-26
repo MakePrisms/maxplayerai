@@ -32,7 +32,8 @@ pub struct ServiceConfig {
     #[serde(default = "model_default")]
     pub model: String,
 }
-fn review_mints() -> Vec<String> { vec![crate::home::DEFAULT_MINT_URL.into()] }
+/// The clients' shipped mint: private evidence names the mint the clients accept.
+fn review_mints() -> Vec<String> { vec![crate::home::DEFAULT_MINIBITS_MINT_URL.into()] }
 fn private_policy(config: &ServiceConfig, keys: &Keys) -> Result<crate::private_content::runtime::Policy, String> {
     let base = match &config.private_git_base {
         Some(base) => base.clone(),
@@ -782,6 +783,44 @@ impl Drop for Flight {
     }
 }
 
+/// Stable intake subscription ids, so every re-issue replaces the same leg on the relay.
+const PUBLIC_INTAKE: &str = "maxplayer-review-requests";
+const PRIVATE_INTAKE: &str = "maxplayer-review-private";
+
+/// (Re)issue both intake legs: public kind-3409 requests, and private requests inside
+/// kind-1059 gift wraps. Separate legs keep public reviews independent of the private
+/// leg, which a `#p`-gating relay serves only after NIP-42 auth.
+async fn subscribe_intake(client: &Client, reviewer: PublicKey) -> Result<(), String> {
+    // Gift-wrap timestamps are intentionally randomized into the past.
+    // Include the transport overlap for both startup history and live filters.
+    let since = Timestamp::from(
+        Timestamp::now()
+            .as_secs()
+            .saturating_sub(crate::private_content::transport::TIMESTAMP_TWEAK_SECS + 60),
+    );
+    for (id, kind) in [
+        (PUBLIC_INTAKE, Kind::Custom(REVIEW_REQUEST_KIND)),
+        (PRIVATE_INTAKE, Kind::GiftWrap),
+    ] {
+        let filter = Filter::new().kind(kind).pubkey(reviewer).since(since);
+        client
+            .subscribe_with_id(SubscriptionId::new(id), filter, None)
+            .await
+            .map_err(|_| "relay_subscribe")?;
+    }
+    Ok(())
+}
+
+/// Operators need to see why a request got no answer: a dropped request only times out
+/// on the client. Ids and pubkeys only, never request content.
+fn log_drop(request: &Event, code: &str) {
+    crate::opline!(
+        "reviewer: dropped request {} from {}: {code}",
+        request.id,
+        request.pubkey
+    );
+}
+
 async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Result<(), String> {
     let store = Store::open(&config.database)?;
     let client = Client::new(keys.clone());
@@ -790,27 +829,47 @@ async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Re
         .add_relay(&config.relay)
         .await
         .map_err(|_| "relay_configuration")?;
+    // `Authenticated` never reaches the pool stream, so watch the relay's own stream,
+    // taken before connect so the first completed auth cannot be missed.
+    let mut relay_notifications = client
+        .relay(&config.relay)
+        .await
+        .map_err(|_| "relay_configuration")?
+        .notifications();
     client.connect().await;
     let mut notifications = client.notifications();
-    client
-        .subscribe(
-            Filter::new()
-                .kinds([Kind::Custom(REVIEW_REQUEST_KIND), Kind::GiftWrap])
-                .pubkey(keys.public_key())
-                // Gift-wrap timestamps are intentionally randomized into the past.
-                // Include the transport overlap for both startup history and live filters.
-                .since(Timestamp::from(Timestamp::now().as_secs().saturating_sub(
-                    crate::private_content::transport::TIMESTAMP_TWEAK_SECS + 60))),
-            None,
-        )
-        .await
-        .map_err(|_| "relay_subscribe")?;
+    subscribe_intake(&client, keys.public_key()).await?;
     let (sender, mut inbox) = tokio::sync::mpsc::channel(256);
     let flights = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
     let reviewer = keys.public_key();
     let intake_keys = keys.clone();
     // JoinSet aborts intake on all worker exit paths, including publication errors.
     let mut intake = tokio::task::JoinSet::new();
+    // An open-read relay closes a `#p`-pinned kind-1059 REQ that arrives before NIP-42
+    // AUTH with `restricted:`, and nostr-sdk then deletes the subscription for good
+    // (#189). The boot REQs race the challenge, and so does every reconnect or in-place
+    // re-challenge (#429), so re-issue both legs after EVERY completed auth.
+    intake.spawn({
+        let client = client.clone();
+        async move {
+            loop {
+                match relay_notifications.recv().await {
+                    Ok(nostr_sdk::pool::RelayNotification::Authenticated) => {
+                        match subscribe_intake(&client, reviewer).await {
+                            Ok(()) => {
+                                crate::opline!("reviewer: intake subscribed after NIP-42 auth")
+                            }
+                            Err(code) => crate::opline!(
+                                "reviewer: intake re-subscribe after NIP-42 auth failed: {code}"
+                            ),
+                        }
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(_) => break,
+                }
+            }
+        }
+    });
     intake.spawn(async move {
         loop {
             let notification = match notifications.recv().await {
@@ -823,20 +882,36 @@ async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Re
             };
             // Never accept a plaintext private inner message on the public lane.
             let request = if request.kind == Kind::GiftWrap {
-                let Ok(inner) = crate::review::private::unwrap(&intake_keys, &request).await else { continue; };
+                let Ok(inner) = crate::review::private::unwrap(&intake_keys, &request).await else {
+                    // Private-content copies to the service identity land here too.
+                    crate::opline_verbose!(
+                        "reviewer: ignored gift wrap {} (not a review request)",
+                        request.id
+                    );
+                    continue;
+                };
                 Box::new(inner)
             } else {
-                if crate::review::private::is_private(&request) { continue; }
+                if crate::review::private::is_private(&request) {
+                    log_drop(&request, "private_request_on_public_lane");
+                    continue;
+                }
                 request
             };
-            let Ok(subject) = validate_request(&request, &reviewer) else {
-                continue;
+            let subject = match validate_request(&request, &reviewer) {
+                Ok(subject) => subject,
+                Err(code) => {
+                    log_drop(&request, &code);
+                    continue;
+                }
             };
             let Some(flight) = Flight::reserve(&flights, &subject) else {
+                crate::opline_verbose!("reviewer: request {} already in flight", request.id);
                 continue;
             };
             // A full queue drops the reservation too. Clients remain blocked and can retry.
-            if sender.try_send((flight, request, subject)).is_err() {
+            if let Err(full) = sender.try_send((flight, request, subject)) {
+                log_drop(&full.into_inner().1, "queue_full");
                 continue;
             }
         }
@@ -849,16 +924,25 @@ async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Re
         let Some((_flight, request, subject)) = next else {
             break;
         };
-        if store
-            .admit(&request.pubkey.to_hex(), Timestamp::now().as_secs())
-            .is_err()
-        {
+        if let Err(code) = store.admit(&request.pubkey.to_hex(), Timestamp::now().as_secs()) {
+            log_drop(&request, &code);
             continue;
         }
         let private_request = if crate::review::private::is_private(&request) {
-            let Ok(bundle) = serde_json::from_str::<crate::review::private::Request>(&request.content) else { continue; };
+            let Ok(bundle) =
+                serde_json::from_str::<crate::review::private::Request>(&request.content)
+            else {
+                log_drop(&request, "invalid_request");
+                continue;
+            };
             let policy = private_policy(&config, &keys)?;
-            let Ok(recipients) = bundle.validate(&request.pubkey, &policy) else { continue; };
+            let recipients = match bundle.validate(&request.pubkey, &policy) {
+                Ok(recipients) => recipients,
+                Err(code) => {
+                    log_drop(&request, &code);
+                    continue;
+                }
+            };
             Some((bundle, policy, recipients))
         } else { None };
         let deadline = tokio::time::Instant::now() + WINDOW;
@@ -893,6 +977,7 @@ async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Re
                     _ => "input_unavailable".into(),
                 };
                 if code == "unauthorized_request" || code == "private_transport_unavailable" {
+                    log_drop(&request, &code);
                     continue;
                 }
                 let event = signed(

@@ -48,7 +48,9 @@ in
     };
     acceptedMints = lib.mkOption {
       type = lib.types.listOf lib.types.str;
-      default = [ "https://testnut.cashudevkit.org" ];
+      # The clients' shipped mint (home::DEFAULT_MINIBITS_MINT_URL). A mismatch makes
+      # the worker drop paid private requests, which clients see only as a timeout.
+      default = [ "https://mint.minibits.cash/Bitcoin" ];
       description = "Trusted mint allowlist for validating private lifecycle evidence; match client policy.";
     };
     signerFile = lib.mkOption {

@@ -28,7 +28,7 @@ use tokio::sync::Mutex;
 
 /// What the relay answered a `REQ` with.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Verdict {
+pub(crate) enum Verdict {
     /// Served — the end-of-stored-events the client waits for.
     Eose,
     /// Refused, with the full reason string (prefix included).
@@ -37,7 +37,7 @@ pub(super) enum Verdict {
 
 /// One `REQ` as the relay saw it.
 #[derive(Debug, Clone)]
-pub(super) struct ReqRecord {
+pub(crate) struct ReqRecord {
     pub subscription_id: String,
     /// Whether NIP-42 had completed on this socket when the `REQ` arrived. `false` here on a
     /// `#p`-pinned subscription IS the #189 bug — the client let a p-gated REQ out before auth.
@@ -56,7 +56,7 @@ pub(super) struct ReqRecord {
 /// is a claim about which kinds reached the wire — the pre-advertise gate (#357) is exactly a test of
 /// what a publish path put here, so the fixture that used to reply OK and DROP the event now keeps it.
 #[derive(Debug, Clone)]
-pub(super) struct PublishedEvent {
+pub(crate) struct PublishedEvent {
     pub kind: u64,
     /// The event's tags, as they arrived. Kept because "advertised" is not only a claim about which
     /// kinds reached the wire but about what they SAID: the #747 terminal beat is an ordinary
@@ -103,7 +103,7 @@ struct Controls {
 }
 
 /// A running fixture relay. Dropping it stops accepting new connections.
-pub(super) struct PGateRelay {
+pub(crate) struct PGateRelay {
     url: String,
     transcript: Arc<Mutex<Vec<ReqRecord>>>,
     /// Every EVENT the client published, in arrival order — the wire record the pre-advertise gate is
@@ -123,7 +123,7 @@ impl PGateRelay {
     /// deployed relay challenges immediately, but a client that fires REQs on socket-up loses the
     /// race regardless of how fast the challenge is; holding it open makes that deterministic
     /// instead of timing-dependent, so the tooth cannot pass by being lucky.
-    pub(super) async fn start(auth_delay: Duration) -> Self {
+    pub(crate) async fn start(auth_delay: Duration) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind fixture relay");
@@ -163,13 +163,13 @@ impl PGateRelay {
     }
 
     /// How many sockets this relay has accepted.
-    pub(super) fn connections(&self) -> usize {
+    pub(crate) fn connections(&self) -> usize {
         self.connections.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Push an UNSOLICITED `CLOSED` for `subscription_id` down the live socket — the deployed relay's
     /// behaviour when it drops a subscription out from under a client that is otherwise healthy.
-    pub(super) async fn close_now(&self, subscription_id: &str, reason: &str) {
+    pub(crate) async fn close_now(&self, subscription_id: &str, reason: &str) {
         let live = self.controls.live.lock().await.clone();
         if let Some(writer) = live {
             let _ = send(&writer, json!(["CLOSED", subscription_id, reason])).await;
@@ -188,7 +188,7 @@ impl PGateRelay {
     /// CLOSE makes the red-prove vacuous (nostr-sdk's own post-auth `resubscribe()` re-sends a
     /// `closed==true` sub on the re-auth and self-heals it), so the non-vacuous prover withholds the
     /// CLOSE and lets the STALE generation alone deafen the leg.
-    pub(super) async fn roll_challenge(&self, close_subs: &[&str]) {
+    pub(crate) async fn roll_challenge(&self, close_subs: &[&str]) {
         let generation = self
             .controls
             .auth_generation
@@ -208,13 +208,13 @@ impl PGateRelay {
         }
     }
 
-    pub(super) fn url(&self) -> String {
+    pub(crate) fn url(&self) -> String {
         self.url.clone()
     }
 
     /// Refuse the next `count` `REQ`s for `subscription_id` that carry an un-pinned filter — i.e. a
     /// relay that keeps rejecting the open-pool half while serving the targeted one.
-    pub(super) async fn refuse_unpinned(&self, subscription_id: &str, count: usize, reason: &str) {
+    pub(crate) async fn refuse_unpinned(&self, subscription_id: &str, count: usize, reason: &str) {
         let mut forced = self.controls.forced.lock().await;
         for _ in 0..count {
             forced.push_back(ForcedClose {
@@ -225,12 +225,12 @@ impl PGateRelay {
     }
 
     /// Every `REQ` the relay has seen, in arrival order.
-    pub(super) async fn reqs(&self) -> Vec<ReqRecord> {
+    pub(crate) async fn reqs(&self) -> Vec<ReqRecord> {
         self.transcript.lock().await.clone()
     }
 
     /// Every `REQ` seen for one subscription id.
-    pub(super) async fn reqs_for(&self, subscription_id: &str) -> Vec<ReqRecord> {
+    pub(crate) async fn reqs_for(&self, subscription_id: &str) -> Vec<ReqRecord> {
         self.reqs()
             .await
             .into_iter()
@@ -239,12 +239,12 @@ impl PGateRelay {
     }
 
     /// Every EVENT the relay has received, in arrival order.
-    pub(super) async fn events(&self) -> Vec<PublishedEvent> {
+    pub(crate) async fn events(&self) -> Vec<PublishedEvent> {
         self.events.lock().await.clone()
     }
 
     /// How many EVENTs of `kind` the relay received — what a publish path actually put on the wire.
-    pub(super) async fn event_kind_count(&self, kind: u64) -> usize {
+    pub(crate) async fn event_kind_count(&self, kind: u64) -> usize {
         self.events()
             .await
             .iter()
@@ -254,7 +254,7 @@ impl PGateRelay {
 
     /// Wait until `predicate` holds over the published EVENTs, or give up. Same contract as
     /// [`Self::wait_until`], over what the client published rather than what it subscribed to.
-    pub(super) async fn wait_until_published<F>(&self, timeout: Duration, predicate: F) -> bool
+    pub(crate) async fn wait_until_published<F>(&self, timeout: Duration, predicate: F) -> bool
     where
         F: Fn(&[PublishedEvent]) -> bool,
     {
@@ -272,7 +272,7 @@ impl PGateRelay {
 
     /// Wait until `predicate` holds over the transcript, or give up. Returns whether it held —
     /// the caller asserts, so a timeout reads as the failure it is rather than a hang.
-    pub(super) async fn wait_until<F>(&self, timeout: Duration, predicate: F) -> bool
+    pub(crate) async fn wait_until<F>(&self, timeout: Duration, predicate: F) -> bool
     where
         F: Fn(&[ReqRecord]) -> bool,
     {

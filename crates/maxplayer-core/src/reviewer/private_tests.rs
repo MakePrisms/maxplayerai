@@ -454,3 +454,68 @@ fn private_delivery_refs_are_not_double_prefixed() {
         assert!(review_source_ref(bad).is_err());
     }
 }
+
+/// The deployed relay reads open but `#p`-gates kind 1059: an intake REQ that arrives
+/// before NIP-42 AUTH is closed `restricted:`, and nostr-sdk deletes it for good (#189).
+/// The worker then received no review request at all, public or private. It must re-issue
+/// both intake legs after every completed auth, including an in-place re-challenge (#429).
+#[tokio::test]
+async fn intake_subscriptions_recover_after_pre_auth_restricted_close_and_re_challenge() {
+    use crate::seller_node::p_gate_relay_fixture::{PGateRelay, ReqRecord, Verdict};
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            // Hold the challenge back so the boot REQs deterministically arrive before AUTH.
+            let relay = PGateRelay::start(Duration::from_millis(300)).await;
+            let dir = tempfile::tempdir().unwrap();
+            let config = ServiceConfig {
+                relay: relay.url(),
+                signer_file: dir.path().join("unused"),
+                provider_key_file: dir.path().join("unused"),
+                database: dir.path().join("reviews.db"),
+                repositories: BTreeMap::new(),
+                accepted_mints: review_mints(),
+                private_git_base: None,
+                model: "fixture".into(),
+            };
+            let provider = TypeSafe {
+                client: reqwest::Client::new(),
+                endpoint: "http://127.0.0.1:9".into(),
+                key: "fixture-not-secret".into(),
+            };
+            let worker = tokio::task::spawn_local(run_worker(config, key(3), provider));
+            let served_after_auth = |reqs: &[ReqRecord], id: &str| {
+                reqs.iter()
+                    .filter(|r| r.subscription_id == id && r.authenticated)
+                    .filter(|r| r.verdict == Verdict::Eose)
+                    .count()
+            };
+            let both_served = |times: usize| {
+                move |reqs: &[ReqRecord]| {
+                    served_after_auth(reqs, PUBLIC_INTAKE) >= times
+                        && served_after_auth(reqs, PRIVATE_INTAKE) >= times
+                }
+            };
+            assert!(
+                relay.wait_until(Duration::from_secs(5), both_served(1)).await,
+                "intake legs must be re-issued after auth: {:?}",
+                relay.reqs().await
+            );
+            let refused_before_auth = relay.reqs_for(PRIVATE_INTAKE).await.into_iter().any(|r| {
+                !r.authenticated
+                    && matches!(&r.verdict, Verdict::Closed(reason) if reason.starts_with("restricted:"))
+            });
+            assert!(refused_before_auth, "the fixture must reproduce the pre-auth refusal");
+
+            relay.roll_challenge(&[]).await;
+            assert!(
+                relay.wait_until(Duration::from_secs(5), both_served(2)).await,
+                "intake legs must be re-issued after an in-place re-auth: {:?}",
+                relay.reqs().await
+            );
+            assert_eq!(relay.connections(), 1, "recovery must not need a reconnect");
+            assert!(!worker.is_finished(), "review worker unexpectedly exited");
+            worker.abort();
+            let _ = worker.await;
+        })
+        .await;
+}
