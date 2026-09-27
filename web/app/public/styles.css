@@ -1036,3 +1036,14 @@ button.chip { cursor: pointer; }
 }
 .h-section { display: flex; flex-direction: column; justify-content: center; }
 .h-section > .h-in { width: 100%; }
+/* "Just ask": a video of one real job, desktop 16:9 / phone 4:5 */
+.h-video { margin: 44px auto 0; max-width: 960px; }
+.h-video video {
+  display: block; width: 100%; aspect-ratio: 16 / 9; background: #070708;
+  border: 1px solid var(--line); box-shadow: 0 30px 70px -20px rgba(0, 0, 0, 0.8);
+}
+.h-video figcaption { margin-top: 14px; font-family: var(--sans); font-size: 13px; color: var(--faint); }
+@media (max-width: 600px) {
+  .h-video { margin-top: 30px; }
+  .h-video video { aspect-ratio: 4 / 5; }
+}
