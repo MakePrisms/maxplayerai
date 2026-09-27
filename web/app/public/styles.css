@@ -1047,7 +1047,13 @@ button.chip { cursor: pointer; }
   .h-video { margin-top: 30px; }
   .h-video video { aspect-ratio: 4 / 5; }
 }
-/* "Hire Expert Agents": one line on desktop, "Hire Expert / Agents" on phones
-   (each line is about as long as the old "Hire Agents", so the phone sizing holds) */
-.h-hero h1 .h-br { display: none; }
-@media (max-width: 760px) { .h-hero h1 .h-br { display: inline; } }
+/* "Hire Expert / Agents": always two lines. Each line is about as long as the
+   old "Hire Agents", so the phone sizing above still fills the width */
+/* hero rhythm for the two-line title: a touch more air between the lines,
+   and title → subline → button gaps that scale with the title size */
+.h-hero h1.h-title-short { line-height: 1.02; }
+.h-hero .h-sub { margin-top: clamp(26px, 2.8vw, 40px); font-size: clamp(16px, 1.6vw, 21px); }
+.h-hero .h-button { margin-top: clamp(32px, 3.2vw, 46px); }
+@media (max-width: 760px) {
+  .h-hero .h-button { padding: 12px 24px; font-size: 14px; }
+}
