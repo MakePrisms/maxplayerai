@@ -1723,6 +1723,14 @@ mod tests {
     fn agent_repo_with_delivery(
         tag: &str,
     ) -> (std::path::PathBuf, std::path::PathBuf, String, String) {
+        agent_repo_with_delivery_on(tag, "maxplayer/abc12345")
+    }
+
+    // [`agent_repo_with_delivery`] on a chosen branch name.
+    fn agent_repo_with_delivery_on(
+        tag: &str,
+        branch: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf, String, String) {
         let root =
             std::env::temp_dir().join(format!("maxplayer-orch-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -1757,7 +1765,7 @@ mod tests {
         // The agent writes a deliverable.
         fs::write(workdir.join("answer.txt"), "the agent did work\n").expect("write answer");
 
-        let branch = "maxplayer/abc12345".to_owned();
+        let branch = branch.to_owned();
         let oid = snapshot_delivery_at(
             &workdir,
             &id,
@@ -1769,6 +1777,20 @@ mod tests {
         )
         .expect("snapshot");
         (root, workdir, branch, oid)
+    }
+
+    // A private job names its delivery ref in full. The container step read the tip through
+    // `delivery_ref`, which added a second `refs/heads/`, so every private delivery failed with
+    // "reference 'refs/heads/refs/heads/delivery/<id>' not found".
+    #[test]
+    fn local_branch_tip_reads_a_full_private_delivery_ref() {
+        let branch = format!("refs/heads/delivery/{}", "ab".repeat(32));
+        let (root, workdir, branch, oid) = agent_repo_with_delivery_on("private-ref", &branch);
+        assert_eq!(
+            local_branch_tip(&workdir, &branch).expect("private tip"),
+            oid
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     // (The config-rewrite security property is proven by tests/hostile_local_git_config.rs against

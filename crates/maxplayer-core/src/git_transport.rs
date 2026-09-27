@@ -483,9 +483,15 @@ pub fn nip98_authorization_header_with_keys(
 /// The fully-qualified ref a delivery push writes for `branch`. Both the push refspec
 /// ([`push_branch_with_header`]) and the branch-scoped token scope (the caller in `run.rs`) derive
 /// the ref from THIS one function, so a future edit cannot split the token scope from the ref
-/// actually pushed — the relay demands they match exactly (PR #929).
+/// actually pushed — the relay demands they match exactly (PR #929). A private job names its
+/// refs in full (`refs/heads/input/<id>`, `refs/heads/delivery/<id>`), and such a name is used
+/// as it is: the relay refuses `refs/heads/refs/heads/…`.
 pub fn delivery_ref(branch: &str) -> String {
-    format!("refs/heads/{branch}")
+    if branch.starts_with("refs/heads/") {
+        branch.to_owned()
+    } else {
+        format!("refs/heads/{branch}")
+    }
 }
 
 /// Resolve the NIP-98 header for a leg: `Some` header only when a key is supplied AND the remote is
@@ -1510,6 +1516,53 @@ mod tests {
         );
     }
 
+    // A private job names its refs in full. The relay accepts only `refs/heads/input/<id>` and
+    // `refs/heads/delivery/<id>`, so a second `refs/heads/` made every private Git write fail.
+    #[test]
+    fn delivery_ref_keeps_a_full_private_ref() {
+        for full in [
+            format!("refs/heads/input/{}", "ab".repeat(32)),
+            format!("refs/heads/delivery/{}", "cd".repeat(32)),
+        ] {
+            assert_eq!(delivery_ref(&full), full);
+        }
+        assert_eq!(
+            delivery_ref("maxplayer/abc12345"),
+            "refs/heads/maxplayer/abc12345"
+        );
+    }
+
+    // The push writes exactly the private input ref, not `refs/heads/refs/heads/input/<id>`.
+    #[test]
+    fn private_input_push_writes_the_input_ref_it_names() {
+        let root = temp_root("private-input-ref");
+        let (workdir, a, _b) = workdir_with_moved_branch(&root);
+        let bare = root.join("remote.git");
+        Repository::init_bare(&bare).expect("bare remote");
+        let remote_url = bare.to_str().expect("utf8").to_owned();
+        let reference = format!("refs/heads/input/{}", "ef".repeat(32));
+        let repo = crate::seller_git::open_plain_workdir_repo(&workdir).expect("open workdir");
+        let pushed = push_gated_object(
+            &repo,
+            &remote_url,
+            &reference,
+            &a.to_string(),
+            None,
+            None,
+            None,
+        )
+        .expect("push the input");
+        assert_eq!(pushed, a.to_string());
+        let remote = Repository::open_bare(&bare).expect("open bare");
+        assert_eq!(remote.refname_to_id(&reference).expect("input ref"), a);
+        assert!(
+            remote
+                .refname_to_id(&format!("refs/heads/{reference}"))
+                .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn expiration_tags(event: &nostr_sdk::Event) -> Vec<String> {
         event
             .tags
@@ -2051,16 +2104,19 @@ pub fn push_private_input(
 
 /// Private-repository reads additionally bound transferred pack bytes and objects.
 /// Exact manifest hashes and uncompressed quotas are checked before materialization.
+/// `header` is a signed NIP-98 `Authorization` value, never a key.
 #[cfg(feature="wallet")]
-pub fn fetch_private_objects(repo: &Repository, remote_url: &str, refs: &[&str], auth: &str) -> Result<(),TransportError> {
-    if header_for(remote_url,Some(auth))?.is_none() { return Err(TransportError::Auth("private fetch needs authentication".into())); }
-    fetch_bounded_objects(repo,remote_url,refs,Some(auth))
+pub fn fetch_private_objects(repo: &Repository, remote_url: &str, refs: &[&str], header: &str) -> Result<(),TransportError> {
+    if header.is_empty() || !crate::delivery_transport::is_relay_git_locator(remote_url) { return Err(TransportError::Auth("private fetch needs authentication".into())); }
+    fetch_bounded_objects(repo,remote_url,refs,Some(header))
 }
+/// Every caller signs `header` itself (the seller through its signer actor). Like
+/// [`header_for`] with a key, the header goes only to relay Git.
 #[cfg(feature="wallet")]
-pub fn fetch_bounded_objects(repo: &Repository, remote_url: &str, refs: &[&str], auth: Option<&str>) -> Result<(),TransportError> {
+pub fn fetch_bounded_objects(repo: &Repository, remote_url: &str, refs: &[&str], header: Option<&str>) -> Result<(),TransportError> {
     assert_allowed_repo_locator(remote_url)?;
     ensure_registered()?;
-    let header=header_for(remote_url,auth)?;
+    let header=header.filter(|_| crate::delivery_transport::is_relay_git_locator(remote_url)).map(str::to_owned);
     let mut remote=bound_remote(repo,remote_url)?;
     let mut callbacks=RemoteCallbacks::new();
     callbacks.transfer_progress(|progress| progress.received_bytes() as u64 <= crate::private_content::MAX_REPO_BYTES && progress.total_objects() <= 100_000);

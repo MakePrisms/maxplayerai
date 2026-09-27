@@ -333,6 +333,39 @@ pub async fn check(
     .await
 }
 
+/// The seller's offer review, before the claim and again before the agent runs. Both sites
+/// route here: a private offer (`request` from [`offer_request`]) goes only over the encrypted
+/// lane. The reviewer does not answer a public request for a private offer, so a public
+/// fallback would block the job.
+pub async fn seller_offer(
+    home: &MaxplayerHome,
+    client: &Client,
+    signer: &crate::seller_node::signer::SignerHandle,
+    relay: &str,
+    request: Option<&Request>,
+    job: &str,
+    buyer: &str,
+) -> Result<Option<String>, String> {
+    if let Some(request) = request {
+        return check(home, client, Identity::Seller(signer), request, buyer).await;
+    }
+    let subject = Subject {
+        offer: job.into(),
+        event: job.into(),
+        kind: JOB_OFFER_KIND,
+        commit: None,
+    };
+    wire::check(
+        &wire::RelayTransport { client, relay },
+        &home.config.review,
+        relay,
+        &subject,
+        buyer,
+        false,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
