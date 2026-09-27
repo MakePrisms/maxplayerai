@@ -374,6 +374,24 @@ fn validate_repo_id<'a>(owner: &str, repo: &'a str) -> Result<&'a str, Response>
     Ok(repo_name)
 }
 
+/// `git <service> --stateless-rpc`, for the advertisement and for the request.
+///
+/// Upload-pack also offers a fetch by commit id (`allow-reachable-sha1-in-want`). A Maxplayer
+/// client reads a pinned private input or contribution base that way, and libgit2 sends such a
+/// request only when the advertisement offers it. This relay serves only protocol v0. In
+/// stateless RPC, upload-pack already serves a commit that is reachable from a ref, so the
+/// setting changes what the advertisement says. Such a commit shows nothing that a full clone
+/// does not show, and the repository ACL applies first.
+fn git_service(service: &str) -> Command {
+    let mut cmd = Command::new("git");
+    if service == "upload-pack" {
+        cmd.arg("-c")
+            .arg("uploadpack.allowReachableSHA1InWant=true");
+    }
+    cmd.arg(service).arg("--stateless-rpc");
+    cmd
+}
+
 /// Apply hardened environment to a git subprocess command.
 ///
 /// Clears all inherited env vars, then sets only the minimum required:
@@ -548,9 +566,11 @@ fn pkt_line(out: &mut Vec<u8>, payload: &[u8]) {
 /// ```
 /// The advertised capabilities are a fixed conservative **offer**; the client
 /// re-negotiates against the real `upload-pack` subprocess in its follow-up
-/// POST, so any subset the real upload-pack supports is safe. `object-format`
-/// is derived from the oid width (40 hex = sha1, 64 = sha256) rather than
-/// hardcoded. Caller guarantees [`fast_path_eligible`] returned true.
+/// POST, so any subset the real upload-pack supports is safe. The offer holds
+/// `allow-reachable-sha1-in-want`, as the subprocess advertisement does with
+/// [`git_service`]. `object-format` is derived from the oid width (40 hex = sha1,
+/// 64 = sha256) rather than hardcoded. Caller guarantees [`fast_path_eligible`]
+/// returned true.
 fn build_upload_pack_advertisement(manifest: &super::manifest::Manifest) -> Vec<u8> {
     // head ref is guaranteed present by `fast_path_eligible`.
     let head_oid = &manifest.refs[&manifest.head];
@@ -565,7 +585,8 @@ fn build_upload_pack_advertisement(manifest: &super::manifest::Manifest) -> Vec<
     let caps = format!(
         "multi_ack thin-pack side-band side-band-64k ofs-delta shallow \
          deepen-since deepen-not deepen-relative no-progress include-tag \
-         multi_ack_detailed no-done symref=HEAD:{head} object-format={fmt} \
+         multi_ack_detailed allow-reachable-sha1-in-want no-done symref=HEAD:{head} \
+         object-format={fmt} \
          agent=buzz-git",
         head = manifest.head,
         fmt = object_format,
@@ -726,10 +747,8 @@ async fn info_refs_subprocess(
         (StatusCode::INTERNAL_SERVER_ERROR, "git error").into_response()
     })?;
 
-    let mut cmd = Command::new("git");
-    cmd.arg(git_subcmd)
-        .arg("--stateless-rpc")
-        .arg("--advertise-refs")
+    let mut cmd = git_service(git_subcmd);
+    cmd.arg("--advertise-refs")
         .arg(repo.path())
         .stdout(std::process::Stdio::from(stdout_file))
         .stderr(std::process::Stdio::from(stderr_file))
@@ -1148,10 +1167,8 @@ async fn run_git_at(
         (StatusCode::INTERNAL_SERVER_ERROR, "git error").into_response()
     })?;
 
-    let mut cmd = Command::new("git");
-    cmd.arg(service)
-        .arg("--stateless-rpc")
-        .arg(repo_path)
+    let mut cmd = git_service(service);
+    cmd.arg(repo_path)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::from(stdout_file))
         .stderr(std::process::Stdio::from(stderr_file))
@@ -2241,6 +2258,8 @@ mod track_c_tests {
         assert!(caps.contains("symref=HEAD:refs/heads/main"));
         assert!(caps.contains("object-format=sha1"));
         assert!(caps.contains("side-band-64k"));
+        // libgit2 fetches a pinned commit by id only with this capability.
+        assert!(caps.contains("allow-reachable-sha1-in-want"));
 
         // 3,4: refs sorted ascending — feature before main (BTreeMap order),
         // each "<oid> <refname>\n", no NUL.

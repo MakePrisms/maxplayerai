@@ -529,10 +529,16 @@ async fn fresh_private_repo_takes_real_input_push_and_targeted_fetch() {
     let work = tempfile::tempdir().unwrap();
     let source = work.path().join("source");
     let fetched = work.path().join("fetched");
-    for dir in [&source, &fetched] {
+    let by_id = work.path().join("by-id");
+    for dir in [&source, &fetched, &by_id] {
         std::fs::create_dir(dir).unwrap();
         stdout(&git(dir, &h.host, None, &["init", "-q"]).await);
     }
+    // Two commits: the parent is reachable from the input ref but is not its tip.
+    std::fs::write(source.join("base.txt"), "base\n").unwrap();
+    stdout(&git(&source, &h.host, None, &["add", "base.txt"]).await);
+    stdout(&git(&source, &h.host, None, &["commit", "-q", "-m", "base"]).await);
+    let parent = stdout(&git(&source, &h.host, None, &["rev-parse", "HEAD"]).await);
     std::fs::write(source.join("brief.txt"), "private input\n").unwrap();
     stdout(&git(&source, &h.host, None, &["add", "brief.txt"]).await);
     stdout(&git(&source, &h.host, None, &["commit", "-q", "-m", "input"]).await);
@@ -564,6 +570,44 @@ async fn fresh_private_repo_takes_real_input_push_and_targeted_fetch() {
     assert_eq!(stdout(&fetched_commit), commit);
     let brief = git(&fetched, &h.host, None, &["show", "FETCH_HEAD:brief.txt"]).await;
     assert_eq!(stdout(&brief), "private input");
+
+    // A Maxplayer client fetches a pinned commit by id, and libgit2 refuses a commit id
+    // refspec unless upload-pack advertises the capability. Protocol v0 (the only one this
+    // relay serves) also refuses a commit that is not a ref tip without it.
+    let advertisement = request(
+        &app,
+        &h.host,
+        "GET",
+        &format!("/git/{owner}/{job}/info/refs?service=git-upload-pack"),
+        Some(&fetch_auth),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(advertisement.status(), StatusCode::OK);
+    let advertisement = axum::body::to_bytes(advertisement.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&advertisement).contains("allow-reachable-sha1-in-want"),
+        "upload-pack must allow a fetch by commit id"
+    );
+    // An empty repository, so git must ask the relay for the parent.
+    let parent_fetch = git(
+        &by_id,
+        &h.host,
+        Some(&fetch_auth),
+        &["-c", "protocol.version=0", "fetch", "-q", &remote, &parent],
+    )
+    .await;
+    stdout(&parent_fetch);
+    let base = git(
+        &by_id,
+        &h.host,
+        None,
+        &["show", &format!("{parent}:base.txt")],
+    )
+    .await;
+    assert_eq!(stdout(&base), "base");
 
     let foreign = format!("refs/heads/input/{}", "33".repeat(32));
     let outsider_auth = scoped_git_token(&outsider, &repo_root, &foreign);
