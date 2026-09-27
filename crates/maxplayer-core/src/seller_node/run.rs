@@ -6912,7 +6912,6 @@ impl SellerNodeRunner {
         let state = self.review_checks.clone();
         let client = self.client.clone();
         let relay = self.relay_url.clone();
-        let config = home.config.review.clone();
         let buyer = buyer.to_owned();
         let job = job_id.to_owned();
         tokio::spawn(async move {
@@ -6922,23 +6921,16 @@ impl SellerNodeRunner {
                 kind: crate::kinds::JOB_OFFER_KIND,
                 commit: None,
             };
-            let result = if let Some(request) = private_request {
-                crate::review::private::check(&review_home, &client,
-                    crate::review::private::Identity::Seller(&review_signer), &request, &buyer).await
-            } else {
-                crate::review::wire::check(
-                &crate::review::wire::RelayTransport {
-                    client: &client,
-                    relay: &relay,
-                },
-                &config,
+            let result = crate::review::private::seller_offer(
+                &review_home,
+                &client,
+                &review_signer,
                 &relay,
-                &subject,
+                private_request.as_ref(),
+                &job,
                 &buyer,
-                false,
             )
-            .await
-            };
+            .await;
             let result = match crate::review::state::completed(&status_root, &subject, &result) {
                 Ok(()) => result,
                 Err(e) => Err(e),
@@ -7860,6 +7852,30 @@ impl SellerNodeRunner {
         settled
     }
 
+    /// The offer review that must pass before the agent runs. It routes through the same
+    /// function as the claim-time review, so a private offer never gets a public request.
+    async fn review_offer_before_run(
+        &self,
+        job_id: &str,
+        buyer: &str,
+    ) -> Result<Option<String>, String> {
+        let request = crate::review::private::offer_request(
+            self.node.home(),
+            &self.seller_pubkey.to_hex(),
+            job_id,
+        )?;
+        crate::review::private::seller_offer(
+            self.node.home(),
+            &self.client,
+            self.node.signer(),
+            &self.relay_url,
+            request.as_ref(),
+            job_id,
+            buyer,
+        )
+        .await
+    }
+
     /// Execute an awarded job end to end: run the agent in a fresh empty-base workdir, snapshot its
     /// output into ONE delivery commit dated at the STORED award time (so a re-created commit after a
     /// restart keeps the same oid — invariant 2), push it under the seller's NIP-98 auth, then bind
@@ -7979,11 +7995,10 @@ impl SellerNodeRunner {
                         opline!("seller node review blocked job_id={job_id}: missing offer");
                         return;
                     };
-                    let subject = crate::review::Subject { offer: job_id.to_owned(), event: job_id.to_owned(),
-                        kind: crate::kinds::JOB_OFFER_KIND, commit: None };
-                    let transport = crate::review::wire::RelayTransport { client: &self.client, relay: &self.relay_url };
-                    if let Err(error) = crate::review::wire::check(&transport, &self.node.home().config.review,
-                        &self.relay_url, &subject, &stored_offer.buyer_pubkey, false).await {
+                    if let Err(error) = self
+                        .review_offer_before_run(job_id, &stored_offer.buyer_pubkey)
+                        .await
+                    {
                         opline!("seller node review blocked job_id={job_id}: {error}");
                         return;
                     }
@@ -13032,6 +13047,90 @@ mod tests {
         }).await;
         runner.client.disconnect().await;
         publisher.disconnect().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // The review before the agent runs must route a private offer like the claim-time review
+    // does. Before the fix it always sent a public kind-3409 request, which the reviewer never
+    // answers for a private offer, so every private job stopped after its award.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_before_run_sends_a_private_offer_only_over_the_encrypted_lane() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.unwrap();
+        let url = relay.url().await.to_string();
+        let (evidence, _, _, policy) = crate::private_content::evidence::inline_fixture_for(true);
+        let root = temp_dir("review-before-run-private");
+        std::fs::create_dir_all(&root).unwrap();
+        // `Store::open` refuses a symlink, and the macOS temp path holds one.
+        let root = root.canonicalize().unwrap();
+        let mut home = crate::home::bootstrap(&root).unwrap();
+        home.config.relay_url = url.clone();
+        home.config.seller = Some(seller_cfg(1, true));
+        home.config.privacy.service_pubkey = Some(policy.service.clone());
+        home.config.privacy.git_base = Some(policy.host.git_prefix.clone());
+        home.config.accepted_mints = policy.host.accepted_mints.clone();
+        home.config
+            .review
+            .reviewers
+            .insert(url.clone(), policy.service.clone());
+        home.config.review.timeout_seconds = 3;
+        // The fixture offer targets key 2, so this seat is key 2.
+        std::fs::write(&home.key_path, format!("{:064x}", 2)).unwrap();
+        let seller = crate::home::public_key_hex(&home).unwrap();
+        let now = nostr_sdk::Timestamp::now().as_secs();
+        let mut ctx =
+            crate::private_content::channel::ContentContext::open(&home, &seller).unwrap();
+        let task = evidence.task_envelope.as_ref().expect("targeted task");
+        ctx.stage(
+            &crate::private_content::PreparedContent::decode(task).unwrap(),
+            now,
+        )
+        .unwrap();
+        ctx.resolve_offer(&evidence.offer, now).unwrap();
+        drop(ctx);
+        let runner = SellerNodeRunner::boot(home).await.unwrap();
+        let id = evidence.offer.id.to_hex();
+
+        // No reviewer runs here, so the check times out. The test is about what it sent.
+        let error = runner
+            .review_offer_before_run(&id, &evidence.offer.pubkey.to_hex())
+            .await
+            .unwrap_err();
+        assert!(error.contains("timeout"), "{error}");
+
+        let reader = Client::default();
+        reader.add_relay(&url).await.unwrap();
+        reader.connect().await;
+        let public = reader
+            .fetch_events(
+                Filter::new().kinds([
+                    Kind::Custom(crate::kinds::REVIEW_REQUEST_KIND),
+                    Kind::Custom(crate::kinds::REVIEW_KIND),
+                ]),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert!(
+            public.is_empty(),
+            "a private offer got a public review request: {public:?}"
+        );
+        let service = nostr_sdk::PublicKey::from_hex(&policy.service).unwrap();
+        let wraps = reader
+            .fetch_events(
+                Filter::new().kind(Kind::GiftWrap).pubkey(service),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !wraps.is_empty(),
+            "no encrypted review request reached the reviewer"
+        );
+        reader.disconnect().await;
+        runner.client.disconnect().await;
+        relay.shutdown();
         let _ = std::fs::remove_dir_all(root);
     }
 
