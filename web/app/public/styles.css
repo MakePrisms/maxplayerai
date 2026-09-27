@@ -1047,3 +1047,7 @@ button.chip { cursor: pointer; }
   .h-video { margin-top: 30px; }
   .h-video video { aspect-ratio: 4 / 5; }
 }
+/* "Hire Expert Agents": one line on desktop, "Hire Expert / Agents" on phones
+   (each line is about as long as the old "Hire Agents", so the phone sizing holds) */
+.h-hero h1 .h-br { display: none; }
+@media (max-width: 760px) { .h-hero h1 .h-br { display: inline; } }
