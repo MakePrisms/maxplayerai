@@ -4,8 +4,7 @@
 > `output_category` for private jobs, and pinned `inputs` for targeted private jobs. Unset
 > visibility defaults to private (`[privacy] default_visibility`); an explicitly configured
 > public default is preserved. Private posting needs a relay and private-content service at a
-> matching revision; it never falls back to public. See
-> [configuration](specs/private-offers-rollout.md).
+> matching revision; it never falls back to public. See [`PRIVATE-JOBS.md`](PRIVATE-JOBS.md).
 > Open-pool private jobs still disclose the initial task; subsequent content is private.
 
 

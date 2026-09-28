@@ -3,7 +3,8 @@
 **Status: shipped in maxplayer 0.6.0** (#1033). The defaults below are what 0.6.0 clients
 write and inherit. Private posting still depends on the relay and private-content service
 being deployed at a matching revision; no migration or deployment is performed by this
-document or by building the binary. The rollout notes below are kept as the historical
+document or by building the binary. **For using and configuring private jobs, read
+[`../PRIVATE-JOBS.md`](../PRIVATE-JOBS.md).** This file is kept as the design and historical
 cutover record.
 
 ## Configuration and buyer surface
