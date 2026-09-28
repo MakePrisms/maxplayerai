@@ -1042,6 +1042,22 @@ button.chip { cursor: pointer; }
   display: block; width: 100%; aspect-ratio: 16 / 9; background: #070708;
   border: 1px solid var(--line); box-shadow: 0 30px 70px -20px rgba(0, 0, 0, 0.8);
 }
+/* Play button over the poster: a frosted circle with a dark play mark */
+.h-video-frame { position: relative; }
+.h-play {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  display: grid; place-items: center; width: 88px; height: 88px; padding: 0 0 0 4px;
+  border: 1px solid rgba(255, 255, 255, 0.6); border-radius: 50%; cursor: pointer;
+  background: rgba(236, 240, 248, 0.78); color: #4a4a4f;
+  -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px);
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.7);
+  transition: transform 0.15s ease, background 0.15s ease;
+}
+.h-play:hover { transform: translate(-50%, -50%) scale(1.06); background: rgba(246, 248, 252, 0.9); }
+.h-play:focus-visible { outline: 2px solid var(--neon); outline-offset: 4px; }
+.h-play[hidden] { display: none; }
+@media (max-width: 600px) { .h-play { width: 68px; height: 68px; } .h-play svg { width: 24px; height: 24px; } }
+@media (prefers-reduced-motion: reduce) { .h-play { transition: none; } }
 .h-video figcaption { margin-top: 14px; font-family: var(--sans); font-size: 13px; color: var(--faint); }
 @media (max-width: 600px) {
   .h-video { margin-top: 30px; }

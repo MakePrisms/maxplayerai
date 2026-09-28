@@ -85,13 +85,32 @@ function wirePicker(): void {
   }
 }
 
+/* ---------------- "Just ask" video ---------------- */
+
+// The video waits for a click: a play button sits over the poster, and native
+// controls take over once it plays. Pausing or finishing brings the button back.
+function wireVideo(video: HTMLVideoElement | null): void {
+  const play = document.querySelector<HTMLButtonElement>(".h-play");
+  if (!video || !play) return;
+  const show = (on: boolean) => { play.hidden = !on; };
+  play.onclick = () => {
+    video.muted = false;
+    video.controls = true;
+    // If the browser refuses sound, play muted rather than not at all.
+    video.play().catch(() => { video.muted = true; return video.play(); }).catch(() => {});
+  };
+  video.addEventListener("play", () => show(false));
+  video.addEventListener("pause", () => { if (!video.seeking) show(true); });
+  video.addEventListener("ended", () => show(true));
+}
+
 /* ---------------- boot ---------------- */
 
 async function boot(): Promise<void> {
   if (location.hash === "#market") { location.replace("/market"); return; }
   const video = document.querySelector<HTMLVideoElement>(".h-video video");
   if (video && matchMedia("(max-width: 760px) and (orientation: portrait)").matches) video.poster = "/media/first-job-vertical-poster.jpg";
-  if (video && matchMedia("(prefers-reduced-motion: reduce)").matches) { video.removeAttribute("autoplay"); video.pause(); video.controls = true; }
+  wireVideo(video);
   wireNav();
   wirePicker();
   if (TRY_IT_ENABLED && document.getElementById("try")) void import("./try/ui.js").then(m => m.bootTry());
