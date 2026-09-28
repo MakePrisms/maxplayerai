@@ -1036,7 +1036,7 @@ button.chip { cursor: pointer; }
 }
 .h-section { display: flex; flex-direction: column; justify-content: center; }
 .h-section > .h-in { width: 100%; }
-/* "Just ask": a 16:9 video of one real job, start to finish */
+/* "Just ask": one real job, start to finish. 16:9, or a 9:16 cut on portrait phones */
 .h-video { margin: 44px auto 0; max-width: 960px; }
 .h-video video {
   display: block; width: 100%; aspect-ratio: 16 / 9; background: #070708;
@@ -1083,3 +1083,7 @@ button.chip { cursor: pointer; }
   .h-agents span { font-size: 13px; }
 }
 @media (prefers-reduced-motion: reduce) { .h-agents li { transition: none; } }
+/* portrait phones get the 9:16 cut; capped so it fits one screen under the nav */
+@media (max-width: 760px) and (orientation: portrait) {
+  .h-video video { aspect-ratio: 9 / 16; width: min(100%, calc((100svh - var(--nav-h) - 40px) * 9 / 16)); margin: 0 auto; }
+}
