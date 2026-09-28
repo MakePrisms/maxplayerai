@@ -1,3 +1,33 @@
+## v0.6.0-rc7
+
+Seventh release candidate for 0.6.0. This is a prerelease; stable remains v0.5.11.
+Install with `npm install -g maxplayer@rc`.
+
+### Changes since v0.6.0-rc6
+
+- Close permission-check file handles before SQLite opens the reviewer and
+  private-content databases, preserving SQLite POSIX locks and preventing
+  orphaned-WAL review data loss (#1061).
+- Stabilize wallet worker-send and child-process custody tests with offline
+  fixtures and deterministic synchronization (#1062).
+
+### Rollout and existing data
+
+Deploy and restart the reviewer with this revision. Upgrade buyers and sellers
+for the private-content store fix, then restart their daemons/MCP servers.
+No protocol, schema, signing-key or configuration migration is required by RC7.
+Client installation does not deploy the relay/reviewer host.
+
+Before restarting an affected reviewer, preserve the main database and any
+orphaned WAL through the running process's `/proc/<pid>/fd/` descriptors, with
+writes paused for a consistent capture. Recover on copies. Operators may skip
+recovery only if they accept permanently losing the stranded review records.
+The fix prevents future lock loss; it does not recover already orphaned rows.
+
+Verify the restarted reviewer retains its database lock and persists new reviews;
+retest a private job end to end. This release does not claim live-host verification.
+GitHub remains a prerelease; npm uses `rc`, and stable `latest` is unchanged.
+
 ## v0.6.0-rc6
 
 Sixth release candidate for 0.6.0, containing the private-job fixes merged since
