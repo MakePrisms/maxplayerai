@@ -1,3 +1,113 @@
+## v0.6.0-rc6
+
+Sixth release candidate for 0.6.0, containing the private-job fixes merged since
+RC5. This is a prerelease; stable remains v0.5.11.
+Install with `npm install -g maxplayer@rc`.
+
+### Changes since v0.6.0-rc5
+
+- Resolve the reviewer's systemd state directory before opening SQLite (#1054).
+- Seed the repository manifest when provisioning a private job, allowing its
+  first input or delivery push (#1055).
+- Recover reviewer subscriptions after NIP-42 authentication, reconnects and
+  subscription closures; isolate malformed requests and retain the client default
+  accepted mints (#1056).
+- Correct private Git ref names and signed input-read headers; use the encrypted
+  review path for the seller's pre-run offer check (#1058).
+- Advertise support for fetching reachable commits by their pinned ID (#1059).
+
+### Coordinated rollout and verification
+
+Upgrade buyers and sellers and restart their daemons/MCP servers. Deploy the
+relay and reviewer from a revision containing these fixes as well: installing a
+client package does not deploy the server. Preserve the RC5 shared identity and
+existing keys; explicit old client settings still require the RC5 migration below.
+
+These fixes are merged and their main-branch CI passed. This publication does not
+claim a newly verified live private-job round trip. Retest a new private job from
+input upload through offer review, seller execution, delivery review and collection.
+Do not treat old jobs as migrated or re-encrypted by this upgrade.
+
+GitHub remains a prerelease; npm uses `rc`, and stable `latest` is unchanged.
+
+## v0.6.0-rc5
+
+Fifth release candidate for 0.6.0. This is a prerelease; stable remains v0.5.11.
+Install with `npm install -g maxplayer@rc`.
+
+### Changes since v0.6.0-rc4
+
+- Reuse the deployed reviewer public identity (`31b18b42…`) as the shared
+  private-content/reviewer default (#1051). Client and relay service defaults agree.
+- Keep the existing reviewer private key in place; no OpenClaw secret-store export
+  or reviewer signer replacement is required for this migration.
+- Document coordinated configuration changes and old-job limitations.
+
+### Existing installations
+
+Upgrading does not overwrite explicit client settings. Set `privacy.service_pubkey`
+and the `wss://relay.maxplayer.ai` reviewer entry to
+`31b18b42bcef9842c10e518834d32da2a0f8f6f8f3758124e25cc392ada1fe5c`, then restart
+buyer/seller daemons and MCP servers. Align the relay's `MAXPLAYER_PRIVATE_SERVICE_PUBKEY`
+override (or deploy its new default) and restart the relay. Verify the worker actually
+uses the matching existing signer and prove a new private job through offer and
+delivery review before calling the rollout complete.
+
+This release does not change live credentials, rewrite existing repository access
+records, or re-encrypt old jobs. Preserve old keys and job state. GitHub remains a
+prerelease; npm uses `rc`, and stable `latest` is unchanged.
+
+## v0.6.0-rc4
+
+Fourth release candidate for 0.6.0. This is a prerelease for testing, not a
+replacement for stable v0.5.11. Install with `npm install -g maxplayer@rc`.
+
+### Changes since v0.6.0-rc3
+
+- Unify the default execution-reviewer identity with the existing private-content
+  service identity (#1049). Both now use `7e6b3b05…`; the reviewer default references
+  the service constant rather than maintaining a competing public key.
+- Add a regression check that fresh-home reviewer, privacy and relay-protocol
+  identity defaults agree. Preserve custom relay trust, explicit reviewer maps,
+  empty maps and disabled review settings.
+- Correct operator setup guidance to reuse the existing content-service private
+  key, keep the relay identity separate, and coordinate signer/client migration.
+
+### Required operator migration
+
+This release does not provision the live reviewer's signing key. The reviewer must
+run with the existing content-service private key before clients use the new trust
+identity. Existing explicit `[review.reviewers]` entries retain their old values:
+update them to match `privacy.service_pubkey` and restart buyer/seller daemons and
+MCP servers. A binary upgrade alone does not repair those explicit settings.
+
+Keep private jobs private. Verify the live reviewer identity and a complete private
+job (offer review through delivery acceptance), plus a public review, before broad
+rollout. Production signer migration and these live checks were not verified when
+this candidate was prepared; local tests and CI are not deployment proof.
+
+GitHub remains a prerelease, npm uses the `rc` dist-tag, and sandbox images
+use the versioned RC tag without moving stable `latest`.
+
+## v0.6.0-rc3
+
+Third release candidate for 0.6.0. This is a prerelease for testing, not a
+replacement for stable v0.5.11. Install with `npm install -g maxplayer@rc`.
+
+### Changes since v0.6.0-rc2
+
+- Fix Docker Desktop seller startup when the VM kernel lacks the flower traffic
+  classifier (#1047). Automatically probe and select a verified u32 fallback.
+- Keep sandbox containment fail-closed. The compatibility backend preserves normal
+  web, DNS and model-proxy access while blocking unsupported packet formats:
+  IPv4 options/fragments, IPv6 extension headers and non-TCP/UDP/ICMP protocols.
+- Independently verify the selected classifier's installed rules and name the
+  classifier in the startup log. No manual networking configuration is required.
+
+Petar reported local Mac verification before requesting this candidate.
+GitHub remains a prerelease, npm uses the `rc` dist-tag, and sandbox images
+use the versioned RC tag without moving stable `latest`.
+
 ## v0.6.0-rc2
 
 Second release candidate for 0.6.0. This is a prerelease for testing, not a
