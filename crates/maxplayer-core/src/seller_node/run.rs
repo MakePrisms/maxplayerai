@@ -812,6 +812,15 @@ fn already_handled_skip_line(job_id: &str, state: Option<super::store::JobState>
     })
 }
 
+/// The `["output", …]` a result carries: the buyer's declared output type (#686), echoed for EVERY
+/// delivery mode. A v2 buyer binds the result's `output` to the offer's and drops a mismatching
+/// result as not-a-delivery — #1065 was the git paths hardcoding `text/plain`, which made every
+/// `application/json` git job undeliverable. A row written before the column existed states none;
+/// text/plain is what such a (pre-v2) offer was answered with.
+fn result_output(offer: &super::store::Offer) -> &str {
+    offer.output.as_deref().unwrap_or("text/plain")
+}
+
 /// Build the delivery co-signature preimage. `creq_hash` is derived from the STORED claim-time creq
 /// (`stored_creq`) — never a rebuild from live config — so a config change between claim and delivery
 /// cannot break the buyer/seller cosignature (audit N-4 / invariant 8). The specific realized mint is
@@ -8704,6 +8713,7 @@ impl SellerNodeRunner {
         let mut draft = git_result_draft(
             job_id,
             &offer.buyer_pubkey,
+            result_output(&offer),
             &seller.git_remote,
             &branch,
             &commit,
@@ -9335,9 +9345,7 @@ impl SellerNodeRunner {
         let draft = gateway::inline_result_draft(
             job_id,
             &offer.buyer_pubkey,
-            // The buyer's declared output type. A row written before that column existed states
-            // none, and text/plain is the shape an answer takes.
-            offer.output.as_deref().unwrap_or("text/plain"),
+            result_output(offer),
             offer.amount_sats,
             &preimage.job_hash,
             &seller_sig,
@@ -9536,6 +9544,7 @@ impl SellerNodeRunner {
         let mut draft = git_result_draft(
             job_id,
             &offer.buyer_pubkey,
+            result_output(&offer),
             &seller.git_remote,
             &branch,
             commit,
@@ -10767,6 +10776,28 @@ mod tests {
                 argv: vec!["claude-agent-acp".to_owned()],
             },
         ]))
+    }
+
+    /// #1065: the seller's result `output` is the buyer's declared type, never a fixed default.
+    /// Bite (measured): make `result_output` return `"text/plain"` and the json arm goes red.
+    #[test]
+    fn every_result_echoes_the_offer_output_type() {
+        let mut row = offer_row("aa".repeat(32).as_str(), &"bb".repeat(32), &offer(10, None, 10_000));
+        for declared in ["application/json", "text/markdown", "text/plain"] {
+            row.output = Some(declared.to_owned());
+            assert_eq!(result_output(&row), declared);
+            let draft = git_result_draft(
+                &row.offer_id, &row.buyer_pubkey, result_output(&row),
+                "https://relay.test/git/s/r.git", "maxplayer/aaaaaaaa", &"d".repeat(40),
+                row.amount_sats, "job-hash", "seller-sig", "delivery commit", &[],
+            );
+            let outputs: Vec<_> = draft.tags.iter()
+                .filter(|t| t.first() == Some("output")).map(|t| t.0[1].clone()).collect();
+            assert_eq!(outputs, vec![declared.to_owned()], "exactly one output tag, the declared one");
+        }
+        // A pre-#686 row states none: text/plain, the only type such an offer was answered with.
+        row.output = None;
+        assert_eq!(result_output(&row), "text/plain");
     }
 
     fn offer(amount: u64, targeted_to: Option<&str>, deadline_unix: u64) -> ParsedOffer {

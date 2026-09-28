@@ -4676,6 +4676,7 @@ mod tests {
         let draft = crate::gateway::git_result_draft(
             &"aa".repeat(32),
             &"bb".repeat(32),
+            "text/plain",
             "https://example.invalid/repo.git",
             "main",
             &"e".repeat(40),
@@ -4702,6 +4703,7 @@ mod tests {
         let bare = crate::gateway::git_result_draft(
             &"aa".repeat(32),
             &"bb".repeat(32),
+            "text/plain",
             "https://example.invalid/repo.git",
             "main",
             &"e".repeat(40),
