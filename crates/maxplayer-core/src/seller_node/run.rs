@@ -812,6 +812,15 @@ fn already_handled_skip_line(job_id: &str, state: Option<super::store::JobState>
     })
 }
 
+/// The `["output", …]` a result carries: the buyer's declared output type (#686), echoed for EVERY
+/// delivery mode. A v2 buyer binds the result's `output` to the offer's and drops a mismatching
+/// result as not-a-delivery — #1065 was the git paths hardcoding `text/plain`, which made every
+/// `application/json` git job undeliverable. A row written before the column existed states none;
+/// text/plain is what such a (pre-v2) offer was answered with.
+fn result_output(offer: &super::store::Offer) -> &str {
+    offer.output.as_deref().unwrap_or("text/plain")
+}
+
 /// Build the delivery co-signature preimage. `creq_hash` is derived from the STORED claim-time creq
 /// (`stored_creq`) — never a rebuild from live config — so a config change between claim and delivery
 /// cannot break the buyer/seller cosignature (audit N-4 / invariant 8). The specific realized mint is
@@ -6912,7 +6921,6 @@ impl SellerNodeRunner {
         let state = self.review_checks.clone();
         let client = self.client.clone();
         let relay = self.relay_url.clone();
-        let config = home.config.review.clone();
         let buyer = buyer.to_owned();
         let job = job_id.to_owned();
         tokio::spawn(async move {
@@ -6922,23 +6930,16 @@ impl SellerNodeRunner {
                 kind: crate::kinds::JOB_OFFER_KIND,
                 commit: None,
             };
-            let result = if let Some(request) = private_request {
-                crate::review::private::check(&review_home, &client,
-                    crate::review::private::Identity::Seller(&review_signer), &request, &buyer).await
-            } else {
-                crate::review::wire::check(
-                &crate::review::wire::RelayTransport {
-                    client: &client,
-                    relay: &relay,
-                },
-                &config,
+            let result = crate::review::private::seller_offer(
+                &review_home,
+                &client,
+                &review_signer,
                 &relay,
-                &subject,
+                private_request.as_ref(),
+                &job,
                 &buyer,
-                false,
             )
-            .await
-            };
+            .await;
             let result = match crate::review::state::completed(&status_root, &subject, &result) {
                 Ok(()) => result,
                 Err(e) => Err(e),
@@ -7860,6 +7861,30 @@ impl SellerNodeRunner {
         settled
     }
 
+    /// The offer review that must pass before the agent runs. It routes through the same
+    /// function as the claim-time review, so a private offer never gets a public request.
+    async fn review_offer_before_run(
+        &self,
+        job_id: &str,
+        buyer: &str,
+    ) -> Result<Option<String>, String> {
+        let request = crate::review::private::offer_request(
+            self.node.home(),
+            &self.seller_pubkey.to_hex(),
+            job_id,
+        )?;
+        crate::review::private::seller_offer(
+            self.node.home(),
+            &self.client,
+            self.node.signer(),
+            &self.relay_url,
+            request.as_ref(),
+            job_id,
+            buyer,
+        )
+        .await
+    }
+
     /// Execute an awarded job end to end: run the agent in a fresh empty-base workdir, snapshot its
     /// output into ONE delivery commit dated at the STORED award time (so a re-created commit after a
     /// restart keeps the same oid — invariant 2), push it under the seller's NIP-98 auth, then bind
@@ -7979,11 +8004,10 @@ impl SellerNodeRunner {
                         opline!("seller node review blocked job_id={job_id}: missing offer");
                         return;
                     };
-                    let subject = crate::review::Subject { offer: job_id.to_owned(), event: job_id.to_owned(),
-                        kind: crate::kinds::JOB_OFFER_KIND, commit: None };
-                    let transport = crate::review::wire::RelayTransport { client: &self.client, relay: &self.relay_url };
-                    if let Err(error) = crate::review::wire::check(&transport, &self.node.home().config.review,
-                        &self.relay_url, &subject, &stored_offer.buyer_pubkey, false).await {
+                    if let Err(error) = self
+                        .review_offer_before_run(job_id, &stored_offer.buyer_pubkey)
+                        .await
+                    {
                         opline!("seller node review blocked job_id={job_id}: {error}");
                         return;
                     }
@@ -8689,6 +8713,7 @@ impl SellerNodeRunner {
         let mut draft = git_result_draft(
             job_id,
             &offer.buyer_pubkey,
+            result_output(&offer),
             &seller.git_remote,
             &branch,
             &commit,
@@ -9320,9 +9345,7 @@ impl SellerNodeRunner {
         let draft = gateway::inline_result_draft(
             job_id,
             &offer.buyer_pubkey,
-            // The buyer's declared output type. A row written before that column existed states
-            // none, and text/plain is the shape an answer takes.
-            offer.output.as_deref().unwrap_or("text/plain"),
+            result_output(offer),
             offer.amount_sats,
             &preimage.job_hash,
             &seller_sig,
@@ -9521,6 +9544,7 @@ impl SellerNodeRunner {
         let mut draft = git_result_draft(
             job_id,
             &offer.buyer_pubkey,
+            result_output(&offer),
             &seller.git_remote,
             &branch,
             commit,
@@ -10752,6 +10776,28 @@ mod tests {
                 argv: vec!["claude-agent-acp".to_owned()],
             },
         ]))
+    }
+
+    /// #1065: the seller's result `output` is the buyer's declared type, never a fixed default.
+    /// Bite (measured): make `result_output` return `"text/plain"` and the json arm goes red.
+    #[test]
+    fn every_result_echoes_the_offer_output_type() {
+        let mut row = offer_row("aa".repeat(32).as_str(), &"bb".repeat(32), &offer(10, None, 10_000));
+        for declared in ["application/json", "text/markdown", "text/plain"] {
+            row.output = Some(declared.to_owned());
+            assert_eq!(result_output(&row), declared);
+            let draft = git_result_draft(
+                &row.offer_id, &row.buyer_pubkey, result_output(&row),
+                "https://relay.test/git/s/r.git", "maxplayer/aaaaaaaa", &"d".repeat(40),
+                row.amount_sats, "job-hash", "seller-sig", "delivery commit", &[],
+            );
+            let outputs: Vec<_> = draft.tags.iter()
+                .filter(|t| t.first() == Some("output")).map(|t| t.0[1].clone()).collect();
+            assert_eq!(outputs, vec![declared.to_owned()], "exactly one output tag, the declared one");
+        }
+        // A pre-#686 row states none: text/plain, the only type such an offer was answered with.
+        row.output = None;
+        assert_eq!(result_output(&row), "text/plain");
     }
 
     fn offer(amount: u64, targeted_to: Option<&str>, deadline_unix: u64) -> ParsedOffer {
@@ -13032,6 +13078,90 @@ mod tests {
         }).await;
         runner.client.disconnect().await;
         publisher.disconnect().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // The review before the agent runs must route a private offer like the claim-time review
+    // does. Before the fix it always sent a public kind-3409 request, which the reviewer never
+    // answers for a private offer, so every private job stopped after its award.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_before_run_sends_a_private_offer_only_over_the_encrypted_lane() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.unwrap();
+        let url = relay.url().await.to_string();
+        let (evidence, _, _, policy) = crate::private_content::evidence::inline_fixture_for(true);
+        let root = temp_dir("review-before-run-private");
+        std::fs::create_dir_all(&root).unwrap();
+        // `Store::open` refuses a symlink, and the macOS temp path holds one.
+        let root = root.canonicalize().unwrap();
+        let mut home = crate::home::bootstrap(&root).unwrap();
+        home.config.relay_url = url.clone();
+        home.config.seller = Some(seller_cfg(1, true));
+        home.config.privacy.service_pubkey = Some(policy.service.clone());
+        home.config.privacy.git_base = Some(policy.host.git_prefix.clone());
+        home.config.accepted_mints = policy.host.accepted_mints.clone();
+        home.config
+            .review
+            .reviewers
+            .insert(url.clone(), policy.service.clone());
+        home.config.review.timeout_seconds = 3;
+        // The fixture offer targets key 2, so this seat is key 2.
+        std::fs::write(&home.key_path, format!("{:064x}", 2)).unwrap();
+        let seller = crate::home::public_key_hex(&home).unwrap();
+        let now = nostr_sdk::Timestamp::now().as_secs();
+        let mut ctx =
+            crate::private_content::channel::ContentContext::open(&home, &seller).unwrap();
+        let task = evidence.task_envelope.as_ref().expect("targeted task");
+        ctx.stage(
+            &crate::private_content::PreparedContent::decode(task).unwrap(),
+            now,
+        )
+        .unwrap();
+        ctx.resolve_offer(&evidence.offer, now).unwrap();
+        drop(ctx);
+        let runner = SellerNodeRunner::boot(home).await.unwrap();
+        let id = evidence.offer.id.to_hex();
+
+        // No reviewer runs here, so the check times out. The test is about what it sent.
+        let error = runner
+            .review_offer_before_run(&id, &evidence.offer.pubkey.to_hex())
+            .await
+            .unwrap_err();
+        assert!(error.contains("timeout"), "{error}");
+
+        let reader = Client::default();
+        reader.add_relay(&url).await.unwrap();
+        reader.connect().await;
+        let public = reader
+            .fetch_events(
+                Filter::new().kinds([
+                    Kind::Custom(crate::kinds::REVIEW_REQUEST_KIND),
+                    Kind::Custom(crate::kinds::REVIEW_KIND),
+                ]),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert!(
+            public.is_empty(),
+            "a private offer got a public review request: {public:?}"
+        );
+        let service = nostr_sdk::PublicKey::from_hex(&policy.service).unwrap();
+        let wraps = reader
+            .fetch_events(
+                Filter::new().kind(Kind::GiftWrap).pubkey(service),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !wraps.is_empty(),
+            "no encrypted review request reached the reviewer"
+        );
+        reader.disconnect().await;
+        runner.client.disconnect().await;
+        relay.shutdown();
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -16715,7 +16845,10 @@ mod tests {
     // maxplayer-relay does. The nostr-relay-builder fixture used above cannot express this: it says
     // `auth-required:`, which nostr-sdk keeps and restores by itself, so every ordering would pass.
 
-    use crate::seller_node::p_gate_relay_fixture::{PGateRelay, PublishedEvent, ReqRecord, Verdict};
+    use crate::seller_node::p_gate_relay_fixture::{
+        PGateRelay, PublishedEvent, ReqRecord, Verdict, p_gated_before_auth, permanently_removed,
+        served_authed,
+    };
 
     /// Generous enough that a slow box never flakes, short enough that a real failure fails fast.
     const FIXTURE_WAIT: Duration = Duration::from_secs(15);
@@ -16752,24 +16885,6 @@ mod tests {
             .get(&RelayUrl::parse(&runner.relay_url).expect("relay url"))
             .cloned()
             .expect("relay handle")
-    }
-
-    /// Every REQ that reached the relay before that session had completed NIP-42, on a filter the
-    /// relay p-gates. This set being non-empty IS #189.
-    fn p_gated_before_auth(reqs: &[ReqRecord]) -> Vec<&ReqRecord> {
-        reqs.iter()
-            .filter(|record| record.p_pinned && !record.authenticated)
-            .collect()
-    }
-
-    /// Every REQ the relay refused with the permanent-class prefix — each one a subscription
-    /// nostr-sdk has deleted from its registry and will never restore.
-    fn permanently_removed(reqs: &[ReqRecord]) -> Vec<&ReqRecord> {
-        reqs.iter()
-            .filter(|record| {
-                matches!(&record.verdict, Verdict::Closed(reason) if reason.starts_with("restricted:"))
-            })
-            .collect()
     }
 
     /// TOOTH #189 (a) — THE ORDERING. A recovery whose AUTH lands well after the socket does must
@@ -17738,15 +17853,6 @@ mod tests {
     /// and kind-1059 legs (what [`subscribe_all`] carries). The liveness probe is transient — it is
     /// re-issued every heartbeat and self-heals — so it is not in this set.
     const LONG_LIVED_SUBS: [&str; 3] = [OFFER_SUB_ID, AWARD_SUB_ID, WRAP_SUB_ID];
-
-    /// How many REQs for `id` the relay served (`EOSE`) on an AUTHENTICATED session — the count that
-    /// must grow after each challenge-roll for the leg to be genuinely restored (not merely re-sent
-    /// onto a stale generation and refused).
-    fn served_authed(reqs: &[ReqRecord], id: &str) -> usize {
-        reqs.iter()
-            .filter(|r| r.subscription_id == id && r.authenticated && r.verdict == Verdict::Eose)
-            .count()
-    }
 
     /// TOOTH #429 — a live-socket NIP-42 RE-CHALLENGE must not leave the money leg deaf: the daemon
     /// re-issues the long-lived subscriptions on every COMPLETED auth, re-armed per challenge-roll.

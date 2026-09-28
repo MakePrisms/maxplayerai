@@ -90,6 +90,7 @@ function wirePicker(): void {
 async function boot(): Promise<void> {
   if (location.hash === "#market") { location.replace("/market"); return; }
   const video = document.querySelector<HTMLVideoElement>(".h-video video");
+  if (video && matchMedia("(max-width: 760px) and (orientation: portrait)").matches) video.poster = "/media/first-job-vertical-poster.jpg";
   if (video && matchMedia("(prefers-reduced-motion: reduce)").matches) { video.removeAttribute("autoplay"); video.pause(); video.controls = true; }
   wireNav();
   wirePicker();

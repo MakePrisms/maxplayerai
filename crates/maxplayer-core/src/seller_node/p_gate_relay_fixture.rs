@@ -28,7 +28,7 @@ use tokio::sync::Mutex;
 
 /// What the relay answered a `REQ` with.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Verdict {
+pub(crate) enum Verdict {
     /// Served — the end-of-stored-events the client waits for.
     Eose,
     /// Refused, with the full reason string (prefix included).
@@ -37,7 +37,7 @@ pub(super) enum Verdict {
 
 /// One `REQ` as the relay saw it.
 #[derive(Debug, Clone)]
-pub(super) struct ReqRecord {
+pub(crate) struct ReqRecord {
     pub subscription_id: String,
     /// Whether NIP-42 had completed on this socket when the `REQ` arrived. `false` here on a
     /// `#p`-pinned subscription IS the #189 bug — the client let a p-gated REQ out before auth.
@@ -56,7 +56,7 @@ pub(super) struct ReqRecord {
 /// is a claim about which kinds reached the wire — the pre-advertise gate (#357) is exactly a test of
 /// what a publish path put here, so the fixture that used to reply OK and DROP the event now keeps it.
 #[derive(Debug, Clone)]
-pub(super) struct PublishedEvent {
+pub(crate) struct PublishedEvent {
     pub kind: u64,
     /// The event's tags, as they arrived. Kept because "advertised" is not only a claim about which
     /// kinds reached the wire but about what they SAID: the #747 terminal beat is an ordinary
@@ -100,10 +100,23 @@ struct Controls {
     /// epoch, so its `#p`-pinned REQs read STALE (closed `auth-required:`) until it answers the new
     /// challenge and catches up — which is the in-place re-auth the fix re-issues its subs on.
     auth_generation: std::sync::atomic::AtomicU64,
+    /// Open-read mode (the deployed Buzz relay): before auth, the relay p-gates only these
+    /// kinds. It serves a `#p`-pinned REQ for other kinds before auth, but only as history.
+    /// `None` keeps the default rule, which refuses every `#p`-pinned REQ before auth.
+    open_read_gated_kinds: Option<Vec<u64>>,
+    /// When set, the relay answers each AUTH with `OK false`, and the socket stays
+    /// unauthenticated. The deployed relay sends no second challenge after that.
+    refuse_auth: std::sync::atomic::AtomicBool,
+}
+
+impl Controls {
+    fn auth_refused(&self) -> bool {
+        self.refuse_auth.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 /// A running fixture relay. Dropping it stops accepting new connections.
-pub(super) struct PGateRelay {
+pub(crate) struct PGateRelay {
     url: String,
     transcript: Arc<Mutex<Vec<ReqRecord>>>,
     /// Every EVENT the client published, in arrival order — the wire record the pre-advertise gate is
@@ -123,14 +136,28 @@ impl PGateRelay {
     /// deployed relay challenges immediately, but a client that fires REQs on socket-up loses the
     /// race regardless of how fast the challenge is; holding it open makes that deterministic
     /// instead of timing-dependent, so the tooth cannot pass by being lucky.
-    pub(super) async fn start(auth_delay: Duration) -> Self {
+    pub(crate) async fn start(auth_delay: Duration) -> Self {
+        Self::start_with(auth_delay, Controls::default()).await
+    }
+
+    /// Like [`Self::start`], but in the deployed relay's open-read mode: before auth, the
+    /// relay refuses a `#p`-pinned REQ only if it asks for one of `gated_kinds`.
+    pub(crate) async fn start_open_read(auth_delay: Duration, gated_kinds: &[u64]) -> Self {
+        let controls = Controls {
+            open_read_gated_kinds: Some(gated_kinds.to_vec()),
+            ..Controls::default()
+        };
+        Self::start_with(auth_delay, controls).await
+    }
+
+    async fn start_with(auth_delay: Duration, controls: Controls) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind fixture relay");
         let addr: SocketAddr = listener.local_addr().expect("fixture relay addr");
         let transcript: Arc<Mutex<Vec<ReqRecord>>> = Arc::new(Mutex::new(Vec::new()));
         let events: Arc<Mutex<Vec<PublishedEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let controls: Arc<Controls> = Arc::new(Controls::default());
+        let controls: Arc<Controls> = Arc::new(controls);
 
         let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let accept = tokio::spawn({
@@ -163,13 +190,13 @@ impl PGateRelay {
     }
 
     /// How many sockets this relay has accepted.
-    pub(super) fn connections(&self) -> usize {
+    pub(crate) fn connections(&self) -> usize {
         self.connections.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Push an UNSOLICITED `CLOSED` for `subscription_id` down the live socket — the deployed relay's
     /// behaviour when it drops a subscription out from under a client that is otherwise healthy.
-    pub(super) async fn close_now(&self, subscription_id: &str, reason: &str) {
+    pub(crate) async fn close_now(&self, subscription_id: &str, reason: &str) {
         let live = self.controls.live.lock().await.clone();
         if let Some(writer) = live {
             let _ = send(&writer, json!(["CLOSED", subscription_id, reason])).await;
@@ -188,7 +215,7 @@ impl PGateRelay {
     /// CLOSE makes the red-prove vacuous (nostr-sdk's own post-auth `resubscribe()` re-sends a
     /// `closed==true` sub on the re-auth and self-heals it), so the non-vacuous prover withholds the
     /// CLOSE and lets the STALE generation alone deafen the leg.
-    pub(super) async fn roll_challenge(&self, close_subs: &[&str]) {
+    pub(crate) async fn roll_challenge(&self, close_subs: &[&str]) {
         let generation = self
             .controls
             .auth_generation
@@ -208,13 +235,20 @@ impl PGateRelay {
         }
     }
 
-    pub(super) fn url(&self) -> String {
+    pub(crate) fn url(&self) -> String {
         self.url.clone()
+    }
+
+    /// Answer every later AUTH with `OK false`.
+    pub(crate) fn refuse_auth(&self) {
+        self.controls
+            .refuse_auth
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Refuse the next `count` `REQ`s for `subscription_id` that carry an un-pinned filter — i.e. a
     /// relay that keeps rejecting the open-pool half while serving the targeted one.
-    pub(super) async fn refuse_unpinned(&self, subscription_id: &str, count: usize, reason: &str) {
+    pub(crate) async fn refuse_unpinned(&self, subscription_id: &str, count: usize, reason: &str) {
         let mut forced = self.controls.forced.lock().await;
         for _ in 0..count {
             forced.push_back(ForcedClose {
@@ -225,12 +259,12 @@ impl PGateRelay {
     }
 
     /// Every `REQ` the relay has seen, in arrival order.
-    pub(super) async fn reqs(&self) -> Vec<ReqRecord> {
+    pub(crate) async fn reqs(&self) -> Vec<ReqRecord> {
         self.transcript.lock().await.clone()
     }
 
     /// Every `REQ` seen for one subscription id.
-    pub(super) async fn reqs_for(&self, subscription_id: &str) -> Vec<ReqRecord> {
+    pub(crate) async fn reqs_for(&self, subscription_id: &str) -> Vec<ReqRecord> {
         self.reqs()
             .await
             .into_iter()
@@ -239,12 +273,12 @@ impl PGateRelay {
     }
 
     /// Every EVENT the relay has received, in arrival order.
-    pub(super) async fn events(&self) -> Vec<PublishedEvent> {
+    pub(crate) async fn events(&self) -> Vec<PublishedEvent> {
         self.events.lock().await.clone()
     }
 
     /// How many EVENTs of `kind` the relay received — what a publish path actually put on the wire.
-    pub(super) async fn event_kind_count(&self, kind: u64) -> usize {
+    pub(crate) async fn event_kind_count(&self, kind: u64) -> usize {
         self.events()
             .await
             .iter()
@@ -254,7 +288,7 @@ impl PGateRelay {
 
     /// Wait until `predicate` holds over the published EVENTs, or give up. Same contract as
     /// [`Self::wait_until`], over what the client published rather than what it subscribed to.
-    pub(super) async fn wait_until_published<F>(&self, timeout: Duration, predicate: F) -> bool
+    pub(crate) async fn wait_until_published<F>(&self, timeout: Duration, predicate: F) -> bool
     where
         F: Fn(&[PublishedEvent]) -> bool,
     {
@@ -272,7 +306,7 @@ impl PGateRelay {
 
     /// Wait until `predicate` holds over the transcript, or give up. Returns whether it held —
     /// the caller asserts, so a timeout reads as the failure it is rather than a hang.
-    pub(super) async fn wait_until<F>(&self, timeout: Duration, predicate: F) -> bool
+    pub(crate) async fn wait_until<F>(&self, timeout: Duration, predicate: F) -> bool
     where
         F: Fn(&[ReqRecord]) -> bool,
     {
@@ -340,6 +374,12 @@ async fn serve_connection(
                 let Some(event) = frame.get(1) else { continue };
                 // Kind 22242 is the NIP-42 auth event. Checking it keeps the fixture honest: a client
                 // that authenticated with something else has not authenticated.
+                if controls.auth_refused() {
+                    let id = event.get("id").and_then(Value::as_str).unwrap_or_default();
+                    let refusal = json!(["OK", id, false, "restricted: not a relay member"]);
+                    send(&writer, refusal).await?;
+                    continue;
+                }
                 if event.get("kind").and_then(Value::as_u64) == Some(22242) {
                     authed_pubkey = event
                         .get("pubkey")
@@ -407,11 +447,17 @@ async fn serve_connection(
                             .auth_generation
                             .load(std::sync::atomic::Ordering::SeqCst);
 
+                let open_read_ungated = controls
+                    .open_read_gated_kinds
+                    .as_ref()
+                    .is_some_and(|gated| asks_no_gated_kind(&filters, gated));
+
                 let verdict = decide(
                     &subscription_id,
                     &pinned,
                     authed_pubkey.as_deref(),
                     stale,
+                    open_read_ungated,
                     &controls,
                 )
                 .await;
@@ -455,6 +501,7 @@ async fn decide(
     pinned: &[Option<&str>],
     authed_pubkey: Option<&str>,
     stale: bool,
+    open_read_ungated: bool,
     controls: &Controls,
 ) -> Verdict {
     let has_unpinned = pinned.iter().any(Option::is_none);
@@ -467,6 +514,12 @@ async fn decide(
         return Verdict::Closed(entry.reason);
     }
     drop(forced);
+
+    // Open read: the deployed relay serves an unauthenticated REQ for kinds that it does
+    // not p-gate, but only as history. It does not add the REQ to live delivery.
+    if open_read_ungated && authed_pubkey.is_none() {
+        return Verdict::Eose;
+    }
 
     // A `#p`-pinned REQ arriving under a STALE (re-challenged) generation is closed
     // `auth-required: not authenticated` — the OBSERVED wire contract on a live re-auth socket (field
@@ -490,6 +543,43 @@ async fn decide(
         }
     }
     Verdict::Eose
+}
+
+/// True when no filter of a REQ asks for a kind in `gated`.
+fn asks_no_gated_kind(filters: &[&Value], gated: &[u64]) -> bool {
+    let mut kinds = filters
+        .iter()
+        .filter_map(|filter| filter.get("kinds").and_then(Value::as_array))
+        .flatten()
+        .filter_map(Value::as_u64);
+    !kinds.any(|kind| gated.contains(&kind))
+}
+
+/// Every REQ that reached the relay before that session had completed NIP-42, on a filter the
+/// relay p-gates. This set being non-empty IS #189.
+pub(crate) fn p_gated_before_auth(reqs: &[ReqRecord]) -> Vec<&ReqRecord> {
+    reqs.iter()
+        .filter(|record| record.p_pinned && !record.authenticated)
+        .collect()
+}
+
+/// Every REQ the relay refused with the permanent-class prefix — each one a subscription
+/// nostr-sdk has deleted from its registry and will never restore.
+pub(crate) fn permanently_removed(reqs: &[ReqRecord]) -> Vec<&ReqRecord> {
+    reqs.iter()
+        .filter(|record| {
+            matches!(&record.verdict, Verdict::Closed(reason) if reason.starts_with("restricted:"))
+        })
+        .collect()
+}
+
+/// How many REQs for `id` the relay served (`EOSE`) on an AUTHENTICATED session — the count that
+/// must grow after each challenge-roll for the leg to be genuinely restored (not merely re-sent
+/// onto a stale generation and refused).
+pub(crate) fn served_authed(reqs: &[ReqRecord], id: &str) -> usize {
+    reqs.iter()
+        .filter(|r| r.subscription_id == id && r.authenticated && r.verdict == Verdict::Eose)
+        .count()
 }
 
 type Writer = futures_util::stream::SplitSink<

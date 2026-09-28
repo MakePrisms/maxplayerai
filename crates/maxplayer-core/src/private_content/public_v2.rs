@@ -681,6 +681,153 @@ pub(crate) mod tests {
             buyer,
         )
     }
+    /// #1065: a PAID public GIT delivery for an offer whose declared output is `offer_output`, with
+    /// the result stating `result_output`. Built with the seller's real draft builder
+    /// (`git_result_draft`) so the fixture carries exactly the tags a seat publishes.
+    pub(crate) fn git_fixture(offer_output: &str, result_output: &str) -> (PrivateEvidence, Keys) {
+        let amount = 10;
+        let buyer = keys(1);
+        let seller = keys(2);
+        let offer = sign(
+            &buyer,
+            offer_draft(
+                gateway::OfferDraft::new(
+                    "public git task",
+                    offer_output,
+                    amount,
+                    2_000_000_000,
+                    seller.public_key().to_hex(),
+                )
+                .to_event_draft(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let creq = gateway::creq::build_seller_creq(
+            &offer.id.to_hex(),
+            amount,
+            "sat",
+            &["https://testnut.cashu.space".into()],
+            &seller.public_key().to_hex(),
+        )
+        .unwrap();
+        let claim = sign(
+            &seller,
+            project(
+                &offer,
+                gateway::claim_draft(
+                    &offer.id.to_hex(),
+                    &buyer.public_key().to_hex(),
+                    &seller.public_key().to_hex(),
+                    gateway::ClaimPayment::Sat(&creq),
+                    &[],
+                    &Default::default(),
+                ),
+                None,
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let award = sign(
+            &buyer,
+            project(
+                &offer,
+                gateway::award_draft(
+                    &offer.id.to_hex(),
+                    &claim.id.to_hex(),
+                    &buyer.public_key().to_hex(),
+                    &seller.public_key().to_hex(),
+                ),
+                None,
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let commit = "2864a68fafe6c0e04ee86ec17f79a44f93ea15b0";
+        let p = crate::receipt::ReceiptPreimage {
+            protocol: crate::receipt::ReceiptProtocol::V2,
+            job_hash: super::super::job_hash(&offer.id.to_hex()).unwrap(),
+            offer_id: offer.id.to_hex(),
+            amount,
+            unit: "sat".into(),
+            buyer_pubkey: buyer.public_key().to_hex(),
+            seller_pubkey: seller.public_key().to_hex(),
+            delivery_integrity_hash: commit.into(),
+            delivery_kind: "fork".into(),
+            exec_metadata_commitment: "none".into(),
+            creq_hash: Some(gateway::creq_hash_hex(&creq)),
+        };
+        let sig = seller
+            .sign_schnorr(&Message::from_digest(p.digest_bytes()))
+            .to_string();
+        let result = sign(
+            &seller,
+            project(
+                &offer,
+                gateway::git_result_draft(
+                    &offer.id.to_hex(),
+                    &buyer.public_key().to_hex(),
+                    result_output,
+                    "https://relay.test/git/seller/repo.git",
+                    &format!("maxplayer/{}", &offer.id.to_hex()[..8]),
+                    commit,
+                    amount,
+                    &p.job_hash,
+                    &sig,
+                    format!("delivery commit {commit}"),
+                    &[],
+                ),
+                Some(&award),
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        (
+            PrivateEvidence {
+                offer,
+                claim,
+                award,
+                result,
+                task_envelope: None,
+                answer_envelope: None,
+            },
+            buyer,
+        )
+    }
+    /// #1065 REGRESSION. A paid public git job whose offer declares a non-default output type
+    /// (`application/json`, the RC7 canary shape) must verify when the seller echoes that type,
+    /// and must NOT verify when the result states another one — the output binding is real, so the
+    /// fix belongs on the seller (echo the offer), not in loosening the buyer.
+    ///
+    /// The seller side of the fix (every result echoes the offer's output) is pinned separately by
+    /// `seller_node::run::tests::every_result_echoes_the_offer_output_type`.
+    #[test]
+    fn public_v2_git_delivery_binds_the_offer_output_type() {
+        for output in ["application/json", "text/plain", "text/markdown"] {
+            let (e, buyer) = git_fixture(output, output);
+            let verified = validate_evidence(&e, &buyer.public_key().to_hex())
+                .unwrap_or_else(|err| panic!("{output}: echoed output must verify: {err:?}"));
+            assert_eq!(verified.preimage.delivery_kind, "fork");
+            assert_eq!(verified.integrity, "2864a68fafe6c0e04ee86ec17f79a44f93ea15b0");
+            assert!(verified.answer.is_none());
+            crate::payment::ReceiptAuthority {
+                buyer: buyer.public_key(),
+                seller: e.claim.pubkey,
+            }
+            .verify_seller_prepay_cosig(
+                &verified.preimage,
+                required(&e.result, "sig:seller").unwrap(),
+                None,
+            )
+            .unwrap();
+        }
+        // The RC7 wire shape: offer application/json, git result text/plain.
+        let (rc7, buyer) = git_fixture("application/json", "text/plain");
+        assert!(validate_evidence(&rc7, &buyer.public_key().to_hex()).is_err());
+    }
     #[test]
     fn public_v2_inline_binds_exact_public_envelope_and_signed_selection() {
         let (e, buyer) = fixture(false, false);

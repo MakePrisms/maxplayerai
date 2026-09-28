@@ -1036,7 +1036,7 @@ button.chip { cursor: pointer; }
 }
 .h-section { display: flex; flex-direction: column; justify-content: center; }
 .h-section > .h-in { width: 100%; }
-/* "Just ask": a video of one real job, desktop 16:9 / phone 4:5 */
+/* "Just ask": one real job, start to finish. 16:9, or a 9:16 cut on portrait phones */
 .h-video { margin: 44px auto 0; max-width: 960px; }
 .h-video video {
   display: block; width: 100%; aspect-ratio: 16 / 9; background: #070708;
@@ -1045,7 +1045,6 @@ button.chip { cursor: pointer; }
 .h-video figcaption { margin-top: 14px; font-family: var(--sans); font-size: 13px; color: var(--faint); }
 @media (max-width: 600px) {
   .h-video { margin-top: 30px; }
-  .h-video video { aspect-ratio: 4 / 5; }
 }
 /* "Hire Expert / Agents": always two lines. Each line is about as long as the
    old "Hire Agents", so the phone sizing above still fills the width */
@@ -1056,6 +1055,51 @@ button.chip { cursor: pointer; }
 .h-hero .h-button { margin-top: clamp(32px, 3.2vw, 46px); }
 @media (max-width: 760px) {
   .h-hero .h-button { padding: 12px 24px; font-size: 14px; }
+}
+/* Sell hero "Put your agent / to work" matches the Buy hero: same line
+   height and desktop size; on phones it fills the width the same way. Its
+   longest line is ~11.6x its font size (Buy's is ~8.7x), so /12 here gives
+   the same line width as Buy's /9 at every phone size */
+.h-hero h1.h-title-long { line-height: 1.02; }
+@media (max-width: 760px) {
+  .h-hero h1.h-title-long { font-size: min(calc((100vw - 60px) / 12), 84px); white-space: nowrap; }
+}
+/* "Works with your favorite agent": a row of agent logos under the three steps */
+.h-agents { margin: 64px auto 0; padding-top: 40px; border-top: 1px solid var(--line); max-width: 960px; }
+.h-agents p { margin: 0; font-size: 12.5px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-2); }
+.h-agents ul {
+  list-style: none; margin: 30px 0 0; padding: 0;
+  display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 24px 28px;
+}
+.h-agents li { display: flex; align-items: center; gap: 10px; color: var(--muted); transition: color 0.12s ease; }
+.h-agents li:hover { color: var(--ink); }
+.h-agents svg { width: 30px; height: 30px; flex: none; }
+.h-agents span { font-family: var(--sans); font-size: 16px; font-weight: 600; white-space: nowrap; }
+@media (max-width: 760px) {
+  .h-agents { margin-top: 48px; padding-top: 32px; }
+  .h-agents ul { display: grid; grid-template-columns: repeat(3, auto); justify-content: space-around; gap: 26px 18px; }
+  .h-agents li { flex-direction: column; gap: 8px; }
+  .h-agents svg { width: 28px; height: 28px; }
+  .h-agents span { font-size: 13px; }
+}
+@media (prefers-reduced-motion: reduce) { .h-agents li { transition: none; } }
+/* portrait phones get the 9:16 cut; capped so it fits one screen under the nav */
+@media (max-width: 760px) and (orientation: portrait) {
+  .h-video video { aspect-ratio: 9 / 16; width: min(100%, calc((100svh - var(--nav-h) - 40px) * 9 / 16)); margin: 0 auto; }
+}
+/* market: on desktop the board fills the screen under the nav (like the
+   Buy/Sell sections). The height still comes only from the viewport, never
+   from the rows, so loading -> loaded never shifts the layout. Floor of ~10
+   rows on very short windows; tablets and phones keep their fixed heights. */
+@media (min-width: 981px) {
+  .market-page {
+    display: flex; flex-direction: column;
+    height: calc(100vh - var(--nav-h)); height: calc(100svh - var(--nav-h));
+    min-height: 520px;
+  }
+  .market-page .book { flex: 1; min-height: 0; }
+  .market-page .col { min-height: 0; }
+  .market-page .rows { flex: 1; height: auto; min-height: 0; }
 }
 
 /* Scoped buyer UI; hidden must beat the homepage flex-section rule. */

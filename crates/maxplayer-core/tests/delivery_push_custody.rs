@@ -15,7 +15,6 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
 
@@ -37,32 +36,13 @@ fn still_ours() -> AuthorityCheck {
     Arc::new(|| Ok(()))
 }
 
-/// Names one fixture directory. A COUNTER, not a clock.
-///
-/// ⛔ This used to read `Instant::now().elapsed().as_nanos()`, which measures the time since an
-/// instant created on that same line — a handful of nanoseconds, and frequently 0. Measured:
-/// `84, 41, 42, 0, 0, 0`. The process id is shared by every test in the binary and cargo runs them
-/// on parallel threads, so two calls collided on one directory and therefore on one `child.sh`:
-/// one test's `fs::write` still held the file open for writing while another `exec`d it, and Linux
-/// answers that with ETXTBSY. Observed on CI as
-/// `spawn: Spawn("/tmp/mp-custody-30387-50/child.sh: Text file busy (os error 26)")`.
-static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
-
-fn shell_child(script: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "mp-custody-{}-{}",
-        std::process::id(),
-        NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).expect("fixture dir");
-    let path = dir.join("child.sh");
-    std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).expect("fixture script");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    }
-    path
+/// These scripts are checked in, not written while other tests spawn children.
+/// A fork can temporarily inherit another thread's writable script descriptor;
+/// even unique filenames and closing our own handle do not prevent ETXTBSY then.
+fn shell_child(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/delivery-push-custody")
+        .join(name)
 }
 
 /// Run the supervisor on its own thread and REFUSE to wait for it longer than `patience`.
@@ -128,7 +108,7 @@ fn a_parent_write_to_a_child_that_never_reads_is_bounded_by_the_deadline() {
         oversized_for_a_pipe < MAX_FRAME_BYTES,
         "this test must stall a write, not trip the frame cap"
     );
-    let program = shell_child("sleep 60");
+    let program = shell_child("sleep.sh");
     let budget = Duration::from_millis(400);
     let deadline = Instant::now() + budget;
 
@@ -170,7 +150,7 @@ fn a_parent_write_to_a_child_that_never_reads_is_bounded_by_the_deadline() {
 #[test]
 fn the_kill_reaches_a_grandchild_that_inherited_the_pipe() {
     // A background descendant, holding the inherited stdout, outliving its own parent's exit.
-    let program = shell_child("sleep 60 &\nexec sleep 60");
+    let program = shell_child("grandchild.sh");
     let budget = Duration::from_millis(300);
     let deadline = Instant::now() + budget;
 
@@ -211,7 +191,7 @@ fn the_kill_reaches_a_grandchild_that_inherited_the_pipe() {
 /// un-waited-for, and that `waitpid` would find it.
 #[test]
 fn a_confirmed_exit_means_this_process_already_reaped_the_child() {
-    let program = shell_child("sleep 60");
+    let program = shell_child("sleep.sh");
     let mut child = KillableChild::spawn(&program, &["__delivery-push"]).expect("spawn");
     let pid = child.pid();
 
