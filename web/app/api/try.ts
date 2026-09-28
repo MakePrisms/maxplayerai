@@ -95,10 +95,13 @@ export async function forward(
 // Vercel's Web-standard function entry point. No framework or server signing key.
 export default {
   async fetch(request: Request) {
-    if (
-      process.env.TRY_IT_API_ENABLED !== "true" ||
-      process.env.TRY_IT_ENABLED !== "true"
-    )
+    // On in Vercel preview deployments (behind Vercel login) so the team can
+    // run a real job; production needs both flags set explicitly.
+    const enabled =
+      process.env.VERCEL_ENV === "preview" ||
+      (process.env.TRY_IT_API_ENABLED === "true" &&
+        process.env.TRY_IT_ENABLED === "true");
+    if (!enabled)
       return Response.json({ error: "Not found" }, { status: 404 });
     if (request.method !== "POST")
       return new Response(null, { status: 405, headers: { Allow: "POST" } });

@@ -1,7 +1,7 @@
 import { HEARTBEAT } from "../model/kinds.js";
 import { createRecord, openStore, RecordState } from "./store.js";
 import { step } from "./controller.js";
-import { RateLimited, transport } from "./transport.js";
+import { NotOpen, RateLimited, transport } from "./transport.js";
 import { identity, NEMO, now, one, promptText, trade } from "./wire.js";
 declare const TRY_IT_MARKET_LINK_ENABLED: boolean;
 export const statuses: Record<string, string> = {
@@ -125,6 +125,13 @@ export async function bootTry() {
       failures = 0;
     } catch (e) {
       await show();
+      if (e instanceof NotOpen) {
+        // The server is switched off: say so once instead of retrying.
+        status.textContent = "Asking isn’t open yet. Check back soon.";
+        status.hidden = false;
+        failures = 6;
+        return;
+      }
       status.textContent =
         failures >= 5 ? "Can’t connect. Try refreshing." : "Connection interrupted. We’ll try again.";
       status.hidden = false;

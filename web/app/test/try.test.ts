@@ -641,6 +641,20 @@ test("Vercel entry point requires both enable flags, restricts method and bounds
         404,
       );
     }
+    // Vercel preview deployments are on without the flags; production is not.
+    process.env.TRY_IT_ENABLED = "false";
+    process.env.TRY_IT_API_ENABLED = "false";
+    process.env.VERCEL_ENV = "preview";
+    assert.equal(
+      (await handler.fetch(new Request("http://localhost/api/try"))).status,
+      405,
+    );
+    process.env.VERCEL_ENV = "production";
+    assert.equal(
+      (await handler.fetch(new Request("http://localhost/api/try"))).status,
+      404,
+    );
+    delete process.env.VERCEL_ENV;
     process.env.TRY_IT_ENABLED = "true";
     process.env.TRY_IT_API_ENABLED = "true";
     assert.equal(
@@ -663,6 +677,7 @@ test("Vercel entry point requires both enable flags, restricts method and bounds
     else process.env.TRY_IT_ENABLED = a;
     if (b === undefined) delete process.env.TRY_IT_API_ENABLED;
     else process.env.TRY_IT_API_ENABLED = b;
+    delete process.env.VERCEL_ENV;
   }
 });
 

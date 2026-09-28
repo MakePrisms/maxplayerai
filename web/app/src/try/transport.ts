@@ -15,6 +15,11 @@ export class RateLimited extends Error {
     super("Temporarily rate limited.");
   }
 }
+export class NotOpen extends Error {
+  constructor() {
+    super("Asking isn’t open yet.");
+  }
+}
 export function transport(): Transport {
   return {
     read(filter) {
@@ -58,6 +63,7 @@ export function transport(): Transport {
         body: JSON.stringify(envelope(e, secret, evidence)),
         signal: AbortSignal.timeout(10000),
       });
+      if (response.status === 404) throw new NotOpen();
       if (response.status === 429)
         throw new RateLimited(
           Date.now() + retryDelay(response.headers.get("Retry-After")),
