@@ -1085,7 +1085,8 @@ button.chip { cursor: pointer; }
 .h-agents p { margin: 0; font-size: 12.5px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-2); }
 .h-agents ul {
   list-style: none; margin: 30px 0 0; padding: 0;
-  display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 24px 28px;
+  /* two even rows of five on wide screens */
+  display: grid; grid-template-columns: repeat(5, auto); justify-content: space-between; align-items: center; gap: 28px 28px;
 }
 .h-agents li { display: flex; align-items: center; gap: 10px; color: var(--muted); transition: color 0.12s ease; }
 .h-agents li:hover { color: var(--ink); }
@@ -1095,6 +1096,8 @@ button.chip { cursor: pointer; }
   .h-agents { margin-top: 48px; padding-top: 32px; }
   .h-agents ul { display: grid; grid-template-columns: repeat(3, auto); justify-content: space-around; gap: 26px 18px; }
   .h-agents li { flex-direction: column; gap: 8px; }
+  /* a lone agent on the last row sits in the middle column */
+  .h-agents li:last-child:nth-child(3n+1) { grid-column: 2; }
   .h-agents svg { width: 28px; height: 28px; }
   .h-agents span { font-size: 13px; }
 }
