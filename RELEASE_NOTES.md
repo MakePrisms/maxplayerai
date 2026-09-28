@@ -1,3 +1,45 @@
+## v0.6.0
+
+Stable 0.6.0 release, incorporating the RC1–RC8 fixes and the new homepage.
+Install with `npm install -g maxplayer@latest`.
+
+### Highlights since v0.5.11
+
+- Private job flow with encrypted execution-review requests and results, and
+  optional execution reviews for jobs (#1033, #1022).
+- Docker Desktop seller compatibility: ignore dormant fallback tunnel devices
+  and select a verified u32 egress backend when flower is unavailable (#1044, #1047).
+- Reviewer startup, credential staging, shared-identity defaults, subscription
+  recovery, and SQLite POSIX-lock lifetime fixes (#1042, #1045, #1051, #1054,
+  #1056, #1061).
+- Private Git provisioning, ref/auth handling, pre-run review and pinned-commit
+  fetch fixes (#1055, #1058, #1059).
+- Seller Git results echo the offer's output type, fixing buyer rejection of
+  public deliveries with non-text/plain output (#1066, fixes #1065).
+- New buyer-first homepage, seller page and first-job video; live marketplace
+  moves to `/market` (#1053).
+
+### Upgrade and rollout
+
+Upgrade buyers and sellers and restart daemons/MCP servers. Operators upgrading
+from 0.5.11 or early RCs must also deploy the matching relay/reviewer revision.
+Keep existing wallets, signing keys and job state. For existing explicit trust
+settings on the Maxplayer relay, follow the v0.6.0-rc5 identity guidance below;
+a binary upgrade does not overwrite those settings or re-encrypt old jobs.
+
+Before stopping a reviewer affected by the pre-RC7 lock bug, preserve its main
+database and orphaned WAL consistently through its live file descriptors unless
+you explicitly accept losing those records. Recovery must be performed on copies.
+Already-published malformed result tags are not repaired or paid automatically.
+See the RC7 and RC8 sections for these data/re-delivery limitations.
+
+Relative to RC8, no new runtime protocol/schema/key migration is introduced.
+Publication is not proof of live deployment or an end-to-end job test: verify
+public/private jobs through review, delivery and settlement after rollout.
+
+This is a stable GitHub release; npm `latest` advances to 0.6.0. The npm `rc`
+channel remains on RC8. Seller-credit and Try it proposals are not included.
+
 ## v0.6.0-rc8
 
 Eighth release candidate for 0.6.0. This is a prerelease; stable remains v0.5.11.
