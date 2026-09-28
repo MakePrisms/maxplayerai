@@ -552,9 +552,9 @@ ol .row:hover .dot.working i, ol .row:focus-visible .dot.working i {
    Big-type close, not a legal strip: link columns up top, a ghost wordmark
    half-cropped at the bottom edge like it's driving out of frame, and the
    finish line — a red/yellow double stripe — as the very last pixels. */
-.site-foot { padding: 44px 18px 0; overflow: hidden; }
+.site-foot { padding: 44px 0 0; overflow: hidden; container-type: inline-size; }
 .foot-cols {
-  max-width: 1060px; margin: 0 auto;
+  max-width: 1096px; margin: 0 auto; padding: 0 18px;
   display: flex; align-items: flex-start; justify-content: space-between; gap: 20px;
 }
 .brand.small span { font-size: 12px; letter-spacing: 0.04em; }
@@ -566,18 +566,16 @@ ol .row:hover .dot.working i, ol .row:focus-visible .dot.working i {
 }
 .foot-nav a:hover { color: var(--neon); }
 .foot-word {
-  margin: 34px 22px 22px; /* the same breath of room on all three sides */
+  margin: 34px 0 max(0.16em, 18px);
   font-family: var(--display); font-style: italic; font-weight: 900; font-stretch: 125%;
-  /* sized to span the width inside the footer's 18px padding plus the 22px
-     side margins (80px total): the wordmark's width ≈ 9.85 × its font size,
-     so this calc fills the space exactly without running off the right edge */
-  font-size: calc((100vw - 80px) / 10.15); line-height: 0.82;
+  /* edge to edge: the wordmark's ink (M's foot to the I's top corner) is
+     9.80 × its font size, so 100cqw / 9.88 fills the footer's full width
+     with a few pixels to spare. 100vw fallback for old browsers. */
+  font-size: calc(100vw / 10.2); font-size: calc(100cqw / 9.88); line-height: 0.82;
   letter-spacing: -0.01em; text-transform: uppercase;
   text-align: center; white-space: nowrap;
-  /* optical centering: the italic pushes the cap line right (the M's top
-     corner sits ~17px deeper than the AI's), so the box-centered word reads
-     right-shifted. Half that lean, in em so it scales with the font. */
-  transform: translateX(-0.06em);
+  /* the italic ink sits a little right of its text box; centre the ink */
+  transform: translateX(-0.02em);
   color: transparent;
   -webkit-text-stroke: 1px #2e2e33;
   user-select: none;
@@ -587,6 +585,8 @@ ol .row:hover .dot.working i, ol .row:focus-visible .dot.working i {
 .foot-word { transition: color 0.25s ease; }
 .foot-word:has(.fw-max:hover) { color: var(--blue); -webkit-text-stroke: 0; }
 .foot-word:has(.fw-ai:hover) { color: #ffdf00; -webkit-text-stroke: 0; }
+/* phones: the wordmark is small, so give its outline a touch more contrast */
+@media (max-width: 600px) { .foot-word { -webkit-text-stroke-color: #3a3a41; } }
 
 /* ---------- docks: floating terminal windows ----------
    Spawn docked (racer left, event mid, runner right), then behave like real
@@ -1130,6 +1130,8 @@ button.chip { cursor: pointer; }
 .try-section .h-button { border:0; margin-top:24px; }
 .try-note, #try-count { color:var(--muted); font:12px/1.6 var(--mono); }
 .try-note { margin:18px 0 0; }
+.try-note a { color:var(--neon); text-underline-offset:3px; }
+.try-note a:hover { color:var(--ink); }
 #try-count { text-align:right; margin-top:8px; }
 #try-status { margin:24px 0 0; color:var(--ink-2); font:15px/1.6 var(--sans); }
 .try-actions { display:flex; align-items:center; justify-content:center; flex-wrap:wrap; gap:12px; }
@@ -1152,20 +1154,6 @@ button.chip { cursor: pointer; }
   .try-section .h-copy { align-items:flex-start; }
 }
 @media(prefers-reduced-motion:reduce) { html { scroll-behavior:auto!important; } }
-
-/* Keep setup reachable when the opt-in hero points to Try it. */
-.try-enabled .try-nav-start { display:none; }
-.try-enabled .nav-cta { min-height:44px; box-sizing:border-box; display:flex; align-items:center; }
-@media(max-width:480px) {
-  .try-enabled .nav { gap:8px; }
-  .try-enabled .nav-cta { padding:6px 8px; font-size:10px; letter-spacing:.04em; }
-  .try-enabled .nav-toggle { margin-left:0; }
-}
-@media(max-width:359px) {
-  .try-enabled .nav-cta { display:none; }
-  .try-enabled .nav-toggle { margin-left:auto; }
-  .try-enabled .try-nav-start { display:block; }
-}
 
 /* Floating "Try it first" pill: pinned to the bottom of the screen and gone
    as soon as the Try it section reaches it. It never moves on hover. */

@@ -19,13 +19,23 @@ export const statuses: Record<string, string> = {
   invalid: "We couldn’t verify this answer.",
   conflict: "Something went wrong. Try refreshing.",
 };
+// "You're <name> asking worker-nemo.", with worker-nemo linking to its
+// market profile in a new tab (so this tab can keep driving the job).
+function buyerLine(el: HTMLElement, name: string): void {
+  const nemo = document.createElement("a");
+  nemo.href = `/market?seller=${NEMO}`;
+  nemo.target = "_blank";
+  nemo.rel = "noopener";
+  nemo.textContent = "worker-nemo";
+  el.replaceChildren(`You're ${name} asking `, nemo, ".");
+}
 export function render(s: RecordState) {
   document.querySelector<HTMLElement>("#try-form")!.hidden = true;
   const question = document.querySelector<HTMLElement>("#try-question")!;
   question.textContent = one(s.offer, "i")[1]!;
   question.hidden = false;
   const buyer = document.querySelector<HTMLElement>("#try-buyer")!;
-  buyer.textContent = `You're ${s.name} asking worker-nemo.`;
+  buyerLine(buyer, s.name);
   buyer.hidden = false;
   const status = document.querySelector<HTMLElement>("#try-status")!;
   status.textContent = statuses[s.phase] ?? "Checking your question…";
@@ -46,11 +56,6 @@ export async function bootTry() {
   if (!section) return;
   section.hidden = false;
   document.body.classList.add("try-enabled");
-  const setup = document.createElement("a");
-  setup.href = "#start";
-  setup.className = "try-nav-start";
-  setup.textContent = "Get started";
-  document.querySelector("#nav-links")!.append(setup);
   // The hero keeps "Get started"; a pill floating at the bottom of the screen
   // points down to the Try it section.
   const float = document.createElement("a");
@@ -246,7 +251,7 @@ export async function bootTry() {
     void run();
   } else {
     const buyer = document.querySelector<HTMLElement>("#try-buyer")!;
-    buyer.textContent = `You're ${visitor.name} asking worker-nemo.`;
+    buyerLine(buyer, visitor.name);
     buyer.hidden = false;
     const heartbeat = async () => {
       try {

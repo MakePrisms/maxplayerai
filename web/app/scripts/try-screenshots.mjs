@@ -66,7 +66,7 @@ for (const width of [320, 390, 1440]) {
   await evaluate("scrollTo(0,0)");
   await new Promise((r) => setTimeout(r, 300));
   const hero = await evaluate(`(()=>{const c=document.querySelector('#hero-cta'),n=document.querySelector('.nav-cta'),f=document.querySelector('#try-float'),fr=f&&f.getBoundingClientRect(),cr=c.getBoundingClientRect();return {width:innerWidth,scrollWidth:document.documentElement.scrollWidth,cta:c.textContent.trim(),upright:!!c.querySelector('span'),navVisible:!!n.getClientRects().length,navHeight:n.getBoundingClientRect().height,float:f&&f.textContent.trim(),floatInHero:!!fr&&getComputedStyle(f).position==='fixed'&&!f.classList.contains('is-gone')&&fr.bottom<=innerHeight&&fr.top>=cr.bottom+16&&fr.left>=0&&fr.right<=innerWidth}})()`);
-  if(hero.scrollWidth>width || !hero.upright || hero.cta!=="Get started" || hero.float!=="Try it first" || !hero.floatInHero || (width>=390 && (!hero.navVisible || hero.navHeight<44))) throw Error(JSON.stringify(hero));
+  if(hero.scrollWidth>width || !hero.upright || hero.cta!=="Get started" || hero.float!=="Try it first" || !hero.floatInHero || (width>480 && !hero.navVisible)) throw Error(JSON.stringify(hero));
   if (width !== 320) {
     const {data} = await call("Page.captureScreenshot", {format:"png"});
     writeFileSync(`${out}/${width}-hero.png`, Buffer.from(data,"base64"));
