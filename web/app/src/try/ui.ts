@@ -2,52 +2,54 @@ import { HEARTBEAT } from "../model/kinds.js";
 import { createRecord, openStore, RecordState } from "./store.js";
 import { step } from "./controller.js";
 import { RateLimited, transport } from "./transport.js";
-import { NEMO, now, one, promptText, trade } from "./wire.js";
+import { identity, NEMO, now, one, promptText, trade } from "./wire.js";
 declare const TRY_IT_MARKET_LINK_ENABLED: boolean;
 export const statuses: Record<string, string> = {
   publishing: "Sending your question…",
   waiting: "Waiting for worker-nemo…",
-  delayed: "worker-nemo hasn’t picked this up yet.",
+  delayed: "Still waiting for an agent.",
   starting: "Starting…",
   working: "worker-nemo is working…",
-  "accept-pending": "Answer received; finishing on the market…",
+  "accept-pending": "Your answer is here. Finishing up…",
   done: "Your answer",
   timeout: "This question timed out.",
   refused: "worker-nemo couldn’t answer this question.",
   invalid: "We couldn’t verify this answer.",
-  conflict: "Conflicting job history. Check status to reconcile.",
+  conflict: "Something went wrong. Try refreshing.",
 };
 export function render(s: RecordState) {
-  const q = document.querySelector<HTMLTextAreaElement>("#try-prompt")!;
-  q.value = one(s.offer, "i")[1]!;
-  q.disabled = true;
-  document.querySelector("#try-count")!.textContent =
-    `${[...q.value].length} / 1,000`;
-  document.querySelector<HTMLButtonElement>("#try-submit")!.disabled = true;
-  document.querySelector("#try-status")!.textContent =
-    statuses[s.phase] ?? s.phase;
+  document.querySelector<HTMLElement>("#try-form")!.hidden = true;
+  const question = document.querySelector<HTMLElement>("#try-question")!;
+  question.textContent = one(s.offer, "i")[1]!;
+  question.hidden = false;
+  const buyer = document.querySelector<HTMLElement>("#try-buyer")!;
+  buyer.textContent = `You're ${s.name}`;
+  buyer.hidden = false;
+  const status = document.querySelector<HTMLElement>("#try-status")!;
+  status.textContent = statuses[s.phase] ?? "Checking your question…";
+  status.hidden = s.phase === "done";
   const market = document.querySelector<HTMLAnchorElement>("#try-market")!;
-  market.hidden = !s.offerAck || !TRY_IT_MARKET_LINK_ENABLED;
-  document.querySelector("#try-job")!.textContent = s.offerAck
-    ? s.offer.id.slice(0, 12)
-    : "";
-  document.querySelector<HTMLElement>("#try-job-panel")!.hidden = !s.offerAck;
-  const answer = document.querySelector<HTMLElement>("#try-answer")!;
-  answer.textContent = s.binding?.answer ?? "";
-  answer.hidden = !s.binding;
-  document.querySelector<HTMLElement>("#try-copy-answer")!.hidden = !s.binding;
+  market.hidden = !!s.binding || !s.offerAck || !TRY_IT_MARKET_LINK_ENABLED;
+  document.querySelector("#try-answer")!.textContent = s.binding?.answer ?? "";
+  document.querySelector<HTMLElement>("#try-answer-panel")!.hidden = !s.binding;
   document.querySelector<HTMLElement>("#try-start")!.hidden =
-    !s.binding &&
-    !["timeout", "refused", "delayed", "invalid", "conflict"].includes(s.phase);
-  document.querySelector<HTMLElement>("#try-check")!.hidden = false;
+    !s.binding && !["timeout", "refused", "delayed", "invalid", "conflict"].includes(s.phase);
+  document.querySelector<HTMLElement>("#try-check")!.hidden =
+    !["timeout", "refused", "invalid", "conflict"].includes(s.phase);
 }
 export async function bootTry() {
   const section = document.querySelector<HTMLElement>("#try");
   if (!section) return;
   section.hidden = false;
+  document.body.classList.add("try-enabled");
+  const setup = document.createElement("a");
+  setup.href = "#start";
+  setup.className = "try-nav-start";
+  setup.textContent = "Get started";
+  document.querySelector("#nav-links")!.append(setup);
   const hero = document.querySelector<HTMLAnchorElement>("#hero-cta")!;
   hero.href = "#try";
-  hero.textContent = "Try it";
+  hero.querySelector("span")!.textContent = "Try it";
   hero.onclick = (e) => {
     e.preventDefault();
     history.pushState(null, "", "#try");
@@ -60,11 +62,12 @@ export async function bootTry() {
       .querySelector<HTMLElement>("#try-h")!
       .focus({ preventScroll: true });
   };
-  const status = document.querySelector("#try-status")!,
+  const status = document.querySelector<HTMLElement>("#try-status")!,
     submit = document.querySelector<HTMLButtonElement>("#try-submit")!,
     input = document.querySelector<HTMLTextAreaElement>("#try-prompt")!;
   if (!navigator.locks || !globalThis.BroadcastChannel) {
-    status.textContent = "This browser cannot safely coordinate tabs.";
+    status.textContent = "Please try another browser.";
+    submit.disabled = true;
     return;
   }
   let store;
@@ -79,6 +82,7 @@ export async function bootTry() {
   const db = store,
     t = transport(),
     channel = new BroadcastChannel("maxplayer-try");
+  const visitor = identity();
   let busy = false,
     online = false,
     failures = 0,
@@ -101,7 +105,7 @@ export async function bootTry() {
     let rateDelay = 0;
     try {
       if (!navigator.locks)
-        throw Error("This browser cannot safely coordinate tabs.");
+        throw Error("Please try another browser.");
       await navigator.locks.request(
         "maxplayer-try-controller",
         { ifAvailable: true },
@@ -116,8 +120,10 @@ export async function bootTry() {
     } catch (e) {
       await show();
       status.textContent =
-        e instanceof Error ? e.message : "Connection unavailable";
+        failures >= 5 ? "Can’t connect. Try refreshing." : "Connection interrupted. We’ll try again.";
+      status.hidden = false;
       failures++;
+      document.querySelector<HTMLElement>("#try-check")!.hidden = failures < 6;
       if (e instanceof RateLimited) {
         rateDelay = Math.max(1000, e.retryAt - Date.now());
         const button = document.querySelector<HTMLButtonElement>("#try-check")!;
@@ -128,8 +134,8 @@ export async function bootTry() {
             Math.ceil((e.retryAt - Date.now()) / 1000),
           );
           status.textContent = remaining
-            ? `Temporarily rate limited. Check status in ${remaining} seconds.`
-            : "You can check status now.";
+            ? `Taking a breather. Retrying in ${remaining}s…`
+            : "Trying again…";
           if (!remaining) {
             clearInterval(countdown);
             button.disabled = false;
@@ -156,22 +162,29 @@ export async function bootTry() {
     }
   };
   input.oninput = () => {
-    document.querySelector("#try-count")!.textContent =
-      `${[...input.value.trim()].length} / 1,000`;
+    const count = [...input.value.trim()].length;
+    const counter = document.querySelector<HTMLElement>("#try-count")!;
+    counter.textContent = `${count} / 1,000`;
+    counter.hidden = count < 900;
   };
   document.querySelector("#try-form")!.addEventListener("submit", async (e) => {
     e.preventDefault();
     try {
-      promptText(input.value);
+      try {
+        promptText(input.value);
+      } catch {
+        status.textContent = "Ask a question in 1–1,000 characters.";
+        return;
+      }
       if (!online) return;
       submit.disabled = true;
-      await db.reserve(createRecord(input.value, now()));
+      await db.reserve(createRecord(input.value, now(), visitor));
       await show();
       channel.postMessage("updated");
       void run();
     } catch (e) {
       status.textContent =
-        e instanceof Error ? e.message : "Enable browser storage to try it";
+        "Enable browser storage to try it";
       submit.disabled = !online;
     }
   });
@@ -179,20 +192,24 @@ export async function bootTry() {
     failures = 0;
     void run();
   });
-  document
-    .querySelector("#try-copy-answer")!
-    .addEventListener(
-      "click",
-      () =>
-        void navigator.clipboard.writeText(
-          document.querySelector("#try-answer")!.textContent ?? "",
-        ),
-    );
+  const copy = document.querySelector<HTMLButtonElement>("#try-copy-answer")!;
+  copy.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(document.querySelector("#try-answer")!.textContent ?? "");
+      copy.textContent = "Copied";
+    } catch {
+      copy.textContent = "Select to copy";
+    }
+    setTimeout(() => { copy.textContent = "Copy answer"; }, 1600);
+  });
   const saved = await db.read();
   if (saved) {
     render(saved);
     void run();
   } else {
+    const buyer = document.querySelector<HTMLElement>("#try-buyer")!;
+    buyer.textContent = `You're ${visitor.name}`;
+    buyer.hidden = false;
     const heartbeat = async () => {
       try {
         const events = await t.read({
@@ -222,11 +239,11 @@ export async function bootTry() {
           one(fresh, "accepting")[1] === "y";
         status.textContent = online
           ? "Ready for your question."
-          : "worker-nemo may be offline.";
+          : "The agent is offline. Check back soon.";
       } catch {
         if (await db.read()) return;
         online = false;
-        status.textContent = "Could not check worker-nemo’s availability.";
+        status.textContent = "Can’t connect right now. We’ll try again.";
       }
       if (!(await db.read())) {
         submit.disabled = !online;

@@ -11,8 +11,8 @@ scripts, external quota store, or direct-to-relay browser publishing path is add
   server entry point, so disabling it closes `/api/try`, not just its UI.
 - `TRY_IT_API_ENABLED=true`: independent server enable flag. Otherwise **404**.
 - `TRY_IT_MARKET_LINK_ENABLED=true`: build-time running-job market link. This stage
-  deliberately uses the spec's **`/market` + copyable short job ID fallback**, not a
-  nonfunctional `?job=` route. Existing market accounting is unchanged.
+  links to **`/market`**; the polish removes the separate job-ID copy control.
+  No job-specific deep-link route is introduced. Existing market accounting is unchanged.
 
 No flags are enabled in checked-in configuration. Emergency API disable stops all
 writes, including continuation. A coordinated production drain belongs to stage 4.
@@ -27,8 +27,8 @@ writes, including continuation. A coordinated production drain belongs to stage 
   profile acknowledgement before offer; pinned claim; persisted binding before ACCEPT.
 - `transport.ts`: read-only job-scoped WebSocket queries; writes only to `/api/try`.
 - `ui.ts`: Web Locks serialize controller work across tabs; BroadcastChannel carries
-  only an update notification. Polls every 3s; bounded 1/2/5/10/30s recovery; manual
-  Check status after exhaustion or terminal state. A valid late result can complete
+  only an update notification. Polls every 3s; bounded 1/2/5/10/30s recovery; a small manual
+  Refresh status link after exhaustion or terminal state. A valid late result can complete
   an already-awarded job. No replacement offer is ever generated for recovery.
 - `api/try.ts`: Web-standard Vercel function, streamed 64-KiB cap, verification before
   forwarding original eventBody bytes to the fixed HTTP bridge with fresh NIP-98.
@@ -116,7 +116,7 @@ TRY_IT_SCREENSHOTS=/tmp/maxplayer-try-screenshots node scripts/try-screenshots.m
 ```
 
 The checker blocks production relay/Coinbase URLs before navigating. It captures 16
-fixture-rendered states at both **390 and 1440px** (32 PNGs), measures overflow/tap
+fixture-rendered states at both **390 and 1440px** plus hero/nav (34 PNGs), measures overflow/tap
 targets also at **320px**, and checks hero focus/reduced motion/nav setup link. These
 are local state fixtures, not screenshots of a live Nemo trade or real-phone tests.
 It generates a temporary `dist/_preview.js`; a normal `npm run build` removes it.

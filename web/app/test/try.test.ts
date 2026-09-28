@@ -8,6 +8,8 @@ import {
   Event,
   hash,
   identity,
+  models,
+  characters,
   namespace,
   NEMO,
   offerTags,
@@ -77,6 +79,14 @@ test("Unicode code points, byte bound, trimming once and internal whitespace", (
     assert.throws(() => promptText(s));
 });
 test("names use the specified lowercase word lists without suffix; kind-0 is restricted", () => {
+  const spec = readFileSync(new URL("../../../docs/specs/try-it.md", import.meta.url), "utf8");
+  for (const [label, words] of [["Model", models], ["Character", characters]] as const) {
+    assert.ok(words.length >= 40);
+    assert.equal(new Set(words).size, words.length);
+    assert.ok(words.every(w => /^[a-z]+$/.test(w)));
+    const line = spec.split("\n").find(line => line.startsWith(`- ${label} words:`))!;
+    assert.deepEqual([...line.matchAll(/`([a-z]+)`/g)].map(m => m[1]), words);
+  }
   for (let i = 0; i < 100; i++) {
     const x = identity();
     assert.ok(validName(x.name));
@@ -99,6 +109,14 @@ test("names use the specified lowercase word lists without suffix; kind-0 is res
       ),
     ),
   );
+});
+test("the displayed visitor identity becomes the reserved buyer profile", () => {
+  const visitor = identity();
+  const record = createRecord("Why slick tyres?", 1800000000, visitor);
+  assert.equal(record.name, visitor.name);
+  assert.equal(record.secret, visitor.secret);
+  assert.deepEqual(JSON.parse(record.profile.content), { name: visitor.name, display_name: visitor.name });
+  assert.equal(record.offer.pubkey, record.profile.pubkey);
 });
 test("reject malformed/duplicate critical tags and extra offer targets", () => {
   const f = fixture();

@@ -96,13 +96,9 @@ export function promptText(input: string) {
   return text;
 }
 export const models =
-  "vantor stradale apex aerion velora radian corsair solaro torven caldera virelli ignis".split(
-    " ",
-  );
+  "vantor stradale apex aerion velora radian corsair solaro torven caldera virelli ignis chicane slipstream redline camber aero apexion valtor revora ventaro torqen astera voltane cravon serran veyra falcar valden aleron zenora meridan orvex savaro draeven varion thalor kestrel pinion kerbline".split(" ");
 export const characters =
-  "nero veloce corsa comet sprint rosso tempest vector falcon spectre foudre strada".split(
-    " ",
-  );
+  "nero veloce corsa comet sprint rosso tempest vector falcon spectre foudre strada fulmine rapida nocturne ember thunder lightning carbon titanium silver crimson scarlet obsidian onyx cobalt graphite jet sonic swift rapid fierce blazing charged nimble dusk dawn stealth storm fire frost".split(" ");
 export const designations = "gt gtr rs gts rr".split(" ");
 const pick = (a: string[]) =>
   a[crypto.getRandomValues(new Uint32Array(1))[0]! % a.length]!;

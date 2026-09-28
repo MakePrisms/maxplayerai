@@ -17,9 +17,9 @@ export interface RecordState {
   acceptAck?: boolean;
   phase: string;
 }
-export function createRecord(input: string, time: number): RecordState {
+export function createRecord(input: string, time: number, visitor = identity()): RecordState {
   const prompt = promptText(input),
-    { secret, name } = identity();
+    { secret, name } = visitor;
   return {
     version: 1,
     secret,

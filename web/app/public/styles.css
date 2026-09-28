@@ -1060,17 +1060,50 @@ button.chip { cursor: pointer; }
 
 /* Scoped buyer UI; hidden must beat the homepage flex-section rule. */
 .try-section[hidden], .try-section [hidden] { display: none !important; }
-.try-section textarea { display:block; width:100%; box-sizing:border-box; resize:vertical; margin:12px 0; padding:14px; background:var(--bg); color:inherit; border:1px solid #777; font:inherit; }
-.try-section button, .try-section a { min-height:44px; }
-.try-section button { cursor:pointer; padding:12px 18px; font:inherit; }
+.try-section .h-in { width:100%; max-width:760px; box-sizing:border-box; }
+.try-section .h-lede { margin:18px auto 0; }
+.try-section textarea { display:block; width:100%; box-sizing:border-box; resize:vertical; margin:28px 0 0; padding:18px; background:var(--bg); color:var(--ink); border:1px solid var(--line); font:16px/1.6 var(--sans); }
+.try-section textarea:focus { outline:1px solid var(--neon); outline-offset:3px; }
+.try-section button, .try-section a { min-height:44px; box-sizing:border-box; }
+.try-section button { cursor:pointer; }
 .try-section button:disabled { opacity:.55; cursor:default; }
-.try-section p { margin:16px 0; }
-.try-note, #try-count, #try-job { font-size:13px; }
-.try-actions { display:flex; flex-wrap:wrap; gap:12px; }
-#try-answer { white-space:pre-wrap; overflow-wrap:anywhere; font:inherit; padding:20px; border:1px solid #777; margin:24px 0; }
-#try-start { margin-top:32px; }
-.try-section .h-copy { overflow-wrap:anywhere; min-width:0; }
-.try-section a:not(.h-button) { display:inline-flex; align-items:center; }
+.try-section .h-button { border:0; margin-top:24px; }
+.try-note, #try-count { color:var(--muted); font:12px/1.6 var(--mono); }
+.try-note { margin:18px 0 0; }
+#try-count { text-align:right; margin-top:8px; }
+#try-status { margin:24px 0 0; color:var(--ink-2); font:15px/1.6 var(--sans); }
+.try-actions { display:flex; align-items:center; justify-content:center; flex-wrap:wrap; gap:12px; }
+#try-question { text-align:left; margin:30px 0 24px; padding:4px 0 4px 18px; border-left:2px solid var(--neon); color:var(--ink-2); font:18px/1.6 var(--sans); overflow-wrap:anywhere; }
+#try-question::before { content:'“'; }
+#try-question::after { content:'”'; }
+#try-answer-panel { margin:24px 0 0; padding:20px 24px 24px; text-align:left; border:1px solid var(--line); background:var(--bg); }
+.try-answer-head { display:flex; justify-content:space-between; align-items:center; gap:16px; }
+.try-answer-head h3, #try-start h3 { margin:0; font:700 13px var(--mono); text-transform:uppercase; letter-spacing:.08em; }
+#try-answer { white-space:pre-wrap; overflow-wrap:anywhere; font:18px/1.65 var(--sans); margin:12px 0 0; color:var(--ink); }
+#try-start { margin-top:32px; padding-top:32px; border-top:1px solid var(--line); }
+#try-start p { margin:12px 0 20px; font:16px var(--sans); color:var(--ink-2); }
+.try-section .h-copy { min-width:0; margin:0; padding:14px 18px; border:1px solid var(--line); text-align:left; gap:12px; }
+.try-section .h-copy code { white-space:normal; word-break:normal; overflow-wrap:normal; overflow:visible; font:15px/1.6 var(--sans); }
+.try-section .try-link { display:inline-flex; align-items:center; justify-content:center; padding:10px 4px; border:0; background:none; color:var(--neon); font:12px/1.4 var(--mono); text-decoration:underline; text-underline-offset:4px; }
+.try-section .try-link:hover { color:var(--ink); }
+#try-start > a { margin-top:12px; }
+@media(max-width:480px) {
+  .try-section .h-button { max-width:calc(100% - 16px); padding:14px 18px; font-size:13px; }
+  #try-answer-panel { padding:16px; }
+  .try-section .h-copy { align-items:flex-start; }
+}
 @media(prefers-reduced-motion:reduce) { html { scroll-behavior:auto!important; } }
 
-.try-section summary { min-height:44px; box-sizing:border-box; padding:13px 0; }
+/* Keep setup reachable when the opt-in hero points to Try it. */
+.try-enabled .try-nav-start { display:none; }
+.try-enabled .nav-cta { min-height:44px; box-sizing:border-box; display:flex; align-items:center; }
+@media(max-width:480px) {
+  .try-enabled .nav { gap:8px; }
+  .try-enabled .nav-cta { padding:6px 8px; font-size:10px; letter-spacing:.04em; }
+  .try-enabled .nav-toggle { margin-left:0; }
+}
+@media(max-width:359px) {
+  .try-enabled .nav-cta { display:none; }
+  .try-enabled .nav-toggle { margin-left:auto; }
+  .try-enabled .try-nav-start { display:block; }
+}
