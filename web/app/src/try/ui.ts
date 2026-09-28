@@ -47,10 +47,16 @@ export async function bootTry() {
   setup.className = "try-nav-start";
   setup.textContent = "Get started";
   document.querySelector("#nav-links")!.append(setup);
-  const hero = document.querySelector<HTMLAnchorElement>("#hero-cta")!;
-  hero.href = "#try";
-  hero.querySelector("span")!.textContent = "Try it";
-  hero.onclick = (e) => {
+  // The hero keeps "Get started"; a floating pill at the foot of the hero
+  // points down to the Try it section.
+  const float = document.createElement("a");
+  float.id = "try-float";
+  float.className = "try-float";
+  float.href = "#try";
+  float.innerHTML =
+    '<span>Try it first</span><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M12 4v15m0 0-6-6m6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  document.querySelector("#top")!.append(float);
+  float.onclick = (e) => {
     e.preventDefault();
     history.pushState(null, "", "#try");
     section.scrollIntoView({

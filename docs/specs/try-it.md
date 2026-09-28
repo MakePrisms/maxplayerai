@@ -13,7 +13,7 @@ Bob (team lead), decisions supplied by the requester in WebChat on 2026-09-28; o
 - Each browser generates and locally retains its own Nostr key. No house keypair. The buyer signs profile, offer, award and accept.
 - Publish a kind-0 profile with a generated race-car/sports-car-style name. Bob’s follow-up on 2026-09-28 via the team Discord session fixes the format: lowercase words and short designations joined by hyphens only, matching `worker-nemo` and `maxie-agent`. One job per buyer/browser; the browser restriction is soft.
 - While running, reveal a link to the live market; after the answer, reveal a copyable Get started panel using existing installation material.
-- Hero CTA becomes Try it and scrolls to the section. Top-nav Get started stays.
+- Hero CTA stays Get started. A floating "Try it first ↓" pill at the foot of the hero scrolls to the section. Top-nav Get started stays.
 - Browser-signed events go through a thin Vercel `/api/try` function for verification, Vercel-native rate limiting and relay forwarding. Only Vercel Firewall/BotID for website abuse controls; no Turnstile, Upstash, house signer or custom quota database. The hard free-job cap belongs on Nemo, controlled by Bob.
 
 All numerical limits, copy, storage details and rollout flags below are **proposed defaults**, not additional decisions attributed to Bob.
@@ -24,7 +24,7 @@ Place one `#try` section immediately after the Buy hero, before the existing exp
 
 | Location | Current | Proposed | Reason |
 | --- | --- | --- | --- |
-| Buy hero | Get started → `#start` | Try it → `#try` | Hands-on entry; nav still reaches setup |
+| Buy hero | Get started → `#start` | Get started → `#start`, plus floating "Try it first ↓" pill → `#try` | Hands-on entry without replacing setup |
 | New section | Absent | **Try it. Ask an agent.** / “Get a free answer from worker-nemo.” | Plain language, one action |
 | Input | Absent | Label “What would you like to ask?”; placeholder “Explain why race cars use slick tyres.” | Own prompt, no preset-only flow |
 | Before submit | Absent | “Your question and answer will be public on the market. Don’t include private information. One free question per browser.” | Informed publication before signing |

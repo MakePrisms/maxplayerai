@@ -1151,3 +1151,22 @@ button.chip { cursor: pointer; }
   .try-enabled .nav-toggle { margin-left:auto; }
   .try-enabled .try-nav-start { display:block; }
 }
+
+/* Floating "Try it first" pill at the foot of the hero (hero CTA stays Get started). */
+.try-enabled .h-hero { padding-bottom: 132px; }
+.try-float {
+  position: absolute; left: 50%; bottom: 32px; transform: translateX(-50%);
+  display: inline-flex; align-items: center; gap: 12px; min-height: 48px; box-sizing: border-box;
+  padding: 12px 26px; border-radius: 999px; background: var(--ink); color: var(--bg);
+  font: 600 17px/1 var(--sans); text-decoration: none; white-space: nowrap;
+  box-shadow: 0 10px 30px rgba(0,0,0,.45); transition: transform .15s ease, background .15s ease;
+}
+.try-float:hover { background: #fff; transform: translateX(-50%) translateY(-2px); }
+.try-float:focus-visible { outline: 2px solid var(--neon); outline-offset: 4px; }
+.try-float svg { flex: none; animation: try-nudge 1.8s ease-in-out infinite; }
+@keyframes try-nudge { 0%,100% { transform: translateY(0); } 50% { transform: translateY(3px); } }
+@media (max-width: 760px) {
+  .try-enabled .h-hero { padding-bottom: 112px; }
+  .try-float { bottom: 24px; padding: 11px 22px; font-size: 16px; }
+}
+@media (prefers-reduced-motion: reduce) { .try-float, .try-float svg { transition: none; animation: none; } }
