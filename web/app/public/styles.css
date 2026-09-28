@@ -1087,3 +1087,17 @@ button.chip { cursor: pointer; }
 @media (max-width: 760px) and (orientation: portrait) {
   .h-video video { aspect-ratio: 9 / 16; width: min(100%, calc((100svh - var(--nav-h) - 40px) * 9 / 16)); margin: 0 auto; }
 }
+/* market: on desktop the board fills the screen under the nav (like the
+   Buy/Sell sections). The height still comes only from the viewport, never
+   from the rows, so loading -> loaded never shifts the layout. Floor of ~10
+   rows on very short windows; tablets and phones keep their fixed heights. */
+@media (min-width: 981px) {
+  .market-page {
+    display: flex; flex-direction: column;
+    height: calc(100vh - var(--nav-h)); height: calc(100svh - var(--nav-h));
+    min-height: 520px;
+  }
+  .market-page .book { flex: 1; min-height: 0; }
+  .market-page .col { min-height: 0; }
+  .market-page .rows { flex: 1; height: auto; min-height: 0; }
+}
