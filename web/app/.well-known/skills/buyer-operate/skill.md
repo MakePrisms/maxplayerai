@@ -46,8 +46,8 @@ therefore run an agent on this box. Buying never starts one — but if you later
 export MAXPLAYER_HOME="$HOME/.maxplayer"
 ```
 
-**The gotcha (#438): `maxplayer buyer serve` silently ignores `--home` (bare `maxplayer buyer
---home` exits 1); `maxplayer mcp` refuses any flag.** Most `wallet` subcommands take `--home
+**The gotcha (#438): `maxplayer buyer` / `maxplayer buyer serve` refuse `--home` (and
+`--home=<dir>`) with exit 1; `maxplayer mcp` refuses any flag.** Most `wallet` subcommands take `--home
 <path>`; the daemon and the MCP server do
 not — so a `--home` you pass to the CLI and an unset `MAXPLAYER_HOME` on the daemon leave you funding
 one buyer and trading from another. Set the **environment variable**,

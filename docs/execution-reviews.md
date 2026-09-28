@@ -1,9 +1,11 @@
 # Execution-safety reviews
 
-Implementation PR #1022 extends proposal #1021. The consolidated private-jobs implementation also integrates the
-review worker, TypeSafe adapter, signed client gates, operator recovery, and local
-integration tests. **It is not yet approved for production deployment.** No paid
-classifier evaluation or default-threshold calibration has been performed.
+Shipped in maxplayer 0.6.0 (#1022, from proposal #1021, integrated with the private-jobs flow
+#1033): the review worker, TypeSafe adapter, signed client gates, operator recovery, and local
+integration tests. Installing or upgrading a client does **not** deploy a reviewer; the relay
+operator runs and upgrades the worker separately, and a released binary is not proof that a
+given relay's reviewer is live. No paid classifier evaluation or default-threshold calibration
+has been performed.
 
 ## What runs where
 
@@ -329,8 +331,7 @@ classifier instructions and requested model, not only the file list. The returne
 model identity is recorded in the signed `provider` tag. `jev-latest` is an alias,
 not pinned weights; configure a pinned provider model for reproducible evaluation.
 
-The required classifier is `execution-safety`, version `1` (this draft has not
-shipped). Unknown optional classifiers do not influence it; duplicates, unsupported
+The required classifier is `execution-safety`, version `1`. Unknown optional classifiers do not influence it; duplicates, unsupported
 versions, invalid probability distributions, or wrong subject/signature fail closed.
 A safe classification is not a correctness guarantee, malware/dependency scan, or
 execution sandbox. General harmful intent is a separate future classifier.

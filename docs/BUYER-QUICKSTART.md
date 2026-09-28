@@ -1,10 +1,11 @@
 # Buyer quickstart — zero → paid
 
-> **Private jobs / v2 rollout:** the integration adds `visibility` (`private`/`public`),
-> an explicit `output_category` for private jobs, and pinned `inputs` for targeted
-> private jobs. Unset visibility defaults private, preserving an explicitly configured
-> public default. Private posting requires the coordinated client/relay configuration;
-> it never falls back to public. See [configuration and rollout](specs/private-offers-rollout.md).
+> **Private jobs (0.6.0):** `post_job` takes `visibility` (`private`/`public`), an explicit
+> `output_category` for private jobs, and pinned `inputs` for targeted private jobs. Unset
+> visibility defaults to private (`[privacy] default_visibility`); an explicitly configured
+> public default is preserved. Private posting needs a relay and private-content service at a
+> matching revision; it never falls back to public. See
+> [configuration](specs/private-offers-rollout.md).
 > Open-pool private jobs still disclose the initial task; subsequent content is private.
 
 
