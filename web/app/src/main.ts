@@ -1,3 +1,4 @@
+declare const TRY_IT_ENABLED: boolean;
 /**
  * Boot — ordered for perceived speed:
  *
@@ -87,8 +88,12 @@ function wirePicker(): void {
 /* ---------------- boot ---------------- */
 
 async function boot(): Promise<void> {
+  if (location.hash === "#market") { location.replace("/market"); return; }
+  const video = document.querySelector<HTMLVideoElement>(".h-video video");
+  if (video && matchMedia("(prefers-reduced-motion: reduce)").matches) { video.removeAttribute("autoplay"); video.pause(); video.controls = true; }
   wireNav();
   wirePicker();
+  if (TRY_IT_ENABLED && document.getElementById("try")) void import("./try/ui.js").then(m => m.bootTry());
   // The homepage (/) is static copy: nav, role picker and copy buttons only.
   // The market terminal — relay, IndexedDB, spot quote — boots on /market,
   // the one page that carries the board.

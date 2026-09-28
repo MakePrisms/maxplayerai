@@ -1,6 +1,6 @@
 # Buy tab: Try it
 
-**Status:** design spec. No code written. **Anchor commit: 8c00b358497c703206c6b661cef0eed18db16958** (= origin/main at writing, 2026-09-28).
+**Status:** implementation of §8 stages 1–3 on `feat/try-it`, default-off; stage 4 remains out of scope. Bob approved building without a separate spec-review round. See [implementation and verification](../../web/app/src/try/README.md). Original design **anchor commit: 8c00b358497c703206c6b661cef0eed18db16958** (= origin/main at writing, 2026-09-28).
 
 **Dependency:** stacked on [#1053](https://github.com/MakePrisms/maxplayerai/pull/1053), review after it. Homepage anchor: **c484db12b6d166fe1d1fc3d79efe006ca457bdbb**, `maxie-agent:feat/friendly-homepage`. The documentation branch starts there, not on main. Upstream has no branch named `feat/friendly-homepage`, so the PR targets main and includes the prerequisite diff. Review this spec's commit independently; rebase onto main after #1053 lands. Main-source citations and homepage-layer citations are deliberately separate in §11.
 
@@ -93,7 +93,7 @@ Feedback is kind 3404 [C1]; only trust Nemo's matching job feedback, and handle 
 
 ## 4. `/api/try`: thin verified forwarding, not a signer
 
-The existing read-only browser relay source must stay read-only [C13]. Add a separate buyer controller and publisher; share kinds/parsers where appropriate, but do not treat the observatory parser as sufficient cryptographic verification. The #1053 homepage currently exits before market boot [C14]; future code must boot Try it independently without starting the whole market engine on Buy. No app implementation in this PR.
+The existing read-only browser relay source must stay read-only [C13]. Add a separate buyer controller and publisher; share kinds/parsers where appropriate, but do not treat the observatory parser as sufficient cryptographic verification. The #1053 homepage currently exits before market boot [C14]; future code must boot Try it independently without starting the whole market engine on Buy. Implementation is isolated in `web/app/src/try` and boots independently of the market.
 
 **Existing solution preflight:** use the vendored relay's existing HTTP `POST /events` bridge [C7], not a bespoke server WebSocket signing service. Browser signs the event **and** a NIP-98 auth event (kind 27235) with its own key:
 
@@ -156,7 +156,7 @@ Market anchor: propose `/market?job=<full-offer-id>`. There is no existing query
 
 ## 8. Staged implementation PRs (all default-off)
 
-This PR is **only this design document**. The following are later work, after #1053 and design review.
+The original document proposed the following stages. Stages **1–3 are now implemented in this draft PR** after Bob approved building without a separate spec-review round; #1053 remains the stack prerequisite. Stage 4 remains unimplemented and all flags remain default-off.
 
 1. **Buyer wire/state module**, behind `TRY_IT_ENABLED=false`: isolated signing/storage/state machine; shared kind constants; Rust-derived golden fixtures for tags, hashes and signatures. Tests: Unicode limits, malformed/duplicate tags, paid claim rejection, foreign seller/root, altered result/co-signature, duplicate/out-of-order delivery, transaction race, reload, storage unavailable, no new offer after lost acknowledgement. Use local fixtures/relay; no live writes.
 2. **Vercel adapter and perimeter**, behind independent server `TRY_IT_API_ENABLED=false` (404 while off): `web/app/api/try.ts` thin function, fixed relay URL, exact-byte NIP-98 forwarding, Firewall setup. `web/app/vercel.json` is currently a static dist/esbuild configuration [C15]; prove Vercel discovers `/api/try` alongside clean static routes. Tests: auth/body mismatch, wrong URL/key, replay/new auth retry, 64-KiB limit, forbidden kinds, related-evidence mismatch, HTTP 200 with accepted=false, relay outage, firewall 429 and ordinary four-write completion. A disabled browser flag must not leave a live unguarded endpoint. Verify native BotID separately only if selected.

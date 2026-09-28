@@ -18,7 +18,12 @@
   "devDependencies": {
     "@types/node": "^26.2.0",
     "esbuild": "^0.25.9",
+    "fake-indexeddb": "6.2.4",
     "tsx": "^4.20.4",
     "typescript": "^5.9.2"
+  },
+  "dependencies": {
+    "@noble/curves": "1.9.7",
+    "@noble/hashes": "1.8.0"
   }
 }

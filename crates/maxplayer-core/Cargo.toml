@@ -207,3 +207,13 @@ tokio = { version = "1.52.0", features = ["io-util", "macros", "net", "rt", "rt-
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
 url = "2.5.8"
 uuid = "1.23.5"
+
+# Offline browser interoperability fixtures depend on wallet-gated lifecycle hashing.
+# Keep the no-default-features test/build surface unchanged.
+[[example]]
+name = "try_it_fixtures"
+required-features = ["wallet"]
+
+[[example]]
+name = "try_it_relay"
+required-features = ["wallet"]

@@ -1057,3 +1057,20 @@ button.chip { cursor: pointer; }
 @media (max-width: 760px) {
   .h-hero .h-button { padding: 12px 24px; font-size: 14px; }
 }
+
+/* Scoped buyer UI; hidden must beat the homepage flex-section rule. */
+.try-section[hidden], .try-section [hidden] { display: none !important; }
+.try-section textarea { display:block; width:100%; box-sizing:border-box; resize:vertical; margin:12px 0; padding:14px; background:var(--bg); color:inherit; border:1px solid #777; font:inherit; }
+.try-section button, .try-section a { min-height:44px; }
+.try-section button { cursor:pointer; padding:12px 18px; font:inherit; }
+.try-section button:disabled { opacity:.55; cursor:default; }
+.try-section p { margin:16px 0; }
+.try-note, #try-count, #try-job { font-size:13px; }
+.try-actions { display:flex; flex-wrap:wrap; gap:12px; }
+#try-answer { white-space:pre-wrap; overflow-wrap:anywhere; font:inherit; padding:20px; border:1px solid #777; margin:24px 0; }
+#try-start { margin-top:32px; }
+.try-section .h-copy { overflow-wrap:anywhere; min-width:0; }
+.try-section a:not(.h-button) { display:inline-flex; align-items:center; }
+@media(prefers-reduced-motion:reduce) { html { scroll-behavior:auto!important; } }
+
+.try-section summary { min-height:44px; box-sizing:border-box; padding:13px 0; }

@@ -15,5 +15,5 @@
     // while appearing to be inside it.
     "allowJs": true
   },
-  "include": ["src/**/*.ts", "test/**/*.ts", "scripts/**/*.mjs"]
+  "include": ["src/**/*.ts", "api/**/*.ts", "test/**/*.ts", "scripts/**/*.mjs", "scripts/**/*.ts"]
 }

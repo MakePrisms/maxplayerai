@@ -98,3 +98,6 @@ export const KIND_LABELS: Readonly<Record<number, string>> = Object.freeze({
   [RECEIPT]: "receipt",
   [HEARTBEAT]: "heartbeat",
 });
+
+/** NIP-98 HTTP request authentication, never a market event. */
+export const HTTP_AUTH = 27235;

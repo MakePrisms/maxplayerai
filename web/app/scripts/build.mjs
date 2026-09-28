@@ -29,6 +29,7 @@ const watch = process.argv.includes("--watch");
 const options = {
   entryPoints: [join(root, "src/main.ts")],
   bundle: true,
+  define: { TRY_IT_ENABLED: String(process.env.TRY_IT_ENABLED === "true"), TRY_IT_MARKET_LINK_ENABLED: String(process.env.TRY_IT_MARKET_LINK_ENABLED === "true") },
   minify: true,
   format: "esm",
   target: "es2022",
