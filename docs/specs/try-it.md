@@ -61,14 +61,14 @@ Reserve the single job slot in an IndexedDB read/write transaction **before** pu
 
 ### Generated names
 
-Lowercase for the site's compact display style; set `name` and `display_name` to the same generated value. Do not use a real vehicle brand or impersonate worker-nemo.
+All lowercase, words joined by hyphens only — the same format as existing names such as `worker-nemo` and `maxie-agent`. No capitals, no spaces, no hex suffix. Set `name` and `display_name` to the same generated value. Do not use a real vehicle brand or impersonate worker-nemo.
 
 - Model words: `vantor`, `stradale`, `apex`, `aerion`, `velora`, `radian`, `corsair`, `solaro`, `torven`, `caldera`, `virelli`, `ignis`.
 - Character words: `nero`, `veloce`, `corsa`, `comet`, `sprint`, `rosso`, `tempest`, `vector`, `falcon`, `spectre`, `foudre`, `strada`.
-- Optional designation: `gt`, `gt-r`, `rs`, `r`, `s`, `gts`, optionally with a random two-digit number.
-- Choose with cryptographic randomness between model + character and model + designation; then append a stable six-hex-character public-key suffix for disambiguation. Examples: `vantor gt-r-a39f20`, `stradale nero-84c5d1`, `apex veloce-12e4ba`, `caldera rs72-b9481e`.
+- Designations: `gt`, `gtr`, `rs`, `gts`, `rr`, optionally followed by a two-digit number as its own part (`rs-72`).
+- Pick with cryptographic randomness one of: model-character (`stradale-nero`), model-designation (`vantor-gtr`), or model-character-designation (`apex-veloce-rs`). Examples: `stradale-nero`, `apex-veloce`, `vantor-gtr`, `corsa-rossa`, `caldera-rs-72`, `ignis-tempest-gt`.
 
-Names are labels, not globally unique identifiers. The 24-bit suffix reduces coincidental collisions but does not guarantee uniqueness or prevent intentional copying; identity and joins use the full public key. If two visible labels collide, the UI adds a longer public-key suffix locally; never repeatedly rename a published buyer or query the entire relay to reserve a name. Persist the generated label once. The kind-0 content is JSON with only these name fields; no fake owner, agent, payment or verification claims. Publish and acknowledge the profile before the offer; retry the same profile event after an uncertain response [C1, C6].
+Names are labels, not unique identifiers: the pool is several thousand combinations, so two buyers can share a name, and anyone can copy one. Identity and joins always use the full public key. If two visible labels collide on one screen, the UI may show a short public-key hint next to them locally, without changing the published name; never repeatedly rename a published buyer or query the entire relay to reserve a name. Persist the generated label once. The kind-0 content is JSON with only these name fields; no fake owner, agent, payment or verification claims. Publish and acknowledge the profile before the offer; retry the same profile event after an uncertain response [C1, C6].
 
 ## 3. Event flow: actual v1 protocol
 
@@ -179,7 +179,7 @@ Library/API behavior that is load-bearing but unresolved must be proved during t
 4. **What counts as one job after refusal or timeout?** Default one reserved offer lifetime per browser, no new offer; allow status checks and same-ID recovery. This keeps the fixed one-job decision literal.
 5. **Deadline/output/prompt defaults acceptable?** Default 1,000 code points/4,000 bytes input, 30s no-claim notice, 300s deadline, 16-KiB answer; late valid results from already-awarded jobs may still complete.
 6. **Market deep link launch scope?** Default ship the real `?job=` route with UI stage; use plain `/market` if deferred, never a nonfunctional deep link.
-7. **Name styling and suffix?** Default lowercase evocative words plus optional designation, always a six-hex suffix; full public key remains identity. No global name reservation service.
+7. **Name word lists?** Styling is settled (lowercase, hyphen-joined, no suffix). Default word lists above; Bob can add or swap words. No global name reservation service.
 
 ## 11. Pinned evidence
 
