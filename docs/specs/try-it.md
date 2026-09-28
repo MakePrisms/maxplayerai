@@ -134,7 +134,7 @@ Use bounded job-scoped reads, not the entire market history. The existing reader
 | Claim received | Persist selection, submit award; show “Starting…” until award acknowledged, then “worker-nemo is working…” |
 | Quota, BotID or relay rejection | Explain temporarily unavailable/rate limited, with countdown if known. Keep job state; only retry the same event after backoff. No direct-relay fallback from the UI. |
 | Nemo refusal/error | “worker-nemo couldn’t answer this question.” Preserve prompt and job link; expose Get started, no fabricated answer. |
-| No result by deadline (+30s reconciliation grace) | “This question timed out.” Stop active polling after final history check; keep View market and Check status. A timeout is not a cancellation event and cannot promise Nemo stopped. |
+| No result by deadline (+30s reconciliation grace) | “This question timed out.” Stop active polling after final history check; keep Check status; hide Watch it live (the job has ended). A timeout is not a cancellation event and cannot promise Nemo stopped. |
 | Late result / return to closed tab | Fetch and verify history; accept a valid result from the already-awarded job, even if local timeout was shown. Never award a new claim after expiry. |
 | Tab closes before award/accept | No server signing surrogate. Nemo waits for award; on reopening the same origin/browser, resume. Result may exist without ACCEPT until then. |
 | Invalid/mismatched result | “We couldn’t verify this answer.” Do not accept or render as trusted answer; retain evidence IDs for debugging without logging prompt/key. |

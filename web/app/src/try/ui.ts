@@ -42,7 +42,13 @@ export function render(s: RecordState) {
   status.textContent = statuses[s.phase] ?? "Checking your question…";
   status.hidden = s.phase === "done";
   const market = document.querySelector<HTMLAnchorElement>("#try-market")!;
-  market.hidden = !!s.binding || !s.offerAck || !TRY_IT_MARKET_LINK_ENABLED;
+  // Watch it live only while the job is still running: once it has ended
+  // (answer, files, refusal, timeout or error) there is nothing left to watch.
+  market.hidden =
+    !!s.binding ||
+    !s.offerAck ||
+    !TRY_IT_MARKET_LINK_ENABLED ||
+    ["done", "files", "timeout", "refused", "invalid", "conflict"].includes(s.phase);
   document.querySelector("#try-answer")!.textContent = s.binding?.answer ?? "";
   document.querySelector<HTMLElement>("#try-answer-panel")!.hidden = !s.binding;
   document.querySelector<HTMLElement>("#try-start")!.hidden =
