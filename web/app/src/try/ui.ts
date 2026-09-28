@@ -272,7 +272,8 @@ export async function bootTry() {
           .sort((a, b) => b.created_at - a.created_at)[0];
         online =
           !!fresh &&
-          now() - fresh.created_at <= 90 &&
+          // Sellers republish every 5 minutes, so allow two beats plus a minute.
+          now() - fresh.created_at <= 660 &&
           one(fresh, "accepting")[1] === "y";
         status.textContent = online
           ? "Ready for your question."

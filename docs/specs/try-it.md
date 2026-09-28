@@ -128,7 +128,7 @@ Use bounded job-scoped reads, not the entire market history. The existing reader
 
 | Condition | Proposed behavior |
 | --- | --- |
-| Nemo has no fresh heartbeat (90s proposed) | “worker-nemo may be offline.” Disable new submission until a fresh accepting heartbeat; unknown is not proof of offline. Offer View market / Get started. Recheck; no fallback worker. |
+| Nemo has no fresh heartbeat (within 11 minutes: two 5-minute beats plus a minute) | “worker-nemo may be offline.” Disable new submission until a fresh accepting heartbeat; unknown is not proof of offline. Offer View market / Get started. Recheck; no fallback worker. |
 | Publishing exceeds 10s | “Checking whether your question was sent…” Query exact ID before retry; reserve the job slot. Never say failed just because an acknowledgement was lost. |
 | No valid claim after 30s | “worker-nemo hasn’t picked this up yet.” Keep observing until the five-minute signed deadline; show View on market / Get started. No second offer. |
 | Claim received | Persist selection, submit award; show “Starting…” until award acknowledged, then “worker-nemo is working…” |
