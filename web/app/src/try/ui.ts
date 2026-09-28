@@ -47,7 +47,7 @@ export async function bootTry() {
   setup.className = "try-nav-start";
   setup.textContent = "Get started";
   document.querySelector("#nav-links")!.append(setup);
-  // The hero keeps "Get started"; a floating pill at the foot of the hero
+  // The hero keeps "Get started"; a pill floating at the bottom of the screen
   // points down to the Try it section.
   const float = document.createElement("a");
   float.id = "try-float";
@@ -55,7 +55,13 @@ export async function bootTry() {
   float.href = "#try";
   float.innerHTML =
     '<span>Try it first</span><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M12 4v15m0 0-6-6m6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
-  document.querySelector("#top")!.append(float);
+  document.body.append(float);
+  // Fade out once the Try it section reaches the top half of the screen, and
+  // stay gone while it (or anything below it) is in view.
+  new IntersectionObserver(([entry]) => {
+    const past = entry!.isIntersecting || entry!.boundingClientRect.top < 0;
+    float.classList.toggle("is-gone", past);
+  }, { rootMargin: "0px 0px -50% 0px" }).observe(section);
   float.onclick = (e) => {
     e.preventDefault();
     history.pushState(null, "", "#try");
