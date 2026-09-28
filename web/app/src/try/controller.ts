@@ -133,6 +133,20 @@ export async function step(
         return false;
       }
     });
+    // Nemo wrote files and delivered a git commit. That is a real delivery, not
+    // a bad one, but this page only reads text: say so, and do not accept it.
+    if (
+      !s.result &&
+      candidates.some((e) => {
+        try {
+          trade(e);
+          return one(e, "delivery")[1] === "git";
+        } catch {
+          return false;
+        }
+      })
+    )
+      return save({ phase: "files" });
     const verified: Event[] = [];
     for (const e of candidates) {
       try {

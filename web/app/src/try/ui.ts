@@ -2,7 +2,7 @@ import { HEARTBEAT } from "../model/kinds.js";
 import { createRecord, openStore, RecordState } from "./store.js";
 import { step } from "./controller.js";
 import { NotOpen, RateLimited, transport } from "./transport.js";
-import { identity, NEMO, now, one, promptText, trade } from "./wire.js";
+import { identity, NEMO, now, one, promptText, questionOf, trade } from "./wire.js";
 declare const TRY_IT_MARKET_LINK_ENABLED: boolean;
 declare const TRY_IT_PREVIEW: boolean;
 const preview = typeof TRY_IT_PREVIEW !== "undefined" && TRY_IT_PREVIEW;
@@ -17,6 +17,7 @@ export const statuses: Record<string, string> = {
   timeout: "This question timed out.",
   refused: "worker-nemo couldn’t answer this question.",
   invalid: "We couldn’t verify this answer.",
+  files: "worker-nemo delivered files instead of a text answer. This page only shows text.",
   conflict: "Something went wrong. Try refreshing.",
 };
 // "You're <name> asking worker-nemo.", with worker-nemo linking to its
@@ -32,7 +33,7 @@ function buyerLine(el: HTMLElement, name: string): void {
 export function render(s: RecordState) {
   document.querySelector<HTMLElement>("#try-form")!.hidden = true;
   const question = document.querySelector<HTMLElement>("#try-question")!;
-  question.textContent = one(s.offer, "i")[1]!;
+  question.textContent = questionOf(one(s.offer, "i")[1]!);
   question.hidden = false;
   const buyer = document.querySelector<HTMLElement>("#try-buyer")!;
   buyerLine(buyer, s.name);
@@ -45,11 +46,16 @@ export function render(s: RecordState) {
   document.querySelector("#try-answer")!.textContent = s.binding?.answer ?? "";
   document.querySelector<HTMLElement>("#try-answer-panel")!.hidden = !s.binding;
   document.querySelector<HTMLElement>("#try-start")!.hidden =
-    !s.binding && !["timeout", "refused", "delayed", "invalid", "conflict"].includes(s.phase);
+    !s.binding && !["timeout", "refused", "delayed", "invalid", "files", "conflict"].includes(s.phase);
+  const pitch = document.querySelector<HTMLElement>("#try-pitch")!;
+  pitch.textContent = s.phase === "files"
+    ? "That’s the other way agents work here: they deliver real work as git commits. Get started to receive them in your own agent."
+    : "Agents on Maxplayer answer in text, like this, or deliver real work as git commits: code, docs, whole projects.";
+  pitch.hidden = !s.binding && s.phase !== "files";
   document.querySelector<HTMLElement>("#try-check")!.hidden =
     !["timeout", "refused", "invalid", "conflict"].includes(s.phase);
   document.querySelector<HTMLElement>("#try-again")!.hidden =
-    !preview || !["done", "timeout", "refused", "invalid", "conflict"].includes(s.phase);
+    !preview || !["done", "timeout", "refused", "invalid", "files", "conflict"].includes(s.phase);
 }
 export async function bootTry() {
   const section = document.querySelector<HTMLElement>("#try");
@@ -186,7 +192,7 @@ export async function bootTry() {
       const s = await db.read();
       if (
         s &&
-        !["done", "refused", "timeout", "invalid", "conflict"].includes(
+        !["done", "refused", "timeout", "invalid", "files", "conflict"].includes(
           s.phase,
         ) &&
         failures < 6

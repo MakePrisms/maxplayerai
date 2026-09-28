@@ -2,10 +2,10 @@
   "accept": {
     "content": "",
     "created_at": 1800000004,
-    "id": "169d9576ae218bbee50a66443e929e8e5a57a55c94bd1c8bf720a48a27e5504f",
+    "id": "f495fa10289f93bd1c7903387dfe598fe8e90382fc286ccbe043819ee94293ad",
     "kind": 3406,
     "pubkey": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
-    "sig": "180b0e13c09e845cb133a9510819a139a06c0ead8302bce942f84b1f160680ba1b65304c47fe97ac4bbf25eca090a20e7981326b57eb5700c7f1557d6fc26556",
+    "sig": "9c29965f51b358bdf747130d2c4164932b1890587ccc261b8d81bfc2a819e7c65f83b73cbaad49e5ed1a2ec19e3f256489759ff43291a68ea90d680fa411e8bc",
     "tags": [
       [
         "status",
@@ -13,13 +13,13 @@
       ],
       [
         "e",
-        "dc61e04aba6a124c4522d6246c3c366b60ae0883dacd54bd71064e2cc27f7167",
+        "fdc2f402e4726626d9e5132b345080e027203fc644994e46a90ff5873704c7b4",
         "",
         "root"
       ],
       [
         "e",
-        "a287c4c05ce11654d7e79b808956bf16efcf691edd6b231ce27cf27ad5103a87"
+        "cbbba457094b50ea58cf2eca2c55c355346f2c701f57d8a989f9c7d8dddc24f3"
       ],
       [
         "p",
@@ -42,10 +42,10 @@
   "award": {
     "content": "",
     "created_at": 1800000002,
-    "id": "c55b3f290cd621f258d99ce99c333ee1ad9109c2cedcf9e17fc79fe31625c9b8",
+    "id": "091d147894894c245526d55c3c443b2629da9b6daa51b125fec95ae9294af2bc",
     "kind": 3405,
     "pubkey": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
-    "sig": "11a2a9e4fe268cc64f8106f190695a76f783ba3213f86290f614ca8dcc53e63b401b168d3f90e59ad1f736cd713a426531aae1978979a2faa3eff49e18b5a672",
+    "sig": "780c66064b6fe89ae189f6cd5b7551e92b7e71de30cf410c9ed4bd3ac488ae47b8524ce6bbaa3afa6d62a8b8782a9d2f27f6df401685dd9111e100094acdd104",
     "tags": [
       [
         "status",
@@ -53,13 +53,13 @@
       ],
       [
         "e",
-        "dc61e04aba6a124c4522d6246c3c366b60ae0883dacd54bd71064e2cc27f7167",
+        "fdc2f402e4726626d9e5132b345080e027203fc644994e46a90ff5873704c7b4",
         "",
         "root"
       ],
       [
         "e",
-        "a287c4c05ce11654d7e79b808956bf16efcf691edd6b231ce27cf27ad5103a87"
+        "cbbba457094b50ea58cf2eca2c55c355346f2c701f57d8a989f9c7d8dddc24f3"
       ],
       [
         "p",
@@ -82,10 +82,10 @@
   "claim": {
     "content": "",
     "created_at": 1800000001,
-    "id": "a287c4c05ce11654d7e79b808956bf16efcf691edd6b231ce27cf27ad5103a87",
+    "id": "cbbba457094b50ea58cf2eca2c55c355346f2c701f57d8a989f9c7d8dddc24f3",
     "kind": 3402,
     "pubkey": "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766",
-    "sig": "6738efd2c07ad56e2b31664a1c80aa3bafe2c55df8cbf6fab8345157b7c70bc2bfbfb32d5cfe6729c09da48418542b647962116eaabe7d186e548796a65d9109",
+    "sig": "8e2debee8ce1871a55eab6c7eaf0daacc875601e6797643df8ece3b5d481c247129c247aa29e08931b1b9883afda1ca754bd4ba169400dcc42d807062aa6c2eb",
     "tags": [
       [
         "status",
@@ -93,7 +93,7 @@
       ],
       [
         "e",
-        "dc61e04aba6a124c4522d6246c3c366b60ae0883dacd54bd71064e2cc27f7167",
+        "fdc2f402e4726626d9e5132b345080e027203fc644994e46a90ff5873704c7b4",
         "",
         "root"
       ],
@@ -120,19 +120,19 @@
     ]
   },
   "contentHash": "6d6c60f4b25af8a9663c94f67291207e55f40bc8ebc934c870002912ba0818ac",
-  "digest": "50010180044ca05fd38eab08bc1bbbed1cf18113a1bdbcfdbffcd2aa7df6f907",
-  "jobHash": "044bac1049ba05d5c09899829642b28d4c17169f25ede005e2fcc965a796dc58",
+  "digest": "29a3fd66719f492673d8a08d76c1bb4ef610d89f48ced4a10edf236f18cab16e",
+  "jobHash": "f518ce99272c7a32c4d8436dcc69d0cb967dbbd598e46c6ad51e3a8124db9a0c",
   "offer": {
     "content": "",
     "created_at": 1800000000,
-    "id": "dc61e04aba6a124c4522d6246c3c366b60ae0883dacd54bd71064e2cc27f7167",
+    "id": "fdc2f402e4726626d9e5132b345080e027203fc644994e46a90ff5873704c7b4",
     "kind": 3401,
     "pubkey": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
-    "sig": "63237c576fc26c292144e2569aa59ed550536d03e05824a0a5d15d39c445ba590dcc285dea0e7f954847a1566c4aed364abfcb80301495851990aeddfe9dcfb8",
+    "sig": "cfd6ac8e9a31083d496470a1ab25a24450dd37274cef1b724944f4b62739c98052febe6c1a592da904e6786689f7b4c2a6e4843e0acd3a3b3dc9d905875ddc4c",
     "tags": [
       [
         "i",
-        "Explain slick tyres 🏎️\nKeep  internal spaces."
+        "Explain slick tyres 🏎️\nKeep  internal spaces.\n\n(Reply in plain text. Don't create, edit or commit any files.)"
       ],
       [
         "output",
@@ -172,18 +172,18 @@
       ]
     ]
   },
-  "preimage": "[\"maxplayer/v1/receipt-preimage\",\"044bac1049ba05d5c09899829642b28d4c17169f25ede005e2fcc965a796dc58\",\"dc61e04aba6a124c4522d6246c3c366b60ae0883dacd54bd71064e2cc27f7167\",0,\"sat\",\"1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f\",\"4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766\",\"6d6c60f4b25af8a9663c94f67291207e55f40bc8ebc934c870002912ba0818ac\",\"inline\",\"none\"]",
+  "preimage": "[\"maxplayer/v1/receipt-preimage\",\"f518ce99272c7a32c4d8436dcc69d0cb967dbbd598e46c6ad51e3a8124db9a0c\",\"fdc2f402e4726626d9e5132b345080e027203fc644994e46a90ff5873704c7b4\",0,\"sat\",\"1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f\",\"4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766\",\"6d6c60f4b25af8a9663c94f67291207e55f40bc8ebc934c870002912ba0818ac\",\"inline\",\"none\"]",
   "result": {
     "content": "Slick tyres put more rubber on dry tarmac.\n\nExact bytes: café 🏎️  \n",
     "created_at": 1800000003,
-    "id": "b7b71d560338216f60815955125fa8f0b6d084ef0c78ca9bac4fe9f1319b3812",
+    "id": "8e873de2c2f4f4eb16b5f5b1faa07c26b6c7a36fe60e7f08abfa5bc3846ebbd7",
     "kind": 3403,
     "pubkey": "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766",
-    "sig": "08fa39e2dbffc6842bd57ead8f0996608d5d43cf12ebb2758000b39815cbf7d19dd9ccc6a5326e0e9f276607483ed7bca52d75e66c89b59fc1d553d0e50247d2",
+    "sig": "a453dbc5595531facc25c971b6330cee42b538063346f664bcfb06463fc074916cc1262104b64f415332e82b397c0e841ce1217bc246c7c6bb672afcad67645e",
     "tags": [
       [
         "e",
-        "dc61e04aba6a124c4522d6246c3c366b60ae0883dacd54bd71064e2cc27f7167",
+        "fdc2f402e4726626d9e5132b345080e027203fc644994e46a90ff5873704c7b4",
         "",
         "root"
       ],
@@ -206,12 +206,12 @@
       ],
       [
         "job-hash",
-        "044bac1049ba05d5c09899829642b28d4c17169f25ede005e2fcc965a796dc58"
+        "f518ce99272c7a32c4d8436dcc69d0cb967dbbd598e46c6ad51e3a8124db9a0c"
       ],
       [
         "sig",
         "seller",
-        "ff985f4d710a96f2b0283bd7ba8b6976d8ab342229eabc8625cc4e9fd096be0696e9e255c84e869b1d48f872e5d63ded7a277111ae34ca0e36d79b1f06fdbd2c"
+        "3a0e18896ed9a1b7bc4bd99fa0a965d9392d1220e3acfadf9c2be0ba92161006b1c7f54debd7ce33296336d9ed6ad798a3e81f3e3737d8863bc17267410b40aa"
       ],
       [
         "t",

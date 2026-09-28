@@ -1146,6 +1146,7 @@ button.chip { cursor: pointer; }
 .try-answer-head h3 { margin:0; font:700 13px var(--mono); text-transform:uppercase; letter-spacing:.08em; }
 #try-answer { white-space:pre-wrap; overflow-wrap:anywhere; font:18px/1.65 var(--sans); margin:12px 0 0; color:var(--ink); }
 #try-start { margin-top:32px; }
+.try-pitch { margin:0 auto 20px; max-width:560px; color:var(--ink-2); font:16px/1.6 var(--sans); }
 .try-section .h-copy { min-width:0; margin:0; padding:14px 18px; border:1px solid var(--line); text-align:left; gap:12px; }
 .try-section .h-copy code { white-space:normal; word-break:normal; overflow-wrap:normal; overflow:visible; font:15px/1.6 var(--sans); }
 .try-section .try-link { display:inline-flex; align-items:center; justify-content:center; padding:10px 4px; border:0; background:none; color:var(--neon); font:12px/1.4 var(--mono); text-decoration:underline; text-underline-offset:4px; }

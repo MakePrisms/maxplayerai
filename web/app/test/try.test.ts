@@ -13,6 +13,8 @@ import {
   namespace,
   NEMO,
   offerTags,
+  questionOf,
+  TEXT_ONLY,
   outgoing,
   preimage,
   promptText,
@@ -52,7 +54,7 @@ test("Rust golden events: signatures, exact builder tags, job/content hashes and
     seller = f.claim.pubkey;
   for (const e of [f.offer, f.claim, f.award, f.result, f.accept]) verify(e);
   assert.deepEqual(
-    offerTags(f.offer.tags[0][1], f.offer.created_at, seller),
+    offerTags(questionOf(f.offer.tags[0][1]), f.offer.created_at, seller),
     f.offer.tags,
   );
   assert.deepEqual(selectionTags(f.offer, f.claim), f.award.tags);
@@ -332,6 +334,24 @@ test("invalid result does not render a trusted answer or publish ACCEPT", async 
   assert.equal(s!.binding, undefined);
   assert.ok(!m.published.some((e) => e.kind === 3406));
   db.close();
+});
+test("a git delivery shows the files state, not invalid, and publishes no ACCEPT", async () => {
+  const { f, db } = await setup(),
+    tags = f.result.tags
+      .filter((t: string[]) => !["delivery", "sig"].includes(t[0]!))
+      .concat([["delivery", "git"], ["commit", "4bdb1465db7569c5ec505df1b83c014c78c61635"]]),
+    m = mock([f.claim, resign(f.result, tags, "delivery commit 4bdb146", sellerKey)]);
+  const s = await step(db, m.t, f.offer.created_at + 5, f.claim.pubkey);
+  assert.equal(s!.phase, "files");
+  assert.equal(s!.binding, undefined);
+  assert.ok(!m.published.some((e) => e.kind === 3406));
+  db.close();
+});
+test("every offer carries the text-only instruction; the question shown is the visitor's own", () => {
+  const task = offerTags("hello", 1800000000)[0]![1]!;
+  assert.equal(task, "hello" + TEXT_ONLY);
+  assert.equal(questionOf(task), "hello");
+  assert.throws(() => questionOf("hello"));
 });
 test("ACCEPT pending retains verified answer and exact signed accept", async () => {
   const { f, db } = await setup(),

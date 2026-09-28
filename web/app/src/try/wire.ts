@@ -125,9 +125,18 @@ export function identity() {
   const secret = bytesToHex(schnorr.utils.randomPrivateKey());
   return { secret, name: generatedName() };
 }
+// Appended to every Try it question so Nemo answers in text. Sellers switch to
+// a git delivery whenever the agent writes files, and this page can only show
+// text. It lowers the odds; it is not a guarantee (see the "files" phase).
+export const TEXT_ONLY = "\n\n(Reply in plain text. Don't create, edit or commit any files.)";
+/** The visitor's question: the offer task minus the text-only instruction. */
+export function questionOf(task: string) {
+  if (!task.endsWith(TEXT_ONLY)) throw Error("Missing text-only instruction");
+  return task.slice(0, -TEXT_ONLY.length);
+}
 export function offerTags(prompt: string, time: number, seller = NEMO) {
   return [
-    ["i", prompt],
+    ["i", prompt + TEXT_ONLY],
     ["output", "text/plain"],
     ["amount", "0", "sat"],
     ["param", "deadline", String(time + 300)],
@@ -150,9 +159,9 @@ export function selectionTags(o: Event, c: Event) {
 export function validateOffer(o: Event, seller = NEMO) {
   verify(o);
   if (o.kind !== OFFER || o.content !== "") throw Error("Invalid offer");
-  const task = one(o, "i")[1]!;
-  if (promptText(task) !== task) throw Error("Untrimmed prompt");
-  equal(o.tags, offerTags(task, o.created_at, seller));
+  const question = questionOf(one(o, "i")[1]!);
+  if (promptText(question) !== question) throw Error("Untrimmed prompt");
+  equal(o.tags, offerTags(question, o.created_at, seller));
 }
 export function trade(e: Event) {
   verify(e);
