@@ -124,7 +124,7 @@ test("attribution: buyer-signed records that disagree render as conflicted, not 
   assert.equal(trade.seller, null, "a conflicted trade names no winner");
 
   const paid = lineFor(events, events[5]!);
-  assert.ok(paid.includes("undetermined runner"), `conflict renders as undetermined (got: ${paid})`);
+  assert.ok(paid.includes("undetermined seller"), `conflict renders as undetermined (got: ${paid})`);
   assert.ok(!paid.includes("Bolty") && !paid.includes("Wally"), `conflict must not guess a name (got: ${paid})`);
 
   // No one is credited earnings on a trade whose winner cannot be trusted.

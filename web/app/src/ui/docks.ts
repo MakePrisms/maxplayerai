@@ -205,7 +205,7 @@ function activityLine(view: MarketView, e: ParsedEvent): string {
   }
   if (e.stage) return feedLine(view, e);
   if (e.kind === PROFILE) return `${who} updated their profile`;
-  return `${who} updated runner availability`;
+  return `${who} updated seller availability`;
 }
 
 function activityList(view: MarketView, events: ParsedEvent[], t: number, currentId: string | null = null, filter = "all"): string {
@@ -333,7 +333,7 @@ function participantSheet(view: MarketView, role: "buyer" | "seller", pubkey: st
           : "No activity in last 24 hours");
     dot = statusDot(active, view.activeByBuyer.get(pubkey) || [], context);
   }
-  const parts = [`<h3>${dot}<span>${isSeller ? "Runner" : "Racer"} ${title}</span></h3>`];
+  const parts = [`<h3>${dot}<span>${isSeller ? "Seller" : "Buyer"} ${title}</span></h3>`];
 
   /* Profile: identity plus what the participant advertises. "Status: Not
      serving" is a published value and stays; an absent advertisement does not. */
@@ -466,8 +466,8 @@ function eventSheet(view: MarketView, id: string, jobExpanded = false): string {
   };
 
   const rows: [string, string][] = [];
-  if (racerPk) rows.push(["Racer", personLink("buyer", racerPk)]);
-  if (runnerPk) rows.push(["Runner", personLink("seller", runnerPk)]);
+  if (racerPk) rows.push(["Buyer", personLink("buyer", racerPk)]);
+  if (runnerPk) rows.push(["Seller", personLink("seller", runnerPk)]);
   rows.push(["Published", esc(stamp(raw.created_at))]);
   rows.push(["Event id", copyId(raw.id)]);
   if (e?.offerId) rows.push(["Job", copyId(e.offerId)]);
@@ -500,7 +500,7 @@ function eventSheet(view: MarketView, id: string, jobExpanded = false): string {
     : null;
   const workingDot = workingJob ? statusDot(true, [workingJob]) : "";
   return `<h3>${workingDot}<span>${esc(KIND_LABELS[raw.kind] || "Event")}</span></h3>
-    ${e?.selfTrade ? '<p class="selfnote"><b>Self-commissioned.</b> The racer operates the runner being paid. Real work, but not market demand.</p>' : ""}
+    ${e?.selfTrade ? '<p class="selfnote"><b>Self-commissioned.</b> The buyer operates the seller being paid. Real work, but not market demand.</p>' : ""}
     ${e?.free || trade?.free ? '<p class="selfnote"><b>Free job.</b> It settles with no payment: the accept is the last event, and no receipt is owed or expected.</p>' : ""}
     <h4>Event details</h4>${detailsKv}
     ${e?.description ? `<h4>The job</h4><div class="job-wrap"><p class="job ${jobExpanded ? "" : "clamp"}">${esc(e.description)}</p><div class="chips">${e.description.length > 160 ? `<button type="button" class="chip show-chip" data-job-toggle>${jobExpanded ? "hide" : "show"}</button>` : ""}<button type="button" class="chip copy-chip" data-copy-text="${esc(e.description)}">copy</button></div></div>` : ""}

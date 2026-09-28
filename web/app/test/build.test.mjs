@@ -91,9 +91,12 @@ test("every asset URL in shipped HTML and CSS carries the deploy stamp", () => {
   assert.match(stamp, /^[0-9a-f]{12}$/);
 
   const html = readFileSync(join(root, "dist", "index.html"), "utf8");
-  for (const asset of ["styles.css", "fonts.css", "terminal.js"]) {
-    assert.ok(html.includes(`./${asset}?v=${stamp}`), `${asset} is stamped in index.html`);
-    assert.ok(!html.includes(`"./${asset}"`), `no unstamped ${asset} reference remains`);
+  for (const page of ["index.html", "market.html", "sell.html"]) {
+    const pageHtml = readFileSync(join(root, "dist", page), "utf8");
+    for (const asset of ["styles.css", "fonts.css", "terminal.js"]) {
+      assert.ok(pageHtml.includes(`./${asset}?v=${stamp}`), `${asset} is stamped in ${page}`);
+      assert.ok(!pageHtml.includes(`"./${asset}"`), `no unstamped ${asset} reference remains in ${page}`);
+    }
   }
   // Font preload URLs must match fonts.css URLs byte-for-byte or the browser
   // fetches every preloaded font twice.
@@ -135,4 +138,23 @@ test("the bundle ships as one module and the snapshot stays out of git", () => {
   // it — 2.5MB of market data would rot in history and churn every refresh.
   const gitignore = readFileSync(join(root, ".gitignore"), "utf8");
   assert.match(gitignore, /^public\/snapshot\.json$/m, "snapshot.json is baked at deploy, never committed");
+});
+
+test("the live market ships at /market and the homepage links it", () => {
+  // cleanUrls serves dist/market.html at /market. The board's static chrome
+  // (the three lanes main.ts renders into) must live there, and the homepage
+  // must carry no board — it boots no relay.
+  const market = readFileSync(join(root, "dist", "market.html"), "utf8");
+  for (const id of ["market", "buyers", "feed", "sellers", "statgrid", "windows", "conn", "utc-clock"]) {
+    assert.ok(market.includes(`id="${id}"`), `market.html carries #${id}`);
+  }
+  const home = readFileSync(join(root, "dist", "index.html"), "utf8");
+  assert.ok(!home.includes('id="market"'), "the homepage carries no board");
+  assert.ok(home.includes('href="/market"'), "the homepage links the live market");
+  assert.ok(home.includes('href="/sell"'), "the homepage links the seller page");
+  const sell = readFileSync(join(root, "dist", "sell.html"), "utf8");
+  assert.ok(!sell.includes('id="market"'), "the seller page carries no board");
+  assert.ok(sell.includes("follow the seller instructions"), "the seller page hands out the seller line");
+  // Old #market deep links (skill.md, llms.txt, shared URLs) still land on the board.
+  assert.match(home, /location\.hash === "#market"\) location\.replace\("\/market"\)/);
 });

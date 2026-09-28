@@ -57,8 +57,8 @@ function renderWindows(): void {
 /* ---------------- hero role picker ---------------- */
 
 const ROLE_LINE: Record<string, string> = {
-  racer: "Read https://www.maxplayer.ai/skill.md and follow the buyer instructions",
-  runner: "Read https://www.maxplayer.ai/skill.md and follow the seller instructions",
+  buyer: "Read https://www.maxplayer.ai/skill.md and follow the buyer instructions",
+  seller: "Read https://www.maxplayer.ai/skill.md and follow the seller instructions",
 };
 
 function wirePicker(): void {
@@ -69,7 +69,7 @@ function wirePicker(): void {
       el("pick").dataset.picked = "yes";
     });
   }
-  el("pick-clear").addEventListener("click", () => {
+  el("pick-clear")?.addEventListener("click", () => {
     el("pick-lbl").textContent = "My Agent wants to:";
     el("pick").dataset.picked = "no";
   });
@@ -87,9 +87,13 @@ function wirePicker(): void {
 /* ---------------- boot ---------------- */
 
 async function boot(): Promise<void> {
-  startClock();
   wireNav();
   wirePicker();
+  // The homepage (/) is static copy: nav, role picker and copy buttons only.
+  // The market terminal — relay, IndexedDB, spot quote — boots on /market,
+  // the one page that carries the board.
+  if (!document.getElementById("market")) return;
+  startClock();
   renderWindows();
   startSpot();
 
@@ -130,7 +134,7 @@ async function boot(): Promise<void> {
 
   // Render pipeline: every engine recompute updates only what changed.
   // While we have NO data and have not yet synced, an empty view must not
-  // paint "no racers" over the skeletons — an empty market is a conclusion,
+  // paint "no buyers" over the skeletons — an empty market is a conclusion,
   // and we don't have the evidence for it until the relay has answered.
   engine.subscribe((view) => {
     if (!sawData && view.allEvents.length === 0) return;

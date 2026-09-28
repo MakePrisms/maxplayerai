@@ -41,7 +41,7 @@ function label(view: MarketView, r: { pubkey: string; name: string | null }): st
  * guards against.
  */
 const CONFLICTED_SELLER =
-  '<span class="unknown" title="The buyer-signed award, accept and receipt for this job name different runners — the winner cannot be determined from the public record.">an undetermined runner</span>';
+  '<span class="unknown" title="The buyer-signed award, accept and receipt for this job name different sellers — the winner cannot be determined from the public record.">an undetermined seller</span>';
 
 /** The other side of an event: named, or null when the record doesn't say. */
 function counterparty(view: MarketView, e: ParsedEvent, want: "buyer" | "seller"): string | null {
@@ -65,7 +65,7 @@ export function feedLine(view: MarketView, e: ParsedEvent): string {
     // it, not before.
     // A free job is named, not priced: "$0.00" would read as a price of zero,
     // and the point is that no payment is part of this job at all.
-    case "offer": return `${who} · ${e.selfTrade ? '<span class="self" title="The racer operates the runner being paid — real work, but not market demand">self</span> ' : ""}${e.free ? '<span class="free" title="A free job: it settles with no payment, so no receipt will ever follow its accept">free</span> ' : ""}${e.executionVisibility === "private" ? '<span title="Execution and delivery content are private">private delivery</span> · ' : ""}${e.description ? esc(e.description) : "posted a job"}${e.amount != null && !e.free ? ` · <span class="sats">${usd(e.amount)}</span>` : ""}`;
+    case "offer": return `${who} · ${e.selfTrade ? '<span class="self" title="The buyer operates the seller being paid — real work, but not market demand">self</span> ' : ""}${e.free ? '<span class="free" title="A free job: it settles with no payment, so no receipt will ever follow its accept">free</span> ' : ""}${e.executionVisibility === "private" ? '<span title="Execution and delivery content are private">private delivery</span> · ' : ""}${e.description ? esc(e.description) : "posted a job"}${e.amount != null && !e.free ? ` · <span class="sats">${usd(e.amount)}</span>` : ""}`;
     case "claim": { const from = counterparty(view, e, "buyer"); return `${who} claimed a job${from ? ` from ${from}` : ""}`; }
     // "awarded the job", not "awarded a claim" — the claim is the mechanism,
     // the job is what the reader understands changed hands.
@@ -85,7 +85,7 @@ export function renderBuyers(view: MarketView): void {
   const rows = view.buyers;
   el("buyers-meta").textContent = rows.length ? `${rows.length} active` : "";
   if (!rows.length) {
-    reconcileList(el("buyers"), [{ key: "-empty", className: "empty", html: "No racers in this period." }]);
+    reconcileList(el("buyers"), [{ key: "-empty", className: "empty", html: "No buyers in this period." }]);
     return;
   }
   const items: KeyedItem[] = rows.map((r, i) => {
@@ -119,7 +119,7 @@ export function renderSellers(view: MarketView): void {
   const online = rows.filter((r) => r.online).length;
   el("sellers-meta").textContent = rows.length ? `${online} online · ${rows.length} seen` : "";
   if (!rows.length) {
-    reconcileList(el("sellers"), [{ key: "-empty", className: "empty", html: "No runners in this period." }]);
+    reconcileList(el("sellers"), [{ key: "-empty", className: "empty", html: "No sellers in this period." }]);
     return;
   }
   const items: KeyedItem[] = rows.map((r, i) => ({
@@ -134,7 +134,7 @@ export function renderSellers(view: MarketView): void {
         ${r.harness ? `<span class="harness" title="${esc(r.harness)}">${esc(shortHarness(r.harness))}</span>` : ""}
       </span>
       <span class="num">${nf.format(r.delivered)}</span>
-      <span class="num ${r.askSats == null ? "dim" : ""}" title="Minimum price advertised by this runner">${r.askSats == null ? "—" : usd(r.askSats)}</span>
+      <span class="num ${r.askSats == null ? "dim" : ""}" title="Minimum price advertised by this seller">${r.askSats == null ? "—" : usd(r.askSats)}</span>
       <span class="num sats">${usd(r.satsEarned)}</span>`,
   }));
   reconcileList(el("sellers"), items);
@@ -174,8 +174,8 @@ export function renderStats(view: MarketView): void {
     ["Delivered", nf.format(m.funnel.delivered), ""],
     ["Receipts", nf.format(m.receiptsOnRecord), "neon"],
     ["Volume", usd(m.satsInReceipts), "neon"],
-    ["Racers", nf.format(m.buyers), ""],
-    ["Runners", nf.format(m.sellers), ""],
+    ["Buyers", nf.format(m.buyers), ""],
+    ["Sellers", nf.format(m.sellers), ""],
   ];
   el("statgrid").innerHTML = cells
     .map(([k, v, cls]) => `<div><dt>${k}</dt><dd class="${cls}">${v}</dd></div>`).join("");
@@ -183,6 +183,6 @@ export function renderStats(view: MarketView): void {
   el("stats-window").textContent = win ? `· ${win.label.toLowerCase()}` : "";
   // An exclusion must be COUNTED, never silent.
   el("stats-note").textContent = m.selfTrades
-    ? `${nf.format(m.selfTrades)} self-commissioned trade${m.selfTrades === 1 ? " is" : "s are"} excluded — the racer operated the runner, so it is real work but not market demand.`
+    ? `${nf.format(m.selfTrades)} self-commissioned trade${m.selfTrades === 1 ? " is" : "s are"} excluded — the buyer operated the seller, so it is real work but not market demand.`
     : "";
 }

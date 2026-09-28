@@ -53,7 +53,7 @@ if (watch) {
   // One stamp derived from every shipped byte the HTML/CSS reference.
   const fontNames = readdirSync(join(root, "public/fonts"));
   const hash = createHash("sha256");
-  for (const rel of ["index.html", "styles.css", "fonts.css", ...fontNames.map((f) => join("fonts", f))]) {
+  for (const rel of ["index.html", "market.html", "sell.html", "styles.css", "fonts.css", ...fontNames.map((f) => join("fonts", f))]) {
     hash.update(readFileSync(join(root, "public", rel)));
   }
   hash.update(readFileSync(join(dist, "terminal.js")));
@@ -67,11 +67,15 @@ if (watch) {
     readFileSync(join(root, "public/fonts.css"), "utf8")
       .replace(/url\((['"])(\.\/fonts\/[^'"?]+)\1\)/g, `url($1$2?v=${STAMP}$1)`),
   );
-  writeFileSync(
-    join(dist, "index.html"),
-    readFileSync(join(root, "public/index.html"), "utf8")
-      .replace(/(href|src)="\.\/(styles\.css|fonts\.css|terminal\.js|fonts\/[^"?]+)"/g, `$1="./$2?v=${STAMP}"`),
-  );
+  // Every page: the buyer homepage (/), the seller page (/sell) and the live
+  // market (/market) — cleanUrls serves sell.html and market.html there.
+  for (const page of ["index.html", "market.html", "sell.html"]) {
+    writeFileSync(
+      join(dist, page),
+      readFileSync(join(root, "public", page), "utf8")
+        .replace(/(href|src)="\.\/(styles\.css|fonts\.css|terminal\.js|fonts\/[^"?]+)"/g, `$1="./$2?v=${STAMP}"`),
+    );
+  }
 
   // The agent-facing surface: skills, discovery index, /skill.md alias.
   cpSync(join(root, ".well-known"), join(dist, ".well-known"), { recursive: true });
