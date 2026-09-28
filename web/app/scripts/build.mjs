@@ -29,7 +29,13 @@ const watch = process.argv.includes("--watch");
 const options = {
   entryPoints: [join(root, "src/main.ts")],
   bundle: true,
-  define: { TRY_IT_ENABLED: String(process.env.TRY_IT_ENABLED === "true"), TRY_IT_MARKET_LINK_ENABLED: String(process.env.TRY_IT_MARKET_LINK_ENABLED === "true") },
+  // Vercel preview deployments show the Try it UI so it can be reviewed.
+  // Production stays off unless TRY_IT_ENABLED=true; /api/try has its own
+  // server flags and stays 404 in previews, so nothing is written to the relay.
+  define: {
+    TRY_IT_ENABLED: String(process.env.TRY_IT_ENABLED === "true" || process.env.VERCEL_ENV === "preview"),
+    TRY_IT_MARKET_LINK_ENABLED: String(process.env.TRY_IT_MARKET_LINK_ENABLED === "true" || process.env.VERCEL_ENV === "preview"),
+  },
   minify: true,
   format: "esm",
   target: "es2022",
