@@ -11,7 +11,7 @@ Bob (team lead), decisions supplied by the requester in WebChat on 2026-09-28; o
 - Visitors write a free-text prompt. These are real buyers and normal market trades, not demos; no demo label or statistical exclusion.
 - Target only **worker-nemo**, public key `f0a77fbdcd2a2dc944310fcb1e5cc03a0120087fb81290822d2420084fa6d1ce` (called `NEMO` below). Free means explicit `payment=none` and amount 0, not a paid zero-sat invoice. Inline answer in the result event.
 - Each browser generates and locally retains its own Nostr key. No house keypair. The buyer signs profile, offer, award and accept.
-- Publish a kind-0 profile with a generated race-car/sports-car-style name. One job per buyer/browser; the browser restriction is soft.
+- Publish a kind-0 profile with a generated race-car/sports-car-style name. Bob’s follow-up on 2026-09-28 via the team Discord session fixes the format: lowercase words and short designations joined by hyphens only, matching `worker-nemo` and `maxie-agent`. One job per buyer/browser; the browser restriction is soft.
 - While running, reveal a link to the live market; after the answer, reveal a copyable Get started panel using existing installation material.
 - Hero CTA becomes Try it and scrolls to the section. Top-nav Get started stays.
 - Browser-signed events go through a thin Vercel `/api/try` function for verification, Vercel-native rate limiting and relay forwarding. Only Vercel Firewall/BotID for website abuse controls; no Turnstile, Upstash, house signer or custom quota database. The hard free-job cap belongs on Nemo, controlled by Bob.
@@ -63,12 +63,12 @@ Reserve the single job slot in an IndexedDB read/write transaction **before** pu
 
 All lowercase, words joined by hyphens only — the same format as existing names such as `worker-nemo` and `maxie-agent`. No capitals, no spaces, no hex suffix. Set `name` and `display_name` to the same generated value. Do not use a real vehicle brand or impersonate worker-nemo.
 
-- Model words: `vantor`, `stradale`, `apex`, `aerion`, `velora`, `radian`, `corsair`, `solaro`, `torven`, `caldera`, `virelli`, `ignis`.
-- Character words: `nero`, `veloce`, `corsa`, `comet`, `sprint`, `rosso`, `tempest`, `vector`, `falcon`, `spectre`, `foudre`, `strada`.
-- Designations: `gt`, `gtr`, `rs`, `gts`, `rr`, optionally followed by a two-digit number as its own part (`rs-72`).
-- Pick with cryptographic randomness one of: model-character (`stradale-nero`), model-designation (`vantor-gtr`), or model-character-designation (`apex-veloce-rs`). Examples: `stradale-nero`, `apex-veloce`, `vantor-gtr`, `corsa-rossa`, `caldera-rs-72`, `ignis-tempest-gt`.
+- Model words: `vantor`, `stradale`, `apex`, `corsa`, `aerion`, `velora`, `radian`, `corsair`, `solaro`, `torven`, `caldera`, `virelli`, `ignis`.
+- Character words: `nero`, `veloce`, `rossa`, `comet`, `sprint`, `rosso`, `tempest`, `vector`, `falcon`, `spectre`, `foudre`, `strada`.
+- Designations: `gt`, `gtr`, `rs`, `gts`, `rr`. Use words and these short designations only; no numeric parts.
+- Pick with cryptographic randomness one of: model-character (`stradale-nero`), model-designation (`vantor-gtr`), or model-character-designation (`apex-veloce-rs`). Examples: `stradale-nero`, `apex-veloce`, `vantor-gt`, `corsa-rossa`, `caldera-rs`, `ignis-tempest-gt`.
 
-Names are labels, not unique identifiers: the pool is several thousand combinations, so two buyers can share a name, and anyone can copy one. Identity and joins always use the full public key. If two visible labels collide on one screen, the UI may show a short public-key hint next to them locally, without changing the published name; never repeatedly rename a published buyer or query the entire relay to reserve a name. Persist the generated label once. The kind-0 content is JSON with only these name fields; no fake owner, agent, payment or verification claims. Publish and acknowledge the profile before the offer; retry the same profile event after an uncertain response [C1, C6].
+Names are labels, not unique identifiers: the pool contains hundreds of combinations, so two buyers can share a name, and anyone can copy one. Identity and joins always use the full public key. If two visible labels collide on one screen, the UI may show a short public-key hint next to them locally, without changing the published name; never repeatedly rename a published buyer or query the entire relay to reserve a name. Persist the generated label once. The kind-0 content is JSON with only these name fields; no fake owner, agent, payment or verification claims. Publish and acknowledge the profile before the offer; retry the same profile event after an uncertain response [C1, C6].
 
 ## 3. Event flow: actual v1 protocol
 
