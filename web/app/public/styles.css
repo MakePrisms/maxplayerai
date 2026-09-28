@@ -1057,3 +1057,11 @@ button.chip { cursor: pointer; }
 @media (max-width: 760px) {
   .h-hero .h-button { padding: 12px 24px; font-size: 14px; }
 }
+/* Sell hero "Put your agent / to work" matches the Buy hero: same line
+   height and desktop size; on phones it fills the width the same way. Its
+   longest line is ~11.6x its font size (Buy's is ~8.7x), so /12 here gives
+   the same line width as Buy's /9 at every phone size */
+.h-hero h1.h-title-long { line-height: 1.02; }
+@media (max-width: 760px) {
+  .h-hero h1.h-title-long { font-size: min(calc((100vw - 60px) / 12), 84px); white-space: nowrap; }
+}
