@@ -992,9 +992,14 @@ pub fn result_draft(
 
 /// Thin wrapper: result-kind git delivery via [`result_draft`] + [`GitResultTags`].
 /// `exec_metadata` is the optional seller-claimed usage block (may be empty).
+///
+/// `output` MUST echo the offer's `["output", …]` tag. A v2 buyer binds the result's `output` to
+/// the offer's and drops a mismatching result as not-a-delivery (#1065: a fixed `text/plain` here
+/// made every `application/json` git job undeliverable, so honest sellers went unpaid).
 pub fn git_result_draft(
     offer_id: &str,
     buyer_pubkey: &str,
+    output: &str,
     repo: &str,
     branch: &str,
     commit_sha: &str,
@@ -1007,7 +1012,7 @@ pub fn git_result_draft(
     result_draft(
         offer_id,
         buyer_pubkey,
-        "text/plain",
+        output,
         amount_sats,
         job_hash,
         seller_signature,
@@ -2065,7 +2070,7 @@ mod tests {
         // but it is not a settlement signal, so "which offer did this receipt settle?" must return
         // None for it — never conflate a delivery with a settlement.
         let result = git_result_draft(
-            "the-offer", BUYER, "https://example.invalid/repo.git", "maxplayer/job",
+            "the-offer", BUYER, "text/plain", "https://example.invalid/repo.git", "maxplayer/job",
             &"a".repeat(40), 7, "hash", "seller-sig", "commit", &[],
         );
         assert_eq!(settled_offer_id(&result), None);
@@ -2081,6 +2086,7 @@ mod tests {
         let result = git_result_draft(
             "offer",
             BUYER,
+            "text/plain",
             "https://example.invalid/repo.git",
             "maxplayer/job",
             &"a".repeat(40),
@@ -2520,7 +2526,7 @@ mod inline_delivery_tests {
     #[test]
     fn a_git_result_is_not_readable_as_inline_and_a_mixed_shape_is_refused() {
         let git = git_result_draft(
-            "offer-1", "buyer-pubkey", "https://relay.test/git/s/r.git", "maxplayer/abcd1234",
+            "offer-1", "buyer-pubkey", "text/plain", "https://relay.test/git/s/r.git", "maxplayer/abcd1234",
             &"d".repeat(40), 2, "job-hash-1", "seller-sig", "delivery commit", &[],
         );
         assert_eq!(
