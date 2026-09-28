@@ -71,6 +71,13 @@ export async function openStore(factory: IDBFactory = indexedDB) {
         if (!old) throw Error("Browser identity was removed");
         return fn(old);
       }),
+    clear: () =>
+      new Promise<void>((resolve, reject) => {
+        const tx = db.transaction("buyer", "readwrite");
+        tx.objectStore("buyer").delete("one");
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      }),
     close: () => db.close(),
   };
 }

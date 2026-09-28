@@ -35,6 +35,8 @@ const options = {
   define: {
     TRY_IT_ENABLED: String(process.env.TRY_IT_ENABLED === "true" || process.env.VERCEL_ENV === "preview"),
     TRY_IT_MARKET_LINK_ENABLED: String(process.env.TRY_IT_MARKET_LINK_ENABLED === "true" || process.env.VERCEL_ENV === "preview"),
+    // Previews only: after a job, the visitor can start over with a fresh key.
+    TRY_IT_PREVIEW: String(process.env.VERCEL_ENV === "preview"),
   },
   minify: true,
   format: "esm",

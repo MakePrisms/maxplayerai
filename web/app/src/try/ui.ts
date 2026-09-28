@@ -4,6 +4,8 @@ import { step } from "./controller.js";
 import { NotOpen, RateLimited, transport } from "./transport.js";
 import { identity, NEMO, now, one, promptText, trade } from "./wire.js";
 declare const TRY_IT_MARKET_LINK_ENABLED: boolean;
+declare const TRY_IT_PREVIEW: boolean;
+const preview = typeof TRY_IT_PREVIEW !== "undefined" && TRY_IT_PREVIEW;
 export const statuses: Record<string, string> = {
   publishing: "Sending your question…",
   waiting: "Waiting for worker-nemo…",
@@ -36,6 +38,8 @@ export function render(s: RecordState) {
     !s.binding && !["timeout", "refused", "delayed", "invalid", "conflict"].includes(s.phase);
   document.querySelector<HTMLElement>("#try-check")!.hidden =
     !["timeout", "refused", "invalid", "conflict"].includes(s.phase);
+  document.querySelector<HTMLElement>("#try-again")!.hidden =
+    !preview || !["done", "timeout", "refused", "invalid", "conflict"].includes(s.phase);
 }
 export async function bootTry() {
   const section = document.querySelector<HTMLElement>("#try");
@@ -56,12 +60,21 @@ export async function bootTry() {
   float.innerHTML =
     '<span>Try it first</span><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M12 4v15m0 0-6-6m6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
   document.body.append(float);
-  // Fade out once the Try it section reaches the top half of the screen, and
-  // stay gone while it (or anything below it) is in view.
-  new IntersectionObserver(([entry]) => {
-    const past = entry!.isIntersecting || entry!.boundingClientRect.top < 0;
-    float.classList.toggle("is-gone", past);
-  }, { rootMargin: "0px 0px -50% 0px" }).observe(section);
+  // Gone the moment the top of the Try it section reaches the pill, and
+  // stays gone for everything below it.
+  let queued = false;
+  const place = () => {
+    queued = false;
+    const reached =
+      section.getBoundingClientRect().top <= float.getBoundingClientRect().bottom;
+    float.classList.toggle("is-gone", reached);
+  };
+  const schedule = () => {
+    if (!queued) (queued = true), requestAnimationFrame(place);
+  };
+  addEventListener("scroll", schedule, { passive: true });
+  addEventListener("resize", schedule);
+  place();
   float.onclick = (e) => {
     e.preventDefault();
     history.pushState(null, "", "#try");
@@ -206,6 +219,11 @@ export async function bootTry() {
         "Enable browser storage to try it";
       submit.disabled = !online;
     }
+  });
+  document.querySelector("#try-again")!.addEventListener("click", async () => {
+    await db.clear();
+    channel.postMessage("updated");
+    location.reload();
   });
   document.querySelector("#try-check")!.addEventListener("click", () => {
     failures = 0;
