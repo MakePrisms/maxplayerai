@@ -25,7 +25,7 @@ export function render(s: RecordState) {
   question.textContent = one(s.offer, "i")[1]!;
   question.hidden = false;
   const buyer = document.querySelector<HTMLElement>("#try-buyer")!;
-  buyer.textContent = `You're ${s.name}`;
+  buyer.textContent = `You're ${s.name} asking worker-nemo.`;
   buyer.hidden = false;
   const status = document.querySelector<HTMLElement>("#try-status")!;
   status.textContent = statuses[s.phase] ?? "Checking your question…";
@@ -206,6 +206,7 @@ export async function bootTry() {
         promptText(input.value);
       } catch {
         status.textContent = "Ask a question in 1–1,000 characters.";
+        status.hidden = false;
         return;
       }
       if (!online) return;
@@ -245,7 +246,7 @@ export async function bootTry() {
     void run();
   } else {
     const buyer = document.querySelector<HTMLElement>("#try-buyer")!;
-    buyer.textContent = `You're ${visitor.name}`;
+    buyer.textContent = `You're ${visitor.name} asking worker-nemo.`;
     buyer.hidden = false;
     const heartbeat = async () => {
       try {
@@ -275,13 +276,13 @@ export async function bootTry() {
           // Sellers republish every 5 minutes, so allow two beats plus a minute.
           now() - fresh.created_at <= 660 &&
           one(fresh, "accepting")[1] === "y";
-        status.textContent = online
-          ? "Ready for your question."
-          : "The agent is offline. Check back soon.";
+        status.textContent = online ? "" : "The agent is offline. Check back soon.";
+        status.hidden = online;
       } catch {
         if (await db.read()) return;
         online = false;
         status.textContent = "Can’t connect right now. We’ll try again.";
+        status.hidden = false;
       }
       if (!(await db.read())) {
         submit.disabled = !online;
