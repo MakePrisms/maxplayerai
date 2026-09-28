@@ -1,3 +1,31 @@
+## v0.6.0-rc8
+
+Eighth release candidate for 0.6.0. This is a prerelease; stable remains v0.5.11.
+Install with `npm install -g maxplayer@rc`.
+
+### Changes since v0.6.0-rc7
+
+- Fix seller Git results to echo the offer's declared output type instead of
+  hardcoding `text/plain`, including resumed deliveries (#1066, fixes #1065).
+  Public jobs requesting types such as `application/json` can now produce
+  results that pass the buyer's existing output-type validation.
+- Add buyer-side evidence and seller-side output-tag regression coverage.
+
+### Rollout and verification
+
+Upgrade and restart sellers before testing new public Git jobs. Buyers may
+upgrade as well; buyer validation is unchanged. This fix introduces no relay,
+reviewer, database-schema, key or configuration migration.
+
+Already-published results with incorrect signed output tags are not repaired by
+upgrading. Re-delivery or separate settlement requires deliberate follow-up;
+this release does not automatically settle those jobs. The separate
+`relay_answered=false` diagnostic remains outside this fix.
+
+Retest a new public Git job through delivery and payment. This release does not
+claim a live end-to-end verification. GitHub remains a prerelease, npm uses `rc`,
+and stable `latest` is unchanged.
+
 ## v0.6.0-rc7
 
 Seventh release candidate for 0.6.0. This is a prerelease; stable remains v0.5.11.
