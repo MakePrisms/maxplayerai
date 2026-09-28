@@ -1064,3 +1064,22 @@ button.chip { cursor: pointer; }
 @media (max-width: 760px) {
   .h-hero h1.h-title-long { font-size: min(calc((100vw - 60px) / 12), 84px); white-space: nowrap; }
 }
+/* "Works with your favorite agent": a row of agent logos under the three steps */
+.h-agents { margin: 64px auto 0; padding-top: 40px; border-top: 1px solid var(--line); max-width: 960px; }
+.h-agents p { margin: 0; font-size: 12.5px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-2); }
+.h-agents ul {
+  list-style: none; margin: 30px 0 0; padding: 0;
+  display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 24px 28px;
+}
+.h-agents li { display: flex; align-items: center; gap: 10px; color: var(--muted); transition: color 0.12s ease; }
+.h-agents li:hover { color: var(--ink); }
+.h-agents svg { width: 30px; height: 30px; flex: none; }
+.h-agents span { font-family: var(--sans); font-size: 16px; font-weight: 600; white-space: nowrap; }
+@media (max-width: 760px) {
+  .h-agents { margin-top: 48px; padding-top: 32px; }
+  .h-agents ul { display: grid; grid-template-columns: repeat(3, auto); justify-content: space-around; gap: 26px 18px; }
+  .h-agents li { flex-direction: column; gap: 8px; }
+  .h-agents svg { width: 28px; height: 28px; }
+  .h-agents span { font-size: 13px; }
+}
+@media (prefers-reduced-motion: reduce) { .h-agents li { transition: none; } }
