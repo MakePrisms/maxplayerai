@@ -3826,12 +3826,8 @@ mod tests {
         );
     }
 
-    // NETWORK (#720): the injected `connector` below only answers check-state. The send leg this
-    // test drives to `Closed` runs through `fixture.wallet`'s OWN http client, which fetches
-    // `MINT`'s (testnut's) keysets over the public internet — so this cannot run under
-    // `net: denied`. Not silenced: `live-mints` is ON in the money-path CI job, which has a
-    // network. See the feature's comment in Cargo.toml.
-    #[cfg(feature = "live-mints")]
+    // The wallet uses cached fixture keysets and an in-process transport, including
+    // the real send leg. This state-machine test must not depend on a public mint.
     #[test]
     fn worker_wires_reconcile_verify_and_send_into_the_real_state_machine() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -4004,10 +4000,7 @@ mod tests {
         );
     }
 
-    // NETWORK (#720): reaches the same real send leg as
-    // `worker_wires_reconcile_verify_and_send_into_the_real_state_machine`, so it fetches the live
-    // mint's keysets too. ON in the money-path CI job; see `live-mints` in Cargo.toml.
-    #[cfg(feature = "live-mints")]
+    // Exercise the real send leg and recipient check without a public mint.
     #[test]
     fn worker_sends_to_the_nostr_identity_not_the_odd_parity_p2pk_lock() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -4254,7 +4247,38 @@ mod tests {
         let proof = p2pk_proof(7, seller);
         let token = Token::new(mint(MINT), vec![proof.clone()], None, CurrencyUnit::Sat);
         let store = Arc::new(cdk_sqlite::wallet::memory::empty().await.unwrap());
-        let wallet = Wallet::new(MINT, CurrencyUnit::Sat, store, [7; 64], None).unwrap();
+        store
+            .add_mint(mint(MINT), Some(MintInfo::new()))
+            .await
+            .unwrap();
+        // TokenV4 expansion on the real send leg needs the fixture's full keyset
+        // id. Seed it just like gate_wallet; never ask testnut for fixture metadata.
+        store
+            .add_mint_keysets(
+                mint(MINT),
+                vec![KeySetInfo {
+                    id: Id::from_str(KEYSET_ID).unwrap(),
+                    unit: CurrencyUnit::Sat,
+                    active: true,
+                    input_fee_ppk: 0,
+                    final_expiry: None,
+                }],
+            )
+            .await
+            .unwrap();
+        let connector = Arc::new(BaseHttpClient::with_transport(
+            mint(MINT),
+            CheckStateTransport::default(),
+            None,
+        ));
+        let wallet = WalletBuilder::new()
+            .mint_url(mint(MINT))
+            .unit(CurrencyUnit::Sat)
+            .localstore(store)
+            .seed([7; 64])
+            .shared_client(connector)
+            .build()
+            .unwrap();
         WalletFixture {
             wallet,
             terms: wallet_terms(seller),
