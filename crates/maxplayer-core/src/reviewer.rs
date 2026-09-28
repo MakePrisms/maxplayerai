@@ -626,11 +626,14 @@ impl Store {
         }
         // Review digests/probabilities are private too; enforce permissions even
         // when reviewer serve is launched outside the systemd unit's umask.
-        let file = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
-            .mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path).map_err(|_| "review_store")?;
-        use std::os::unix::fs::PermissionsExt;
-        if !file.metadata().map_err(|_| "review_store")?.is_file() { return Err("review_store".into()); }
-        file.set_permissions(std::fs::Permissions::from_mode(0o600)).map_err(|_| "review_store")?;
+        // Close before SQLite opens: closing any descriptor drops this process's POSIX locks on the file.
+        {
+            let file = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
+                .mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path).map_err(|_| "review_store")?;
+            use std::os::unix::fs::PermissionsExt;
+            if !file.metadata().map_err(|_| "review_store")?.is_file() { return Err("review_store".into()); }
+            file.set_permissions(std::fs::Permissions::from_mode(0o600)).map_err(|_| "review_store")?;
+        }
         let db = rusqlite::Connection::open_with_flags(path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW).map_err(|_| "review_store")?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
@@ -1792,3 +1795,7 @@ fn log_refused(output: &Output<EventId>, what: &str) {
 #[cfg(test)]
 #[path = "reviewer/private_tests.rs"]
 mod private_tests;
+
+#[cfg(test)]
+#[path = "reviewer/sqlite_lock_tests.rs"]
+mod sqlite_lock_tests;
