@@ -20,20 +20,23 @@ impl ContentStore {
         use std::fs::OpenOptions;
         #[cfg(unix)]
         use std::os::unix::fs::OpenOptionsExt;
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true);
-        #[cfg(unix)]
+        // Close before SQLite opens: closing any descriptor drops this process's POSIX locks on the file.
         {
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
-        let file = options
-            .open(path)
-            .map_err(|_| Error("cannot open private content database"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .map_err(|_| Error("cannot secure content database"))?;
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create(true);
+            #[cfg(unix)]
+            {
+                options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            }
+            let file = options
+                .open(path)
+                .map_err(|_| Error("cannot open private content database"))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .map_err(|_| Error("cannot secure content database"))?;
+            }
         }
         let db = Connection::open_with_flags(
             path,
