@@ -406,28 +406,19 @@ function participantSheet(view: MarketView, role: "buyer" | "seller", pubkey: st
     ]));
   }
 
-  /* In-progress / overdue chips keep their place between Stats and the feed —
-     the click-through behind the working streaks. */
+  /* In-progress chips keep their place between Stats and the feed — the
+     click-through behind the working streaks. Overdue jobs (awarded, past the
+     deadline, nothing delivered) are not listed: they are not current work. */
   const trackedJobs = [...new Map([
     ...(b?.inProgressJobs || []), ...(s?.inProgressJobs || []),
   ].map((job) => [job.offerId, job])).values()];
   const working = trackedJobs.filter((job) => job.state !== JOB_OVERDUE);
-  const overdue = trackedJobs.filter((job) => job.state === JOB_OVERDUE);
   if (working.length) {
     parts.push(`<h4>In progress · ${nf.format(working.length)} job${working.length === 1 ? "" : "s"}</h4>
       <div class="chips active-jobs">${working.map((job) =>
         `<button type="button" class="chip working-chip" data-open="event" data-id="${job.awardId}" title="Open job history">IN PROGRESS · ${short(job.offerId)}</button>`,
       ).join("")}</div>`);
   }
-  // Overdue is the runner dock's section only: the runner owes the delivery.
-  if (isSeller && overdue.length) {
-    parts.push(`<h4>Overdue · ${nf.format(overdue.length)} job${overdue.length === 1 ? "" : "s"}</h4>
-      <p class="job-note">Awarded, past the offer deadline, and no delivery has been published. The award stands; nothing here says it was paid or cancelled.</p>
-      <div class="chips active-jobs">${overdue.map((job) =>
-        `<button type="button" class="chip overdue-chip" data-open="event" data-id="${job.awardId}" title="${esc(`Deadline ${stamp(job.deadline ?? 0)} · no delivery published`)}">OVERDUE · ${short(job.offerId)}</button>`,
-      ).join("")}</div>`);
-  }
-
   parts.push(`<h4>Recent activity</h4>${filteredActivityHtml(view, d.activity, t, activityFilter)}`);
   return parts.join("");
 }

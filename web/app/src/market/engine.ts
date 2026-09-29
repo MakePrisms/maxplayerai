@@ -53,18 +53,22 @@ export interface MarketView {
 }
 
 /**
- * Receipts are OPTIONAL announcements — a trade can settle with no public
- * receipt ever published. "Active until paid" therefore needs an expiry, or a
- * delivered-but-never-receipted trade signals work forever.
+ * How long a trade with NO deadline and nothing delivered may sit silent
+ * before its lamp goes out. Delivery itself ends a lamp at once (see
+ * activeTradeJobs), so this only bounds offers and awards that go quiet.
  */
 export const ACTIVE_GRACE_SECONDS = 86400;
 
 /**
  * What keeps a participant's streaks moving. A racer is active from the moment
  * they POST an offer; a runner from the moment they POST a claim. Activity
- * ends when the trade pays (accept or receipt), is declined, loses the award
- * to another runner, or blows its deadline with nothing delivered — an ended
- * trade must never read as busy.
+ * ends when the work is DELIVERED (a result), when the trade is accepted or
+ * paid, is declined, loses the award to another runner, or blows its deadline
+ * with nothing delivered — an ended trade must never read as busy.
+ *
+ * Delivery ends it, not the accept: many buyers settle without ever
+ * publishing an ACCEPT or RECEIPT, and waiting on those kept lamps sweeping
+ * for up to a day after the work was done.
  */
 export function activeTradeJobs(allEvents: RawEvent[], t: number): {
   byBuyer: Map<string, ActiveJob[]>;
@@ -84,20 +88,16 @@ export function activeTradeJobs(allEvents: RawEvent[], t: number): {
   const tradeByOffer = new Map(trades.map((tr) => [tr.offerId, tr]));
   const over = (trade: Trade | undefined, offerId: string): boolean => {
     if (!trade) return true;
-    // Done means the buyer ACCEPTED the delivery: the work is finished and
-    // signed off. Payment (the receipt) is a separate, OPTIONAL announcement —
-    // most settled trades never publish one, so gating solely on the receipt
-    // left the lamp flashing through the whole grace window after every job
-    // that completed normally. Either the accept or a receipt ends it.
+    // Delivered, accepted or paid: nobody is working on it any more. The
+    // accept and the receipt are OPTIONAL announcements — plenty of buyers
+    // deliver-and-pay without publishing either — so the result alone ends it.
+    if (trade.at.result != null) return true;
     if (trade.at.accept != null || trade.at.receipt != null) return true;
     if (trade.declineReason) return true;                                // declined
     const deadline = deadlines.get(offerId);
-    if (deadline && deadline < t && trade.at.result == null) return true; // blown, nothing delivered
-    // Delivered a day ago with still no public accept/receipt: whatever
-    // settlement happened, it happened — stop signalling work.
-    if (trade.at.result != null && t - trade.at.result > ACTIVE_GRACE_SECONDS) return true;
+    if (deadline && deadline < t) return true;                           // blown, nothing delivered
     // No deadline to expire it and nothing moving: a day of silence ends it.
-    if (!deadline && trade.at.result == null) {
+    if (!deadline) {
       const stamps = Object.values(trade.at).filter((n): n is number => Number.isFinite(n));
       if (stamps.length && t - Math.max(...stamps) > ACTIVE_GRACE_SECONDS) return true;
     }

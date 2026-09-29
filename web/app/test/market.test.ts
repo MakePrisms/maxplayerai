@@ -185,13 +185,26 @@ test("activeTradeJobs: only TERMINAL feedback ends a job — progress notes neve
   assert.ok(active.bySeller.get(SELLER)?.length, "unclassified feedback leaves the job running");
 });
 
-test("activeTradeJobs: delivered-but-never-receipted expires after the grace period", () => {
+test("activeTradeJobs: delivery ends the lamp at once — no accept or receipt needed", () => {
+  // Many buyers deliver-and-pay without ever publishing an ACCEPT or RECEIPT.
+  // Waiting on those kept lamps sweeping for up to a day after the work was done.
   const o = offer(T0, { deadline: T0 + 5000 });
-  const events = [o, claim(o.id, SELLER, T0 + 1), award(o.id, SELLER, T0 + 2), result(o.id, SELLER, T0 + 3)];
-  const fresh = activeTradeJobs(events, T0 + 100);
-  assert.ok(fresh.bySeller.get(SELLER)?.length, "awaiting payment reads active");
-  const stale = activeTradeJobs(events, T0 + 3 + ACTIVE_GRACE_SECONDS + 1);
-  assert.ok(!stale.bySeller.get(SELLER)?.length, "receipts are optional, so activity must expire");
+  const awarded = [o, claim(o.id, SELLER, T0 + 1), award(o.id, SELLER, T0 + 2)];
+  assert.ok(activeTradeJobs(awarded, T0 + 10).bySeller.get(SELLER)?.length, "awarded, not delivered: working");
+  const delivered = [...awarded, result(o.id, SELLER, T0 + 3)];
+  const active = activeTradeJobs(delivered, T0 + 4);
+  assert.ok(!active.bySeller.get(SELLER)?.length, "the runner's lamp is out the moment it delivers");
+  assert.ok(!active.byBuyer.get(BUYER)?.length, "and the racer's");
+});
+
+test("activeTradeJobs: a blown deadline ends the lamp; a job with no deadline expires after a day of silence", () => {
+  const o = offer(T0, { deadline: T0 + 500 });
+  const awarded = [o, claim(o.id, SELLER, T0 + 1), award(o.id, SELLER, T0 + 2)];
+  assert.ok(!activeTradeJobs(awarded, T0 + 501).bySeller.get(SELLER)?.length, "past the deadline, nothing delivered: out");
+  const o2 = offer(T0);
+  const quiet = [o2, claim(o2.id, SELLER, T0 + 1), award(o2.id, SELLER, T0 + 2)];
+  assert.ok(activeTradeJobs(quiet, T0 + 100).bySeller.get(SELLER)?.length, "no deadline: working while recent");
+  assert.ok(!activeTradeJobs(quiet, T0 + 2 + ACTIVE_GRACE_SECONDS + 1).bySeller.get(SELLER)?.length, "a day of silence ends it");
 });
 
 test("rankClimbs diffs all-time standings now vs 24h ago; new entrants are not climbers", () => {
