@@ -42,7 +42,7 @@ resolve the item(s) above, then re-run `maxplayer seller`. To bypass these check
 recommended), pass --skip-doctor.
 ```
 
-**Read it — the five blocking checks and their fixes:**
+**Read it — the blocking checks every seat runs, and their fixes:**
 - `seller key` FAIL → *ensure the seller key file exists and is readable (mode 0600) — it
   is auto-generated on first run*
 - `relay reachability` FAIL → *check relay_url in config.toml and network/relay
@@ -54,12 +54,17 @@ recommended), pass --skip-doctor.
 - `sandbox launcher` FAIL (launcher not on PATH / not a file) → *install the launcher
   program or fix [sandbox] launcher (or remove [sandbox] to run unsandboxed)*
 
-A `WARN` (e.g. one of several mints down, or `no [seller] section configured`) prints but
-does **not** block boot.
+- `nix` FAIL (no working nix) → an environment requirement (#745), not a readiness check:
+  `--skip-doctor` does **not** bypass it
+
+For a seat strangers can reach (`--claim-open-pool` or `--accept-open-targeted`),
+`sandbox containment`, `sandbox engine floor` and `home permissions` are blocking FAILs too;
+on a seat only named buyers reach they are WARNs. A `WARN` (e.g. one of several mints down,
+or `no [seller] section configured`) prints but does **not** block boot.
 
 **Fix:** resolve the FAILed item using its hint, then re-run `maxplayer seller`. Re-running
-`maxplayer doctor` confirms it before you retry. `--skip-doctor` bypasses the gate but is
-not recommended — a bad launcher or unresolvable agent means every awarded job dies at
+`maxplayer doctor` confirms it before you retry. `--skip-doctor` bypasses every check except
+`nix`, and is not recommended — a bad launcher or unresolvable agent means every awarded job dies at
 spawn and you lose the award.
 
 **Dead end → report it:** if a check FAILs with a detail you cannot resolve, file on

@@ -5,7 +5,8 @@
 > `devShells.default` — **plus a launch-relay slice**: `packages.maxplayer-relay` (the buzz-derived
 > relay, crate `buzz-relay`, scoped by a closed compiled kind allowlist — no write-policy plugin),
 > `nixosModules.relay` + `nixosConfigurations.relay` (a deployable relay box,
-> `nixos-rebuild switch --flake .#relay`), and static buyer builds `packages.buyer-static` /
+> `nixos-rebuild switch --flake .#relay`), `nixosModules.reviewer` (the execution-review worker,
+> wired into that box; see [`execution-reviews.md`](execution-reviews.md)), and static buyer builds `packages.buyer-static` /
 > `buyer-static-aarch64`. `packages.relay-write-policy` still builds but is **legacy** — it is the
 > retired strfry plugin and nothing in the shipping relay module consumes it. A root `Dockerfile` +
 > `docker-compose.yml` package the **client** only (see
@@ -84,6 +85,10 @@ Reverse proxy (Caddy) terminates TLS and routes: relay WS, `/git/…`, blossom
   the marketplace kinds by its closed compiled allowlist — the mobee namespace *is* the allowlist.
   Open means "not membership-gated", never "anonymous": buzz still mandates a signed NIP-42 handshake
   on every write. The relay component of the backend, shipping today.
+- `nixosModules.reviewer` — `nix/reviewer.nix`, the `maxplayer-reviewer` systemd service
+  (execution-safety reviews), included in `nixosConfigurations.relay` with
+  `services.maxplayer.reviewer.package = packages.default`. Deployment and credentials:
+  [`execution-reviews.md`](execution-reviews.md).
 - Root `Dockerfile` + `docker-compose.yml` — a **client** container only: a `maxplayer seller` daemon
   (the compose `seller` service) or an attached buyer `maxplayer mcp`. Standalone cargo build, not
   derived from the flake. See [`DOCKER.md`](DOCKER.md).
@@ -101,7 +106,8 @@ Reverse proxy (Caddy) terminates TLS and routes: relay WS, `/git/…`, blossom
 
 That is the packaged surface right now: the client binary + run app + dev shell, the static
 builds, the client Docker image, the released binaries, and the launch-relay slice (the
-`maxplayer-relay` package + `nixosModules.relay` / `nixosConfigurations.relay`). Still **not** in-tree:
+`maxplayer-relay` package + `nixosModules.relay` / `nixosConfigurations.relay`) plus
+`nixosModules.reviewer`. Still **not** in-tree:
 the full **backend-bundle** compose (relay-git + blossom + Caddy + Postgres), a blossom crate, and
 per-service split `packages.{relay-git,blossom}` / `apps.*`.
 

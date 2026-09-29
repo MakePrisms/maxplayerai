@@ -131,21 +131,14 @@ Mechanics for a DinD seat (both platforms):
 
 gVisor overhead (Linux seats) is workload-shaped: CPU-bound work is near-native, while syscall/IO/network-heavy work is slower — and **`npm install` is close to the worst case** (thousands of small file ops plus fetches). Modern gVisor (systrap + directfs) is far better than its old reputation; mitigate by keeping cost off the hot path — bake dependency installs into the image at build time, put `node_modules` and caches on a tmpfs overlay, keep a warm package cache. Measure `npm ci` under `runc` vs `runsc` on a real project before judging.
 
-### Image distribution — build-your-own today, publish next (future improvement)
+### Image distribution
 
-**Today the sandbox image is not published anywhere.** `[sandbox] image` is a bare local tag (`maxplayer-sandbox:latest`), and the only way to get it is `docker build -f docker/maxplayer-sandbox/Dockerfile .` from the repository root. Every docker-mode seller builds it themselves — and, for a real agent, extends it with the agent CLI (as with `maxplayer-sandbox-claude`). Four consequences make this untenable at scale:
+**Shipped:** `.github/workflows/publish-sandbox-image.yml` publishes a multi-platform `ghcr.io/makeprisms/maxplayer-sandbox:v<version>` for every release and records its manifest-list digest. With `[sandbox] image` unset, a docker seat uses the version-pinned ref for its own build (`DEFAULT_SANDBOX_IMAGE`, `seller_exec.rs`); `maxplayer-sandbox:latest` is a local-dev tag only. The doctor's `sandbox image` check passes when the image is present, warns with the exact `docker pull <ref>` when it is absent but pullable, and fails when it is unreachable.
 
-- **No pull path.** A bare tag makes `docker run` try Docker Hub, 404, and the seat cannot run jobs — so building is mandatory, not optional.
-- **npm sellers have no Dockerfile.** The daemon ships via npm (the binary); that package does not carry `docker/maxplayer-sandbox/`. So the common install cannot build the image without separately cloning the repo. *(Confirm what the npm package includes.)*
-- **No version pinning.** `:latest` is not reproducible; a buyer cannot know which image ran their job — weak for a marketplace built on verifiable delivery.
-- **The boot gate does not check the image.** `maxplayer doctor` verifies docker is installed but NOT that the configured image exists, so a missing image fails at the pre-advertise probe with a raw docker pull error, not a build/pull hint.
+Still open:
 
-Target end-state:
-
-- **Publish versioned images to a registry** (e.g. `ghcr.io/makeprisms/maxplayer-sandbox:<version>`) via a CI build-and-push job. Sellers **pull**, not build.
 - **Layer:** `maxplayer-sandbox` (base: node + git + CA certs + ACP adapters) and `maxplayer-sandbox-<agent>` (base + the agent CLI). The CLI is now **bakeable with no secret** — the auth token became a runtime `-e` value once credential forwarding landed, so the Dockerfile's "provisioning the CLI is a seller-operator step" note can be revisited.
-- **Digest-pin** the image (`…@sha256:…`) so a buyer can tell exactly what ran.
-- **`maxplayer doctor` should verify the configured image is present or pullable**, and on absence print the exact `docker pull` (or build) command — so a seller gets a clear signal, not a probe-time docker error.
+- **Digest-pin** the image (`…@sha256:…`) so a buyer can tell exactly what ran. CI records the digest today, but seats still pull by tag.
 
 ## 5. v2 — per-OS microVMs
 
@@ -190,4 +183,4 @@ Split out deliberately: this is the largest engineering item in the plan and it 
 - **DinD floor:** decided (§4) — DinD is offered on every seat. Linux keeps full isolation via gVisor; Mac (stock Docker Desktop) accepts a bounded cross-job risk. Residual: surface the Mac compromise to buyers as a seat capability flag, and nudge Mac sellers toward Colima for the gVisor path?
 - **Apple `container` rollout:** depends on sellers being on macOS 26 — track adoption before defaulting Apple Silicon to v2.
 - **Provisioning track (§6):** store poisoning, GC policy, substituter restrictions — all live there, not in v1.
-- **Image distribution (§4):** publish versioned sandbox images (base + per-agent) to a registry so sellers pull instead of build, digest-pin for reproducibility, and make `doctor` check image presence — see §4 for the full write-up.
+- **Image distribution (§4):** versioned base images and the doctor image check have shipped; per-agent images and digest pinning remain open — see §4.

@@ -150,9 +150,11 @@ relay-git, and relay / mint / key are automatic.
 
 ```text
 Usage:
-  maxplayer seller --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--name <display>] [--home <dir>] [--skip-doctor]
+  maxplayer seller --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--accept-open-targeted] [--name <display>] [--home <dir>] [--skip-doctor]
   maxplayer seller   # zero-prompt relaunch from config.toml
   maxplayer seller --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch
+  maxplayer seller fees [--home <dir>]   # per-job ledger: what the buyer paid / mint fee / platform fee (10%) / you keep, plus what is remitted / unremitted
+  maxplayer seller fees remit [--home <dir>] [--dry-run | --confirm]   # inspect / force the platform fee remittance the node performs automatically after each collect; dry run unless --confirm
 
 Notes:
   - required user choices: --agent (or --agent-argv) + --rate-sats (first run)
@@ -161,7 +163,8 @@ Notes:
   - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (no working nix, agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint
   - --skip-doctor: bypass the startup readiness checks (default: checks-on; not recommended). The nix check still runs — it is an environment requirement (#745) with no bypass
   - --unsafe-no-sandbox: serve a STRANGER-FACING surface with no working sandbox (either open surface) — this box then runs code written by strangers with no containment (waives only that one check)
-  - open-pool claiming is OFF by default; pass --claim-open-pool to opt in
+  - BOTH open surfaces are OFF by default, and they are separate: --claim-open-pool opts in to untargeted pool offers, --accept-open-targeted opts in to targeted offers from buyers you have not named
+  - with neither set and no [seller] accept_offers_only_from, this seat claims NOTHING and says so at boot
   - --offer-backfill-secs <n>: see OPEN-POOL offers posted up to n seconds before startup (default 1200; 0 = live-only; targeted offers always backfill)
 ```
 
@@ -427,7 +430,7 @@ For usage-billed API access, use the stdin form:
 printenv OPENAI_API_KEY | codex login --with-api-key
 ```
 
-(The removed `--api-key` flag no longer exists; `--with-api-key` and `--device-auth` do.)
+(`--api-key` is deprecated and hidden — see the warning below; use `--with-api-key` or `--device-auth`.)
 
 ### The verification gate — run this for every provider
 
