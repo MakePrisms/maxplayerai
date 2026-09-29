@@ -16,7 +16,7 @@ fn main() {
     let s = seller.public_key().to_hex();
     let time = 1_800_000_000;
     // Try it appends a text-only instruction to every question (web/app/src/try/wire.ts TEXT_ONLY).
-    let task = "Explain slick tyres 🏎️\nKeep  internal spaces.\n\n(Reply in plain text. Don't create, edit or commit any files.)";
+    let task = "Explain slick tyres 🏎️\nKeep  internal spaces.\n\n(Reply in plain text, under 300 words. Don't create, edit or commit any files.)";
     let od = OfferDraft::new(task, "text/plain", 0, time + 300, &s)
         .with_payment_mode(PaymentMode::None)
         .accepting_delivery(["inline"])

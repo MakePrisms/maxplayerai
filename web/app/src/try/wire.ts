@@ -128,7 +128,11 @@ export function identity() {
 // Appended to every Try it question so Nemo answers in text. Sellers switch to
 // a git delivery whenever the agent writes files, and this page can only show
 // text. It lowers the odds; it is not a guarantee (see the "files" phase).
-export const TEXT_ONLY = "\n\n(Reply in plain text. Don't create, edit or commit any files.)";
+// The word cap keeps the answer inside the seller's inline limit (4 KiB minus
+// the marker line, INLINE_ANSWER_MAX_BYTES); a longer answer can only ship as
+// a file, which this line also forbids, so the seller refuses (no_sentinel).
+// 300 words is ~1.8 KB of English, leaving room for multi-byte text.
+export const TEXT_ONLY = "\n\n(Reply in plain text, under 300 words. Don't create, edit or commit any files.)";
 /** The visitor's question: the offer task minus the text-only instruction. */
 export function questionOf(task: string) {
   if (!task.endsWith(TEXT_ONLY)) throw Error("Missing text-only instruction");
