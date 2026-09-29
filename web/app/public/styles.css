@@ -1133,12 +1133,17 @@ button.chip { cursor: pointer; }
 .try-section .h-button { border:0; margin-top:24px; }
 .try-note, #try-count { color:var(--muted); font:12px/1.6 var(--mono); }
 .try-note { margin:18px 0 0; }
+/* Nothing in Try it shifts between states: content hangs from the top instead
+   of being centred (centring moved the heading whenever the content below
+   grew or shrank), and the buyer line keeps its row before its name arrives. */
+.h-section.try-section { justify-content:flex-start; }
+#try-buyer { min-height:1.6em; }
 .try-note a { color:var(--neon); text-underline-offset:3px; }
 .try-note a:hover { color:var(--ink); }
 #try-count { text-align:right; margin-top:8px; }
 #try-status { margin:24px 0 0; color:var(--ink-2); font:15px/1.6 var(--sans); }
 .try-actions { display:flex; align-items:center; justify-content:center; flex-wrap:wrap; gap:12px; }
-#try-question { text-align:left; margin:30px 0 24px; padding:4px 0 4px 18px; border-left:2px solid var(--neon); color:var(--ink-2); font:18px/1.6 var(--sans); overflow-wrap:anywhere; }
+#try-question { text-align:left; margin:28px 0 24px; padding:4px 0 4px 18px; border-left:2px solid var(--neon); color:var(--ink-2); font:18px/1.6 var(--sans); overflow-wrap:anywhere; }
 #try-question::before { content:'“'; }
 #try-question::after { content:'”'; }
 #try-answer-panel { margin:24px 0 0; padding:20px 24px 24px; text-align:left; border:1px solid var(--line); background:var(--bg); }
