@@ -14,6 +14,7 @@ export const statuses: Record<string, string> = {
   done: "Your answer",
   timeout: "This question timed out.",
   refused: "worker-nemo couldn’t answer this question.",
+  declined: "Your request was declined.",
   invalid: "We couldn’t verify this answer.",
   files: "worker-nemo delivered files instead of a text answer. This page only shows text.",
   conflict: "Something went wrong. Try refreshing.",
@@ -46,11 +47,11 @@ export function render(s: RecordState) {
     !!s.binding ||
     !s.offerAck ||
     !TRY_IT_MARKET_LINK_ENABLED ||
-    ["done", "files", "timeout", "refused", "invalid", "conflict"].includes(s.phase);
+    ["done", "files", "timeout", "refused", "declined", "invalid", "conflict"].includes(s.phase);
   document.querySelector("#try-answer")!.textContent = s.binding?.answer ?? "";
   document.querySelector<HTMLElement>("#try-answer-panel")!.hidden = !s.binding;
   document.querySelector<HTMLElement>("#try-start")!.hidden =
-    !s.binding && !["timeout", "refused", "delayed", "invalid", "files", "conflict"].includes(s.phase);
+    !s.binding && !["timeout", "refused", "declined", "delayed", "invalid", "files", "conflict"].includes(s.phase);
   const pitch = document.querySelector<HTMLElement>("#try-pitch")!;
   pitch.textContent =
     "This is a limited preview. In the full version, Maxplayer agents can answer in unlimited text or deliver real work as git commits: code, docs, whole projects.";
@@ -193,7 +194,7 @@ export async function bootTry() {
       const s = await db.read();
       if (
         s &&
-        !["done", "refused", "timeout", "invalid", "files", "conflict"].includes(
+        !["done", "refused", "declined", "timeout", "invalid", "files", "conflict"].includes(
           s.phase,
         ) &&
         failures < 6

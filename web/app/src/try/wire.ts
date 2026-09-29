@@ -1,5 +1,6 @@
 import {
   OFFER,
+  REVIEW,
   CLAIM,
   RESULT,
   AWARD,
@@ -12,6 +13,25 @@ import { sha256 } from "@noble/hashes/sha256";
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils";
 export const NEMO =
   "f0a77fbdcd2a2dc944310fcb1e5cc03a0120087fb81290822d2420084fa6d1ce";
+// Maxplayer's review service (crates/maxplayer-core/src/home.rs DEFAULT_PRIVACY_SERVICE_PUBKEY).
+// Sellers skip an offer its execution-safety check rates unsafe (review.rs, threshold 0.5).
+export const REVIEWER =
+  "31b18b42bcef9842c10e518834d32da2a0f8f6f8f3758124e25cc392ada1fe5c";
+/** True when a signed REVIEW from the review service flags this offer as unsafe. */
+export function declines(e: Event, offerId: string, reviewer = REVIEWER): boolean {
+  try {
+    verify(e);
+    if (e.kind !== REVIEW || e.pubkey !== reviewer) return false;
+    const r = JSON.parse(e.content);
+    if (r?.status !== "ok" || r.subject?.offer !== offerId || r.subject?.event !== offerId || r.subject?.kind !== OFFER)
+      return false;
+    const c = (r.results ?? []).find((x: any) => x?.classifier === "execution-safety");
+    const p = c?.probabilities?.unsafe;
+    return typeof p === "number" && Number.isFinite(p) && p >= 0.5;
+  } catch {
+    return false;
+  }
+}
 export const RELAY_HTTP = "https://relay.maxplayer.ai/events";
 export const RELAY_WS = "wss://relay.maxplayer.ai";
 export interface Event {

@@ -84,6 +84,7 @@ for (const width of [320, 390, 1440]) {
     "done",
     "timeout",
     "refused",
+    "declined",
     "invalid",
     "files",
     "conflict",
@@ -98,7 +99,7 @@ for (const width of [320, 390, 1440]) {
     );
     const state = await evaluate(`(()=>{const visible=id=>!document.querySelector(id).hidden;return {form:visible('#try-form'),question:visible('#try-question'),answer:visible('#try-answer-panel'),market:visible('#try-market'),refresh:visible('#try-check'),status:visible('#try-status')}})()`);
     const ready = ['ready','offline','storage-unavailable'].includes(phase);
-    if(state.form!==ready || state.question===ready || state.answer!==['done','accept-pending'].includes(phase) || (phase==='done' && state.status) || (['done','files','timeout','refused','invalid','conflict'].includes(phase) && state.market) || (phase==='working' && state.refresh)) throw Error(JSON.stringify({phase,state}));
+    if(state.form!==ready || state.question===ready || state.answer!==['done','accept-pending'].includes(phase) || (phase==='done' && state.status) || (['done','files','timeout','refused','declined','invalid','conflict'].includes(phase) && state.market) || (phase==='working' && state.refresh)) throw Error(JSON.stringify({phase,state}));
     reports.push({ phase, ...metrics, state });
     // The heading, buyer line and question/form row sit at the same height in every state.
     const first = reports.find((r) => r.width === width);
