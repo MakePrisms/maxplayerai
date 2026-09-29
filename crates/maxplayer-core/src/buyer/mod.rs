@@ -899,7 +899,7 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
             };
         }
     }
-    let (award_amount, claim_id, send_relay, quoted_mints) = match &attempt {
+    let (award_amount, claim_id, send_relay, mut quoted_mints) = match &attempt {
         Some(attempt) => (
             attempt.amount_sats,
             attempt.claim_id.clone(),
@@ -1009,6 +1009,9 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
                 ),
             );
         }
+        // An attempt pinned meanwhile froze its claim's quoted mints; the ceiling must use those,
+        // not the list read before the guard.
+        quoted_mints = attempt_quoted_mints(&current);
     }
     let ceiling = match award_ceiling(context, &params.job_id, &quoted_mints, award_amount).await {
         Ok(ceiling) => ceiling,
@@ -1359,57 +1362,71 @@ async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
     }
 }
 
-/// Honest reserve snapshot: the live wallet balance (through the actor) and the budget spent total
-/// (fresh fold, shown in status). Never a sentinel or a stale cached value. Issue #378 removed the
-/// total cap, so the wallet balance is the sole reservation ceiling.
-async fn money_snapshot(context: &BuyerContext) -> Result<(u64, u64), String> {
-    let balance = context
-        .wallet
-        .balance()
-        .await
-        .map_err(|error| error.to_string())??;
-    let gate = BudgetGate::from_home(&context.home).map_err(|error| error.to_string())?;
-    Ok((balance, gate.spent()))
-}
-
 /// The wallet ceiling an award of `amount_sats` is reserved against (#1076): the balance at the ONE
 /// mint that will fund it, chosen exactly as accept will choose it.
 ///
-/// Before this, every reserve site read `money_snapshot`'s balance, which is the actor wallet's
-/// `total_balance()` — bound to the DEFAULT mint only. A buyer whose covering balance sat at an
-/// extra mint the seller accepts was refused ("200 sat exceeds available 0 sat") even though accept
-/// (`select_source_mint`) would have paid from that mint directly. Summing every mint instead
-/// would be the opposite defect: 150 + 150 at two mints passes a 200 award no single mint can pay.
+/// Before this, every reserve site read the actor wallet's `total_balance()` — bound to the
+/// DEFAULT mint only. A buyer whose covering balance sat at an extra mint the seller accepts was
+/// refused ("200 sat exceeds available 0 sat") even though accept (`select_source_mint`) would
+/// have paid from that mint directly. Summing every mint instead would be the opposite defect:
+/// 150 + 150 at two mints passes a 200 award no single mint can pay.
 ///
-/// The mint is decided by, in order: the mint already recorded on this job's reservation (a
-/// re-hold never re-selects, so a balance shift cannot move a reservation between mints); else
+/// The mint is decided by, in order: a LIVE reservation's pin (a re-hold never re-selects, and
+/// accept seals the same pin — see `job_lifecycle::accept_source_seed`); else
 /// [`crate::crossmint::select_source_mint`] over the claim's quoted mints and the configured
-/// per-mint balances — the same call, inputs and fallback accept uses. A failed per-mint read
-/// falls back to the pre-#1076 pooled default-mint check (logged): conservative, never looser.
+/// per-mint balances — the same call and inputs accept uses. A failed per-mint read REFUSES
+/// (retryable at every call site): admitting against some other figure would leave a hold that
+/// the per-mint sums of later awards do not see.
 async fn award_ceiling(
     context: &BuyerContext,
     job_id: &str,
     quoted_mints: &[String],
     amount_sats: u64,
 ) -> Result<MintCeiling, String> {
-    let recorded = context
+    let pin = context
         .store
-        .reservation_mint(job_id)
+        .reservation_pin(job_id)
         .map_err(|error| error.to_string())?;
-    let balances = match context.wallet.balances().await.map_err(|error| error.to_string())? {
-        Ok(rows) => rows,
-        Err(error) => {
-            crate::opline!(
-                "buyer: per-mint balance read failed for {job_id} ({error}); checking the award \
-                 against the default-mint balance"
-            );
-            let (balance, _spent) = money_snapshot(context).await?;
-            return Ok(MintCeiling::pooled(balance));
-        }
-    };
-    Ok(award_ceiling_from_balances(
+    let read = context
+        .wallet
+        .balances()
+        .await
+        .map_err(|error| error.to_string())?;
+    ceiling_from_read(
         context.home.config.default_mint(),
         context.home.config.allow_real_mints,
+        &pin,
+        quoted_mints,
+        read,
+        amount_sats,
+        job_id,
+    )
+}
+
+/// [`award_ceiling`] after its reads: refuse on a failed per-mint read, else choose the mint.
+fn ceiling_from_read(
+    default_mint: &str,
+    allow_real_mints: bool,
+    pin: &store::ReservationPin,
+    quoted_mints: &[String],
+    read: Result<Vec<crate::wallet_ops::MintBalance>, String>,
+    amount_sats: u64,
+    job_id: &str,
+) -> Result<MintCeiling, String> {
+    let balances = read.map_err(|error| {
+        format!(
+            "per-mint balance read failed for job {job_id} ({error}); the award ceiling cannot be \
+             checked, so nothing was reserved — retry"
+        )
+    })?;
+    let recorded = match pin {
+        store::ReservationPin::Unpinned => None,
+        store::ReservationPin::Default => Some(default_mint.to_owned()),
+        store::ReservationPin::Mint(mint) => Some(mint.clone()),
+    };
+    Ok(award_ceiling_from_balances(
+        default_mint,
+        allow_real_mints,
         recorded.as_deref(),
         quoted_mints,
         &balances,
@@ -3537,6 +3554,42 @@ mod tests {
             vec![mint_row(CEIL_DEFAULT, 0, true, true), mint_row(CEIL_OTHER, 900, false, false)];
         let ceiling = award_ceiling_from_balances(CEIL_DEFAULT, true, None, &quoted, &balances, 200);
         assert_eq!(ceiling, MintCeiling::at_mint(CEIL_DEFAULT, 0, true));
+    }
+
+    // #1076 review finding 3: a failed per-mint read REFUSES instead of admitting a pooled NULL row
+    // that later per-mint checks at other mints would not see.
+    #[test]
+    fn a_failed_per_mint_read_refuses_the_award() {
+        let error = ceiling_from_read(
+            CEIL_DEFAULT,
+            true,
+            &store::ReservationPin::Unpinned,
+            &[CEIL_EXTRA.to_owned()],
+            Err("wallet db locked".to_owned()),
+            200,
+            "job-x",
+        )
+        .expect_err("no ceiling without a per-mint read");
+        assert!(error.contains("job-x") && error.contains("nothing was reserved"), "{error}");
+    }
+
+    // A live unrecorded reservation is held at the default: its re-hold is checked there, not at a
+    // mint a fresh selection would now pick.
+    #[test]
+    fn a_default_pin_checks_the_rehold_at_the_default() {
+        let balances =
+            vec![mint_row(CEIL_DEFAULT, 250, true, true), mint_row(CEIL_EXTRA, 900, false, true)];
+        let ceiling = ceiling_from_read(
+            CEIL_DEFAULT,
+            true,
+            &store::ReservationPin::Default,
+            &[CEIL_EXTRA.to_owned()],
+            Ok(balances),
+            200,
+            "job-x",
+        )
+        .expect("ceiling");
+        assert_eq!(ceiling, MintCeiling::at_mint(CEIL_DEFAULT, 250, true));
     }
 
     // A re-hold of an existing reservation is checked at the mint recorded on it, never re-selected:
