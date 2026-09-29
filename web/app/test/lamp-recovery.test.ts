@@ -181,24 +181,23 @@ test("a terminal event stamped in the mark's own second, delivered late, still e
   const o = offer(BUYER, T0, T0 + 50_000);
   const c = claim(o.id, SELLER, T0 + 1);
   const a = award(o.id, SELLER, T0 + 2);
-  const r = result(o.id, SELLER, T0 + 3);
-  relay.events.push(o, c, a, r);
-  const b = boot(relay, [o, c, a, r]);
-  assert.ok(lampOn(b.engine.cache.all(), SELLER), "delivered, unpaid: the runner's lamp is on");
+  relay.events.push(o, c, a);
+  const b = boot(relay, [o, c, a]);
+  assert.ok(lampOn(b.engine.cache.all(), SELLER), "awarded, not delivered: the runner's lamp is on");
 
   // Tick 1: an unrelated offer stamped T raises the mark to T.
   const T = T0 + 100;
   relay.events.push(offer(BUYER2, T, T + 50_000));
   b.tick();
-  assert.equal(b.engine.cache.size, 5, "tick 1 delivered the offer that raised the mark");
+  assert.equal(b.engine.cache.size, 4, "tick 1 delivered the offer that raised the mark");
 
-  // Then the receipt, ALSO stamped T, reaches the relay. Tick 2 must still see it.
-  const paid = receipt(o.id, T);
-  relay.events.push(paid);
+  // Then the delivery, ALSO stamped T, reaches the relay. Tick 2 must still see it.
+  const done = result(o.id, SELLER, T);
+  relay.events.push(done);
   b.tick();
   const again = b.sock.reqs[b.sock.reqs.length - 1]!.filters[0]!.since as number;
-  assert.ok(again <= T, `tick 2 asked since ${again}, above the mark ${T} — the receipt stamped ${T} can never be returned`);
-  assert.ok(b.engine.cache.has(paid.id), "the late receipt was delivered");
+  assert.ok(again <= T, `tick 2 asked since ${again}, above the mark ${T} — the result stamped ${T} can never be returned`);
+  assert.ok(b.engine.cache.has(done.id), "the late result was delivered");
   assert.equal(lampOn(b.engine.cache.all(), SELLER), false, "and the runner's lamp is out");
   assert.equal(lampOn(b.engine.cache.all(), BUYER), false, "and the racer's");
 });
@@ -225,10 +224,11 @@ test("every forward ask trails the mark by exactly the overlap; the mark stays m
 
 /* ---------------- D2: recovery ---------------- */
 
-test("a store seeded PAST a missed receipt converges to job-ended on the next boot, without clearing IndexedDB", () => {
-  // THE STICKY CASE — Bob's computer. The cache holds the job's offer, claim,
-  // award and result, plus later events that raised its newest stamp far
-  // above the receipt it never received. History is marked complete, so the
+test("a store seeded PAST a missed delivery converges to job-ended on the next boot, without clearing IndexedDB", () => {
+  // THE STICKY CASE — Bob's computer. The cache holds the job's offer, claim
+  // and award, plus later events that raised its newest stamp far above the
+  // result it never received. (Delivery is what ends a lamp, so the result is
+  // the terminal event that matters.) History is marked complete, so the
   // base source resumes from `newest + 1` and the receipt is never asked for
   // again: every reload rebuilds the same lamp from the same IndexedDB. The
   // phone, with a fresh store, walks history and shows the job done.
@@ -236,17 +236,17 @@ test("a store seeded PAST a missed receipt converges to job-ended on the next bo
   const o = offer(BUYER, T0, T0 + 50_000);
   const c = claim(o.id, SELLER, T0 + 1);
   const a = award(o.id, SELLER, T0 + 2);
-  const r = result(o.id, SELLER, T0 + 3);
-  const paid = receipt(o.id, T0 + 100);                   // on the relay, never in this store
+  const paid = result(o.id, SELLER, T0 + 100);             // on the relay, never in this store
   const beat = heartbeat(SELLER, T0 + 4000);
   const later = offer(BUYER2, T0 + 5000, T0 + 50_000);     // what raised the mark
-  relay.events.push(o, c, a, r, paid, beat, later);
-  const cached = [o, c, a, r, beat, later];
+  relay.events.push(o, c, a, paid, beat, later);
+  const cached = [o, c, a, beat, later];
+  assert.ok(lampOn(cached, SELLER), "precondition: the store shows the runner working");
 
   const b = boot(relay, cached);
-  assert.ok(b.engine.cache.newest! > paid.created_at, "precondition: the store's mark is above the missed receipt");
+  assert.ok(b.engine.cache.newest! > paid.created_at, "precondition: the store's mark is above the missed result");
   assert.equal(b.engine.cache.has(paid.id), true,
-    `the boot walk did not reach the receipt (asked since ${String(b.sock.reqs[0]!.filters[0]!.since)}, receipt at ${paid.created_at})`);
+    `the boot walk did not reach the result (asked since ${String(b.sock.reqs[0]!.filters[0]!.since)}, result at ${paid.created_at})`);
   assert.equal(lampOn(b.engine.cache.all(), SELLER), false, "the runner's lamp is out");
   assert.equal(lampOn(b.engine.cache.all(), BUYER), false, "the racer's lamp is out");
   for (const e of cached) assert.ok(b.engine.cache.has(e.id), "nothing the store held was thrown away to get here");
@@ -280,7 +280,8 @@ test("recoveryFloor: null with nothing open, the oldest open job otherwise, neve
   const a = award(o.id, SELLER, T0 + 2);
   const r = result(o.id, SELLER, T0 + 3);
   assert.equal(recoveryFloor([o, c, a, r, receipt(o.id, T0 + 4)], NOW), null, "a paid job needs no recovery");
-  assert.equal(recoveryFloor([o, c, a, r], NOW), T0, "an unpaid delivery reaches back to the offer");
+  assert.equal(recoveryFloor([o, c, a, r], NOW), null, "nor does a delivered one: delivery ends the lamp");
+  assert.equal(recoveryFloor([o, c, a], NOW), T0, "an undelivered award reaches back to the offer");
   assert.equal(recoveryFloor([], NOW), null);
 
   // An award nobody ever delivers against stays open forever; the floor must not.
