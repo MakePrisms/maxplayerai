@@ -894,7 +894,7 @@ fn fetch_review_ref_inner(
     let check = budget.clone();
     let mut callbacks = RemoteCallbacks::new();
     callbacks.transfer_progress(move |p| {
-        check.check().is_ok() && p.received_bytes() <= max_bytes && p.total_objects() <= 100_000
+        check.check().is_ok() && p.received_bytes() <= max_bytes && p.total_objects() <= crate::private_content::MAX_OBJECTS
     });
     let mut options = FetchOptions::new();
     options
@@ -2119,7 +2119,7 @@ pub fn fetch_bounded_objects(repo: &Repository, remote_url: &str, refs: &[&str],
     let header=header.filter(|_| crate::delivery_transport::is_relay_git_locator(remote_url)).map(str::to_owned);
     let mut remote=bound_remote(repo,remote_url)?;
     let mut callbacks=RemoteCallbacks::new();
-    callbacks.transfer_progress(|progress| progress.received_bytes() as u64 <= crate::private_content::MAX_REPO_BYTES && progress.total_objects() <= 100_000);
+    callbacks.transfer_progress(|progress| progress.received_bytes() <= crate::private_content::MAX_GIT_TRANSFER_BYTES && progress.total_objects() <= crate::private_content::MAX_OBJECTS);
     let mut options=FetchOptions::new();
     options.download_tags(AutotagOption::None).remote_callbacks(callbacks);
     let context=LegContext {mint:header.map(static_auth),authority:None,lifetime:None,short:true,read_budget:None,intended_url:remote_url.into()};

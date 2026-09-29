@@ -11,7 +11,7 @@ use base64::Engine;
 use buzz_core::TenantContext;
 use buzz_db::private_jobs::PrivateJobRepo;
 use maxplayer_private_protocol::{
-    is_hex, strict_json,
+    is_hex, strict_json, MAX_COMMITS, MAX_FILE_BYTES, MAX_FILES, MAX_OBJECTS, MAX_REPO_BYTES,
     wire::{self, HostPolicy},
 };
 use nostr::{Event, JsonUtil};
@@ -259,7 +259,7 @@ pub async fn provision(
             unavailable()
         })?;
     Ok(Json(
-        serde_json::json!({"repo":format!("{prefix}{buyer}/{job_id}"),"job_id":job_id,"max_file_bytes":10485760,"max_repository_bytes":104857600,"max_files":1000}),
+        serde_json::json!({"repo":format!("{prefix}{buyer}/{job_id}"),"job_id":job_id,"max_file_bytes":MAX_FILE_BYTES,"max_repository_bytes":MAX_REPO_BYTES,"max_files":MAX_FILES}),
     ))
 }
 
@@ -294,7 +294,7 @@ async fn inspect_quota(repo: &std::path::Path) -> Result<(), Response> {
     let mut objects = 0usize;
     for line in text.lines() {
         objects += 1;
-        if objects > 100_000 {
+        if objects > MAX_OBJECTS {
             return Err(quota_error());
         }
         let fields: Vec<_> = line.split(' ').collect();
@@ -303,11 +303,11 @@ async fn inspect_quota(repo: &std::path::Path) -> Result<(), Response> {
         }
         let size = fields[2].parse::<u64>().map_err(|_| deny())?;
         total = total.checked_add(size).ok_or_else(quota_error)?;
-        if total > 100 * 1024 * 1024 || (fields[1] == "blob" && size > 10 * 1024 * 1024) {
+        if total > MAX_REPO_BYTES || (fields[1] == "blob" && size > MAX_FILE_BYTES) {
             return Err(quota_error());
         }
         if fields[1] == "commit" {
-            if commits.len() >= 1000 {
+            if commits.len() >= MAX_COMMITS {
                 return Err(quota_error());
             }
             commits.push(fields[0]);
@@ -318,7 +318,7 @@ async fn inspect_quota(repo: &std::path::Path) -> Result<(), Response> {
         let mut files = 0usize;
         for entry in tree.split(|b| *b == 0).filter(|s| !s.is_empty()) {
             files += 1;
-            if files > 1000 {
+            if files > MAX_FILES {
                 return Err(quota_error());
             }
             // No submodule auto-fetch or symlink materialization from private inputs.

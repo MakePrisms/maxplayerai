@@ -47,7 +47,7 @@ buyer_delivery = true
 skip_buyer_pubkeys = []
 skip_seller_pubkeys = []
 reject_at_or_above_ppm = 500000
-timeout_seconds = 30
+timeout_seconds = 300
 
 [review.reviewers]
 "wss://relay.maxplayer.ai" = "31b18b42bcef9842c10e518834d32da2a0f8f6f8f3758124e25cc392ada1fe5c"
@@ -98,7 +98,7 @@ for verifying signed reviews on the next check.
 
 ## Timeouts and actual retry actions
 
-A client wait defaults to 30 seconds. **A timeout ends that review wait, not the job.**
+A client wait defaults to 300 seconds. Existing explicit shorter timeouts remain in effect. **A timeout ends that review wait, not the job.**
 It does not claim, accept, reject, pay, bypass the check, or extend job deadlines.
 
 Seller:
@@ -264,8 +264,12 @@ hooks, builds or execution. Scratch data is removed after success or failure.
 A process crash can leave scratch directories under the OS temporary directory;
 normal host temporary-file cleanup should reclaim them.
 
-Git reads share the request's 30-second deadline, with a 10-second maximum per
-HTTP leg, a 32 MiB aggregate HTTP-response cap and a 100,000-object transfer cap.
+Git reads share the request's 300-second deadline, with a 10-second maximum per
+HTTP leg. The aggregate HTTP-response cap uses the shared Git transfer budget: the 100 MiB
+repository quota plus framing/compression allowance (64 bytes per allowed object
+and 64 KiB fixed overhead). Client private-input fetches use that budget too; the
+retained uncompressed quota stays 100 MiB. The transfer object cap uses the shared
+100,000-object quota.
 The existing review input/file limits still apply after fetching. Inaccessible,
 missing, oversized, or timed-out fetches produce an error review, never approval.
 These bounds can reject large Git histories even when the final files are small.
@@ -284,8 +288,11 @@ Relay-level admission controls are still needed against identity churn.
 
 ## Provider retries, deduplication, and crashes
 
-The worker has a 30-second processing budget including input acquisition. It makes
-**at most three provider attempts total**: initial call plus two retries. Only
+The worker has a 300-second processing budget including input acquisition. Each
+provider request has a 30-second HTTP timeout and **at most three attempts**:
+initial call plus two retries. Larger snapshots use bounded, overlapping batches
+with at most four concurrent provider requests; the whole batch set shares the
+same 300-second deadline. Only
 transport failures, HTTP 408/429, and server errors are transient. Other HTTP errors,
 invalid JSON/probabilities, and oversized responses stop immediately. Redirects and
 hidden HTTP retries are disabled. Backoff honors numeric `Retry-After`; date-form or
@@ -317,19 +324,49 @@ block; no automatic retry seeks a more permissive probability.
 ## Exact input and coverage
 
 Canonical JSON contains the subject, full verified offer, full verified result when
-present, and a sorted path manifest. Each manifest item contains a SHA-256 byte hash
-and exact UTF-8 text. Git data comes from the advertised immutable commit, not branch
+present, a sorted path-to-SHA-256 manifest, and a hash-to-exact-UTF-8-text
+dictionary (shared blobs appear only once). Git data comes from the advertised immutable commit, not branch
 HEAD or a worktree. No hooks, scripts, build steps, filters, or delivered code run.
 Inline deliveries are supported only when the offer declares inline support and the
 RESULT passes the existing inline parser; their signed event ID binds the text.
 
-Limits: 128 KiB source JSON and serialized provider request, 256 files, 4096 tree entries, 4096-byte paths, 16 KiB
-provider/review response. Symlinks, submodules, non-UTF-8 paths/content, binary blobs,
-inaccessible objects, and incomplete/oversized input fail closed. No truncation.
-The input digest covers **the actual serialized provider request**, including the
-classifier instructions and requested model, not only the file list. The returned
-model identity is recorded in the signed `provider` tag. `jev-latest` is an alias,
-not pinned weights; configure a pinned provider model for reproducible evaluation.
+Repository file limits now reference the same protocol constants as private-job
+hosting and client preflight: **1,000 files and 10 MiB per blob**, with a **100 MiB
+unique-blob budget** for the inspected snapshot. Repeated blobs share storage in
+memory and appear once in the content map; every path remains in the path-to-hash
+manifest. The private repository quota additionally counts all retained Git objects
+and caps history at 1,000 commits / 100,000 objects. That existing admission policy
+is unchanged. Ordinary public relay repositories retain their separate configurable
+pack-storage quotas (500 MiB per pack / 1,000 MiB per repository by default); this
+change does **not** impose private admission quotas on public hosting or make the
+reviewer support every public storage configuration.
+
+Signed source events remain bounded at 128 KiB. Provider requests remain bounded
+at 128 KiB serialized, with at most 30 KiB of state (conservative UTF-8 byte budget
+for TypeSafe's [32k-token state + question limit](https://docs.typesafe.ai/models)).
+Larger canonical snapshots are split into UTF-8-aligned fragments up to 24 KiB with
+1 KiB overlap; JSON escaping can reduce the fragment size further. Every byte,
+including all source events and all file contents, participates. No truncation or
+sampling. At most 100,000 tree entries are walked; paths longer than 4096 bytes,
+symlinks, submodules, non-UTF-8 paths/content, binary blobs, inaccessible objects,
+and incomplete inputs still fail closed. Provider/review responses remain 16 KiB.
+
+An OK review requires a valid response for **every** fragment, all from the same
+returned model identity. The aggregate uses the largest `unsafe` probability across
+fragments; it is a conservative screening score, **not a calibrated probability for
+the repository as a whole**. Fragmentation loses global context and overlap does not
+guarantee detection of attacks spanning distant fragments. These reviews remain a
+safety signal, not proof that execution is safe. A failed, timed-out, or malformed
+fragment produces an error review, never approval based on partial results. Large
+reviews make more billable provider calls and can still hit timeouts/rate limits.
+
+For a single request the input digest covers the actual serialized provider request.
+For multiple requests it covers a domain-separated, ordered, length-prefixed list
+of **all exact provider request bytes**, including instructions, requested model,
+fragment offsets and complete source hash. Thus batching strategy and any input
+change invalidate the cache. Completed reviews remain immutable; a crash during a
+batch set remains indeterminate and is not silently rebilled. Returned model identity
+is recorded in the signed `provider` tag. Configure a pinned model for reproducibility.
 
 The required classifier is `execution-safety`, version `1`. Unknown optional classifiers do not influence it; duplicates, unsupported
 versions, invalid probability distributions, or wrong subject/signature fail closed.

@@ -18,6 +18,13 @@ pub const MAX_ENVELOPE_BYTES: usize = 23 * 1024;
 pub const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
 pub const MAX_REPO_BYTES: u64 = 100 * 1024 * 1024;
 pub const MAX_FILES: usize = 1000;
+/// Retained history/object quotas, shared by client preflight and relay quarantine.
+pub const MAX_COMMITS: usize = 1000;
+pub const MAX_OBJECTS: usize = 100_000;
+/// Wire framing/compression overhead is not retained repository content. Give
+/// near-quota incompressible packs room without weakening the uncompressed quota.
+pub const MAX_GIT_TRANSFER_BYTES: usize =
+    MAX_REPO_BYTES as usize + MAX_OBJECTS * 64 + 64 * 1024;
 
 /// Errors intentionally contain no untrusted content, keys, paths, or decoded message text.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -13,7 +13,7 @@ pub fn check_objects(repo: &Repository) -> Result<()> {
     let mut ids = Vec::new();
     let mut overflow = false;
     odb.foreach(|oid| {
-        if ids.len() >= 100_000 {
+        if ids.len() >= super::MAX_OBJECTS {
             overflow = true;
             return false;
         }
@@ -40,7 +40,7 @@ pub fn check_objects(repo: &Repository) -> Result<()> {
         }
         if kind == ObjectType::Commit {
             commits += 1;
-            if commits > 1000 {
+            if commits > super::MAX_COMMITS {
                 return Err(Error("input history too large"));
             }
             let commit = repo
