@@ -24,6 +24,8 @@ import {
   sign,
   validName,
   verify,
+  declines,
+  REVIEWER,
 } from "../src/try/wire.js";
 import { createRecord, openStore, RecordState } from "../src/try/store.js";
 import { step, Transport } from "../src/try/controller.js";
@@ -345,6 +347,28 @@ test("a git delivery shows the files state, not invalid, and publishes no ACCEPT
   assert.equal(s!.phase, "files");
   assert.equal(s!.binding, undefined);
   assert.ok(!m.published.some((e) => e.kind === 3406));
+  db.close();
+});
+test("a safety-check decline shows declined; only the review service's signed unsafe verdict counts", async () => {
+  const { f, db } = await setup(),
+    reviewer = "03".repeat(32),
+    review = (unsafe: number, key = reviewer, offer = f.offer.id) =>
+      sign(key, 3408, [["e", offer, "", "root"], ["e", offer, "", "reply"]], JSON.stringify({
+        schema: 1, subject: { offer, event: offer, kind: 3401, commit: null }, input_sha256: "00".repeat(32),
+        status: "ok", results: [{ classifier: "execution-safety", version: "1", label: unsafe >= 0.5 ? "unsafe" : "safe",
+          probabilities: { safe: 1 - unsafe, unsafe } }], error_code: null }), f.offer.created_at + 2);
+  const ok = review(0.99), rk = ok.pubkey;
+  assert.ok(declines(ok, f.offer.id, rk));
+  assert.ok(!declines(review(0.1), f.offer.id, rk));
+  assert.ok(!declines(review(0.99, "04".repeat(32)), f.offer.id, rk), "wrong signer");
+  assert.ok(!declines(review(0.99, reviewer, "ab".repeat(32)), f.offer.id, rk), "other offer");
+  assert.ok(!declines(ok, f.offer.id), "only the real review service by default");
+  assert.equal(REVIEWER, "31b18b42bcef9842c10e518834d32da2a0f8f6f8f3758124e25cc392ada1fe5c");
+  // A safe verdict leaves the job waiting; an unsafe one ends it, before and after the 30s mark.
+  assert.equal((await step(db, mock([review(0.1)]).t, f.offer.created_at + 5, f.claim.pubkey, () => {}, rk))!.phase, "waiting");
+  const m = mock([ok]);
+  assert.equal((await step(db, m.t, f.offer.created_at + 5, f.claim.pubkey, () => {}, rk))!.phase, "declined");
+  assert.ok(!m.published.some((e) => e.kind === 3405), "no award");
   db.close();
 });
 test("every offer carries the text-only instruction; the question shown is the visitor's own", () => {

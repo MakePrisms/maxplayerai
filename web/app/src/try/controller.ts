@@ -1,11 +1,13 @@
-import { CLAIM, RESULT, FEEDBACK, AWARD, ACCEPT } from "../model/kinds.js";
+import { CLAIM, RESULT, FEEDBACK, AWARD, ACCEPT, REVIEW } from "../model/kinds.js";
 import {
   auth,
   claim,
+  declines,
   Event,
   Evidence,
   NEMO,
   now,
+  REVIEWER,
   one,
   result,
   selectionTags,
@@ -24,6 +26,7 @@ export async function step(
   time = now(),
   seller = NEMO,
   notify: (state: RecordState) => void = () => {},
+  reviewer = REVIEWER,
 ): Promise<RecordState | undefined> {
   let s = await store.read();
   if (!s) return;
@@ -196,6 +199,17 @@ export async function step(
     } catch {
       /* unrelated */
     }
+  }
+  // The safety check flagged the question, so no seller will take it.
+  if (!s.claim) {
+    const reviews = await transport.read({
+      "#e": [s.offer.id],
+      authors: [reviewer],
+      kinds: [REVIEW],
+      limit: 10,
+    });
+    if (reviews.some((e) => declines(e, s!.offer.id, reviewer)))
+      return save({ phase: "declined" });
   }
   if (time > s.offer.created_at + 330) return save({ phase: "timeout" });
   if (!s.claim && time > s.offer.created_at + 30)

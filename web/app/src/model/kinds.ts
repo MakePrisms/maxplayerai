@@ -40,6 +40,8 @@ export const RECEIPT = 3400;
  * false "offline".
  */
 export const HEARTBEAT = 30340;
+/** Signed execution-safety review of an offer or result, published by Maxplayer's review service. */
+export const REVIEW = 3408;
 
 /** The maxplayer namespace tag value. Every trade event and the heartbeat carry `["t","maxplayer"]`. */
 export const MAXPLAYER_TAG = "maxplayer";
