@@ -308,8 +308,9 @@ fn verify_object(
 }
 
 /// Bounded object-only inspection. Symlinks, submodules and non-text blobs fail closed.
-pub fn git_files(path: &Path, commit: &str) -> Result<Vec<(String, Arc<[u8]>)>, String> {
+pub fn git_files(path: &Path, commit: &str) -> Result<Vec<(String, Arc<ReviewBlob>)>, String> {
     let repo = git2::Repository::open_bare(path).map_err(|_| "input_unavailable")?;
+    crate::private_content::repositories::check_object_quotas(&repo).map_err(|_| "input_too_large")?;
     let oid = git2::Oid::from_str(commit).map_err(|_| "invalid_subject")?;
     verify_object(&repo, oid, git2::ObjectType::Commit)?;
     let commit = repo.find_commit(oid).map_err(|_| "input_unavailable")?;
@@ -318,14 +319,12 @@ pub fn git_files(path: &Path, commit: &str) -> Result<Vec<(String, Arc<[u8]>)>, 
     let mut files = Vec::new();
     let mut size = 0usize;
     let mut failure = None;
-    let mut blobs = BTreeMap::<git2::Oid, Arc<[u8]>>::new();
-    let mut entries = 0usize;
+    let spool = Arc::new(private_spool()?);
+    let mut blobs = BTreeMap::<git2::Oid, Arc<ReviewBlob>>::new();
     let deadline = std::time::Instant::now() + WINDOW;
     tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
-        entries += 1;
-        let mut read = || -> Result<Option<(String, Arc<[u8]>)>, String> {
+        let mut read = || -> Result<Option<(String, Arc<ReviewBlob>)>, String> {
             if std::time::Instant::now() >= deadline { return Err("input_unavailable".into()); }
-            if entries > crate::private_content::MAX_OBJECTS { return Err("input_too_large".into()); }
             let name = entry.name().ok_or("unsupported_input")?;
             let path = format!("{root}{name}");
             if path.len() > 4096 { return Err("unsupported_input".into()); }
@@ -344,7 +343,6 @@ pub fn git_files(path: &Path, commit: &str) -> Result<Vec<(String, Arc<[u8]>)>, 
                     if len > crate::private_content::MAX_FILE_BYTES as usize {
                         return Err("input_too_large".into());
                     }
-                    if files.len() >= MAX_FILES { return Err("input_too_large".into()); }
                     if let Some(bytes) = blobs.get(&entry.id()) {
                         return Ok(Some((path, bytes.clone())));
                     }
@@ -356,8 +354,10 @@ pub fn git_files(path: &Path, commit: &str) -> Result<Vec<(String, Arc<[u8]>)>, 
                     if blob.is_binary() || blob.content().contains(&0) || std::str::from_utf8(blob.content()).is_err() {
                         return Err("unsupported_input".into());
                     }
-                    let bytes: Arc<[u8]> = blob.content().into();
-                    size += bytes.len();
+                    use std::io::Write;
+                    (&*spool).write_all(blob.content()).map_err(|_| "input_unavailable")?;
+                    let bytes = Arc::new(ReviewBlob { spool: spool.clone(), offset: size as u64, len: len, digest: input_digest(blob.content()) });
+                    size += len;
                     blobs.insert(entry.id(), bytes.clone());
                     Ok(Some((path, bytes)))
                 }
@@ -447,7 +447,7 @@ fn inspect_fetched(
     repo: &git2::Repository,
     path: &Path,
     commit: &str,
-) -> Result<Vec<(String, Arc<[u8]>)>, String> {
+) -> Result<Vec<(String, Arc<ReviewBlob>)>, String> {
     let expected = git2::Oid::from_str(commit).map_err(|_| "invalid_subject")?;
     let tip = repo
         .find_reference("refs/review/delivery")
@@ -475,7 +475,7 @@ fn relay_git_files(
     commit: &str,
     keys: &Keys,
     deadline: std::time::Instant,
-) -> Result<Vec<(String, Arc<[u8]>)>, String> {
+) -> Result<Vec<(String, Arc<ReviewBlob>)>, String> {
     validate_git_destination(relay, url)?;
     let source = review_source_ref(branch)?;
     if git2::Oid::from_str(commit).is_err() {
@@ -503,21 +503,46 @@ fn relay_git_files(
     inspect_fetched(&repo, &scratch.0, commit)
 }
 
-fn file_manifest(files: Vec<(String, Arc<[u8]>)>) -> Result<Value, String> {
+fn private_spool() -> Result<std::fs::File, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let file = tempfile::tempfile().map_err(|_| "input_unavailable")?;
+    // Anonymous tempfile creation can inherit a permissive process umask.
+    // Tighten the descriptor before writing any private repository content.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600)).map_err(|_| "input_unavailable")?;
+    Ok(file)
+}
+
+/// Content is spooled once per unique blob. A large review must not retain the
+/// entire uncompressed repository and several JSON copies in worker memory.
+#[derive(Debug, Clone)]
+pub struct ReviewBlob {
+    spool: Arc<std::fs::File>,
+    offset: u64,
+    len: usize,
+    digest: String,
+}
+impl serde::Serialize for ReviewBlob {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use std::os::unix::fs::FileExt;
+        let mut bytes = vec![0u8; self.len];
+        self.spool.read_exact_at(&mut bytes, self.offset).map_err(serde::ser::Error::custom)?;
+        let text = std::str::from_utf8(&bytes).map_err(serde::ser::Error::custom)?;
+        serializer.serialize_str(text)
+    }
+}
+#[derive(serde::Serialize)]
+struct FileManifest {
+    contents: BTreeMap<String, ReviewBlob>,
+    paths: BTreeMap<String, String>,
+}
+fn file_manifest(files: Vec<(String, Arc<ReviewBlob>)>) -> Result<FileManifest, String> {
     let mut paths = BTreeMap::new();
     let mut contents = BTreeMap::new();
-    // Keep the Arc alive alongside its digest; aliases need neither rehashing nor copies.
-    let mut hashes = BTreeMap::<*const u8, (Arc<[u8]>, String)>::new();
-    for (path, bytes) in files {
-        let digest = hashes.entry(bytes.as_ptr())
-            .or_insert_with(|| (bytes.clone(), input_digest(&bytes))).1.clone();
-        paths.insert(path, digest.clone());
-        if !contents.contains_key(&digest) {
-            let text = std::str::from_utf8(&bytes).map_err(|_| "unsupported_input")?;
-            contents.insert(digest, text.to_owned());
-        }
+    for (path, blob) in files {
+        paths.insert(path, blob.digest.clone());
+        contents.entry(blob.digest.clone()).or_insert_with(|| blob.as_ref().clone());
     }
-    Ok(json!({"paths":paths,"contents":contents}))
+    Ok(FileManifest { paths, contents })
 }
 
 async fn fetch(client: &Client, id: &str) -> Result<Event, String> {
@@ -612,10 +637,10 @@ async fn snapshot(
         result = Some(event);
     }
     let manifest = file_manifest(files)?;
-    let input = serde_json::to_vec(
-        &json!({"schema":1,"subject":subject,"offer":offer,"result":result,"files":manifest}),
-    ).map_err(|_| "invalid_input")?;
-    Plan::new(input, &config.model)
+    let metadata = json!({"schema":1,"subject":subject,"offer":offer,"result":result});
+    let model = config.model.clone();
+    tokio::task::spawn_blocking(move || Plan::from_parts(&metadata, &manifest, &model, deadline))
+        .await.map_err(|_| "input_unavailable")?
 }
 
 /// Persist before publishing. Successful records are immutable, including unsafe decisions.
@@ -1274,10 +1299,10 @@ mod tests {
                     &[],
                 )
                 .unwrap();
-            assert_eq!(
-                inspect_fetched(&repo, &path, &oid.to_string()).unwrap(),
-                vec![("answer.txt".into(), Arc::<[u8]>::from(b"delivered text".as_slice()))]
-            );
+            let files = inspect_fetched(&repo, &path, &oid.to_string()).unwrap();
+            assert_eq!(files.len(), 1);
+            assert_eq!(files[0].0, "answer.txt");
+            assert_eq!(serde_json::to_value(files[0].1.as_ref()).unwrap(), json!("delivered text"));
             assert_eq!(
                 inspect_fetched(&repo, &path, &"a".repeat(40)).unwrap_err(),
                 "input_integrity"
@@ -1514,10 +1539,10 @@ mod tests {
             &[&parent],
         )
         .unwrap();
-        assert_eq!(
-            git_files(&p, &oid.to_string()).unwrap(),
-            vec![("file.txt".into(), Arc::<[u8]>::from(b"first".as_slice()))]
-        );
+        let files = git_files(&p, &oid.to_string()).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, "file.txt");
+        assert_eq!(serde_json::to_value(files[0].1.as_ref()).unwrap(), json!("first"));
         builder.insert("link", blob, 0o120000).unwrap();
         let tid = builder.write().unwrap();
         let tree = repo.find_tree(tid).unwrap();
@@ -1751,8 +1776,10 @@ async fn private_snapshot(
         }
     }
     let files = file_manifest(files)?;
-    let input = serde_json::to_vec(&json!({"schema":2,"subject":bundle.subject,"task":resolved.offer.task,"answer":answer,"evidence":bundle,"files":files})).map_err(|_| "invalid_input")?;
-    Plan::new(input, &config.model)
+    let metadata = json!({"schema":2,"subject":bundle.subject,"task":resolved.offer.task,"answer":answer,"evidence":bundle});
+    let model = config.model.clone();
+    tokio::task::spawn_blocking(move || Plan::from_parts(&metadata, &files, &model, deadline))
+        .await.map_err(|_| "input_unavailable")?
 }
 
 async fn publish_review(client: &Client, relay: &str, keys: &Keys, event: &Event, recipients: Option<&[String]>) -> Result<(), String> {

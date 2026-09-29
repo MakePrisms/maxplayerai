@@ -7,6 +7,13 @@ use std::{collections::BTreeSet, path::Path};
 /// Client preflight of every retained object, including imported bases/history.
 /// Server quarantine/CAS quota checks remain authoritative against concurrent writes.
 pub fn check_objects(repo: &Repository) -> Result<()> {
+    inspect_objects(repo, true)
+}
+/// Shared quota-only check; public history need not obey private path/type policy.
+pub fn check_object_quotas(repo: &Repository) -> Result<()> {
+    inspect_objects(repo, false)
+}
+fn inspect_objects(repo: &Repository, private: bool) -> Result<()> {
     let odb = repo
         .odb()
         .map_err(|_| Error("input object database unavailable"))?;
@@ -25,7 +32,6 @@ pub fn check_objects(repo: &Repository) -> Result<()> {
         return Err(Error("input object count exceeded"));
     }
     let mut bytes = 0u64;
-    let mut commits = 0usize;
     for id in ids {
         let (size, kind) = odb
             .read_header(id)
@@ -38,45 +44,16 @@ pub fn check_objects(repo: &Repository) -> Result<()> {
         {
             return Err(Error("input object quota exceeded"));
         }
-        if kind == ObjectType::Commit {
-            commits += 1;
-            if commits > super::MAX_COMMITS {
-                return Err(Error("input history too large"));
-            }
-            let commit = repo
-                .find_commit(id)
-                .map_err(|_| Error("invalid input commit"))?;
-            let tree = commit.tree().map_err(|_| Error("invalid input tree"))?;
-            let mut files = 0usize;
-            let mut invalid = false;
-            tree.walk(git2::TreeWalkMode::PreOrder, |prefix, entry| {
-                let Some(name) = entry.name() else {
-                    invalid = true;
-                    return git2::TreeWalkResult::Abort;
-                };
-                if super::validate_path(&format!("{prefix}{name}")).is_err() {
-                    invalid = true;
-                    return git2::TreeWalkResult::Abort;
+        // Inspect each unique tree once, not every historical snapshot. Shared
+        // trees in long histories must not multiply validation work.
+        if private && kind == ObjectType::Tree {
+            let tree = repo.find_tree(id).map_err(|_| Error("invalid input tree"))?;
+            for entry in tree.iter() {
+                let name = entry.name().ok_or(Error("invalid input path"))?;
+                super::validate_path(name)?;
+                if !matches!(entry.filemode(), 0o040000 | 0o100644 | 0o100755) {
+                    return Err(Error("input snapshot refused"));
                 }
-                match entry.filemode() {
-                    0o040000 => {}
-                    0o100644 | 0o100755 => {
-                        files += 1;
-                    }
-                    _ => {
-                        invalid = true;
-                        return git2::TreeWalkResult::Abort;
-                    }
-                }
-                if files > super::MAX_FILES {
-                    invalid = true;
-                    return git2::TreeWalkResult::Abort;
-                }
-                git2::TreeWalkResult::Ok
-            })
-            .map_err(|_| Error("input snapshot refused"))?;
-            if invalid {
-                return Err(Error("input snapshot refused"));
             }
         }
     }
@@ -96,9 +73,6 @@ pub fn input_manifest(task: &PreparedContent) -> Result<Vec<super::Attachment>> 
         } else {
             entries.push(input.clone());
         }
-    }
-    if entries.len() > super::MAX_FILES {
-        return Err(Error("too many pinned inputs"));
     }
     Ok(entries)
 }

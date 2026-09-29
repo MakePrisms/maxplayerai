@@ -11,7 +11,7 @@ use base64::Engine;
 use buzz_core::TenantContext;
 use buzz_db::private_jobs::PrivateJobRepo;
 use maxplayer_private_protocol::{
-    is_hex, strict_json, MAX_COMMITS, MAX_FILE_BYTES, MAX_FILES, MAX_OBJECTS, MAX_REPO_BYTES,
+    is_hex, strict_json, MAX_FILE_BYTES, MAX_OBJECTS, MAX_REPO_BYTES,
     wire::{self, HostPolicy},
 };
 use nostr::{Event, JsonUtil};
@@ -259,119 +259,15 @@ pub async fn provision(
             unavailable()
         })?;
     Ok(Json(
-        serde_json::json!({"repo":format!("{prefix}{buyer}/{job_id}"),"job_id":job_id,"max_file_bytes":MAX_FILE_BYTES,"max_repository_bytes":MAX_REPO_BYTES,"max_files":MAX_FILES}),
+        serde_json::json!({"repo":format!("{prefix}{buyer}/{job_id}"),"job_id":job_id,"max_file_bytes":MAX_FILE_BYTES,"max_repository_bytes":MAX_REPO_BYTES,"max_objects":MAX_OBJECTS,"max_pack_bytes":state.config.git_max_pack_bytes,"max_compressed_repository_bytes":state.config.git_max_repo_bytes}),
     ))
 }
 
-/// Scan the quarantined object graph, before any CAS publication. Object-store CAS
-/// serializes concurrent pushes: a losing candidate never combines two separate quota
-/// allowances; its retry hydrates the new committed graph and is measured again.
+/// Compatibility entry point for private integration tests; production pushes use
+/// the common quota checker for both public and private repositories.
+#[cfg(test)]
 pub async fn enforce_quota(repo: &std::path::Path) -> Result<(), Response> {
-    tokio::time::timeout(std::time::Duration::from_secs(30), inspect_quota(repo))
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::REQUEST_TIMEOUT,
-                "private repository inspection timed out",
-            )
-                .into_response()
-        })?
-}
-async fn inspect_quota(repo: &std::path::Path) -> Result<(), Response> {
-    let output = inspect(
-        repo,
-        &[
-            "cat-file",
-            "--batch-all-objects",
-            "--batch-check=%(objectname) %(objecttype) %(objectsize)",
-        ],
-        8 * 1024 * 1024,
-    )
-    .await?;
-    let text = std::str::from_utf8(&output).map_err(|_| deny())?;
-    let mut total = 0u64;
-    let mut commits = vec![];
-    let mut objects = 0usize;
-    for line in text.lines() {
-        objects += 1;
-        if objects > MAX_OBJECTS {
-            return Err(quota_error());
-        }
-        let fields: Vec<_> = line.split(' ').collect();
-        if fields.len() != 3 {
-            return Err(deny());
-        }
-        let size = fields[2].parse::<u64>().map_err(|_| deny())?;
-        total = total.checked_add(size).ok_or_else(quota_error)?;
-        if total > MAX_REPO_BYTES || (fields[1] == "blob" && size > MAX_FILE_BYTES) {
-            return Err(quota_error());
-        }
-        if fields[1] == "commit" {
-            if commits.len() >= MAX_COMMITS {
-                return Err(quota_error());
-            }
-            commits.push(fields[0]);
-        }
-    }
-    for commit in commits {
-        let tree = inspect(repo, &["ls-tree", "-rz", commit], 1024 * 1024).await?;
-        let mut files = 0usize;
-        for entry in tree.split(|b| *b == 0).filter(|s| !s.is_empty()) {
-            files += 1;
-            if files > MAX_FILES {
-                return Err(quota_error());
-            }
-            // No submodule auto-fetch or symlink materialization from private inputs.
-            // Rejecting either in this first implementation is explicit, never followed.
-            if entry.starts_with(b"160000 ") || entry.starts_with(b"120000 ") {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "private job snapshots cannot contain symlinks or submodules",
-                )
-                    .into_response());
-            }
-        }
-    }
-    Ok(())
-}
-fn quota_error() -> Response {
-    (
-        StatusCode::PAYLOAD_TOO_LARGE,
-        "private repository quota exceeded",
-    )
-        .into_response()
-}
-async fn inspect(repo: &std::path::Path, args: &[&str], cap: u64) -> Result<Vec<u8>, Response> {
-    use std::process::Stdio;
-    use tokio::io::AsyncReadExt;
-    let mut command = tokio::process::Command::new("git");
-    super::transport::harden_git_env(&mut command);
-    let mut child = command
-        .args(args)
-        .current_dir(repo)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|_| unavailable())?;
-    let mut bytes = Vec::new();
-    child
-        .stdout
-        .take()
-        .ok_or_else(unavailable)?
-        .take(cap + 1)
-        .read_to_end(&mut bytes)
-        .await
-        .map_err(|_| unavailable())?;
-    if bytes.len() as u64 > cap {
-        let _ = child.kill().await;
-        return Err(quota_error());
-    }
-    if !child.wait().await.map_err(|_| unavailable())?.success() {
-        return Err(deny());
-    }
-    Ok(bytes)
+    super::quota::enforce(repo, true).await
 }
 
 /// All smart-HTTP responses are authenticated. Never place packs, ref advertisements
@@ -387,6 +283,7 @@ pub async fn no_store(mut response: Response) -> Response {
         .append(header::VARY, HeaderValue::from_static("Authorization"));
     response
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -433,7 +330,7 @@ mod tests {
         assert!(enforce_quota(dir.path()).await.is_ok());
         std::fs::write(
             dir.path().join("oversized"),
-            vec![0u8; 10 * 1024 * 1024 + 1],
+            vec![0u8; MAX_FILE_BYTES as usize + 1],
         )
         .unwrap();
         commit(dir.path());
@@ -449,16 +346,13 @@ mod tests {
         assert!(enforce_quota(dir.path()).await.is_err());
     }
     #[tokio::test]
-    async fn file_count_and_symlinks_fail_before_publication() {
+    async fn more_than_thousand_files_are_allowed_but_private_symlinks_are_not() {
         let dir = repo();
         for i in 0..1001 {
             std::fs::write(dir.path().join(format!("f{i}")), b"x").unwrap();
         }
         commit(dir.path());
-        assert_eq!(
-            enforce_quota(dir.path()).await.unwrap_err().status(),
-            StatusCode::PAYLOAD_TOO_LARGE
-        );
+        enforce_quota(dir.path()).await.unwrap();
         #[cfg(unix)]
         {
             let dir = repo();

@@ -265,14 +265,19 @@ A process crash can leave scratch directories under the OS temporary directory;
 normal host temporary-file cleanup should reclaim them.
 
 Git reads share the request's 300-second deadline, with a 10-second maximum per
-HTTP leg. The aggregate HTTP-response cap uses the shared Git transfer budget: the 100 MiB
-repository quota plus framing/compression allowance (64 bytes per allowed object
-and 64 KiB fixed overhead). Client private-input fetches use that budget too; the
-retained uncompressed quota stays 100 MiB. The transfer object cap uses the shared
-100,000-object quota.
+HTTP leg. The aggregate HTTP-response cap uses the shared Git transfer budget: the 5 GiB
+uncompressed repository quota plus framing/compression allowance (64 bytes per allowed object
+and 64 KiB fixed overhead). Relay upload-pack responses and client private-input
+fetches use that budget too; the
+retained uncompressed quota is 5 GiB. The transfer object cap uses the shared
+1,000,000-object quota.
 The existing review input/file limits still apply after fetching. Inaccessible,
 missing, oversized, or timed-out fetches produce an error review, never approval.
 These bounds can reject large Git histories even when the final files are small.
+The relay waits for a successful, nonempty Git subprocess result before serving a
+fetch, then streams the completed temporary pack from disk rather than buffering
+it in RAM. The Git reverse-proxy upload allowance is 1056 MiB, above the relay's
+1 GiB admission ceiling; media upload allowances are unchanged.
 
 An optional `repositories` object still supports operator-managed exact URL-to-local
 bare-path overrides, including offline fixtures. Omit it for normal relay fetching;
@@ -330,16 +335,38 @@ HEAD or a worktree. No hooks, scripts, build steps, filters, or delivered code r
 Inline deliveries are supported only when the offer declares inline support and the
 RESULT passes the existing inline parser; their signed event ID binds the text.
 
-Repository file limits now reference the same protocol constants as private-job
-hosting and client preflight: **1,000 files and 10 MiB per blob**, with a **100 MiB
-unique-blob budget** for the inspected snapshot. Repeated blobs share storage in
-memory and appear once in the content map; every path remains in the path-to-hash
-manifest. The private repository quota additionally counts all retained Git objects
-and caps history at 1,000 commits / 100,000 objects. That existing admission policy
-is unchanged. Ordinary public relay repositories retain their separate configurable
-pack-storage quotas (500 MiB per pack / 1,000 MiB per repository by default); this
-change does **not** impose private admission quotas on public hosting or make the
-reviewer support every public storage configuration.
+Repository limits reference the same protocol constants as public/private relay
+admission and client preflight: **100 MiB per blob, 5 GiB of unique uncompressed
+retained Git objects (including history), and 1,000,000 objects**. There are **no
+separate file-count or commit-count caps**, including during review tree traversal.
+Relay pack upload and compressed repository storage both default to **1 GiB**;
+explicit operator overrides remain supported and apply equally to public/private
+storage. Reviewer fetches allow repacking/framing overhead above the uncompressed
+quota, since a fresh pack need not have the same size as stored packs.
+
+Repeated blobs appear once in the content map; every path remains in the
+path-to-hash manifest. Unique file contents and canonical review JSON are spooled
+into owner-private temporary files. Memory is bounded by metadata and individual
+blobs/batches rather than multiple copies of the entire repository. Temporary
+spools are unlinked and reclaimed when their handles close, including after a crash.
+Git fetch scratch directories retain the cleanup behavior described above.
+
+These defaults are admission ceilings, **not a guarantee that a near-5-GiB review
+finishes within the 300-second processing window or a reasonable provider bill**.
+Provider requests remain bounded and an incomplete review fails closed. No paid
+full-ceiling review has been benchmarked. Binary/symlink/submodule handling is
+unchanged; accepting a repository for storage is not an assertion that every
+content type has an available classifier.
+
+Public seller repositories still accumulate multiple job branches; the 1 GiB
+compressed-storage ceiling applies to that physical shared repository, not
+independently to each job branch. Private jobs have individual repositories. This
+change unifies quota values and enforcement, **not repository layout or retention**.
+The provisioning response advertises the new limits without a `max_files` field.
+Deploy client, relay and reviewer updates together: older clients intentionally
+refuse changed provisioning limits rather than assuming unsupported capacity.
+Per-account storage budgeting and disk-watermark admission are separate follow-up
+work; existing relay operation/cache concurrency controls are preserved.
 
 Signed source events remain bounded at 128 KiB. Provider requests remain bounded
 at 128 KiB serialized, with at most 30 KiB of state (conservative UTF-8 byte budget
@@ -347,7 +374,7 @@ for TypeSafe's [32k-token state + question limit](https://docs.typesafe.ai/model
 Larger canonical snapshots are split into UTF-8-aligned fragments up to 24 KiB with
 1 KiB overlap; JSON escaping can reduce the fragment size further. Every byte,
 including all source events and all file contents, participates. No truncation or
-sampling. At most 100,000 tree entries are walked; paths longer than 4096 bytes,
+sampling. Tree traversal has no separate entry-count cap; paths longer than 4096 bytes,
 symlinks, submodules, non-UTF-8 paths/content, binary blobs, inaccessible objects,
 and incomplete inputs still fail closed. Provider/review responses remain 16 KiB.
 

@@ -3,7 +3,7 @@
 use super::{
     cas_publish::{self, CasError, ParentState, PublishLimits},
     manifest::pointer_key,
-    private_jobs::enforce_quota,
+    quota::{enforce_with_limits, Limits},
     store::GitStore,
 };
 use axum::{
@@ -32,6 +32,10 @@ fn git(path: &Path, args: &[&str]) {
         "git failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+async fn enforce_quota(path: &Path) -> Result<(), Response> {
+    // Exercise the real scanner at a small test budget, not a 5 GiB allocation.
+    enforce_with_limits(path, true, Limits { bytes: 100 * 1024 * 1024, ..Limits::default() }).await
 }
 fn snapshot(label: u8) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();

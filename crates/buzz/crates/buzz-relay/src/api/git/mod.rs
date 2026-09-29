@@ -30,6 +30,7 @@ pub mod manifest_event;
 pub mod pack_cache;
 pub mod policy;
 pub mod private_jobs;
+pub mod quota;
 pub mod store;
 pub mod transport;
 

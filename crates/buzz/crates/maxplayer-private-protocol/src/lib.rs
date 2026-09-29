@@ -15,14 +15,15 @@ pub const BODY_SCHEMA: &str = "maxplayer.content.v2";
 pub const ENVELOPE_SCHEMA: &str = "maxplayer.content-envelope.v2";
 pub const MAX_BODY_BYTES: usize = 16 * 1024;
 pub const MAX_ENVELOPE_BYTES: usize = 23 * 1024;
-pub const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
-pub const MAX_REPO_BYTES: u64 = 100 * 1024 * 1024;
-pub const MAX_FILES: usize = 1000;
-/// Retained history/object quotas, shared by client preflight and relay quarantine.
-pub const MAX_COMMITS: usize = 1000;
-pub const MAX_OBJECTS: usize = 100_000;
-/// Wire framing/compression overhead is not retained repository content. Give
-/// near-quota incompressible packs room without weakening the uncompressed quota.
+/// Shared admission policy for public/private Git repositories and review fetches.
+pub const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
+/// Sum of unique, uncompressed retained Git object sizes (including history).
+pub const MAX_REPO_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+pub const MAX_PACK_BYTES: u64 = 1024 * 1024 * 1024;
+pub const MAX_COMPRESSED_REPO_BYTES: u64 = 1024 * 1024 * 1024;
+pub const MAX_OBJECTS: usize = 1_000_000;
+/// A fetch may repack retained objects differently from storage. Bound it by
+/// uncompressed data plus object/framing overhead, not by the upload pack limit.
 pub const MAX_GIT_TRANSFER_BYTES: usize =
     MAX_REPO_BYTES as usize + MAX_OBJECTS * 64 + 64 * 1024;
 
@@ -302,9 +303,6 @@ impl ContentBody {
         }
         if let Some(contribution) = &self.contribution {
             contribution.validate(&self.job_id)?;
-        }
-        if self.attachments.len() > MAX_FILES {
-            return Err(Error("too many attachments"));
         }
         let mut paths = BTreeSet::new();
         for attachment in &self.attachments {

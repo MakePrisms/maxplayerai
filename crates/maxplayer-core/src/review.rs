@@ -11,7 +11,6 @@ use std::collections::BTreeMap;
 
 /// Event/task envelope bound, not a repository or aggregate review-input quota.
 pub const MAX_INPUT_BYTES: usize = 128 * 1024;
-pub const MAX_FILES: usize = maxplayer_private_protocol::MAX_FILES;
 pub const MAX_REVIEW_BYTES: usize = 16 * 1024;
 pub const CLASSIFIER: &str = "execution-safety";
 pub const CLASSIFIER_VERSION: &str = "1";
@@ -253,7 +252,7 @@ pub fn input_bytes(
     files: Vec<(String, Vec<u8>)>,
 ) -> Result<Vec<u8>, String> {
     subject.validate()?;
-    if files.len() > MAX_FILES || task.len() > MAX_INPUT_BYTES {
+    if task.len() > MAX_INPUT_BYTES {
         return Err("review: input too large".into());
     }
     if subject.kind == JOB_OFFER_KIND && !files.is_empty() {
