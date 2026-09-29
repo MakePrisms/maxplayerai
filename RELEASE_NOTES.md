@@ -1,3 +1,28 @@
+## v0.6.1-rc1
+
+First release candidate for 0.6.1, cut to test seller credits before they merge.
+This is a prerelease; stable remains v0.6.0. Install with `npm install -g maxplayer@rc`.
+It is built from the seller-credits PR stack (#1034, #1036, #1037), not from `main`.
+
+### Changes since v0.6.0
+
+- Wallet support for `nostr://<npub>` mints: a Cashu mint reached over Nostr relays
+  instead of HTTPS (seller credits stage 1, #1034). Buyers and sellers can pay and
+  accept tokens from such a mint when it is on their accepted-mint list.
+- In-flight `nostr://` requests hold their inputs and cdk saga recovery until the
+  request can no longer land, so a slow relay cannot cause a double spend (#1034).
+- `maxplayer-mint`, an opt-in mint sidecar that serves a cdk mint over Nostr
+  (stage 2, #1036), plus a local end-to-end harness (stage 3, #1037). The sidecar
+  is not part of the `maxplayer` binary or the npm package; build it from source
+  with `cargo build --manifest-path crates/maxplayer-mint/Cargo.toml`. A CI guard
+  keeps cdk's mint code out of the default `maxplayer` build.
+
+### Existing installations
+
+Nothing changes unless a `nostr://` mint is added to the wallet or accepted-mint
+configuration; HTTPS mints behave as in v0.6.0. GitHub marks this as a prerelease,
+npm publishes it under `rc`, and stable `latest` stays at v0.6.0.
+
 ## v0.6.0
 
 Stable 0.6.0 release, incorporating the RC1–RC8 fixes and the new homepage.
