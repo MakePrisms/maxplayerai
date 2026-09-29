@@ -1138,6 +1138,15 @@ button.chip { cursor: pointer; }
    grew or shrank), and the buyer line keeps its row before its name arrives. */
 .h-section.try-section { justify-content:flex-start; }
 #try-buyer { min-height:1.6em; }
+/* ...but hung low enough that the heading-to-Ask block (--try-upper tall, as
+   measured) sits centred on screen, as the old centring had it. Anything that
+   arrives later (status, answer, buttons) only extends the section downward. */
+.try-section { --try-upper:356px; --try-pad:96px; }
+.try-section .h-in {
+  padding-top: max(var(--try-pad), calc((100vh - var(--nav-h) - var(--try-upper)) / 2));
+  padding-top: max(var(--try-pad), calc((100svh - var(--nav-h) - var(--try-upper)) / 2));
+}
+@media (max-width: 760px) { .try-section { --try-upper:340px; --try-pad:64px; } }
 .try-note a { color:var(--neon); text-underline-offset:3px; }
 .try-note a:hover { color:var(--ink); }
 #try-count { text-align:right; margin-top:8px; }
