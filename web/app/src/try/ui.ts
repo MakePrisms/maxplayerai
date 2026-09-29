@@ -4,8 +4,6 @@ import { step } from "./controller.js";
 import { NotOpen, RateLimited, transport } from "./transport.js";
 import { identity, NEMO, now, one, promptText, questionOf, trade } from "./wire.js";
 declare const TRY_IT_MARKET_LINK_ENABLED: boolean;
-declare const TRY_IT_PREVIEW: boolean;
-const preview = typeof TRY_IT_PREVIEW !== "undefined" && TRY_IT_PREVIEW;
 export const statuses: Record<string, string> = {
   publishing: "Sending your question…",
   waiting: "Waiting for worker-nemo…",
@@ -59,8 +57,6 @@ export function render(s: RecordState) {
   pitch.hidden = !s.binding && s.phase !== "files";
   document.querySelector<HTMLElement>("#try-check")!.hidden =
     !["timeout", "refused", "invalid", "conflict"].includes(s.phase);
-  document.querySelector<HTMLElement>("#try-again")!.hidden =
-    !preview || !["done", "timeout", "refused", "invalid", "files", "conflict"].includes(s.phase);
 }
 export async function bootTry() {
   const section = document.querySelector<HTMLElement>("#try");
@@ -236,11 +232,6 @@ export async function bootTry() {
         "Enable browser storage to try it";
       submit.disabled = !online;
     }
-  });
-  document.querySelector("#try-again")!.addEventListener("click", async () => {
-    await db.clear();
-    channel.postMessage("updated");
-    location.reload();
   });
   document.querySelector("#try-check")!.addEventListener("click", () => {
     failures = 0;
