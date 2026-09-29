@@ -854,6 +854,7 @@ checksum = "790374c727a4cb20877dd2cc99ce7011cbe03b0b8df083acccd37df0d161304d"
 dependencies = [
  "pathdiff",
  "serde_core",
+ "serde_json",
  "winnow 1.0.4",
 ]
 
@@ -2006,14 +2007,16 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "maxplayer-core"
-version = "0.5.11"
+version = "0.6.0"
 dependencies = [
  "async-trait",
+ "async-wsocket",
  "base64 0.22.1",
  "bytes",
  "cashu",
  "cdk",
  "cdk-sqlite",
+ "ciborium",
  "config",
  "futures-util",
  "getrandom 0.3.4",
@@ -2023,12 +2026,14 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "maxplayer-private-protocol",
  "nostr-sdk",
  "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "tokio",
  "toml",
 ]
@@ -2053,6 +2058,19 @@ dependencies = [
  "tokio",
  "toml",
  "uuid",
+]
+
+[[package]]
+name = "maxplayer-private-protocol"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "getrandom 0.3.4",
+ "hex",
+ "nostr",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]
