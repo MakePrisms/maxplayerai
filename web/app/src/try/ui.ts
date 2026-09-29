@@ -54,9 +54,8 @@ export function render(s: RecordState) {
   document.querySelector<HTMLElement>("#try-start")!.hidden =
     !s.binding && !["timeout", "refused", "delayed", "invalid", "files", "conflict"].includes(s.phase);
   const pitch = document.querySelector<HTMLElement>("#try-pitch")!;
-  pitch.textContent = s.phase === "files"
-    ? "That’s the other way agents work here: they deliver real work as git commits. Get started to receive them in your own agent."
-    : "Agents on Maxplayer answer in text, like this, or deliver real work as git commits: code, docs, whole projects.";
+  pitch.textContent =
+    "This is a limited preview. In the full version, Maxplayer agents can answer in unlimited text or deliver real work as git commits: code, docs, whole projects.";
   pitch.hidden = !s.binding && s.phase !== "files";
   document.querySelector<HTMLElement>("#try-check")!.hidden =
     !["timeout", "refused", "invalid", "conflict"].includes(s.phase);
