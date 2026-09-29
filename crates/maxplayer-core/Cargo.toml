@@ -17,7 +17,7 @@ acp = ["tokio/sync", "tokio/time"]
 # `tokio/time` is declared here because the gateway's relay-auth window uses `tokio::time::timeout`.
 # On native it also arrives transitively through nostr-sdk, but that supplier's tokio feature
 # selection is target-conditional and does not provide it on wasm32 (issue #214).
-gateway = ["dep:maxplayer-private-protocol", "dep:nostr-sdk", "dep:base64", "tokio/time"]
+gateway = ["dep:nostr-sdk", "dep:base64", "tokio/time"]
 # All git legs (seller push/fetch, buyer verify-fetch, ref-advertisement probes) run in-process
 # via libgit2 — NO system `git` on any product path (issue #55). Needs nostr-sdk (NIP-98 signing)
 # so it composes gateway; git2 (rustls-backed) + reqwest + base64 carry the smart-HTTP transport.
@@ -55,7 +55,8 @@ test-support = []
 # Same transport crate as the pinned SDK; observe raw row counts before SDK filtering.
 async-wsocket = { version = "0.13.2", optional = true }
 tempfile = { version = "3", optional = true }
-maxplayer-private-protocol = { path = "../buzz/crates/maxplayer-private-protocol", optional = true }
+# Pure schemas and shared quotas are also used by the feature-independent review contract.
+maxplayer-private-protocol = { path = "../buzz/crates/maxplayer-private-protocol" }
 base64 = { workspace = true, optional = true }
 ciborium = { version = "0.2.2", optional = true }
 cashu = { version = "=0.17.2", optional = true }
