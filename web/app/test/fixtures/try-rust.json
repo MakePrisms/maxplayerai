@@ -1,0 +1,227 @@
+{
+  "accept": {
+    "content": "",
+    "created_at": 1800000004,
+    "id": "5cc5947c2f45561a1a3e63267ada6b80f8b8428bdbedf9cc2dccdf84b67d4a6f",
+    "kind": 3406,
+    "pubkey": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
+    "sig": "7c22e22afe1104618f647bf4fbf94e56e8f6f29fdd21257dd0cb278e7ddb7130dd3c71b2ccd37ecfd0551e1c7b54ea93fef26cbee576f48d2fccb8da489be1aa",
+    "tags": [
+      [
+        "status",
+        "accepted"
+      ],
+      [
+        "e",
+        "a5ad6f880ebf438cad32aa6658ff58bb496e322db42f05253b41f31d1c162bf0",
+        "",
+        "root"
+      ],
+      [
+        "e",
+        "06f3846641e3e8e6d50b7fb8b1e2a912787c1a5a36e6c202e76bc889b8bab3ae"
+      ],
+      [
+        "p",
+        "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f"
+      ],
+      [
+        "p",
+        "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766"
+      ],
+      [
+        "t",
+        "maxplayer"
+      ],
+      [
+        "v",
+        "1"
+      ]
+    ]
+  },
+  "award": {
+    "content": "",
+    "created_at": 1800000002,
+    "id": "b575bf1e02c98b4de4d441fc331cf31ea452ffbb74bdcc5d92b643cd34b34ebd",
+    "kind": 3405,
+    "pubkey": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
+    "sig": "34cb69476c12b55ebd68c49b2671dc1c14931e2663ee4833c86f56b1dec06934adc47e1213578286d90075b7433bb3ad973bc01e5a6f00d2cb1f8813b6274298",
+    "tags": [
+      [
+        "status",
+        "accepted"
+      ],
+      [
+        "e",
+        "a5ad6f880ebf438cad32aa6658ff58bb496e322db42f05253b41f31d1c162bf0",
+        "",
+        "root"
+      ],
+      [
+        "e",
+        "06f3846641e3e8e6d50b7fb8b1e2a912787c1a5a36e6c202e76bc889b8bab3ae"
+      ],
+      [
+        "p",
+        "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f"
+      ],
+      [
+        "p",
+        "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766"
+      ],
+      [
+        "t",
+        "maxplayer"
+      ],
+      [
+        "v",
+        "1"
+      ]
+    ]
+  },
+  "claim": {
+    "content": "",
+    "created_at": 1800000001,
+    "id": "06f3846641e3e8e6d50b7fb8b1e2a912787c1a5a36e6c202e76bc889b8bab3ae",
+    "kind": 3402,
+    "pubkey": "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766",
+    "sig": "35d8847392f4daf85523705ff3e3892b346aeacbf477994d1b41c99ab61150f651a31d74c02c0b1627174ffcded18329c29a60e19f9754509a217c4a25f0f321",
+    "tags": [
+      [
+        "status",
+        "processing"
+      ],
+      [
+        "e",
+        "a5ad6f880ebf438cad32aa6658ff58bb496e322db42f05253b41f31d1c162bf0",
+        "",
+        "root"
+      ],
+      [
+        "p",
+        "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f"
+      ],
+      [
+        "p",
+        "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766"
+      ],
+      [
+        "payment",
+        "none"
+      ],
+      [
+        "t",
+        "maxplayer"
+      ],
+      [
+        "v",
+        "1"
+      ]
+    ]
+  },
+  "contentHash": "6d6c60f4b25af8a9663c94f67291207e55f40bc8ebc934c870002912ba0818ac",
+  "digest": "99657b24484dcf3e5266992cd19eaae4059a59f29cc1cec329c33f14c0a28fa9",
+  "jobHash": "0fb098b1e6d8c9e9d03686b522de1dc69b9175b60eb41d8c8c796e4f1eb6e3fe",
+  "offer": {
+    "content": "",
+    "created_at": 1800000000,
+    "id": "a5ad6f880ebf438cad32aa6658ff58bb496e322db42f05253b41f31d1c162bf0",
+    "kind": 3401,
+    "pubkey": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
+    "sig": "d96918609bd108bdad7dd6f99f8e84af1a6453c98e01a4f2eb7f13c424da91fafd88cdaf1c2d7f94897ba9311f7b751f1156d5792c94fc1e30ce600af4392b2f",
+    "tags": [
+      [
+        "i",
+        "Explain slick tyres 🏎️\nKeep  internal spaces.\n\n(Reply in plain text, under 300 words. Don't create, edit or commit any files.)"
+      ],
+      [
+        "output",
+        "text/plain"
+      ],
+      [
+        "amount",
+        "0",
+        "sat"
+      ],
+      [
+        "param",
+        "deadline",
+        "1800000300"
+      ],
+      [
+        "param",
+        "accepts-delivery",
+        "inline"
+      ],
+      [
+        "param",
+        "payment",
+        "none"
+      ],
+      [
+        "p",
+        "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766"
+      ],
+      [
+        "t",
+        "maxplayer"
+      ],
+      [
+        "v",
+        "1"
+      ]
+    ]
+  },
+  "preimage": "[\"maxplayer/v1/receipt-preimage\",\"0fb098b1e6d8c9e9d03686b522de1dc69b9175b60eb41d8c8c796e4f1eb6e3fe\",\"a5ad6f880ebf438cad32aa6658ff58bb496e322db42f05253b41f31d1c162bf0\",0,\"sat\",\"1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f\",\"4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766\",\"6d6c60f4b25af8a9663c94f67291207e55f40bc8ebc934c870002912ba0818ac\",\"inline\",\"none\"]",
+  "result": {
+    "content": "Slick tyres put more rubber on dry tarmac.\n\nExact bytes: café 🏎️  \n",
+    "created_at": 1800000003,
+    "id": "98d18184003de38de4fa4fbfc90939ed6d77deae41b1c3a5d756f73aeac63bc8",
+    "kind": 3403,
+    "pubkey": "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766",
+    "sig": "6e791ba474bba675e2756cf3c54af10f1602d78f75a2601ebb077fc8c4e55f0b3a93642c709f1483e27b3ae9f74d395b029aa446df76e4af14fa1248542166f2",
+    "tags": [
+      [
+        "e",
+        "a5ad6f880ebf438cad32aa6658ff58bb496e322db42f05253b41f31d1c162bf0",
+        "",
+        "root"
+      ],
+      [
+        "p",
+        "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f"
+      ],
+      [
+        "delivery",
+        "inline"
+      ],
+      [
+        "output",
+        "text/plain"
+      ],
+      [
+        "amount",
+        "0",
+        "sat"
+      ],
+      [
+        "job-hash",
+        "0fb098b1e6d8c9e9d03686b522de1dc69b9175b60eb41d8c8c796e4f1eb6e3fe"
+      ],
+      [
+        "sig",
+        "seller",
+        "d3e33b2c25c9a2a7a5fa9615b356aee9dc2a9b8994363330ae27f418594561ac28e4262205fd2c9ea62ad102b370fcce9cbb1777e65a0f4ec3b36c64678c3da3"
+      ],
+      [
+        "t",
+        "maxplayer"
+      ],
+      [
+        "v",
+        "1"
+      ]
+    ]
+  },
+  "source": "Rust gateway builders/parsers + job_lifecycle::job_hash_for_offer + receipt::ReceiptPreimage"
+}

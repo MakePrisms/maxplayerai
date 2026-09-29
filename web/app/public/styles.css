@@ -552,9 +552,9 @@ ol .row:hover .dot.working i, ol .row:focus-visible .dot.working i {
    Big-type close, not a legal strip: link columns up top, a ghost wordmark
    half-cropped at the bottom edge like it's driving out of frame, and the
    finish line — a red/yellow double stripe — as the very last pixels. */
-.site-foot { padding: 44px 18px 0; overflow: hidden; }
+.site-foot { padding: 44px 0 0; overflow: hidden; container-type: inline-size; }
 .foot-cols {
-  max-width: 1060px; margin: 0 auto;
+  max-width: 1096px; margin: 0 auto; padding: 0 18px;
   display: flex; align-items: flex-start; justify-content: space-between; gap: 20px;
 }
 .brand.small span { font-size: 12px; letter-spacing: 0.04em; }
@@ -566,18 +566,16 @@ ol .row:hover .dot.working i, ol .row:focus-visible .dot.working i {
 }
 .foot-nav a:hover { color: var(--neon); }
 .foot-word {
-  margin: 34px 22px 22px; /* the same breath of room on all three sides */
+  margin: 34px 0 max(0.16em, 18px);
   font-family: var(--display); font-style: italic; font-weight: 900; font-stretch: 125%;
-  /* sized to span the width inside the footer's 18px padding plus the 22px
-     side margins (80px total): the wordmark's width ≈ 9.85 × its font size,
-     so this calc fills the space exactly without running off the right edge */
-  font-size: calc((100vw - 80px) / 10.15); line-height: 0.82;
+  /* edge to edge: the wordmark's ink (M's foot to the I's top corner) is
+     9.80 × its font size, so 100cqw / 9.88 fills the footer's full width
+     with a few pixels to spare. 100vw fallback for old browsers. */
+  font-size: calc(100vw / 10.2); font-size: calc(100cqw / 9.88); line-height: 0.82;
   letter-spacing: -0.01em; text-transform: uppercase;
   text-align: center; white-space: nowrap;
-  /* optical centering: the italic pushes the cap line right (the M's top
-     corner sits ~17px deeper than the AI's), so the box-centered word reads
-     right-shifted. Half that lean, in em so it scales with the font. */
-  transform: translateX(-0.06em);
+  /* the italic ink sits a little right of its text box; centre the ink */
+  transform: translateX(-0.02em);
   color: transparent;
   -webkit-text-stroke: 1px #2e2e33;
   user-select: none;
@@ -587,6 +585,8 @@ ol .row:hover .dot.working i, ol .row:focus-visible .dot.working i {
 .foot-word { transition: color 0.25s ease; }
 .foot-word:has(.fw-max:hover) { color: var(--blue); -webkit-text-stroke: 0; }
 .foot-word:has(.fw-ai:hover) { color: #ffdf00; -webkit-text-stroke: 0; }
+/* phones: the wordmark is small, so give its outline a touch more contrast */
+@media (max-width: 600px) { .foot-word { -webkit-text-stroke-color: #3a3a41; } }
 
 /* ---------- docks: floating terminal windows ----------
    Spawn docked (racer left, event mid, runner right), then behave like real
@@ -1042,6 +1042,22 @@ button.chip { cursor: pointer; }
   display: block; width: 100%; aspect-ratio: 16 / 9; background: #070708;
   border: 1px solid var(--line); box-shadow: 0 30px 70px -20px rgba(0, 0, 0, 0.8);
 }
+/* Play button over the poster: a frosted circle with a dark play mark */
+.h-video-frame { position: relative; }
+.h-play {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  display: grid; place-items: center; width: 88px; height: 88px; padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.6); border-radius: 50%; cursor: pointer;
+  background: rgba(236, 240, 248, 0.78); color: #4a4a4f;
+  -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px);
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.7);
+  transition: transform 0.15s ease, background 0.15s ease;
+}
+.h-play:hover { transform: translate(-50%, -50%) scale(1.06); background: rgba(246, 248, 252, 0.9); }
+.h-play:focus-visible { outline: 2px solid var(--neon); outline-offset: 4px; }
+.h-play[hidden] { display: none; }
+@media (max-width: 600px) { .h-play { width: 68px; height: 68px; } .h-play svg { width: 24px; height: 24px; } }
+@media (prefers-reduced-motion: reduce) { .h-play { transition: none; } }
 .h-video figcaption { margin-top: 14px; font-family: var(--sans); font-size: 13px; color: var(--faint); }
 @media (max-width: 600px) {
   .h-video { margin-top: 30px; }
@@ -1069,7 +1085,8 @@ button.chip { cursor: pointer; }
 .h-agents p { margin: 0; font-size: 12.5px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-2); }
 .h-agents ul {
   list-style: none; margin: 30px 0 0; padding: 0;
-  display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 24px 28px;
+  /* two even rows of five on wide screens */
+  display: grid; grid-template-columns: repeat(5, auto); justify-content: space-between; align-items: center; gap: 28px 28px;
 }
 .h-agents li { display: flex; align-items: center; gap: 10px; color: var(--muted); transition: color 0.12s ease; }
 .h-agents li:hover { color: var(--ink); }
@@ -1079,6 +1096,8 @@ button.chip { cursor: pointer; }
   .h-agents { margin-top: 48px; padding-top: 32px; }
   .h-agents ul { display: grid; grid-template-columns: repeat(3, auto); justify-content: space-around; gap: 26px 18px; }
   .h-agents li { flex-direction: column; gap: 8px; }
+  /* a lone agent on the last row sits in the middle column */
+  .h-agents li:last-child:nth-child(3n+1) { grid-column: 2; }
   .h-agents svg { width: 28px; height: 28px; }
   .h-agents span { font-size: 13px; }
 }
@@ -1101,3 +1120,76 @@ button.chip { cursor: pointer; }
   .market-page .col { min-height: 0; }
   .market-page .rows { flex: 1; height: auto; min-height: 0; }
 }
+
+/* Scoped buyer UI; hidden must beat the homepage flex-section rule. */
+.try-section[hidden], .try-section [hidden] { display: none !important; }
+.try-section .h-in { width:100%; max-width:760px; box-sizing:border-box; }
+.try-section .h-lede { margin:18px auto 0; }
+.try-section textarea { display:block; width:100%; box-sizing:border-box; resize:vertical; margin:28px 0 0; padding:18px; background:var(--bg); color:var(--ink); border:1px solid var(--line); font:16px/1.6 var(--sans); }
+.try-section textarea:focus { outline:1px solid var(--neon); outline-offset:3px; }
+.try-section button, .try-section a { min-height:44px; box-sizing:border-box; }
+.try-section button { cursor:pointer; }
+.try-section button:disabled { opacity:.55; cursor:default; }
+.try-section .h-button { border:0; margin-top:24px; }
+.try-note, #try-count { color:var(--muted); font:12px/1.6 var(--mono); }
+.try-note { margin:18px 0 0; }
+/* Nothing in Try it shifts between states: content hangs from the top instead
+   of being centred (centring moved the heading whenever the content below
+   grew or shrank), and the buyer line keeps its row before its name arrives. */
+.h-section.try-section { justify-content:flex-start; }
+#try-buyer { min-height:1.6em; }
+/* ...but hung low enough that the heading-to-Ask block (--try-upper tall, as
+   measured) sits centred on screen, as the old centring had it. Anything that
+   arrives later (status, answer, buttons) only extends the section downward. */
+.try-section { --try-upper:356px; --try-pad:96px; }
+.try-section .h-in {
+  padding-top: max(var(--try-pad), calc((100vh - var(--nav-h) - var(--try-upper)) / 2));
+  padding-top: max(var(--try-pad), calc((100svh - var(--nav-h) - var(--try-upper)) / 2));
+}
+@media (max-width: 760px) { .try-section { --try-upper:340px; --try-pad:64px; } }
+.try-note a { color:var(--neon); text-underline-offset:3px; }
+.try-note a:hover { color:var(--ink); }
+#try-count { text-align:right; margin-top:8px; }
+#try-status { margin:24px 0 0; color:var(--ink-2); font:15px/1.6 var(--sans); }
+.try-actions { display:flex; align-items:center; justify-content:center; flex-wrap:wrap; gap:12px; }
+#try-question { text-align:left; margin:28px 0 24px; padding:4px 0 4px 18px; border-left:2px solid var(--neon); color:var(--ink-2); font:18px/1.6 var(--sans); overflow-wrap:anywhere; }
+#try-question::before { content:'“'; }
+#try-question::after { content:'”'; }
+#try-answer-panel { margin:24px 0 0; padding:20px 24px 24px; text-align:left; border:1px solid var(--line); background:var(--bg); }
+.try-answer-head { display:flex; justify-content:space-between; align-items:center; gap:16px; }
+.try-answer-head h3 { margin:0; font:700 13px var(--mono); text-transform:uppercase; letter-spacing:.08em; }
+#try-answer { white-space:pre-wrap; overflow-wrap:anywhere; font:18px/1.65 var(--sans); margin:12px 0 0; color:var(--ink); }
+#try-start { margin-top:32px; }
+.try-pitch { margin:0 auto 20px; max-width:560px; color:var(--ink-2); font:16px/1.6 var(--sans); }
+.try-section .h-copy { min-width:0; margin:0; padding:14px 18px; border:1px solid var(--line); text-align:left; gap:12px; }
+.try-section .h-copy code { white-space:normal; word-break:normal; overflow-wrap:normal; overflow:visible; font:15px/1.6 var(--sans); }
+.try-section .try-link { display:inline-flex; align-items:center; justify-content:center; padding:10px 4px; border:0; background:none; color:var(--neon); font:12px/1.4 var(--mono); text-decoration:underline; text-underline-offset:4px; }
+.try-section .try-link:hover { color:var(--ink); }
+#try-start > .h-button { margin-top:0; }
+@media(max-width:480px) {
+  .try-section .h-button { max-width:calc(100% - 16px); padding:14px 18px; font-size:13px; }
+  #try-answer-panel { padding:16px; }
+  .try-section .h-copy { align-items:flex-start; }
+}
+@media(prefers-reduced-motion:reduce) { html { scroll-behavior:auto!important; } }
+
+/* Floating "Try it first" pill: pinned to the bottom of the screen and gone
+   as soon as the Try it section reaches it. It never moves on hover. */
+.try-float {
+  position: fixed; left: 50%; bottom: 24px; z-index: 40; transform: translateX(-50%);
+  display: inline-flex; align-items: center; gap: 7px; min-height: 38px; box-sizing: border-box;
+  padding: 9px 16px 9px 18px; border-radius: 999px;
+  background: rgba(244, 244, 241, 0.94); color: #0a0a0b;
+  font-family: var(--sans); font-weight: 500; font-size: 15px; line-height: 1;
+  text-decoration: none; white-space: nowrap;
+  -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35), 0 16px 40px -8px rgba(0, 0, 0, 0.7);
+  transition: opacity 0.2s ease, visibility 0.2s ease, background 0.12s ease;
+}
+.try-float:hover { background: #fff; }
+.try-float:focus-visible { outline: 2px solid var(--neon); outline-offset: 4px; }
+.try-float.is-gone { opacity: 0; visibility: hidden; pointer-events: none; }
+.try-float svg { flex: none; width: 14px; height: 14px; animation: try-nudge 1.8s ease-in-out infinite; }
+@keyframes try-nudge { 0%,100% { transform: translateY(0); } 50% { transform: translateY(2px); } }
+@media (max-width: 760px) { .try-float { bottom: max(16px, env(safe-area-inset-bottom)); } }
+@media (prefers-reduced-motion: reduce) { .try-float, .try-float svg { transition: none; animation: none; } }

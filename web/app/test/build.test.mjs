@@ -156,5 +156,6 @@ test("the live market ships at /market and the homepage links it", () => {
   assert.ok(!sell.includes('id="market"'), "the seller page carries no board");
   assert.ok(sell.includes("follow the seller instructions"), "the seller page hands out the seller line");
   // Old #market deep links (skill.md, llms.txt, shared URLs) still land on the board.
-  assert.match(home, /location\.hash === "#market"\) location\.replace\("\/market"\)/);
+  assert.match(readFileSync(join(root, "src/main.ts"), "utf8"), /location\.hash === "#market".*location\.replace\("\/market"\)/);
+  assert.ok(!home.includes("<script>"), "no inline scripts in the browser-key origin");
 });

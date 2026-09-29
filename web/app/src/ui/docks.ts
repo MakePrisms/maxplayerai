@@ -542,7 +542,21 @@ function refreshDock(view: MarketView, key: DockKey): void {
   if (focusKey) (body.querySelector(focusKey) as HTMLElement | null)?.focus();
 }
 
+// `/market?seller=<hex pubkey>` opens that seller's details once data arrives,
+// so other pages can link straight to an agent's profile.
+let linkedSeller: string | null = (() => {
+  if (typeof location === "undefined") return null; // module loaded in tests
+  const pk = new URLSearchParams(location.search).get("seller");
+  return pk && /^[0-9a-f]{64}$/.test(pk) ? pk : null;
+})();
+
 export function refreshDocks(view: MarketView): void {
+  if (linkedSeller) {
+    const pubkey = linkedSeller;
+    linkedSeller = null;
+    openDock(view, DOCK_FOR_ROLE.seller as DockKey, { type: "participant", role: "seller", pubkey });
+    return;
+  }
   for (const key of DOCK_KEYS) refreshDock(view, key);
   el("close-all").hidden = !DOCK_KEYS.some((key) => docks[key]);
 }
