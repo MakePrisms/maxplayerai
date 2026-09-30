@@ -1,3 +1,79 @@
+## v0.6.1-rc2
+
+Second release candidate for 0.6.1, prepared from main after the shared repository
+limits and Git diff review changes (#1072). Once published, install with
+`npm install -g maxplayer@0.6.1-rc2`. This is a prerelease: publish on npm `rc`,
+leaving stable `latest` at v0.6.0.
+
+### Release scope
+
+RC1 was a separate seller-credits test build from the unmerged #1034/#1036/#1037
+stack. **RC2 does not include those unmerged changes**, including `nostr://` mint
+support or the mint sidecar. RC1 seller-credit testers should remain on RC1 until
+that feature stack is included in a later release; RC2 is not its feature superset.
+The RC1 notes below are preserved as the record of that published test build.
+
+### Changes since stable v0.6.0
+
+- Unified public/private repository defaults: 1 GiB compressed storage/upload,
+  5 GiB unique uncompressed Git objects, 100 MiB per file and one million objects.
+  Remove separate file-count and commit-count caps in clients, relay and reviewer.
+- Git delivery security reviews now send the task plus the diff against the
+  contribution's pinned starting commit, including additions, deletions, edits,
+  mode changes and surrounding context. Artifact jobs diff against the empty tree.
+  Small diffs stay together; large hunks split with task/path/location context.
+  Every batch must succeed; independent requests can still miss interactions.
+- Disk-backed relay downloads and review requests reduce whole-input memory copies;
+  raise the Git-only reverse-proxy upload allowance. No transcript collection.
+- Website/market updates: Try it on Buy and revised copy (#1068), graceful Try it
+  safety declines (#1073), updated first-job video (#1074), and delivery-aware
+  market lamps/removal of seller-profile Overdue status (#1075). Try it remains
+  controlled by its existing deployment flags.
+- Private-job documentation and v0.6.0 accuracy corrections (#1071).
+
+### Coordinated rollout
+
+Deploy matching relay, reviewer and Git reverse-proxy configuration, then update
+and restart buyer/seller clients and MCP servers. Prepare client builds first:
+older clients reject the changed private-repository provisioning limits. The
+checked-in NixOS `#relay` deployment includes relay, reviewer and Nginx together.
+Preserve existing wallets, keys, databases and repository data.
+
+Public seller repositories still share storage across job branches. The new
+limits do not change repository layout or retention. Large reviews can still
+exceed provider/time budgets; batching is not proof of safe execution or a full
+code-correctness review. Changed binary files, symlinks and submodules remain
+unsupported review inputs. No paid full-size JEV benchmark is claimed.
+
+Release publication alone does not deploy services or prove live compatibility.
+Smoke-test private provisioning/delivery/collection and a reviewed Git contribution
+after updating the server and clients.
+
+## v0.6.1-rc1
+
+First release candidate for 0.6.1, cut to test seller credits before they merge.
+This is a prerelease; stable remains v0.6.0. Install with `npm install -g maxplayer@rc`.
+It is built from the seller-credits PR stack (#1034, #1036, #1037), not from `main`.
+
+### Changes since v0.6.0
+
+- Wallet support for `nostr://<npub>` mints: a Cashu mint reached over Nostr relays
+  instead of HTTPS (seller credits stage 1, #1034). Buyers and sellers can pay and
+  accept tokens from such a mint when it is on their accepted-mint list.
+- In-flight `nostr://` requests hold their inputs and cdk saga recovery until the
+  request can no longer land, so a slow relay cannot cause a double spend (#1034).
+- `maxplayer-mint`, an opt-in mint sidecar that serves a cdk mint over Nostr
+  (stage 2, #1036), plus a local end-to-end harness (stage 3, #1037). The sidecar
+  is not part of the `maxplayer` binary or the npm package; build it from source
+  with `cargo build --manifest-path crates/maxplayer-mint/Cargo.toml`. A CI guard
+  keeps cdk's mint code out of the default `maxplayer` build.
+
+### Existing installations
+
+Nothing changes unless a `nostr://` mint is added to the wallet or accepted-mint
+configuration; HTTPS mints behave as in v0.6.0. GitHub marks this as a prerelease,
+npm publishes it under `rc`, and stable `latest` stays at v0.6.0.
+
 ## v0.6.0
 
 Stable 0.6.0 release, incorporating the RC1–RC8 fixes and the new homepage.
