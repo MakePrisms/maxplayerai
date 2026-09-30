@@ -19,6 +19,7 @@ pub(super) struct Plan {
     source_hash: String,
     ranges: Vec<std::ops::Range<usize>>,
     pub digest: String,
+    prepared: bool,
 }
 impl Plan {
     #[cfg(test)]
@@ -180,6 +181,7 @@ impl Plan {
             source_hash,
             ranges,
             digest: String::new(),
+            prepared: false,
         };
         if plan.ranges.len() == 1 {
             plan.digest = input_digest(&plan.body(0)?);
@@ -207,7 +209,22 @@ impl Plan {
             .map_err(|_| "input_unavailable")?;
         String::from_utf8(bytes).map_err(|_| "unsupported_input".into())
     }
+    pub(super) fn prepared(input: std::fs::File, ranges: Vec<std::ops::Range<usize>>, model: &str, deadline: std::time::Instant) -> Result<Self, String> {
+        let mut plan = Self { input, len: 0, model: model.into(), source_hash: String::new(), ranges, digest: String::new(), prepared: true };
+        let mut hash = Sha256::new();
+        hash.update(b"maxplayer-contextual-diff-v1\0");
+        hash.update((plan.ranges.len() as u64).to_be_bytes());
+        for i in 0..plan.ranges.len() {
+            if std::time::Instant::now() >= deadline { return Err("input_unavailable".into()); }
+            let body = plan.body(i)?;
+            hash.update((body.len() as u64).to_be_bytes());
+            hash.update(body);
+        }
+        plan.digest = hex::encode(hash.finalize());
+        Ok(plan)
+    }
     pub fn body(&self, i: usize) -> Result<Vec<u8>, String> {
+        if self.prepared { return Ok(self.read_range(self.ranges[i].clone())?.into_bytes()); }
         let range = &self.ranges[i];
         let text = self.read_range(range.clone())?;
         if self.ranges.len() == 1 {

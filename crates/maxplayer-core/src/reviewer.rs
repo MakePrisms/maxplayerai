@@ -3,6 +3,7 @@
 //! No checkout, hooks, builds or arbitrary-URL fetches. Private review inputs and
 //! results travel only through authenticated recipient-encrypted messages.
 mod batches;
+mod diff;
 use batches::Plan;
 use std::sync::Arc;
 use crate::gateway::{MAXPLAYER_TAG, TagSpec};
@@ -308,6 +309,7 @@ fn verify_object(
 }
 
 /// Bounded object-only inspection. Symlinks, submodules and non-text blobs fail closed.
+#[cfg(test)]
 pub fn git_files(path: &Path, commit: &str) -> Result<Vec<(String, Arc<ReviewBlob>)>, String> {
     let repo = git2::Repository::open_bare(path).map_err(|_| "input_unavailable")?;
     crate::private_content::repositories::check_object_quotas(&repo).map_err(|_| "input_too_large")?;
@@ -443,20 +445,21 @@ impl Drop for ReviewScratch {
     }
 }
 
+#[cfg(test)]
 fn inspect_fetched(
     repo: &git2::Repository,
     path: &Path,
     commit: &str,
 ) -> Result<Vec<(String, Arc<ReviewBlob>)>, String> {
-    let expected = git2::Oid::from_str(commit).map_err(|_| "invalid_subject")?;
-    let tip = repo
-        .find_reference("refs/review/delivery")
-        .and_then(|r| r.peel_to_commit())
-        .map_err(|_| "input_unavailable")?;
-    if tip.id() != expected {
-        return Err("input_integrity".into());
-    }
+    verify_fetched_tip(repo, commit)?;
     git_files(path, commit)
+}
+
+fn verify_fetched_tip(repo: &git2::Repository, commit: &str) -> Result<(), String> {
+    let expected = git2::Oid::from_str(commit).map_err(|_| "invalid_subject")?;
+    let tip = repo.find_reference("refs/review/delivery").and_then(|r| r.peel_to_commit()).map_err(|_| "input_unavailable")?;
+    if tip.id() != expected { return Err("input_integrity".into()); }
+    Ok(())
 }
 
 fn review_source_ref(branch: &str) -> Result<String, String> {
@@ -466,41 +469,6 @@ fn review_source_ref(branch: &str) -> Result<String, String> {
         return Err("invalid_subject".into());
     }
     Ok(source)
-}
-
-fn relay_git_files(
-    relay: &str,
-    url: &str,
-    branch: &str,
-    commit: &str,
-    keys: &Keys,
-    deadline: std::time::Instant,
-) -> Result<Vec<(String, Arc<ReviewBlob>)>, String> {
-    validate_git_destination(relay, url)?;
-    let source = review_source_ref(branch)?;
-    if git2::Oid::from_str(commit).is_err() {
-        return Err("invalid_subject".into());
-    }
-    if std::time::Instant::now() >= deadline {
-        return Err("input_unavailable".into());
-    }
-    let scratch = ReviewScratch::new()?;
-    let repo = git2::Repository::init_bare(&scratch.0).map_err(|_| "input_unavailable")?;
-    let header = crate::git_transport::nip98_authorization_header_with_keys(url, keys, None, None)
-        .map_err(|_| "input_unavailable")?;
-    crate::git_transport::fetch_review_ref(
-        &repo,
-        url,
-        &format!("+{source}:refs/review/delivery"),
-        header,
-        MAX_GIT_FETCH_BYTES,
-        deadline,
-    )
-    .map_err(|_| "input_unavailable")?;
-    if std::time::Instant::now() >= deadline {
-        return Err("input_unavailable".into());
-    }
-    inspect_fetched(&repo, &scratch.0, commit)
 }
 
 fn private_spool() -> Result<std::fs::File, String> {
@@ -590,7 +558,7 @@ async fn snapshot(
         }
     }
     let mut result = None;
-    let mut files = Vec::new();
+    let files = Vec::new();
     if subject.kind == JOB_RESULT_KIND {
         let event = fetch(client, &subject.event).await?;
         if event.kind != Kind::Custom(JOB_RESULT_KIND) || !root_is(&event, &subject.offer) {
@@ -624,15 +592,20 @@ async fn snapshot(
             let branch = delivery.branch().to_owned();
             let commit = subject.commit.clone().unwrap();
             let keys = keys.clone();
-            files = tokio::task::spawn_blocking(move || {
+            let base = crate::contribution::parse_contribution_offer(&crate::job_lifecycle::event_to_draft(&offer).tags)
+                .map_err(|_| "invalid_subject")?.map(|c| c.base.oid().to_owned());
+            let task = parsed.task.clone();
+            let subject = subject.clone();
+            let model = config.model.clone();
+            return tokio::task::spawn_blocking(move || {
                 if let Some(path) = path {
-                    git_files(&path, &commit)
+                    diff::plan(&path, &commit, base.as_deref(), &task, &subject, &model, deadline)
                 } else {
-                    relay_git_files(&relay, &url, &branch, &commit, &keys, deadline)
+                    diff::relay_plan(&relay, &url, &branch, &commit, base.as_deref(), &task, &subject, &model, &keys, deadline)
                 }
             })
             .await
-            .map_err(|_| "input_unavailable")??;
+            .map_err(|_| "input_unavailable")?;
         }
         result = Some(event);
     }
@@ -1758,7 +1731,7 @@ async fn private_snapshot(
     use crate::private_content as pc;
     let task = bundle.task_envelope.as_deref().map(pc::PreparedContent::decode).transpose().map_err(|_| "invalid_subject")?;
     let resolved = pc::lifecycle::resolve_offer(&bundle.offer, task.as_ref(), &policy.service, &policy.service, &policy.host).map_err(|_| "invalid_subject")?;
-    let mut files = Vec::new();
+    let files = Vec::new();
     let mut answer = None;
     if let Some(evidence) = &bundle.delivery {
         let checked = evidence.validate(&bundle.offer.pubkey.to_hex(), policy).map_err(|_| "invalid_subject")?;
@@ -1769,10 +1742,14 @@ async fn private_snapshot(
             let branch = tags.required("branch").map_err(|_| "invalid_subject")?.to_owned();
             let relay = config.relay.clone(); let commit = commit.clone(); let keys = keys.clone();
             let path = config.repositories.get(&url).cloned();
-            files = tokio::task::spawn_blocking(move || {
-                if let Some(path) = path { git_files(&path, &commit) }
-                else { relay_git_files(&relay, &url, &branch, &commit, &keys, deadline) }
-            }).await.map_err(|_| "input_unavailable")??;
+            let base = resolved.contribution.as_ref().map(|c| c.base_oid.clone());
+            let task = resolved.offer.task.clone();
+            let subject = bundle.subject.clone();
+            let model = config.model.clone();
+            return tokio::task::spawn_blocking(move || {
+                if let Some(path) = path { diff::plan(&path, &commit, base.as_deref(), &task, &subject, &model, deadline) }
+                else { diff::relay_plan(&relay, &url, &branch, &commit, base.as_deref(), &task, &subject, &model, &keys, deadline) }
+            }).await.map_err(|_| "input_unavailable")?;
         }
     }
     let files = file_manifest(files)?;
