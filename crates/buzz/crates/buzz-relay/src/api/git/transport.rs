@@ -937,38 +937,33 @@ pub async fn upload_pack(
     // `PACK_OPS_TIMEOUT` (504 on hang) via `run_git_at`, logs git's stderr on
     // failure, and lets us fail closed on a non-zero exit or empty output.
     //
-    // TRADE-OFF vs upstream streaming: the whole pack is buffered in RAM per
-    // fetch (bounded by `git_max_repo_bytes`), and the per-stream byte/second
-    // metrics are dropped. Future work (keeper/gudnuf): a first-chunk-peek path
-    // could restore streaming + metrics while staying fail-closed.
-    let output = run_git_at(
-        repo.path(),
-        "upload-pack",
-        body,
-        &[],
-        &state.config.git_repo_path,
-        state.config.git_max_repo_bytes,
-    )
-    .await?;
-    // `run_git_at` waited for the subprocess to exit, so the hydrated tempdir's
-    // objects have been fully read — safe to drop now.
+    // Await completion before serving, but retain the pack on disk rather than
+    // loading a potentially multi-GiB fetch response into RAM. A fresh pack may
+    // differ from stored compression; use the common uncompressed+framing budget.
+    let (output, ok, len) = run_git_spooled_at(
+        repo.path(), "upload-pack", body, &[], &state.config.git_repo_path,
+        maxplayer_private_protocol::MAX_GIT_TRANSFER_BYTES as u64,
+    ).await?;
     drop(repo);
-
-    // Fail closed. A healthy upload-pack always emits a valid pkt-line stream (at
-    // minimum a NAK); a non-zero exit or empty output means git failed, and
-    // serving that as a 200 was the silent-mask bug. `run_git_at` sets
-    // `ok = status.success()` for upload-pack and logs git's stderr on both a
-    // non-zero exit and the exit-0-but-empty case.
-    if !output.ok || output.stdout.is_empty() {
-        warn!(
-            ok = output.ok,
-            stdout_bytes = output.stdout.len(),
-            "git upload-pack failed or produced no output — failing closed \
-             (this was previously masked as an empty 200 OK)"
-        );
+    if !ok || len == 0 {
         return Err((StatusCode::INTERNAL_SERVER_ERROR, "git upload-pack failed").into_response());
     }
-    Ok(build_git_response("upload-pack", output))
+    // into_file unlinks the pathname while keeping the descriptor alive. Closing
+    // the response (including client cancellation) reclaims the temporary pack.
+    let file = tokio::fs::File::from_std(output.into_file());
+    use futures_util::StreamExt;
+    // Keep the operation slot until the download finishes or is cancelled, so
+    // slow readers cannot accumulate unbounded open temporary packs.
+    let stream = tokio_util::io::ReaderStream::new(file).map(move |chunk| {
+        let _hold_permit = &_permit;
+        chunk
+    });
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/x-git-upload-pack-result")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(stream))
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "git response failed").into_response())
+
 }
 
 /// `POST /git/{owner}/{repo}/git-receive-pack`
@@ -1006,10 +1001,8 @@ pub async fn receive_pack(
     body: Body,
 ) -> Result<Response, Response> {
     let repo_name = validate_repo_id(&params.owner, &params.repo)?;
-    let private_job = super::private_jobs::authorize(&state, &auth.tenant, &params.owner, &params.repo, &auth.pubkey.to_hex(), true).await?;
-    let pack_limit = if private_job.is_some() {
-        state.config.git_max_pack_bytes.min(maxplayer_private_protocol::MAX_REPO_BYTES)
-    } else { state.config.git_max_pack_bytes };
+    super::private_jobs::authorize(&state, &auth.tenant, &params.owner, &params.repo, &auth.pubkey.to_hex(), true).await?;
+    let pack_limit = state.config.git_max_pack_bytes;
     let body = decode_git_request_body(&headers, body, pack_limit);
     let pusher_hex = hex::encode(auth.pubkey.to_bytes());
     let _permit = acquire_git_permit(&state, "receive_pack")?;
@@ -1150,6 +1143,26 @@ async fn run_git_at(
     scratch_dir: &Path,
     max_output_bytes: u64,
 ) -> Result<PackOutput, Response> {
+    let (output, success, _) = run_git_spooled_at(repo_path, service, body, extra_env, scratch_dir, max_output_bytes).await?;
+    let stdout = tokio::fs::read(output.path()).await.map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "git stdout read failed").into_response())?;
+    // Hook declines can exit zero: in-band rejection must still block CAS.
+    let report_rejected = service == "receive-pack" && receive_pack_report_rejected(&stdout);
+    if report_rejected {
+        warn!(service = %service, "git receive-pack report-status contains a rejected (ng) ref update");
+    }
+    Ok(PackOutput { stdout, ok: success && !report_rejected })
+}
+
+/// Await Git's status with bounded time and disk-backed output. Only small
+/// receive-pack status replies are subsequently materialized in memory.
+async fn run_git_spooled_at(
+    repo_path: &Path,
+    service: &str,
+    body: Body,
+    extra_env: &[(&str, String)],
+    scratch_dir: &Path,
+    max_output_bytes: u64,
+) -> Result<(tempfile::NamedTempFile, bool, u64), Response> {
     let stdout_tmp = tempfile::NamedTempFile::new_in(scratch_dir).map_err(|e| {
         error!(error = %e, service = %service, "git stdout tempfile failed");
         (StatusCode::INTERNAL_SERVER_ERROR, "git error").into_response()
@@ -1263,42 +1276,11 @@ async fn run_git_at(
         // still guards genuine subprocess failures (spawn/IO/abort).
     }
 
-    // Primary fence for a denied push: scan the report-status for an `ng`
-    // (rejected) ref update. `git receive-pack` exits 0 on a pre-receive hook
-    // decline, so the exit code alone is insufficient — the rejection lives in
-    // the in-band report-status. Fold both signals into `ok` so `finalize_push`
-    // skips CAS publish + kind:30618 on any rejected ref.
-    let stdout = tokio::fs::read(stdout_tmp.path()).await.map_err(|e| {
-        error!(error = %e, service = %service, "git stdout read failed");
-        (StatusCode::INTERNAL_SERVER_ERROR, "git error").into_response()
-    })?;
-
-    // Fork hardening (PR#1, re-carried): surface the silent-failure case where
-    // git exits 0 but produced no output. For upload-pack this is the v0
-    // multi-round-negotiation death that used to reach the client as an empty
-    // 200 OK; log git's stderr so the trigger is diagnosable in the journal.
-    // (The upload_pack read handler fails this closed on `stdout.is_empty()`.)
-    if status.success() && stdout.is_empty() {
+    if status.success() && stdout_len == 0 {
         let stderr = read_log_prefix(stderr_tmp.path(), 64 * 1024).await;
-        warn!(
-            stderr = %stderr,
-            service = %service,
-            "git subprocess exited 0 but produced no output"
-        );
+        warn!(stderr = %stderr, service = %service, "git subprocess exited 0 but produced no output");
     }
-
-    let report_rejected = service == "receive-pack" && receive_pack_report_rejected(&stdout);
-    if report_rejected {
-        warn!(
-            service = %service,
-            "git receive-pack report-status contains a rejected (ng) ref update"
-        );
-    }
-
-    Ok(PackOutput {
-        stdout,
-        ok: status.success() && !report_rejected,
-    })
+    Ok((stdout_tmp, status.success(), stdout_len))
 }
 
 async fn read_log_prefix(path: &Path, max_bytes: u64) -> String {
@@ -1493,9 +1475,11 @@ async fn finalize_push(state: &Arc<AppState>, ctx: PushContext) -> Response {
         if let Err(response) = super::private_jobs::authorize(state, &ctx.tenant, &ctx.owner, &ctx.repo_id, &ctx.pusher.to_hex(), true).await {
             return response;
         }
-        if let Err(response) = super::private_jobs::enforce_quota(ctx.repo_handle.path()).await {
-            return response;
-        }
+    }
+    // Same admission quotas for both storage paths, before the publication CAS.
+    let private = maxplayer_private_protocol::is_hex(&ctx.repo_id, 32);
+    if let Err(response) = super::quota::enforce(ctx.repo_handle.path(), private).await {
+        return response;
     }
 
     // Step 7 (CAS). The PushContext binds `parent_state` (observed at
@@ -1695,6 +1679,37 @@ mod track_c_tests {
     use buzz_core::CommunityId;
     use nostr::{EventBuilder, Keys, Kind, Tag};
     use std::collections::BTreeMap;
+
+    #[tokio::test]
+    async fn upload_pack_spools_complete_output_and_rejects_over_budget() {
+        use tokio::io::AsyncReadExt;
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        assert!(std::process::Command::new("git").args(["init", "--bare", "-q"]).arg(&repo).status().unwrap().success());
+        let mut child = std::process::Command::new("git").arg("-C").arg(&repo)
+            .args(["fast-import", "--quiet"]).stdin(std::process::Stdio::piped()).spawn().unwrap();
+        {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(b"commit refs/heads/main\ncommitter Test <test@example.test> 1 +0000\ndata 1\nx\nM 100644 inline file\ndata 5\nhello\n\n").unwrap();
+        }
+        assert!(child.wait().unwrap().success());
+        let oid = std::process::Command::new("git").arg("-C").arg(&repo).args(["rev-parse", "refs/heads/main"]).output().unwrap();
+        assert!(oid.status.success());
+        let want = format!("want {}\n", String::from_utf8(oid.stdout).unwrap().trim());
+        let request = format!("{:04x}{}00000009done\n", want.len()+4, want);
+        let (output, ok, len) = run_git_spooled_at(&repo, "upload-pack", Body::from(request.clone()), &[], root.path(), 1024 * 1024).await.unwrap();
+        assert!(ok && len > 8);
+        let mut file = tokio::fs::File::from_std(output.into_file());
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes.len() as u64, len);
+        assert!(bytes.windows(4).any(|part| part == b"PACK"));
+        let result = run_git_spooled_at(&repo, "upload-pack", Body::from(request), &[], root.path(), len - 1).await;
+        assert_eq!(result.unwrap_err().status(), StatusCode::PAYLOAD_TOO_LARGE);
+        // A protocol/subprocess error must remain unsuccessful, never a valid pack.
+        let (_, ok, _) = run_git_spooled_at(&repo, "upload-pack", Body::from("invalid"), &[], root.path(), 1024).await.unwrap();
+        assert!(!ok);
+    }
 
     fn oid_sha1() -> String {
         "cb09a769da1c01f458fa6959d4e8eded38fac8d3".to_string()

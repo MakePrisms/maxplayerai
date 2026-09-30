@@ -242,9 +242,9 @@ pub struct Config {
     pub git_repo_path: std::path::PathBuf,
     /// Parent directory for process-isolated immutable pack cache sessions.
     pub git_pack_cache_path: std::path::PathBuf,
-    /// Maximum pack file size for git push (bytes). Default: 500 MB.
+    /// Maximum pack file size for git push (bytes). Default: 1 GiB.
     pub git_max_pack_bytes: u64,
-    /// Maximum total bytes materialized for one git repo request. Default: 1 GB.
+    /// Maximum total bytes materialized for one git repo request. Default: 1 GiB.
     ///
     /// This bounds clone/fetch hydration work across a repo's historical pack
     /// set rather than only bounding one incoming push body.
@@ -781,11 +781,11 @@ impl Config {
         let git_max_pack_bytes: u64 = std::env::var("BUZZ_GIT_MAX_PACK_BYTES")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(500 * 1024 * 1024); // 500 MB
+            .unwrap_or(maxplayer_private_protocol::MAX_PACK_BYTES); // shared 1 GiB default
         let git_max_repo_bytes: u64 = std::env::var("BUZZ_GIT_MAX_REPO_BYTES")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| git_max_pack_bytes.saturating_mul(2)); // 1 GB at defaults
+            .unwrap_or(maxplayer_private_protocol::MAX_COMPRESSED_REPO_BYTES); // shared 1 GiB default
         let git_pack_cache_max_bytes: u64 = std::env::var("BUZZ_GIT_PACK_CACHE_MAX_BYTES")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -1062,6 +1062,30 @@ mod tests {
         let custom = custom.unwrap();
         assert!(!custom.private_job_repos);
         assert_eq!(custom.private_service_pubkey.as_deref(), Some("custom-service"));
+    }
+
+    #[test]
+    fn shared_git_defaults_and_explicit_storage_overrides() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let names = ["BUZZ_GIT_MAX_PACK_BYTES", "BUZZ_GIT_MAX_REPO_BYTES"];
+        let saved = names.map(std::env::var_os);
+        for name in names { std::env::remove_var(name); }
+        let defaults = Config::from_env();
+        std::env::set_var(names[0], "123456");
+        std::env::set_var(names[1], "234567");
+        let custom = Config::from_env();
+        for (name, value) in names.into_iter().zip(saved) {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        let defaults = defaults.unwrap();
+        assert_eq!(defaults.git_max_pack_bytes, maxplayer_private_protocol::MAX_PACK_BYTES);
+        assert_eq!(defaults.git_max_repo_bytes, maxplayer_private_protocol::MAX_COMPRESSED_REPO_BYTES);
+        let custom = custom.unwrap();
+        assert_eq!(custom.git_max_pack_bytes, 123456);
+        assert_eq!(custom.git_max_repo_bytes, 234567);
     }
 
     #[test]

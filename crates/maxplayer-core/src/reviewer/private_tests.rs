@@ -311,6 +311,12 @@ async fn private_git_review_reads_exact_commit_and_refuses_changed_binding() {
     let blob = repo.blob(b"private git file canary").unwrap();
     let mut tree = repo.treebuilder(None).unwrap();
     tree.insert("answer.txt", blob, 0o100644).unwrap();
+    // Both old bottlenecks: more than 256 files and more than 128 KiB of content.
+    for n in 0..300 {
+        let body = format!("private git file canary {n}: {}", "x".repeat(1024));
+        let blob = repo.blob(body.as_bytes()).unwrap();
+        tree.insert(&format!("part-{n}.txt"), blob, 0o100644).unwrap();
+    }
     let tree = repo.find_tree(tree.write().unwrap()).unwrap();
     let sig = git2::Signature::now("fixture", "fixture@example.invalid").unwrap();
     let commit = repo
@@ -386,10 +392,19 @@ async fn private_git_review_reads_exact_commit_and_refuses_changed_binding() {
     .await
     .unwrap();
     assert!(
-        String::from_utf8(input)
+        String::from_utf8(input.body(0).unwrap())
             .unwrap()
             .contains("private git file canary")
     );
+    let count = input.batch_count();
+    assert!(count > 1);
+    let responses = (0..count).map(|_| (200, None, super::tests::response(0.01))).collect();
+    let (provider, calls, http) = super::tests::http_provider(responses).await;
+    let (review, _) = input.classify(&provider, &request.subject, tokio::time::Instant::now() + WINDOW).await.unwrap();
+    http.await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), count);
+    assert_eq!(review.decision(&request.subject, 500_000).unwrap(), Decision::Passed);
+    assert_eq!(review.input_sha256, input.digest);
     let mut changed = request;
     changed.subject.commit = Some("ff".repeat(20));
     assert!(changed.validate(&key(1).public_key(), &policy).is_err());
@@ -440,7 +455,7 @@ async fn reviewer_public_v2_snapshot_remains_public_and_reads_exact_inline_envel
     )
     .await
     .unwrap();
-    let provider: Value = serde_json::from_slice(&body).unwrap();
+    let provider: Value = serde_json::from_slice(&body.body(0).unwrap()).unwrap();
     let input: Value = serde_json::from_str(provider["state"].as_str().unwrap()).unwrap();
     assert_eq!(input["result"]["content"], evidence.result.content);
     assert!(!private::is_private(&request));

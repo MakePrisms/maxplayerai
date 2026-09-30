@@ -121,7 +121,9 @@ impl ProvisionRequest {
             || reply.job_id != self.job
             || reply.max_file_bytes != super::MAX_FILE_BYTES
             || reply.max_repository_bytes != super::MAX_REPO_BYTES
-            || reply.max_files != super::MAX_FILES
+            || reply.max_objects != super::MAX_OBJECTS
+            || reply.max_pack_bytes == 0
+            || reply.max_compressed_repository_bytes == 0
         {
             return Err(Error("private hosting binding or limits mismatch"));
         }
@@ -135,7 +137,9 @@ struct ProvisionReply {
     job_id: String,
     max_file_bytes: u64,
     max_repository_bytes: u64,
-    max_files: usize,
+    max_objects: usize,
+    max_pack_bytes: u64,
+    max_compressed_repository_bytes: u64,
 }
 /// Re-mint for each attempt. A nonce distinguishes otherwise-identical retries in the
 /// same second, while the server's replay guard rejects reuse of a particular auth ID.

@@ -1,6 +1,6 @@
 //! Immutable input snapshots. libgit2 object reads, never checkout/hooks/submodule
 //! recursion. Only manifest-listed regular blobs reach a fresh job-scoped directory.
-use super::{Attachment, Error, MAX_FILE_BYTES, MAX_FILES, MAX_REPO_BYTES, Result};
+use super::{Attachment, Error, MAX_FILE_BYTES, MAX_REPO_BYTES, Result};
 use git2::{IndexEntry, IndexTime, Oid, Repository};
 use sha2::{Digest, Sha256};
 use std::{
@@ -40,7 +40,7 @@ fn private_dir(path: &Path) -> Result<()> {
 /// user identity. Upload and publication happen only AFTER the complete manifest binds.
 pub fn prepare(repo: &Repository, job: &str, files: &[InputFile]) -> Result<InputSnapshot> {
     super::require_hex(job, 32)?;
-    if files.is_empty() || files.len() > MAX_FILES {
+    if files.is_empty() {
         return Err(Error("invalid input file count"));
     }
     let mut paths = BTreeSet::new();
@@ -142,9 +142,6 @@ pub fn materialize(
     destination: &Path,
 ) -> Result<()> {
     super::require_hex(job, 32)?;
-    if manifest.len() > MAX_FILES {
-        return Err(Error("too many input files"));
-    }
     let mut entries = Vec::new();
     let mut paths = BTreeSet::new();
     let mut total = 0u64;
@@ -184,12 +181,13 @@ pub fn materialize(
         {
             return Err(Error("input manifest integrity mismatch"));
         }
-        entries.push((input.path.clone(), blob.content().to_vec()));
+        entries.push((input.path.clone(), entry.id()));
     }
     reject_overlaps(&paths)?;
     private_dir(destination)?;
     let mut dirs = BTreeSet::new();
-    for (path, bytes) in entries {
+    for (path, oid) in entries {
+        let blob = repo.find_blob(oid).map_err(git_error)?;
         let mut parent = destination.to_path_buf();
         let components: Vec<_> = path.split('/').collect();
         for component in &components[..components.len() - 1] {
@@ -206,7 +204,7 @@ pub fn materialize(
             options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
         let mut file = options.open(destination.join(path)).map_err(io_error)?;
-        file.write_all(&bytes).map_err(io_error)?;
+        file.write_all(blob.content()).map_err(io_error)?;
         file.sync_all().map_err(io_error)?;
     }
     Ok(())

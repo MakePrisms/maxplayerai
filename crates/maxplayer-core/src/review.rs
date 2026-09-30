@@ -9,8 +9,8 @@ use crate::kinds::{JOB_OFFER_KIND, JOB_RESULT_KIND, REVIEW_KIND, REVIEW_REQUEST_
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Event/task envelope bound, not a repository or aggregate review-input quota.
 pub const MAX_INPUT_BYTES: usize = 128 * 1024;
-pub const MAX_FILES: usize = 256;
 pub const MAX_REVIEW_BYTES: usize = 16 * 1024;
 pub const CLASSIFIER: &str = "execution-safety";
 pub const CLASSIFIER_VERSION: &str = "1";
@@ -45,7 +45,7 @@ impl Default for ReviewConfig {
                 DEFAULT_REVIEWER_PUBKEY.to_owned(),
             )]),
             reject_at_or_above_ppm: 500_000,
-            timeout_seconds: 30,
+            timeout_seconds: 300,
         }
     }
 }
@@ -252,20 +252,20 @@ pub fn input_bytes(
     files: Vec<(String, Vec<u8>)>,
 ) -> Result<Vec<u8>, String> {
     subject.validate()?;
-    if files.len() > MAX_FILES || task.len() > MAX_INPUT_BYTES {
+    if task.len() > MAX_INPUT_BYTES {
         return Err("review: input too large".into());
     }
     if subject.kind == JOB_OFFER_KIND && !files.is_empty() {
         return Err("review: offer cannot carry delivery files".into());
     }
     let mut sorted = BTreeMap::new();
-    let mut total = task.len();
+    let mut total = 0usize;
     for (path, bytes) in files {
         total = total
-            .checked_add(path.len())
-            .and_then(|n| n.checked_add(bytes.len()))
+            .checked_add(bytes.len())
             .ok_or("review: input too large")?;
-        if total > MAX_INPUT_BYTES {
+        if total > maxplayer_private_protocol::MAX_REPO_BYTES as usize
+            || bytes.len() > maxplayer_private_protocol::MAX_FILE_BYTES as usize {
             return Err("review: input too large".into());
         }
         if path.is_empty()
@@ -288,9 +288,6 @@ pub fn input_bytes(
         files: sorted,
     })
     .map_err(|e| e.to_string())?;
-    if bytes.len() > MAX_INPUT_BYTES {
-        return Err("review: input too large".into());
-    }
     Ok(bytes)
 }
 pub fn input_digest(bytes: &[u8]) -> String {
@@ -835,7 +832,7 @@ mod tests {
         assert_eq!(input_digest(&a), input_digest(&b));
         assert!(input_bytes(&s, "task", vec![("../secret".into(), vec![])]).is_err());
         assert!(input_bytes(&s, "task", vec![("a".into(), vec![255])]).is_err());
-        assert!(input_bytes(&s, "task", vec![("a".into(), vec![b'x'; MAX_INPUT_BYTES])]).is_err());
+        assert!(input_bytes(&s, "task", vec![("a".into(), vec![b'x'; maxplayer_private_protocol::MAX_FILE_BYTES as usize + 1])]).is_err());
     }
     #[test]
     fn mock_classifier_uses_bounded_input_and_maps_errors_without_leaking_them() {

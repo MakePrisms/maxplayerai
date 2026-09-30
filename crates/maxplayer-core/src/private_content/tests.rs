@@ -1651,3 +1651,21 @@ default_visibility = "public"
     let roundtrip: PrivacyConfig = toml::from_str(&toml::to_string(&custom).unwrap()).unwrap();
     assert_eq!(roundtrip, custom);
 }
+
+#[test]
+fn shared_quotas_allow_more_than_thousand_commits_and_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = git2::Repository::init_bare(dir.path()).unwrap();
+    let blob = repo.blob(b"same content").unwrap();
+    let mut builder = repo.treebuilder(None).unwrap();
+    for i in 0..1001 { builder.insert(&format!("f{i}"), blob, 0o100644).unwrap(); }
+    let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+    let sig = git2::Signature::now("test", "test@example.test").unwrap();
+    let mut parent = None;
+    for _ in 0..1001 {
+        let parents: Vec<_> = parent.iter().collect();
+        let oid = repo.commit(Some("refs/heads/main"), &sig, &sig, "history", &tree, &parents).unwrap();
+        parent = Some(repo.find_commit(oid).unwrap());
+    }
+    repositories::check_objects(&repo).unwrap();
+}

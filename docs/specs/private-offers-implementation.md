@@ -72,13 +72,19 @@ cannot be adopted by provisioning. The default `m<seller-prefix>` public reposit
 unaffected. The provisioning switch defaults on; disabling it never makes existing private
 repositories public.
 
-A private push measures the entire quarantined object graph against the 100 MiB cumulative
-uncompressed limit (including history), 10 MiB blob limit and 1,000 files per commit. The initial
-implementation also bounds inspection to 100,000 objects, 1,000 commits and 30 seconds, and refuses
-symlinks and submodules. These limits require representative contribution fixtures before rollout.
-The existing manifest-pointer CAS is the publication transaction: two pushes based on one parent
-cannot both publish their independently measured graphs. A loser must hydrate the winning parent
-and be measured again; failed pushes cannot make partial refs visible. The concurrent-push integration test proves this publication/quota boundary with two overlapping 54 MiB snapshots.
+Public and private pushes measure the entire quarantined object graph against the
+shared 5 GiB cumulative uncompressed limit (including history), 100 MiB blob limit
+and 1,000,000 unique-object limit before CAS publication. There are no separate
+file-count or commit-count limits. Compressed upload/storage both default to 1 GiB
+and operator overrides apply equally to both repository types. Inspection has a
+300-second processing deadline. Private path/type restrictions (including no
+symlinks/submodules) remain separate from these shared quotas; unique trees are
+inspected once rather than revisiting every historical snapshot.
+The existing manifest-pointer CAS is the publication transaction: two pushes based
+on one parent cannot both publish their independently measured graphs. A loser
+must hydrate the winning parent and be measured again; failed pushes cannot make
+partial refs visible. The concurrent-push integration test exercises this with a
+small injected quota and two overlapping 54 MiB snapshots.
 
 No READY phase, post-award buyer input handoff, application-level service ACK, paid external
 service or production probe has been introduced.

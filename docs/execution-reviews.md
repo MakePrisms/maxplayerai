@@ -47,7 +47,7 @@ buyer_delivery = true
 skip_buyer_pubkeys = []
 skip_seller_pubkeys = []
 reject_at_or_above_ppm = 500000
-timeout_seconds = 30
+timeout_seconds = 300
 
 [review.reviewers]
 "wss://relay.maxplayer.ai" = "31b18b42bcef9842c10e518834d32da2a0f8f6f8f3758124e25cc392ada1fe5c"
@@ -98,7 +98,7 @@ for verifying signed reviews on the next check.
 
 ## Timeouts and actual retry actions
 
-A client wait defaults to 30 seconds. **A timeout ends that review wait, not the job.**
+A client wait defaults to 300 seconds. Existing explicit shorter timeouts remain in effect. **A timeout ends that review wait, not the job.**
 It does not claim, accept, reject, pay, bypass the check, or extend job deadlines.
 
 Seller:
@@ -264,11 +264,20 @@ hooks, builds or execution. Scratch data is removed after success or failure.
 A process crash can leave scratch directories under the OS temporary directory;
 normal host temporary-file cleanup should reclaim them.
 
-Git reads share the request's 30-second deadline, with a 10-second maximum per
-HTTP leg, a 32 MiB aggregate HTTP-response cap and a 100,000-object transfer cap.
+Git reads share the request's 300-second deadline, with a 10-second maximum per
+HTTP leg. The aggregate HTTP-response cap uses the shared Git transfer budget: the 5 GiB
+uncompressed repository quota plus framing/compression allowance (64 bytes per allowed object
+and 64 KiB fixed overhead). Relay upload-pack responses and client private-input
+fetches use that budget too; the
+retained uncompressed quota is 5 GiB. The transfer object cap uses the shared
+1,000,000-object quota.
 The existing review input/file limits still apply after fetching. Inaccessible,
 missing, oversized, or timed-out fetches produce an error review, never approval.
 These bounds can reject large Git histories even when the final files are small.
+The relay waits for a successful, nonempty Git subprocess result before serving a
+fetch, then streams the completed temporary pack from disk rather than buffering
+it in RAM. The Git reverse-proxy upload allowance is 1056 MiB, above the relay's
+1 GiB admission ceiling; media upload allowances are unchanged.
 
 An optional `repositories` object still supports operator-managed exact URL-to-local
 bare-path overrides, including offline fixtures. Omit it for normal relay fetching;
@@ -284,8 +293,11 @@ Relay-level admission controls are still needed against identity churn.
 
 ## Provider retries, deduplication, and crashes
 
-The worker has a 30-second processing budget including input acquisition. It makes
-**at most three provider attempts total**: initial call plus two retries. Only
+The worker has a 300-second processing budget including input acquisition. Each
+provider request has a 30-second HTTP timeout and **at most three attempts**:
+initial call plus two retries. Larger review inputs use bounded batches
+with at most four concurrent provider requests; the whole batch set shares the
+same 300-second deadline. Only
 transport failures, HTTP 408/429, and server errors are transient. Other HTTP errors,
 invalid JSON/probabilities, and oversized responses stop immediately. Redirects and
 hidden HTTP retries are disabled. Backoff honors numeric `Retry-After`; date-form or
@@ -316,20 +328,84 @@ block; no automatic retry seeks a more permissive probability.
 
 ## Exact input and coverage
 
-Canonical JSON contains the subject, full verified offer, full verified result when
-present, and a sorted path manifest. Each manifest item contains a SHA-256 byte hash
-and exact UTF-8 text. Git data comes from the advertised immutable commit, not branch
-HEAD or a worktree. No hooks, scripts, build steps, filters, or delivered code run.
-Inline deliveries are supported only when the offer declares inline support and the
-RESULT passes the existing inline parser; their signed event ID binds the text.
+Git delivery reviews contain the task, subject/event/commit identifiers, pinned base
+commit, and a structured diff with three context lines. The base comes from the
+verified contribution offer (public tags or resolved private content), never the
+seller's chosen parent or a moving branch. It must be available and an ancestor of
+the delivered commit. Missing, corrupt or unrelated baselines fail closed. Artifact
+jobs without a contribution baseline compare against the empty tree, including all
+new files. Renames are represented as deletion plus addition. Mode-only changes
+are included. Deleted text is included; unchanged files/history are not sent.
+Git objects are read without checkout, hooks, filters, scripts or execution.
+Offer and inline reviews retain their existing canonical event input; inline
+support must be declared by the offer and validated by the existing parser.
 
-Limits: 128 KiB source JSON and serialized provider request, 256 files, 4096 tree entries, 4096-byte paths, 16 KiB
-provider/review response. Symlinks, submodules, non-UTF-8 paths/content, binary blobs,
-inaccessible objects, and incomplete/oversized input fail closed. No truncation.
-The input digest covers **the actual serialized provider request**, including the
-classifier instructions and requested model, not only the file list. The returned
-model identity is recorded in the signed `provider` tag. `jev-latest` is an alias,
-not pinned weights; configure a pinned provider model for reproducible evaluation.
+Repository limits reference the same protocol constants as public/private relay
+admission and client preflight: **100 MiB per blob, 5 GiB of unique uncompressed
+retained Git objects (including history), and 1,000,000 objects**. There are **no
+separate file-count or commit-count caps**, including during review tree traversal.
+Relay pack upload and compressed repository storage both default to **1 GiB**;
+explicit operator overrides remain supported and apply equally to public/private
+storage. Reviewer fetches allow repacking/framing overhead above the uncompressed
+quota, since a fresh pack need not have the same size as stored packs.
+
+Diff provider requests are spooled into owner-private, unlinked temporary files.
+Preparation retains individual blobs/patches and the current request, not copies
+of the complete review. Spools are reclaimed when handles close, including after
+a crash. Git fetch scratch directories retain the cleanup behavior described above.
+
+These defaults are admission ceilings, **not a guarantee that a near-5-GiB review
+finishes within the 300-second processing window or a reasonable provider bill**.
+Provider requests remain bounded and an incomplete review fails closed. No paid
+full-ceiling review has been benchmarked. Changed binary blobs, symlinks and
+submodules are unsupported; unchanged files are outside the diff review scope.
+Accepting a repository for storage does not assert that every content type has an
+available classifier.
+
+Public seller repositories still accumulate multiple job branches; the 1 GiB
+compressed-storage ceiling applies to that physical shared repository, not
+independently to each job branch. Private jobs have individual repositories. This
+change unifies quota values and enforcement, **not repository layout or retention**.
+The provisioning response advertises the new limits without a `max_files` field.
+Deploy client, relay and reviewer updates together: older clients intentionally
+refuse changed provisioning limits rather than assuming unsupported capacity.
+Per-account storage budgeting and disk-watermark admission are separate follow-up
+work; existing relay operation/cache concurrency controls are preserved.
+
+Signed source events remain bounded at 128 KiB. Provider requests remain bounded
+at 128 KiB serialized, with at most 30 KiB of state (conservative UTF-8 byte budget
+for TypeSafe's [32k-token state + question limit](https://docs.typesafe.ai/models)).
+Git diffs are packed into complete JSON requests with at most 24 KiB of state.
+Every request repeats the full task, subject and pinned commit identifiers. Whole
+file hunks are kept together when they fit. Oversized hunks split preferentially at
+line boundaries (UTF-8 boundaries for oversized lines), repeating old/new paths,
+file modes, hunk coordinates and byte offsets on every piece. No diff bytes are
+truncated. Small diffs use one request. The full repeated task/context plus a
+change fragment must fit in one request;
+otherwise review returns an explicit input error rather than dropping task context.
+This is a review-context limit, not a lower repository-size quota.
+Offer/inline canonical inputs retain the existing UTF-8 fragment path (24 KiB,
+1 KiB overlap); this change specifically replaces Git delivery snapshot batching.
+Changed non-UTF-8/binary content, symlinks/submodules and unavailable inputs fail
+closed. Provider/review responses remain 16 KiB.
+
+An OK review requires a valid response for **every** fragment, all from the same
+returned model identity. The aggregate uses the largest `unsafe` probability across
+fragments; it is a conservative screening score, **not a calibrated probability for
+the repository as a whole**. Independent requests lose global context and cannot
+guarantee detection of attacks spanning requests or depending on unchanged code
+outside the diff. These reviews remain a
+safety signal, not proof that execution is safe. A failed, timed-out, or malformed
+fragment produces an error review, never approval based on partial results. Large
+reviews make more billable provider calls and can still hit timeouts/rate limits.
+
+Git diff review digests use a new domain-separated, ordered, length-prefixed list
+of **all exact provider request bytes**, including instructions, requested model,
+task, pinned commit IDs, paths and hunk pieces. Old full-snapshot results cannot
+be reused for diff review. Offer/inline digest behavior is unchanged. Thus batching
+strategy and any input change invalidate the cache. Completed reviews remain immutable; a crash during a
+batch set remains indeterminate and is not silently rebilled. Returned model identity
+is recorded in the signed `provider` tag. Configure a pinned model for reproducibility.
 
 The required classifier is `execution-safety`, version `1`. Unknown optional classifiers do not influence it; duplicates, unsupported
 versions, invalid probability distributions, or wrong subject/signature fail closed.
