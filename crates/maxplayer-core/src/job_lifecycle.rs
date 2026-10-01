@@ -1362,6 +1362,52 @@ fn classify_ok_false(message: &str) -> SendOutcome {
 /// seller is realized at (recorded for reporting). Equal on a direct payment; on a cross-mint hop
 /// `funding` is the source and `delivery` is the target, so they differ — which is exactly the case
 /// the old single `realized_mint` field mis-reported (it carried the source under a delivery name).
+/// Read accept's reservation pin, and the per-mint balances only when nothing is pinned (#1076).
+///
+/// `maxplayer accept` runs outside the daemon's `money_lock`, so while it awaits the balance read
+/// the daemon's sweep can re-reserve a released job at a newly selected mint. The pin is therefore
+/// read AGAIN after the balance read: a reservation that appeared meanwhile wins and the balance
+/// selection is dropped. (This narrows the window to the synchronous stretch before the bind write;
+/// the daemon's own settle holds `money_lock` and has no window.) An unreadable ledger refuses.
+pub(crate) async fn accept_pin_and_balances<F, Fut>(
+    db_path: &std::path::Path,
+    job_id: &str,
+    read_balances: F,
+) -> Result<
+    (
+        crate::buyer::store::ReservationPin,
+        Option<Result<Vec<crate::wallet_ops::MintBalance>, String>>,
+    ),
+    JobLifecycleError,
+>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<crate::wallet_ops::MintBalance>, String>>,
+{
+    use crate::buyer::store::ReservationPin;
+    let read_pin = || {
+        crate::buyer::store::read_reservation_pin(db_path, job_id).map_err(|error| {
+            JobLifecycleError::Io(format!(
+                "accept: could not read the reservation ledger for job {job_id} ({error}); \
+                 nothing was accepted — retry"
+            ))
+        })
+    };
+    let pin = read_pin()?;
+    if pin != ReservationPin::Unpinned {
+        return Ok((pin, None));
+    }
+    let balances = read_balances().await;
+    let reread = read_pin()?;
+    if reread != ReservationPin::Unpinned {
+        crate::opline!(
+            "accept: job {job_id} was reserved while balances were read; sealing the reserved mint"
+        );
+        return Ok((reread, None));
+    }
+    Ok((ReservationPin::Unpinned, Some(balances)))
+}
+
 /// The funding mint accept seeds `plan_payment` with (#1076). A live reservation's mint wins —
 /// `Default` (a live row with no recorded mint) is the configured default it was checked against —
 /// so the sealed mint is the mint the ledger holds the funds at. With no live reservation, the
@@ -1695,23 +1741,12 @@ pub async fn accept_claim_async(
     // mint that is never spent while the mint that IS spent carries no hold for it — so a second
     // award could reserve the same sats. The pin is read from the buyer ledger; an unreadable
     // ledger refuses the accept (retryable) rather than guessing.
-    let pin = crate::buyer::store::read_reservation_pin(
+    let (pin, balances) = accept_pin_and_balances(
         &home.root.join(crate::buyer::STATE_DB_FILE),
         &request.job_id,
+        || async { crate::wallet_ops::balances_async(home).await.map_err(|error| error.to_string()) },
     )
-    .map_err(|error| {
-        JobLifecycleError::Io(format!(
-            "accept: could not read the reservation ledger for job {} ({error}); nothing was \
-             accepted — retry",
-            request.job_id
-        ))
-    })?;
-    let balances = match &pin {
-        crate::buyer::store::ReservationPin::Unpinned => {
-            Some(crate::wallet_ops::balances_async(home).await.map_err(|error| error.to_string()))
-        }
-        _ => None,
-    };
+    .await?;
     let source_seed = accept_source_seed(
         home.config.default_mint(),
         &accepted_mints,
@@ -3993,6 +4028,90 @@ mod tests {
 
         store.release(&job, 2).expect("release");
         assert_eq!(read_reservation_pin(&db, &job).expect("read"), ReservationPin::Unpinned);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // #1076 second review (low): CLI accept runs outside `money_lock`. A reservation committed by
+    // the daemon WHILE accept awaits the balance read must win over the balance selection.
+    // Red-on-revert: without the re-read this returns Unpinned + balances, and the seed is the
+    // default (the balance selection) instead of the reserved extra mint.
+    #[tokio::test(flavor = "current_thread")]
+    async fn accept_follows_a_reservation_committed_during_the_balance_read() {
+        use crate::buyer::reservations::MintCeiling;
+        use crate::buyer::store::{BuyerStore, ReservationPin};
+        let root = std::env::temp_dir().join(format!(
+            "maxplayer-accept-reread-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        let db = root.join(crate::buyer::STATE_DB_FILE);
+        let job = "c".repeat(64);
+        let store = BuyerStore::open(&db).expect("open");
+        store
+            .reserve_at(&job, 200, &MintCeiling::at_mint(SEED_EXTRA, 300, false), 1)
+            .expect("reserve");
+        store.release(&job, 2).expect("release: accept starts Unpinned");
+
+        let accepted = vec![SEED_DEFAULT.to_owned(), SEED_EXTRA.to_owned()];
+        let (pin, balances) = accept_pin_and_balances(&db, &job, || async {
+            // The daemon's sweep re-holds the job at extra while the wallet read is in flight.
+            store
+                .reserve_at(&job, 200, &MintCeiling::at_mint(SEED_EXTRA, 300, false), 3)
+                .expect("concurrent re-hold");
+            Ok(vec![seed_row(SEED_DEFAULT, 500, true), seed_row(SEED_EXTRA, 300, false)])
+        })
+        .await
+        .expect("pin");
+        assert_eq!(pin, ReservationPin::Mint(SEED_EXTRA.to_owned()));
+        assert!(balances.is_none(), "the pre-commit balance selection must be dropped");
+        let seed = accept_source_seed(
+            SEED_DEFAULT,
+            &accepted,
+            true,
+            &pin,
+            balances.as_ref().map(|r| r.as_ref().map(Vec::as_slice).map_err(String::as_str)),
+            200,
+        );
+        assert_eq!(seed, SEED_EXTRA);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // With nothing reserved before or after the read, the balances pass through unchanged; a pin
+    // present up front skips the wallet read entirely.
+    #[tokio::test(flavor = "current_thread")]
+    async fn accept_pin_and_balances_reads_balances_only_when_unpinned() {
+        use crate::buyer::reservations::MintCeiling;
+        use crate::buyer::store::{BuyerStore, ReservationPin};
+        let root = std::env::temp_dir().join(format!(
+            "maxplayer-accept-unpinned-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        let db = root.join(crate::buyer::STATE_DB_FILE);
+        let job = "d".repeat(64);
+        let (pin, balances) = accept_pin_and_balances(&db, &job, || async {
+            Ok(vec![seed_row(SEED_DEFAULT, 500, true)])
+        })
+        .await
+        .expect("no ledger yet");
+        assert_eq!(pin, ReservationPin::Unpinned);
+        assert_eq!(balances.expect("read").expect("ok").len(), 1);
+
+        let store = BuyerStore::open(&db).expect("open");
+        store
+            .reserve_at(&job, 200, &MintCeiling::at_mint(SEED_EXTRA, 300, false), 1)
+            .expect("reserve");
+        let (pin, balances) = accept_pin_and_balances(&db, &job, || async {
+            panic!("a pinned accept must not read balances")
+        })
+        .await
+        .expect("pinned");
+        assert_eq!(pin, ReservationPin::Mint(SEED_EXTRA.to_owned()));
+        assert!(balances.is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 
