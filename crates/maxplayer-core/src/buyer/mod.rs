@@ -2144,9 +2144,7 @@ async fn resolve_attempt_via_chokepoint(
     let ceiling = match award_ceiling(context, job_id, &quoted_mints, amount_sats).await {
         Ok(ceiling) => ceiling,
         Err(error) => {
-            return Err(AwardError::Presence(StoreError(format!(
-                "money snapshot unavailable (wallet/budget): {error}"
-            ))));
+            return Err(AwardError::Presence(StoreError(error)));
         }
     };
     let probe_home = context.home.clone();
