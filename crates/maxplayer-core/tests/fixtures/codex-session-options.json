@@ -1,0 +1,543 @@
+{
+  "1.2.0": [
+    {
+      "method": "session/new",
+      "result": {
+        "configOptions": [
+          {
+            "id": "model",
+            "name": "Model",
+            "description": "Model Codex uses for the session",
+            "category": "model",
+            "type": "select",
+            "currentValue": "gpt-5.6-sol",
+            "options": [
+              {
+                "value": "gpt-5.6-sol",
+                "name": "GPT-5.6-Sol",
+                "description": "Latest frontier agentic coding model."
+              },
+              {
+                "value": "gpt-5.6-terra",
+                "name": "GPT-5.6-Terra",
+                "description": "Balanced agentic coding model for everyday work."
+              },
+              {
+                "value": "gpt-5.6-luna",
+                "name": "GPT-5.6-Luna",
+                "description": "Fast and affordable agentic coding model."
+              },
+              {
+                "value": "gpt-5.5",
+                "name": "GPT-5.5",
+                "description": "Frontier model for complex coding, research, and real-world work."
+              },
+              {
+                "value": "gpt-5.2",
+                "name": "GPT-5.2",
+                "description": "Optimized for professional work and long-running agents."
+              }
+            ]
+          },
+          {
+            "id": "reasoning_effort",
+            "name": "Reasoning effort",
+            "description": "How much reasoning effort the model should use",
+            "category": "thought_level",
+            "type": "select",
+            "currentValue": "low",
+            "options": [
+              {
+                "value": "low",
+                "name": "Low",
+                "description": "Fast responses with lighter reasoning"
+              },
+              {
+                "value": "medium",
+                "name": "Medium",
+                "description": "Balances speed and reasoning depth for everyday tasks"
+              },
+              {
+                "value": "high",
+                "name": "High",
+                "description": "Greater reasoning depth for complex problems"
+              },
+              {
+                "value": "xhigh",
+                "name": "Xhigh",
+                "description": "Extra high reasoning depth for complex problems"
+              },
+              {
+                "value": "max",
+                "name": "Max",
+                "description": "Maximum reasoning depth for the hardest problems"
+              },
+              {
+                "value": "ultra",
+                "name": "Ultra",
+                "description": "Maximum reasoning with automatic task delegation"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "method": "session/set_config_option",
+      "result": {
+        "configOptions": [
+          {
+            "id": "model",
+            "name": "Model",
+            "description": "Model Codex uses for the session",
+            "category": "model",
+            "type": "select",
+            "currentValue": "gpt-5.6-sol",
+            "options": [
+              {
+                "value": "gpt-5.6-sol",
+                "name": "GPT-5.6-Sol",
+                "description": "Latest frontier agentic coding model."
+              },
+              {
+                "value": "gpt-5.6-terra",
+                "name": "GPT-5.6-Terra",
+                "description": "Balanced agentic coding model for everyday work."
+              },
+              {
+                "value": "gpt-5.6-luna",
+                "name": "GPT-5.6-Luna",
+                "description": "Fast and affordable agentic coding model."
+              },
+              {
+                "value": "gpt-5.5",
+                "name": "GPT-5.5",
+                "description": "Frontier model for complex coding, research, and real-world work."
+              },
+              {
+                "value": "gpt-5.2",
+                "name": "GPT-5.2",
+                "description": "Optimized for professional work and long-running agents."
+              }
+            ]
+          },
+          {
+            "id": "reasoning_effort",
+            "name": "Reasoning effort",
+            "description": "How much reasoning effort the model should use",
+            "category": "thought_level",
+            "type": "select",
+            "currentValue": "low",
+            "options": [
+              {
+                "value": "low",
+                "name": "Low",
+                "description": "Fast responses with lighter reasoning"
+              },
+              {
+                "value": "medium",
+                "name": "Medium",
+                "description": "Balances speed and reasoning depth for everyday tasks"
+              },
+              {
+                "value": "high",
+                "name": "High",
+                "description": "Greater reasoning depth for complex problems"
+              },
+              {
+                "value": "xhigh",
+                "name": "Xhigh",
+                "description": "Extra high reasoning depth for complex problems"
+              },
+              {
+                "value": "max",
+                "name": "Max",
+                "description": "Maximum reasoning depth for the hardest problems"
+              },
+              {
+                "value": "ultra",
+                "name": "Ultra",
+                "description": "Maximum reasoning with automatic task delegation"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "method": "session/set_config_option",
+      "result": {
+        "configOptions": [
+          {
+            "id": "model",
+            "name": "Model",
+            "description": "Model Codex uses for the session",
+            "category": "model",
+            "type": "select",
+            "currentValue": "gpt-5.6-sol",
+            "options": [
+              {
+                "value": "gpt-5.6-sol",
+                "name": "GPT-5.6-Sol",
+                "description": "Latest frontier agentic coding model."
+              },
+              {
+                "value": "gpt-5.6-terra",
+                "name": "GPT-5.6-Terra",
+                "description": "Balanced agentic coding model for everyday work."
+              },
+              {
+                "value": "gpt-5.6-luna",
+                "name": "GPT-5.6-Luna",
+                "description": "Fast and affordable agentic coding model."
+              },
+              {
+                "value": "gpt-5.5",
+                "name": "GPT-5.5",
+                "description": "Frontier model for complex coding, research, and real-world work."
+              },
+              {
+                "value": "gpt-5.2",
+                "name": "GPT-5.2",
+                "description": "Optimized for professional work and long-running agents."
+              }
+            ]
+          },
+          {
+            "id": "reasoning_effort",
+            "name": "Reasoning effort",
+            "description": "How much reasoning effort the model should use",
+            "category": "thought_level",
+            "type": "select",
+            "currentValue": "high",
+            "options": [
+              {
+                "value": "low",
+                "name": "Low",
+                "description": "Fast responses with lighter reasoning"
+              },
+              {
+                "value": "medium",
+                "name": "Medium",
+                "description": "Balances speed and reasoning depth for everyday tasks"
+              },
+              {
+                "value": "high",
+                "name": "High",
+                "description": "Greater reasoning depth for complex problems"
+              },
+              {
+                "value": "xhigh",
+                "name": "Xhigh",
+                "description": "Extra high reasoning depth for complex problems"
+              },
+              {
+                "value": "max",
+                "name": "Max",
+                "description": "Maximum reasoning depth for the hardest problems"
+              },
+              {
+                "value": "ultra",
+                "name": "Ultra",
+                "description": "Maximum reasoning with automatic task delegation"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "2.1.1": [
+    {
+      "method": "session/new",
+      "result": {
+        "configOptions": [
+          {
+            "id": "model",
+            "name": "Model",
+            "description": "Model Codex uses for the session",
+            "category": "model",
+            "type": "select",
+            "currentValue": "gpt-6.1-sol",
+            "options": [
+              {
+                "value": "gpt-6.1-sol",
+                "name": "6.1 Sol",
+                "description": "Latest workhorse model for coding and everyday work."
+              },
+              {
+                "value": "gpt-6-astra",
+                "name": "6 Astra",
+                "description": "Frontier intelligence for the most demanding work."
+              },
+              {
+                "value": "gpt-6-sol",
+                "name": "6 Sol",
+                "description": "Previous generation workhorse model."
+              },
+              {
+                "value": "gpt-6-luna",
+                "name": "6 Luna",
+                "description": "Fast and affordable model for easier tasks."
+              },
+              {
+                "value": "gpt-5.6-sol",
+                "name": "5.6 Sol",
+                "description": "Older generation workhorse model."
+              },
+              {
+                "value": "gpt-5.6-terra",
+                "name": "5.6 Terra",
+                "description": "Older balanced model for straightforward work."
+              },
+              {
+                "value": "gpt-5.6-luna",
+                "name": "5.6 Luna",
+                "description": "Older fast and efficient model."
+              },
+              {
+                "value": "gpt-5.5",
+                "name": "5.5",
+                "description": "Legacy coding model."
+              }
+            ]
+          },
+          {
+            "id": "reasoning_effort",
+            "name": "Reasoning effort",
+            "description": "How much reasoning effort the model should use",
+            "category": "thought_level",
+            "type": "select",
+            "currentValue": "low",
+            "options": [
+              {
+                "value": "low",
+                "name": "Low",
+                "description": "Fast responses with lighter reasoning"
+              },
+              {
+                "value": "medium",
+                "name": "Medium",
+                "description": "Balances speed and reasoning depth for everyday tasks"
+              },
+              {
+                "value": "high",
+                "name": "High",
+                "description": "Greater reasoning depth for complex problems"
+              },
+              {
+                "value": "xhigh",
+                "name": "Xhigh",
+                "description": "Extra high reasoning depth for complex problems"
+              },
+              {
+                "value": "max",
+                "name": "Max",
+                "description": "Maximum reasoning depth for the hardest problems"
+              },
+              {
+                "value": "ultra",
+                "name": "Ultra",
+                "description": "Maximum reasoning with automatic task delegation"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "method": "session/set_config_option",
+      "result": {
+        "configOptions": [
+          {
+            "id": "model",
+            "name": "Model",
+            "description": "Model Codex uses for the session",
+            "category": "model",
+            "type": "select",
+            "currentValue": "gpt-5.6-sol",
+            "options": [
+              {
+                "value": "gpt-6.1-sol",
+                "name": "6.1 Sol",
+                "description": "Latest workhorse model for coding and everyday work."
+              },
+              {
+                "value": "gpt-6-astra",
+                "name": "6 Astra",
+                "description": "Frontier intelligence for the most demanding work."
+              },
+              {
+                "value": "gpt-6-sol",
+                "name": "6 Sol",
+                "description": "Previous generation workhorse model."
+              },
+              {
+                "value": "gpt-6-luna",
+                "name": "6 Luna",
+                "description": "Fast and affordable model for easier tasks."
+              },
+              {
+                "value": "gpt-5.6-sol",
+                "name": "5.6 Sol",
+                "description": "Older generation workhorse model."
+              },
+              {
+                "value": "gpt-5.6-terra",
+                "name": "5.6 Terra",
+                "description": "Older balanced model for straightforward work."
+              },
+              {
+                "value": "gpt-5.6-luna",
+                "name": "5.6 Luna",
+                "description": "Older fast and efficient model."
+              },
+              {
+                "value": "gpt-5.5",
+                "name": "5.5",
+                "description": "Legacy coding model."
+              }
+            ]
+          },
+          {
+            "id": "reasoning_effort",
+            "name": "Reasoning effort",
+            "description": "How much reasoning effort the model should use",
+            "category": "thought_level",
+            "type": "select",
+            "currentValue": "low",
+            "options": [
+              {
+                "value": "low",
+                "name": "Low",
+                "description": "Fast responses with lighter reasoning"
+              },
+              {
+                "value": "medium",
+                "name": "Medium",
+                "description": "Balances speed and reasoning depth for everyday tasks"
+              },
+              {
+                "value": "high",
+                "name": "High",
+                "description": "Greater reasoning depth for complex problems"
+              },
+              {
+                "value": "xhigh",
+                "name": "Xhigh",
+                "description": "Extra high reasoning depth for complex problems"
+              },
+              {
+                "value": "max",
+                "name": "Max",
+                "description": "Maximum reasoning depth for the hardest problems"
+              },
+              {
+                "value": "ultra",
+                "name": "Ultra",
+                "description": "Maximum reasoning with automatic task delegation"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "method": "session/set_config_option",
+      "result": {
+        "configOptions": [
+          {
+            "id": "model",
+            "name": "Model",
+            "description": "Model Codex uses for the session",
+            "category": "model",
+            "type": "select",
+            "currentValue": "gpt-5.6-sol",
+            "options": [
+              {
+                "value": "gpt-6.1-sol",
+                "name": "6.1 Sol",
+                "description": "Latest workhorse model for coding and everyday work."
+              },
+              {
+                "value": "gpt-6-astra",
+                "name": "6 Astra",
+                "description": "Frontier intelligence for the most demanding work."
+              },
+              {
+                "value": "gpt-6-sol",
+                "name": "6 Sol",
+                "description": "Previous generation workhorse model."
+              },
+              {
+                "value": "gpt-6-luna",
+                "name": "6 Luna",
+                "description": "Fast and affordable model for easier tasks."
+              },
+              {
+                "value": "gpt-5.6-sol",
+                "name": "5.6 Sol",
+                "description": "Older generation workhorse model."
+              },
+              {
+                "value": "gpt-5.6-terra",
+                "name": "5.6 Terra",
+                "description": "Older balanced model for straightforward work."
+              },
+              {
+                "value": "gpt-5.6-luna",
+                "name": "5.6 Luna",
+                "description": "Older fast and efficient model."
+              },
+              {
+                "value": "gpt-5.5",
+                "name": "5.5",
+                "description": "Legacy coding model."
+              }
+            ]
+          },
+          {
+            "id": "reasoning_effort",
+            "name": "Reasoning effort",
+            "description": "How much reasoning effort the model should use",
+            "category": "thought_level",
+            "type": "select",
+            "currentValue": "high",
+            "options": [
+              {
+                "value": "low",
+                "name": "Low",
+                "description": "Fast responses with lighter reasoning"
+              },
+              {
+                "value": "medium",
+                "name": "Medium",
+                "description": "Balances speed and reasoning depth for everyday tasks"
+              },
+              {
+                "value": "high",
+                "name": "High",
+                "description": "Greater reasoning depth for complex problems"
+              },
+              {
+                "value": "xhigh",
+                "name": "Xhigh",
+                "description": "Extra high reasoning depth for complex problems"
+              },
+              {
+                "value": "max",
+                "name": "Max",
+                "description": "Maximum reasoning depth for the hardest problems"
+              },
+              {
+                "value": "ultra",
+                "name": "Ultra",
+                "description": "Maximum reasoning with automatic task delegation"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

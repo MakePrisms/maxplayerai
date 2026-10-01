@@ -532,6 +532,72 @@ impl AdmissionPolicy {
     }
 }
 
+/// Explicit, typed session settings. More harnesses can be added without widening Codex config.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessSessionSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex: Option<CodexSessionSettings>,
+}
+
+impl HarnessSessionSettings {
+    fn is_empty(&self) -> bool {
+        self.codex.is_none()
+    }
+}
+
+/// The two ACP options we allow an operator to set. No provider, URL or authentication fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodexSessionSettings {
+    #[serde(deserialize_with = "deserialize_codex_model")]
+    pub model: String,
+    pub reasoning_effort: CodexReasoningEffort,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CodexReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+    Ultra,
+}
+
+impl CodexReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+            Self::Ultra => "ultra",
+        }
+    }
+}
+
+fn deserialize_codex_model<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let model = String::deserialize(d)?;
+    if model.is_empty()
+        || model.len() > 128
+        || !model
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+    {
+        return Err(serde::de::Error::custom(
+            "codex model must be a bare model id (letters, digits, '.', '_' or '-'); set reasoning_effort separately",
+        ));
+    }
+    Ok(model)
+}
+
 /// Executor sandbox config (`[sandbox]` section): which executor the awarded agent command runs
 /// under. Absent ⇒ pass-through — the command runs exactly as configured, byte-identical to no
 /// sandbox. Present ⇒ [`SandboxMode`] selects the executor: `launcher` prepends a launcher argv so
@@ -684,6 +750,9 @@ pub struct SandboxConfig {
     /// remains unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_chatgpt: Option<CodexChatgptConfig>,
+    /// Docker-only harness session settings, independent of the authentication provider.
+    #[serde(default, skip_serializing_if = "HarnessSessionSettings::is_empty")]
+    pub harnesses: HarnessSessionSettings,
     /// `docker` mode: run the job's git delivery INSIDE the sandbox container (Track B).
     ///
     /// **The DEFAULT for a docker seat, since the container path was proven live.** Container
@@ -901,7 +970,7 @@ pub enum McpToolTransport {
     Stdio,
     /// The agent's own Streamable-HTTP MCP client connects to the proxy URL directly, with the
     /// placeholder in an `Authorization` header the session config names. No bridge process.
-    /// `claude-agent-acp` maps this ACP shape (measured on 0.67.0); a harness that does not map it
+    /// `claude-agent-acp` maps this ACP shape (source-checked on 0.85.0); a harness that does not map it
     /// gets no tool at all, so use this only where that is known.
     Http,
 }
@@ -2623,6 +2692,38 @@ mod tests {
             "maxplayer-home-{label}-{}-{id}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn codex_session_config_loads_from_disk_and_rejects_unsafe_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let config = "[sandbox]\nmode='docker'\n[sandbox.harnesses.codex]\nmodel='gpt-5.6-sol'\nreasoning_effort='high'\n";
+        fs::write(&path, config).unwrap();
+        let parsed = load_config(&path).unwrap();
+        let selected = parsed.sandbox.unwrap().harnesses.codex.unwrap();
+        assert_eq!(selected.model, "gpt-5.6-sol");
+        assert_eq!(selected.reasoning_effort, CodexReasoningEffort::High);
+        for invalid in [
+            config.replace("'high'", "'extreme'"),
+            config.replace("gpt-5.6-sol", "gpt-5.6-sol[high]"),
+            config.replace("gpt-5.6-sol", ""),
+            format!("{config}base_url='https://elsewhere'\n"),
+            format!("{config}model_provider='other'\n"),
+        ] {
+            fs::write(&path, invalid).unwrap();
+            assert!(load_config(&path).is_err());
+        }
+        fs::write(&path, "[sandbox]\nmode='docker'\n").unwrap();
+        assert!(
+            load_config(&path)
+                .unwrap()
+                .sandbox
+                .unwrap()
+                .harnesses
+                .codex
+                .is_none()
+        );
     }
 
     /// #487: the suggested seller claim floor is the rate buyers are told to post at. A fresh

@@ -600,3 +600,35 @@ credential does not cross the container boundary* in step 3.
 
 Dead ends exit as an issue on **https://github.com/MakePrisms/maxplayerai** naming the exact log
 line or command output you saw, or a note on the Maxplayer market channel (buzz).
+
+
+### Codex model and reasoning effort (Docker)
+
+To select a model for a Docker Codex seat, add this to the seller's `config.toml`
+(keep the existing `[sandbox] mode = "docker"` and authentication configuration):
+
+```toml
+[sandbox.harnesses.codex]
+model = "gpt-5.6-sol"
+reasoning_effort = "high"
+```
+
+This works with API-key authentication and `[sandbox.codex_chatgpt]`. Restart the
+seller after editing. Both fields are required when this table is present. Effort
+must be one of `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `ultra`;
+the selected model must also offer that effort. Unknown efforts fail config loading;
+unavailable models/efforts fail the pre-advertise probe rather than falling back.
+Use a bare model ID, not `gpt-5.6-sol[high]`, in `model`.
+
+Maxplayer sets the adapter's ACP `model` and `reasoning_effort` session options
+before prompting and verifies the acknowledged values. Heartbeats, claims and
+results use the effective combined identity, e.g. `gpt-5.6-sol[high]` (buyer filters
+match it exactly). Omit the table to keep the adapter's existing defaults.
+
+This is not free-form Codex configuration: it cannot set providers, endpoints,
+credentials, approval modes or sandbox modes. ChatGPT mode continues to remove
+operator `CODEX_CONFIG` and `MODEL_PROVIDER`; do not add them to `forward_env`.
+No host Codex home is mounted. Only commands with basename `codex-acp` use this
+setting; Claude and other harnesses remain unchanged. Use matching updated seller
+and sandbox-image builds: an old installed image does not gain this feature from
+a config edit.

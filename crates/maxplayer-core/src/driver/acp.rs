@@ -56,7 +56,7 @@ pub struct SessionConfig {
 /// difference between them is the `type` key:
 ///
 /// * [`Self::Stdio`] carries NO `type` key. The adapter the sandbox image bakes (`claude-agent-acp`
-///   0.67.0, `dist/acp-agent.js`, the `mcpServers` loop in `newSession`) treats an entry without
+///   0.85.0, `dist/acp-agent.js`, the `mcpServers` loop in `newSession`) treats an entry without
 ///   `type` as a stdio server, and an entry with any `type` other than `http`/`sse` as unknown — it
 ///   DROPS that entry. So a stdio entry must never say `type: "stdio"`; the absence is the tag.
 /// * [`Self::Http`] carries `type: "http"`, a `url`, and `headers`.
@@ -543,7 +543,7 @@ mod mcp_server_wire_tests {
     use super::*;
     use serde_json::json;
 
-    // The adapter drops a stdio entry that carries a `type` key (`claude-agent-acp` 0.67.0 reads
+    // The adapter drops a stdio entry that carries a `type` key (`claude-agent-acp` 0.85.0 reads
     // `"type" in server` before anything else), so the stdio shape must serialize with none.
     #[test]
     fn a_stdio_server_serializes_with_no_type_key() {

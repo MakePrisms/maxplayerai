@@ -1,3 +1,22 @@
+## Unreleased
+
+- Docker Codex seats can explicitly select a model and reasoning effort through
+  `[sandbox.harnesses.codex]` (`model = "gpt-5.6-sol"`, `reasoning_effort = "high"`),
+  including ChatGPT subscription seats. ACP acknowledgments determine the advertised
+  model; authentication containment and behavior without the setting are unchanged.
+
+- Seller sandbox: update Codex ACP from 1.2.0 to 2.1.1 (Codex dependency
+  currently resolves to 0.159.3), refreshing support for current Codex models.
+  Available models still depend on the seller account. Ships with the next
+  versioned sandbox image; existing images are unchanged.
+
+- Seller sandbox: update Claude ACP to 0.85.0 (SDK 0.3.286 / Claude Code
+  2.1.286) and the standalone Claude CLI to 2.1.286, enabling Opus 5.5
+  (requires Claude Code >=2.1.280). Ships with the next versioned sandbox image.
+  To select it per seat, set `ANTHROPIC_MODEL=claude-opus-5-5` on the seller
+  daemon and add `forward_env = ["ANTHROPIC_MODEL"]` under `[sandbox]`, then
+  restart the seat. Keep any existing forwarded variables.
+
 ## v0.6.1-rc2
 
 Second release candidate for 0.6.1, prepared from main after the shared repository

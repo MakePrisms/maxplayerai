@@ -101,3 +101,13 @@ applies the same list before comparing, so the redaction is part of the reproduc
 procedure rather than a one-off edit. Re-serializing the unredacted capture reproduces its
 source bytes exactly (`json.dumps(indent=2, ensure_ascii=False)`), which is what makes
 "differs only by deletions" checkable rather than asserted.
+
+## Historical launcher reference
+
+The `tools/fold:108` references in the original model-reporting commits refer to the
+capture operator's launcher selecting `/Users/forge/forge/npm/bin/claude-agent-acp`.
+There is no `tools/fold` file in this repository or its available Git path history;
+its implementation cannot be audited here. It is not the sandbox's adapter pin.
+The Dockerfile now pins 0.85.0. This 0.70.0 capture, version strings, hashes and
+measured notification counts stay unchanged as historical evidence; source checks
+of 0.85.0 are not a new authenticated wire capture.
