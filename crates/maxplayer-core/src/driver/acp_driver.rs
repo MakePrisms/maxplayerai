@@ -783,15 +783,15 @@ fn is_claude_agent_acp(initialize_result: &Value) -> bool {
 ///
 /// COUPLING, stated deliberately: `_meta.claudeCode.emitRawSDKMessages` is claude-agent-acp's own
 /// extension and is no part of ACP. It is here because the concrete model id is reachable NOWHERE
-/// else. `session/new` publishes only the picker alias, there is no `session/set_model`, and
-/// `session/update` usage carries no model at all — measured against 0.70.0, the version
-/// `tools/fold:108` gives every Claude seat. This is the only surface that names what actually ran.
+/// else reliably. The historical 0.70.0 wire capture below documents the picker alias and
+/// differing model surfaces; do not relabel that capture as a newer adapter measurement.
 ///
-/// The FILTER is the cost control, and the adapter honours it: `dist/acp-agent.js:5183` defaults the
-/// flag to `false`, and `:1829` gates every frame on `shouldEmitRawMessage` (`:5241`) before building
-/// a notification. Measured on 0.70.0, one prompt turn: unfiltered `true` emits 15 notifications,
-/// this filter emits exactly 1 (2472 bytes), and without the opt-in the gate is false and nothing is
-/// sent. Any other harness gets byte-identical params to the ones it got before.
+/// Source-checked against the sandbox's 0.85.0 adapter (`dist/acp-agent.js`): `agentInfo.name`
+/// comes from packageJson.name, newSession preserves this opt-in and defaults it to false,
+/// and the notification gate calls shouldEmitRawMessage before sending `_claude/sdkMessage`.
+/// The filter matches type and optional subtype/origin, so only system/init is requested here.
+/// The original 0.70.0 live measurement was 15 frames unfiltered versus one filtered frame;
+/// it is historical evidence, not a live 0.85.0 count. Other harnesses get unchanged params.
 fn session_new_params(cfg: SessionConfig, is_claude_adapter: bool) -> Result<Value, DriverError> {
     let mut params = serde_json::to_value(cfg)
         .map_err(|error| DriverError::Other(format!("failed to encode session params: {error}")))?;
@@ -1043,10 +1043,10 @@ mod tests {
     /// source, and so it invented `opus[1m]` — a string the real wire never sends — and had
     /// no `default` row at all. Source-reading cannot falsify an invented fixture, which is why
     /// every test here was green while a Claude seat advertised `default` to the market (#896).
-    /// Captured from `$HOME/forge/npm/bin/claude-agent-acp`, which is the binary `tools/fold:108`
-    /// gives every Claude seat — NOT whatever `claude-agent-acp` resolves to on a PATH, which on this
-    /// host is a different install at a different version. A capture taken against a binary the fleet
-    /// does not run is an invented fixture with a timestamp. `initialize.agentInfo.version` in the
+    /// Captured from `$HOME/forge/npm/bin/claude-agent-acp`. The original `tools/fold:108`
+    /// reference describes the capture operator's external launcher, not a file or pin in this
+    /// repository (see the fixture README). That workstation had a different version on PATH.
+    /// A capture taken against a binary the fleet does not run is an invented fixture with a timestamp. `initialize.agentInfo.version` in the
     /// capture reports 0.70.0.
     ///
     /// Verbatim from the wire: `sessionId`, every `configOptions` entry's `id`/`name`/`description`/
@@ -1423,7 +1423,7 @@ mod tests {
     }
 
     /// The `initialize` result CAPTURED from `$HOME/forge/npm/bin/claude-agent-acp` 0.70.0 —
-    /// `tools/fold:108`'s binary. Trimmed to `agentInfo`, the only part any gate here reads.
+    /// the historical capture operator's binary, not the current sandbox pin. Trimmed to `agentInfo`.
     fn claude_initialize_result() -> Value {
         json!({
             "protocolVersion": 1,

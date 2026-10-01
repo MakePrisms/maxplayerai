@@ -72,14 +72,13 @@ RUN apt-get update \
 
 # The ACP adapters the built-in harness presets resolve on PATH (`claude-agent-acp`, `codex-acp` —
 # see crates/maxplayer-core/src/agent_presets.rs). Baking them in means the job container does not fetch
-# them at run time, so a job's first turn is not spent installing its own harness. NOTE: each adapter
-# shells out to its underlying CLI — the `claude` / `codex` binary. codex-acp bundles `@openai/codex`,
-# so its CLI comes for free; the claude adapter needs the `claude` binary provisioned separately, so we
-# install `@anthropic-ai/claude-code` here too. Both CLIs are now IN this base image; the seller-operator
-# only needs to forward CREDENTIALS at run time (`docker run -e …` / the #647 credential proxy) — no
-# token is baked. On a standard glibc image the adapter auto-resolves `claude` on PATH, so no
-# CLAUDE_CODE_EXECUTABLE is needed here (that override is only for hosts like NixOS whose loader can't
-# run the npm-shipped binary — see docs/SELLER-QUICKSTART.md Gotcha 2).
+# them at run time, so a job's first turn is not spent installing its own harness. codex-acp
+# bundles its CLI. claude-agent-acp 0.85.0 resolves the native CLI bundled by claude-agent-sdk
+# 0.3.286 (Claude Code 2.1.286), NOT `claude` on PATH, unless CLAUDE_CODE_EXECUTABLE overrides it.
+# Keep the standalone `claude` CLI available for direct CLI use / explicit overrides, aligned with
+# that SDK's claudeCodeVersion. Raising only this global package does not upgrade ACP turns.
+# Both Claude pins clear Opus 5.5's Claude Code >=2.1.280 floor. Credentials are forwarded at run
+# time; no token is baked. NixOS executable overrides remain operator-specific (see the quickstart).
 #
 # Versions are PINNED to exact releases. An unpinned `npm install -g` resolves to whatever is latest at
 # build time, so two builds of the same commit could bake different adapters — which makes the published
@@ -87,9 +86,9 @@ RUN apt-get update \
 # digest correspond to a known adapter/CLI set, closing the gap called out in #792 (babu's F6 from the #221
 # security review). Bump these deliberately alongside a release.
 RUN npm install -g \
-    @agentclientprotocol/claude-agent-acp@0.67.0 \
+    @agentclientprotocol/claude-agent-acp@0.85.0 \
     @agentclientprotocol/codex-acp@1.2.0 \
-    @anthropic-ai/claude-code@2.1.223 \
+    @anthropic-ai/claude-code@2.1.286 \
     && npm cache clean --force
 
 # cursor. Deliberately NOT on the line above: `npm i -g cursor-agent` installs an unrelated third

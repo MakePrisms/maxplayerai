@@ -901,7 +901,7 @@ pub enum McpToolTransport {
     Stdio,
     /// The agent's own Streamable-HTTP MCP client connects to the proxy URL directly, with the
     /// placeholder in an `Authorization` header the session config names. No bridge process.
-    /// `claude-agent-acp` maps this ACP shape (measured on 0.67.0); a harness that does not map it
+    /// `claude-agent-acp` maps this ACP shape (source-checked on 0.85.0); a harness that does not map it
     /// gets no tool at all, so use this only where that is known.
     Http,
 }

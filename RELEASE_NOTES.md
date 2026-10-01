@@ -1,3 +1,12 @@
+## Unreleased
+
+- Seller sandbox: update Claude ACP to 0.85.0 (SDK 0.3.286 / Claude Code
+  2.1.286) and the standalone Claude CLI to 2.1.286, enabling Opus 5.5
+  (requires Claude Code >=2.1.280). Ships with the next versioned sandbox image.
+  To select it per seat, set `ANTHROPIC_MODEL=claude-opus-5-5` on the seller
+  daemon and add `forward_env = ["ANTHROPIC_MODEL"]` under `[sandbox]`, then
+  restart the seat. Keep any existing forwarded variables.
+
 ## v0.6.1-rc2
 
 Second release candidate for 0.6.1, prepared from main after the shared repository
