@@ -312,7 +312,8 @@ pub struct Phase1BaseOwned {
 ///   exists; from then on it is in the orchestrator's memory only.
 /// - `FreshAfterAgent`: it never exists while the agent does. The host writes it (mode `0600`) into
 ///   the exchange directory after it has verified the marker, and the orchestrator reads and deletes
-///   it. Every other process in the container has been reaped by then.
+///   it. Each subsequent HTTP leg requests a fresh header through a nonce-bound exchange.
+///   Every other process in the container has been reaped by then.
 /// - `None`: a public/anonymous https remote takes no header.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "mode", rename_all = "kebab-case")]
@@ -535,22 +536,30 @@ fn deliver_in_container(
     remove_planted_exchange_files(&inputs.out_dir);
     write_agent_done_marker(&inputs.out_dir, &inputs.handoff_nonce, &output.delivery_oid)?;
 
-    let header = match &inputs.push_token {
+    let mint = match &inputs.push_token {
         PushTokenSource::None => None,
-        PushTokenSource::LongLived { header } => Some(header.clone()),
-        PushTokenSource::FreshAfterAgent { wait_secs } => Some(await_push_token(
-            &inputs.out_dir,
-            Duration::from_secs(*wait_secs),
-        )?),
+        PushTokenSource::LongLived { header } => Some(git_transport::static_auth(header.clone())),
+        PushTokenSource::FreshAfterAgent { wait_secs } => {
+            // Initial hand-off proves host readiness. Do not reuse this header after local packing.
+            let _ = await_push_token(&inputs.out_dir, Duration::from_secs(*wait_secs))?;
+            Some(fresh_push_minter(
+                inputs.out_dir.clone(),
+                inputs.handoff_nonce.clone(),
+                inputs.relay_url.clone(),
+                Duration::from_secs(*wait_secs),
+            ))
+        }
     };
-    let pushed = push_delivery(
-        &output.delivery_repo_dir,
-        &inputs.relay_url,
-        &inputs.delivery_branch,
-        header,
-        &PushRetryPolicy::default(),
-        &output.delivery_oid,
-    )?;
+    let pushed = git_transport::with_container_push_http(|| {
+        push_delivery_with_minter(
+            &output.delivery_repo_dir,
+            &inputs.relay_url,
+            &inputs.delivery_branch,
+            mint,
+            &PushRetryPolicy::default(),
+            &output.delivery_oid,
+        )
+    })?;
     write_delivery_oid(&inputs.out_dir, &pushed)?;
     Ok(output)
 }
@@ -644,8 +653,8 @@ fn unix_now() -> u64 {
 }
 
 /// Retry policy for the delivery push. Exponential backoff with full jitter, bounded by an attempt
-/// count. The caller must pick values whose worst-case total sleep stays inside the relay's NIP-98
-/// token age window (±60 s), because the push token is minted just before the first attempt.
+/// count. Fresh-after-agent delivery requests a new token per HTTP leg, including retries.
+/// Static-token callers must supply a token covering the complete operation.
 #[derive(Clone, Copy, Debug)]
 pub struct PushRetryPolicy {
     /// Total attempts, including the first. `1` disables retrying.
@@ -657,8 +666,7 @@ pub struct PushRetryPolicy {
 }
 
 impl Default for PushRetryPolicy {
-    /// 5 attempts, 0.5 s base, 8 s cap. Worst-case total backoff (full jitter) ≤ 15.5 s, well inside
-    /// the 60 s token window even with per-attempt push time.
+    /// 5 attempts, 0.5 s base, 8 s cap. Authorization is refreshed after each backoff.
     fn default() -> Self {
         Self {
             max_attempts: 5,
@@ -776,6 +784,24 @@ pub fn push_delivery(
     policy: &PushRetryPolicy,
     gated_oid: &str,
 ) -> Result<String, OrchestratorError> {
+    push_delivery_with_minter(
+        repo_dir,
+        relay_url,
+        branch,
+        header.map(git_transport::static_auth),
+        policy,
+        gated_oid,
+    )
+}
+
+fn push_delivery_with_minter(
+    repo_dir: &Path,
+    relay_url: &str,
+    branch: &str,
+    mint: Option<git_transport::AuthMinter>,
+    policy: &PushRetryPolicy,
+    gated_oid: &str,
+) -> Result<String, OrchestratorError> {
     let tip = local_branch_tip(repo_dir, branch)?;
     if tip != gated_oid {
         return Err(OrchestratorError::Tampered(format!(
@@ -789,12 +815,14 @@ pub fn push_delivery(
     let pushed = push_with_retry(
         policy,
         |_attempt| {
-            git_transport::push_branch_with_header(
+            git_transport::push_branch_with_minter(
                 repo_dir,
                 relay_url,
                 branch,
                 gated_oid,
-                header.clone(),
+                mint.clone(),
+                None,
+                None,
             )
         },
         default_is_retryable,
@@ -876,6 +904,63 @@ pub const AGENT_DONE_MARKER: &str = "agent-done";
 /// The fresh push token the host writes (mode `0600`) after it verified the marker, in the
 /// fresh-after-agent mode. Read and DELETED by the orchestrator. It never exists while the agent does.
 pub const PUSH_TOKEN_FILE: &str = "push-token";
+/// Nonce-bound request for the next wire-leg token; never accepted before agent-done.
+pub const PUSH_TOKEN_REQUEST: &str = "push-token-request";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PushTokenRequest {
+    nonce: String,
+    sequence: u64,
+}
+
+/// Read only a bounded regular file, and refuse replay or a request from an agent that guessed
+/// the hand-off. The destination/ref remain host-owned; requests cannot supply either.
+pub fn read_push_token_request(
+    out: &Path,
+    nonce: &str,
+    previous: u64,
+) -> Result<Option<u64>, OrchestratorError> {
+    let Some(raw) = read_exchange_file(out, PUSH_TOKEN_REQUEST, EXCHANGE_MARKER_MAX_BYTES)? else {
+        return Ok(None);
+    };
+    let request: PushTokenRequest = serde_json::from_slice(&raw)
+        .map_err(|_| OrchestratorError::Tampered("invalid push token request".into()))?;
+    if request.nonce != nonce
+        || request.sequence != previous.saturating_add(1)
+        || request.sequence > 64
+    {
+        return Err(OrchestratorError::Tampered(
+            "invalid push token request sequence or nonce".into(),
+        ));
+    }
+    Ok(Some(request.sequence))
+}
+
+pub(crate) fn fresh_push_minter(
+    out: PathBuf,
+    nonce: String,
+    remote: String,
+    wait: Duration,
+) -> git_transport::AuthMinter {
+    let sequence = std::sync::Mutex::new(0u64);
+    std::sync::Arc::new(move |destination| {
+        if !git_transport::same_destination(&remote, destination) {
+            return Err("wrong push token destination".into());
+        }
+        let mut sequence = sequence
+            .lock()
+            .map_err(|_| "push token request lock failed")?;
+        *sequence += 1;
+        let request = PushTokenRequest {
+            nonce: nonce.clone(),
+            sequence: *sequence,
+        };
+        let json = serde_json::to_string(&request).map_err(|_| "encode push token request")?;
+        write_file_atomically(&out.join(PUSH_TOKEN_REQUEST), &json, None)
+            .map_err(|e| e.to_string())?;
+        await_push_token(&out, wait).map_err(|e| e.to_string())
+    })
+}
 /// The orchestrator's account of the run, written on every exit ([`Phase1Outcome`]).
 pub const OUTCOME_FILE: &str = "outcome.json";
 /// Size caps, in bytes, for the files one side reads out of the exchange directory
@@ -1084,6 +1169,7 @@ pub fn write_outcome(out_dir: &Path, outcome: &Phase1Outcome) -> Result<(), Orch
 fn remove_planted_exchange_files(out_dir: &Path) {
     for name in [
         AGENT_DONE_MARKER,
+        PUSH_TOKEN_REQUEST,
         PUSH_TOKEN_FILE,
         DELIVERY_OID_FILE,
         OUTCOME_FILE,
@@ -1197,9 +1283,9 @@ fn await_push_token(out_dir: &Path, wait: Duration) -> Result<String, Orchestrat
         .ok_or_else(|| {
             OrchestratorError::TokenUnavailable("token file vanished before it was read".into())
         })?;
-    if let Err(error) = std::fs::remove_file(&path) {
-        eprintln!("sandbox orchestrator: could not delete the consumed token file: {error}");
-    }
+    std::fs::remove_file(&path).map_err(|_| {
+        OrchestratorError::TokenUnavailable("could not delete consumed push token".into())
+    })?;
     let raw = String::from_utf8(raw)
         .map_err(|_| OrchestratorError::TokenUnavailable("token file is not UTF-8".into()))?;
     let header = raw.trim();
@@ -1468,9 +1554,9 @@ pub fn read_exchange_file(
                 )));
             }
         };
-        let metadata = file.metadata().map_err(|error| {
-            OrchestratorError::Io(format!("stat {}: {error}", path.display()))
-        })?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| OrchestratorError::Io(format!("stat {}: {error}", path.display())))?;
         if !metadata.file_type().is_file() {
             return Err(OrchestratorError::Tampered(format!(
                 "{} is not a regular file ({:?}); only a job process could have planted it; \
@@ -1481,9 +1567,9 @@ pub fn read_exchange_file(
         }
         let limit = max_bytes as u64 + 1;
         let mut bytes = Vec::with_capacity(metadata.len().min(limit) as usize);
-        file.take(limit).read_to_end(&mut bytes).map_err(|error| {
-            OrchestratorError::Io(format!("read {}: {error}", path.display()))
-        })?;
+        file.take(limit)
+            .read_to_end(&mut bytes)
+            .map_err(|error| OrchestratorError::Io(format!("read {}: {error}", path.display())))?;
         if bytes.len() > max_bytes {
             return Err(OrchestratorError::Tampered(format!(
                 "{} exceeds {max_bytes} bytes; only a job process would write that; refusing to \
@@ -2193,6 +2279,92 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn fresh_token_requests_refresh_after_retry_and_reject_other_destinations() {
+        let root = fresh_root("refresh-retry");
+        let remote = "https://relay.example/git/owner/job.git";
+        let minter = fresh_push_minter(
+            root.clone(),
+            NONCE.into(),
+            remote.into(),
+            Duration::from_secs(3),
+        );
+        assert!(minter("https://evil.example/git/job.git").is_err());
+        assert!(!root.join(PUSH_TOKEN_REQUEST).exists());
+        let out = root.clone();
+        let host = std::thread::spawn(move || {
+            for previous in 0..2 {
+                assert!(wait_for_file(
+                    &out.join(PUSH_TOKEN_REQUEST),
+                    Duration::from_secs(3),
+                    Duration::from_millis(5)
+                ));
+                assert_eq!(
+                    read_push_token_request(&out, NONCE, previous).unwrap(),
+                    Some(previous + 1)
+                );
+                std::fs::remove_file(out.join(PUSH_TOKEN_REQUEST)).unwrap();
+                write_secret_file(
+                    &out.join(PUSH_TOKEN_FILE),
+                    &format!("Nostr fresh-{}", previous + 1),
+                )
+                .unwrap();
+            }
+        });
+        let policy = PushRetryPolicy {
+            max_attempts: 2,
+            base_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+        };
+        let mut headers = Vec::new();
+        let result = push_with_retry(
+            &policy,
+            |attempt| {
+                headers.push(minter(remote).unwrap());
+                if attempt == 1 {
+                    Err(TransportError::Io("interrupted upload".into()))
+                } else {
+                    Ok("delivered".into())
+                }
+            },
+            default_is_retryable,
+            |_| {},
+            |d| d,
+        )
+        .unwrap();
+        host.join().unwrap();
+        assert_eq!(result, "delivered");
+        assert_eq!(headers, ["Nostr fresh-1", "Nostr fresh-2"]);
+        assert!(!root.join(PUSH_TOKEN_FILE).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn token_refresh_refuses_forged_replayed_and_oversized_requests() {
+        let root = fresh_root("refresh-invalid");
+        for (nonce, sequence, previous) in [
+            ("wrong", 1, 0),
+            (NONCE, 1, 1),
+            (NONCE, 3, 0),
+            (NONCE, 65, 64),
+        ] {
+            let json = serde_json::to_string(&PushTokenRequest {
+                nonce: nonce.into(),
+                sequence,
+            })
+            .unwrap();
+            std::fs::write(root.join(PUSH_TOKEN_REQUEST), json).unwrap();
+            assert!(read_push_token_request(&root, NONCE, previous).is_err());
+        }
+        std::fs::write(
+            root.join(PUSH_TOKEN_REQUEST),
+            vec![b'x'; EXCHANGE_MARKER_MAX_BYTES + 1],
+        )
+        .unwrap();
+        assert!(read_push_token_request(&root, NONCE, 0).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     // Fresh-after-agent mode: the orchestrator writes the marker, then WAITS for the token file; a
     // "host" thread that sees the marker writes the token; the orchestrator consumes (deletes) it and
     // pushes. Proves both directions of the hand-off and that the token file is gone afterwards.
@@ -2807,7 +2979,20 @@ mod tests {
                 |io| read_delivery_oid(io).map(|_| ()),
                 format!("{}\n", "c".repeat(40)),
             ),
-            (OUTCOME_FILE, |io| read_outcome(io).map(|_| ()), valid_outcome),
+            (
+                OUTCOME_FILE,
+                |io| read_outcome(io).map(|_| ()),
+                valid_outcome,
+            ),
+            (
+                PUSH_TOKEN_REQUEST,
+                |io| read_push_token_request(io, NONCE, 0).map(|_| ()),
+                serde_json::to_string(&PushTokenRequest {
+                    nonce: NONCE.into(),
+                    sequence: 1,
+                })
+                .unwrap(),
+            ),
         ]
     }
 
@@ -2880,6 +3065,7 @@ mod tests {
             (AGENT_DONE_MARKER, EXCHANGE_MARKER_MAX_BYTES),
             (DELIVERY_OID_FILE, EXCHANGE_OID_MAX_BYTES),
             (OUTCOME_FILE, EXCHANGE_OUTCOME_MAX_BYTES),
+            (PUSH_TOKEN_REQUEST, EXCHANGE_MARKER_MAX_BYTES),
         ];
         for (name, read, _) in host_readers() {
             let cap = caps.iter().find(|(n, _)| *n == name).expect("a cap per file").1;
