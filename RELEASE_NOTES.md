@@ -1,5 +1,10 @@
 ## Unreleased
 
+- Seller sandbox: update Codex ACP from 1.2.0 to 2.1.1 (Codex dependency
+  currently resolves to 0.159.3), refreshing support for current Codex models.
+  Available models still depend on the seller account. Ships with the next
+  versioned sandbox image; existing images are unchanged.
+
 - Seller sandbox: update Claude ACP to 0.85.0 (SDK 0.3.286 / Claude Code
   2.1.286) and the standalone Claude CLI to 2.1.286, enabling Opus 5.5
   (requires Claude Code >=2.1.280). Ships with the next versioned sandbox image.

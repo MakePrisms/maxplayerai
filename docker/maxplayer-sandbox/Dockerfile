@@ -73,7 +73,8 @@ RUN apt-get update \
 # The ACP adapters the built-in harness presets resolve on PATH (`claude-agent-acp`, `codex-acp` —
 # see crates/maxplayer-core/src/agent_presets.rs). Baking them in means the job container does not fetch
 # them at run time, so a job's first turn is not spent installing its own harness. codex-acp
-# bundles its CLI. claude-agent-acp 0.85.0 resolves the native CLI bundled by claude-agent-sdk
+# 2.1.1 launches its @openai/codex dependency (currently 0.159.3, range ^0.159.1).
+# claude-agent-acp 0.85.0 resolves the native CLI bundled by claude-agent-sdk
 # 0.3.286 (Claude Code 2.1.286), NOT `claude` on PATH, unless CLAUDE_CODE_EXECUTABLE overrides it.
 # Keep the standalone `claude` CLI available for direct CLI use / explicit overrides, aligned with
 # that SDK's claudeCodeVersion. Raising only this global package does not upgrade ACP turns.
@@ -87,7 +88,7 @@ RUN apt-get update \
 # security review). Bump these deliberately alongside a release.
 RUN npm install -g \
     @agentclientprotocol/claude-agent-acp@0.85.0 \
-    @agentclientprotocol/codex-acp@1.2.0 \
+    @agentclientprotocol/codex-acp@2.1.1 \
     @anthropic-ai/claude-code@2.1.286 \
     && npm cache clean --force
 
