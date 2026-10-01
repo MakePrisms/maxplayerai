@@ -33,6 +33,7 @@ const options = {
   // Production stays off unless TRY_IT_ENABLED=true; /api/try has its own
   // server flags and stays 404 in previews, so nothing is written to the relay.
   define: {
+    WEB_ANALYTICS_ENABLED: String(process.env.VERCEL_ENV === "production"),
     TRY_IT_ENABLED: String(process.env.TRY_IT_ENABLED === "true" || process.env.VERCEL_ENV === "preview"),
     TRY_IT_MARKET_LINK_ENABLED: String(process.env.TRY_IT_MARKET_LINK_ENABLED === "true" || process.env.VERCEL_ENV === "preview"),
   },
