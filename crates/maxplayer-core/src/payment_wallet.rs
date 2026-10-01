@@ -99,6 +99,19 @@ pub(crate) async fn nostr_recovery_hold(
         .into_iter()
         .filter(|saga| saga.mint_url == wallet.mint_url && saga.unit == wallet.unit)
         .filter_map(|saga| {
+            // A melt saga is held for good, not for REQUEST_SETTLE: cdk 0.17.2 resumes
+            // `Melt(ProofsReserved)` by compensating with no NUT-07 check, so if its pre-melt swap
+            // already landed, recovery would mark spent inputs Unspent. A nostr:// mint never melts
+            // now (`wallet_ops::refuse_nostr_melt`); this covers a row left by an older binary,
+            // which must be reconciled by hand (#1034 re-review N1).
+            if matches!(saga.state, cdk::wallet::types::WalletSagaState::Melt(_)) {
+                return Some(format!(
+                    "{} ({}): melt saga on a nostr:// mint; cdk recovery would release its inputs \
+                     without asking the mint, so it is never resumed automatically — reconcile by hand",
+                    saga.id,
+                    saga.state.state_str()
+                ));
+            }
             nostr_request_may_be_live(wallet, &saga)
                 .map(|reason| format!("{} ({}): {reason}", saga.id, saga.state.state_str()))
         })
@@ -3381,6 +3394,43 @@ mod tests {
             reason.contains("(proofs_reserved)") && reason.contains("(swap_requested)"),
             "{reason}"
         );
+        assert_eq!(
+            reserved_unspent_count(&wallet).await,
+            (1, 2),
+            "nothing unspent, nothing dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn cdk_recovery_never_resumes_a_nostr_melt_saga_even_after_settle() {
+        // #1034 re-review N1: a Melt(ProofsReserved) left by an older binary must not reach cdk's
+        // resume (compensation with no NUT-07 check) once the 300s hold would have lifted. Every
+        // other saga here has settled, so without the melt rule recovery would run.
+        let settled = cashu::util::unix_time() - crate::nostr_mint::REQUEST_SETTLE.as_secs() - 1;
+        let wallet = nostr_reserved_send_wallet(settled, false).await;
+        let mut melt = WalletSaga::new(
+            uuid::Uuid::now_v7(),
+            WalletSagaState::Melt(cdk::wallet::types::MeltSagaState::ProofsReserved),
+            Amount::from(7),
+            mint(NOSTR_MINT),
+            CurrencyUnit::Sat,
+            cdk::wallet::types::OperationData::Melt(cdk::wallet::types::MeltOperationData {
+                quote_id: "old-melt-quote".to_owned(),
+                amount: Amount::from(5),
+                fee_reserve: Amount::from(2),
+                counter_start: None,
+                counter_end: None,
+                change_amount: None,
+                change_blinded_messages: None,
+            }),
+        );
+        melt.updated_at = settled;
+        wallet.localstore.add_saga(melt).await.unwrap();
+        let outcome = recover_incomplete_sagas_guarded(&wallet).await.unwrap();
+        let GuardedRecovery::Held(reason) = outcome else {
+            panic!("cdk recovery ran with a nostr:// melt saga present");
+        };
+        assert!(reason.contains("melt saga on a nostr:// mint"), "{reason}");
         assert_eq!(
             reserved_unspent_count(&wallet).await,
             (1, 2),

@@ -1947,6 +1947,23 @@ mod tests {
         );
     }
 
+    // #1034 re-review: the opener is the guard for journal replay (`sweep_hops`) and authorize_pay's
+    // hop path. A nostr:// source must be refused before either wallet is opened.
+    #[tokio::test]
+    async fn a_nostr_source_cannot_open_a_hop() {
+        let root = scratch_dir("nostr-source-open");
+        let home = crate::home::bootstrap(&root).expect("bootstrap");
+        let nostr = "nostr://npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d";
+        let Err(error) = CdkHopEffects::open(&home, nostr, "https://seller.example").await else {
+            panic!("a nostr:// hop source opened");
+        };
+        assert!(
+            matches!(error, HopError::Mint(ref detail) if detail.contains("cannot be a hop source")),
+            "unexpected refusal: {error:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn crossmint_hop_recovery_source_quote_502_refuses_without_supersession_record() {
         let (source_mint, responder) = crate::payment_wallet::http_502_mint();
