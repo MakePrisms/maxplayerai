@@ -114,6 +114,39 @@ impl Ceiling {
     }
 }
 
+/// The wallet ceiling ONE reservation is checked against (#1076).
+///
+/// A payment is funded from exactly one mint — the one accept seals through
+/// [`crate::crossmint::select_source_mint`] — so the ceiling that decides whether an award is
+/// affordable is the balance AT that mint, less what is already reserved against it. The
+/// whole-wallet default-mint figure used before refused a buyer funded only at an extra mint
+/// ("200 sat exceeds available 0 sat"), and a summed-across-mints figure would be the opposite
+/// defect: 150 + 150 at two mints passes a 200 award that no single mint can pay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MintCeiling {
+    /// Normalized URL of the funding mint, recorded on the reservation row. `None` is the legacy
+    /// POOLED check: every `Reserved` row counts against `balance` and the row records no mint.
+    pub mint: Option<String>,
+    /// Live spendable balance at `mint` (or the whole wallet for the pooled check).
+    pub balance: u64,
+    /// Whether `mint` is the buyer's configured default. Rows written before #1076 carry no mint;
+    /// they were all checked against the default-mint wallet, so they count against the default
+    /// and only the default.
+    pub is_default: bool,
+}
+
+impl MintCeiling {
+    /// Checked against the balance at one funding mint.
+    pub fn at_mint(mint: impl Into<String>, balance: u64, is_default: bool) -> Self {
+        Self { mint: Some(mint.into()), balance, is_default }
+    }
+
+    /// The pre-#1076 pooled check: `balance − every reserved row`, no mint recorded.
+    pub fn pooled(balance: u64) -> Self {
+        Self { mint: None, balance, is_default: true }
+    }
+}
+
 /// Success of a [`reserve`](crate::buyer::store::BuyerStore::reserve): the guard passed and the
 /// row is `Reserved`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,6 +169,9 @@ pub enum ReserveRefused {
         requested: u64,
         available: u64,
         bound: Ceiling,
+        /// The mint whose balance was the ceiling (#1076), or `None` for a legacy pooled check
+        /// (the whole-wallet figure every reserve used before per-mint ceilings).
+        mint: Option<String>,
     },
     /// The job already holds a `Reserved` row for a DIFFERENT amount. A job's amount is fixed by
     /// its signed offer, so a divergent re-reserve is a bug, not an idempotent retry — refused.
@@ -158,10 +194,23 @@ impl std::fmt::Display for ReserveRefused {
                 requested,
                 available,
                 bound,
+                mint: None,
             } => write!(
                 formatter,
                 "reservation refused: {requested} sat exceeds available {available} sat \
                  (bound by the {} ceiling; available = wallet_balance − reserved)",
+                bound.as_str()
+            ),
+            Self::InsufficientAvailable {
+                requested,
+                available,
+                bound,
+                mint: Some(mint),
+            } => write!(
+                formatter,
+                "reservation refused: {requested} sat exceeds available {available} sat at \
+                 {mint} (bound by the {} ceiling; available = balance at that mint − reserved \
+                 against it)",
                 bound.as_str()
             ),
             Self::AmountMismatch {

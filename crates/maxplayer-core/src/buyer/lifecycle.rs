@@ -23,7 +23,7 @@ use crate::job_lifecycle::{
     PresenceRead, SendOutcome,
 };
 
-use super::reservations::{Converted, JobDisposition, ReservationState, ReserveRefused};
+use super::reservations::{Converted, JobDisposition, MintCeiling, ReservationState, ReserveRefused};
 use super::store::{AttemptState, AwardAttempt, AwardRecord, BeginAttempt, BuyerStore, StoreError};
 use crate::gateway::PaymentMode;
 
@@ -882,14 +882,16 @@ impl std::error::Error for AwardError {}
 /// spend, which may differ; the kind-3405 carries no amount tag, so the attempt/reservation is
 /// the only artifact of the sum that was really awarded.
 ///
-/// `balance` is the honest live-wallet snapshot the caller supplies — the wallet-ceiling input
-/// [`BuyerStore::reserve`] guards against (issue #378 removed the budget ceiling's `total_cap`/`spent`).
+/// `ceiling` is the honest live-wallet snapshot the caller supplies — the wallet-ceiling input
+/// [`BuyerStore::reserve_at`] guards against (issue #378 removed the budget ceiling's
+/// `total_cap`/`spent`). Since #1076 it is the balance at the ONE mint the job will be funded
+/// from (see [`MintCeiling`]); every reserve and re-hold below is checked against it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn award_with_reservation<P, PFut, R, RFut, S, SFut>(
     store: &BuyerStore,
     job_id: &str,
     amount: u64,
-    balance: u64,
+    ceiling: MintCeiling,
     now_unix: i64,
     award_present_on_relay: P,
     prepare: R,
@@ -932,7 +934,7 @@ where
             // `reserve` is idempotent for a live row and re-reserves a `Released` one; a `Spent`
             // row means the job was already paid (a manual collect can settle without the awards
             // row), and the row is still owed for history/attribution — skip the reserve, write it.
-            match store.reserve(job_id, attempt.amount_sats, balance, now_unix) {
+            match store.reserve_at(job_id, attempt.amount_sats, &ceiling, now_unix) {
                 Ok(_) | Err(ReserveRefused::AlreadySpent { .. }) => {}
                 Err(refused) => {
                     return Err(AwardError::PublishedButUnrecorded {
@@ -971,7 +973,7 @@ where
             // the awards row) — resolution is then pure bookkeeping the row is still owed for
             // (history, #261 attribution), so it proceeds unfunded exactly as the sibling arms
             // do.
-            match store.reserve(job_id, attempt.amount_sats, balance, now_unix) {
+            match store.reserve_at(job_id, attempt.amount_sats, &ceiling, now_unix) {
                 Ok(_) | Err(ReserveRefused::AlreadySpent { .. }) => {}
                 Err(refused) => return Err(AwardError::Reserve(refused)),
             }
@@ -989,7 +991,7 @@ where
                     // exactly the #322 ledger state — award public, funds returned) before
                     // repairing the row. A refused re-reserve leaves a public award unfunded,
                     // which is the loud PublishedButUnrecorded case, not a quiet skip.
-                    match store.reserve(job_id, amount_sats, balance, now_unix) {
+                    match store.reserve_at(job_id, amount_sats, &ceiling, now_unix) {
                         Ok(_) | Err(ReserveRefused::AlreadySpent { .. }) => {}
                         Err(refused) => {
                             return Err(AwardError::PublishedButUnrecorded {
@@ -1086,7 +1088,7 @@ where
 
     // Reserve before any signing: a refusal signs NOTHING (and writes no row).
     store
-        .reserve(job_id, amount, balance, now_unix)
+        .reserve_at(job_id, amount, &ceiling, now_unix)
         .map_err(AwardError::Reserve)?;
 
     let prepared = match prepare().await {
@@ -1957,7 +1959,7 @@ mod tests {
             &store,
             &job_b,
             40,
-            100,            2,
+            MintCeiling::pooled(100),            2,
             no_relay,
             || {
                 prepared.store(true, Ordering::SeqCst);
@@ -1990,7 +1992,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,            1,
+            MintCeiling::pooled(100),            1,
             no_relay,
             || async { Err(JobLifecycleError::Relay("claim vanished from the relay".into())) },
             no_send,
@@ -2034,7 +2036,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,            7,
+            MintCeiling::pooled(100),            7,
             no_relay,
             || {
                 let job = job.clone();
@@ -2146,7 +2148,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,            9,
+            MintCeiling::pooled(100),            9,
             no_relay,
             no_prepare,
             no_send,
@@ -2196,7 +2198,7 @@ mod tests {
             &store,
             &job,
             99,
-            100,            9,
+            MintCeiling::pooled(100),            9,
             || async move { Ok(PresenceRead::Present(relayed)) },
             no_prepare,
             no_send,
@@ -2250,7 +2252,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,            9,
+            MintCeiling::pooled(100),            9,
             || async move { Ok(PresenceRead::Present(found)) },
             no_prepare,
             no_send,
@@ -2303,7 +2305,7 @@ mod tests {
                 &store,
                 &job,
                 40,
-                100,                9,
+                MintCeiling::pooled(100),                9,
                 || async move { probe_result },
                 no_prepare,
                 no_send,
@@ -2368,7 +2370,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,            1,
+            MintCeiling::pooled(100),            1,
             no_relay,
             || {
                 let job = job.clone();
@@ -2406,7 +2408,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,            2,
+            MintCeiling::pooled(100),            2,
             no_relay,
             no_prepare,
             |bytes: String, _event_id: String| {
@@ -2450,7 +2452,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,            1,
+            MintCeiling::pooled(100),            1,
             no_relay,
             || {
                 let job = job.clone();
@@ -2482,7 +2484,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,            2,
+            MintCeiling::pooled(100),            2,
             no_relay,
             no_prepare,
             no_send,
@@ -2531,7 +2533,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,            3,
+            MintCeiling::pooled(100),            3,
             || async move { Ok(PresenceRead::Present(relayed)) },
             no_prepare,
             no_send,
@@ -2575,7 +2577,7 @@ mod tests {
                 &store,
                 &job,
                 40,
-                100,                3,
+                MintCeiling::pooled(100),                3,
                 || async { Ok(PresenceRead::ConfirmedAbsent) },
                 no_prepare,
                 no_send,
@@ -2644,7 +2646,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,            3,
+            MintCeiling::pooled(100),            3,
             no_relay,
             no_prepare,
             no_send,
@@ -2699,7 +2701,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,            3,
+            MintCeiling::pooled(100),            3,
             no_relay,
             no_prepare,
             send_acked,
@@ -2754,7 +2756,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,            3,
+            MintCeiling::pooled(100),            3,
             no_relay,
             no_prepare,
             no_send,
@@ -2814,7 +2816,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,            3,
+            MintCeiling::pooled(100),            3,
             no_relay,
             no_prepare,
             |_bytes: String, _event_id: String| async {
@@ -2885,7 +2887,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,            4,
+            MintCeiling::pooled(100),            4,
             no_relay,
             no_prepare,
             |_bytes: String, _event_id: String| async {
@@ -2927,7 +2929,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,            1,
+            MintCeiling::pooled(100),            1,
             no_relay,
             || {
                 let job = job.clone();
@@ -2948,7 +2950,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,            2,
+            MintCeiling::pooled(100),            2,
             no_relay,
             no_prepare,
             |_bytes: String, _event_id: String| async {
@@ -3009,7 +3011,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,            3,
+            MintCeiling::pooled(100),            3,
             no_relay,
             no_prepare,
             no_send,
@@ -3306,7 +3308,7 @@ mod tests {
                     &store,
                     &job,
                     amount,
-                    balance,
+                    MintCeiling::pooled(balance),
                     1,
                     no_relay,
                     || async move { Ok(fake_prepared(&job_out)) },
@@ -3371,7 +3373,7 @@ mod tests {
             &store,
             &winner,
             amount,
-            balance,
+            MintCeiling::pooled(balance),
             2,
             no_relay,
             no_prepare,
@@ -3477,7 +3479,7 @@ mod tests {
                         &store,
                         &job_y,
                         award,
-                        stale_balance,
+                        MintCeiling::pooled(stale_balance),
                         4,
                         no_relay,
                         || async move { Ok(fake_prepared(&job_out)) },
@@ -3551,7 +3553,7 @@ mod tests {
                         &store,
                         &job_y,
                         award,
-                        snap,
+                        MintCeiling::pooled(snap),
                         4,
                         no_relay,
                         || async move { Ok(fake_prepared(&job_out)) },
