@@ -4507,6 +4507,7 @@ mod tests {
             // Same decision and the same reason: a host ChatGPT session is a containment concern,
             // and reading one here would give the check a second reason to move.
             codex_chatgpt: None,
+            harnesses: Default::default(),
             // ABSENT, with its two companion keys unset: where the delivery's git runs is a
             // delivery concern, and this check asserts the engine-version floor. Absent is what a
             // real docker seat has, so the check measures the seat as shipped — which since the

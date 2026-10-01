@@ -644,6 +644,7 @@ fn a_job_launched_through_the_policy_is_contained_and_an_uncontained_one_is_not(
         // mount would differ between the two for a reason this test is not measuring.
         dns_servers: Vec::new(),
         codex_chatgpt: None,
+        harnesses: Default::default(),
         // ABSENT, as an operator's docker config has it — which since the default moved means the
         // container delivery path. Written as `None` rather than `Some(false)` so this fixture stays
         // the config a real seat has. It cannot change what this test measures: the delivery path
@@ -2244,6 +2245,7 @@ fn gate_config(network: &str) -> maxplayer_core::home::SandboxConfig {
         dns_servers: vec![GATE_DNS_RESOLVER.to_owned()],
         file_credentials: Vec::new(),
         codex_chatgpt: None,
+        harnesses: Default::default(),
         container_delivery: None,
         container_delivery_token: None,
         container_delivery_token_cap_secs: None,

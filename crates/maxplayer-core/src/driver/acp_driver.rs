@@ -85,6 +85,8 @@ pub struct AcpDriver {
     /// (`engine.rs:133`, then `:141`). A caller that started a session without readying the driver
     /// first would send no opt-in and resolve no model; it would fail closed to absent, not wrong.
     is_claude_adapter: bool,
+    is_codex_adapter: bool,
+    codex_session: Option<crate::home::CodexSessionSettings>,
 }
 
 impl AcpDriver {
@@ -107,7 +109,67 @@ impl AcpDriver {
             session_model: None,
             claude_turn_model: Arc::new(Mutex::new(None)),
             is_claude_adapter: false,
+            is_codex_adapter: false,
+            codex_session: None,
         }
+    }
+
+    pub fn with_codex_session(
+        mut self,
+        settings: Option<crate::home::CodexSessionSettings>,
+    ) -> Self {
+        self.codex_session = settings;
+        self
+    }
+
+    async fn configure_codex_session(
+        &mut self,
+        session_id: &SessionId,
+        initial: &Value,
+    ) -> Result<(), DriverError> {
+        let Some(settings) = self.codex_session.clone() else {
+            return Ok(());
+        };
+        if !self.is_codex_adapter {
+            return Err(DriverError::Other(
+                "Codex session settings require @agentclientprotocol/codex-acp".into(),
+            ));
+        }
+        let mut response = initial.clone();
+        // Model first: changing it can change which reasoning efforts the adapter supports.
+        for (id, category, value) in [
+            ("model", "model", settings.model.as_str()),
+            (
+                "reasoning_effort",
+                "thought_level",
+                settings.reasoning_effort.as_str(),
+            ),
+        ] {
+            codex_option(&response, id, category, Some(value))?;
+            let request = self.send_request(
+                "session/set_config_option",
+                json!({
+                    "sessionId": session_id, "configId": id, "value": value,
+                }),
+            )?;
+            response = self.wait_response(request).await?;
+            if codex_option(&response, id, category, None)? != value {
+                return Err(DriverError::Other(format!(
+                    "Codex did not apply requested {id}"
+                )));
+            }
+        }
+        // Read BOTH acknowledged values after the last update; never advertise requested values
+        // without confirmation, and never retain session/new's stale default-effort suffix.
+        let model = codex_option(&response, "model", "model", None)?;
+        let effort = codex_option(&response, "reasoning_effort", "thought_level", None)?;
+        if model != settings.model || effort != settings.reasoning_effort.as_str() {
+            return Err(DriverError::Other(
+                "Codex effective model/effort differs from configured selection".into(),
+            ));
+        }
+        self.session_model = Some(format!("{model}[{effort}]"));
+        Ok(())
     }
 
     fn spawn(&mut self) -> Result<(), DriverError> {
@@ -311,6 +373,8 @@ impl Driver for AcpDriver {
         // gated on this and on nothing else — not on the program name we spawned, which an operator
         // may alias, wrap or rename in `[agents]`.
         self.is_claude_adapter = is_claude_agent_acp(&result);
+        self.is_codex_adapter = result.pointer("/agentInfo/name").and_then(Value::as_str)
+            == Some("@agentclientprotocol/codex-acp");
         let protocol_version = result
             .get("protocol_version")
             .or_else(|| result.get("protocolVersion"))
@@ -340,7 +404,9 @@ impl Driver for AcpDriver {
         // model leaves this `None`, and nothing downstream fabricates one.
         self.session_model = session_model_from_result(&result);
         self.reset_turn_model();
-        session_id_from_result(&result)
+        let session_id = session_id_from_result(&result)?;
+        self.configure_codex_session(&session_id, &result).await?;
+        Ok(session_id)
     }
 
     async fn prompt(
@@ -682,6 +748,51 @@ const MODEL_CONFIG_CATEGORY: &str = "model";
 /// concrete id off the turn; absence is only what is left when that fails.
 const CLAUDE_PICKER_DEFAULT: &str = "default";
 
+/// Restrict mutation to the two known select options and values actually offered by this adapter.
+fn codex_option<'a>(
+    result: &'a Value,
+    id: &str,
+    category: &str,
+    requested: Option<&str>,
+) -> Result<&'a str, DriverError> {
+    let fail = || {
+        DriverError::Other(format!(
+            "Codex session option {id} is missing, malformed, or does not support the requested value"
+        ))
+    };
+    let options = result
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .ok_or_else(fail)?;
+    let mut matching = options
+        .iter()
+        .filter(|v| v.get("id").and_then(Value::as_str) == Some(id));
+    let option = matching.next().ok_or_else(fail)?;
+    if matching.next().is_some()
+        || option.get("type").and_then(Value::as_str) != Some("select")
+        || option.get("category").and_then(Value::as_str) != Some(category)
+    {
+        return Err(fail());
+    }
+    if let Some(requested) = requested {
+        let choices = option
+            .get("options")
+            .and_then(Value::as_array)
+            .ok_or_else(fail)?;
+        if !choices
+            .iter()
+            .any(|v| v.get("value").and_then(Value::as_str) == Some(requested))
+        {
+            return Err(fail());
+        }
+    }
+    option
+        .get("currentValue")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(fail)
+}
+
 /// The harness-resolved model id from a `session/new` result, as the resolved identity INCLUDING any
 /// reasoning-effort suffix (e.g. `gpt-5.6-terra[medium]`).
 ///
@@ -1003,6 +1114,176 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn codex_session_options_accept_captured_v1_and_v2_frames() {
+        let captures: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/codex-session-options.json"
+        ))
+        .unwrap();
+        for version in ["1.2.0", "2.1.1"] {
+            let frames = &captures[version];
+            assert!(
+                codex_option(&frames[0]["result"], "model", "model", Some("gpt-5.6-sol")).is_ok()
+            );
+            assert!(
+                codex_option(
+                    &frames[1]["result"],
+                    "reasoning_effort",
+                    "thought_level",
+                    Some("high")
+                )
+                .is_ok()
+            );
+            assert_eq!(
+                codex_option(&frames[2]["result"], "model", "model", None).unwrap(),
+                "gpt-5.6-sol"
+            );
+            assert_eq!(
+                codex_option(
+                    &frames[2]["result"],
+                    "reasoning_effort",
+                    "thought_level",
+                    None
+                )
+                .unwrap(),
+                "high"
+            );
+        }
+    }
+
+    fn codex_options(model: &str, effort: &str) -> Value {
+        json!({"configOptions": [
+            {"id":"model","category":"model","type":"select","currentValue":model,
+             "options":[{"value":"gpt-5.6-sol"}]},
+            {"id":"reasoning_effort","category":"thought_level","type":"select","currentValue":effort,
+             "options":[{"value":"low"},{"value":"high"}]}
+        ]})
+    }
+
+    #[test]
+    fn codex_session_options_refuse_unknown_values_and_malformed_reports() {
+        let value = codex_options("gpt-5.6-sol", "low");
+        assert!(codex_option(&value, "model", "model", Some("gpt-5.6-sol[high]")).is_err());
+        assert!(codex_option(&value, "reasoning_effort", "thought_level", Some("ultra")).is_err());
+        assert!(codex_option(&value, "base_url", "model", None).is_err());
+        let mut bad = value.clone();
+        bad["configOptions"][0]["category"] = json!("provider");
+        assert!(codex_option(&bad, "model", "model", None).is_err());
+        let mut duplicate = value.clone();
+        duplicate["configOptions"]
+            .as_array_mut()
+            .unwrap()
+            .push(value["configOptions"][0].clone());
+        assert!(codex_option(&duplicate, "model", "model", None).is_err());
+    }
+
+    // Exercise the real JSON-RPC driver, not a reimplementation of option sequencing.
+    #[cfg(unix)]
+    async fn codex_session_wire_case(configured: bool, refuse: bool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut initial = codex_options("gpt-5.6-sol", "low");
+        initial["sessionId"] = json!("test-session");
+        initial["models"] = json!({"currentModelId":"gpt-5.6-sol[low]"});
+        let final_options = codex_options("gpt-5.6-sol", if refuse { "low" } else { "high" });
+        let responses = [
+            json!({"agentInfo":{"name":"@agentclientprotocol/codex-acp"},"protocolVersion":1}),
+            initial,
+            codex_options("gpt-5.6-sol", "low"),
+            final_options,
+        ];
+        let mut script = String::from("set -eu\n");
+        for (index, response) in responses.iter().enumerate() {
+            script.push_str(&format!(
+                "IFS= read -r line\nprintf '%s\\n' \"$line\" >> requests\nprintf '%s\\n' '{}'\n",
+                json!({"jsonrpc":"2.0","id":index+1,"result":response})
+            ));
+        }
+        script.push_str("cat >/dev/null\n");
+        let script_path = tmp.path().join("adapter.sh");
+        std::fs::write(&script_path, script).unwrap();
+        let mut driver = AcpDriver::new(
+            AgentCommand::new(
+                "sh".into(),
+                vec![script_path.to_string_lossy().into_owned()],
+            ),
+            PermissionOutcome::Allow,
+            Duration::from_secs(3),
+        );
+        // Each shell uses a private working directory; no shared test files.
+        driver.command.args = vec![
+            "-c".into(),
+            "cd \"$1\" && exec sh \"$2\"".into(),
+            "sh".into(),
+            tmp.path().to_string_lossy().into_owned(),
+            script_path.to_string_lossy().into_owned(),
+        ];
+        if configured {
+            driver = driver.with_codex_session(Some(crate::home::CodexSessionSettings {
+                model: "gpt-5.6-sol".into(),
+                reasoning_effort: crate::home::CodexReasoningEffort::High,
+            }));
+        }
+        driver.ready().await.unwrap();
+        let result = driver
+            .start_session(SessionConfig {
+                cwd: tmp.path().into(),
+                mcp_servers: vec![],
+                env: vec![],
+            })
+            .await;
+        if refuse && configured {
+            assert!(result.is_err());
+        } else {
+            result.unwrap();
+            assert_eq!(
+                driver.session_model.as_deref(),
+                Some(if configured {
+                    "gpt-5.6-sol[high]"
+                } else {
+                    "gpt-5.6-sol[low]"
+                })
+            );
+            assert_eq!(
+                driver.usage().unwrap().model.as_deref(),
+                driver.session_model.as_deref()
+            );
+        }
+        driver.shutdown().await.unwrap();
+        let requests = std::fs::read_to_string(tmp.path().join("requests")).unwrap();
+        let requests: Vec<Value> = requests
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(requests.len(), if configured { 4 } else { 2 });
+        if configured {
+            assert_eq!(requests[2]["method"], "session/set_config_option");
+            assert_eq!(
+                requests[2]["params"],
+                json!({"sessionId":"test-session","configId":"model","value":"gpt-5.6-sol"})
+            );
+            assert_eq!(
+                requests[3]["params"],
+                json!({"sessionId":"test-session","configId":"reasoning_effort","value":"high"})
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_session_options_update_effective_model_before_prompt() {
+        codex_session_wire_case(true, false).await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_session_options_absent_preserve_defaults_and_wire() {
+        codex_session_wire_case(false, false).await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_session_options_refuse_unacknowledged_effort() {
+        codex_session_wire_case(true, true).await;
+    }
     use crate::driver::{ContentBlock, ExtMethod, PermissionOutcome};
 
     #[test]

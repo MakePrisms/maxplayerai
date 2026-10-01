@@ -1,5 +1,10 @@
 ## Unreleased
 
+- Docker Codex seats can explicitly select a model and reasoning effort through
+  `[sandbox.harnesses.codex]` (`model = "gpt-5.6-sol"`, `reasoning_effort = "high"`),
+  including ChatGPT subscription seats. ACP acknowledgments determine the advertised
+  model; authentication containment and behavior without the setting are unchanged.
+
 - Seller sandbox: update Codex ACP from 1.2.0 to 2.1.1 (Codex dependency
   currently resolves to 0.159.3), refreshing support for current Codex models.
   Available models still depend on the seller account. Ships with the next

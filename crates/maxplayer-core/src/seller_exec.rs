@@ -236,6 +236,7 @@ pub struct SandboxPolicy {
     kind: PolicyKind,
     /// Host ChatGPT auth for a Docker `codex-acp` command. All other commands ignore this value.
     codex_chatgpt: Option<crate::home::CodexChatgptConfig>,
+    codex_session: Option<crate::home::CodexSessionSettings>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -447,11 +448,34 @@ pub struct AgentLaunch {
 }
 
 impl SandboxPolicy {
+    /// Internal container handoff: settings are typed and travel outside the agent environment.
+    pub(crate) fn with_codex_session(
+        mut self,
+        settings: Option<crate::home::CodexSessionSettings>,
+    ) -> Self {
+        self.codex_session = settings;
+        self
+    }
+
+    fn codex_session_for_command(
+        &self,
+        argv: &[String],
+    ) -> Option<crate::home::CodexSessionSettings> {
+        let name = argv
+            .first()
+            .and_then(|p| Path::new(p).file_name())
+            .and_then(|s| s.to_str());
+        (name == Some("codex-acp"))
+            .then(|| self.codex_session.clone())
+            .flatten()
+    }
+
     /// A pass-through policy: the agent command runs exactly as configured.
     pub fn passthrough() -> Self {
         Self {
             kind: PolicyKind::Passthrough,
             codex_chatgpt: None,
+            codex_session: None,
         }
     }
 
@@ -466,6 +490,7 @@ impl SandboxPolicy {
         Self {
             kind,
             codex_chatgpt: None,
+            codex_session: None,
         }
     }
 
@@ -474,6 +499,7 @@ impl SandboxPolicy {
         Self {
             kind: PolicyKind::Docker(policy),
             codex_chatgpt: None,
+            codex_session: None,
         }
     }
 
@@ -505,6 +531,11 @@ impl SandboxPolicy {
         let Some(config) = config else {
             return Ok(Self::passthrough());
         };
+        if config.harnesses.codex.is_some() && config.mode != SandboxMode::Docker {
+            return Err(ExecError::Config(
+                "[sandbox.harnesses.codex] requires sandbox mode = docker".into(),
+            ));
+        }
         match config.mode {
             SandboxMode::Launcher => {
                 // The container-delivery keys name a container that launcher mode never creates. A
@@ -818,6 +849,7 @@ impl SandboxPolicy {
                     container_delivery,
                 });
                 policy.codex_chatgpt = config.codex_chatgpt.clone();
+                policy.codex_session = config.harnesses.codex.clone();
                 Ok(policy)
             }
         }
@@ -2764,7 +2796,8 @@ pub async fn run_agent_job_in_env(
         agent,
         crate::driver::PermissionOutcome::Allow,
         timeout.duration(),
-    );
+    )
+    .with_codex_session(prepared.codex_session.clone());
     let log_path = workdir.join(crate::seller_git::SELLER_RUN_LOG);
     let mut log = EventLog::open(&log_path).map_err(|error| ExecError::Agent(error.to_string()))?;
     let params = RunParams {
@@ -2836,6 +2869,7 @@ pub async fn run_agent_job_in_env(
 /// outlive the job that ran in it.
 #[cfg_attr(not(feature = "acp"), allow(dead_code))]
 pub(crate) struct PreparedLaunch {
+    pub codex_session: Option<crate::home::CodexSessionSettings>,
     /// The container environment (`-e` pairs under docker): the delivery identity plus the contained
     /// or forwarded agent auth. Placeholders and base URLs, never a real contained credential.
     pub env: Vec<(String, String)>,
@@ -3062,6 +3096,7 @@ pub(crate) async fn prepare_launch(
         env.extend(forwarded);
     }
     Ok(PreparedLaunch {
+        codex_session: policy.codex_session_for_command(agent_command),
         env,
         effective_command,
         forwarded_secrets,
@@ -4092,6 +4127,32 @@ mod tests {
         } else {
             "other"
         }
+    }
+
+    #[test]
+    fn codex_session_settings_are_command_scoped_and_not_environment() {
+        let config = crate::home::parse_config_toml("[sandbox]\nmode='docker'\n[sandbox.harnesses.codex]\nmodel='gpt-5.6-sol'\nreasoning_effort='high'\n").unwrap();
+        let policy = SandboxPolicy::from_config(config.sandbox.as_ref()).unwrap();
+        assert!(
+            policy
+                .codex_session_for_command(&["claude-agent-acp".into()])
+                .is_none()
+        );
+        let selected = policy
+            .codex_session_for_command(&["/usr/bin/codex-acp".into()])
+            .unwrap();
+        assert_eq!(
+            selected.reasoning_effort,
+            crate::home::CodexReasoningEffort::High
+        );
+        let env = forwarded_agent_env_from(&policy, |_| None);
+        assert!(
+            env.is_empty(),
+            "session options must not create environment overrides"
+        );
+        let mut config = config.sandbox.unwrap();
+        config.mode = crate::home::SandboxMode::Launcher;
+        assert!(SandboxPolicy::from_config(Some(&config)).is_err());
     }
 
     // The default (pass-through) policy launches the agent command exactly as configured: the
@@ -6724,6 +6785,12 @@ mod tests {
             codex_chatgpt: Some(crate::home::CodexChatgptConfig {
                 auth_file: auth_file.clone(),
             }),
+            harnesses: crate::home::HarnessSessionSettings {
+                codex: Some(crate::home::CodexSessionSettings {
+                    model: "gpt-5.6-sol".into(),
+                    reasoning_effort: crate::home::CodexReasoningEffort::High,
+                }),
+            },
             ..Default::default()
         };
         let policy = SandboxPolicy::from_config(Some(&config)).expect("valid policy");
