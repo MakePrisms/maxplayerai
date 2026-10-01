@@ -869,6 +869,14 @@ impl CdkHopEffects {
         source_mint: &str,
         target_mint: &str,
     ) -> Result<Self, HopError> {
+        // A hop melts at its source, and its recovery sweep asks the source melt quote's status —
+        // both cdk calls that can release `nostr://` inputs early. `plan_payment` never plans such a
+        // hop; this refuses a journaled one (or any other caller) before a wallet is even opened.
+        if crate::mint_wire::is_nostr_scheme(source_mint) {
+            return Err(HopError::Mint(format!(
+                "source mint {source_mint}: a nostr:// mint cannot be a hop source (it never melts)"
+            )));
+        }
         let source = buyer_fund::open_wallet_at_mint_async(home, source_mint)
             .await
             .map_err(|error| HopError::Mint(format!("source mint {source_mint}: {error}")))?;

@@ -771,6 +771,28 @@ pub fn configured_mints(home: &MaxplayerHome) -> Result<Vec<String>, WalletOpsEr
     Ok(out)
 }
 
+/// Refuse every melt-side call on a `nostr://` mint: raising a melt quote, preparing or confirming a
+/// melt, and asking a melt quote's status.
+///
+/// The `nostr://` settle hold in `payment_wallet` (inputs and cdk saga recovery held until a
+/// published request can no longer land) wraps the send and recovery paths only. cdk 0.17.2's melt
+/// does its own unlocking: `PreparedMelt::confirm` may publish a pre-melt swap and then, on an
+/// ambiguous error such as a relay timeout, compensate a `ProofsReserved` melt saga — inputs back to
+/// `Unspent`, saga deleted, no NUT-07 check — while that swap can still be executed by the mint; and
+/// `check_melt_quote_status` resumes and compensates an in-progress melt saga the same way. Until that
+/// compensation is held for `REQUEST_SETTLE` too, a `nostr://` mint does not melt at all. Credits are
+/// spent directly at the issuing mint, so nothing that needs a `nostr://` melt is lost.
+pub fn refuse_nostr_melt(mint_url: &str) -> Result<(), WalletOpsError> {
+    if crate::mint_wire::is_nostr_scheme(mint_url) {
+        return Err(WalletOpsError::Wallet(format!(
+            "melt refused at nostr:// mint {mint_url}: melting from a nostr:// mint is not supported \
+             (cdk could release its inputs while a published request can still land); spend credits \
+             directly with a seller that accepts this mint"
+        )));
+    }
+    Ok(())
+}
+
 fn mint_is_allowed(home: &MaxplayerHome, mint_url: &str) -> Result<String, WalletOpsError> {
     let normalized = normalize_mint_url(mint_url)?;
     let allowed = configured_mints(home)?;
@@ -1313,6 +1335,7 @@ pub async fn melt_within_async(
         return Err(WalletOpsError::Wallet("bolt11 invoice is empty".into()));
     }
     let mint_url = resolve_mint(home, mint_override)?;
+    refuse_nostr_melt(&mint_url)?;
     // Fail closed against the real-mint gate before opening the wallet. Operator melts are a
     // deliberate action OUTSIDE the job-pay budget gate (BudgetGate is deliberately not wired in
     // here — owner decision pending), but they must still honor `allow_real_mints`.
@@ -1361,6 +1384,7 @@ pub async fn pay_melt_quote_async(
         return Err(WalletOpsError::Wallet("melt quote id is empty".into()));
     }
     let mint_url = resolve_mint(home, mint_override)?;
+    refuse_nostr_melt(&mint_url)?;
     if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
         return Err(WalletOpsError::RealMintDisallowed { mint_url });
     }
@@ -1387,6 +1411,7 @@ async fn pay_quote_on_wallet(
     quote: &cdk::wallet::MeltQuote,
     ceiling: Option<&MeltCeiling>,
 ) -> Result<MeltOutcome, WalletOpsError> {
+    refuse_nostr_melt(&mint_url)?;
     let invoice_sats = quote.amount.to_u64();
     let fee_reserve_sats = quote.fee_reserve.to_u64();
     // The money hold, at the moment of spending: THIS quote — not the plan's estimate — is what the
@@ -1588,6 +1613,7 @@ pub fn prepare_melt_payment_blocking(
         return Err(WalletOpsError::Wallet("melt quote id is empty".into()));
     }
     let mint_url = resolve_mint(home, mint_override)?;
+    refuse_nostr_melt(&mint_url)?;
     if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
         return Err(WalletOpsError::RealMintDisallowed { mint_url });
     }
@@ -1873,6 +1899,7 @@ pub async fn melt_quote_async(
         return Err(WalletOpsError::Wallet("bolt11 invoice is empty".into()));
     }
     let mint_url = resolve_mint(home, mint_override)?;
+    refuse_nostr_melt(&mint_url)?;
     if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
         return Err(WalletOpsError::RealMintDisallowed { mint_url });
     }
@@ -1928,6 +1955,7 @@ pub async fn melt_status_for_quote_async(
         return Ok(None);
     }
     let mint_url = resolve_mint(home, mint_override)?;
+    refuse_nostr_melt(&mint_url)?;
     if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
         return Err(WalletOpsError::RealMintDisallowed { mint_url });
     }
@@ -1967,6 +1995,7 @@ pub async fn melt_status_for_invoice_async(
 ) -> Result<Option<MeltQuoteStatus>, WalletOpsError> {
     let bolt11 = bolt11.trim();
     let mint_url = resolve_mint(home, mint_override)?;
+    refuse_nostr_melt(&mint_url)?;
     if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
         return Err(WalletOpsError::RealMintDisallowed { mint_url });
     }
@@ -2978,6 +3007,81 @@ mod tests {
             !message.contains(DEFAULT_MINT_URL),
             "MintNotAllowed must NOT name the testnut constant as the default on a minibits home: {message}"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Advisor finding on #1034: cdk 0.17.2's melt confirm and `check_melt_quote_status` can
+    // compensate a melt saga (inputs back to Unspent) while a nostr:// request may still land. Every
+    // melt-side entry point refuses a nostr:// mint before a wallet is opened, so no such call can
+    // reach cdk. Remove any one guard and its assertion below goes red.
+    #[tokio::test(flavor = "current_thread")]
+    async fn every_melt_entry_point_refuses_a_nostr_mint_before_touching_cdk() {
+        const NOSTR: &str =
+            "nostr://npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d";
+        const BOLT11: &str = "lnbc25m1pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdq5vdhkven9v5sxyetpdeessp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygs9q5sqqqqqqqqqqqqqqqqsgq2a25dxl5hrntdtn6zvydt7d66hyzsyhqs4wdynavys42xgl6sgx9c4g7me86a27t07mdtfry458rtjr0v92cnmswpsjscgt2vcse3sgpz3uapa";
+        let root = temp_home("nostr-no-melt");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap(&root).expect("bootstrap");
+        let nostr = add_mint(&mut home, NOSTR).expect("a nostr:// mint can be configured");
+        home.config.allow_real_mints = true;
+        let refused = |label: &str, error: WalletOpsError| {
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("melt refused at nostr:// mint"),
+                "{label}: expected the nostr:// melt refusal, got: {rendered}"
+            );
+        };
+        refused(
+            "melt_quote_async",
+            melt_quote_async(&home, BOLT11, Some(&nostr))
+                .await
+                .unwrap_err(),
+        );
+        refused(
+            "melt_within_async",
+            melt_within_async(&home, BOLT11, Some(&nostr), None)
+                .await
+                .unwrap_err(),
+        );
+        let ceiling = MeltCeiling {
+            max_debit_sats: 10_000,
+            invoice_sats: 2_500,
+            planned_quote_id: None,
+        };
+        refused(
+            "pay_melt_quote_async",
+            pay_melt_quote_async(&home, "quote-1", Some(&nostr), &ceiling)
+                .await
+                .unwrap_err(),
+        );
+        refused(
+            "melt_status_for_quote_async",
+            melt_status_for_quote_async(&home, "quote-1", Some(&nostr))
+                .await
+                .unwrap_err(),
+        );
+        refused(
+            "melt_status_for_invoice_async",
+            melt_status_for_invoice_async(&home, BOLT11, Some(&nostr))
+                .await
+                .unwrap_err(),
+        );
+        let home_for_thread = home.clone();
+        let nostr_for_thread = nostr.clone();
+        let blocking = std::thread::spawn(move || {
+            prepare_melt_payment_blocking(
+                &home_for_thread,
+                "quote-1",
+                Some(&nostr_for_thread),
+                &ceiling,
+            )
+            .map(|_| ())
+        })
+        .join()
+        .expect("thread");
+        refused("prepare_melt_payment_blocking", blocking.unwrap_err());
+        // An https mint is not caught by the guard.
+        assert!(refuse_nostr_melt("https://mint.example").is_ok());
         let _ = std::fs::remove_dir_all(&root);
     }
 }
