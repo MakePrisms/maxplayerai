@@ -13,10 +13,10 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
 use super::reservations::{
-    available_breakdown, compute_available, Converted, Dispositions, JobDisposition,
+    available_breakdown, compute_available, Converted, Dispositions, JobDisposition, MintCeiling,
     ReconcileReport, Released, Reserved, ReservationState, ReserveRefused,
 };
 
@@ -40,7 +40,11 @@ use super::reservations::{
 ///   all) before the first send, so a retry re-sends the identical event instead of re-selecting a
 ///   claim and minting a new one. One row per job, ever — the PK is the "never award twice"
 ///   invariant made structural. Additive table; created by `init_schema` on open.
-pub const SCHEMA_VERSION: i64 = 6;
+/// - v7 — per-mint reservation ceilings (#1076): nullable `source_mint` on `reservations`, the mint
+///   the reservation was checked against and will be funded from. NULL (every pre-v7 row) counts
+///   against the default mint, which is what those rows were checked against. Additive column via
+///   [`BuyerStore::migrate`].
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// A cloneable handle to the daemon-owned SQLite state.
 #[derive(Clone)]
@@ -113,7 +117,11 @@ impl BuyerStore {
                  amount_sats     INTEGER NOT NULL CHECK (amount_sats >= 0),
                  state           TEXT NOT NULL CHECK (state IN ('reserved','spent','released')),
                  created_at_unix INTEGER NOT NULL,
-                 updated_at_unix INTEGER NOT NULL
+                 updated_at_unix INTEGER NOT NULL,
+                 -- v7 (#1076): the funding mint this reservation was checked against. NULL =
+                 -- written before per-mint ceilings (or by the pooled check); counts against the
+                 -- default mint.
+                 source_mint     TEXT
              );
              -- v3: pending auto-award intents. One row per posted job the daemon still owes an
              -- award. `pending` = awaiting a payable claim; `awarded` = a 3405 was published;
@@ -244,6 +252,11 @@ impl BuyerStore {
                 "ALTER TABLE award_attempts ADD COLUMN relay_url TEXT NOT NULL DEFAULT '';",
             )?;
         }
+        // v7 (#1076): NULL backfill is the honest value — a pre-v7 row was checked against the
+        // default-mint wallet, and NULL rows count against the default mint.
+        if !Self::column_exists(conn, "reservations", "source_mint")? {
+            conn.execute_batch("ALTER TABLE reservations ADD COLUMN source_mint TEXT;")?;
+        }
         Ok(())
     }
 
@@ -312,6 +325,22 @@ impl BuyerStore {
         balance: u64,
         now_unix: i64,
     ) -> Result<Reserved, ReserveRefused> {
+        self.reserve_at(job_id, amount, &MintCeiling::pooled(balance), now_unix)
+    }
+
+    /// [`reserve`](Self::reserve) against ONE funding mint's ceiling (#1076):
+    /// `available = balance_at_mint − reserved against that mint`, where rows with no recorded mint
+    /// count against the default. The mint is recorded on the row, so a later re-hold of the same
+    /// job is checked against the same mint. [`MintCeiling::pooled`] is the pre-#1076 check (every
+    /// reserved row against one balance, no mint recorded).
+    pub fn reserve_at(
+        &self,
+        job_id: &str,
+        amount: u64,
+        ceiling: &MintCeiling,
+        now_unix: i64,
+    ) -> Result<Reserved, ReserveRefused> {
+        let balance = ceiling.balance;
         let mut conn = self
             .conn
             .lock()
@@ -334,7 +363,22 @@ impl BuyerStore {
                             requested: amount,
                         });
                     }
-                    // Same amount already reserved — idempotent replay, no new commitment.
+                    // Same amount already reserved — idempotent replay, no new commitment. A live row
+                    // with no recorded mint (pre-v7, or the pooled `reserve`) was counted against
+                    // the default; when this re-hold is checked at the default, record it (#1076
+                    // review). Only the default: that is the mint the row already counts against,
+                    // so the per-mint sums do not move. Recording any other mint here would move
+                    // the hold without an available-check at that mint.
+                    if ceiling.is_default {
+                        if let Some(mint) = ceiling.mint.as_deref() {
+                            tx.execute(
+                                "UPDATE reservations SET source_mint = ?2
+                                 WHERE job_id = ?1 AND source_mint IS NULL",
+                                params![job_id, mint],
+                            )
+                            .map_err(|error| ReserveRefused::Store(error.to_string()))?;
+                        }
+                    }
                     tx.commit()
                         .map_err(|error| ReserveRefused::Store(error.to_string()))?;
                     return Ok(Reserved::Idempotent);
@@ -352,8 +396,8 @@ impl BuyerStore {
 
         // The available-check + the reserve write are ONE transaction. `reserved` sums only
         // `Reserved`-state rows and therefore excludes this job (fresh, or currently released).
-        let reserved =
-            sum_reserved(&tx).map_err(|error| ReserveRefused::Store(error.to_string()))?;
+        let reserved = sum_reserved_against(&tx, ceiling)
+            .map_err(|error| ReserveRefused::Store(error.to_string()))?;
         let breakdown = available_breakdown(balance, reserved);
         if amount > breakdown.available {
             // Refuse with ZERO written — the transaction rolls back on drop, so no released→reserved
@@ -362,17 +406,20 @@ impl BuyerStore {
                 requested: amount,
                 available: breakdown.available,
                 bound: breakdown.bound,
+                mint: ceiling.mint.clone(),
             });
         }
 
         tx.execute(
-            "INSERT INTO reservations (job_id, amount_sats, state, created_at_unix, updated_at_unix)
-             VALUES (?1, ?2, 'reserved', ?3, ?3)
+            "INSERT INTO reservations
+                 (job_id, amount_sats, state, created_at_unix, updated_at_unix, source_mint)
+             VALUES (?1, ?2, 'reserved', ?3, ?3, ?4)
              ON CONFLICT(job_id) DO UPDATE SET
                  amount_sats = excluded.amount_sats,
                  state = 'reserved',
-                 updated_at_unix = excluded.updated_at_unix",
-            params![job_id, amount as i64, now_unix],
+                 updated_at_unix = excluded.updated_at_unix,
+                 source_mint = excluded.source_mint",
+            params![job_id, amount as i64, now_unix, ceiling.mint],
         )
         .map_err(|error| ReserveRefused::Store(error.to_string()))?;
         tx.commit()
@@ -578,6 +625,29 @@ impl BuyerStore {
     pub fn reservation(&self, job_id: &str) -> Result<Option<(ReservationState, u64)>, StoreError> {
         let conn = self.lock()?;
         read_reservation(&conn, job_id)
+    }
+
+    /// Which mint a LIVE (`reserved`) reservation for `job_id` holds funds at (#1076). A released or
+    /// spent row, or no row, is [`ReservationPin::Unpinned`]: the next award re-selects. Both the
+    /// award re-hold and accept's funding-mint seal read this, so the mint the ledger encumbers is
+    /// the mint the payment spends.
+    pub fn reservation_pin(&self, job_id: &str) -> Result<ReservationPin, StoreError> {
+        let conn = self.lock()?;
+        query_reservation_pin(&conn, job_id, true)
+    }
+
+    /// The raw `source_mint` column for `job_id`, whatever the row's state. Inspection / tests —
+    /// money decisions use [`reservation_pin`](Self::reservation_pin), which ignores dead rows.
+    pub fn reservation_mint(&self, job_id: &str) -> Result<Option<String>, StoreError> {
+        let conn = self.lock()?;
+        let mint: Option<Option<String>> = conn
+            .query_row(
+                "SELECT source_mint FROM reservations WHERE job_id = ?1",
+                [job_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(mint.flatten())
     }
 
     // ---- Pending auto-award intents (#126/#127) ------------------------------------------------
@@ -1260,6 +1330,83 @@ fn sum_reserved(tx: &rusqlite::Transaction<'_>) -> Result<u64, StoreError> {
     Ok(reserved.max(0) as u64)
 }
 
+/// The funding mint a live reservation pins (#1076). See [`BuyerStore::reservation_pin`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReservationPin {
+    /// No `reserved` row: nothing is held, so the funding mint is free to be selected.
+    Unpinned,
+    /// A `reserved` row with no recorded mint (pre-v7, or the pooled `reserve`). It was checked
+    /// against, and counts against, the configured default mint.
+    Default,
+    /// A `reserved` row held at this (normalized) mint.
+    Mint(String),
+}
+
+fn query_reservation_pin(
+    conn: &Connection,
+    job_id: &str,
+    has_source_mint: bool,
+) -> Result<ReservationPin, StoreError> {
+    let sql = if has_source_mint {
+        "SELECT source_mint FROM reservations WHERE job_id = ?1 AND state = 'reserved'"
+    } else {
+        "SELECT NULL FROM reservations WHERE job_id = ?1 AND state = 'reserved'"
+    };
+    let row: Option<Option<String>> = conn
+        .query_row(sql, [job_id], |row| row.get::<_, Option<String>>(0))
+        .optional()?;
+    Ok(match row {
+        None => ReservationPin::Unpinned,
+        Some(None) => ReservationPin::Default,
+        Some(Some(mint)) => ReservationPin::Mint(mint),
+    })
+}
+
+/// [`BuyerStore::reservation_pin`] for a caller that does not own the daemon's store — accept,
+/// which also runs from the `maxplayer accept` CLI. Opens the existing DB without creating it or
+/// touching its schema: no file or no `reservations` table is [`ReservationPin::Unpinned`], and a
+/// table that predates `source_mint` reads live rows as [`ReservationPin::Default`] (what they
+/// were checked against). Any other failure is returned — the caller must not guess a mint.
+pub fn read_reservation_pin(db_path: &Path, job_id: &str) -> Result<ReservationPin, StoreError> {
+    if !db_path.exists() {
+        return Ok(ReservationPin::Unpinned);
+    }
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    let has_table: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'reservations')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_table {
+        return Ok(ReservationPin::Unpinned);
+    }
+    let has_source_mint = BuyerStore::column_exists(&conn, "reservations", "source_mint")?;
+    query_reservation_pin(&conn, job_id, has_source_mint)
+}
+
+/// The in-flight `reserved` term for one ceiling (#1076). Pooled: every `Reserved` row. Per mint:
+/// rows recorded at that mint, plus unrecorded (pre-v7 / pooled) rows when the mint is the default.
+fn sum_reserved_against(
+    tx: &rusqlite::Transaction<'_>,
+    ceiling: &MintCeiling,
+) -> Result<u64, StoreError> {
+    let Some(mint) = ceiling.mint.as_deref() else {
+        return sum_reserved(tx);
+    };
+    let reserved: i64 = tx.query_row(
+        "SELECT COALESCE(SUM(amount_sats), 0) FROM reservations
+         WHERE state = 'reserved'
+           AND (source_mint = ?1 OR (source_mint IS NULL AND ?2))",
+        params![mint, ceiling.is_default],
+        |row| row.get(0),
+    )?;
+    Ok(reserved.max(0) as u64)
+}
+
 fn read_meta_i64(conn: &Connection, key: &str) -> Result<Option<i64>, StoreError> {
     let value: Option<String> = conn
         .query_row("SELECT value FROM buyer_meta WHERE key = ?1", [key], |row| {
@@ -1312,7 +1459,7 @@ mod tests {
     // ---- Reservation ledger (#123) ------------------------------------------------------------
 
     use super::super::reservations::{
-        Ceiling, Converted, JobDisposition, Released, Reserved, ReserveRefused,
+        Ceiling, Converted, JobDisposition, MintCeiling, Released, Reserved, ReserveRefused,
     };
     use std::collections::BTreeMap;
 
@@ -1661,7 +1808,7 @@ mod tests {
             .reserve(&job_b, 40, 100, 2)
             .expect_err("over-available award must refuse");
         assert!(
-            matches!(refused, ReserveRefused::InsufficientAvailable { requested: 40, available: 20, bound: Ceiling::Wallet }),
+            matches!(refused, ReserveRefused::InsufficientAvailable { requested: 40, available: 20, bound: Ceiling::Wallet, mint: None }),
             "unexpected refusal: {refused:?}"
         );
         // ZERO written: no row for job_b, reserved + available unchanged.
@@ -2200,6 +2347,178 @@ mod tests {
              nothing else"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- #1076: per-mint reservation ceilings ------------------------------------------------
+
+    const MINT_DEFAULT: &str = "https://default.example";
+    const MINT_EXTRA: &str = "https://extra.example";
+
+    // The #1076 repro at the store: 0 at the default, 300 at an extra mint, a 200 reservation
+    // checked against the extra mint's ceiling FITS and records that mint. Red-on-revert: checking
+    // against the default-mint balance (0) refuses exactly as the issue reports.
+    #[test]
+    fn a_covering_extra_mint_balance_reserves_and_records_the_mint() {
+        let (store, path) = fresh_store("mint-extra-covers");
+        let job = "a".repeat(64);
+        let refused = store
+            .reserve_at(&job, 200, &MintCeiling::at_mint(MINT_DEFAULT, 0, true), 1)
+            .expect_err("the default mint holds nothing");
+        assert!(refused.to_string().contains(MINT_DEFAULT), "names the mint: {refused}");
+        store
+            .reserve_at(&job, 200, &MintCeiling::at_mint(MINT_EXTRA, 300, false), 2)
+            .expect("the extra mint covers it");
+        assert_eq!(store.reservation_mint(&job).expect("mint").as_deref(), Some(MINT_EXTRA));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Reservations only count against the mint they were checked at: a reservation at the extra
+    // mint does not shrink the default's ceiling, and vice versa — but two at the SAME mint do.
+    #[test]
+    fn reservations_count_only_against_their_own_mint() {
+        let (store, path) = fresh_store("mint-separate");
+        let extra = MintCeiling::at_mint(MINT_EXTRA, 300, false);
+        let default = MintCeiling::at_mint(MINT_DEFAULT, 100, true);
+        store.reserve_at(&"a".repeat(64), 200, &extra, 1).expect("extra 200 of 300");
+        store.reserve_at(&"b".repeat(64), 100, &default, 2).expect("default untouched by extra");
+        let refused = store
+            .reserve_at(&"c".repeat(64), 150, &extra, 3)
+            .expect_err("extra has 100 left");
+        assert!(
+            matches!(refused, ReserveRefused::InsufficientAvailable { requested: 150, available: 100, .. }),
+            "got {refused:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // A row with no recorded mint (every pre-v7 row, and the pooled fallback) was checked against
+    // the default-mint wallet, so it counts against the default — and ONLY the default.
+    #[test]
+    fn unrecorded_rows_count_against_the_default_mint_only() {
+        let (store, path) = fresh_store("mint-legacy");
+        store.reserve(&"a".repeat(64), 80, 100, 1).expect("legacy pooled reserve");
+        assert_eq!(store.reservation_mint(&"a".repeat(64)).expect("mint"), None);
+        let refused = store
+            .reserve_at(&"b".repeat(64), 40, &MintCeiling::at_mint(MINT_DEFAULT, 100, true), 2)
+            .expect_err("the legacy 80 counts against the default");
+        assert!(matches!(refused, ReserveRefused::InsufficientAvailable { available: 20, .. }));
+        store
+            .reserve_at(&"c".repeat(64), 40, &MintCeiling::at_mint(MINT_EXTRA, 40, false), 3)
+            .expect("the legacy row does not count against another mint");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // A v6 store (reservations without `source_mint`) gains the column on open; its rows read as
+    // unrecorded and keep counting against the default.
+    #[test]
+    fn a_v6_reservations_table_gains_source_mint_on_open() {
+        let path = temp_db("migrate-v7-source-mint");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).expect("raw open");
+            conn.execute_batch(
+                "CREATE TABLE buyer_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE reservations (
+                     job_id          TEXT PRIMARY KEY,
+                     amount_sats     INTEGER NOT NULL CHECK (amount_sats >= 0),
+                     state           TEXT NOT NULL CHECK (state IN ('reserved','spent','released')),
+                     created_at_unix INTEGER NOT NULL,
+                     updated_at_unix INTEGER NOT NULL
+                 );
+                 INSERT INTO buyer_meta (key, value) VALUES ('schema_version', '6');
+                 INSERT INTO reservations VALUES ('job-old', 70, 'reserved', 1, 1);",
+            )
+            .expect("seed v6 shape");
+        }
+        let store = BuyerStore::open(&path).expect("open migrates the column in");
+        assert_eq!(store.health().expect("health").schema_version, SCHEMA_VERSION);
+        assert_eq!(store.reservation_mint("job-old").expect("mint"), None);
+        let refused = store
+            .reserve_at(&"n".repeat(64), 40, &MintCeiling::at_mint(MINT_DEFAULT, 100, true), 2)
+            .expect_err("the migrated 70 still counts against the default");
+        assert!(matches!(refused, ReserveRefused::InsufficientAvailable { available: 30, .. }));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // #1076 review: only a LIVE reservation pins a mint. A released row keeps its column (history)
+    // but no longer pins, so the next award re-selects; re-reserving records the new mint.
+    #[test]
+    fn reservation_pin_ignores_released_rows() {
+        let (store, path) = fresh_store("pin-released");
+        let job = "a".repeat(64);
+        store
+            .reserve_at(&job, 200, &MintCeiling::at_mint(MINT_EXTRA, 300, false), 1)
+            .expect("reserve");
+        assert_eq!(store.reservation_pin(&job).expect("pin"), ReservationPin::Mint(MINT_EXTRA.into()));
+        store.release(&job, 2).expect("release");
+        assert_eq!(store.reservation_pin(&job).expect("pin"), ReservationPin::Unpinned);
+        assert_eq!(store.reservation_mint(&job).expect("raw").as_deref(), Some(MINT_EXTRA));
+        store
+            .reserve_at(&job, 200, &MintCeiling::at_mint(MINT_DEFAULT, 500, true), 3)
+            .expect("re-reserve at the default");
+        assert_eq!(store.reservation_pin(&job).expect("pin"), ReservationPin::Mint(MINT_DEFAULT.into()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // #1076 review: a live unrecorded row gains the default mint on an idempotent re-hold checked
+    // at the default — and ONLY the default, the mint it already counts against.
+    #[test]
+    fn an_idempotent_rehold_records_the_default_on_an_unrecorded_row() {
+        let (store, path) = fresh_store("pin-backfill");
+        let job = "a".repeat(64);
+        store.reserve(&job, 200, 500, 1).expect("pooled reserve");
+        assert_eq!(store.reservation_pin(&job).expect("pin"), ReservationPin::Default);
+        let replay = store
+            .reserve_at(&job, 200, &MintCeiling::at_mint(MINT_EXTRA, 900, false), 2)
+            .expect("idempotent");
+        assert_eq!(replay, Reserved::Idempotent);
+        assert_eq!(
+            store.reservation_pin(&job).expect("pin"),
+            ReservationPin::Default,
+            "a non-default re-hold must not move the hold without a check at that mint"
+        );
+        let replay = store
+            .reserve_at(&job, 200, &MintCeiling::at_mint(MINT_DEFAULT, 500, true), 3)
+            .expect("idempotent");
+        assert_eq!(replay, Reserved::Idempotent);
+        assert_eq!(store.reservation_pin(&job).expect("pin"), ReservationPin::Mint(MINT_DEFAULT.into()));
+        assert_eq!(store.reserved_in_flight().expect("r"), 200, "the backfill moved no money");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // The accept-side reader tolerates older ledgers: a v6 table (no `source_mint`) reads a live row
+    // as Default; a DB without a reservations table reads Unpinned. It never creates or migrates.
+    #[test]
+    fn read_reservation_pin_handles_older_ledgers_without_migrating() {
+        let path = temp_db("pin-reader-v6");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).expect("raw open");
+            conn.execute_batch(
+                "CREATE TABLE reservations (
+                     job_id TEXT PRIMARY KEY, amount_sats INTEGER NOT NULL, state TEXT NOT NULL,
+                     created_at_unix INTEGER NOT NULL, updated_at_unix INTEGER NOT NULL
+                 );
+                 INSERT INTO reservations VALUES ('live', 70, 'reserved', 1, 1);
+                 INSERT INTO reservations VALUES ('dead', 70, 'released', 1, 1);",
+            )
+            .expect("seed v6");
+        }
+        assert_eq!(read_reservation_pin(&path, "live").expect("live"), ReservationPin::Default);
+        assert_eq!(read_reservation_pin(&path, "dead").expect("dead"), ReservationPin::Unpinned);
+        let conn = Connection::open(&path).expect("reopen");
+        assert!(
+            !BuyerStore::column_exists(&conn, "reservations", "source_mint").expect("cols"),
+            "the reader must not migrate the daemon's DB"
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+
+        let empty = temp_db("pin-reader-empty");
+        let _ = std::fs::remove_file(&empty);
+        Connection::open(&empty).expect("create").execute_batch("CREATE TABLE t (x);").expect("t");
+        assert_eq!(read_reservation_pin(&empty, "x").expect("no table"), ReservationPin::Unpinned);
+        let _ = std::fs::remove_file(&empty);
     }
 
     // The v6 in-cycle column migration's backfill DEFAULTS are the conservative direction, and
