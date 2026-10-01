@@ -1,4 +1,5 @@
 declare const TRY_IT_ENABLED: boolean;
+declare const WEB_ANALYTICS_ENABLED: boolean;
 /**
  * Boot — ordered for perceived speed:
  *
@@ -13,6 +14,7 @@ declare const TRY_IT_ENABLED: boolean;
  * label aging and online-staleness — and they never rebuild structure.
  */
 import { RELAY_URL, SNAPSHOT_TIMEOUT_MS, SNAPSHOT_URL, TRANSPORT } from "./config.js";
+import { startAnalytics } from "./analytics.js";
 import { createEngine } from "./market/engine.js";
 import { DEFAULT_WINDOW, WINDOWS } from "./market/participants.js";
 import { createRelaySource } from "./source/relay.js";
@@ -227,4 +229,5 @@ async function boot(): Promise<void> {
   await ingestSnapshot();
 }
 
+if (WEB_ANALYTICS_ENABLED) startAnalytics();
 void boot();

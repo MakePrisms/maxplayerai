@@ -24,6 +24,7 @@
   },
   "dependencies": {
     "@noble/curves": "1.9.7",
-    "@noble/hashes": "1.8.0"
+    "@noble/hashes": "1.8.0",
+    "@vercel/analytics": "2.0.1"
   }
 }
