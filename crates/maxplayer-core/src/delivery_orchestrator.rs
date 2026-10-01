@@ -942,7 +942,7 @@ pub(crate) fn fresh_push_minter(
     remote: String,
     wait: Duration,
 ) -> git_transport::AuthMinter {
-    let sequence = std::sync::Mutex::new(0u64);
+    let sequence = std::sync::Mutex::new(Some(0u64));
     std::sync::Arc::new(move |destination| {
         if !git_transport::same_destination(&remote, destination) {
             return Err("wrong push token destination".into());
@@ -950,15 +950,24 @@ pub(crate) fn fresh_push_minter(
         let mut sequence = sequence
             .lock()
             .map_err(|_| "push token request lock failed")?;
-        *sequence += 1;
+        // A lost response must not be mistaken for the next leg's reply. Leave the channel
+        // closed on ANY hand-off failure; a retry may never consume a late, uncorrelated token.
+        let next = sequence
+            .take()
+            .ok_or("push token channel closed after a failed hand-off")?
+            .checked_add(1)
+            .filter(|n| *n <= 64)
+            .ok_or("push token request limit reached")?;
         let request = PushTokenRequest {
             nonce: nonce.clone(),
-            sequence: *sequence,
+            sequence: next,
         };
         let json = serde_json::to_string(&request).map_err(|_| "encode push token request")?;
         write_file_atomically(&out.join(PUSH_TOKEN_REQUEST), &json, None)
             .map_err(|e| e.to_string())?;
-        await_push_token(&out, wait).map_err(|e| e.to_string())
+        let header = await_push_token(&out, wait).map_err(|e| e.to_string())?;
+        *sequence = Some(next);
+        Ok(header)
     })
 }
 /// The orchestrator's account of the run, written on every exit ([`Phase1Outcome`]).
@@ -2336,6 +2345,26 @@ mod tests {
         assert_eq!(result, "delivered");
         assert_eq!(headers, ["Nostr fresh-1", "Nostr fresh-2"]);
         assert!(!root.join(PUSH_TOKEN_FILE).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn token_refresh_never_consumes_a_late_reply_after_timeout() {
+        let root = fresh_root("refresh-late-reply");
+        let remote = "https://relay.example/git/owner/job.git";
+        let minter = fresh_push_minter(root.clone(), NONCE.into(), remote.into(), Duration::ZERO);
+        assert!(minter(remote).is_err(), "no host response");
+        // The host answers after the wait ended. This must never become authorization for
+        // another wire request, even though it has the right header shape and destination.
+        std::fs::remove_file(root.join(PUSH_TOKEN_REQUEST)).unwrap();
+        write_secret_file(&root.join(PUSH_TOKEN_FILE), "Nostr late-reply").unwrap();
+        let error = minter(remote).expect_err("the timed-out channel stays closed");
+        assert!(error.contains("channel closed"));
+        assert!(!root.join(PUSH_TOKEN_REQUEST).exists());
+        assert!(
+            root.join(PUSH_TOKEN_FILE).exists(),
+            "late header was not consumed"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
