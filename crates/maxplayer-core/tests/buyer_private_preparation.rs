@@ -92,7 +92,10 @@ fn buyer_prepares_both_discovery_modes_retries_and_refuses_incomplete_publicatio
         std::env::set_var("no_proxy", "127.0.0.1,localhost");
     }
     assert!(std::env::var_os("GIT_SSL_NO_VERIFY").is_none());
-    let buyer = Keys::generate();
+    // Public test key (scalar 128): its pubkey contains "403". A transient
+    // HTTP 503 must not become an auth refusal just because the URL has those digits.
+    let buyer = Keys::parse(&format!("{:064x}", 128)).unwrap();
+    assert!(buyer.public_key().to_hex().contains("403"));
     let seller = Keys::generate();
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let pin = contribution::ContributionOffer {

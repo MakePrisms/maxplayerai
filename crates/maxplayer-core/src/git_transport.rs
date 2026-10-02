@@ -1071,16 +1071,28 @@ pub fn ls_remote(
 /// Map a libgit2 error to a scrubbed [`TransportError`]. Auth/permission signals map to
 /// `Auth` (fail-closed); everything else to `Io`. The secret is never in a git2 error.
 fn map_git_error(error: git2::Error) -> TransportError {
+    // Destinations are data, not HTTP status/auth evidence: a random pubkey or
+    // ephemeral port containing "403" must not suppress retries of a real 503.
     let lowered = error.message().to_ascii_lowercase();
-    if lowered.contains("401")
-        || lowered.contains("403")
+    let lowered = lowered
+        .split_whitespace()
+        .filter(|word| !word.contains("://"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let auth_status = lowered.split_whitespace().any(|word| {
+        matches!(
+            word.trim_matches(|c: char| c.is_ascii_punctuation()),
+            "401" | "403" | "404"
+        )
+    });
+    if error.code() == git2::ErrorCode::Auth
+        || auth_status
         || lowered.contains("authentication")
         || lowered.contains("unauthorized")
         || lowered.contains("forbidden")
         || lowered.contains("permission")
         || lowered.contains("could not read username")
         || lowered.contains("repository not found")
-        || lowered.contains("404")
     {
         TransportError::Auth(error.message().to_owned())
     } else {
@@ -1384,6 +1396,43 @@ impl Write for HttpStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_error_classification_ignores_status_digits_and_auth_words_in_urls() {
+        for message in [
+            "http status 503 for https://relay.example:40301/git/abc401def/abc404def/info/refs",
+            "http status 503 for https://forbidden.example/git/authentication/permission",
+            "http request: error sending request for url (https://relay.example:40401/git/403)",
+            "http status 302 for https://unauthorized.example/git/401: redirects are refused",
+        ] {
+            let mapped = map_git_error(git2::Error::from_str(message));
+            assert!(matches!(mapped, TransportError::Io(_)), "{message}: {mapped:?}");
+            assert!(crate::delivery_orchestrator::default_is_retryable(&mapped));
+        }
+    }
+
+    #[test]
+    fn git_error_classification_preserves_actual_auth_refusals() {
+        for message in [
+            "http status 401 for https://relay.example/git/503",
+            "http status 403 for https://relay.example/git/503",
+            "http status 404 for https://relay.example/git/503",
+            "unexpected http status code: 401",
+            "authentication failed",
+            "permission denied",
+            "repository not found",
+        ] {
+            let mapped = map_git_error(git2::Error::from_str(message));
+            assert!(matches!(mapped, TransportError::Auth(_)), "{message}: {mapped:?}");
+            assert!(!crate::delivery_orchestrator::default_is_retryable(&mapped));
+        }
+        let mapped = map_git_error(git2::Error::new(
+            git2::ErrorCode::Auth,
+            git2::ErrorClass::Net,
+            "credentials refused",
+        ));
+        assert!(matches!(mapped, TransportError::Auth(_)));
+    }
 
     #[test]
     fn container_http_policy_is_scoped_and_restored_after_panic() {

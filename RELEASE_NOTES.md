@@ -1,5 +1,9 @@
 ## Unreleased
 
+- Git upload retries no longer mistake HTTP-status digits or auth words in a
+  repository URL for an authentication refusal. Actual permission refusals still
+  stop immediately.
+
 - Private contribution preparation forwards a single fetched pack unchanged to
   an empty input repository when the server supports it, avoiding redundant
   libgit2 delta search. Other layouts retain the existing upload path; quotas,
