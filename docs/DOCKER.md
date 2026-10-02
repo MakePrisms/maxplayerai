@@ -505,9 +505,19 @@ seller node delivery path: CONTAINER — one container runs the agent and every 
 
 `maxplayer doctor` reports the same answer in its `relay token policy` row.
 
-The default token mode mints a 60-second branch-scoped push token after the agent has exited, so it
-works with the relay as deployed today. See `SELLER-QUICKSTART.md`, section 3c, "Container-side
-delivery", for the token modes, the log lines to watch, and the known limits.
+The default token mode obtains branch-scoped push authorization only after the agent and its
+children have exited. After the initial hand-off, the container requests a fresh token from the
+host immediately before each HTTP leg, including retries; it does not reuse an aged token after
+packing or uploading. Token requests are nonce-bound and sequenced, and the host chooses the
+repository and ref. Upgrade both the seller daemon and the sandbox image for this handshake;
+a new container with an old daemon fails closed when refresh is not answered.
+
+Container receive-pack uploads have a 300-second HTTP request ceiling, a 15-second connection
+limit, and (on Linux) a 60-second TCP unacknowledged-data limit. This permits uploads longer than
+the former 120-second ceiling, but is not an unlimited or application-progress-based timeout.
+The host still kills the container at the job deadline plus the existing delivery/exit margins.
+Host-side delivery, repository advertisements and buyer verification keep their existing timeouts.
+See `SELLER-QUICKSTART.md`, section 3c, "Container-side delivery", for the token modes and logs.
 
 `container_delivery_token = "long-lived"` needs a relay that advertises
 `scoped_token_max_lifetime_secs` in its NIP-11 `limitation` object. The seat reads that field at boot

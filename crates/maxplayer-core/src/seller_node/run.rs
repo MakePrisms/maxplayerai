@@ -9025,6 +9025,7 @@ impl SellerNodeRunner {
             .saturating_add(orch::PUSH_MARGIN_SECS)
             .saturating_add(orch::CONTAINER_EXIT_GRACE_SECS);
         let mut marker: Option<orch::AgentDoneMarker> = None;
+        let mut token_sequence = 0;
         let mut last_alive_line = Instant::now();
         let exit: Result<std::process::ExitStatus, Fail> = loop {
             match child.try_wait() {
@@ -9072,6 +9073,39 @@ impl SellerNodeRunner {
                     }
                     // A forged, planted (FIFO, symlink, over-cap) or malformed marker: no token,
                     // no delivery. The break lands on the teardown below.
+                    Err(error) => break Err(Fail::Delivery(error.to_string())),
+                }
+            }
+            if fresh_mode && marker.is_some() {
+                match orch::read_push_token_request(&io_dir, &nonce, token_sequence) {
+                    Ok(Some(sequence)) => {
+                        // Consume the request BEFORE publishing its response. Otherwise a fast
+                        // container can replace it for the next leg before the host removes it.
+                        if let Err(error) =
+                            std::fs::remove_file(io_dir.join(orch::PUSH_TOKEN_REQUEST))
+                        {
+                            break Err(Fail::Delivery(format!("token request consume: {error}")));
+                        }
+                        let header = match self
+                            .mint_push_header(&seller.git_remote, &push_ref, None)
+                            .await
+                        {
+                            Ok(header) => header,
+                            Err(failure) => break Err(failure),
+                        };
+                        if now_unix().max(0) as u64 > hard_deadline {
+                            break Err(Fail::Timeout(
+                                "container token signing exceeded delivery deadline".into(),
+                            ));
+                        }
+                        if let Err(error) =
+                            orch::write_secret_file(&io_dir.join(orch::PUSH_TOKEN_FILE), &header)
+                        {
+                            break Err(Fail::Delivery(format!("token refresh hand-off: {error}")));
+                        }
+                        token_sequence = sequence;
+                    }
+                    Ok(None) => {}
                     Err(error) => break Err(Fail::Delivery(error.to_string())),
                 }
             }

@@ -258,6 +258,46 @@ fn client_default() -> &'static reqwest::blocking::Client {
     })
 }
 
+// Container delivery is killed by its host at the job deadline + margins. Do not widen
+// host delivery's 120s leg / 150s operation contract, or the buyer's short fetch budget.
+thread_local! {
+    static CONTAINER_PUSH_HTTP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn with_container_push_http<T>(body: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CONTAINER_PUSH_HTTP.set(self.0);
+        }
+    }
+    let _restore = Restore(CONTAINER_PUSH_HTTP.replace(true));
+    body()
+}
+
+/// Matches the relay's pack-operation ceiling. A host supervisor still bounds the whole
+/// container, including local packing, token hand-offs and all retry attempts.
+const CONTAINER_HTTP_LEG_TIMEOUT: Duration = Duration::from_secs(300);
+
+fn client_container() -> &'static reqwest::blocking::Client {
+    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        let builder = reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(15))
+            .timeout(CONTAINER_HTTP_LEG_TIMEOUT)
+            .redirect(no_redirects())
+            .retry(no_hidden_replay())
+            .danger_accept_invalid_certs(accept_invalid_certs());
+        // Linux containers: bound unacknowledged upload data, while allowing an acknowledged
+        // slow transfer to use the longer total budget. This is TCP progress, not app progress.
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        let builder = builder.tcp_user_timeout(Duration::from_secs(60));
+        builder
+            .build()
+            .expect("build container delivery HTTP client")
+    })
+}
+
 /// Short-timeout client for the buyer verify fetch — fail-closed money path.
 fn client_short() -> &'static reqwest::blocking::Client {
     static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
@@ -1142,6 +1182,8 @@ impl HttpStream {
     fn send(&mut self) -> io::Result<()> {
         let client = if self.short {
             client_short()
+        } else if CONTAINER_PUSH_HTTP.get() && self.is_post && self.service == "git-receive-pack" {
+            client_container()
         } else {
             client_default()
         };
@@ -1309,6 +1351,192 @@ impl Write for HttpStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn container_http_policy_is_scoped_and_restored_after_panic() {
+        assert!(!CONTAINER_PUSH_HTTP.get());
+        let result = std::panic::catch_unwind(|| {
+            with_container_push_http(|| {
+                assert!(CONTAINER_PUSH_HTTP.get());
+                with_container_push_http(|| assert!(CONTAINER_PUSH_HTTP.get()));
+                assert!(CONTAINER_PUSH_HTTP.get());
+                panic!("test unwind");
+            })
+        });
+        assert!(result.is_err());
+        assert!(!CONTAINER_PUSH_HTTP.get());
+    }
+
+    #[test]
+    fn container_wire_retry_requests_a_new_host_token() {
+        use crate::delivery_orchestrator as orch;
+        use std::io::{BufRead, BufReader};
+        let out = temp_root("wire-token-refresh");
+        let nonce = "private-handoff-nonce";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let remote = format!("http://{}", listener.local_addr().unwrap());
+        let mint = orch::fresh_push_minter(
+            out.clone(),
+            nonce.into(),
+            remote.clone(),
+            Duration::from_secs(5),
+        );
+        let host_out = out.clone();
+        let host = std::thread::spawn(move || {
+            for previous in 0..2 {
+                assert!(orch::wait_for_file(
+                    &host_out.join(orch::PUSH_TOKEN_REQUEST),
+                    Duration::from_secs(5),
+                    Duration::from_millis(5)
+                ));
+                assert_eq!(
+                    orch::read_push_token_request(&host_out, nonce, previous).unwrap(),
+                    Some(previous + 1)
+                );
+                std::fs::remove_file(host_out.join(orch::PUSH_TOKEN_REQUEST)).unwrap();
+                orch::write_secret_file(
+                    &host_out.join(orch::PUSH_TOKEN_FILE),
+                    &format!("Nostr wire-{}", previous + 1),
+                )
+                .unwrap();
+            }
+        });
+        let server = std::thread::spawn(move || {
+            let mut headers = Vec::new();
+            for status in ["503 Service Unavailable", "200 OK"] {
+                let (socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket);
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if line.to_ascii_lowercase().starts_with("authorization:") {
+                        headers.push(line.split_once(':').unwrap().1.trim().to_string());
+                    }
+                }
+                write!(
+                    reader.get_mut(),
+                    "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+            }
+            headers
+        });
+        let policy = orch::PushRetryPolicy {
+            max_attempts: 2,
+            base_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+        };
+        let result = with_container_push_http(|| {
+            orch::push_with_retry(
+                &policy,
+                |_| {
+                    let mut stream = HttpStream {
+                        mint: Some(mint.clone()),
+                        authority: None,
+                        lifetime: None,
+                        short: false,
+                        read_budget: None,
+                        url: remote.clone(),
+                        destination: remote.clone(),
+                        service: "git-receive-pack",
+                        is_post: true,
+                        sent: false,
+                        request_body: vec![],
+                        response: None,
+                    };
+                    stream
+                        .send()
+                        .map(|_| "delivered".to_string())
+                        .map_err(|e| TransportError::Io(e.to_string()))
+                },
+                orch::default_is_retryable,
+                |_| {},
+                |d| d,
+            )
+        })
+        .unwrap();
+        host.join().unwrap();
+        assert_eq!(server.join().unwrap(), ["Nostr wire-1", "Nostr wire-2"]);
+        assert_eq!(result, "delivered");
+        assert!(!out.join(orch::PUSH_TOKEN_FILE).exists());
+        std::fs::remove_dir_all(out).unwrap();
+    }
+
+    /// Real 125-second throttled HTTP upload through the production stream/client selection.
+    /// Explicit opt-in avoids adding two minutes to every core unit-test run.
+    #[test]
+    #[ignore = "125-second slow-upload regression; run explicitly"]
+    fn container_upload_survives_old_120_second_cutoff() {
+        use std::io::{BufRead, BufReader};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(150)))
+                .unwrap();
+            let mut reader = BufReader::new(socket);
+            let mut length = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+            }
+            assert!(length > 0);
+            let start = std::time::Instant::now();
+            // Pace the body, rather than sleeping before the response. Several MiB exceed the
+            // socket buffers so the client must keep transmitting throughout the test.
+            let mut received = 0;
+            let mut chunk = vec![0; 64 * 1024];
+            while received < length {
+                let n = chunk.len().min(length - received);
+                reader.read_exact(&mut chunk[..n]).unwrap();
+                received += n;
+                let target = Duration::from_secs(125).mul_f64(received as f64 / length as f64);
+                std::thread::sleep(target.saturating_sub(start.elapsed()));
+            }
+            reader
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+        let mut stream = HttpStream {
+            mint: None,
+            authority: None,
+            lifetime: None,
+            short: false,
+            read_budget: None,
+            url: format!("http://{addr}/git-receive-pack"),
+            destination: format!("http://{addr}"),
+            service: "git-receive-pack",
+            is_post: true,
+            sent: false,
+            request_body: vec![0x5a; 16 * 1024 * 1024],
+            response: None,
+        };
+        let start = std::time::Instant::now();
+        let result = with_container_push_http(|| {
+            let mut body = Vec::new();
+            stream.read_to_end(&mut body).map(|_| body)
+        });
+        server.join().unwrap();
+        assert_eq!(result.unwrap(), b"ok");
+        assert!(start.elapsed() > DEFAULT_HTTP_LEG_TIMEOUT);
+        assert!(!CONTAINER_PUSH_HTTP.get());
+    }
 
     /// A delta search that fits its budget says nothing; one that outlasts it says how long it took.
     ///
