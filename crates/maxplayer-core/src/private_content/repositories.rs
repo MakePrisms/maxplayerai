@@ -65,7 +65,7 @@ fn inspect_objects(repo: &Repository, private: bool, used: Usage) -> Result<Usag
                 super::validate_path(name)?;
                 if !matches!(entry.filemode(), 0o040000 | 0o100644 | 0o100755) {
                     return Err(Error(
-                        "input snapshot refused: private job repositories cannot contain symlinks or submodules",
+                        "input snapshot refused: private job repositories cannot contain symlinks, submodules or other special file modes",
                     ));
                 }
             }
@@ -173,9 +173,11 @@ pub(super) fn upload_error(
     if !crate::git_transport::is_permanent_refusal(error) {
         return Error(fallback);
     }
-    if error.to_string().contains("cannot contain symlinks or submodules") {
+    let status = crate::git_transport::reported_http_status(error);
+    let excerpt = crate::git_transport::refusal_excerpt(error).unwrap_or_default();
+    if status == Some(400) && excerpt.contains("cannot contain symlinks or submodules") {
         Error("relay refused the private input: private job repositories cannot contain symlinks or submodules")
-    } else if crate::git_transport::reported_http_status(error) == Some(413) {
+    } else if status == Some(413) {
         Error("relay refused the private input: it exceeds the private job repository limits")
     } else {
         Error("relay refused the private input upload (permanent HTTP refusal; not retried)")

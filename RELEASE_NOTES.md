@@ -4,8 +4,10 @@
   repository URL for an authentication refusal. Actual permission refusals still
   stop immediately.
 - A permanent relay refusal of a private input upload (a 4xx other than 408, 409,
-  425 or 429, such as a quota or symlink/submodule refusal) is no longer retried
-  with a full re-upload, and the post error names the refusal.
+  421, 425 or 429, such as a quota or symlink/submodule refusal) is no longer
+  retried with a full re-upload, and the post error names the refusal. Relay: a
+  failure of the relay's own repository inspection now returns 503 (retryable)
+  instead of 400; this part needs a relay redeploy.
 
 - Private contribution preparation forwards a single fetched pack unchanged to
   an empty input repository when the server supports it, including jobs that also

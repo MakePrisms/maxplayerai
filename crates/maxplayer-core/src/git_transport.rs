@@ -1377,6 +1377,17 @@ fn refusal_reason(response: reqwest::blocking::Response) -> String {
     }
 }
 
+/// The server's refusal excerpt, if the buyer-input transport kept one.
+pub(crate) fn refusal_excerpt(error: &TransportError) -> Option<&str> {
+    let message = match error {
+        TransportError::Io(m)
+        | TransportError::Auth(m)
+        | TransportError::Rejected(m)
+        | TransportError::Transport(m) => m,
+    };
+    message.split_once(REFUSAL_MARKER).map(|(_, excerpt)| excerpt)
+}
+
 /// The HTTP status a transport error reports, if it reports one. Reads only the
 /// transport's own `http status NNN` prefix, never a URL or a refusal excerpt.
 pub(crate) fn reported_http_status(error: &TransportError) -> Option<u16> {
@@ -1398,12 +1409,13 @@ pub(crate) fn reported_http_status(error: &TransportError) -> Option<u16> {
     None
 }
 
-/// A refusal no retry can change: a 4xx other than timeout, conflict, too-early
-/// or rate limiting. Retrying one re-sends the whole upload for the same answer.
+/// A refusal no retry can change: a 4xx other than timeout, conflict, misdirected
+/// request, too-early or rate limiting. Retrying one re-sends the whole upload for
+/// the same answer.
 pub(crate) fn is_permanent_refusal(error: &TransportError) -> bool {
     matches!(
         reported_http_status(error),
-        Some(code @ 400..=499) if !matches!(code, 408 | 409 | 425 | 429)
+        Some(code @ 400..=499) if !matches!(code, 408 | 409 | 421 | 425 | 429)
     )
 }
 
@@ -1484,6 +1496,7 @@ mod tests {
             ("http status 409 for https://relay.example/git/o/r (refusal: push superseded)", false),
             ("http status 408 for https://relay.example/git/o/r", false),
             ("http status 429 for https://relay.example/git/o/r", false),
+            ("http status 421 for https://relay.example/git/o/r", false),
             ("http status 503 for https://relay.example/git/400/r (refusal: status 400)", false),
             ("http request: error sending request for url (https://relay.example:40400/)", false),
         ] {

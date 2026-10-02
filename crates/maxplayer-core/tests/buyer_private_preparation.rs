@@ -240,7 +240,12 @@ fn buyer_prepares_both_discovery_modes_retries_and_refuses_incomplete_publicatio
             assert_eq!(events, 0, "a refused input push after the base must not queue the offer");
         } else if label == "policy" {
             let error = result.unwrap_err().to_string();
-            assert!(error.contains("cannot contain symlinks or submodules"), "{error}");
+            assert!(
+                error.contains(
+                    "relay refused the private input: private job repositories cannot contain symlinks or submodules"
+                ),
+                "the fixed message, not the server's text: {error}"
+            );
             assert_eq!(
                 server.requests().len(),
                 3,
