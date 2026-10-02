@@ -2,6 +2,7 @@
 //! post/validation/money path unchanged; own it in the daemon, not the tool call.
 use super::*;
 use sha2::{Digest, Sha256};
+use std::time::Instant;
 
 fn canonical(value: &Value) -> Value {
     match value {
@@ -16,17 +17,28 @@ fn canonical(value: &Value) -> Value {
         _ => value.clone(),
     }
 }
+/// Pre-claim fingerprinting must answer well inside MCP's 15-second tool deadline
+/// (the daemon then waits at most 1s more): a call that times out at MCP while the
+/// daemon goes on to claim and publish invites a second hire under a new key.
+const FINGERPRINT_BUDGET: Duration = Duration::from_secs(8);
+
+/// The input files could not be hashed before the deadline. Nothing was claimed.
+#[derive(Debug, PartialEq, Eq)]
+struct FingerprintExpired;
+
 /// Local input files are part of the intent: the same paths with different
 /// CONTENTS are a different hire, and rewriting identical bytes is not. Hashes the
 /// bytes posting would read (regular file, no symlink follow, bounded like
 /// `private_content::inputs`); an unreadable or oversized source fingerprints as
-/// such, and posting itself reports it.
-fn input_state(params: &Value) -> Value {
+/// such, and posting itself reports it. Files are hashed in parallel and the whole
+/// read stops at `deadline`.
+fn input_state(params: &Value, deadline: Instant) -> Result<Value, FingerprintExpired> {
     use std::io::Read;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     let Some(inputs) = params.get("inputs").and_then(Value::as_array) else {
-        return Value::Null;
+        return Ok(Value::Null);
     };
-    let digest = |source: &str| -> Option<String> {
+    let digest = |source: &str| -> Result<Option<String>, FingerprintExpired> {
         let mut options = std::fs::OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
@@ -34,39 +46,91 @@ fn input_state(params: &Value) -> Value {
             use std::os::unix::fs::OpenOptionsExt;
             options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
-        let file = options.open(source).ok()?;
-        let metadata = file.metadata().ok()?;
+        let Ok(file) = options.open(source) else {
+            return Ok(None);
+        };
+        let Ok(metadata) = file.metadata() else {
+            return Ok(None);
+        };
         if !metadata.is_file() || metadata.len() > crate::private_content::MAX_FILE_BYTES {
-            return None;
+            return Ok(None);
         }
         let mut hasher = Sha256::new();
         let mut reader = file.take(crate::private_content::MAX_FILE_BYTES + 1);
-        let mut buffer = vec![0; 64 * 1024];
+        let mut buffer = vec![0; 256 * 1024];
         loop {
-            let n = reader.read(&mut buffer).ok()?;
+            if Instant::now() >= deadline {
+                return Err(FingerprintExpired);
+            }
+            let Ok(n) = reader.read(&mut buffer) else {
+                return Ok(None);
+            };
             if n == 0 {
                 break;
             }
             hasher.update(&buffer[..n]);
         }
-        Some(hex::encode(hasher.finalize()))
+        Ok(Some(hex::encode(hasher.finalize())))
     };
-    Value::Array(
-        inputs
-            .iter()
-            .map(|input| {
-                input
-                    .get("source")
-                    .and_then(Value::as_str)
-                    .and_then(digest)
-                    .map_or(Value::Null, Value::String)
-            })
-            .collect(),
-    )
+    let sources: Vec<Option<&str>> = inputs
+        .iter()
+        .map(|input| input.get("source").and_then(Value::as_str))
+        .collect();
+    let next = AtomicUsize::new(0);
+    let workers = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .clamp(1, 8)
+        .min(sources.len().max(1));
+    let mut digests: Vec<Result<Option<String>, FingerprintExpired>> =
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..workers)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut done = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(source) = sources.get(i) else {
+                                break done;
+                            };
+                            done.push((i, source.map_or(Ok(None), digest)));
+                        }
+                    })
+                })
+                .collect();
+            let mut all: Vec<_> = handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap_or_default())
+                .collect();
+            all.sort_by_key(|(i, _)| *i);
+            all.into_iter().map(|(_, d)| d).collect()
+        });
+    if digests.len() != sources.len() {
+        // A hashing thread panicked; treat it like running out of time: no claim.
+        return Err(FingerprintExpired);
+    }
+    let digests = digests
+        .drain(..)
+        .map(|d| d.map(|d| d.map_or(Value::Null, Value::String)))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Value::Array(digests))
 }
 /// `(handle, fingerprint, explicit)`.
+#[cfg(test)]
 fn identity(params: &mut Value) -> Result<(String, String, bool), String> {
-    let inputs = input_state(params);
+    identity_before(params, Instant::now() + FINGERPRINT_BUDGET)
+}
+fn identity_before(
+    params: &mut Value,
+    deadline: Instant,
+) -> Result<(String, String, bool), String> {
+    let inputs = input_state(params, deadline).map_err(|FingerprintExpired| {
+        format!(
+            "post_job input files could not be fingerprinted within {}s, so this call claimed \
+             and posted nothing. Retry the identical call (a second read is usually faster), \
+             or attach fewer or smaller input files",
+            FINGERPRINT_BUDGET.as_secs()
+        )
+    })?;
     let map = params
         .as_object_mut()
         .ok_or("post_job arguments must be an object")?;
@@ -166,10 +230,24 @@ where
     F: FnOnce(Value) -> Fut,
     Fut: std::future::Future<Output = Response> + Send + 'static,
 {
-    // Hashing input files is blocking I/O.
+    submit_within(store, id, params, FINGERPRINT_BUDGET, work).await
+}
+async fn submit_within<F, Fut>(
+    store: BuyerStore,
+    id: Value,
+    params: Value,
+    budget: Duration,
+    work: F,
+) -> Response
+where
+    F: FnOnce(Value) -> Fut,
+    Fut: std::future::Future<Output = Response> + Send + 'static,
+{
+    // Hashing input files is blocking I/O, bounded so the ack beats MCP's deadline.
+    let deadline = Instant::now() + budget;
     let identified = tokio::task::spawn_blocking(move || {
         let mut params = params;
-        let identity = identity(&mut params);
+        let identity = identity_before(&mut params, deadline);
         (params, identity)
     })
     .await;
@@ -286,6 +364,67 @@ mod tests {
             keyed_after.1, keyed_before.1,
             "same request_id with changed contents is refused"
         );
+    }
+
+    /// Regression (#1096 advisor round 2, nit 2): hashing large inputs ran unbounded
+    /// before the claim, so MCP could time out while the daemon went on to publish.
+    #[tokio::test]
+    async fn input_fingerprint_past_its_budget_claims_and_posts_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("big.bin");
+        std::fs::write(&source, vec![7u8; 1024 * 1024]).unwrap();
+        let store = BuyerStore::open(dir.path().join("buyer.sqlite")).unwrap();
+        let params = json!({"task":"t","inputs":[{"source":source,"path":"big.bin"}]});
+        let refused = submit_within(
+            store.clone(),
+            json!(1),
+            params.clone(),
+            Duration::ZERO,
+            |_| async { panic!("posted after the fingerprint budget expired") },
+        )
+        .await
+        .error
+        .expect("expired fingerprint is refused")
+        .message;
+        assert!(refused.contains("claimed and posted nothing"), "{refused}");
+        let handle = identity(&mut params.clone()).unwrap().0;
+        assert!(
+            store.preparation(&handle).unwrap().is_none(),
+            "no preparation row, so an identical retry starts cleanly"
+        );
+        let posted = submit(store.clone(), json!(2), params, |_| async {
+            Response::ok(Value::Null, json!({"job_id":"in-budget"}))
+        })
+        .await
+        .result
+        .unwrap();
+        assert_eq!(posted["job_id"], "in-budget");
+    }
+
+    #[test]
+    fn many_inputs_fingerprint_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let files: Vec<_> = (0..20)
+            .map(|i| {
+                let source = dir.path().join(format!("f{i}"));
+                std::fs::write(&source, format!("body {i}")).unwrap();
+                json!({"source":source,"path":format!("f{i}")})
+            })
+            .collect();
+        let state = input_state(
+            &json!({"inputs":files}),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        let expected: Vec<Value> = (0..20)
+            .map(|i| json!(hex::encode(Sha256::digest(format!("body {i}").as_bytes()))))
+            .collect();
+        assert_eq!(state, Value::Array(expected));
+        let missing = input_state(
+            &json!({"inputs":[{"source":dir.path().join("absent"),"path":"a"}]}),
+            Instant::now() + Duration::from_secs(5),
+        );
+        assert_eq!(missing, Ok(json!([null])));
     }
 
     #[tokio::test]

@@ -230,10 +230,13 @@ even from another MCP connection. A repeat answered from an earlier post returns
 `deduplicated: true`: nothing new was published. Without a `request_id` this only
 covers retries within 10 minutes of completion; after that, identical arguments
 are a new hire (re-posting a lapsed job works). Local input files are part of the
-arguments: changing a file's contents is a different request. Optionally supply
+arguments: changing a file's contents is a different request. They are hashed
+before `post_job` answers, within 8 seconds; if very large inputs cannot be read
+in time, the call returns an error and nothing is claimed or posted. Optionally supply
 `request_id: "my-post-001"` and keep both it and all other arguments unchanged on
 retries; a request ID never expires, and reusing it with different arguments is
-refused. Use a **new** request ID only when you deliberately want to hire again.
+refused (the refusal says what that request ID already did, such as the job it
+posted). Use a **new** request ID only when you deliberately want to hire again.
 The CLI's synchronous `post` path is unchanged.
 
 A failure **before any offer was queued** (for example a transient input-upload

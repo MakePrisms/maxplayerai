@@ -18,6 +18,40 @@ pub(crate) const IMPLICIT_DEDUP_SECS: i64 = 600;
 /// `offer_id` of a row a pre-column build left unfinished or failed.
 pub(crate) const UNKNOWN_OFFER: &str = "unknown";
 
+/// Refusal for a `request_id` reused with different arguments or changed inputs.
+/// THIS call posted nothing; what the key already did is stated, never assumed,
+/// because a new key is a second hire.
+fn mismatch(response: Option<&str>, failed: bool, offer_id: Option<&str>) -> String {
+    let earlier = match (response, failed, offer_id) {
+        (None, _, _) => "Its earlier post_job is still preparing; poll that preparation_id with \
+                         get_job"
+            .to_owned(),
+        (Some(_), _, Some(UNKNOWN_OFFER)) => "Its earlier post_job ran on an earlier build that \
+             did not record its offer, so an offer may be live; inspect buyer jobs"
+            .to_owned(),
+        (Some(_), true, Some(offer)) => format!(
+            "Its earlier post_job failed after queueing offer {offer}, which may be live; \
+             inspect it with get_job job_id={offer}"
+        ),
+        (Some(_), true, None) => {
+            "Its earlier post_job failed before any offer was queued; nothing was published".into()
+        }
+        (Some(_), false, Some(job)) => format!("Its earlier post_job posted job {job}"),
+        (Some(body), false, None) => serde_json::from_str::<Value>(body)
+            .ok()
+            .and_then(|r| r["result"]["job_id"].as_str().map(str::to_owned))
+            .map_or_else(
+                || "Its earlier post_job posted a job".to_owned(),
+                |job| format!("Its earlier post_job posted job {job}"),
+            ),
+    };
+    format!(
+        "request_id already belongs to different post_job arguments (or input files that have \
+         changed since); this call posted nothing. {earlier}. Repeat the original arguments to \
+         get its answer; a new request_id is a new hire"
+    )
+}
+
 impl BuyerStore {
     /// Returns `true` when the caller now owns (and must run) the preparation.
     pub(crate) fn claim_preparation(
@@ -29,24 +63,25 @@ impl BuyerStore {
     ) -> Result<bool, StoreError> {
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing: Option<(String, bool, bool, Option<String>, Option<i64>)> = tx
+        type Row = (String, Option<String>, bool, Option<String>, Option<i64>);
+        let existing: Option<Row> = tx
             .query_row(
-                "SELECT fingerprint, response IS NULL, failed, offer_id, completed_at
+                "SELECT fingerprint, response, failed, offer_id, completed_at
                    FROM post_preparations WHERE handle=?1",
                 [handle],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
-        if let Some((existing, running, failed, offer_id, completed_at)) = &existing {
+        if let Some((existing, response, failed, offer_id, completed_at)) = &existing {
             if existing != fingerprint {
-                return Err(StoreError(
-                    "request_id already belongs to different post_job arguments (or the \
-                     input files' contents changed); nothing was posted. Reuse the original \
-                     arguments, or check the earlier job before choosing a new request_id"
-                        .into(),
-                ));
+                return Err(StoreError(mismatch(
+                    response.as_deref(),
+                    *failed,
+                    offer_id.as_deref(),
+                )));
             }
-            if *running {
+            let running = response.is_none();
+            if running {
                 return Ok(false);
             }
             let rerun = if *failed {
@@ -210,11 +245,11 @@ mod tests {
                 .claim_preparation("preparation:a", "body", true, 0)
                 .unwrap()
         );
-        assert!(
-            store
-                .claim_preparation("preparation:a", "changed", true, 0)
-                .is_err()
-        );
+        let running = store
+            .claim_preparation("preparation:a", "changed", true, 0)
+            .unwrap_err()
+            .0;
+        assert!(running.contains("still preparing"), "{running}");
         store
             .finish_preparation("preparation:a", &ok("one"), 0)
             .unwrap();
@@ -284,6 +319,40 @@ mod tests {
                     .unwrap(),
                 "possibly published: never re-run after the window either (#1096 advisor F1)"
             );
+        }
+    }
+
+    /// Regression (#1096 advisor round 2, nit 1): a reused request_id was told
+    /// "nothing was posted" even when that key had already posted a job.
+    #[test]
+    fn reused_request_id_states_what_the_key_already_did() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BuyerStore::open(dir.path().join("db")).unwrap();
+        let refusal = |h: &str| store.claim_preparation(h, "other", true, 3).unwrap_err().0;
+
+        assert!(store.claim_preparation("posted", "f", true, 0).unwrap());
+        store.record_preparation_offer("posted", "job-1").unwrap();
+        store.finish_preparation("posted", &ok("job-1"), 1).unwrap();
+        let posted = refusal("posted");
+        assert!(posted.contains("posted job job-1"), "{posted}");
+        assert!(!posted.contains("nothing was published"), "{posted}");
+
+        assert!(store.claim_preparation("queued", "f", true, 0).unwrap());
+        store.record_preparation_offer("queued", "offer-2").unwrap();
+        store.finish_preparation("queued", &failed(), 1).unwrap();
+        let queued = refusal("queued");
+        assert!(
+            queued.contains("offer-2") && queued.contains("may be live"),
+            "{queued}"
+        );
+
+        assert!(store.claim_preparation("early", "f", true, 0).unwrap());
+        store.finish_preparation("early", &failed(), 1).unwrap();
+        assert!(refusal("early").contains("nothing was published"));
+
+        for message in [posted, queued] {
+            assert!(message.contains("this call posted nothing"), "{message}");
+            assert!(message.contains("new hire"), "{message}");
         }
     }
 

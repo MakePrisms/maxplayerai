@@ -19,7 +19,10 @@
   success says `deduplicated: true`, a repeated failure says so in its message).
   Without `request_id`, a successful post dedupes identical arguments for 10
   minutes; an explicit `request_id` never expires. Input files are fingerprinted
-  by content. A failure before any offer was queued re-runs on retry; once an
+  by content, in parallel and within 8 seconds; if that budget runs out the call
+  claims and posts nothing and says so. Reusing a `request_id` with different
+  arguments is refused with what that key already did (still preparing, posted
+  job id, or a possibly-live offer). A failure before any offer was queued re-runs on retry; once an
   offer was queued, failures and restarts are never re-run, for either key kind,
   and the error names the offer id; abandoned owned staging directories are
   cleaned without touching live work or legacy unlabelled temporary directories.
