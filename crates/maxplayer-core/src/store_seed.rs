@@ -153,27 +153,32 @@ pub(crate) fn import(store: &Path, base_oid: &str) -> Result<bool, String> {
             // staging name ends in `.part`, never `.idx`, so a torn copy is never scanned.
             for (from, name) in [(pack, pack_name), (idx, idx_name)] {
                 let tmp = pack_dir.join(format!("tmp_seed_{}.part", name.to_string_lossy()));
-                fs::copy(from, &tmp).map_err(|e| format!("copy seed: {e}"))?;
+                fs::copy(from, &tmp).map_err(|e| (false, format!("copy seed: {e}")))?;
                 let dest = pack_dir.join(name);
-                fs::rename(&tmp, &dest).map_err(|e| format!("place seed: {e}"))?;
+                fs::rename(&tmp, &dest).map_err(|e| (false, format!("place seed: {e}")))?;
                 placed.push(dest);
             }
         }
-        let repo = git2::Repository::open_bare(store).map_err(|e| format!("open store: {e}"))?;
-        let oid = git2::Oid::from_str(base_oid).map_err(|e| e.to_string())?;
-        repo.find_commit(oid)
-            .map_err(|_| "seed does not contain the base commit".to_owned())?;
+        let repo =
+            git2::Repository::open_bare(store).map_err(|e| (false, format!("open store: {e}")))?;
+        let oid = git2::Oid::from_str(base_oid).map_err(|e| (false, e.to_string()))?;
+        if repo.find_commit(oid).is_err() {
+            return Err((true, "seed does not contain the base commit".to_owned()));
+        }
         Ok((repo, oid))
     })();
     let (repo, oid) = match result {
         Ok(found) => found,
-        Err(error) => {
+        Err((useless, error)) => {
             // Index files first, so no half-removed pack is ever visible.
             placed.sort_by_key(|p| p.extension().is_none_or(|e| e != "idx"));
             for path in placed {
                 let _ = fs::remove_file(path);
             }
-            let _ = fs::remove_dir_all(&seed);
+            // Only a seed without its base is worthless; an IO failure keeps it for a retry.
+            if useless {
+                let _ = fs::remove_dir_all(&seed);
+            }
             return Err(error);
         }
     };

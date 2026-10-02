@@ -220,9 +220,16 @@ impl GitDeliveryVerifier {
             let tip = repo
                 .refname_to_id(&fetched_ref)
                 .map_err(|_| DeliveryError::MissingBaseObject)?;
-            match tip == parsed || repo.graph_descendant_of(tip, parsed).unwrap_or(false) {
-                true => Ok(()),
-                false => Err(DeliveryError::MissingBaseObject),
+            if tip == parsed {
+                return Ok(());
+            }
+            match repo.graph_descendant_of(tip, parsed) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(DeliveryError::MissingBaseObject),
+                Err(error) => Err(DeliveryError::GitCommandFailed {
+                    operation: "base-in-pin",
+                    cause: error.message().to_owned(),
+                }),
             }
         })
     }
