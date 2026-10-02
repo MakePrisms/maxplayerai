@@ -47,7 +47,7 @@ use super::reservations::{
 /// - v8 — durable MCP post preparation handles and request deduplication (#1095).
 pub const SCHEMA_VERSION: i64 = 8;
 
-mod preparations;
+pub(crate) mod preparations;
 
 /// A cloneable handle to the daemon-owned SQLite state.
 #[derive(Clone)]
@@ -269,20 +269,27 @@ impl BuyerStore {
             conn.execute_batch("ALTER TABLE reservations ADD COLUMN source_mint TEXT;")?;
         }
         // v8 columns added during the same unreleased cycle as the table. A pre-column
-        // row never recorded whether an offer was signed, so a failed one is marked as
-        // possibly published (`offer_id 'unknown'`): never silently re-run.
+        // build never recorded whether it reached publication, so every row it left
+        // unfinished or failed is marked possibly published (`offer_id 'unknown'`) and
+        // is never silently re-run. Columns and backfill commit together or not at all.
         if !Self::column_exists(conn, "post_preparations", "offer_id")? {
-            conn.execute_batch("ALTER TABLE post_preparations ADD COLUMN offer_id TEXT;")?;
-        }
-        if !Self::column_exists(conn, "post_preparations", "failed")? {
-            conn.execute_batch(
-                "ALTER TABLE post_preparations ADD COLUMN failed INTEGER NOT NULL DEFAULT 0;
-                 UPDATE post_preparations SET failed = 1, offer_id = 'unknown'
-                  WHERE response LIKE '%\"error\":%';",
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch("ALTER TABLE post_preparations ADD COLUMN offer_id TEXT;")?;
+            if !Self::column_exists(&tx, "post_preparations", "failed")? {
+                tx.execute_batch(
+                    "ALTER TABLE post_preparations ADD COLUMN failed INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            if !Self::column_exists(&tx, "post_preparations", "completed_at")? {
+                tx.execute_batch("ALTER TABLE post_preparations ADD COLUMN completed_at INTEGER;")?;
+            }
+            tx.execute_batch(
+                "UPDATE post_preparations SET offer_id = 'unknown'
+                  WHERE response IS NULL OR json_extract(response, '$.error') IS NOT NULL;
+                 UPDATE post_preparations SET failed = 1
+                  WHERE response IS NOT NULL AND json_extract(response, '$.error') IS NOT NULL;",
             )?;
-        }
-        if !Self::column_exists(conn, "post_preparations", "completed_at")? {
-            conn.execute_batch("ALTER TABLE post_preparations ADD COLUMN completed_at INTEGER;")?;
+            tx.commit()?;
         }
         Ok(())
     }

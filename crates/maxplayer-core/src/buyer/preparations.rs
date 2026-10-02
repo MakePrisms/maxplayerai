@@ -17,29 +17,49 @@ fn canonical(value: &Value) -> Value {
     }
 }
 /// Local input files are part of the intent: the same paths with different
-/// contents are a different hire. Metadata only (no reads); unreadable sources
-/// still fingerprint, and posting itself reports them.
+/// CONTENTS are a different hire, and rewriting identical bytes is not. Hashes the
+/// bytes posting would read (regular file, no symlink follow, bounded like
+/// `private_content::inputs`); an unreadable or oversized source fingerprints as
+/// such, and posting itself reports it.
 fn input_state(params: &Value) -> Value {
+    use std::io::Read;
     let Some(inputs) = params.get("inputs").and_then(Value::as_array) else {
         return Value::Null;
+    };
+    let digest = |source: &str| -> Option<String> {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = options.open(source).ok()?;
+        let metadata = file.metadata().ok()?;
+        if !metadata.is_file() || metadata.len() > crate::private_content::MAX_FILE_BYTES {
+            return None;
+        }
+        let mut hasher = Sha256::new();
+        let mut reader = file.take(crate::private_content::MAX_FILE_BYTES + 1);
+        let mut buffer = vec![0; 64 * 1024];
+        loop {
+            let n = reader.read(&mut buffer).ok()?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buffer[..n]);
+        }
+        Some(hex::encode(hasher.finalize()))
     };
     Value::Array(
         inputs
             .iter()
             .map(|input| {
-                let state = input
+                input
                     .get("source")
                     .and_then(Value::as_str)
-                    .and_then(|source| std::fs::symlink_metadata(source).ok())
-                    .map(|m| {
-                        let modified = m
-                            .modified()
-                            .ok()
-                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                            .map(|d| d.as_nanos().to_string());
-                        json!({ "len": m.len(), "modified_ns": modified })
-                    });
-                state.unwrap_or(Value::Null)
+                    .and_then(digest)
+                    .map_or(Value::Null, Value::String)
             })
             .collect(),
     )
@@ -87,9 +107,10 @@ pub(super) fn poll(context: &BuyerContext, id: Value, handle: &str) -> Response 
     poll_store(&context.store, id, handle, false)
 }
 /// `deduplicated` marks an answer given to a REPEATED post_job instead of posting.
+/// A failure after an offer was recorded always names it: it may be live.
 fn poll_store(store: &BuyerStore, id: Value, handle: &str, deduplicated: bool) -> Response {
-    match store.preparation(handle) {
-        Ok(Some(Some(mut response))) => {
+    match store.preparation_state(handle) {
+        Ok(Some((Some(mut response), offer))) => {
             response.id = id;
             if let Some(Value::Object(result)) = response.result.as_mut() {
                 result.insert("status".into(), json!("posted"));
@@ -102,9 +123,26 @@ fn poll_store(store: &BuyerStore, id: Value, handle: &str, deduplicated: bool) -
                     );
                 }
             }
+            if let Some(error) = response.error.as_mut() {
+                let offer = offer
+                    .as_deref()
+                    .filter(|o| *o != store::preparations::UNKNOWN_OFFER);
+                if let Some(offer) = offer.filter(|o| !error.message.contains(*o)) {
+                    error.message.push_str(&format!(
+                        " Offer {offer} was queued for publication before this failure and may \
+                         be live; auto-award was NOT armed. Inspect it with get_job \
+                         job_id={offer}."
+                    ));
+                }
+                if deduplicated {
+                    error.message.push_str(
+                        " (deduplicated: this repeated post_job did not run or publish anything)",
+                    );
+                }
+            }
             response
         }
-        Ok(Some(None)) => Response::ok(
+        Ok(Some((None, _))) => Response::ok(
             id,
             json!({"status":"preparing","preparation_id":handle,
             "next":"Call get_job with job_id=preparation_id; do not post another job."}),
@@ -123,14 +161,22 @@ pub(super) async fn start(context: &Arc<BuyerContext>, id: Value, params: Value)
     )
     .await
 }
-async fn submit<F, Fut>(store: BuyerStore, id: Value, mut params: Value, work: F) -> Response
+async fn submit<F, Fut>(store: BuyerStore, id: Value, params: Value, work: F) -> Response
 where
     F: FnOnce(Value) -> Fut,
     Fut: std::future::Future<Output = Response> + Send + 'static,
 {
-    let (handle, fingerprint, explicit) = match identity(&mut params) {
-        Ok(identity) => identity,
-        Err(e) => return Response::err(id, CODE_METHOD_NOT_FOUND, e),
+    // Hashing input files is blocking I/O.
+    let identified = tokio::task::spawn_blocking(move || {
+        let mut params = params;
+        let identity = identity(&mut params);
+        (params, identity)
+    })
+    .await;
+    let (params, (handle, fingerprint, explicit)) = match identified {
+        Ok((params, Ok(identity))) => (params, identity),
+        Ok((_, Err(e))) => return Response::err(id, CODE_METHOD_NOT_FOUND, e),
+        Err(_) => return Response::err(id, CODE_INTERNAL, "post_job fingerprint worker stopped"),
     };
     match store.claim_preparation(&handle, &fingerprint, explicit, now_unix()) {
         Ok(true) => {
@@ -214,25 +260,31 @@ mod tests {
     }
 
     #[test]
-    fn changed_input_file_contents_are_a_different_intent() {
+    fn input_file_contents_not_timestamps_are_the_intent() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("brief.txt");
         std::fs::write(&source, "one").unwrap();
         let params = json!({"task":"t","inputs":[{"source":source,"path":"brief.txt"}]});
         let before = identity(&mut params.clone()).unwrap();
-        assert_eq!(identity(&mut params.clone()).unwrap(), before);
-        std::fs::write(&source, "two, longer").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&source, "one").unwrap(); // same bytes, new mtime
+        assert_eq!(
+            identity(&mut params.clone()).unwrap(),
+            before,
+            "rewriting identical bytes is the same request (#1096 advisor F5)"
+        );
+        std::fs::write(&source, "two").unwrap(); // same length, new bytes
         let after = identity(&mut params.clone()).unwrap();
-        assert_ne!(after.0, before.0, "automatic key follows the file");
+        assert_ne!(after.0, before.0, "automatic key follows the contents");
         let keyed =
             json!({"request_id":"k","task":"t","inputs":[{"source":source,"path":"brief.txt"}]});
         let keyed_before = identity(&mut keyed.clone()).unwrap();
-        std::fs::write(&source, "three, longer still").unwrap();
+        std::fs::write(&source, "six").unwrap();
         let keyed_after = identity(&mut keyed.clone()).unwrap();
         assert_eq!(keyed_after.0, keyed_before.0);
         assert_ne!(
             keyed_after.1, keyed_before.1,
-            "same request_id with changed files is refused"
+            "same request_id with changed contents is refused"
         );
     }
 
@@ -350,7 +402,11 @@ mod tests {
         })
         .await;
         assert_eq!(runs.load(Ordering::SeqCst), 0);
-        assert!(retry.error.is_some());
+        let message = retry.error.unwrap().message;
+        assert!(
+            message.contains("offer-1") && message.contains("deduplicated"),
+            "the repeat names the possibly-live offer (#1096 advisor F2): {message}"
+        );
     }
 
     /// A restart before any offer was queued leaves a retryable handle, not a

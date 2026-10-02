@@ -3,10 +3,11 @@
 //!
 //! What a finished row means for the NEXT identical request:
 //! - failed with no `offer_id`: nothing can have been published, so it re-runs;
-//! - an `offer_id` was recorded (the offer was about to be queued/published): a
-//!   failure stays sticky, because re-running could hire twice;
-//! - automatic (argument-derived) keys only deduplicate a retry within
-//!   [`IMPLICIT_DEDUP_SECS`] of completion; after that the same arguments are a
+//! - failed with an `offer_id` (the offer was about to be queued/published, or a
+//!   pre-column build left it `unknown`): sticky for EVERY key kind and forever,
+//!   because re-running could hire twice;
+//! - succeeded: an automatic (argument-derived) key answers identical retries for
+//!   [`IMPLICIT_DEDUP_SECS`] after completion; after that the same arguments are a
 //!   new hire, exactly as before #1095. An explicit `request_id` never expires.
 use super::*;
 use crate::buyer::protocol::{CODE_INTERNAL, Response};
@@ -14,6 +15,8 @@ use serde_json::Value;
 
 /// How long a finished automatic-key preparation answers identical retries.
 pub(crate) const IMPLICIT_DEDUP_SECS: i64 = 600;
+/// `offer_id` of a row a pre-column build left unfinished or failed.
+pub(crate) const UNKNOWN_OFFER: &str = "unknown";
 
 impl BuyerStore {
     /// Returns `true` when the caller now owns (and must run) the preparation.
@@ -37,16 +40,22 @@ impl BuyerStore {
         if let Some((existing, running, failed, offer_id, completed_at)) = &existing {
             if existing != fingerprint {
                 return Err(StoreError(
-                    "request_id already belongs to different post_job arguments".into(),
+                    "request_id already belongs to different post_job arguments (or the \
+                     input files' contents changed); nothing was posted. Reuse the original \
+                     arguments, or check the earlier job before choosing a new request_id"
+                        .into(),
                 ));
             }
             if *running {
                 return Ok(false);
             }
-            let nothing_published = *failed && offer_id.is_none();
-            let expired = !explicit
-                && completed_at.is_none_or(|t| now.saturating_sub(t) >= IMPLICIT_DEDUP_SECS);
-            if !nothing_published && !expired {
+            let rerun = if *failed {
+                offer_id.is_none()
+            } else {
+                !explicit
+                    && completed_at.is_none_or(|t| now.saturating_sub(t) >= IMPLICIT_DEDUP_SECS)
+            };
+            if !rerun {
                 return Ok(false);
             }
         }
@@ -104,17 +113,29 @@ impl BuyerStore {
     }
 
     pub(crate) fn preparation(&self, handle: &str) -> Result<Option<Option<Response>>, StoreError> {
-        let row: Option<Option<String>> = self
+        Ok(self
+            .preparation_state(handle)?
+            .map(|(response, _)| response))
+    }
+
+    /// The stored response (None while running) and the recorded offer id, if any.
+    pub(crate) fn preparation_state(
+        &self,
+        handle: &str,
+    ) -> Result<Option<(Option<Response>, Option<String>)>, StoreError> {
+        let row: Option<(Option<String>, Option<String>)> = self
             .lock()?
             .query_row(
-                "SELECT response FROM post_preparations WHERE handle=?1",
+                "SELECT response, offer_id FROM post_preparations WHERE handle=?1",
                 [handle],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        row.map(|s| {
-            s.map(|s| serde_json::from_str(&s).map_err(|e| StoreError(e.to_string())))
-                .transpose()
+        row.map(|(response, offer)| {
+            let response = response
+                .map(|s| serde_json::from_str(&s).map_err(|e| StoreError(e.to_string())))
+                .transpose()?;
+            Ok((response, offer))
         })
         .transpose()
     }
@@ -134,9 +155,14 @@ impl BuyerStore {
             rows
         };
         for (handle, offer_id) in rows {
-            let message = match &offer_id {
+            let message = match offer_id.as_deref() {
                 None => "preparation interrupted by daemon restart before any offer was queued; \
                          nothing was published. Repeat the identical post_job to start again."
+                    .to_owned(),
+                Some(UNKNOWN_OFFER) => "preparation interrupted by daemon restart; it was \
+                     started by an earlier build that did not record its offer, so an offer may \
+                     be live and auto-award was NOT armed. Inspect buyer jobs before posting \
+                     again; repeating this post_job returns this message rather than posting."
                     .to_owned(),
                 Some(id) => format!(
                     "preparation interrupted by daemon restart after offer {id} was queued for \
@@ -252,6 +278,12 @@ mod tests {
                 !store.claim_preparation(&late, "f", explicit, 2).unwrap(),
                 "possibly published: never re-run in the window"
             );
+            assert!(
+                !store
+                    .claim_preparation(&late, "f", explicit, 1 + IMPLICIT_DEDUP_SECS * 10)
+                    .unwrap(),
+                "possibly published: never re-run after the window either (#1096 advisor F1)"
+            );
         }
     }
 
@@ -291,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_column_rows_migrate_failed_as_possibly_published() {
+    fn pre_column_rows_migrate_failed_and_unfinished_as_possibly_published() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
         {
@@ -300,23 +332,38 @@ mod tests {
                 "CREATE TABLE post_preparations (handle TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, response TEXT);",
             )
             .unwrap();
-            for (handle, response) in [("bad", failed()), ("good", ok("old"))] {
+            for (handle, response) in [
+                ("bad", Some(failed())),
+                ("good", Some(ok("old"))),
+                ("inflight", None),
+            ] {
                 conn.execute(
                     "INSERT INTO post_preparations VALUES (?1, 'f', ?2)",
-                    params![handle, serde_json::to_string(&response).unwrap()],
+                    params![handle, response.map(|r| serde_json::to_string(&r).unwrap())],
                 )
                 .unwrap();
             }
         }
         let store = BuyerStore::open(&path).unwrap();
-        assert!(
-            !store.claim_preparation("bad", "f", true, 0).unwrap(),
-            "unknown publication stays sticky"
-        );
+        store.interrupt_preparations(0).unwrap();
+        for explicit in [true, false] {
+            assert!(
+                !store.claim_preparation("bad", "f", explicit, 0).unwrap(),
+                "unknown publication stays sticky (explicit={explicit})"
+            );
+            assert!(
+                !store
+                    .claim_preparation("inflight", "f", explicit, 0)
+                    .unwrap(),
+                "a pre-column in-flight row may have published (explicit={explicit})"
+            );
+        }
+        let inflight = store.preparation("inflight").unwrap().unwrap().unwrap();
+        assert!(inflight.error.unwrap().message.contains("earlier build"));
         assert!(!store.claim_preparation("good", "f", true, 0).unwrap());
         assert!(
             store.claim_preparation("good", "f", false, 0).unwrap(),
-            "no completion time: automatic key expired"
+            "a successful row with no completion time: automatic key expired"
         );
     }
 
