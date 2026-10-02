@@ -3554,6 +3554,34 @@ mod tests {
         assert_eq!(ceiling, MintCeiling::at_mint(CEIL_DEFAULT, 0, true));
     }
 
+    // rc1 credits flow: a buyer funded only at a `nostr://` credit mint the seller's claim accepts
+    // is reserved against THAT mint (the #1076 repro on the credits line), and the recorded mint is
+    // the normalized form `balances_async` reports, so the per-mint SQL match is exact.
+    #[test]
+    fn a_nostr_credit_mint_funds_the_ceiling() {
+        const CREDITS: &str =
+            "nostr://npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d";
+        let normalized = crate::wallet_ops::normalize_mint_url(CREDITS).expect("nostr mint parses");
+        assert_eq!(
+            crate::wallet_ops::normalize_mint_url(&format!("{CREDITS}/")).expect("slash"),
+            normalized
+        );
+        let balances =
+            vec![mint_row(CEIL_DEFAULT, 0, true, true), mint_row(&normalized, 300, false, true)];
+        let quoted = vec![CREDITS.to_owned()];
+        let ceiling = award_ceiling_from_balances(CEIL_DEFAULT, true, None, &quoted, &balances, 200);
+        assert_eq!(ceiling, MintCeiling::at_mint(normalized.clone(), 300, false));
+        let pinned = award_ceiling_from_balances(
+            CEIL_DEFAULT,
+            true,
+            Some(&normalized),
+            &quoted,
+            &balances,
+            200,
+        );
+        assert_eq!(pinned, ceiling, "a re-hold at the recorded credit mint finds the same row");
+    }
+
     // #1076 review finding 3: a failed per-mint read REFUSES instead of admitting a pooled NULL row
     // that later per-mint checks at other mints would not see.
     #[test]

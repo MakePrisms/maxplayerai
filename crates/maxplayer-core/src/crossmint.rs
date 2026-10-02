@@ -120,6 +120,17 @@ pub fn plan_payment(
         return Ok(PayPlan::Direct { mint: buyer_mint });
     }
 
+    // A hop melts at the source. A `nostr://` source never melts (see
+    // `wallet_ops::refuse_nostr_melt`): refuse here, before any quote is raised, so an award filter
+    // treats such a claim as unpayable instead of failing later at pay time.
+    if crate::mint_wire::is_nostr_scheme(buyer_selected_mint) {
+        return Err(AuthorizePayError::Input(format!(
+            "nostr:// mint {buyer_mint} is not in the creq mint list {accepted_mints:?}, and a \
+             nostr:// mint cannot fund a cross-mint hop (it never melts); pay a seller that accepts \
+             this mint, or fund an accepted mint"
+        )));
+    }
+
     // No overlap. Hop to the first accepted mint that the fence admits; refuse fail-closed if none
     // does, rather than hopping to a mint we are not permitted to hold ecash at.
     let target = accepted_mints
@@ -654,5 +665,23 @@ mod tests {
         let pay_plan = plan_payment(&sealed, &accepted, true).expect("re-derives from the seal");
         assert_eq!(pay_plan.source_mint(), &mint(cuba), "pay honors the sealed source");
         assert!(!pay_plan.is_hop());
+    }
+
+    // A `nostr://` source never hops (it would melt there, and a nostr:// melt can release inputs
+    // while a published request can still land). Listed, it still pays direct.
+    #[test]
+    fn a_nostr_buyer_mint_never_plans_a_hop() {
+        let nostr = "nostr://npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d";
+        let error = plan_payment(nostr, &["https://seller.example".to_owned()], true)
+            .expect_err("a nostr:// source must not plan a hop");
+        assert!(
+            error.to_string().contains("cannot fund a cross-mint hop"),
+            "unexpected refusal: {error}"
+        );
+        let direct = plan_payment(nostr, &[nostr.to_owned()], true).expect("listed nostr mint");
+        assert!(!direct.is_hop(), "a listed nostr:// mint pays direct");
+        let hop_to = plan_payment("https://buyer.example", &[nostr.to_owned()], true)
+            .expect("an https source may still hop");
+        assert!(hop_to.is_hop());
     }
 }
