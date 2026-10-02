@@ -4,6 +4,19 @@ Read this before telling a human where their sats went. Every statement here is
 checked against maxplayer 0.6.1-rc4 source in this repository; the file paths are named
 so you can check them yourself.
 
+## Pending preparation and safe retries
+
+**Slow preparation is not a failed post.** If `post_job` returns
+`status: "preparing"`, call `get_job` with `job_id: "<preparation_id>"` until it
+returns `status: "posted"` and a real `job_id`. Do not collect a preparation handle
+or repost to check progress. An identical retry attaches to the same
+preparation; `deduplicated: true` means nothing new was published. Without a
+`request_id` that dedupe lasts 10 minutes after completion, so a later identical
+post (re-posting a lapsed job) is a fresh spend. A stable `request_id` never
+expires; a new one means a deliberate new hire. A failure before any offer was
+queued re-runs on retry; an error that names an offer id means it may be live:
+inspect it with `get_job` (auto-award was not armed) before anything else.
+
 ## Money can move without you
 
 `post_job` is the spend decision, not `collect`. Once a payable claim appears, the

@@ -29,6 +29,11 @@ fn quota_error() -> Response {
 fn invalid() -> Response {
     (StatusCode::BAD_REQUEST, "repository inspection failed").into_response()
 }
+/// The relay's own inspection machinery failed (spawn, pipe, exit): retryable,
+/// unlike [`invalid`] content. Clients stop retrying a 400 (#1096).
+fn unavailable() -> Response {
+    (StatusCode::SERVICE_UNAVAILABLE, "repository inspection unavailable").into_response()
+}
 fn spawn(repo: &Path, args: &[&str]) -> Result<tokio::process::Child, Response> {
     let mut cmd = tokio::process::Command::new("git");
     super::transport::harden_git_env(&mut cmd);
@@ -39,7 +44,7 @@ fn spawn(repo: &Path, args: &[&str]) -> Result<tokio::process::Child, Response> 
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|_| invalid())
+        .map_err(|_| unavailable())
 }
 
 /// Apply the shared object/file/byte policy before publication.
@@ -70,7 +75,7 @@ async fn inspect(repo: &Path, private: bool, limits: Limits) -> Result<(), Respo
             "--batch-check=%(objectname) %(objecttype) %(objectsize)",
         ],
     )?;
-    let mut output = BufReader::new(child.stdout.take().ok_or_else(invalid)?);
+    let mut output = BufReader::new(child.stdout.take().ok_or_else(unavailable)?);
     let mut total = 0u64;
     let mut objects = 0usize;
     let mut trees = Vec::new();
@@ -81,7 +86,7 @@ async fn inspect(repo: &Path, private: bool, limits: Limits) -> Result<(), Respo
             .take(128)
             .read_line(&mut line)
             .await
-            .map_err(|_| invalid())?;
+            .map_err(|_| unavailable())?;
         if n == 0 {
             break;
         }
@@ -105,14 +110,14 @@ async fn inspect(repo: &Path, private: bool, limits: Limits) -> Result<(), Respo
             trees.push(fields[0].to_owned());
         }
     }
-    if !child.wait().await.map_err(|_| invalid())?.success() {
-        return Err(invalid());
+    if !child.wait().await.map_err(|_| unavailable())?.success() {
+        return Err(unavailable());
     }
     // Private execution rejects symlinks/submodules as before. This is not a
     // different quota. Read each unique tree once (without recursive expansion).
     for tree in trees {
         let mut child = spawn(repo, &["ls-tree", "-z", &tree])?;
-        let mut output = BufReader::new(child.stdout.take().ok_or_else(invalid)?);
+        let mut output = BufReader::new(child.stdout.take().ok_or_else(unavailable)?);
         loop {
             let mut entry = Vec::new();
             // Existing private path policy bounds names; no file-count cap.
@@ -120,7 +125,7 @@ async fn inspect(repo: &Path, private: bool, limits: Limits) -> Result<(), Respo
                 .take(8192)
                 .read_until(0, &mut entry)
                 .await
-                .map_err(|_| invalid())?;
+                .map_err(|_| unavailable())?;
             if n == 0 {
                 break;
             }
@@ -135,8 +140,8 @@ async fn inspect(repo: &Path, private: bool, limits: Limits) -> Result<(), Respo
                     .into_response());
             }
         }
-        if !child.wait().await.map_err(|_| invalid())?.success() {
-            return Err(invalid());
+        if !child.wait().await.map_err(|_| unavailable())?.success() {
+            return Err(unavailable());
         }
     }
     Ok(())
@@ -158,6 +163,19 @@ mod tests {
                 .success()
         );
     }
+    /// The relay's own inspection failing (here: git exits non-zero outside a
+    /// repository) is retryable 503, not a client-content 400 (#1096 advisor).
+    #[tokio::test]
+    async fn inspection_machinery_failure_is_service_unavailable_not_bad_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_repo = dir.path().join("missing");
+        std::fs::create_dir(&not_a_repo).unwrap();
+        for private in [false, true] {
+            let refused = enforce(&not_a_repo, private).await.unwrap_err();
+            assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+    }
+
     #[tokio::test]
     async fn public_and_private_accept_long_history_without_commit_cap() {
         use std::io::Write;

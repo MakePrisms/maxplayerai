@@ -48,6 +48,9 @@
 //! A leaked branch-scoped token is bounded authority, not zero authority: it can replay a push to
 //! that one ref of that one repository until it expires. The binding above keeps it from leaving.
 
+#[cfg(feature = "wallet")]
+mod pack_forward;
+
 use std::cell::RefCell;
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -1068,16 +1071,31 @@ pub fn ls_remote(
 /// Map a libgit2 error to a scrubbed [`TransportError`]. Auth/permission signals map to
 /// `Auth` (fail-closed); everything else to `Io`. The secret is never in a git2 error.
 fn map_git_error(error: git2::Error) -> TransportError {
+    // Destinations are data, not HTTP status/auth evidence: a random pubkey or
+    // ephemeral port containing "403" must not suppress retries of a real 503.
     let lowered = error.message().to_ascii_lowercase();
-    if lowered.contains("401")
-        || lowered.contains("403")
+    let lowered = lowered
+        .split(REFUSAL_MARKER)
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter(|word| !word.contains("://"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let auth_status = lowered.split_whitespace().any(|word| {
+        matches!(
+            word.trim_matches(|c: char| c.is_ascii_punctuation()),
+            "401" | "403" | "404"
+        )
+    });
+    if error.code() == git2::ErrorCode::Auth
+        || auth_status
         || lowered.contains("authentication")
         || lowered.contains("unauthorized")
         || lowered.contains("forbidden")
         || lowered.contains("permission")
         || lowered.contains("could not read username")
         || lowered.contains("repository not found")
-        || lowered.contains("404")
     {
         TransportError::Auth(error.message().to_owned())
     } else {
@@ -1121,16 +1139,16 @@ fn service_url(base: &str, name: &str, is_post: bool) -> String {
     }
 }
 
-impl SmartSubtransport for NostrHttp {
+impl NostrHttp {
     /// One leg. `url` is the repo-root URL libgit2 resolved for the remote — after any rewrite the
     /// repository configuration applied. It must be the destination the caller named; otherwise no
     /// request is built and the refusal is recorded for [`with_context`]. The header never travels
     /// anywhere but the intended URL, whatever the configuration says.
-    fn action(
+    fn stream(
         &self,
         url: &str,
         service: Service,
-    ) -> Result<Box<dyn SmartSubtransportStream>, git2::Error> {
+    ) -> Result<HttpStream, git2::Error> {
         let bound = self
             .intended_url
             .as_deref()
@@ -1150,7 +1168,7 @@ impl SmartSubtransport for NostrHttp {
         }
         let (name, is_post) = service_parts(service);
         let full_url = service_url(url, name, is_post);
-        Ok(Box::new(HttpStream {
+        Ok(HttpStream {
             mint: self.mint.clone(),
             authority: self.authority.clone(),
             lifetime: self.lifetime.clone(),
@@ -1165,8 +1183,19 @@ impl SmartSubtransport for NostrHttp {
             is_post,
             sent: false,
             request_body: Vec::new(),
+            streaming_body: None,
             response: None,
-        }))
+        })
+    }
+}
+
+impl SmartSubtransport for NostrHttp {
+    fn action(
+        &self,
+        url: &str,
+        service: Service,
+    ) -> Result<Box<dyn SmartSubtransportStream>, git2::Error> {
+        Ok(Box::new(self.stream(url, service)?))
     }
 
     fn close(&self) -> Result<(), git2::Error> {
@@ -1189,6 +1218,7 @@ struct HttpStream {
     is_post: bool,
     sent: bool,
     request_body: Vec<u8>,
+    streaming_body: Option<reqwest::blocking::Body>,
     response: Option<reqwest::blocking::Response>,
 }
 
@@ -1234,7 +1264,9 @@ impl HttpStream {
                     format!("application/x-{}-request", self.service),
                 )
                 .header("Accept", format!("application/x-{}-result", self.service))
-                .body(std::mem::take(&mut self.request_body))
+                .body(self.streaming_body.take().unwrap_or_else(|| {
+                    std::mem::take(&mut self.request_body).into()
+                }))
         } else {
             client.get(&self.url).header("Accept", "*/*")
         };
@@ -1303,8 +1335,17 @@ impl HttpStream {
             )));
         }
         if !status.is_success() {
+            // Buyer input preparation only: keep a short, printable excerpt of a 4xx
+            // refusal so the caller can name a permanent relay policy refusal instead
+            // of retrying a full upload. Never used for classification (see
+            // [`map_git_error`]) and never forwarded verbatim to users.
+            let reason = if BUYER_INPUT_HTTP.get() && status.is_client_error() {
+                refusal_reason(response)
+            } else {
+                String::new()
+            };
             return Err(io::Error::other(format!(
-                "http status {} for {}",
+                "http status {} for {}{reason}",
                 status.as_u16(),
                 self.url
             )));
@@ -1312,6 +1353,70 @@ impl HttpStream {
         self.response = Some(response);
         Ok(())
     }
+}
+
+/// Marker before a server-supplied refusal excerpt. Text after it is server data,
+/// not transport evidence, so error classification ignores it.
+const REFUSAL_MARKER: &str = " (refusal: ";
+
+fn refusal_reason(response: reqwest::blocking::Response) -> String {
+    let mut bytes = Vec::new();
+    if response.take(512).read_to_end(&mut bytes).is_err() {
+        return String::new();
+    }
+    let text: String = String::from_utf8_lossy(&bytes)
+        .chars()
+        .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { ' ' })
+        .take(200)
+        .collect();
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
+        String::new()
+    } else {
+        format!("{REFUSAL_MARKER}{text})")
+    }
+}
+
+/// The server's refusal excerpt, if the buyer-input transport kept one.
+pub(crate) fn refusal_excerpt(error: &TransportError) -> Option<&str> {
+    let message = match error {
+        TransportError::Io(m)
+        | TransportError::Auth(m)
+        | TransportError::Rejected(m)
+        | TransportError::Transport(m) => m,
+    };
+    message.split_once(REFUSAL_MARKER).map(|(_, excerpt)| excerpt)
+}
+
+/// The HTTP status a transport error reports, if it reports one. Reads only the
+/// transport's own `http status NNN` prefix, never a URL or a refusal excerpt.
+pub(crate) fn reported_http_status(error: &TransportError) -> Option<u16> {
+    let message = match error {
+        TransportError::Io(m)
+        | TransportError::Auth(m)
+        | TransportError::Rejected(m)
+        | TransportError::Transport(m) => m,
+    };
+    let message = message.split(REFUSAL_MARKER).next().unwrap_or_default();
+    let mut words = message.split_whitespace();
+    while let Some(word) = words.next() {
+        if word == "status" {
+            if let Some(code) = words.next().and_then(|w| w.parse::<u16>().ok()) {
+                return Some(code);
+            }
+        }
+    }
+    None
+}
+
+/// A refusal no retry can change: a 4xx other than timeout, conflict, misdirected
+/// request, too-early or rate limiting. Retrying one re-sends the whole upload for
+/// the same answer.
+pub(crate) fn is_permanent_refusal(error: &TransportError) -> bool {
+    matches!(
+        reported_http_status(error),
+        Some(code @ 400..=499) if !matches!(code, 408 | 409 | 421 | 425 | 429)
+    )
 }
 
 impl Read for HttpStream {
@@ -1367,6 +1472,71 @@ impl Write for HttpStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_error_classification_ignores_status_digits_and_auth_words_in_urls() {
+        for message in [
+            "http status 503 for https://relay.example:40301/git/abc401def/abc404def/info/refs",
+            "http status 503 for https://forbidden.example/git/authentication/permission",
+            "http request: error sending request for url (https://relay.example:40401/git/403)",
+            "http status 302 for https://unauthorized.example/git/401: redirects are refused",
+        ] {
+            let mapped = map_git_error(git2::Error::from_str(message));
+            assert!(matches!(mapped, TransportError::Io(_)), "{message}: {mapped:?}");
+            assert!(crate::delivery_orchestrator::default_is_retryable(&mapped));
+        }
+    }
+
+    #[test]
+    fn permanent_refusals_are_4xx_except_retryable_statuses() {
+        for (message, permanent) in [
+            ("http status 400 for https://relay.example/git/o/r/git-receive-pack (refusal: private job snapshots cannot contain symlinks or submodules)", true),
+            ("http status 413 for https://relay.example/git/o/r/git-receive-pack", true),
+            ("http status 422 for https://relay.example:40409/git/o/r", true),
+            ("http status 409 for https://relay.example/git/o/r (refusal: push superseded)", false),
+            ("http status 408 for https://relay.example/git/o/r", false),
+            ("http status 429 for https://relay.example/git/o/r", false),
+            ("http status 421 for https://relay.example/git/o/r", false),
+            ("http status 503 for https://relay.example/git/400/r (refusal: status 400)", false),
+            ("http request: error sending request for url (https://relay.example:40400/)", false),
+        ] {
+            let error = map_git_error(git2::Error::from_str(message));
+            assert_eq!(is_permanent_refusal(&error), permanent, "{message}");
+        }
+    }
+
+    #[test]
+    fn refusal_excerpt_never_changes_retry_classification() {
+        for message in [
+            "http status 503 for https://relay.example/git/o/r (refusal: forbidden permission 403 unauthorized)",
+            "http status 400 for https://relay.example/git/o/r (refusal: authentication repository not found 401)",
+        ] {
+            assert!(matches!(map_git_error(git2::Error::from_str(message)), TransportError::Io(_)), "{message}");
+        }
+    }
+
+    #[test]
+    fn git_error_classification_preserves_actual_auth_refusals() {
+        for message in [
+            "http status 401 for https://relay.example/git/503",
+            "http status 403 for https://relay.example/git/503",
+            "http status 404 for https://relay.example/git/503",
+            "unexpected http status code: 401",
+            "authentication failed",
+            "permission denied",
+            "repository not found",
+        ] {
+            let mapped = map_git_error(git2::Error::from_str(message));
+            assert!(matches!(mapped, TransportError::Auth(_)), "{message}: {mapped:?}");
+            assert!(!crate::delivery_orchestrator::default_is_retryable(&mapped));
+        }
+        let mapped = map_git_error(git2::Error::new(
+            git2::ErrorCode::Auth,
+            git2::ErrorClass::Net,
+            "credentials refused",
+        ));
+        assert!(matches!(mapped, TransportError::Auth(_)));
+    }
 
     #[test]
     fn container_http_policy_is_scoped_and_restored_after_panic() {
@@ -1464,6 +1634,7 @@ mod tests {
                         is_post: true,
                         sent: false,
                         request_body: vec![],
+                        streaming_body: None,
                         response: None,
                     };
                     stream
@@ -1551,6 +1722,7 @@ mod tests {
             is_post: true,
             sent: false,
             request_body: vec![0x5a; 16 * 1024 * 1024],
+            streaming_body: None,
             response: None,
         };
         let start = std::time::Instant::now();
@@ -1954,6 +2126,7 @@ mod tests {
             is_post: false,
             sent: true,
             request_body: vec![],
+            streaming_body: None,
             response: Some(response),
         };
         let mut received = Vec::new();
@@ -2373,33 +2546,22 @@ pub fn push_private_input(
     with_buyer_input_http(|| {
         for attempt in 0..3 {
             let result = (|| {
-                let mut remote = bound_remote(repo, remote_url)?;
-                let context = LegContext {
-                    mint: Some(mint.clone()),
-                    authority: None,
-                    lifetime: None,
-                    short: false,
-                    read_budget: None,
-                    intended_url: remote_url.into(),
-                };
-                let existing = with_context(context, || {
-                    remote.connect(Direction::Fetch)?;
-                    let oid = remote
-                        .list()?
-                        .iter()
-                        .find(|head| head.name() == reference)
-                        .map(|head| head.oid());
-                    remote.disconnect()?;
-                    Ok::<_, git2::Error>(oid)
-                })?;
-                if let Some(existing) = existing {
-                    return if existing == oid {
+                // Preserve the local-config binding gate even on the direct path.
+                let _remote = bound_remote(repo, remote_url)?;
+                let advertisement = pack_forward::advertise(remote_url, mint.clone())?;
+                if let Some(existing) = advertisement.refs.get(reference) {
+                    return if *existing == oid {
                         Ok(oid.to_string())
                     } else {
                         Err(TransportError::Transport(
                             "private input ref already has a different commit".into(),
                         ))
                     };
+                }
+                if advertisement.can_forward() {
+                    if let Some(pack) = pack_forward::candidate(repo)? {
+                        return pack_forward::push(remote_url, reference, oid, mint.clone(), pack);
+                    }
                 }
                 push_gated_object(
                     repo,
@@ -2414,6 +2576,7 @@ pub fn push_private_input(
             match result {
                 Err(error)
                     if attempt < 2
+                        && !is_permanent_refusal(&error)
                         && crate::delivery_orchestrator::default_is_retryable(&error) =>
                 {
                     std::thread::sleep(Duration::from_secs(1 << attempt));

@@ -175,3 +175,123 @@ fn bounded_fetch_sends_no_header_off_relay_git() {
     assert_eq!(server.requests().len(), requests.len(), "the private fetch sent nothing");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// Fetch from a real upload-pack backend, then prove receive-pack got the exact
+// same compressed bytes, a fixed Content-Length and one freshly minted token per
+// request. No packbuilder invocation can satisfy the byte-for-byte assertion by
+// chance (the fixture source is deliberately packed with Git's reuse settings).
+fn fetched_staging(root: &Path) -> (git2::Repository, String, String) {
+    let source = root.join("source.git");
+    let oid = bare_with_commit(&source, "refs/heads/main");
+    let repo = git2::Repository::open_bare(&source).unwrap();
+    repo.config().unwrap().set_bool("uploadpack.allowReachableSHA1InWant", true).unwrap();
+    let server = GitHttpAuthServer::spawn_with(&source, "/source", git_http_fixture::FixtureOptions { allow_anonymous:true, ..Default::default() });
+    let staging = git2::Repository::init_bare(root.join("fetched.git")).unwrap();
+    maxplayer_core::git_transport::fetch_private_input_base(&staging,&server.repo_url(),&oid,None).unwrap();
+    let packs = std::fs::read_dir(staging.path().join("objects/pack")).unwrap()
+        .map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|e| e=="pack")).collect::<Vec<_>>();
+    assert_eq!(packs.len(),1);
+    let hash=git2::Oid::hash_object(git2::ObjectType::Blob, &std::fs::read(&packs[0]).unwrap()).unwrap().to_string();
+    (staging,oid,hash)
+}
+fn counted_auth(url: &str) -> AuthMinter {
+    let intended=url.to_owned();
+    let count=std::sync::atomic::AtomicUsize::new(0);
+    Arc::new(move |destination| {
+        assert_eq!(destination,intended);
+        Ok(format!("Nostr request-{}",count.fetch_add(1,std::sync::atomic::Ordering::SeqCst)))
+    })
+}
+#[test]
+fn fetched_pack_forwarding_preserves_bytes_and_reconciles_lost_response() {
+    init_test_env();
+    for lose in [false,true] {
+        let root=tempfile::tempdir().unwrap();
+        let (staging,oid,hash)=fetched_staging(root.path());
+        let dest=git2::Repository::init_bare(root.path().join("dest.git")).unwrap();
+        let server=GitHttpAuthServer::spawn_with(dest.path(),&private_mount(),git_http_fixture::FixtureOptions {lose_receive_pack_response:lose,..Default::default()});
+        let reference=format!("refs/heads/input/{}","ab".repeat(32));
+        let url=server.repo_url();
+        assert_eq!(push_private_input(&staging,&url,&reference,&oid,counted_auth(&url)).unwrap(),oid);
+        assert_eq!(dest.refname_to_id(&reference).unwrap().to_string(),oid);
+        let requests=server.requests();
+        let posts=requests.iter().filter(|r|r.method=="POST").collect::<Vec<_>>();
+        assert_eq!(posts.len(),1,"lost ACK must reconcile instead of reposting");
+        assert_eq!(posts[0].pack_digest.as_deref(),Some(hash.as_str()));
+        assert!(posts[0].content_length.unwrap()>32);
+        assert_eq!(requests.len(),if lose {3} else {2});
+        for (i,r) in requests.iter().enumerate() {assert_eq!(r.authorization,Some(format!("Nostr request-{i}")));}
+    }
+}
+#[test]
+fn forward_pack_redirect_on_either_leg_is_refused() {
+    init_test_env();
+    for leg in [1,2] {
+        let root=tempfile::tempdir().unwrap();
+        let (staging,oid,_)=fetched_staging(root.path());
+        let dest=git2::Repository::init_bare(root.path().join("dest.git")).unwrap();
+        let trap=std::net::TcpListener::bind("127.0.0.1:0").unwrap();trap.set_nonblocking(true).unwrap();
+        let server=GitHttpAuthServer::spawn_with(dest.path(),&private_mount(),git_http_fixture::FixtureOptions {
+            redirect_to:Some(format!("https://{}/stolen",trap.local_addr().unwrap())),redirect_method:Some(if leg == 1 {"GET"} else {"POST"}),..Default::default()});
+        let url=server.repo_url();
+        assert!(push_private_input(&staging,&url,&format!("refs/heads/input/{}","ab".repeat(32)),&oid,counted_auth(&url)).is_err());
+        assert!(trap.accept().is_err());
+        assert_eq!(dest.references().unwrap().count(),0);
+    }
+}
+#[test]
+fn forward_pack_refuses_bad_status_on_wire() {
+    init_test_env();
+    fn pkt(s:&str)->String{format!("{:04x}{s}",s.len()+4)}
+    for reply in ["0000".to_owned(),format!("{}{}0000",pkt("unpack ok\n"),pkt("ok refs/heads/wrong\n")),
+        format!("{}{}0000",pkt("unpack ok\n"),pkt("ng refs/heads/input/test denied\n")),
+        format!("{}0000",pkt("unpack bad pack\n"))] {
+        let root=tempfile::tempdir().unwrap();let (staging,oid,_)=fetched_staging(root.path());
+        let dest=git2::Repository::init_bare(root.path().join("dest.git")).unwrap();
+        let server=GitHttpAuthServer::spawn_with(dest.path(),&private_mount(),git_http_fixture::FixtureOptions{receive_status:Some(reply.into_bytes()),..Default::default()});
+        let url=server.repo_url();
+        assert!(push_private_input(&staging,&url,&format!("refs/heads/input/{}","ab".repeat(32)),&oid,counted_auth(&url)).is_err());
+        assert_eq!(server.requests().len(),6,"three explicit attempts retain the existing retry policy");
+    }
+}
+
+#[test]
+fn forward_conditions_fall_back_to_libgit2() {
+    init_test_env();
+    for condition in ["two-packs","loose-object","non-empty","no-report-status","no-ofs-delta"] {
+        let root=tempfile::tempdir().unwrap();
+        let (staging,oid,_)=fetched_staging(root.path());
+        let dest=git2::Repository::init_bare(root.path().join("dest.git")).unwrap();
+        let mut options=git_http_fixture::FixtureOptions::default();
+        match condition {
+            "two-packs" => {
+                let path=std::fs::read_dir(staging.path().join("objects/pack")).unwrap().map(|e|e.unwrap().path()).find(|p|p.extension().is_some_and(|e|e=="pack")).unwrap();
+                std::fs::copy(path,staging.path().join(format!("objects/pack/pack-{}.pack","ee".repeat(20)))).unwrap();
+            }
+            "loose-object" => { staging.blob(b"an additional input snapshot object").unwrap(); }
+            "non-empty" => { bare_with_commit(dest.path(),"refs/heads/main"); }
+            other => {
+                let caps=if other=="no-report-status" {"ofs-delta"} else {"report-status"};
+                let line=format!("{} capabilities^{{}}\0{caps}\n",git2::Oid::zero());
+                let prelude="# service=git-receive-pack\n";
+                options.receive_advertisement=Some(format!("{:04x}{prelude}0000{:04x}{line}0000",prelude.len()+4,line.len()+4).into_bytes());
+            }
+        }
+        let server=GitHttpAuthServer::spawn_with(dest.path(),&private_mount(),options);
+        let url=server.repo_url();
+        let result=push_private_input(&staging,&url,&format!("refs/heads/input/{}","ab".repeat(32)),&oid,counted_auth(&url));
+        if condition!="no-report-status" {assert!(result.is_ok(),"{condition}: {result:?}");}
+        let requests=server.requests();
+        assert!(requests.iter().filter(|r|r.method=="GET").count()>=2,"{condition}: libgit2 must make its own advertisement request");
+    }
+}
+
+#[test]
+fn forward_candidate_still_refuses_repo_local_destination_rewrite() {
+    init_test_env();
+    let root=tempfile::tempdir().unwrap(); let (staging,oid,_)=fetched_staging(root.path());
+    let intended="https://relay.example.invalid/git/owner/job";
+    staging.config().unwrap().set_str("url.https://attacker.example.invalid/.insteadOf", "https://relay.example.invalid/").unwrap();
+    let mint:AuthMinter=Arc::new(|_|panic!("must reject before signing or sending"));
+    assert!(push_private_input(&staging,intended,&format!("refs/heads/input/{}","ab".repeat(32)),&oid,mint).is_err());
+}

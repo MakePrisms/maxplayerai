@@ -216,3 +216,34 @@ Everything the daemon owns lives under `$MAXPLAYER_HOME`:
 
 Stopping the daemon stops awards and payments; it does not cancel jobs already awarded. Restarting it
 re-arms the auto-award loop.
+
+### Slow MCP job preparation and safe retries
+
+`post_job` can return `status: "preparing"` with a `preparation_id` while the buyer
+fetches and uploads private inputs. This is a preparation handle, **not a published
+job ID**. Call `get_job` with `job_id` set to that handle until it returns
+`status: "posted"` and the actual `job_id`. Use that job ID for the normal award and
+collect flow. Do not call `collect` on a preparation handle.
+
+Retrying `post_job` with identical arguments attaches to the same preparation,
+even from another MCP connection. A repeat answered from an earlier post returns
+`deduplicated: true`: nothing new was published. Without a `request_id` this only
+covers retries within 10 minutes of completion; after that, identical arguments
+are a new hire (re-posting a lapsed job works). Local input files are part of the
+arguments: changing a file's contents is a different request. They are hashed
+before `post_job` answers, within 8 seconds; if very large inputs cannot be read
+in time, the call returns an error and nothing is claimed or posted. Optionally supply
+`request_id: "my-post-001"` and keep both it and all other arguments unchanged on
+retries; a request ID never expires, and reusing it with different arguments is
+refused (the refusal says what that request ID already did, such as the job it
+posted). Use a **new** request ID only when you deliberately want to hire again.
+The CLI's synchronous `post` path is unchanged.
+
+A failure **before any offer was queued** (for example a transient input-upload
+error) is not cached: the identical retry runs again. Once an offer has been
+queued for publication, a failure or daemon crash is never re-run by a retry. The
+error then names the offer id: inspect it with `get_job`, and award it with
+`award_claim` if needed, because auto-award was not armed for it.
+The daemon cleans abandoned directories in `private-input-staging/` on startup,
+using per-directory locks to preserve live work. Legacy unlabelled `.tmp*`
+directories are left untouched rather than guessing which files are safe to delete.

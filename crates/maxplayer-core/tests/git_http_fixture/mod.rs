@@ -38,6 +38,10 @@ pub struct RecordedRequest {
     /// Path + query exactly as sent by the client.
     pub target: String,
     pub authorization: Option<String>,
+    pub content_length: Option<u64>,
+    pub pack_digest: Option<String>,
+    /// Capabilities on a receive-pack POST's first command, e.g. `report-status ofs-delta`.
+    pub push_capabilities: Option<String>,
 }
 
 /// Optional behaviours a test can ask the fixture for. Default = the plain auth-gated server every
@@ -47,9 +51,14 @@ pub struct FixtureOptions {
     /// Mock only the provisioning API for buyer-posting integration tests. Real
     /// relay ACL enforcement is tested in buzz's private_jobs_http_tests.
     pub private_job_host: bool,
+    pub receive_advertisement: Option<Vec<u8>>,
+    pub receive_status: Option<Vec<u8>>,
+    pub redirect_method: Option<&'static str>,
     pub allow_anonymous: bool,
     /// Reject one request before the Git backend sees it.
     pub reject_request: Option<(usize, &'static str)>,
+    /// Body for [`Self::reject_request`]'s response (default `injected refusal`).
+    pub reject_body: Option<&'static str>,
     /// Commit receive-pack normally but discard its response (ambiguous success).
     pub lose_receive_pack_response: bool,
     /// Sleep this long before answering the FIRST request this server sees, so a test can put real
@@ -393,6 +402,9 @@ fn handle_connection(
             method: method.clone(),
             target: target.clone(),
             authorization: authorization.clone(),
+            content_length: headers.get("content-length").and_then(|s| s.parse().ok()),
+            pack_digest: None,
+            push_capabilities: None,
         });
         recorded.len()
     };
@@ -426,6 +438,18 @@ fn handle_connection(
         tls.flush()?;
     }
     let body = read_body(&mut tls, &headers, &buf[head_end + 4..])?;
+    if method == "POST" && target.ends_with("git-receive-pack") {
+        if let Some(offset) = body.windows(4).position(|w| w == b"PACK") {
+            requests.lock().expect("requests")[ordinal-1].pack_digest = Some(git2::Oid::hash_object(git2::ObjectType::Blob, &body[offset..]).expect("hash fixture pack").to_string());
+        }
+        let first = std::str::from_utf8(body.get(..4).unwrap_or_default()).ok().and_then(|n| usize::from_str_radix(n, 16).ok());
+        if let Some(line) = first.and_then(|n| body.get(4..n)) {
+            if let Some(caps) = line.splitn(2, |b| *b == 0).nth(1) {
+                requests.lock().expect("requests")[ordinal-1].push_capabilities = Some(String::from_utf8_lossy(caps).trim_end().to_owned());
+            }
+        }
+    }
+
 
     // Held AFTER the request (and its Authorization) was recorded, so the recording timestamps the
     // token as minted, and whatever the client sends next is genuinely later.
@@ -449,7 +473,7 @@ fn handle_connection(
         }
     }
 
-    if let Some(location) = &options.redirect_to {
+    if let Some(location) = options.redirect_to.as_ref().filter(|_| options.redirect_method.is_none_or(|m| m == method)) {
         let header = format!("Location: {location}");
         return respond(
             &mut tls,
@@ -462,7 +486,17 @@ fn handle_connection(
 
     if let Some((nth, status)) = options.reject_request {
         if ordinal == nth {
-            return respond(&mut tls, status, &[], "text/plain", b"injected refusal");
+            return respond(&mut tls, status, &[], "text/plain", options.reject_body.unwrap_or("injected refusal").as_bytes());
+        }
+    }
+    if method == "GET" && target.ends_with("info/refs?service=git-receive-pack") {
+        if let Some(advertisement) = &options.receive_advertisement {
+            return respond(&mut tls, "200 OK", &[], "application/x-git-receive-pack-advertisement", advertisement);
+        }
+    }
+    if method == "POST" && target.ends_with("git-receive-pack") {
+        if let Some(status) = &options.receive_status {
+            return respond(&mut tls, "200 OK", &[], "application/x-git-receive-pack-result", status);
         }
     }
     if options.private_job_host && method == "PUT" && target.starts_with("/api/jobs/private/") {

@@ -618,6 +618,32 @@ pub fn post_job(home: &MaxplayerHome, request: PostJobRequest) -> Result<PostJob
     runtime.block_on(post_job_async(home, request))
 }
 
+/// Called with an offer's id immediately BEFORE it is queued or published. An error
+/// aborts the post with nothing published. Lets the buyer daemon record that an
+/// offer may exist, so a crash or failure after this point is never re-run blindly.
+pub type OfferObserver = std::sync::Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
+tokio::task_local! {
+    static OFFER_OBSERVER: OfferObserver;
+}
+
+/// Run `work` (a posting future) with `observer` notified before publication.
+pub async fn with_offer_observer<F: std::future::Future>(observer: OfferObserver, work: F) -> F::Output {
+    OFFER_OBSERVER.scope(observer, work).await
+}
+
+/// No-op outside [`with_offer_observer`] (the CLI's synchronous post).
+pub(crate) fn note_offer_before_publication(offer_id: &str) -> Result<(), JobLifecycleError> {
+    OFFER_OBSERVER
+        .try_with(|observer| observer(offer_id))
+        .unwrap_or(Ok(()))
+        .map_err(|error| {
+            JobLifecycleError::Input(format!(
+                "post_job refused before publication: preparation state unavailable ({error})"
+            ))
+        })
+}
+
 /// Async `post_job` for callers already on a Tokio runtime (MCP dispatch).
 /// Avoids nested `block_on` when publishing the offer over the relay.
 pub async fn post_job_async(
@@ -735,6 +761,7 @@ pub async fn post_job_async(
         .map_err(|e| JobLifecycleError::Relay(e.to_string()))?;
     crate::private_content::public_v2::Context::open(home).and_then(|mut ctx|ctx.remember(&event,&event))
         .map_err(|e| JobLifecycleError::Input(e.to_string()))?;
+    note_offer_before_publication(&event.id.to_hex())?;
     // Publish exactly the signed event retained locally (no second signing timestamp).
     publish_signed_event_async(home, &keys, &event).await?;
     let event_id = event.id.to_hex();

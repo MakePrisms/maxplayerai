@@ -1,3 +1,34 @@
+## Unreleased
+
+- Git upload retries no longer mistake HTTP-status digits or auth words in a
+  repository URL for an authentication refusal. Actual permission refusals still
+  stop immediately.
+- A permanent relay refusal of a private input upload (a 4xx other than 408, 409,
+  421, 425 or 429, such as a quota or symlink/submodule refusal) is no longer
+  retried with a full re-upload, and the post error names the refusal. Relay: a
+  failure of the relay's own repository inspection now returns 503 (retryable)
+  instead of 400; this part needs a relay redeploy.
+
+- Private contribution preparation forwards a single fetched pack unchanged to
+  an empty input repository when the server supports it, including jobs that also
+  attach input files (the base is staged and uploaded separately, first), avoiding redundant
+  libgit2 delta search. Other layouts retain the existing upload path; quotas,
+  per-request authorization, redirect refusal and ref acknowledgement stay intact.
+- MCP `post_job` now returns a durable preparation handle for slow work. Poll it
+  with `get_job`; identical retries do not publish duplicate offers (a repeated
+  success says `deduplicated: true`, a repeated failure says so in its message).
+  Without `request_id`, a successful post dedupes identical arguments for 10
+  minutes; an explicit `request_id` never expires. Input files are fingerprinted
+  by content, in parallel and within 8 seconds; if that budget runs out the call
+  claims and posts nothing and says so. Reusing a `request_id` with different
+  arguments is refused with what that key already did (still preparing, posted
+  job id, or a possibly-live offer). A failure before any offer was queued re-runs on retry; once an
+  offer was queued, failures and restarts are never re-run, for either key kind,
+  and the error names the offer id; abandoned owned staging directories are
+  cleaned without touching live work or legacy unlabelled temporary directories.
+  Buyer state adds an additive v8 preparation table; restart the buyer daemon and
+  MCP server together after upgrading. No relay deployment is needed.
+
 ## v0.6.1-rc4
 
 Fourth release candidate for 0.6.1, prepared from main after the private-job delivery

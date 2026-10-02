@@ -7,20 +7,31 @@ use std::{collections::BTreeSet, path::Path};
 /// Client preflight of every retained object, including imported bases/history.
 /// Server quarantine/CAS quota checks remain authoritative against concurrent writes.
 pub fn check_objects(repo: &Repository) -> Result<()> {
-    inspect_objects(repo, true)
+    inspect_objects(repo, true, Usage::default()).map(|_| ())
+}
+/// Like [`check_objects`], counting `used` from repositories staged for the same
+/// job: one job repository receives them all, so the quota is their sum.
+pub fn check_objects_after(repo: &Repository, used: Usage) -> Result<Usage> {
+    inspect_objects(repo, true, used)
 }
 /// Shared quota-only check; public history need not obey private path/type policy.
 pub fn check_object_quotas(repo: &Repository) -> Result<()> {
-    inspect_objects(repo, false)
+    inspect_objects(repo, false, Usage::default()).map(|_| ())
 }
-fn inspect_objects(repo: &Repository, private: bool) -> Result<()> {
+/// Objects and uncompressed bytes already counted against one job's quota.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Usage {
+    objects: usize,
+    bytes: u64,
+}
+fn inspect_objects(repo: &Repository, private: bool, used: Usage) -> Result<Usage> {
     let odb = repo
         .odb()
         .map_err(|_| Error("input object database unavailable"))?;
     let mut ids = Vec::new();
     let mut overflow = false;
     odb.foreach(|oid| {
-        if ids.len() >= super::MAX_OBJECTS {
+        if used.objects + ids.len() >= super::MAX_OBJECTS {
             overflow = true;
             return false;
         }
@@ -31,7 +42,8 @@ fn inspect_objects(repo: &Repository, private: bool) -> Result<()> {
     if overflow {
         return Err(Error("input object count exceeded"));
     }
-    let mut bytes = 0u64;
+    let objects = used.objects + ids.len();
+    let mut bytes = used.bytes;
     for id in ids {
         let (size, kind) = odb
             .read_header(id)
@@ -52,12 +64,14 @@ fn inspect_objects(repo: &Repository, private: bool) -> Result<()> {
                 let name = entry.name().ok_or(Error("invalid input path"))?;
                 super::validate_path(name)?;
                 if !matches!(entry.filemode(), 0o040000 | 0o100644 | 0o100755) {
-                    return Err(Error("input snapshot refused"));
+                    return Err(Error(
+                        "input snapshot refused: private job repositories cannot contain symlinks, submodules or other special file modes",
+                    ));
                 }
             }
         }
     }
-    Ok(())
+    Ok(Usage { objects, bytes })
 }
 
 /// Every manifest pin in the committed task participates in pre-claim staging,
@@ -146,6 +160,45 @@ pub fn upload_inputs(
         &snapshot.commit_oid,
         mint,
     )
-    .map_err(|_| Error("private input upload unavailable"))?;
+    .map_err(|e| upload_error(&e, "private input upload unavailable"))?;
     Ok(())
+}
+
+/// Name a permanent relay refusal of a private input upload in fixed words. The
+/// server's text is matched, never echoed; anything else keeps `fallback`.
+pub(super) fn upload_error(
+    error: &crate::git_transport::TransportError,
+    fallback: &'static str,
+) -> Error {
+    if !crate::git_transport::is_permanent_refusal(error) {
+        return Error(fallback);
+    }
+    let status = crate::git_transport::reported_http_status(error);
+    let excerpt = crate::git_transport::refusal_excerpt(error).unwrap_or_default();
+    if status == Some(400) && excerpt.contains("cannot contain symlinks or submodules") {
+        Error("relay refused the private input: private job repositories cannot contain symlinks or submodules")
+    } else if status == Some(413) {
+        Error("relay refused the private input: it exceeds the private job repository limits")
+    } else {
+        Error("relay refused the private input upload (permanent HTTP refusal; not retried)")
+    }
+}
+
+#[cfg(test)]
+mod quota_tests {
+    use super::*;
+
+    #[test]
+    fn staged_repositories_share_one_job_quota() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init_bare(dir.path()).unwrap();
+        repo.blob(b"one").unwrap();
+        repo.blob(b"two").unwrap();
+        let alone = check_objects_after(&repo, Usage::default()).unwrap();
+        assert_eq!((alone.objects, alone.bytes), (2, 6));
+        let near_count = Usage { objects: super::super::MAX_OBJECTS - 1, bytes: 0 };
+        assert!(check_objects_after(&repo, near_count).is_err());
+        let near_bytes = Usage { objects: 0, bytes: super::super::MAX_REPO_BYTES - 5 };
+        assert!(check_objects_after(&repo, near_bytes).is_err());
+    }
 }

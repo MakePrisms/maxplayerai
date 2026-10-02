@@ -207,7 +207,7 @@ async fn dispatch_async(state: &McpState, request: &McpRequest) -> Value {
                 Err(_) => tool_error(
                     id,
                     format!(
-                        "tool deadline exceeded ({TOOL_DEADLINE_SECS}s); server still alive — retry or narrow the call"
+                        "tool deadline exceeded ({TOOL_DEADLINE_SECS}s); server still alive — for post_job, retry only the identical arguments and request_id to recover its preparation; otherwise retry or narrow the call"
                     ),
                 ),
             }
@@ -225,10 +225,11 @@ fn tools() -> Value {
     json!([
         {
             "name": "post_job",
-            "description": with_guides("Publish a real maxplayer job offer (OFFER kind) to the configured maxplayer relay, then let the buyer daemon drive the award: once a payable seller claim appears the daemon auto-awards it under the hood, so the normal flow is just post_job then collect (two calls). max_sats caps what the daemon will commit to (defaults to amount_sats); it never auto-awards a claim it cannot pay. harness, harness_family, model and capabilities are ALL hard award filters (only a seller advertising them can be awarded), enforced identically on the manual and automatic award paths; model requires harness (the preset), and a harness_family given alongside harness must name the same harness it does. Omit them all and every claim passes exactly as before. Targeted seller p-tag is the documented default (pass seller_pubkey); set untargeted=true for an open offer. Optional repo+branch attach git delivery tags. CONTRIBUTION (freelance-PR) mode: supply target_repo_owner + target_repo_url + base_branch + base_oid to post a job-class=contribution offer against a repo you own (seller forks it and delivers a PR); these four are ALL-OR-NOTHING (a partial set is refused). Omit all four ⇒ from-scratch job. PAYMENT MODE: payment defaults to \"sat\" — a priced job that commits real money at award and needs a funded wallet. payment=\"none\" posts a FREE job instead: it requires amount_sats=0, commits nothing, needs no wallet and no mint, and is awarded only to a seller whose claim also says none (a seat advertising takes_no_payment). A free job settles through collect exactly like a priced one, but pays nothing. Never echoes secrets."),
+            "description": with_guides("Publish a real maxplayer job offer (OFFER kind) to the configured maxplayer relay, then let the buyer daemon drive the award: once a payable seller claim appears the daemon auto-awards it under the hood, so the normal flow is just post_job then collect (two calls). max_sats caps what the daemon will commit to (defaults to amount_sats); it never auto-awards a claim it cannot pay. harness, harness_family, model and capabilities are ALL hard award filters (only a seller advertising them can be awarded), enforced identically on the manual and automatic award paths; model requires harness (the preset), and a harness_family given alongside harness must name the same harness it does. Omit them all and every claim passes exactly as before. Targeted seller p-tag is the documented default (pass seller_pubkey); set untargeted=true for an open offer. Optional repo+branch attach git delivery tags. CONTRIBUTION (freelance-PR) mode: supply target_repo_owner + target_repo_url + base_branch + base_oid to post a job-class=contribution offer against a repo you own (seller forks it and delivers a PR); these four are ALL-OR-NOTHING (a partial set is refused). Omit all four ⇒ from-scratch job. PAYMENT MODE: payment defaults to \"sat\" — a priced job that commits real money at award and needs a funded wallet. payment=\"none\" posts a FREE job instead: it requires amount_sats=0, commits nothing, needs no wallet and no mint, and is awarded only to a seller whose claim also says none (a seat advertising takes_no_payment). A free job settles through collect exactly like a priced one, but pays nothing. Slow preparation returns status=preparing with preparation_id; this is NOT a published job. Poll get_job with job_id=preparation_id until status=posted yields the real job_id, then use that job_id normally. Never repost with changed arguments to poll. An identical retry attaches to the same preparation (status=posted with deduplicated=true means nothing new was published); without request_id that only holds for 10 minutes after it finishes, so a later identical post is a new hire. A failure before any offer was queued re-runs on retry. request_id is a permanent idempotency key; a new one is a deliberate new hire. Never echoes secrets."),
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "request_id": { "type": "string", "description": "Stable idempotency key for this posting intent (1–128 ASCII letters/digits, dash or underscore). Reuse it with identical arguments on retries. Omit to deduplicate identical arguments automatically; choose a NEW request_id only to deliberately hire again." },
                     "task": { "type": "string" },
                     "output": { "type": "string", "description": "MIME / output type (e.g. text/plain)" },
                     "amount_sats": { "type": "integer", "minimum": 0 },
@@ -316,7 +317,7 @@ fn tools() -> Value {
         },
         {
             "name": "get_job",
-            "description": format!("Read job state from the relay (offer + claims + results). Surfaces claim created_at and flags the most-recent LIVE claim. Optional include_display_names=true adds best-effort cosmetic kind-0 names; the default skips that extra network fetch and hex pubkeys remain authoritative. Optional wait_for=claim|result long-poll; timeout_secs bounds the wait, capped internally at {cap}s (values above {cap} are refused, not silently shortened) — omit timeout_secs to use the {cap}s default. Local accept-bind attached if present. Results may carry seller-claimed exec-metadata attribution (harness, model): harness is the RESOLVED id (e.g. claude-agent-acp) — a DIFFERENT vocabulary from post_job's harness labels (claude), so never string-compare the two — and every such value is an attribution, not a verification. Never invents claims/results. awarded_delivery_pending is true when an award is committed, the awarded seller has delivered, and settlement (accept) has not yet run — a distinct fact from live_claim_id and from accepted.", cap = long_poll::WAIT_FOR_CAP_SECS),
+            "description": format!("Read job state from the relay (offer + claims + results). Surfaces claim created_at and flags the most-recent LIVE claim. Optional include_display_names=true adds best-effort cosmetic kind-0 names; the default skips that extra network fetch and hex pubkeys remain authoritative. Optional wait_for=claim|result long-poll; timeout_secs bounds the wait, capped internally at {cap}s (values above {cap} are refused, not silently shortened) — omit timeout_secs to use the {cap}s default. Local accept-bind attached if present. Results may carry seller-claimed exec-metadata attribution (harness, model): harness is the RESOLVED id (e.g. claude-agent-acp) — a DIFFERENT vocabulary from post_job's harness labels (claude), so never string-compare the two — and every such value is an attribution, not a verification. Also accepts a preparation_id as job_id to poll a slow post: returns status=preparing or status=posted with the real job_id, or a terminal error; preparation polling is local and does not long-poll relay events. Never invents claims/results. awarded_delivery_pending is true when an award is committed, the awarded seller has delivered, and settlement (accept) has not yet run — a distinct fact from live_claim_id and from accepted.", cap = long_poll::WAIT_FOR_CAP_SECS),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -375,7 +376,7 @@ async fn call_tool_async(state: &McpState, params: &Value) -> Result<Value, Stri
     // moved tool gets a pointer to the command that replaced it. `award_claim` maps to the daemon's
     // `award` RPC (manual, claim_id-named award).
     match name {
-        "post_job" => route_tool(state, "post_job", "post_job", arguments).await,
+        "post_job" => route_tool(state, "post_job", "prepare_post_job", arguments).await,
         "get_job" => route_tool(state, "get_job", "get_job", arguments).await,
         "collect" => route_tool(state, "collect", "collect", arguments).await,
         "award_claim" => route_tool(state, "award_claim", "award", arguments).await,
@@ -978,3 +979,7 @@ mod tests {
     // (job_lifecycle::post_job_* , buyer::* , collect_integrity). The MCP is a thin router; its own
     // tests cover the transport surface (framing, tool list, moved-tool pointers, never-echo).
 }
+
+#[cfg(all(test, unix, feature = "wallet"))]
+#[path = "mcp/preparation_tests.rs"]
+mod preparation_tests;

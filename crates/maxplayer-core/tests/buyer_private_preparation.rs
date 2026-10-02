@@ -63,8 +63,8 @@ fn buyer_prepares_both_discovery_modes_retries_and_refuses_incomplete_publicatio
         "/git/buyer/job",
         FixtureOptions {
             private_job_host: true,
-            // PUT provisioning, GET reconciliation, GET advertisement, POST upload.
-            reject_request: Some((4, "503 Service Unavailable")),
+            // PUT provisioning, GET receive-pack advertisement, POST forwarded pack.
+            reject_request: Some((3, "503 Service Unavailable")),
             lose_receive_pack_response: true,
             ..Default::default()
         },
@@ -75,13 +75,49 @@ fn buyer_prepares_both_discovery_modes_retries_and_refuses_incomplete_publicatio
         "/git/buyer/job",
         FixtureOptions {
             private_job_host: true,
-            reject_request: Some((4, "403 Forbidden")),
+            reject_request: Some((3, "403 Forbidden")),
             ..Default::default()
         },
     );
+    // Contribution + confidential inputs: the base must still be forwarded (#1096 review).
+    let with_inputs_repo = git2::Repository::init_bare(root.path().join("with-inputs")).unwrap();
+    let with_inputs = GitHttpAuthServer::spawn_with(
+        with_inputs_repo.path(),
+        "/git/buyer/job",
+        FixtureOptions {
+            private_job_host: true,
+            ..Default::default()
+        },
+    );
+    // A permanent relay policy refusal of the forwarded pack (request 3) is not retried.
+    let policy_repo = git2::Repository::init_bare(root.path().join("policy")).unwrap();
+    let policy = GitHttpAuthServer::spawn_with(
+        policy_repo.path(),
+        "/git/buyer/job",
+        FixtureOptions {
+            private_job_host: true,
+            reject_request: Some((3, "400 Bad Request")),
+            reject_body: Some("private job snapshots cannot contain symlinks or submodules"),
+            ..Default::default()
+        },
+    );
+    // The input push AFTER a successful base push is refused: nothing may be queued.
+    let late_refusal_repo = git2::Repository::init_bare(root.path().join("late-refusal")).unwrap();
+    let late_refusal = GitHttpAuthServer::spawn_with(
+        late_refusal_repo.path(),
+        "/git/buyer/job",
+        FixtureOptions {
+            private_job_host: true,
+            // PUT, GET adv, POST base (forwarded); request 5 is a leg of the input upload.
+            reject_request: Some((5, "403 Forbidden")),
+            ..Default::default()
+        },
+    );
+    let brief = root.path().join("brief.md");
+    std::fs::write(&brief, "confidential brief\n").unwrap();
     // Install all test trust anchors before either reqwest client is constructed.
     let mut pem = String::new();
-    for server in [&source, &relay, &refused] {
+    for server in [&source, &relay, &refused, &with_inputs, &policy, &late_refusal] {
         pem.push_str(&std::fs::read_to_string(server.ca_file(root.path())).unwrap());
     }
     let ca = root.path().join("all-ca.pem");
@@ -92,7 +128,10 @@ fn buyer_prepares_both_discovery_modes_retries_and_refuses_incomplete_publicatio
         std::env::set_var("no_proxy", "127.0.0.1,localhost");
     }
     assert!(std::env::var_os("GIT_SSL_NO_VERIFY").is_none());
-    let buyer = Keys::generate();
+    // Public test key (scalar 128): its pubkey contains "403". A transient
+    // HTTP 503 must not become an auth refusal just because the URL has those digits.
+    let buyer = Keys::parse(&format!("{:064x}", 128)).unwrap();
+    assert!(buyer.public_key().to_hex().contains("403"));
     let seller = Keys::generate();
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let pin = contribution::ContributionOffer {
@@ -105,6 +144,9 @@ fn buyer_prepares_both_discovery_modes_retries_and_refuses_incomplete_publicatio
         ("open", None, &relay, true),
         ("targeted", Some(seller.public_key().to_hex()), &relay, true),
         ("refused", None, &refused, false),
+        ("inputs", Some(seller.public_key().to_hex()), &with_inputs, true),
+        ("policy", None, &policy, false),
+        ("late-refusal", Some(seller.public_key().to_hex()), &late_refusal, false),
     ] {
         let mut home = home::bootstrap(root.path().join(label)).unwrap();
         home.config.relay_url = "ws://127.0.0.1:1".into();
@@ -119,7 +161,14 @@ fn buyer_prepares_both_discovery_modes_retries_and_refuses_incomplete_publicatio
         let request = job_lifecycle::PostJobRequest {
             visibility: Some(pc::wire::Visibility::Private),
             output_category: Some(pc::wire::Output::Code),
-            inputs: vec![],
+            inputs: if label == "inputs" || label == "late-refusal" {
+                vec![pc::inputs::InputFile {
+                    source: brief.clone(),
+                    path: "brief.md".into(),
+                }]
+            } else {
+                vec![]
+            },
             task: "contribute".into(),
             output: "git".into(),
             amount_sats: 0,
@@ -146,7 +195,63 @@ fn buyer_prepares_both_discovery_modes_retries_and_refuses_incomplete_publicatio
             &offer.to_event_draft(),
             Some(&pin),
         ));
-        if succeeds {
+        if label == "inputs" {
+            let outcome = result.unwrap();
+            assert!(with_inputs_repo.find_commit(base).is_ok());
+            assert!(with_inputs_repo.find_commit(parent).is_ok());
+            assert_eq!(with_inputs_repo.references().unwrap().count(), 2, "base ref + input ref");
+            let pushes: Vec<_> = with_inputs
+                .requests()
+                .into_iter()
+                .filter(|r| r.method == "POST" && r.target.ends_with("git-receive-pack"))
+                .collect();
+            assert_eq!(pushes.len(), 2);
+            assert_eq!(
+                pushes[0].push_capabilities.as_deref(),
+                Some("report-status ofs-delta"),
+                "the fetched base is forwarded first, into the empty repository"
+            );
+            let second = pushes[1]
+                .push_capabilities
+                .as_deref()
+                .expect("the input push carries a parsed command");
+            assert_ne!(second, "report-status ofs-delta", "inputs use the ordinary upload path");
+            let input_ref = with_inputs_repo
+                .references()
+                .unwrap()
+                .map(|r| r.unwrap())
+                .find(|r| r.target() != Some(base))
+                .expect("the input ref");
+            let tree = input_ref.peel_to_commit().unwrap().tree().unwrap();
+            let blob = with_inputs_repo
+                .find_blob(tree.get_name("brief.md").unwrap().id())
+                .unwrap();
+            assert_eq!(blob.content(), b"confidential brief\n");
+            let store =
+                pc::store::ContentStore::open(&home.root.join("private-content.sqlite")).unwrap();
+            assert!(store.event(&outcome.job_id).unwrap().is_some());
+        } else if label == "late-refusal" {
+            assert!(result.is_err());
+            assert!(late_refusal_repo.find_commit(base).is_ok(), "the base push completed");
+            let db = rusqlite::Connection::open(home.root.join("private-content.sqlite")).unwrap();
+            let events: i64 = db
+                .query_row("SELECT COUNT(*) FROM content_events", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(events, 0, "a refused input push after the base must not queue the offer");
+        } else if label == "policy" {
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains(
+                    "relay refused the private input: private job repositories cannot contain symlinks or submodules"
+                ),
+                "the fixed message, not the server's text: {error}"
+            );
+            assert_eq!(
+                server.requests().len(),
+                3,
+                "a permanent 400 is not retried: PUT, advertisement, one POST"
+            );
+        } else if succeeds {
             let outcome = result.unwrap();
             let store =
                 pc::store::ContentStore::open(&home.root.join("private-content.sqlite")).unwrap();
@@ -171,7 +276,7 @@ fn buyer_prepares_both_discovery_modes_retries_and_refuses_incomplete_publicatio
             );
             assert_eq!(
                 server.requests().len(),
-                4,
+                3,
                 "permission refusal is not retried"
             );
         }

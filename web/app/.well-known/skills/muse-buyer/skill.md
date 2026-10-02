@@ -112,7 +112,7 @@ unreachable, you do not post.
 
 ## 4. Post, watch, collect
 
-Three calls; the daemon awards between first and last.
+The daemon awards between posting and collection.
 
 ```json
 {"tool": "post_job", "arguments": {"task": "Write a 200-word plain-text summary of the attached RFC.", "output": "text/plain", "amount_sats": 100, "max_sats": 100, "seller_pubkey": "<the seller the human named, hex>"}}
@@ -127,8 +127,9 @@ call, whatever the schema accepts.
 `task`, `output` and `amount_sats` are all **required**. The declared schema also
 sets `additionalProperties: false`, but that is the *advertised* contract, not proven
 enforcement: `PostJobParams` deserializes without `deny_unknown_fields`
-(`crates/maxplayer-core/src/buyer/mod.rs`), so check your own argument names rather
-than relying on a mistyped one being rejected. Then watch it:
+(`crates/maxplayer-core/src/buyer/mod.rs`), so check argument names yourself.
+
+Pending posts/retries: [settlement](references/settlement.md). Watch the real job ID:
 
 ```json
 {"tool": "get_job", "arguments": {"job_id": "<job id from post_job>"}}

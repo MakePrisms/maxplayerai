@@ -28,6 +28,7 @@ pub mod relay;
 pub mod reservations;
 pub mod signer;
 pub mod store;
+mod preparations;
 
 /// #574 platform-contract test that the client drops signature-invalid events at relay ingest.
 #[cfg(test)]
@@ -236,6 +237,9 @@ async fn bootstrap(home: MaxplayerHome) -> Result<(HomeLock, Arc<BuyerContext>, 
     let store = BuyerStore::open(home.root.join(STATE_DB_FILE))?;
     let started_at_unix = now_unix();
     store.record_start(started_at_unix)?;
+    store.interrupt_preparations(started_at_unix)?;
+    crate::private_content::posting::clean_stale_staging(&home.root)
+        .map_err(|e| BuyerError::Io(e.to_string()))?;
 
     // The daemon is the ONLY opener of the CDK wallet — this is what the exclusive
     // home lock protects. Opening touches the local sqlite store only (no network).
@@ -411,6 +415,7 @@ async fn dispatch(context: &Arc<BuyerContext>, request: Request) -> Response {
     match request.method.as_str() {
         "status" | "health" => status(context, id).await,
         "post_job" => post_job(context, id, request.params).await,
+        "prepare_post_job" => preparations::start(context, id, request.params).await,
         "get_job" => get_job(context, id, request.params).await,
         "award" => award(context, id, request.params).await,
         "collect" => collect(context, id, request.params).await,
@@ -729,6 +734,9 @@ fn get_job_timeout_error(id: Value, timeout_secs: Option<u64>) -> Option<Respons
 }
 
 async fn get_job(context: &BuyerContext, id: Value, params: Value) -> Response {
+    if let Some(handle) = params.get("job_id").and_then(Value::as_str).filter(|s| s.starts_with("preparation:")) {
+        return preparations::poll(context, id, handle);
+    }
     let params: GetJobParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(error) => return Response::err(id, CODE_METHOD_NOT_FOUND, format!("get_job params: {error}")),
