@@ -101,11 +101,23 @@ fn buyer_prepares_both_discovery_modes_retries_and_refuses_incomplete_publicatio
             ..Default::default()
         },
     );
+    // The input push AFTER a successful base push is refused: nothing may be queued.
+    let late_refusal_repo = git2::Repository::init_bare(root.path().join("late-refusal")).unwrap();
+    let late_refusal = GitHttpAuthServer::spawn_with(
+        late_refusal_repo.path(),
+        "/git/buyer/job",
+        FixtureOptions {
+            private_job_host: true,
+            // PUT, GET adv, POST base (forwarded); request 5 is a leg of the input upload.
+            reject_request: Some((5, "403 Forbidden")),
+            ..Default::default()
+        },
+    );
     let brief = root.path().join("brief.md");
     std::fs::write(&brief, "confidential brief\n").unwrap();
     // Install all test trust anchors before either reqwest client is constructed.
     let mut pem = String::new();
-    for server in [&source, &relay, &refused, &with_inputs, &policy] {
+    for server in [&source, &relay, &refused, &with_inputs, &policy, &late_refusal] {
         pem.push_str(&std::fs::read_to_string(server.ca_file(root.path())).unwrap());
     }
     let ca = root.path().join("all-ca.pem");
@@ -134,6 +146,7 @@ fn buyer_prepares_both_discovery_modes_retries_and_refuses_incomplete_publicatio
         ("refused", None, &refused, false),
         ("inputs", Some(seller.public_key().to_hex()), &with_inputs, true),
         ("policy", None, &policy, false),
+        ("late-refusal", Some(seller.public_key().to_hex()), &late_refusal, false),
     ] {
         let mut home = home::bootstrap(root.path().join(label)).unwrap();
         home.config.relay_url = "ws://127.0.0.1:1".into();
@@ -148,7 +161,7 @@ fn buyer_prepares_both_discovery_modes_retries_and_refuses_incomplete_publicatio
         let request = job_lifecycle::PostJobRequest {
             visibility: Some(pc::wire::Visibility::Private),
             output_category: Some(pc::wire::Output::Code),
-            inputs: if label == "inputs" {
+            inputs: if label == "inputs" || label == "late-refusal" {
                 vec![pc::inputs::InputFile {
                     source: brief.clone(),
                     path: "brief.md".into(),
@@ -198,14 +211,33 @@ fn buyer_prepares_both_discovery_modes_retries_and_refuses_incomplete_publicatio
                 Some("report-status ofs-delta"),
                 "the fetched base is forwarded first, into the empty repository"
             );
-            assert_ne!(
-                pushes[1].push_capabilities.as_deref(),
-                Some("report-status ofs-delta"),
-                "inputs use the ordinary upload path"
-            );
+            let second = pushes[1]
+                .push_capabilities
+                .as_deref()
+                .expect("the input push carries a parsed command");
+            assert_ne!(second, "report-status ofs-delta", "inputs use the ordinary upload path");
+            let input_ref = with_inputs_repo
+                .references()
+                .unwrap()
+                .map(|r| r.unwrap())
+                .find(|r| r.target() != Some(base))
+                .expect("the input ref");
+            let tree = input_ref.peel_to_commit().unwrap().tree().unwrap();
+            let blob = with_inputs_repo
+                .find_blob(tree.get_name("brief.md").unwrap().id())
+                .unwrap();
+            assert_eq!(blob.content(), b"confidential brief\n");
             let store =
                 pc::store::ContentStore::open(&home.root.join("private-content.sqlite")).unwrap();
             assert!(store.event(&outcome.job_id).unwrap().is_some());
+        } else if label == "late-refusal" {
+            assert!(result.is_err());
+            assert!(late_refusal_repo.find_commit(base).is_ok(), "the base push completed");
+            let db = rusqlite::Connection::open(home.root.join("private-content.sqlite")).unwrap();
+            let events: i64 = db
+                .query_row("SELECT COUNT(*) FROM content_events", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(events, 0, "a refused input push after the base must not queue the offer");
         } else if label == "policy" {
             let error = result.unwrap_err().to_string();
             assert!(error.contains("cannot contain symlinks or submodules"), "{error}");

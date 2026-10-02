@@ -74,10 +74,18 @@ pub async fn post(
             None
         };
         let (source, oid) = (source.clone(), oid.clone());
+        let inputs_path = snapshot.as_ref().map(|_| staging.path().to_owned());
         let base_repo = tokio::task::spawn_blocking(move || {
             crate::git_transport::fetch_private_input_base(&base_repo, &source, &oid, mint)
                 .map_err(|_| Error("pinned contribution base unavailable"))?;
-            repositories::check_objects(&base_repo)?;
+            let used = repositories::check_objects_after(&base_repo, Default::default())?;
+            // Base and inputs land in one job repository: check their combined quota
+            // before uploading either, not each staging repository alone.
+            if let Some(path) = inputs_path {
+                let inputs = git2::Repository::open_bare(path)
+                    .map_err(|_| Error("input staging unavailable"))?;
+                repositories::check_objects_after(&inputs, used)?;
+            }
             Ok::<_, Error>(base_repo)
         })
         .await
