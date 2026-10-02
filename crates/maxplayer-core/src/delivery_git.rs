@@ -325,6 +325,20 @@ impl GitDeliveryVerifier {
         Ok(changed)
     }
 
+    fn seed_base(&self, fork: &GitDelivery, base_oid: &CommitOid) {
+        if self.ensure_repository(fork.commit_oid()).is_err() {
+            return;
+        }
+        match crate::store_seed::import(&self.repository, base_oid.as_str()) {
+            Ok(true) => crate::opline_verbose!("buyer store: seeded base {}", base_oid.as_str()),
+            Ok(false) => {}
+            Err(error) => crate::opline!(
+                "buyer store: base seed {} not used ({error}); the fetch proceeds unseeded",
+                base_oid.as_str()
+            ),
+        }
+    }
+
     /// Contribution buyer verify-path orchestration (the ONE state machine, all pre-pay). Bare —
     /// the transport allowlist is applied by [`PayPathDeliveryVerifier::verify_contribution`] BEFORE
     /// this runs. In order: fetch the fork tip into the store + tip-match, base-from-pin, descendant gate,
@@ -337,6 +351,11 @@ impl GitDeliveryVerifier {
         base_oid: &CommitOid,
         policy: &crate::contribution::ContentPolicy,
     ) -> Result<VerifiedContribution, DeliveryError> {
+        // 0. Advisory: import the base posting fetched (#1096 review B2), so the fork fetch
+        // negotiates `have <base>` instead of asking the relay to pack the whole history,
+        // which on a medium repo outlasts the 10s money-path client. Proves nothing: steps
+        // 1-3 still fetch, tip-match, fetch the base from the pin, and gate descent.
+        self.seed_base(fork, base_oid);
         // 1. fetch fork tip into the store + tip-match (retains the object under refs/maxplayer/deliveries/…).
         let verified = self.verify(fork)?;
         // 2. base-from-pin into the same buyer store (fail-closed if absent from the pinned target).
@@ -1166,6 +1185,40 @@ mod contribution_tests {
                 .collect::<Vec<_>>(),
             ["src/feature.rs"]
         );
+    }
+
+    /// #1096 review B2: the base posting fetched is imported before the fork fetch, so that
+    /// fetch negotiates against it instead of pulling the whole history on the 10s client.
+    #[test]
+    fn contribution_verify_imports_the_posting_seed_before_fetching() {
+        let fx = scenario(3, "src/feature.rs");
+        let staging = fx.root.join("posting-staging.git");
+        git2::Repository::init_bare(&staging).unwrap();
+        let target = Repository::open_bare(&fx.target_git).unwrap();
+        let mut builder = target.packbuilder().unwrap();
+        builder
+            .insert_commit(Oid::from_str(fx.base_oid.as_str()).unwrap())
+            .unwrap();
+        let mut buf = git2::Buf::new();
+        builder.write_buf(&mut buf).unwrap();
+        let dest_repo = git2::Repository::open_bare(&staging).unwrap();
+        let odb = dest_repo.odb().unwrap();
+        let mut writer = odb.packwriter().unwrap();
+        std::io::Write::write_all(&mut writer, &buf).unwrap();
+        writer.commit().unwrap();
+        crate::store_seed::write(&fx.store, &staging, fx.base_oid.as_str()).unwrap();
+        let seed = fx.store.with_file_name("store-seeds").join(fx.base_oid.as_str());
+        assert!(seed.is_dir());
+        GitDeliveryVerifier::new(&fx.store)
+            .contribution_verify(
+                &fork_delivery(&fx),
+                fx.target_git.to_str().unwrap(),
+                "main",
+                &fx.base_oid,
+                &ContentPolicy::floor(),
+            )
+            .expect("a seeded contribution still verifies through every gate");
+        assert!(!seed.exists(), "the seed was imported into the store");
     }
 
     /// Author a seller CONTRIBUTION delivery the way the node does (#616): clone the pinned target,

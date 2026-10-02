@@ -159,11 +159,18 @@ pub async fn post(
                 )
                 .map_err(|e| e.to_string())
             });
+            let store = crate::collect::delivery_store_path(home);
             tokio::task::spawn_blocking(move || {
                 crate::git_transport::push_private_input(
                     &base_repo, &remote, &reference, &oid, mint,
                 )
-                .map_err(|e| repositories::upload_error(&e, "base input upload unavailable"))
+                .map_err(|e| repositories::upload_error(&e, "base input upload unavailable"))?;
+                // Keep the fetched base for the buyer's later verify fetch (#1096 review
+                // B2). Advisory: a failure only makes that fetch as slow as before.
+                if let Err(e) = crate::store_seed::write(&store, base_repo.path(), &oid) {
+                    crate::opline!("buyer base seed not kept ({e}); collect fetches unseeded");
+                }
+                Ok::<_, Error>(())
             })
             .await
             .map_err(|_| Error("base input worker unavailable"))??;
