@@ -45,6 +45,7 @@ fn container_entry_refreshes_each_wire_leg_and_delivers_the_gated_commit() {
         max_agent_attempts: 1,
         agent_env_names: vec![],
         mcp_servers: vec![],
+        codex_session: None,
         relay_url: relay.repo_url(),
         push_token: orch::PushTokenSource::FreshAfterAgent { wait_secs: 5 },
         handoff_nonce: nonce.clone(),
