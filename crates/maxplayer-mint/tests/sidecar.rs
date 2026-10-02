@@ -625,15 +625,13 @@ fn init_refuses_over_an_existing_mint() {
     let _: &Path = home.dir();
 }
 
-fn total_issued(mint: &Mint) -> impl std::future::Future<Output = u64> + '_ {
-    async move {
-        mint.total_issued()
-            .await
-            .unwrap()
-            .values()
-            .map(|a| a.clone().to_u64())
-            .sum()
-    }
+async fn total_issued(mint: &Mint) -> u64 {
+    mint.total_issued()
+        .await
+        .unwrap()
+        .values()
+        .map(|a| a.to_u64())
+        .sum()
 }
 
 async fn receive_file(h: &Harness, file: &Path) -> Amount {
