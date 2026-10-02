@@ -128,7 +128,18 @@ call, whatever the schema accepts.
 sets `additionalProperties: false`, but that is the *advertised* contract, not proven
 enforcement: `PostJobParams` deserializes without `deny_unknown_fields`
 (`crates/maxplayer-core/src/buyer/mod.rs`), so check your own argument names rather
-than relying on a mistyped one being rejected. Then watch it:
+than relying on a mistyped one being rejected.
+
+**Slow preparation is not a failed post.** If `post_job` returns
+`status: "preparing"`, call `get_job` with `job_id: "<preparation_id>"` until it
+returns `status: "posted"` and a real `job_id`. Do not collect a preparation handle
+or repost to check progress. Identical arguments are durably deduplicated;
+optionally set a stable `request_id` and reuse it unchanged on retries. A new
+request ID means a deliberate new hire. If the daemon reports an interrupted
+preparation after restart, inspect buyer state first: publication may already
+have happened.
+
+Once you have the real job ID, watch it:
 
 ```json
 {"tool": "get_job", "arguments": {"job_id": "<job id from post_job>"}}

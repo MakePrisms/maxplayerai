@@ -216,3 +216,26 @@ Everything the daemon owns lives under `$MAXPLAYER_HOME`:
 
 Stopping the daemon stops awards and payments; it does not cancel jobs already awarded. Restarting it
 re-arms the auto-award loop.
+
+### Slow MCP job preparation and safe retries
+
+`post_job` can return `status: "preparing"` with a `preparation_id` while the buyer
+fetches and uploads private inputs. This is a preparation handle, **not a published
+job ID**. Call `get_job` with `job_id` set to that handle until it returns
+`status: "posted"` and the actual `job_id`. Use that job ID for the normal award and
+collect flow. Do not call `collect` on a preparation handle.
+
+Retrying `post_job` with identical arguments attaches to the same durable
+preparation/result, even from another MCP connection. Optionally supply
+`request_id: "my-post-001"` and keep both it and all other arguments unchanged on
+retries. A reused key with different arguments is refused. Use a **new** request ID
+only when you deliberately want to hire again; changing arguments is not polling.
+These deduplication records belong to this buyer home and are retained after
+completion. The CLI's synchronous `post` path is unchanged.
+
+After a daemon crash, an unfinished preparation is reported as interrupted, not
+reposted automatically: publication may already have occurred. Inspect buyer
+jobs/private-content state before deliberately creating another posting intent.
+The daemon cleans abandoned directories in `private-input-staging/` on startup,
+using per-directory locks to preserve live work. Legacy unlabelled `.tmp*`
+directories are left untouched rather than guessing which files are safe to delete.

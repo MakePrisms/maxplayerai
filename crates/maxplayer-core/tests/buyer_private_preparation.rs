@@ -63,8 +63,8 @@ fn buyer_prepares_both_discovery_modes_retries_and_refuses_incomplete_publicatio
         "/git/buyer/job",
         FixtureOptions {
             private_job_host: true,
-            // PUT provisioning, GET reconciliation, GET advertisement, POST upload.
-            reject_request: Some((4, "503 Service Unavailable")),
+            // PUT provisioning, GET receive-pack advertisement, POST forwarded pack.
+            reject_request: Some((3, "503 Service Unavailable")),
             lose_receive_pack_response: true,
             ..Default::default()
         },
@@ -75,7 +75,7 @@ fn buyer_prepares_both_discovery_modes_retries_and_refuses_incomplete_publicatio
         "/git/buyer/job",
         FixtureOptions {
             private_job_host: true,
-            reject_request: Some((4, "403 Forbidden")),
+            reject_request: Some((3, "403 Forbidden")),
             ..Default::default()
         },
     );
@@ -171,7 +171,7 @@ fn buyer_prepares_both_discovery_modes_retries_and_refuses_incomplete_publicatio
             );
             assert_eq!(
                 server.requests().len(),
-                4,
+                3,
                 "permission refusal is not retried"
             );
         }

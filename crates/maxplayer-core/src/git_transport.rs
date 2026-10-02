@@ -48,6 +48,9 @@
 //! A leaked branch-scoped token is bounded authority, not zero authority: it can replay a push to
 //! that one ref of that one repository until it expires. The binding above keeps it from leaving.
 
+#[cfg(feature = "wallet")]
+mod pack_forward;
+
 use std::cell::RefCell;
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -1121,16 +1124,16 @@ fn service_url(base: &str, name: &str, is_post: bool) -> String {
     }
 }
 
-impl SmartSubtransport for NostrHttp {
+impl NostrHttp {
     /// One leg. `url` is the repo-root URL libgit2 resolved for the remote — after any rewrite the
     /// repository configuration applied. It must be the destination the caller named; otherwise no
     /// request is built and the refusal is recorded for [`with_context`]. The header never travels
     /// anywhere but the intended URL, whatever the configuration says.
-    fn action(
+    fn stream(
         &self,
         url: &str,
         service: Service,
-    ) -> Result<Box<dyn SmartSubtransportStream>, git2::Error> {
+    ) -> Result<HttpStream, git2::Error> {
         let bound = self
             .intended_url
             .as_deref()
@@ -1150,7 +1153,7 @@ impl SmartSubtransport for NostrHttp {
         }
         let (name, is_post) = service_parts(service);
         let full_url = service_url(url, name, is_post);
-        Ok(Box::new(HttpStream {
+        Ok(HttpStream {
             mint: self.mint.clone(),
             authority: self.authority.clone(),
             lifetime: self.lifetime.clone(),
@@ -1165,8 +1168,19 @@ impl SmartSubtransport for NostrHttp {
             is_post,
             sent: false,
             request_body: Vec::new(),
+            streaming_body: None,
             response: None,
-        }))
+        })
+    }
+}
+
+impl SmartSubtransport for NostrHttp {
+    fn action(
+        &self,
+        url: &str,
+        service: Service,
+    ) -> Result<Box<dyn SmartSubtransportStream>, git2::Error> {
+        Ok(Box::new(self.stream(url, service)?))
     }
 
     fn close(&self) -> Result<(), git2::Error> {
@@ -1189,6 +1203,7 @@ struct HttpStream {
     is_post: bool,
     sent: bool,
     request_body: Vec<u8>,
+    streaming_body: Option<reqwest::blocking::Body>,
     response: Option<reqwest::blocking::Response>,
 }
 
@@ -1234,7 +1249,9 @@ impl HttpStream {
                     format!("application/x-{}-request", self.service),
                 )
                 .header("Accept", format!("application/x-{}-result", self.service))
-                .body(std::mem::take(&mut self.request_body))
+                .body(self.streaming_body.take().unwrap_or_else(|| {
+                    std::mem::take(&mut self.request_body).into()
+                }))
         } else {
             client.get(&self.url).header("Accept", "*/*")
         };
@@ -1464,6 +1481,7 @@ mod tests {
                         is_post: true,
                         sent: false,
                         request_body: vec![],
+                        streaming_body: None,
                         response: None,
                     };
                     stream
@@ -1551,6 +1569,7 @@ mod tests {
             is_post: true,
             sent: false,
             request_body: vec![0x5a; 16 * 1024 * 1024],
+            streaming_body: None,
             response: None,
         };
         let start = std::time::Instant::now();
@@ -1954,6 +1973,7 @@ mod tests {
             is_post: false,
             sent: true,
             request_body: vec![],
+            streaming_body: None,
             response: Some(response),
         };
         let mut received = Vec::new();
@@ -2373,33 +2393,22 @@ pub fn push_private_input(
     with_buyer_input_http(|| {
         for attempt in 0..3 {
             let result = (|| {
-                let mut remote = bound_remote(repo, remote_url)?;
-                let context = LegContext {
-                    mint: Some(mint.clone()),
-                    authority: None,
-                    lifetime: None,
-                    short: false,
-                    read_budget: None,
-                    intended_url: remote_url.into(),
-                };
-                let existing = with_context(context, || {
-                    remote.connect(Direction::Fetch)?;
-                    let oid = remote
-                        .list()?
-                        .iter()
-                        .find(|head| head.name() == reference)
-                        .map(|head| head.oid());
-                    remote.disconnect()?;
-                    Ok::<_, git2::Error>(oid)
-                })?;
-                if let Some(existing) = existing {
-                    return if existing == oid {
+                // Preserve the local-config binding gate even on the direct path.
+                let _remote = bound_remote(repo, remote_url)?;
+                let advertisement = pack_forward::advertise(remote_url, mint.clone())?;
+                if let Some(existing) = advertisement.refs.get(reference) {
+                    return if *existing == oid {
                         Ok(oid.to_string())
                     } else {
                         Err(TransportError::Transport(
                             "private input ref already has a different commit".into(),
                         ))
                     };
+                }
+                if advertisement.can_forward() {
+                    if let Some(pack) = pack_forward::candidate(repo)? {
+                        return pack_forward::push(remote_url, reference, oid, mint.clone(), pack);
+                    }
                 }
                 push_gated_object(
                     repo,

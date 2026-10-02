@@ -33,8 +33,8 @@ pub async fn post(
     };
     let mut ctx = ContentContext::open(home, &keys.public_key().to_hex())?;
     let job = super::random_id()?;
-    let staging =
-        tempfile::tempdir_in(&home.root).map_err(|_| Error("input staging unavailable"))?;
+    let staging = super::input_staging::Staging::new(&home.root)
+        .map_err(|_| Error("input staging unavailable"))?;
     let repo = git2::Repository::init_bare(staging.path())
         .map_err(|_| Error("input staging unavailable"))?;
     let snapshot = if request.inputs.is_empty() {
@@ -207,4 +207,9 @@ pub async fn post(
         task: offer.task,
         output: offer.output,
     })
+}
+
+/// Called under the buyer daemon home lock; each live staging directory also has its own lease.
+pub(crate) fn clean_stale_staging(home: &std::path::Path) -> std::io::Result<()> {
+    super::input_staging::clean(home)
 }

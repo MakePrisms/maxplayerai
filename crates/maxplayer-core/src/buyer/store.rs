@@ -44,7 +44,10 @@ use super::reservations::{
 ///   the reservation was checked against and will be funded from. NULL (every pre-v7 row) counts
 ///   against the default mint, which is what those rows were checked against. Additive column via
 ///   [`BuyerStore::migrate`].
-pub const SCHEMA_VERSION: i64 = 7;
+/// - v8 — durable MCP post preparation handles and request deduplication (#1095).
+pub const SCHEMA_VERSION: i64 = 8;
+
+mod preparations;
 
 /// A cloneable handle to the daemon-owned SQLite state.
 #[derive(Clone)]
@@ -98,7 +101,12 @@ impl BuyerStore {
 
     fn init_schema(conn: &Connection) -> Result<(), StoreError> {
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS buyer_meta (
+            "CREATE TABLE IF NOT EXISTS post_preparations (
+                 handle TEXT PRIMARY KEY,
+                 fingerprint TEXT NOT NULL,
+                 response TEXT
+             );
+             CREATE TABLE IF NOT EXISTS buyer_meta (
                  key   TEXT PRIMARY KEY,
                  value TEXT NOT NULL
              );

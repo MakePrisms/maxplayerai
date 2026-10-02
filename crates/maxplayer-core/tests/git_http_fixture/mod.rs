@@ -38,6 +38,8 @@ pub struct RecordedRequest {
     /// Path + query exactly as sent by the client.
     pub target: String,
     pub authorization: Option<String>,
+    pub content_length: Option<u64>,
+    pub pack_sha256: Option<String>,
 }
 
 /// Optional behaviours a test can ask the fixture for. Default = the plain auth-gated server every
@@ -47,6 +49,9 @@ pub struct FixtureOptions {
     /// Mock only the provisioning API for buyer-posting integration tests. Real
     /// relay ACL enforcement is tested in buzz's private_jobs_http_tests.
     pub private_job_host: bool,
+    pub receive_advertisement: Option<Vec<u8>>,
+    pub receive_status: Option<Vec<u8>>,
+    pub redirect_method: Option<&'static str>,
     pub allow_anonymous: bool,
     /// Reject one request before the Git backend sees it.
     pub reject_request: Option<(usize, &'static str)>,
@@ -393,6 +398,8 @@ fn handle_connection(
             method: method.clone(),
             target: target.clone(),
             authorization: authorization.clone(),
+            content_length: headers.get("content-length").and_then(|s| s.parse().ok()),
+            pack_sha256: None,
         });
         recorded.len()
     };
@@ -426,6 +433,13 @@ fn handle_connection(
         tls.flush()?;
     }
     let body = read_body(&mut tls, &headers, &buf[head_end + 4..])?;
+    if method == "POST" && target.ends_with("git-receive-pack") {
+        use sha2::{Digest, Sha256};
+        if let Some(offset) = body.windows(4).position(|w| w == b"PACK") {
+            requests.lock().expect("requests")[ordinal-1].pack_sha256 = Some(hex::encode(Sha256::digest(&body[offset..])));
+        }
+    }
+
 
     // Held AFTER the request (and its Authorization) was recorded, so the recording timestamps the
     // token as minted, and whatever the client sends next is genuinely later.
@@ -449,7 +463,7 @@ fn handle_connection(
         }
     }
 
-    if let Some(location) = &options.redirect_to {
+    if let Some(location) = options.redirect_to.as_ref().filter(|_| options.redirect_method.is_none_or(|m| m == method)) {
         let header = format!("Location: {location}");
         return respond(
             &mut tls,
@@ -463,6 +477,16 @@ fn handle_connection(
     if let Some((nth, status)) = options.reject_request {
         if ordinal == nth {
             return respond(&mut tls, status, &[], "text/plain", b"injected refusal");
+        }
+    }
+    if method == "GET" && target.ends_with("info/refs?service=git-receive-pack") {
+        if let Some(advertisement) = &options.receive_advertisement {
+            return respond(&mut tls, "200 OK", &[], "application/x-git-receive-pack-advertisement", advertisement);
+        }
+    }
+    if method == "POST" && target.ends_with("git-receive-pack") {
+        if let Some(status) = &options.receive_status {
+            return respond(&mut tls, "200 OK", &[], "application/x-git-receive-pack-result", status);
         }
     }
     if options.private_job_host && method == "PUT" && target.starts_with("/api/jobs/private/") {

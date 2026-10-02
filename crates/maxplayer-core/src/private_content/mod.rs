@@ -33,6 +33,8 @@ pub mod evidence;
 
 #[cfg(feature="wallet")]
 pub mod posting;
+#[cfg(feature="wallet")]
+mod input_staging;
 
 #[cfg(feature="wallet")]
 pub mod public_v2;
