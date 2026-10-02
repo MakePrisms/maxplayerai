@@ -46,4 +46,7 @@ cdk-sqlite = { version = "=0.17.2", default-features = false, features = ["mint"
 maxplayer-core = { path = "../maxplayer-core", features = ["wallet"] }
 nostr-relay-builder = "0.44"
 tempfile = "3"
+# examples/local_relay.rs only: the auth-on-connect front the e2e run uses.
+tokio-tungstenite = "=0.26.2"
+futures-util = "0.3"
 uuid = { version = "1", features = ["v7"] }
