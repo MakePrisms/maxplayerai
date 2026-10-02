@@ -40,6 +40,8 @@ pub struct RecordedRequest {
     pub authorization: Option<String>,
     pub content_length: Option<u64>,
     pub pack_digest: Option<String>,
+    /// Capabilities on a receive-pack POST's first command, e.g. `report-status ofs-delta`.
+    pub push_capabilities: Option<String>,
 }
 
 /// Optional behaviours a test can ask the fixture for. Default = the plain auth-gated server every
@@ -400,6 +402,7 @@ fn handle_connection(
             authorization: authorization.clone(),
             content_length: headers.get("content-length").and_then(|s| s.parse().ok()),
             pack_digest: None,
+            push_capabilities: None,
         });
         recorded.len()
     };
@@ -436,6 +439,12 @@ fn handle_connection(
     if method == "POST" && target.ends_with("git-receive-pack") {
         if let Some(offset) = body.windows(4).position(|w| w == b"PACK") {
             requests.lock().expect("requests")[ordinal-1].pack_digest = Some(git2::Oid::hash_object(git2::ObjectType::Blob, &body[offset..]).expect("hash fixture pack").to_string());
+        }
+        let first = std::str::from_utf8(body.get(..4).unwrap_or_default()).ok().and_then(|n| usize::from_str_radix(n, 16).ok());
+        if let Some(line) = first.and_then(|n| body.get(4..n)) {
+            if let Some(caps) = line.splitn(2, |b| *b == 0).nth(1) {
+                requests.lock().expect("requests")[ordinal-1].push_capabilities = Some(String::from_utf8_lossy(caps).trim_end().to_owned());
+            }
         }
     }
 

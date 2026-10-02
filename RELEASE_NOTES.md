@@ -5,7 +5,8 @@
   stop immediately.
 
 - Private contribution preparation forwards a single fetched pack unchanged to
-  an empty input repository when the server supports it, avoiding redundant
+  an empty input repository when the server supports it, including jobs that also
+  attach input files (the base is staged and uploaded separately, first), avoiding redundant
   libgit2 delta search. Other layouts retain the existing upload path; quotas,
   per-request authorization, redirect refusal and ref acknowledgement stay intact.
 - MCP `post_job` now returns a durable preparation handle for slow work. Poll it

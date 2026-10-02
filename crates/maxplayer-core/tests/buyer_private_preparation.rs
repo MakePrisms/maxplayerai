@@ -79,9 +79,21 @@ fn buyer_prepares_both_discovery_modes_retries_and_refuses_incomplete_publicatio
             ..Default::default()
         },
     );
+    // Contribution + confidential inputs: the base must still be forwarded (#1096 review).
+    let with_inputs_repo = git2::Repository::init_bare(root.path().join("with-inputs")).unwrap();
+    let with_inputs = GitHttpAuthServer::spawn_with(
+        with_inputs_repo.path(),
+        "/git/buyer/job",
+        FixtureOptions {
+            private_job_host: true,
+            ..Default::default()
+        },
+    );
+    let brief = root.path().join("brief.md");
+    std::fs::write(&brief, "confidential brief\n").unwrap();
     // Install all test trust anchors before either reqwest client is constructed.
     let mut pem = String::new();
-    for server in [&source, &relay, &refused] {
+    for server in [&source, &relay, &refused, &with_inputs] {
         pem.push_str(&std::fs::read_to_string(server.ca_file(root.path())).unwrap());
     }
     let ca = root.path().join("all-ca.pem");
@@ -108,6 +120,7 @@ fn buyer_prepares_both_discovery_modes_retries_and_refuses_incomplete_publicatio
         ("open", None, &relay, true),
         ("targeted", Some(seller.public_key().to_hex()), &relay, true),
         ("refused", None, &refused, false),
+        ("inputs", Some(seller.public_key().to_hex()), &with_inputs, true),
     ] {
         let mut home = home::bootstrap(root.path().join(label)).unwrap();
         home.config.relay_url = "ws://127.0.0.1:1".into();
@@ -122,7 +135,14 @@ fn buyer_prepares_both_discovery_modes_retries_and_refuses_incomplete_publicatio
         let request = job_lifecycle::PostJobRequest {
             visibility: Some(pc::wire::Visibility::Private),
             output_category: Some(pc::wire::Output::Code),
-            inputs: vec![],
+            inputs: if label == "inputs" {
+                vec![pc::inputs::InputFile {
+                    source: brief.clone(),
+                    path: "brief.md".into(),
+                }]
+            } else {
+                vec![]
+            },
             task: "contribute".into(),
             output: "git".into(),
             amount_sats: 0,
@@ -149,7 +169,31 @@ fn buyer_prepares_both_discovery_modes_retries_and_refuses_incomplete_publicatio
             &offer.to_event_draft(),
             Some(&pin),
         ));
-        if succeeds {
+        if label == "inputs" {
+            let outcome = result.unwrap();
+            assert!(with_inputs_repo.find_commit(base).is_ok());
+            assert!(with_inputs_repo.find_commit(parent).is_ok());
+            assert_eq!(with_inputs_repo.references().unwrap().count(), 2, "base ref + input ref");
+            let pushes: Vec<_> = with_inputs
+                .requests()
+                .into_iter()
+                .filter(|r| r.method == "POST" && r.target.ends_with("git-receive-pack"))
+                .collect();
+            assert_eq!(pushes.len(), 2);
+            assert_eq!(
+                pushes[0].push_capabilities.as_deref(),
+                Some("report-status ofs-delta"),
+                "the fetched base is forwarded first, into the empty repository"
+            );
+            assert_ne!(
+                pushes[1].push_capabilities.as_deref(),
+                Some("report-status ofs-delta"),
+                "inputs use the ordinary upload path"
+            );
+            let store =
+                pc::store::ContentStore::open(&home.root.join("private-content.sqlite")).unwrap();
+            assert!(store.event(&outcome.job_id).unwrap().is_some());
+        } else if succeeds {
             let outcome = result.unwrap();
             let store =
                 pc::store::ContentStore::open(&home.root.join("private-content.sqlite")).unwrap();
