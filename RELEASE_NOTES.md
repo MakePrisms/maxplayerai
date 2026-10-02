@@ -1,3 +1,47 @@
+## v0.6.1-rc4
+
+Fourth release candidate for 0.6.1, prepared from main after the private-job delivery
+fixes. Once published, install with `npm install -g maxplayer@0.6.1-rc4`.
+This is a prerelease: publish on npm `rc`, leaving stable `latest` unchanged at v0.6.0.
+
+### Changes since v0.6.1-rc3
+
+- Container delivery requests fresh, branch-scoped authorization from the seller
+  host immediately before every Git HTTP request and retry, rather than reusing a
+  short-lived token. Failed token hand-offs stop further refreshes so late replies
+  cannot authorize later requests. The signing key remains outside the container
+  (#1081).
+- Container upload POSTs have a five-minute request ceiling, a 15-second connection
+  timeout, and on Linux a 60-second bound on unacknowledged TCP data. This is not a
+  progress-aware or unlimited upload policy; existing job deadlines still apply.
+  Host-side delivery and buyer payment-verification timeout contracts are unchanged
+  (#1081).
+- Buyers preload the exact starting commit and its reachable history before
+  publishing either targeted or open-pool private contribution offers. Sellers then
+  upload only missing contribution data. Preparation failures prevent publication;
+  existing jobs are not retroactively preloaded. Open-pool bidders still inspect the
+  public source, and private-repo reads remain restricted until seller selection
+  (#1093).
+- Buyer preparation requests have a five-minute ceiling, including downloading the
+  starting history, with a 15-second connection timeout. Input uploads get up to
+  three attempts with fresh authorization and backoff. Before retrying, the buyer
+  checks the exact remote ref to recover a lost success response or reject a
+  conflicting commit. Repository quotas and payment behavior are unchanged (#1093).
+- Mint-sidecar test helper cleanup resolves two clippy warnings; no mint runtime
+  behavior changes (#1088).
+
+### Rollout
+
+Deploy the relay containing #1093 **before upgrading buyers**: old relays reject
+open-pool input preparation before publication. No new schema migration is required
+for these delivery fixes. Upgrade/restart buyer daemons to use the new preparation
+path.
+
+Upgrade the **seller daemon and versioned sandbox image together** for #1081. A new
+container with an old daemon fails closed when authorization refresh is unanswered;
+a daemon-only upgrade leaves old images without the fix. Test the combined rollout
+with a newly posted private job.
+
 ## v0.6.1-rc3
 
 Third release candidate for 0.6.1, prepared from main after the seller-credits stack
