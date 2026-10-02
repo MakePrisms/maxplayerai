@@ -1,4 +1,5 @@
 //! Shared closed private-content v2 schemas. No wallet, network or lifecycle runtime.
+pub mod mint;
 pub mod strict_json;
 pub mod wire;
 
