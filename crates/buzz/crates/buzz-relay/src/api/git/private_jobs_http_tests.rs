@@ -30,6 +30,7 @@ fn token(keys: &Keys, url: &str, method: &str, body: Option<&[u8]>) -> String {
     let mut tags = vec![
         Tag::parse(["u", url]).unwrap(),
         Tag::parse(["method", method]).unwrap(),
+        Tag::parse(["nonce", &uuid::Uuid::new_v4().to_string()]).unwrap(),
     ];
     if let Some(body) = body {
         tags.push(Tag::parse(["payload", hex::encode(Sha256::digest(body)).as_str()]).unwrap());
@@ -200,6 +201,7 @@ fn private_offer(buyer: &Keys, seller: &Keys, job: &str) -> Event {
         .unwrap()
 }
 struct Harness {
+    pool: sqlx::PgPool,
     host: String,
     tenant: buzz_core::CommunityId,
     state: Arc<crate::state::AppState>,
@@ -285,6 +287,7 @@ async fn harness(service: &Keys, bind_addr: Option<std::net::SocketAddr>) -> Har
         media,
     );
     Harness {
+        pool,
         host,
         tenant: buzz_core::CommunityId::from_uuid(community),
         state: Arc::new(state),
@@ -323,6 +326,7 @@ async fn private_http_acl_precedes_manifest_cache_and_provision_replay_is_reject
         object_server,
         _shutdown,
         _temp,
+        ..
     } = harness(&service, None).await;
     let job = "17".repeat(32);
     let base = format!("https://{host}/git/{}/{job}", buyer.public_key().to_hex());
@@ -491,6 +495,16 @@ async fn private_http_acl_precedes_manifest_cache_and_provision_replay_is_reject
 #[tokio::test]
 #[ignore = "requires disposable PRIVATE_JOB_TEST_DATABASE_URL and PRIVATE_JOB_TEST_REDIS_URL"]
 async fn fresh_private_repo_takes_real_input_push_and_targeted_fetch() {
+    buyer_prepared_repo(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PRIVATE_JOB_TEST_DATABASE_URL and PRIVATE_JOB_TEST_REDIS_URL"]
+async fn open_pool_buyer_preloads_then_only_selected_seller_can_fetch_and_deliver() {
+    buyer_prepared_repo(true).await;
+}
+
+async fn buyer_prepared_repo(open_pool: bool) {
     let buyer = Keys::generate();
     let seller = Keys::generate();
     let service = Keys::generate();
@@ -510,10 +524,23 @@ async fn fresh_private_repo_takes_real_input_push_and_targeted_fetch() {
     let job = "31".repeat(32);
     let owner = buyer.public_key().to_hex();
     let provision_path = format!("/api/jobs/private/{job}");
-    let body = serde_json::to_vec(&serde_json::json!({
-        "signed_offer": private_offer(&buyer, &seller, &job)
-    }))
-    .unwrap();
+    let offer = if open_pool {
+        let targeted = private_offer(&buyer, &seller, &job);
+        let mut tags: Vec<Tag> = targeted.tags.iter().filter(|tag| {
+            !matches!(tag.as_slice()[0].as_str(), "discovery" | "p" | "content-id" | "content-commitment")
+        }).cloned().collect();
+        tags.push(Tag::parse(["discovery", "open"]).unwrap());
+        tags.push(Tag::parse(["i", &serde_json::json!({
+            "schema": "maxplayer.public-task.v2", "text": "public contribution task",
+            "requested_output": "text/plain", "dispatch": {}
+        }).to_string()]).unwrap());
+        EventBuilder::new(Kind::from(3401), "").tags(tags).sign_with_keys(&buyer).unwrap()
+    } else { private_offer(&buyer, &seller, &job) };
+    let body = serde_json::to_vec(&serde_json::json!({"signed_offer":offer})).unwrap();
+    if open_pool {
+        let outsider_auth = token(&outsider, &format!("https://{}{provision_path}", h.host), "PUT", Some(&body));
+        assert_eq!(request(&app, &h.host, "PUT", &provision_path, Some(&outsider_auth), body.clone()).await.status(), StatusCode::FORBIDDEN);
+    }
     let auth = token(
         &buyer,
         &format!("https://{}{provision_path}", h.host),
@@ -544,6 +571,17 @@ async fn fresh_private_repo_takes_real_input_push_and_targeted_fetch() {
     stdout(&git(&source, &h.host, None, &["commit", "-q", "-m", "input"]).await);
     let commit = stdout(&git(&source, &h.host, None, &["rev-parse", "HEAD"]).await);
 
+    if open_pool {
+        // Even with generic public Git reads enabled, every unselected bidder is
+        // denied before hydration; knowing the public job id grants no access.
+        for bidder in [&seller, &outsider] {
+            let before = h.accesses.load(Ordering::SeqCst);
+            let auth = token(bidder, &repo_root, "GET", None);
+            let denied = request(&app, &h.host, "GET", &format!("/git/{owner}/{job}/info/refs?service=git-upload-pack"), Some(&auth), vec![]).await;
+            assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+            assert_eq!(h.accesses.load(Ordering::SeqCst), before);
+        }
+    }
     let push_auth = scoped_git_token(&buyer, &repo_root, &reference);
     let refspec = format!("HEAD:{reference}");
     let push = git(
@@ -556,6 +594,40 @@ async fn fresh_private_repo_takes_real_input_push_and_targeted_fetch() {
     stdout(&push);
     let manifest = published_manifest(&h.objects, h.tenant, &owner, &job);
     assert_eq!(manifest.refs.get(&reference), Some(&commit));
+
+    if open_pool {
+        // Publishing the exact signed offer freezes buyer inputs, independently
+        // of the later award. A repeat provisioning request must not unfreeze it.
+        sqlx::query("INSERT INTO events(community_id,id,pubkey,created_at,kind,tags,content,sig) VALUES($1,$2,$3,NOW(),3401,$4,$5,$6)")
+            .bind(h.tenant.as_uuid()).bind(offer.id.as_bytes().as_slice())
+            .bind(offer.pubkey.as_bytes().as_slice()).bind(serde_json::to_value(&offer.tags).unwrap())
+            .bind(&offer.content).bind(hex::decode(offer.sig.to_string()).unwrap())
+            .execute(&h.pool).await.unwrap();
+        let repeat = serde_json::to_vec(&serde_json::json!({"signed_offer": offer})).unwrap();
+        let auth = token(&buyer, &format!("https://{}{provision_path}", h.host), "PUT", Some(&repeat));
+        assert_eq!(request(&app, &h.host, "PUT", &provision_path, Some(&auth), repeat).await.status(), StatusCode::OK);
+        let extra = format!("refs/heads/input/{}", "34".repeat(32));
+        let extra_auth = scoped_git_token(&buyer, &repo_root, &extra);
+        assert!(!git(&source, &h.host, Some(&extra_auth), &["push", &remote, &format!("HEAD:{extra}")]).await.status.success());
+        let common = || vec![
+            Tag::parse(["t", "maxplayer"]).unwrap(), Tag::parse(["v", "2"]).unwrap(),
+            Tag::parse(["job", &job]).unwrap(), Tag::parse(["e", &offer.id.to_hex(), "", "root"]).unwrap(),
+            Tag::parse(["p", &owner]).unwrap(),
+        ];
+        let mut tags = common();
+        tags.extend([Tag::parse(["status", "processing"]).unwrap(), Tag::parse(["payment", "none"]).unwrap()]);
+        let claim = EventBuilder::new(Kind::from(3402), "").tags(tags).sign_with_keys(&seller).unwrap();
+        let mut tags = common();
+        tags.extend([Tag::parse(["e", &claim.id.to_hex()]).unwrap(), Tag::parse(["p", &seller.public_key().to_hex()]).unwrap(), Tag::parse(["status", "accepted"]).unwrap()]);
+        let award = EventBuilder::new(Kind::from(3405), "").allow_self_tagging().tags(tags).sign_with_keys(&buyer).unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({"signed_offer": offer, "signed_claim": claim, "signed_award": award})).unwrap();
+        let auth = token(&seller, &format!("https://{}{provision_path}", h.host), "PUT", Some(&body));
+        assert_eq!(request(&app, &h.host, "PUT", &provision_path, Some(&auth), body).await.status(), StatusCode::OK);
+        let stored = h.state.db.private_job_repo(h.tenant, &owner, &job).await.unwrap().unwrap();
+        assert!(stored.input_frozen);
+        assert!(!stored.can_read(&outsider.public_key().to_hex()));
+        assert!(stored.can_read(&seller.public_key().to_hex()));
+    }
 
     let fetch_auth = token(&seller, &repo_root, "GET", None);
     let fetch = git(
@@ -624,6 +696,18 @@ async fn fresh_private_repo_takes_real_input_push_and_targeted_fetch() {
         published_manifest(&h.objects, h.tenant, &owner, &job).refs,
         manifest.refs
     );
+    if open_pool {
+        std::fs::write(fetched.join("answer.txt"), "contribution").unwrap();
+        stdout(&git(&fetched, &h.host, None, &["checkout", "-q", "-b", "work", "FETCH_HEAD"]).await);
+        stdout(&git(&fetched, &h.host, None, &["add", "answer.txt"]).await);
+        stdout(&git(&fetched, &h.host, None, &["commit", "-q", "-m", "answer"]).await);
+        let delivery = format!("refs/heads/delivery/{}", "35".repeat(32));
+        let auth = scoped_git_token(&seller, &repo_root, &delivery);
+        stdout(&git(&fetched, &h.host, Some(&auth), &["push", &remote, &format!("HEAD:{delivery}")]).await);
+        let after = published_manifest(&h.objects, h.tenant, &owner, &job);
+        assert_eq!(after.refs.get(&reference), Some(&commit));
+        assert!(after.refs.contains_key(&delivery));
+    }
     server.abort();
     h.object_server.abort();
 }

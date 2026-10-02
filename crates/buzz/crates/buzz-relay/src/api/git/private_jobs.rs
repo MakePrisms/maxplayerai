@@ -53,7 +53,7 @@ pub async fn authorize(
         .ok_or_else(deny)?;
     let allowed = if write {
         !job.closed
-            && (actor == job.buyer && !job.input_frozen && job.target.is_some()
+            && (actor == job.buyer && !job.input_frozen && job.award_id.is_none()
                 || job.seller.as_deref() == Some(actor) && job.award_id.is_some())
     } else {
         job.can_read(actor)
@@ -218,7 +218,7 @@ pub async fn provision(
         job.seller = Some(seller);
         job.award_id = Some(award.id.to_hex());
         job.input_frozen = true;
-    } else if actor != buyer || job.target.is_none() || request.signed_claim.is_some() {
+    } else if actor != buyer || request.signed_claim.is_some() {
         return Err(deny());
     }
     // Never adopt an existing public repository's history as a private job.

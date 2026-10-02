@@ -72,7 +72,9 @@ block/buzz stays meaningful and upstream commits remain scannable/pullable.
    `crates/maxplayer-private-protocol` shares closed v2 schemas with the client;
    `buzz-db::private_jobs` and migration 0025 hold immutable tenant/buyer/job ACLs;
    Git transport/policy/provisioning and announcement handling enforce those ACLs,
-   immutable refs and quotas. Private repositories never emit public ref-state
+   immutable refs and quotas. Buyers can prepare both targeted and open-pool repos
+   before publication; open-pool read access still requires selection, and publishing
+   freezes buyer inputs. Private repositories never emit public ref-state
    announcements. See `docs/specs/private-offers-implementation.md` in the parent
    Maxplayer repository for rollout status and remaining integration.
 

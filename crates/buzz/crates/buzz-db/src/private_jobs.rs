@@ -51,7 +51,6 @@ impl PrivateJobRepo {
             actor == self.buyer
                 && !self.input_frozen
                 && self.award_id.is_none()
-                && self.target.is_some()
                 && hex32(id)
         } else if let Some(id) = delivery {
             self.seller.as_deref() == Some(actor) && self.award_id.is_some() && hex32(id)
@@ -150,6 +149,26 @@ mod tests {
             closed: false,
             input_frozen: false,
         }
+    }
+    #[test]
+    fn open_pool_buyer_input_is_allowed_only_before_publication_or_award() {
+        let mut job = fixture();
+        job.target = None;
+        let seller = "44".repeat(32);
+        let input = format!("refs/heads/input/{}", "66".repeat(32));
+        let zero = "00".repeat(20);
+        let oid = "88".repeat(20);
+        assert!(job.can_create_ref(&job.buyer, &input, &zero, &oid));
+        assert!(!job.can_read(&seller));
+        assert!(!job.can_create_ref(&seller, &input, &zero, &oid));
+        assert!(!job.can_create_ref(&job.buyer, &input, &oid, &oid));
+        job.input_frozen = true;
+        assert!(!job.can_create_ref(&job.buyer, &input, &zero, &oid));
+        job.input_frozen = false;
+        job.award_id = Some("aa".repeat(32));
+        job.seller = Some(seller.clone());
+        assert!(job.can_read(&seller));
+        assert!(!job.can_create_ref(&job.buyer, &input, &zero, &oid));
     }
     #[test]
     fn outsiders_are_denied_and_award_only_grants_selected_delivery_writes() {

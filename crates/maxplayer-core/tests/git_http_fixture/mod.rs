@@ -44,6 +44,14 @@ pub struct RecordedRequest {
 /// existing test uses; each knob is additive.
 #[derive(Clone, Default)]
 pub struct FixtureOptions {
+    /// Mock only the provisioning API for buyer-posting integration tests. Real
+    /// relay ACL enforcement is tested in buzz's private_jobs_http_tests.
+    pub private_job_host: bool,
+    pub allow_anonymous: bool,
+    /// Reject one request before the Git backend sees it.
+    pub reject_request: Option<(usize, &'static str)>,
+    /// Commit receive-pack normally but discard its response (ambiguous success).
+    pub lose_receive_pack_response: bool,
     /// Sleep this long before answering the FIRST request this server sees, so a test can put real
     /// elapsed time between one leg and the next (a token minted once, up front, then visibly
     /// predates the later legs).
@@ -396,7 +404,7 @@ fn handle_connection(
     // NIP-98-style gate: EVERY smart endpoint needs Authorization; challenge otherwise.
     // With Expect: 100-continue no body is in flight yet, so refuse immediately; else
     // drain the body first so the client can read the 401 without a connection reset.
-    if authorization.is_none() {
+    if authorization.is_none() && !options.allow_anonymous {
         if !expects_continue {
             let _ = read_body(&mut tls, &headers, &buf[head_end + 4..]);
         }
@@ -450,6 +458,38 @@ fn handle_connection(
             "text/plain",
             b"moved\n",
         );
+    }
+
+    if let Some((nth, status)) = options.reject_request {
+        if ordinal == nth {
+            return respond(&mut tls, status, &[], "text/plain", b"injected refusal");
+        }
+    }
+    if options.private_job_host && method == "PUT" && target.starts_with("/api/jobs/private/") {
+        let request: serde_json::Value = serde_json::from_slice(&body)?;
+        let offer = &request["signed_offer"];
+        let job = target.strip_prefix("/api/jobs/private/").unwrap();
+        let host = headers.get("host").unwrap();
+        let reply = serde_json::json!({
+            "repo": format!("https://{host}/git/{}/{job}", offer["pubkey"].as_str().unwrap()),
+            "job_id": job, "max_file_bytes": 100 * 1024 * 1024u64,
+            "max_repository_bytes": 5 * 1024 * 1024 * 1024u64,
+            "max_objects": 1_000_000, "max_pack_bytes": 1024 * 1024u64,
+            "max_compressed_repository_bytes": 1024 * 1024u64,
+        });
+        return respond(&mut tls, "200 OK", &[], "application/json", &serde_json::to_vec(&reply)?);
+    }
+    let dynamic_mount;
+    let mount = if options.private_job_host && target.starts_with("/git/") {
+        dynamic_mount = target.split('/').take(4).collect::<Vec<_>>().join("/");
+        dynamic_mount.as_str()
+    } else { mount };
+    if options.lose_receive_pack_response && method == "POST" && target.ends_with("/git-receive-pack") {
+        let mut child = Command::new("git").args(["receive-pack", "--stateless-rpc"])
+            .arg(repo).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
+        child.stdin.take().unwrap().write_all(&body)?;
+        assert!(child.wait()?.success());
+        return Ok(());
     }
 
     // Smart-HTTP v0/v2: pass the client's Git-Protocol offer through to the backend.
