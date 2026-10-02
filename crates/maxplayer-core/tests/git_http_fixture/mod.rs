@@ -39,7 +39,7 @@ pub struct RecordedRequest {
     pub target: String,
     pub authorization: Option<String>,
     pub content_length: Option<u64>,
-    pub pack_sha256: Option<String>,
+    pub pack_digest: Option<String>,
 }
 
 /// Optional behaviours a test can ask the fixture for. Default = the plain auth-gated server every
@@ -399,7 +399,7 @@ fn handle_connection(
             target: target.clone(),
             authorization: authorization.clone(),
             content_length: headers.get("content-length").and_then(|s| s.parse().ok()),
-            pack_sha256: None,
+            pack_digest: None,
         });
         recorded.len()
     };
@@ -434,9 +434,8 @@ fn handle_connection(
     }
     let body = read_body(&mut tls, &headers, &buf[head_end + 4..])?;
     if method == "POST" && target.ends_with("git-receive-pack") {
-        use sha2::{Digest, Sha256};
         if let Some(offset) = body.windows(4).position(|w| w == b"PACK") {
-            requests.lock().expect("requests")[ordinal-1].pack_sha256 = Some(hex::encode(Sha256::digest(&body[offset..])));
+            requests.lock().expect("requests")[ordinal-1].pack_digest = Some(git2::Oid::hash_object(git2::ObjectType::Blob, &body[offset..]).expect("hash fixture pack").to_string());
         }
     }
 

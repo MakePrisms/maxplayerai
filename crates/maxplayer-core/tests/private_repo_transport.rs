@@ -191,8 +191,7 @@ fn fetched_staging(root: &Path) -> (git2::Repository, String, String) {
     let packs = std::fs::read_dir(staging.path().join("objects/pack")).unwrap()
         .map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|e| e=="pack")).collect::<Vec<_>>();
     assert_eq!(packs.len(),1);
-    use sha2::{Digest,Sha256};
-    let hash=hex::encode(Sha256::digest(std::fs::read(&packs[0]).unwrap()));
+    let hash=git2::Oid::hash_object(git2::ObjectType::Blob, &std::fs::read(&packs[0]).unwrap()).unwrap().to_string();
     (staging,oid,hash)
 }
 fn counted_auth(url: &str) -> AuthMinter {
@@ -218,7 +217,7 @@ fn fetched_pack_forwarding_preserves_bytes_and_reconciles_lost_response() {
         let requests=server.requests();
         let posts=requests.iter().filter(|r|r.method=="POST").collect::<Vec<_>>();
         assert_eq!(posts.len(),1,"lost ACK must reconcile instead of reposting");
-        assert_eq!(posts[0].pack_sha256.as_deref(),Some(hash.as_str()));
+        assert_eq!(posts[0].pack_digest.as_deref(),Some(hash.as_str()));
         assert!(posts[0].content_length.unwrap()>32);
         assert_eq!(requests.len(),if lose {3} else {2});
         for (i,r) in requests.iter().enumerate() {assert_eq!(r.authorization,Some(format!("Nostr request-{i}")));}
