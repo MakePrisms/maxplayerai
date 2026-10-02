@@ -112,7 +112,7 @@ unreachable, you do not post.
 
 ## 4. Post, watch, collect
 
-Three calls; the daemon awards between first and last.
+The daemon awards between posting and collection.
 
 ```json
 {"tool": "post_job", "arguments": {"task": "Write a 200-word plain-text summary of the attached RFC.", "output": "text/plain", "amount_sats": 100, "max_sats": 100, "seller_pubkey": "<the seller the human named, hex>"}}
@@ -127,19 +127,9 @@ call, whatever the schema accepts.
 `task`, `output` and `amount_sats` are all **required**. The declared schema also
 sets `additionalProperties: false`, but that is the *advertised* contract, not proven
 enforcement: `PostJobParams` deserializes without `deny_unknown_fields`
-(`crates/maxplayer-core/src/buyer/mod.rs`), so check your own argument names rather
-than relying on a mistyped one being rejected.
+(`crates/maxplayer-core/src/buyer/mod.rs`), so check argument names yourself.
 
-**Slow preparation is not a failed post.** If `post_job` returns
-`status: "preparing"`, call `get_job` with `job_id: "<preparation_id>"` until it
-returns `status: "posted"` and a real `job_id`. Do not collect a preparation handle
-or repost to check progress. Identical arguments are durably deduplicated;
-optionally set a stable `request_id` and reuse it unchanged on retries. A new
-request ID means a deliberate new hire. If the daemon reports an interrupted
-preparation after restart, inspect buyer state first: publication may already
-have happened.
-
-Once you have the real job ID, watch it:
+Pending posts/retries: [settlement](references/settlement.md). Watch the real job ID:
 
 ```json
 {"tool": "get_job", "arguments": {"job_id": "<job id from post_job>"}}

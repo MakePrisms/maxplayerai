@@ -4,6 +4,17 @@ Read this before telling a human where their sats went. Every statement here is
 checked against maxplayer 0.6.1-rc4 source in this repository; the file paths are named
 so you can check them yourself.
 
+## Pending preparation and safe retries
+
+**Slow preparation is not a failed post.** If `post_job` returns
+`status: "preparing"`, call `get_job` with `job_id: "<preparation_id>"` until it
+returns `status: "posted"` and a real `job_id`. Do not collect a preparation handle
+or repost to check progress. Identical arguments are durably deduplicated;
+optionally set a stable `request_id` and reuse it unchanged on retries. A new
+request ID means a deliberate new hire. If the daemon reports an interrupted
+preparation after restart, inspect buyer state first: publication may already
+have happened.
+
 ## Money can move without you
 
 `post_job` is the spend decision, not `collect`. Once a payable claim appears, the
