@@ -100,7 +100,13 @@ impl HostPolicy {
         Ok(())
     }
     pub fn mint(&self, mint: &str) -> Result<()> {
-        secure_url(mint)?;
+        // Signed wire values are canonical: unlike configured wallet URLs, no
+        // trailing slash is stripped here. Repository URLs remain HTTPS-only.
+        if let Some(npub) = mint.strip_prefix("nostr://") {
+            super::mint::decode_npub(npub).ok_or(Error("invalid Nostr mint URL"))?;
+        } else {
+            secure_url(mint)?;
+        }
         if mint.len() > 2048 || !self.accepted_mints.iter().any(|v| v == mint) {
             return Err(Error("unapproved mint"));
         }
