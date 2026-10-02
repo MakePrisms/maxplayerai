@@ -1,3 +1,7 @@
+## Unreleased
+
+- Private jobs accept canonical `nostr://<npub>` mints when explicitly approved; mint membership checks remain unchanged.
+
 ## v0.6.1-rc3
 
 Third release candidate for 0.6.1, prepared from main after the seller-credits stack
