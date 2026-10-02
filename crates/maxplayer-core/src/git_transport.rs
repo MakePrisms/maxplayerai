@@ -266,6 +266,7 @@ fn client_default() -> &'static reqwest::blocking::Client {
 thread_local! {
     static CONTAINER_PUSH_HTTP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static BUYER_INPUT_HTTP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SELLER_INPUT_FETCH_HTTP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub(crate) fn with_container_push_http<T>(body: impl FnOnce() -> T) -> T {
@@ -289,6 +290,21 @@ fn with_buyer_input_http<T>(body: impl FnOnce() -> T) -> T {
         }
     }
     let _restore = Restore(BUYER_INPUT_HTTP.replace(true));
+    body()
+}
+
+// The seller's PRE-CLAIM read of a private job's inputs/contribution base. The relay
+// builds a whole upload-pack before answering, so a big base cannot fit the 10s payment
+// verification client; this runs off the seller's event loop (`seller_node::run`) and
+// uses the large-transfer client. Never used for collection/payment verification.
+fn with_seller_input_fetch_http<T>(body: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SELLER_INPUT_FETCH_HTTP.set(self.0);
+        }
+    }
+    let _restore = Restore(SELLER_INPUT_FETCH_HTTP.replace(true));
     body()
 }
 
@@ -1227,6 +1243,7 @@ impl HttpStream {
         let client = if self.short {
             client_short()
         } else if BUYER_INPUT_HTTP.get()
+            || SELLER_INPUT_FETCH_HTTP.get()
             || (CONTAINER_PUSH_HTTP.get() && self.is_post && self.service == "git-receive-pack")
         {
             client_large_transfer()
@@ -2608,8 +2625,10 @@ pub fn fetch_bounded_objects(repo: &Repository, remote_url: &str, refs: &[&str],
     callbacks.transfer_progress(|progress| progress.received_bytes() <= crate::private_content::MAX_GIT_TRANSFER_BYTES && progress.total_objects() <= crate::private_content::MAX_OBJECTS);
     let mut options=FetchOptions::new();
     options.download_tags(AutotagOption::None).remote_callbacks(callbacks);
-    let context=LegContext {mint:header.map(static_auth),authority:None,lifetime:None,short:true,read_budget:None,intended_url:remote_url.into()};
-    with_context(context,|| remote.fetch(refs,Some(&mut options),None))
+    // Not the short money-path client: a large pinned base legitimately takes longer than
+    // 10s for the relay to pack (#1096 review B2). Byte/object caps above still bound it.
+    let context=LegContext {mint:header.map(static_auth),authority:None,lifetime:None,short:false,read_budget:None,intended_url:remote_url.into()};
+    with_seller_input_fetch_http(|| with_context(context,|| remote.fetch(refs,Some(&mut options),None)))
 }
 
 /// Prepare a contribution base before publishing a private offer. This is NOT the
