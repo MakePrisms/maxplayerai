@@ -580,3 +580,102 @@ pub fn check_dispatch(tags: &Tags, d: &Dispatch) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod mint_tests {
+    use super::*;
+
+    const NPUB: &str = "npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d";
+
+    fn policy(mint: &str) -> HostPolicy {
+        HostPolicy {
+            git_prefix: "https://git.example/git/".into(),
+            accepted_mints: vec![mint.into()],
+        }
+    }
+
+    #[test]
+    fn private_mints_accept_https_and_canonical_nostr() {
+        for mint in ["https://mint.example".to_owned(), format!("nostr://{NPUB}")] {
+            policy(&mint).mint(&mint).unwrap();
+        }
+    }
+
+    #[test]
+    fn private_mints_reject_noncanonical_nostr_even_when_approved() {
+        let mut checksum = NPUB.to_owned();
+        checksum.pop();
+        checksum.push('q');
+        for mint in [
+            format!("NOSTR://{NPUB}"),
+            format!("nostr://{}", NPUB.to_uppercase()),
+            format!("nostr://{checksum}"),
+            format!("nostr://{NPUB}/"),
+            format!("nostr://{NPUB}/v1"),
+            format!("nostr://{NPUB}?x=1"),
+            format!("nostr://{NPUB}#fragment"),
+            format!("nostr://user@{NPUB}"),
+            format!("nostr://{NPUB}:443"),
+            format!("nostr://{}", NPUB.replacen("npub", "nsec", 1)),
+            NPUB.into(),
+            "nostr://npub1notakey".into(),
+            "nostr://".into(),
+        ] {
+            assert!(policy(&mint).mint(&mint).is_err(), "{mint}");
+        }
+    }
+
+    #[test]
+    fn private_mints_still_require_explicit_approval() {
+        let mint = format!("nostr://{NPUB}");
+        assert!(policy("https://mint.example").mint(&mint).is_err());
+        assert!(policy(&mint).mint("https://unknown.example").is_err());
+    }
+
+    #[test]
+    fn private_receipt_validates_realized_nostr_mint_membership() {
+        use nostr::prelude::{EventBuilder, Keys, Kind, Tag};
+        let mint = format!("nostr://{NPUB}");
+        let keys = Keys::parse(&format!("{:064x}", 1)).unwrap();
+        let hash = "ab".repeat(32);
+        let signature = "cd".repeat(64);
+        let rows = vec![
+            vec!["t", "maxplayer"],
+            vec!["v", "2"],
+            vec!["job", &hash],
+            vec!["e", &hash, "", "root"],
+            vec!["e", &hash, "", "reply"],
+            vec!["p", &hash],
+            vec!["job-hash", &hash],
+            vec!["amount", "100", "sat"],
+            vec!["mint", &mint],
+            vec!["sig", "seller", &signature],
+            vec!["sig", "buyer", &signature],
+            vec!["creq-hash", &hash],
+            vec!["delivery_kind", "inline"],
+            vec!["delivery_integrity_hash", &hash],
+        ];
+        let event = EventBuilder::new(Kind::from(3400), "")
+            .tags(rows.into_iter().map(|row| Tag::parse(row).unwrap()))
+            .sign_with_keys(&keys)
+            .unwrap();
+        validate_private(&event, &policy(&mint)).unwrap();
+        assert!(validate_private(&event, &policy("https://mint.example")).is_err());
+    }
+
+    #[test]
+    fn private_repo_urls_remain_https_only() {
+        let host = HostPolicy {
+            git_prefix: format!("nostr://{NPUB}/"),
+            accepted_mints: vec![],
+        };
+        assert!(host.job_repo(&"ab".repeat(32), &"cd".repeat(32)).is_err());
+        for mint in [
+            "http://mint.example",
+            "https://user@mint.example",
+            "https://mint.example?q=1",
+        ] {
+            assert!(policy(mint).mint(mint).is_err());
+        }
+    }
+}
