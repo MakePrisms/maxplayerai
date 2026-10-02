@@ -305,9 +305,17 @@ fn cmd_setup(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     // auto-adds an unconfigured mint (identical to `wallet mints add <url>`) instead of exiting 2
     // ("not configured"). Idempotent, and never changes the default (adds to extra_mints only).
     if let Some(raw) = opts.mint.as_deref() {
-        if let Err(error) = wallet_ops::add_mint(&mut home, raw) {
-            let _ = writeln!(err, "{error}");
-            return RUNTIME_ERROR;
+        match wallet_ops::add_mint(&mut home, raw) {
+            Ok(normalized) => {
+                // Keep stdout available for the payment invoice.
+                if let Some(hint) = seller_mint_hint(&home, &normalized) {
+                    let _ = writeln!(err, "{hint}");
+                }
+            }
+            Err(error) => {
+                let _ = writeln!(err, "{error}");
+                return RUNTIME_ERROR;
+            }
         }
     }
     match wallet_ops::mint_blocking(&home, amount, opts.mint.as_deref()) {
@@ -1044,6 +1052,9 @@ fn cmd_mints(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             match wallet_ops::add_mint(&mut home, url) {
                 Ok(normalized) => {
                     let _ = writeln!(out, "added mint={normalized}");
+                    if let Some(hint) = seller_mint_hint(&home, &normalized) {
+                        let _ = writeln!(out, "{hint}");
+                    }
                     SUCCESS
                 }
                 Err(error) => {
@@ -1076,6 +1087,24 @@ fn cmd_mints(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             USAGE_ERROR
         }
     }
+}
+
+/// Wallet mint registration does not change the seller's claim payment methods.
+#[cfg(feature = "wallet")]
+fn seller_mint_hint(home: &MaxplayerHome, normalized: &str) -> Option<String> {
+    if home.config.seller.is_none()
+        || home
+            .config
+            .accepted_mints
+            .iter()
+            .any(|mint| wallet_ops::normalize_mint_url(mint).ok().as_deref() == Some(normalized))
+    {
+        return None;
+    }
+    Some(format!(
+        "note: this home is a seller; to accept payment at this mint in claims, also append it to accepted_mints in {} and restart the seller node",
+        home.root.join("config.toml").display()
+    ))
 }
 
 #[cfg(test)]
@@ -1220,6 +1249,96 @@ mod tests {
         let err_text = String::from_utf8(err).expect("utf8");
         assert!(!err_text.starts_with("ALARM"), "missing must NOT masquerade as the accounting-gap alarm");
         assert!(err_text.contains("refusing to remint"), "got: {err_text}");
+    }
+
+    #[cfg(feature = "wallet")]
+    fn check_mints_add_hint(seller: bool, accepted: bool) {
+        let root = ux_test_home("seller-mint-hint");
+        let mut seeded = home::bootstrap(&root).expect("bootstrap");
+        let mint = "nostr://npub1sellercredits";
+        home::save_config(&mut seeded, |config| {
+            if seller {
+                config.seller = Some(home::SellerConfig {
+                    agent_command: vec!["claude".into()],
+                    rate_sats: 5,
+                    takes_no_payment: false,
+                    git_remote: "https://example.invalid/seller.git".into(),
+                    job_timeout_secs: None,
+                    agents: vec![],
+                    claim_open_pool: false,
+                    accept_open_targeted: false,
+                    accept_offers_only_from: vec![],
+                    offer_backfill_secs: home::default_offer_backfill_secs(),
+                    contribution_enabled: true,
+                    slots: 1,
+                    claim_award_timeout_secs: None,
+                });
+            }
+            if accepted {
+                // Membership uses normalized URLs, including non-default accepted mints.
+                config.accepted_mints.push(format!("{mint}/"));
+            }
+        })
+        .expect("save config");
+        let original_accepted = seeded.config.accepted_mints.clone();
+        // Exercise both a new registration and the idempotent already-extra-mint path.
+        for _ in 0..2 {
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            assert_eq!(
+                cmd_mints(
+                    &[
+                        "add".into(),
+                        format!(" {mint}/ "),
+                        "--home".into(),
+                        root.display().to_string()
+                    ],
+                    &mut out,
+                    &mut err,
+                ),
+                SUCCESS
+            );
+            assert!(err.is_empty());
+            let expected = if seller && !accepted {
+                format!(
+                    "added mint={mint}\nnote: this home is a seller; to accept payment at this mint in claims, also append it to accepted_mints in {} and restart the seller node\n",
+                    root.join("config.toml").display()
+                )
+            } else {
+                format!("added mint={mint}\n")
+            };
+            assert_eq!(String::from_utf8(out).expect("utf8"), expected);
+            let reloaded = home::bootstrap(&root).expect("reload");
+            assert_eq!(reloaded.config.accepted_mints, original_accepted);
+            assert_eq!(
+                reloaded
+                    .config
+                    .extra_mints
+                    .iter()
+                    .filter(|entry| *entry == mint)
+                    .count(),
+                1
+            );
+        }
+        std::fs::remove_dir_all(root).expect("clean test home");
+    }
+
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn mints_add_hint_for_seller_missing_accepted_mint() {
+        check_mints_add_hint(true, false);
+    }
+
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn mints_add_hint_absent_for_already_accepted_mint() {
+        check_mints_add_hint(true, true);
+    }
+
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn mints_add_hint_absent_for_non_seller() {
+        check_mints_add_hint(false, false);
     }
 
     // ---- #445 + #506 setup-UX fold ----
