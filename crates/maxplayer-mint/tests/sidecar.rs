@@ -561,6 +561,11 @@ async fn mint_and_melt_refused_on_local_issue() {
             methods.as_array().is_none_or(|m| m.is_empty()),
             "NUT-{nut} advertises {methods}"
         );
+        assert_eq!(
+            ok(&info)["nuts"][nut]["disabled"],
+            json!(true),
+            "NUT-{nut} must say disabled"
+        );
     }
 }
 

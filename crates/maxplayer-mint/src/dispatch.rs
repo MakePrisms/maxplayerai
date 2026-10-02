@@ -24,7 +24,17 @@ pub async fn execute(mint: &Mint, operation: &str, body: Value) -> Outcome {
 
 async fn run(mint: &Mint, operation: &str, body: Value) -> Result<Value, ErrorBody> {
     match operation {
-        op::INFO => encode(&mint.mint_info().await.map_err(nut)?.time(unix_time())),
+        op::INFO => {
+            // cdk persists NUT-04/05 with no methods but `disabled: false`. A local-issue mint
+            // neither mints nor melts, so say so explicitly, also for a mint whose info is
+            // already in its sqlite (#1086 review).
+            let mut info = mint.mint_info().await.map_err(nut)?.time(unix_time());
+            info.nuts.nut04.methods.clear();
+            info.nuts.nut04.disabled = true;
+            info.nuts.nut05.methods.clear();
+            info.nuts.nut05.disabled = true;
+            encode(&info)
+        }
         op::KEYS => encode(&mint.pubkeys()),
         op::KEYSET => {
             #[derive(serde::Deserialize)]
