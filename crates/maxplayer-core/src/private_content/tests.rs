@@ -1669,3 +1669,72 @@ fn shared_quotas_allow_more_than_thousand_commits_and_files() {
     }
     repositories::check_objects(&repo).unwrap();
 }
+
+#[cfg(feature = "wallet")]
+#[test]
+fn private_invoice_accepts_mixed_https_nostr_and_preserves_membership_guard() {
+    use cashu::nuts::nut18::PaymentRequest;
+    use nostr_sdk::prelude::{Nip19Profile, ToBech32};
+    let offer = "ab".repeat(32);
+    let seller = keys(2).public_key();
+    let nostr_mint = format!("nostr://{}", seller.to_bech32().unwrap());
+    let profile = Nip19Profile::new(seller, []).to_bech32().unwrap();
+    let mut policy = host();
+    policy.accepted_mints.push(nostr_mint.clone());
+    for mints in [
+        vec!["https://mint.example".to_owned(), nostr_mint.clone()],
+        vec![nostr_mint.clone()],
+    ] {
+        let request: PaymentRequest = serde_json::from_value(serde_json::json!({
+            "i":offer,"a":100,"u":"sat","s":true,"m":mints,"d":null,
+            "t":[{"t":"nostr","a":profile,"g":[["n","17"]]}]
+        }))
+        .unwrap();
+        for raw in [request.to_string(), request.to_bech32_string().unwrap()] {
+            invoice::validate(&raw, &offer, 100, &seller.to_hex(), &policy).unwrap();
+            // A only: the old all-entry membership guard deliberately remains.
+            assert!(invoice::validate(&raw, &offer, 100, &seller.to_hex(), &host()).is_err());
+        }
+    }
+    for mints in [
+        vec![nostr_mint.clone(), nostr_mint],
+        vec!["https://unknown.example".into()],
+        vec![
+            "https://unknown.example".into(),
+            "https://mint.example".into(),
+        ],
+    ] {
+        let request: PaymentRequest = serde_json::from_value(serde_json::json!({
+            "i":offer,"a":100,"u":"sat","s":true,"m":mints,"d":null,
+            "t":[{"t":"nostr","a":profile,"g":[["n","17"]]}]
+        }))
+        .unwrap();
+        assert!(
+            invoice::validate(&request.to_string(), &offer, 100, &seller.to_hex(), &policy)
+                .is_err()
+        );
+    }
+}
+
+#[cfg(feature = "wallet")]
+#[test]
+fn private_invoice_all_mints_guard_blocks_unapproved_hop_target() {
+    // Evidence for deferring the proposed at-least-one rule: when balances do
+    // not cover the invoice, planning can hop to the seller's first mint, not
+    // necessarily the entry approved by the private checker.
+    let listed = vec![
+        "https://unapproved.example".into(),
+        "https://mint.example".into(),
+    ];
+    let source = crate::crossmint::select_source_mint(
+        "https://buyer-default.example",
+        &listed,
+        true,
+        &[],
+        100,
+    );
+    let plan = crate::crossmint::plan_payment(&source, &listed, true).unwrap();
+    assert_eq!(plan.realized_mint().to_string(), listed[0]);
+    assert!(host().mint(&listed[1]).is_ok());
+    assert!(host().mint(&plan.realized_mint().to_string()).is_err());
+}
