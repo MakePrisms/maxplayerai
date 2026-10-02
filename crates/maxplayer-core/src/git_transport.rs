@@ -262,6 +262,7 @@ fn client_default() -> &'static reqwest::blocking::Client {
 // host delivery's 120s leg / 150s operation contract, or the buyer's short fetch budget.
 thread_local! {
     static CONTAINER_PUSH_HTTP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static BUYER_INPUT_HTTP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub(crate) fn with_container_push_http<T>(body: impl FnOnce() -> T) -> T {
@@ -275,26 +276,39 @@ pub(crate) fn with_container_push_http<T>(body: impl FnOnce() -> T) -> T {
     body()
 }
 
-/// Matches the relay's pack-operation ceiling. A host supervisor still bounds the whole
-/// container, including local packing, token hand-offs and all retry attempts.
-const CONTAINER_HTTP_LEG_TIMEOUT: Duration = Duration::from_secs(300);
+// Only pre-publication buyer input transfers use this scope. In particular it must
+// not relax collection/payment verification's short fetch deadline.
+fn with_buyer_input_http<T>(body: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BUYER_INPUT_HTTP.set(self.0);
+        }
+    }
+    let _restore = Restore(BUYER_INPUT_HTTP.replace(true));
+    body()
+}
 
-fn client_container() -> &'static reqwest::blocking::Client {
+/// Matches the relay's pack-operation ceiling. Used for container uploads and
+/// pre-publication buyer preparation, never collection/payment verification.
+const LARGE_TRANSFER_HTTP_LEG_TIMEOUT: Duration = Duration::from_secs(300);
+
+fn client_large_transfer() -> &'static reqwest::blocking::Client {
     static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         let builder = reqwest::blocking::Client::builder()
             .connect_timeout(Duration::from_secs(15))
-            .timeout(CONTAINER_HTTP_LEG_TIMEOUT)
+            .timeout(LARGE_TRANSFER_HTTP_LEG_TIMEOUT)
             .redirect(no_redirects())
             .retry(no_hidden_replay())
             .danger_accept_invalid_certs(accept_invalid_certs());
-        // Linux containers: bound unacknowledged upload data, while allowing an acknowledged
+        // On supported platforms, bound unacknowledged data while allowing an acknowledged
         // slow transfer to use the longer total budget. This is TCP progress, not app progress.
         #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
         let builder = builder.tcp_user_timeout(Duration::from_secs(60));
         builder
             .build()
-            .expect("build container delivery HTTP client")
+            .expect("build large-transfer HTTP client")
     })
 }
 
@@ -1182,8 +1196,10 @@ impl HttpStream {
     fn send(&mut self) -> io::Result<()> {
         let client = if self.short {
             client_short()
-        } else if CONTAINER_PUSH_HTTP.get() && self.is_post && self.service == "git-receive-pack" {
-            client_container()
+        } else if BUYER_INPUT_HTTP.get()
+            || (CONTAINER_PUSH_HTTP.get() && self.is_post && self.service == "git-receive-pack")
+        {
+            client_large_transfer()
         } else {
             client_default()
         };
@@ -1473,6 +1489,16 @@ mod tests {
     #[test]
     #[ignore = "125-second slow-upload regression; run explicitly"]
     fn container_upload_survives_old_120_second_cutoff() {
+        slow_upload(false);
+    }
+
+    #[test]
+    #[ignore = "125-second buyer slow-upload regression; run explicitly"]
+    fn buyer_input_upload_survives_old_120_second_cutoff() {
+        slow_upload(true);
+    }
+
+    fn slow_upload(buyer: bool) {
         use std::io::{BufRead, BufReader};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1528,10 +1554,15 @@ mod tests {
             response: None,
         };
         let start = std::time::Instant::now();
-        let result = with_container_push_http(|| {
+        let mut upload = || {
             let mut body = Vec::new();
             stream.read_to_end(&mut body).map(|_| body)
-        });
+        };
+        let result = if buyer {
+            with_buyer_input_http(upload)
+        } else {
+            with_container_push_http(&mut upload)
+        };
         server.join().unwrap();
         assert_eq!(result.unwrap(), b"ok");
         assert!(start.elapsed() > DEFAULT_HTTP_LEG_TIMEOUT);
@@ -2317,17 +2348,81 @@ mod tests {
 }
 /// Upload a caller-owned, bounded private input snapshot. Unlike delivery workdirs,
 /// input staging is a fresh bare repository; it never executes hooks or trusts HEAD.
-#[cfg(feature="wallet")]
+#[cfg(feature = "wallet")]
 pub fn push_private_input(
-    repo: &Repository, remote_url: &str, reference: &str, commit: &str, mint: AuthMinter,
+    repo: &Repository,
+    remote_url: &str,
+    reference: &str,
+    commit: &str,
+    mint: AuthMinter,
 ) -> Result<String, TransportError> {
     assert_allowed_repo_locator(remote_url)?;
-    let suffix=reference.strip_prefix("refs/heads/input/").ok_or_else(||TransportError::Transport("not a private input ref".into()))?;
-    if !crate::private_content::is_hex(suffix,32) || !repo.is_bare() {
-        return Err(TransportError::Transport("invalid private input staging repository".into()));
+    let suffix = reference
+        .strip_prefix("refs/heads/input/")
+        .ok_or_else(|| TransportError::Transport("not a private input ref".into()))?;
+    if !crate::private_content::is_hex(suffix, 32) || !repo.is_bare() {
+        return Err(TransportError::Transport(
+            "invalid private input staging repository".into(),
+        ));
     }
     ensure_registered()?;
-    push_gated_object(repo,remote_url,reference,commit,Some(mint),None,None)
+    // Reuse one immutable ref and commit on every attempt. Reconcile an ambiguous
+    // success through the authenticated advertisement: a lost POST response must
+    // not turn a successfully uploaded input into a failed job preparation.
+    let oid = gated_commit(repo, commit)?;
+    with_buyer_input_http(|| {
+        for attempt in 0..3 {
+            let result = (|| {
+                let mut remote = bound_remote(repo, remote_url)?;
+                let context = LegContext {
+                    mint: Some(mint.clone()),
+                    authority: None,
+                    lifetime: None,
+                    short: false,
+                    read_budget: None,
+                    intended_url: remote_url.into(),
+                };
+                let existing = with_context(context, || {
+                    remote.connect(Direction::Fetch)?;
+                    let oid = remote
+                        .list()?
+                        .iter()
+                        .find(|head| head.name() == reference)
+                        .map(|head| head.oid());
+                    remote.disconnect()?;
+                    Ok::<_, git2::Error>(oid)
+                })?;
+                if let Some(existing) = existing {
+                    return if existing == oid {
+                        Ok(oid.to_string())
+                    } else {
+                        Err(TransportError::Transport(
+                            "private input ref already has a different commit".into(),
+                        ))
+                    };
+                }
+                push_gated_object(
+                    repo,
+                    remote_url,
+                    reference,
+                    commit,
+                    Some(mint.clone()),
+                    None,
+                    None,
+                )
+            })();
+            match result {
+                Err(error)
+                    if attempt < 2
+                        && crate::delivery_orchestrator::default_is_retryable(&error) =>
+                {
+                    std::thread::sleep(Duration::from_secs(1 << attempt));
+                }
+                result => return result,
+            }
+        }
+        unreachable!("the final attempt returns")
+    })
 }
 
 /// Private-repository reads additionally bound transferred pack bytes and objects.
@@ -2352,4 +2447,41 @@ pub fn fetch_bounded_objects(repo: &Repository, remote_url: &str, refs: &[&str],
     options.download_tags(AutotagOption::None).remote_callbacks(callbacks);
     let context=LegContext {mint:header.map(static_auth),authority:None,lifetime:None,short:true,read_budget:None,intended_url:remote_url.into()};
     with_context(context,|| remote.fetch(refs,Some(&mut options),None))
+}
+
+/// Prepare a contribution base before publishing a private offer. This is NOT the
+/// buyer's payment-time verification fetch. Keep object/byte quotas, use the 300s
+/// preparation budget, and sign each request freshly when the source is relay Git.
+#[cfg(feature = "wallet")]
+pub fn fetch_private_input_base(
+    repo: &Repository,
+    remote_url: &str,
+    commit: &str,
+    mint: Option<AuthMinter>,
+) -> Result<(), TransportError> {
+    assert_allowed_repo_locator(remote_url)?;
+    ensure_registered()?;
+    let mut remote = bound_remote(repo, remote_url)?;
+    let mut callbacks = RemoteCallbacks::new();
+    callbacks.transfer_progress(|progress| {
+        progress.received_bytes() <= crate::private_content::MAX_GIT_TRANSFER_BYTES
+            && progress.total_objects() <= crate::private_content::MAX_OBJECTS
+    });
+    let mut options = FetchOptions::new();
+    options
+        .download_tags(AutotagOption::None)
+        .remote_callbacks(callbacks);
+    let context = LegContext {
+        mint,
+        authority: None,
+        lifetime: None,
+        short: false,
+        read_budget: None,
+        intended_url: remote_url.into(),
+    };
+    with_buyer_input_http(|| {
+        with_context(context, || {
+            remote.fetch(&[commit], Some(&mut options), None)
+        })
+    })
 }

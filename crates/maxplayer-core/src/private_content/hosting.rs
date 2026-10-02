@@ -48,8 +48,6 @@ impl ProvisionRequest {
             {
                 return Err(Error("invalid private provisioning award"));
             }
-        } else if tags.get("discovery") != Some("targeted") {
-            return Err(Error("open-pool repo requires selected award"));
         }
         let job = tags.required("job")?.to_string();
         let repo = host.job_repo(&offer.pubkey.to_hex(), &job)?;

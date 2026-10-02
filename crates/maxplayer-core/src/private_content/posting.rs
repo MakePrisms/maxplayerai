@@ -42,25 +42,27 @@ pub async fn post(
     } else {
         Some(inputs::prepare(&repo, &job, &request.inputs)?)
     };
-    let imported_base = if offer.seller_pubkey.is_some() {
-        contribution.map(|c| (c.target.clone_url().to_owned(), c.base.oid().to_owned()))
-    } else {
-        None
-    };
+    // Both discovery modes prepare the exact base before the offer becomes visible.
+    let imported_base =
+        contribution.map(|c| (c.target.clone_url().to_owned(), c.base.oid().to_owned()));
     let imported_ref = if let Some((source, oid)) = &imported_base {
-        let header = if crate::delivery_transport::is_relay_git_locator(source) {
-            Some(
+        let mint = if crate::delivery_transport::is_relay_git_locator(source) {
+            let intended = source.clone();
+            let signing = keys.clone();
+            Some(std::sync::Arc::new(move |destination: &str| {
+                if !crate::git_transport::same_destination(&intended, destination) {
+                    return Err("wrong base input source".into());
+                }
                 crate::git_transport::nip98_authorization_header_with_keys(
-                    source, keys, None, None,
-                )
-                .map_err(|_| Error("base input authorization unavailable"))?,
-            )
+                    destination, &signing, None, None,
+                ).map_err(|e| e.to_string())
+            }) as crate::git_transport::AuthMinter)
         } else {
             None
         };
         let (source, oid) = (source.clone(), oid.clone());
         let repo = tokio::task::spawn_blocking(move || {
-            crate::git_transport::fetch_bounded_objects(&repo, &source, &[&oid], header.as_deref())
+            crate::git_transport::fetch_private_input_base(&repo, &source, &oid, mint)
                 .map_err(|_| Error("pinned contribution base unavailable"))?;
             repositories::check_objects(&repo)?;
             Ok::<_, Error>(repo)
@@ -113,7 +115,7 @@ pub async fn post(
         &ctx.policy.host,
     )?;
     // Setup is authenticated storage, not an application ACK or a lifecycle event.
-    if offer.seller_pubkey.is_some() {
+    {
         let provision =
             hosting::ProvisionRequest::new(&prepared.event, None, None, &ctx.policy.host)?;
         let auth = hosting::auth_header(keys, provision.url(), provision.body())?;

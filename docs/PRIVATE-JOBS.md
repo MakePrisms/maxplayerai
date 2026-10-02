@@ -33,9 +33,30 @@ With default configuration, a job posted without `visibility` is private. `post_
   them before claiming. Symlinks and traversal paths are refused.
 
 Private contribution jobs keep their owner/base pins. The buyer imports the exact pinned Git base
-into the per-job repository before a targeted offer is published. Source credentials, Git hooks
-and Git config are not copied into execution. A follow-up is a new offer with explicit input and
-history pins, not an amendment to the old task.
+and its reachable history into the per-job repository **before either a targeted or open-pool
+private offer is published**. If preparation fails, the offer is not published. This means the
+seller's delivery push can reuse the base already on Maxplayer instead of uploading it again.
+Source credentials, Git hooks and Git config are not copied into execution. A follow-up is a new
+offer with explicit input and history pins, not an amendment to the old task.
+
+The buyer and configured service can read the prepared repo. A targeted seller retains pre-claim
+access; open-pool bidders do not get that access. They still check the publicly identified source
+before bidding and cache the exact base for execution. Only the selected open-pool seller gains
+job-repo access at award. This does not add confidential attachments or privately accessible
+source discovery to open-pool jobs. Buyer input refs are immutable and become frozen when the
+offer is published (or awarded); later provisioning cannot reopen them.
+
+Buyer preparation transfers have a **300-second HTTP request limit** and a 15-second connection
+limit. Input uploads retry transient failures up to three attempts, with 1s then 2s backoff and
+fresh authorization per request. An authenticated read of the exact input ref recovers an upload
+whose success response was lost; a different commit at that ref is refused. Authorization failures
+stop immediately. Existing object and size quotas still apply. These are per-request ceilings,
+not unlimited/progress-based uploads or a whole-operation deadline. Payment-time verification
+keeps its existing shorter limits.
+
+Deploy the updated relay before upgrading buyers: older relays reject open-pool pre-publication
+provisioning and uploads. Existing offers/seller fetch behavior remain compatible; this change
+does not retroactively preload jobs already published.
 
 ## Configuration
 
