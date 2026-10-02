@@ -52,7 +52,9 @@ fn inspect_objects(repo: &Repository, private: bool) -> Result<()> {
                 let name = entry.name().ok_or(Error("invalid input path"))?;
                 super::validate_path(name)?;
                 if !matches!(entry.filemode(), 0o040000 | 0o100644 | 0o100755) {
-                    return Err(Error("input snapshot refused"));
+                    return Err(Error(
+                        "input snapshot refused: private job repositories cannot contain symlinks or submodules",
+                    ));
                 }
             }
         }
@@ -146,6 +148,24 @@ pub fn upload_inputs(
         &snapshot.commit_oid,
         mint,
     )
-    .map_err(|_| Error("private input upload unavailable"))?;
+    .map_err(|e| upload_error(&e, "private input upload unavailable"))?;
     Ok(())
+}
+
+/// Name a permanent relay refusal of a private input upload in fixed words. The
+/// server's text is matched, never echoed; anything else keeps `fallback`.
+pub(super) fn upload_error(
+    error: &crate::git_transport::TransportError,
+    fallback: &'static str,
+) -> Error {
+    if !crate::git_transport::is_permanent_refusal(error) {
+        return Error(fallback);
+    }
+    if error.to_string().contains("cannot contain symlinks or submodules") {
+        Error("relay refused the private input: private job repositories cannot contain symlinks or submodules")
+    } else if crate::git_transport::reported_http_status(error) == Some(413) {
+        Error("relay refused the private input: it exceeds the private job repository limits")
+    } else {
+        Error("relay refused the private input upload (permanent HTTP refusal; not retried)")
+    }
 }

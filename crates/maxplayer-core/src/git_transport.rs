@@ -1075,6 +1075,9 @@ fn map_git_error(error: git2::Error) -> TransportError {
     // ephemeral port containing "403" must not suppress retries of a real 503.
     let lowered = error.message().to_ascii_lowercase();
     let lowered = lowered
+        .split(REFUSAL_MARKER)
+        .next()
+        .unwrap_or_default()
         .split_whitespace()
         .filter(|word| !word.contains("://"))
         .collect::<Vec<_>>()
@@ -1332,8 +1335,17 @@ impl HttpStream {
             )));
         }
         if !status.is_success() {
+            // Buyer input preparation only: keep a short, printable excerpt of a 4xx
+            // refusal so the caller can name a permanent relay policy refusal instead
+            // of retrying a full upload. Never used for classification (see
+            // [`map_git_error`]) and never forwarded verbatim to users.
+            let reason = if BUYER_INPUT_HTTP.get() && status.is_client_error() {
+                refusal_reason(response)
+            } else {
+                String::new()
+            };
             return Err(io::Error::other(format!(
-                "http status {} for {}",
+                "http status {} for {}{reason}",
                 status.as_u16(),
                 self.url
             )));
@@ -1341,6 +1353,58 @@ impl HttpStream {
         self.response = Some(response);
         Ok(())
     }
+}
+
+/// Marker before a server-supplied refusal excerpt. Text after it is server data,
+/// not transport evidence, so error classification ignores it.
+const REFUSAL_MARKER: &str = " (refusal: ";
+
+fn refusal_reason(response: reqwest::blocking::Response) -> String {
+    let mut bytes = Vec::new();
+    if response.take(512).read_to_end(&mut bytes).is_err() {
+        return String::new();
+    }
+    let text: String = String::from_utf8_lossy(&bytes)
+        .chars()
+        .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { ' ' })
+        .take(200)
+        .collect();
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
+        String::new()
+    } else {
+        format!("{REFUSAL_MARKER}{text})")
+    }
+}
+
+/// The HTTP status a transport error reports, if it reports one. Reads only the
+/// transport's own `http status NNN` prefix, never a URL or a refusal excerpt.
+pub(crate) fn reported_http_status(error: &TransportError) -> Option<u16> {
+    let message = match error {
+        TransportError::Io(m)
+        | TransportError::Auth(m)
+        | TransportError::Rejected(m)
+        | TransportError::Transport(m) => m,
+    };
+    let message = message.split(REFUSAL_MARKER).next().unwrap_or_default();
+    let mut words = message.split_whitespace();
+    while let Some(word) = words.next() {
+        if word == "status" {
+            if let Some(code) = words.next().and_then(|w| w.parse::<u16>().ok()) {
+                return Some(code);
+            }
+        }
+    }
+    None
+}
+
+/// A refusal no retry can change: a 4xx other than timeout, conflict, too-early
+/// or rate limiting. Retrying one re-sends the whole upload for the same answer.
+pub(crate) fn is_permanent_refusal(error: &TransportError) -> bool {
+    matches!(
+        reported_http_status(error),
+        Some(code @ 400..=499) if !matches!(code, 408 | 409 | 425 | 429)
+    )
 }
 
 impl Read for HttpStream {
@@ -1408,6 +1472,33 @@ mod tests {
             let mapped = map_git_error(git2::Error::from_str(message));
             assert!(matches!(mapped, TransportError::Io(_)), "{message}: {mapped:?}");
             assert!(crate::delivery_orchestrator::default_is_retryable(&mapped));
+        }
+    }
+
+    #[test]
+    fn permanent_refusals_are_4xx_except_retryable_statuses() {
+        for (message, permanent) in [
+            ("http status 400 for https://relay.example/git/o/r/git-receive-pack (refusal: private job snapshots cannot contain symlinks or submodules)", true),
+            ("http status 413 for https://relay.example/git/o/r/git-receive-pack", true),
+            ("http status 422 for https://relay.example:40409/git/o/r", true),
+            ("http status 409 for https://relay.example/git/o/r (refusal: push superseded)", false),
+            ("http status 408 for https://relay.example/git/o/r", false),
+            ("http status 429 for https://relay.example/git/o/r", false),
+            ("http status 503 for https://relay.example/git/400/r (refusal: status 400)", false),
+            ("http request: error sending request for url (https://relay.example:40400/)", false),
+        ] {
+            let error = map_git_error(git2::Error::from_str(message));
+            assert_eq!(is_permanent_refusal(&error), permanent, "{message}");
+        }
+    }
+
+    #[test]
+    fn refusal_excerpt_never_changes_retry_classification() {
+        for message in [
+            "http status 503 for https://relay.example/git/o/r (refusal: forbidden permission 403 unauthorized)",
+            "http status 400 for https://relay.example/git/o/r (refusal: authentication repository not found 401)",
+        ] {
+            assert!(matches!(map_git_error(git2::Error::from_str(message)), TransportError::Io(_)), "{message}");
         }
     }
 
@@ -2472,6 +2563,7 @@ pub fn push_private_input(
             match result {
                 Err(error)
                     if attempt < 2
+                        && !is_permanent_refusal(&error)
                         && crate::delivery_orchestrator::default_is_retryable(&error) =>
                 {
                     std::thread::sleep(Duration::from_secs(1 << attempt));

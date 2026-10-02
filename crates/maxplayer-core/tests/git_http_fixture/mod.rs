@@ -57,6 +57,8 @@ pub struct FixtureOptions {
     pub allow_anonymous: bool,
     /// Reject one request before the Git backend sees it.
     pub reject_request: Option<(usize, &'static str)>,
+    /// Body for [`Self::reject_request`]'s response (default `injected refusal`).
+    pub reject_body: Option<&'static str>,
     /// Commit receive-pack normally but discard its response (ambiguous success).
     pub lose_receive_pack_response: bool,
     /// Sleep this long before answering the FIRST request this server sees, so a test can put real
@@ -484,7 +486,7 @@ fn handle_connection(
 
     if let Some((nth, status)) = options.reject_request {
         if ordinal == nth {
-            return respond(&mut tls, status, &[], "text/plain", b"injected refusal");
+            return respond(&mut tls, status, &[], "text/plain", options.reject_body.unwrap_or("injected refusal").as_bytes());
         }
     }
     if method == "GET" && target.ends_with("info/refs?service=git-receive-pack") {

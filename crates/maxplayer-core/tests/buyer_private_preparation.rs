@@ -89,11 +89,23 @@ fn buyer_prepares_both_discovery_modes_retries_and_refuses_incomplete_publicatio
             ..Default::default()
         },
     );
+    // A permanent relay policy refusal of the forwarded pack (request 3) is not retried.
+    let policy_repo = git2::Repository::init_bare(root.path().join("policy")).unwrap();
+    let policy = GitHttpAuthServer::spawn_with(
+        policy_repo.path(),
+        "/git/buyer/job",
+        FixtureOptions {
+            private_job_host: true,
+            reject_request: Some((3, "400 Bad Request")),
+            reject_body: Some("private job snapshots cannot contain symlinks or submodules"),
+            ..Default::default()
+        },
+    );
     let brief = root.path().join("brief.md");
     std::fs::write(&brief, "confidential brief\n").unwrap();
     // Install all test trust anchors before either reqwest client is constructed.
     let mut pem = String::new();
-    for server in [&source, &relay, &refused, &with_inputs] {
+    for server in [&source, &relay, &refused, &with_inputs, &policy] {
         pem.push_str(&std::fs::read_to_string(server.ca_file(root.path())).unwrap());
     }
     let ca = root.path().join("all-ca.pem");
@@ -121,6 +133,7 @@ fn buyer_prepares_both_discovery_modes_retries_and_refuses_incomplete_publicatio
         ("targeted", Some(seller.public_key().to_hex()), &relay, true),
         ("refused", None, &refused, false),
         ("inputs", Some(seller.public_key().to_hex()), &with_inputs, true),
+        ("policy", None, &policy, false),
     ] {
         let mut home = home::bootstrap(root.path().join(label)).unwrap();
         home.config.relay_url = "ws://127.0.0.1:1".into();
@@ -193,6 +206,14 @@ fn buyer_prepares_both_discovery_modes_retries_and_refuses_incomplete_publicatio
             let store =
                 pc::store::ContentStore::open(&home.root.join("private-content.sqlite")).unwrap();
             assert!(store.event(&outcome.job_id).unwrap().is_some());
+        } else if label == "policy" {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("cannot contain symlinks or submodules"), "{error}");
+            assert_eq!(
+                server.requests().len(),
+                3,
+                "a permanent 400 is not retried: PUT, advertisement, one POST"
+            );
         } else if succeeds {
             let outcome = result.unwrap();
             let store =

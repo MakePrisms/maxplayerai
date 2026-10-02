@@ -3,6 +3,9 @@
 - Git upload retries no longer mistake HTTP-status digits or auth words in a
   repository URL for an authentication refusal. Actual permission refusals still
   stop immediately.
+- A permanent relay refusal of a private input upload (a 4xx other than 408, 409,
+  425 or 429, such as a quota or symlink/submodule refusal) is no longer retried
+  with a full re-upload, and the post error names the refusal.
 
 - Private contribution preparation forwards a single fetched pack unchanged to
   an empty input repository when the server supports it, including jobs that also

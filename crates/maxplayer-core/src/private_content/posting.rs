@@ -155,7 +155,7 @@ pub async fn post(
                 crate::git_transport::push_private_input(
                     &base_repo, &remote, &reference, &oid, mint,
                 )
-                .map_err(|_| Error("base input upload unavailable"))
+                .map_err(|e| repositories::upload_error(&e, "base input upload unavailable"))
             })
             .await
             .map_err(|_| Error("base input worker unavailable"))??;
