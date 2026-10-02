@@ -9,9 +9,11 @@
   libgit2 delta search. Other layouts retain the existing upload path; quotas,
   per-request authorization, redirect refusal and ref acknowledgement stay intact.
 - MCP `post_job` now returns a durable preparation handle for slow work. Poll it
-  with `get_job`; identical retries do not publish duplicate offers. An optional
-  `request_id` distinguishes deliberate repeat hires. Interrupted preparations
-  fail closed across daemon restarts; abandoned owned staging directories are
+  with `get_job`; identical retries do not publish duplicate offers and say
+  `deduplicated: true`. Without `request_id`, identical arguments dedupe for 10
+  minutes after completion; an explicit `request_id` never expires. A failure
+  before any offer was queued re-runs on retry; once an offer was queued, failures
+  and restarts are never re-run and name the offer id; abandoned owned staging directories are
   cleaned without touching live work or legacy unlabelled temporary directories.
   Buyer state adds an additive v8 preparation table; restart the buyer daemon and
   MCP server together after upgrading. No relay deployment is needed.

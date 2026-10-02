@@ -248,7 +248,8 @@ you read, or a note on the Maxplayer market channel (buzz).
 If `post_job` returns `status=preparing`, poll `get_job` using
 `job_id=<preparation_id>`. It is not yet a published job. Wait for `status=posted`
 and use the returned real `job_id` for collect. Do not repost to check progress.
-Identical arguments are durably deduplicated. An optional `request_id` must be
-reused unchanged on retry; choose a new one only for a deliberate separate hire.
-After an interrupted preparation, inspect buyer state before posting again: the
-offer may already exist. Never treat an MCP timeout as proof that nothing posted.
+A repeat returning `deduplicated: true` posted nothing new. Without `request_id`,
+identical arguments dedupe for 10 minutes after completion; `request_id` never
+expires and must be reused unchanged; a new one is a deliberate separate hire.
+An error naming an offer id may already be live: `get_job` it before posting again.
+Never treat an MCP timeout as proof that nothing posted.

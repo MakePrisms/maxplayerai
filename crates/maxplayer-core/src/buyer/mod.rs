@@ -237,7 +237,7 @@ async fn bootstrap(home: MaxplayerHome) -> Result<(HomeLock, Arc<BuyerContext>, 
     let store = BuyerStore::open(home.root.join(STATE_DB_FILE))?;
     let started_at_unix = now_unix();
     store.record_start(started_at_unix)?;
-    store.interrupt_preparations()?;
+    store.interrupt_preparations(started_at_unix)?;
     crate::private_content::posting::clean_stale_staging(&home.root)
         .map_err(|e| BuyerError::Io(e.to_string()))?;
 

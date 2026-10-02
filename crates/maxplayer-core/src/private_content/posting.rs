@@ -181,6 +181,9 @@ pub async fn post(
             .map_err(|_| Error("base input worker unavailable"))??;
         }
     }
+    // From the enqueue on, the outbox may publish this offer even after a crash.
+    crate::job_lifecycle::note_offer_before_publication(&prepared.event.id.to_hex())
+        .map_err(|_| Error("preparation state unavailable; offer not published"))?;
     if let Some(task) = &prepared.task {
         ctx.enqueue(&prepared.event, &prepared.event, None, None, None, task)?;
     } else {

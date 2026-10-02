@@ -104,7 +104,10 @@ impl BuyerStore {
             "CREATE TABLE IF NOT EXISTS post_preparations (
                  handle TEXT PRIMARY KEY,
                  fingerprint TEXT NOT NULL,
-                 response TEXT
+                 response TEXT,
+                 failed INTEGER NOT NULL DEFAULT 0,
+                 offer_id TEXT,
+                 completed_at INTEGER
              );
              CREATE TABLE IF NOT EXISTS buyer_meta (
                  key   TEXT PRIMARY KEY,
@@ -264,6 +267,22 @@ impl BuyerStore {
         // default-mint wallet, and NULL rows count against the default mint.
         if !Self::column_exists(conn, "reservations", "source_mint")? {
             conn.execute_batch("ALTER TABLE reservations ADD COLUMN source_mint TEXT;")?;
+        }
+        // v8 columns added during the same unreleased cycle as the table. A pre-column
+        // row never recorded whether an offer was signed, so a failed one is marked as
+        // possibly published (`offer_id 'unknown'`): never silently re-run.
+        if !Self::column_exists(conn, "post_preparations", "offer_id")? {
+            conn.execute_batch("ALTER TABLE post_preparations ADD COLUMN offer_id TEXT;")?;
+        }
+        if !Self::column_exists(conn, "post_preparations", "failed")? {
+            conn.execute_batch(
+                "ALTER TABLE post_preparations ADD COLUMN failed INTEGER NOT NULL DEFAULT 0;
+                 UPDATE post_preparations SET failed = 1, offer_id = 'unknown'
+                  WHERE response LIKE '%\"error\":%';",
+            )?;
+        }
+        if !Self::column_exists(conn, "post_preparations", "completed_at")? {
+            conn.execute_batch("ALTER TABLE post_preparations ADD COLUMN completed_at INTEGER;")?;
         }
         Ok(())
     }
