@@ -140,25 +140,43 @@ pub(crate) fn import(store: &Path, base_oid: &str) -> Result<bool, String> {
     let pairs = pack_pairs(&seed).map_err(|e| format!("read seed: {e}"))?;
     let pack_dir = store.join("objects/pack");
     private_dir(&pack_dir).map_err(|e| format!("store pack dir: {e}"))?;
-    for (pack, idx) in &pairs {
-        let (pack_name, idx_name) = (pack.file_name().unwrap(), idx.file_name().unwrap());
-        if pack_dir.join(idx_name).exists() {
-            continue;
+    // Files this import placed, so a failed import takes them back out of the store.
+    let mut placed = Vec::new();
+    let result = (|| {
+        for (pack, idx) in &pairs {
+            let (pack_name, idx_name) = (pack.file_name().unwrap(), idx.file_name().unwrap());
+            if pack_dir.join(idx_name).exists() {
+                continue;
+            }
+            // The pack lands before its index: libgit2 only loads a pack through its .idx, so
+            // a crash between the two leaves an unused file, never a half-visible pack. The
+            // staging name ends in `.part`, never `.idx`, so a torn copy is never scanned.
+            for (from, name) in [(pack, pack_name), (idx, idx_name)] {
+                let tmp = pack_dir.join(format!("tmp_seed_{}.part", name.to_string_lossy()));
+                fs::copy(from, &tmp).map_err(|e| format!("copy seed: {e}"))?;
+                let dest = pack_dir.join(name);
+                fs::rename(&tmp, &dest).map_err(|e| format!("place seed: {e}"))?;
+                placed.push(dest);
+            }
         }
-        // The pack lands before its index: libgit2 only loads a pack through its .idx, so a
-        // crash between the two leaves an unused file, never a half-visible pack.
-        for (from, name) in [(pack, pack_name), (idx, idx_name)] {
-            let tmp = pack_dir.join(format!("tmp_seed_{}", name.to_string_lossy()));
-            fs::copy(from, &tmp).map_err(|e| format!("copy seed: {e}"))?;
-            fs::rename(&tmp, pack_dir.join(name)).map_err(|e| format!("place seed: {e}"))?;
+        let repo = git2::Repository::open_bare(store).map_err(|e| format!("open store: {e}"))?;
+        let oid = git2::Oid::from_str(base_oid).map_err(|e| e.to_string())?;
+        repo.find_commit(oid)
+            .map_err(|_| "seed does not contain the base commit".to_owned())?;
+        Ok((repo, oid))
+    })();
+    let (repo, oid) = match result {
+        Ok(found) => found,
+        Err(error) => {
+            // Index files first, so no half-removed pack is ever visible.
+            placed.sort_by_key(|p| p.extension().is_none_or(|e| e != "idx"));
+            for path in placed {
+                let _ = fs::remove_file(path);
+            }
+            let _ = fs::remove_dir_all(&seed);
+            return Err(error);
         }
-    }
-    let repo = git2::Repository::open_bare(store).map_err(|e| format!("open store: {e}"))?;
-    let oid = git2::Oid::from_str(base_oid).map_err(|e| e.to_string())?;
-    if repo.find_commit(oid).is_err() {
-        let _ = fs::remove_dir_all(&seed);
-        return Err("seed does not contain the base commit".to_owned());
-    }
+    };
     if repo.find_reference(&base_ref(base_oid)).is_err() {
         repo.reference(&base_ref(base_oid), oid, false, "maxplayer seeded base")
             .map_err(|e| format!("base ref: {e}"))?;
@@ -253,6 +271,10 @@ mod tests {
                 .unwrap()
                 .find_reference(&base_ref(&other))
                 .is_err()
+        );
+        assert!(
+            pack_pairs(&store.join("objects/pack")).unwrap().is_empty(),
+            "a refused seed leaves none of its packs in the store"
         );
         let _ = (oid, fs::remove_dir_all(&root));
     }

@@ -78,9 +78,11 @@ impl<E: Clone + Send + 'static> PreflightGate<E> {
             inner.state.retain(|_, s| matches!(s, State::Running));
         }
         if running >= MAX_RUNNING || inner.state.len() >= MAX_TRACKED {
-            if inner.redrive.len() < MAX_TRACKED {
-                inner.redrive.insert(id.to_owned(), event.clone());
+            if inner.redrive.len() >= MAX_TRACKED && !inner.redrive.contains_key(id) {
+                // Nothing would re-drive it: say so, and let the next sighting retry.
+                return Gate::Failed("private input staging queue full".into());
             }
+            inner.redrive.insert(id.to_owned(), event.clone());
             return Gate::Pending;
         }
         inner.redrive.remove(id);
@@ -198,6 +200,31 @@ mod tests {
             gate.poll("o", &"e".to_owned(), || async { Ok(()) }),
             Gate::Failed(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_full_waiting_queue_reports_the_skip_instead_of_dropping_it() {
+        let gate = PreflightGate::new();
+        let mut releases = Vec::new();
+        for i in 0..MAX_RUNNING {
+            let (release, wait) = tokio::sync::oneshot::channel::<()>();
+            releases.push(release);
+            gate.poll(&format!("run{i}"), &format!("e{i}"), move || async move {
+                wait.await.ok();
+                Ok(())
+            });
+        }
+        for i in 0..MAX_TRACKED {
+            assert_eq!(
+                gate.poll(&format!("wait{i}"), &format!("w{i}"), || async { Ok(()) }),
+                Gate::Pending
+            );
+        }
+        assert!(matches!(
+            gate.poll("overflow", &"x".to_owned(), || async { Ok(()) }),
+            Gate::Failed(_)
+        ));
+        drop(releases);
     }
 
     #[tokio::test]

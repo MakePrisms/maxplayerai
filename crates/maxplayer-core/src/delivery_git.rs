@@ -211,11 +211,19 @@ impl GitDeliveryVerifier {
                     operation: "fetch-base",
                     cause: error.to_string(),
                 })?;
-            // The pinned target MUST actually contain base_oid — resolve it as a commit in the store.
+            // The pinned target MUST actually contain base_oid: it must be the fetched branch tip
+            // or one of its ancestors. Mere presence in the store is not enough — an earlier job,
+            // or a posting seed (#1096 review B2), can hold an object the branch no longer has.
             let parsed = Self::parse_oid(base_oid)?;
             repo.find_commit(parsed)
-                .map(|_| ())
-                .map_err(|_| DeliveryError::MissingBaseObject)
+                .map_err(|_| DeliveryError::MissingBaseObject)?;
+            let tip = repo
+                .refname_to_id(&fetched_ref)
+                .map_err(|_| DeliveryError::MissingBaseObject)?;
+            match tip == parsed || repo.graph_descendant_of(tip, parsed).unwrap_or(false) {
+                true => Ok(()),
+                false => Err(DeliveryError::MissingBaseObject),
+            }
         })
     }
 
@@ -1373,6 +1381,29 @@ mod contribution_tests {
         // fail-closed MissingBaseObject (the buyer never bases against an oid absent from the pin).
         assert!(matches!(
             v.fetch_base(fx.target_git.to_str().unwrap(), "main", &bogus_base),
+            Err(DeliveryError::MissingBaseObject)
+        ));
+    }
+
+    /// #1096 review B2 (advisor finding 1): a base object already in the store (a posting
+    /// seed, or an earlier job) must not stand in for the pinned branch containing it.
+    #[test]
+    fn base_present_in_store_but_absent_from_pinned_branch_fails_closed() {
+        let fx = scenario(1, "src/feature.rs");
+        let orphan = fx.root.join("orphan_seeded");
+        fs::create_dir_all(&orphan).unwrap();
+        ok(["init", "--initial-branch=main"], &orphan);
+        commit(&orphan, "z.txt", "orphan base\n", "orphan base");
+        let orphan_oid = oid(&orphan, "HEAD");
+        let mut v = GitDeliveryVerifier::new(&fx.store);
+        v.verify(&fork_delivery(&fx)).expect("fetch fork tip");
+        // Put the orphan's objects into the store, as a seed would.
+        let store = Repository::open_bare(&fx.store).unwrap();
+        let mut remote = store.remote_anonymous(orphan.to_str().unwrap()).unwrap();
+        remote.fetch(&["+refs/heads/main:refs/test/orphan"], None, None).unwrap();
+        assert!(store.find_commit(Oid::from_str(orphan_oid.as_str()).unwrap()).is_ok());
+        assert!(matches!(
+            v.fetch_base(fx.target_git.to_str().unwrap(), "main", &orphan_oid),
             Err(DeliveryError::MissingBaseObject)
         ));
     }
