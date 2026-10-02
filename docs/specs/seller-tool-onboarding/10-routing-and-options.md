@@ -99,7 +99,7 @@ host process, reaches the vendor. The vendor's host joins the PROXY's destinatio
 `ProxyEngine::new` builds from the registered credentials.
 
 Two transport shapes, because the ACP `mcpServers` entry has two wire forms (read off the baked
-`claude-agent-acp` 0.67.0 adapter, not guessed):
+`claude-agent-acp` 0.85.0 adapter, not guessed):
 
 - `stdio` (default): the agent spawns the bridge with `--proxy-url`, `--path` and `--placeholder`
   as flags. Flags, not env: a stdio server's `args` reach the child whenever a stdio server works at

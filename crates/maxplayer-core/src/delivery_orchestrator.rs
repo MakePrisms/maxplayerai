@@ -345,6 +345,9 @@ pub struct Phase1Inputs {
     /// The ACP harness argv the orchestrator drives (Task B9), as the host would have spawned it:
     /// the preset command plus any containment redirect flags. Carries NO secret.
     pub agent_argv: Vec<String>,
+    /// Typed ACP options from the operator, not agent environment or free-form Codex config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_session: Option<crate::home::CodexSessionSettings>,
     /// The workdir INSIDE the container ([`crate::seller_exec::CONTAINER_WORKDIR`]).
     pub workdir: PathBuf,
     /// The exchange directory INSIDE the container ([`CONTAINER_EXCHANGE_DIR`]).
@@ -600,7 +603,7 @@ fn drive_acp_agent(
     let env = agent_env_allowlist(&inputs.agent_env_names, &identity, |key| {
         std::env::var(key).ok()
     });
-    let policy = SandboxPolicy::passthrough();
+    let policy = SandboxPolicy::passthrough().with_codex_session(inputs.codex_session.clone());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1895,6 +1898,26 @@ mod tests {
 
     const NONCE: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+    #[test]
+    fn codex_session_settings_survive_container_handoff_and_old_inputs_default_to_none() {
+        let mut inputs = inputs_for(Path::new("/tmp/test"), PushTokenSource::None);
+        inputs.codex_session = Some(crate::home::CodexSessionSettings {
+            model: "gpt-5.6-sol".into(),
+            reasoning_effort: crate::home::CodexReasoningEffort::High,
+        });
+        let encoded = serde_json::to_value(&inputs).unwrap();
+        let decoded: Phase1Inputs = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded.codex_session, inputs.codex_session);
+        let mut legacy = encoded;
+        legacy.as_object_mut().unwrap().remove("codex_session");
+        assert!(
+            serde_json::from_value::<Phase1Inputs>(legacy)
+                .unwrap()
+                .codex_session
+                .is_none()
+        );
+    }
+
     // A from-scratch inputs literal for `root`, pushing to a remote the allowlist REFUSES — so the
     // push fails fast and locally (`TransportError::Transport`, never retried), which is what lets
     // these tests drive the whole entry sequence without a relay.
@@ -1907,6 +1930,7 @@ mod tests {
             message: "delivery".to_owned(),
             author_date_unix: DATE,
             agent_argv: vec!["claude-agent-acp".to_owned()],
+            codex_session: None,
             workdir: root.join("work"),
             out_dir: root.join("io"),
             prompt: "do the task".to_owned(),

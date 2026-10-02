@@ -1,3 +1,57 @@
+## v0.6.1-rc3
+
+Third release candidate for 0.6.1, prepared from main after the seller-credits stack
+merged (#1084–#1087). Once published, install with `npm install -g maxplayer@0.6.1-rc3`.
+This is a prerelease: publish on npm `rc`, leaving stable `latest` at v0.6.0.
+
+### Release scope
+
+RC3 is the first build from `main` with seller credits. It includes everything in RC2
+and the `nostr://` mint support and `maxplayer-mint` sidecar that RC1 tested from the
+unmerged stack, so RC1 testers can move to RC3. Known gap from RC1: a cross-mint hop
+that RC1 journaled with a `nostr://` source is no longer swept automatically;
+reconcile it by hand.
+
+### Changes since v0.6.1-rc2
+
+- Wallet support for `nostr://<npub>` mints, reached over Nostr relays instead of
+  HTTPS (#1085). Accept one by adding its URL to `accepted_mints` and running
+  `maxplayer wallet mints add <url>`. Melting is refused on every `nostr://` mint,
+  including through cross-mint hops, and a `nostr://` melt saga is never resumed
+  automatically. In-flight requests hold their inputs and cdk recovery until they can
+  no longer land.
+- `maxplayer-mint`, an opt-in sidecar that lets a seller issue its own credits
+  (1 credit = 1 sat) over Nostr, with no HTTP server and no open port (#1086). It
+  serves no minting or melting and says so in its info. It is not part of the
+  `maxplayer` binary or the npm package; build it from source
+  (`crates/maxplayer-mint/README.md`). A CI guard keeps cdk's mint code out of the
+  default build.
+- Seller-credits design spec (#1084), operator guide with backup and service setup,
+  and the end-to-end harness (#1087).
+- Buyer awards are reserved against the mint that will fund the job, not only the
+  default mint, so a buyer funded at an extra mint is no longer refused at award
+  (#1077). Refusals name the mint. The buyer store moves to schema v7 (an additive
+  column; older binaries still open it).
+- Website: production page-view analytics through Vercel, with query strings and
+  fragments stripped (#1083).
+
+- Docker Codex seats can explicitly select a model and reasoning effort through
+  `[sandbox.harnesses.codex]` (`model = "gpt-5.6-sol"`, `reasoning_effort = "high"`),
+  including ChatGPT subscription seats. ACP acknowledgments determine the advertised
+  model; authentication containment and behavior without the setting are unchanged.
+
+- Seller sandbox: update Codex ACP from 1.2.0 to 2.1.1 (Codex dependency
+  currently resolves to 0.159.3), refreshing support for current Codex models.
+  Available models still depend on the seller account. Ships with the next
+  versioned sandbox image; existing images are unchanged.
+
+- Seller sandbox: update Claude ACP to 0.85.0 (SDK 0.3.286 / Claude Code
+  2.1.286) and the standalone Claude CLI to 2.1.286, enabling Opus 5.5
+  (requires Claude Code >=2.1.280). Ships with the next versioned sandbox image.
+  To select it per seat, set `ANTHROPIC_MODEL=claude-opus-5-5` on the seller
+  daemon and add `forward_env = ["ANTHROPIC_MODEL"]` under `[sandbox]`, then
+  restart the seat. Keep any existing forwarded variables.
+
 ## v0.6.1-rc2
 
 Second release candidate for 0.6.1, prepared from main after the shared repository

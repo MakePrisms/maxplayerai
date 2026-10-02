@@ -8943,6 +8943,7 @@ impl SellerNodeRunner {
             message,
             author_date_unix: author_date,
             agent_argv: prepared.effective_command.clone(),
+            codex_session: prepared.codex_session.clone(),
             workdir: std::path::PathBuf::from(CONTAINER_WORKDIR),
             out_dir: std::path::PathBuf::from(orch::CONTAINER_EXCHANGE_DIR),
             prompt: prompt.to_owned(),

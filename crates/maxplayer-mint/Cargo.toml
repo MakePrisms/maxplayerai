@@ -1,0 +1,52 @@
+[package]
+name = "maxplayer-mint"
+version = "0.5.11"
+edition = "2024"
+description = "Opt-in Cashu mint sidecar for Maxplayer seller credits, reachable only over Nostr relays"
+repository = "https://github.com/MakePrisms/maxplayerai"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# ITS OWN WORKSPACE, on purpose (docs/specs/seller-credits.md §4, decision 12). cdk's `mint` feature
+# forces `cdk-signatory/grpc`, whose build script needs `protoc`. Cargo unifies features across every
+# package selected for a build, so as a member of the root workspace this crate would put cdk's mint
+# code — and the `protoc` requirement — into `cargo build --workspace`, which is what the default CI
+# job runs and what builds the `maxplayer` binary. A separate workspace with its own Cargo.lock keeps
+# the root graph byte-for-byte unchanged: `maxplayer` cannot depend on this crate, and nothing here
+# can leak a feature into it. Build it with `--manifest-path crates/maxplayer-mint/Cargo.toml`.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "maxplayer-mint"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+bip39 = "2.2"
+cdk = { version = "=0.17.2", default-features = false, features = ["mint"] }
+cdk-common = { version = "=0.17.2", default-features = false, features = ["mint"] }
+cdk-sqlite = { version = "=0.17.2", default-features = false, features = ["mint"] }
+getrandom = "0.3"
+# Default features only: `mint_wire` (the envelope types) needs serde and nothing else.
+maxplayer-core = { path = "../maxplayer-core" }
+nostr-sdk = { version = "0.44.1", features = ["nip44"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
+toml = "0.8"
+
+[dev-dependencies]
+cdk = { version = "=0.17.2", default-features = false, features = ["mint", "wallet"] }
+cdk-sqlite = { version = "=0.17.2", default-features = false, features = ["mint", "wallet"] }
+# The real stage-1 wallet connector, so tests drive the sidecar exactly as a buyer or seller would.
+maxplayer-core = { path = "../maxplayer-core", features = ["wallet"] }
+nostr-relay-builder = "0.44"
+tempfile = "3"
+# examples/local_relay.rs only: the auth-on-connect front the e2e run uses.
+tokio-tungstenite = "=0.26.2"
+futures-util = "0.3"
+uuid = { version = "1", features = ["v7"] }

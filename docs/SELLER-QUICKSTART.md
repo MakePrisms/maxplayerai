@@ -1670,6 +1670,18 @@ Credentials still have to be in **this** environment, not your login shell — a
 signed in for you is not signed in for the service unless its config lives under the same `%h`
 ([§3b](#3b-setup-gotchas--two-environment-prerequisites-that-silently-break-execute)).
 
+### Issue your own credits (optional)
+
+A seller can run its own credit mint, `maxplayer-mint`, and hand buyers credits (1 credit = 1 sat)
+to spend on jobs. It is a separate binary, not in the default release. Build, backup, service unit
+and setup: [`crates/maxplayer-mint/README.md`](../crates/maxplayer-mint/README.md).
+
+To accept **another** seller's credits, do both: append its `nostr://` URL to `accepted_mints`
+(after your Lightning mint, which stays first because the platform fee is paid from it), and run
+`maxplayer wallet mints add <nostr:// URL>`. Without the second step your node still takes the
+credits, but your wallet lists them as `role=unconfigured` and won't send them. Credits are never
+melted: `wallet melt` refuses any `nostr://` mint, configured or not.
+
 ---
 
 ## Acceptance checklist
@@ -1686,3 +1698,35 @@ signed in for you is not signed in for the service unless its config lives under
 → both open surfaces off by default; --accept-open-targeted for targeted offers from unnamed buyers, --claim-open-pool for the open pool
 → --rate-sats defaults to 100, the rate buyers post at: wallet nets face − fee; receipt records FACE, not net; dust refused up front
 ```
+
+
+### Codex model and reasoning effort (Docker)
+
+To select a model for a Docker Codex seat, add this to the seller's `config.toml`
+(keep the existing `[sandbox] mode = "docker"` and authentication configuration):
+
+```toml
+[sandbox.harnesses.codex]
+model = "gpt-5.6-sol"
+reasoning_effort = "high"
+```
+
+This works with API-key authentication and `[sandbox.codex_chatgpt]`. Restart the
+seller after editing. Both fields are required when this table is present. Effort
+must be one of `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `ultra`;
+the selected model must also offer that effort. Unknown efforts fail config loading;
+unavailable models/efforts fail the pre-advertise probe rather than falling back.
+Use a bare model ID, not `gpt-5.6-sol[high]`, in `model`.
+
+Maxplayer sets the adapter's ACP `model` and `reasoning_effort` session options
+before prompting and verifies the acknowledged values. Heartbeats, claims and
+results use the effective combined identity, e.g. `gpt-5.6-sol[high]` (buyer filters
+match it exactly). Omit the table to keep the adapter's existing defaults.
+
+This is not free-form Codex configuration: it cannot set providers, endpoints,
+credentials, approval modes or sandbox modes. ChatGPT mode continues to remove
+operator `CODEX_CONFIG` and `MODEL_PROVIDER`; do not add them to `forward_env`.
+No host Codex home is mounted. Only commands with basename `codex-acp` use this
+setting; Claude and other harnesses remain unchanged. Use matching updated seller
+and sandbox-image builds: an old installed image does not gain this feature from
+a config edit.

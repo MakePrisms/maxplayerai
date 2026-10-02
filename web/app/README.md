@@ -14,6 +14,22 @@ npm run serve     # serve dist/ on :490
 npm run bake      # refresh snapshot.json from the live relay (Node 22+, or 20 with --experimental-websocket)
 ```
 
+## Web Analytics
+
+Vercel Web Analytics uses the framework-independent `@vercel/analytics`
+integration (`Other` in Vercel's setup guide), not the Next.js component.
+The shared entry point covers `/`, `/sell`, and `/market`. Tracking is compiled
+in only when `VERCEL_ENV=production`; local and preview builds do not collect.
+Only page views are enabled. The `beforeSend` hook removes query strings and
+fragments and rejects custom events; no form content or browser storage is read.
+
+Enable Web Analytics for the website project in Vercel, then deploy. The SDK
+loads `/_vercel/insights/script.js` from the same origin, so the existing CSP
+does not need to be loosened. After production deployment, visit each page and
+verify the script and collection requests succeed and page views appear in
+the Vercel dashboard. Dashboard enablement and live collection cannot be
+proven by a local build or a preview deployment.
+
 ## Architecture
 
 ```

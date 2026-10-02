@@ -869,6 +869,14 @@ impl CdkHopEffects {
         source_mint: &str,
         target_mint: &str,
     ) -> Result<Self, HopError> {
+        // A hop melts at its source, and its recovery sweep asks the source melt quote's status —
+        // both cdk calls that can release `nostr://` inputs early. `plan_payment` never plans such a
+        // hop; this refuses a journaled one (or any other caller) before a wallet is even opened.
+        if crate::mint_wire::is_nostr_scheme(source_mint) {
+            return Err(HopError::Mint(format!(
+                "source mint {source_mint}: a nostr:// mint cannot be a hop source (it never melts)"
+            )));
+        }
         let source = buyer_fund::open_wallet_at_mint_async(home, source_mint)
             .await
             .map_err(|error| HopError::Mint(format!("source mint {source_mint}: {error}")))?;
@@ -924,11 +932,13 @@ impl CdkHopEffects {
                 self.target.mint_url, mint_quote.id
             )));
         }
-        let (melt_quote_id, quoted_cost, cost) =
-            self.raise_melt_quote(&mint_quote.request).await?;
+        let (melt_quote_id, quoted_cost, cost) = self.raise_melt_quote(&mint_quote.request).await?;
         self.require_source_covers(quoted_cost).await?;
-        let planned_cost =
-            authorized_hop_cost(quoted_cost, cost.fee_reserve, self.hop_fee_buffer_multiplier)?;
+        let planned_cost = authorized_hop_cost(
+            quoted_cost,
+            cost.fee_reserve,
+            self.hop_fee_buffer_multiplier,
+        )?;
         Ok(HopJournal {
             attempt_id: attempt_id.to_owned(),
             source_mint: self.source.mint_url.to_string(),
@@ -1230,12 +1240,21 @@ async fn sweep_one(
     let mut effects = CdkHopEffects::open(home, &pairing.source_mint, &pairing.target_mint).await?;
     let mut recovered = Vec::new();
     for (label, wallet) in [("source", &effects.source), ("target", &effects.target)] {
-        bounded(
+        // Never plain cdk recovery: on a nostr:// mint it would unspend inputs and drop swap rows
+        // while a signed request can still land. A held mint leaves the hop unfinished (fail-closed,
+        // printed as a strand) for the next sweep.
+        let outcome = bounded(
             &format!("{label} saga recovery"),
             HOP_LEG_TIMEOUT,
-            wallet.recover_incomplete_sagas(),
+            crate::payment_wallet::recover_incomplete_sagas_guarded(wallet),
         )
         .await?;
+        if let crate::payment_wallet::GuardedRecovery::Held(reason) = outcome {
+            return Err(HopError::Mint(format!(
+                "{label} saga recovery on {}: {reason}",
+                wallet.mint_url
+            )));
+        }
         recovered.push(wallet.mint_url.to_string());
     }
     require_both_mints_recovered(&recovered, &pairing)?;
@@ -1551,7 +1570,11 @@ mod tests {
         };
         let settled =
             run_hop(&store, &mut restarted, &journal("attempt-1")).expect("the restart recovers");
-        assert_eq!(world.borrow().melts.len(), 1, "the restart must not melt again");
+        assert_eq!(
+            world.borrow().melts.len(),
+            1,
+            "the restart must not melt again"
+        );
         assert_eq!(
             settled.unused_fee_reserve_sats, 0,
             "a recovered melt has no observed fee to reconcile (fail-safe)"
@@ -1922,6 +1945,23 @@ mod tests {
             matches!(err, HopError::Mint(_)),
             "a 4xx is a protocol bug, never clean-cancelled as downtime: {err:?}"
         );
+    }
+
+    // #1034 re-review: the opener is the guard for journal replay (`sweep_hops`) and authorize_pay's
+    // hop path. A nostr:// source must be refused before either wallet is opened.
+    #[tokio::test]
+    async fn a_nostr_source_cannot_open_a_hop() {
+        let root = scratch_dir("nostr-source-open");
+        let home = crate::home::bootstrap(&root).expect("bootstrap");
+        let nostr = "nostr://npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d";
+        let Err(error) = CdkHopEffects::open(&home, nostr, "https://seller.example").await else {
+            panic!("a nostr:// hop source opened");
+        };
+        assert!(
+            matches!(error, HopError::Mint(ref detail) if detail.contains("cannot be a hop source")),
+            "unexpected refusal: {error:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
