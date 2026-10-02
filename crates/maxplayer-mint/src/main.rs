@@ -50,8 +50,11 @@ async fn init(home: &MintHome) -> Result<()> {
         "BACK UP {} NOW, and keep exactly one live copy.",
         home.dir().display()
     );
-    println!("Losing it makes every credit this mint issued worthless.");
-    println!("Restoring an OLD copy can let credits that were already spent be spent again.");
+    println!("Losing nostr.key or seed makes every credit this mint issued worthless.");
+    println!(
+        "An OLD or MISSING mint.sqlite can let spent credits be spent again: never delete it."
+    );
+    println!("Stop `maxplayer-mint run` before you copy the directory.");
     Ok(())
 }
 

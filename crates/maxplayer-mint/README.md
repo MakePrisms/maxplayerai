@@ -30,14 +30,28 @@ This creates `<home>/mint/`, where `<home>` is `$MAXPLAYER_HOME` or `~/.maxplaye
 your `maxplayer` seller uses). It prints the mint's `nostr://` URL and the two setup lines from
 step 4. It refuses if `<home>/mint/` already exists.
 
-`<home>/mint/` holds everything the mint is: `nostr.key` (its identity), `seed`, `mint.sqlite`
-(keysets and spent proofs), `mint.toml`, and `issued/`. The directory is `0700`, the files `0600`.
+`<home>/mint/` holds everything the mint is:
+
+- `nostr.key` and `seed`: the mint itself. Whoever holds them can issue credits under your mint.
+- `mint.sqlite`: the keysets and every proof already spent.
+- `mint.toml`: relays and rate limit.
+- `issued/`: one token file per `issue`. A file nobody has received yet is spendable credits.
+
+The directory is created `0700`, and that mode is what keeps it private. `nostr.key`, `seed`,
+`mint.toml` and the token files are `0600`, but cdk creates `mint.sqlite` under your umask, so
+never loosen the directory mode.
 
 **Back it up now, and keep exactly one live copy.**
 
-- Losing it makes every credit the mint issued worthless. There is no platform backup.
-- Restoring an **old** copy can let credits that were already spent be spent again, because the
-  old database doesn't know about them. Restore only the latest copy, and never run two copies.
+- Losing `nostr.key` or `seed` makes every credit the mint issued worthless. There is no
+  platform backup.
+- An **old or missing** `mint.sqlite` can let credits that were already spent be spent again:
+  with the seed still there, the mint comes back with the same keys and no record of what was
+  spent. Restore only the latest copy, never delete `mint.sqlite` to fix a problem, and never
+  run two copies.
+- Stop the service before you copy the directory (`systemctl --user stop maxplayer-mint`, then
+  `start` again). A copy taken while `run` is serving can be torn.
+- Protect the backup like the mint: it can issue credits and holds every unreceived token.
 
 ## 2. Configure (optional)
 
@@ -66,7 +80,8 @@ Wants=network-online.target
 ExecStart=%h/.local/bin/maxplayer-mint run
 Environment=MAXPLAYER_HOME=%h/.maxplayer
 UMask=0077
-# `run` shuts down cleanly on SIGINT.
+NoNewPrivileges=yes
+# `run` shuts down cleanly on SIGINT. It does not handle SIGTERM.
 KillSignal=SIGINT
 Restart=always
 RestartSec=10
@@ -74,6 +89,13 @@ RestartSec=10
 [Install]
 WantedBy=default.target
 ```
+
+The unit runs as your user, so the mint can read the rest of `~/.maxplayer`, including the
+seller wallet. Don't count on systemd's filesystem options (`ProtectSystem=`, `ReadWritePaths=`,
+`PrivateTmp=`) to fence it in: in a user unit they need unprivileged user namespaces, and where
+those are restricted they can have no effect without any error. On our Ubuntu 24.04 host
+(systemd 255) they didn't stop the service writing outside `mint/`. To keep the mint away from
+the seller wallet, run it as a separate Unix user with its own `MAXPLAYER_HOME`.
 
 ```bash
 systemctl --user daemon-reload
@@ -104,8 +126,10 @@ maxplayer wallet mints add nostr://npub1…
 ```
 
 Without this step your node still takes payment in credits, but `maxplayer wallet balance` shows
-them as `role=unconfigured` and `send`/`melt` refuse them. Restart `maxplayer seller` after
-editing `config.toml`.
+them as `role=unconfigured` and `send` refuses them. With it, your wallet can send, receive and
+pay jobs directly with the credits. It never melts them: `wallet melt` and cross-mint hops refuse
+any `nostr://` mint, configured or not, and the mint itself serves no mint or melt. Restart
+`maxplayer seller` after editing `config.toml`.
 
 Any other seller who wants to accept your credits does the same two steps with your URL.
 
@@ -133,5 +157,5 @@ budget like sats, and your mint charges no fee.
 ## What isn't there yet
 
 - No Lightning backend: credits are only issued with `issue`, and can't be bought or cashed out
-  through the mint.
+  through the mint. `maxplayer wallet melt` refuses them too.
 - No expiry, revocation or retirement of credits.

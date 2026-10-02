@@ -13,13 +13,22 @@ Pieces:
   job inline, so no model and no git remote are needed.
 - `mcp-call.mjs`: calls one buyer MCP tool (`post_job`, `get_job`, `collect`).
 
-Binaries: `cargo build -p maxplayer --release --no-default-features --features wallet,acp` and,
-in this crate, `cargo build --example local_relay` plus the `maxplayer-mint` bin.
+Binaries, built from the repo root (`maxplayer-mint` is its own cargo workspace):
+
+```sh
+cargo build --release -p maxplayer --no-default-features --features wallet,acp
+cargo build --release --manifest-path crates/maxplayer-mint/Cargo.toml --bin maxplayer-mint --example local_relay
+```
+
+`maxplayer` lands in `target/release/`, `maxplayer-mint` in `crates/maxplayer-mint/target/release/`
+and the relay in `crates/maxplayer-mint/target/release/examples/`.
 
 ## Run
 
+From `crates/maxplayer-mint/e2e`, with `maxplayer` and `maxplayer-mint` on `PATH`:
+
 ```sh
-local_relay 47810                                  # prints ws://127.0.0.1:47810
+../target/release/examples/local_relay 47810       # prints ws://127.0.0.1:47810
 MAXPLAYER_HOME=$A maxplayer-mint init              # then mint.toml: relays = ["ws://127.0.0.1:47810"]
 MAXPLAYER_HOME=$A maxplayer-mint run &
 MAXPLAYER_HOME=$BUYER maxplayer whoami             # bootstraps; set relay_url, accepted_mints = [A]
@@ -45,7 +54,8 @@ The job was claimed, awarded and delivered inline. B's node received the 100 cre
 mint (`mint_fee=0 fee_sats=10 kept=90`). The buyer's payment journal went intent → locked → sent
 → receipt_published → closed. B's fee remit was refused before spending while B held 0 sats at
 its Lightning mint. After B was funded, B's retry paid 8 sats to `maxplayer@strike.me` plus a
-1-sat melt fee.
+1-sat melt fee. Both come out of the 10 sats accrued: core reserves the Lightning fee from the
+accrued amount and invoices the rest, and the unused reserve comes back to B's wallet as change.
 
 The wallet only treats `accepted_mints[0]` plus `extra_mints` as its own mints. So a seller that
 accepts a credit mint also runs `wallet mints add <credit mint>` (step above). Without it, B's
@@ -68,7 +78,6 @@ ran under `strace -f -e trace=connect`.
   - Buyer (MCP + daemon): the same three relays only. It never contacted any mint over HTTP.
   - B: the three relays, mint.minibits.cash (its Lightning mint), strike.me (LNURL). Never A over
     HTTP (A has no HTTP surface).
-- No process listened on a TCP port.
 
 Outbound HTTP was observed, not denied: this box has unprivileged user namespaces disabled, so no
 network policy could be enforced. The connect trace counts as the stage 3 check (Bob, 24 Sep). Paths

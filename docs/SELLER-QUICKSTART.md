@@ -1679,7 +1679,8 @@ and setup: [`crates/maxplayer-mint/README.md`](../crates/maxplayer-mint/README.m
 To accept **another** seller's credits, do both: append its `nostr://` URL to `accepted_mints`
 (after your Lightning mint, which stays first because the platform fee is paid from it), and run
 `maxplayer wallet mints add <nostr:// URL>`. Without the second step your node still takes the
-credits, but your wallet lists them as `role=unconfigured` and won't send or melt them.
+credits, but your wallet lists them as `role=unconfigured` and won't send them. Credits are never
+melted: `wallet melt` refuses any `nostr://` mint, configured or not.
 
 ---
 
