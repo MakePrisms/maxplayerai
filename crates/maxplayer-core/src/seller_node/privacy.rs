@@ -211,6 +211,12 @@ pub fn input_cache(home: &MaxplayerHome, offer: &str) -> std::path::PathBuf {
 }
 /// Prove the exact inputs are readable before CLAIM. Cache only verified Git
 /// objects; execution later uses this pinned baseline instead of fetching a new tip.
+/// Whether [`preflight`] has anything to stage. Offers without inputs or a contribution
+/// base skip the off-loop gate entirely.
+pub fn needs_preflight(resolved: &pc::lifecycle::ResolvedOffer) -> bool {
+    !resolved.attachments.is_empty() || resolved.contribution.is_some()
+}
+
 pub async fn preflight(
     home: &MaxplayerHome,
     signer: &super::signer::SignerHandle,

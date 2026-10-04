@@ -4354,6 +4354,9 @@ pub struct SellerNodeRunner {
     capacity_skip_pending: std::sync::atomic::AtomicBool,
     // Bounded off-loop review work; None is pending, Some is terminal until restart.
     review_checks: Arc<std::sync::Mutex<std::collections::BTreeMap<String, Option<Result<Option<String>, String>>>>>,
+    /// Pre-claim private input staging, off the event loop (#1096 review B2): a large base
+    /// can take minutes for the relay to pack. Finished offers are re-driven on the drain tick.
+    private_preflight: super::preflight::PreflightGate<nostr_sdk::Event>,
 
     /// #562: serializes delivery pushes to this seat's ONE `seller.git_remote`. Every awarded job
     /// executes on its own task and pushes a per-job branch to the SAME delivery repo; concurrent
@@ -4822,6 +4825,7 @@ impl SellerNodeRunner {
             slots,
             capacity_skip_pending: std::sync::atomic::AtomicBool::new(false),
             review_checks: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
+            private_preflight: super::preflight::PreflightGate::new(),
             delivery_push_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             terminal_offers: TerminalOffers::new(TERMINAL_OFFERS_CAP, TERMINAL_AUTHORS_PER_OFFER),
             fed_under_rate_offers: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
@@ -5633,6 +5637,9 @@ impl SellerNodeRunner {
                     continue;
                 }
                 _ = drain_tick.tick() => {
+                    for staged in self.private_preflight.take_redrive() {
+                        self.on_offer(&staged).await;
+                    }
                     self.sweep_lapsed_claims();
                     self.reconsider_capacity_skips().await;
                     self.start_due_harness_probes();
@@ -6696,10 +6703,29 @@ impl SellerNodeRunner {
                 opline!("seller public protocol marker failed id={}: {e}",event.id);return;
             }
         }
-        // Input staging is pre-claim. A missing input never becomes an empty job.
-        if let Some(resolved) = &private {
-            if let Err(e) = super::privacy::preflight(self.node.home(), self.node.signer(), event, resolved).await {
-                opline!("seller private inputs unavailable id={}: {e}", event.id); return;
+        // Input staging is pre-claim. A missing input never becomes an empty job. It runs
+        // off-loop: a large base can take minutes to pack, and this loop also serves awards,
+        // heartbeats and shutdown. A finished staging re-drives this offer on the drain tick.
+        if let Some(resolved) = private.as_ref().filter(|r| super::privacy::needs_preflight(r)) {
+            let (home, signer, staged, owned) = (
+                self.node.home().clone(),
+                self.node.signer().clone(),
+                event.clone(),
+                resolved.clone(),
+            );
+            match self.private_preflight.poll(&event.id.to_hex(), event, move || async move {
+                super::privacy::preflight(&home, &signer, &staged, &owned)
+                    .await
+                    .map_err(|e| e.to_string())
+            }) {
+                super::preflight::Gate::Ready => {}
+                super::preflight::Gate::Pending => {
+                    opline_verbose!("seller private inputs staging id={} (off-loop)", event.id);
+                    return;
+                }
+                super::preflight::Gate::Failed(e) => {
+                    opline!("seller private inputs unavailable id={}: {e}", event.id); return;
+                }
             }
         }
         let offer = if let Some(resolved) = &private { resolved.offer.clone() } else {

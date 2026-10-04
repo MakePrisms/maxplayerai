@@ -149,6 +149,42 @@ fn private_fetch_sends_the_signed_header_unchanged() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+// Regression (#1096 review B2): the seller's pre-claim read of a private base used the 10s
+// payment-verification client, but the relay packs a whole repository before its first byte
+// (11.6s for a 37 MB repo, 78s for 300 MB, measured against a real relay). Any medium repo
+// therefore failed to stage and the offer got no claim.
+#[test]
+fn private_fetch_survives_a_relay_that_packs_for_longer_than_ten_seconds() {
+    init_test_env();
+    let root = temp("slow-pack");
+    let reference = format!("refs/heads/input/{}", "ef".repeat(32));
+    let served = root.join("served.git");
+    let oid = bare_with_commit(&served, &reference);
+    git2::Repository::open_bare(&served)
+        .expect("open served")
+        .config()
+        .expect("served config")
+        .set_bool("uploadpack.allowReachableSHA1InWant", true)
+        .expect("allow a fetch by commit id");
+    let server = GitHttpAuthServer::spawn_with(
+        &served,
+        &private_mount(),
+        git_http_fixture::FixtureOptions {
+            first_response_delay: Some(std::time::Duration::from_secs(12)),
+            ..Default::default()
+        },
+    );
+    let url = server.repo_url();
+    let header = nip98_authorization_header_with_keys(&url, &nostr_sdk::Keys::generate(), None, None)
+        .expect("sign header");
+    let dest = git2::Repository::init_bare(root.join("dest.git")).expect("dest repo");
+    let started = std::time::Instant::now();
+    fetch_private_objects(&dest, &url, &[&oid], &header).expect("a slow relay pack still stages");
+    assert!(started.elapsed() >= std::time::Duration::from_secs(12));
+    assert!(dest.find_commit(git2::Oid::from_str(&oid).unwrap()).is_ok());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // The header goes only to relay Git, as it did when the fetch signed it from a key.
 #[test]
 fn bounded_fetch_sends_no_header_off_relay_git() {

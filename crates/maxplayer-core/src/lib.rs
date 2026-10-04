@@ -33,6 +33,8 @@ pub mod git_transport;
 pub mod delivery_orchestrator;
 #[cfg(feature = "git-delivery")]
 mod store_maint;
+#[cfg(feature = "git-delivery")]
+pub(crate) mod store_seed;
 #[cfg(feature = "wallet")]
 pub mod doctor;
 pub mod delivery_transport;

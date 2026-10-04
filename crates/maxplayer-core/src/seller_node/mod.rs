@@ -26,6 +26,7 @@ pub mod outbox;
 #[cfg(test)]
 pub(crate) mod p_gate_relay_fixture;
 pub mod publisher;
+pub(crate) mod preflight;
 pub(crate) mod privacy;
 pub mod run;
 pub mod shutdown;

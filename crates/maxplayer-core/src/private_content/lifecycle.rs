@@ -7,6 +7,7 @@ use super::{
 use crate::gateway::{ParsedOffer, PaymentMode};
 use nostr_sdk::prelude::Event;
 
+#[derive(Clone)]
 pub struct ResolvedOffer {
     pub offer: ParsedOffer,
     pub attachments: Vec<Attachment>,

@@ -264,6 +264,16 @@ fn buyer_prepares_both_discovery_modes_retries_and_refuses_incomplete_publicatio
                 destination.find_commit(parent).is_ok(),
                 "base history must be present too"
             );
+            // #1096 review B2: the fetched base is kept for the buyer's verify fetch.
+            let seed = home.root.join("store-seeds").join(base.to_string());
+            assert!(
+                std::fs::read_dir(&seed)
+                    .unwrap()
+                    .flatten()
+                    .any(|e| e.path().extension().is_some_and(|x| x == "idx")),
+                "base seed kept at {}",
+                seed.display()
+            );
         } else {
             assert!(result.is_err());
             let db = rusqlite::Connection::open(home.root.join("private-content.sqlite")).unwrap();

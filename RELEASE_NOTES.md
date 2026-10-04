@@ -1,5 +1,18 @@
 ## Unreleased
 
+- Private contributions on larger repositories no longer time out. The relay
+  packs a whole repository before its first byte (about 11 s for 37 MB and 75 s
+  for 300 MB), which outlasted the 10 s client on two reads:
+  - Seller: the pre-claim read of private inputs and contribution bases uses the
+    large-transfer client (300 s per leg) and runs off the seller event loop, so
+    heartbeats, awards and shutdown keep running; a finished staging re-drives
+    the offer. At most 4 run at once.
+  - Buyer: posting keeps the fetched base under `<home>/store-seeds/` (up to
+    14 days), and collect imports it into the delivery store before fetching the
+    delivered fork, so that fetch asks only for the seller's new commits (under
+    0.3 s for the same 300 MB repository). Every verification gate still runs;
+    a missing seed only means the old, slower fetch.
+  No relay deployment is needed. Update sellers and buyers.
 - Git upload retries no longer mistake HTTP-status digits or auth words in a
   repository URL for an authentication refusal. Actual permission refusals still
   stop immediately.
