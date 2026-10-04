@@ -49,7 +49,11 @@
 //! that one ref of that one repository until it expires. The binding above keeps it from leaving.
 
 #[cfg(feature = "wallet")]
+mod local_base;
+#[cfg(feature = "wallet")]
 mod pack_forward;
+#[cfg(feature = "wallet")]
+pub use local_base::prepare_private_input_base;
 
 use std::cell::RefCell;
 use std::io::{self, Read, Write};
@@ -846,6 +850,9 @@ fn push_gated_object(
     }
     let mut options = PushOptions::new();
     options.remote_callbacks(callbacks);
+    if BUYER_INPUT_HTTP.get() {
+        options.packbuilder_parallelism(0);
+    }
 
     if lifetime.is_some() {
         silence_local_pack_abort_panics();

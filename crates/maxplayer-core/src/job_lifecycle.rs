@@ -138,6 +138,8 @@ pub enum JobKind {
 pub struct ContributionSpec {
     pub target_repo_owner: String,
     pub target_repo_url: String,
+    /// Absolute checkout path on the buyer daemon. Never included in offer pins.
+    pub base_local_path: Option<PathBuf>,
     pub base_branch: String,
     pub base_oid: String,
     pub accepts: Option<Vec<String>>,
@@ -924,6 +926,15 @@ fn contribution_offer_from_spec(
 ) -> Result<crate::contribution::ContributionOffer, JobLifecycleError> {
     use crate::contribution::{ContributionBase, ContributionOffer, TargetRepoPin, ACCEPTS_FORK};
 
+    if spec
+        .base_local_path
+        .as_ref()
+        .is_some_and(|path| !path.is_absolute())
+    {
+        return Err(JobLifecycleError::Input(
+            "base_local_path must be an absolute path on the buyer daemon machine".into(),
+        ));
+    }
     let owner = spec.target_repo_owner.trim().to_owned();
     let url = spec.target_repo_url.trim().to_owned();
     let branch = spec.base_branch.trim().to_owned();
@@ -6584,6 +6595,7 @@ mod tests {
         ContributionSpec {
             target_repo_owner: owner.into(),
             target_repo_url: url.into(),
+            base_local_path: None,
             base_branch: branch.into(),
             base_oid: oid.into(),
             accepts,
@@ -6618,6 +6630,40 @@ mod tests {
             requested_model: None,
             required_capabilities: Vec::new(),
         }
+    }
+
+    #[test]
+    fn local_base_path_is_absolute_and_never_in_offer() {
+        let mut request = contribution_post_request(
+            &"aa".repeat(32),
+            "https://example.test/private",
+            "main",
+            &"bb".repeat(20),
+            None,
+        );
+        let JobKind::Contribution(spec) = &request.job else {
+            unreachable!()
+        };
+        let without = contribution_offer_from_spec(spec).unwrap();
+        let before = build_offer_draft(&request, 10, Some(&without)).unwrap();
+        let JobKind::Contribution(spec) = &mut request.job else {
+            unreachable!()
+        };
+        spec.base_local_path = Some("/private/checkout".into());
+        let with = contribution_offer_from_spec(spec).unwrap();
+        assert_eq!(with, without, "local-only path must not enter wire pins");
+        let after = build_offer_draft(&request, 10, Some(&with)).unwrap();
+        assert_eq!(before, after, "event and tags must be unchanged");
+        let JobKind::Contribution(spec) = &mut request.job else {
+            unreachable!()
+        };
+        spec.base_local_path = Some("relative".into());
+        assert!(
+            contribution_offer_from_spec(spec)
+                .unwrap_err()
+                .to_string()
+                .contains("absolute path")
+        );
     }
 
     #[test]

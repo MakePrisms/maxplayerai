@@ -225,7 +225,7 @@ fn tools() -> Value {
     json!([
         {
             "name": "post_job",
-            "description": with_guides("Publish a real maxplayer job offer (OFFER kind) to the configured maxplayer relay, then let the buyer daemon drive the award: once a payable seller claim appears the daemon auto-awards it under the hood, so the normal flow is just post_job then collect (two calls). max_sats caps what the daemon will commit to (defaults to amount_sats); it never auto-awards a claim it cannot pay. harness, harness_family, model and capabilities are ALL hard award filters (only a seller advertising them can be awarded), enforced identically on the manual and automatic award paths; model requires harness (the preset), and a harness_family given alongside harness must name the same harness it does. Omit them all and every claim passes exactly as before. Targeted seller p-tag is the documented default (pass seller_pubkey); set untargeted=true for an open offer. Optional repo+branch attach git delivery tags. CONTRIBUTION (freelance-PR) mode: supply target_repo_owner + target_repo_url + base_branch + base_oid to post a job-class=contribution offer against a repo you own (seller forks it and delivers a PR); these four are ALL-OR-NOTHING (a partial set is refused). Omit all four ⇒ from-scratch job. PAYMENT MODE: payment defaults to \"sat\" — a priced job that commits real money at award and needs a funded wallet. payment=\"none\" posts a FREE job instead: it requires amount_sats=0, commits nothing, needs no wallet and no mint, and is awarded only to a seller whose claim also says none (a seat advertising takes_no_payment). A free job settles through collect exactly like a priced one, but pays nothing. Slow preparation returns status=preparing with preparation_id; this is NOT a published job. Poll get_job with job_id=preparation_id until status=posted yields the real job_id, then use that job_id normally. Never repost with changed arguments to poll. An identical retry attaches to the same preparation (status=posted with deduplicated=true means nothing new was published); without request_id that only holds for 10 minutes after it finishes, so a later identical post is a new hire. A failure before any offer was queued re-runs on retry. request_id is a permanent idempotency key; a new one is a deliberate new hire. Never echoes secrets."),
+            "description": with_guides("Publish a real maxplayer job offer (OFFER kind) to the configured maxplayer relay, then let the buyer daemon drive the award: once a payable seller claim appears the daemon auto-awards it under the hood, so the normal flow is just post_job then collect (two calls). max_sats caps what the daemon will commit to (defaults to amount_sats); it never auto-awards a claim it cannot pay. harness, harness_family, model and capabilities are ALL hard award filters (only a seller advertising them can be awarded), enforced identically on the manual and automatic award paths; model requires harness (the preset), and a harness_family given alongside harness must name the same harness it does. Omit them all and every claim passes exactly as before. Targeted seller p-tag is the documented default (pass seller_pubkey); set untargeted=true for an open offer. Optional repo+branch attach git delivery tags. CONTRIBUTION (freelance-PR) mode: supply target_repo_owner + target_repo_url + base_branch + base_oid to post a job-class=contribution offer against a repo you own (seller forks it and delivers a PR); these four are ALL-OR-NOTHING (a partial set is refused). Omit all four ⇒ from-scratch job. Optional base_local_path is an absolute checkout or bare-repo path on the buyer daemon machine, valid only in contribution mode. For private posts it supplies only the pinned base and its history; the path stays local. If unavailable, the buyer downloads target_repo_url as usual. Private open-pool sellers still need access to target_repo_url before claiming; use a targeted seller for a private upstream. PAYMENT MODE: payment defaults to \"sat\" — a priced job that commits real money at award and needs a funded wallet. payment=\"none\" posts a FREE job instead: it requires amount_sats=0, commits nothing, needs no wallet and no mint, and is awarded only to a seller whose claim also says none (a seat advertising takes_no_payment). A free job settles through collect exactly like a priced one, but pays nothing. Slow preparation returns status=preparing with preparation_id; this is NOT a published job. Poll get_job with job_id=preparation_id until status=posted yields the real job_id, then use that job_id normally. Never repost with changed arguments to poll. An identical retry attaches to the same preparation (status=posted with deduplicated=true means nothing new was published); without request_id that only holds for 10 minutes after it finishes, so a later identical post is a new hire. A failure before any offer was queued re-runs on retry. request_id is a permanent idempotency key; a new one is a deliberate new hire. Never echoes secrets."),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -292,6 +292,10 @@ fn tools() -> Value {
                     "target_repo_owner": {
                         "type": "string",
                         "description": "Contribution mode: owner pubkey (64 hex) of the target repo you own. Requires target_repo_url + base_branch + base_oid."
+                    },
+                    "base_local_path": {
+                        "type": "string",
+                        "description": "Contribution only: absolute path to a local checkout (including a linked worktree) or bare repo on the buyer daemon machine. Private posts use the pinned commit and its history, never other branches or uncommitted files. The path stays local. Falls back to target_repo_url if unusable. Public posts do not upload a base."
                     },
                     "target_repo_url": {
                         "type": "string",
@@ -577,6 +581,25 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn local_base_mcp_schema_exposes_local_only_contribution_hint() {
+        let list = tools();
+        let post = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "post_job")
+            .unwrap();
+        let param = &post["inputSchema"]["properties"]["base_local_path"];
+        assert_eq!(param["type"], "string");
+        assert!(
+            param["description"]
+                .as_str()
+                .unwrap()
+                .contains("buyer daemon")
+        );
+    }
 
     // The post_job schema promises that EVERY request axis constrains award selection (#897 wired
     // the last of them). Keep those caller-facing claims tied to the real award predicate: removing
