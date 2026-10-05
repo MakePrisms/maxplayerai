@@ -138,6 +138,8 @@ pub enum JobKind {
 pub struct ContributionSpec {
     pub target_repo_owner: String,
     pub target_repo_url: String,
+    /// Absolute checkout path on the buyer daemon. Never included in offer pins.
+    pub base_local_path: Option<PathBuf>,
     pub base_branch: String,
     pub base_oid: String,
     pub accepts: Option<Vec<String>>,
@@ -684,6 +686,17 @@ pub async fn post_job_async(
             "post_job requires seller_pubkey (targeted default) or untargeted=true".into(),
         ));
     }
+    // Open-pool sellers check the base from target_repo_url before any seller is picked, so
+    // they never see a base read from a local checkout: the job would silently get no claims.
+    if request.untargeted
+        && matches!(&request.job, JobKind::Contribution(spec) if spec.base_local_path.is_some())
+    {
+        return Err(JobLifecycleError::Input(
+            "base_local_path only works for a direct job (set seller_pubkey): in an open-pool job \
+             sellers must be able to read target_repo_url themselves before claiming"
+                .into(),
+        ));
+    }
     match (&request.repo, &request.branch) {
         (Some(_), None) | (None, Some(_)) => {
             return Err(JobLifecycleError::Input(
@@ -924,6 +937,15 @@ fn contribution_offer_from_spec(
 ) -> Result<crate::contribution::ContributionOffer, JobLifecycleError> {
     use crate::contribution::{ContributionBase, ContributionOffer, TargetRepoPin, ACCEPTS_FORK};
 
+    if spec
+        .base_local_path
+        .as_ref()
+        .is_some_and(|path| !path.is_absolute())
+    {
+        return Err(JobLifecycleError::Input(
+            "base_local_path must be an absolute path on the buyer daemon machine".into(),
+        ));
+    }
     let owner = spec.target_repo_owner.trim().to_owned();
     let url = spec.target_repo_url.trim().to_owned();
     let branch = spec.base_branch.trim().to_owned();
@@ -5762,6 +5784,36 @@ mod tests {
     }
 
     #[test]
+    fn post_job_refuses_local_base_on_open_pool() {
+        let root = std::env::temp_dir().join(format!(
+            "maxplayer-jobs-local-open-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+        let mut request = contribution_post_request(
+            &"aa".repeat(32),
+            "https://example.test/private",
+            "main",
+            &"bb".repeat(20),
+            None,
+        );
+        assert!(request.untargeted);
+        if let JobKind::Contribution(spec) = &mut request.job {
+            spec.base_local_path = Some("/private/checkout".into());
+        }
+        let err = post_job(&home, request).expect_err("open-pool local base refused");
+        let msg = err.to_string();
+        assert!(msg.contains("base_local_path only works for a direct job"), "{msg}");
+        assert!(msg.contains("seller_pubkey"), "{msg}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn post_job_refuses_missing_seller_without_untargeted() {
         let root = std::env::temp_dir().join(format!(
             "maxplayer-jobs-post-{}-{}",
@@ -6584,6 +6636,7 @@ mod tests {
         ContributionSpec {
             target_repo_owner: owner.into(),
             target_repo_url: url.into(),
+            base_local_path: None,
             base_branch: branch.into(),
             base_oid: oid.into(),
             accepts,
@@ -6618,6 +6671,40 @@ mod tests {
             requested_model: None,
             required_capabilities: Vec::new(),
         }
+    }
+
+    #[test]
+    fn local_base_path_is_absolute_and_never_in_offer() {
+        let mut request = contribution_post_request(
+            &"aa".repeat(32),
+            "https://example.test/private",
+            "main",
+            &"bb".repeat(20),
+            None,
+        );
+        let JobKind::Contribution(spec) = &request.job else {
+            unreachable!()
+        };
+        let without = contribution_offer_from_spec(spec).unwrap();
+        let before = build_offer_draft(&request, 10, Some(&without)).unwrap();
+        let JobKind::Contribution(spec) = &mut request.job else {
+            unreachable!()
+        };
+        spec.base_local_path = Some("/private/checkout".into());
+        let with = contribution_offer_from_spec(spec).unwrap();
+        assert_eq!(with, without, "local-only path must not enter wire pins");
+        let after = build_offer_draft(&request, 10, Some(&with)).unwrap();
+        assert_eq!(before, after, "event and tags must be unchanged");
+        let JobKind::Contribution(spec) = &mut request.job else {
+            unreachable!()
+        };
+        spec.base_local_path = Some("relative".into());
+        assert!(
+            contribution_offer_from_spec(spec)
+                .unwrap_err()
+                .to_string()
+                .contains("absolute path")
+        );
     }
 
     #[test]

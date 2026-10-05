@@ -1,5 +1,13 @@
 ## Unreleased
 
+- Private contribution jobs can use `base_local_path`, an absolute checkout or
+  bare-repository path on the buyer daemon machine. The buyer uploads only the
+  pinned commit and its history, not other branches or uncommitted files. The
+  path stays local. An unavailable checkout falls back to the usual URL download.
+  It works only for a direct job (`seller_pubkey`); an open-pool post with
+  `base_local_path` is refused, because open-pool sellers must read the
+  original URL before claiming. Symlinks and submodules remain unsupported.
+
 - Private contributions on larger repositories no longer time out. The relay
   packs a whole repository before its first byte (about 11 s for 37 MB and 75 s
   for 300 MB), which outlasted the 10 s client on two reads:

@@ -247,3 +247,40 @@ error then names the offer id: inspect it with `get_job`, and award it with
 The daemon cleans abandoned directories in `private-input-staging/` on startup,
 using per-directory locks to preserve live work. Legacy unlabelled `.tmp*`
 directories are left untouched rather than guessing which files are safe to delete.
+
+## Use a local checkout for a private contribution
+
+When the target repository is private, pass `base_local_path` to `post_job`
+alongside all four contribution pins: `target_repo_owner`, `target_repo_url`,
+`base_branch`, and `base_oid`. Use an absolute path on the **machine running the
+buyer daemon**, not on a remote MCP client. A normal checkout, linked worktree,
+or bare repository works. For example:
+
+```json
+{
+  "visibility": "private",
+  "output_category": "code",
+  "base_local_path": "/home/me/projects/my-repo"
+}
+```
+
+These are additions to your usual job arguments and contribution pins, not a
+complete post request. Keep `target_repo_url` as the repository's HTTPS URL.
+The local repository must contain the exact `base_oid` commit and its history.
+The buyer copies only objects reachable from that commit: other branches,
+unreachable objects and uncommitted changes are not uploaded. It does not check
+the pin against the remote, run Git hooks, or require the Git command-line tool.
+The local path is never included in the offer, seller task, or relay request.
+
+If the path is missing, cannot be opened, or lacks the commit or its history, the
+buyer logs one line and tries the usual URL download. A private upstream without
+a usable local copy can still fail because the built-in downloader does not use
+your SSH keys or credential helper. Relative paths and paths supplied without
+contribution pins are refused. Public posts do not upload a base.
+
+`base_local_path` works only for a direct job: set `seller_pubkey`. That
+seller reads the uploaded base from the private job repository. An open-pool
+post (`untargeted=true`) with `base_local_path` is refused before anything is
+uploaded, because open-pool sellers fetch the original URL themselves before
+claiming and would never see the local copy. Existing size limits and the refusal of
+symlinks or submodules anywhere in the base history still apply.

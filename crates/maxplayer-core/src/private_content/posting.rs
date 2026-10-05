@@ -54,55 +54,69 @@ pub async fn post(
         ),
         None => None,
     };
-    let imported_ref = if let (Some((source, oid)), Some(base_staging)) =
-        (&imported_base, &base_staging)
-    {
-        let base_repo = git2::Repository::init_bare(base_staging.path())
-            .map_err(|_| Error("input staging unavailable"))?;
-        let mint = if crate::delivery_transport::is_relay_git_locator(source) {
-            let intended = source.clone();
-            let signing = keys.clone();
-            Some(std::sync::Arc::new(move |destination: &str| {
-                if !crate::git_transport::same_destination(&intended, destination) {
-                    return Err("wrong base input source".into());
+    let imported_ref =
+        if let (Some((source, oid)), Some(base_staging)) = (&imported_base, &base_staging) {
+            let base_repo = git2::Repository::init_bare(base_staging.path())
+                .map_err(|_| Error("input staging unavailable"))?;
+            let mint = if crate::delivery_transport::is_relay_git_locator(source) {
+                let intended = source.clone();
+                let signing = keys.clone();
+                Some(std::sync::Arc::new(move |destination: &str| {
+                    if !crate::git_transport::same_destination(&intended, destination) {
+                        return Err("wrong base input source".into());
+                    }
+                    crate::git_transport::nip98_authorization_header_with_keys(
+                        destination,
+                        &signing,
+                        None,
+                        None,
+                    )
+                    .map_err(|e| e.to_string())
+                }) as crate::git_transport::AuthMinter)
+            } else {
+                None
+            };
+            let (source, oid) = (source.clone(), oid.clone());
+            let local_path = match &request.job {
+                crate::job_lifecycle::JobKind::Contribution(spec) => spec.base_local_path.clone(),
+                crate::job_lifecycle::JobKind::FromScratch => None,
+            };
+            let inputs_path = snapshot.as_ref().map(|_| staging.path().to_owned());
+            let base_repo = tokio::task::spawn_blocking(move || {
+                crate::git_transport::prepare_private_input_base(
+                    &base_repo,
+                    local_path.as_deref(),
+                    &source,
+                    &oid,
+                    mint,
+                )
+                .map_err(|_| Error("pinned contribution base unavailable"))?;
+                let used = repositories::check_objects_after(&base_repo, Default::default())?;
+                // Base and inputs land in one job repository: check their combined quota
+                // before uploading either, not each staging repository alone.
+                if let Some(path) = inputs_path {
+                    let inputs = git2::Repository::open_bare(path)
+                        .map_err(|_| Error("input staging unavailable"))?;
+                    repositories::check_objects_after(&inputs, used)?;
                 }
-                crate::git_transport::nip98_authorization_header_with_keys(
-                    destination, &signing, None, None,
-                ).map_err(|e| e.to_string())
-            }) as crate::git_transport::AuthMinter)
+                Ok::<_, Error>(base_repo)
+            })
+            .await
+            .map_err(|_| Error("base input worker unavailable"))??;
+            let reference = format!("refs/heads/input/{}", super::random_id()?);
+            base_repo
+                .reference(
+                    &reference,
+                    git2::Oid::from_str(&imported_base.as_ref().unwrap().1)
+                        .map_err(|_| Error("invalid base pin"))?,
+                    false,
+                    "pinned input",
+                )
+                .map_err(|_| Error("base input pin unavailable"))?;
+            Some((base_repo, reference))
         } else {
             None
         };
-        let (source, oid) = (source.clone(), oid.clone());
-        let inputs_path = snapshot.as_ref().map(|_| staging.path().to_owned());
-        let base_repo = tokio::task::spawn_blocking(move || {
-            crate::git_transport::fetch_private_input_base(&base_repo, &source, &oid, mint)
-                .map_err(|_| Error("pinned contribution base unavailable"))?;
-            let used = repositories::check_objects_after(&base_repo, Default::default())?;
-            // Base and inputs land in one job repository: check their combined quota
-            // before uploading either, not each staging repository alone.
-            if let Some(path) = inputs_path {
-                let inputs = git2::Repository::open_bare(path)
-                    .map_err(|_| Error("input staging unavailable"))?;
-                repositories::check_objects_after(&inputs, used)?;
-            }
-            Ok::<_, Error>(base_repo)
-        })
-        .await
-        .map_err(|_| Error("base input worker unavailable"))??;
-        let reference = format!("refs/heads/input/{}", super::random_id()?);
-        base_repo.reference(
-            &reference,
-            git2::Oid::from_str(&imported_base.as_ref().unwrap().1)
-                .map_err(|_| Error("invalid base pin"))?,
-            false,
-            "pinned input",
-        )
-        .map_err(|_| Error("base input pin unavailable"))?;
-        Some((base_repo, reference))
-    } else {
-        None
-    };
     let pin = contribution.map(|c| super::Contribution {
         target_owner_pubkey: c.target.owner_pubkey().into(),
         target_clone_url: c.target.clone_url().into(),
@@ -191,7 +205,8 @@ pub async fn post(
                 )
                 .map_err(|e| e.to_string())
             });
-            let (snapshot, task, path) = (snapshot.clone(), task.clone(), staging.path().to_owned());
+            let (snapshot, task, path) =
+                (snapshot.clone(), task.clone(), staging.path().to_owned());
             let host = wire::HostPolicy {
                 git_prefix: ctx.policy.host.git_prefix.clone(),
                 accepted_mints: ctx.policy.host.accepted_mints.clone(),

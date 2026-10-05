@@ -463,6 +463,9 @@ struct PostJobParams {
     target_repo_owner: Option<String>,
     #[serde(default)]
     target_repo_url: Option<String>,
+    /// Local-only hint on the buyer daemon machine; never an offer field.
+    #[serde(default)]
+    base_local_path: Option<std::path::PathBuf>,
     #[serde(default)]
     base_branch: Option<String>,
     #[serde(default)]
@@ -550,11 +553,15 @@ fn post_job_kind(params: &PostJobParams) -> Result<JobKind, String> {
         &params.base_branch,
         &params.base_oid,
     ) {
+        (None, None, None, None) if params.base_local_path.is_some() => {
+            Err("base_local_path is only valid in contribution mode".into())
+        }
         (None, None, None, None) => Ok(JobKind::FromScratch),
         (Some(owner), Some(url), Some(branch), Some(oid)) => {
             Ok(JobKind::Contribution(ContributionSpec {
                 target_repo_owner: owner.clone(),
                 target_repo_url: url.clone(),
+                base_local_path: params.base_local_path.clone(),
                 base_branch: branch.clone(),
                 base_oid: oid.clone(),
                 accepts: params.accepts.clone(),
@@ -6747,6 +6754,29 @@ mod tests {
     // FREE JOB LANE — the `post_job` RPC's `payment` parameter (§1.1). This is the surface that
     // makes the lane reachable by a user; until it existed the daemon hardcoded `Sat`.
     // ————————————————————————————————————————————————————————————————————————————————————————
+
+    #[test]
+    fn local_base_rpc_requires_contribution_and_preserves_path() {
+        let mut body = json!({"task":"t", "output":"git", "amount_sats":0, "base_local_path":"/private/checkout"});
+        let params: PostJobParams = serde_json::from_value(body.clone()).unwrap();
+        assert!(
+            post_job_kind(&params)
+                .unwrap_err()
+                .contains("only valid in contribution mode")
+        );
+        body["target_repo_owner"] = json!("aa".repeat(32));
+        body["target_repo_url"] = json!("https://example.test/private");
+        body["base_branch"] = json!("main");
+        body["base_oid"] = json!("bb".repeat(20));
+        let params: PostJobParams = serde_json::from_value(body).unwrap();
+        let JobKind::Contribution(spec) = post_job_kind(&params).unwrap() else {
+            panic!("contribution lost")
+        };
+        assert_eq!(
+            spec.base_local_path.as_deref(),
+            Some(std::path::Path::new("/private/checkout"))
+        );
+    }
 
     /// The mode a `post_job` request body resolves to, going through the REAL deserializer — so a
     /// `#[serde(default)]` that stopped defaulting, or a field renamed on one side only, is caught
