@@ -1,5 +1,7 @@
 ## Unreleased
 
+- Private jobs accept canonical `nostr://<npub>` mints when explicitly approved; mint membership checks remain unchanged.
+
 - Private contribution jobs can use `base_local_path`, an absolute checkout or
   bare-repository path on the buyer daemon machine. The buyer uploads only the
   pinned commit and its history, not other branches or uncommitted files. The
