@@ -1,6 +1,21 @@
-## Unreleased
+## v0.6.1-rc6
 
-- Private jobs accept canonical `nostr://<npub>` mints when explicitly approved; mint membership checks remain unchanged.
+Sixth release candidate for 0.6.1, prepared from main after the private-contribution
+speed and timeout fixes (#1096, #1097, #1098) and the seller mint fixes (#1091, #1092).
+rc5 was prepared but never tagged; this release supersedes it. Once published, install with
+`npm install -g maxplayer@0.6.1-rc6`. This is a prerelease: publish on npm `rc`,
+leaving stable `latest` unchanged at v0.6.0.
+
+### Changes since v0.6.1-rc4
+
+- Private jobs accept canonical `nostr://<npub>` mints when explicitly approved
+  (lowercase npub with a valid checksum; no path, port, query or fragment).
+  Mint membership checks are unchanged: every mint in a private claim, and the
+  realized receipt mint, must still be in the validating client's
+  `accepted_mints`; a mint only in `extra_mints` is still refused (#1092).
+- `wallet mints add` and `wallet setup --mint` on a seller home print a one-line
+  note when the mint is not in `accepted_mints`, since only `accepted_mints`
+  reaches seller claims. `accepted_mints` is not modified (#1091).
 
 - Private contribution jobs can use `base_local_path`, an absolute checkout or
   bare-repository path on the buyer daemon machine. The buyer uploads only the
@@ -51,6 +66,20 @@
   cleaned without touching live work or legacy unlabelled temporary directories.
   Buyer state adds an additive v8 preparation table; restart the buyer daemon and
   MCP server together after upgrading. No relay deployment is needed.
+
+### Rollout
+
+The relay must already contain #1093 (required since rc4) before buyers upgrade. The
+503-instead-of-400 relay change from #1096 takes effect only after a relay redeploy;
+it is optional and has no ordering constraint. Restart the buyer daemon and MCP server
+together after upgrading (buyer state adds the v8 preparation table). Upgrade sellers
+to get the longer, off-loop pre-claim fetch (#1097). No sandbox image change is
+needed beyond rc4's.
+
+For paid private jobs using `nostr://` mints (#1092): redeploy the reviewer and list
+each such mint explicitly in its `accepted_mints`; a binary upgrade alone does not
+approve them. Buyers and sellers must also list the mint in `accepted_mints`. No relay
+redeploy is needed for #1092.
 
 ## v0.6.1-rc4
 
