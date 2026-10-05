@@ -278,9 +278,9 @@ a usable local copy can still fail because the built-in downloader does not use
 your SSH keys or credential helper. Relative paths and paths supplied without
 contribution pins are refused. Public posts do not upload a base.
 
-Use `seller_pubkey` to select a seller for an inaccessible private upstream.
-Targeted sellers read the uploaded base from the private job repository. In an
-open-pool job (`untargeted=true`), posting can succeed with a local copy, but
-sellers still need to fetch the original URL before claiming. This option does
-not change that seller behaviour. Existing size limits and the refusal of
+`base_local_path` works only for a direct job: set `seller_pubkey`. That
+seller reads the uploaded base from the private job repository. An open-pool
+post (`untargeted=true`) with `base_local_path` is refused before anything is
+uploaded, because open-pool sellers fetch the original URL themselves before
+claiming and would never see the local copy. Existing size limits and the refusal of
 symlinks or submodules anywhere in the base history still apply.

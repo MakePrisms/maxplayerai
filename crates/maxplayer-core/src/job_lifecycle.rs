@@ -686,6 +686,17 @@ pub async fn post_job_async(
             "post_job requires seller_pubkey (targeted default) or untargeted=true".into(),
         ));
     }
+    // Open-pool sellers check the base from target_repo_url before any seller is picked, so
+    // they never see a base read from a local checkout: the job would silently get no claims.
+    if request.untargeted
+        && matches!(&request.job, JobKind::Contribution(spec) if spec.base_local_path.is_some())
+    {
+        return Err(JobLifecycleError::Input(
+            "base_local_path only works for a direct job (set seller_pubkey): in an open-pool job \
+             sellers must be able to read target_repo_url themselves before claiming"
+                .into(),
+        ));
+    }
     match (&request.repo, &request.branch) {
         (Some(_), None) | (None, Some(_)) => {
             return Err(JobLifecycleError::Input(
@@ -5770,6 +5781,36 @@ mod tests {
         assert!(claims[0].live, "processing claim stays live when no deadline is known");
         assert!(!claims[1].live, "error claim is never live");
         assert_eq!(claims[0].status, "processing");
+    }
+
+    #[test]
+    fn post_job_refuses_local_base_on_open_pool() {
+        let root = std::env::temp_dir().join(format!(
+            "maxplayer-jobs-local-open-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+        let mut request = contribution_post_request(
+            &"aa".repeat(32),
+            "https://example.test/private",
+            "main",
+            &"bb".repeat(20),
+            None,
+        );
+        assert!(request.untargeted);
+        if let JobKind::Contribution(spec) = &mut request.job {
+            spec.base_local_path = Some("/private/checkout".into());
+        }
+        let err = post_job(&home, request).expect_err("open-pool local base refused");
+        let msg = err.to_string();
+        assert!(msg.contains("base_local_path only works for a direct job"), "{msg}");
+        assert!(msg.contains("seller_pubkey"), "{msg}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
