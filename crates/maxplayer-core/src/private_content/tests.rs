@@ -1672,7 +1672,7 @@ fn shared_quotas_allow_more_than_thousand_commits_and_files() {
 
 #[cfg(feature = "wallet")]
 #[test]
-fn private_invoice_accepts_mixed_https_nostr_and_preserves_membership_guard() {
+fn private_invoice_accepts_well_formed_mixed_and_unknown_mints() {
     use cashu::nuts::nut18::PaymentRequest;
     use nostr_sdk::prelude::{Nip19Profile, ToBech32};
     let offer = "ab".repeat(32);
@@ -1684,6 +1684,11 @@ fn private_invoice_accepts_mixed_https_nostr_and_preserves_membership_guard() {
     for mints in [
         vec!["https://mint.example".to_owned(), nostr_mint.clone()],
         vec![nostr_mint.clone()],
+        vec!["https://unknown.example".into()],
+        vec![
+            "https://mint.example".into(),
+            "https://unknown.example".into(),
+        ],
     ] {
         let request: PaymentRequest = serde_json::from_value(serde_json::json!({
             "i":offer,"a":100,"u":"sat","s":true,"m":mints,"d":null,
@@ -1692,17 +1697,18 @@ fn private_invoice_accepts_mixed_https_nostr_and_preserves_membership_guard() {
         .unwrap();
         for raw in [request.to_string(), request.to_bech32_string().unwrap()] {
             invoice::validate(&raw, &offer, 100, &seller.to_hex(), &policy).unwrap();
-            // A only: the old all-entry membership guard deliberately remains.
-            assert!(invoice::validate(&raw, &offer, 100, &seller.to_hex(), &host()).is_err());
+            invoice::validate(&raw, &offer, 100, &seller.to_hex(), &host()).unwrap();
         }
     }
     for mints in [
         vec![nostr_mint.clone(), nostr_mint],
-        vec!["https://unknown.example".into()],
-        vec![
-            "https://unknown.example".into(),
-            "https://mint.example".into(),
-        ],
+        vec![],
+        (0..33)
+            .map(|i| format!("https://mint{i}.example"))
+            .collect(),
+        vec!["http://insecure.example".into()],
+        vec!["nostr://not-an-npub".into()],
+        vec!["https://user@mint.example".into()],
     ] {
         let request: PaymentRequest = serde_json::from_value(serde_json::json!({
             "i":offer,"a":100,"u":"sat","s":true,"m":mints,"d":null,
@@ -1718,10 +1724,9 @@ fn private_invoice_accepts_mixed_https_nostr_and_preserves_membership_guard() {
 
 #[cfg(feature = "wallet")]
 #[test]
-fn private_invoice_all_mints_guard_blocks_unapproved_hop_target() {
-    // Evidence for deferring the proposed at-least-one rule: when balances do
-    // not cover the invoice, planning can hop to the seller's first mint, not
-    // necessarily the entry approved by the private checker.
+fn private_invoice_all_mints_guard_now_allows_seller_listed_hop_target() {
+    // Deliberate trust widening: private jobs now follow the public rule,
+    // including hopping to a seller-listed mint the checker did not configure.
     let listed = vec![
         "https://unapproved.example".into(),
         "https://mint.example".into(),
@@ -1736,5 +1741,13 @@ fn private_invoice_all_mints_guard_blocks_unapproved_hop_target() {
     let plan = crate::crossmint::plan_payment(&source, &listed, true).unwrap();
     assert_eq!(plan.realized_mint().to_string(), listed[0]);
     assert!(host().mint(&listed[1]).is_ok());
-    assert!(host().mint(&plan.realized_mint().to_string()).is_err());
+    host()
+        .well_formed_mint(&plan.realized_mint().to_string())
+        .unwrap();
+    let seller = keys(2).public_key();
+    let offer = "ab".repeat(32);
+    let raw =
+        crate::gateway::creq::build_seller_creq(&offer, 100, "sat", &listed, &seller.to_hex())
+            .unwrap();
+    invoice::validate(&raw, &offer, 100, &seller.to_hex(), &host()).unwrap();
 }

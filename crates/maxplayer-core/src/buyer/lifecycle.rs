@@ -41,6 +41,8 @@ pub struct AwardFilters<'a> {
     /// The buyer's own paying mint (config default). A claim whose `creq` lists no mint the buyer
     /// can settle at is skipped — the #126 mandatory guard: never auto-award what we cannot pay.
     pub buyer_mint: &'a str,
+    /// Configured-wallet snapshot shared with the reservation ceiling. Empty on read failure.
+    pub balances: &'a [crate::wallet_ops::MintBalance],
     /// Whether real (non-testnut) mints are permitted; gates the mint-compat check.
     pub allow_real_mints: bool,
     /// The harness the OFFER asked for, read back from the relay (never from award params — the
@@ -96,11 +98,13 @@ pub fn award_filters_for_offer<'a>(
     max_sats: u64,
     buyer_mint: &'a str,
     allow_real_mints: bool,
+    balances: &'a [crate::wallet_ops::MintBalance],
 ) -> AwardFilters<'a> {
     AwardFilters {
         offer_amount_sats: offer.amount_sats,
         max_sats,
         buyer_mint,
+        balances,
         allow_real_mints,
         requested_agent: offer.requested_agent.as_deref(),
         requested_harness_family: offer.requested_harness_family.as_deref(),
@@ -420,6 +424,7 @@ pub fn unsatisfiable_capability_request(
         offer_amount_sats: 0,
         max_sats: 0,
         buyer_mint: "",
+        balances: &[],
         allow_real_mints: false,
         // Placeholder, like the money fields above: this helper consults only the request axes.
         payment_mode: PaymentMode::Sat,
@@ -485,6 +490,42 @@ pub fn capability_park_reason(view: &JobView, filters: &AwardFilters) -> Option<
     ))
 }
 
+/// Diagnose a seller list that would require hopping into a credit mint.
+pub fn credit_hop_refusal(creq: Option<&str>, filters: &AwardFilters) -> Option<String> {
+    let request = crate::gateway::creq::parse_creq(creq?).ok()?;
+    let listed: Vec<String> = request.mints.iter().map(ToString::to_string).collect();
+    if listed.is_empty()
+        || !listed
+            .iter()
+            .all(|mint| crate::mint_wire::is_nostr_scheme(mint))
+    {
+        return None;
+    }
+    let source = crate::crossmint::select_source_mint(
+        filters.buyer_mint,
+        &listed,
+        filters.allow_real_mints,
+        filters.balances,
+        filters.offer_amount_sats,
+    );
+    plan_payment(&source, &listed, filters.allow_real_mints)
+        .err()
+        .map(|e| e.to_string())
+}
+
+pub fn mint_park_reason(view: &JobView, filters: &AwardFilters) -> Option<String> {
+    let candidates = crate::job_lifecycle::claims_at_deadline(view);
+    let live: Vec<_> = candidates.iter().filter(|c| c.live).collect();
+    if live.is_empty() {
+        return None;
+    }
+    let reasons = live
+        .iter()
+        .map(|c| credit_hop_refusal(c.creq.as_deref(), filters))
+        .collect::<Option<Vec<_>>>()?;
+    Some(reasons.join("; "))
+}
+
 /// Whether a claim may be awarded a job that asked for a specific harness.
 ///
 /// No request ⇒ every claim passes. A request ⇒ the claim must ADVERTISE that harness. A claim
@@ -513,7 +554,13 @@ pub enum NamedAwardRefused {
     NotLive { claim_id: String },
     /// The named claim cannot be paid (missing/malformed creq, price ≠ offer amount, wrong unit, or
     /// no mutually-payable mint) — awarding it would commit to something the buyer cannot settle.
-    Unpayable { claim_id: String },
+    Unpayable {
+        claim_id: String,
+    },
+    CreditHop {
+        claim_id: String,
+        reason: String,
+    },
     /// The job asked for a harness the named claim does not advertise — awarding it would buy work
     /// from a seller that never said it could do it this way.
     AgentMismatch { claim_id: String, requested: String },
@@ -537,7 +584,13 @@ impl std::fmt::Display for NamedAwardRefused {
                 formatter,
                 "award refused: claim {claim_id} is not payable (price/mint/creq incompatible — the buyer could not settle it)"
             ),
-            Self::AgentMismatch { claim_id, requested } => write!(
+            Self::CreditHop { claim_id, reason } => {
+                write!(formatter, "award refused: claim {claim_id}: {reason}")
+            }
+            Self::AgentMismatch {
+                claim_id,
+                requested,
+            } => write!(
                 formatter,
                 "award refused: job requested agent {requested:?}, which claim {claim_id} does not advertise"
             ),
@@ -589,8 +642,21 @@ pub fn named_claim_awardable(
     if let Err(refusal) = claim_meets_capability_request(&claim.capability, filters) {
         return Err(NamedAwardRefused::Capability { claim_id: claim_id.to_owned(), refusal });
     }
-    if !claim_is_settleable(claim.payment_mode, &view.job_id, claim.creq.as_deref(), filters) {
-        return Err(NamedAwardRefused::Unpayable { claim_id: claim_id.to_owned() });
+    if !claim_is_settleable(
+        claim.payment_mode,
+        &view.job_id,
+        claim.creq.as_deref(),
+        filters,
+    ) {
+        if let Some(reason) = credit_hop_refusal(claim.creq.as_deref(), filters) {
+            return Err(NamedAwardRefused::CreditHop {
+                claim_id: claim_id.to_owned(),
+                reason,
+            });
+        }
+        return Err(NamedAwardRefused::Unpayable {
+            claim_id: claim_id.to_owned(),
+        });
     }
     Ok(())
 }
@@ -655,7 +721,14 @@ fn claim_is_settleable(
     // fence admits. This is the SAME planning the pay path performs, so a claim that passes here is
     // one the buyer can actually pay, by whichever of those two routes.
     let listed: Vec<String> = request.mints.iter().map(|mint| mint.to_string()).collect();
-    plan_payment(filters.buyer_mint, &listed, filters.allow_real_mints).is_ok()
+    let source = crate::crossmint::select_source_mint(
+        filters.buyer_mint,
+        &listed,
+        filters.allow_real_mints,
+        filters.balances,
+        filters.offer_amount_sats,
+    );
+    plan_payment(&source, &listed, filters.allow_real_mints).is_ok()
 }
 
 /// What [`award_with_reservation`] may do about a job, decided BEFORE any reserve, sign, or send.
@@ -1662,12 +1735,41 @@ mod tests {
             offer_amount_sats: offer_amount,
             max_sats,
             buyer_mint: DEFAULT_MINT_URL,
+            balances: &[],
             allow_real_mints: false,
             requested_agent: None,
             requested_harness_family: None,
             requested_model: None,
             required_capabilities: &[],
         }
+    }
+
+    #[test]
+    fn credits_first_extra_credit_is_awardable_on_manual_and_auto_paths() {
+        let credit = "nostr://npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d";
+        let job = "a".repeat(64);
+        let view = view_with(&job, 10, vec![claim(&job, true, 10, &[credit.into()])]);
+        let rows = [crate::wallet_ops::MintBalance {
+            mint_url: credit.into(),
+            balance_sats: 10,
+            is_default: false,
+            configured: true,
+        }];
+        let mut f = filters(10, 10);
+        f.allow_real_mints = true;
+        f.balances = &rows;
+        let selected = select_awardable_claim(&view, &f).expect("held extra credits pay direct");
+        named_claim_awardable(&view, &selected, &f).unwrap();
+        // An unavailable snapshot falls back to the default, and cannot hop to credits.
+        f.balances = &[];
+        assert!(select_awardable_claim(&view, &f).is_none());
+        let refusal = named_claim_awardable(&view, &selected, &f)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refusal.contains("cannot receive") && refusal.contains(credit),
+            "{refusal}"
+        );
     }
 
     // A live claim priced at the offer amount, quoting the buyer's default mint, is selected.
@@ -4008,7 +4110,7 @@ mod tests {
     /// predicate, and the fix in both cases is to call the real thing rather than to test the copy
     /// harder.
     fn filters_from_offer<'a>(offer: &'a OfferView, max_sats: u64) -> AwardFilters<'a> {
-        award_filters_for_offer(offer, max_sats, DEFAULT_MINT_URL, false)
+        award_filters_for_offer(offer, max_sats, DEFAULT_MINT_URL, false, &[])
     }
 
     // THE ACCEPTANCE TEST FOR #897, both axes through BOTH selection entry points.
@@ -4694,7 +4796,7 @@ mod free_lane_tests {
     /// path that reached `plan_payment` with these would refuse, so a free award that succeeds here
     /// has provably not touched one.
     fn walletless_filters(offer: &OfferView) -> AwardFilters<'_> {
-        award_filters_for_offer(offer, 0, "", false)
+        award_filters_for_offer(offer, 0, "", false, &[])
     }
 
     /// PROPERTY 1 — THE BOTH-ENDS RULE, at the award. All four combinations, in one test so no
@@ -4735,7 +4837,7 @@ mod free_lane_tests {
         assert_eq!(
             select_awardable_claim(
                 &view(priced.clone(), claim_view(PaymentMode::None, None)),
-                &award_filters_for_offer(&priced, 21, MINT, false)
+                &award_filters_for_offer(&priced, 21, MINT, false, &[])
             ),
             None,
             "offer=absent / claim=none must REFUSE: a seller cannot make a priced job free"
@@ -4745,8 +4847,11 @@ mod free_lane_tests {
         let paid_creq = build_seller_creq(JOB, 21, "sat", &[MINT.to_owned()], SELLER).expect("creq");
         assert_eq!(
             select_awardable_claim(
-                &view(priced.clone(), claim_view(PaymentMode::Sat, Some(paid_creq))),
-                &award_filters_for_offer(&priced, 21, MINT, false)
+                &view(
+                    priced.clone(),
+                    claim_view(PaymentMode::Sat, Some(paid_creq))
+                ),
+                &award_filters_for_offer(&priced, 21, MINT, false, &[])
             )
             .as_deref(),
             Some("c".repeat(64).as_str()),

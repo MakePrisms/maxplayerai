@@ -1490,6 +1490,37 @@ mod tests {
     }
 
     #[test]
+    fn credits_first_https_hop_settles_once_with_credit_listed_first() {
+        let credit = "nostr://npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d";
+        let target = "https://seller.example";
+        let plan = crate::crossmint::plan_payment(
+            "https://buyer.example",
+            &[credit.into(), target.into()],
+            true,
+        )
+        .unwrap();
+        assert_eq!(plan.realized_mint().to_string(), target);
+        let mut pairing = journal("credits-first-hop");
+        pairing.source_mint = plan.source_mint().to_string();
+        pairing.target_mint = plan.realized_mint().to_string();
+        let store = MemJournal::default();
+        let world = MintWorld::shared();
+        let mut effects = FakeMints {
+            world: Rc::clone(&world),
+        };
+        assert_eq!(
+            run_hop(&store, &mut effects, &pairing).unwrap().minted_sats,
+            100
+        );
+        assert_eq!(
+            run_hop(&store, &mut effects, &pairing).unwrap().minted_sats,
+            100
+        );
+        assert_eq!(world.borrow().melts.len(), 1);
+        assert_eq!(world.borrow().mints.len(), 1);
+    }
+
+    #[test]
     fn a_clean_hop_melts_once_mints_once_and_journals_the_pairing_before_the_melt() {
         let store = MemJournal::default();
         let world = MintWorld::shared();

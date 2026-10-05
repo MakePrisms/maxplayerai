@@ -914,6 +914,10 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
             };
         }
     }
+    // Pinned-attempt resolution above can re-enter money_lock. From here on,
+    // keep selection, its balance snapshot, and reservation under one guard.
+    let _guard = context.money_lock.lock().await;
+    let balances = read_award_balances(context).await;
     let (award_amount, claim_id, send_relay, mut quoted_mints) = match &attempt {
         Some(attempt) => (
             attempt.amount_sats,
@@ -952,6 +956,7 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
                 max_sats,
                 context.home.config.default_mint(),
                 context.home.config.allow_real_mints,
+                balances.as_deref().unwrap_or(&[]),
             );
 
             // Manual award names the claim but applies the SAME hard filters as auto-award —
@@ -984,14 +989,10 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
         }
     };
 
-    // Serialize with collect: the reserve below reads a balance/spent snapshot that must not race
-    // a concurrent melt. Held across the whole chokepoint call (see the deadlock note above for
-    // why not earlier).
-    let _guard = context.money_lock.lock().await;
-    // Re-derive BOTH pinned-attempt gates from a fresh read under the guard. The reads above ran
-    // before the lock, and the wait to get here (view fetches, then the guard itself — unbounded
-    // behind a settle) is long enough for an attempt to be pinned by a concurrent path or for
-    // the deadline to cross.
+    // The guard already protects the shared selection/ceiling balance snapshot.
+    // Recheck both pinned-attempt gates under the guard. A concurrent path could
+    // have pinned an attempt before we acquired it, and the balance/view awaits
+    // can carry us across the deadline.
     if let Ok(Some(current)) = context.store.award_attempt(&params.job_id) {
         // A claim named by the caller must still be refused when an attempt pinned MEANWHILE
         // names another: silently resolving a claim the caller never sanctioned is the thing
@@ -1028,7 +1029,13 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
         // not the list read before the guard.
         quoted_mints = attempt_quoted_mints(&current);
     }
-    let ceiling = match award_ceiling(context, &params.job_id, &quoted_mints, award_amount).await {
+    let ceiling = match award_ceiling_with_read(
+        context,
+        &params.job_id,
+        &quoted_mints,
+        award_amount,
+        balances,
+    ) {
         Ok(ceiling) => ceiling,
         Err(error) => return Response::err(id, CODE_INTERNAL, error),
     };
@@ -1398,15 +1405,27 @@ async fn award_ceiling(
     quoted_mints: &[String],
     amount_sats: u64,
 ) -> Result<MintCeiling, String> {
+    let read = read_award_balances(context).await;
+    award_ceiling_with_read(context, job_id, quoted_mints, amount_sats, read)
+}
+
+async fn read_award_balances(
+    context: &BuyerContext,
+) -> Result<Vec<crate::wallet_ops::MintBalance>, String> {
+    context.wallet.balances().await.map_err(|e| e.to_string())?
+}
+
+fn award_ceiling_with_read(
+    context: &BuyerContext,
+    job_id: &str,
+    quoted_mints: &[String],
+    amount_sats: u64,
+    read: Result<Vec<crate::wallet_ops::MintBalance>, String>,
+) -> Result<MintCeiling, String> {
     let pin = context
         .store
         .reservation_pin(job_id)
-        .map_err(|error| error.to_string())?;
-    let read = context
-        .wallet
-        .balances()
-        .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|e| e.to_string())?;
     ceiling_from_read(
         context.home.config.default_mint(),
         context.home.config.allow_real_mints,
@@ -1622,11 +1641,14 @@ async fn drive_auto_award(
         // THE SAME constructor the manual award path uses, so the two cannot apply different filters.
         // Both selection entry points then consult `claim_meets_capability_request`:
         // `select_awardable_claim` here, `named_claim_awardable` on the manual path.
+        let guard = context.money_lock.lock().await;
+        let balances = read_award_balances(context).await;
         let filters = lifecycle::award_filters_for_offer(
             offer,
             max_sats,
             context.home.config.default_mint(),
             context.home.config.allow_real_mints,
+            balances.as_deref().unwrap_or(&[]),
         );
 
         // Built AFTER `filters` so the deadline park can name the capability request that refused
@@ -1634,15 +1656,16 @@ async fn drive_auto_award(
         // the only thing that makes an actionable reason available here; the decision itself is
         // unchanged, and a job with no request parks with the wording it always did.
         if now_unix() as u64 > offer.deadline_unix {
+            drop(guard); // settle_intent_from_attempt acquires the same lock.
             // A pinned attempt past its deadline is NOT "no awardable claim appeared" — a claim
             // was selected and signed for. Reflect the ATTEMPT's truth on the intent instead of
             // a false park reason; the periodic sweep continues anything still unresolved.
             if settle_intent_from_attempt(context, &keys, job_id).await {
                 return Ok(());
             }
-            let reason = lifecycle::park_reason_deadline_passed(
-                lifecycle::capability_park_reason(&view, &filters).as_deref(),
-            );
+            let diagnosis = lifecycle::capability_park_reason(&view, &filters)
+                .or_else(|| lifecycle::mint_park_reason(&view, &filters));
+            let reason = lifecycle::park_reason_deadline_passed(diagnosis.as_deref());
             crate::opline!("{}", auto_award_park_line(job_id, &reason));
             let _ = context.store.mark_award_parked(job_id, &reason, now_unix());
             return Ok(());
@@ -1650,10 +1673,18 @@ async fn drive_auto_award(
 
         if let Some(claim_id) = lifecycle::select_awardable_claim(&view, &filters) {
             let quoted_mints = claim_creq_mints(&view, &claim_id);
-            return finalize_auto_award(context, job_id, offer.amount_sats, claim_id, quoted_mints)
-                .await;
+            return finalize_auto_award(
+                context,
+                job_id,
+                offer.amount_sats,
+                claim_id,
+                quoted_mints,
+                balances,
+            )
+            .await;
         }
 
+        drop(guard);
         // No awardable claim yet — re-check after a bounded interval (no tight spin on a
         // live-but-unpayable claim). The deadline check above bounds the total wait.
         tokio::time::sleep(AUTO_AWARD_POLL_INTERVAL).await;
@@ -1685,11 +1716,11 @@ async fn finalize_auto_award(
     offer_amount: u64,
     claim_id: String,
     quoted_mints: Vec<String>,
+    balances: Result<Vec<crate::wallet_ops::MintBalance>, String>,
 ) -> Result<(), String> {
-    let _guard = context.money_lock.lock().await;
-    // Deadline TOCTOU re-check under the guard (same as the manual RPC): the caller's deadline
-    // gate ran before this lock, whose wait is unbounded behind a settle. Err keeps the intent
-    // pending — the deadline arm / the sweep resolves the pinned attempt by probe.
+    // Caller holds money_lock from the shared filter/ceiling snapshot through this await.
+    // Keep the pinned-attempt deadline check at the reserve/publish boundary.
+    // The caller holds the guard; Err leaves the intent pending for a probe.
     if let Ok(Some(current)) = context.store.award_attempt(job_id) {
         if resume_crossed_deadline(&current, now_unix()) {
             return Err(format!(
@@ -1698,7 +1729,7 @@ async fn finalize_auto_award(
             ));
         }
     }
-    let ceiling = award_ceiling(context, job_id, &quoted_mints, offer_amount).await?;
+    let ceiling = award_ceiling_with_read(context, job_id, &quoted_mints, offer_amount, balances)?;
     let home = context.home.clone();
     let job = job_id.to_owned();
     let publish_claim = claim_id.clone();
@@ -3541,10 +3572,50 @@ mod tests {
     // (the call accept seals through) picks from the same inputs.
     #[test]
     fn award_ceiling_mint_matches_the_accept_selection() {
+        let credit = "nostr://npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d";
         let cases: Vec<(Vec<String>, Vec<crate::wallet_ops::MintBalance>, u64)> = vec![
-            (vec![CEIL_EXTRA.into()], vec![mint_row(CEIL_DEFAULT, 500, true, true), mint_row(CEIL_EXTRA, 500, false, true)], 100),
-            (vec![CEIL_EXTRA.into()], vec![mint_row(CEIL_DEFAULT, 500, true, true)], 100),
-            (vec![CEIL_OTHER.into(), CEIL_EXTRA.into()], vec![mint_row(CEIL_OTHER, 50, false, true), mint_row(CEIL_EXTRA, 500, false, true)], 100),
+            (
+                vec![CEIL_DEFAULT.into(), credit.into()],
+                vec![
+                    mint_row(CEIL_DEFAULT, 500, true, true),
+                    mint_row(credit, 500, false, true),
+                ],
+                100,
+            ),
+            (
+                vec![credit.into()],
+                vec![mint_row(credit, 100, false, true)],
+                100,
+            ),
+            (
+                vec![credit.into(), CEIL_EXTRA.into()],
+                vec![
+                    mint_row(credit, 99, false, true),
+                    mint_row(CEIL_EXTRA, 100, false, true),
+                ],
+                100,
+            ),
+            (
+                vec![CEIL_EXTRA.into()],
+                vec![
+                    mint_row(CEIL_DEFAULT, 500, true, true),
+                    mint_row(CEIL_EXTRA, 500, false, true),
+                ],
+                100,
+            ),
+            (
+                vec![CEIL_EXTRA.into()],
+                vec![mint_row(CEIL_DEFAULT, 500, true, true)],
+                100,
+            ),
+            (
+                vec![CEIL_OTHER.into(), CEIL_EXTRA.into()],
+                vec![
+                    mint_row(CEIL_OTHER, 50, false, true),
+                    mint_row(CEIL_EXTRA, 500, false, true),
+                ],
+                100,
+            ),
             (vec![], vec![mint_row(CEIL_EXTRA, 500, false, true)], 100),
         ];
         for (quoted, balances, amount) in cases {

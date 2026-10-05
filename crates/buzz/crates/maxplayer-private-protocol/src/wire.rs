@@ -100,6 +100,16 @@ impl HostPolicy {
         Ok(())
     }
     pub fn mint(&self, mint: &str) -> Result<()> {
+        self.well_formed_mint(mint)?;
+        if !self.accepted_mints.iter().any(|v| v == mint) {
+            return Err(Error("unapproved mint"));
+        }
+        Ok(())
+    }
+
+    /// Signed claim and receipt mints need not be configured by the checker.
+    /// Settlement still binds the destination to the signed seller claim.
+    pub fn well_formed_mint(&self, mint: &str) -> Result<()> {
         // Signed wire values are canonical: unlike configured wallet URLs, no
         // trailing slash is stripped here. Repository URLs remain HTTPS-only.
         if let Some(npub) = mint.strip_prefix("nostr://") {
@@ -107,8 +117,8 @@ impl HostPolicy {
         } else {
             secure_url(mint)?;
         }
-        if mint.len() > 2048 || !self.accepted_mints.iter().any(|v| v == mint) {
-            return Err(Error("unapproved mint"));
+        if mint.len() > 2048 {
+            return Err(Error("mint URL too long"));
         }
         Ok(())
     }
@@ -417,7 +427,7 @@ pub fn validate_private(event: &Event, host: &HostPolicy) -> Result<Tags> {
             "job-class" => member(v, &["contribution"])?,
             "metadata_trust" => member(v, &["seller-claimed"])?,
             "repo" => host.repo(v)?,
-            "mint" => host.mint(v)?,
+            "mint" => host.well_formed_mint(v)?,
             "branch" => require_hex(
                 v.strip_prefix("refs/heads/delivery/")
                     .ok_or(Error("invalid delivery ref"))?,
@@ -633,7 +643,7 @@ mod mint_tests {
     }
 
     #[test]
-    fn private_receipt_validates_realized_nostr_mint_membership() {
+    fn private_receipt_validates_realized_nostr_mint_well_formedness() {
         use nostr::prelude::{EventBuilder, Keys, Kind, Tag};
         let mint = format!("nostr://{NPUB}");
         let keys = Keys::parse(&format!("{:064x}", 1)).unwrap();
@@ -660,7 +670,7 @@ mod mint_tests {
             .sign_with_keys(&keys)
             .unwrap();
         validate_private(&event, &policy(&mint)).unwrap();
-        assert!(validate_private(&event, &policy("https://mint.example")).is_err());
+        validate_private(&event, &policy("https://mint.example")).unwrap();
     }
 
     #[test]

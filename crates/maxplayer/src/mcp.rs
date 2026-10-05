@@ -696,6 +696,7 @@ mod tests {
             offer_amount_sats: 10,
             max_sats: 10,
             buyer_mint: DEFAULT_MINT_URL,
+            balances: &[],
             allow_real_mints: false,
             requested_agent: None,
             requested_harness_family: None,

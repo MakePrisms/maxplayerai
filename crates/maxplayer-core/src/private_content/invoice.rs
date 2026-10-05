@@ -114,7 +114,7 @@ pub fn validate(
     let mut seen = BTreeSet::new();
     for mint in mints {
         let mint = text(mint)?;
-        host.mint(mint)?;
+        host.well_formed_mint(mint)?;
         if !seen.insert(mint) {
             return Err(Error("duplicate invoice mint"));
         }

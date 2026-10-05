@@ -50,3 +50,9 @@ tempfile = "3"
 tokio-tungstenite = "=0.26.2"
 futures-util = "0.3"
 uuid = { version = "1", features = ["v7"] }
+# Credits-first integration: real HTTPS CDK mint APIs, simulated Lightning only.
+cdk-axum = { version = "=0.17.2", default-features = false }
+cdk-fake-wallet = "=0.17.2"
+hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
+rcgen = "0.13"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
