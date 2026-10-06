@@ -1150,8 +1150,18 @@ fn receipt_preimage_bound(
     let mut computed = receipt_preimage_for(key, buyer, seller, kind);
     if let Some(private) = private {
         computed.protocol = crate::receipt::ReceiptProtocol::V2;
-        if computed != private.preimage || key.result_id.as_str() != private.evidence.result.id.to_hex() {
-            return Err(EffectError::new("payment key differs from immutable private result"));
+        if !crate::private_content::public_v2::is_public(&private.evidence.offer) {
+            private
+                .evidence
+                .validate_realized_mint(&key.mint.to_string(), &private.policy)
+                .map_err(|e| EffectError::new(e.to_string()))?;
+        }
+        if computed != private.preimage
+            || key.result_id.as_str() != private.evidence.result.id.to_hex()
+        {
+            return Err(EffectError::new(
+                "payment key differs from immutable private result",
+            ));
         }
     }
     Ok(computed)
@@ -2000,6 +2010,57 @@ mod tests {
             other_mint.digest_hex(),
             "co-signed preimage digest must not depend on the realized mint"
         );
+    }
+
+    #[test]
+    fn credits_first_receipt_destination_guard_runs_before_spend() {
+        let (evidence, request, buyer, policy) =
+            crate::private_content::evidence::inline_fixture_with_payment(true, true);
+        let verified = evidence
+            .validate_request(&request, &buyer.public_key().to_hex(), &policy)
+            .unwrap();
+        let private = PrivateReceipt {
+            preimage: verified.preimage,
+            evidence,
+            policy,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut home = home::bootstrap(dir.path()).unwrap();
+        home.config.allow_real_mints = true;
+        let derive = |mints: &[String]| {
+            derive_payment(
+                &home,
+                &request.job_id,
+                &request.result_id,
+                &request.delivery_integrity_hash,
+                &request.job_hash,
+                &request.seller_pubkey,
+                request.amount_sats,
+                mints,
+                Some("https://funding.example"),
+                request.creq_hash.clone(),
+            )
+            .unwrap()
+        };
+        let good = derive(&request.accepted_mints);
+        receipt_preimage_bound(
+            &good.key,
+            &buyer.public_key().to_hex(),
+            &request.seller_pubkey,
+            DeliveryKind::Inline,
+            Some(&private),
+        )
+        .unwrap();
+        let bad = derive(&["https://outside.example".into()]);
+        let err = receipt_preimage_bound(
+            &bad.key,
+            &buyer.public_key().to_hex(),
+            &request.seller_pubkey,
+            DeliveryKind::Inline,
+            Some(&private),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("outside signed claim"), "{err}");
     }
 
     // Finding CC (load-bearing): the pay-path attempt id is derived from the SEALED realized-mint

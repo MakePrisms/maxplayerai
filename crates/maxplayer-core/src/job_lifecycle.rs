@@ -1584,19 +1584,33 @@ pub async fn accept_claim_async(
     // re-bind a corrected result) is tracked separately; until then one settlement per job.
     let existing_bind = load_accepted_bind(home, &request.job_id)?;
     assert_single_settlement(existing_bind.as_ref(), &request.job_id, &result.result_id)?;
-    if let Some(mut bind) = existing_bind.filter(|b| b.private_evidence.is_some()) {
+    if let Some(mut bind) = existing_bind {
         // Never re-plan funding or replace immutable evidence on a same-result retry.
         if bind.claim_id != request.claim_id || bind.private_evidence != result.private_evidence {
             return Err(JobLifecycleError::Input("accepted private evidence changed".into()));
         }
         validate_private_bind(home, &bind)?;
         if bind.accept_event_id.is_empty() {
-            let evidence = bind.private_evidence.as_ref().unwrap();
-            let policy = crate::private_content::runtime::Policy::for_evidence(home, evidence)
-                .map_err(|e| JobLifecycleError::Input(e.to_string()))?;
-            let draft = accept_draft(&bind.job_id, &bind.claim_id, &keys.public_key().to_hex(), &bind.seller_pubkey);
-            let draft = crate::private_content::carriers::project(&evidence.offer, &draft, Some(&evidence.award), None, &policy.host)
-                .map_err(|e| JobLifecycleError::Input(e.to_string()))?;
+            let draft = accept_draft(
+                &bind.job_id,
+                &bind.claim_id,
+                &keys.public_key().to_hex(),
+                &bind.seller_pubkey,
+            );
+            let draft = if let Some(evidence) = bind.private_evidence.as_ref() {
+                let policy = crate::private_content::runtime::Policy::for_evidence(home, evidence)
+                    .map_err(|e| JobLifecycleError::Input(e.to_string()))?;
+                crate::private_content::carriers::project(
+                    &evidence.offer,
+                    &draft,
+                    Some(&evidence.award),
+                    None,
+                    &policy.host,
+                )
+                .map_err(|e| JobLifecycleError::Input(e.to_string()))?
+            } else {
+                draft
+            };
             bind.accept_event_id = publish_draft_async(home, &keys, &draft).await?;
             bind.accepted_at = now_unix();
             write_accepted_bind(home, &bind)?;
@@ -1793,7 +1807,20 @@ pub async fn accept_claim_async(
     let (pin, balances) = accept_pin_and_balances(
         &home.root.join(crate::buyer::STATE_DB_FILE),
         &request.job_id,
-        || async { crate::wallet_ops::balances_async(home).await.map_err(|error| error.to_string()) },
+        || async {
+            let balances = crate::wallet_ops::balances_async(home)
+                .await
+                .map_err(|error| error.to_string())?;
+            // Unpinned accept has no live hold of its own. Match award's net selection;
+            // accept_pin_and_balances rechecks afterward so a concurrent pin still wins.
+            crate::buyer::store::available_balances(
+                &home.root.join(crate::buyer::STATE_DB_FILE),
+                &request.job_id,
+                home.config.default_mint(),
+                &balances,
+            )
+            .map_err(|error| error.to_string())
+        },
     )
     .await?;
     let source_seed = accept_source_seed(
@@ -3982,6 +4009,176 @@ fn result_attribution(tags: &[TagSpec]) -> (Option<String>, Option<String>) {
 mod tests {
     use super::*;
     use crate::home;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn credits_first_same_result_reaccept_keeps_mints_and_attempt_id() {
+        use crate::payment::{
+            DeliveryIntegrityHash, JobHash, JobId, PaymentKey, PaymentTerms, ResultId,
+        };
+        use cashu::secret::Secret;
+        use cashu::{Amount, CurrencyUnit, Id, Proof, State};
+        use cdk::wallet::types::ProofInfo;
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_sdk::prelude::*;
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut home = home::bootstrap(dir.path()).unwrap();
+        home.config.relay_url = relay.url().await.to_string();
+        home.config.allow_real_mints = true;
+        home.config.review.buyer_delivery = false;
+        let lightning = "https://seller.example";
+        let credit = "nostr://npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d";
+        home.config.accepted_mints = vec![lightning.into()];
+        home.config.extra_mints = vec![credit.into()];
+        let buyer = buyer_keys(&home).unwrap();
+        let seller = Keys::generate();
+        let sign = |draft: &EventDraft, keys: &Keys| {
+            gateway::nostr::event_builder(draft)
+                .unwrap()
+                .sign_with_keys(keys)
+                .unwrap()
+        };
+        let mut offer = OfferDraft::new(
+            "credits-first reaccept",
+            "text/plain",
+            10,
+            Timestamp::now().as_secs() + 600,
+            seller.public_key().to_hex(),
+        );
+        offer.accepts_delivery = vec!["inline".into()];
+        let offer = sign(&offer.to_event_draft(), &buyer);
+        let job = offer.id.to_hex();
+        let listed = vec![lightning.into(), credit.into()];
+        let creq = gateway::creq::build_seller_creq(
+            &job,
+            10,
+            "sat",
+            &listed,
+            &seller.public_key().to_hex(),
+        )
+        .unwrap();
+        let claim = sign(
+            &gateway::claim_draft(
+                &job,
+                &buyer.public_key().to_hex(),
+                &seller.public_key().to_hex(),
+                gateway::ClaimPayment::Sat(&creq),
+                &[],
+                &Default::default(),
+            ),
+            &seller,
+        );
+        let answer = "accepted once";
+        let hash = crate::receipt::result_content_hash_hex(answer);
+        let preimage = crate::receipt::ReceiptPreimage {
+            protocol: crate::receipt::ReceiptProtocol::V1,
+            job_hash: job_hash_for_offer(&job, "credits-first reaccept", 10),
+            offer_id: job.clone(),
+            amount: 10,
+            unit: "sat".into(),
+            buyer_pubkey: buyer.public_key().to_hex(),
+            seller_pubkey: seller.public_key().to_hex(),
+            delivery_integrity_hash: hash,
+            delivery_kind: "inline".into(),
+            exec_metadata_commitment: "none".into(),
+            creq_hash: Some(gateway::creq_hash_hex(&creq)),
+        };
+        let sig = seller
+            .sign_schnorr(&nostr_sdk::secp256k1::Message::from_digest(
+                preimage.digest_bytes(),
+            ))
+            .to_string();
+        let result = sign(
+            &gateway::inline_result_draft(
+                &job,
+                &buyer.public_key().to_hex(),
+                "text/plain",
+                10,
+                &preimage.job_hash,
+                &sig,
+                answer,
+                &[],
+            ),
+            &seller,
+        );
+        let client = Client::new(buyer.clone());
+        client.add_relay(&home.config.relay_url).await.unwrap();
+        client.connect().await;
+        client.wait_for_connection(Duration::from_secs(5)).await;
+        for event in [&offer, &claim, &result] {
+            assert!(!client.send_event(event).await.unwrap().success.is_empty());
+        }
+        let request = || AcceptClaimRequest {
+            job_id: job.clone(),
+            claim_id: claim.id.to_hex(),
+            result_id: Some(result.id.to_hex()),
+        };
+        let first = accept_claim_async(&home, request()).await.unwrap().bind;
+        assert_eq!(first.funding_mint.as_deref(), Some(lightning));
+        let wallet = crate::buyer_fund::open_wallet_at_mint_async(&home, credit)
+            .await
+            .unwrap();
+        let proof = Proof::new(
+            Amount::from(10),
+            "009a1f293253e41e".parse::<Id>().unwrap(),
+            Secret::new("credits-first-reaccept-local-balance"),
+            cashu::SecretKey::generate().public_key(),
+        );
+        wallet
+            .localstore
+            .update_proofs(
+                vec![
+                    ProofInfo::new(
+                        proof,
+                        credit.parse().unwrap(),
+                        State::Unspent,
+                        CurrencyUnit::Sat,
+                    )
+                    .unwrap(),
+                ],
+                vec![],
+            )
+            .await
+            .unwrap();
+        let rows = crate::wallet_ops::balances_async(&home).await.unwrap();
+        assert_eq!(
+            crate::crossmint::select_source_mint(lightning, &listed, true, &rows, 10),
+            credit,
+            "control: fresh selection changes after credits arrive"
+        );
+        let retry = accept_claim_async(&home, request()).await.unwrap().bind;
+        assert_eq!(retry.funding_mint, first.funding_mint);
+        assert_eq!(retry.delivery_mint, first.delivery_mint);
+        let attempt = |bind: &AcceptedBind| {
+            let plan = crate::crossmint::plan_payment(
+                bind.funding_mint.as_deref().unwrap(),
+                &bind.accepted_mints,
+                true,
+            )
+            .unwrap();
+            let terms = PaymentTerms::new(
+                plan.realized_mint().clone(),
+                Amount::from(bind.amount_sats),
+                CurrencyUnit::Sat,
+                seller.public_key(),
+                format!("02{}", seller.public_key().to_hex())
+                    .parse()
+                    .unwrap(),
+            );
+            PaymentKey::new(
+                JobId::new(&bind.job_id).unwrap(),
+                ResultId::new(&bind.result_id).unwrap(),
+                DeliveryIntegrityHash::from_hex(&bind.commit_oid).unwrap(),
+                JobHash::from_hex(&bind.job_hash).unwrap(),
+                &terms,
+                bind.creq_hash.clone(),
+            )
+            .attempt_id()
+        };
+        assert_eq!(attempt(&first), attempt(&retry));
+        client.disconnect().await;
+    }
 
     // ---- #1076 review: accept seals the mint a LIVE reservation holds ---------------------------
 
@@ -7970,6 +8167,50 @@ mod private_flow_tests {
         assert_eq!(view.results.len(), 1);
         assert_eq!(view.claims[0].status, CLAIM_STATUS_EXPIRED); // delivery pay window has elapsed
         client.disconnect().await;
+    }
+
+    #[test]
+    fn credits_first_private_mixed_claim_is_visible_and_awardable() {
+        let approved = "https://testnut.cashu.space";
+        let (e, _, buyer, policy) = crate::private_content::evidence::inline_fixture_with_mints(
+            true,
+            true,
+            2_000_000_000,
+            vec![approved.into(), "https://unknown.example".into()],
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let mut home = home::bootstrap(dir.path()).unwrap();
+        home.config.accepted_mints = vec![approved.into()];
+        home.config.privacy.service_pubkey = Some(policy.service);
+        home.config.privacy.git_base = Some(policy.host.git_prefix);
+        let mut ctx = ContentContext::open(&home, &buyer.public_key().to_hex()).unwrap();
+        for raw in [e.task_envelope.as_ref(), e.answer_envelope.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            ctx.stage(&PreparedContent::decode(raw).unwrap(), 1_999_999_900)
+                .unwrap();
+        }
+        let view = private_view_from_events(
+            &home,
+            &mut ctx,
+            &e.offer,
+            vec![e.claim.clone()],
+            vec![e.award.clone()],
+            vec![e.result.clone()],
+            1_999_999_900,
+        )
+        .unwrap();
+        assert_eq!(view.claims.len(), 1, "#1069 mixed claim must be visible");
+        let f = crate::buyer::lifecycle::award_filters_for_offer(
+            view.offer.as_ref().unwrap(),
+            10,
+            approved,
+            true,
+            &[],
+        );
+        let claim = crate::buyer::lifecycle::select_awardable_claim(&view, &f).unwrap();
+        crate::buyer::lifecycle::named_claim_awardable(&view, &claim, &f).unwrap();
     }
 
     #[tokio::test]

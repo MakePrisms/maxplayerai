@@ -126,6 +126,21 @@ impl PrivateEvidence {
 
 #[cfg(feature = "wallet")]
 impl PrivateEvidence {
+    /// Check the derived delivery/receipt mint, not request.realized_mint (which
+    /// carries the funding source and may legitimately be outside the creq).
+    pub(crate) fn validate_realized_mint(&self, mint: &str, policy: &Policy) -> Result<()> {
+        let claim = wire::validate_private(&self.claim, &policy.host)?;
+        let request = crate::gateway::creq::parse_creq(claim.required("creq")?)
+            .map_err(|_| Error("invalid signed claim invoice"))?;
+        policy.host.well_formed_mint(mint)?;
+        let realized: cdk::mint_url::MintUrl =
+            mint.parse().map_err(|_| Error("invalid realized mint"))?;
+        if !request.mints.contains(&realized) {
+            return Err(Error("realized mint is outside signed claim creq"));
+        }
+        Ok(())
+    }
+
     /// The sealed bind is a projection, not a second source of authority. Check
     /// every spend/artifact field against the original signed chain on each use.
     pub fn validate_request(
@@ -240,6 +255,25 @@ pub(crate) fn inline_fixture_with_deadline(
     nostr_sdk::Keys,
     Policy,
 ) {
+    inline_fixture_with_mints(
+        targeted,
+        paid,
+        deadline,
+        vec!["https://testnut.cashu.space".into()],
+    )
+}
+#[cfg(all(test, feature = "wallet"))]
+pub(crate) fn inline_fixture_with_mints(
+    targeted: bool,
+    paid: bool,
+    deadline: u64,
+    mints: Vec<String>,
+) -> (
+    PrivateEvidence,
+    crate::authorize_pay::AuthorizePayRequest,
+    nostr_sdk::Keys,
+    Policy,
+) {
     let amount = if paid { 10 } else { 0 };
     let payment_mode = if paid {
         crate::gateway::PaymentMode::Sat
@@ -260,7 +294,7 @@ pub(crate) fn inline_fixture_with_deadline(
         service: service.clone(),
         host: wire::HostPolicy {
             git_prefix: "https://git.example/git/".into(),
-            accepted_mints: vec!["https://testnut.cashu.space".into()],
+            accepted_mints: mints,
         },
     };
     let prepared = builders::prepare_offer(
@@ -492,5 +526,21 @@ mod tests {
                 .validate_request(&request, &buyer.public_key().to_hex(), &policy)
                 .is_err()
         );
+    }
+    #[test]
+    fn credits_first_realized_mint_must_be_in_signed_creq() {
+        let (evidence, request, buyer, mut policy) = inline_fixture_with_payment(true, true);
+        // Config membership is irrelevant; signed seller membership is authority.
+        policy.host.accepted_mints.clear();
+        evidence
+            .validate_request(&request, &buyer.public_key().to_hex(), &policy)
+            .unwrap();
+        evidence
+            .validate_realized_mint(&request.accepted_mints[0], &policy)
+            .unwrap();
+        let error = evidence
+            .validate_realized_mint("https://outside.example", &policy)
+            .unwrap_err();
+        assert!(error.to_string().contains("outside signed claim"));
     }
 }

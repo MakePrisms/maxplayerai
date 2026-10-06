@@ -1422,6 +1422,54 @@ pub fn read_reservation_pin(db_path: &Path, job_id: &str) -> Result<ReservationP
     query_reservation_pin(&conn, job_id, has_source_mint)
 }
 
+/// Net balances used only for source selection. The reservation ceiling still uses raw
+/// balances: reserve_at subtracts live holds atomically when it writes the new hold.
+#[cfg(feature = "wallet")]
+pub(crate) fn available_balances(
+    db_path: &Path,
+    job_id: &str,
+    default_mint: &str,
+    balances: &[crate::wallet_ops::MintBalance],
+) -> Result<Vec<crate::wallet_ops::MintBalance>, StoreError> {
+    let mut available = balances.to_vec();
+    if !db_path.exists() {
+        return Ok(available);
+    }
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    let has_table: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'reservations')", [], |row| row.get(0))?;
+    if !has_table {
+        return Ok(available);
+    }
+    let has_source = BuyerStore::column_exists(&conn, "reservations", "source_mint")?;
+    let sql = if has_source {
+        "SELECT source_mint, amount_sats FROM reservations WHERE state = 'reserved' AND job_id != ?1"
+    } else {
+        "SELECT NULL, amount_sats FROM reservations WHERE state = 'reserved' AND job_id != ?1"
+    };
+    let normalize = |mint: &str| {
+        crate::wallet_ops::normalize_mint_url(mint).unwrap_or_else(|_| mint.trim().to_owned())
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([job_id], |row| {
+        Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    for row in rows {
+        let (mint, amount) = row?;
+        let mint = normalize(mint.as_deref().unwrap_or(default_mint));
+        for balance in &mut available {
+            if normalize(&balance.mint_url) == mint {
+                balance.balance_sats = balance.balance_sats.saturating_sub(amount.max(0) as u64);
+            }
+        }
+    }
+    Ok(available)
+}
+
 /// The in-flight `reserved` term for one ceiling (#1076). Pooled: every `Reserved` row. Per mint:
 /// rows recorded at that mint, plus unrecorded (pre-v7 / pooled) rows when the mint is the default.
 fn sum_reserved_against(

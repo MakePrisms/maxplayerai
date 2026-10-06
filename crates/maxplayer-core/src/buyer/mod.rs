@@ -914,15 +914,12 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
             };
         }
     }
-    let (award_amount, claim_id, send_relay, mut quoted_mints) = match &attempt {
-        Some(attempt) => (
-            attempt.amount_sats,
-            attempt.claim_id.clone(),
-            attempt_relay(attempt, &context.home),
-            attempt_quoted_mints(attempt),
-        ),
-        None => {
-            let view = match job_lifecycle::fetch_job_view_async(
+    // Fetch before locking or snapshotting balances: relay I/O must not hold up other
+    // money paths or age the snapshot before reservation. Pinned attempts still skip
+    // this read entirely; their signed decision is already sealed.
+    let view = if attempt.is_none() {
+        Some(
+            match job_lifecycle::fetch_job_view_async(
                 &context.home,
                 &keys,
                 &params.job_id,
@@ -933,7 +930,26 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
             {
                 Ok(view) => view,
                 Err(error) => return Response::err(id, CODE_INTERNAL, error.to_string()),
-            };
+            },
+        )
+    } else {
+        None
+    };
+    // Pinned-attempt resolution above can re-enter money_lock. From here on,
+    // keep selection, its balance snapshot, and reservation under one guard.
+    let _guard = context.money_lock.lock().await;
+    let balances = read_award_balances(context, &params.job_id).await;
+    let (award_amount, claim_id, send_relay, mut quoted_mints) = match &attempt {
+        Some(attempt) => (
+            attempt.amount_sats,
+            attempt.claim_id.clone(),
+            attempt_relay(attempt, &context.home),
+            attempt_quoted_mints(attempt),
+        ),
+        None => {
+            let view = view
+                .as_ref()
+                .expect("unpinned award fetched its view before locking");
             let Some(offer) = view.offer.as_ref() else {
                 return Response::err(
                     id,
@@ -947,11 +963,16 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
             // every other filter come from the SIGNED OFFER, never from award params, so the request
             // cannot be changed after the fact. Sharing the constructor is what makes "both paths
             // filter identically" structural instead of a convention someone has to keep noticing.
+            let available = match award_filter_balances(&params.job_id, &balances) {
+                Ok(available) => available,
+                Err(error) => return Response::err(id, CODE_INTERNAL, error),
+            };
             let filters = lifecycle::award_filters_for_offer(
                 offer,
                 max_sats,
                 context.home.config.default_mint(),
                 context.home.config.allow_real_mints,
+                available,
             );
 
             // Manual award names the claim but applies the SAME hard filters as auto-award —
@@ -960,12 +981,14 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
             // claim that passes those same filters.
             let claim_id = match params.claim_id.clone() {
                 Some(claim_id) => {
-                    if let Err(refused) = lifecycle::named_claim_awardable(&view, &claim_id, &filters) {
+                    if let Err(refused) =
+                        lifecycle::named_claim_awardable(view, &claim_id, &filters)
+                    {
                         return Response::err(id, CODE_REFUSED, refused.to_string());
                     }
                     claim_id
                 }
-                None => match lifecycle::select_awardable_claim(&view, &filters) {
+                None => match lifecycle::select_awardable_claim(view, &filters) {
                     Some(claim_id) => claim_id,
                     None => {
                         return Response::err(
@@ -979,19 +1002,20 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
                     }
                 },
             };
-            let quoted_mints = claim_creq_mints(&view, &claim_id);
-            (offer_amount, claim_id, context.home.config.relay_url.clone(), quoted_mints)
+            let quoted_mints = claim_creq_mints(view, &claim_id);
+            (
+                offer_amount,
+                claim_id,
+                context.home.config.relay_url.clone(),
+                quoted_mints,
+            )
         }
     };
 
-    // Serialize with collect: the reserve below reads a balance/spent snapshot that must not race
-    // a concurrent melt. Held across the whole chokepoint call (see the deadlock note above for
-    // why not earlier).
-    let _guard = context.money_lock.lock().await;
-    // Re-derive BOTH pinned-attempt gates from a fresh read under the guard. The reads above ran
-    // before the lock, and the wait to get here (view fetches, then the guard itself — unbounded
-    // behind a settle) is long enough for an attempt to be pinned by a concurrent path or for
-    // the deadline to cross.
+    // The guard already protects the shared selection/ceiling balance snapshot.
+    // Recheck both pinned-attempt gates under the guard. A concurrent path could
+    // have pinned an attempt before we acquired it, and the balance/view awaits
+    // can carry us across the deadline.
     if let Ok(Some(current)) = context.store.award_attempt(&params.job_id) {
         // A claim named by the caller must still be refused when an attempt pinned MEANWHILE
         // names another: silently resolving a claim the caller never sanctioned is the thing
@@ -1028,7 +1052,13 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
         // not the list read before the guard.
         quoted_mints = attempt_quoted_mints(&current);
     }
-    let ceiling = match award_ceiling(context, &params.job_id, &quoted_mints, award_amount).await {
+    let ceiling = match award_ceiling_with_read(
+        context,
+        &params.job_id,
+        &quoted_mints,
+        award_amount,
+        balances,
+    ) {
         Ok(ceiling) => ceiling,
         Err(error) => return Response::err(id, CODE_INTERNAL, error),
     };
@@ -1398,15 +1428,63 @@ async fn award_ceiling(
     quoted_mints: &[String],
     amount_sats: u64,
 ) -> Result<MintCeiling, String> {
-    let pin = context
-        .store
-        .reservation_pin(job_id)
-        .map_err(|error| error.to_string())?;
-    let read = context
+    let read = read_award_balances(context, job_id).await;
+    award_ceiling_with_read(context, job_id, quoted_mints, amount_sats, read)
+}
+
+#[derive(Debug)]
+struct AwardBalances {
+    raw: Vec<crate::wallet_ops::MintBalance>,
+    available: Vec<crate::wallet_ops::MintBalance>,
+}
+
+async fn read_award_balances(
+    context: &BuyerContext,
+    job_id: &str,
+) -> Result<AwardBalances, String> {
+    let raw = context
         .wallet
         .balances()
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|e| e.to_string())??;
+    let available = store::available_balances(
+        &context.home.root.join(STATE_DB_FILE),
+        job_id,
+        context.home.config.default_mint(),
+        &raw,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(AwardBalances { raw, available })
+}
+
+fn balance_snapshot_error(job_id: &str, error: &str) -> String {
+    format!(
+        "per-mint balance read failed for job {job_id} ({error}); the award ceiling cannot be checked, so nothing was reserved — retry"
+    )
+}
+
+/// Both manual and auto paths must pass this gate BEFORE mint filtering, so an
+/// unavailable wallet snapshot can never masquerade as a credits-hop refusal.
+fn award_filter_balances<'a>(
+    job_id: &str,
+    read: &'a Result<AwardBalances, String>,
+) -> Result<&'a [crate::wallet_ops::MintBalance], String> {
+    read.as_ref()
+        .map(|snapshot| snapshot.available.as_slice())
+        .map_err(|error| balance_snapshot_error(job_id, error))
+}
+
+fn award_ceiling_with_read(
+    context: &BuyerContext,
+    job_id: &str,
+    quoted_mints: &[String],
+    amount_sats: u64,
+    read: Result<AwardBalances, String>,
+) -> Result<MintCeiling, String> {
+    let pin = context
+        .store
+        .reservation_pin(job_id)
+        .map_err(|e| e.to_string())?;
     ceiling_from_read(
         context.home.config.default_mint(),
         context.home.config.allow_real_mints,
@@ -1424,16 +1502,11 @@ fn ceiling_from_read(
     allow_real_mints: bool,
     pin: &store::ReservationPin,
     quoted_mints: &[String],
-    read: Result<Vec<crate::wallet_ops::MintBalance>, String>,
+    read: Result<AwardBalances, String>,
     amount_sats: u64,
     job_id: &str,
 ) -> Result<MintCeiling, String> {
-    let balances = read.map_err(|error| {
-        format!(
-            "per-mint balance read failed for job {job_id} ({error}); the award ceiling cannot be \
-             checked, so nothing was reserved — retry"
-        )
-    })?;
+    let balances = read.map_err(|error| balance_snapshot_error(job_id, &error))?;
     let recorded = match pin {
         store::ReservationPin::Unpinned => None,
         store::ReservationPin::Default => Some(default_mint.to_owned()),
@@ -1444,7 +1517,8 @@ fn ceiling_from_read(
         allow_real_mints,
         recorded.as_deref(),
         quoted_mints,
-        &balances,
+        &balances.raw,
+        &balances.available,
         amount_sats,
     ))
 }
@@ -1456,6 +1530,7 @@ fn award_ceiling_from_balances(
     recorded_mint: Option<&str>,
     quoted_mints: &[String],
     balances: &[crate::wallet_ops::MintBalance],
+    available: &[crate::wallet_ops::MintBalance],
     amount_sats: u64,
 ) -> MintCeiling {
     let normalize = |raw: &str| {
@@ -1467,7 +1542,7 @@ fn award_ceiling_from_balances(
             default_mint,
             quoted_mints,
             allow_real_mints,
-            balances,
+            available,
             amount_sats,
         ),
     };
@@ -1622,11 +1697,31 @@ async fn drive_auto_award(
         // THE SAME constructor the manual award path uses, so the two cannot apply different filters.
         // Both selection entry points then consult `claim_meets_capability_request`:
         // `select_awardable_claim` here, `named_claim_awardable` on the manual path.
+        let guard = context.money_lock.lock().await;
+        let balances = read_award_balances(context, job_id).await;
+        let available = match award_filter_balances(job_id, &balances) {
+            Ok(available) => available,
+            Err(reason) => {
+                drop(guard);
+                if now_unix() as u64 > offer.deadline_unix {
+                    if settle_intent_from_attempt(context, &keys, job_id).await {
+                        return Ok(());
+                    }
+                    crate::opline!("{}", auto_award_park_line(job_id, &reason));
+                    let _ = context.store.mark_award_parked(job_id, &reason, now_unix());
+                    return Ok(());
+                }
+                // Like a failed ceiling read, keep the intent pending and surface
+                // the retryable error to the driver instead of diagnosing its mints.
+                return Err(reason);
+            }
+        };
         let filters = lifecycle::award_filters_for_offer(
             offer,
             max_sats,
             context.home.config.default_mint(),
             context.home.config.allow_real_mints,
+            available,
         );
 
         // Built AFTER `filters` so the deadline park can name the capability request that refused
@@ -1634,15 +1729,16 @@ async fn drive_auto_award(
         // the only thing that makes an actionable reason available here; the decision itself is
         // unchanged, and a job with no request parks with the wording it always did.
         if now_unix() as u64 > offer.deadline_unix {
+            drop(guard); // settle_intent_from_attempt acquires the same lock.
             // A pinned attempt past its deadline is NOT "no awardable claim appeared" — a claim
             // was selected and signed for. Reflect the ATTEMPT's truth on the intent instead of
             // a false park reason; the periodic sweep continues anything still unresolved.
             if settle_intent_from_attempt(context, &keys, job_id).await {
                 return Ok(());
             }
-            let reason = lifecycle::park_reason_deadline_passed(
-                lifecycle::capability_park_reason(&view, &filters).as_deref(),
-            );
+            let diagnosis = lifecycle::capability_park_reason(&view, &filters)
+                .or_else(|| lifecycle::mint_park_reason(&view, &filters));
+            let reason = lifecycle::park_reason_deadline_passed(diagnosis.as_deref());
             crate::opline!("{}", auto_award_park_line(job_id, &reason));
             let _ = context.store.mark_award_parked(job_id, &reason, now_unix());
             return Ok(());
@@ -1650,10 +1746,18 @@ async fn drive_auto_award(
 
         if let Some(claim_id) = lifecycle::select_awardable_claim(&view, &filters) {
             let quoted_mints = claim_creq_mints(&view, &claim_id);
-            return finalize_auto_award(context, job_id, offer.amount_sats, claim_id, quoted_mints)
-                .await;
+            return finalize_auto_award(
+                context,
+                job_id,
+                offer.amount_sats,
+                claim_id,
+                quoted_mints,
+                balances,
+            )
+            .await;
         }
 
+        drop(guard);
         // No awardable claim yet — re-check after a bounded interval (no tight spin on a
         // live-but-unpayable claim). The deadline check above bounds the total wait.
         tokio::time::sleep(AUTO_AWARD_POLL_INTERVAL).await;
@@ -1685,11 +1789,11 @@ async fn finalize_auto_award(
     offer_amount: u64,
     claim_id: String,
     quoted_mints: Vec<String>,
+    balances: Result<AwardBalances, String>,
 ) -> Result<(), String> {
-    let _guard = context.money_lock.lock().await;
-    // Deadline TOCTOU re-check under the guard (same as the manual RPC): the caller's deadline
-    // gate ran before this lock, whose wait is unbounded behind a settle. Err keeps the intent
-    // pending — the deadline arm / the sweep resolves the pinned attempt by probe.
+    // Caller holds money_lock from the shared filter/ceiling snapshot through this await.
+    // Keep the pinned-attempt deadline check at the reserve/publish boundary.
+    // The caller holds the guard; Err leaves the intent pending for a probe.
     if let Ok(Some(current)) = context.store.award_attempt(job_id) {
         if resume_crossed_deadline(&current, now_unix()) {
             return Err(format!(
@@ -1698,7 +1802,7 @@ async fn finalize_auto_award(
             ));
         }
     }
-    let ceiling = award_ceiling(context, job_id, &quoted_mints, offer_amount).await?;
+    let ceiling = award_ceiling_with_read(context, job_id, &quoted_mints, offer_amount, balances)?;
     let home = context.home.clone();
     let job = job_id.to_owned();
     let publish_claim = claim_id.clone();
@@ -3379,6 +3483,45 @@ mod tests {
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
+    // Drive the actual manual handler into a relay connection whose handshake never
+    // completes. No sleeps or elapsed-time assertion: receiving the HTTP request is
+    // the barrier proving the fetch is in flight, and try_lock checks immediately.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn manual_award_relay_fetch_does_not_hold_money_lock() {
+        use tokio::io::AsyncReadExt;
+
+        let root = temp_home("award-fetch-lock");
+        let mut home = bootstrap_home(&root).expect("bootstrap home");
+        let relay = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        home.config.relay_url = format!("ws://{}", relay.local_addr().expect("address"));
+        let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
+        let request = award(&context, json!(1), json!({"job_id": "a".repeat(64)}));
+        tokio::pin!(request);
+        let blocked_fetch = async {
+            let (mut stream, _) = relay.accept().await.expect("relay connection");
+            let mut byte = [0];
+            stream
+                .read_exact(&mut byte)
+                .await
+                .expect("handshake request");
+            stream // Keep the connection open without answering the handshake.
+        };
+        let stream = tokio::select! {
+            response = &mut request => panic!("award finished before relay barrier: {response:?}"),
+            stream = tokio::time::timeout(Duration::from_secs(10), blocked_fetch) => {
+                stream.expect("manual award must reach the relay")
+            }
+        };
+        assert!(
+            context.money_lock.try_lock().is_ok(),
+            "manual award must leave money_lock available while its relay fetch is blocked"
+        );
+        drop(stream);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // #774 defence in depth. `raise_open_file_limit` claims it lifts the soft descriptor limit
     // toward the hard one; a comment saying so is not evidence, so this executes it.
     //
@@ -3517,10 +3660,19 @@ mod tests {
     #[test]
     fn award_ceiling_counts_a_covering_extra_mint_the_claim_accepts() {
         let quoted = vec![CEIL_DEFAULT.to_owned(), CEIL_EXTRA.to_owned()];
-        let balances =
-            vec![mint_row(CEIL_DEFAULT, 0, true, true), mint_row(CEIL_EXTRA, 300, false, true)];
-        let ceiling =
-            award_ceiling_from_balances(CEIL_DEFAULT, true, None, &quoted, &balances, 200);
+        let balances = vec![
+            mint_row(CEIL_DEFAULT, 0, true, true),
+            mint_row(CEIL_EXTRA, 300, false, true),
+        ];
+        let ceiling = award_ceiling_from_balances(
+            CEIL_DEFAULT,
+            true,
+            None,
+            &quoted,
+            &balances,
+            &balances,
+            200,
+        );
         assert_eq!(ceiling, MintCeiling::at_mint(CEIL_EXTRA, 300, false));
     }
 
@@ -3529,10 +3681,19 @@ mod tests {
     #[test]
     fn award_ceiling_never_sums_balances_across_mints() {
         let quoted = vec![CEIL_DEFAULT.to_owned(), CEIL_EXTRA.to_owned()];
-        let balances =
-            vec![mint_row(CEIL_DEFAULT, 150, true, true), mint_row(CEIL_EXTRA, 150, false, true)];
-        let ceiling =
-            award_ceiling_from_balances(CEIL_DEFAULT, true, None, &quoted, &balances, 200);
+        let balances = vec![
+            mint_row(CEIL_DEFAULT, 150, true, true),
+            mint_row(CEIL_EXTRA, 150, false, true),
+        ];
+        let ceiling = award_ceiling_from_balances(
+            CEIL_DEFAULT,
+            true,
+            None,
+            &quoted,
+            &balances,
+            &balances,
+            200,
+        );
         assert_eq!(ceiling.balance, 150, "one mint's balance, never 300");
         assert!(ceiling.balance < 200);
     }
@@ -3541,15 +3702,110 @@ mod tests {
     // (the call accept seals through) picks from the same inputs.
     #[test]
     fn award_ceiling_mint_matches_the_accept_selection() {
+        let credit = "nostr://npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d";
         let cases: Vec<(Vec<String>, Vec<crate::wallet_ops::MintBalance>, u64)> = vec![
-            (vec![CEIL_EXTRA.into()], vec![mint_row(CEIL_DEFAULT, 500, true, true), mint_row(CEIL_EXTRA, 500, false, true)], 100),
-            (vec![CEIL_EXTRA.into()], vec![mint_row(CEIL_DEFAULT, 500, true, true)], 100),
-            (vec![CEIL_OTHER.into(), CEIL_EXTRA.into()], vec![mint_row(CEIL_OTHER, 50, false, true), mint_row(CEIL_EXTRA, 500, false, true)], 100),
+            (
+                vec![CEIL_DEFAULT.into(), credit.into()],
+                vec![
+                    mint_row(CEIL_DEFAULT, 500, true, true),
+                    mint_row(credit, 500, false, true),
+                ],
+                100,
+            ),
+            (
+                vec![credit.into()],
+                vec![mint_row(credit, 100, false, true)],
+                100,
+            ),
+            (
+                vec![credit.into(), CEIL_EXTRA.into()],
+                vec![
+                    mint_row(credit, 99, false, true),
+                    mint_row(CEIL_EXTRA, 100, false, true),
+                ],
+                100,
+            ),
+            (
+                vec![CEIL_EXTRA.into()],
+                vec![
+                    mint_row(CEIL_DEFAULT, 500, true, true),
+                    mint_row(CEIL_EXTRA, 500, false, true),
+                ],
+                100,
+            ),
+            (
+                vec![CEIL_EXTRA.into()],
+                vec![mint_row(CEIL_DEFAULT, 500, true, true)],
+                100,
+            ),
+            (
+                vec![CEIL_OTHER.into(), CEIL_EXTRA.into()],
+                vec![
+                    mint_row(CEIL_OTHER, 50, false, true),
+                    mint_row(CEIL_EXTRA, 500, false, true),
+                ],
+                100,
+            ),
             (vec![], vec![mint_row(CEIL_EXTRA, 500, false, true)], 100),
         ];
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("buyer.sqlite");
+        let store = BuyerStore::open(&db).unwrap();
+        let credit_mint = crate::wallet_ops::normalize_mint_url(credit).unwrap();
+        store
+            .reserve_at(
+                "job-a",
+                100,
+                &MintCeiling::at_mint(credit_mint, 100, false),
+                1,
+            )
+            .unwrap();
+        let raw = vec![
+            mint_row(credit, 100, false, true),
+            mint_row(CEIL_EXTRA, 100, false, true),
+        ];
+        let net = store::available_balances(&db, "job-b", CEIL_DEFAULT, &raw).unwrap();
+        let quoted = vec![CEIL_EXTRA.to_owned(), credit.to_owned()];
+        let accept = job_lifecycle::accept_source_seed(
+            CEIL_DEFAULT,
+            &quoted,
+            true,
+            &store::ReservationPin::Unpinned,
+            Some(Ok(&net)),
+            100,
+        );
+        let ceiling = ceiling_from_read(
+            CEIL_DEFAULT,
+            true,
+            &store::ReservationPin::Unpinned,
+            &quoted,
+            Ok(AwardBalances {
+                raw,
+                available: net,
+            }),
+            100,
+            "job-b",
+        )
+        .unwrap();
+        assert_eq!(accept, CEIL_EXTRA);
+        assert_eq!(ceiling.mint.as_deref(), Some(accept.as_str()));
         for (quoted, balances, amount) in cases {
-            let accept = crate::crossmint::select_source_mint(CEIL_DEFAULT, &quoted, true, &balances, amount);
-            let ceiling = award_ceiling_from_balances(CEIL_DEFAULT, true, None, &quoted, &balances, amount);
+            let accept = crate::crossmint::select_source_mint(
+                CEIL_DEFAULT,
+                &quoted,
+                true,
+                &balances,
+                amount,
+            );
+            let ceiling = award_ceiling_from_balances(
+                CEIL_DEFAULT,
+                true,
+                None,
+                &quoted,
+                &balances,
+                &balances,
+                amount,
+            );
             assert_eq!(
                 ceiling.mint.as_deref(),
                 Some(crate::wallet_ops::normalize_mint_url(&accept).unwrap().as_str()),
@@ -3558,14 +3814,103 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn reserved_credits_choose_sats_for_filter_ceiling_accept_and_award() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("buyer.sqlite");
+        let store = BuyerStore::open(&db).unwrap();
+        let credit = "nostr://npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d";
+        let credit = crate::wallet_ops::normalize_mint_url(credit).unwrap();
+        let raw = vec![
+            mint_row(&credit, 100, false, true),
+            mint_row(CEIL_EXTRA, 100, false, true),
+        ];
+        store
+            .reserve_at("job-a", 100, &MintCeiling::at_mint(&credit, 100, false), 1)
+            .unwrap();
+        let listed = vec![CEIL_EXTRA.to_owned(), credit.clone()];
+        let available = store::available_balances(&db, "job-b", CEIL_DEFAULT, &raw).unwrap();
+        assert_eq!(available[0].balance_sats, 0);
+        let source =
+            crate::crossmint::select_source_mint(CEIL_DEFAULT, &listed, true, &available, 100);
+        assert_eq!(
+            source, CEIL_EXTRA,
+            "reserved credits must not win source selection"
+        );
+        let ceiling = ceiling_from_read(
+            CEIL_DEFAULT,
+            true,
+            &store::ReservationPin::Unpinned,
+            &listed,
+            Ok(AwardBalances {
+                raw: raw.clone(),
+                available,
+            }),
+            100,
+            "job-b",
+        )
+        .unwrap();
+        assert_eq!(ceiling.mint.as_deref(), Some(CEIL_EXTRA));
+        let (pin, balances) = job_lifecycle::accept_pin_and_balances(&db, "job-b", || async {
+            store::available_balances(&db, "job-b", CEIL_DEFAULT, &raw).map_err(|e| e.to_string())
+        })
+        .await
+        .unwrap();
+        let accept = job_lifecycle::accept_source_seed(
+            CEIL_DEFAULT,
+            &listed,
+            true,
+            &pin,
+            balances
+                .as_ref()
+                .map(|r| r.as_ref().map(Vec::as_slice).map_err(String::as_str)),
+            100,
+        );
+        assert_eq!(accept, CEIL_EXTRA);
+        assert_eq!(
+            store.reserve_at("job-b", 100, &ceiling, 2).unwrap(),
+            reservations::Reserved::New {
+                available_before: 100
+            }
+        );
+        assert_eq!(
+            store.reservation_pin("job-b").unwrap(),
+            store::ReservationPin::Mint(CEIL_EXTRA.into())
+        );
+        // Exclude this job's own live row: a retry must not count its own hold twice.
+        let own = store::available_balances(&db, "job-a", CEIL_DEFAULT, &raw).unwrap();
+        assert_eq!(own[0].balance_sats, 100);
+    }
+
+    #[test]
+    fn balance_read_failure_diagnostic_is_not_a_credit_hop_refusal() {
+        let error = award_filter_balances("job-b", &Err("wallet db locked".into())).unwrap_err();
+        assert!(
+            error.contains("per-mint balance read failed") && error.contains("wallet db locked")
+        );
+        assert!(!error.contains("cannot receive a hop"));
+        let parked = auto_award_park_line("job-b", &error);
+        assert!(parked.contains("balance read failed") && parked.contains("retry"));
+    }
+
     // An unconfigured, DB-discovered mint is never a funding source, so its proofs never raise the
     // ceiling — even when the claim quotes it.
     #[test]
     fn award_ceiling_ignores_unconfigured_mints() {
         let quoted = vec![CEIL_OTHER.to_owned()];
-        let balances =
-            vec![mint_row(CEIL_DEFAULT, 0, true, true), mint_row(CEIL_OTHER, 900, false, false)];
-        let ceiling = award_ceiling_from_balances(CEIL_DEFAULT, true, None, &quoted, &balances, 200);
+        let balances = vec![
+            mint_row(CEIL_DEFAULT, 0, true, true),
+            mint_row(CEIL_OTHER, 900, false, false),
+        ];
+        let ceiling = award_ceiling_from_balances(
+            CEIL_DEFAULT,
+            true,
+            None,
+            &quoted,
+            &balances,
+            &balances,
+            200,
+        );
         assert_eq!(ceiling, MintCeiling::at_mint(CEIL_DEFAULT, 0, true));
     }
 
@@ -3584,13 +3929,25 @@ mod tests {
         let balances =
             vec![mint_row(CEIL_DEFAULT, 0, true, true), mint_row(&normalized, 300, false, true)];
         let quoted = vec![CREDITS.to_owned()];
-        let ceiling = award_ceiling_from_balances(CEIL_DEFAULT, true, None, &quoted, &balances, 200);
-        assert_eq!(ceiling, MintCeiling::at_mint(normalized.clone(), 300, false));
+        let ceiling = award_ceiling_from_balances(
+            CEIL_DEFAULT,
+            true,
+            None,
+            &quoted,
+            &balances,
+            &balances,
+            200,
+        );
+        assert_eq!(
+            ceiling,
+            MintCeiling::at_mint(normalized.clone(), 300, false)
+        );
         let pinned = award_ceiling_from_balances(
             CEIL_DEFAULT,
             true,
             Some(&normalized),
             &quoted,
+            &balances,
             &balances,
             200,
         );
@@ -3625,7 +3982,10 @@ mod tests {
             true,
             &store::ReservationPin::Default,
             &[CEIL_EXTRA.to_owned()],
-            Ok(balances),
+            Ok(AwardBalances {
+                available: balances.clone(),
+                raw: balances,
+            }),
             200,
             "job-x",
         )
@@ -3641,7 +4001,13 @@ mod tests {
         let balances =
             vec![mint_row(CEIL_DEFAULT, 500, true, true), mint_row(CEIL_EXTRA, 250, false, true)];
         let ceiling = award_ceiling_from_balances(
-            CEIL_DEFAULT, true, Some(CEIL_EXTRA), &quoted, &balances, 200,
+            CEIL_DEFAULT,
+            true,
+            Some(CEIL_EXTRA),
+            &quoted,
+            &balances,
+            &balances,
+            200,
         );
         assert_eq!(ceiling, MintCeiling::at_mint(CEIL_EXTRA, 250, false));
     }

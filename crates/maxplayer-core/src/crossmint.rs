@@ -87,7 +87,7 @@ impl PayPlan {
 /// source: a hop ends with the buyer holding ecash at the target, so an unfenced target would let a
 /// real-sats mint in through the back door while `allow_real_mints` is off.
 ///
-/// Target selection is the FIRST admissible entry of `accepted_mints` — the seller's list order is
+/// Hop target selection is the FIRST fence-admitted non-credit entry of `accepted_mints` — list order is
 /// their preference. It must stay deterministic: the attempt id is derived from the realized mint, so
 /// a retry that re-derived a different target would compute a different attempt id and defeat
 /// pays-once.
@@ -131,12 +131,14 @@ pub fn plan_payment(
         )));
     }
 
-    // No overlap. Hop to the first accepted mint that the fence admits; refuse fail-closed if none
-    // does, rather than hopping to a mint we are not permitted to hold ecash at.
+    // No overlap. Credit mints cannot receive a hop. Preserve seller order among
+    // the remaining fence-admitted targets; refuse before award if none remain.
     let target = accepted_mints
         .iter()
         .zip(listed)
-        .find(|(raw, _)| home::mint_allowed(raw, allow_real_mints))
+        .find(|(raw, _)| {
+            !crate::mint_wire::is_nostr_scheme(raw) && home::mint_allowed(raw, allow_real_mints)
+        })
         .map(|(_, parsed)| parsed);
 
     match target {
@@ -146,9 +148,9 @@ pub fn plan_payment(
         }),
         None => Err(AuthorizePayError::Input(format!(
             "real-mint fence: buyer mint {buyer_mint} is not in the creq mint list \
-             {accepted_mints:?} and no accepted mint is an allow-listed testnut/dev mint, so the \
-             cross-mint hop has nowhere permitted to land; set allow_real_mints=true to pay at a \
-             real mint"
+             {accepted_mints:?} and no accepted non-credit mint passes the real-mint fence, so the \
+             cross-mint hop has nowhere permitted to land; nostr:// credit mints cannot receive \
+             a hop. Fund a listed mint directly or use a permitted https:// target"
         ))),
     }
 }
@@ -158,13 +160,13 @@ pub fn plan_payment(
 /// the default (which would drain the default and pay a melt fee). Falls back to the configured
 /// default — today's behavior — when no held, accepted, fence-admissible mint covers the amount.
 ///
-/// Deterministic preference: the FIRST entry of the seller's `accepted_mints`, in the seller's list
-/// order, that (1) passes the real-mint fence and (2) shows a balance `>= amount_sats`. Returning an
-/// accepted mint makes [`plan_payment`] plan a DIRECT payment from it (no hop); the seller's order is
-/// their stated preference and keeps the choice stable across retries.
+/// Deterministic preference: covering configured credits (`nostr://`) first, then
+/// covering HTTPS mints, preserving seller order within each group. The fence
+/// applies to both. Returning a listed mint makes [`plan_payment`] pay direct.
 ///
-/// Balance-awareness is ADVISORY and applied ONCE, here at accept. The result is sealed into the
-/// accept-bind and re-derived (not re-decided) at pay, so a later balance or config-default change
+/// Balance-awareness is ADVISORY: award uses it to pin the reservation source, and accept
+/// honors that pin (or selects a source when no pin exists). The accept-bind seals the result,
+/// which is re-derived (not re-decided) at pay, so a later balance or config-default change
 /// cannot shift the sealed mint — the pays-once attempt-id invariant is unchanged. Exact coverage
 /// (including fees) is enforced at pay: if the chosen mint's balance is spent before pay, the pay
 /// refuses fail-closed at that sealed mint rather than silently re-selecting a different one.
@@ -175,16 +177,21 @@ pub(crate) fn select_source_mint(
     balances: &[crate::wallet_ops::MintBalance],
     amount_sats: u64,
 ) -> String {
-    accepted_mints
-        .iter()
-        .find(|accepted| {
-            let mint = accepted.as_str();
-            home::mint_allowed(mint, allow_real_mints) && holds_at_least(balances, mint, amount_sats)
-        })
-        .cloned()
-        .unwrap_or_else(|| config_default.to_owned())
+    // Credits first; preserve the seller's order within each scheme. Never sum
+    // balances or spend a discovered-but-unconfigured wallet row.
+    for scheme in ["nostr://", "https://"] {
+        if let Some(mint) = accepted_mints.iter().find(|mint| {
+            mint.starts_with(scheme)
+                && home::mint_allowed(mint, allow_real_mints)
+                && holds_at_least(balances, mint, amount_sats)
+        }) {
+            return mint.clone();
+        }
+    }
+    config_default.to_owned()
 }
 
+/// Callers supply net-available balances (live holds for other jobs subtracted).
 /// Whether configured `balances` shows at least `amount_sats` at `mint`, comparing normalized mint
 /// URLs. Balance display was widened in #266 to include DB-discovered, unconfigured mints; source
 /// selection deliberately excludes those rows because the selected mint is sealed into the
@@ -299,6 +306,40 @@ mod tests {
 
     fn mint(url: &str) -> MintUrl {
         MintUrl::from_str(url).expect("test mint url parses")
+    }
+
+    #[test]
+    fn seller_creq_explicit_default_port_uses_held_mint_and_pays_direct() {
+        use crate::gateway::creq::{build_seller_creq, parse_creq};
+        use crate::wallet_ops::{normalize_mint_url, MintBalance};
+
+        let configured = "https://mint.example:443";
+        let price = 100;
+        let seller = nostr_sdk::Keys::generate().public_key().to_hex();
+        let raw = build_seller_creq("port-regression", price, "sat", &[configured.into()], &seller)
+            .unwrap();
+        let request = parse_creq(&raw).unwrap();
+        let listed: Vec<String> = request.mints.iter().map(ToString::to_string).collect();
+        let balances = [MintBalance {
+            mint_url: normalize_mint_url(configured).unwrap(),
+            balance_sats: price,
+            is_default: true,
+            configured: true,
+        }];
+        let source = select_source_mint(configured, &listed, true, &balances, price);
+        let plan = plan_payment(&source, &listed, true).unwrap();
+        assert_eq!(
+            plan,
+            PayPlan::Direct { mint: mint(configured) },
+            "a seller mint funded under the same :443 wallet identity must pay Direct, not Hop"
+        );
+        assert!(holds_at_least(&balances, &listed[0], price));
+        assert_eq!(source, configured);
+        // A different fallback proves selection used the covering row, not the default.
+        assert_eq!(
+            select_source_mint("https://unfunded.example", &listed, true, &balances, price),
+            configured
+        );
     }
 
     // Invariant 2 — the decision tooth. Overlap must NOT hop: the existing direct path stays exactly
@@ -680,8 +721,58 @@ mod tests {
         );
         let direct = plan_payment(nostr, &[nostr.to_owned()], true).expect("listed nostr mint");
         assert!(!direct.is_hop(), "a listed nostr:// mint pays direct");
-        let hop_to = plan_payment("https://buyer.example", &[nostr.to_owned()], true)
-            .expect("an https source may still hop");
-        assert!(hop_to.is_hop());
+        let refusal = plan_payment("https://buyer.example", &[nostr.to_owned()], true)
+            .expect_err("credits cannot receive a hop");
+        assert!(refusal.to_string().contains(nostr));
+    }
+    const CREDIT: &str = "nostr://npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d";
+
+    #[test]
+    fn credits_first_source_selection_matrix() {
+        let sats = "https://seller.example";
+        let default = DEFAULT_MINT_URL;
+        for listed in [
+            vec![sats.into(), CREDIT.into()],
+            vec![CREDIT.into(), sats.into()],
+        ] {
+            for (credit_sats, configured, allowed, expected) in [
+                (100, true, true, CREDIT),
+                (99, true, true, sats),
+                (100, false, true, sats),
+                (100, true, false, default),
+            ] {
+                let mut credits = balance(CREDIT, credit_sats);
+                credits.configured = configured;
+                let rows = [balance(sats, 100), credits];
+                assert_eq!(
+                    select_source_mint(default, &listed, allowed, &rows, 100),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn credits_first_hop_skips_credit_targets_in_every_position() {
+        let a = "https://a.example";
+        let b = "https://b.example";
+        for listed in [
+            vec![CREDIT.into(), a.into(), b.into()],
+            vec![a.into(), CREDIT.into(), b.into()],
+            vec![a.into(), b.into(), CREDIT.into()],
+        ] {
+            let plan = plan_payment(DEFAULT_MINT_URL, &listed, true).unwrap();
+            assert!(plan.is_hop());
+            assert_eq!(plan.realized_mint().to_string(), a);
+        }
+        let listed = vec![CREDIT.into()];
+        let error = plan_payment(DEFAULT_MINT_URL, &listed, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(CREDIT) && error.contains("cannot receive"),
+            "{error}"
+        );
+        assert!(!plan_payment(CREDIT, &listed, true).unwrap().is_hop());
     }
 }

@@ -114,8 +114,12 @@ pub fn validate(
     let mut seen = BTreeSet::new();
     for mint in mints {
         let mint = text(mint)?;
-        host.mint(mint)?;
-        if !seen.insert(mint) {
+        host.well_formed_mint(mint)?;
+        // Match buyer wallet/reservation identity: fold case and trailing slashes,
+        // but preserve explicit ports. Keep the original signed bytes untouched.
+        let normalized =
+            cashu::MintUrl::from_str(mint).map_err(|_| Error("invalid invoice mint"))?;
+        if !seen.insert(normalized.to_string()) {
             return Err(Error("duplicate invoice mint"));
         }
     }

@@ -998,3 +998,346 @@ async fn second_run_process_exits_while_first_serves() {
     .await
     .unwrap();
 }
+
+/// Pre-upgrade safety probe: the old planner selects a credit target. A valid
+/// inline cosignature ensures this reaches quote planning, not an earlier gate.
+#[tokio::test(flavor = "multi_thread")]
+async fn credits_first_preupgrade_bind_replans_without_spend_or_journal() {
+    use maxplayer_core::{
+        authorize_pay::{AuthorizePayRequest, JobClass, authorize_pay_async},
+        budget::BudgetGate,
+        home,
+        receipt::{ReceiptPreimage, ReceiptProtocol, result_content_hash_hex},
+    };
+    use nostr_sdk::secp256k1::Message;
+    let h = harness(1, 100).await;
+    // Pin the old target failure with the actual sidecar and CDK quote call.
+    let target_wallet = h.wallet().await;
+    let quote_error = target_wallet
+        .mint_quote(
+            cdk::nuts::PaymentMethod::BOLT11,
+            Some(Amount::from(100)),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(quote_error.contains("unsupported"), "{quote_error}");
+    assert_eq!(target_wallet.total_balance().await.unwrap(), Amount::ZERO);
+    let dir = tempfile::tempdir().unwrap();
+    let mut home = home::bootstrap(dir.path()).unwrap();
+    home.config.allow_real_mints = true;
+    home.config.relay_url = h.relay_urls[0].clone();
+    // An unopened local source: any source HTTP access would fail, proving the
+    // reported target-quote refusal precedes even a source melt quote.
+    let source = "https://127.0.0.1:1";
+    home.config.accepted_mints = vec![source.into()];
+    let keys = Keys::parse(&home::read_secret_key_hex(&home).unwrap()).unwrap();
+    let answer = "credits-first safety probe";
+    let hash = result_content_hash_hex(answer);
+    let preimage = ReceiptPreimage {
+        protocol: ReceiptProtocol::V1,
+        job_hash: "bb".repeat(32),
+        offer_id: "aa".repeat(32),
+        amount: 100,
+        unit: "sat".into(),
+        buyer_pubkey: keys.public_key().to_hex(),
+        seller_pubkey: keys.public_key().to_hex(),
+        delivery_integrity_hash: hash.clone(),
+        delivery_kind: "inline".into(),
+        exec_metadata_commitment: "none".into(),
+        creq_hash: None,
+    };
+    let request = AuthorizePayRequest {
+        private_evidence: None,
+        job_id: preimage.offer_id.clone(),
+        result_id: "cc".repeat(32),
+        job_class: JobClass::FromScratch,
+        delivery_integrity_hash: hash.clone(),
+        job_hash: preimage.job_hash.clone(),
+        seller_pubkey: preimage.seller_pubkey.clone(),
+        amount_sats: 100,
+        repo: String::new(),
+        branch: String::new(),
+        commit_oid: hash,
+        inline_answer: Some(answer.into()),
+        seller_signature: keys
+            .sign_schnorr(&Message::from_digest(preimage.digest_bytes()))
+            .to_string(),
+        creq_hash: None,
+        accepted_mints: vec![h.url.clone(), "https://127.0.0.1:2".into()],
+        realized_mint: Some(source.into()),
+        contribution: None,
+        payment_mode: maxplayer_core::gateway::PaymentMode::Sat,
+    };
+    let mut gate = BudgetGate::from_home(&home).unwrap();
+    let error = authorize_pay_async(&home, &mut gate, request)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("target mint quote"), "{error}");
+    if std::env::var_os("MAXPLAYER_TEST_PREUPGRADE").is_some() {
+        // Run with the target skip reverted to prove the upgrade assumption.
+        assert!(error.contains("unsupported"), "{error}");
+    } else {
+        assert!(
+            error.contains("127.0.0.1:2"),
+            "must reach the HTTPS target: {error}"
+        );
+        assert!(
+            !error.contains("unsupported"),
+            "must not quote the credit target: {error}"
+        );
+    }
+    assert_eq!(gate.spent(), 0);
+    for path in ["payment-journal", "crossmint-journal", "spent.jsonl"] {
+        assert!(!home.root.join(path).exists(), "unexpected {path}");
+    }
+    eprintln!("UPGRADE SAFETY: {error}; spent=0, no payment/hop journals or budget ledger");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn credits_first_real_sidecar_direct_seller_locked_payment() {
+    use cdk::nuts::SpendingConditions;
+    use maxplayer_core::{
+        crossmint::plan_payment, payment::PaymentTerms, payment_wallet::CdkSellerReceive,
+    };
+    let h = harness(1, 100).await;
+    let buyer = h.wallet().await;
+    let token = Token::new(
+        h.url.parse().unwrap(),
+        fund(&h.mint, 100).await,
+        None,
+        CurrencyUnit::Sat,
+    );
+    buyer
+        .receive(&token.to_string(), ReceiveOptions::default())
+        .await
+        .unwrap();
+    let seller = Keys::generate();
+    let seller_key: cdk::nuts::SecretKey = seller.secret_key().to_secret_hex().parse().unwrap();
+    // Lightning-first seller ordering must not obstruct direct credits.
+    let listed = vec!["https://lightning.example".into(), h.url.clone()];
+    let plan = plan_payment(&h.url, &listed, true).unwrap();
+    assert!(!plan.is_hop());
+    let terms = PaymentTerms::new(
+        plan.realized_mint().clone(),
+        Amount::from(10),
+        CurrencyUnit::Sat,
+        seller.public_key(),
+        seller_key.public_key(),
+    );
+    let sent = buyer
+        .prepare_send(
+            Amount::from(10),
+            SendOptions {
+                conditions: Some(SpendingConditions::new_p2pk(seller_key.public_key(), None)),
+                ..SendOptions::default()
+            },
+        )
+        .await
+        .unwrap()
+        .confirm(None)
+        .await
+        .unwrap();
+    let seller_wallet = h.wallet().await;
+    let receive = CdkSellerReceive::new(&seller_wallet, seller_key);
+    let accepted = listed.iter().map(|m| m.parse().unwrap()).collect();
+    assert_eq!(
+        receive
+            .receive(&sent, &terms, &accepted, plan.realized_mint())
+            .await
+            .unwrap(),
+        Amount::from(10)
+    );
+    assert_eq!(buyer.total_balance().await.unwrap(), Amount::from(90));
+    assert_eq!(
+        seller_wallet.total_balance().await.unwrap(),
+        Amount::from(10)
+    );
+    assert!(
+        receive
+            .receive(&sent, &terms, &accepted, plan.realized_mint())
+            .await
+            .is_err(),
+        "never redeem twice"
+    );
+}
+
+#[path = "support/https_mint.rs"]
+mod https_mint;
+
+/// Child process confines SSL_CERT_FILE to this fixture; no process-global TLS
+/// configuration races with other tests. The actual sidecar and both HTTPS mints
+/// stay alive in the parent's Tokio runtime.
+#[tokio::test(flavor = "multi_thread")]
+async fn credits_first_real_sidecar_and_https_hop() {
+    use cdk::wallet::types::ProofInfo;
+    use maxplayer_core::{buyer_fund, home};
+    let credits = harness(1, 100).await;
+    let source = https_mint::start().await;
+    let target = https_mint::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut home = home::bootstrap(dir.path()).unwrap();
+    home::save_config(&mut home, |c| {
+        c.accepted_mints = vec![source.url.clone()];
+        c.extra_mints = vec![credits.url.clone()];
+        c.relay_url = credits.relay_urls[0].clone();
+        c.allow_real_mints = true;
+        c.per_job_budget_sats = 1_000;
+    })
+    .unwrap();
+    // Authentic CDK proofs. Insert the issued funding into the buyer DB, without
+    // requiring a parent-process TLS override just to receive test funding.
+    let wallet = buyer_fund::open_wallet_at_mint_async(&home, &source.url)
+        .await
+        .unwrap();
+    let mut rows = Vec::new();
+    for (mint, url, amount) in [
+        (&source.mint, &source.url, 256),
+        (&credits.mint, &credits.url, 5),
+    ] {
+        for proof in fund(mint, amount).await {
+            rows.push(
+                ProofInfo::new(
+                    proof,
+                    url.parse().unwrap(),
+                    State::Unspent,
+                    CurrencyUnit::Sat,
+                )
+                .unwrap(),
+            );
+        }
+    }
+    wallet.localstore.update_proofs(rows, vec![]).await.unwrap();
+    let ca = dir.path().join("fixture-ca.pem");
+    std::fs::write(&ca, format!("{}{}", source.certificate, target.certificate)).unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
+        .args([
+            "--ignored",
+            "--exact",
+            "credits_first_https_hop_child",
+            "--nocapture",
+        ])
+        .env("CREDITS_FIRST_TEST_HOME", dir.path())
+        .env("CREDITS_FIRST_TEST_TARGET", &target.url)
+        .env("SSL_CERT_FILE", &ca)
+        .env("NO_PROXY", "127.0.0.1,localhost");
+    let output = tokio::task::spawn_blocking(move || child.output().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "invoked only by the HTTPS fixture parent with isolated TLS roots"]
+async fn credits_first_https_hop_child() {
+    use maxplayer_core::{
+        authorize_pay::{AuthorizePayRequest, JobClass, authorize_pay_async},
+        budget::BudgetGate,
+        home,
+        receipt::{ReceiptPreimage, ReceiptProtocol, result_content_hash_hex},
+        wallet_ops,
+    };
+    use nostr_sdk::secp256k1::Message;
+    let root = std::env::var("CREDITS_FIRST_TEST_HOME").expect("fixture parent required");
+    let target = std::env::var("CREDITS_FIRST_TEST_TARGET").unwrap();
+    let home = home::bootstrap(root).unwrap();
+    let source = home.config.default_mint().to_owned();
+    let credit = home.config.extra_mints[0].clone();
+    let keys = Keys::parse(&home::read_secret_key_hex(&home).unwrap()).unwrap();
+    let answer = "credits-first actual HTTPS hop";
+    let hash = result_content_hash_hex(answer);
+    let preimage = ReceiptPreimage {
+        protocol: ReceiptProtocol::V1,
+        job_hash: "bb".repeat(32),
+        offer_id: "aa".repeat(32),
+        amount: 100,
+        unit: "sat".into(),
+        buyer_pubkey: keys.public_key().to_hex(),
+        seller_pubkey: keys.public_key().to_hex(),
+        delivery_integrity_hash: hash.clone(),
+        delivery_kind: "inline".into(),
+        exec_metadata_commitment: "none".into(),
+        creq_hash: None,
+    };
+    let request = AuthorizePayRequest {
+        private_evidence: None,
+        job_id: preimage.offer_id.clone(),
+        result_id: "cc".repeat(32),
+        job_class: JobClass::FromScratch,
+        delivery_integrity_hash: hash.clone(),
+        job_hash: preimage.job_hash.clone(),
+        seller_pubkey: preimage.seller_pubkey.clone(),
+        amount_sats: 100,
+        repo: String::new(),
+        branch: String::new(),
+        commit_oid: hash,
+        inline_answer: Some(answer.into()),
+        seller_signature: keys
+            .sign_schnorr(&Message::from_digest(preimage.digest_bytes()))
+            .to_string(),
+        creq_hash: None,
+        accepted_mints: vec![credit.clone(), target.clone()],
+        realized_mint: Some(source.clone()),
+        contribution: None,
+        payment_mode: maxplayer_core::gateway::PaymentMode::Sat,
+    };
+    let mut gate = BudgetGate::from_home(&home).unwrap();
+    // Receipt delivery is outside this mint fixture: the plain local relay does
+    // not provide the auth-on-connect receipt handshake. Assert the hop itself
+    // settled through production authorize_pay, and that retry cannot melt twice.
+    let first = authorize_pay_async(&home, &mut gate, request.clone()).await;
+    let directory = maxplayer_core::crossmint_hop::hop_journal_dir(&home);
+    let entries: Vec<_> = std::fs::read_dir(&directory)
+        .unwrap_or_else(|e| panic!("no hop journal: {e}; pay={first:?}"))
+        .collect();
+    assert_eq!(entries.len(), 1);
+    let records = std::fs::read_to_string(entries[0].as_ref().unwrap().path()).unwrap();
+    let records: Vec<Value> = records
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        records.iter().any(|r| r["record"] == "planned"
+            && r["source_mint"] == source
+            && r["target_mint"] == target),
+        "{records:?}; {first:?}"
+    );
+    assert!(
+        records
+            .iter()
+            .any(|r| r["record"] == "settled" && r["minted_sats"] == 100),
+        "{records:?}; {first:?}"
+    );
+    let balances = wallet_ops::balances_async(&home).await.unwrap();
+    let held = |rows: &[wallet_ops::MintBalance], mint: &str| {
+        rows.iter()
+            .find(|r| r.mint_url == mint)
+            .unwrap()
+            .balance_sats
+    };
+    assert_eq!(
+        held(&balances, &credit),
+        5,
+        "insufficient credits stay untouched"
+    );
+    assert!(held(&balances, &source) <= 156, "source paid the full hop");
+    let spent = gate.spent();
+    let _ = authorize_pay_async(&home, &mut gate, request).await;
+    let retry = wallet_ops::balances_async(&home).await.unwrap();
+    assert_eq!(
+        held(&retry, &source),
+        held(&balances, &source),
+        "no second melt"
+    );
+    assert_eq!(held(&retry, &credit), 5);
+    assert_eq!(gate.spent(), spent, "no second budget charge");
+}

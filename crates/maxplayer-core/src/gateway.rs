@@ -1457,12 +1457,21 @@ pub mod creq {
         // CurrencyUnit::from_str is infallible (unknown units fall back to Custom), so an
         // offer unit always maps to a NUT-18 unit.
         let unit = CurrencyUnit::from_str(unit).unwrap_or(CurrencyUnit::Custom(unit.to_owned()));
-        let mints = accepted_mints
+        let mut mints = accepted_mints
             .iter()
-            .map(|m| MintUrl::from_str(m).map_err(|e| CreqError::Mint(format!("{m}: {e}"))))
+            .map(|m| {
+                let mint = MintUrl::from_str(m)
+                    .map_err(|e| CreqError::Mint(format!("{m}: {e}")))?;
+                // Validate URL structure without using Url's port-stripped spelling.
+                nostr_sdk::Url::parse(m).map_err(|e| CreqError::Mint(format!("{m}: {e}")))?;
+                Ok::<_, CreqError>(mint)
+            })
             .collect::<Result<Vec<_>, _>>()?;
-        let seller_key =
-            PublicKey::from_hex(seller_pubkey_hex).map_err(|e| CreqError::SellerKey(e.to_string()))?;
+        // Keep seller preference order, but never emit normalized-equal invoice mints.
+        let mut seen = std::collections::BTreeSet::new();
+        mints.retain(|mint| seen.insert(mint.to_string()));
+        let seller_key = PublicKey::from_hex(seller_pubkey_hex)
+            .map_err(|e| CreqError::SellerKey(e.to_string()))?;
         // Empty relay list: the transport addresses the seller's key; relay hints are optional.
         let nprofile = Nip19Profile::new(seller_key, [])
             .to_bech32()
@@ -2226,6 +2235,29 @@ mod creq_tests {
             .expect("claim carries a creq tag");
         assert_eq!(creq_tag.value(), Some(creq.as_str()));
         assert!(creq_tag.value().unwrap().starts_with("creqA"));
+    }
+
+    #[test]
+    fn seller_creq_deduplicates_normalized_mints() {
+        let mints = [
+            "https://M.example:443",
+            "https://m.example/",
+            "https://M.example",
+            "https://m.example",
+            "https://m.example:443/",
+            "https://other.example",
+        ]
+        .map(str::to_owned);
+        let raw = build_seller_creq("job", 100, "sat", &mints, &seller_hex()).unwrap();
+        let request = parse_creq(&raw).unwrap();
+        assert_eq!(
+            request
+                .mints
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["https://m.example:443", "https://m.example", "https://other.example"]
+        );
     }
 
     /// Round-trip: `PaymentRequest::from_str(tag)` yields a=offer.amount, u=offer.unit,
