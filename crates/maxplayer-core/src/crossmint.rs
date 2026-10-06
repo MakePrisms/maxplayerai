@@ -308,6 +308,40 @@ mod tests {
         MintUrl::from_str(url).expect("test mint url parses")
     }
 
+    #[test]
+    fn seller_creq_explicit_default_port_uses_held_mint_and_pays_direct() {
+        use crate::gateway::creq::{build_seller_creq, parse_creq};
+        use crate::wallet_ops::{normalize_mint_url, MintBalance};
+
+        let configured = "https://mint.example:443";
+        let price = 100;
+        let seller = nostr_sdk::Keys::generate().public_key().to_hex();
+        let raw = build_seller_creq("port-regression", price, "sat", &[configured.into()], &seller)
+            .unwrap();
+        let request = parse_creq(&raw).unwrap();
+        let listed: Vec<String> = request.mints.iter().map(ToString::to_string).collect();
+        let balances = [MintBalance {
+            mint_url: normalize_mint_url(configured).unwrap(),
+            balance_sats: price,
+            is_default: true,
+            configured: true,
+        }];
+        let source = select_source_mint(configured, &listed, true, &balances, price);
+        let plan = plan_payment(&source, &listed, true).unwrap();
+        assert_eq!(
+            plan,
+            PayPlan::Direct { mint: mint(configured) },
+            "a seller mint funded under the same :443 wallet identity must pay Direct, not Hop"
+        );
+        assert!(holds_at_least(&balances, &listed[0], price));
+        assert_eq!(source, configured);
+        // A different fallback proves selection used the covering row, not the default.
+        assert_eq!(
+            select_source_mint("https://unfunded.example", &listed, true, &balances, price),
+            configured
+        );
+    }
+
     // Invariant 2 — the decision tooth. Overlap must NOT hop: the existing direct path stays exactly
     // as it was. Asserted on the decision, not on a downstream outcome, because a hop that happened
     // and then coincidentally produced the right amount would still be a bug.

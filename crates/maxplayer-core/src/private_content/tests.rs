@@ -1730,16 +1730,19 @@ fn private_invoice_rejects_normalized_equal_mint_aliases() {
     let offer = "ab".repeat(32);
     let seller = keys(2).public_key();
     let profile = Nip19Profile::new(seller, []).to_bech32().unwrap();
-    for alias in ["https://m.example/", "https://M.example:443"] {
+    for alias in ["https://m.example/", "https://M.example", "https://M.example:443"] {
         let request: PaymentRequest = serde_json::from_value(serde_json::json!({
             "i":offer,"a":100,"u":"sat","s":true,"m":["https://m.example", alias],"d":null,
             "t":[{"t":"nostr","a":profile,"g":[["n","17"]]}]
         }))
         .unwrap();
         for raw in [request.to_string(), request.to_bech32_string().unwrap()] {
-            let error =
-                invoice::validate(&raw, &offer, 100, &seller.to_hex(), &host()).unwrap_err();
-            assert_eq!(error.to_string(), "duplicate invoice mint", "{alias}");
+            let result = invoice::validate(&raw, &offer, 100, &seller.to_hex(), &host());
+            if alias.ends_with(":443") {
+                assert!(result.is_ok(), "explicit port is a distinct wallet identity: {result:?}");
+            } else {
+                assert_eq!(result.unwrap_err().to_string(), "duplicate invoice mint", "{alias}");
+            }
         }
     }
 }

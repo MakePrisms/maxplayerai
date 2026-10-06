@@ -1460,9 +1460,11 @@ pub mod creq {
         let mut mints = accepted_mints
             .iter()
             .map(|m| {
-                let url =
-                    nostr_sdk::Url::parse(m).map_err(|e| CreqError::Mint(format!("{m}: {e}")))?;
-                MintUrl::from_str(url.as_str()).map_err(|e| CreqError::Mint(format!("{m}: {e}")))
+                let mint = MintUrl::from_str(m)
+                    .map_err(|e| CreqError::Mint(format!("{m}: {e}")))?;
+                // Validate URL structure without using Url's port-stripped spelling.
+                nostr_sdk::Url::parse(m).map_err(|e| CreqError::Mint(format!("{m}: {e}")))?;
+                Ok::<_, CreqError>(mint)
             })
             .collect::<Result<Vec<_>, _>>()?;
         // Keep seller preference order, but never emit normalized-equal invoice mints.
@@ -2240,7 +2242,9 @@ mod creq_tests {
         let mints = [
             "https://M.example:443",
             "https://m.example/",
+            "https://M.example",
             "https://m.example",
+            "https://m.example:443/",
             "https://other.example",
         ]
         .map(str::to_owned);
@@ -2252,7 +2256,7 @@ mod creq_tests {
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>(),
-            ["https://m.example", "https://other.example"]
+            ["https://m.example:443", "https://m.example", "https://other.example"]
         );
     }
 
