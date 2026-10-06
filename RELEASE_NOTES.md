@@ -1,3 +1,33 @@
+## v0.6.1-rc7
+
+Seventh release candidate for 0.6.1, prepared from main with credits-first buyer
+mint choice (#1100, fixes #1039). Once published, install with
+`npm install -g maxplayer@0.6.1-rc7`. This is a prerelease: publish on npm `rc`,
+leaving stable `latest` unchanged at v0.6.0.
+
+### Changes since v0.6.1-rc6
+
+- Buyers spend credits (`nostr://` mints) first when they hold enough there;
+  otherwise they pay at the first funded `https` mint in the seller's order.
+  Award selection uses the available balance after subtracting live reservations.
+- A cross-mint payment hop never targets a credit mint. A claim that cannot be
+  paid is refused at award time instead of failing after the seller delivers.
+- Manual awards no longer hold the money lock while fetching from the relay,
+  so a slow relay fetch does not block other money operations.
+- Private jobs follow the public mint rule: any well-formed seller-listed mint
+  is accepted, while payment stays within the signed payment request (`creq`).
+- Mint deduplication preserves explicit ports, keeping wallet mint identities
+  aligned with the seller's listed mints.
+
+### Operator notes
+
+- Redeploy the reviewer service from this release. An old reviewer drops private
+  claims whose mints are not on its own accepted list.
+- Known limitations: pre-upgrade credits-only pinned reservations remain stuck.
+  Pay-time sealed-mint enforcement is tracked in #1101. The public reproduction
+  in #1069 remains unexplained.
+- No protocol, relay or store migration is required.
+
 ## v0.6.1-rc6
 
 Sixth release candidate for 0.6.1, prepared from main after the private-contribution
