@@ -115,7 +115,12 @@ pub fn validate(
     for mint in mints {
         let mint = text(mint)?;
         host.well_formed_mint(mint)?;
-        if !seen.insert(mint) {
+        // URL canonicalization also removes HTTPS's explicit default port, which
+        // MintUrl alone preserves. Keep the original signed bytes untouched.
+        let url = nostr_sdk::Url::parse(mint).map_err(|_| Error("invalid invoice mint"))?;
+        let normalized =
+            cashu::MintUrl::from_str(url.as_str()).map_err(|_| Error("invalid invoice mint"))?;
+        if !seen.insert(normalized.to_string()) {
             return Err(Error("duplicate invoice mint"));
         }
     }

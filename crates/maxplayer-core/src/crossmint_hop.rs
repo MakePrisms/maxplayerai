@@ -877,6 +877,11 @@ impl CdkHopEffects {
                 "source mint {source_mint}: a nostr:// mint cannot be a hop source (it never melts)"
             )));
         }
+        if crate::mint_wire::is_nostr_scheme(target_mint) {
+            return Err(HopError::Mint(format!(
+                "target mint {target_mint}: a nostr:// mint cannot be a hop target (credits cannot receive a hop)"
+            )));
+        }
         let source = buyer_fund::open_wallet_at_mint_async(home, source_mint)
             .await
             .map_err(|error| HopError::Mint(format!("source mint {source_mint}: {error}")))?;
@@ -1980,6 +1985,22 @@ mod tests {
 
     // #1034 re-review: the opener is the guard for journal replay (`sweep_hops`) and authorize_pay's
     // hop path. A nostr:// source must be refused before either wallet is opened.
+    #[tokio::test]
+    async fn a_nostr_target_cannot_open_a_hop() {
+        let root = scratch_dir("nostr-target-open");
+        let home = crate::home::bootstrap(&root).expect("bootstrap");
+        let nostr = "nostr://npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d";
+        let Err(error) = CdkHopEffects::open(&home, "https://127.0.0.1:1", nostr).await else {
+            panic!("a nostr:// hop target opened");
+        };
+        assert!(
+            matches!(error, HopError::Mint(ref detail) if detail.contains("cannot be a hop target")),
+            "{error:?}"
+        );
+        assert!(!root.join("crossmint-journal").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn a_nostr_source_cannot_open_a_hop() {
         let root = scratch_dir("nostr-source-open");

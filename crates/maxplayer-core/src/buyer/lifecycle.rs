@@ -1772,6 +1772,74 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn reserved_credits_filter_uses_available_sats_on_manual_and_auto_paths() {
+        let credit = "nostr://npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d";
+        let lightning = "https://lightning.example";
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("buyer.sqlite");
+        let store = super::super::store::BuyerStore::open(&db).unwrap();
+        let credit = crate::wallet_ops::normalize_mint_url(credit).unwrap();
+        store
+            .reserve_at("job-a", 100, &MintCeiling::at_mint(&credit, 100, false), 1)
+            .unwrap();
+        let raw = [credit.as_str(), lightning].map(|mint| crate::wallet_ops::MintBalance {
+            mint_url: mint.into(),
+            balance_sats: 100,
+            is_default: false,
+            configured: true,
+        });
+        let rows =
+            super::super::store::available_balances(&db, "job-b", DEFAULT_MINT_URL, &raw).unwrap();
+        let job = "b".repeat(64);
+        let listed = vec![lightning.into(), credit];
+        let view = view_with(&job, 100, vec![claim(&job, true, 100, &listed)]);
+        let mut f = filters(100, 100);
+        f.allow_real_mints = true;
+        f.balances = &rows;
+        assert_eq!(
+            crate::crossmint::select_source_mint(f.buyer_mint, &listed, true, f.balances, 100),
+            lightning
+        );
+        let selected = select_awardable_claim(&view, &f).unwrap();
+        named_claim_awardable(&view, &selected, &f).unwrap();
+        let ceiling = super::super::ceiling_from_read(
+            DEFAULT_MINT_URL,
+            true,
+            &super::super::store::ReservationPin::Unpinned,
+            &listed,
+            Ok(super::super::AwardBalances {
+                raw: raw.to_vec(),
+                available: rows,
+            }),
+            100,
+            &job,
+        )
+        .unwrap();
+        let outcome = award_with_reservation(
+            &store,
+            &job,
+            100,
+            ceiling,
+            2,
+            no_relay,
+            || async {
+                let mut prepared = fake_prepared(&job);
+                prepared.quoted_mints = listed;
+                Ok(prepared)
+            },
+            send_acked,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, AwardOutcome::Published(_)));
+        assert_eq!(
+            store.reservation_pin(&job).unwrap(),
+            super::super::store::ReservationPin::Mint(lightning.into())
+        );
+    }
+
     // A live claim priced at the offer amount, quoting the buyer's default mint, is selected.
     #[test]
     fn select_picks_live_payable_claim() {

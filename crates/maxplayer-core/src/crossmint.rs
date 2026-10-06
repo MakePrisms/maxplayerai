@@ -164,8 +164,9 @@ pub fn plan_payment(
 /// covering HTTPS mints, preserving seller order within each group. The fence
 /// applies to both. Returning a listed mint makes [`plan_payment`] pay direct.
 ///
-/// Balance-awareness is ADVISORY and applied ONCE, here at accept. The result is sealed into the
-/// accept-bind and re-derived (not re-decided) at pay, so a later balance or config-default change
+/// Balance-awareness is ADVISORY: award uses it to pin the reservation source, and accept
+/// honors that pin (or selects a source when no pin exists). The accept-bind seals the result,
+/// which is re-derived (not re-decided) at pay, so a later balance or config-default change
 /// cannot shift the sealed mint — the pays-once attempt-id invariant is unchanged. Exact coverage
 /// (including fees) is enforced at pay: if the chosen mint's balance is spent before pay, the pay
 /// refuses fail-closed at that sealed mint rather than silently re-selecting a different one.
@@ -190,6 +191,7 @@ pub(crate) fn select_source_mint(
     config_default.to_owned()
 }
 
+/// Callers supply net-available balances (live holds for other jobs subtracted).
 /// Whether configured `balances` shows at least `amount_sats` at `mint`, comparing normalized mint
 /// URLs. Balance display was widened in #266 to include DB-discovered, unconfigured mints; source
 /// selection deliberately excludes those rows because the selected mint is sealed into the

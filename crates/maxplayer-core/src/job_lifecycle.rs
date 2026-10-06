@@ -1807,7 +1807,20 @@ pub async fn accept_claim_async(
     let (pin, balances) = accept_pin_and_balances(
         &home.root.join(crate::buyer::STATE_DB_FILE),
         &request.job_id,
-        || async { crate::wallet_ops::balances_async(home).await.map_err(|error| error.to_string()) },
+        || async {
+            let balances = crate::wallet_ops::balances_async(home)
+                .await
+                .map_err(|error| error.to_string())?;
+            // Unpinned accept has no live hold of its own. Match award's net selection;
+            // accept_pin_and_balances rechecks afterward so a concurrent pin still wins.
+            crate::buyer::store::available_balances(
+                &home.root.join(crate::buyer::STATE_DB_FILE),
+                &request.job_id,
+                home.config.default_mint(),
+                &balances,
+            )
+            .map_err(|error| error.to_string())
+        },
     )
     .await?;
     let source_seed = accept_source_seed(

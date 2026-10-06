@@ -1724,6 +1724,28 @@ fn private_invoice_accepts_well_formed_mixed_and_unknown_mints() {
 
 #[cfg(feature = "wallet")]
 #[test]
+fn private_invoice_rejects_normalized_equal_mint_aliases() {
+    use cashu::nuts::nut18::PaymentRequest;
+    use nostr_sdk::prelude::{Nip19Profile, ToBech32};
+    let offer = "ab".repeat(32);
+    let seller = keys(2).public_key();
+    let profile = Nip19Profile::new(seller, []).to_bech32().unwrap();
+    for alias in ["https://m.example/", "https://M.example:443"] {
+        let request: PaymentRequest = serde_json::from_value(serde_json::json!({
+            "i":offer,"a":100,"u":"sat","s":true,"m":["https://m.example", alias],"d":null,
+            "t":[{"t":"nostr","a":profile,"g":[["n","17"]]}]
+        }))
+        .unwrap();
+        for raw in [request.to_string(), request.to_bech32_string().unwrap()] {
+            let error =
+                invoice::validate(&raw, &offer, 100, &seller.to_hex(), &host()).unwrap_err();
+            assert_eq!(error.to_string(), "duplicate invoice mint", "{alias}");
+        }
+    }
+}
+
+#[cfg(feature = "wallet")]
+#[test]
 fn private_invoice_all_mints_guard_now_allows_seller_listed_hop_target() {
     // Deliberate trust widening: private jobs now follow the public rule,
     // including hopping to a seller-listed mint the checker did not configure.
