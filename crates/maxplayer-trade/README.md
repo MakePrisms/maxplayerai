@@ -21,7 +21,7 @@ prototype, not a production deployment or an unconditional atomicity guarantee.
   `--max-fees` defaults to 16 in the relevant asset. No platform/trade fees.
 - Taker generates the secret and locks **first**, for 60 minutes. Maker verifies the first
   lock before locking **second**, for 15 minutes. Both parties preflight both mints (reachable
-  NUT-07/14, reported clock within 60 seconds), keysets and fees before locking. Each received
+  NUT-07/09/12/14, reported clock within 60 seconds), keysets and fees before locking. Each received
   lock must have exact hash/keys/thresholds/SIG_INPUTS/deadline, unique proofs, DLEQ, exact
   net-after-input-fee value, and fresh UNSPENT state. Asset identity is **mint URL + unit**;
   both assets can be `sat`. Taker refuses to initiate a claim with less than three minutes left.
@@ -54,9 +54,9 @@ This crate is its **own Cargo workspace**, with pinned CDK/Cashu 0.17.2 and Nost
 Do not add it to the root workspace. From the repository root:
 
 ```sh
-cargo build --manifest-path crates/maxplayer-trade/Cargo.toml --locked --bins --examples
-# Tests build actual CDK mints, so protoc is required (available in the Nix devshell).
+# Tests/examples enable the real CDK mint dev-dependencies; protoc is required.
 export PROTOC="$(find /nix/store -maxdepth 3 -path '*/bin/protoc' -print -quit)"
+cargo build --manifest-path crates/maxplayer-trade/Cargo.toml --locked --bins --examples
 cargo test --manifest-path crates/maxplayer-trade/Cargo.toml --locked -- --test-threads=1
 TRADE_LAB_SECONDS=1 cargo test --manifest-path crates/maxplayer-trade/Cargo.toml \
   --locked --features lab -- --test-threads=1
@@ -80,6 +80,21 @@ explicit pre-effect or post-mint/pre-wallet-commit boundaries. No real-money set
 | Two-mint integration/recovery | 6 / 0 | 11 / 0 |
 | Pinned-CDK orphan-quote reproducer | 1 / 0 | 1 / 0 |
 | Relay union/unreachable/production fence | 3 / 0 | 3 / 0 |
+| Review adversarial regressions | 10 / 0 | 18 / 0 |
+
+**Totals after review fixes: 45 default / 58 lab passed, zero failures.**
+Touched-file rustfmt check and the production-default binary/examples build passed.
+Clippy --all-targets --features lab --no-deps exited 0 with non-blocking style warnings
+(collapsible conditionals, unwrap-after-is_some, existing argument-count/import/clone lints).
+
+The fee-bearing sell-back fixture originally recovered after every inbox step, generating a
+request/quote replay storm inside the eight-second lab lock. It now mirrors the real CLI's
+three-second recovery cadence; no deadline was widened. **20/20 repeated lab runs passed**
+(each run trades in both directions with exact fee assertions). Command on the compiled lab
+e2e binary: TRADE_LAB_SECONDS=1 <lab-e2e> --exact
+fee_bearing_trade_and_sell_back_exact_balances --test-threads=1 --nocapture.
+The initial H2 early-return mutation hit a fixture unwrap; setup now tolerates the deliberately
+injected error, and the rerun fails at the actual refund safety assertion.
 
 Integration tests run two in-process **CDK 0.17.2 FakeWallet mints with distinct mint keys**,
 both unit `sat`, SQLite wallets, and a local Nostr relay (same relay-builder used by
@@ -115,6 +130,11 @@ A=https://testnut.cashudevkit.org
 B=https://testnut.cashu.space
 "$TRADE" --home "$RUN/maker" fund "$A" --amount 128
 "$TRADE" --home "$RUN/taker" fund "$B" --amount 128
+# Record balances on both mints before trading.
+for role in maker taker; do
+  "$TRADE" --home "$RUN/$role" balance "$A"
+  "$TRADE" --home "$RUN/$role" balance "$B"
+done
 "$TRADE" --home "$RUN/maker" list --give-mint "$A" --give 32 \
   --want-mint "$B" --want 24 > "$RUN/list.jsonl"
 LOT="$(python3 -c 'import json,sys; print([json.loads(l)["lot_id"] for l in sys.stdin if "lot_id" in json.loads(l)][-1])' < "$RUN/list.jsonl")"
@@ -130,6 +150,8 @@ for role in maker taker; do
   "$TRADE" --home "$RUN/$role" balance "$B"
 done
 cat "$RUN/maker.log"
+# Independent public readback: uses neither the coordinator nor wallet/journal.
+cargo run --manifest-path crates/maxplayer-trade/Cargo.toml --locked --example read_trade -- "$LOT"
 ```
 
 After interruption, use the same home and relays: `maxplayer-trade --home <home> recover`.
@@ -138,7 +160,45 @@ remain running for the full lock duration. An inconclusive mint result is retain
 To cancel an unused listing: `maxplayer-trade --home <maker-home> cancel <lot-id>`.
 Cancellation does not revoke an already authorized HTLC.
 
-## Live evidence — 2026-10-07
+## Live review-fix evidence — 2026-10-07
+
+Fresh homes:
+`/home/openclaw/.openclaw/workspace/.openclaw/tmp/credit-trade-review-20261007-i084gidm/{maker,taker}`.
+The flow above ran on a frozen **default-feature** binary after both updated suites passed.
+Binary SHA-256: 87e489e69b36ad1626a1592af8e7ccbc84e0f28fa95ea550ed4581ded31448d2.
+After mutation builds, the worktree default binary was rebuilt and compared byte-for-byte.
+Original orphan homes were left untouched. Both swaps are `complete`, all four lock/claim
+attempts are done with saved outputs, all wallet proofs are UNSPENT, and reservations are zero.
+
+- Maker: `https://testnut.cashudevkit.org`, `cdk-mintd/0.18.0`.
+- Taker: `https://testnut.cashu.space`, `cdk-mintd/0.17.0-rc.3`.
+- Lot: `c9b171bbab62792bf93bc0cfe316485fa69b529248ea324ce81f3383aad5fd81`.
+- Available: `4f03dd274ad5b619dbd00afdb781a4f4a0a2a79e99fee9cc1b76bdf0925abc0c`.
+- Sold: `1fb82c244c187d71adfe0e2d0e54ca3bd397d891b49f42827c529e77a7b81a2b`.
+- Swap: `613087b4-6e59-45d8-a18c-cf9f607bfe07`.
+
+| Home | cashudevkit before → after | cashu.space before → after |
+|---|---:|---:|
+| Maker | 128 → **93** | 0 → **24** |
+| Taker | 0 → **32** | 128 → **101** |
+
+Both mints charge 100 ppk. Maker: 33 gross, 32 net, 2 locking fee + 1 claim fee, debit 35.
+Taker: 25 gross, 24 net, 2 locking fee + 1 claim fee, debit 27. Per mint, final balances sum
+to 125 = 128 − 3 mint fees. No platform fee or unsecured send.
+
+Independent `read_trade` fetched both public relays and verified signatures, author binding,
+contiguous sequence/previous-id chain and sold status. Ditto returned all three events;
+Damus returned no events in that read. The union proves readback;
+neither relay's ACK alone is used as evidence of retention. Initially discovery was empty
+after publication ACK, and take refused **before any lock**. Independent readback subsequently
+found the signed lot/initial status; repeating the unchanged discover/take commands completed.
+No validation was bypassed and no replacement swap was fabricated.
+
+**Live refund not run:** the existing lab configuration permits short locks only against
+127.0.0.1, not either public test mint. That fence was preserved. Both local refund paths and
+the failed-claim/refund path passed against the two actual in-process CDK mints.
+
+## Earlier baseline live evidence — 2026-10-07
 
 Actual fresh homes on this machine:
 `/home/openclaw/.openclaw/workspace/.openclaw/tmp/credit-trade-final-20261007/{maker,taker}`.
@@ -189,11 +249,93 @@ bug, **not successful recovery**. The corrected `fund` waits for PAID and works 
 as demonstrated by this live run. The original homes are preserved; no reservation was cleared,
 CDK was not patched/upgraded, and this old-quote bug is **not a blocker for fresh-home trading**.
 
+## Paid-review findings and regression evidence
+
+The paid cashu-rust-dev review read code only at 15b15ec; this author-led fix pass independently
+built and exercised the consequences. It is not a new independent reviewer sign-off.
+
+Before editing production code, the C1 premise test passed on the unfixed adapter in **both
+directions**: hostile witness passed validation, the mint rejected the claim, and inputs stayed
+UNSPENT. After fixing it, admission rejects the witness and the redemption defense independently
+clears it. Mutation of that defense reproduces HTTP 400 "malformed signature".
+
+All named tests are in tests/review_regressions.rs and instantiate two distinct-key CDK 0.17.2
+FakeWallet mints plus a local relay. Faults are HTTP middleware around the real mint router,
+not mock successful swaps. Lab-gated tests use only the existing loopback timing configuration.
+
+| Finding | Resolution and test | Mutation evidence |
+|---|---|---|
+| C1 | Fixed — c1_sender_witness_rejected_and_sanitized_both_directions | Removing admission fails its rejection assertion; removing sanitization fails the mint-claim safety assertion. |
+| C2 | Fixed — c2_partial_claim_recovers_preimage_and_refunds_only_unspent | Restoring all-or-nothing witness extraction leaves maker receipt 0 instead of 24. |
+| H1 | Fixed — h1_maker_offline_past_long_still_claims | Restoring the long deadline leaves maker receipt 0 instead of 24. |
+| H2 | Fixed — h2_failed_claim_abandoned_then_taker_refunds; h2_unsent_lock_expires_and_releases_reservation; h2_maker_abandoned_lock_releases_listing; h2_pending_inputs_prevent_abandonment; h2_landed_claim_lost_reply_never_refunds | Six mutations: disable abandonment (claim/taker lock/maker lock), allow PENDING, restore early error return, remove refund fairness guard. Each fails its safety assertion. |
+| H3 | Fixed — h3_uppercase_hash_request_rejected_at_admission | Restoring permissive hex admission accepts the uppercase request and fails rejection. |
+| M1 | Fixed — m1_notice_recovers_without_nut07_witness | Not required; actual mint responses have witnesses stripped, encrypted notice still completes maker claim. |
+| M2 | Fixed — m2_missing_dleq_persists_result_and_credits_change; m2_invalid_present_dleq_persisted_but_not_credited; m2_l3_preflight_requires_restore_and_dleq | Not required. |
+| M3 | Fixed — m3_claimed_terminal_without_refund | Not required; terminal recovery returns, and no refund attempt exists. |
+| L1 | Fixed — l1_taker_lock_deadline_leaves_twenty_seconds_for_delivery | Not required; inspects the saved send deadline. |
+| L2 | Fixed — l2_own_fee_mismatch_not_journalled | Not required; mismatched fee is refused before any attempt record. |
+| L3 | Fixed — m2_l3_preflight_requires_restore_and_dleq | Not required. |
+| L4 | Fixed — l4_active_quote_cannot_cancel | Not required; listing remains uncancelled. |
+| L5 | Fixed — l5_mint_clock_controls_claim_cutoff | Not required; fast mint clock prevents starting a claim. |
+
+H3 representation correction: the hash is 64 lowercase hex characters. Pinned Cashu HTLC public
+keys serialize as **33-byte compressed SEC1 / 66 lowercase hex characters**. Requiring 64-hex
+Cashu keys would reject the valid keys produced by this crate; canonical serialized keys are
+required instead. Nostr identity keys remain 64-hex.
+
+Mutation procedure: copy only this standalone crate (excluding target) into separate disposable
+directories under .openclaw/tmp/review-1107-fix/mutation-*. Remove one safety condition per copy,
+then run its named regression with:
+
+```sh
+PROTOC=<protoc> TRADE_LAB_SECONDS=1 CARGO_TARGET_DIR=<idle-warm-target> \
+  cargo test --manifest-path <disposable-copy>/Cargo.toml --locked --features lab \
+  --test review_regressions <test-name> -- --test-threads=1
+```
+
+All **11 mutations compiled and failed at the intended safety assertion** (exit 101), not at fixture setup. The PR source tree was not used for mutant edits. Logs and full copies are retained under the path above.
+
+## Review-fix recovery policy
+
+- Received proofs must have **no witness**. Redemption also clears any supplied witness before
+  adding our preimage/signature. Hashes must be lowercase 64-hex. Cashu HTLC public keys must
+  use their canonical lowercase **66-hex compressed** representation (not Nostr's 64-hex keys).
+- Preimage discovery scans individual SPENT proofs, skipping UNSPENT/PENDING states and
+  refund/malformed witnesses. Valid preimages are compared as bytes and persisted monotonically.
+  The encrypted `claimed` notice now carries the preimage; NUT-07 remains the fallback.
+- The maker claims immediately once it knows the preimage, with **no claim send deadline**.
+  A partial taker claim cannot prevent payment recovery. After short + margin, the maker selects
+  only freshly confirmed UNSPENT proofs for refund, never the full original set. It remains
+  `settling` until its outgoing proofs are reconciled. Unknown SPENT proofs are not silently
+  treated as our refund.
+- **H2 fairness:** a taker may refund its own payment only if its claim was never attempted or
+  is affirmatively abandoned. Abandonment requires all three: the saved send deadline + **20 s**
+  grace (the RPC timeout) has passed, restore returns no signatures/outputs, and every input is
+  UNSPENT. PENDING, partial restore, unavailable evidence and lost replies remain ambiguous.
+  Abandoned records and their exact outputs are retained; those outputs are never resubmitted.
+  An abandoned lock expires and releases its reservation (a maker's abandoned lot is cancelled).
+- **M3 policy:** after receiving the maker's funds, a taker **never refunds its payment**.
+  If the maker has not claimed by long + margin, the taker becomes terminal
+  `complete_unclaimed`, ending retries (even if mint info is offline once the local deadline has passed) and allowing future takes/`recover` to finish.
+  The maker remains entitled to the original lock and can still claim under NUT-14.
+- Claim/refund decisions read fresh mint info and use `max(local time, mint time)`.
+  Taker locks use `send_before = min(exp − 20 s, short − cutoff)`; production locks remain
+  60/15 minutes, quote hold 60 seconds, and claim cutoff 3 minutes.
+- Both mints must advertise NUT-09 and NUT-12 as well as NUT-07/14. Swap results are journalled
+  before DLEQ refusal. Missing DLEQ prevents forwarding, but owned change is credited;
+  present invalid DLEQ is an error. Own-lock claim fees are checked before journalling.
+  Cancellation is refused while a quote/swap is active.
+
+These are client recovery policies, not mint/NUT changes. Already-delivered HTTPS requests have
+no server-enforced expiry; the grace rule assumes an honest mint's current restore/state evidence.
+A mint can still lie, withhold evidence, or process an already-delivered request late.
+
 ## Boundaries, deviations and uncovered cases
 
 - Authorized deviation from the integration spec: standalone crate, home/seed/CDK wallets and
   trade SQLite journal; HTTP(S) test mints and public relays; no jobs, budget/ledger, MCP,
-  Nostr-mint transport, sidecar changes, or production-relay deployment. Fork PR stays draft.
+  Nostr-mint transport, sidecar changes, or production-relay deployment. Same-repository PR #1107 stays draft.
 - Trade swaps use pinned CDK **public lower-level primitives** with explicitly journaled outputs,
   rather than opaque high-level send/receive sagas. Claims and refunds use the same durable
   adapter; refunds include the empty-preimage witness required by pinned CDK. No dependency fork.
@@ -210,8 +352,8 @@ CDK was not patched/upgraded, and this old-quote bug is **not a blocker for fres
 - NUT-14 receiver claims remain possible after locktime. Honest/available mints, intact keys,
   clock bounds, and a running recovery watcher are required. An offline maker can lose its
   recovery window; an issuer can lie or refuse service. This is not trustlessness against mints.
-- Not covered: every crash boundary, OS/power-loss durability, long outages/clock skew, hidden or
-  malformed live witnesses, live refunds, live reverse pairing/sell-back, mint key rotation,
+- Not covered: every crash boundary, OS/power-loss durability, arbitrary long outages/clock skew,
+  pre-fix journal migration, malformed live witnesses, live refunds, live reverse pairing/sell-back, mint key rotation,
   adversarial fee changes, exhaustive peer flood/quote-limit concurrency, 24-hour relay retention,
   root workspace suites locally, real money, or production deployment. Tests cover selected
   process-exit boundaries and one claim/refund race, not a full model checker.
