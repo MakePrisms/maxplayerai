@@ -11,7 +11,8 @@ use std::{
     os::unix::fs::OpenOptionsExt,
     sync::Arc,
 };
-pub async fn preflight(mint: &str) -> Result<()> {
+async fn info(mint: &str) -> Result<serde_json::Value> {
+    crate::Asset::new(mint)?.fence()?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(15))
@@ -23,6 +24,18 @@ pub async fn preflight(mint: &str) -> Result<()> {
         .error_for_status()?
         .json()
         .await?;
+    Ok(info)
+}
+pub async fn action_time(mint: &str) -> Result<u64> {
+    let info = info(mint).await?;
+    Ok(cdk::util::unix_time().max(info["time"].as_u64().context("missing mint time")?))
+}
+pub async fn preflight(mint: &str) -> Result<()> {
+    let info = info(mint).await?;
+    ensure!(
+        info["nuts"]["9"]["supported"] == true && info["nuts"]["12"]["supported"] == true,
+        "mint does not advertise NUT-09 and NUT-12"
+    );
     ensure!(
         info["nuts"]["7"]["supported"] == true && info["nuts"]["14"]["supported"] == true,
         "mint does not advertise NUT-07 and NUT-14"

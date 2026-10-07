@@ -38,6 +38,8 @@ pub struct Attempt {
     result: Option<Proofs>,
     done: bool,
     send_before: Option<u64>,
+    #[serde(default)]
+    pub abandoned: bool,
 }
 pub async fn rpc<T: serde::de::DeserializeOwned>(
     mint: &str,
@@ -214,6 +216,10 @@ pub async fn lock(
             )?,
             false,
         );
+        ensure!(
+            fee(std::iter::repeat_n(p.ppk, out.len()))? == p.claim_fee,
+            "own lock claim fee mismatch"
+        );
         let total: u64 = p.inputs.iter().map(|p| u64::from(p.amount)).sum();
         let change = total - p.debit;
         if change > 0 {
@@ -232,6 +238,7 @@ pub async fn lock(
                 outputs: out,
                 result: None,
                 done: false,
+                abandoned: false,
                 send_before: Some(send_before),
             },
         )
@@ -261,6 +268,7 @@ pub async fn redeem(
         ensure!(total > cost, "uneconomic redemption");
         let mut inputs = proofs.clone();
         for p in &mut inputs {
+            p.witness = None;
             p.add_preimage(preimage.into());
             p.sign_p2pk(key.parse()?)?;
         }
@@ -277,6 +285,7 @@ pub async fn redeem(
                 outputs: out,
                 result: None,
                 done: false,
+                abandoned: false,
                 send_before,
             },
         )
@@ -297,9 +306,21 @@ pub async fn execute(home: &Path, j: &Journal, id: &str) -> Result<Proofs> {
                 },
             )
             .await?;
-            let signatures = if restored.outputs.is_empty() {
+            let signatures = if restored.outputs.is_empty() && restored.signatures.is_empty() {
+                let now = crate::wallet::action_time(&a.mint).await?;
+                if a.send_before
+                    .is_some_and(|exp| now > exp.saturating_add(20))
+                {
+                    unspent(&a.mint, &a.inputs).await?;
+                    a.abandoned = true;
+                    j.put("attempt", id, &a).await?;
+                }
                 ensure!(
-                    a.send_before.is_none_or(|exp| cdk::util::unix_time() < exp),
+                    !a.abandoned,
+                    "attempt abandoned; outputs retained and never resubmitted"
+                );
+                ensure!(
+                    a.send_before.is_none_or(|exp| now < exp),
                     "attempt deadline passed; retained for reconciliation, no new swap"
                 );
                 unspent(&a.mint, &a.inputs).await?;
@@ -353,15 +374,8 @@ pub async fn execute(home: &Path, j: &Journal, id: &str) -> Result<Proofs> {
                 a.outputs.iter().map(|o| o.secret.clone()).collect(),
                 &keys,
             )?;
-            ensure!(result.iter().all(|p| p.dleq.is_some()), "mint omitted DLEQ");
-            w.verify_token_dleq(&Token::new(
-                a.mint.parse()?,
-                result.clone(),
-                None,
-                CurrencyUnit::Sat,
-            ))
-            .await?;
             a.result = Some(result);
+            a.abandoned = false;
             j.put("attempt", id, &a).await?;
             #[cfg(feature = "lab")]
             if std::env::var("TRADE_CRASH_AFTER_SWAP")
@@ -372,6 +386,21 @@ pub async fn execute(home: &Path, j: &Journal, id: &str) -> Result<Proofs> {
             }
         }
         let result = a.result.as_ref().unwrap();
+        // Persist first; a missing DLEQ must not hide recoverable owned outputs.
+        let w = wallet(home, &a.mint).await?;
+        if result.iter().any(|p| p.dleq.is_some()) {
+            w.verify_token_dleq(&Token::new(
+                a.mint.parse()?,
+                result
+                    .iter()
+                    .filter(|p| p.dleq.is_some())
+                    .cloned()
+                    .collect(),
+                None,
+                CurrencyUnit::Sat,
+            ))
+            .await?;
+        }
         unspent(&a.mint, result).await?;
         let owned = result
             .iter()
@@ -390,6 +419,13 @@ pub async fn execute(home: &Path, j: &Journal, id: &str) -> Result<Proofs> {
             .await?
             .update_proofs(owned, a.inputs.ys()?)
             .await?;
+        ensure!(
+            result
+                .iter()
+                .zip(&a.outputs)
+                .all(|(p, o)| o.owned || p.dleq.is_some()),
+            "mint omitted DLEQ on forwarded proofs; owned change credited"
+        );
         a.done = true;
         j.put("attempt", id, &a).await?;
     }
@@ -421,6 +457,7 @@ pub async fn validate(
     let exp = expected.secret_data();
     let mut ys = HashSet::new();
     for proof in p {
+        ensure!(proof.witness.is_none(), "unexpected sender witness");
         ensure!(proof.keyset_id == keyset, "unquoted keyset");
         ensure!(ys.insert(proof.y()?), "duplicate proof");
         let s: cashu::nuts::nut10::Secret = (&proof.secret).try_into()?;
@@ -447,32 +484,45 @@ pub async fn validate(
     ensure!(total.checked_sub(cost) == Some(net), "incorrect net amount");
     unspent(mint, p).await
 }
-pub async fn witness(mint: &str, p: &Proofs, hash: &str) -> Result<Option<String>> {
-    let s = states(mint, p).await?;
-    if s.states.iter().all(|s| s.state == State::Unspent) {
-        return Ok(None);
-    }
-    ensure!(
-        s.states.iter().all(|s| s.state == State::Spent),
-        "partial/pending outgoing state"
-    );
-    let mut found = None;
-    for s in s.states {
-        let Witness::HTLCWitness(witness) = s.witness.context("SPENT without witness")? else {
-            bail!("missing HTLC witness")
-        };
-        let pre = witness.preimage.as_str();
-        use sha2::{Digest, Sha256};
-        ensure!(
-            hex::encode(Sha256::digest(hex::decode(pre)?)) == hash,
-            "SPENT without matching preimage (possibly refund)"
-        );
-        if let Some(ref previous) = found {
-            ensure!(previous == pre, "witness conflict");
+pub fn matches_preimage(preimage: &str, hash: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    match (hex::decode(preimage), hex::decode(hash)) {
+        (Ok(pre), Ok(hash)) if pre.len() == 32 && hash.len() == 32 => {
+            Sha256::digest(pre).as_slice() == hash.as_slice()
         }
-        found = Some(pre.to_string());
+        _ => false,
     }
-    Ok(found)
+}
+pub async fn witness(mint: &str, p: &Proofs, hash: &str) -> Result<Option<String>> {
+    for s in states(mint, p).await?.states {
+        if s.state != State::Spent {
+            continue;
+        }
+        if let Some(Witness::HTLCWitness(w)) = s.witness {
+            if matches_preimage(&w.preimage, hash) {
+                return Ok(Some(w.preimage));
+            }
+        }
+    }
+    Ok(None)
+}
+/// Fresh NUT-07 selection: never include spent or pending proofs in a refund.
+pub async fn refundable(mint: &str, proofs: &Proofs) -> Result<Proofs> {
+    let unspent: HashSet<_> = states(mint, proofs)
+        .await?
+        .states
+        .into_iter()
+        .filter(|s| s.state == State::Unspent)
+        .map(|s| s.y)
+        .collect();
+    proofs
+        .iter()
+        .filter_map(|p| match p.y() {
+            Ok(y) if unspent.contains(&y) => Some(Ok(p.clone())),
+            Ok(_) => None,
+            Err(e) => Some(Err(e.into())),
+        })
+        .collect()
 }
 
 fn total(proofs: &Proofs) -> Result<u64> {
@@ -480,4 +530,13 @@ fn total(proofs: &Proofs) -> Result<u64> {
         sum.checked_add(u64::from(p.amount))
             .context("proof amount overflow")
     })
+}
+
+pub async fn refunded_all(j: &Journal, id: &str, outgoing: &Proofs) -> Result<bool> {
+    let Some(a) = j.get::<Attempt>("attempt", id).await? else {
+        return Ok(false);
+    };
+    Ok(a.done
+        && a.inputs.ys()?.into_iter().collect::<HashSet<_>>()
+            == outgoing.ys()?.into_iter().collect::<HashSet<_>>())
 }
