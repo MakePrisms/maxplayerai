@@ -54,6 +54,12 @@ Bob, Discord **#cashu-token-marketplace, 24 Sep 2026**; go at **17:16 UTC**:
   constants; 3410 appears only as an unknown-kind negative test. Global registry review remains.
 - **Q7 settled:** canary capped at 100 sats principal + 10 sats mint fees, one trade in flight;
   **Bob's separate go is still required** before running it.
+- **Late-claim squeeze accepted (Bob, 2026-10-07 20:29 UTC):** no changes to the sidecar mint or
+  to NUT-14 semantics (for example refusing receiver claims after locktime). The residual risk in
+  §3.2 stays: a taker can still claim after the maker's deadline while the maker lock is unspent,
+  so a maker offline from around the short deadline until near the long deadline can lose its side.
+  Mitigation stays client-side: maker recovery refunds its own lock promptly once the short
+  deadline plus clock margin passes.
 
 **Settled — Bob, #cashu-token-marketplace, 2026-10-07 19:40 UTC** ("ok great" in reply to
 "Are 60 min / 15 min / 60 s OK?"): **Q2** taker lock 60 min / maker lock 15 min (nominal minimum
