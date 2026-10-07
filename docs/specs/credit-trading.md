@@ -1,18 +1,18 @@
 # Credit trading — owner-directed, fixed-lot Cashu swaps
 
-**Status:** design spec; no runtime code changed. **Core anchor commit:
-`c16155e556ef54e0ec1258a4bd7bd61cbb8faf60`** (= freshly fetched `origin/main`, 24 Sep 2026).
-**Unmerged sidecar/transport anchor commit: `ddfbf5d63fbfcddf60ad2282494a36a780c84864`.**
-Citations use `file:line @sha`, re-grepped at those commits. The local throwaway probe is not
-product implementation. Proposed kinds, commands, flags and journal extensions below do not exist yet.
+**Status:** design spec; no runtime code changed. **Anchor commit: `8c3bf74f87ca4e5d0f7b0bff64c41a7073ac849e`**
+(= freshly fetched `origin/main`, 2026-10-07). All repository citations use this single anchor,
+re-derived by grep. The local throwaway probe is not product implementation. Proposed trade kinds,
+commands, flags and journal extensions below do not exist yet.
 
-Builds on [seller credits, PR #1030](https://github.com/MakePrisms/maxplayerai/pull/1030),
-`docs/specs/seller-credits.md` at `f2d29afc0e97be4376315ac6503785f592c11f9d`, read before this design.
-The dependency stack is **not merged**: #1030 design; [#1034](https://github.com/MakePrisms/maxplayerai/pull/1034)
-transport (`ae657c4`); [#1036](https://github.com/MakePrisms/maxplayerai/pull/1036) sidecar;
-[#1037](https://github.com/MakePrisms/maxplayerai/pull/1037) e2e (`ddfbf5d`). Core citations do not
-imply that `nostr://` or sidecar behavior has landed on main. Implementation waits for the stack
-and revalidates its eventual merge commits.
+Builds on [seller credits](seller-credits.md), now merged: #1084 spec (`a381dc4`), #1085
+Nostr transport (`f31731b`), #1086 sidecar (`1dfc3a0`), #1087 e2e (`7d01bdf`), on 2026-10-02.
+Follow-ups #1077 (per-mint award reservations), #1088, #1091 (mints-add hint), #1092
+(private jobs accept `nostr://`) and #1100 (credits-first selection) are also on main, released
+as v0.6.1-rc7. This replaces the unmerged #1030/#1034/#1036/#1037 dependency framing.
+The older seller-credit spec is historical design; current anchored source wins where it differs.
+Open integration issues: #1035 (persisted request-exp recovery fence), #1090 (flaky sidecar test),
+#1101 (sealed `delivery_mint` at pay). This documentation refresh does not resolve them.
 
 ## 0. Settled inputs — not relitigated here
 
@@ -29,8 +29,8 @@ Bob, Discord **#cashu-token-marketplace, 24 Sep 2026**; go at **17:16 UTC**:
 5. No trade fee now. **Job platform-fee behavior stays exactly as today**, including credit-paid
    jobs. No fee-rate, accrual, remit, default-mint or failure-policy change.
 6. Pilot credit mint is the opt-in `maxplayer-mint` sidecar over `nostr://`.
-7. Payment may use any mint the credit seller accepts, provided NUT-14 and NUT-07 with usable
-   spent-proof witnesses work. Refuse unsupported/unknown capabilities at quote time.
+7. Payment may use any mint the credit seller accepts. The 2026-10-07 Q4 update below settles
+   the quote-time capability rule; it replaces the older tested-compatibility requirement.
 8. Both buying and selling require an owner's direction through CLI or an MCP call made for that
    direction. No autonomous speculation. Market scanning before a job payment is future work.
 9. Integrate in `maxplayer`; no separate order-book service, seller HTTP server or public HTTPS.
@@ -39,6 +39,25 @@ Bob, Discord **#cashu-token-marketplace, 24 Sep 2026**; go at **17:16 UTC**:
 10. Distinguish relay failure from an empty market. Listing is not endorsement; the buyer's owner
     chooses whom and which mint to trust. Rocky's HTTP book, loopback-only fence, per-buyer policy
     file and ManySails `/v1/restore` change are superseded, not dependencies.
+
+**Settled update — Bob, #cashu-token-marketplace, 2026-10-07 (request 19:37 UTC):**
+
+- **Q1 agreed:** taker generates the secret and locks first; maker locks second.
+- **Q4 settled:** any payment mint the credit seller accepts is eligible if reachable info
+  advertises NUT-14 and NUT-07 at quote time. A tested-only allowlist is too tight. Advertisement
+  is not proof of working claims/refunds/witnesses; the separately authorized canary tests those
+  behaviors for its particular mint/configuration, not every eligible mint forever.
+- **Q5 settled:** listings live 24 h, then republish with fresh backing/status checks; trade-request
+  dedup lasts 30 days. Keep unresolved money records until reconciled, even beyond retention.
+- **Q6 settled:** deploy persistent 3410/3411 under buzz `Scope::MessagesWrite` before any client
+  uses the feature; 23412 stays ephemeral. At this anchor all three are unallocated in product
+  constants; 3410 appears only as an unknown-kind negative test. Global registry review remains.
+- **Q7 settled:** canary capped at 100 sats principal + 10 sats mint fees, one trade in flight;
+  **Bob's separate go is still required** before running it.
+
+**Not settled — proposed, pending Bob:** **Q2** taker lock 60 min / maker lock 15 min
+(nominal minimum 45 min recovery gap; clock/cutoff qualifications in §3.2); **Q3** quote hold 60 s,
+one open quote per taker and four per maker. These are not approved timing values.
 
 Inherited from #1030: acceptance is opt-in and transferable credits may pay **any** seller that
 accepts that mint, not exclusively the issuer. Issuers retain mint backup/key-loss risk. Credits
@@ -72,7 +91,7 @@ Use two new ordinary persistent kinds, **3410 CREDIT_LOT** and **3411 CREDIT_LOT
 **23412 CREDIT_TRADE** for encrypted, ephemeral negotiation. These numbers are proposals pending
 registry collision review; they do not reuse job OFFER, RECEIPT, REVIEW or mint-operation kinds.
 Existing constants include 3400–3409 and 30340
-(`crates/maxplayer-core/src/kinds.rs:44 @c16155e`, `crates/maxplayer-core/src/kinds.rs:49 @c16155e`).
+(`crates/maxplayer-core/src/kinds.rs:44 @8c3bf74`, `crates/maxplayer-core/src/kinds.rs:49 @8c3bf74`).
 All new events carry `t=maxplayer`, `v=1`; credit content also has `trade_v=1`. This is an additive
 extension, not a change to job protocol interpretation.
 
@@ -83,13 +102,16 @@ extension, not a change to job protocol interpretation.
   "trade_v": 1,
   "give": {"mint_url": "nostr://<credit-mint-npub>", "unit": "sat", "net": 1000},
   "want": {"mint_url": "https://mint.minibits.cash/Bitcoin", "unit": "sat", "net": 800},
-  "expires_at": 1790366400,
-  "deadline_policy": {"long_hours": 24, "short_hours": 12, "min_gap_hours": 12},
+  "expires_at": 1791488220,
+  "deadline_policy": {"long_seconds": 3600, "short_seconds": 900, "min_gap_seconds": 2700},
   "fee_policy": "sender-funds-net-v1"
 }
 ```
 
-This schematic uses a placeholder npub, not a valid token. Single-letter tags `g` (give mint), `w` (want mint), `u` (give unit), and `x` (want unit)
+This schematic uses the proposed, pending Bob timing policy and a placeholder npub, not a valid token.
+Listing expiry is publication +24 h; republishing uses a new id after checking backing and retiring
+the old lot (never two live lots backed by the same proofs). Single-letter tags `g` (give mint),
+`w` (want mint), `u` (give unit), and `x` (want unit)
 support standard Nostr `#g/#w/#u/#x` filters; `expiration` carries listing expiry. Content is
 authoritative and tags must agree. Expiry stops new quote acceptance, not recovery or completion
 of a previously authorized swap. Optional
@@ -131,7 +153,8 @@ Fetch listings and complete valid status chains from `wss://relay.maxplayer.ai`,
 author, age and pagination. Show expiry, freshness, trust warning, assets, net amounts and indicative
 mint costs. Never infer available from an absent cancellation. Fetch matching status history before
 quoting, then ask the maker for a fresh quote/reservation. Maker availability is not implied by a
-recent listing. Discard expired listings even if the relay still stores them.
+recent listing. Discard expired listings even if the relay still stores them. Relay retention must
+cover the full 24 h advertised lifetime and status chain; clients fail closed on history gaps.
 
 CLI/MCP result distinguishes `ok` with zero validated lots after EOSE, `relay_unreachable`,
 `timeout_or_partial`, `invalid_or_quarantined` and cached/stale results. EOSE is not proof the relay
@@ -140,7 +163,7 @@ relay is assumed to work; losing this single relay can halt discovery and negoti
 
 ## 3. Swap decision: taker holds secret, taker locks first
 
-**Decision A: change the earlier seller-secret / seller-credit-first proposal told to Bob.**
+**Decision A: settled Q1 (Bob, 2026-10-07), replacing the earlier seller-secret proposal.**
 The **taker** samples a fresh random 32-byte secret `s`, persists it privately, and sends only
 `H=SHA256(s)` until claiming. The taker locks its `want` asset first with the **long** deadline.
 The maker verifies that lock, then locks its `give` asset with the **short** deadline. The taker
@@ -149,14 +172,15 @@ signed encrypted taker notice, verifies its hash, and claims the first lock.
 
 | Choice | Inventory grief / option | Mint-availability and offline risk |
 |---|---|---|
-| Earlier: maker/seller secret, credits locked first, long; taker sats second, short | A stranger can solicit hours-long credit locks without committing funds. Rate limits do not remove Sybil free options. | Taker must learn secret from payment mint/notice and claim credits during the gap; credit mint outage can hurt taker. |
-| **Selected: taker secret, taker locks first long; maker second short** | Taker must actually immobilize value before maker creates an hours-long lock. Short quote holds still admit bounded DoS, and a funded taker retains an option to abort. | **Maker** must observe its outgoing mint's claim witness and redeem at the taker's mint during the gap. Taker/that mint can withhold the notice/witness; maker can lose if outage lasts too long. Taker carries first-lock unavailability/capital-lock risk. |
+| Earlier: maker/seller secret, credits locked first, long; taker sats second, short | A stranger can solicit timed credit locks without committing funds. Rate limits do not remove Sybil free options. | Taker must learn secret from payment mint/notice and claim credits during the gap; credit mint outage can hurt taker. |
+| **Selected: taker secret, taker locks first long; maker second short** | Taker must actually immobilize value before maker creates a timed lock. Short quote holds still admit bounded DoS, and a funded taker retains an option to abort. | **Maker** must observe its outgoing mint's claim witness and redeem at the taker's mint during the gap. Taker/that mint can withhold the notice/witness; maker can lose if outage lasts too long. Taker carries first-lock unavailability/capital-lock risk. |
 
-The alternative is better for publicly listed inventory; it does **not** eliminate grief or turn
+The selected order is better for publicly listed inventory; it does **not** eliminate grief or turn
 independent custodial mints into trustless consensus. Direction is symmetric: in a sell-back,
 taker may lock **credits** first and maker locks **sats** second. Never hardcode deadline order to
 "credit" versus "bitcoin". The credit buyer still preflights the credit mint before either party
-locks, and the maker must accept the taker's exact funding mint and its witness behavior.
+locks, and the maker must accept the taker's exact funding mint under Q4, including the
+residual risk that advertised witness support fails.
 
 **Decision B: issuer trust is unavoidable.** An issuer selling its own credits controls their mint.
 It can take payment and then refuse a claim or subsequent spending, forge state, selectively reveal
@@ -169,18 +193,23 @@ not unconditional protection against either mint. Owners explicitly choose issue
 ### 3.1 Preflight, quote and exact locks
 
 Before **any** lock, both parties preflight both assets: configured URL/identity, reachable info,
-active and input keysets, NUT-10/11/12/14 and NUT-07 witness compatibility, fee schedule, amount and
-proof limits, and clock health. Bitcoin payer specifically verifies the credit mint. An info flag
-is necessary, not proof of witness retention or correct refund behavior; stage-1 compatibility
-results gate execution. Unsupported or uncertain capability is a quote refusal, not fallback to
-an unsecured send. Doctor exposes the failed mint/op distinctly from relay failure.
+active and input keysets, advertised NUT-14 and NUT-07, fee schedule, amount and proof limits,
+and clock health. Bitcoin payer specifically verifies the credit mint. Refuse unreachable info or
+missing/false NUT-14/07 advertisement at quote time; do not restrict to previously tested mints.
+Owner trust and seller acceptance remain mandatory. DLEQ and exact conditions are verified when
+proofs arrive. An info flag is not proof of witness retention or correct refund behavior. Known
+observed failures pause that mint and surface an error; lack of a prior test alone is not refusal.
+The capped canary exercises claim, refund and witness recovery on its selected mints, reducing
+implementation risk without certifying other mints or future behavior. Never fall back to an
+unsecured send. Doctor exposes the failed mint/op distinctly from relay failure.
 
 1. Taker requests quote with fresh request id and owner caps. Maker signs a quote binding lot id,
    both peers, exact assets/net/gross amounts, keysets/fees, `H`, per-swap receive/refund public keys,
-   proof-count limits, absolute deadlines, short claim cutoff, and quote expiry. Both peers persist
+   proof-count limits, absolute deadlines, short claim cutoff, and quote expiry (anchored to quote issuance, never acceptance). Both peers persist
    its hash. No party signs or spends against just a mutable display price.
-2. Quote acceptance acquires a **five-minute soft hold** on that lot, bounded to one per maker
-   identity and a small global cap. It does not create an HTLC. Failed/expired quote releases only
+2. Quote issuance acquires a **60-second soft hold (proposed, pending Bob)** on that lot, bounded
+   to one open quote per authenticated taker identity and four per maker. Acceptance consumes the
+   same window, not a new 60 seconds. It does not create an HTLC. Failed/expired quote releases only
    the soft hold; the lot remains wallet-backed. Process duplicate quote ids before rate limits;
    repeated identical requests do not renew hold or deadlines. New requests face normal admission.
 3. Taker commits cap/ledger reservation and recovery intent **before** creating its long lock.
@@ -227,15 +256,42 @@ sequenceDiagram
     Note over T,MM: On abort, refund keys actively swap after respective deadlines
 ```
 
-### 3.2 Hours-long windows, not automatic refunds
+### 3.2 Shorter proposed windows, not automatic refunds
 
-Default absolute deadlines from quote time: **long = +24 h, short = +12 h**, minimum 12 h gap.
-Stop initiating the taker's claim at **short − 2 h**; maker refuses to create the second lock if
-less than 10 h remain until short or the full gap is unavailable. Five-minute quote expiry is an
-admission window, not a settlement deadline. The lab compresses time only for tests.
+**Q2/Q3: proposed, pending Bob.** From the same signed quote timestamp: taker/long lock = **+60 min**,
+maker/short lock = **+15 min**, nominal gap **45 min**; quote admission/soft hold **60 s**.
+Do not restart either deadline when the second lock is created or a request is retried. Maker
+must initiate its lock within the original quote window after validating the first lock; a late
+first lock is refunded, never grounds to extend a quote. Both verify the exact absolute deadlines.
+
+The happy path completes in seconds. Deadlines matter only when something fails: shorter windows
+reduce how long funds stay stuck on an aborted trade, but reduce how long a seller restart, relay
+outage or payment-mint outage the maker can survive after the secret is revealed without losing
+its side. They are recovery budgets, not required waiting periods before successful settlement.
+
+**Proposed claim cutoff:** taker refuses to initiate a claim with **less than 3 min remaining on
+the maker lock**, and cancels/drops retries once that cutoff is reached. Its prepared claim request
+must have persisted `exp` no later than **short − 2 min** (and no later than its actual caller
+wait); use an appropriately shortened call window, never publish an already-expired request.
+This leaves 1 min for request delivery/processing before that expiry, plus 2 min for clock margin.
+Maker also refuses a second lock unless at least 3 min remain and the full deadline gap holds.
+The bounds are conservative proposed margins, to be validated by the stage-3 two-mint fault lab,
+not measured production latency guarantees.
+
+With accurate clocks a claim before short leaves at least 45 min until long. To preserve that
+minimum under the proposed clock bound (each mint within 60 s of the agreed reference, hence up
+to 120 s relative skew), stop executable claims by short − 2 min. This gives at least 45 min
+from an on-time claim to the earliest long refund under those bounds. Mint request admission,
+queueing and execution must respect that fence; if execution can continue after `exp`, account
+for that bounded processing time too or refuse the timing policy. The local probe does not prove
+this cross-mint operational bound. **“Always 45 min” is conditional on these bounds and compliant
+clients**, not an HTLC-enforced guarantee: pinned CDK permits late receiver claims after expiry.
+A malicious/late taker or unbounded clock/processing error can defeat that margin. Maker must
+monitor/refund promptly and accept this residual risk; unconditional atomicity is not claimed.
 
 Synchronize clocks, refuse new locks on detected skew above 60 s, record observed mint info time
-when supplied, and monitor well before expiry. Clock health is not a Byzantine-mint guarantee.
+when supplied, and monitor well before expiry. If clock uncertainty cannot be bounded, refuse this timing policy rather than claiming its
+45 min margin. Clock health is not a Byzantine-mint guarantee.
 Late taker claims can still happen: HTLC receiver claims remain valid **after locktime** and race
 refunds. A deadline enables a refund; it does not revoke the claim or transfer funds automatically.
 Refund uses the sender's refund-key signature in an explicit swap back to fresh wallet outputs.
@@ -248,8 +304,8 @@ not permission to enter new trades.
 
 23412 uses NIP-44 v2 to the peer's bound identity, signed by the sender; `p` is routing metadata,
 not confidentiality. No mint RPC is overloaded with negotiation: 23410/23411 remain mint request /
-response (`crates/maxplayer-core/src/mint_wire.rs:41 @ddfbf5d`,
-`crates/maxplayer-core/src/mint_wire.rs:44 @ddfbf5d`). Subscribe before publishing and authenticate
+response (`crates/maxplayer-core/src/mint_wire.rs:41 @8c3bf74`,
+`crates/maxplayer-core/src/mint_wire.rs:44 @8c3bf74`). Subscribe before publishing and authenticate
 NIP-42 with the same signing identity. Verify signature, peer, lot/quote/swap ids, message type,
 version, body hash and expiry before any state transition.
 
@@ -296,14 +352,28 @@ releasing either. No second service, budget database or seed store.
 | Maker cancellation while in flight | Existing authorized swap continues/reconciles | Stop new takers; cancellation cannot claw back issued locks |
 | Keys/seed lost, issuer rollback/fraud | Recovery may be impossible | No protocol guarantee; explicit owner/issuer risk |
 
-Mint request expiry must not outlive its caller's actual wait. Transport clock bound is
-`crates/maxplayer-core/src/mint_wire.rs:132 @ddfbf5d`; its expiry calculation is
-`crates/maxplayer-core/src/nostr_mint.rs:392 @ddfbf5d`. Main's existing short mint-call timeout is
-`crates/maxplayer-core/src/payment_wallet.rs:35 @c16155e`. Do not put an hours-long HTLC wait inside
-that call or let dropping a future mark proofs free. Existing saga retirement
-(`crates/maxplayer-core/src/payment_wallet.rs:827 @c16155e`) needs trade-reservation awareness;
+For the proposed trade path, mint request expiry must not outlive its caller's actual wait.
+This requires threading the remaining deadline into the connector; do not assume current
+`request_exp` or dropping a future already enforces the proposed trade-specific cutoff. Transport clock bound is
+`crates/maxplayer-core/src/mint_wire.rs:132 @8c3bf74`; its expiry calculation is
+`crates/maxplayer-core/src/nostr_mint.rs:392 @8c3bf74`. Main's HTTPS/read mint-call timeout is
+`crates/maxplayer-core/src/payment_wallet.rs:33 @8c3bf74`. Do not put a timed HTLC wait inside
+that call or let dropping a future mark proofs free. Nostr mutations use the longer
+`mint_mutation_timeout` (`crates/maxplayer-core/src/payment_wallet.rs:41 @8c3bf74`), not a universal
+5 s bound. Existing saga retirement
+(`crates/maxplayer-core/src/payment_wallet.rs:946 @8c3bf74`) needs trade-reservation awareness;
 this spec does not claim it already understands HTLCs. Restore retrieves signatures for persisted
 outputs, not the counterparty's secret; NUT-07 supplies the claim witness.
+
+**Required #1035 fence (not yet implemented on main):** before any publication, persist exact
+request event id, `exp` and saga/trade binding, including all retry requests. Recovery waits until
+all persisted expiries plus allowed mint clock skew have passed, then reconciles NUT-07 and
+restore before compensation or releasing reservations. Missing request evidence remains held for
+manual reconciliation, never guessed safe. Main still derives a hold from `updated_at + 300s`
+(`crates/maxplayer-core/src/payment_wallet.rs:61 @8c3bf74`); that estimate is **not** the trade
+recovery contract. Test future persisted `exp` despite old `updated_at`, interrupted publication,
+late delivery, and empty restore; never drop a live request's saga. #1035 is a prerequisite to
+safe trade recovery, not a fix claimed by this spec.
 
 ## 5. Fee-inclusive quote and owner caps
 
@@ -334,8 +404,9 @@ leave `refund_blocked_fee`, alert owner and request a new explicit cap, not auto
 The credit mint must be configured **before** accepting/receiving:
 `maxplayer wallet mints add nostr://<mint-npub>`. This does not change default mint or seller
 acceptance. Config distinguishes wallet `extra_mints` from seller `accepted_mints`
-(`crates/maxplayer-core/src/home.rs:1637 @c16155e`). Seller operators accept their own mint and append
-it after the bitcoin fee mint as #1030 describes. Trade UI does not silently add or trust a mint.
+(`crates/maxplayer-core/src/home.rs:1746 @8c3bf74`). Seller operators accept their own mint and append
+it after the bitcoin fee mint when retaining bitcoin fee remittance; a credits-only seller
+can operate but still owes platform fees in real sats. Trade UI does not silently add or trust a mint.
 
 Successful claim swaps locked proofs into fresh ordinary wallet proofs at the acquired asset's
 mint. Only confirmed unspent outputs become spendable balance. Existing job payment then uses them
@@ -343,15 +414,30 @@ at an issuer/other seller advertising that mint, one credit per sat of job price
 still blocks spending. No special credit ledger, denomination, redemption promise or job discount
 is added. A discount applies at purchase, not by rewriting a later job's amount.
 
-Reuse `BudgetGate::check` (`crates/maxplayer-core/src/budget.rs:191 @c16155e`), append-before-effect
-`authorize_then_attempt` (`crates/maxplayer-core/src/budget.rs:239 @c16155e`) and idempotent
-`credit_reserve` (`crates/maxplayer-core/src/budget.rs:266 @c16155e`). Current check enforces the
+**Current #1100 behavior:** acquired covering, configured `nostr://` credits are selected before
+HTTPS sats for jobs at the issuer or any accepting seller, preserving seller order within each
+group (`crates/maxplayer-core/src/crossmint.rs:173 @8c3bf74`). Net availability excludes existing
+per-mint award holds; coverage and fee checks still apply. Credit mints are never cross-mint hop
+targets (`crates/maxplayer-core/src/crossmint.rs:140 @8c3bf74`), and never melt sources
+(`crates/maxplayer-core/src/wallet_ops.rs:785 @8c3bf74`). A sats-only buyer therefore cannot award
+a credits-only seller through a sats-to-credit hop: it must acquire accepted credits first.
+Buying credits is the proposed paid route to do that (existing transfers/operator issuance are
+not a sats-funded job-payment conversion). Trading remains owner-directed, never automatic at award.
+Private claims/receipts now validate well-formed mint identities rather than requiring every
+listed mint to be buyer-accepted (`crates/buzz/crates/maxplayer-private-protocol/src/wire.rs:112 @8c3bf74`);
+planning must still select a permitted mint. Do not restore the obsolete all-listed-mints rule.
+Issue #1101 tracks enforcing the sealed delivery mint at pay; this spec neither fixes nor assumes
+that open issue resolved. Stage 4 must verify source/reservation/sealed-mint consistency.
+
+Reuse `BudgetGate::check` (`crates/maxplayer-core/src/budget.rs:191 @8c3bf74`), append-before-effect
+`authorize_then_attempt` (`crates/maxplayer-core/src/budget.rs:239 @8c3bf74`) and idempotent
+`credit_reserve` (`crates/maxplayer-core/src/budget.rs:266 @8c3bf74`). Current check enforces the
 configured **per-job cap only**; older `docs/protocol-v1.md` §11 mentions a total cap, but no rolling
 total cap is implemented here. Do not invent one or change job behavior in this feature. Apply the
 same cap conservatively to each trade's maximum outbound `sat` face-value debit, plus owner quote
 caps; explicit asset fields prevent treating credit face value as liquid bitcoin wealth.
 
-Extend the additive spend record (`crates/maxplayer-core/src/budget.rs:87 @c16155e`) with defaulted
+Extend the additive spend record (`crates/maxplayer-core/src/budget.rs:87 @8c3bf74`) with defaulted
 `purpose=job|credit_trade`, `trade_id`, `asset`, `phase` and reconciliation reference. Existing records
 remain job spends. Namespace attempt ids `credit-trade/<swap>/<role>/<phase>` and reconciliation ids
 separately; validate immutable amounts/assets on retry, since dedup by id alone is not authorization.
@@ -365,11 +451,11 @@ face-value accounting; no P&L/net-worth interpretation is promised.
 
 Trade settlement bypasses job `collect`, job receipt creation and seller platform-fee accrual.
 Later credit-paid jobs use those paths **unchanged**: platform rate is still 1,000 bps
-(`crates/maxplayer-core/src/platform_fee.rs:48 @c16155e`), seller fee remains payable in real sats,
+(`crates/maxplayer-core/src/platform_fee.rs:48 @8c3bf74`), seller fee remains payable in real sats,
 and fee accrual/remittance failures behave as today. Tests must prove a trade creates no job fee
 and a subsequent credit-funded job still does. This is not a free-job lane.
 
-Doctor extends existing mint probing (`crates/maxplayer-core/src/doctor.rs:86 @c16155e`) with
+Doctor extends existing mint probing (`crates/maxplayer-core/src/doctor.rs:88 @8c3bf74`) with
 trade capability, reserved/pending/claimable/refundable states and deadlines. Recovery extends the
 existing wallet machinery with the HTLC journal; it must not simply call generic saga recovery
 and assume balances are safe. Pinned wallet gaps and required refund adapter are in §9.
@@ -400,21 +486,21 @@ normal tool results. Disabling new trading does not disable recovery of outstand
 
 ## 8. Required relay changes and security boundary
 
-At the core anchor, persistent allowlisting lives in
-`crates/buzz/crates/buzz-relay/src/handlers/ingest.rs:244 @c16155e`; unknown kinds are rejected at
-`crates/buzz/crates/buzz-relay/src/handlers/ingest.rs:375 @c16155e`. **Stage 2 must add named constants
+At the anchor, persistent allowlisting lives in
+`crates/buzz/crates/buzz-relay/src/handlers/ingest.rs:244 @8c3bf74`; unknown kinds are rejected at
+`crates/buzz/crates/buzz-relay/src/handlers/ingest.rs:375 @8c3bf74`. **Stage 2 must add named constants
 for 3410 and 3411 in core `kinds.rs` and buzz ingest, and add both to the `Scope::MessagesWrite` arm
 of `required_scope_for_kind`, beside the existing review kinds**
-(`crates/buzz/crates/buzz-relay/src/handlers/ingest.rs:363 @c16155e`). Update the test currently
+(`crates/buzz/crates/buzz-relay/src/handlers/ingest.rs:363 @8c3bf74`). Update the test currently
 asserting that 3410 is unknown and retain an unknown-kind negative control. Deploy that explicit
-allowlist change before enabling listing publication; do not enable broad open ingest.
+allowlist change before any client uses these trade kinds; do not enable broad open ingest.
 
 23412 is ephemeral: no persistent allowlist addition, WS-only and unstored. WebSocket handling
-requires authenticated NIP-42 identity (`crates/buzz/crates/buzz-relay/src/handlers/event.rs:614 @c16155e`),
-author/auth key equality except gift-wrap (`crates/buzz/crates/buzz-relay/src/handlers/event.rs:637 @c16155e`),
+requires authenticated NIP-42 identity (`crates/buzz/crates/buzz-relay/src/handlers/event.rs:614 @8c3bf74`),
+author/auth key equality except gift-wrap (`crates/buzz/crates/buzz-relay/src/handlers/event.rs:637 @8c3bf74`),
 and routes ephemeral kinds before persistent ingest
-(`crates/buzz/crates/buzz-relay/src/handlers/event.rs:675 @c16155e`). Channel-less ephemeral events
-fan out globally (`crates/buzz/crates/buzz-relay/src/handlers/event.rs:844 @c16155e`). Encryption does
+(`crates/buzz/crates/buzz-relay/src/handlers/event.rs:675 @8c3bf74`). Channel-less ephemeral events
+fan out globally (`crates/buzz/crates/buzz-relay/src/handlers/event.rs:844 @8c3bf74`). Encryption does
 not hide peer tags, timing or traffic volume; application-level size/rate/expiry bounds are required.
 
 Security limits: signatures prove authorship, not solvency or mint honesty; a malicious wallet can
@@ -434,11 +520,14 @@ recovery may continue if its transport remains reachable. No fallback relay dura
 
 ## 9. Pinned dependency evidence and local probe
 
-Both main's wallet (`crates/maxplayer-core/Cargo.toml:83 @c16155e`) and the sidecar
-(`crates/maxplayer-mint/Cargo.toml:29 @ddfbf5d`) pin **CDK 0.17.2**, not Minibits' deployed version.
+Both main's wallet (`crates/maxplayer-core/Cargo.toml:83 @8c3bf74`) and the sidecar
+(`crates/maxplayer-mint/Cargo.toml:29 @8c3bf74`) pin **CDK 0.17.2**, not Minibits' deployed version.
 Checked the unpacked `cdk`, `cashu`, `cdk-common` and `cdk-sqlite` 0.17.2 sources, not remembered
 APIs. CDK's package records upstream source commit `6132607495ae0741e412a63f2acc34e4ccddfc55`.
 Source inspection is version-specific, not a claim that newer upstream has no fix.
+The refresh audit re-grepped **39 unique repository citations** at the single anchor and
+byte-compared the three copied modules (one import adaptation) plus the shared protocol crate.
+`git diff --check` passed. Mermaid source was reviewed; rendered GitHub visualization is unverified.
 
 | Claim | Pinned source checked |
 |---|---|
@@ -450,16 +539,16 @@ Source inspection is version-specific, not a claim that newer upstream has no fi
 | Spent-state witness retrieved from stored proofs | `cdk-0.17.2/src/mint/check_spendable.rs`, `ys_needing_witness`, `witness_map` |
 | Input fee aggregation, single ceil after sum | `cdk-0.17.2/src/fees.rs`, `calculate_fee`; splitting in `cashu-0.17.2/src/amount.rs` |
 
-Sidecar construction is `crates/maxplayer-mint/src/backend.rs:28 @ddfbf5d`, configuring the `sat`
-unit with defaults at `crates/maxplayer-mint/src/backend.rs:36 @ddfbf5d`. Its dispatcher passes
-`info`, `swap`, `checkstate`, `restore` to CDK without stripping witness fields:
-`crates/maxplayer-mint/src/dispatch.rs:27 @ddfbf5d`,
-`crates/maxplayer-mint/src/dispatch.rs:43 @ddfbf5d`,
-`crates/maxplayer-mint/src/dispatch.rs:47 @ddfbf5d`,
-`crates/maxplayer-mint/src/dispatch.rs:51 @ddfbf5d`. Keys/keysets are also served. The matching
-connector passes these operations (`crates/maxplayer-core/src/nostr_mint.rs:531 @ddfbf5d`,
-`crates/maxplayer-core/src/nostr_mint.rs:542 @ddfbf5d`,
-`crates/maxplayer-core/src/nostr_mint.rs:546 @ddfbf5d`). No new sidecar operation, mint/melt endpoint,
+Sidecar construction is `crates/maxplayer-mint/src/backend.rs:28 @8c3bf74`, configuring the `sat`
+unit with defaults at `crates/maxplayer-mint/src/backend.rs:36 @8c3bf74`. Its dispatcher forces NUT-04/05 disabled with empty method lists in `info`, while retaining
+NUT-07/14; it passes `swap`, `checkstate`, `restore` to CDK without stripping witness fields:
+`crates/maxplayer-mint/src/dispatch.rs:27 @8c3bf74`,
+`crates/maxplayer-mint/src/dispatch.rs:53 @8c3bf74`,
+`crates/maxplayer-mint/src/dispatch.rs:57 @8c3bf74`,
+`crates/maxplayer-mint/src/dispatch.rs:61 @8c3bf74`. Keys/keysets are also served. The matching
+connector passes these operations (`crates/maxplayer-core/src/nostr_mint.rs:531 @8c3bf74`,
+`crates/maxplayer-core/src/nostr_mint.rs:542 @8c3bf74`,
+`crates/maxplayer-core/src/nostr_mint.rs:546 @8c3bf74`). No new sidecar operation, mint/melt endpoint,
 HTTP endpoint or ManySails restore change is necessary for the protocol.
 
 ### 9.1 Probe setup and result boundary
@@ -467,28 +556,35 @@ HTTP endpoint or ManySails restore change is necessary for the protocol.
 Throwaway crate: `~/.openclaw/workspace/.openclaw/tmp/credit-htlc-probe/` (not committed).
 `cdk`, `cashu`, `cdk-common`, `cdk-sqlite`, `cdk-fake-wallet` pinned to `=0.17.2`, CDK features
 `mint,wallet,bip353`. Tests copy sidecar `backend.rs` and `dispatch.rs` plus core `mint_wire.rs`
-**from `git show ddfbf5d`**, changing only the dispatch import to the copied module. Mint uses the
+**from `git show 8c3bf74`**, changing only the dispatch import to the copied module.
+The merged wire module also needs `maxplayer-private-protocol`; its whole source crate is copied
+unchanged from the same anchor into the tmp probe and used as a path dependency. The first refresh
+build exposed that missing harness dependency; adding it changes no production source. Mint uses the
 sidecar's actual `MintBuilder` configuration, SQLite and zero-fee unit, not a fake info response.
 Test funds are blind-signed locally with disposable keys. CDK's direct in-process connector from
 the earlier matching-version probe connects real wallets; no HTTP or relay transport for the swap.
 
-Run inside the repository devshell with `PROTOC` supplied and the target/log under that tmp dir:
+Run with the available Rust toolchain (cargo 1.98.1 for this refresh) and Nix `PROTOC`,
+with target/log under the tmp dir; use the repository devshell if cargo is unavailable:
 
 ```sh
 PROTOC=<nix-protobuf>/bin/protoc CARGO_TARGET_DIR=<probe>/target \
   cargo test --manifest-path <probe>/Cargo.toml --test htlc sidecar_htlc_probe -- --nocapture
 ```
 
-**Observed result, 24 Sep 2026:** `sidecar_htlc_probe` **1 passed, 0 failed**; five copied
-mint-wire helper tests filtered out. Runtime 5.93 s after compilation. Assertions:
+**Observed result, 2026-10-07 (refresh):** `sidecar_htlc_probe` **1 passed, 0 failed**,
+5 copied mint-wire helper tests filtered out; test runtime **5.04 s** after compilation.
+Log: `<probe>/refresh-20261007.log`. The copied wire module emits one harmless unexpected
+`cfg(feature="gateway")` warning in the standalone harness. Assertions:
 
 | Required item | Result |
 |---|---|
-| **1. Sidecar advertises NUT-14 + NUT-07** | **PASS** via copied real sidecar `info` dispatcher; both `supported=true`. No sidecar capability-advertisement change needed. |
+| **1. Sidecar advertises NUT-14 + NUT-07** | **PASS** via copied real sidecar `info` dispatcher; both `supported=true`. NUT-04/05 both assert `disabled=true`; no capability-advertisement change needed. |
 | **2. Hash + receiver key + locktime + refund key claim** | **PASS**. A native wallet produced the 64-sat HTLC token; raw mint swaps with neither witness component, preimage only, or receiver signature only were all refused. Native wallet receive with the matching preimage and receiver signature returned 64 sats. |
 | **3. Refund by refund key only after locktime** | **PASS at mint API**, with a compatibility constraint. The same refund token with refund-key signature and explicit HTLC witness `preimage:""` was refused before its deadline and accepted after it; unsigned refund after expiry was refused. Test deadline was +4 seconds with a bounded real wait past equality, not a production timing recommendation. A signatures-only witness without the `preimage` field was also refused by pinned CDK. |
 | **4. NUT-07 witness contains claim preimage** | **PASS** via sidecar `checkstate` dispatch: all claim-input Ys were SPENT and every serialized witness contained the exact preimage. No peer claim notification was used to retrieve it. |
 | **5. Native wallet HTLC construction/redemption** | **PASS** for `prepare_send` with `HTLCConditions` and `receive` with preimage + signing key. **FAIL / integration gap** for high-level refund without the secret: `receive` returned `Preimage not provided` even after locktime with the correct refund key. Lower-level signed swap succeeded. |
+| **6. Seconds-scale deadlines** | **PASS**: claim uses +10 s and must complete before expiry; refund uses +4 s, refusing early and accepting only after strict expiry. This demonstrates no hours-scale minimum in pinned CDK, not a two-mint timing guarantee. |
 
 **Required integration, not a mint capability failure:** use native CDK HTLC creation and normal
 claims. Maxplayer still needs its trade coordinator, exact-condition validation, witness polling,
@@ -512,7 +608,8 @@ changes no runtime code.
 **Minibits info only, 24 Sep 2026:** GET `https://mint.minibits.cash/Bitcoin/v1/info` returned
 `cdk-mintd/0.17.6` and supported NUTs 7/10/11/12/14. Saved response locally with the probe.
 This did **not** prove claims, refunds or witness retention at Minibits, and is not approval for a
-live swap. Missing witness compatibility must refuse a quote, not be inferred from a version.
+live swap. Historical info is not current quote preflight. Lack of prior compatibility testing does not
+refuse an otherwise eligible mint under Q4; advertising still does not prove behavior.
 
 Related read-only issue search found [cashubtc/cdk#2252](https://github.com/cashubtc/cdk/issues/2252),
 which discusses signatures-only HTLC refund witnesses and other implementation divergences.
@@ -524,24 +621,35 @@ or other mint implementation source; the concrete claims above are pinned-source
 Every stage has a **default-off** gate. Proposed `[credit_trading] enabled=false` is the umbrella;
 subgates below also default false. Existing job/wallet defaults are unchanged. Closing an admission
 gate stops new trades but leaves safety recovery of already-authorized trades available. Each stage
-must rebase/re-grep anchors after the seller-credit stack lands; do not merge this spec as code.
+must rebase/re-grep anchors against its then-current main; do not merge this spec as code.
 
 | Stage / default-off gate | Scope | Required failure tests before advancing |
 |---|---|---|
 | **1. Probe-backed mint capabilities** / `capability_checks` | Port the pinned local tests to maintained fixtures; doctor + quote-time checks; select/journal compatible refund handling | Missing NUT-14/07; advertised-but-missing witness; unreachable mint vs relay; false/unsupported info; wrong keyset/URL/unit; missing signature/preimage; early/late refund, strict boundary, malformed/duplicate conditions, wrong refund key; native refund gap; no spend during preflight |
 | **2. Listings + discovery** / `listings` (relay admission separately default-off) | 3410/3411 allowlist, 23412 registry, signed parser, durable backing and outbox | Unknown kind rejected before relay gate and admitted only when enabled; auth/author mismatch; immutable-term edits; status forks/out-of-order history; terminal resurrection; stale/partial/no EOSE vs empty; overlisting across processes and competing job/send; quote-hold Sybil bounds; cancel/publish crash; expired/fake/oversized listing |
-| **3. Swap + recovery fake-money lab** / `lab_swaps` | Two local sidecar/CDK mints, encrypted local relay, both directions, no external networking; wallet journal/refund adapter | Kill each process before/after every journal/ledger/mint boundary; lost request vs lost reply after commit; same-id conflict; concurrent takers; replay after expiry; frozen/dropped state witness; partial restore; claim/refund race with expired deadlines; mint/relay outage past gap; clock skew; wrong keys/hash/mint; fee changes and fee rounding/caps; reservations not released by generic saga retirement; seed restore plus spent-input reconciliation; balances and no platform fee; offline taker notice recovered from NUT-07 |
-| **4. CLI + MCP** / `owner_tools` | Thin wrappers around the same tested state machine, exact approval/caps, shared home | No owner direction means no list/take; stale quote/cap mismatch; request-id retries across CLI/MCP; restart with flag off still offers recovery; hidden/unconfigured mint refusal; redacted secrets; recovery blocked fee; no job code path auto-trades; acquired credit funds a job and unchanged fee accrual/remit behavior is demonstrated |
-| **5. Capped real-money canary** / `real_money_canary` | Separate explicit operator authorization, trusted issuer and verified bitcoin mint, fresh small funded wallets | Proposed max 100 bitcoin sats principal per trade, one in flight, max 10 sats mint fees, manual issuer exposure cap in credit units; prove small claim and refund under observed witness behavior; pause on any accounting/capability mismatch. Reconcile every proof/ledger entry before expanding. No production relay or mint writes are authorized by this documentation task |
+| **3. Swap + recovery fake-money lab** / `lab_swaps` | Two local sidecar/CDK mints, encrypted local relay, both directions, no external networking; wallet journal/refund adapter | Kill each process before/after every journal/ledger/mint boundary; persisted-exp fence from #1035 (old updated_at with future exp, missing record); lost request vs lost reply after commit; same-id conflict; concurrent takers; replay after expiry; frozen/dropped state witness; partial restore; claim/refund race with expired deadlines; mint/relay outage past gap; clock skew; wrong keys/hash/mint; fee changes and fee rounding/caps; reservations not released by generic saga retirement; seed restore plus spent-input reconciliation; balances and no platform fee; offline taker notice recovered from NUT-07 |
+| **4. CLI + MCP** / `owner_tools` | Thin wrappers around the same tested state machine, exact approval/caps, shared home | No owner direction means no list/take; stale quote/cap mismatch; request-id retries across CLI/MCP; restart with flag off still offers recovery; hidden/unconfigured mint refusal; redacted secrets; recovery blocked fee; no job code path auto-trades; acquired credits selected first for a job, sats-only buyer refused for credits-only seller, per-mint holds and sealed delivery mint (#1101), unchanged fee accrual/remit behavior |
+| **5. Capped real-money canary** / `real_money_canary` | Separate explicit Bob authorization, trusted issuer and seller-accepted advertising bitcoin mint, fresh small funded wallets | Settled max 100 bitcoin sats principal per trade, one in flight, max 10 sats mint fees, manual issuer exposure cap in credit units; prove small claim and refund under observed witness behavior; pause on any accounting/capability mismatch. Reconcile every proof/ledger entry before expanding. No production relay or mint writes are authorized by this documentation task |
 
 Stage 2's relay flag guards only the two new kinds, never relaxes unrelated admission. Stage 3
 must use honest-money invariants even on fake money; do not green it with protocol-invalid tokens.
-Short lab deadlines need a deterministic clock/harness or bounded real wait; production defaults
-remain hours. Attach exact test counts and untested boundaries to each implementation PR.
+Short lab deadlines need a deterministic clock/harness or bounded real wait; production proposals remain 60/15 min pending Bob, not lab seconds. Attach exact test counts and untested boundaries to each implementation PR.
 
 ## 11. Self-review: flaws fixed vs risks accepted
 
-**Fixed in this design:**
+**Fixed in this refresh (since `9f17266`):**
+
+- Unmerged-stack and old money-path framing → single current-main anchor, credits-first selection,
+  no credit hop targets, current private mint checks and explicit #1101 boundary.
+- Tested-only mint gate contradicted Q4 → reachable advertised NUT-14/07, with behavioral risk
+  and canary scope explicit; no prior-test allowlist hidden in preflight or open questions.
+- Stale 24h/12h and five-minute values → Q2/Q3 clearly pending, 60/15 min and 60 s proposals,
+  3 min claim cutoff plus expiry/clock qualifications; no unconditional 45 min guarantee.
+- Generic recovery reuse could release live requests → persisted `exp` + skew prerequisite #1035,
+  distinct from main's `updated_at + 300s` estimate.
+- Old-sidecar probe missed NUT-04/05 override → recopy merged backend/dispatch and assert its info.
+
+**Other flaws addressed by this design:**
 
 - Unit-only pricing confused two `sat` assets → explicit URL+unit everywhere, including caps/ledger.
 - Seller-first secret proposal let unpaid strangers lock inventory → taker-funded first lock;
@@ -553,14 +661,14 @@ remain hours. Attach exact test counts and untested boundaries to each implement
   Nostr index tags plus content/tag consistency checks.
 - Public `available` was liable to imply spendable stock → wallet reservation + active-swap CAS,
   soft holds and fresh maker quote; ambiguous money never released.
-- Info flags/state alone were liable to imply spendability → compatibility evidence plus DLEQ and
-  exact condition checks; unknown witness behavior refuses quotes.
+- Info flags/state alone were liable to imply spendability → fresh advertised-capability checks plus DLEQ and
+  exact condition checks; advertising risk is accepted under Q4 and the canary tests behavior.
 - Zero trade fees were liable to hide swap costs/change job fees → fee-inclusive net quote and
   explicit separation from existing job settlement/platform accrual.
 - Reuse of budget/recovery was liable to imply existing HTLC support → named additive extensions,
   current per-operation cap limitation and required failure tests.
 
-**Accepted/remaining risks:** issuer/mint fraud; offline beyond the safety gap; maker dependence on
+**Accepted/remaining risks:** advertised-but-broken NUT support without a tested-only allowlist; issuer/mint fraud; offline beyond the safety gap; maker dependence on
 witness availability under the selected order; funded free options and Sybil quote DoS; single-relay
 censorship; traffic analysis; external cloned-wallet double spending; backup/key loss; changing mint
 fees blocking capped recovery. Mitigation narrows exposure, not a promise of trustlessness. Owner
@@ -577,10 +685,8 @@ market making, oracle pricing and issuer guarantees are not part of this design.
 | Open question | Proposed default |
 |---|---|
 | Final kind registry allocation / relay rollout owner | Reserve 3410/3411/23412 after collision review, deploy guarded buzz support before clients; no reuse of job kinds |
-| Operational deadline sizing | 24 h first / 12 h second / 12 h gap, stop claim initiation 2 h before short; enlarge if measured recovery needs more, never shorten silently |
-| How to certify non-sidecar mint witness/refund compatibility without a fresh live probe on every quote? | Version/config-bound compatibility evidence from controlled tests or explicit canary, short-lived info/keyset preflight on every quote; unknown refuses, no hidden allow-by-brand shortcut |
+| **Q2 — proposed, pending Bob** | 60 min taker / 15 min maker, 45 min nominal gap; 3 min minimum remaining to initiate claim, persisted claim exp ≤ short − 2 min; clock/late-claim caveats in §3.2 |
 | Pinned CDK refund integration | Narrow journaled lower-level refund adapter using CDK primitives; evaluate an upstream fix separately, no blanket dependency upgrade or forked money stack |
-| Initial quote-hold/abuse limits | Five-minute hold, one per authenticated taker identity and four globally per maker; operator tunable downward, metrics before expansion; no promise against Sybils |
-| Listing lifetime / status retention | 24 h listing lifetime; 30 days local dedup/terminal history, unresolved money records retained until resolution; relay retention must cover full advertised lifetime and clients fail closed on gaps |
+| **Q3 — proposed, pending Bob** | 60 s hold, one open quote per taker and four per maker; bounded retries do not renew it |
 | Owner-directed tool boundary | Harness enforces owner instruction; expose no autonomous entry hook. List authorizes one fixed fill within its caps; recovery only completes/refunds that authorization |
-| Canary amount and issuer exposure | One trade at a time, ≤100 bitcoin sats principal + ≤10 sats mint fees, explicitly approved credit-face cap; require a new go before real-money/production-relay testing |
+| Canary execution (Q7 cap settled) | Bob must give a separate go; choose mints and explicit credit-face exposure cap, ≤100 sats principal + ≤10 sats fees, one in flight |
