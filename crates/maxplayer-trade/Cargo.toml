@@ -5,9 +5,13 @@ edition = "2024"
 publish = false
 license = "MIT OR Apache-2.0"
 
+[features]
+lab = []
+
 [workspace]
 
 [dependencies]
+cdk-common = { version = "=0.17.2", default-features = false, features = ["wallet"] }
 anyhow = "1"
 cdk = { version = "=0.17.2", default-features = false, features = ["wallet"] }
 cashu = { version = "=0.17.2", default-features = false, features = ["wallet"] }
@@ -23,6 +27,15 @@ hex = "0.4"
 fs2 = "0.4"
 url = "2"
 
+uuid = { version = "1", features = ["v4", "serde"] }
+bitcoin = "0.32"
+
 [dev-dependencies]
+cdk = { version = "=0.17.2", default-features = false, features = ["mint", "wallet"] }
+cdk-sqlite = { version = "=0.17.2", features = ["mint", "wallet"] }
+cdk-fake-wallet = "=0.17.2"
+cdk-axum = "=0.17.2"
+axum = "0.8"
+nostr-relay-builder = "=0.44.0"
 tempfile = "3"
 uuid = { version = "1", features = ["v4"] }

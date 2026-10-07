@@ -46,7 +46,7 @@ impl Asset {
         ensure!(Self::new(&self.mint_url)? == *self, "noncanonical asset");
         Ok(())
     }
-    pub fn fence(&self, allow_real: bool) -> Result<()> {
+    pub fn fence(&self) -> Result<()> {
         self.validate()?;
         let u = url::Url::parse(&self.mint_url)?;
         let h = u.host_str().unwrap();
@@ -60,8 +60,8 @@ impl Asset {
             && (h == "testnut.cashudevkit.org" || h == "testnut.cashu.space")
             && u.path() == "/";
         ensure!(
-            test || local || allow_real,
-            "mint fence: fake-money mints only; real money needs separate authorization"
+            test || local,
+            "mint fence: fake-money mints only; no real-money override"
         );
         ensure!(
             u.scheme() == "https" || (local && u.scheme() == "http"),
@@ -274,7 +274,7 @@ mod tests {
             "http://127.0.0.1:123",
             "http://[::1]:123",
         ] {
-            Asset::new(u).unwrap().fence(false).unwrap();
+            Asset::new(u).unwrap().fence().unwrap();
         }
     }
     #[test]
@@ -282,7 +282,7 @@ mod tests {
         assert!(
             Asset::new("https://mint.minibits.cash/Bitcoin")
                 .unwrap()
-                .fence(false)
+                .fence()
                 .is_err()
         );
     }
@@ -301,7 +301,7 @@ mod tests {
         assert!(
             Asset::new("https://testnut.cashu.space.evil.example")
                 .unwrap()
-                .fence(false)
+                .fence()
                 .is_err()
         );
     }
@@ -480,3 +480,9 @@ mod listing_tests {
         assert_eq!(lifecycle(&l, &[s.clone(), s]).unwrap(), Status::Available);
     }
 }
+
+pub mod coordinator;
+pub mod journal;
+pub mod market;
+pub mod mint;
+pub mod wallet;

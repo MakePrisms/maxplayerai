@@ -2,29 +2,52 @@ use anyhow::{Context, Result, ensure};
 use cdk::{
     amount::SplitTarget,
     nuts::{CurrencyUnit, PaymentMethod},
-    wallet::{Wallet, WalletBuilder},
 };
 use clap::{Parser, Subcommand};
 use fs2::FileExt;
-use sha2::{Digest, Sha256};
 use std::{
     fs::{self, OpenOptions},
-    io::Write,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::PathBuf,
-    sync::Arc,
 };
 #[derive(Parser)]
 struct Cli {
     #[arg(long)]
     home: PathBuf,
     #[arg(long)]
-    allow_real_mint: bool,
+    relay: Vec<String>,
     #[command(subcommand)]
     command: Command,
 }
 #[derive(Subcommand)]
 enum Command {
+    List {
+        #[arg(long)]
+        give_mint: String,
+        #[arg(long)]
+        give: u64,
+        #[arg(long)]
+        want_mint: String,
+        #[arg(long)]
+        want: u64,
+        #[arg(long, default_value_t = 16)]
+        max_fees: u64,
+    },
+    Discover,
+    Cancel {
+        lot: String,
+    },
+    Serve,
+    Take {
+        lot: String,
+        #[arg(long)]
+        max_give: u64,
+        #[arg(long)]
+        min_receive: u64,
+        #[arg(long, default_value_t = 16)]
+        max_fees: u64,
+    },
+    Recover,
     Preflight {
         mint: String,
     },
@@ -39,71 +62,12 @@ enum Command {
         mint: String,
     },
 }
-async fn preflight(mint: &str) -> Result<()> {
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?;
-    let info: serde_json::Value = client
-        .get(format!("{}/v1/info", mint.trim_end_matches('/')))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    ensure!(
-        info["nuts"]["7"]["supported"] == true && info["nuts"]["14"]["supported"] == true,
-        "mint does not advertise NUT-07 and NUT-14"
-    );
-    let now = cdk::util::unix_time();
-    let time = info["time"]
-        .as_u64()
-        .context("mint clock uncertainty: missing info time")?;
-    ensure!(
-        now.abs_diff(time) <= 60,
-        "mint clock skew exceeds 60 seconds"
-    );
-    println!(
-        "{}",
-        serde_json::json!({"mint":mint,"version":info["version"],"nut07":true,"nut14":true,"clock_skew_seconds":now.abs_diff(time)})
-    );
-    Ok(())
-}
-async fn wallet(home: &std::path::Path, mint: &str) -> Result<Wallet> {
-    let path = home.join("wallet.seed");
-    if !path.exists() {
-        let a = cashu::nuts::SecretKey::generate();
-        let b = cashu::nuts::SecretKey::generate();
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)?;
-        f.write_all(&a.to_secret_bytes())?;
-        f.write_all(&b.to_secret_bytes())?;
-        f.sync_all()?;
-        std::fs::File::open(home)?.sync_all()?;
-    }
-    let seed: [u8; 64] = fs::read(path)?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("invalid seed"))?;
-    let asset = hex::encode(Sha256::digest(format!("{mint}|sat")));
-    let db_path = home.join(format!("{asset}.sqlite"));
-    OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .open(&db_path)?;
-    let db = cdk_sqlite::WalletSqliteDatabase::new(db_path).await?;
-    Ok(WalletBuilder::new()
-        .mint_url(mint.parse()?)
-        .unit(CurrencyUnit::Sat)
-        .localstore(Arc::new(db))
-        .seed(seed)
-        .build()?)
-}
+use maxplayer_trade::{
+    Asset, Leg, coordinator,
+    journal::Journal,
+    market::Market,
+    wallet::{preflight, wallet},
+};
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -118,13 +82,87 @@ async fn main() -> Result<()> {
         .open(cli.home.join("owner.lock"))?;
     lock.try_lock_exclusive()
         .context("home is already in use")?;
+    if !matches!(
+        &cli.command,
+        Command::Preflight { .. } | Command::Fund { .. } | Command::Balance { .. }
+    ) {
+        let keys = maxplayer_trade::wallet::identity(&cli.home)?;
+        let relays = if cli.relay.is_empty() {
+            maxplayer_trade::market::DEFAULT_RELAYS
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            cli.relay.clone()
+        };
+        let j = Journal::open(&cli.home).await?;
+        let mut m = Market::connect(keys, &relays).await?;
+        coordinator::recover(&cli.home, &j, &m).await?;
+        return match cli.command {
+            Command::List {
+                give_mint,
+                give,
+                want_mint,
+                want,
+                max_fees,
+            } => {
+                coordinator::list(
+                    &cli.home,
+                    &j,
+                    &m,
+                    Leg {
+                        asset: Asset::new(&give_mint)?,
+                        net: give,
+                    },
+                    Leg {
+                        asset: Asset::new(&want_mint)?,
+                        net: want,
+                    },
+                    max_fees,
+                )
+                .await?;
+                Ok(())
+            }
+            Command::Discover => {
+                let lots = m.discover(None).await?;
+                println!(
+                    "{}",
+                    serde_json::json!({"status":"ok","listings":lots.iter().map(|e|serde_json::json!({"lot_id":e.id,"maker":e.pubkey,"terms":serde_json::from_str::<serde_json::Value>(&e.content).unwrap()})).collect::<Vec<_>>() })
+                );
+                Ok(())
+            }
+            Command::Cancel { lot } => coordinator::cancel(&cli.home, &j, &m, &lot).await,
+            Command::Take {
+                lot,
+                max_give,
+                min_receive,
+                max_fees,
+            } => {
+                let id = coordinator::start_take(
+                    &cli.home,
+                    &j,
+                    &m,
+                    &lot,
+                    max_give,
+                    min_receive,
+                    max_fees,
+                )
+                .await?;
+                coordinator::run(&cli.home, &j, &mut m, Some(&id)).await
+            }
+            Command::Serve => coordinator::run(&cli.home, &j, &mut m, None).await,
+            Command::Recover => coordinator::recover_until_settled(&cli.home, &j, &mut m).await,
+            _ => unreachable!(),
+        };
+    }
     let mint_arg = match &cli.command {
         Command::Preflight { mint } | Command::Fund { mint, .. } | Command::Balance { mint } => {
             mint
         }
+        _ => unreachable!(),
     };
     let asset = maxplayer_trade::Asset::new(mint_arg)?;
-    asset.fence(cli.allow_real_mint)?;
+    asset.fence()?;
     let mint = &asset.mint_url;
     if matches!(cli.command, Command::Preflight { .. }) {
         return preflight(mint).await;
