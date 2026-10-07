@@ -1,179 +1,217 @@
-# maxplayer-trade — incomplete, blocked prototype
+# maxplayer-trade — standalone fake-money Cashu trades
 
-**No end-to-end trade was completed. This is not a trading-ready implementation.**
-Draft work against design #1041 (`555fc08`), based on main `8c3bf74`.
-Work stopped at the live funding/recovery blocker below, per the task's instruction to stop
-and report blockers. Fixing that blocker alone will **not** complete the missing coordinator.
+A fixed-lot CLI, independent of jobs, the maxplayer daemon, core, and `relay.maxplayer.ai`.
+**A live 32-for-24 trade completed on 2026-10-07**, including both claims, NUT-07 witness
+recovery, fee-inclusive net delivery, and a signed `sold` status. This is a test-money
+prototype, not a production deployment or an unconditional atomicity guarantee.
 
 ## Implemented
 
-- Independent Cargo workspace and lock; pinned CDK/Cashu/CDK-SQLite **0.17.2**, Nostr SDK **0.44.1**.
-  No dependency on maxplayer-core; no edits to other crates or root manifests/lock.
-- CLI `preflight`, `fund`, `balance`; explicit separate `--home`, private seed and SQLite CDK
-  wallet, cross-process home exclusion. Asset identity includes canonical mint URL and `sat`.
-- Default mint fence: the two named testnuts hosts, loopback IPs and localhost. HTTPS required
-  except loopback HTTP. No redirects (both preflight and pinned CDK's native HTTP transport).
-  `--allow-real-mint` exists but **was not used**; real money remains separately unauthorized.
-- Preflight checks reachable NUT-07/14 advertisements and reported clock within 60 seconds.
-- Library primitives for signed 3410 immutable lots and 3411 status chains: signatures, versions,
-  tag/content agreement, 24-hour expiry, terminal status, sequence/fork/gap checks; bounded
-  binary-denomination fee calculation. These primitives are **not a backed listing CLI**.
-- Non-tradable public relay diagnostic, using an independent receiver and NIP-44 for 23412.
-  Diagnostic bodies are explicitly `trade_v:0`, not executable listings; no bearer proofs,
-  wallet seeds, or trade preimages were published.
+- `list`, `discover`, `cancel`, `serve`, `take`, `recover`, `preflight`, `fund`, `balance`.
+- Immutable signed 3410 lots (24 hours), hash-chained 3411 statuses, signature/content/tag
+  validation, fork/gap quarantine, no terminal reopening. Every configured relay is queried;
+  discovery unions their results. No EOSE is an error, not an empty market; partial relay
+  failures are reported separately. Every publication is attempted at every configured relay.
+- NIP-44 v2 encrypted 23412 negotiation, NIP-42 authentication, raw relay-message reception
+  (retries are not suppressed by SDK event dedup), persisted signed outbox and request digests.
+  Conflicting request IDs are rejected; quote rejection outcomes and completed swaps are retained.
+- Quote binds immutable price/assets, net/gross/debits/fees/keysets, both identities, unique
+  per-swap receive/refund keys, hash, and deadlines. Hold: 60 seconds; one open quote per taker,
+  four per maker. `--max-give` caps total outgoing debit; `--min-receive` caps net receipt;
+  `--max-fees` defaults to 16 in the relevant asset. No platform/trade fees.
+- Taker generates the secret and locks **first**, for 60 minutes. Maker verifies the first
+  lock before locking **second**, for 15 minutes. Both parties preflight both mints (reachable
+  NUT-07/14, reported clock within 60 seconds), keysets and fees before locking. Each received
+  lock must have exact hash/keys/thresholds/SIG_INPUTS/deadline, unique proofs, DLEQ, exact
+  net-after-input-fee value, and fresh UNSPENT state. Asset identity is **mint URL + unit**;
+  both assets can be `sat`. Taker refuses to initiate a claim with less than three minutes left.
+- Maker settlement reads the preimage from NUT-07 witnesses on **its own outgoing proofs**;
+  the taker's encrypted notice is only an optimization. Maker publishes sold after claiming
+  the incoming leg. Locked proofs are never counted as ordinary wallet balance.
+- Private SQLite journal using CDK's KV API; exact inputs, blinded outputs, secrets/blinding
+  factors, signed witnesses, results and send deadlines are persisted before mint effects.
+  Recovery restores the same outputs and never creates a replacement swap on a timeout alone.
+  Concrete proofs are reserved in the CDK wallet, not just subtracted in an order-book counter.
+  A home-wide process lock plus durable reservation intents cover interrupted row-by-row CDK
+  reservations. Partial/missing restore evidence remains held, not guessed safe.
+- Refunds are real signed swaps with an explicit HTLC witness `preimage: ""`, using the refund
+  key after strict locktime plus clock margin. Maker recovery polls every three seconds and
+  refunds after its short deadline +60 seconds when the mint is reachable. A claim that wins
+  the refund race is reconciled through its witness. Refund outputs survive a process exit.
+- `recover` resumes existing authorizations until terminal; it does not admit new requests.
+  `serve` continuously accepts quotes and recovers swaps. **Keep a watcher running while funds
+  are locked.** Stop it before another command uses the same home. Do not delete a trade home.
 
-## Missing — do not mistake primitive tests for swap coverage
+The only permitted mints are `https://testnut.cashudevkit.org`, `https://testnut.cashu.space`,
+and loopback HTTP(S) mints. **There is no real-money override.** HTTP redirects are disabled.
+Default relays: `wss://relay.ditto.pub`, `wss://relay.damus.io`; repeat global `--relay URL`
+to configure alternatives, including `wss://nostr-pub.wellorder.net`. The production relay is
+explicitly forbidden. No production relay writes were made.
 
-Not implemented: `list`, `discover`, `take`, cancellation CLI, backed proof reservations,
-trade SQLite journal/outbox, quote negotiation/holds/caps/idempotency, either HTLC leg,
-DLEQ/exact-condition/UNSPENT verification, preimage recovery, settlement/sold publication,
-`recover`, lower-level signed HTLC refund adapter, or swap crash recovery.
-No automated two-FakeWallet-mint/local-relay e2e, nonzero-fee swap, sell-back, overlisting test,
-maker/taker disappearance test, or killed-process swap test has run. No live lots or swaps exist.
-No production clock/recovery guarantee is asserted.
+## Build and automated tests
 
-## Build and tests
-
-From the repository root (standalone manifest is mandatory):
-
-```sh
-nix develop --extra-experimental-features 'nix-command flakes' --command \
-  cargo build --manifest-path crates/maxplayer-trade/Cargo.toml --locked --bins --examples
-nix develop --extra-experimental-features 'nix-command flakes' --command \
-  cargo test --manifest-path crates/maxplayer-trade/Cargo.toml --locked
-```
-
-Current crate has wallet-only dependencies, so it does not require `protoc` yet. Adding the
-planned in-process CDK mint fixtures requires the mint features and devshell `PROTOC`, as in
-`crates/maxplayer-mint`; do not add this workspace to the root build.
-For long builds redirect output to a log, background once, and use one long process wait;
-do not pipe cargo through `tail` or start duplicate watchers.
-
-| Suite | Passed | Failed | Meaning |
-|---|---:|---:|---|
-| Protocol primitives (`src/lib.rs`) | 21 | 0 | Asset fence, fee arithmetic, signed lifecycle/tampering/expiry |
-| CLI integration (`tests/cli.rs`) | 3 | 0 | Real CLI entry point, home privacy/reopen, fence, process lock |
-| Pinned-CDK bug reproducer (`tests/pinned_quote_recovery.rs`) | 1 | 0 | Confirms the bug, **not successful recovery** |
-| Required two-mint trade e2e | — | — | Not implemented/run |
-| Required swap failure/recovery suite | — | — | Not implemented/run |
-
-An initial reproducer fixture used `u64::MAX` for SQLite expiry and failed conversion; it was
-corrected to a valid timestamp and rerun. That fixture error is separate from the live blocker.
-The root CI workflow does not test this independent workspace; no CI coverage is claimed here.
-
-## Live run, 2026-10-07: funding blocker
-
-Both mints returned reachable info, advertised NUT-07 and NUT-14, and observed clock skew 0 s:
-
-| Role | Mint | Reported version | Final local balance |
-|---|---|---|---:|
-| Maker | https://testnut.cashudevkit.org | cdk-mintd/0.18.0 | 0 sat |
-| Taker | https://testnut.cashu.space | cdk-mintd/0.17.0-rc.3 | 0 sat |
-
-128-unit quote creation succeeded at both mints. The initial CLI called `mint()` before the
-FakeWallet auto-payment had completed. CDK returned **`Amount undefined`** (mintable amount 0).
-The CLI now waits for `PAID` before issuance, but the original quotes remain blocked:
-
-- Maker quote: `01a1181c-9e87-7ff1-b9d4-176ec59adfda`
-- Taker quote: `01a1181c-acbf-7a40-817a-8c37a9ca04bf`
-- Both remote quotes subsequently reported **PAID**, amount 128, not issued.
-- Both local `mint_quote` rows have amount_paid=128, amount_issued=0 and non-null
-  `used_by_operation`, with **zero wallet_sagas rows**.
-- Retrying via CDK's `check_mint_quote()` then `mint()` returned
-  **`Quote already in use by another operation`** on both homes.
-
-Pinned source trace:
-
-1. `cdk-0.17.2/src/wallet/issue/saga/mod.rs::prepare_common` reserves before
-   `prepare_after_reserve` rejects amount zero. This observed path leaves an orphan reservation.
-2. `cdk-0.17.2/src/wallet/issue/mod.rs::inner_check_mint_quote_status` finds the missing saga
-   and calls `release_mint_quote(operation_id)`, but keeps the original in-memory
-   `mint_quote.used_by_operation` value.
-3. Its final `add_mint_quote(mint_quote.clone())` writes that stale reservation back.
-   `cdk-sql-common-0.17.2`'s upsert explicitly restores `used_by_operation`.
-4. The next issuance cannot reserve the quote. The offline SQLite reproducer proves this
-   release/write-back/re-reservation failure using the pinned public database API.
-
-**This is an initial CLI timing bug followed by a pinned-client recovery bug, not proof of a
-mint HTLC incompatibility.** No HTLC request was sent. No quote/proof reservation was forcibly
-cleared; no dependency was upgraded, mint/NUT semantics changed, fresh wallet substituted,
-or unsecured send attempted. The original homes are preserved privately for reconciliation.
-A narrow, tested orphan-quote recovery fix/adapter is needed before resuming these quotes;
-this draft does not implement or claim that fix.
-
-### Exact commands used and reproducible diagnostic commands
-
-These homes are **not committed**. On this machine:
+This crate is its **own Cargo workspace**, with pinned CDK/Cashu 0.17.2 and Nostr SDK 0.44.1.
+Do not add it to the root workspace. From the repository root:
 
 ```sh
-TRADE=crates/maxplayer-trade/target/debug/maxplayer-trade
-TRADE_RUN=/home/openclaw/.openclaw/workspace/.openclaw/tmp/credit-trade-live
-
-# Initial attempts (using the pre-fix binary): quote creation succeeded, issuance failed.
-"$TRADE" --home "$TRADE_RUN/maker" fund https://testnut.cashudevkit.org --amount 128
-"$TRADE" --home "$TRADE_RUN/taker" fund https://testnut.cashu.space --amount 128
-
-# Retried existing quotes after adding the PAID wait; both hit the orphan reservation.
-"$TRADE" --home "$TRADE_RUN/maker" fund https://testnut.cashudevkit.org --amount 128 \
-  --quote 01a1181c-9e87-7ff1-b9d4-176ec59adfda
-"$TRADE" --home "$TRADE_RUN/taker" fund https://testnut.cashu.space --amount 128 \
-  --quote 01a1181c-acbf-7a40-817a-8c37a9ca04bf
-
-# Read local final balances (no issuance or trading).
-"$TRADE" --home "$TRADE_RUN/maker" balance https://testnut.cashudevkit.org
-"$TRADE" --home "$TRADE_RUN/taker" balance https://testnut.cashu.space
-
-# Offline deterministic blocker reproduction, without touching preserved homes.
-cargo test --manifest-path crates/maxplayer-trade/Cargo.toml --locked \
-  --test pinned_quote_recovery
-
-# Public non-tradable relay diagnostic; creates new diagnostic events on each run.
-crates/maxplayer-trade/target/debug/examples/relay_probe
+cargo build --manifest-path crates/maxplayer-trade/Cargo.toml --locked --bins --examples
+# Tests build actual CDK mints, so protoc is required (available in the Nix devshell).
+export PROTOC="$(find /nix/store -maxdepth 3 -path '*/bin/protoc' -print -quit)"
+cargo test --manifest-path crates/maxplayer-trade/Cargo.toml --locked -- --test-threads=1
+TRADE_LAB_SECONDS=1 cargo test --manifest-path crates/maxplayer-trade/Cargo.toml \
+  --locked --features lab -- --test-threads=1
+# Rebuild the production executable after the lab build.
+cargo build --manifest-path crates/maxplayer-trade/Cargo.toml --locked --bin maxplayer-trade
 ```
 
-The corrected funding CLI has **not** been live-proven on fresh quotes after the stop.
-There are no rerunnable `list → discover → take` commands yet; inventing them here would
-misrepresent this draft.
+Long runs should be backgrounded once, redirected to a log and awaited through that process;
+do not pipe a build through tail/grep or start duplicate watchers. If cargo is unavailable,
+wrap the command with `nix develop --extra-experimental-features 'nix-command flakes' --command`.
 
-## Public relay observations
+`lab` is compile-time-only test instrumentation. `TRADE_LAB_SECONDS=1` uses 24/8-second locks,
+2-second claim cutoff and 1-second refund margin, **only for 127.0.0.1 mints**. Production builds
+ignore these test settings and retain 3600/900/180/60. Crash injection exits the subprocess at
+explicit pre-effect or post-mint/pre-wallet-commit boundaries. No real-money setting exists.
 
-Second run used different publishing and subscribing clients; the first self-subscription
-probe was inconclusive because SDK event dedup suppresses the sender's own event notifications.
-The table reports observed short-window readback, **not a 24-hour retention guarantee**.
+| Suite | Default passed/failed | Lab passed/failed |
+|---|---:|---:|
+| Protocol primitives | 21 / 0 | 21 / 0 |
+| CLI privacy, lock, hard fence | 4 / 0 | 4 / 0 |
+| Two-mint integration/recovery | 6 / 0 | 11 / 0 |
+| Pinned-CDK orphan-quote reproducer | 1 / 0 | 1 / 0 |
+| Relay union/unreachable/production fence | 3 / 0 | 3 / 0 |
 
-| Relay | Kind | Publish ACK | Peer subscription | Immediate ID fetch |
-|---|---:|---|---|---|
-| relay.ditto.pub | 3410 | Accepted | Delivered | Absent |
-| relay.ditto.pub | 3411 | Accepted | Delivered | Absent |
-| relay.ditto.pub | 23412 | Accepted | Delivered | Absent (expected for ephemeral) |
-| relay.damus.io | 3410 | Accepted | Delivered | Returned |
-| relay.damus.io | 3411 | Accepted | Delivered | Returned |
-| relay.damus.io | 23412 | Accepted | Delivered | Returned (unexpected for ephemeral) |
+Integration tests run two in-process **CDK 0.17.2 FakeWallet mints with distinct mint keys**,
+both unit `sat`, SQLite wallets, and a local Nostr relay (same relay-builder used by
+`crates/maxplayer-mint/examples/local_relay.rs`). They exercise real mint HTTP operations and
+NIP-44 negotiation, not mocked successful swaps:
 
-Ditto returned 3411 once in the earlier run, so persistent readback is inconsistent in these
-observations. Damus is the candidate fallback for future listing tests; **no trade used either
-relay**. NIP-44 confidentiality does not depend on ephemeral events actually being deleted.
-No writes went to relay.maxplayer.ai.
+- list → discover → take → both claims → sold, zero and nonzero `input_fee_ppk`, exact balances;
+- sell-back direction with exact fee-inclusive balances;
+- maker never locks → taker refund; taker never claims → prompt maker refund;
+- maker offline at claim → NUT-07-only preimage recovery;
+- subprocess exit after a committed mint swap → journal recovery, no double debit;
+- subprocess exit after refund → exact output recovery;
+- late claim wins against a prepared refund → maker obtains witness and completes;
+- wrong hash/key/deadline/net, forged/missing DLEQ, duplicate proofs rejected;
+- interrupted quote-expiry index update recovers without releasing listing backing;
+- overlisting and cancelled lots rejected; primitive tests also reject expired/tampered lots;
+- lot and status split across two relays still discovered through the union; unreachable is
+  distinguished from a real empty EOSE response.
 
-Diagnostic event IDs, in the same order as the table:
+Root CI does not run this independent workspace. These local counts are separate from root CI.
 
-```text
-ditto 3410  b3d5f19219ddc953d83e0b2a14b0af54b0170346fa03ea41330c3e02a5b806e2
-ditto 3411  0c651afb69ad0e156b68a46c15bfcbb62f9ce63a20e9d8b67671e102c19f4ee7
-ditto 23412 cc395c74c40520549c5cf28d614dbf880442e8dbeb171d6a25d46cff368bf3e9
-damus 3410  2a93d6632d236ee505c19dd3e8b2976637670cbd14e8325a9fde7d2f7cdc076d
-damus 3411  4d30983a15b08b6f2359179be9b62621f30e360ab2442941d54a1b1d1a89a512
-damus 23412 0c6afde437c4d7a95c6b522c368e36cfa2c2d00812e1d1070947fe13d30ce7dd
+## Rerunnable public-relay trade
+
+Use **fresh homes**. These commands use fake auto-paid testnut quotes; they never pay invoices.
+The only public data is signed listing/status metadata and encrypted negotiation events.
+
+```sh
+set -eu
+umask 077
+TRADE="$PWD/crates/maxplayer-trade/target/debug/maxplayer-trade"
+RUN="$(mktemp -d /tmp/maxplayer-trade-live.XXXXXX)"
+A=https://testnut.cashudevkit.org
+B=https://testnut.cashu.space
+"$TRADE" --home "$RUN/maker" fund "$A" --amount 128
+"$TRADE" --home "$RUN/taker" fund "$B" --amount 128
+"$TRADE" --home "$RUN/maker" list --give-mint "$A" --give 32 \
+  --want-mint "$B" --want 24 > "$RUN/list.jsonl"
+LOT="$(python3 -c 'import json,sys; print([json.loads(l)["lot_id"] for l in sys.stdin if "lot_id" in json.loads(l)][-1])' < "$RUN/list.jsonl")"
+"$TRADE" --home "$RUN/maker" serve > "$RUN/maker.log" 2>&1 &
+MAKER_PID=$!
+"$TRADE" --home "$RUN/taker" discover
+"$TRADE" --home "$RUN/taker" take "$LOT" --max-give 40 --min-receive 32
+# Only stop the maker after both sides are complete; otherwise keep recovery running.
+kill "$MAKER_PID"
+wait "$MAKER_PID" || true
+for role in maker taker; do
+  "$TRADE" --home "$RUN/$role" balance "$A"
+  "$TRADE" --home "$RUN/$role" balance "$B"
+done
+cat "$RUN/maker.log"
 ```
 
-## Spec differences and constraints
+After interruption, use the same home and relays: `maxplayer-trade --home <home> recover`.
+`serve` also resumes journaled work. A refund is not available until its deadline; a watcher may
+remain running for the full lock duration. An inconclusive mint result is retained for recovery.
+To cancel an unused listing: `maxplayer-trade --home <maker-home> cancel <lot-id>`.
+Cancellation does not revoke an already authorized HTLC.
 
-- Authorized override: separate crate/home/wallet, no jobs, daemon, budget/ledger integration,
-  MCP, or relay.maxplayer.ai. Fork publication instead of the repository skill's usual origin.
-- Partial scope only: HTTPS/loopback assets; sat unit; bounded lot amounts ≤1,000,000 and status
-  history ≤256. No Nostr mint transport is implemented. The amount/history bounds are local
-  prototype limits, not changes to mint semantics.
-- Library declares production 3600/900-second locks, 60-second quotes, and 180-second cutoff;
-  **no executing swap path exists**, so this is not proof of timing enforcement.
-- No trade fees implemented or charged. No hash-lock bypass, no unlocked transfers, no change to
-  accepted late-claim semantics. Those money-path rules remain requirements for future work.
+## Live evidence — 2026-10-07
+
+Actual fresh homes on this machine:
+`/home/openclaw/.openclaw/workspace/.openclaw/tmp/credit-trade-final-20261007/{maker,taker}`.
+The commands above were executed using these homes and a copied production-default binary.
+Neither the original `credit-trade-live` homes nor their reservations were changed.
+
+- Relays: **wss://relay.ditto.pub + wss://relay.damus.io** (both queried/published).
+- Maker mint: **https://testnut.cashudevkit.org**, `cdk-mintd/0.18.0`.
+- Taker mint: **https://testnut.cashu.space**, `cdk-mintd/0.17.0-rc.3`.
+- Both advertised NUT-07/14, reported clock skew 0–1 seconds and input fee **100 ppk**.
+- Lot: `d659b210246a41cef13c3edfe790ba01d0a60b15ed0ee2d74856eaea52a1c445`.
+- Initial available event: `f5e981a34c5fbf4f94853fa1c78e4e008aa77c1acce54b60edfcc95890595dee`.
+- Sold event: `a85ca93f54f8c5c922593996c7584945dc7fb3daa8510e86fa8e503facb96d58`.
+- Swap: `4f312a95-19aa-4b8a-b871-86bc6731751a`; **maker complete, taker complete**.
+
+| Home | cashudevkit before → after | cashu.space before → after |
+|---|---:|---:|
+| Maker | 128 → **93** | 0 → **24** |
+| Taker | 0 → **32** | 128 → **101** |
+
+Maker: net 32, gross lock 33 (2 proofs), preparation fee 2, claim fee 1, debit 35.
+Taker: net 24, gross lock 25 (3 proofs), preparation fee 2, claim fee 1, debit 27.
+Each mint's combined final balances are 125, exactly 128 minus its three units of mint fees.
+There were **no trade/platform fees, no unsecured sends, and no live protocol blocker**.
+An earlier fresh-home run also completed with the same final balances (lot
+`85e59585ca6462b7dbf5b459d7e8d5a1077a8742641e3fb541895a2a9c909b3c`).
+Private proofs/preimages are not included in this document or logs.
+
+### Relay observations
+
+The earlier independent-reader probe found inconsistent persistent readback at Ditto; hence
+publish-to-all and read-the-union. Damus returned stored **23412** events despite their ephemeral
+kind. This is acceptable here because their contents are NIP-44 encrypted; confidentiality does
+not rely on deletion. Neither observation guarantees 24-hour retention or relay completeness.
+The diagnostic remains rerunnable as `target/debug/examples/relay_probe` from this crate.
+
+### Preserved CDK 0.17.2 orphan-quote bug
+
+The old CLI attempted issuance before testnut auto-pay, producing `Amount undefined`. Two old
+quotes subsequently remained `PAID` with a reservation but no saga:
+`01a1181c-9e87-7ff1-b9d4-176ec59adfda` and `01a1181c-acbf-7a40-817a-8c37a9ca04bf`.
+`inner_check_mint_quote_status` releases the orphan reservation, then writes the still-reserved
+in-memory quote back through `add_mint_quote`, resurrecting `used_by_operation`. The next mint
+returns **`Quote already in use by another operation`**.
+
+`tests/pinned_quote_recovery.rs` retains the exact public-database-API reproducer. It proves the
+bug, **not successful recovery**. The corrected `fund` waits for PAID and works on fresh quotes,
+as demonstrated by this live run. The original homes are preserved; no reservation was cleared,
+CDK was not patched/upgraded, and this old-quote bug is **not a blocker for fresh-home trading**.
+
+## Boundaries, deviations and uncovered cases
+
+- Authorized deviation from the integration spec: standalone crate, home/seed/CDK wallets and
+  trade SQLite journal; HTTP(S) test mints and public relays; no jobs, budget/ledger, MCP,
+  Nostr-mint transport, sidecar changes, or production-relay deployment. Fork PR stays draft.
+- Trade swaps use pinned CDK **public lower-level primitives** with explicitly journaled outputs,
+  rather than opaque high-level send/receive sagas. Claims and refunds use the same durable
+  adapter; refunds include the empty-preimage witness required by pinned CDK. No dependency fork.
+- Negotiation carries bounded proof arrays whose mint/unit are bound by the quote and verified
+  against that mint's keys, rather than an additional bearer-token wrapper. Denominations are
+  binary; fees use one ceil after summing input ppk. Limits: 1,000,000 net per lot, 128 proofs,
+  48 KiB encrypted plaintext, 256 status revisions, 4,096 events per relay query, eight relays.
+- Two SQLite domains (trade journal and per-mint wallet) are coordinated by durable intents and
+  exclusive home ownership, not a cross-database atomic transaction. Other copies of a wallet
+  seed remain outside the single-owner guarantee. No record pruning is implemented.
+- A persisted client send deadline prevents **resubmitting** an expired mint request; HTTPS
+  mints do not offer an enforceable server-side request expiry. Already-delivered requests may
+  race refunds. Ambiguous/partial restoration remains held; no automatic unsafe compensation.
+- NUT-14 receiver claims remain possible after locktime. Honest/available mints, intact keys,
+  clock bounds, and a running recovery watcher are required. An offline maker can lose its
+  recovery window; an issuer can lie or refuse service. This is not trustlessness against mints.
+- Not covered: every crash boundary, OS/power-loss durability, long outages/clock skew, hidden or
+  malformed live witnesses, live refunds, live reverse pairing/sell-back, mint key rotation,
+  adversarial fee changes, exhaustive peer flood/quote-limit concurrency, 24-hour relay retention,
+  root workspace suites locally, real money, or production deployment. Tests cover selected
+  process-exit boundaries and one claim/refund race, not a full model checker.
