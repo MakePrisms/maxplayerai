@@ -55,9 +55,10 @@ Bob, Discord **#cashu-token-marketplace, 24 Sep 2026**; go at **17:16 UTC**:
 - **Q7 settled:** canary capped at 100 sats principal + 10 sats mint fees, one trade in flight;
   **Bob's separate go is still required** before running it.
 
-**Not settled — proposed, pending Bob:** **Q2** taker lock 60 min / maker lock 15 min
-(nominal minimum 45 min recovery gap; clock/cutoff qualifications in §3.2); **Q3** quote hold 60 s,
-one open quote per taker and four per maker. These are not approved timing values.
+**Settled — Bob, #cashu-token-marketplace, 2026-10-07 19:40 UTC** ("ok great" in reply to
+"Are 60 min / 15 min / 60 s OK?"): **Q2** taker lock 60 min / maker lock 15 min (nominal minimum
+45 min recovery gap; clock/cutoff qualifications in §3.2); **Q3** quote hold 60 s, one open quote
+per taker and four per maker.
 
 Inherited from #1030: acceptance is opt-in and transferable credits may pay **any** seller that
 accepts that mint, not exclusively the issuer. Issuers retain mint backup/key-loss risk. Credits
@@ -108,7 +109,7 @@ extension, not a change to job protocol interpretation.
 }
 ```
 
-This schematic uses the proposed, pending Bob timing policy and a placeholder npub, not a valid token.
+This schematic uses the settled Q2/Q3 timing policy and a placeholder npub, not a valid token.
 Listing expiry is publication +24 h; republishing uses a new id after checking backing and retiring
 the old lot (never two live lots backed by the same proofs). Single-letter tags `g` (give mint),
 `w` (want mint), `u` (give unit), and `x` (want unit)
@@ -207,7 +208,7 @@ unsecured send. Doctor exposes the failed mint/op distinctly from relay failure.
    both peers, exact assets/net/gross amounts, keysets/fees, `H`, per-swap receive/refund public keys,
    proof-count limits, absolute deadlines, short claim cutoff, and quote expiry (anchored to quote issuance, never acceptance). Both peers persist
    its hash. No party signs or spends against just a mutable display price.
-2. Quote issuance acquires a **60-second soft hold (proposed, pending Bob)** on that lot, bounded
+2. Quote issuance acquires a **60-second soft hold (settled Q3)** on that lot, bounded
    to one open quote per authenticated taker identity and four per maker. Acceptance consumes the
    same window, not a new 60 seconds. It does not create an HTLC. Failed/expired quote releases only
    the soft hold; the lot remains wallet-backed. Process duplicate quote ids before rate limits;
@@ -256,9 +257,9 @@ sequenceDiagram
     Note over T,MM: On abort, refund keys actively swap after respective deadlines
 ```
 
-### 3.2 Shorter proposed windows, not automatic refunds
+### 3.2 Short windows, not automatic refunds
 
-**Q2/Q3: proposed, pending Bob.** From the same signed quote timestamp: taker/long lock = **+60 min**,
+**Q2/Q3: settled (Bob, 2026-10-07 19:40 UTC).** From the same signed quote timestamp: taker/long lock = **+60 min**,
 maker/short lock = **+15 min**, nominal gap **45 min**; quote admission/soft hold **60 s**.
 Do not restart either deadline when the second lock is created or a request is retried. Maker
 must initiate its lock within the original quote window after validating the first lock; a late
@@ -633,7 +634,7 @@ must rebase/re-grep anchors against its then-current main; do not merge this spe
 
 Stage 2's relay flag guards only the two new kinds, never relaxes unrelated admission. Stage 3
 must use honest-money invariants even on fake money; do not green it with protocol-invalid tokens.
-Short lab deadlines need a deterministic clock/harness or bounded real wait; production proposals remain 60/15 min pending Bob, not lab seconds. Attach exact test counts and untested boundaries to each implementation PR.
+Short lab deadlines need a deterministic clock/harness or bounded real wait; production values are the settled 60/15 min, not lab seconds. Attach exact test counts and untested boundaries to each implementation PR.
 
 ## 11. Self-review: flaws fixed vs risks accepted
 
@@ -643,7 +644,7 @@ Short lab deadlines need a deterministic clock/harness or bounded real wait; pro
   no credit hop targets, current private mint checks and explicit #1101 boundary.
 - Tested-only mint gate contradicted Q4 → reachable advertised NUT-14/07, with behavioral risk
   and canary scope explicit; no prior-test allowlist hidden in preflight or open questions.
-- Stale 24h/12h and five-minute values → Q2/Q3 clearly pending, 60/15 min and 60 s proposals,
+- Stale 24h/12h and five-minute values → Q2/Q3 settled by Bob at 60/15 min and 60 s,
   3 min claim cutoff plus expiry/clock qualifications; no unconditional 45 min guarantee.
 - Generic recovery reuse could release live requests → persisted `exp` + skew prerequisite #1035,
   distinct from main's `updated_at + 300s` estimate.
@@ -685,8 +686,7 @@ market making, oracle pricing and issuer guarantees are not part of this design.
 | Open question | Proposed default |
 |---|---|
 | Final kind registry allocation / relay rollout owner | Reserve 3410/3411/23412 after collision review, deploy guarded buzz support before clients; no reuse of job kinds |
-| **Q2 — proposed, pending Bob** | 60 min taker / 15 min maker, 45 min nominal gap; 3 min minimum remaining to initiate claim, persisted claim exp ≤ short − 2 min; clock/late-claim caveats in §3.2 |
+| Claim cutoff (derived from settled Q2) | 3 min minimum remaining on the maker lock to initiate a claim; persisted claim exp ≤ short − 2 min; clock/late-claim caveats in §3.2 |
 | Pinned CDK refund integration | Narrow journaled lower-level refund adapter using CDK primitives; evaluate an upstream fix separately, no blanket dependency upgrade or forked money stack |
-| **Q3 — proposed, pending Bob** | 60 s hold, one open quote per taker and four per maker; bounded retries do not renew it |
 | Owner-directed tool boundary | Harness enforces owner instruction; expose no autonomous entry hook. List authorizes one fixed fill within its caps; recovery only completes/refunds that authorization |
 | Canary execution (Q7 cap settled) | Bob must give a separate go; choose mints and explicit credit-face exposure cap, ≤100 sats principal + ≤10 sats fees, one in flight |
