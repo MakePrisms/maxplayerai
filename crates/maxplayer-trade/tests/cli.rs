@@ -83,3 +83,20 @@ fn concurrent_home_is_refused() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("home is already in use"));
 }
+#[test]
+fn no_real_money_override_exists() {
+    let h = home();
+    let out = Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
+        .args([
+            "--home",
+            h.path().to_str().unwrap(),
+            "--allow-real-mint",
+            "balance",
+            "https://mint.minibits.cash/Bitcoin",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unexpected argument"));
+    assert!(!h.path().join("wallet.seed").exists());
+}
