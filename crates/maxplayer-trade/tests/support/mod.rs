@@ -17,7 +17,21 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+#[derive(Default)]
+pub struct Faults {
+    pub reject_info: std::sync::atomic::AtomicBool,
+    pub reject_restore: std::sync::atomic::AtomicBool,
+    pub reject_swap: std::sync::atomic::AtomicBool,
+    pub lose_reply: std::sync::atomic::AtomicBool,
+    pub hide_witness: std::sync::atomic::AtomicBool,
+    pub invalid_dleq: std::sync::atomic::AtomicBool,
+    pub pending_inputs: std::sync::atomic::AtomicBool,
+    pub omit_dleq: std::sync::atomic::AtomicBool,
+    pub missing_nut: std::sync::atomic::AtomicU64,
+    pub clock_offset: std::sync::atomic::AtomicU64,
+}
 pub struct MintFixture {
+    pub faults: Arc<Faults>,
     pub url: String,
     pub mint: Mint,
     task: tokio::task::JoinHandle<()>,
@@ -72,10 +86,92 @@ impl MintFixture {
         let router = cdk_axum::create_mint_router(Arc::new(mint.clone()), vec!["bolt11".into()])
             .await
             .unwrap();
+        let faults = Arc::new(Faults::default());
+        let control = faults.clone();
+        let router = router.layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let control = control.clone();
+                async move {
+                    use axum::response::IntoResponse;
+                    use std::sync::atomic::Ordering::SeqCst;
+                    let path = req.uri().path().to_owned();
+                    if path.ends_with("/info") && control.reject_info.load(SeqCst)
+                        || path.ends_with("/restore") && control.reject_restore.load(SeqCst)
+                        || path.ends_with("/swap") && control.reject_swap.load(SeqCst)
+                    {
+                        return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    }
+                    let response = next.run(req).await;
+                    if path.ends_with("/swap") && control.lose_reply.load(SeqCst) {
+                        return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    }
+                    let (parts, body) = response.into_parts();
+                    let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                    if let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        if path.ends_with("/info") {
+                            let nut = control.missing_nut.load(SeqCst);
+                            if nut != 0 {
+                                v["nuts"][nut.to_string()]["supported"] = false.into();
+                            }
+                            if let Some(t) = v["time"].as_u64() {
+                                v["time"] = (t + control.clock_offset.load(SeqCst)).into();
+                            }
+                        }
+                        if path.ends_with("/checkstate") && control.pending_inputs.load(SeqCst) {
+                            if let Some(states) = v["states"].as_array_mut() {
+                                for state in states {
+                                    if state["state"] == "UNSPENT" {
+                                        state["state"] = "PENDING".into();
+                                    }
+                                }
+                            }
+                        }
+                        if control.invalid_dleq.load(SeqCst) {
+                            if let Some(sigs) = v["signatures"].as_array_mut() {
+                                for sig in sigs {
+                                    if !sig["dleq"].is_null() {
+                                        sig["dleq"]["e"] = "01".repeat(32).into();
+                                    }
+                                }
+                            }
+                        }
+                        if path.ends_with("/checkstate") && control.hide_witness.load(SeqCst) {
+                            if let Some(states) = v["states"].as_array_mut() {
+                                for state in states {
+                                    state.as_object_mut().unwrap().remove("witness");
+                                }
+                            }
+                        }
+                        if control.omit_dleq.load(SeqCst) {
+                            if let Some(sigs) = v["signatures"].as_array_mut() {
+                                for sig in sigs {
+                                    sig.as_object_mut().unwrap().remove("dleq");
+                                }
+                            }
+                        }
+                        let mut response = axum::response::Response::from_parts(
+                            parts,
+                            axum::body::Body::from(serde_json::to_vec(&v).unwrap()),
+                        );
+                        response
+                            .headers_mut()
+                            .remove(axum::http::header::CONTENT_LENGTH);
+                        response
+                    } else {
+                        axum::response::Response::from_parts(parts, axum::body::Body::from(bytes))
+                    }
+                }
+            },
+        ));
         let task = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
-        Self { url, mint, task }
+        Self {
+            url,
+            mint,
+            task,
+            faults,
+        }
     }
 }
 pub async fn fund(home: &Path, mint: &str, n: u64) {
@@ -190,7 +286,19 @@ impl Fixture {
         if let Ok(Some(e)) =
             tokio::time::timeout(std::time::Duration::from_millis(100), m.inbox.recv()).await
         {
+            let message = m.decode(&e).unwrap();
+            let started = std::time::Instant::now();
             coordinator::handle(home, j, m, &e).await.unwrap();
+            if let Some(s) = j.get::<Swap>("swap", &message.swap_id).await.unwrap() {
+                eprintln!(
+                    "fixture maker={maker} step={} state={} elapsed_ms={} now={} quote_timing={:?}",
+                    message.step,
+                    s.state,
+                    started.elapsed().as_millis(),
+                    coordinator::now(),
+                    s.quote.as_ref().map(|q| (q.issued, q.short, q.cutoff))
+                );
+            }
         }
     }
     pub async fn state(&self, maker: bool, id: &str) -> Option<String> {
@@ -198,18 +306,24 @@ impl Fixture {
         j.get::<Swap>("swap", id).await.unwrap().map(|s| s.state)
     }
     pub async fn pump(&mut self, id: &str, target: &str) {
+        // Match the CLI's three-second recovery cadence. Resending after every inbox
+        // message creates an artificial request/quote storm during a reverse trade.
+        let mut next_recovery = std::time::Instant::now() + std::time::Duration::from_secs(3);
         for _ in 0..100 {
             self.step(true).await;
             self.step(false).await;
             if self.state(false, id).await.as_deref() == Some(target) {
                 return;
             }
-            coordinator::recover(&self.maker, &self.jm, &self.mm)
-                .await
-                .unwrap();
-            coordinator::recover(&self.taker, &self.jt, &self.mt)
-                .await
-                .unwrap();
+            if std::time::Instant::now() >= next_recovery {
+                coordinator::recover(&self.maker, &self.jm, &self.mm)
+                    .await
+                    .unwrap();
+                coordinator::recover(&self.taker, &self.jt, &self.mt)
+                    .await
+                    .unwrap();
+                next_recovery = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            }
         }
         panic!(
             "target {target}: {:?} {:?}",

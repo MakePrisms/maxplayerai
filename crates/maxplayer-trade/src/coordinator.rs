@@ -102,7 +102,7 @@ pub struct Swap {
     pub max_fees: u64,
 }
 fn terminal(s: &Swap) -> bool {
-    ["complete", "refunded", "expired"].contains(&s.state.as_str())
+    ["complete", "complete_unclaimed", "refunded", "expired"].contains(&s.state.as_str())
 }
 fn timing(l: &Lot) -> Result<(u64, u64, u64, u64)> {
     #[cfg(feature = "lab")]
@@ -199,6 +199,7 @@ pub async fn cancel(home: &Path, j: &Journal, m: &Market, id: &str) -> Result<()
         lifecycle(&l.event, &l.statuses)? == Status::Available,
         "lot is terminal"
     );
+    ensure!(l.active.is_none(), "cannot cancel active swap");
     l.cancelled = true;
     j.put("listing", id, &l).await?;
     if l.active.is_none() {
@@ -358,7 +359,11 @@ async fn handle_message(home: &Path, j: &Journal, m: &Market, e: &Event) -> Resu
             "taker quote limit"
         );
         let req: Request = serde_json::from_value(msg.body)?;
-        ensure!(hex::decode(&req.hash)?.len() == 32, "invalid hash");
+        ensure!(
+            req.hash.len() == 64 && hex::encode(hex::decode(&req.hash)?) == req.hash,
+            "noncanonical hash"
+        );
+        canonical_key(&req.taker_key)?;
         let _: cashu::nuts::PublicKey = req.taker_key.parse()?;
         ensure!(
             req.min_receive <= lot.give.net && req.max_give >= req.funding.debit,
@@ -454,7 +459,7 @@ async fn handle_message(home: &Path, j: &Journal, m: &Market, e: &Event) -> Resu
         let (g, f) = gross(lot.give.net, q.give.ppk)?;
         ensure!(q.give.gross == g && q.give.claim_fee == f, "maker net fees");
         validate_terms(home, &lot.give, &q.give).await?;
-        let _: cashu::nuts::PublicKey = q.maker_key.parse()?;
+        canonical_key(&q.maker_key)?;
         s.quote = Some(q);
         s.state = "accepted".into();
         save(j, &s).await?;
@@ -502,6 +507,18 @@ async fn handle_message(home: &Path, j: &Journal, m: &Market, e: &Event) -> Resu
                 s.state = "second_validated".into();
                 save(j, &s).await?;
             }
+            "claimed" if s.role == "maker" && s.state == "second_locked" => {
+                let pre = msg.body["preimage"]
+                    .as_str()
+                    .context("missing claimed preimage")?;
+                ensure!(
+                    mint::matches_preimage(pre, &q.request.hash),
+                    "invalid claimed preimage"
+                );
+                s.preimage = Some(pre.to_owned());
+                s.state = "claiming".into();
+                save(j, &s).await?;
+            }
             _ => {}
         }
     }
@@ -515,94 +532,167 @@ pub async fn advance(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Resu
         return Ok(());
     };
     let own_mint = s.plan.mint.clone();
-    let long = s.role == "taker";
+    let taker = s.role == "taker";
+    let lock_id = format!("{}-lock", s.id);
+    let claim_id = format!("{}-claim", s.id);
     if s.state == "accepted" || s.state == "first_validated" {
-        let attempt = format!("{}-lock", s.id);
-        let started = j.get::<mint::Attempt>("attempt", &attempt).await?.is_some();
-        if !started {
-            ensure!(
-                now() < q.exp && now() + q.cutoff < q.short,
-                "quote expired before lock"
-            );
-            preflight(&q.lot).await?;
+        let result: Result<Proofs> = async {
+            if j.get::<mint::Attempt>("attempt", &lock_id).await?.is_none() {
+                ensure!(
+                    now() < q.exp && now() + q.cutoff < q.short,
+                    "quote expired before lock"
+                );
+                preflight(&q.lot).await?;
+            }
+            let c = if taker {
+                mint::conditions(&q.request.hash, &q.maker_key, &q.request.taker_key, q.long)?
+            } else {
+                mint::conditions(&q.request.hash, &q.request.taker_key, &q.maker_key, q.short)?
+            };
+            let exp = if taker {
+                q.exp.saturating_sub(20)
+            } else {
+                q.exp
+            };
+            mint::lock(home, j, &lock_id, &s.plan, &c, exp.min(q.short - q.cutoff)).await
         }
-        let c = if long {
-            mint::conditions(&q.request.hash, &q.maker_key, &q.request.taker_key, q.long)?
-        } else {
-            mint::conditions(&q.request.hash, &q.request.taker_key, &q.maker_key, q.short)?
-        };
-        s.outgoing = mint::lock(
-            home,
-            j,
-            &attempt,
-            &s.plan,
-            &c,
-            q.exp.min(q.short - q.cutoff),
-        )
-        .await?;
-        s.state = if long {
-            "first_locked"
-        } else {
-            "second_locked"
+        .await;
+        match result {
+            Ok(proofs) => {
+                s.outgoing = proofs;
+                s.state = if taker {
+                    "first_locked"
+                } else {
+                    "second_locked"
+                }
+                .into();
+                save(j, s).await?;
+            }
+            Err(e) => {
+                eprintln!("lock {}: {e}", s.id);
+                if j.get::<mint::Attempt>("attempt", &lock_id)
+                    .await?
+                    .is_some_and(|a| a.abandoned)
+                {
+                    if taker {
+                        mint::release(home, &s.plan, &s.id).await?;
+                    } else {
+                        let mut l: Listing = j.get("listing", &s.lot.id.to_hex()).await?.unwrap();
+                        // Abandon the lot too, so its backing reservation can be released.
+                        l.cancelled = true;
+                        l.active = None;
+                        j.put("listing", &s.lot.id.to_hex(), &l).await?;
+                        mint::release(home, &l.plan, &l.reservation).await?;
+                        finish_listing(j, m, &mut l, Status::Cancelled).await?;
+                    }
+                    s.state = "expired".into();
+                    save(j, s).await?;
+                    return Ok(());
+                }
+            }
         }
-        .into();
-        save(j, s).await?;
     }
-    if s.state == "second_validated"
-        && (now() + q.cutoff < q.short
-            || j.get::<mint::Attempt>("attempt", &format!("{}-claim", s.id))
+    if taker && s.state == "second_validated" {
+        let result: Result<()> = async {
+            let started = j
+                .get::<mint::Attempt>("attempt", &claim_id)
                 .await?
-                .is_some())
-    {
-        mint::redeem(
-            home,
-            j,
-            &format!("{}-claim", s.id),
-            &q.lot.give.asset.mint_url,
-            &s.incoming,
-            &s.key,
-            s.preimage.as_ref().unwrap(),
-            s.max_fees,
-            Some(q.short - q.cutoff),
-        )
-        .await?;
-        s.state = "claimed".into();
-        save(j, s).await?;
+                .is_some();
+            let time = wallet::action_time(&q.lot.give.asset.mint_url).await?;
+            if started || time + q.cutoff < q.short {
+                mint::redeem(
+                    home,
+                    j,
+                    &claim_id,
+                    &q.lot.give.asset.mint_url,
+                    &s.incoming,
+                    &s.key,
+                    s.preimage.as_ref().unwrap(),
+                    s.max_fees,
+                    Some(q.short - q.cutoff),
+                )
+                .await?;
+                s.state = "claimed".into();
+                save(j, s).await?;
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(e) = result {
+            eprintln!("claim {}: {e}", s.id);
+        }
     }
-    if !long && s.state == "second_locked" {
+    if !taker && ["second_locked", "claiming", "settling"].contains(&s.state.as_str()) {
+        if s.preimage.is_none() {
+            match mint::witness(&own_mint, &s.outgoing, &q.request.hash).await {
+                Ok(Some(pre)) => {
+                    s.preimage = Some(pre);
+                    s.state = "claiming".into();
+                    save(j, s).await?;
+                }
+                Ok(None) => {}
+                Err(e) => eprintln!("witness {}: {e}", s.id),
+            }
+        }
+        // Preimage knowledge is monotone, independent of refund outcomes.
+        if s.preimage.is_some() && s.state != "settling" {
+            match mint::redeem(
+                home,
+                j,
+                &claim_id,
+                &q.lot.want.asset.mint_url,
+                &s.incoming,
+                &s.key,
+                s.preimage.as_ref().unwrap(),
+                s.max_fees,
+                None,
+            )
+            .await
+            {
+                Ok(_) => {
+                    s.state = "settling".into();
+                    save(j, s).await?;
+                    let mut l: Listing = j.get("listing", &s.lot.id.to_hex()).await?.unwrap();
+                    finish_listing(j, m, &mut l, Status::Sold).await?;
+                }
+                Err(e) => eprintln!("maker claim {}: {e}", s.id),
+            }
+        }
         let refund_id = format!("{}-refund", s.id);
         let refund_started = j
             .get::<mint::Attempt>("attempt", &refund_id)
             .await?
             .is_some();
-        let mut refunded = false;
         if refund_started {
-            // Restore our refund before interpreting an empty-preimage SPENT witness.
-            // If the claim won the race, execution fails and its witness drives the other claim.
-            refunded = mint::execute(home, j, &refund_id).await.is_ok();
-        }
-        if !refunded {
-            if let Some(pre) = mint::witness(&own_mint, &s.outgoing, &q.request.hash).await? {
-                s.preimage = Some(pre);
-                s.state = "claiming".into();
-                save(j, s).await?;
-            } else if now() > q.short + q.margin {
-                mint::redeem(
-                    home,
-                    j,
-                    &refund_id,
-                    &own_mint,
-                    &s.outgoing,
-                    &s.key,
-                    "",
-                    s.max_fees,
-                    None,
-                )
-                .await?;
-                refunded = true;
+            if let Err(e) = mint::execute(home, j, &refund_id).await {
+                eprintln!("refund recovery {}: {e}", s.id);
             }
         }
-        if refunded {
+        let time = wallet::action_time(&own_mint).await?;
+        if !refund_started && time > q.short + q.margin {
+            let remaining = mint::refundable(&own_mint, &s.outgoing).await?;
+            if !remaining.is_empty() {
+                if let Err(e) = mint::redeem(
+                    home, j, &refund_id, &own_mint, &remaining, &s.key, "", s.max_fees, None,
+                )
+                .await
+                {
+                    eprintln!("maker refund {}: {e}", s.id);
+                }
+            }
+        }
+        let all_spent = mint::states(&own_mint, &s.outgoing)
+            .await?
+            .states
+            .iter()
+            .all(|p| p.state == cashu::nuts::State::Spent);
+        if all_spent && s.state == "settling" {
+            s.state = "complete".into();
+            save(j, s).await?;
+        } else if all_spent
+            && s.preimage.is_none()
+            && mint::refunded_all(j, &refund_id, &s.outgoing).await?
+        {
             s.state = "refunded".into();
             save(j, s).await?;
             let mut l: Listing = j.get("listing", &s.lot.id.to_hex()).await?.unwrap();
@@ -610,26 +700,20 @@ pub async fn advance(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Resu
             finish_listing(j, m, &mut l, Status::Cancelled).await?;
         }
     }
-    if !long && s.state == "claiming" {
-        mint::redeem(
-            home,
-            j,
-            &format!("{}-claim", s.id),
-            &q.lot.want.asset.mint_url,
-            &s.incoming,
-            &s.key,
-            s.preimage.as_ref().unwrap(),
-            s.max_fees,
-            Some(q.long),
-        )
-        .await?;
-        s.state = "complete".into();
-        save(j, s).await?;
-        let mut l: Listing = j.get("listing", &s.lot.id.to_hex()).await?.unwrap();
-        finish_listing(j, m, &mut l, Status::Sold).await?;
-    }
-    if long && s.state == "claimed" {
-        if mint::witness(&own_mint, &s.outgoing, &q.request.hash)
+    if taker && s.state == "claimed" {
+        // Terminal bookkeeping spends nothing. Local time alone is a sufficient lower
+        // bound on max(local, mint) once long + margin has passed, even if info is offline.
+        let local = now();
+        let time = if local > q.long + q.margin {
+            local
+        } else {
+            wallet::action_time(&own_mint).await?
+        };
+        if time > q.long + q.margin {
+            // We received the maker's funds: our lock remains theirs forever, never refund it.
+            s.state = "complete_unclaimed".into();
+            save(j, s).await?;
+        } else if mint::witness(&own_mint, &s.outgoing, &q.request.hash)
             .await?
             .is_some()
         {
@@ -637,29 +721,42 @@ pub async fn advance(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Resu
             save(j, s).await?;
         }
     }
-    if long
-        && ["first_locked", "second_validated"].contains(&s.state.as_str())
-        && now() > q.long + q.margin
-    {
-        mint::redeem(
-            home,
-            j,
-            &format!("{}-refund", s.id),
-            &own_mint,
-            &s.outgoing,
-            &s.key,
-            "",
-            s.max_fees,
-            None,
-        )
-        .await?;
-        s.state = "refunded".into();
-        save(j, s).await?;
+    if taker && ["first_locked", "second_validated"].contains(&s.state.as_str()) {
+        let time = wallet::action_time(&own_mint).await?;
+        let claim = j.get::<mint::Attempt>("attempt", &claim_id).await?;
+        // Ambiguous or successful claims can NEVER authorize a refund of our payment.
+        if time > q.long + q.margin && claim.is_none_or(|a| a.abandoned) {
+            let refund_id = format!("{}-refund", s.id);
+            if j.get::<mint::Attempt>("attempt", &refund_id)
+                .await?
+                .is_some()
+            {
+                mint::execute(home, j, &refund_id).await?;
+            } else {
+                let remaining = mint::refundable(&own_mint, &s.outgoing).await?;
+                ensure!(!remaining.is_empty(), "no unspent taker refund inputs");
+                mint::redeem(
+                    home, j, &refund_id, &own_mint, &remaining, &s.key, "", s.max_fees, None,
+                )
+                .await?;
+            }
+            s.state = "refunded".into();
+            save(j, s).await?;
+        }
     }
     match s.state.as_str() {
         "first_locked" => send(m, j, s, "first", serde_json::to_value(&s.outgoing)?).await?,
         "second_locked" => send(m, j, s, "second", serde_json::to_value(&s.outgoing)?).await?,
-        "claimed" => send(m, j, s, "claimed", serde_json::json!({})).await?,
+        "claimed" => {
+            send(
+                m,
+                j,
+                s,
+                "claimed",
+                serde_json::json!({"preimage":s.preimage}),
+            )
+            .await?
+        }
         "complete" => {
             let _ = send(m, j, s, "done", serde_json::json!({})).await;
             println!(
@@ -777,7 +874,11 @@ pub async fn run(home: &Path, j: &Journal, m: &mut Market, until: Option<&str>) 
             if let Some(s) = j.get::<Swap>("swap", id).await? {
                 if terminal(&s) {
                     println!("{}", serde_json::json!({"swap_id":id,"state":s.state}));
-                    ensure!(s.state == "complete", "trade ended {}", s.state);
+                    ensure!(
+                        ["complete", "complete_unclaimed"].contains(&s.state.as_str()),
+                        "trade ended {}",
+                        s.state
+                    );
                     return Ok(());
                 }
             }
@@ -816,4 +917,10 @@ pub async fn recover_until_settled(home: &Path, j: &Journal, m: &mut Market) -> 
          }
         }
     }
+}
+
+fn canonical_key(key: &str) -> Result<()> {
+    let parsed: cashu::nuts::PublicKey = key.parse()?;
+    ensure!(key == parsed.to_string(), "noncanonical Cashu key");
+    Ok(())
 }
