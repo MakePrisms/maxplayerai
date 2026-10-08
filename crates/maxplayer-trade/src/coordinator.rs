@@ -104,7 +104,15 @@ pub struct Swap {
     pub refund_generation: u32,
 }
 fn terminal(s: &Swap) -> bool {
-    ["complete", "complete_unclaimed", "refunded", "expired"].contains(&s.state.as_str())
+    [
+        "complete",
+        "complete_unclaimed",
+        "refunded",
+        "expired",
+        "refund_quarantined",
+        "claim_quarantined",
+    ]
+    .contains(&s.state.as_str())
 }
 fn timing(l: &Lot) -> Result<(u64, u64, u64, u64)> {
     #[cfg(feature = "lab")]
@@ -116,7 +124,11 @@ fn timing(l: &Lot) -> Result<(u64, u64, u64, u64)> {
                 "lab timing requires loopback mints"
             );
         }
-        return Ok((24, 8, 2, 1));
+        // Debug SQLite/crypto plus the fresh /info RPC took ~2.8s for one
+        // lock step on the shared host. Eight seconds left only six usable
+        // seconds for the whole exchange. Scale ONLY loopback lab locks;
+        // retain the 3:1 ratio, cutoff, margin and all production gates.
+        return Ok((48, 16, 2, 1));
     }
     let _ = l;
     Ok((LONG_SECONDS, SHORT_SECONDS, CLAIM_CUTOFF_SECONDS, 60))
@@ -527,6 +539,38 @@ async fn handle_message(home: &Path, j: &Journal, m: &Market, e: &Event) -> Resu
     advance(home, j, m, &mut s).await
 }
 pub async fn advance(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Result<()> {
+    let result = advance_inner(home, j, m, s).await;
+    // Run even when redemption returned an error. Persist terminal manual-recovery
+    // status before the next tick; never turn a quarantined claim into refund authority.
+    for (suffix, state) in [
+        ("claim".to_string(), "claim_quarantined"),
+        (
+            if s.refund_generation == 0 {
+                "refund".into()
+            } else {
+                format!("refund-{}", s.refund_generation)
+            },
+            "refund_quarantined",
+        ),
+    ] {
+        if j.get::<mint::Attempt>("attempt", &format!("{}-{suffix}", s.id))
+            .await?
+            .is_some_and(|a| a.quarantined)
+        {
+            if s.state != state {
+                s.state = state.into();
+                save(j, s).await?;
+                println!(
+                    "{}",
+                    serde_json::json!({"swap_id":s.id,"state":s.state,"manual_recovery":true})
+                );
+            }
+            break;
+        }
+    }
+    result
+}
+async fn advance_inner(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Result<()> {
     if terminal(s) {
         return Ok(());
     }
@@ -614,8 +658,10 @@ pub async fn advance(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Resu
     }
     if s.state == "lock_unforwardable" {
         // Do not forward even if a later restore repairs DLEQ. Settle owned change and
-        // funding reservations before following the normal timed refund path.
-        mint::settle_unforwardable(home, j, &lock_id).await?;
+        // funding reservations independently of the normal timed refund path.
+        if let Err(e) = mint::settle_unforwardable(home, j, &lock_id).await {
+            eprintln!("unforwardable settle {}: {e}", s.id);
+        }
     }
     if taker && s.state == "second_validated" {
         let result: Result<()> = async {
@@ -969,7 +1015,14 @@ async fn validate_terms(home: &Path, leg: &Leg, t: &Terms) -> Result<()> {
 pub async fn recover_until_settled(home: &Path, j: &Journal, m: &mut Market) -> Result<()> {
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
     loop {
-        if j.all::<Swap>("swap").await?.iter().all(terminal) {
+        let swaps = j.all::<Swap>("swap").await?;
+        if swaps.iter().all(terminal) {
+            for s in swaps {
+                println!(
+                    "{}",
+                    serde_json::json!({"swap_id":s.id,"state":s.state,"manual_recovery":s.state.ends_with("_quarantined")})
+                );
+            }
             return Ok(());
         }
         tokio::select! {

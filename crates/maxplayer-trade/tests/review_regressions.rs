@@ -3,7 +3,7 @@ use maxplayer_trade::{coordinator, mint};
 use sha2::{Digest, Sha256};
 use support::*;
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn c1_sender_witness_rejected_and_sanitized_both_directions() {
     let f = Fixture::new(0).await;
     for (sender, receiver, url, journal) in [
@@ -75,7 +75,7 @@ async fn wait_past(t: u64) {
     }
 }
 #[cfg(feature = "lab")]
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn c2_partial_claim_recovers_preimage_and_refunds_only_unspent() {
     let mut f = Fixture::new(0).await;
     let lot = coordinator::list(
@@ -150,7 +150,7 @@ async fn c2_partial_claim_recovers_preimage_and_refunds_only_unspent() {
     );
 }
 #[cfg(feature = "lab")]
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn h1_maker_offline_past_long_still_claims() {
     let mut f = Fixture::new(0).await;
     let id = through_second(&mut f).await;
@@ -165,7 +165,7 @@ async fn h1_maker_offline_past_long_still_claims() {
         "H1 late maker claim must remain possible"
     );
 }
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn m1_notice_recovers_without_nut07_witness() {
     let mut f = Fixture::new(0).await;
     let id = through_second(&mut f).await;
@@ -179,7 +179,7 @@ async fn m1_notice_recovers_without_nut07_witness() {
     );
     assert_eq!(balance(&f.maker, &f.b.url).await, 24);
 }
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn m2_l3_preflight_requires_restore_and_dleq() {
     let f = Fixture::new(0).await;
     for nut in [9, 12] {
@@ -190,7 +190,7 @@ async fn m2_l3_preflight_requires_restore_and_dleq() {
         );
     }
 }
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l2_own_fee_mismatch_not_journalled() {
     let f = Fixture::new(100).await;
     let mut p = mint::plan(&f.taker, &f.b.url, 24, 16).await.unwrap();
@@ -210,7 +210,7 @@ async fn l2_own_fee_mismatch_not_journalled() {
         "L2 must refuse before journal"
     );
 }
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l4_active_quote_cannot_cancel() {
     let mut f = Fixture::new(0).await;
     let lot = f.list(false).await;
@@ -232,7 +232,7 @@ async fn l4_active_quote_cannot_cancel() {
     );
 }
 #[cfg(feature = "lab")]
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn h2_failed_claim_abandoned_then_taker_refunds() {
     let mut f = Fixture::new(0).await;
     let id = through_second(&mut f).await;
@@ -275,7 +275,7 @@ async fn h2_failed_claim_abandoned_then_taker_refunds() {
     assert_eq!(balance(&f.taker, &f.b.url).await, 128);
 }
 #[cfg(feature = "lab")]
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn h2_unsent_lock_expires_and_releases_reservation() {
     use cdk::cdk_database::WalletDatabase;
     let mut f = Fixture::new(0).await;
@@ -313,7 +313,7 @@ async fn h2_unsent_lock_expires_and_releases_reservation() {
     );
 }
 #[cfg(feature = "lab")]
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn h2_landed_claim_lost_reply_never_refunds() {
     let mut f = Fixture::new(0).await;
     let id = through_second(&mut f).await;
@@ -351,7 +351,7 @@ async fn h2_landed_claim_lost_reply_never_refunds() {
         Some("complete_unclaimed")
     );
 }
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn h3_uppercase_hash_request_rejected_at_admission() {
     let mut f = Fixture::new(0).await;
     let lot = f.list(false).await;
@@ -394,7 +394,7 @@ async fn h3_uppercase_hash_request_rejected_at_admission() {
     );
 }
 #[cfg(feature = "lab")]
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn m3_claimed_terminal_without_refund() {
     let mut f = Fixture::new(0).await;
     let id = through_second(&mut f).await;
@@ -422,7 +422,7 @@ async fn m3_claimed_terminal_without_refund() {
     .unwrap();
     assert_eq!(balance(&f.taker, &f.b.url).await, 104);
 }
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l1_taker_lock_deadline_leaves_twenty_seconds_for_delivery() {
     let mut f = Fixture::new(0).await;
     let lot = f.list(false).await;
@@ -441,7 +441,7 @@ async fn l1_taker_lock_deadline_leaves_twenty_seconds_for_delivery() {
         Some((q.exp - 20).min(q.short - q.cutoff))
     );
 }
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l5_mint_clock_controls_claim_cutoff() {
     let mut f = Fixture::new(0).await;
     let id = through_second(&mut f).await;
@@ -456,7 +456,7 @@ async fn l5_mint_clock_controls_claim_cutoff() {
     );
     assert_eq!(balance(&f.taker, &f.a.url).await, 0);
 }
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn m2_missing_dleq_persists_result_and_credits_change() {
     let f = Fixture::new(0).await;
     let p = mint::plan(&f.taker, &f.b.url, 24, 16).await.unwrap();
@@ -488,7 +488,7 @@ async fn m2_missing_dleq_persists_result_and_credits_change() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn m2_invalid_present_dleq_persisted_but_not_credited() {
     let f = Fixture::new(0).await;
     let p = mint::plan(&f.taker, &f.b.url, 24, 16).await.unwrap();
@@ -529,7 +529,7 @@ async fn m2_invalid_present_dleq_persisted_but_not_credited() {
     );
 }
 #[cfg(feature = "lab")]
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn h2_pending_inputs_prevent_abandonment() {
     let mut f = Fixture::new(0).await;
     let lot = f.list(false).await;
@@ -554,7 +554,7 @@ async fn h2_pending_inputs_prevent_abandonment() {
     assert_eq!(f.state(false, &id).await.as_deref(), Some("accepted"));
 }
 #[cfg(feature = "lab")]
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn h2_maker_abandoned_lock_releases_listing() {
     use cdk::cdk_database::WalletDatabase;
     let mut f = Fixture::new(0).await;
@@ -601,7 +601,7 @@ async fn second_event(f: &mut Fixture, id: &str) -> nostr_sdk::Event {
     .unwrap()
 }
 #[cfg(feature = "lab")]
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn n1_maker_refund_before_taker_observes_abandonment() {
     let mut f = Fixture::new(100).await;
     let id = through_second(&mut f).await;
@@ -633,7 +633,7 @@ async fn n1_maker_refund_before_taker_observes_abandonment() {
     );
 }
 #[cfg(feature = "lab")]
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn n2_late_claim_after_abandonment_restore_outage_never_refunds() {
     let mut f = Fixture::new(0).await;
     let id = through_second(&mut f).await;
@@ -683,7 +683,7 @@ async fn n2_late_claim_after_abandonment_restore_outage_never_refunds() {
     );
 }
 #[cfg(feature = "lab")]
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn n2_grace_covers_swap_timeout_and_deadline_follows_checkstate() {
     let mut f = Fixture::new(0).await;
     let lot = f.list(false).await;
@@ -737,7 +737,7 @@ async fn n2_grace_covers_swap_timeout_and_deadline_follows_checkstate() {
     );
 }
 #[cfg(feature = "lab")]
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn n2_late_lock_after_abandonment_is_restored_and_refunded() {
     let mut f = Fixture::new(0).await;
     let lot = f.list(false).await;
@@ -856,28 +856,28 @@ async fn unforwardable_case(maker: bool, invalid: bool) {
     );
 }
 #[cfg(feature = "lab")]
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn n3_maker_missing_dleq_refunds() {
     unforwardable_case(true, false).await;
 }
 #[cfg(feature = "lab")]
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn n3_maker_invalid_dleq_refunds() {
     unforwardable_case(true, true).await;
 }
 #[cfg(feature = "lab")]
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn n3_taker_missing_dleq_refunds() {
     unforwardable_case(false, false).await;
 }
 #[cfg(feature = "lab")]
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn n3_taker_invalid_dleq_refunds() {
     unforwardable_case(false, true).await;
 }
 
 #[cfg(feature = "lab")]
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn n4_partial_claim_wins_nut07_swap_race_reselects_refund() {
     let mut f = Fixture::new(0).await;
     let lot = coordinator::list(
@@ -973,7 +973,7 @@ async fn n4_partial_claim_wins_nut07_swap_race_reselects_refund() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nit_notice_preimage_normalized_before_storage() {
     let mut f = Fixture::new(0).await;
     let id = through_second(&mut f).await;
@@ -1007,7 +1007,7 @@ async fn nit_notice_preimage_normalized_before_storage() {
 }
 
 #[cfg(feature = "lab")]
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn n1_restore_after_nut07_catches_landing_claim() {
     let mut f = Fixture::new(0).await;
     let id = through_second(&mut f).await;
@@ -1040,7 +1040,7 @@ async fn n1_restore_after_nut07_catches_landing_claim() {
 }
 
 #[cfg(feature = "lab")]
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn n4_lost_refund_reply_reconciles_outputs_before_complete() {
     let mut f = Fixture::new(0).await;
     let lot = coordinator::list(
@@ -1115,4 +1115,340 @@ async fn n4_lost_refund_reply_reconciles_outputs_before_complete() {
     );
     assert_eq!(balance(&f.maker, &f.b.url).await, 24);
     assert_eq!(balance(&f.taker, &f.a.url).await, 16);
+}
+
+// Appendix A, with the fault deliberately left on for lock restoration. Refund
+// replies can independently verify or remain invalid. Both roles must progress.
+#[cfg(feature = "lab")]
+async fn persistent_invalid(maker: bool, bad_refund: bool) {
+    let mut f = Fixture::new(100).await;
+    let lot = f.list(false).await;
+    let id = f.start(&lot).await;
+    f.step(true).await;
+    if maker {
+        f.step(false).await;
+    }
+    let faults = if maker {
+        f.a.faults.clone()
+    } else {
+        f.b.faults.clone()
+    };
+    faults.invalid_dleq.store(true, SeqCst);
+    let e = if maker {
+        f.mm.inbox.recv().await.unwrap()
+    } else {
+        f.mt.inbox.recv().await.unwrap()
+    };
+    let (home, j, m, url) = if maker {
+        (&f.maker, &f.jm, &f.mm, &f.a.url)
+    } else {
+        (&f.taker, &f.jt, &f.mt, &f.b.url)
+    };
+    let _ = coordinator::handle(home, j, m, &e).await;
+    let s = j.get::<Swap>("swap", &id).await.unwrap().unwrap();
+    assert_eq!(s.state, "lock_unforwardable");
+    faults.invalid_swap_only_off.store(!bad_refund, SeqCst);
+    let before = balance(home, url).await;
+    let q = s.quote.unwrap();
+    wait_past(if maker {
+        q.short + q.margin
+    } else {
+        q.long + q.margin
+    })
+    .await;
+    for _ in 0..3 {
+        coordinator::recover(home, j, m).await.unwrap();
+    }
+    assert_eq!(
+        j.get::<Swap>("swap", &id).await.unwrap().unwrap().state,
+        if bad_refund {
+            "refund_quarantined"
+        } else {
+            "refunded"
+        },
+        "persistent invalid DLEQ must not strand the lock"
+    );
+    let a = j
+        .get::<serde_json::Value>("attempt", &format!("{id}-refund"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        a["result"].as_array().is_some_and(|p| !p.is_empty()),
+        "exact refund outputs retained"
+    );
+    assert_eq!(a["quarantined"], bad_refund);
+    if bad_refund {
+        assert_eq!(
+            balance(home, url).await,
+            before,
+            "unverified outputs never credited"
+        );
+        faults.reject_info.store(true, SeqCst);
+        faults.reject_restore.store(true, SeqCst);
+        faults.reject_swap.store(true, SeqCst);
+        coordinator::recover_until_settled(home, j, &mut if maker { f.mm } else { f.mt })
+            .await
+            .unwrap();
+        assert_eq!(
+            j.get::<serde_json::Value>("attempt", &format!("{id}-refund"))
+                .await
+                .unwrap()
+                .unwrap(),
+            a,
+            "terminal attempt never retried"
+        );
+    } else {
+        assert_eq!(
+            balance(home, url).await,
+            before + s.plan.gross - s.plan.claim_fee
+        );
+    }
+}
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_maker_persistent_invalid_dleq() {
+    persistent_invalid(true, true).await;
+}
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_taker_persistent_invalid_dleq() {
+    persistent_invalid(false, true).await;
+}
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_maker_invalid_lock_valid_refund() {
+    persistent_invalid(true, false).await;
+}
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_taker_invalid_lock_valid_refund() {
+    persistent_invalid(false, false).await;
+}
+
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_owned_change_spent_does_not_block_refund() {
+    for maker in [false, true] {
+        let mut f = Fixture::new(100).await;
+        let lot = f.list(false).await;
+        let id = f.start(&lot).await;
+        f.step(true).await;
+        if maker {
+            f.step(false).await;
+        }
+        let faults = if maker {
+            f.a.faults.clone()
+        } else {
+            f.b.faults.clone()
+        };
+        faults.omit_dleq.store(true, SeqCst);
+        faults.reject_restore_after_swap.store(true, SeqCst);
+        let e = if maker {
+            f.mm.inbox.recv().await.unwrap()
+        } else {
+            f.mt.inbox.recv().await.unwrap()
+        };
+        let (home, j, m, url) = if maker {
+            (&f.maker, &f.jm, &f.mm, &f.a.url)
+        } else {
+            (&f.taker, &f.jt, &f.mt, &f.b.url)
+        };
+        let _ = coordinator::handle(home, j, m, &e).await;
+        let s = j.get::<Swap>("swap", &id).await.unwrap().unwrap();
+        assert_eq!(s.state, "lock_unforwardable");
+        faults.omit_dleq.store(false, SeqCst);
+        faults.reject_restore.store(false, SeqCst);
+        let a = j
+            .get::<serde_json::Value>("attempt", &format!("{id}-lock"))
+            .await
+            .unwrap()
+            .unwrap();
+        let result: cashu::nuts::Proofs = serde_json::from_value(a["result"].clone()).unwrap();
+        let owned: cashu::nuts::Proofs = result
+            .into_iter()
+            .zip(a["outputs"].as_array().unwrap())
+            .filter(|(_, o)| o["owned"] == true)
+            .map(|(p, _)| p)
+            .collect();
+        assert!(!owned.is_empty());
+        maxplayer_trade::wallet::wallet(home, url)
+            .await
+            .unwrap()
+            .swap(
+                None,
+                cdk::amount::SplitTarget::default(),
+                owned,
+                None,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(
+            mint::settle_unforwardable(home, j, &format!("{id}-lock"))
+                .await
+                .is_err(),
+            "spent change reproduces settlement failure"
+        );
+        let before = balance(home, url).await;
+        let q = s.quote.unwrap();
+        wait_past(if maker {
+            q.short + q.margin
+        } else {
+            q.long + q.margin
+        })
+        .await;
+        coordinator::recover(home, j, m).await.unwrap();
+        assert_eq!(
+            j.get::<Swap>("swap", &id).await.unwrap().unwrap().state,
+            "refunded",
+            "spent change cannot block timed refund"
+        );
+        assert_eq!(
+            balance(home, url).await,
+            before + s.plan.gross - s.plan.claim_fee
+        );
+    }
+}
+
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_claim_quarantine_and_witness_normalization() {
+    let mut f = Fixture::new(0).await;
+    let id = through_second(&mut f).await;
+    f.a.faults.invalid_dleq.store(true, SeqCst);
+    f.step(false).await;
+    let s = f.jt.get::<Swap>("swap", &id).await.unwrap().unwrap();
+    assert_eq!(s.state, "claim_quarantined");
+    assert_eq!(
+        balance(&f.taker, &f.a.url).await,
+        0,
+        "unverified claim never credited"
+    );
+    f.a.faults.uppercase_witness.store(true, SeqCst);
+    let maker = f.jm.get::<Swap>("swap", &id).await.unwrap().unwrap();
+    let hash = &s.quote.as_ref().unwrap().request.hash;
+    let observed = mint::states(&f.a.url, &maker.outgoing).await.unwrap();
+    assert!(observed.states.iter().all(|state| matches!(&state.witness,
+        Some(cashu::nuts::Witness::HTLCWitness(w)) if w.preimage == s.preimage.as_ref().unwrap().to_uppercase())));
+    assert_eq!(
+        mint::witness(&f.a.url, &maker.outgoing, hash)
+            .await
+            .unwrap(),
+        s.preimage
+    );
+    f.a.faults.hide_witness.store(true, SeqCst);
+    assert!(
+        !mint::claim_not_landed(&f.jt, "no-such-attempt", &f.a.url, &maker.outgoing, hash)
+            .await
+            .unwrap(),
+        "SPENT without witness must fail closed"
+    );
+    f.a.faults.hide_witness.store(false, SeqCst);
+    coordinator::recover(&f.taker, &f.jt, &f.mt).await.unwrap();
+    assert!(
+        f.jt.get::<mint::Attempt>("attempt", &format!("{id}-refund"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    coordinator::recover(&f.maker, &f.jm, &f.mm).await.unwrap();
+    assert_eq!(
+        balance(&f.maker, &f.b.url).await,
+        24,
+        "maker still recovers revealed preimage"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preflight_reports_witness_emission_unverified() {
+    let f = Fixture::new(0).await;
+    f.a.faults.hide_witness.store(true, SeqCst);
+    let binary = env!("CARGO_BIN_EXE_maxplayer-trade");
+    let out = tokio::process::Command::new(binary)
+        .args(["--home", f.maker.to_str().unwrap(), "preflight", &f.a.url])
+        .output()
+        .await
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        v["nut07_witnesses"]
+            .as_str()
+            .unwrap()
+            .starts_with("unverified:")
+    );
+}
+
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_unlanded_and_ambiguous_claims_stay_retryable() {
+    let mut f = Fixture::new(0).await;
+    let id = through_second(&mut f).await;
+    f.a.faults.reject_swap.store(true, SeqCst);
+    f.step(false).await;
+    let claim = format!("{id}-claim");
+    let a =
+        f.jt.get::<serde_json::Value>("attempt", &claim)
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(a["result"].is_null());
+    assert_eq!(a["quarantined"], false);
+    f.a.faults.reject_swap.store(false, SeqCst);
+    f.a.faults.invalid_dleq.store(true, SeqCst);
+    f.a.faults.reject_restore_after_swap.store(true, SeqCst);
+    coordinator::recover(&f.taker, &f.jt, &f.mt).await.unwrap();
+    let a =
+        f.jt.get::<serde_json::Value>("attempt", &claim)
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(a["result"].is_array());
+    assert_eq!(
+        a["quarantined"], false,
+        "restore outage cannot establish commit"
+    );
+    assert_eq!(
+        f.state(false, &id).await.as_deref(),
+        Some("second_validated")
+    );
+    f.a.faults.reject_restore.store(false, SeqCst);
+    coordinator::recover(&f.taker, &f.jt, &f.mt).await.unwrap();
+    assert_eq!(
+        f.state(false, &id).await.as_deref(),
+        Some("claim_quarantined")
+    );
+    assert_eq!(balance(&f.taker, &f.a.url).await, 0);
+}
+
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_maker_claim_quarantined() {
+    let mut f = Fixture::new(0).await;
+    let id = through_second(&mut f).await;
+    f.step(false).await;
+    f.b.faults.invalid_dleq.store(true, SeqCst);
+    coordinator::recover(&f.maker, &f.jm, &f.mm).await.unwrap();
+    assert_eq!(
+        f.state(true, &id).await.as_deref(),
+        Some("claim_quarantined")
+    );
+    assert_eq!(balance(&f.maker, &f.b.url).await, 0);
+    let a =
+        f.jm.get::<serde_json::Value>("attempt", &format!("{id}-claim"))
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(a["result"].is_array());
+    assert_eq!(a["quarantined"], true);
+    coordinator::recover(&f.maker, &f.jm, &f.mm).await.unwrap();
+    assert_eq!(
+        f.jm.get::<serde_json::Value>("attempt", &format!("{id}-claim"))
+            .await
+            .unwrap()
+            .unwrap(),
+        a
+    );
 }

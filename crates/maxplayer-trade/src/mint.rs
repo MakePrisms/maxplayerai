@@ -43,6 +43,8 @@ pub struct Attempt {
     #[serde(default)]
     pub unforwardable: bool,
     #[serde(default)]
+    pub quarantined: bool,
+    #[serde(default)]
     pub observed_preimage: Option<String>,
 }
 pub const RPC_TIMEOUT_SECONDS: u64 = 20;
@@ -248,6 +250,7 @@ pub async fn lock(
                 done: false,
                 abandoned: false,
                 unforwardable: false,
+                quarantined: false,
                 observed_preimage: None,
                 send_before: Some(send_before),
             },
@@ -297,6 +300,7 @@ pub async fn redeem(
                 done: false,
                 abandoned: false,
                 unforwardable: false,
+                quarantined: false,
                 observed_preimage: None,
                 send_before,
             },
@@ -307,6 +311,10 @@ pub async fn redeem(
 }
 pub async fn execute(home: &Path, j: &Journal, id: &str) -> Result<Proofs> {
     let mut a: Attempt = j.get("attempt", id).await?.context("missing attempt")?;
+    ensure!(
+        !a.quarantined,
+        "owned outputs quarantined; manual recovery required"
+    );
     if !a.done {
         if a.result.is_none() {
             let messages: Vec<_> = a.outputs.iter().map(|o| o.message.clone()).collect();
@@ -423,6 +431,12 @@ pub async fn execute(home: &Path, j: &Journal, id: &str) -> Result<Proofs> {
                 .await;
             if let Err(e) = verified {
                 a.unforwardable = a.outputs.iter().any(|o| !o.owned);
+                // Only a cryptographic failure is terminal, not unavailable keys/RPCs.
+                // Full exact-output restore plus SPENT inputs binds the mint's reported
+                // commit to this attempt. SPENT alone could be a competing spender.
+                if !a.unforwardable && matches!(e, cdk::Error::CouldNotVerifyDleq) {
+                    a.quarantined = owned_commit_evidence(&a).await?;
+                }
                 j.put("attempt", id, &a).await?;
                 return Err(e.into());
             }
@@ -532,7 +546,7 @@ pub async fn witness(mint: &str, p: &Proofs, hash: &str) -> Result<Option<String
         }
         if let Some(Witness::HTLCWitness(w)) = s.witness {
             if matches_preimage(&w.preimage, hash) {
-                return Ok(Some(w.preimage));
+                return Ok(Some(hex::encode(hex::decode(w.preimage)?)));
             }
         }
     }
@@ -815,4 +829,37 @@ pub async fn refund_settled(j: &Journal, id: &str) -> Result<bool> {
     Ok(j.get::<Attempt>("attempt", id)
         .await?
         .is_none_or(|a| a.done))
+}
+
+/// Mint-reported commit evidence, not trustlessness against a dishonest issuer.
+async fn owned_commit_evidence(a: &Attempt) -> Result<bool> {
+    if a.outputs.is_empty() || a.outputs.iter().any(|o| !o.owned) || a.result.is_none() {
+        return Ok(false);
+    }
+    let r: RestoreResponse = rpc(
+        &a.mint,
+        "restore",
+        &RestoreRequest {
+            outputs: a.outputs.iter().map(|o| o.message.clone()).collect(),
+        },
+    )
+    .await?;
+    if r.outputs.len() != a.outputs.len() || r.signatures.len() != a.outputs.len() {
+        return Ok(false);
+    }
+    let mut seen = HashSet::new();
+    for (m, sig) in r.outputs.iter().zip(&r.signatures) {
+        if !seen.insert(m.blinded_secret)
+            || !a.outputs.iter().any(|o| o.message == *m)
+            || sig.amount != m.amount
+            || sig.keyset_id != m.keyset_id
+        {
+            return Ok(false);
+        }
+    }
+    Ok(states(&a.mint, &a.inputs)
+        .await?
+        .states
+        .iter()
+        .all(|s| s.state == State::Spent))
 }

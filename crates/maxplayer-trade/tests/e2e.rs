@@ -54,15 +54,15 @@ async fn swap_roundtrip(ppk: u64) {
         );
     }
 }
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_mints_same_unit_trade_and_sell_back() {
     swap_roundtrip(0).await;
 }
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fee_bearing_trade_and_sell_back_exact_balances() {
     swap_roundtrip(100).await;
 }
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn overlisting_and_cancelled_lot_rejected() {
     let f = Fixture::new(0).await;
     let lot = f.list(false).await;
@@ -77,7 +77,7 @@ async fn overlisting_and_cancelled_lot_rejected() {
     );
     assert_eq!(balance(&f.maker, &f.a.url).await, 128);
 }
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn maker_offline_at_claim_recovers_from_mint_witness() {
     let mut f = Fixture::new(0).await;
     let lot = f.list(false).await;
@@ -102,7 +102,7 @@ async fn maker_offline_at_claim_recovers_from_mint_witness() {
     assert_eq!(balance(&f.maker, &f.b.url).await, 24);
 }
 #[cfg(feature = "lab")]
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn maker_never_locks_taker_refunds() {
     let mut f = Fixture::new(0).await;
     let lot = f.list(false).await;
@@ -117,7 +117,7 @@ async fn maker_never_locks_taker_refunds() {
     assert_eq!(balance(&f.taker, &f.b.url).await, 128);
 }
 #[cfg(feature = "lab")]
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn taker_never_claims_maker_refunds_promptly() {
     let mut f = Fixture::new(0).await;
     let lot = f.list(false).await;
@@ -139,7 +139,7 @@ async fn wait_past(deadline: u64) {
     }
 }
 #[cfg(feature = "lab")]
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn killed_process_after_mint_swap_resumes_exact_journal() {
     let mut f = Fixture::new(0).await;
     let lot = f.list(false).await;
@@ -249,16 +249,16 @@ async fn refund_crash_case(before: bool) {
     }
 }
 #[cfg(feature = "lab")]
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refund_outputs_survive_process_exit() {
     refund_crash_case(false).await;
 }
 #[cfg(feature = "lab")]
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn late_claim_wins_refund_race_maker_recovers_preimage() {
     refund_crash_case(true).await;
 }
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exact_lock_validation_rejects_wrong_hash_key_deadline_dleq_and_net() {
     use maxplayer_trade::journal::Journal;
     let f = Fixture::new(100).await;
@@ -339,7 +339,7 @@ async fn exact_lock_validation_rejects_wrong_hash_key_deadline_dleq_and_net() {
             .is_err()
     );
 }
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn expired_quote_recovers_interrupted_active_index() {
     let mut f = Fixture::new(0).await;
     let lot = f.list(false).await;

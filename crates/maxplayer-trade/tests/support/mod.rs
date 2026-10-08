@@ -30,11 +30,14 @@ pub struct Faults {
     pub checkstate_entered: tokio::sync::Notify,
     pub checkstate_release: tokio::sync::Notify,
     pub reject_info: std::sync::atomic::AtomicBool,
+    pub reject_restore_after_swap: std::sync::atomic::AtomicBool,
+    pub uppercase_witness: std::sync::atomic::AtomicBool,
     pub reject_restore: std::sync::atomic::AtomicBool,
     pub reject_swap: std::sync::atomic::AtomicBool,
     pub lose_reply: std::sync::atomic::AtomicBool,
     pub hide_witness_once: std::sync::atomic::AtomicBool,
     pub hide_witness: std::sync::atomic::AtomicBool,
+    pub invalid_swap_only_off: std::sync::atomic::AtomicBool,
     pub invalid_dleq: std::sync::atomic::AtomicBool,
     pub pending_inputs: std::sync::atomic::AtomicBool,
     pub omit_dleq: std::sync::atomic::AtomicBool,
@@ -140,6 +143,11 @@ impl MintFixture {
                         control.checkstate_reply_entered.notify_one();
                         control.checkstate_reply_release.notified().await;
                     }
+                    if path.ends_with("/swap")
+                        && control.reject_restore_after_swap.swap(false, SeqCst)
+                    {
+                        control.reject_restore.store(true, SeqCst);
+                    }
                     if path.ends_with("/swap") && control.lose_reply.load(SeqCst) {
                         return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
                     }
@@ -155,6 +163,23 @@ impl MintFixture {
                                 v["time"] = (t + control.clock_offset.load(SeqCst)).into();
                             }
                         }
+                        if path.ends_with("/checkstate") && control.uppercase_witness.load(SeqCst) {
+                            if let Some(states) = v["states"].as_array_mut() {
+                                for state in states {
+                                    if let Some(w) = state["witness"].as_str() {
+                                        if let Ok(mut witness) =
+                                            serde_json::from_str::<serde_json::Value>(w)
+                                        {
+                                            if let Some(pre) = witness["preimage"].as_str() {
+                                                witness["preimage"] = pre.to_uppercase().into();
+                                                state["witness"] =
+                                                    serde_json::to_string(&witness).unwrap().into();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if path.ends_with("/checkstate") && control.pending_inputs.load(SeqCst) {
                             if let Some(states) = v["states"].as_array_mut() {
                                 for state in states {
@@ -164,7 +189,10 @@ impl MintFixture {
                                 }
                             }
                         }
-                        if control.invalid_dleq.load(SeqCst) {
+                        if control.invalid_dleq.load(SeqCst)
+                            && !(path.ends_with("/swap")
+                                && control.invalid_swap_only_off.load(SeqCst))
+                        {
                             if let Some(sigs) = v["signatures"].as_array_mut() {
                                 for sig in sigs {
                                     if !sig["dleq"].is_null() {
