@@ -184,7 +184,7 @@ fn skill_commands_and_flags_match_binary_help() {
                 .chars()
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
                 .collect();
-            if name.is_empty() {
+            if !name.starts_with(|c: char| c.is_ascii_alphabetic()) {
                 continue;
             }
             let flag = format!("--{name}");
