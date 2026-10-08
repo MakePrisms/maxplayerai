@@ -139,7 +139,11 @@ fn cli_requires_both_exact_url_and_environment() {
             cmd.args(["--real-mint-allow", mint]);
         }
         let out = cmd.args(["balance", mint]).output().unwrap();
-        assert_eq!(out.status.success(), ok);
+        assert_eq!(
+            out.status.success(),
+            ok,
+            "SAFETY: real mint requires BOTH exact URL and environment opt-in"
+        );
     }
 }
 #[cfg(feature = "lab")]

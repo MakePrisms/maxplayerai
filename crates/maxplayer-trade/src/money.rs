@@ -184,7 +184,11 @@ pub async fn fund(home: &Path, j: &Journal, url: &str, amount: u64) -> Result<Fu
         "mint did not bind funding quote to NUT-20 key"
     );
     let invoice_check = MeltQuoteBolt11Request {
-        request: f.invoice.as_ref().unwrap().parse()?,
+        request: f
+            .invoice
+            .as_ref()
+            .context("missing funding invoice")?
+            .parse()?,
         unit: CurrencyUnit::Sat,
         options: None,
     };
@@ -282,7 +286,14 @@ pub async fn resume_fund(home: &Path, j: &Journal, f: &mut Funding) -> Result<()
         f.result = Some(p);
         j.put("funding", &f.id, f).await?;
     }
-    credit(home, &f.mint, f.result.as_ref().unwrap(), &vec![], &f.id).await?;
+    credit(
+        home,
+        &f.mint,
+        f.result.as_ref().context("missing funding result")?,
+        &vec![],
+        &f.id,
+    )
+    .await?;
     f.done = true;
     j.put("funding", &f.id, f).await?;
     database(home, &f.mint)
@@ -530,7 +541,7 @@ pub async fn resume_withdraw(home: &Path, j: &Journal, a: &mut Withdrawal) -> Re
         }
         prepare_withdraw(home, j, a).await?;
         reserve_withdraw(home, a).await?;
-        let q = a.quote.as_ref().unwrap();
+        let q = a.quote.as_ref().context("missing withdrawal quote")?;
         ensure!(
             q.expiry > cdk::util::unix_time(),
             "melt quote expired; reservation retained"
@@ -624,7 +635,14 @@ pub async fn resume_withdraw(home: &Path, j: &Journal, a: &mut Withdrawal) -> Re
                     .all(|s| s.state == State::Spent),
                 "paid melt has unspent or pending inputs"
             );
-            credit(home, &a.mint, a.result.as_ref().unwrap(), &a.inputs, &a.id).await?;
+            credit(
+                home,
+                &a.mint,
+                a.result.as_ref().context("missing withdrawal change")?,
+                &a.inputs,
+                &a.id,
+            )
+            .await?;
             a.state = MeltState::Done;
         }
         _ => {} // Unknown, failed, or ambiguous UNPAID: preserve all reservations.

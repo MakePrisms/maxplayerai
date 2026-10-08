@@ -419,7 +419,7 @@ pub async fn execute(home: &Path, j: &Journal, id: &str) -> Result<Proofs> {
                 std::process::exit(86);
             }
         }
-        let result = a.result.as_ref().unwrap();
+        let result = a.result.as_ref().context("missing attempt result")?;
         // Persist first; a missing DLEQ must not hide recoverable owned outputs.
         let w = wallet(home, &a.mint).await?;
         if result.iter().any(|p| p.dleq.is_some()) {
@@ -482,7 +482,7 @@ pub async fn execute(home: &Path, j: &Journal, id: &str) -> Result<Proofs> {
         "unforwardable lock is retained for refund, never forwarding"
     );
     Ok(a.result
-        .unwrap()
+        .context("missing completed attempt result")?
         .into_iter()
         .zip(a.outputs)
         .filter(|(_, o)| !o.owned)
@@ -719,15 +719,18 @@ pub async fn unforwardable(j: &Journal, id: &str) -> Result<Option<Proofs>> {
     let Some(a) = j.get::<Attempt>("attempt", id).await? else {
         return Ok(None);
     };
-    Ok(a.unforwardable.then(|| {
+    if !a.unforwardable {
+        return Ok(None);
+    }
+    Ok(Some(
         a.result
-            .unwrap()
+            .context("missing unforwardable result")?
             .into_iter()
             .zip(a.outputs)
             .filter(|(_, o)| !o.owned)
             .map(|(p, _)| p)
-            .collect()
-    }))
+            .collect(),
+    ))
 }
 
 /// Repair DLEQ metadata from the mint, without ever forwarding this lock. Invalid change
@@ -807,19 +810,13 @@ pub async fn settle_unforwardable(home: &Path, j: &Journal, id: &str) -> Result<
         result.ys()? == a.result.as_ref().context("missing result")?.ys()?,
         "lock output identity changed"
     );
+    let mint_url = a.mint.parse::<cdk::mint_url::MintUrl>()?;
     database(home, &a.mint)
         .await?
         .update_proofs(
             owned
                 .into_iter()
-                .map(|p| {
-                    ProofInfo::new(
-                        p,
-                        a.mint.parse().unwrap(),
-                        State::Unspent,
-                        CurrencyUnit::Sat,
-                    )
-                })
+                .map(|p| ProofInfo::new(p, mint_url.clone(), State::Unspent, CurrencyUnit::Sat))
                 .collect::<std::result::Result<Vec<_>, _>>()?,
             a.inputs.ys()?,
         )

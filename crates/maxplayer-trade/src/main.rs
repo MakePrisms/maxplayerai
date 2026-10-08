@@ -154,10 +154,10 @@ async fn main() -> Result<()> {
             }
             Command::Discover => {
                 let lots = m.discover(None).await?;
-                println!(
-                    "{}",
-                    serde_json::json!({"status":"ok","listings":lots.iter().map(|e|serde_json::json!({"lot_id":e.id,"maker":e.pubkey,"terms":serde_json::from_str::<serde_json::Value>(&e.content).unwrap()})).collect::<Vec<_>>() })
-                );
+                let listings = lots.iter().map(|e| {
+                    Ok(serde_json::json!({"lot_id":e.id,"maker":e.pubkey,"terms":serde_json::from_str::<serde_json::Value>(&e.content)?}))
+                }).collect::<Result<Vec<_>>>()?;
+                println!("{}", serde_json::json!({"status":"ok","listings":listings}));
                 Ok(())
             }
             Command::Cancel { lot } => coordinator::cancel(&cli.home, &j, &m, &lot).await,

@@ -84,7 +84,7 @@ fn concurrent_home_is_refused() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("home is already in use"));
 }
 #[test]
-fn no_real_money_override_exists() {
+fn unsafe_single_flag_override_is_not_supported() {
     let h = home();
     let out = Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
         .args([
@@ -114,6 +114,7 @@ fn skill_commands_and_flags_match_binary_help() {
         "preflight",
         "fund",
         "balance",
+        "withdraw",
     ];
     let binary = env!("CARGO_BIN_EXE_maxplayer-trade");
     let help = Command::new(binary).arg("--help").output().unwrap();
@@ -144,6 +145,7 @@ fn skill_commands_and_flags_match_binary_help() {
                 "--max-fees",
             ],
             "take" => &["--max-give", "--min-receive", "--max-fees"],
+            "withdraw" => &["--invoice"],
             "fund" => &["--amount", "--quote"],
             _ => &[],
         };

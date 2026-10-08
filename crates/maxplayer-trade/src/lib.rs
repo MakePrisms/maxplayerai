@@ -1,5 +1,5 @@
 //! Standalone fixed-lot protocol primitives. No job or daemon integration.
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -49,7 +49,7 @@ impl Asset {
     pub fn fence(&self) -> Result<()> {
         self.validate()?;
         let u = url::Url::parse(&self.mint_url)?;
-        let h = u.host_str().unwrap();
+        let h = u.host_str().context("missing mint host")?;
         let local = h == "localhost"
             || h.trim_matches(['[', ']'])
                 .parse::<std::net::IpAddr>()

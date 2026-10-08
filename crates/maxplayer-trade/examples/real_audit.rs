@@ -38,6 +38,14 @@ async fn main() -> Result<()> {
         println!("{}", a.summary());
     }
     for s in j.all::<Swap>("swap").await? {
+        if !urls.contains(&s.plan.mint) {
+            println!(
+                "{}",
+                serde_json::json!({"swap":s.id,"mint":s.plan.mint,"audit":"not requested; remote witness unverified"})
+            );
+            continue;
+        }
+        let mut witness_shapes = Vec::new();
         let mut claimed = 0;
         let mut refunded = 0;
         let mut missing = 0;
@@ -45,6 +53,9 @@ async fn main() -> Result<()> {
         let mut unspent = 0;
         if !s.outgoing.is_empty() {
             for st in mint::states(&s.plan.mint, &s.outgoing).await?.states {
+                if let Some(Witness::HTLCWitness(ref w)) = st.witness {
+                    witness_shapes.push(serde_json::json!({"type":"HTLCWitness","preimage":if w.preimage.is_empty(){"empty"}else{"redacted"},"signature_count":w.signatures.as_ref().map_or(0,Vec::len),"signatures":"redacted"}));
+                }
                 match st.state {
                     State::Spent => match st.witness {
                         Some(Witness::HTLCWitness(w))
@@ -66,7 +77,7 @@ async fn main() -> Result<()> {
             "outgoing_proofs":s.outgoing.len(),"claimed_witnesses":claimed,"refund_witnesses":refunded,
             "missing_or_invalid_witnesses":missing,"pending":pending,"unspent":unspent,
             "short":s.quote.as_ref().map(|q| q.short),"long":s.quote.as_ref().map(|q| q.long),
-            "margin":s.quote.as_ref().map(|q| q.margin),"preimages":"redacted"})
+            "margin":s.quote.as_ref().map(|q| q.margin),"preimages":"redacted","witness_shapes":witness_shapes})
         );
         ensure!(
             missing == 0,
