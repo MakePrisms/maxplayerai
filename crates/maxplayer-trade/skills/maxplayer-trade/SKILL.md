@@ -5,11 +5,8 @@ description: Trade Cashu tokens for a human with the standalone maxplayer-trade 
 
 # Trade Cashu for the human
 
-> **Blocked draft — do not execute real-money workflows on head 9dad8e6.**
-> Its binary still has a 500-sat cap and requires the old opt-in; the decided
-> no-opt-in/100,000-sat behavior below has not landed. Do not enable a bypass.
-> Read [verification](references/verification.md) before any use. Help checks
-> validate syntax only, not these missing money-policy changes.
+> Verified against implementation head **1929972**. Read the scoped evidence and
+> remaining withdrawal bounds in [verification](references/verification.md).
 
 ## 1. Establish custody and scope
 
@@ -30,14 +27,16 @@ attach a home or database to chat. Report only public IDs, mint URLs, amounts, s
 and redacted errors. Invoice delivery belongs in the human's private conversation.
 **Done:** the correct home and authorized mint identities (URL + sat unit) are known.
 
-## 2. Check readiness and get explicit authorization (target behavior)
+## 2. Check readiness and get explicit authorization
 
 Use `balance <mint>` and `preflight <mint>` for each relevant mint. Passing preflight
 allows a mint, but does not establish honesty or complete compatibility. The CLI
-also preflights before every fund/list/take: NUT-07/09/12/14, a sat keyset, reachable
+also preflights before fund/list/take/withdraw: NUT-07/09/12/14, an active sat keyset, reachable
 mint, and clock skew at most 60 seconds. Real mints need no opt-in setting. Never
 bypass a failed check. Gross locks and cumulative funding per mint per home are
-capped at **100,000 sats**; fees can make an otherwise eligible net amount too large.
+capped at **100,000 sats**, as is each withdrawal invoice. The withdrawal Lightning
+fee reserve ceiling is **32 sats**, not a total-fee cap. Fees can make an otherwise
+eligible net lock amount too large.
 
 **Before every real-money `fund`, `list`, `take`, or `withdraw`, present the exact
 operation and get an explicit yes.** A broad “trade for me”, previous trade approval,
@@ -51,7 +50,7 @@ or a published listing is not approval for a new operation. State:
   can hold funds longer, indefinitely with a dishonest mint. Funding and withdrawal
   have their own unresolved-payment risk, not a guaranteed 75-minute timeout.
 - A mint can steal its tokens. If the counterparty vanishes, funds stay locked until
-  the refund deadline and successful recovery. `serve` must stay up for a seller.
+  the refund deadline and successful recovery. `serve` must stay running while locks are live (the active `take` also watches its trade).
   NUT-14 claims remain valid after locktime. Nutshell refund status: round 4 reports a **successful cashu.cz Nutshell/0.21.0
   refund**; see the version-specific limits in [verification](references/verification.md). NUT-07 advertisement alone does not prove witness emission.
 
@@ -116,8 +115,12 @@ or report the retained authorization and recover it without paying again.
 `balance <mint>` reports wallet balance, not total wealth or proof that every
 reservation is spendable. After **any interruption**, use `recover` with the same
 home and relays before new work. It resumes existing authorizations and does not
-admit new trade requests. Keep recovery running for non-terminal states; restore
-`serve` if an authorized unsold listing should continue accepting quotes.
+admit new trade requests. It makes **one bounded pass**, at most **120 seconds per
+funding/withdrawal/swap item**, without waiting for lock deadlines: exit **0** means
+all terminal with no deferred work, **2** unresolved/deferred, **1** command error.
+Timeout does not undo an RPC or release reservations. Restore `serve` while locks
+are live; a single recovery pass is not a watcher. See the recovery reference for
+quarantine and errors.
 **Done:** classify every reported outcome using the recovery reference.
 
 ## 4. Verify and report

@@ -5,7 +5,9 @@ configuration. It resumes existing authorizations, not new trade requests. Do no
 run it concurrently with the home-owning watcher. Recovery can complete already
 authorized money effects; it is not a read-only status command. Do not enlarge the
 authorization or construct replacement outputs. Keep `serve` up when authorized
-listings should continue; recovery alone does not accept new quotes.
+listings should continue **and while any locks are live**; recovery alone does not
+accept new quotes. An active `take` watches its own trade; after interruption restore
+`serve` instead of starting another take.
 
 Refunds require a signed mint operation **after** the deadline plus margin, not
 merely waiting for expiry. Production taker/maker locks are 60/15 minutes, with
@@ -14,6 +16,22 @@ for normal worst-case lock/recovery handling, but never promise a release deadli
 A vanished peer means waiting for refund; a vanished or dishonest mint can block
 recovery indefinitely. An offline seller can miss its recovery opportunity; NUT-14
 receiver claims remain valid after locktime. Keep the watcher alive.
+
+## Bounded pass and exit status
+
+`recover` makes one pass without waiting for future lock deadlines. Each funding,
+withdrawal, and swap attempt has a **120-second** budget; this is not a 120-second
+whole-command deadline. Items are handled sequentially and relay/setup/publication
+work is additional. A timeout does not undo a delivered RPC or release reservations.
+
+- **0:** all reported items terminal and no work deferred. Quarantines count as
+  terminal, so inspect states and manual-recovery markers even on zero exit.
+- **2:** unresolved or deferred work, including individual item errors/timeouts or
+  deferred publication. Preserve authorization, resume `serve` for live locks or
+  make a later bounded pass with backoff; do not busy-loop or duplicate payments.
+- **1:** command-level error (for example home lock, setup, or journal failure).
+  Diagnose the redacted error; preserve the home. Clap syntax/usage errors can also
+  exit 2, so distinguish those from a recovery-incomplete report.
 
 ## Trade states
 
@@ -34,11 +52,11 @@ receiver claims remain valid after locktime. Keep the watcher alive.
 | `complete` | Terminal: trade legs settled according to this role's evidence. Check balances; retain home. |
 | `complete_unclaimed` | Terminal taker outcome: received maker tokens, maker still entitled to original taker lock. Never refund it; retain home. |
 | `refunded` | Terminal: this role's outgoing refund completed, not a successful trade. Fees may remain spent; invalid change can still require manual recovery. |
-| `expired` | Terminal authorization expiry without a confirmed lock, not a successful trade. Do not infer safety from time alone; use the reported state and accounting. |
+| `expired` | Terminal authorization expiry without a surviving authorized lock, not a successful trade. Do not infer safety from time alone; use the reported state and accounting. |
 | `refund_quarantined` | Terminal manual recovery: refund commit evidence exists, owned outputs failed verification. Not refunded spendable balance. |
 | `claim_quarantined` | Terminal manual recovery: claim commit evidence exists, owned outputs failed verification. Not a successful credited claim, and not permission to refund. |
 
-All rows above `complete` are non-terminal. Keep recovery active. A terminal result
+All rows above `complete` are non-terminal. Keep `serve` running for live locks. A terminal result
 is not proof that every piece of private journaled change is spendable. A mint
 processing an already-delivered request arbitrarily late is a residual risk.
 

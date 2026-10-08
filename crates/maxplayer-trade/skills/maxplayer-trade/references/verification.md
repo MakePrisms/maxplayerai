@@ -1,63 +1,58 @@
 # Verification status
 
-## Base and release gate
+## Implementation base and scope
 
-Rebased onto **9dad8e62669468492f997b4cb44fabe2b26ba8e1**, the published round-4
-head whose eight GitHub CI jobs and Vercel checks passed, checked at 20:00 UTC on
-2026-10-08. This is a **blocked draft**, not permission to run real-money workflows.
+Verified against **19299727e5e25479977cd95dee86a45a16bb3821** on PR #1107.
+The four local skill commits (ec196bb, e33fb25, f4a283b, a9a9df1) were rebased
+onto that head, followed by this final documentation/verification update. The PR
+remains draft; this skill does not certify every mint or authorize money movement.
 
-The user's decided behavior is **not implemented at this head**:
+Source checks establish:
 
-- `src/real_money.rs` still sets the cap to **500**, not 100,000 sats.
-- The binary still exposes `--real-mint-allow` and requires the old environment
-  opt-in. This skill deliberately does not instruct agents to enable either.
-- `preflight` checks NUT-07/09/12/14 and clock skew, but its standalone implementation
-  does not check the required sat keyset. Keyset checks elsewhere do not establish
-  the requested uniform automatic preflight for every operation.
-- Withdrawal exposes only the invoice argument; its source caps Lightning reserve
-  at 32 sats but does not enforce a user-selected total fee/debit ceiling. Never
-  execute it to discover the quote or assume the trade fee flag applies.
+- `src/real_money.rs`: 100,000-sat gross lock cap.
+- `src/money.rs`: 100,000 cumulative funding per mint/home, including retained
+  pending intents; 100,000 per withdrawal invoice; 32-sat Lightning fee reserve.
+- `src/main.rs`, `src/wallet.rs`, `src/coordinator.rs`: no real-money opt-in;
+  automatic NUT-07/09/12/14, active sat keyset, and at-most-60-second clock-skew
+  preflight for funding/listing/taking/withdrawal.
+- `src/money.rs`, `src/coordinator.rs`, `src/main.rs`: one recovery pass with
+  120-second per-item budgets; exits 0 terminal/no deferred work, 2 unresolved or
+  deferred, 1 command error. Terminal quarantines still require manual recovery.
+- Withdrawal has no user-selectable total-debit/input-fee cap. The command reference
+  retains the rule to stop when the human's approved bounds cannot be enforced.
 
-A successful help test proves command/flag spelling and the 16-sat list/take fee
-default, **not** the missing cap, no-opt-in behavior, preflight guarantee, or monetary
-safety. Those defaults/policies are not advertised by help; source was checked too.
-The intended workflow must be reverified on the later implementation before use.
+The staged CLI-STATE-HANDOFF glossary agrees with the application command/flag
+inventory and swap/withdrawal states. Two qualifications matter: exit 2 can also
+be a Clap usage error, and terminal items alone do not ensure exit 0 if work such
+as listing publication was deferred. Per-item timeouts are not a whole-pass limit.
+Market commands such as discovery also recover prior authorizations before dispatch.
 
-## Checks run on this base
+## Checks
 
-Default (no lab feature) binary build passed, using the crate’s standalone Cargo
-manifest and locked dependencies, with only the maxplayer-trade binary selected.
-Read root help and all ten subcommand help pages from that binary. Extended the
-existing `skill_commands_and_flags_match_binary_help` test to derive command coverage
-from root help, validate canonical signatures against each command, scan flags in
-all skill Markdown (including references), and assert the documented fee defaults.
-The test invokes only help, with no home, mint requests, payments, or jobs.
+Verification uses the default binary, locked standalone manifest, and this checkout's
+separate target directory, not the shared lab runner's binaries. Help checks execute
+only help; no money-moving commands, real wallets, Maxplayer jobs, or lab loops.
+The exhaustive test checks every application command, command-local flags, all skill
+Markdown, and the list/take 16-sat fee default. Help establishes syntax; the source
+checks above establish policy.
 
-Focused test output:
+Final local results:
 
-```text
-PASS preflight <mint>
-PASS balance <mint>
-PASS fund <mint> --amount <sats> [--quote <quote-id>]
-PASS list --give-mint <mint> --give <net-sats> --want-mint <mint> --want <net-sats> --max-fees <sats>
-PASS discover
-PASS serve
-PASS cancel <lot>
-PASS take <lot> --max-give <total-sats> --min-receive <net-sats> --max-fees <sats>
-PASS withdraw <mint> --invoice <bolt11>
-PASS recover
-PASS 10 commands; 14 distinct flags; list/take fee default 16; 4 skill documents
-test result: ok. 1 passed; 0 failed; 4 filtered out
-```
+- Default binary build: passed (no lab feature).
+- CLI test target: **5 passed, 0 failed**. Non-help cases use disposable empty
+  homes only; no real wallet or money movement. The initial expanded scanner
+  mistook the usage-line global home option for a command-local option; corrected
+  to inspect the Options section, then reran successfully.
+- Exhaustive help check: **10 application commands, 13 distinct long flags,
+  4 Markdown documents**, fee default 16; also checks short help and built-in help.
+  Focused final-document rerun: **1 passed, 0 failed, 4 filtered out**.
+- Standalone trade formatting: passed. Root workspace formatting: failed on
+  **153 untouched files**, outside this task; no unrelated formatting applied.
+- Skill frontmatter, resource links, and diff whitespace: passed.
 
-Skill frontmatter validation, resource-link resolution, and whitespace checks passed.
-Other CLI tests and money-path suites were not run by this documentation task. No
-real or fake-money operations were executed. No push was made.
-
-This base qualified through completed CI just before the five-hour wait limit.
-The queued no-opt-in/100,000-sat implementation did not land within that window;
-verification of that later behavior remains outstanding. Keep this draft blocked
-until that implementation is available and rebase/rebuild/reverify it then.
+No full money-path/lab suite or loops were run; those remain the separate runner's
+scope. No real mint fund/withdraw/take/list, real wallets, or Maxplayer jobs were
+used. The shared lab target and the operator's wallet home were not touched.
 
 ## Nutshell evidence available during drafting
 

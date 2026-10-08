@@ -128,6 +128,8 @@ fn skill_commands_and_flags_match_binary_help() {
         String::from_utf8(out.stdout).unwrap()
     };
     let root_help = read_help(&["--help"]);
+    assert_eq!(read_help(&["-h"]), root_help);
+    assert_eq!(read_help(&["help"]), root_help);
     let commands: BTreeSet<_> = root_help
         .split("Commands:")
         .nth(1)
@@ -143,6 +145,10 @@ fn skill_commands_and_flags_match_binary_help() {
         .iter()
         .map(|command| (*command, read_help(&[command, "--help"])))
         .collect();
+    for command in &commands {
+        assert_eq!(read_help(&[command, "-h"]), helps[command]);
+        assert_eq!(read_help(&["help", command]), helps[command]);
+    }
     let has_flag = |help: &str, flag: &str| help.split_whitespace().any(|word| word == flag);
     let mut checked = BTreeSet::new();
     // The canonical block is an executable-interface inventory, not a second
@@ -166,6 +172,18 @@ fn skill_commands_and_flags_match_binary_help() {
             if word.starts_with("--") {
                 assert!(has_flag(help, word), "{command} missing {word}");
             }
+        }
+        for flag in help
+            .split("Options:")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .filter(|word| word.starts_with("--"))
+        {
+            assert!(
+                flag == "--help" || signature.contains(flag),
+                "undocumented {command} flag {flag}"
+            );
         }
         println!("PASS {signature}");
     }
@@ -207,6 +225,12 @@ fn skill_commands_and_flags_match_binary_help() {
             }
         }
     }
+    let supported_flags: BTreeSet<_> = all_help
+        .split_whitespace()
+        .filter(|word| word.starts_with("--"))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(flags, supported_flags, "document every supported long flag");
     for command in ["list", "take"] {
         assert!(
             helps[command]
