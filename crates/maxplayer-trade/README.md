@@ -1,7 +1,7 @@
 # maxplayer-trade — standalone fake-money Cashu trades
 
 A fixed-lot CLI, independent of jobs, the maxplayer daemon, core, and `relay.maxplayer.ai`.
-**A live 32-for-24 trade completed on 2026-10-07**, including both claims, NUT-07 witness
+**A live 32-for-24 trade completed on 2026-10-08**, including both claims, NUT-07 witness
 recovery, fee-inclusive net delivery, and a signed `sold` status. This is a test-money
 prototype, not a production deployment or an unconditional atomicity guarantee.
 
@@ -80,11 +80,11 @@ explicit pre-effect or post-mint/pre-wallet-commit boundaries. No real-money set
 | Two-mint integration/recovery | 6 / 0 | 11 / 0 |
 | Pinned-CDK orphan-quote reproducer | 1 / 0 | 1 / 0 |
 | Relay union/unreachable/production fence | 3 / 0 | 3 / 0 |
-| Review adversarial regressions | 10 / 0 | 18 / 0 |
+| Review adversarial regressions | 11 / 0 | 30 / 0 |
 
-**Totals after review fixes: 45 default / 58 lab passed, zero failures.**
+**Final second-pass totals: 46 default / 70 lab passed, zero failures.**
 Touched-file rustfmt check and the production-default binary/examples build passed.
-Clippy --all-targets --features lab --no-deps exited 0 with non-blocking style warnings
+Clippy --all-targets --no-deps in both default and lab modes exited 0 with non-blocking style warnings
 (collapsible conditionals, unwrap-after-is_some, existing argument-count/import/clone lints).
 
 The fee-bearing sell-back fixture originally recovered after every inbox step, generating a
@@ -159,6 +159,84 @@ After interruption, use the same home and relays: `maxplayer-trade --home <home>
 remain running for the full lock duration. An inconclusive mint result is retained for recovery.
 To cancel an unused listing: `maxplayer-trade --home <maker-home> cancel <lot-id>`.
 Cancellation does not revoke an already authorized HTLC.
+
+## Second fix pass — reviewed base 05b7f03 (2026-10-08)
+
+This is an **author-led fix/verification pass**, not another independent reviewer sign-off.
+The paid re-review at `05b7f0334ac69918c6938eff650614f04b3c89a2` identified N1–N4;
+all four are accepted and fixed. Only this standalone crate changes. No mint/NUT changes,
+unlocked transfers, validation bypass, new Maxplayer jobs, production rollout, or merge.
+
+Every regression below uses the two real in-process **CDK 0.17.2 FakeWallet mints and local
+relay**. The HTTP middleware can hold a real swap in flight beyond its client timeout and
+release it later; it never fabricates successful signatures. Late-arrival tests advance the
+fixture's reported mint clock past grace while the real request is held. Public mints cannot
+use lab timing. Existing assertions are retained; old abandonment waits now follow the
+60-second grace constant instead of assuming 20 seconds.
+
+| Finding | Resolution and regression tests | Mutation evidence |
+|---|---|---|
+| N1 | Fixed: `n1_maker_refund_before_taker_observes_abandonment`; `n1_restore_after_nut07_catches_landing_claim`. Refund-spent inputs no longer strand the taker; a second restore catches the NUT-07 race. Exact fee-bearing refund balance asserted. | Rejecting SPENT refund witnesses strands the taker; removing post-NUT-07 restore wrongly marks a landed claim abandoned. Both fail safety assertions. |
+| N2 | Fixed: `n2_late_claim_after_abandonment_restore_outage_never_refunds`; `n2_grace_covers_swap_timeout_and_deadline_follows_checkstate`; `n2_late_lock_after_abandonment_is_restored_and_refunded`. Fresh refund evidence, deadline immediately before POST, derived 60-second grace, post-abandonment lock reconciliation. | Four independent mutations: persisted-flag refund authorization, 20-second grace, pre-NUT-07 deadline gate, and missing post-abandonment lock check. All fail their distinct safety assertions. |
+| N3 | Fixed: `n3_maker_missing_dleq_refunds`, `n3_maker_invalid_dleq_refunds`, `n3_taker_missing_dleq_refunds`, `n3_taker_invalid_dleq_refunds`. Explicit unforwardable state, timed refund, exact net-of-fee balance, no reserved spent inputs. | Disabling the state transition makes all four coordinator tests fail at the explicit recovery-state assertion. |
+| N4 | Fixed: `n4_partial_claim_wins_nut07_swap_race_reselects_refund`; `n4_lost_refund_reply_reconciles_outputs_before_complete`. Retire a freshly proven rejected refund, retain its exact outputs, select fresh UNSPENT inputs, and claim using the learned preimage. | Disabling reselection or same-step claim leaves the maker nonterminal; removing the refund-output reconciliation gate terminates with uncredited outputs. |
+| Dead cancel guard | Removed; `l4_active_quote_cannot_cancel` retains active-quote refusal. | No money-path mutation needed for dead code removal. |
+| Notice preimage | Lowercase normalization before persistence; `nit_notice_preimage_normalized_before_storage`. | No mutation required. |
+| Taker lock release | Explicit `lock_reconciling`; covered by the late-lock test and `h2_unsent_lock_expires_and_releases_reservation`. Maker's active index also survives a raced release failure. | Late-lock mutation expires without the mandatory restore and fails before releasing the held request. |
+
+The original `h2_landed_claim_lost_reply_never_refunds` was mutation-checked again:
+removing its refund fairness guard produces the forbidden refund and fails its safety assertion.
+**Eleven disposable mutations compiled, with 14 expected test failures, all at safety assertions**
+(not build/setup failures). Copies and logs are retained under
+`.openclaw/tmp/review-1107-pass2/release-mutations/`; the PR source was byte-for-byte unchanged during the run.
+Mutation builds used a separate warm target from the PR's test/live binary.
+
+### Final-tree verification
+
+- Default: **46 passed / 0 failed**; lab: **70 passed / 0 failed**. Per-suite counts are above.
+- **20/20** zero-fee full trade + sell-back runs and **20/20** fee-bearing full trade + sell-back
+  runs passed, each with exact balances in both directions. The **five N1/N2 tests each passed
+  20/20 times** (100 regression executions). Tests ran on the compiled lab binaries.
+- Touched-file rustfmt check, default/lab clippy (`--all-targets --no-deps`) and final default
+  binary/examples build exited 0. Clippy retains non-blocking style warnings and the explicit
+  constant-invariant assertion warning. The rebuilt default binary matched the live binary.
+- Earlier overlapping checkpoint runs missed the short lab claim window (zero-fee sell-back
+  and H2 setup); those failure logs are retained. Their isolated checks and final serialized
+  suites passed without widening any deadline or loosening an assertion. This is not a claim
+  of load-independent wall-clock test timing. The outer runner was terminated (SIGTERM)
+  during round 10; only unfinished repetitions were resumed on the same binaries, and the
+  incomplete attempt is not counted as a pass or an assertion failure.
+- Evidence logs: `target/second-pass/`; disposable mutations: path above. Root CI is separate
+  because this crate is an independent Cargo workspace. No new paid review was commissioned.
+
+### Fresh-home live evidence — final default-feature binary
+
+- Homes: `/home/openclaw/.openclaw/workspace/.openclaw/tmp/review-1107-pass2/live-20261008-_jdz9jay/{maker,taker}`; old orphan homes untouched.
+- Binary SHA-256: `5021b70fbc91646e5f8d7a503b2060ebcc89f583d836d4c59ef301b98410578e`.
+- Maker mint: `https://testnut.cashudevkit.org`, `cdk-mintd/0.18.0`.
+- Taker mint: `https://testnut.cashu.space`, `cdk-mintd/0.17.0-rc.3`.
+- Lot: `7c3e2b8cd0df45b11092f73ab0ab84db1c19d0066f9a6a17495975f7b86a84f9`.
+- Available: `f25dbc10ebcd3f3a6435e206f848bf59254ac8ad4d2cda38d4d4c635f2372e6b`.
+- Sold: `7017f8c44c83d677aa50533cca29a8081cb85260785dfd8957f7dd2abfb0afce`.
+- Swap: `cdd45454-b24e-4b42-9909-0f96a13c553f`; **both roles complete**, all four lock/claim attempts done,
+  exact outputs saved, all wallet proofs UNSPENT, zero remaining reservations.
+
+| Home | cashudevkit before → after | cashu.space before → after |
+|---|---:|---:|
+| Maker | 128 → **93** | 0 → **24** |
+| Taker | 0 → **32** | 128 → **101** |
+
+Both mints charge **100 ppk**. Maker locks 33 gross for 32 net, pays 2 locking fee + 1 claim
+fee, and debits 35. Taker locks 25 gross for 24 net, pays 2 + 1, and debits 27. Each mint's
+combined ending balances are **125 = 128 − 3 mint fees**, exactly. No platform/trade fee.
+
+The independent `read_trade` reader verified all three events from **relay.ditto.pub**, including
+signatures, author binding and the contiguous status chain ending in sold. Independent read
+attempts: **1**. No event or trade was republished. ACKs alone are
+not counted as retained evidence. No private proof/preimage is included here.
+
+Live refunds and live sell-back were not run; short refunds and both trade directions are covered
+by the real local mints. No public-mint locktime fence was shortened for this run.
 
 ## Live review-fix evidence — 2026-10-07
 
@@ -249,7 +327,7 @@ bug, **not successful recovery**. The corrected `fund` waits for PAID and works 
 as demonstrated by this live run. The original homes are preserved; no reservation was cleared,
 CDK was not patched/upgraded, and this old-quote bug is **not a blocker for fresh-home trading**.
 
-## Paid-review findings and regression evidence
+## First fix pass — historical review and regression evidence
 
 The paid cashu-rust-dev review read code only at 15b15ec; this author-led fix pass independently
 built and exercised the consequences. It is not a new independent reviewer sign-off.
@@ -309,12 +387,37 @@ All **11 mutations compiled and failed at the intended safety assertion** (exit 
   only freshly confirmed UNSPENT proofs for refund, never the full original set. It remains
   `settling` until its outgoing proofs are reconciled. Unknown SPENT proofs are not silently
   treated as our refund.
-- **H2 fairness:** a taker may refund its own payment only if its claim was never attempted or
-  is affirmatively abandoned. Abandonment requires all three: the saved send deadline + **20 s**
-  grace (the RPC timeout) has passed, restore returns no signatures/outputs, and every input is
-  UNSPENT. PENDING, partial restore, unavailable evidence and lost replies remain ambiguous.
-  Abandoned records and their exact outputs are retained; those outputs are never resubmitted.
-  An abandoned lock expires and releases its reservation (a maker's abandoned lot is cancelled).
+- **Fresh-evidence fairness (N1/N2/H2):** a persisted `abandoned` flag is never refund
+  authority. At the taker's refund decision, an existing claim attempt requires its deadline
+  plus **60 seconds** of grace to have passed, an empty restore of its exact outputs, a fresh
+  NUT-07 check of the bound incoming proofs, and another empty restore **after** NUT-07.
+  PENDING, RPC errors, partial/nonempty restore, a SPENT matching-preimage witness, or an
+  ambiguous/missing SPENT witness means **no refund this tick**. Explicit HTLC refund witnesses
+  (empty or nonmatching preimages) are accepted: a maker refund must not strand the taker.
+  When there is no claim attempt, there are no claim outputs to restore; any stored incoming
+  proofs still require fresh, unambiguous NUT-07 evidence before refunding.
+- **Send/abandonment discipline (N2):** the send deadline is checked immediately before the
+  swap POST, after the last NUT-07 and mint-clock RPC, with no intervening RPC. Grace is derived
+  as `3 * RPC_TIMEOUT_SECONDS` (20 seconds per RPC), covering the swap timeout plus 40 seconds
+  of margin. Abandonment never discards exact outputs or resubmits them. A lock cannot expire
+  or release its backing on the flag alone: a post-abandonment restore → NUT-07 → restore
+  recheck is mandatory. `lock_reconciling` keeps late results reachable when evidence or
+  release fails; a restored late lock becomes outgoing and follows the normal timed refund.
+- **Unforwardable own locks (N3):** missing/invalid DLEQ records `lock_unforwardable` and the
+  locked proofs as outgoing, never sends them to the peer, and follows refund-after-locktime.
+  Owned change and spent funding reservations are settled through the wallet; invalid present
+  DLEQ is never credited. Recovery can repair DLEQ metadata by restoring the exact outputs
+  and verifying again. Even repaired locks remain unforwardable. An issuer that continues to
+  supply invalid evidence or refuses restoration can still block recovery; this is not a
+  validation bypass or a guarantee against a dishonest mint.
+- **Refund races (N4):** a rejected maker refund is retired only on fresh empty restore,
+  NUT-07 evidence of a matching-preimage competing claim (without PENDING/ambiguous states),
+  and a second empty restore. Its exact outputs stay journaled. A durable refund generation
+  permits a fresh UNSPENT-only selection. Matching preimages are persisted independently of
+  negative evidence (including before a final restore can fail) and drive the maker's claim in
+  the same recovery step. A crash cannot force another outgoing-mint witness read to reclaim
+  that already learned preimage. SPENT refund inputs alone are not completion: the maker
+  remains `settling` until its exact refund outputs have been restored and credited.
 - **M3 policy:** after receiving the maker's funds, a taker **never refunds its payment**.
   If the maker has not claimed by long + margin, the taker becomes terminal
   `complete_unclaimed`, ending retries (even if mint info is offline once the local deadline has passed) and allowing future takes/`recover` to finish.
@@ -324,7 +427,7 @@ All **11 mutations compiled and failed at the intended safety assertion** (exit 
   60/15 minutes, quote hold 60 seconds, and claim cutoff 3 minutes.
 - Both mints must advertise NUT-09 and NUT-12 as well as NUT-07/14. Swap results are journalled
   before DLEQ refusal. Missing DLEQ prevents forwarding, but owned change is credited;
-  present invalid DLEQ is an error. Own-lock claim fees are checked before journalling.
+  present invalid DLEQ is quarantined for verified restoration and timed recovery. Own-lock claim fees are checked before journalling.
   Cancellation is refused while a quote/swap is active.
 
 These are client recovery policies, not mint/NUT changes. Already-delivered HTTPS requests have
