@@ -83,6 +83,15 @@ PAID alone is not completion: all change must be restored, DLEQ-verified, accoun
 and credited before `done`. A definitively unpaid payment becomes `unpaid_released` only
 with safe release evidence. An unsent expired quote can be released. Balances/preflight
 are inspection commands and do not resume payment authorizations. Report dust and fees.
+Never infer a fee reserve from another mint: the live run observed 2 sats on Minibits/
+Macadamia and 5 on cashu.cz. An insufficient-balance refusal can leave an unsent
+`quote_created` record. There is no cancellation command: preserve it, let its quote expire,
+then resume that exact invoice to reconcile `unpaid_released` before replacing the payment
+plan. Do not fund the home or edit its journal to force an unaffordable authorization.
+`recover` waits for all retained money authorizations as well as swaps. An unrelated
+pending or fenced withdrawal can therefore keep the command running after a particular
+swap refunded. A process timeout is not that swap's outcome: stop the process, inspect
+its saved state and balances, and preserve the separate withdrawal without replacing it.
 
 ## Relay delivery
 

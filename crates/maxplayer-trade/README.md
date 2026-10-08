@@ -94,7 +94,7 @@ It is not installed in the Maxplayer website skill index. The CLI regression
   abandonment grace and starts it after the final restore/state/release can create a lock
   on an already-expired swap; automatic recovery cannot close that server-side window.
 
-## Build and automated tests
+## Build and automated tests (historical round-three counts below)
 
 This crate is its **own Cargo workspace**, with pinned CDK/Cashu 0.17.2 and Nostr SDK 0.44.1.
 Do not add it to the root workspace. From the repository root:
@@ -306,7 +306,7 @@ removing its refund fairness guard produces the forbidden refund and fails its s
 `.openclaw/tmp/review-1107-pass2/release-mutations/`; the PR source was byte-for-byte unchanged during the run.
 Mutation builds used a separate warm target from the PR's test/live binary.
 
-### Final-tree verification
+### Historical round-two final-tree verification
 
 - Default: **46 passed / 0 failed**; lab: **70 passed / 0 failed**. Per-suite counts are above.
 - **20/20** zero-fee full trade + sell-back runs and **20/20** fee-bearing full trade + sell-back
@@ -571,9 +571,9 @@ A mint can still lie, withhold evidence, or process an already-delivered request
   clock bounds, and a running recovery watcher are required. An offline maker can lose its
   recovery window; an issuer can lie or refuse service. This is not trustlessness against mints.
 - Not covered: every crash boundary, OS/power-loss durability, arbitrary long outages/clock skew,
-  pre-fix journal migration, malformed live witnesses, live refunds, live reverse pairing/sell-back, mint key rotation,
+  pre-fix journal migration, malformed live witnesses, mint key rotation,
   adversarial fee changes, exhaustive peer flood/quote-limit concurrency, 24-hour relay retention,
-  root workspace suites locally, real money, or production deployment. Tests cover selected
+  root workspace suites locally, or production deployment. Round-four live coverage is recorded separately below. Tests cover selected
   process-exit boundaries and one claim/refund race, not a full model checker.
 
 
@@ -610,12 +610,19 @@ its separate run report; the historical test counts above predate this change.
 - Withdrawals have a 500-sat invoice cap and a 32-sat fee-reserve cap. Input selection requires change to remain positive even
   if the whole reserve is consumed, unless arithmetic proves zero change. Sweep conservatively; do not interpret a `paid_change_unreconciled` result as dust
   or fees. Preserve every funded home and stop for inspection on unresolved state.
+  Reserves are mint-specific (live: Minibits/Macadamia 2, cashu.cz 5 sats), not a global
+  constant. An insufficient-funds refusal may leave a pre-send `quote_created` authorization.
+  No cancellation command exists: preserve it, await its natural expiry and resume the exact
+  invoice for `unpaid_released`; do not edit the journal or silently replace it.
 - NUT-07 advertisement is insufficient for HTLC refund safety. Check actual spent-proof
   witness emission and parsing on each mint before running the timed refund scenario.
   Never log proofs, tokens, wallet keys, blinding secrets, or HTLC/payment preimages.
 
 `recover` resumes the funding and withdrawal journals in addition to trade authorizations.
-Use the same explicit allow-list on recovery. Funding caps are lifetime caps, not current
+It waits for all of them: an unrelated pending/fenced withdrawal can keep the command
+running after a particular swap refunded. A process timeout alone is not a failed refund;
+stop the process and inspect the saved swap state/balances without replacing the separate
+withdrawal. Use the same explicit allow-list on recovery. Funding caps are lifetime caps, not current
 balance caps; deleting or replacing a funded home is not a supported reset.
 
 The tool's per-home caps do not constrain the external wallet paying a funding invoice.
@@ -639,7 +646,7 @@ TRADE_REAL_MONEY_TEST=1 cargo run --manifest-path crates/maxplayer-trade/Cargo.t
   https://mint.minibits.cash/Bitcoin https://mint.macadamia.cash
 ```
 
-### Real-money-path implementation validation (2026-10-08)
+### Historical real-money-path implementation validation (2026-10-08, before live funding)
 
 | Suite | Default | Lab |
 |---|---:|---:|
@@ -667,6 +674,18 @@ The inherited round-3 review work on the base trade coordinator is separate; its
 worktree and PR were not changed by this implementation.
 
 ## Round 4 relay policy and real-money integration (author-led verification)
+
+Current measured results, per-suite counts, mutation assertions, relay probes, both live
+refunds and real-sat accounting are in the [round-four evidence report](evidence/round4-20261008/REPORT.md).
+Round four passed **66 default / 100 lab tests**, **100 under CPU contention**, and **860
+repeated executions (20 full rounds)**, with zero test failures. Three safety mutations
+failed at their intended assertions; restored controls passed. The final default binary
+completed a fake trade/sell-back and both fake/real production-timing refunds; Nutshell
+refund witnesses and withdrawals are verified. Minibits returned, the old authorization
+reconciled without payment, and five sweeps returned 257 sats. Final run accounting:
+**9169 = 9125 in the designated wallet + 22 retained dust + 22 fees**. All real-home authorizations
+are terminal and retained spendable proofs were remotely confirmed UNSPENT. The report
+preserves both the real recovery-harness timeout and the unsent cashu.cz reserve refusal.
 
 Testing-only opt-in and journaled `withdraw` were cherry-picked onto the third-pass
 quarantine fix. Both `TRADE_REAL_MONEY_TEST=1` and an exact `--real-mint-allow` are

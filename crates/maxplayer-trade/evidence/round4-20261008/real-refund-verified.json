@@ -1,0 +1,44 @@
+{
+  "lot": "115feef3626b7e25803e05b2037aed29f05f0c0b1fc04813f7898caa660b4561",
+  "before": {
+    "maker": {
+      "https://mint.macadamia.cash": 116,
+      "https://cashu.cz": 0
+    },
+    "taker": {
+      "https://mint.macadamia.cash": 0,
+      "https://cashu.cz": 104
+    }
+  },
+  "real": true,
+  "swap": "e242bfeb-28ee-459e-b700-42624330114c",
+  "short": 1791473964,
+  "long": 1791476664,
+  "margin": 60,
+  "taker_killed_before_claim": true,
+  "incoming_proofs": 3,
+  "error": "Command '['/home/openclaw/.openclaw/workspace/.openclaw/tmp/round4-1107/bin/maxplayer-trade', '--home', '/home/openclaw/.openclaw/workspace/.openclaw/tmp/realmoney-20261008T053645Z/pair2-taker', '--real-mint-allow', 'https://mint.macadamia.cash', '--real-mint-allow', 'https://cashu.cz', 'recover']' timed out after 180 seconds",
+  "observed_states": {
+    "maker": "refunded",
+    "taker": "refunded"
+  },
+  "harness_state": "STOP",
+  "state": "both_refunded_independently_verified",
+  "after": {
+    "maker": {
+      "https://mint.macadamia.cash": 114,
+      "https://cashu.cz": 0
+    },
+    "taker": {
+      "https://mint.macadamia.cash": 0,
+      "https://cashu.cz": 104
+    }
+  },
+  "evidence": [
+    "wire-witnesses.json",
+    "real-maker-after-short-audit.log",
+    "real-taker-after-long-audit.log",
+    "real-accounting-after-live.json"
+  ],
+  "explanation": "The bounded recover command timed out on the preserved, fenced, non-terminal Minibits withdrawal after this swap refunded. No second recovery or payment attempt was made. Original STOP record retained in real-refund.json."
+}
