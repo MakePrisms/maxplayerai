@@ -656,6 +656,18 @@ pub async fn advance(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Resu
         ]
         .contains(&s.state.as_str())
     {
+        let mut refund_id = if s.refund_generation == 0 {
+            format!("{}-refund", s.id)
+        } else {
+            format!("{}-refund-{}", s.id, s.refund_generation)
+        };
+        if s.preimage.is_none() {
+            if let Some(pre) = mint::refund_preimage(j, &refund_id, &q.request.hash).await? {
+                s.preimage = Some(pre);
+                s.state = "claiming".into();
+                save(j, s).await?;
+            }
+        }
         if s.preimage.is_none() {
             match mint::witness(&own_mint, &s.outgoing, &q.request.hash).await {
                 Ok(Some(pre)) => {
@@ -668,34 +680,9 @@ pub async fn advance(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Resu
             }
         }
         // Preimage knowledge is monotone, independent of refund outcomes.
-        if s.preimage.is_some() && s.state != "settling" {
-            match mint::redeem(
-                home,
-                j,
-                &claim_id,
-                &q.lot.want.asset.mint_url,
-                &s.incoming,
-                &s.key,
-                s.preimage.as_ref().unwrap(),
-                s.max_fees,
-                None,
-            )
-            .await
-            {
-                Ok(_) => {
-                    s.state = "settling".into();
-                    save(j, s).await?;
-                    let mut l: Listing = j.get("listing", &s.lot.id.to_hex()).await?.unwrap();
-                    finish_listing(j, m, &mut l, Status::Sold).await?;
-                }
-                Err(e) => eprintln!("maker claim {}: {e}", s.id),
-            }
+        if let Err(e) = maker_claim(home, j, m, s, &q, &claim_id).await {
+            eprintln!("maker claim {}: {e}", s.id);
         }
-        let mut refund_id = if s.refund_generation == 0 {
-            format!("{}-refund", s.id)
-        } else {
-            format!("{}-refund-{}", s.id, s.refund_generation)
-        };
         let mut refund_started = j
             .get::<mint::Attempt>("attempt", &refund_id)
             .await?
@@ -703,7 +690,24 @@ pub async fn advance(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Resu
         if refund_started {
             if let Err(e) = mint::execute(home, j, &refund_id).await {
                 eprintln!("refund recovery {}: {e}", s.id);
-                if mint::failed_refund(j, &refund_id, &q.request.hash).await? {
+                let retired = match mint::failed_refund(j, &refund_id, &q.request.hash).await {
+                    Ok(pre) => pre.is_some(),
+                    Err(e) => {
+                        eprintln!("refund evidence {}: {e}", s.id);
+                        false
+                    }
+                };
+                // Positive witness knowledge is useful even when absence is ambiguous.
+                // Never let a restore outage discard a preimage already observed this tick.
+                if s.preimage.is_none() {
+                    if let Some(pre) = mint::refund_preimage(j, &refund_id, &q.request.hash).await?
+                    {
+                        s.preimage = Some(pre);
+                        s.state = "claiming".into();
+                        save(j, s).await?;
+                    }
+                }
+                if retired {
                     // Preserve the failed attempt forever; a durable generation selects fresh inputs.
                     s.refund_generation = s
                         .refund_generation
@@ -712,6 +716,9 @@ pub async fn advance(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Resu
                     save(j, s).await?;
                     refund_id = format!("{}-refund-{}", s.id, s.refund_generation);
                     refund_started = false;
+                }
+                if let Err(e) = maker_claim(home, j, m, s, &q, &claim_id).await {
+                    eprintln!("maker claim after refund race {}: {e}", s.id);
                 }
             }
         }
@@ -980,4 +987,39 @@ fn canonical_key(key: &str) -> Result<()> {
     let parsed: cashu::nuts::PublicKey = key.parse()?;
     ensure!(key == parsed.to_string(), "noncanonical Cashu key");
     Ok(())
+}
+
+async fn maker_claim(
+    home: &Path,
+    j: &Journal,
+    m: &Market,
+    s: &mut Swap,
+    q: &Quote,
+    claim_id: &str,
+) -> Result<()> {
+    let Some(pre) = s.preimage.as_ref() else {
+        return Ok(());
+    };
+    if s.state == "settling" {
+        return Ok(());
+    }
+    mint::redeem(
+        home,
+        j,
+        claim_id,
+        &q.lot.want.asset.mint_url,
+        &s.incoming,
+        &s.key,
+        pre,
+        s.max_fees,
+        None,
+    )
+    .await?;
+    s.state = "settling".into();
+    save(j, s).await?;
+    let mut l: Listing = j
+        .get("listing", &s.lot.id.to_hex())
+        .await?
+        .context("missing listing")?;
+    finish_listing(j, m, &mut l, Status::Sold).await
 }

@@ -42,6 +42,8 @@ pub struct Attempt {
     pub abandoned: bool,
     #[serde(default)]
     pub unforwardable: bool,
+    #[serde(default)]
+    pub observed_preimage: Option<String>,
 }
 pub const RPC_TIMEOUT_SECONDS: u64 = 20;
 // Three RPC timeouts: the swap timeout plus two timeouts of scheduling/clock margin.
@@ -246,6 +248,7 @@ pub async fn lock(
                 done: false,
                 abandoned: false,
                 unforwardable: false,
+                observed_preimage: None,
                 send_before: Some(send_before),
             },
         )
@@ -294,6 +297,7 @@ pub async fn redeem(
                 done: false,
                 abandoned: false,
                 unforwardable: false,
+                observed_preimage: None,
                 send_before,
             },
         )
@@ -324,7 +328,7 @@ pub async fn execute(home: &Path, j: &Journal, id: &str) -> Result<Proofs> {
                         (secret.kind() == cashu::nuts::nut10::Kind::HTLC)
                             .then(|| secret.secret_data().data().to_owned())
                     });
-                    if fresh_not_landed(&a, hash.as_deref(), false).await? {
+                    if fresh_not_landed(&a, hash.as_deref()).await? {
                         a.abandoned = true;
                         j.put("attempt", id, &a).await?;
                     }
@@ -571,20 +575,11 @@ pub async fn refunded_all(j: &Journal, id: &str, outgoing: &Proofs) -> Result<bo
 
 /// Snapshot evidence, never a cached authorization. Both restores must be wholly empty.
 /// For claims, a SPENT input is safe only with an explicit nonmatching refund witness.
-async fn fresh_not_landed(
-    a: &Attempt,
-    hash: Option<&str>,
-    require_claim_spent: bool,
-) -> Result<bool> {
-    if a.result.is_some() || a.done {
+async fn fresh_not_landed(a: &Attempt, hash: Option<&str>) -> Result<bool> {
+    if a.result.is_some() || a.done || !restore_empty(a).await? {
         return Ok(false);
     }
-    if !restore_empty(a).await? {
-        return Ok(false);
-    }
-    let states = states(&a.mint, &a.inputs).await?;
-    let mut matching_spent = false;
-    for s in states.states {
+    for s in states(&a.mint, &a.inputs).await?.states {
         match s.state {
             State::Unspent => {}
             State::Spent => {
@@ -594,10 +589,7 @@ async fn fresh_not_landed(
                 let Some(Witness::HTLCWitness(w)) = s.witness else {
                     return Ok(false);
                 };
-                let matches = matches_preimage(&w.preimage, hash);
-                if require_claim_spent {
-                    matching_spent |= matches;
-                } else if matches {
+                if matches_preimage(&w.preimage, hash) {
                     return Ok(false);
                 }
             }
@@ -605,7 +597,7 @@ async fn fresh_not_landed(
         }
     }
     // A swap may have landed during NUT-07. Never infer absence from the first restore.
-    Ok(restore_empty(a).await? && (!require_claim_spent || matching_spent))
+    restore_empty(a).await
 }
 async fn restore_empty(a: &Attempt) -> Result<bool> {
     let r: RestoreResponse = rpc(
@@ -654,20 +646,54 @@ pub async fn claim_not_landed(
     {
         return Ok(false);
     }
-    fresh_not_landed(&a, Some(hash), false).await
+    fresh_not_landed(&a, Some(hash)).await
 }
 pub async fn lock_not_landed(j: &Journal, id: &str) -> Result<bool> {
     let a: Attempt = j.get("attempt", id).await?.context("missing lock")?;
-    Ok(a.abandoned && fresh_not_landed(&a, None, false).await?)
+    Ok(a.abandoned && fresh_not_landed(&a, None).await?)
 }
-pub async fn failed_refund(j: &Journal, id: &str, hash: &str) -> Result<bool> {
+pub async fn failed_refund(j: &Journal, id: &str, hash: &str) -> Result<Option<String>> {
     let mut a: Attempt = j.get("attempt", id).await?.context("missing refund")?;
-    if !fresh_not_landed(&a, Some(hash), true).await? {
-        return Ok(false);
+    if a.result.is_some() || a.done || !restore_empty(&a).await? {
+        return Ok(None);
+    }
+    let observed = states(&a.mint, &a.inputs).await?;
+    let preimage = observed.states.iter().find_map(|s| {
+        if s.state != State::Spent {
+            return None;
+        }
+        match &s.witness {
+            Some(Witness::HTLCWitness(w)) if matches_preimage(&w.preimage, hash) => {
+                Some(w.preimage.clone())
+            }
+            _ => None,
+        }
+    });
+    let Some(preimage) = preimage else {
+        return Ok(None);
+    };
+    let preimage = hex::encode(hex::decode(preimage)?);
+    // Positive knowledge survives even if the final restore fails or another input is
+    // PENDING. It authorizes a claim, NEVER a replacement refund without fresh absence.
+    a.observed_preimage = Some(preimage.clone());
+    j.put("attempt", id, &a).await?;
+    if observed.states.iter().any(|s| match s.state {
+        State::Unspent => false,
+        State::Spent => !matches!(s.witness, Some(Witness::HTLCWitness(_))),
+        _ => true,
+    }) || !restore_empty(&a).await?
+    {
+        return Ok(None);
     }
     a.abandoned = true;
     j.put("attempt", id, &a).await?;
-    Ok(true)
+    Ok(Some(preimage))
+}
+pub async fn refund_preimage(j: &Journal, id: &str, hash: &str) -> Result<Option<String>> {
+    Ok(j.get::<Attempt>("attempt", id)
+        .await?
+        .and_then(|a| a.observed_preimage)
+        .filter(|pre| matches_preimage(pre, hash)))
 }
 pub async fn unforwardable(j: &Journal, id: &str) -> Result<Option<Proofs>> {
     let Some(a) = j.get::<Attempt>("attempt", id).await? else {

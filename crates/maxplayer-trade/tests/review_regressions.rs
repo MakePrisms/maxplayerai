@@ -936,6 +936,9 @@ async fn n4_partial_claim_wins_nut07_swap_race_reselects_refund() {
         }
     );
     recovery.unwrap();
+    // The initial witness scan is unavailable. The refund's own fresh-evidence check
+    // must preserve the preimage it learns later and claim in THIS recovery step.
+    f.a.faults.hide_witness_once.store(true, SeqCst);
     coordinator::recover(&f.maker, &f.jm, &f.mm).await.unwrap();
     assert_eq!(
         f.state(true, &id).await.as_deref(),

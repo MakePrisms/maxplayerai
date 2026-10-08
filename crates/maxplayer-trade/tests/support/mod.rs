@@ -33,6 +33,7 @@ pub struct Faults {
     pub reject_restore: std::sync::atomic::AtomicBool,
     pub reject_swap: std::sync::atomic::AtomicBool,
     pub lose_reply: std::sync::atomic::AtomicBool,
+    pub hide_witness_once: std::sync::atomic::AtomicBool,
     pub hide_witness: std::sync::atomic::AtomicBool,
     pub invalid_dleq: std::sync::atomic::AtomicBool,
     pub pending_inputs: std::sync::atomic::AtomicBool,
@@ -172,7 +173,10 @@ impl MintFixture {
                                 }
                             }
                         }
-                        if path.ends_with("/checkstate") && control.hide_witness.load(SeqCst) {
+                        if path.ends_with("/checkstate")
+                            && (control.hide_witness.load(SeqCst)
+                                || control.hide_witness_once.swap(false, SeqCst))
+                        {
                             if let Some(states) = v["states"].as_array_mut() {
                                 for state in states {
                                     state.as_object_mut().unwrap().remove("witness");
