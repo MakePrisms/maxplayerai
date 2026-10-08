@@ -46,9 +46,8 @@ or a published listing is not approval for a new operation. State:
   have their own unresolved-payment risk, not a guaranteed 75-minute timeout.
 - A mint can steal its tokens. If the counterparty vanishes, funds stay locked until
   the refund deadline and successful recovery. `serve` must stay up for a seller.
-  NUT-14 claims remain valid after locktime. Nutshell refund status: **unverified**
-  unless the version-specific evidence in [verification](references/verification.md)
-  says otherwise. NUT-07 advertisement alone does not prove witness emission.
+  NUT-14 claims remain valid after locktime. Nutshell refund status: round 4 reports a **successful cashu.cz Nutshell/0.21.0
+  refund**; see the version-specific limits in [verification](references/verification.md). NUT-07 advertisement alone does not prove witness emission.
 
 Use the human's price and fee budget, never more permissive limits. If fees are
 unspecified, propose a numeric cap and wait for yes; the CLI default is not consent.
