@@ -40,7 +40,13 @@ pub struct Attempt {
     send_before: Option<u64>,
     #[serde(default)]
     pub abandoned: bool,
+    #[serde(default)]
+    pub unforwardable: bool,
 }
+pub const RPC_TIMEOUT_SECONDS: u64 = 20;
+// Three RPC timeouts: the swap timeout plus two timeouts of scheduling/clock margin.
+pub const ABANDON_GRACE_SECONDS: u64 = 3 * RPC_TIMEOUT_SECONDS;
+
 pub async fn rpc<T: serde::de::DeserializeOwned>(
     mint: &str,
     op: &str,
@@ -49,7 +55,7 @@ pub async fn rpc<T: serde::de::DeserializeOwned>(
     crate::Asset::new(mint)?.fence()?;
     let r = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(20))
+        .timeout(std::time::Duration::from_secs(RPC_TIMEOUT_SECONDS))
         .build()?
         .post(format!("{mint}/v1/{op}"))
         .json(body)
@@ -239,6 +245,7 @@ pub async fn lock(
                 result: None,
                 done: false,
                 abandoned: false,
+                unforwardable: false,
                 send_before: Some(send_before),
             },
         )
@@ -286,6 +293,7 @@ pub async fn redeem(
                 result: None,
                 done: false,
                 abandoned: false,
+                unforwardable: false,
                 send_before,
             },
         )
@@ -309,21 +317,29 @@ pub async fn execute(home: &Path, j: &Journal, id: &str) -> Result<Proofs> {
             let signatures = if restored.outputs.is_empty() && restored.signatures.is_empty() {
                 let now = crate::wallet::action_time(&a.mint).await?;
                 if a.send_before
-                    .is_some_and(|exp| now > exp.saturating_add(20))
+                    .is_some_and(|exp| now > exp.saturating_add(ABANDON_GRACE_SECONDS))
                 {
-                    unspent(&a.mint, &a.inputs).await?;
-                    a.abandoned = true;
-                    j.put("attempt", id, &a).await?;
+                    let hash = a.inputs.first().and_then(|p| {
+                        let secret: cashu::nuts::nut10::Secret = (&p.secret).try_into().ok()?;
+                        (secret.kind() == cashu::nuts::nut10::Kind::HTLC)
+                            .then(|| secret.secret_data().data().to_owned())
+                    });
+                    if fresh_not_landed(&a, hash.as_deref(), false).await? {
+                        a.abandoned = true;
+                        j.put("attempt", id, &a).await?;
+                    }
                 }
                 ensure!(
                     !a.abandoned,
                     "attempt abandoned; outputs retained and never resubmitted"
                 );
+                unspent(&a.mint, &a.inputs).await?;
+                // Refresh mint time after NUT-07. No RPC may separate this gate and swap POST.
+                let now = crate::wallet::action_time(&a.mint).await?;
                 ensure!(
                     a.send_before.is_none_or(|exp| now < exp),
                     "attempt deadline passed; retained for reconciliation, no new swap"
                 );
-                unspent(&a.mint, &a.inputs).await?;
                 #[cfg(feature = "lab")]
                 if std::env::var("TRADE_CRASH_BEFORE_SWAP").ok().as_deref() == Some(id) {
                     std::process::exit(87);
@@ -389,17 +405,23 @@ pub async fn execute(home: &Path, j: &Journal, id: &str) -> Result<Proofs> {
         // Persist first; a missing DLEQ must not hide recoverable owned outputs.
         let w = wallet(home, &a.mint).await?;
         if result.iter().any(|p| p.dleq.is_some()) {
-            w.verify_token_dleq(&Token::new(
-                a.mint.parse()?,
-                result
-                    .iter()
-                    .filter(|p| p.dleq.is_some())
-                    .cloned()
-                    .collect(),
-                None,
-                CurrencyUnit::Sat,
-            ))
-            .await?;
+            let verified = w
+                .verify_token_dleq(&Token::new(
+                    a.mint.parse()?,
+                    result
+                        .iter()
+                        .filter(|p| p.dleq.is_some())
+                        .cloned()
+                        .collect(),
+                    None,
+                    CurrencyUnit::Sat,
+                ))
+                .await;
+            if let Err(e) = verified {
+                a.unforwardable = a.outputs.iter().any(|o| !o.owned);
+                j.put("attempt", id, &a).await?;
+                return Err(e.into());
+            }
         }
         unspent(&a.mint, result).await?;
         let owned = result
@@ -419,16 +441,22 @@ pub async fn execute(home: &Path, j: &Journal, id: &str) -> Result<Proofs> {
             .await?
             .update_proofs(owned, a.inputs.ys()?)
             .await?;
-        ensure!(
-            result
-                .iter()
-                .zip(&a.outputs)
-                .all(|(p, o)| o.owned || p.dleq.is_some()),
-            "mint omitted DLEQ on forwarded proofs; owned change credited"
-        );
+        if !result
+            .iter()
+            .zip(&a.outputs)
+            .all(|(p, o)| o.owned || p.dleq.is_some())
+        {
+            a.unforwardable = true;
+            j.put("attempt", id, &a).await?;
+            bail!("mint omitted DLEQ on forwarded proofs; owned change credited");
+        }
         a.done = true;
         j.put("attempt", id, &a).await?;
     }
+    ensure!(
+        !a.unforwardable,
+        "unforwardable lock is retained for refund, never forwarding"
+    );
     Ok(a.result
         .unwrap()
         .into_iter()
@@ -539,4 +567,218 @@ pub async fn refunded_all(j: &Journal, id: &str, outgoing: &Proofs) -> Result<bo
     Ok(a.done
         && a.inputs.ys()?.into_iter().collect::<HashSet<_>>()
             == outgoing.ys()?.into_iter().collect::<HashSet<_>>())
+}
+
+/// Snapshot evidence, never a cached authorization. Both restores must be wholly empty.
+/// For claims, a SPENT input is safe only with an explicit nonmatching refund witness.
+async fn fresh_not_landed(
+    a: &Attempt,
+    hash: Option<&str>,
+    require_claim_spent: bool,
+) -> Result<bool> {
+    if a.result.is_some() || a.done {
+        return Ok(false);
+    }
+    if !restore_empty(a).await? {
+        return Ok(false);
+    }
+    let states = states(&a.mint, &a.inputs).await?;
+    let mut matching_spent = false;
+    for s in states.states {
+        match s.state {
+            State::Unspent => {}
+            State::Spent => {
+                let Some(hash) = hash else {
+                    return Ok(false);
+                };
+                let Some(Witness::HTLCWitness(w)) = s.witness else {
+                    return Ok(false);
+                };
+                let matches = matches_preimage(&w.preimage, hash);
+                if require_claim_spent {
+                    matching_spent |= matches;
+                } else if matches {
+                    return Ok(false);
+                }
+            }
+            _ => return Ok(false),
+        }
+    }
+    // A swap may have landed during NUT-07. Never infer absence from the first restore.
+    Ok(restore_empty(a).await? && (!require_claim_spent || matching_spent))
+}
+async fn restore_empty(a: &Attempt) -> Result<bool> {
+    let r: RestoreResponse = rpc(
+        &a.mint,
+        "restore",
+        &RestoreRequest {
+            outputs: a.outputs.iter().map(|o| o.message.clone()).collect(),
+        },
+    )
+    .await?;
+    Ok(r.outputs.is_empty() && r.signatures.is_empty())
+}
+/// Same-step proof required at the taker's refund, including after persisted abandonment.
+pub async fn claim_not_landed(
+    j: &Journal,
+    id: &str,
+    mint: &str,
+    incoming: &Proofs,
+    hash: &str,
+) -> Result<bool> {
+    let Some(a) = j.get::<Attempt>("attempt", id).await? else {
+        // No claim was submitted, but counterparty evidence must still be unambiguous.
+        if incoming.is_empty() {
+            return Ok(true);
+        }
+        for s in states(mint, incoming).await?.states {
+            match s.state {
+                State::Unspent => {}
+                State::Spent => match s.witness {
+                    Some(Witness::HTLCWitness(w)) if !matches_preimage(&w.preimage, hash) => {}
+                    _ => return Ok(false),
+                },
+                _ => return Ok(false),
+            }
+        }
+        return Ok(true);
+    };
+    ensure!(
+        a.mint == mint && a.inputs.ys()? == incoming.ys()?,
+        "claim input binding mismatch"
+    );
+    let time = crate::wallet::action_time(mint).await?;
+    if !a
+        .send_before
+        .is_some_and(|exp| time > exp.saturating_add(ABANDON_GRACE_SECONDS))
+    {
+        return Ok(false);
+    }
+    fresh_not_landed(&a, Some(hash), false).await
+}
+pub async fn lock_not_landed(j: &Journal, id: &str) -> Result<bool> {
+    let a: Attempt = j.get("attempt", id).await?.context("missing lock")?;
+    Ok(a.abandoned && fresh_not_landed(&a, None, false).await?)
+}
+pub async fn failed_refund(j: &Journal, id: &str, hash: &str) -> Result<bool> {
+    let mut a: Attempt = j.get("attempt", id).await?.context("missing refund")?;
+    if !fresh_not_landed(&a, Some(hash), true).await? {
+        return Ok(false);
+    }
+    a.abandoned = true;
+    j.put("attempt", id, &a).await?;
+    Ok(true)
+}
+pub async fn unforwardable(j: &Journal, id: &str) -> Result<Option<Proofs>> {
+    let Some(a) = j.get::<Attempt>("attempt", id).await? else {
+        return Ok(None);
+    };
+    Ok(a.unforwardable.then(|| {
+        a.result
+            .unwrap()
+            .into_iter()
+            .zip(a.outputs)
+            .filter(|(_, o)| !o.owned)
+            .map(|(p, _)| p)
+            .collect()
+    }))
+}
+
+/// Repair DLEQ metadata from the mint, without ever forwarding this lock. Invalid change
+/// stays quarantined until independently verified; spent funding inputs are never released.
+pub async fn settle_unforwardable(home: &Path, j: &Journal, id: &str) -> Result<()> {
+    let mut a: Attempt = j.get("attempt", id).await?.context("missing lock")?;
+    ensure!(a.unforwardable, "not an unforwardable lock");
+    if a.done {
+        return Ok(());
+    }
+    let r: RestoreResponse = rpc(
+        &a.mint,
+        "restore",
+        &RestoreRequest {
+            outputs: a.outputs.iter().map(|o| o.message.clone()).collect(),
+        },
+    )
+    .await?;
+    ensure!(
+        r.outputs.len() == a.outputs.len() && r.signatures.len() == a.outputs.len(),
+        "incomplete lock restore"
+    );
+    let signatures = a
+        .outputs
+        .iter()
+        .map(|o| {
+            let i = r
+                .outputs
+                .iter()
+                .position(|m| m == &o.message)
+                .context("restore output mismatch")?;
+            let sig = r.signatures[i].clone();
+            ensure!(
+                sig.amount == o.message.amount && sig.keyset_id == o.message.keyset_id,
+                "signature mismatch"
+            );
+            Ok(sig)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let w = wallet(home, &a.mint).await?;
+    let keys = w.load_keyset_keys(a.outputs[0].message.keyset_id).await?;
+    let result = cdk::dhke::construct_proofs(
+        signatures,
+        a.outputs
+            .iter()
+            .map(|o| o.r.parse())
+            .collect::<std::result::Result<Vec<SecretKey>, _>>()?,
+        a.outputs.iter().map(|o| o.secret.clone()).collect(),
+        &keys,
+    )?;
+    // Refuse invalid present DLEQ, including on change. Missing DLEQ still never forwards.
+    let present: Proofs = result
+        .iter()
+        .filter(|p| p.dleq.is_some())
+        .cloned()
+        .collect();
+    if !present.is_empty() {
+        w.verify_token_dleq(&Token::new(
+            a.mint.parse()?,
+            present,
+            None,
+            CurrencyUnit::Sat,
+        ))
+        .await?;
+    }
+    let owned: Proofs = result
+        .iter()
+        .zip(&a.outputs)
+        .filter(|(_, o)| o.owned)
+        .map(|(p, _)| p.clone())
+        .collect();
+    if !owned.is_empty() {
+        unspent(&a.mint, &owned).await?;
+    }
+    // Only the exact lock result may replace the original record.
+    ensure!(
+        result.ys()? == a.result.as_ref().context("missing result")?.ys()?,
+        "lock output identity changed"
+    );
+    database(home, &a.mint)
+        .await?
+        .update_proofs(
+            owned
+                .into_iter()
+                .map(|p| {
+                    ProofInfo::new(
+                        p,
+                        a.mint.parse().unwrap(),
+                        State::Unspent,
+                        CurrencyUnit::Sat,
+                    )
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+            a.inputs.ys()?,
+        )
+        .await?;
+    a.result = Some(result);
+    a.done = true;
+    j.put("attempt", id, &a).await
 }

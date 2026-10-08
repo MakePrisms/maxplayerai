@@ -100,6 +100,8 @@ pub struct Swap {
     pub outgoing: Proofs,
     pub incoming: Proofs,
     pub max_fees: u64,
+    #[serde(default)]
+    pub refund_generation: u32,
 }
 fn terminal(s: &Swap) -> bool {
     ["complete", "complete_unclaimed", "refunded", "expired"].contains(&s.state.as_str())
@@ -202,9 +204,7 @@ pub async fn cancel(home: &Path, j: &Journal, m: &Market, id: &str) -> Result<()
     ensure!(l.active.is_none(), "cannot cancel active swap");
     l.cancelled = true;
     j.put("listing", id, &l).await?;
-    if l.active.is_none() {
-        mint::release(home, &l.plan, &l.reservation).await?;
-    }
+    mint::release(home, &l.plan, &l.reservation).await?;
     finish_listing(j, m, &mut l, Status::Cancelled).await
 }
 async fn finish_listing(j: &Journal, m: &Market, l: &mut Listing, status: Status) -> Result<()> {
@@ -278,6 +278,7 @@ pub async fn start_take(
         request,
         quote: None,
         plan,
+        refund_generation: 0,
         state: "requested".into(),
         outgoing: vec![],
         incoming: vec![],
@@ -415,6 +416,7 @@ async fn handle_message(home: &Path, j: &Journal, m: &Market, e: &Event) -> Resu
             request: req,
             quote: Some(q.clone()),
             plan: l.plan.clone(),
+            refund_generation: 0,
             state: "quoted".into(),
             outgoing: vec![],
             incoming: vec![],
@@ -515,7 +517,7 @@ async fn handle_message(home: &Path, j: &Journal, m: &Market, e: &Event) -> Resu
                     mint::matches_preimage(pre, &q.request.hash),
                     "invalid claimed preimage"
                 );
-                s.preimage = Some(pre.to_owned());
+                s.preimage = Some(hex::encode(hex::decode(pre)?));
                 s.state = "claiming".into();
                 save(j, &s).await?;
             }
@@ -535,7 +537,7 @@ pub async fn advance(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Resu
     let taker = s.role == "taker";
     let lock_id = format!("{}-lock", s.id);
     let claim_id = format!("{}-claim", s.id);
-    if s.state == "accepted" || s.state == "first_validated" {
+    if ["accepted", "first_validated", "lock_reconciling"].contains(&s.state.as_str()) {
         let result: Result<Proofs> = async {
             if j.get::<mint::Attempt>("attempt", &lock_id).await?.is_none() {
                 ensure!(
@@ -570,19 +572,37 @@ pub async fn advance(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Resu
             }
             Err(e) => {
                 eprintln!("lock {}: {e}", s.id);
-                if j.get::<mint::Attempt>("attempt", &lock_id)
+                if let Some(proofs) = mint::unforwardable(j, &lock_id).await? {
+                    s.outgoing = proofs;
+                    s.state = "lock_unforwardable".into();
+                    save(j, s).await?;
+                } else if j
+                    .get::<mint::Attempt>("attempt", &lock_id)
                     .await?
                     .is_some_and(|a| a.abandoned)
                 {
+                    // Persist a retryable state before release; a late result is restored next tick.
+                    s.state = "lock_reconciling".into();
+                    save(j, s).await?;
+                    if !mint::lock_not_landed(j, &lock_id).await? {
+                        return Ok(());
+                    }
                     if taker {
-                        mint::release(home, &s.plan, &s.id).await?;
+                        if let Err(e) = mint::release(home, &s.plan, &s.id).await {
+                            eprintln!("lock release {}: {e}", s.id);
+                            return Ok(());
+                        }
                     } else {
                         let mut l: Listing = j.get("listing", &s.lot.id.to_hex()).await?.unwrap();
-                        // Abandon the lot too, so its backing reservation can be released.
+                        // Keep the active index intact if a late lock races release. Recovery
+                        // must reach execute again, not loop in cancelled-listing cleanup.
+                        if let Err(e) = mint::release(home, &l.plan, &l.reservation).await {
+                            eprintln!("maker lock release {}: {e}", s.id);
+                            return Ok(());
+                        }
                         l.cancelled = true;
                         l.active = None;
                         j.put("listing", &s.lot.id.to_hex(), &l).await?;
-                        mint::release(home, &l.plan, &l.reservation).await?;
                         finish_listing(j, m, &mut l, Status::Cancelled).await?;
                     }
                     s.state = "expired".into();
@@ -591,6 +611,11 @@ pub async fn advance(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Resu
                 }
             }
         }
+    }
+    if s.state == "lock_unforwardable" {
+        // Do not forward even if a later restore repairs DLEQ. Settle owned change and
+        // funding reservations before following the normal timed refund path.
+        mint::settle_unforwardable(home, j, &lock_id).await?;
     }
     if taker && s.state == "second_validated" {
         let result: Result<()> = async {
@@ -622,7 +647,15 @@ pub async fn advance(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Resu
             eprintln!("claim {}: {e}", s.id);
         }
     }
-    if !taker && ["second_locked", "claiming", "settling"].contains(&s.state.as_str()) {
+    if !taker
+        && [
+            "second_locked",
+            "claiming",
+            "settling",
+            "lock_unforwardable",
+        ]
+        .contains(&s.state.as_str())
+    {
         if s.preimage.is_none() {
             match mint::witness(&own_mint, &s.outgoing, &q.request.hash).await {
                 Ok(Some(pre)) => {
@@ -658,14 +691,28 @@ pub async fn advance(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Resu
                 Err(e) => eprintln!("maker claim {}: {e}", s.id),
             }
         }
-        let refund_id = format!("{}-refund", s.id);
-        let refund_started = j
+        let mut refund_id = if s.refund_generation == 0 {
+            format!("{}-refund", s.id)
+        } else {
+            format!("{}-refund-{}", s.id, s.refund_generation)
+        };
+        let mut refund_started = j
             .get::<mint::Attempt>("attempt", &refund_id)
             .await?
             .is_some();
         if refund_started {
             if let Err(e) = mint::execute(home, j, &refund_id).await {
                 eprintln!("refund recovery {}: {e}", s.id);
+                if mint::failed_refund(j, &refund_id, &q.request.hash).await? {
+                    // Preserve the failed attempt forever; a durable generation selects fresh inputs.
+                    s.refund_generation = s
+                        .refund_generation
+                        .checked_add(1)
+                        .context("refund generation overflow")?;
+                    save(j, s).await?;
+                    refund_id = format!("{}-refund-{}", s.id, s.refund_generation);
+                    refund_started = false;
+                }
             }
         }
         let time = wallet::action_time(&own_mint).await?;
@@ -721,11 +768,21 @@ pub async fn advance(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Resu
             save(j, s).await?;
         }
     }
-    if taker && ["first_locked", "second_validated"].contains(&s.state.as_str()) {
+    if taker
+        && ["first_locked", "second_validated", "lock_unforwardable"].contains(&s.state.as_str())
+    {
         let time = wallet::action_time(&own_mint).await?;
-        let claim = j.get::<mint::Attempt>("attempt", &claim_id).await?;
-        // Ambiguous or successful claims can NEVER authorize a refund of our payment.
-        if time > q.long + q.margin && claim.is_none_or(|a| a.abandoned) {
+        // Errors, PENDING, matching claim witnesses or nonempty restores all fail closed.
+        if time > q.long + q.margin
+            && mint::claim_not_landed(
+                j,
+                &claim_id,
+                &q.lot.give.asset.mint_url,
+                &s.incoming,
+                &q.request.hash,
+            )
+            .await?
+        {
             let refund_id = format!("{}-refund", s.id);
             if j.get::<mint::Attempt>("attempt", &refund_id)
                 .await?
