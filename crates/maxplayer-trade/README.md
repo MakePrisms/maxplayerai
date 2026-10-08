@@ -5,13 +5,17 @@ A fixed-lot CLI, independent of jobs, the maxplayer daemon, core, and `relay.max
 recovery, fee-inclusive net delivery, and a signed `sold` status. This is a test-money
 prototype, not a production deployment or an unconditional atomicity guarantee.
 
+Current operating policy is in [Round 4](#round-4-relay-policy-and-real-money-integration-author-led-verification).
+Earlier dated verification sections are historical snapshots, not current coverage totals.
+
 ## Implemented
 
-- `list`, `discover`, `cancel`, `serve`, `take`, `recover`, `preflight`, `fund`, `balance`.
+- `list`, `discover`, `cancel`, `serve`, `take`, `recover`, `preflight`, `fund`, `balance`, `withdraw`.
 - Immutable signed 3410 lots (24 hours), hash-chained 3411 statuses, signature/content/tag
   validation, fork/gap quarantine, no terminal reopening. Every configured relay is queried;
   discovery unions their results. No EOSE is an error, not an empty market; partial relay
-  failures are reported separately. Every publication is attempted at every configured relay.
+  failures are reported separately. Every publication is journaled and attempted on eligible configured relays;
+  positive receipts, cooldowns and bounded retry budgets survive restart.
 - NIP-44 v2 encrypted 23412 negotiation, NIP-42 authentication, raw relay-message reception
   (retries are not suppressed by SDK event dedup), persisted signed outbox and request digests.
   Conflicting request IDs are rejected; quote rejection outcomes and completed swaps are retained.
@@ -46,8 +50,8 @@ The default permitted mints are `https://testnut.cashudevkit.org`, `https://test
 and loopback HTTP(S) mints. Real mints require both `TRADE_REAL_MONEY_TEST=1` and a repeated
 global `--real-mint-allow <exact-canonical-HTTPS-URL>` for each mint, on every invocation.
 No wildcard, prefix, environment-only, or persisted authorization exists. HTTP redirects are disabled.
-Default relays: `wss://relay.ditto.pub`, `wss://relay.damus.io`; repeat global `--relay URL`
-to configure alternatives, including `wss://nostr-pub.wellorder.net`. The production relay is
+Default relays: `wss://nos.lol`, `wss://relay.primal.net`, `wss://offchain.pub`; repeat
+`--relay URL` before the command to configure alternatives. The production relay is
 explicitly forbidden. No production relay writes were made.
 
 ## Agent skill
@@ -661,3 +665,60 @@ spend ceiling. The live run stopped before funding because that cannot enforce t
 hard source-wallet budget. No source-wallet CLI/core edits or budget waiver were made.
 The inherited round-3 review work on the base trade coordinator is separate; its parallel
 worktree and PR were not changed by this implementation.
+
+## Round 4 relay policy and real-money integration (author-led verification)
+
+Testing-only opt-in and journaled `withdraw` were cherry-picked onto the third-pass
+quarantine fix. Both `TRADE_REAL_MONEY_TEST=1` and an exact `--real-mint-allow` are
+required for real mints. Neither changes the default fake-money fence or enables lab
+clocks. Gross locks remain capped at 500 sats; funding is cumulatively capped at 500
+sats per mint per home, counting even unresolved intents. No maxplayer CLI/core changes.
+
+### Relay traffic and failure behavior
+
+The serialized healthy-trade regression publishes **10 unique events per relay**: lot, available, sold, plus
+request, quote, first, second, claimed and one done from each party. The trade/sell-back
+regression asserts this count and exactly one attempt per event on a healthy relay.
+A concurrent live trade can omit the claimed notice if mint evidence already makes the
+taker complete before that notice is sent, giving nine rather than ten unique events.
+Before this fix, the three-second serve/recover tick resent unchanged state messages
+(up to 20 sends/minute per waiting role/relay, plus handling-triggered sends); replayed
+requests caused more quote replies. Listing completion resent the available status.
+A disposable original-head two-relay reproduction completed one trade in 7.60 seconds
+with **38 publication attempts for 10 unique events** (3410: 2, 3411: 6, 23412: 30);
+individual events were sent up to ten times. The fixed healthy-path budget for the same
+two relays is 20 attempts (30 for the three new defaults). This measures avoidable
+amplification rather than guessing the historical relay threshold. The Damus ban reported repeated
+rate-limit violations, but its private threshold and exact historical send count are unknown.
+
+The publisher journals the signed event, retry charge and positive per-relay receipts.
+Success requires at least one recorded positive ACK; a missing/negative ACK is never
+success. Attempts run in parallel with a 12-second bound. Failed copies are revisited by
+serve/recover ticks, with exponential backoff (6 seconds initially, capped at 300 seconds,
+plus 0–5 seconds jitter) and at most 12 attempts per event/relay. ACKed copies are never
+republished, including after restart. `rate-limited:` pauses the entire relay for at least
+five minutes; `blocked:`/`banned:` disables writes to it for that home. No blind restart
+resets those limits. Exhausted/blocked delivery needs another explicitly configured relay;
+no automatic retry-budget reset exists. A 24-hour event-age bound stops historical retries.
+
+Admission of a quote/first/second leg additionally requires a receipt for the preceding
+local message. This cannot undo a lock already committed at a mint: its state must still
+be recorded even if publishing the resulting lock message fails. Such locks follow their
+normal timed refund path. Relay outage never authorizes a new spend or substitutes for
+mint evidence. Active swaps are recovered before listing publication; listing-delivery
+errors cannot skip other swaps' refund branches. Network attempts can delay a tick, so
+"three seconds" is a nominal cadence, not a real-time deadline guarantee.
+
+ACKs are not storage evidence. Two independent fresh-key probe rounds checked all three
+kinds, live subscription delivery, then fetch-by-id at least 60 seconds later. The second
+round used a new readback client that had not seen the live events. Selected defaults
+passed all checks; Ditto and Wellorder did not retain 23412 in these probes, and Nostr Band
+failed. This dated snapshot is not a promise of future public-relay retention. Encrypted
+23412 messages may be retained despite their ephemeral kind; do not promise deletion.
+
+Withdrawal states remain `quote_created`, `request_sent`, `pending`, and
+`paid_change_unreconciled` until reconciled. `done` requires exact restored, verified,
+accounted-for change and SPENT inputs, not PAID alone; `unpaid_released` requires safe
+absence/termination evidence. Ambiguous sends are not resubmitted. Preserve every funded
+home and exact authorization. Quarantined trade outputs never become withdrawal balance.
+The skill documents these states and the CLI help regression includes `withdraw --invoice`.

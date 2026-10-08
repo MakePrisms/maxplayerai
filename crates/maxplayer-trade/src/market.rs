@@ -1,13 +1,41 @@
 use crate::{LOT, STATUS, Status, TRADE, journal::Journal, lifecycle, parse_lot};
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, time::Duration};
-pub const DEFAULT_RELAYS: [&str; 2] = ["wss://relay.ditto.pub", "wss://relay.damus.io"];
+pub const DEFAULT_RELAYS: [&str; 3] = [
+    "wss://nos.lol",
+    "wss://relay.primal.net",
+    "wss://offchain.pub",
+];
 pub struct Market {
     pub clients: Vec<Client>,
     pub keys: Keys,
+    urls: Vec<String>,
     pub inbox: tokio::sync::mpsc::Receiver<Event>,
+}
+/// Per-event, per-relay receipts survive CLI restarts. An ACK is not a storage proof.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct Delivery {
+    pub ack: bool,
+    pub attempts: u32,
+    pub next: u64,
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Publication {
+    pub event: Event,
+    pub relays: BTreeMap<String, Delivery>,
+}
+#[derive(Default, Serialize, Deserialize)]
+struct RelayGate {
+    next: u64,
+    blocked: bool,
+}
+const MAX_PUBLICATION_ATTEMPTS: u32 = 12;
+fn retry_delay(attempt: u32) -> u64 {
+    // Independent random jitter, without ever logging random material.
+    let jitter = u64::from(uuid::Uuid::new_v4().as_bytes()[0]) % 6;
+    (3u64.saturating_mul(1u64 << attempt.min(7))).min(300) + jitter
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -81,10 +109,12 @@ impl Market {
         while tasks.join_next().await.is_some() {}
         Ok(Self {
             clients,
+            urls: urls.to_vec(),
             keys,
             inbox,
         })
     }
+    /// Unjournaled one-shot for diagnostics/fixtures; trading uses publish_durable.
     pub async fn publish(&self, e: &Event) -> Result<Vec<String>> {
         let mut tasks = tokio::task::JoinSet::new();
         for c in &self.clients {
@@ -105,6 +135,127 @@ impl Market {
             "relays unreachable: no publication ACK"
         );
         Ok(accepted)
+    }
+    /// Success requires at least one *recorded* positive ACK. Never infer success
+    /// from timeout, live delivery, retry exhaustion, or a negative OK response.
+    pub async fn publish_durable(&self, j: &Journal, e: &Event) -> Result<Vec<String>> {
+        let id = e.id.to_hex();
+        let mut row = j
+            .get::<Publication>("publication", &id)
+            .await?
+            .unwrap_or(Publication {
+                event: e.clone(),
+                relays: BTreeMap::new(),
+            });
+        let now = crate::coordinator::now();
+        let mut pending = Vec::new();
+        for (url, client) in self.urls.iter().zip(&self.clients) {
+            let gate = j
+                .get::<RelayGate>("relay_gate", &hex::encode(url))
+                .await?
+                .unwrap_or_default();
+            let d = row.relays.entry(url.clone()).or_default();
+            if d.ack
+                || d.attempts >= MAX_PUBLICATION_ATTEMPTS
+                || d.next > now
+                || gate.blocked
+                || gate.next > now
+            {
+                continue;
+            }
+            // Persist the retry charge BEFORE sending; a crash cannot reset the budget.
+            d.attempts += 1;
+            d.next = now + retry_delay(d.attempts);
+            let c = client.clone();
+            let event = e.clone();
+            let url = url.clone();
+            pending.push((url, c, event));
+        }
+        j.put("publication", &id, &row).await?;
+        let mut tasks = tokio::task::JoinSet::new();
+        for (url, c, event) in pending {
+            tasks.spawn(async move {
+                (
+                    url,
+                    tokio::time::timeout(Duration::from_secs(12), c.send_event(&event)).await,
+                )
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            let (url, result) = result?;
+            let d = row
+                .relays
+                .get_mut(&url)
+                .context("missing delivery intent")?;
+            let (ack, reason) = match result {
+                Ok(Ok(output)) => (
+                    !output.success.is_empty(),
+                    output
+                        .failed
+                        .values()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                ),
+                Ok(Err(error)) => (false, error.to_string()),
+                Err(_) => (false, "timeout".into()),
+            };
+            if ack {
+                d.ack = true;
+            } else {
+                let lower = reason.to_ascii_lowercase();
+                let mut gate = j
+                    .get::<RelayGate>("relay_gate", &hex::encode(&url))
+                    .await?
+                    .unwrap_or_default();
+                if lower.contains("blocked:") || lower.contains("banned:") {
+                    gate.blocked = true;
+                }
+                gate.next = gate.next.max(if lower.contains("rate-limited:") {
+                    now + 300 + retry_delay(d.attempts)
+                } else {
+                    d.next
+                });
+                j.put("relay_gate", &hex::encode(&url), &gate).await?;
+            }
+            j.put("publication", &id, &row).await?;
+        }
+        let accepted: Vec<String> = row
+            .relays
+            .iter()
+            .filter(|(_, d)| d.ack)
+            .map(|(u, _)| u.clone())
+            .collect();
+        ensure!(
+            !accepted.is_empty(),
+            "relays unreachable: no publication ACK (retained with bounded backoff)"
+        );
+        Ok(accepted)
+    }
+    /// Called by the serve/recover tick after active-swap recovery.
+    pub async fn retry_publications(&self, j: &Journal) -> Result<()> {
+        for row in j.all::<Publication>("publication").await? {
+            if row.event.created_at.as_secs().saturating_add(86400) < crate::coordinator::now() {
+                continue;
+            }
+            let _ = self.publish_durable(j, &row.event).await;
+        }
+        Ok(())
+    }
+    pub async fn require_sent(
+        &self,
+        j: &Journal,
+        peer: PublicKey,
+        swap: &str,
+        step: &str,
+    ) -> Result<()> {
+        let id = format!("{peer}_{swap}_{step}");
+        let event = j
+            .get::<Event>("outbox", &id)
+            .await?
+            .context("prerequisite publication missing")?;
+        self.publish_durable(j, &event).await?;
+        Ok(())
     }
     pub async fn query(&self, f: Filter) -> Result<(Vec<Event>, usize)> {
         let mut tasks = tokio::task::JoinSet::new();
@@ -213,7 +364,7 @@ impl Market {
             j.put("outbox", &id, &e).await?;
             e
         };
-        self.publish(&e).await?;
+        self.publish_durable(j, &e).await?;
         Ok(())
     }
     pub fn decode(&self, e: &Event) -> Result<Envelope> {

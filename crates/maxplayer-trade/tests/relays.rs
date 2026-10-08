@@ -1,6 +1,5 @@
 use maxplayer_trade::{Asset, Leg, Status, lot_event, market::Market, status_event};
 use nostr_relay_builder::prelude::*;
-use nostr_sdk::prelude::*;
 #[tokio::test]
 async fn discovery_unions_lot_and_status_from_different_relays() {
     let a = LocalRelay::new(RelayBuilder::default());
@@ -63,5 +62,172 @@ async fn production_relay_is_forbidden() {
         Market::connect(Keys::generate(), &["wss://relay.maxplayer.ai".into()])
             .await
             .is_err()
+    );
+}
+
+use maxplayer_trade::{journal::Journal, market::Publication};
+fn diagnostic(keys: &Keys, kind: u16) -> Event {
+    EventBuilder::new(Kind::Custom(kind), uuid::Uuid::new_v4().to_string())
+        .sign_with_keys(keys)
+        .unwrap()
+}
+#[tokio::test]
+async fn positive_ack_is_deduplicated_across_restart() {
+    let relay = LocalRelay::new(RelayBuilder::default());
+    relay.run().await.unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let j = Journal::open(home.path()).await.unwrap();
+    let keys = Keys::generate();
+    let m = Market::connect(keys.clone(), &[relay.url().await.to_string()])
+        .await
+        .unwrap();
+    let e = diagnostic(&keys, 3410);
+    m.publish_durable(&j, &e).await.unwrap();
+    for _ in 0..20 {
+        m.publish_durable(&j, &e).await.unwrap();
+    }
+    drop(j);
+    let j = Journal::open(home.path()).await.unwrap();
+    m.retry_publications(&j).await.unwrap();
+    let row = j
+        .get::<Publication>("publication", &e.id.to_hex())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        row.relays.values().all(|d| d.ack && d.attempts == 1),
+        "unchanged events must not be republished, even after reopen"
+    );
+}
+#[tokio::test]
+async fn rate_limited_relay_is_not_hammered_and_missing_ack_fails_closed() {
+    let relay = LocalRelay::new(RelayBuilder::default().rate_limit(RateLimit {
+        notes_per_minute: 1,
+        ..Default::default()
+    }));
+    relay.run().await.unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let j = Journal::open(home.path()).await.unwrap();
+    let keys = Keys::generate();
+    let m = Market::connect(keys.clone(), &[relay.url().await.to_string()])
+        .await
+        .unwrap();
+    m.publish_durable(&j, &diagnostic(&keys, 3410))
+        .await
+        .unwrap();
+    let refused = diagnostic(&keys, 3411);
+    assert!(
+        m.publish_durable(&j, &refused).await.is_err(),
+        "SAFETY: missing ACK must not count as publication success"
+    );
+    for _ in 0..20 {
+        assert!(m.publish_durable(&j, &refused).await.is_err());
+    }
+    let row = j
+        .get::<Publication>("publication", &refused.id.to_hex())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.relays.values().all(|d| !d.ack && d.attempts == 1));
+    let gate = j
+        .get::<serde_json::Value>("relay_gate", &hex::encode(relay.url().await.to_string()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        gate["next"].as_u64().unwrap() >= maxplayer_trade::coordinator::now() + 290,
+        "rate-limited OK must impose the five-minute relay-wide cooldown, not ordinary retry delay"
+    );
+    let another = diagnostic(&keys, 3411);
+    assert!(m.publish_durable(&j, &another).await.is_err());
+    let row = j
+        .get::<Publication>("publication", &another.id.to_hex())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        row.relays.values().all(|d| d.attempts == 0),
+        "rate limit applies across new events too"
+    );
+}
+#[tokio::test]
+async fn ephemeral_ack_does_not_prove_stored_readback() {
+    let relay = LocalRelay::new(RelayBuilder::default());
+    relay.run().await.unwrap();
+    let keys = Keys::generate();
+    let m = Market::connect(keys.clone(), &[relay.url().await.to_string()])
+        .await
+        .unwrap();
+    let e = diagnostic(&keys, 23412);
+    m.publish(&e).await.unwrap();
+    let fresh = Market::connect(Keys::generate(), &[relay.url().await.to_string()])
+        .await
+        .unwrap();
+    assert!(
+        fresh
+            .query(Filter::new().id(e.id))
+            .await
+            .unwrap()
+            .0
+            .is_empty(),
+        "ACK is not storage evidence"
+    );
+}
+
+#[derive(Debug, Clone)]
+struct BlockWrites(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+impl WritePolicy for BlockWrites {
+    fn admit_event<'a>(
+        &'a self,
+        _: &'a Event,
+        _: &'a std::net::SocketAddr,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = PolicyResult> + Send + 'a>> {
+        Box::pin(async move {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            PolicyResult::Reject("test block".into())
+        })
+    }
+}
+#[tokio::test]
+async fn blocked_relay_stays_blocked_across_events_and_restart_healthy_ack_suffices() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering::SeqCst},
+    };
+    let count = Arc::new(AtomicUsize::new(0));
+    let blocked = LocalRelay::new(RelayBuilder::default().write_policy(BlockWrites(count.clone())));
+    blocked.run().await.unwrap();
+    let good = LocalRelay::new(RelayBuilder::default());
+    good.run().await.unwrap();
+    let keys = Keys::generate();
+    let urls = [
+        blocked.url().await.to_string(),
+        good.url().await.to_string(),
+    ];
+    let m = Market::connect(keys.clone(), &urls).await.unwrap();
+    let h = tempfile::tempdir().unwrap();
+    let j = Journal::open(h.path()).await.unwrap();
+    assert_eq!(
+        m.publish_durable(&j, &diagnostic(&keys, 3410))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(j);
+    let j = Journal::open(h.path()).await.unwrap();
+    for _ in 0..3 {
+        assert_eq!(
+            m.publish_durable(&j, &diagnostic(&keys, 3411))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    assert_eq!(
+        count.load(SeqCst),
+        1,
+        "blocked relay must not be hammered by other events or a restart"
     );
 }

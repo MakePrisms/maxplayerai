@@ -10,7 +10,7 @@ async fn main() -> Result<()> {
         .context("usage: read_trade LOT_ID")?
         .parse()?;
     let mut union = BTreeMap::new();
-    for relay in ["wss://relay.ditto.pub", "wss://relay.damus.io"] {
+    for relay in maxplayer_trade::market::DEFAULT_RELAYS {
         let client = Client::default();
         client.add_relay(relay).await?;
         client.connect().await;

@@ -30,6 +30,24 @@ async fn swap_roundtrip(ppk: u64) {
         balance(&f.taker, &f.a.url).await,
         balance(&f.taker, &f.b.url).await,
     ];
+    // A completed trade uses three public events and seven encrypted envelopes:
+    // request, quote, first, second, claimed, and one done from each role.
+    let mut published =
+        f.jm.all::<maxplayer_trade::market::Publication>("publication")
+            .await
+            .unwrap();
+    published.extend(
+        f.jt.all::<maxplayer_trade::market::Publication>("publication")
+            .await
+            .unwrap(),
+    );
+    assert_eq!(published.len(), 10, "one trade's unique publication volume");
+    assert!(
+        published
+            .iter()
+            .all(|p| p.relays.values().all(|d| d.attempts == 1)),
+        "healthy trade must publish each event once per relay"
+    );
     let reverse = f.list(true).await;
     let rid = f.start(&reverse).await;
     f.pump(&rid, "complete").await;

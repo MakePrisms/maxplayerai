@@ -197,8 +197,8 @@ pub async fn list(
     // Persist reservation intent first; recovery completes it before any new wallet operation.
     j.put("listing", &id, &row).await?;
     mint::reserve(home, &row.plan, &row.reservation).await?;
-    m.publish(&row.event).await?;
-    m.publish(&row.statuses[0]).await?;
+    m.publish_durable(j, &row.event).await?;
+    m.publish_durable(j, &row.statuses[0]).await?;
     row.published = 1;
     j.put("listing", &id, &row).await?;
     println!(
@@ -221,7 +221,7 @@ pub async fn cancel(home: &Path, j: &Journal, m: &Market, id: &str) -> Result<()
 }
 async fn finish_listing(j: &Journal, m: &Market, l: &mut Listing, status: Status) -> Result<()> {
     if lifecycle(&l.event, &l.statuses)? == Status::Available {
-        let prev = l.statuses.last().unwrap();
+        let prev = l.statuses.last().context("listing has no status history")?;
         l.statuses.push(status_event(
             &m.keys,
             l.event.id,
@@ -234,8 +234,8 @@ async fn finish_listing(j: &Journal, m: &Market, l: &mut Listing, status: Status
     if l.published == l.statuses.len() {
         return Ok(());
     }
-    for e in &l.statuses {
-        m.publish(e).await?;
+    for e in &l.statuses[l.published..] {
+        m.publish_durable(j, e).await?;
     }
     l.published = l.statuses.len();
     j.put("listing", &l.event.id.to_hex(), l).await?;
@@ -351,6 +351,7 @@ async fn handle_message(home: &Path, j: &Journal, m: &Market, e: &Event) -> Resu
             .context("unknown lot")?;
         ensure!(
             !l.cancelled
+                && l.published > 0
                 && lifecycle(&l.event, &l.statuses)? == Status::Available
                 && l.active.is_none(),
             "lot busy or terminal"
@@ -447,6 +448,7 @@ async fn handle_message(home: &Path, j: &Journal, m: &Market, e: &Event) -> Resu
         "peer/lot mismatch"
     );
     if msg.step == "quote" && s.role == "taker" && s.quote.is_none() {
+        m.require_sent(j, s.peer.parse()?, &s.id, "request").await?;
         let q: Quote = serde_json::from_value(msg.body)?;
         let lot = parse_lot(&s.lot, now())?;
         let (long, short, cutoff, margin) = timing(&lot)?;
@@ -482,6 +484,7 @@ async fn handle_message(home: &Path, j: &Journal, m: &Market, e: &Event) -> Resu
         ensure!(msg.quote_hash == hash(q)?, "quote digest mismatch");
         match msg.step.as_str() {
             "first" if s.role == "maker" && s.state == "quoted" => {
+                m.require_sent(j, s.peer.parse()?, &s.id, "quote").await?;
                 ensure!(
                     now() < q.exp && now() + q.cutoff < q.short,
                     "late first lock"
@@ -504,6 +507,7 @@ async fn handle_message(home: &Path, j: &Journal, m: &Market, e: &Event) -> Resu
                 save(j, &s).await?;
             }
             "second" if s.role == "taker" && s.state == "first_locked" => {
+                m.require_sent(j, s.peer.parse()?, &s.id, "first").await?;
                 let p: Proofs = serde_json::from_value(msg.body)?;
                 let c =
                     mint::conditions(&q.request.hash, &q.request.taker_key, &q.maker_key, q.short)?;
@@ -637,7 +641,10 @@ async fn advance_inner(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Re
                             return Ok(());
                         }
                     } else {
-                        let mut l: Listing = j.get("listing", &s.lot.id.to_hex()).await?.unwrap();
+                        let mut l: Listing = j
+                            .get("listing", &s.lot.id.to_hex())
+                            .await?
+                            .context("missing maker listing")?;
                         // Keep the active index intact if a late lock races release. Recovery
                         // must reach execute again, not loop in cancelled-listing cleanup.
                         if let Err(e) = mint::release(home, &l.plan, &l.reservation).await {
@@ -678,7 +685,7 @@ async fn advance_inner(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Re
                     &q.lot.give.asset.mint_url,
                     &s.incoming,
                     &s.key,
-                    s.preimage.as_ref().unwrap(),
+                    s.preimage.as_ref().context("missing taker preimage")?,
                     s.max_fees,
                     Some(q.short - q.cutoff),
                 )
@@ -795,7 +802,10 @@ async fn advance_inner(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Re
         {
             s.state = "refunded".into();
             save(j, s).await?;
-            let mut l: Listing = j.get("listing", &s.lot.id.to_hex()).await?.unwrap();
+            let mut l: Listing = j
+                .get("listing", &s.lot.id.to_hex())
+                .await?
+                .context("missing maker listing")?;
             l.cancelled = true;
             finish_listing(j, m, &mut l, Status::Cancelled).await?;
         }
@@ -883,43 +893,6 @@ pub async fn recover(home: &Path, j: &Journal, m: &Market) -> Result<()> {
         eprintln!("money recovery: {e}");
     }
     let swaps = j.all::<Swap>("swap").await?;
-    for mut l in j.all::<Listing>("listing").await? {
-        if l.active
-            .as_ref()
-            .is_some_and(|id| swaps.iter().any(|s| &s.id == id && s.state == "expired"))
-        {
-            l.active = None;
-            if l.cancelled {
-                mint::release(home, &l.plan, &l.reservation).await?;
-            }
-            j.put("listing", &l.event.id.to_hex(), &l).await?;
-        }
-        if l.cancelled && lifecycle(&l.event, &l.statuses)? == Status::Available {
-            if l.active.is_none() {
-                mint::release(home, &l.plan, &l.reservation).await?;
-            }
-            finish_listing(j, m, &mut l, Status::Cancelled).await?;
-        }
-        if let Some(s) = swaps
-            .iter()
-            .find(|s| s.role == "maker" && s.lot.id == l.event.id && !terminal(s))
-        {
-            l.active = Some(s.id.clone());
-            j.put("listing", &l.event.id.to_hex(), &l).await?;
-        }
-        if l.active.is_none()
-            && !l.cancelled
-            && lifecycle(&l.event, &l.statuses)? == Status::Available
-        {
-            mint::reserve(home, &l.plan, &l.reservation).await?;
-            if l.published == 0 {
-                m.publish(&l.event).await?;
-                m.publish(&l.statuses[0]).await?;
-                l.published = 1;
-                j.put("listing", &l.event.id.to_hex(), &l).await?;
-            }
-        }
-    }
     for mut s in swaps {
         if s.state == "requested" && now() > s.created + 60 {
             mint::release(home, &s.plan, &s.id).await?;
@@ -930,8 +903,11 @@ pub async fn recover(home: &Path, j: &Journal, m: &Market) -> Result<()> {
 
         if terminal(&s) {
             if s.role == "maker" && ["complete", "refunded"].contains(&s.state.as_str()) {
-                let mut l: Listing = j.get("listing", &s.lot.id.to_hex()).await?.unwrap();
-                finish_listing(
+                let mut l: Listing = j
+                    .get("listing", &s.lot.id.to_hex())
+                    .await?
+                    .context("missing maker listing")?;
+                let publication = finish_listing(
                     j,
                     m,
                     &mut l,
@@ -941,7 +917,10 @@ pub async fn recover(home: &Path, j: &Journal, m: &Market) -> Result<()> {
                         Status::Cancelled
                     },
                 )
-                .await?;
+                .await;
+                if let Err(error) = publication {
+                    eprintln!("terminal listing publication: {error}");
+                }
             }
             continue;
         }
@@ -957,7 +936,10 @@ pub async fn recover(home: &Path, j: &Journal, m: &Market) -> Result<()> {
             s.state = "expired".into();
             save(j, &s).await?;
             if s.role == "maker" {
-                let mut l: Listing = j.get("listing", &s.lot.id.to_hex()).await?.unwrap();
+                let mut l: Listing = j
+                    .get("listing", &s.lot.id.to_hex())
+                    .await?
+                    .context("missing maker listing")?;
                 l.active = None;
                 if l.cancelled {
                     mint::release(home, &l.plan, &l.reservation).await?;
@@ -977,6 +959,52 @@ pub async fn recover(home: &Path, j: &Journal, m: &Market) -> Result<()> {
             eprintln!("recovery {}: {e}", s.id);
         }
     }
+    let swaps = j.all::<Swap>("swap").await?;
+    for mut l in j.all::<Listing>("listing").await? {
+        let publication: Result<()> = async {
+            if l.active
+                .as_ref()
+                .is_some_and(|id| swaps.iter().any(|s| &s.id == id && s.state == "expired"))
+            {
+                l.active = None;
+                if l.cancelled {
+                    mint::release(home, &l.plan, &l.reservation).await?;
+                }
+                j.put("listing", &l.event.id.to_hex(), &l).await?;
+            }
+            if l.cancelled && lifecycle(&l.event, &l.statuses)? == Status::Available {
+                if l.active.is_none() {
+                    mint::release(home, &l.plan, &l.reservation).await?;
+                }
+                finish_listing(j, m, &mut l, Status::Cancelled).await?;
+            }
+            if let Some(s) = swaps
+                .iter()
+                .find(|s| s.role == "maker" && s.lot.id == l.event.id && !terminal(s))
+            {
+                l.active = Some(s.id.clone());
+                j.put("listing", &l.event.id.to_hex(), &l).await?;
+            }
+            if l.active.is_none()
+                && !l.cancelled
+                && lifecycle(&l.event, &l.statuses)? == Status::Available
+            {
+                mint::reserve(home, &l.plan, &l.reservation).await?;
+                if l.published == 0 {
+                    m.publish_durable(j, &l.event).await?;
+                    m.publish_durable(j, &l.statuses[0]).await?;
+                    l.published = 1;
+                    j.put("listing", &l.event.id.to_hex(), &l).await?;
+                }
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = publication {
+            eprintln!("listing recovery: {error}");
+        }
+    }
+    m.retry_publications(j).await?;
     Ok(())
 }
 pub async fn run(home: &Path, j: &Journal, m: &mut Market, until: Option<&str>) -> Result<()> {

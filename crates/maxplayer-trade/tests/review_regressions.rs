@@ -1452,3 +1452,77 @@ async fn probe_maker_claim_quarantined() {
         a
     );
 }
+
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r4_all_relays_down_after_both_locks_still_refunds() {
+    let mut f = Fixture::new(0).await;
+    let id = through_second(&mut f).await;
+    let s = f.jm.get::<Swap>("swap", &id).await.unwrap().unwrap();
+    let q = s.quote.unwrap();
+    f.relay.shutdown();
+    wait_past(q.short + q.margin).await;
+    coordinator::recover(&f.maker, &f.jm, &f.mm).await.unwrap();
+    assert_eq!(
+        f.state(true, &id).await.as_deref(),
+        Some("refunded"),
+        "SAFETY: relay outage must not block mint-only maker refund"
+    );
+    wait_past(q.long + q.margin).await;
+    coordinator::recover(&f.taker, &f.jt, &f.mt).await.unwrap();
+    assert_eq!(
+        f.state(false, &id).await.as_deref(),
+        Some("refunded"),
+        "SAFETY: relay outage must not block mint-only taker refund"
+    );
+    assert_eq!(balance(&f.maker, &f.a.url).await, 128);
+    assert_eq!(balance(&f.taker, &f.b.url).await, 128);
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r4_missing_quote_ack_cannot_authorize_maker_lock() {
+    use maxplayer_trade::market::{Delivery, Publication};
+    let mut f = Fixture::new(0).await;
+    let lot = f.list(false).await;
+    let id = f.start(&lot).await;
+    f.step(true).await;
+    f.step(false).await;
+    // Model a relay delivering the quote while losing every OK reply. The
+    // taker's first lock is genuine; only the maker's receipt is absent.
+    let outbox = f.jm.all::<nostr_sdk::Event>("outbox").await.unwrap();
+    let quote = outbox
+        .into_iter()
+        .find(|e| f.mt.decode(e).is_ok_and(|m| m.step == "quote"))
+        .unwrap();
+    let mut row =
+        f.jm.get::<Publication>("publication", &quote.id.to_hex())
+            .await
+            .unwrap()
+            .unwrap();
+    for d in row.relays.values_mut() {
+        *d = Delivery {
+            ack: false,
+            attempts: 12,
+            next: u64::MAX,
+        };
+    }
+    f.jm.put("publication", &quote.id.to_hex(), &row)
+        .await
+        .unwrap();
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), f.mm.inbox.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let _ = coordinator::handle(&f.maker, &f.jm, &f.mm, &event).await;
+    assert_eq!(
+        f.state(true, &id).await.as_deref(),
+        Some("quoted"),
+        "SAFETY: missing ACK must not advance maker money state"
+    );
+    assert!(
+        f.jm.get::<mint::Attempt>("attempt", &format!("{id}-lock"))
+            .await
+            .unwrap()
+            .is_none(),
+        "SAFETY: missing ACK must not create lock authorization"
+    );
+}
