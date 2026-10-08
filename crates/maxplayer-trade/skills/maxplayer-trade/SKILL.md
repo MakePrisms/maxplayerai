@@ -1,109 +1,131 @@
 ---
 name: maxplayer-trade
-description: Sell or buy fixed lots of fake-money Cashu assets with the standalone maxplayer-trade CLI; fund, inspect balances, preflight mints, and recover interrupted trades.
+description: Trade Cashu tokens for a human with the standalone maxplayer-trade CLI, including real money. Use for “sell/list X of mint A for Y of mint B”, “buy that lot”, “find listings”, “fund my trade wallet”, “withdraw”, “check balance”, or “something got interrupted”.
 ---
 
-# Trade test Cashu assets
+# Trade Cashu for the human
 
-Use the standalone `maxplayer-trade` binary, not Maxplayer jobs, wallets, or daemon.
+## 1. Establish custody and scope
 
-## Shared preparation
+Use the standalone binary, not Maxplayer jobs or the Maxplayer wallet/daemon. Read
+[commands and limits](references/commands.md) before constructing a command and
+[recovery](references/recovery.md) before handling an interruption.
 
-1. Choose a private persistent home. Put `--home <home>` before every command and use
-   that same home throughout the role's lifetime. Never delete it during a trade.
-   Never print secrets, wallet seeds, proofs, preimages, or tokens; do not dump journals.
-2. Stay on fenced test mints: `https://testnut.cashudevkit.org`,
-   `https://testnut.cashu.space`, or a deliberately configured loopback test mint.
-   Real money is refused by default. Only for explicitly authorized small-value tests,
-   use the dual opt-in below. Run `preflight <mint>` for both mints.
-   Preflight advertisement is not proof of NUT-07 witness emission; missing evidence
-   at refund time deliberately blocks a taker refund. Escalate persistent ambiguity.
-3. Run `balance <mint>`. For fake auto-paid funding only, use
-   `fund <mint> --amount <amount>`; resume a retained quote with the same amount and
-   `--quote <quote-id>`. Never pay a real invoice. Check the resulting balance.
+Choose **one private, persistent absolute home** for this human's trade wallet. Put
+`--home <home>` before **every** command. Preserve that same home, keys, databases,
+and journals across restarts. Never delete it while funds, reservations, unresolved
+funding/withdrawals, or trades exist; retain it for historical recovery afterward.
+Never use a fresh home to evade caps. Only one process may own it: stop the watcher
+cleanly before another command, then promptly resume it if obligations remain.
+Never copy its seed into another active wallet.
 
-## Sell
+Never print secrets, seeds, keys, tokens, proofs, preimages, or raw journals; never
+attach a home or database to chat. Report only public IDs, mint URLs, amounts, states,
+and redacted errors. Invoice delivery belongs in the human's private conversation.
+**Done:** the correct home and authorized mint identities (URL + sat unit) are known.
 
-1. Match the user's exact assets, net price, and fee budget:
-   `list --give-mint <mint> --give <net> --want-mint <mint> --want <net> [--max-fees <cap>]`.
-   Record the public lot ID, not any private journal data.
-2. Keep `serve` running while funds are locked, until complete or refunded. The home
-   has an exclusive process lock: do not run another command concurrently on it.
-   After an interruption, run `recover` with the same home (and relay configuration).
-3. `cancel <lot>` is only for a listing with no active quote/swap; it cannot revoke
-   an authorized HTLC. Check cancellation output, never assume it unlocks an active trade.
+## 2. Check readiness and get explicit authorization
 
-## Buy
+Use `balance <mint>` and `preflight <mint>` for each relevant mint. Passing preflight
+allows a mint, but does not establish honesty or complete compatibility. The CLI
+also preflights before every fund/list/take: NUT-07/09/12/14, a sat keyset, reachable
+mint, and clock skew at most 60 seconds. Real mints need no opt-in setting. Never
+bypass a failed check. Gross locks and cumulative funding per mint per home are
+capped at **100,000 sats**; fees can make an otherwise eligible net amount too large.
 
-1. Run `discover` and select a public lot whose mint pair and price the user authorized.
-2. Before `take`, verify that `--max-give` matches the user's maximum total debit
-   including mint fees and `--min-receive` matches the user's minimum net receipt.
-   Never silently raise either spending or fee authority to make a trade work.
-3. Run `take <lot> --max-give <cap> --min-receive <minimum> [--max-fees <cap>]`.
-   Keep it running through settlement. After interruption run `recover`; use `serve`
-   if a continuous watcher is needed, keeping it running until complete or refunded.
+**Before every real-money `fund`, `list`, `take`, or `withdraw`, present the exact
+operation and get an explicit yes.** A broad “trade for me”, previous trade approval,
+or a published listing is not approval for a new operation. State:
 
-## Recovery and terminal outcomes
+- Both mint URLs and direction (or the single funding/withdrawal mint and destination).
+- Exact net amounts, maximum total debit, minimum receipt, and fee cap in sats.
+- Public lot ID for a purchase; invoice amount/destination for a withdrawal.
+- Worst-case normal trade lock budget: **about 75 minutes**, not a guaranteed release
+  time. Protocol locks are 60/15 minutes plus margins; outages or ambiguous evidence
+  can hold funds longer, indefinitely with a dishonest mint. Funding and withdrawal
+  have their own unresolved-payment risk, not a guaranteed 75-minute timeout.
+- A mint can steal its tokens. If the counterparty vanishes, funds stay locked until
+  the refund deadline and successful recovery. `serve` must stay up for a seller.
+  NUT-14 claims remain valid after locktime. Nutshell refund status: **unverified**
+  unless the version-specific evidence in [verification](references/verification.md)
+  says otherwise. NUT-07 advertisement alone does not prove witness emission.
 
-`recover` resumes existing authorizations and reports terminal state; it does not admit
-new requests. Preserve the home and continue recovery for nonterminal states, including
-`lock_reconciling`, `lock_unforwardable`, `claiming`, and `settling`. Refunds are signed
-swaps after deadlines, not automatic expiry. Production locks are 60/15 minutes.
+Use the human's price and fee budget, never more permissive limits. If fees are
+unspecified, propose a numeric cap and wait for yes; the CLI default is not consent.
+If a command cannot enforce the approved bounds, **do not run it**: explain the
+missing enforcement and escalate. Do not substitute a guessed flag or a larger cap.
+**Done:** an explicit yes binds this exact action, amounts, limits, and risks.
 
-- `complete`: both legs settled.
-- `complete_unclaimed`: taker received payment; maker remains entitled to the taker's
-  locked leg. Never attempt to refund that leg.
-- `refunded`: this role's refund completed; this is not a successful sale.
-- `expired`: authorization expired without a confirmed lock; no successful trade.
-- `refund_quarantined` / `claim_quarantined`: terminal **manual recovery**, not spendable
-  balance or success. Mint-reported commit evidence exists but owned outputs failed
-  DLEQ verification. Exact attempts/outputs remain private in the journal. Automatic
-  retries stop. Preserve the entire home and escalate to a human; never import or
-  credit these outputs, retry with fresh outputs, delete records, or print secrets.
+## 3. Execute the selected workflow
 
-Verify public completion and balances only after stopping the home-owning watcher safely.
-If a mint stays unavailable, witness evidence stays ambiguous, or recovery quarantines
-funds, report the public swap ID/state to the human and retain the home for investigation.
+### Fund my trade wallet
 
-## Explicit real-money testing and withdrawal
+After confirmation, `fund <mint> --amount <sats>`. On a real mint it prints a BOLT11
+invoice and never auto-pays. Give that invoice privately to the human to pay from
+**their own wallet**; the agent must never pay without separate explicit consent.
+Do not treat printing an invoice as funded balance. Preserve the quote ID; after
+interruption use `recover`, and when needed resume that same funding quote with
+`fund <mint> --amount <same-sats> --quote <quote-id>` after confirmation. Never create
+or pay a replacement merely because a reply or issuance timed out.
+**Done:** issuance is reconciled and `balance <mint>` confirms the result, or the
+retained quote is reported as unresolved without another payment.
 
-Testing only, not production permission: require `TRADE_REAL_MONEY_TEST=1` plus
-`--real-mint-allow <exact-canonical-HTTPS-URL>` for every real mint on every invocation.
-Either alone is refused; no wildcard or persisted authorization exists. Never use
-this opt-in without explicit spending authority. Gross locks are capped at 500 sats;
-funding is capped at 500 cumulative sats per mint per home, including unresolved quotes.
-Lab timings remain restricted to loopback mints.
+### Sell/list X of mint A for Y of mint B
 
-`withdraw <mint> --invoice <exact-invoice>` authorizes that invoice once (invoice cap
-500 sats, fee-reserve cap 32). It journals exact inputs and change outputs before sending.
-`recover` resumes existing withdrawals as well as swaps. `quote_created`, `request_sent`,
-`pending`, and `paid_change_unreconciled` are nonterminal: retain the home, do not replace
-invoices, discard records, or retry through another payer. An ambiguous POST is not resent.
-PAID alone is not completion: all change must be restored, DLEQ-verified, accounted for,
-and credited before `done`. A definitively unpaid payment becomes `unpaid_released` only
-with safe release evidence. An unsent expired quote can be released. Balances/preflight
-are inspection commands and do not resume payment authorizations. Report dust and fees.
-Never infer a fee reserve from another mint: the live run observed 2 sats on Minibits/
-Macadamia and 5 on cashu.cz. An insufficient-balance refusal can leave an unsent
-`quote_created` record. There is no cancellation command: preserve it, let its quote expire,
-then resume that exact invoice to reconcile `unpaid_released` before replacing the payment
-plan. Do not fund the home or edit its journal to force an unaffordable authorization.
-`recover` waits for all retained money authorizations as well as swaps. An unrelated
-pending or fenced withdrawal can therefore keep the command running after a particular
-swap refunded. A process timeout is not that swap's outcome: stop the process, inspect
-its saved state and balances, and preserve the separate withdrawal without replacing it.
+After confirmation, `list --give-mint <A> --give <X> --want-mint <B> --want <Y>
+--max-fees <cap>`. X and Y are net lot amounts, not interchangeable “bitcoin” assets.
+The seller's maximum debit is X plus the approved outgoing fee cap. Record the lot
+ID and keep `serve` running until complete or refunded. Listing authorizes serving
+that fixed lot; it does not authorize further listings or price changes.
 
-## Relay delivery
+`cancel <lot>` is allowed only with **no active quote/swap**. Cancellation never
+revokes an authorized HTLC lock. On rejection, continue recovery; do not force-release
+reservations. **Done:** terminal trade state and balances are checked, or a confirmed
+inactive cancellation is reported; an unresolved lock is never called cancelled.
 
-Defaults: `wss://nos.lol`, `wss://relay.primal.net`, `wss://offchain.pub`.
-Fresh-client probes verified ACK, live delivery, and 60-second storage for all three
-protocol kinds on 2026-10-08; this is a snapshot, not a future storage guarantee.
-Never use the production relay. Override with repeated `--relay` before the command.
-One positive ACK is required; missing ACKs never count as success. Receipts and retry
-budgets persist across restart. Unchanged ACKed events are not republished. Missing
-copies are retried on serve/recover ticks with exponential backoff and jitter, at most
-12 attempts per event/relay. `rate-limited:` pauses that relay for at least five minutes;
-`blocked:`/`banned:` disables publication to it for this home. Never delete that journal
-to bypass limits. After exhaustion or a block, report delivery as incomplete and use
-an explicitly configured reachable relay for recovery. Mint-only timed refunds remain
-available during a relay outage; keep recovery running. ACKs are not persistent readback.
+### Find listings / buy that lot
+
+`discover`, inspect the exact mint pair and public lot ID, and match the human's
+price. Discovery alone authorizes no purchase. For “receive X A for at most Y B”,
+set `--min-receive X` and `--max-give Y` when Y is the total spending ceiling. If Y
+was explicitly a net price plus a separately approved fee F, the total ceiling can
+be Y + F; otherwise never silently add fees. A stricter limit is fine, a looser one
+is not. See the worked example in the command reference.
+
+After confirmation, `take <lot> --max-give <total-cap> --min-receive <net-minimum>
+--max-fees <cap>`. Keep it running through settlement. Never repeat a take to “fix”
+a timeout. **Done:** verify the terminal result and per-mint balances, or enter recovery.
+
+### Withdraw
+
+Use only an invoice the human provides. Validate amount, destination, expiry, and
+fee/debit bounds before confirmation. `withdraw <mint> --invoice <bolt11>` may spend
+immediately; it is **not** a quote preview. Read the withdrawal limitations in the
+command reference first. Non-terminal means payment and/or change remain unresolved,
+not that payment failed. Never create a replacement invoice, withdrawal, or payment
+while one is unresolved. **Done:** `done` and reconciled change/balance are confirmed,
+or report the retained authorization and recover it without paying again.
+
+### Check balance / something got interrupted
+
+`balance <mint>` reports wallet balance, not total wealth or proof that every
+reservation is spendable. After **any interruption**, use `recover` with the same
+home and relays before new work. It resumes existing authorizations and does not
+admit new trade requests. Keep recovery running for non-terminal states; restore
+`serve` if an authorized unsold listing should continue accepting quotes.
+**Done:** classify every reported outcome using the recovery reference.
+
+## 4. Verify and report
+
+Check public swap/withdrawal state and balances after safely stopping the owner
+process. A zero exit, elapsed deadline, missing listing, or mint saying PAID is not
+by itself reconciled success. Keep the home. Report spent/received amounts and fees
+only when known; distinguish complete, refunded, unresolved, and manual recovery.
+
+On `refund_quarantined` or `claim_quarantined`, stop new money actions and escalate
+to the human immediately. These are terminal **manual recovery**, not success or
+spendable funds. Never credit/import unverifiable outputs, edit journal records,
+replace attempts, or treat quarantine as refund permission. Persistent RPC failure,
+missing witnesses, unexpected states, or accounting discrepancies also need a human;
+retain safe recovery for other obligations, without weakening any check.
+**Done:** the human has an accurate outcome and any unresolved custody obligations.
