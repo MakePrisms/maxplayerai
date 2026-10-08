@@ -1,0 +1,52 @@
+{
+  "state": "complete",
+  "controller_pid": 3712990,
+  "controller_sid": 3712990,
+  "manual_maker_recover": false,
+  "real": false,
+  "before": {
+    "maker": {
+      "https://testnut.cashudevkit.org": 128,
+      "https://testnut.cashu.space": 0
+    },
+    "taker": {
+      "https://testnut.cashudevkit.org": 0,
+      "https://testnut.cashu.space": 128
+    }
+  },
+  "lot": "b78611cf54b900d415ebedb1645edd42ab990b351e0beccb185be8199fc06c38",
+  "maker_process": {
+    "pid": 3713138,
+    "pgid": 3713138,
+    "sid": 3713138,
+    "guardian_pid": 3713137,
+    "guardian_sid": 3713137,
+    "started": 1791497004.4540477
+  },
+  "taker_pid": 3713148,
+  "swap": "16802081-bba2-4de0-ac6d-3e3eb6a37dcc",
+  "short": 1791497908,
+  "long": 1791500608,
+  "margin": 60,
+  "taker_killed_before_claim": true,
+  "automatic_maker_refund_at": 1791497976.4390173,
+  "maker_stop_reason": "intentional SIGTERM after journal refunded",
+  "maker_after": {
+    "https://testnut.cashudevkit.org": 126,
+    "https://testnut.cashu.space": 0
+  },
+  "after": {
+    "maker": {
+      "https://testnut.cashudevkit.org": 126,
+      "https://testnut.cashu.space": 0
+    },
+    "taker": {
+      "https://testnut.cashudevkit.org": 0,
+      "https://testnut.cashu.space": 126
+    }
+  },
+  "states": {
+    "maker": "refunded",
+    "taker": "refunded"
+  }
+}

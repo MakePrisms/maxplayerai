@@ -1,0 +1,6 @@
+{
+  "mutation": "restore global pending wait",
+  "mutant_exit": 101,
+  "restored_exit": 0,
+  "assertion": "SAFETY: recover must exit despite unreachable authorization"
+}
