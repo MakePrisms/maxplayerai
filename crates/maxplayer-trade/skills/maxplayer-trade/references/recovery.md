@@ -73,8 +73,8 @@ wallet credit. Recover or resume that exact quote, never pay a second invoice to
 resolve missing credit. A historical CDK orphan-quote reservation problem needs a
 human; never clear it from the database yourself.
 
-Listing statuses (`available`, `reserved`, `sold`, `cancelled`, `expired`) are not
-wallet settlement states. Relay absence, a publication ACK, or a stale listing is
+Published listing statuses (`available`, `sold`, `cancelled`) are not wallet
+settlement states. Reservations/active quotes and lot expiry are separate conditions. Relay absence, a publication ACK, or a stale listing is
 not permission to duplicate a trade. A listing quarantined by discovery validation
 must not be purchased or manually reconstructed to bypass checks.
 

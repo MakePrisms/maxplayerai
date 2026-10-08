@@ -5,6 +5,12 @@ description: Trade Cashu tokens for a human with the standalone maxplayer-trade 
 
 # Trade Cashu for the human
 
+> **Blocked draft — do not execute real-money workflows on head 9dad8e6.**
+> Its binary still has a 500-sat cap and requires the old opt-in; the decided
+> no-opt-in/100,000-sat behavior below has not landed. Do not enable a bypass.
+> Read [verification](references/verification.md) before any use. Help checks
+> validate syntax only, not these missing money-policy changes.
+
 ## 1. Establish custody and scope
 
 Use the standalone binary, not Maxplayer jobs or the Maxplayer wallet/daemon. Read
@@ -24,7 +30,7 @@ attach a home or database to chat. Report only public IDs, mint URLs, amounts, s
 and redacted errors. Invoice delivery belongs in the human's private conversation.
 **Done:** the correct home and authorized mint identities (URL + sat unit) are known.
 
-## 2. Check readiness and get explicit authorization
+## 2. Check readiness and get explicit authorization (target behavior)
 
 Use `balance <mint>` and `preflight <mint>` for each relevant mint. Passing preflight
 allows a mint, but does not establish honesty or complete compatibility. The CLI

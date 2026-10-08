@@ -3,7 +3,11 @@
 Every invocation starts `maxplayer-trade --home <private-absolute-home>`.
 Optional repeated global `--relay <url>` goes before the subcommand; preserve the
 same relay set during recovery. Use the binary's default relays unless deliberately
-configured; default relay identities/backoff await final round-4 verification.
+configured; defaults at verified base 9dad8e6 are `wss://nos.lol`,
+`wss://relay.primal.net`, and `wss://offchain.pub`. These are source constants,
+not values printed in help. ACKed copies are not resent; retries use exponential
+backoff with jitter, at most 12 attempts per event/relay and a 24-hour age cutoff.
+Rate limiting pauses a relay for at least five minutes.
 Relay ACK is not proof of stored readback or trade success. Respect backoff; do not
 restart loops or generate fresh identities to evade rate limits.
 
@@ -25,7 +29,7 @@ recover
 Use `--help` at the root or on a subcommand to verify the installed interface.
 Never use a lab-feature binary for the human's funds.
 
-## Trade limits
+## Intended trade limits — blocked until the money-policy change lands
 
 - Asset identity is canonical mint URL plus unit `sat`; equal units do not make two
   issuers equivalent. Confirm URLs, not just display names. Use HTTPS for real mints.
@@ -58,7 +62,9 @@ a test mint behaved that way. Reuse the retained quote for the same mint/amount.
 
 ## Withdrawal: enforcement before execution
 
-The current planned interface has no user-selectable withdrawal fee flag. Do **not**
+The verified 9dad8e6 interface has no user-selectable withdrawal fee flag. Its source
+limits the Lightning reserve to 32 sats, but does not expose a Cashu input-fee or
+total-debit cap. Therefore the generic approved-fee workflow is blocked on this head. Do **not**
 reuse the trade fee flag on withdrawal. Before invoking withdrawal, establish the
 installed implementation's hard Lightning reserve bound and input-fee/total-debit
 bound, and ensure all fit the human's numeric approval. A reserve-only cap does not
