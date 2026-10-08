@@ -60,8 +60,8 @@ impl Asset {
             && (h == "testnut.cashudevkit.org" || h == "testnut.cashu.space")
             && u.path() == "/";
         ensure!(
-            test || local,
-            "mint fence: fake-money mints only; no real-money override"
+            test || local || crate::real_money::allows(&self.mint_url),
+            "mint fence: fake-money mints only without explicit real-money authorization"
         );
         ensure!(
             u.scheme() == "https" || (local && u.scheme() == "http"),
@@ -486,3 +486,6 @@ pub mod journal;
 pub mod market;
 pub mod mint;
 pub mod wallet;
+
+pub mod money;
+pub mod real_money;

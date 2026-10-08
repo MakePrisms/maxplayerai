@@ -16,6 +16,8 @@ struct Cli {
     home: PathBuf,
     #[arg(long)]
     relay: Vec<String>,
+    #[arg(long, global = true)]
+    real_mint_allow: Vec<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -58,6 +60,11 @@ enum Command {
         #[arg(long)]
         quote: Option<String>,
     },
+    Withdraw {
+        mint: String,
+        #[arg(long)]
+        invoice: String,
+    },
     Balance {
         mint: String,
     },
@@ -71,6 +78,7 @@ use maxplayer_trade::{
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    maxplayer_trade::real_money::configure(cli.real_mint_allow.clone())?;
     fs::create_dir_all(&cli.home)?;
     fs::set_permissions(&cli.home, fs::Permissions::from_mode(0o700))?;
     let lock = OpenOptions::new()
@@ -82,9 +90,30 @@ async fn main() -> Result<()> {
         .open(cli.home.join("owner.lock"))?;
     lock.try_lock_exclusive()
         .context("home is already in use")?;
+    let money_journal = Journal::open(&cli.home).await?;
+    // Inspection must not submit an earlier payment authorization. Newly credited
+    // money proofs remain reserved until explicit recovery settles their journal.
+    if matches!(cli.command, Command::Recover)
+        && money_journal
+            .all::<coordinator::Swap>("swap")
+            .await?
+            .is_empty()
+        && money_journal
+            .all::<coordinator::Listing>("listing")
+            .await?
+            .is_empty()
+    {
+        while maxplayer_trade::money::recover(&cli.home, &money_journal).await? {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+        return Ok(());
+    }
     if !matches!(
         &cli.command,
-        Command::Preflight { .. } | Command::Fund { .. } | Command::Balance { .. }
+        Command::Preflight { .. }
+            | Command::Fund { .. }
+            | Command::Balance { .. }
+            | Command::Withdraw { .. }
     ) {
         let keys = maxplayer_trade::wallet::identity(&cli.home)?;
         let relays = if cli.relay.is_empty() {
@@ -156,9 +185,10 @@ async fn main() -> Result<()> {
         };
     }
     let mint_arg = match &cli.command {
-        Command::Preflight { mint } | Command::Fund { mint, .. } | Command::Balance { mint } => {
-            mint
-        }
+        Command::Preflight { mint }
+        | Command::Fund { mint, .. }
+        | Command::Balance { mint }
+        | Command::Withdraw { mint, .. } => mint,
         _ => unreachable!(),
     };
     let asset = maxplayer_trade::Asset::new(mint_arg)?;
@@ -166,6 +196,46 @@ async fn main() -> Result<()> {
     let mint = &asset.mint_url;
     if matches!(cli.command, Command::Preflight { .. }) {
         return preflight(mint).await;
+    }
+    if let Command::Withdraw { ref invoice, .. } = cli.command {
+        preflight(mint).await?;
+        let a = maxplayer_trade::money::withdraw(&cli.home, &money_journal, mint, invoice).await?;
+        println!("{}", a.summary());
+        return Ok(());
+    }
+    if let Command::Fund {
+        amount, ref quote, ..
+    } = cli.command
+    {
+        if maxplayer_trade::real_money::allows(mint) {
+            ensure!(
+                amount > 0 && amount <= maxplayer_trade::real_money::CAP,
+                "funding cap exceeds 500 sats"
+            );
+            preflight(mint).await?;
+            let mut f = if let Some(id) = quote {
+                money_journal
+                    .all::<maxplayer_trade::money::Funding>("funding")
+                    .await?
+                    .into_iter()
+                    .find(|f| f.quote.as_ref() == Some(id) && f.mint == *mint && f.amount == amount)
+                    .context("quote not journaled for this mint and amount")?
+            } else {
+                maxplayer_trade::money::fund(&cli.home, &money_journal, mint, amount).await?
+            };
+            println!(
+                "{}",
+                serde_json::json!({"quote":f.quote,"invoice":f.invoice,"amount":f.amount,"note":"pay externally; tool never auto-pays"})
+            );
+            for _ in 0..30 {
+                maxplayer_trade::money::resume_fund(&cli.home, &money_journal, &mut f).await?;
+                if f.done {
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            anyhow::bail!("funding remains pending; invoice and intent retained; run recover");
+        }
     }
     let w = wallet(&cli.home, mint).await?;
     match cli.command {

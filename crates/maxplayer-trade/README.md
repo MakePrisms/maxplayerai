@@ -1,4 +1,4 @@
-# maxplayer-trade — standalone fake-money Cashu trades
+# maxplayer-trade — standalone Cashu trades (fake money by default)
 
 A fixed-lot CLI, independent of jobs, the maxplayer daemon, core, and `relay.maxplayer.ai`.
 **A live 32-for-24 trade completed on 2026-10-08**, including both claims, NUT-07 witness
@@ -42,8 +42,10 @@ prototype, not a production deployment or an unconditional atomicity guarantee.
   `serve` continuously accepts quotes and recovers swaps. **Keep a watcher running while funds
   are locked.** Stop it before another command uses the same home. Do not delete a trade home.
 
-The only permitted mints are `https://testnut.cashudevkit.org`, `https://testnut.cashu.space`,
-and loopback HTTP(S) mints. **There is no real-money override.** HTTP redirects are disabled.
+The default permitted mints are `https://testnut.cashudevkit.org`, `https://testnut.cashu.space`,
+and loopback HTTP(S) mints. Real mints require both `TRADE_REAL_MONEY_TEST=1` and a repeated
+global `--real-mint-allow <exact-canonical-HTTPS-URL>` for each mint, on every invocation.
+No wildcard, prefix, environment-only, or persisted authorization exists. HTTP redirects are disabled.
 Default relays: `wss://relay.ditto.pub`, `wss://relay.damus.io`; repeat global `--relay URL`
 to configure alternatives, including `wss://nostr-pub.wellorder.net`. The production relay is
 explicitly forbidden. No production relay writes were made.
@@ -116,7 +118,7 @@ Only lab locks are scaled 2×, preserving their 3:1 ratio; the two-second cutoff
 one-second margin are unchanged. Tests use two Tokio workers instead of one per visible
 CPU, avoiding per-test oversubscription. Existing deadline and balance assertions remain unchanged.
 Crash injection exits the subprocess at
-explicit pre-effect or post-mint/pre-wallet-commit boundaries. No real-money setting exists.
+explicit pre-effect or post-mint/pre-wallet-commit boundaries. Real-mint opt-in never enables lab timings.
 
 | Suite | Default passed/failed | Lab passed/failed |
 |---|---:|---:|
@@ -569,3 +571,51 @@ A mint can still lie, withhold evidence, or process an already-delivered request
   adversarial fee changes, exhaustive peer flood/quote-limit concurrency, 24-hour relay retention,
   root workspace suites locally, real money, or production deployment. Tests cover selected
   process-exit boundaries and one claim/refund race, not a full model checker.
+
+
+## Experimental real-money path
+
+This path is **not a production safety certification**. Public-mint results, if any, belong in
+its separate run report; the historical test counts above predate this change.
+
+- Each real-mint lock gross is capped at **500 sats**, at both planning and submission.
+- Real funding is capped at **500 sats cumulatively per mint per home**. The journal charges
+  an intent before creating the mint quote; pending, failed, issued and lost-reply intents
+  stay charged across restarts. A lost quote response is deliberately not auto-replaced.
+- Real `fund` locks the quote to a private NUT-20 key and requires the mint to echo that
+  binding before printing the invoice and quote. Issuance is signed with that key. It prints
+  the invoice and quote only after recording them. It never pays an
+  invoice. It waits up to 30 seconds; `fund --quote <id>` or `recover` resumes it. Issuance
+  records its exact outputs before POST and restores those outputs after an ambiguous reply.
+- `withdraw <mint> --invoice <bolt11>` uses raw NUT-05, **not CDK's melt saga**. Its private
+  `trade.sqlite` record binds the invoice, quote, amount, fee reserve, input fee, exact input
+  proofs and blank change outputs including secrets/blinding factors before submission.
+  Same-invoice invocations resume the original authorization rather than paying again.
+- Explicit non-terminal states: `quote_created`, `request_sent`, `pending`, and
+  `paid_change_unreconciled`. A timeout never triggers another melt POST. `PAID` alone does
+  not mean `done`: the mint may commit payment before change signatures. Change is restored
+  by the recorded blinded messages, matched against the quote, unblinded, DLEQ-verified,
+  fee-bounded and credited before settlement. Empty restore is not proof of zero change.
+  Zero change is terminal only when the input/amount/input-fee arithmetic proves it.
+- Definitive UNPAID response or payment-failed error 20004, or a previously observed PENDING
+  followed by UNPAID, additionally requires fresh UNSPENT inputs before release. An UNPAID
+  snapshot after an ambiguous send is not sufficient: the original POST might still arrive.
+- New proofs are credited **reserved**, then the journal is marked done, then they are
+  released. Recovery finishes an interrupted release. Never open a home concurrently or
+  spend its proofs outside this tool. The CLI holds the home lock; library callers must too.
+- Withdrawals have a 500-sat invoice cap and a 32-sat fee-reserve cap. Input selection requires change to remain positive even
+  if the whole reserve is consumed, unless arithmetic proves zero change. Sweep conservatively; do not interpret a `paid_change_unreconciled` result as dust
+  or fees. Preserve every funded home and stop for inspection on unresolved state.
+- NUT-07 advertisement is insufficient for HTLC refund safety. Check actual spent-proof
+  witness emission and parsing on each mint before running the timed refund scenario.
+  Never log proofs, tokens, wallet keys, blinding secrets, or HTLC/payment preimages.
+
+`recover` resumes the funding and withdrawal journals in addition to trade authorizations.
+Use the same explicit allow-list on recovery. Funding caps are lifetime caps, not current
+balance caps; deleting or replacing a funded home is not a supported reset.
+
+The tool's per-home caps do not constrain the external wallet paying a funding invoice.
+A hard source-wallet budget needs a quote-bound total-debit ceiling at the payment's
+confirmation boundary, including input/swap fees. A separately checked estimate is not
+such a ceiling if the payer creates a fresh quote when paying. Do not use an unbounded
+payer for a run that requires a hard spending ceiling.

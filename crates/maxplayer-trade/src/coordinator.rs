@@ -879,6 +879,9 @@ async fn advance_inner(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Re
     Ok(())
 }
 pub async fn recover(home: &Path, j: &Journal, m: &Market) -> Result<()> {
+    if let Err(e) = crate::money::recover(home, j).await {
+        eprintln!("money recovery: {e}");
+    }
     let swaps = j.all::<Swap>("swap").await?;
     for mut l in j.all::<Listing>("listing").await? {
         if l.active
@@ -1016,7 +1019,7 @@ pub async fn recover_until_settled(home: &Path, j: &Journal, m: &mut Market) -> 
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
     loop {
         let swaps = j.all::<Swap>("swap").await?;
-        if swaps.iter().all(terminal) {
+        if swaps.iter().all(terminal) && !crate::money::pending(j).await? {
             for s in swaps {
                 println!(
                     "{}",

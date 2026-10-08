@@ -19,6 +19,8 @@ use std::{
 };
 #[derive(Default)]
 pub struct Faults {
+    pub prefer_async_melt: std::sync::atomic::AtomicBool,
+    pub lose_melt_reply: std::sync::atomic::AtomicBool,
     pub hold_swap: std::sync::atomic::AtomicBool,
     pub swap_entered: tokio::sync::Notify,
     pub swap_release: tokio::sync::Notify,
@@ -109,6 +111,24 @@ impl MintFixture {
                     use axum::response::IntoResponse;
                     use std::sync::atomic::Ordering::SeqCst;
                     let path = req.uri().path().to_owned();
+                    let req = if path.ends_with("/melt/bolt11")
+                        && control.prefer_async_melt.load(SeqCst)
+                    {
+                        let (parts, body) = req.into_parts();
+                        let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                        let mut v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                        v["prefer_async"] = true.into();
+                        let mut request = axum::extract::Request::from_parts(
+                            parts,
+                            axum::body::Body::from(serde_json::to_vec(&v).unwrap()),
+                        );
+                        request
+                            .headers_mut()
+                            .remove(axum::http::header::CONTENT_LENGTH);
+                        request
+                    } else {
+                        req
+                    };
                     if path.ends_with("/info") && control.reject_info.load(SeqCst)
                         || path.ends_with("/restore") && control.reject_restore.load(SeqCst)
                         || path.ends_with("/swap") && control.reject_swap.load(SeqCst)
@@ -148,7 +168,9 @@ impl MintFixture {
                     {
                         control.reject_restore.store(true, SeqCst);
                     }
-                    if path.ends_with("/swap") && control.lose_reply.load(SeqCst) {
+                    if (path.ends_with("/swap") && control.lose_reply.load(SeqCst))
+                        || (path.ends_with("/melt/bolt11") && control.lose_melt_reply.load(SeqCst))
+                    {
                         return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
                     }
                     let (parts, body) = response.into_parts();

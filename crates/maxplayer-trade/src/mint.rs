@@ -69,7 +69,7 @@ pub async fn rpc<T: serde::de::DeserializeOwned>(
     let text = r.text().await?;
     ensure!(
         status.is_success(),
-        "mint {mint} {op}: HTTP {status}: {text}"
+        "mint {mint} {op}: HTTP {status} (body withheld)"
     );
     serde_json::from_str(&text).with_context(|| format!("mint {mint} {op}: invalid response"))
 }
@@ -101,6 +101,9 @@ pub async fn plan(home: &Path, mint: &str, net: u64, max_fee: u64) -> Result<Pla
     w.refresh_keysets().await?;
     let k = w.fetch_active_keyset().await?;
     let (gross, claim_fee) = gross(net, k.input_fee_ppk)?;
+    if crate::real_money::allows(mint) {
+        crate::real_money::check_lock_gross(gross)?;
+    }
     let db = database(home, mint).await?;
     let mut available = db
         .get_proofs(
@@ -203,6 +206,9 @@ pub async fn lock(
     c: &SpendingConditions,
     send_before: u64,
 ) -> Result<Proofs> {
+    if crate::real_money::allows(&p.mint) {
+        crate::real_money::check_lock_gross(p.gross)?;
+    }
     if j.get::<Attempt>("attempt", id).await?.is_none() {
         let w = wallet(home, &p.mint).await?;
         w.refresh_keysets().await?;
