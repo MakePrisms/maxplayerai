@@ -619,3 +619,45 @@ A hard source-wallet budget needs a quote-bound total-debit ceiling at the payme
 confirmation boundary, including input/swap fees. A separately checked estimate is not
 such a ceiling if the payer creates a fresh quote when paying. Do not use an unbounded
 payer for a run that requires a hard spending ceiling.
+
+### Secret-free home audit
+
+Stop the home's running process first. The audit helper takes its exclusive owner lock,
+reports balances/funding/withdrawal accounting, and queries NUT-07 for every recorded
+outgoing HTLC proof. It counts matching claim witnesses, empty-preimage refund witnesses,
+missing/invalid witnesses, PENDING and UNSPENT proofs; it never prints proof material or
+preimages. Missing/invalid spent witnesses make it fail. It does not recover or submit
+payments. Supply every mint needed by that home's recorded trades:
+
+```sh
+TRADE_REAL_MONEY_TEST=1 cargo run --manifest-path crates/maxplayer-trade/Cargo.toml \
+  --locked --example real_audit -- /absolute/preserved/trade-home \
+  https://mint.minibits.cash/Bitcoin https://mint.macadamia.cash
+```
+
+### Real-money-path implementation validation (2026-10-08)
+
+| Suite | Default | Lab |
+|---|---:|---:|
+| Protocol primitives and gross cap | 22 | 22 |
+| Existing CLI checks | 4 | 4 |
+| Two-mint integration/recovery | 6 | 11 |
+| New money-path/opt-in/recovery checks | 12 | 13 |
+| Pinned quote reproducer | 1 | 1 |
+| Relay checks | 3 | 3 |
+| Existing review regressions | 11 | 30 |
+| **Passed / failed** | **59 / 0** | **84 / 0** |
+
+All suites used `--test-threads=1`; no timing failures needed reruns. A disposable mutation
+that swallowed the change-restore error and marked the melt `Done` failed the explicit
+`SAFETY: restore failure must not mark done` assertion. Restoring the original implementation
+passed the same test. Touched-file fmt and whitespace checks passed. Default/lab clippy
+`--all-targets --no-deps` exited 0 with non-blocking style warnings, including the new CLI's
+nested funding `if`. Binaries/examples were rebuilt without `lab` afterward.
+
+**No public real-money trades were run for this revision.** The specified installed payer,
+`maxplayer wallet melt` at `89eca2d`, creates a fresh payment quote and confirms with no
+spend ceiling. The live run stopped before funding because that cannot enforce the requested
+hard source-wallet budget. No source-wallet CLI/core edits or budget waiver were made.
+The inherited round-3 review work on the base trade coordinator is separate; its parallel
+worktree and PR were not changed by this implementation.
