@@ -740,7 +740,7 @@ pub async fn advance(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Resu
             .states
             .iter()
             .all(|p| p.state == cashu::nuts::State::Spent);
-        if all_spent && s.state == "settling" {
+        if all_spent && s.state == "settling" && mint::refund_settled(j, &refund_id).await? {
             s.state = "complete".into();
             save(j, s).await?;
         } else if all_spent

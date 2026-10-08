@@ -1038,3 +1038,81 @@ async fn n1_restore_after_nut07_catches_landing_claim() {
     assert_eq!(balance(&f.taker, &f.a.url).await, 32);
     assert_eq!(balance(&f.taker, &f.b.url).await, 104);
 }
+
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread")]
+async fn n4_lost_refund_reply_reconciles_outputs_before_complete() {
+    let mut f = Fixture::new(0).await;
+    let lot = coordinator::list(
+        &f.maker,
+        &f.jm,
+        &f.mm,
+        maxplayer_trade::Leg {
+            asset: maxplayer_trade::Asset::new(&f.a.url).unwrap(),
+            net: 24,
+        },
+        maxplayer_trade::Leg {
+            asset: maxplayer_trade::Asset::new(&f.b.url).unwrap(),
+            net: 24,
+        },
+        16,
+    )
+    .await
+    .unwrap();
+    let id = coordinator::start_take(&f.taker, &f.jt, &f.mt, &lot, 40, 24, 16)
+        .await
+        .unwrap();
+    f.step(true).await;
+    f.step(false).await;
+    f.step(true).await;
+    let mut maker = f.jm.get::<Swap>("swap", &id).await.unwrap().unwrap();
+    let taker = f.jt.get::<Swap>("swap", &id).await.unwrap().unwrap();
+    let chosen = vec![
+        maker
+            .outgoing
+            .iter()
+            .max_by_key(|p| p.amount)
+            .unwrap()
+            .clone(),
+    ];
+    mint::redeem(
+        &f.taker,
+        &f.jt,
+        "n4-partial",
+        &f.a.url,
+        &chosen,
+        &taker.key,
+        taker.preimage.as_ref().unwrap(),
+        16,
+        None,
+    )
+    .await
+    .unwrap();
+    coordinator::advance(&f.maker, &f.jm, &f.mm, &mut maker)
+        .await
+        .unwrap();
+    assert_eq!(maker.state, "settling");
+    wait_past(maker.quote.as_ref().unwrap().short + 1).await;
+    f.a.faults.lose_reply.store(true, SeqCst);
+    coordinator::recover(&f.maker, &f.jm, &f.mm).await.unwrap();
+    assert_eq!(
+        f.state(true, &id).await.as_deref(),
+        Some("settling"),
+        "N4 SPENT refund inputs must not make uncredited outputs terminal"
+    );
+    assert_eq!(balance(&f.maker, &f.a.url).await, 104);
+    f.a.faults.reject_restore.store(true, SeqCst);
+    coordinator::recover(&f.maker, &f.jm, &f.mm).await.unwrap();
+    assert_eq!(f.state(true, &id).await.as_deref(), Some("settling"));
+    f.a.faults.reject_restore.store(false, SeqCst);
+    f.a.faults.lose_reply.store(false, SeqCst);
+    coordinator::recover(&f.maker, &f.jm, &f.mm).await.unwrap();
+    assert_eq!(f.state(true, &id).await.as_deref(), Some("complete"));
+    assert_eq!(
+        balance(&f.maker, &f.a.url).await,
+        112,
+        "N4 exact lost-reply refund credited"
+    );
+    assert_eq!(balance(&f.maker, &f.b.url).await, 24);
+    assert_eq!(balance(&f.taker, &f.a.url).await, 16);
+}

@@ -808,3 +808,11 @@ pub async fn settle_unforwardable(home: &Path, j: &Journal, id: &str) -> Result<
     a.done = true;
     j.put("attempt", id, &a).await
 }
+
+/// SPENT inputs alone cannot prove that our refund outputs were credited. Keep the
+/// coordinator live until the current exact refund attempt has been reconciled.
+pub async fn refund_settled(j: &Journal, id: &str) -> Result<bool> {
+    Ok(j.get::<Attempt>("attempt", id)
+        .await?
+        .is_none_or(|a| a.done))
+}
