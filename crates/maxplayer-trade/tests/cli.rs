@@ -100,3 +100,58 @@ fn no_real_money_override_exists() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("unexpected argument"));
     assert!(!h.path().join("wallet.seed").exists());
 }
+
+#[test]
+fn skill_commands_and_flags_match_binary_help() {
+    let skill = include_str!("../skills/maxplayer-trade/SKILL.md");
+    let commands = [
+        "list",
+        "discover",
+        "cancel",
+        "serve",
+        "take",
+        "recover",
+        "preflight",
+        "fund",
+        "balance",
+    ];
+    let binary = env!("CARGO_BIN_EXE_maxplayer-trade");
+    let help = Command::new(binary).arg("--help").output().unwrap();
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).unwrap();
+    assert!(help.split_whitespace().any(|word| word == "--home"));
+    for command in commands {
+        assert!(
+            skill.contains(&format!("`{command}")),
+            "skill must document {command}"
+        );
+        assert!(
+            help.lines()
+                .any(|l| l.split_whitespace().next() == Some(command))
+        );
+        let out = Command::new(binary)
+            .args([command, "--help"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{command} help");
+        let help = String::from_utf8(out.stdout).unwrap();
+        let flags: &[&str] = match command {
+            "list" => &[
+                "--give-mint",
+                "--give",
+                "--want-mint",
+                "--want",
+                "--max-fees",
+            ],
+            "take" => &["--max-give", "--min-receive", "--max-fees"],
+            "fund" => &["--amount", "--quote"],
+            _ => &[],
+        };
+        for flag in flags {
+            assert!(
+                help.split_whitespace().any(|word| word == *flag),
+                "{command} {flag}"
+            );
+        }
+    }
+}

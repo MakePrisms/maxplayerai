@@ -21,7 +21,7 @@ prototype, not a production deployment or an unconditional atomicity guarantee.
   `--max-fees` defaults to 16 in the relevant asset. No platform/trade fees.
 - Taker generates the secret and locks **first**, for 60 minutes. Maker verifies the first
   lock before locking **second**, for 15 minutes. Both parties preflight both mints (reachable
-  NUT-07/09/12/14, reported clock within 60 seconds), keysets and fees before locking. Each received
+  advertised NUT-07/09/12/14, reported clock within 60 seconds), keysets and fees before locking. Each received
   lock must have exact hash/keys/thresholds/SIG_INPUTS/deadline, unique proofs, DLEQ, exact
   net-after-input-fee value, and fresh UNSPENT state. Asset identity is **mint URL + unit**;
   both assets can be `sat`. Taker refuses to initiate a claim with less than three minutes left.
@@ -48,6 +48,46 @@ Default relays: `wss://relay.ditto.pub`, `wss://relay.damus.io`; repeat global `
 to configure alternatives, including `wss://nostr-pub.wellorder.net`. The production relay is
 explicitly forbidden. No production relay writes were made.
 
+## Agent skill
+
+The standalone skill is [skills/maxplayer-trade/SKILL.md](skills/maxplayer-trade/SKILL.md).
+It is not installed in the Maxplayer website skill index. The CLI regression
+`skill_commands_and_flags_match_binary_help` checks its commands and flags against the built binary.
+
+## Third review recovery policy (base ebc6ef5)
+
+- Unforwardable-lock settlement is bookkeeping, not a prerequisite for refund. Errors
+  (including persistently invalid DLEQ or already-spent owned change) are logged and do
+  not skip the timed refund branches. The lock is never forwarded.
+- `refund_quarantined` and `claim_quarantined` are terminal **manual-recovery** states,
+  not success or wallet balance. Exact attempts, blinded outputs, secrets and returned
+  proofs stay in the private journal; `recover` prints swap ID, state and
+  `manual_recovery: true`. No automatic execution is retried after quarantine.
+- Quarantine requires a specific cryptographic DLEQ verification failure on an owned-only
+  attempt, a full NUT-09 restore bound to every exact blinded output (unique outputs and
+  matching signature amounts/keysets), and every input reported SPENT by NUT-07.
+  SPENT alone is insufficient: it could be a competing claim/refund. Empty/partial restore,
+  PENDING, key-loading or RPC failures cannot establish this terminal state. Attempts
+  without that evidence stay retryable/reconcilable. This is mint-reported commit evidence
+  under the existing honest-issuer assumption, not cryptographic proof against a lying mint.
+- Invalid outputs are never credited. Preserve the whole home and escalate quarantine to
+  a human for verified restoration; do not import unverified proofs, delete the attempt,
+  generate replacement outputs or reinterpret a quarantined claim as refund permission.
+  An unforwardable lock's invalid change may still require manual recovery even when its
+  separately verified refund reaches `refunded`. Terminal does not mean all journaled
+  material became spendable. A quarantined maker listing stays held for human resolution.
+- **NUT-07 witnesses:** `/v1/info` advertises NUT-07 but does not promise witness emission.
+  There is no stateless cheap probe: `checkstate` on an unknown or UNSPENT Y has no spend
+  witness. Proving emission needs a known spent HTLC and its expected witness, ordinarily
+  requiring funded creation and redemption (and mint fees); preflight has neither a known
+  spent Y nor authority to spend. It explicitly reports `nut07_witnesses: unverified...`.
+  At refund time a missing/ambiguous SPENT witness fails closed: no taker refund that tick,
+  even if the maker actually refunded. Keep recovery running; persistent omission needs
+  human investigation. NUT-07 advertisement must never be reported as compatibility proof.
+- Residual late-lock window: a mint that holds a delivered POST beyond the 60-second
+  abandonment grace and starts it after the final restore/state/release can create a lock
+  on an already-expired swap; automatic recovery cannot close that server-side window.
+
 ## Build and automated tests
 
 This crate is its **own Cargo workspace**, with pinned CDK/Cashu 0.17.2 and Nostr SDK 0.44.1.
@@ -68,28 +108,33 @@ Long runs should be backgrounded once, redirected to a log and awaited through t
 do not pipe a build through tail/grep or start duplicate watchers. If cargo is unavailable,
 wrap the command with `nix develop --extra-experimental-features 'nix-command flakes' --command`.
 
-`lab` is compile-time-only test instrumentation. `TRADE_LAB_SECONDS=1` uses 24/8-second locks,
+`lab` is compile-time-only test instrumentation. `TRADE_LAB_SECONDS=1` uses 48/16-second locks,
 2-second claim cutoff and 1-second refund margin, **only for 127.0.0.1 mints**. Production builds
-ignore these test settings and retain 3600/900/180/60. Crash injection exits the subprocess at
+ignore these test settings and retain 3600/900/180/60. The original 24/8-second fixture left only six usable claim seconds; under shared-host
+load a single maker-lock step took 2.8 seconds and setup consumed the claim window.
+Only lab locks are scaled 2×, preserving their 3:1 ratio; the two-second cutoff and
+one-second margin are unchanged. Tests use two Tokio workers instead of one per visible
+CPU, avoiding per-test oversubscription. Existing deadline and balance assertions remain unchanged.
+Crash injection exits the subprocess at
 explicit pre-effect or post-mint/pre-wallet-commit boundaries. No real-money setting exists.
 
 | Suite | Default passed/failed | Lab passed/failed |
 |---|---:|---:|
 | Protocol primitives | 21 / 0 | 21 / 0 |
-| CLI privacy, lock, hard fence | 4 / 0 | 4 / 0 |
+| CLI privacy, lock, hard fence, skill help | 5 / 0 | 5 / 0 |
 | Two-mint integration/recovery | 6 / 0 | 11 / 0 |
 | Pinned-CDK orphan-quote reproducer | 1 / 0 | 1 / 0 |
 | Relay union/unreachable/production fence | 3 / 0 | 3 / 0 |
-| Review adversarial regressions | 11 / 0 | 30 / 0 |
+| Review adversarial regressions | 12 / 0 | 39 / 0 |
 
-**Final second-pass totals: 46 default / 70 lab passed, zero failures.**
+**Final third-pass totals: 48 default / 80 lab passed, zero failures.**
 Touched-file rustfmt check and the production-default binary/examples build passed.
 Clippy --all-targets --no-deps in both default and lab modes exited 0 with non-blocking style warnings
 (collapsible conditionals, unwrap-after-is_some, existing argument-count/import/clone lints).
 
-The fee-bearing sell-back fixture originally recovered after every inbox step, generating a
+In earlier rounds, the fee-bearing sell-back fixture recovered after every inbox step, generating a
 request/quote replay storm inside the eight-second lab lock. It now mirrors the real CLI's
-three-second recovery cadence; no deadline was widened. **20/20 repeated lab runs passed**
+three-second recovery cadence; no deadline was widened in those rounds. **20/20 earlier repeated lab runs passed**
 (each run trades in both directions with exact fee assertions). Command on the compiled lab
 e2e binary: TRADE_LAB_SECONDS=1 <lab-e2e> --exact
 fee_bearing_trade_and_sell_back_exact_balances --test-threads=1 --nocapture.
@@ -160,11 +205,75 @@ remain running for the full lock duration. An inconclusive mint result is retain
 To cancel an unused listing: `maxplayer-trade --home <maker-home> cancel <lot-id>`.
 Cancellation does not revoke an already authorized HTLC.
 
+## Third-pass verification and fresh live evidence — 2026-10-08
+
+Author-led fixes to paid review #3 at `ebc6ef59f78f41b6f9a31cb8180a6648f7756f36`;
+not an independent reviewer sign-off. Only this crate changes. The round-2
+`fresh_not_landed`/`claim_not_landed` helpers and taker refund branch were compared
+byte-for-byte with that head and are unchanged. Production timings and mint fences
+are unchanged. No real-money mint, other worktree, Maxplayer job or merge is involved.
+
+| Review item | Regression/evidence |
+|---|---|
+| §2.1 persistent invalid lock | `probe_{maker,taker}_persistent_invalid_dleq`: terminal refund quarantine, outputs retained, no credit or repeated execution. |
+| §2.1 independently valid refund | `probe_{maker,taker}_invalid_lock_valid_refund`: bad lock restore remains enabled, verified refund reaches refunded and exact balance. |
+| §2.1 spent change | `probe_owned_change_spent_does_not_block_refund`: both roles, credited change spent through native CDK swap between ticks; settlement fails but refund succeeds. |
+| §2.1 owned claims | `probe_claim_quarantine_and_witness_normalization`, `probe_maker_claim_quarantined`, `probe_unlanded_and_ambiguous_claims_stay_retryable`: both roles, no unverified balance, no refund after claim, rejected swap and restore outage remain retryable. |
+| §2.2 | `preflight_reports_witness_emission_unverified`; the claim/witness probe also asserts SPENT without a witness fails closed. No stateless emission probe exists; limitation is explicit above. |
+| §2.3 | Residual late-lock window documented above; no deadline-logic change. Existing N2 late-lock regression retained. |
+| Witness normalization | Uppercase NUT-07 preimages are injected and observed, then normalized before coordinator storage. |
+| Timing | `m1`, `m3`, notice normalization and both zero/positive-fee roundtrips: **5/5 passed** with two CPU burners and tests sharing CPUs 0–3; two Tokio workers, one test thread. |
+| Agent skill | Frontmatter validator passed; CLI help test passed. All nine commands and every documented flag separately checked on the exact live default binary. |
+
+**Mutation evidence:** three isolated copies under
+`.openclaw/tmp/review-1107-pass3/final-mutations/`, changing only one guard per copy:
+restore fatal settlement (`settle-fatal`), disable owned-output quarantine (`no-quarantine`),
+and reject SPENT refund witnesses (`n1-spent`). Both Appendix A probes fail at the
+"persistent invalid DLEQ must not strand the lock" safety assertion in each of the first
+two copies; the earlier N1 regression fails at "N1 maker refund must not strand taker".
+**Three mutations, five intended safety-assertion failures**, not build/setup errors.
+The source worktree was never mutated.
+
+Checkpoint failures are retained: the initial spent-change test incorrectly used the HTLC
+redemption helper for ordinary change (mint correctly rejected it); the corrected fixture
+uses native CDK swap. The original eight-second lab claim window also failed under shared
+load, then passed alone. The lab-only adjustment above addresses measured fixture latency,
+not weakened assertions. Full suites and repeat logs live in `target/third-pass/`.
+The repetition runner executes all eight `probe_` tests, the zero-fee full trade/sell-back,
+and the fee-bearing full trade/sell-back for twenty serialized rounds; final results are
+reported on PR #1107. These checks are separate from root-workspace CI.
+
+### Live default-feature binary
+
+- Fresh homes: `/home/openclaw/.openclaw/workspace/.openclaw/tmp/credit-trade-round3-20261008-c9_08k84/{maker,taker}`; retained, private; old homes untouched.
+- Binary SHA-256: `86c3d9be7cf1f0cb20f0df66a15701007ff0ccd1b84fecfc0a4fcb73d8af9586`. The later final CLI-test binary is byte-identical.
+- Maker mint: testnut.cashudevkit.org (`cdk-mintd/0.18.0`); taker mint:
+  testnut.cashu.space (`cdk-mintd/0.17.0-rc.3`), both 100 ppk.
+- Lot: `b04f2990f887dcd5955bffdfd5ffbca21521bb9db7513063c3cd7c08f1b5dad1`.
+- Available event: `ff01eb54c13e83e863f0fea0ccb5b72503fc2ea182f200b49d8bc5b53e162847`.
+- Sold event: `63a835aab201f1f54e8e1a3de4cd77559aee446e3888db4a4bf97e88bf476eef`.
+- Swap: `0e4c96cc-ecb3-4d79-874f-0b8cbd985f6c`; both roles **complete**,
+  all four lock/claim attempts done with retained results, zero proof reservations,
+  all remaining wallet proofs UNSPENT.
+
+| Home | cashudevkit before → after | cashu.space before → after |
+|---|---:|---:|
+| Maker | 128 → **93** | 0 → **24** |
+| Taker | 0 → **32** | 128 → **101** |
+
+The independent `read_trade` reader verified all three signed public events on
+**relay.ditto.pub**, including the contiguous chain ending in sold. Damus returned the lot
+and available event but not sold in that read. No republication or retry was needed.
+Each mint's combined final balance is **125 = 128 − 3 mint fees**. No real invoices,
+platform fees, live refunds or live reverse trade were involved; refund and reverse-trade
+coverage is from the actual local CDK mints. Issuer honesty, missing witnesses and the
+late-server-processing residual remain explicit limitations, not atomicity guarantees.
+
 ## Second fix pass — reviewed base 05b7f03 (2026-10-08)
 
 This is an **author-led fix/verification pass**, not another independent reviewer sign-off.
 The paid re-review at `05b7f0334ac69918c6938eff650614f04b3c89a2` identified N1–N4;
-all four are accepted and fixed. Only this standalone crate changes. No mint/NUT changes,
+all four were accepted; the third review found the remaining N3 settlement blocker described above. Only this standalone crate changes. No mint/NUT changes,
 unlocked transfers, validation bypass, new Maxplayer jobs, production rollout, or merge.
 
 Every regression below uses the two real in-process **CDK 0.17.2 FakeWallet mints and local
@@ -178,7 +287,7 @@ use lab timing. Existing assertions are retained; old abandonment waits now foll
 |---|---|---|
 | N1 | Fixed: `n1_maker_refund_before_taker_observes_abandonment`; `n1_restore_after_nut07_catches_landing_claim`. Refund-spent inputs no longer strand the taker; a second restore catches the NUT-07 race. Exact fee-bearing refund balance asserted. | Rejecting SPENT refund witnesses strands the taker; removing post-NUT-07 restore wrongly marks a landed claim abandoned. Both fail safety assertions. |
 | N2 | Fixed: `n2_late_claim_after_abandonment_restore_outage_never_refunds`; `n2_grace_covers_swap_timeout_and_deadline_follows_checkstate`; `n2_late_lock_after_abandonment_is_restored_and_refunded`. Fresh refund evidence, deadline immediately before POST, derived 60-second grace, post-abandonment lock reconciliation. | Four independent mutations: persisted-flag refund authorization, 20-second grace, pre-NUT-07 deadline gate, and missing post-abandonment lock check. All fail their distinct safety assertions. |
-| N3 | Fixed: `n3_maker_missing_dleq_refunds`, `n3_maker_invalid_dleq_refunds`, `n3_taker_missing_dleq_refunds`, `n3_taker_invalid_dleq_refunds`. Explicit unforwardable state, timed refund, exact net-of-fee balance, no reserved spent inputs. | Disabling the state transition makes all four coordinator tests fail at the explicit recovery-state assertion. |
+| N3 | Round-2 partial (superseded by the third-pass fix above): `n3_maker_missing_dleq_refunds`, `n3_maker_invalid_dleq_refunds`, `n3_taker_missing_dleq_refunds`, `n3_taker_invalid_dleq_refunds`. Explicit unforwardable state, timed refund, exact net-of-fee balance, no reserved spent inputs. | Disabling the state transition makes all four coordinator tests fail at the explicit recovery-state assertion. |
 | N4 | Fixed: `n4_partial_claim_wins_nut07_swap_race_reselects_refund`; `n4_lost_refund_reply_reconciles_outputs_before_complete`. Retire a freshly proven rejected refund, retain its exact outputs, select fresh UNSPENT inputs, and claim using the learned preimage. | Disabling reselection or same-step claim leaves the maker nonterminal; removing the refund-output reconciliation gate terminates with uncredited outputs. |
 | Dead cancel guard | Removed; `l4_active_quote_cannot_cancel` retains active-quote refusal. | No money-path mutation needed for dead code removal. |
 | Notice preimage | Lowercase normalization before persistence; `nit_notice_preimage_normalized_before_storage`. | No mutation required. |
@@ -408,7 +517,7 @@ All **11 mutations compiled and failed at the intended safety assertion** (exit 
   Owned change and spent funding reservations are settled through the wallet; invalid present
   DLEQ is never credited. Recovery can repair DLEQ metadata by restoring the exact outputs
   and verifying again. Even repaired locks remain unforwardable. An issuer that continues to
-  supply invalid evidence or refuses restoration can still block recovery; this is not a
+  supply invalid evidence can cause terminal manual-recovery quarantine, while refusal of restoration can still block recovery; this is not a
   validation bypass or a guarantee against a dishonest mint.
 - **Refund races (N4):** a rejected maker refund is retired only on fresh empty restore,
   NUT-07 evidence of a matching-preimage competing claim (without PENDING/ambiguous states),
