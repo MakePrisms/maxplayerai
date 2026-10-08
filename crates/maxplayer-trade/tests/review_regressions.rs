@@ -257,7 +257,7 @@ async fn h2_failed_claim_abandoned_then_taker_refunds() {
     );
     let s = f.jt.get::<Swap>("swap", &id).await.unwrap().unwrap();
     let q = s.quote.unwrap();
-    wait_past((q.short - q.cutoff + 20).max(q.long + q.margin)).await;
+    wait_past((q.short - q.cutoff + mint::ABANDON_GRACE_SECONDS).max(q.long + q.margin)).await;
     coordinator::recover(&f.taker, &f.jt, &f.mt).await.unwrap();
     assert!(
         f.jt.get::<mint::Attempt>("attempt", &format!("{id}-claim"))
@@ -285,7 +285,9 @@ async fn h2_unsent_lock_expires_and_releases_reservation() {
     f.b.faults.reject_swap.store(true, SeqCst);
     f.step(false).await;
     assert_eq!(f.state(false, &id).await.as_deref(), Some("accepted"));
-    f.b.faults.clock_offset.store(60, SeqCst);
+    f.b.faults
+        .clock_offset
+        .store(60 + mint::ABANDON_GRACE_SECONDS, SeqCst);
     coordinator::recover(&f.taker, &f.jt, &f.mt).await.unwrap();
     assert_eq!(
         f.state(false, &id).await.as_deref(),
@@ -535,7 +537,9 @@ async fn h2_pending_inputs_prevent_abandonment() {
     f.step(true).await;
     f.b.faults.reject_swap.store(true, SeqCst);
     f.step(false).await;
-    f.b.faults.clock_offset.store(60, SeqCst);
+    f.b.faults
+        .clock_offset
+        .store(60 + mint::ABANDON_GRACE_SECONDS, SeqCst);
     f.b.faults.pending_inputs.store(true, SeqCst);
     coordinator::recover(&f.taker, &f.jt, &f.mt).await.unwrap();
     assert!(
@@ -560,7 +564,9 @@ async fn h2_maker_abandoned_lock_releases_listing() {
     f.step(false).await;
     f.a.faults.reject_swap.store(true, SeqCst);
     f.step(true).await;
-    f.a.faults.clock_offset.store(60, SeqCst);
+    f.a.faults
+        .clock_offset
+        .store(60 + mint::ABANDON_GRACE_SECONDS, SeqCst);
     coordinator::recover(&f.maker, &f.jm, &f.mm).await.unwrap();
     assert_eq!(
         f.state(true, &id).await.as_deref(),
@@ -578,4 +584,454 @@ async fn h2_maker_abandoned_lock_releases_listing() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[cfg(feature = "lab")]
+async fn second_event(f: &mut Fixture, id: &str) -> nostr_sdk::Event {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let e = f.mt.inbox.recv().await.unwrap();
+            let msg = f.mt.decode(&e).unwrap();
+            if msg.swap_id == id && msg.step == "second" {
+                break e;
+            }
+        }
+    })
+    .await
+    .unwrap()
+}
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread")]
+async fn n1_maker_refund_before_taker_observes_abandonment() {
+    let mut f = Fixture::new(100).await;
+    let id = through_second(&mut f).await;
+    f.a.faults.reject_swap.store(true, SeqCst);
+    let event = second_event(&mut f, &id).await;
+    let _ = coordinator::handle(&f.taker, &f.jt, &f.mt, &event).await;
+    let s = f.jt.get::<Swap>("swap", &id).await.unwrap().unwrap();
+    let q = s.quote.unwrap();
+    f.a.faults.reject_swap.store(false, SeqCst);
+    wait_past(q.short + q.margin).await;
+    coordinator::recover(&f.maker, &f.jm, &f.mm).await.unwrap();
+    assert_eq!(f.state(true, &id).await.as_deref(), Some("refunded"));
+    wait_past(q.long + q.margin).await;
+    // Only the evidence clock advances; real HTLC refund eligibility has already passed.
+    f.a.faults
+        .clock_offset
+        .store(mint::ABANDON_GRACE_SECONDS, SeqCst);
+    coordinator::recover(&f.taker, &f.jt, &f.mt).await.unwrap();
+    coordinator::recover(&f.taker, &f.jt, &f.mt).await.unwrap();
+    assert_eq!(
+        f.state(false, &id).await.as_deref(),
+        Some("refunded"),
+        "N1 maker refund must not strand taker"
+    );
+    assert_eq!(
+        balance(&f.taker, &f.b.url).await,
+        128 - s.plan.lock_fee - s.plan.claim_fee,
+        "N1 refund restores exact balance net of fees"
+    );
+}
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread")]
+async fn n2_late_claim_after_abandonment_restore_outage_never_refunds() {
+    let mut f = Fixture::new(0).await;
+    let id = through_second(&mut f).await;
+    f.a.faults.hold_swap.store(true, SeqCst);
+    let event = second_event(&mut f, &id).await;
+    let _ = coordinator::handle(&f.taker, &f.jt, &f.mt, &event).await; // actual HTTP timeout
+    f.a.faults.swap_entered.notified().await;
+    let s = f.jt.get::<Swap>("swap", &id).await.unwrap().unwrap();
+    let q = s.quote.unwrap();
+    f.a.faults.clock_offset.store(120, SeqCst);
+    coordinator::recover(&f.taker, &f.jt, &f.mt).await.unwrap();
+    assert!(
+        f.jt.get::<mint::Attempt>("attempt", &format!("{id}-claim"))
+            .await
+            .unwrap()
+            .unwrap()
+            .abandoned,
+        "fixture must reach persisted abandonment before landing"
+    );
+    f.a.faults.swap_release.notify_one();
+    f.a.faults.swap_finished.notified().await;
+    f.a.faults.reject_restore.store(true, SeqCst);
+    wait_past(q.long + q.margin).await;
+    coordinator::recover(&f.taker, &f.jt, &f.mt).await.unwrap();
+    assert!(
+        f.jt.get::<mint::Attempt>("attempt", &format!("{id}-refund"))
+            .await
+            .unwrap()
+            .is_none(),
+        "N2 persisted abandonment must not authorize a refund during restore outage"
+    );
+    assert_eq!(
+        balance(&f.taker, &f.b.url).await,
+        104,
+        "N2 no refund after a late landed claim"
+    );
+    f.a.faults.reject_restore.store(false, SeqCst);
+    coordinator::recover(&f.taker, &f.jt, &f.mt).await.unwrap();
+    assert_eq!(
+        balance(&f.taker, &f.a.url).await,
+        32,
+        "N2 late claim credited on recovery"
+    );
+    assert_eq!(
+        f.state(false, &id).await.as_deref(),
+        Some("complete_unclaimed")
+    );
+}
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread")]
+async fn n2_grace_covers_swap_timeout_and_deadline_follows_checkstate() {
+    let mut f = Fixture::new(0).await;
+    let lot = f.list(false).await;
+    let id = f.start(&lot).await;
+    f.step(true).await;
+    f.b.faults.reject_swap.store(true, SeqCst);
+    f.step(false).await;
+    f.b.faults.reject_swap.store(false, SeqCst);
+    let a: serde_json::Value =
+        f.jt.get("attempt", &format!("{id}-lock"))
+            .await
+            .unwrap()
+            .unwrap();
+    let deadline = a["send_before"].as_u64().unwrap();
+    f.b.faults.hold_checkstate.store(true, SeqCst);
+    let control = f.b.faults.clone();
+    tokio::join!(coordinator::recover(&f.taker, &f.jt, &f.mt), async {
+        control.checkstate_entered.notified().await;
+        control
+            .clock_offset
+            .store(deadline + 1 - coordinator::now(), SeqCst);
+        control.checkstate_release.notify_one();
+    })
+    .0
+    .unwrap();
+    let a: serde_json::Value =
+        f.jt.get("attempt", &format!("{id}-lock"))
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(
+        a["result"].is_null(),
+        "N2 deadline must be checked after final NUT-07 RPC, immediately before POST"
+    );
+    f.b.faults
+        .clock_offset
+        .store(deadline + 30 - coordinator::now(), SeqCst);
+    coordinator::recover(&f.taker, &f.jt, &f.mt).await.unwrap();
+    assert!(
+        !f.jt
+            .get::<mint::Attempt>("attempt", &format!("{id}-lock"))
+            .await
+            .unwrap()
+            .unwrap()
+            .abandoned,
+        "N2 grace must cover at least swap timeout plus margin (60s)"
+    );
+    assert!(
+        mint::ABANDON_GRACE_SECONDS >= 60
+            && mint::ABANDON_GRACE_SECONDS >= mint::RPC_TIMEOUT_SECONDS
+    );
+}
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread")]
+async fn n2_late_lock_after_abandonment_is_restored_and_refunded() {
+    let mut f = Fixture::new(0).await;
+    let lot = f.list(false).await;
+    let id = f.start(&lot).await;
+    f.step(true).await;
+    f.b.faults.hold_swap.store(true, SeqCst);
+    f.step(false).await; // lock POST times out but server retains request
+    f.b.faults.swap_entered.notified().await;
+    let s = f.jt.get::<Swap>("swap", &id).await.unwrap().unwrap();
+    // Simulate the durable abandonment boundary, then make its mandatory recheck fail.
+    // No coordinator refund/expiry decision may rely on this saved flag.
+    let aid = format!("{id}-lock");
+    let mut a: mint::Attempt = f.jt.get("attempt", &aid).await.unwrap().unwrap();
+    a.abandoned = true;
+    f.jt.put("attempt", &aid, &a).await.unwrap();
+    f.b.faults.reject_restore.store(true, SeqCst);
+    coordinator::recover(&f.taker, &f.jt, &f.mt).await.unwrap();
+    assert_ne!(
+        f.state(false, &id).await.as_deref(),
+        Some("expired"),
+        "N2 lock cannot expire without post-abandonment restore"
+    );
+    f.b.faults.swap_release.notify_one();
+    f.b.faults.swap_finished.notified().await;
+    f.b.faults.reject_restore.store(false, SeqCst);
+    coordinator::recover(&f.taker, &f.jt, &f.mt).await.unwrap();
+    let restored = f.jt.get::<Swap>("swap", &id).await.unwrap().unwrap();
+    assert!(
+        !restored.outgoing.is_empty(),
+        "N2 late lock must become recoverable outgoing"
+    );
+    wait_past(s.quote.unwrap().long + 1).await;
+    coordinator::recover(&f.taker, &f.jt, &f.mt).await.unwrap();
+    assert_eq!(f.state(false, &id).await.as_deref(), Some("refunded"));
+    assert_eq!(balance(&f.taker, &f.b.url).await, 128);
+}
+#[cfg(feature = "lab")]
+async fn unforwardable_case(maker: bool, invalid: bool) {
+    use cdk::cdk_database::WalletDatabase;
+    let mut f = Fixture::new(100).await;
+    let lot = f.list(false).await;
+    let id = f.start(&lot).await;
+    f.step(true).await;
+    if maker {
+        f.step(false).await;
+    }
+    let faults = if maker {
+        f.a.faults.clone()
+    } else {
+        f.b.faults.clone()
+    };
+    if invalid {
+        faults.invalid_dleq.store(true, SeqCst);
+    } else {
+        faults.omit_dleq.store(true, SeqCst);
+    }
+    // Failure is expected; exercise durable coordinator consequence, not its return value.
+    let e = if maker {
+        f.mm.inbox.recv().await.unwrap()
+    } else {
+        f.mt.inbox.recv().await.unwrap()
+    };
+    let (home, j, m, mint) = if maker {
+        (&f.maker, &f.jm, &f.mm, &f.a.url)
+    } else {
+        (&f.taker, &f.jt, &f.mt, &f.b.url)
+    };
+    let _ = coordinator::handle(home, j, m, &e).await;
+    let s = j.get::<Swap>("swap", &id).await.unwrap().unwrap();
+    assert_eq!(
+        s.state, "lock_unforwardable",
+        "N3 explicit nonforwarding refund state"
+    );
+    assert!(
+        !s.outgoing.is_empty(),
+        "N3 locked value retained for refund"
+    );
+    faults.invalid_dleq.store(false, SeqCst);
+    faults.omit_dleq.store(false, SeqCst);
+    let q = s.quote.as_ref().unwrap();
+    wait_past(if maker {
+        q.short + q.margin
+    } else {
+        q.long + q.margin
+    })
+    .await;
+    coordinator::recover(home, j, m).await.unwrap();
+    assert_eq!(
+        j.get::<Swap>("swap", &id).await.unwrap().unwrap().state,
+        "refunded",
+        "N3 unforwardable lock must finish refunded"
+    );
+    assert_eq!(
+        balance(home, mint).await,
+        128 - s.plan.lock_fee - s.plan.claim_fee,
+        "N3 exact refund/change balance net of fees"
+    );
+    let reservation = if maker {
+        f.jm.get::<Listing>("listing", &lot)
+            .await
+            .unwrap()
+            .unwrap()
+            .reservation
+    } else {
+        id
+    };
+    assert!(
+        maxplayer_trade::wallet::database(home, mint)
+            .await
+            .unwrap()
+            .get_reserved_proofs(&reservation.parse().unwrap())
+            .await
+            .unwrap()
+            .is_empty(),
+        "N3 no spent funding reservation leak"
+    );
+}
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread")]
+async fn n3_maker_missing_dleq_refunds() {
+    unforwardable_case(true, false).await;
+}
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread")]
+async fn n3_maker_invalid_dleq_refunds() {
+    unforwardable_case(true, true).await;
+}
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread")]
+async fn n3_taker_missing_dleq_refunds() {
+    unforwardable_case(false, false).await;
+}
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread")]
+async fn n3_taker_invalid_dleq_refunds() {
+    unforwardable_case(false, true).await;
+}
+
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread")]
+async fn n4_partial_claim_wins_nut07_swap_race_reselects_refund() {
+    let mut f = Fixture::new(0).await;
+    let lot = coordinator::list(
+        &f.maker,
+        &f.jm,
+        &f.mm,
+        maxplayer_trade::Leg {
+            asset: maxplayer_trade::Asset::new(&f.a.url).unwrap(),
+            net: 24,
+        },
+        maxplayer_trade::Leg {
+            asset: maxplayer_trade::Asset::new(&f.b.url).unwrap(),
+            net: 24,
+        },
+        16,
+    )
+    .await
+    .unwrap();
+    let id = coordinator::start_take(&f.taker, &f.jt, &f.mt, &lot, 40, 24, 16)
+        .await
+        .unwrap();
+    f.step(true).await;
+    f.step(false).await;
+    f.step(true).await;
+    let mut maker = f.jm.get::<Swap>("swap", &id).await.unwrap().unwrap();
+    let taker = f.jt.get::<Swap>("swap", &id).await.unwrap().unwrap();
+    let chosen = vec![
+        maker
+            .outgoing
+            .iter()
+            .max_by_key(|p| p.amount)
+            .unwrap()
+            .clone(),
+    ];
+    assert_eq!(u64::from(chosen[0].amount), 16);
+    wait_past(maker.quote.as_ref().unwrap().short + 1).await;
+    f.a.faults.hold_swap.store(true, SeqCst);
+    let (recovery, ()) = tokio::join!(
+        coordinator::advance(&f.maker, &f.jm, &f.mm, &mut maker),
+        async {
+            f.a.faults.swap_entered.notified().await;
+            mint::redeem(
+                &f.taker,
+                &f.jt,
+                "n4-racing-claim",
+                &f.a.url,
+                &chosen,
+                &taker.key,
+                taker.preimage.as_ref().unwrap(),
+                16,
+                None,
+            )
+            .await
+            .unwrap();
+            f.a.faults.swap_release.notify_one();
+        }
+    );
+    recovery.unwrap();
+    coordinator::recover(&f.maker, &f.jm, &f.mm).await.unwrap();
+    assert_eq!(
+        f.state(true, &id).await.as_deref(),
+        Some("complete"),
+        "N4 rejected refund must not strand unspent remainder"
+    );
+    assert_eq!(
+        balance(&f.maker, &f.b.url).await,
+        24,
+        "N4 learned witness must claim payment"
+    );
+    assert_eq!(
+        balance(&f.maker, &f.a.url).await,
+        112,
+        "N4 exactly eight unspent units refunded"
+    );
+    assert_eq!(balance(&f.taker, &f.a.url).await, 16);
+    assert_eq!(
+        f.jm.get::<Swap>("swap", &id)
+            .await
+            .unwrap()
+            .unwrap()
+            .refund_generation,
+        1
+    );
+    assert!(
+        f.jm.get::<mint::Attempt>("attempt", &format!("{id}-refund"))
+            .await
+            .unwrap()
+            .is_some(),
+        "N4 original exact outputs retained"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn nit_notice_preimage_normalized_before_storage() {
+    let mut f = Fixture::new(0).await;
+    let id = through_second(&mut f).await;
+    f.step(false).await;
+    let event = f.mm.inbox.recv().await.unwrap();
+    let mut msg = f.mm.decode(&event).unwrap();
+    assert_eq!(msg.step, "claimed");
+    msg.request_id = uuid::Uuid::new_v4().to_string();
+    let upper = msg.body["preimage"].as_str().unwrap().to_uppercase();
+    msg.body["preimage"] = upper.clone().into();
+    let dir = f.root.path().join("uppercase-notice");
+    std::fs::create_dir(&dir).unwrap();
+    let j = maxplayer_trade::journal::Journal::open(&dir).await.unwrap();
+    f.mt.send(&j, f.mm.keys.public_key(), &msg).await.unwrap();
+    let event = loop {
+        let e = f.mm.inbox.recv().await.unwrap();
+        if f.mm.decode(&e).unwrap().request_id == msg.request_id {
+            break e;
+        }
+    };
+    coordinator::handle(&f.maker, &f.jm, &f.mm, &event)
+        .await
+        .unwrap();
+    let maker = f.jm.get::<Swap>("swap", &id).await.unwrap().unwrap();
+    assert_eq!(
+        maker.preimage.as_deref(),
+        Some(upper.to_lowercase().as_str()),
+        "notice preimage must be canonical"
+    );
+    assert_eq!(maker.state, "complete");
+}
+
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread")]
+async fn n1_restore_after_nut07_catches_landing_claim() {
+    let mut f = Fixture::new(0).await;
+    let id = through_second(&mut f).await;
+    f.a.faults.hold_swap.store(true, SeqCst);
+    let event = second_event(&mut f, &id).await;
+    let _ = coordinator::handle(&f.taker, &f.jt, &f.mt, &event).await;
+    f.a.faults.swap_entered.notified().await;
+    f.a.faults.clock_offset.store(120, SeqCst);
+    f.a.faults.hold_checkstate_reply.store(true, SeqCst);
+    tokio::join!(coordinator::recover(&f.taker, &f.jt, &f.mt), async {
+        f.a.faults.checkstate_reply_entered.notified().await;
+        f.a.faults.swap_release.notify_one();
+        f.a.faults.swap_finished.notified().await;
+        f.a.faults.checkstate_reply_release.notify_one();
+    })
+    .0
+    .unwrap();
+    assert!(
+        !f.jt
+            .get::<mint::Attempt>("attempt", &format!("{id}-claim"))
+            .await
+            .unwrap()
+            .unwrap()
+            .abandoned,
+        "N1 restore after NUT-07 must catch signatures that landed after its UNSPENT snapshot"
+    );
+    coordinator::recover(&f.taker, &f.jt, &f.mt).await.unwrap();
+    assert_eq!(balance(&f.taker, &f.a.url).await, 32);
+    assert_eq!(balance(&f.taker, &f.b.url).await, 104);
 }

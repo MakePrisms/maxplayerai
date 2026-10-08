@@ -19,6 +19,16 @@ use std::{
 };
 #[derive(Default)]
 pub struct Faults {
+    pub hold_swap: std::sync::atomic::AtomicBool,
+    pub swap_entered: tokio::sync::Notify,
+    pub swap_release: tokio::sync::Notify,
+    pub swap_finished: tokio::sync::Notify,
+    pub hold_checkstate_reply: std::sync::atomic::AtomicBool,
+    pub checkstate_reply_entered: tokio::sync::Notify,
+    pub checkstate_reply_release: tokio::sync::Notify,
+    pub hold_checkstate: std::sync::atomic::AtomicBool,
+    pub checkstate_entered: tokio::sync::Notify,
+    pub checkstate_release: tokio::sync::Notify,
     pub reject_info: std::sync::atomic::AtomicBool,
     pub reject_restore: std::sync::atomic::AtomicBool,
     pub reject_swap: std::sync::atomic::AtomicBool,
@@ -101,7 +111,34 @@ impl MintFixture {
                     {
                         return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
                     }
-                    let response = next.run(req).await;
+                    if path.ends_with("/checkstate") && control.hold_checkstate.swap(false, SeqCst)
+                    {
+                        control.checkstate_entered.notify_one();
+                        control.checkstate_release.notified().await;
+                    }
+                    let response =
+                        if path.ends_with("/swap") && control.hold_swap.swap(false, SeqCst) {
+                            // Keep a real mint request alive after the HTTP client times out.
+                            // This models server work already delivered, not a fabricated signature.
+                            let c = control.clone();
+                            tokio::spawn(async move {
+                                c.swap_entered.notify_one();
+                                c.swap_release.notified().await;
+                                let response = next.run(req).await;
+                                c.swap_finished.notify_one();
+                                response
+                            })
+                            .await
+                            .unwrap()
+                        } else {
+                            next.run(req).await
+                        };
+                    if path.ends_with("/checkstate")
+                        && control.hold_checkstate_reply.swap(false, SeqCst)
+                    {
+                        control.checkstate_reply_entered.notify_one();
+                        control.checkstate_reply_release.notified().await;
+                    }
                     if path.ends_with("/swap") && control.lose_reply.load(SeqCst) {
                         return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
                     }
