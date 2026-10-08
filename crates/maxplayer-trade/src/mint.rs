@@ -101,9 +101,7 @@ pub async fn plan(home: &Path, mint: &str, net: u64, max_fee: u64) -> Result<Pla
     w.refresh_keysets().await?;
     let k = w.fetch_active_keyset().await?;
     let (gross, claim_fee) = gross(net, k.input_fee_ppk)?;
-    if crate::real_money::allows(mint) {
-        crate::real_money::check_lock_gross(gross)?;
-    }
+    crate::real_money::check_lock_gross(gross)?;
     let db = database(home, mint).await?;
     let mut available = db
         .get_proofs(
@@ -206,10 +204,9 @@ pub async fn lock(
     c: &SpendingConditions,
     send_before: u64,
 ) -> Result<Proofs> {
-    if crate::real_money::allows(&p.mint) {
-        crate::real_money::check_lock_gross(p.gross)?;
-    }
+    crate::real_money::check_lock_gross(p.gross)?;
     if j.get::<Attempt>("attempt", id).await?.is_none() {
+        crate::wallet::preflight(&p.mint).await?;
         let w = wallet(home, &p.mint).await?;
         w.refresh_keysets().await?;
         ensure!(
@@ -351,6 +348,20 @@ pub async fn execute(home: &Path, j: &Journal, id: &str) -> Result<Proofs> {
                     !a.abandoned,
                     "attempt abandoned; outputs retained and never resubmitted"
                 );
+                // Restored results may settle without a new admission check. A new
+                // lock POST, including replay of a prepared attempt, must pass again.
+                if a.outputs.iter().any(|o| !o.owned) {
+                    let gross = a
+                        .outputs
+                        .iter()
+                        .filter(|o| !o.owned)
+                        .try_fold(0u64, |n, o| {
+                            n.checked_add(u64::from(o.message.amount))
+                                .context("lock gross overflow")
+                        })?;
+                    crate::real_money::check_lock_gross(gross)?;
+                    crate::wallet::preflight(&a.mint).await?;
+                }
                 unspent(&a.mint, &a.inputs).await?;
                 // Refresh mint time after NUT-07. No RPC may separate this gate and swap POST.
                 let now = crate::wallet::action_time(&a.mint).await?;

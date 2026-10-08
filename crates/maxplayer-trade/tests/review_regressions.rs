@@ -1526,3 +1526,191 @@ async fn r4_missing_quote_ack_cannot_authorize_maker_lock() {
         "SAFETY: missing ACK must not create lock authorization"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lock_rechecks_preflight_after_planning_before_effects() {
+    let f = Fixture::new(0).await;
+    let p = mint::plan(&f.taker, &f.b.url, 24, 16).await.unwrap();
+    let key = cashu::nuts::SecretKey::generate().public_key().to_string();
+    let c = mint::conditions(&"ab".repeat(32), &key, &key, coordinator::now() + 3600).unwrap();
+    f.b.faults.missing_nut.store(14, SeqCst);
+    assert!(
+        mint::lock(
+            &f.taker,
+            &f.jt,
+            "preflight-lock",
+            &p,
+            &c,
+            coordinator::now() + 60
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        f.jt.get::<mint::Attempt>("attempt", "preflight-lock")
+            .await
+            .unwrap()
+            .is_none(),
+        "SAFETY: changed preflight must refuse lock before intent or funds move"
+    );
+    assert_eq!(balance(&f.taker, &f.b.url).await, 128);
+    mint::unspent(&f.b.url, &p.inputs).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn take_rechecks_preflight_before_reserving_money() {
+    let f = Fixture::new(0).await;
+    let lot = f.list(false).await;
+    f.b.faults.missing_nut.store(7, SeqCst);
+    assert!(
+        coordinator::start_take(&f.taker, &f.jt, &f.mt, &lot, 128, 1, 16)
+            .await
+            .is_err()
+    );
+    assert!(f.jt.all::<Swap>("swap").await.unwrap().is_empty());
+    assert_eq!(balance(&f.taker, &f.b.url).await, 128);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lock_cap_applies_at_planning_and_submission() {
+    let h = tempfile::tempdir().unwrap();
+    let m = MintFixture::start(0).await;
+    fund(h.path(), &m.url, 100_001).await;
+    let j = maxplayer_trade::journal::Journal::open(h.path())
+        .await
+        .unwrap();
+    let mut p = mint::plan(h.path(), &m.url, 100_000, 0).await.unwrap();
+    assert!(
+        mint::plan(h.path(), &m.url, 100_001, 0).await.is_err(),
+        "SAFETY: planning must reject gross above 100,000"
+    );
+    let key = cashu::nuts::SecretKey::generate().public_key().to_string();
+    let c = mint::conditions(&"ab".repeat(32), &key, &key, coordinator::now() + 3600).unwrap();
+    p.gross = 100_001;
+    assert!(
+        mint::lock(h.path(), &j, "cap", &p, &c, coordinator::now() + 60)
+            .await
+            .is_err(),
+        "SAFETY: submission must reject gross above 100,000"
+    );
+    assert!(
+        j.get::<mint::Attempt>("attempt", "cap")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    p.gross = 100_000;
+    let proofs = mint::lock(h.path(), &j, "cap", &p, &c, coordinator::now() + 60)
+        .await
+        .unwrap();
+    assert_eq!(
+        proofs.iter().map(|p| u64::from(p.amount)).sum::<u64>(),
+        100_000
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replayed_lock_rechecks_preflight_without_losing_intent() {
+    let f = Fixture::new(0).await;
+    let p = mint::plan(&f.taker, &f.b.url, 24, 16).await.unwrap();
+    let key = cashu::nuts::SecretKey::generate().public_key().to_string();
+    let c = mint::conditions(&"ab".repeat(32), &key, &key, coordinator::now() + 3600).unwrap();
+    f.b.faults.reject_swap.store(true, SeqCst);
+    assert!(
+        mint::lock(
+            &f.taker,
+            &f.jt,
+            "replay-preflight",
+            &p,
+            &c,
+            coordinator::now() + 60
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        f.jt.get::<mint::Attempt>("attempt", "replay-preflight")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    f.b.faults.reject_swap.store(false, SeqCst);
+    f.b.faults.missing_nut.store(14, SeqCst);
+    assert!(
+        mint::execute(&f.taker, &f.jt, "replay-preflight")
+            .await
+            .is_err(),
+        "SAFETY: replayed lock must recheck preflight before swap POST"
+    );
+    mint::unspent(&f.b.url, &p.inputs).await.unwrap();
+    assert_eq!(balance(&f.taker, &f.b.url).await, 128);
+    f.b.faults.missing_nut.store(0, SeqCst);
+    assert_eq!(
+        mint::execute(&f.taker, &f.jt, "replay-preflight")
+            .await
+            .unwrap()
+            .iter()
+            .map(|p| u64::from(p.amount))
+            .sum::<u64>(),
+        24
+    );
+}
+
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r4_recover_unreachable_withdrawal_does_not_block_other_mint_refund_or_exit() {
+    let mut f = Fixture::new(0).await;
+    let id = through_second(&mut f).await;
+    let s = f.jm.get::<Swap>("swap", &id).await.unwrap().unwrap();
+    let q = s.quote.unwrap();
+    // Synthetic authorization, never a real funded home or invoice.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let stuck_id = "00000000-0000-4000-8000-000000000001";
+    let stuck = serde_json::json!({
+        "id": stuck_id, "mint":dead, "invoice":"fixture-only", "state":"quote_created",
+        "quote":{"quote":"fixture-quote", "amount":1, "fee_reserve":1, "expiry":coordinator::now()+3600, "state":"UNPAID"}, "input_fee":0, "inputs":[], "outputs":[],
+        "final_reply":false, "seen_pending":false, "result":null, "change":null
+    });
+    f.jm.put("withdrawal", stuck_id, &stuck).await.unwrap();
+    wait_past(q.short + q.margin).await;
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
+            .args([
+                "--home",
+                f.maker.to_str().unwrap(),
+                "--relay",
+                &f.relay_url,
+                "recover",
+            ])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("SAFETY: recover must exit despite unreachable authorization")
+    .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "SAFETY: distinct incomplete recovery exit"
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains(stuck_id));
+    assert!(stdout.contains("recovery_incomplete"));
+    assert_eq!(
+        f.state(true, &id).await.as_deref(),
+        Some("refunded"),
+        "SAFETY: unrelated reachable mint must refund in same pass"
+    );
+    assert_eq!(
+        f.jm.get::<serde_json::Value>("withdrawal", stuck_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        stuck,
+        "SAFETY: unreachable item must be untouched"
+    );
+    assert_eq!(balance(&f.maker, &f.a.url).await, 128);
+}

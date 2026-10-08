@@ -155,8 +155,9 @@ pub async fn fund(home: &Path, j: &Journal, url: &str, amount: u64) -> Result<Fu
         total
             .checked_add(amount)
             .is_some_and(|n| n <= crate::real_money::CAP),
-        "cumulative funding exceeds 500 sats"
+        "cumulative funding exceeds 100,000 sats"
     );
+    crate::wallet::preflight(url).await?;
     let mut f = Funding {
         id: uuid::Uuid::new_v4().to_string(),
         mint: url.into(),
@@ -265,6 +266,7 @@ pub async fn resume_fund(home: &Path, j: &Journal, f: &mut Funding) -> Result<()
         let (out, mut sigs) = restore(&f.mint, &f.outputs).await?;
         let selected = if out.is_empty() {
             ensure!(q["state"] == "PAID", "issued outputs not yet restored");
+            crate::wallet::preflight(&f.mint).await?;
             let mut request = MintRequest {
                 quote: id.clone(),
                 outputs: f.outputs.iter().map(|o| o.message.clone()).collect(),
@@ -358,7 +360,7 @@ pub async fn withdraw(home: &Path, j: &Journal, url: &str, invoice: &str) -> Res
         .div_ceil(1000);
     ensure!(
         amount > 0 && amount <= crate::real_money::CAP,
-        "withdrawal exceeds test cap"
+        "withdrawal exceeds 100,000-sat invoice cap"
     );
     let mut a = Withdrawal {
         id: uuid::Uuid::new_v4().to_string(),
@@ -387,7 +389,7 @@ pub async fn withdraw(home: &Path, j: &Journal, url: &str, invoice: &str) -> Res
     );
     ensure!(
         u64::from(q.fee_reserve) <= 32,
-        "withdrawal reserve exceeds 32 sat test limit"
+        "withdrawal reserve exceeds 32 sat limit"
     );
     q.payment_preimage = None;
     a.quote = Some(q);
@@ -657,16 +659,40 @@ pub async fn resume_withdraw(home: &Path, j: &Journal, a: &mut Withdrawal) -> Re
     Ok(())
 }
 pub async fn recover(home: &Path, j: &Journal) -> Result<bool> {
-    let mut pending = false;
+    let mut failed = false;
     for mut f in j.all::<Funding>("funding").await? {
-        resume_fund(home, j, &mut f).await?;
-        pending |= !f.done;
+        if !matches!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                resume_fund(home, j, &mut f)
+            )
+            .await,
+            Ok(Ok(()))
+        ) {
+            failed = true;
+            eprintln!(
+                "funding {}: recovery deferred (error or timeout); authorization retained",
+                f.id
+            );
+        }
     }
     for mut a in j.all::<Withdrawal>("withdrawal").await? {
-        resume_withdraw(home, j, &mut a).await?;
-        pending |= !a.terminal();
+        if !matches!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                resume_withdraw(home, j, &mut a)
+            )
+            .await,
+            Ok(Ok(()))
+        ) {
+            failed = true;
+            eprintln!(
+                "withdrawal {}: recovery deferred (error or timeout); authorization retained",
+                a.id
+            );
+        }
     }
-    Ok(pending)
+    Ok(pending(j).await? || failed)
 }
 
 pub async fn pending(j: &Journal) -> Result<bool> {

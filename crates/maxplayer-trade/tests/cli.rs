@@ -48,22 +48,26 @@ fn fresh_home_balance_is_zero_and_private() {
     assert_eq!(out.stdout, second.stdout);
 }
 #[test]
-fn cli_fence_refuses_real_mint_before_wallet_initialization() {
+fn real_mint_balance_needs_no_opt_in() {
     let h = home();
     let out = Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
         .args([
             "--home",
             h.path().to_str().unwrap(),
-            "fund",
+            "balance",
             "https://mint.minibits.cash/Bitcoin",
-            "--amount",
-            "1",
         ])
         .output()
         .unwrap();
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("mint fence"));
-    assert!(!h.path().join("wallet.seed").exists());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["balance"],
+        0
+    );
 }
 #[test]
 fn concurrent_home_is_refused() {
@@ -84,13 +88,13 @@ fn concurrent_home_is_refused() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("home is already in use"));
 }
 #[test]
-fn unsafe_single_flag_override_is_not_supported() {
+fn removed_opt_in_flag_is_not_supported() {
     let h = home();
     let out = Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
         .args([
             "--home",
             h.path().to_str().unwrap(),
-            "--allow-real-mint",
+            "--real-mint-allow",
             "balance",
             "https://mint.minibits.cash/Bitcoin",
         ])

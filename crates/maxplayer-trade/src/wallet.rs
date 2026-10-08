@@ -48,6 +48,22 @@ pub async fn preflight(mint: &str) -> Result<()> {
         now.abs_diff(time) <= 60,
         "mint clock skew exceeds 60 seconds"
     );
+    let keysets: serde_json::Value = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?
+        .get(format!("{}/v1/keysets", mint.trim_end_matches('/')))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    ensure!(
+        keysets["keysets"].as_array().is_some_and(|sets| sets
+            .iter()
+            .any(|k| k["unit"] == "sat" && k["active"] == true)),
+        "mint has no active sat keyset"
+    );
     println!(
         "{}",
         serde_json::json!({"mint":mint,"version":info["version"],"nut07":true,"nut07_witnesses":"unverified: requires a known spent HTLC; advertisement is not emission evidence","nut14":true,"clock_skew_seconds":now.abs_diff(time)})

@@ -889,74 +889,92 @@ async fn advance_inner(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Re
     Ok(())
 }
 pub async fn recover(home: &Path, j: &Journal, m: &Market) -> Result<()> {
-    if let Err(e) = crate::money::recover(home, j).await {
-        eprintln!("money recovery: {e}");
-    }
+    recover_pass(home, j, m).await.map(|_| ())
+}
+async fn recover_pass(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
+    let mut deferred = match crate::money::recover(home, j).await {
+        Ok(pending) => pending,
+        Err(_) => {
+            eprintln!("money recovery deferred; journal retained");
+            true
+        }
+    };
     let swaps = j.all::<Swap>("swap").await?;
     for mut s in swaps {
-        if s.state == "requested" && now() > s.created + 60 {
-            mint::release(home, &s.plan, &s.id).await?;
-            s.state = "expired".into();
-            save(j, &s).await?;
-            continue;
-        }
-
-        if terminal(&s) {
-            if s.role == "maker" && ["complete", "refunded"].contains(&s.state.as_str()) {
-                let mut l: Listing = j
-                    .get("listing", &s.lot.id.to_hex())
-                    .await?
-                    .context("missing maker listing")?;
-                let publication = finish_listing(
-                    j,
-                    m,
-                    &mut l,
-                    if s.state == "complete" {
-                        Status::Sold
-                    } else {
-                        Status::Cancelled
-                    },
-                )
-                .await;
-                if let Err(error) = publication {
-                    eprintln!("terminal listing publication: {error}");
-                }
-            }
-            continue;
-        }
-        if ["quoted", "accepted", "first_validated"].contains(&s.state.as_str())
-            && s.quote.as_ref().is_some_and(|q| now() >= q.exp)
-            && j.get::<mint::Attempt>("attempt", &format!("{}-lock", s.id))
-                .await?
-                .is_none()
-        {
-            if s.role == "taker" {
+        let item = async {
+            if s.state == "requested" && now() > s.created + 60 {
                 mint::release(home, &s.plan, &s.id).await?;
+                s.state = "expired".into();
+                save(j, &s).await?;
+                return Ok::<(), anyhow::Error>(());
             }
-            s.state = "expired".into();
-            save(j, &s).await?;
-            if s.role == "maker" {
-                let mut l: Listing = j
-                    .get("listing", &s.lot.id.to_hex())
-                    .await?
-                    .context("missing maker listing")?;
-                l.active = None;
-                if l.cancelled {
-                    mint::release(home, &l.plan, &l.reservation).await?;
+
+            if terminal(&s) {
+                if s.role == "maker" && ["complete", "refunded"].contains(&s.state.as_str()) {
+                    let mut l: Listing = j
+                        .get("listing", &s.lot.id.to_hex())
+                        .await?
+                        .context("missing maker listing")?;
+                    let publication = finish_listing(
+                        j,
+                        m,
+                        &mut l,
+                        if s.state == "complete" {
+                            Status::Sold
+                        } else {
+                            Status::Cancelled
+                        },
+                    )
+                    .await;
+                    if let Err(error) = publication {
+                        deferred = true;
+                        eprintln!("terminal listing publication: {error}");
+                    }
                 }
-                j.put("listing", &s.lot.id.to_hex(), &l).await?;
+                return Ok::<(), anyhow::Error>(());
             }
-            continue;
-        }
-        if s.role == "taker" && s.state == "requested" {
-            mint::reserve(home, &s.plan, &s.id).await?;
-            let _ = send(m, j, &s, "request", serde_json::to_value(&s.request)?).await;
-        }
-        if s.role == "maker" && s.state == "quoted" {
-            let _ = send(m, j, &s, "quote", serde_json::to_value(&s.quote)?).await;
-        }
-        if let Err(e) = advance(home, j, m, &mut s).await {
-            eprintln!("recovery {}: {e}", s.id);
+            if ["quoted", "accepted", "first_validated"].contains(&s.state.as_str())
+                && s.quote.as_ref().is_some_and(|q| now() >= q.exp)
+                && j.get::<mint::Attempt>("attempt", &format!("{}-lock", s.id))
+                    .await?
+                    .is_none()
+            {
+                if s.role == "taker" {
+                    mint::release(home, &s.plan, &s.id).await?;
+                }
+                s.state = "expired".into();
+                save(j, &s).await?;
+                if s.role == "maker" {
+                    let mut l: Listing = j
+                        .get("listing", &s.lot.id.to_hex())
+                        .await?
+                        .context("missing maker listing")?;
+                    l.active = None;
+                    if l.cancelled {
+                        mint::release(home, &l.plan, &l.reservation).await?;
+                    }
+                    j.put("listing", &s.lot.id.to_hex(), &l).await?;
+                }
+                return Ok::<(), anyhow::Error>(());
+            }
+            if s.role == "taker" && s.state == "requested" {
+                mint::reserve(home, &s.plan, &s.id).await?;
+                let _ = send(m, j, &s, "request", serde_json::to_value(&s.request)?).await;
+            }
+            if s.role == "maker" && s.state == "quoted" {
+                let _ = send(m, j, &s, "quote", serde_json::to_value(&s.quote)?).await;
+            }
+            advance(home, j, m, &mut s).await
+        };
+        if !matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(120), item).await,
+            Ok(Ok(()))
+        ) {
+            deferred = true;
+            eprintln!(
+                "swap {}: recovery deferred (error or timeout); journal retained",
+                s.id
+            );
         }
     }
     let swaps = j.all::<Swap>("swap").await?;
@@ -1001,11 +1019,14 @@ pub async fn recover(home: &Path, j: &Journal, m: &Market) -> Result<()> {
         }
         .await;
         if let Err(error) = publication {
+            deferred = true;
             eprintln!("listing recovery: {error}");
         }
     }
-    m.retry_publications(j).await?;
-    Ok(())
+    if m.retry_publications(j).await.is_err() {
+        deferred = true;
+    }
+    Ok(deferred)
 }
 pub async fn run(home: &Path, j: &Journal, m: &mut Market, until: Option<&str>) -> Result<()> {
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
@@ -1042,29 +1063,54 @@ async fn validate_terms(home: &Path, leg: &Leg, t: &Terms) -> Result<()> {
     );
     Ok(())
 }
-/// Recover only existing authorizations; do not admit fresh quote requests.
-pub async fn recover_until_settled(home: &Path, j: &Journal, m: &mut Market) -> Result<()> {
-    let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
-    loop {
-        let swaps = j.all::<Swap>("swap").await?;
-        if swaps.iter().all(terminal) && !crate::money::pending(j).await? {
-            for s in swaps {
-                println!(
-                    "{}",
-                    serde_json::json!({"swap_id":s.id,"state":s.state,"manual_recovery":s.state.ends_with("_quarantined")})
-                );
-            }
-            return Ok(());
-        }
-        tokio::select! {
-         _=tick.tick()=>recover(home,j,m).await?,
-         event=m.inbox.recv()=>if let Some(event)=event {
-          if m.decode(&event).is_ok_and(|msg|msg.step!="request") {
-            if let Err(error)=handle(home,j,m,&event).await{eprintln!("recovery message rejected: {error}");}
-          }
-         }
-        }
+/// A bounded pass left existing authorizations unresolved. CLI exit code: 2.
+#[derive(Debug)]
+pub struct RecoveryIncomplete;
+impl std::fmt::Display for RecoveryIncomplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "recovery incomplete; retained items require a later pass or serve"
+        )
     }
+}
+impl std::error::Error for RecoveryIncomplete {}
+
+/// Print only public identifiers and states, never recovery material.
+pub async fn recovery_status(j: &Journal, mut unresolved: bool) -> Result<()> {
+    for s in j.all::<Swap>("swap").await? {
+        unresolved |= !terminal(&s);
+        println!(
+            "{}",
+            serde_json::json!({"swap_id":s.id,"state":s.state,"terminal":terminal(&s),"manual_recovery":s.state.ends_with("_quarantined")})
+        );
+    }
+    for f in j.all::<crate::money::Funding>("funding").await? {
+        unresolved |= !f.done;
+        println!(
+            "{}",
+            serde_json::json!({"funding_id":f.id,"terminal":f.done})
+        );
+    }
+    for a in j.all::<crate::money::Withdrawal>("withdrawal").await? {
+        unresolved |= !a.terminal();
+        println!("{}", a.summary());
+    }
+    println!(
+        "{}",
+        serde_json::json!({"status":if unresolved {"recovery_incomplete"} else {"recovery_complete"}})
+    );
+    if unresolved {
+        return Err(RecoveryIncomplete.into());
+    }
+    Ok(())
+}
+
+/// One bounded pass, without admitting fresh requests or waiting for deadlines.
+/// The historical function name is retained for library callers.
+pub async fn recover_until_settled(home: &Path, j: &Journal, m: &mut Market) -> Result<()> {
+    let deferred = recover_pass(home, j, m).await?;
+    recovery_status(j, deferred).await
 }
 
 fn canonical_key(key: &str) -> Result<()> {

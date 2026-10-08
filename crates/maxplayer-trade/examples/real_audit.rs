@@ -9,7 +9,6 @@ async fn main() -> Result<()> {
     let home = std::path::PathBuf::from(args.next().context("usage: real_audit HOME MINT...")?);
     let urls = args.collect::<Vec<_>>();
     ensure!(!urls.is_empty(), "at least one exact mint URL required");
-    maxplayer_trade::real_money::configure(urls.clone())?;
     ensure!(
         home.join("wallet.seed").exists() && home.join("trade.sqlite").exists(),
         "existing funded home required"

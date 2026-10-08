@@ -1,8 +1,4 @@
 use anyhow::{Context, Result, ensure};
-use cdk::{
-    amount::SplitTarget,
-    nuts::{CurrencyUnit, PaymentMethod},
-};
 use clap::{Parser, Subcommand};
 use fs2::FileExt;
 use std::{
@@ -12,17 +8,18 @@ use std::{
 };
 #[derive(Parser)]
 struct Cli {
+    /// Private, exclusively owned journal and wallet directory. Never delete a funded home.
     #[arg(long)]
     home: PathBuf,
+    /// Relay URL (repeatable); defaults to nos.lol, relay.primal.net and offchain.pub.
     #[arg(long)]
     relay: Vec<String>,
-    #[arg(long, global = true)]
-    real_mint_allow: Vec<String>,
     #[command(subcommand)]
     command: Command,
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Publish a fixed lot and reserve its inputs; preflights both mints.
     List {
         #[arg(long)]
         give_mint: String,
@@ -32,27 +29,34 @@ enum Command {
         want_mint: String,
         #[arg(long)]
         want: u64,
+        /// Maximum combined lock and claim mint fees, in sats.
         #[arg(long, default_value_t = 16)]
         max_fees: u64,
     },
+    /// Discover verified available lots across all configured relays.
     Discover,
-    Cancel {
-        lot: String,
-    },
+    /// Cancel an inactive lot and release its reserved inputs.
+    Cancel { lot: String },
+    /// Keep running to accept trades and recover existing money authorizations.
     Serve,
+    /// Take a lot within explicit debit, net-receipt and fee limits.
     Take {
         lot: String,
+        /// Maximum total debit including mint fees, in sats.
         #[arg(long)]
         max_give: u64,
+        /// Minimum net received after mint input fees, in sats.
         #[arg(long)]
         min_receive: u64,
+        /// Maximum combined lock and claim mint fees, in sats.
         #[arg(long, default_value_t = 16)]
         max_fees: u64,
     },
+    /// One recovery pass; exit 2 if items remain pending. Does not wait for lock deadlines.
     Recover,
-    Preflight {
-        mint: String,
-    },
+    /// Check NUT-07/09/12/14, an active sat keyset, and clock skew <= 60 seconds.
+    Preflight { mint: String },
+    /// Create or resume keyed funding; lifetime cap is 100,000 sats per mint/home. Never pays invoices.
     Fund {
         mint: String,
         #[arg(long)]
@@ -60,14 +64,14 @@ enum Command {
         #[arg(long)]
         quote: Option<String>,
     },
+    /// Pay one exact BOLT11 invoice (max 100,000 sats), journaling inputs and change.
     Withdraw {
         mint: String,
         #[arg(long)]
         invoice: String,
     },
-    Balance {
-        mint: String,
-    },
+    /// Read spendable wallet balance without submitting existing money authorizations.
+    Balance { mint: String },
 }
 use maxplayer_trade::{
     Asset, Leg, coordinator,
@@ -76,9 +80,21 @@ use maxplayer_trade::{
     wallet::{preflight, wallet},
 };
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
+    match execute().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::ExitCode::from(if error.is::<coordinator::RecoveryIncomplete>() {
+                2
+            } else {
+                1
+            })
+        }
+    }
+}
+async fn execute() -> Result<()> {
     let cli = Cli::parse();
-    maxplayer_trade::real_money::configure(cli.real_mint_allow.clone())?;
     fs::create_dir_all(&cli.home)?;
     fs::set_permissions(&cli.home, fs::Permissions::from_mode(0o700))?;
     let lock = OpenOptions::new()
@@ -103,10 +119,8 @@ async fn main() -> Result<()> {
             .await?
             .is_empty()
     {
-        while maxplayer_trade::money::recover(&cli.home, &money_journal).await? {
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        }
-        return Ok(());
+        let pending = maxplayer_trade::money::recover(&cli.home, &money_journal).await?;
+        return coordinator::recovery_status(&money_journal, pending).await;
     }
     if !matches!(
         &cli.command,
@@ -126,7 +140,9 @@ async fn main() -> Result<()> {
         };
         let j = Journal::open(&cli.home).await?;
         let mut m = Market::connect(keys, &relays).await?;
-        coordinator::recover(&cli.home, &j, &m).await?;
+        if !matches!(cli.command, Command::Recover) {
+            coordinator::recover(&cli.home, &j, &m).await?;
+        }
         return match cli.command {
             Command::List {
                 give_mint,
@@ -207,84 +223,37 @@ async fn main() -> Result<()> {
         amount, ref quote, ..
     } = cli.command
     {
-        if maxplayer_trade::real_money::allows(mint) {
-            ensure!(
-                amount > 0 && amount <= maxplayer_trade::real_money::CAP,
-                "funding cap exceeds 500 sats"
-            );
-            preflight(mint).await?;
-            let mut f = if let Some(id) = quote {
-                money_journal
-                    .all::<maxplayer_trade::money::Funding>("funding")
-                    .await?
-                    .into_iter()
-                    .find(|f| f.quote.as_ref() == Some(id) && f.mint == *mint && f.amount == amount)
-                    .context("quote not journaled for this mint and amount")?
-            } else {
-                maxplayer_trade::money::fund(&cli.home, &money_journal, mint, amount).await?
-            };
-            println!(
-                "{}",
-                serde_json::json!({"quote":f.quote,"invoice":f.invoice,"amount":f.amount,"note":"pay externally; tool never auto-pays"})
-            );
-            for _ in 0..30 {
-                maxplayer_trade::money::resume_fund(&cli.home, &money_journal, &mut f).await?;
-                if f.done {
-                    return Ok(());
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        ensure!(
+            amount > 0 && amount <= maxplayer_trade::real_money::CAP,
+            "funding cap exceeds 100,000 sats"
+        );
+        preflight(mint).await?;
+        let mut f = if let Some(id) = quote {
+            money_journal
+                .all::<maxplayer_trade::money::Funding>("funding")
+                .await?
+                .into_iter()
+                .find(|f| f.quote.as_ref() == Some(id) && f.mint == *mint && f.amount == amount)
+                .context("quote not journaled for this mint and amount")?
+        } else {
+            maxplayer_trade::money::fund(&cli.home, &money_journal, mint, amount).await?
+        };
+        println!(
+            "{}",
+            serde_json::json!({"quote":f.quote,"invoice":f.invoice,"amount":f.amount,"note":"pay externally; tool never auto-pays"})
+        );
+        for _ in 0..30 {
+            maxplayer_trade::money::resume_fund(&cli.home, &money_journal, &mut f).await?;
+            if f.done {
+                return Ok(());
             }
-            anyhow::bail!("funding remains pending; invoice and intent retained; run recover");
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
+        anyhow::bail!("funding remains pending; invoice and intent retained; run recover");
     }
+
     let w = wallet(&cli.home, mint).await?;
     match cli.command {
-        Command::Fund {
-            amount, ref quote, ..
-        } => {
-            ensure!(
-                amount > 0 && amount <= 500_000,
-                "funding amount out of test range"
-            );
-            preflight(mint).await?;
-            let q = if let Some(id) = quote {
-                w.check_mint_quote(id).await?
-            } else {
-                w.mint_quote(PaymentMethod::BOLT11, Some(amount.into()), None, None)
-                    .await?
-            };
-            ensure!(
-                q.mint_url.to_string().trim_end_matches('/') == mint
-                    && q.unit == CurrencyUnit::Sat
-                    && q.amount == Some(amount.into()),
-                "resumed quote does not match requested asset/amount"
-            );
-            println!(
-                "{}",
-                serde_json::json!({"quote":q.id,"amount":amount,"note":"test mint auto-pay only; no invoice is paid by this tool"})
-            );
-            for _ in 0..30 {
-                let current = w.check_mint_quote(&q.id).await?;
-                if current.state != cashu::nuts::nut23::QuoteState::Paid {
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    continue;
-                }
-                match w.mint(&q.id, SplitTarget::default(), None).await {
-                    Ok(p) => {
-                        println!(
-                            "{}",
-                            serde_json::json!({"minted_proofs":p.len(),"balance":u64::from(w.total_balance().await?)})
-                        );
-                        return Ok(());
-                    }
-                    Err(e) if e.to_string().to_lowercase().contains("not paid") => {
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            anyhow::bail!("test quote remains unpaid; retained in wallet for recovery")
-        }
         Command::Balance { .. } => {
             println!(
                 "{}",

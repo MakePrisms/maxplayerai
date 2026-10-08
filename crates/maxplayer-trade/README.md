@@ -1,9 +1,9 @@
-# maxplayer-trade — standalone Cashu trades (fake money by default)
+# maxplayer-trade — standalone real-money Cashu trades
 
 A fixed-lot CLI, independent of jobs, the maxplayer daemon, core, and `relay.maxplayer.ai`.
 **A live 32-for-24 trade completed on 2026-10-08**, including both claims, NUT-07 witness
-recovery, fee-inclusive net delivery, and a signed `sold` status. This is a test-money
-prototype, not a production deployment or an unconditional atomicity guarantee.
+recovery, fee-inclusive net delivery, and a signed `sold` status. Real-money trading is a normal supported use; this is not a production safety certification
+or an unconditional atomicity guarantee.
 
 Current operating policy is in [Round 4](#round-4-relay-policy-and-real-money-integration-author-led-verification).
 Earlier dated verification sections are historical snapshots, not current coverage totals.
@@ -42,14 +42,29 @@ Earlier dated verification sections are historical snapshots, not current covera
   key after strict locktime plus clock margin. Maker recovery polls every three seconds and
   refunds after its short deadline +60 seconds when the mint is reachable. A claim that wins
   the refund race is reconciled through its witness. Refund outputs survive a process exit.
-- `recover` resumes existing authorizations until terminal; it does not admit new requests.
+- `recover` makes one bounded pass over existing authorizations; it does not admit new requests or wait for deadlines. Exit **2** and status `recovery_incomplete` mean retained items need a later pass; exit 0 means all money authorizations are terminal, exit 1 is a command error. Each funding/withdrawal/swap attempt has a 120-second budget, independent of other items. HTTP requests may already have landed at timeout: the exact journal remains authoritative; no timeout releases funds.
   `serve` continuously accepts quotes and recovers swaps. **Keep a watcher running while funds
   are locked.** Stop it before another command uses the same home. Do not delete a trade home.
 
-The default permitted mints are `https://testnut.cashudevkit.org`, `https://testnut.cashu.space`,
-and loopback HTTP(S) mints. Real mints require both `TRADE_REAL_MONEY_TEST=1` and a repeated
-global `--real-mint-allow <exact-canonical-HTTPS-URL>` for each mint, on every invocation.
-No wildcard, prefix, environment-only, or persisted authorization exists. HTTP redirects are disabled.
+Any canonical HTTPS mint can be used if automatic preflight passes: advertised NUT-07/09/12/14,
+an active sat keyset, and clock skew at most 60 seconds. Preflight runs before each `list`,
+`take`, funding quote/issuance and lock submission; successful earlier preflight is not cached
+as permission for a later lock. Test mints and loopback HTTP(S) fixtures remain supported.
+HTTP is refused except on loopback, and redirects are disabled. There is no real-money
+opt-in environment variable or allow-list flag. Each lock's gross amount and cumulative
+funding per mint/home are capped at **100,000 sats**, including pending/lost funding intents.
+Each withdrawal invoice is also capped at **100,000 sats**, plus at most 32 sats of
+quoted fee reserve; spendable funds must cover the invoice, input fees and required change.
+
+**Risks:** a mint can cheat: an issuer-run mint can steal its users' funds. Capability
+advertisements are not evidence of honest operation. If the counterparty disappears,
+funds remain locked until their deadlines and then require a successful refund transaction;
+expiry does not return funds automatically. **Keep `serve` running while funds are locked**,
+monitor its errors, and preserve the home. Never trade beyond the user's confirmed limits.
+Nutshell/0.21.0 at cashu.cz completed a real timed refund in the dated round-four live test
+(two SPENT proofs, empty-preimage HTLC refund witnesses, one signature each); this is not
+a guarantee for other deployments or versions.
+
 Default relays: `wss://nos.lol`, `wss://relay.primal.net`, `wss://offchain.pub`; repeat
 `--relay URL` before the command to configure alternatives. The production relay is
 explicitly forbidden. No production relay writes were made.
@@ -122,7 +137,7 @@ Only lab locks are scaled 2×, preserving their 3:1 ratio; the two-second cutoff
 one-second margin are unchanged. Tests use two Tokio workers instead of one per visible
 CPU, avoiding per-test oversubscription. Existing deadline and balance assertions remain unchanged.
 Crash injection exits the subprocess at
-explicit pre-effect or post-mint/pre-wallet-commit boundaries. Real-mint opt-in never enables lab timings.
+explicit pre-effect or post-mint/pre-wallet-commit boundaries. Public mints never enable lab timings.
 
 | Suite | Default passed/failed | Lab passed/failed |
 |---|---:|---:|
@@ -577,16 +592,16 @@ A mint can still lie, withhold evidence, or process an already-delivered request
   process-exit boundaries and one claim/refund race, not a full model checker.
 
 
-## Experimental real-money path
+## Funding and withdrawals
 
 This path is **not a production safety certification**. Public-mint results, if any, belong in
 its separate run report; the historical test counts above predate this change.
 
-- Each real-mint lock gross is capped at **500 sats**, at both planning and submission.
-- Real funding is capped at **500 sats cumulatively per mint per home**. The journal charges
+- Each lock gross is capped at **100,000 sats**, at both planning and submission.
+- Funding on every mint is capped at **100,000 sats cumulatively per mint per home**. The journal charges
   an intent before creating the mint quote; pending, failed, issued and lost-reply intents
   stay charged across restarts. A lost quote response is deliberately not auto-replaced.
-- Real `fund` locks the quote to a private NUT-20 key and requires the mint to echo that
+- `fund` locks the quote to a private NUT-20 key and requires the mint to echo that
   binding before printing the invoice and quote. Issuance is signed with that key. It prints
   the invoice and quote only after recording them. It never pays an
   invoice. It waits up to 30 seconds; `fund --quote <id>` or `recover` resumes it. Issuance
@@ -607,7 +622,7 @@ its separate run report; the historical test counts above predate this change.
 - New proofs are credited **reserved**, then the journal is marked done, then they are
   released. Recovery finishes an interrupted release. Never open a home concurrently or
   spend its proofs outside this tool. The CLI holds the home lock; library callers must too.
-- Withdrawals have a 500-sat invoice cap and a 32-sat fee-reserve cap. Input selection requires change to remain positive even
+- Withdrawals have a 100,000-sat invoice cap and a 32-sat fee-reserve cap. Input selection requires change to remain positive even
   if the whole reserve is consumed, unless arithmetic proves zero change. Sweep conservatively; do not interpret a `paid_change_unreconciled` result as dust
   or fees. Preserve every funded home and stop for inspection on unresolved state.
   Reserves are mint-specific (live: Minibits/Macadamia 2, cashu.cz 5 sats), not a global
@@ -618,12 +633,11 @@ its separate run report; the historical test counts above predate this change.
   witness emission and parsing on each mint before running the timed refund scenario.
   Never log proofs, tokens, wallet keys, blinding secrets, or HTLC/payment preimages.
 
-`recover` resumes the funding and withdrawal journals in addition to trade authorizations.
-It waits for all of them: an unrelated pending/fenced withdrawal can keep the command
-running after a particular swap refunded. A process timeout alone is not a failed refund;
-stop the process and inspect the saved swap state/balances without replacing the separate
-withdrawal. Use the same explicit allow-list on recovery. Funding caps are lifetime caps, not current
-balance caps; deleting or replacing a funded home is not a supported reset.
+`recover` attempts each funding, withdrawal and swap once and reports public IDs and states.
+An unreachable mint or stuck authorization does not stop other items or keep the command
+running indefinitely. Pending items remain non-terminal; exit 2 requests a later pass.
+Use `serve` for continuous recovery while locks are live. Historical round-four harness
+results below predate this bounded-pass fix.
 
 The tool's per-home caps do not constrain the external wallet paying a funding invoice.
 A hard source-wallet budget needs a quote-bound total-debit ceiling at the payment's
@@ -641,7 +655,7 @@ preimages. Missing/invalid spent witnesses make it fail. It does not recover or 
 payments. Supply every mint needed by that home's recorded trades:
 
 ```sh
-TRADE_REAL_MONEY_TEST=1 cargo run --manifest-path crates/maxplayer-trade/Cargo.toml \
+cargo run --manifest-path crates/maxplayer-trade/Cargo.toml \
   --locked --example real_audit -- /absolute/preserved/trade-home \
   https://mint.minibits.cash/Bitcoin https://mint.macadamia.cash
 ```
@@ -687,11 +701,13 @@ reconciled without payment, and five sweeps returned 257 sats. Final run account
 are terminal and retained spendable proofs were remotely confirmed UNSPENT. The report
 preserves both the real recovery-harness timeout and the unsent cashu.cz reserve refusal.
 
-Testing-only opt-in and journaled `withdraw` were cherry-picked onto the third-pass
-quarantine fix. Both `TRADE_REAL_MONEY_TEST=1` and an exact `--real-mint-allow` are
-required for real mints. Neither changes the default fake-money fence or enables lab
-clocks. Gross locks remain capped at 500 sats; funding is cumulatively capped at 500
-sats per mint per home, counting even unresolved intents. No maxplayer CLI/core changes.
+The counts and live results above describe head `9dad8e62669468492f997b4cb44fabe2b26ba8e1`,
+before the subsequently delivered scope change. That historical head had testing-only
+mint admission and 500-sat lock/funding caps. The current design removes mint opt-in,
+requires automatic preflight and raises lock, funding and withdrawal invoice caps to 100,000 sats. Historical live
+results are not a test of this new binary. The withdrawal fee-reserve limit stays 32 sats.
+An invoice at the cap still requires enough balance for fees and verified change; the
+cap is not a promise that a 100,000-sat balance can pay a 100,000-sat invoice plus fees. No maxplayer CLI/core changes.
 
 ### Relay traffic and failure behavior
 

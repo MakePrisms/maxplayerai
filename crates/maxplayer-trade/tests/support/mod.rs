@@ -31,6 +31,7 @@ pub struct Faults {
     pub hold_checkstate: std::sync::atomic::AtomicBool,
     pub checkstate_entered: tokio::sync::Notify,
     pub checkstate_release: tokio::sync::Notify,
+    pub no_sat_keyset: std::sync::atomic::AtomicBool,
     pub reject_info: std::sync::atomic::AtomicBool,
     pub reject_restore_after_swap: std::sync::atomic::AtomicBool,
     pub uppercase_witness: std::sync::atomic::AtomicBool,
@@ -59,6 +60,9 @@ impl Drop for MintFixture {
 }
 impl MintFixture {
     pub async fn start(ppk: u64) -> Self {
+        Self::with_melt_reserve(ppk, 1.0).await
+    }
+    pub async fn with_melt_reserve(ppk: u64, percent: f32) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let db = Arc::new(cdk_sqlite::mint::memory::empty().await.unwrap());
@@ -74,7 +78,7 @@ impl MintFixture {
         let fake = cdk_fake_wallet::FakeWallet::new(
             FeeReserve {
                 min_fee_reserve: 1.into(),
-                percent_fee_reserve: 1.0,
+                percent_fee_reserve: percent,
             },
             Default::default(),
             Default::default(),
@@ -84,7 +88,7 @@ impl MintFixture {
         b.add_payment_processor(
             CurrencyUnit::Sat,
             PaymentMethod::BOLT11,
-            MintMeltLimits::new(1, 10000),
+            MintMeltLimits::new(1, 200_000),
             Arc::new(fake),
         )
         .await
@@ -176,6 +180,9 @@ impl MintFixture {
                     let (parts, body) = response.into_parts();
                     let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
                     if let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        if path.ends_with("/keysets") && control.no_sat_keyset.load(SeqCst) {
+                            v["keysets"] = serde_json::json!([]);
+                        }
                         if path.ends_with("/info") {
                             let nut = control.missing_nut.load(SeqCst);
                             if nut != 0 {

@@ -55,14 +55,6 @@ impl Asset {
                 .parse::<std::net::IpAddr>()
                 .map(|x| x.is_loopback())
                 .unwrap_or(false);
-        let test = u.scheme() == "https"
-            && u.port().is_none()
-            && (h == "testnut.cashudevkit.org" || h == "testnut.cashu.space")
-            && u.path() == "/";
-        ensure!(
-            test || local || crate::real_money::allows(&self.mint_url),
-            "mint fence: fake-money mints only without explicit real-money authorization"
-        );
         ensure!(
             u.scheme() == "https" || (local && u.scheme() == "http"),
             "HTTP allowed only on loopback"
@@ -278,12 +270,12 @@ mod tests {
         }
     }
     #[test]
-    fn real_mint_denied() {
+    fn real_mint_transport_allowed() {
         assert!(
             Asset::new("https://mint.minibits.cash/Bitcoin")
                 .unwrap()
                 .fence()
-                .is_err()
+                .is_ok()
         );
     }
     #[test]
@@ -297,13 +289,8 @@ mod tests {
         }
     }
     #[test]
-    fn lookalike_denied() {
-        assert!(
-            Asset::new("https://testnut.cashu.space.evil.example")
-                .unwrap()
-                .fence()
-                .is_err()
-        );
+    fn nonloopback_http_denied() {
+        assert!(Asset::new("http://mint.example").unwrap().fence().is_err());
     }
     #[test]
     fn same_unit_different_fee() {
