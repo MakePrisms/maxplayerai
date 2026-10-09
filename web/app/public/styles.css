@@ -1195,8 +1195,6 @@ button.chip { cursor: pointer; }
 /* Chat reuses Sell's section rhythm and chrome, with a title-specific width. */
 .h-hero h1.h-title-chat { line-height: 1.02; }
 .chat-page .h-copy code { white-space: normal; overflow-wrap: anywhere; word-break: normal; }
-.chat-page #cmd-instruction { font: 15px/1.6 var(--sans); }
-.h-chat-limits { max-width: 700px; margin-top: 30px; }
 @media (max-width: 760px) {
   .h-hero h1.h-title-chat { font-size: min(calc((100vw - 60px) / 12.6), 84px); white-space: nowrap; }
 }
