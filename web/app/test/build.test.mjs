@@ -173,6 +173,7 @@ test("/tokens ships its own read-only bundle and stays unlisted", () => {
   assert.match(tokens, /<aside class="dock dock-(left|right) pinned" id="trade-detail"[^>]*hidden>/);
   assert.ok(!/dock-mid/.test(tokens), "the lot popup never opens in the middle");
   assert.ok(!tokens.includes('id="done"'), "no completed-trades table under the board (bob)");
+  assert.ok(!tokens.includes('id="stats-note"') && !tokens.includes("Mints can fail"), "no footnotes (bob)");
   assert.ok(tokens.indexOf('id="trade-detail"') > tokens.indexOf("</footer>"), "the popup lives outside the page flow");
   // Team link only (bob): nothing on the public site points at it.
   for (const page of ["index.html", "market.html", "sell.html", "tokens.html", "llms.txt", "skill.md"]) {

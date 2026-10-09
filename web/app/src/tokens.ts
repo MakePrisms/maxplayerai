@@ -91,13 +91,6 @@ function renderStats(v: BookView, t: number): void {
     ["Median fill", c.medianFill == null ? "—" : duration(c.medianFill), false],
   ];
   el("statgrid").innerHTML = cells.map(([k, val, neon]) => `<div><dt>${k}</dt><dd${neon ? ' class="neon"' : ""}>${esc(val)}</dd></div>`).join("");
-  const notes: string[] = [`${c.cancelled} cancelled and ${c.expired} expired in this period`];
-  if (v.quarantined.length) notes.push(`${v.quarantined.length} listing${v.quarantined.length === 1 ? "" : "s"} hidden: broken or forked status history`);
-  if (v.rejected) notes.push(`${v.rejected} invalid listing${v.rejected === 1 ? "" : "s"} ignored`);
-  if (v.pending) notes.push(`${v.pending} still loading`);
-  el("stats-note").textContent =
-    "A trade counts as completed when its seller signs the lot sold; settlement itself is private. " +
-    "Every listing and status is signature-checked in your browser with the trade CLI's rules. " + notes.join(" · ") + ".";
 }
 
 let selected: string | null = null;

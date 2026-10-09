@@ -1207,7 +1207,6 @@ button.chip { cursor: pointer; }
 .tag[data-s="cancelled"] { color: var(--muted); }
 .tag[data-s="expired"] { color: var(--faint); }
 .tag[data-s="quarantined"] { color: var(--warn); border-color: rgba(255, 138, 61, 0.4); }
-.trades-foot { padding: 0 16px 18px; }
 #trade-detail-body code { overflow-wrap: anywhere; }
 #trade-detail-body .kv dd { min-width: 0; }
 @media (max-width: 980px) {
