@@ -11,7 +11,7 @@ import { TRADE_LOT, TRADE_STATUS } from "../src/model/kinds.js";
 import { completedStats, createBook } from "../src/trade/book.js";
 import { lifecycle, parseLot, type NostrEvent } from "../src/trade/validate.js";
 import { allowedRelay, createTradeReader, drain, lotFilter, statusFilters, STATUS_CHUNK } from "../src/trade/relays.js";
-import { mintLabel, rate, timeLeft } from "../src/trade/format.js";
+import { dockSide, mintLabel, rate, timeLeft } from "../src/trade/format.js";
 
 /** The fixture generator's test keys: bytes 0x11… (maker) and 0x22… (other). */
 const MAKER = "11".repeat(32);
@@ -354,4 +354,12 @@ test("completed trades never count a quarantined or stranger-closed lot", () => 
   book.ingest(status(fork, 2, f1.id, "sold"));
   book.ingest(status(fork, 2, f1.id, "cancelled", MAKER, T0 + 99));
   assert.equal(completedStats(book.view(NOW), NOW, null).trades, 0);
+});
+
+test("the lot popup docks to the clicked side, never the middle", () => {
+  assert.equal(dockSide("lots", 1300, 1440), "left");
+  assert.equal(dockSide("recent", 10, 1440), "right");
+  assert.equal(dockSide("done", 200, 1440), "left");
+  assert.equal(dockSide("done", 720, 1440), "right");
+  assert.equal(dockSide("done", null, 1440), "left");
 });

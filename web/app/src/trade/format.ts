@@ -39,3 +39,14 @@ export function seller(pubkey: string): { npub: string; short: string } {
     return { npub: pubkey, short: pubkey.slice(0, 8) };
   }
 }
+
+/**
+ * Which edge the lot popup docks to (bob: never the middle). Open lots are
+ * the left column, Recent the right; the full-width completed table follows
+ * the click, and a keyboard open (no pointer) docks left.
+ */
+export function dockSide(list: string, clientX: number | null, width: number): "left" | "right" {
+  if (list === "lots") return "left";
+  if (list === "recent") return "right";
+  return clientX != null && clientX >= width / 2 ? "right" : "left";
+}

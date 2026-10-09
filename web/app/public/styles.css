@@ -1196,7 +1196,7 @@ button.chip { cursor: pointer; }
    Same board chrome as /market; two columns (open lots, recent) instead of
    three. Everything is scoped to .trades-page so /market cannot change. */
 .trades-page .market-bar .col-meta { white-space: normal; text-align: right; }
-.trades-book { grid-template-columns: 1.6fr 1fr; }
+.trades-book { grid-template-columns: 1fr 1fr; }
 .lots-grid { grid-template-columns: minmax(0, 1.3fr) minmax(0, 1.3fr) 64px minmax(0, 1fr) 62px; }
 .recent-grid { grid-template-columns: 74px minmax(0, 1fr) 34px; }
 .trades-page .feed .row.recent-grid { grid-template-columns: 74px minmax(0, 1fr) 34px; }

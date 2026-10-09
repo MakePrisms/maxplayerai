@@ -11,7 +11,7 @@ declare const WEB_ANALYTICS_ENABLED: boolean;
  */
 import { startAnalytics } from "./analytics.js";
 import { WINDOWS, completedStats, createBook, type BookView, type LotRow } from "./trade/book.js";
-import { mintLabel, rate, seller, timeLeft } from "./trade/format.js";
+import { dockSide, mintLabel, rate, seller, timeLeft } from "./trade/format.js";
 import { DEFAULT_TRADE_RELAYS, createTradeReader, type RelayState } from "./trade/relays.js";
 import { ago, duration, esc, nf, now, stamp } from "./ui/format.js";
 import { reconcileList, type KeyedItem } from "./ui/reconcile.js";
@@ -203,8 +203,14 @@ function boot(): void {
     if (ev instanceof KeyboardEvent && ev.key !== "Enter" && ev.key !== " ") return;
     ev.preventDefault();
     selected = row.dataset.lot ?? null;
+    const list = row.closest("ol")?.id ?? "";
+    const x = ev instanceof MouseEvent && ev.detail > 0 ? ev.clientX : null;
+    const side = dockSide(list, x, window.innerWidth);
+    const box = el("trade-detail");
+    box.classList.toggle("dock-left", side === "left");
+    box.classList.toggle("dock-right", side === "right");
     renderDetail();
-    // Opened like /market's event dock: the popup takes focus at the top.
+    // Opened like /market's docks: the popup takes focus at the top.
     el("trade-detail-body").scrollTop = 0;
     el("trade-detail-close").focus();
   };

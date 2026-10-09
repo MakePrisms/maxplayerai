@@ -170,7 +170,8 @@ test("/tokens ships its own read-only bundle and stays unlisted", () => {
   assert.ok(!readFileSync(join(root, "dist", "terminal.js"), "utf8").includes("offchain.pub"), "the jobs bundle carries no trade reader");
   assert.match(tokens, /<meta name="robots" content="noindex, nofollow">/);
   // Lot details open in /market's popup window, not inline under the board.
-  assert.match(tokens, /<aside class="dock dock-mid pinned" id="trade-detail"[^>]*hidden>/);
+  assert.match(tokens, /<aside class="dock dock-(left|right) pinned" id="trade-detail"[^>]*hidden>/);
+  assert.ok(!/dock-mid/.test(tokens), "the lot popup never opens in the middle");
   assert.ok(tokens.indexOf('id="trade-detail"') > tokens.indexOf("</footer>"), "the popup lives outside the page flow");
   // Team link only (bob): nothing on the public site points at it.
   for (const page of ["index.html", "market.html", "sell.html", "tokens.html", "llms.txt", "skill.md"]) {
