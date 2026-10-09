@@ -132,6 +132,17 @@ pub(super) fn hint(f: &Facts) -> Value {
         Some(ReservationState::Spent) => settled_turn_one(f),
         Some(ReservationState::Reserved) => {
             if let Some(error) = f.failure.as_deref() {
+                // #1122: a signed verdict refusal is deterministic; "retry now" would mislead.
+                if error.contains(crate::review::VERDICT_REFUSED_PREFIX) {
+                    return body(
+                        MODE_AUTO,
+                        "failed",
+                        1,
+                        None,
+                        Some(error),
+                        review_note("policy_refused"),
+                    );
+                }
                 return body(
                     MODE_AUTO,
                     "failed",
@@ -209,6 +220,19 @@ fn review_note(state: &str) -> String {
              or failed; see error), and the daemon does not retry that on its own. Call collect to \
              retry the review and the settle now; it never pays twice. If it keeps failing, see the \
              maxplayer-debug-buying skill. {NOT_A_HUMAN_DECISION}"
+        ),
+        // #1122: a signed verdict refusal names its unsafe ppm, threshold and verdict event id.
+        // Neither the daemon nor a plain collect overrides it; only the human's explicit,
+        // verdict-bound decision does (collect accept_review_verdict=<verdict event id>).
+        "policy_refused" => format!(
+            "The delivery review refused this delivery ({state}; the error names the unsafe \
+             probability, the local threshold and the verdict event id). The daemon never settles \
+             a refused delivery, and a plain collect re-runs the same verdict, so it cannot \
+             override a refusal; nothing is paid unless the review passes. This is the human's \
+             decision: relay those numbers to them. Only if they accept this exact verdict, call \
+             collect with accept_review_verdict set to the verdict event id; otherwise raise \
+             review.reject_at_or_above_ppm or leave it unsettled. See the maxplayer-debug-buying \
+             skill."
         ),
         _ => format!(
             "The delivery review refused this delivery ({state}; see error). collect re-runs the \
@@ -669,6 +693,13 @@ mod tests {
             assert_eq!(state(&hint), ("auto", "failed", 1));
             assert!(note(&hint).contains("cannot override a refusal"), "{hint}");
             assert!(!note(&hint).contains("Call collect to retry"), "{hint}");
+            // #1122: only a verdict refusal offers the verdict-bound human decision.
+            assert_eq!(
+                note(&hint).contains("accept_review_verdict"),
+                refused == "policy_refused",
+                "{hint}"
+            );
+            assert!(!note(&hint).contains("Do not ask the human"), "{hint}");
         }
 
         let pending = hint(&Facts {
@@ -678,6 +709,35 @@ mod tests {
         });
         assert_eq!(state(&pending), ("auto", "settling", 1));
         assert!(note(&pending).contains("Do not ask the human"), "{pending}");
+    }
+
+    #[test]
+    fn a_recorded_verdict_refusal_reads_failed_with_the_verdict_decision() {
+        let refusal = format!(
+            "collect: {} this delivery: unsafe probability 900000 ppm; verdict event {}",
+            crate::review::VERDICT_REFUSED_PREFIX,
+            "c".repeat(64)
+        );
+        let held = hint(&Facts {
+            delivered: true,
+            failure: Some(refusal.clone()),
+            ..reserved_award()
+        });
+        assert_eq!(state(&held), ("auto", "failed", 1));
+        assert_eq!(held["error"], json!(refusal));
+        assert!(note(&held).contains("accept_review_verdict"), "{held}");
+        assert!(!note(&held).contains("Call collect to retry now"), "{held}");
+        // Any other recorded refusal keeps the generic retry note.
+        let other = hint(&Facts {
+            delivered: true,
+            failure: Some("collect: review: timeout; retry available".into()),
+            ..reserved_award()
+        });
+        assert!(
+            note(&other).contains("Call collect to retry now"),
+            "{other}"
+        );
+        assert!(!note(&other).contains("accept_review_verdict"), "{other}");
     }
 
     #[test]

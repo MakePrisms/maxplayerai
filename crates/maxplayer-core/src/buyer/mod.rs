@@ -1302,6 +1302,8 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
 /// Params for the `collect` RPC.
 #[derive(Debug, Deserialize)]
 struct CollectParams {
+    #[serde(default)]
+    accept_review_verdict: Option<String>,
     job_id: String,
     #[serde(default)]
     out: Option<String>,
@@ -1371,7 +1373,15 @@ async fn settle_job(
     context: &BuyerContext,
     job_id: &str,
     out: Option<String>,
+    accept_review_verdict: Option<String>,
 ) -> Result<collect::CollectOutcome, SettleJobError> {
+    crate::review::validate_accept_review_verdict(accept_review_verdict.as_deref()).map_err(
+        |e| {
+            SettleJobError::Pay(collect::CollectError::Lifecycle(
+                job_lifecycle::JobLifecycleError::Input(e),
+            ))
+        },
+    )?;
     // Serialize with award + other collects: at most one wallet-melting op in flight daemon-wide.
     let _guard = context.money_lock.lock().await;
 
@@ -1390,9 +1400,13 @@ async fn settle_job(
     // in-closure accept produced, so the wire code and operator line are unchanged.
     let bind = match job_lifecycle::load_accepted_bind(&context.home, job_id) {
         Ok(Some(bind)) => bind,
-        Ok(None) => job_lifecycle::accept_for_collect_async(&context.home, job_id)
-            .await
-            .map_err(|error| SettleJobError::Pay(collect::CollectError::Lifecycle(error)))?,
+        Ok(None) => job_lifecycle::accept_for_collect_async(
+            &context.home,
+            job_id,
+            accept_review_verdict.clone(),
+        )
+        .await
+        .map_err(|error| SettleJobError::Pay(collect::CollectError::Lifecycle(error)))?,
         Err(error) => return Err(SettleJobError::Pay(collect::CollectError::Lifecycle(error))),
     };
 
@@ -1407,6 +1421,7 @@ async fn settle_job(
         )
     };
     let request = CollectRequest {
+        accept_review_verdict,
         job_id: job_id.to_owned(),
         out,
     };
@@ -1538,7 +1553,13 @@ fn collect_pay_response(pay: &collect::CollectPayment) -> Value {
 async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
     let params: CollectParams = match serde_json::from_value(params) {
         Ok(params) => params,
-        Err(error) => return Response::err(id, CODE_METHOD_NOT_FOUND, format!("collect params: {error}")),
+        Err(error) => {
+            return Response::err(
+                id,
+                CODE_METHOD_NOT_FOUND,
+                format!("collect params: {error}"),
+            );
+        }
     };
 
     if params.close_session {
@@ -1550,6 +1571,11 @@ async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
     }
     match session_reply::collect_target(context, &params.job_id, params.turn).await {
         Ok(Some(row)) => {
+            // A verdict-bound acceptance binds turn 1's delivery subject only; a session turn's
+            // review is not widened here, so refuse rather than silently ignore the decision.
+            if params.accept_review_verdict.is_some() {
+                return Response::err(id, CODE_REFUSED, "accept_review_verdict applies to a job's turn-1 delivery only; it cannot accept a session turn's refused review".to_owned());
+            }
             if params.out.is_some() {
                 return Response::err(id, CODE_REFUSED, "a session turn collects into results/<job>-t<n>; omit out".to_owned());
             }
@@ -1591,7 +1617,13 @@ async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
         Err(error) => return Response::err(id, CODE_REFUSED, error),
     }
     let close_session = params.close_session;
-    let settled = settle_job(context, &params.job_id, params.out).await;
+    let settled = settle_job(
+        context,
+        &params.job_id,
+        params.out,
+        params.accept_review_verdict,
+    )
+    .await;
     match &settled {
         Ok(_) => settlement::note_refusal(context, &params.job_id, None),
         // Nothing delivered yet is not a settle refusal (the watcher treats it the same way).
@@ -3119,7 +3151,9 @@ async fn settle_awarded(context: &Arc<BuyerContext>, wake: Option<&nostr_sdk::Ev
             }
             Ok(None) => {}
         }
-        let settled = settle_job(context, &job_id, None).await;
+        // Never an acceptance from this background sweep: a refused verdict settles only on an
+        // explicit `collect accept_review_verdict` (or one already recorded for this exact subject).
+        let settled = settle_job(context, &job_id, None, None).await;
         // `get_job.settlement` reads this: a refusal shows as `failed`, a success clears it. "Not
         // delivered yet" is neither, so it leaves any earlier record standing.
         match &settled {
@@ -8345,4 +8379,242 @@ mod tests {
         assert_eq!(claim_price_sats(None), None);
     }
 
+}
+
+#[cfg(test)]
+mod review_verdict_params_tests {
+    use super::CollectParams;
+    #[test]
+    fn collect_params_optional_review_verdict() {
+        let plain: CollectParams =
+            serde_json::from_value(serde_json::json!({"job_id":"job"})).unwrap();
+        assert_eq!(plain.accept_review_verdict, None);
+        let explicit: CollectParams = serde_json::from_value(
+            serde_json::json!({"job_id":"job", "accept_review_verdict":"a".repeat(64)}),
+        )
+        .unwrap();
+        assert_eq!(explicit.accept_review_verdict, Some("a".repeat(64)));
+    }
+}
+
+/// #1122 end to end on a real in-process relay and the daemon's own code: the watcher's automatic
+/// settlement never accepts a refused verdict, a mismatched verdict id fails closed, and an explicit
+/// `collect accept_review_verdict=<verdict id>` then settles the held job (it does not stay blocked).
+#[cfg(test)]
+mod review_verdict_settle_tests {
+    use super::*;
+    use crate::home::bootstrap as bootstrap_home;
+    use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+    use nostr_sdk::prelude::{Client, Keys};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_verdict_holds_auto_settle_until_an_explicit_verdict_bound_collect() {
+        use crate::gateway::{self, ClaimPayment, OfferDraft, PaymentMode};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let root = tempfile::tempdir().expect("tempdir");
+        let reviewer = Keys::generate();
+        let mut home = bootstrap_home(root.path()).expect("bootstrap home");
+        home.config.relay_url = relay_url.clone();
+        home.config.review.buyer_delivery = true;
+        home.config.review.timeout_seconds = 5;
+        home.config
+            .review
+            .reviewers
+            .insert(relay_url.clone(), reviewer.public_key().to_hex());
+        let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
+        let net = Client::new(Keys::generate());
+        net.add_relay(&relay_url).await.expect("add relay");
+        net.connect().await;
+        net.wait_for_connection(Duration::from_secs(5)).await;
+        let publish = |keys: &Keys, draft: &gateway::EventDraft| {
+            let event = gateway::nostr::event_builder(draft)
+                .expect("event builder")
+                .sign_with_keys(keys)
+                .expect("sign");
+            let net = net.clone();
+            async move {
+                net.send_event(&event).await.expect("publish");
+                event.id.to_hex()
+            }
+        };
+
+        let buyer = buyer_keys(&context.home).expect("buyer keys");
+        let (buyer_hex, seller) = (buyer.public_key().to_hex(), Keys::generate());
+        let seller_hex = seller.public_key().to_hex();
+        let (task, output) = ("say hello", "text/plain");
+        let offer = OfferDraft::new(task, output, 0, now_unix() as u64 + 3_600, &seller_hex)
+            .with_payment_mode(PaymentMode::None)
+            .accepting_delivery(["inline"])
+            .to_event_draft();
+        let job_id = publish(&buyer, &offer).await;
+        let claim = gateway::claim_draft(
+            &job_id,
+            &buyer_hex,
+            &seller_hex,
+            ClaimPayment::None,
+            &[],
+            &Default::default(),
+        );
+        let claim_id = publish(&seller, &claim).await;
+        let award = gateway::award_draft(&job_id, &claim_id, &buyer_hex, &seller_hex);
+        let award_id = publish(&buyer, &award).await;
+        let job_hash = job_lifecycle::job_hash_for_offer(&job_id, task, 0);
+        let result = gateway::inline_result_draft(
+            &job_id,
+            &buyer_hex,
+            output,
+            0,
+            &job_hash,
+            &"ab".repeat(32),
+            "hello",
+            &[],
+        );
+        let result_id = publish(&seller, &result).await;
+
+        // The reviewer's signed verdict for exactly this delivery: 90% unsafe, at/above 50%.
+        let subject = crate::review::Subject {
+            offer: job_id.clone(),
+            event: result_id.clone(),
+            kind: crate::kinds::JOB_RESULT_KIND,
+            commit: None,
+        };
+        let review = crate::review::Review {
+            schema: 1,
+            subject: subject.clone(),
+            input_sha256: crate::review::input_digest(b"fixture"),
+            status: "ok".into(),
+            results: vec![crate::review::Classification {
+                classifier: crate::review::CLASSIFIER.into(),
+                version: crate::review::CLASSIFIER_VERSION.into(),
+                label: "unsafe".into(),
+                probabilities: BTreeMap::from([("safe".into(), 0.1), ("unsafe".into(), 0.9)]),
+            }],
+            error_code: None,
+        };
+        let verdict = publish(
+            &reviewer,
+            &crate::review::review_draft(&review).expect("review draft"),
+        )
+        .await;
+
+        let now = now_unix();
+        context.store.reserve(&job_id, 0, 0, now).expect("reserve");
+        context
+            .store
+            .record_award(&job_id, &claim_id, &award_id, &seller_hex, 0, now)
+            .expect("record award");
+
+        // The watcher's own pass: it settles with NO acceptance, so the verdict refuses it.
+        settle_awarded(&context, None).await;
+        let bind = || job_lifecycle::load_accepted_bind(&context.home, &job_id).unwrap();
+        assert!(bind().is_none(), "a refused verdict must write no bind");
+        let status = crate::review::state::read(&context.home.root, &result_id).expect("status");
+        assert_eq!(status.state, "policy_refused", "{status:?}");
+        assert!(status.detail.contains("900000 ppm"), "{status:?}");
+        assert!(status.detail.contains(&verdict), "{status:?}");
+        let refusal = context
+            .settle_failures
+            .lock()
+            .unwrap()
+            .get(&job_id)
+            .cloned();
+        let refusal = refusal.expect("the watcher recorded its refusal for get_job");
+        assert!(
+            refusal.contains(crate::review::VERDICT_REFUSED_PREFIX),
+            "{refusal}"
+        );
+        assert!(refusal.contains("accept_review_verdict"), "{refusal}");
+        assert!(
+            crate::review::recorded_acceptance(&context.home, &subject)
+                .unwrap()
+                .is_none(),
+            "the daemon records no acceptance on its own"
+        );
+        // A later sweep is held, not retried, and still applies no acceptance.
+        settle_awarded(&context, None).await;
+        assert!(bind().is_none());
+        let read = get_job(&context, json!(1), json!({ "job_id": job_id }))
+            .await
+            .result
+            .expect("get_job view");
+        assert_eq!(read["settlement"]["state"], json!("failed"), "{read}");
+        assert!(
+            read["settlement"]["note"]
+                .as_str()
+                .unwrap()
+                .contains("accept_review_verdict"),
+            "{read}"
+        );
+
+        // A verdict id that is not this verdict fails closed and settles nothing.
+        let wrong = collect(
+            &context,
+            json!(2),
+            json!({ "job_id": job_id, "accept_review_verdict": "f".repeat(64) }),
+        )
+        .await;
+        let error = wrong
+            .error
+            .expect("a mismatched verdict id must refuse")
+            .message;
+        assert!(error.contains("does not match this verdict"), "{error}");
+        assert!(bind().is_none());
+
+        // The explicit, verdict-bound collect is the manual settle trigger: it settles the job.
+        let settled = collect(
+            &context,
+            json!(3),
+            json!({ "job_id": job_id, "accept_review_verdict": verdict }),
+        )
+        .await;
+        let body = settled
+            .result
+            .unwrap_or_else(|| panic!("{:?}", settled.error));
+        assert_eq!(body["pay"]["amount_sats"], json!(0), "{body}");
+        let dest = context.home.root.join("results").join(&job_id);
+        assert_eq!(
+            std::fs::read_to_string(dest.join(collect::INLINE_ANSWER_FILENAME)).expect("answer"),
+            "hello"
+        );
+        assert_eq!(bind().expect("bind").result_id, result_id);
+        assert!(matches!(
+            context.store.reservation(&job_id).unwrap(),
+            Some((reservations::ReservationState::Spent, 0))
+        ));
+        let evidence: Value = serde_json::from_slice(
+            &std::fs::read(
+                context
+                    .home
+                    .root
+                    .join("reviews")
+                    .join(format!("{result_id}.json")),
+            )
+            .expect("review evidence"),
+        )
+        .unwrap();
+        assert_eq!(evidence["review_event"], json!(verdict));
+        assert_eq!(evidence["accepted_verdict"]["unsafe_ppm"], json!(900_000));
+        assert_eq!(
+            evidence["accepted_verdict"]["configured_threshold_ppm"],
+            json!(500_000)
+        );
+        assert_eq!(
+            crate::review::state::read(&context.home.root, &result_id)
+                .unwrap()
+                .state,
+            "passed"
+        );
+        assert!(
+            context
+                .settle_failures
+                .lock()
+                .unwrap()
+                .get(&job_id)
+                .is_none()
+        );
+        net.disconnect().await;
+        relay.shutdown();
+    }
 }

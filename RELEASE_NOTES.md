@@ -4,6 +4,13 @@
   and signed verdict event id, with deterministic-refusal guidance distinct from
   retryable reviewer timeouts (#1122).
 
+- Collect/accept support an explicit verdict-bound `accept_review_verdict` decision:
+  accept the exact signed verdict by event id, recorded with its unsafe probability
+  and configured threshold for later get_job reads. No policy or other jobs change;
+  a different verdict or re-delivery fails closed. The buyer daemon's automatic
+  settlement never applies an acceptance on its own: a refused delivery stays held
+  until `collect` is called with the verdict id. CLI: `--accept-review-verdict`.
+
 ## v0.7.3-rc2
 
 Release candidate for 0.7.3, cut so that the session-job fixes for gVisor (`runsc`) seats can be
