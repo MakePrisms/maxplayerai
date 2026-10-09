@@ -82,18 +82,18 @@ directions:
 Each direction gets a test (§7, A3).
 
 The cost is that a person using a generic NIP-17 client (Amethyst, 0xchat) cannot chat with an agent
-directly. That is open question Q7.
+directly. That is a deliberate v1 cut (§11).
 
 ### 3.2 Relay
 
 v1 uses the home's `relay_url`, the same relay the trade path uses. Both peers must be on the same
 relay. For two default installs, that holds. Kind-10050 DM-relay lists and multiple relays are
-follow-ups (Q8).
+follow-ups (§11).
 
 ### 3.3 Delivery semantics
 
-Relay `OK` is not delivery. Outbound messages go into a local outbox table first, and the outbox
-retries after a crash (the same rule as `private_content/session.rs`). Inbound deduplication uses the
+v1 sends each message once and records the relay's answer in the log. There is no outbox and no
+retry: a lost chat message costs a re-send by hand, not money. Inbound deduplication uses the
 **rumor id**, not the wrap id: outer timestamps are randomized (`transport.rs:6,92`), and the receive
 cursor is `receive_since(last)` with overlap (`:88`).
 
@@ -138,36 +138,36 @@ a Claude Code or Codex subscription cannot use chat v1 (Q2).
 
 ## 5. Bounds
 
-All bounds are enforced in the process, not by the model. Defaults are in brackets; each is set in
-`chat/config.toml`.
+Three bounds, enforced in the process, not by the model. Each is set in `chat/config.toml`.
 
 | Bound | Default | On breach |
 |---|---|---|
-| `max_auto_replies` per conversation session | 10 | Session → `paused(budget)`. Inbound messages are still recorded. No reply until `chat resume <peer>`. **This is the loop breaker for two bots replying forever.** |
-| `max_replies_per_day` per peer | 50 | Same pause, reason `daily`. The count resets at UTC midnight. |
+| `max_auto_replies` per conversation | 10 | Conversation → `paused`. Inbound messages are still recorded. No reply until `chat resume <peer>`, which refills the budget. **This is the loop breaker for two bots replying forever.** |
 | `max_reply_chars` | 2000 | The reply is truncated at a char boundary before sending; `max_tokens` is derived from it. |
-| `max_inbound_chars` | 8000 | The message is refused at decode time (recorded as `refused: too long`, content not stored). |
-| `reply_timeout_secs` | 60 | No reply is sent, and the attempt counts against the budget. |
-| `min_reply_interval_secs` per peer | 10 | Inbound messages that arrive inside the interval are batched into one reply turn. |
+| `max_inbound_chars` | 8000 | The message is refused at decode time and not stored. |
+
+The model call has a fixed 60 s timeout; a timeout sends nothing and counts against the budget.
+Inbound messages are answered one at a time, in order.
 
 A message from a sender who is **not** approved is dropped after unwrapping, with no reply, no
-pairing code and no stored content. A counter in `chat list` shows the number of such messages. Only
-an unwrap can reveal the sender, because the seal is inside the wrap.
+pairing code and no stored content. Only an unwrap can reveal the sender, because the seal is inside
+the wrap.
 
 ## 6. Owner surface (CLI only)
 
 ```
-maxplayer chat init                      # writes chat/config.toml + empty chat/persona.md, prints what is shared
 maxplayer chat peer add <npub|hex> --name <label>
-maxplayer chat peer remove <peer> [--purge]
-maxplayer chat peer list
-maxplayer chat send <peer> "<text>"      # owner-authored message, sent verbatim; resets nothing
+maxplayer chat peer remove <peer>
+maxplayer chat send <peer> "<text>"      # owner-authored message, sent verbatim
 maxplayer chat serve                     # foreground loop; takes chat.lock
-maxplayer chat list                      # peers, state (active / paused(reason) / stopped), counts, dropped-unapproved count
-maxplayer chat log <peer> [--tail N]     # full transcript, each line marked peer / agent / owner
+maxplayer chat list                      # peers and state (active / paused / stopped)
+maxplayer chat log <peer>                # full transcript, each line marked peer / agent / owner
 maxplayer chat stop <peer> | --all       # no more auto-replies; inbound still recorded
-maxplayer chat resume <peer>             # new session: auto-reply budget refilled
+maxplayer chat resume <peer>             # auto-reply budget refilled
 ```
+
+Setup is one hand-written file: the quickstart shows a five-line `chat/config.toml`. `chat serve`
+refuses to start without it.
 
 * **Introduce:** each owner runs `chat peer add` with the other's npub, which they got from
   `maxplayer whoami`. Approval is effectively mutual, because each side keeps only messages from its
@@ -175,41 +175,34 @@ maxplayer chat resume <peer>             # new session: auto-reply budget refill
 * **Start:** the owner sends the first message with `chat send`. The agents reply to each other after
   that, within the bounds.
 * **Stop:** `chat stop` takes effect before the next reply. The serve loop re-reads state before every
-  model call and again before every send. `--all` and `enabled = false` in config are the global kill
-  switch. Stopping the `serve` process also stops everything.
+  send. `--all` is the global kill switch, and so is stopping the `serve` process.
 * **Read:** `chat log` is local only and reads `chat/chat.sqlite`. Nothing is published.
 
 MCP is unchanged in v1. `AGENTS.md` states that the MCP exposes exactly the four buyer tools, and adding
-chat tools would change that contract (Q6).
+chat tools would change that contract (§11).
 
 ### 6.1 Local state, all under `$MAXPLAYER_HOME/chat/`
 
-* `config.toml`: `enabled`, `display_name`, `endpoint`, `model`, `key_file`, the §5 bounds. This is a
+* `config.toml`: `display_name`, `endpoint`, `model`, `key_file`, the §5 bounds. This is a
   **separate file**, not a `[chat]` table in `config.toml`, because `MaxplayerConfig` is
   `deny_unknown_fields` (`home.rs:1730-1731`). A new table would make an older binary refuse to boot
   after a rollback, the same hazard #895 describes for `[seat]`.
-* `persona.md`: owner-written, shared with peers.
-* `chat.sqlite`: `peers(pubkey, label, added_at, state, session_replies, day, day_replies)`,
-  `messages(rumor_id UNIQUE, peer, direction, origin {peer|agent|owner}, text, created_at, status)`,
-  `outbox`, `cursor`, `dropped(count)`.
+* `persona.md`: optional, owner-written, shared with peers.
+* `chat.sqlite`: `peers(pubkey, label, state, replies_left)`,
+  `messages(rumor_id UNIQUE, peer, origin {peer|agent|owner}, text, created_at)`, `cursor`.
 * `chat.lock`.
 
-## 7. Staged implementation and acceptance criteria
+## 7. Implementation and acceptance criteria
 
-Every stage stays off by default: without `chat/config.toml`, `chat serve` refuses with "chat not
-configured: run maxplayer chat init", and nothing else in the binary changes behavior.
+Off by default: without `chat/config.toml`, `chat serve` refuses with "chat not configured", and
+nothing else in the binary changes behavior.
 
-**PR 1: core module, no network.** `maxplayer-core/src/chat/` (built under `wallet` because it needs
-`rusqlite` and `nostr-sdk`; it uses none of the wallet modules): envelope encode/decode, store, bounds
-state machine, `compose_chat_request`, a `ChatModel` trait with an OpenAI-compatible client and a
-scripted mock.
-
-**PR 2: CLI and serve loop.** `maxplayer/src/chat_cli.rs`, dispatched from `cli.rs` next to `whoami`,
-plus the relay loop on `transport::wrap` / `unwrap_message`, and the end-to-end test on
-`nostr-relay-builder`.
-
-**PR 3: docs.** A buyer-quickstart section, the share-warning text, and a `doctor` row for chat
-config and key-file mode.
+**One implementation PR.** `maxplayer-core/src/chat/` (built under `wallet` because it needs
+`rusqlite` and `nostr-sdk`; it uses none of the wallet modules): envelope, store, reply budget,
+`compose_chat_request`, a `ChatModel` trait with an OpenAI-compatible client and a scripted mock.
+`maxplayer/src/chat_cli.rs`, dispatched from `cli.rs` next to `whoami`, with the serve loop on
+`transport::wrap` / `unwrap_message`. The end-to-end test runs on `nostr-relay-builder`. A short
+quickstart section with the config example and the "persona is public to peers" warning.
 
 Acceptance criteria. Each is a named test that fails if the behavior is removed:
 
@@ -217,7 +210,7 @@ Acceptance criteria. Each is a named test that fails if the behavior is removed:
   from A produces exactly one model call on B and one reply delivered to A, and both `chat log`s show
   the same three lines.
 * **A2 (approval).** A wrap from an unapproved key, and one from an approved key to a third party, each
-  give zero model calls, zero stored text, and `dropped` incremented by one.
+  give zero model calls and zero stored text.
 * **A3 (domain separation, both ways).** A NUT-18 payment rumor and a private-content envelope sent to
   a chat home give zero model calls and nothing stored. A chat rumor fed to
   `unwrap_own_payment_gift_wrap` returns `Ok(None)`.
@@ -230,13 +223,10 @@ Acceptance criteria. Each is a named test that fails if the behavior is removed:
 * **A6 (no wallet).** `chat serve` runs on a home with no wallet DB. Afterwards no wallet, budget or
   buyer/seller lock file exists, and `buyer.lock`/`seller.lock` held by another process do not block
   it.
-* **A7 (stop is prompt).** `chat stop` issued while a mock model call is in flight results in no
-  send; the reply is recorded as `discarded: stopped`.
-* **A8 (bounds).** An over-long inbound message is refused unstored; an over-long reply is truncated
-  to `max_reply_chars`; a model timeout sends nothing and counts one against the budget.
-* **A9 (dedup and crash).** The same rumor delivered twice (two wrap ids) is stored and answered once.
-  A reply written to the outbox before a simulated crash is sent once after restart.
-* **A10 (secrets).** Neither the identity key nor the API key appears in any log line, request body or
+* **A7 (stop).** `chat stop` issued while a mock model call is in flight results in no send.
+* **A8 (bounds and dedup).** An over-long inbound message is refused unstored; an over-long reply is
+  truncated to `max_reply_chars`. The same rumor delivered twice (two wrap ids) is answered once.
+* **A9 (secrets).** Neither the identity key nor the API key appears in any log line, request body or
   `chat log` output (sentinel-grep test, like whoami's `output_never_contains_secret_key`).
 
 The draft PR for this spec is docs-only. Its checks are the repo's CI, and no product build applies.
@@ -253,7 +243,7 @@ The draft PR for this spec is docs-only. Its checks are the repo's CI, and no pr
    request, and the harness reads the owner's own config. This is fixed by making the reply a direct
    model call (§4).
 4. *Two agents replying to each other with no cap is an unbounded spend.* This is fixed by the
-   per-session and per-day budget (§5, A5).
+   per-conversation reply budget (§5, A5).
 
 **Risks that come with the settled decisions (each one named, not mitigated beyond §5):**
 
@@ -290,11 +280,15 @@ The draft PR for this spec is docs-only. Its checks are the repo's CI, and no pr
 |---|---|---|
 | Q1 | Chat identity: the home key, or a dedicated chat key? | **Home key.** The npub you share is the one `whoami` prints and the one stage 2 will trade with. Cost: the chat process holds a key that also derives the P2PK payment key (§4). |
 | Q2 | Reply engine: direct API call (needs an API key) or an ACP harness in docker with tools denied (works with subscriptions)? | **Direct API call** for v1. A harness path is a follow-up, once we can prove it is tool-less. |
-| Q3 | Default caps (§5)? | 10 per session, 50 per day, 2000-char replies, 8000-char inbound. |
-| Q4 | Can the agent start a conversation, or only the owner? | **Owner only** (`chat send`). Auto-replies after that. |
-| Q5 | Should `chat send` mark owner messages as owner-authored to the peer? | **No** on the wire (no new fields); marked as owner in the local log. |
-| Q6 | MCP tools for read/stop/send? | **Not in v1** (keeps the four-tool contract). Follow-up: read-only `chat_log` plus `chat_stop`. |
-| Q7 | Plain NIP-17 interop for people on Amethyst/0xchat? | **No.** The envelope is required (§3.1). |
-| Q8 | Multiple relays / kind-10050 DM relay lists? | **No.** Use the home `relay_url` only. |
-| Q9 | Transcript retention? | Keep everything locally; `peer remove --purge` deletes it. |
-| Q10 | Should the persona disclose that it is an AI agent? | **Yes**, in the fixed preamble. |
+
+Smaller choices are fixed in the text: only the owner starts a conversation (`chat send`); owner
+messages are marked only in the local log; the preamble says the agent is an AI; transcripts stay
+local.
+
+## 11. Deliberately left out of v1
+
+Each of these was considered and cut to keep v1 minimal. Any of them can be added later without a
+wire change: the safety-review model (Bob), daily caps, reply batching, an outbound outbox with
+retry, a `chat init` command, a `doctor` row, MCP chat tools (MCP stays at four tools), multiple
+relays and kind-10050 DM relay lists, plain NIP-17 interop with Amethyst/0xchat (not in v1;
+§3.1), a dedicated chat key, a harness-based reply engine, and transcript purge.
