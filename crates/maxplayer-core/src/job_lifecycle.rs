@@ -209,6 +209,7 @@ pub struct JobView {
     pub offer: Option<OfferView>,
     pub claims: Vec<ClaimView>,
     pub results: Vec<ResultView>,
+    /// Newest live claim for display/wait summaries; not the only award candidate.
     pub live_claim_id: Option<String>,
     #[serde(serialize_with="serialize_accepted_view")]
     pub accepted: Option<AcceptedBind>,
@@ -322,6 +323,7 @@ pub struct ClaimView {
     /// Cosmetic kind-0 `name` for this claim's `seller_pubkey` (untrusted).
     pub display_name: Option<String>,
     pub status: String,
+    /// This claim remains active independently of other sellers' claims.
     pub live: bool,
     /// The seller-authored NUT-18 payment request (`creqA…`) string read from the
     /// claim's `["creq", …]` tag, when present. `None` for a claim that carries none — the
@@ -2685,7 +2687,8 @@ fn delivery_pay_deadline(results: &[ResultView], seller_pubkey: &str) -> Option<
 ///
 /// Both reclassifications are DERIVED — never stored, never read from the wall clock inside this
 /// function (tests pass a fixed `now`). `claims` must be pre-sorted newest-first; the newest claim
-/// that is still `processing` or `delivered` becomes the live one.
+/// that is still `processing` or `delivered` supplies the summary id. Every such claim
+/// is independently live; a newer incompatible seller must not hide an older candidate.
 ///
 /// `offer_deadline_unix == None` (offer not yet on the relay) means expiry cannot be derived,
 /// so status-based liveness is preserved unchanged.
@@ -2710,7 +2713,7 @@ pub(crate) fn derive_claim_liveness(
         .find(|claim| claim.status == "processing" || claim.status == CLAIM_STATUS_DELIVERED)
         .map(|claim| claim.claim_id.clone());
     for claim in claims.iter_mut() {
-        claim.live = live_claim_id.as_deref() == Some(claim.claim_id.as_str());
+        claim.live = claim.status == "processing" || claim.status == CLAIM_STATUS_DELIVERED;
     }
     live_claim_id
 }
@@ -5935,7 +5938,7 @@ mod tests {
     }
 
     #[test]
-    fn processing_claim_before_deadline_is_live_newest_wins() {
+    fn processing_claims_are_independently_live_newest_is_summary() {
         let deadline = 1_700_000_000u64;
         let mut claims = vec![
             claim_view("newest", 200, "processing"),
@@ -5943,7 +5946,7 @@ mod tests {
         ];
         let live = derive_claim_liveness(&mut claims, &[], Some(deadline), deadline - 10);
         assert_eq!(live.as_deref(), Some("newest"), "newest processing claim is live");
-        assert!(claims[0].live && !claims[1].live);
+        assert!(claims[0].live && claims[1].live);
         assert_eq!(claims[0].status, "processing", "not expired before the deadline");
     }
 
