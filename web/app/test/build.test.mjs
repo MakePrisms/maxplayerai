@@ -91,7 +91,7 @@ test("every asset URL in shipped HTML and CSS carries the deploy stamp", () => {
   assert.match(stamp, /^[0-9a-f]{12}$/);
 
   const html = readFileSync(join(root, "dist", "index.html"), "utf8");
-  for (const page of ["index.html", "market.html", "sell.html"]) {
+  for (const page of ["index.html", "market.html", "sell.html", "chat.html"]) {
     const pageHtml = readFileSync(join(root, "dist", page), "utf8");
     for (const asset of ["styles.css", "fonts.css", "terminal.js"]) {
       assert.ok(pageHtml.includes(`./${asset}?v=${stamp}`), `${asset} is stamped in ${page}`);
@@ -158,4 +158,29 @@ test("the live market ships at /market and the homepage links it", () => {
   // Old #market deep links (skill.md, llms.txt, shared URLs) still land on the board.
   assert.match(readFileSync(join(root, "src/main.ts"), "utf8"), /location\.hash === "#market".*location\.replace\("\/market"\)/);
   assert.ok(!home.includes("<script>"), "no inline scripts in the browser-key origin");
+});
+
+test("all site pages share navigation and footer links, with a current page and no inline scripts", () => {
+  const pages = ["index.html", "sell.html", "chat.html", "market.html"];
+  let expectedNav;
+  let expectedFooter;
+  for (const page of pages) {
+    const html = readFileSync(join(root, "dist", page), "utf8");
+    const nav = html.match(/<nav class="nav-links"[^>]*>([\s\S]*?)<\/nav>/)?.[1];
+    const footer = html.match(/<nav class="foot-nav"[^>]*>([\s\S]*?)<\/nav>/)?.[1];
+    assert.ok(nav && footer, `${page} has shared chrome`);
+    const links = (markup) => [...markup.matchAll(/href="([^"]+)"[^>]*>([^<]+)<\/a>/g)].map((m) => [m[1], m[2]]);
+    expectedNav ??= links(nav);
+    expectedFooter ??= links(footer);
+    assert.deepEqual(links(nav), expectedNav, `${page} nav matches`);
+    assert.deepEqual(links(footer), expectedFooter, `${page} footer matches`);
+    assert.match(nav, /href="\/sell"[^>]*>Sell<\/a>\s*<a href="\/chat"[^>]*>Chat<\/a>/);
+    const route = page === "index.html" ? "/" : `/${page.replace(".html", "")}`;
+    assert.ok(nav.includes(`href="${route}" aria-current="page"`), `${page} marks itself current`);
+    assert.equal([...nav.matchAll(/aria-current="page"/g)].length, 1);
+    for (const script of html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/g)) {
+      assert.match(script[1], /\bsrc="/);
+      assert.equal(script[2].trim(), "", `${page} has no inline script`);
+    }
+  }
 });
