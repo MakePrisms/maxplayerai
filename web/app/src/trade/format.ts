@@ -1,4 +1,4 @@
-/** Display helpers for /trades. Pure; no DOM. */
+/** Display helpers for /tokens. Pure; no DOM. */
 import { npubEncode } from "./nip19.js";
 
 /**

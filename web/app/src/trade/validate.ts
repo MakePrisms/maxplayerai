@@ -1,5 +1,5 @@
 /**
- * The trade CLI's listing rules, ported 1:1 for the read-only /trades page.
+ * The trade CLI's listing rules, ported 1:1 for the read-only /tokens page.
  *
  * Source of truth: crates/maxplayer-trade/src/lib.rs (PR #1107) — `common`,
  * `parse_lot`, `Asset::validate` and `lifecycle`. Every rule below names the

@@ -8,7 +8,7 @@ import { schnorr } from "@noble/curves/secp256k1";
 import { sha256 } from "@noble/hashes/sha256";
 import { bytesToHex } from "@noble/hashes/utils";
 import { TRADE_LOT, TRADE_STATUS } from "../src/model/kinds.js";
-import { createBook } from "../src/trade/book.js";
+import { completedStats, createBook } from "../src/trade/book.js";
 import { lifecycle, parseLot, type NostrEvent } from "../src/trade/validate.js";
 import { allowedRelay, createTradeReader, drain, lotFilter, statusFilters, STATUS_CHUNK } from "../src/trade/relays.js";
 import { mintLabel, rate, timeLeft } from "../src/trade/format.js";
@@ -305,4 +305,53 @@ test("format: mints, prices and time left", () => {
   assert.equal(timeLeft(45), "45s");
   assert.equal(timeLeft(12 * 60 + 5), "12m");
   assert.equal(timeLeft(23 * 3600 + 5 * 60), "23h 05m");
+});
+
+test("completed trades: sold lots only, windowed by the sold status's time", () => {
+  const book = createBook();
+  const sell = (l: NostrEvent, soldAt: number, key = MAKER) => {
+    const s1 = status(l, 1, l.id, "available", key, l.created_at + 1);
+    book.ingest(l); book.ingest(s1); book.ingest(status(l, 2, s1.id, "sold", key, soldAt));
+  };
+  const t = T0 + 10 * 86400;
+  const recent = lot(MAKER, t - 3600, 100, 90);
+  const lastWeek = lot(OTHER, t - 3 * 86400, 50, 60, [B, A]);
+  const old = lot(MAKER, t - 9 * 86400, 10, 9);
+  sell(recent, t - 3600 + 120);
+  sell(lastWeek, t - 3 * 86400 + 600, OTHER);
+  sell(old, t - 9 * 86400 + 60);
+  const c1 = lot(MAKER, t - 7200, 5, 5);
+  const c1s = status(c1, 1, c1.id, "available");
+  book.ingest(c1); book.ingest(c1s); book.ingest(status(c1, 2, c1s.id, "cancelled", MAKER, t - 7000));
+  const v = book.view(t);
+  const day = completedStats(v, t, 86400);
+  assert.deepEqual(day.rows.map((r) => r.id), [recent.id]);
+  assert.equal(day.giveSats, 100);
+  assert.equal(day.wantSats, 90);
+  assert.equal(day.medianFill, 120 - 1 + 1);
+  assert.equal(day.cancelled, 1);
+  const week = completedStats(v, t, 7 * 86400);
+  assert.deepEqual(week.rows.map((r) => r.id), [recent.id, lastWeek.id]);
+  assert.equal(week.sellers, 2);
+  assert.equal(week.pairs, 2);
+  assert.equal(week.medianFill, (120 + 600) / 2);
+  const all = completedStats(v, t, null);
+  assert.equal(all.trades, 3);
+  assert.equal(all.giveSats, 160);
+  assert.equal(all.wantSats, 159);
+  assert.equal(completedStats(book.view(t), t, 60).medianFill, null);
+});
+
+test("completed trades never count a quarantined or stranger-closed lot", () => {
+  const book = createBook();
+  const l = lot();
+  const s1 = status(l, 1, l.id, "available");
+  book.ingest(l); book.ingest(s1);
+  book.ingest(status(l, 2, s1.id, "sold", OTHER));
+  const fork = lot(MAKER, T0 + 1, 7, 8);
+  const f1 = status(fork, 1, fork.id, "available");
+  book.ingest(fork); book.ingest(f1);
+  book.ingest(status(fork, 2, f1.id, "sold"));
+  book.ingest(status(fork, 2, f1.id, "cancelled", MAKER, T0 + 99));
+  assert.equal(completedStats(book.view(NOW), NOW, null).trades, 0);
 });

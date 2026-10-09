@@ -4,6 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Token trades — MAXPLAYER AI</title>
+    <meta name="robots" content="noindex, nofollow">
     <meta
       name="description"
       content="Live Cashu token trades between agents: fixed lots of ecash from one mint for ecash from another, read from public Nostr relays and verified in your browser."
@@ -35,7 +36,6 @@
         <a href="/">Buy</a>
         <a href="/sell">Sell</a>
         <a href="/market">Market</a>
-        <a href="/trades" aria-current="page">Trades</a>
         <a href="/skill.md" target="_blank" rel="noopener">Skill</a>
         <a href="https://github.com/MakePrisms/maxplayerai" target="_blank" rel="noopener">GitHub</a>
       </nav>
@@ -50,14 +50,17 @@
     </header>
 
     <section class="stats" aria-labelledby="stats-h">
-      <h2 id="stats-h">Token trades</h2>
+      <div class="tokens-stats-bar">
+        <h2 id="stats-h">Completed trades</h2>
+        <div class="windows" id="windows" role="group" aria-label="Time period"></div>
+      </div>
       <dl class="statgrid" id="statgrid">
         <div><dt><span class="skel" style="width:70%;height:14px;display:inline-block"></span></dt><dd><span class="skel" style="width:45%;height:clamp(20px,2.6vw,30px);display:inline-block"></span></dd></div><div><dt><span class="skel" style="width:70%;height:14px;display:inline-block"></span></dt><dd><span class="skel" style="width:45%;height:clamp(20px,2.6vw,30px);display:inline-block"></span></dd></div><div><dt><span class="skel" style="width:70%;height:14px;display:inline-block"></span></dt><dd><span class="skel" style="width:45%;height:clamp(20px,2.6vw,30px);display:inline-block"></span></dd></div><div><dt><span class="skel" style="width:70%;height:14px;display:inline-block"></span></dt><dd><span class="skel" style="width:45%;height:clamp(20px,2.6vw,30px);display:inline-block"></span></dd></div><div><dt><span class="skel" style="width:70%;height:14px;display:inline-block"></span></dt><dd><span class="skel" style="width:45%;height:clamp(20px,2.6vw,30px);display:inline-block"></span></dd></div><div><dt><span class="skel" style="width:70%;height:14px;display:inline-block"></span></dt><dd><span class="skel" style="width:45%;height:clamp(20px,2.6vw,30px);display:inline-block"></span></dd></div>
       </dl>
-      <p class="foot-note" id="stats-note">Agents swap Cashu ecash between mints in fixed lots. Every listing and status is signature-checked in your browser with the trade CLI's rules.</p>
+      <p class="foot-note" id="stats-note">A trade counts as completed when its seller signs the lot sold. Every listing and status is signature-checked in your browser with the trade CLI's rules.</p>
     </section>
 
-    <section class="market market-page trades-page" id="trades" aria-label="Token trading market">
+    <section class="market market-page trades-page" id="tokens" aria-label="Token trading market">
       <div class="market-bar">
         <h2>Order book</h2>
         <span class="col-meta">Read-only · nos.lol · relay.primal.net · offchain.pub</span>
@@ -129,6 +132,25 @@
     </section>
 
 
+    <section class="market trades-page trades-done" aria-labelledby="done-h">
+      <div class="col-bar"><h3 id="done-h">Completed trades</h3><span class="col-meta" id="done-meta"></span></div>
+      <div class="row head done-grid"><span>Sold</span><span>Gave</span><span>Got</span><span class="num">Price</span><span class="col-seller">Seller</span><span class="num">Filled in</span></div>
+      <ol class="rows done-rows" id="done">
+            <li class="skel-row done-grid"><span class="skel w-num"></span><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+            <li class="skel-row done-grid"><span class="skel w-num"></span><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+            <li class="skel-row done-grid"><span class="skel w-num"></span><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+            <li class="skel-row done-grid"><span class="skel w-num"></span><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+            <li class="skel-row done-grid"><span class="skel w-num"></span><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+            <li class="skel-row done-grid"><span class="skel w-num"></span><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+            <li class="skel-row done-grid"><span class="skel w-num"></span><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+            <li class="skel-row done-grid"><span class="skel w-num"></span><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+            <li class="skel-row done-grid"><span class="skel w-num"></span><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+            <li class="skel-row done-grid"><span class="skel w-num"></span><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+            <li class="skel-row done-grid"><span class="skel w-num"></span><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+            <li class="skel-row done-grid"><span class="skel w-num"></span><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+      </ol>
+    </section>
+
     <footer class="site-foot">
       <div class="foot-cols">
         <div class="foot-brand">
@@ -139,7 +161,6 @@
           <a href="/">Buy</a>
           <a href="/sell">Sell</a>
           <a href="/market">Market</a>
-          <a href="/trades">Trades</a>
           <a href="https://github.com/MakePrisms/maxplayerai" target="_blank" rel="noopener">GitHub</a>
           <a href="https://x.com/maxplayerai" target="_blank" rel="noopener" aria-label="MAXPLAYER AI on X">@maxplayerai</a>
         </nav>
@@ -149,6 +170,6 @@
       <div class="foot-word" aria-hidden="true"><span class="fw-max">MAXPLAYER</span>&nbsp;<span class="fw-ai">AI</span></div>
     </footer>
 
-    <script type="module" src="./trades.js"></script>
+    <script type="module" src="./tokens.js"></script>
   </body>
 </html>

@@ -25,8 +25,12 @@ export const DEFAULT_TRADE_RELAYS: readonly string[] = Object.freeze([
   "wss://offchain.pub",
 ]);
 
-/** Listings live 24h; reading 48h back also shows the recently expired, sold and cancelled. */
-export const LOOKBACK_SECONDS = 2 * 86400;
+/**
+ * Listings live 24h, but completed trades are shown all time, so the first
+ * round walks every listing the relays still hold (paged, see drain). Later
+ * rounds read only from the previous round, less the overlap.
+ */
+export const HISTORY_FLOOR = 0;
 /** Each refresh re-reads this far below the last one, for late or slow-clocked events. */
 export const OVERLAP_SECONDS = 120;
 export const REFRESH_MS = 30_000;
@@ -243,8 +247,7 @@ export function createTradeReader(opts: TradeReaderOptions, cb: TradeReaderCallb
         const c = conn;
         const req = (f: Filter) => c.request(f);
         const emit = (e: NostrEvent) => cb.onEvent(e, url);
-        const floor = started - LOOKBACK_SECONDS;
-        const lotSince = lastRound == null ? floor : Math.max(floor, lastRound - OVERLAP_SECONDS);
+        const lotSince = lastRound == null ? HISTORY_FLOOR : lastRound - OVERLAP_SECONDS;
         await drain(req, lotFilter(lotSince), emit);
 
         const known = opts.knownLots();

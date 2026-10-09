@@ -1,18 +1,19 @@
 declare const WEB_ANALYTICS_ENABLED: boolean;
 /**
- * /trades — the token-trade market, read-only.
+ * /tokens — the token-trade market, read-only and unlisted (team link only:
+ * no nav, footer or llms.txt entry, and served noindex).
  *
- * Its own bundle (trades.js): the jobs board's terminal.js is untouched and
+ * Its own bundle (tokens.js): the jobs board's terminal.js is untouched and
  * this page never opens the production relay. It reads listings and status
  * chains from the trade CLI's public relays (trade/relays.ts), validates every
  * event with the CLI's rules (trade/validate.ts), and renders the book
  * (trade/book.ts). No wallet, no keys, no trading: nothing here can sign.
  */
 import { startAnalytics } from "./analytics.js";
-import { createBook, type BookView, type LotRow } from "./trade/book.js";
+import { WINDOWS, completedStats, createBook, type BookView, type LotRow } from "./trade/book.js";
 import { mintLabel, rate, seller, timeLeft } from "./trade/format.js";
 import { DEFAULT_TRADE_RELAYS, createTradeReader, type RelayState } from "./trade/relays.js";
-import { ago, esc, nf, now, stamp } from "./ui/format.js";
+import { ago, duration, esc, nf, now, stamp } from "./ui/format.js";
 import { reconcileList, type KeyedItem } from "./ui/reconcile.js";
 
 const el = (id: string): HTMLElement => document.getElementById(id) as HTMLElement;
@@ -64,24 +65,59 @@ function closedItem(r: LotRow, t: number): KeyedItem {
   };
 }
 
-function renderStats(v: BookView): void {
-  const s = v.stats;
+let windowKey = "24h";
+
+function wireWindows(onChange: () => void): void {
+  const box = el("windows");
+  box.innerHTML = WINDOWS.map((w) => `<button type="button" data-w="${w.key}" aria-pressed="${w.key === windowKey}">${w.label}</button>`).join("");
+  box.addEventListener("click", (ev) => {
+    const b = (ev.target as HTMLElement).closest<HTMLElement>("button[data-w]");
+    if (!b) return;
+    windowKey = b.dataset.w ?? windowKey;
+    for (const x of box.querySelectorAll("button")) x.setAttribute("aria-pressed", String(x === b));
+    onChange();
+  });
+}
+
+function doneItem(r: LotRow, t: number): KeyedItem {
+  const s = seller(r.lot.maker);
+  return {
+    key: r.id,
+    className: "row done-grid",
+    tabIndex: 0,
+    data: { lot: r.id },
+    html:
+      `<span class="when" data-ts="${r.updated_at}" title="${esc(stamp(r.updated_at))}">${ago(r.updated_at, t)}</span>` +
+      `<span class="leg">${legHtml(r.lot.give.net, r.lot.give.mint_url)}</span>` +
+      `<span class="leg">${legHtml(r.lot.want.net, r.lot.want.mint_url)}</span>` +
+      `<span class="num">${esc(rate(r.price))}</span>` +
+      `<span class="person col-seller" title="${esc(s.npub)}">${esc(s.short)}</span>` +
+      `<span class="num">${esc(duration(r.updated_at - r.lot.created_at))}</span>`,
+  };
+}
+
+function renderStats(v: BookView, t: number, answered: boolean): void {
+  const w = WINDOWS.find((x) => x.key === windowKey) ?? WINDOWS[0]!;
+  const c = completedStats(v, t, w.seconds);
   const cells: [string, string, boolean][] = [
-    ["Open lots", nf.format(s.open), true],
-    ["Sats offered", nf.format(s.openGiveSats), true],
-    ["Sold · 24h", nf.format(s.sold24h), false],
-    ["Sats sold · 24h", nf.format(s.soldSats24h), false],
-    ["Sellers", nf.format(s.makers), false],
-    ["Mints", nf.format(s.mints), false],
+    ["Trades", nf.format(c.trades), true],
+    ["Sats sold", nf.format(c.giveSats), true],
+    ["Sats received", nf.format(c.wantSats), false],
+    ["Sellers", nf.format(c.sellers), false],
+    ["Mint pairs", nf.format(c.pairs), false],
+    ["Median fill", c.medianFill == null ? "—" : duration(c.medianFill), false],
   ];
-  el("statgrid").innerHTML = cells.map(([k, val, neon]) => `<div><dt>${k}</dt><dd${neon ? ' class="neon"' : ""}>${val}</dd></div>`).join("");
-  const notes: string[] = [];
+  el("statgrid").innerHTML = cells.map(([k, val, neon]) => `<div><dt>${k}</dt><dd${neon ? ' class="neon"' : ""}>${esc(val)}</dd></div>`).join("");
+  el("done-meta").textContent = `${c.trades} · ${w.label.toLowerCase()}`;
+  if (c.rows.length) reconcileList(el("done"), c.rows.slice(0, 500).map((r) => doneItem(r, t)));
+  else if (answered) reconcileList(el("done"), [{ key: "-empty", className: "empty", html: "No completed trades in this period." }]);
+  const notes: string[] = [`${c.cancelled} cancelled and ${c.expired} expired in this period`];
   if (v.quarantined.length) notes.push(`${v.quarantined.length} listing${v.quarantined.length === 1 ? "" : "s"} hidden: broken or forked status history`);
   if (v.rejected) notes.push(`${v.rejected} invalid listing${v.rejected === 1 ? "" : "s"} ignored`);
   if (v.pending) notes.push(`${v.pending} still loading`);
   el("stats-note").textContent =
-    "Every listing and status is signature-checked in your browser with the trade CLI's rules. " +
-    "Sold counts only what sellers announced." + (notes.length ? " " + notes.join(" · ") + "." : "");
+    "A trade counts as completed when its seller signs the lot sold; settlement itself is private. " +
+    "Every listing and status is signature-checked in your browser with the trade CLI's rules. " + notes.join(" · ") + ".";
 }
 
 let selected: string | null = null;
@@ -114,12 +150,13 @@ function render(v: BookView, answered: boolean): void {
   const t = now();
   // An empty book is a conclusion; the skeletons hold until a relay has answered.
   if (!answered && v.open.length + v.closed.length === 0) return;
-  renderStats(v);
+  renderStats(v, t, answered);
+  const recent = v.closed.filter((r) => r.updated_at >= t - 2 * 86400);
   el("lots-meta").textContent = `${v.open.length} open`;
-  el("recent-meta").textContent = `${v.closed.length} in 48h`;
+  el("recent-meta").textContent = `${recent.length} in 48h`;
   if (v.open.length) reconcileList(el("lots"), v.open.map((r) => openItem(r, t)));
   else if (answered) reconcileList(el("lots"), [{ key: "-empty", className: "empty", html: "No open lots right now." }]);
-  if (v.closed.length) reconcileList(el("recent"), v.closed.slice(0, 120).map((r) => closedItem(r, t)));
+  if (recent.length) reconcileList(el("recent"), recent.slice(0, 120).map((r) => closedItem(r, t)));
   else if (answered) reconcileList(el("recent"), [{ key: "-empty", className: "empty", html: "Nothing sold, cancelled or expired in the last 48 hours." }]);
   renderDetail();
 }
@@ -132,6 +169,7 @@ function boot(): void {
   let answered = false;
   const live = () => [...states].filter(([, s]) => s === "live").map(([u]) => u);
   const paint = () => render(book.view(now(), live()), answered);
+  wireWindows(() => paint());
 
   const conn = el("conn");
   const connText = el("conn-text");
@@ -168,7 +206,7 @@ function boot(): void {
     renderDetail();
     el("trade-detail").scrollIntoView({ block: "nearest", behavior: "smooth" });
   };
-  for (const id of ["lots", "recent"]) {
+  for (const id of ["lots", "recent", "done"]) {
     el(id).addEventListener("click", pick);
     el(id).addEventListener("keydown", pick);
   }
@@ -179,7 +217,7 @@ function boot(): void {
   setInterval(() => {
     const t = now();
     for (const n of document.querySelectorAll<HTMLElement>("[data-expires]")) n.textContent = timeLeft(Number(n.dataset.expires) - t);
-    for (const n of document.querySelectorAll<HTMLElement>("#recent [data-ts]")) n.textContent = ago(Number(n.dataset.ts), t);
+    for (const n of document.querySelectorAll<HTMLElement>("#recent [data-ts], #done [data-ts]")) n.textContent = ago(Number(n.dataset.ts), t);
   }, 1000);
   setInterval(paint, 60_000);
 }

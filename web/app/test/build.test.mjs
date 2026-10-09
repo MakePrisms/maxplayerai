@@ -91,9 +91,9 @@ test("every asset URL in shipped HTML and CSS carries the deploy stamp", () => {
   assert.match(stamp, /^[0-9a-f]{12}$/);
 
   const html = readFileSync(join(root, "dist", "index.html"), "utf8");
-  for (const page of ["index.html", "market.html", "sell.html", "trades.html"]) {
+  for (const page of ["index.html", "market.html", "sell.html", "tokens.html"]) {
     const pageHtml = readFileSync(join(root, "dist", page), "utf8");
-    const script = page === "trades.html" ? "trades.js" : "terminal.js";
+    const script = page === "tokens.html" ? "tokens.js" : "terminal.js";
     for (const asset of ["styles.css", "fonts.css", script]) {
       assert.ok(pageHtml.includes(`./${asset}?v=${stamp}`), `${asset} is stamped in ${page}`);
       assert.ok(!pageHtml.includes(`"./${asset}"`), `no unstamped ${asset} reference remains in ${page}`);
@@ -161,34 +161,36 @@ test("the live market ships at /market and the homepage links it", () => {
   assert.ok(!home.includes("<script>"), "no inline scripts in the browser-key origin");
 });
 
-test("/trades ships its own read-only bundle and every page links it", () => {
-  const trades = readFileSync(join(root, "dist", "trades.html"), "utf8");
-  for (const id of ["trades", "lots", "recent", "statgrid", "conn", "utc-clock", "trade-detail"]) {
-    assert.ok(trades.includes(`id="${id}"`), `trades.html carries #${id}`);
+test("/tokens ships its own read-only bundle and stays unlisted", () => {
+  const tokens = readFileSync(join(root, "dist", "tokens.html"), "utf8");
+  for (const id of ["tokens", "lots", "recent", "done", "windows", "statgrid", "conn", "utc-clock", "trade-detail"]) {
+    assert.ok(tokens.includes(`id="${id}"`), `tokens.html carries #${id}`);
   }
-  assert.ok(!trades.includes("terminal.js"), "the jobs bundle is not loaded on /trades");
+  assert.ok(!tokens.includes("terminal.js"), "the jobs bundle is not loaded on /tokens");
   assert.ok(!readFileSync(join(root, "dist", "terminal.js"), "utf8").includes("offchain.pub"), "the jobs bundle carries no trade reader");
-  for (const page of ["index.html", "market.html", "sell.html", "trades.html"]) {
-    const html = readFileSync(join(root, "dist", page), "utf8");
-    assert.equal((html.match(/href="\/trades"/g) ?? []).length, 2, `${page} links /trades in the nav and footer`);
+  assert.match(tokens, /<meta name="robots" content="noindex, nofollow">/);
+  // Team link only (bob): nothing on the public site points at it.
+  for (const page of ["index.html", "market.html", "sell.html", "tokens.html", "llms.txt", "skill.md"]) {
+    const text = readFileSync(join(root, "dist", page), "utf8");
+    assert.ok(!/href="\/(tokens|trades)"|\]\(\/(tokens|trades)\)/.test(text), `${page} does not link the token page`);
   }
-  assert.ok(trades.includes('<a href="/trades" aria-current="page">Trades</a>'));
 });
 
-test("the /trades CSP opens only the trade relays, and only on /trades", () => {
+test("the /tokens CSP opens only the trade relays, only on /tokens, and is noindex", () => {
   const { headers } = JSON.parse(readFileSync(join(root, "vercel.json"), "utf8"));
-  const csp = (path) => headers
-    .filter((h) => new RegExp(`^${h.source.replace(/^\//, "\\/")}$`).test(path))
-    .flatMap((h) => h.headers.filter((x) => x.key === "Content-Security-Policy").map((x) => x.value));
-  for (const path of ["/", "/market", "/sell", "/terminal.js", "/trades.js"]) {
+  const matching = (path) => headers.filter((h) => new RegExp(`^${h.source.replace(/^\//, "\\/")}$`).test(path));
+  const csp = (path) => matching(path).flatMap((h) => h.headers.filter((x) => x.key === "Content-Security-Policy").map((x) => x.value));
+  for (const path of ["/", "/market", "/sell", "/terminal.js", "/tokens.js", "/tokensx"]) {
     const [v, ...rest] = csp(path);
     assert.equal(rest.length, 0, `${path} gets exactly one CSP`);
     assert.match(v, /connect-src 'self' wss:\/\/relay\.maxplayer\.ai https:\/\/api\.coinbase\.com;/, path);
     assert.ok(!v.includes("nos.lol"), `${path} does not open the trade relays`);
   }
-  const [t, ...more] = csp("/trades");
-  assert.equal(more.length, 0, "/trades gets exactly one CSP");
+  const [t, ...more] = csp("/tokens");
+  assert.equal(more.length, 0, "/tokens gets exactly one CSP");
   assert.match(t, /connect-src 'self' wss:\/\/nos\.lol wss:\/\/relay\.primal\.net wss:\/\/offchain\.pub;/);
-  assert.ok(!t.includes("relay.maxplayer.ai"), "/trades cannot reach the production relay");
+  assert.ok(!t.includes("relay.maxplayer.ai"), "/tokens cannot reach the production relay");
   assert.match(t, /script-src 'self';/);
+  const robots = matching("/tokens").flatMap((h) => h.headers.filter((x) => x.key === "X-Robots-Tag").map((x) => x.value));
+  assert.deepEqual(robots, ["noindex, nofollow"]);
 });

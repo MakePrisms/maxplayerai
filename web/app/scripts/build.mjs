@@ -25,12 +25,12 @@ const dist = join(root, "dist");
 const SITE_ORIGIN = "https://www.maxplayer.ai";
 
 const watch = process.argv.includes("--watch");
-const PAGES = ["index.html", "market.html", "sell.html", "trades.html"];
+const PAGES = ["index.html", "market.html", "sell.html", "tokens.html"];
 
 const options = {
-  // terminal.js serves /, /sell and /market; trades.js serves /trades only,
+  // terminal.js serves /, /sell and /market; tokens.js serves /tokens only,
   // so the token-trade reader never ships in (or changes) the jobs bundle.
-  entryPoints: { terminal: join(root, "src/main.ts"), trades: join(root, "src/trades.ts") },
+  entryPoints: { terminal: join(root, "src/main.ts"), tokens: join(root, "src/tokens.ts") },
   bundle: true,
   // Vercel preview deployments show the Try it UI so it can be reviewed.
   // Production stays off unless TRY_IT_ENABLED=true; /api/try has its own
@@ -68,7 +68,7 @@ if (watch) {
     hash.update(readFileSync(join(root, "public", rel)));
   }
   hash.update(readFileSync(join(dist, "terminal.js")));
-  hash.update(readFileSync(join(dist, "trades.js")));
+  hash.update(readFileSync(join(dist, "tokens.js")));
   const STAMP = hash.digest("hex").slice(0, 12);
 
   // Stamp the specifiers, not the files: fonts.css's url()s and every asset
@@ -80,12 +80,12 @@ if (watch) {
       .replace(/url\((['"])(\.\/fonts\/[^'"?]+)\1\)/g, `url($1$2?v=${STAMP}$1)`),
   );
   // Every page: the buyer homepage (/), the seller page (/sell), the live
-  // market (/market) and the token trades (/trades) — cleanUrls serves them.
+  // market (/market) and the unlisted token-trade page (/tokens) — cleanUrls serves them.
   for (const page of PAGES) {
     writeFileSync(
       join(dist, page),
       readFileSync(join(root, "public", page), "utf8")
-        .replace(/(href|src)="\.\/(styles\.css|fonts\.css|terminal\.js|trades\.js|fonts\/[^"?]+)"/g, `$1="./$2?v=${STAMP}"`),
+        .replace(/(href|src)="\.\/(styles\.css|fonts\.css|terminal\.js|tokens\.js|fonts\/[^"?]+)"/g, `$1="./$2?v=${STAMP}"`),
     );
   }
 
@@ -125,5 +125,5 @@ if (watch) {
   writeFileSync(join(dist, ".buildstamp"), JSON.stringify({ flat: true, stamp: STAMP }, null, 2) + "\n");
 
   const kb = (f) => (statSync(join(dist, f)).size / 1024).toFixed(1);
-  console.log(`dist/terminal.js ${kb("terminal.js")} KB · dist/trades.js ${kb("trades.js")} KB · stamp ${STAMP}`);
+  console.log(`dist/terminal.js ${kb("terminal.js")} KB · dist/tokens.js ${kb("tokens.js")} KB · stamp ${STAMP}`);
 }

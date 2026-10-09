@@ -195,3 +195,53 @@ export function createBook() {
 }
 
 export type Book = ReturnType<typeof createBook>;
+
+/** Window toggles for completed-trade stats, as on /market. `null` = all time. */
+export const WINDOWS: readonly { key: string; label: string; seconds: number | null }[] = [
+  { key: "24h", label: "24 hours", seconds: 86400 },
+  { key: "7d", label: "Week", seconds: 7 * 86400 },
+  { key: "all", label: "All time", seconds: null },
+];
+
+export interface CompletedStats {
+  /** Sold lots in the window, newest first. */
+  rows: LotRow[];
+  trades: number;
+  /** Sats the sellers gave (sum of give legs). */
+  giveSats: number;
+  /** Sats the sellers received (sum of want legs). */
+  wantSats: number;
+  sellers: number;
+  /** Distinct give-mint → want-mint pairs. */
+  pairs: number;
+  /** Median seconds from listing to the signed `sold` status, or null with no trades. */
+  medianFill: number | null;
+  cancelled: number;
+  expired: number;
+}
+
+/**
+ * Completed trades = lots whose validated chain ends in `sold`, counted at
+ * the sold status's time. "Completed" is what the seller announced: the
+ * settlement itself is private (encrypted negotiation) and not visible here.
+ */
+export function completedStats(v: BookView, now: number, windowSeconds: number | null): CompletedStats {
+  const since = windowSeconds == null ? -Infinity : now - windowSeconds;
+  const inWindow = v.closed.filter((r) => r.updated_at >= since);
+  const rows = inWindow.filter((r) => r.state === "sold");
+  const fills = rows.map((r) => r.updated_at - r.lot.created_at).sort((a, b) => a - b);
+  const mid = fills.length >> 1;
+  const medianFill = fills.length === 0 ? null
+    : fills.length % 2 ? (fills[mid] as number) : Math.round(((fills[mid - 1] as number) + (fills[mid] as number)) / 2);
+  return {
+    rows,
+    trades: rows.length,
+    giveSats: rows.reduce((s, r) => s + r.lot.give.net, 0),
+    wantSats: rows.reduce((s, r) => s + r.lot.want.net, 0),
+    sellers: new Set(rows.map((r) => r.lot.maker)).size,
+    pairs: new Set(rows.map((r) => `${r.lot.give.mint_url}\n${r.lot.want.mint_url}`)).size,
+    medianFill,
+    cancelled: inWindow.filter((r) => r.state === "cancelled").length,
+    expired: inWindow.filter((r) => r.state === "expired").length,
+  };
+}
