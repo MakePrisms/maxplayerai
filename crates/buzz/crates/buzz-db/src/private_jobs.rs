@@ -110,11 +110,49 @@ impl Db {
         let Some(row) = row else {
             return Ok(false);
         };
-        if row.get::<String, _>("offer_id") != job.offer_id
-            || row.get::<Option<String>, _>("target") != job.target
+        if row.get::<Option<String>, _>("target") != job.target
             || row.get::<String, _>("service") != job.service
         {
             return Ok(false);
+        }
+        if row.get::<String, _>("offer_id") != job.offer_id {
+            // Pre-publication offer re-bind. Slow input uploads can push the signed
+            // offer past the relay's event-timestamp window; the buyer then re-signs
+            // the identical offer (fresh `created_at`, new id) and re-provisions.
+            // Permitted only while nothing references the stored offer: the request
+            // carries no award, the row holds no award and is not closed, buyer
+            // inputs are not frozen, the stored offer id was never published, and no
+            // lifecycle event roots at it. Anything else stays a hard conflict.
+            if job.award_id.is_some()
+                || row.get::<Option<String>, _>("award_id").is_some()
+                || row.get::<bool, _>("closed")
+            {
+                return Ok(false);
+            }
+            let rebound = sqlx::query(
+                "UPDATE private_job_repositories j SET offer_id=$4
+                 WHERE j.community_id=$1 AND j.buyer=$2 AND j.job_id=$3
+                   AND j.award_id IS NULL AND j.closed=FALSE AND j.input_frozen=FALSE
+                   AND NOT EXISTS (SELECT 1 FROM events e WHERE e.community_id=$1
+                       AND e.id=decode(j.offer_id,'hex'))
+                   AND NOT EXISTS (SELECT 1 FROM events e WHERE e.community_id=$1
+                       AND e.pubkey=decode(j.buyer,'hex') AND e.kind IN (3400,3406,3407)
+                       AND EXISTS (SELECT 1 FROM jsonb_array_elements(e.tags) t
+                           WHERE t=jsonb_build_array('e',j.offer_id,'','root')))
+                   AND NOT EXISTS (SELECT 1 FROM private_job_repositories p
+                       WHERE p.community_id=$1 AND p.offer_id=$4)",
+            )
+            .bind(community.as_uuid())
+            .bind(&job.buyer)
+            .bind(&job.job_id)
+            .bind(&job.offer_id)
+            .execute(&mut *tx)
+            .await?;
+            if rebound.rows_affected() != 1 {
+                return Ok(false);
+            }
+            tx.commit().await?;
+            return Ok(true);
         }
         let old_award: Option<String> = row.get("award_id");
         let old_seller: Option<String> = row.get("seller");
@@ -244,10 +282,26 @@ mod postgres_tests {
                 .unwrap()
                 .is_none()
         );
+        // Pre-publication re-bind: a different offer id for the same unawarded,
+        // unpublished job MOVES the binding (the buyer re-signed a stale offer).
         let mut wrong_offer = job.clone();
         wrong_offer.offer_id = "aa".repeat(32);
         assert!(
-            !db.ensure_private_job_repo(communities[0], &wrong_offer)
+            db.ensure_private_job_repo(communities[0], &wrong_offer)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            db.private_job_repo(communities[0], &job.buyer, &job.job_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .offer_id,
+            wrong_offer.offer_id
+        );
+        // Re-bind back, so the award flow below exercises the original offer id.
+        assert!(
+            db.ensure_private_job_repo(communities[0], &job)
                 .await
                 .unwrap()
         );
@@ -277,6 +331,21 @@ mod postgres_tests {
         let winner = if selected.seller == a.seller { &a } else { &b };
         assert!(
             db.ensure_private_job_repo(communities[0], winner)
+                .await
+                .unwrap()
+        );
+        // An awarded job never re-binds, with or without an award in the request.
+        let mut moved = job.clone();
+        moved.offer_id = "ee".repeat(32);
+        assert!(
+            !db.ensure_private_job_repo(communities[0], &moved)
+                .await
+                .unwrap()
+        );
+        let mut moved_award = winner.clone();
+        moved_award.offer_id = "ee".repeat(32);
+        assert!(
+            !db.ensure_private_job_repo(communities[0], &moved_award)
                 .await
                 .unwrap()
         );
@@ -327,6 +396,14 @@ mod postgres_tests {
                 .unwrap()
                 .unwrap()
                 .input_frozen
+        );
+        // A published offer never re-binds: the public record references its id.
+        let mut rebind_published = input.clone();
+        rebind_published.offer_id = "fe".repeat(32);
+        assert!(
+            !db.ensure_private_job_repo(communities[0], &rebind_published)
+                .await
+                .unwrap()
         );
         // JSON array containment is order-insensitive; exact tag row equality is required.
         event(

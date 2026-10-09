@@ -35,6 +35,25 @@ tells you which field to look at.
 
 ---
 
+## Symptom: I posted a job and no seller ever claimed it — the job looks invisible
+
+**Check first:** call `get_job` (or read the post_job response). A `publish_refused`
+field means the relay permanently refused the offer's publication, and the field
+carries the relay's own reason (for example
+`invalid: event timestamp too far from server time` after a very long input upload).
+The offer never reached the relay, so no seller could ever see it. The auto-award
+parks with the same reason in `parked_awards`. **Recovery: post the job again** — a
+new post publishes a fresh offer; nothing was committed or spent for the refused one.
+If `publish_refused` is absent and `read_confirmed` is false with `pending` true, the
+offer is still queued for publication; give the daemon time and read again.
+
+Open-pool and public **contribution** jobs have one more post-time gate: the pinned
+base repository must be readable by sellers (anonymously for non-relay sources). A
+refusal naming "contribution base is not readable by sellers" means exactly that;
+post a targeted private job (`seller_pubkey`) for a private repository instead.
+
+---
+
 ## Symptom: I posted a job, a seller claimed it, but it was never awarded and the claim lapsed
 
 Two different causes produce the identical dead-looking job. `maxplayer buyer status`

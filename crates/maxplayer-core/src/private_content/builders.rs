@@ -167,6 +167,51 @@ pub fn prepare_offer(
     }
     Ok(PreparedOffer { event, task })
 }
+/// Re-sign a prepared-but-unpublished offer with a fresh `created_at`.
+///
+/// Base and input uploads can take longer than the relay's ±15-minute event
+/// timestamp window. The relay then refuses the original signed bytes forever
+/// ("invalid: event timestamp too far from server time"), while every upload the
+/// buyer paid for stays valid: the task envelope and the uploaded refs commit to
+/// the job id and the envelope, never to the offer event id. Re-signing the exact
+/// tag vector and content changes only `created_at`, the event id (the job's
+/// public id) and the signature. The caller must re-provision the job repository
+/// for the new id before publication, and must not have enqueued the old event.
+pub fn resign_offer(
+    keys: &Keys,
+    prepared: &PreparedOffer,
+    service: &str,
+    host: &HostPolicy,
+) -> Result<PreparedOffer> {
+    if prepared.event.pubkey != keys.public_key() {
+        return Err(Error("wrong offer signer"));
+    }
+    let tags: std::result::Result<Vec<_>, _> = prepared
+        .event
+        .tags
+        .iter()
+        .map(|tag| Tag::parse(tag.as_slice().to_vec()))
+        .collect();
+    // The result must never reproduce the refused bytes: a strictly newer
+    // `created_at` guarantees a new event id even inside the same second.
+    let created_at = nostr_sdk::prelude::Timestamp::now()
+        .as_secs()
+        .max(prepared.event.created_at.as_secs() + 1);
+    let event = EventBuilder::new(prepared.event.kind, prepared.event.content.clone())
+        .allow_self_tagging()
+        .tags(tags.map_err(|_| Error("invalid event tag"))?)
+        .custom_created_at(nostr_sdk::prelude::Timestamp::from(created_at))
+        .sign_with_keys(keys)
+        .map_err(|_| Error("could not sign content carrier"))?;
+    super::wire::validate_private(&event, host)?;
+    if let Some(task) = &prepared.task {
+        super::wire::bind_content(task, &event, &event, None, None, None, service, host)?;
+    }
+    Ok(PreparedOffer {
+        event,
+        task: prepared.task.clone(),
+    })
+}
 pub fn sign(keys: &Keys, draft: EventDraft) -> Result<Event> {
     let tags: std::result::Result<Vec<_>, _> =
         draft.tags.into_iter().map(|t| Tag::parse(t.0)).collect();

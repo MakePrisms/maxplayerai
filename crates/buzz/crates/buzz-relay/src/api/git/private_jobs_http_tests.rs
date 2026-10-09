@@ -312,6 +312,74 @@ fn published_manifest(
 }
 #[tokio::test]
 #[ignore = "requires disposable PRIVATE_JOB_TEST_DATABASE_URL and PRIVATE_JOB_TEST_REDIS_URL"]
+async fn pre_publication_rebind_moves_the_offer_binding_through_the_provision_handler() {
+    let buyer = Keys::generate();
+    let seller = Keys::generate();
+    let service = Keys::generate();
+    let Harness {
+        host,
+        tenant,
+        state,
+        _shutdown,
+        _temp,
+        ..
+    } = harness(&service, None).await;
+    let job = "19".repeat(32);
+    let app = super::transport::git_router(state.clone());
+    let provision_path = format!("/api/jobs/private/{job}");
+    let url = format!("https://{host}{provision_path}");
+    let first = private_offer(&buyer, &seller, &job);
+    let body = serde_json::to_vec(&serde_json::json!({"signed_offer":first})).unwrap();
+    let auth = token(&buyer, &url, "PUT", Some(&body));
+    assert_eq!(
+        request(&app, &host, "PUT", &provision_path, Some(&auth), body)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    // The buyer re-signed a stale offer: same job and target, later timestamp, new
+    // id. Pre-publication, the provision handler moves the binding instead of 409.
+    let second = EventBuilder::new(Kind::from(3401), "")
+        .allow_self_tagging()
+        .tags(first.tags.iter().cloned())
+        .custom_created_at(nostr::Timestamp::from(first.created_at.as_secs() + 1))
+        .sign_with_keys(&buyer)
+        .unwrap();
+    assert_ne!(first.id, second.id);
+    let body = serde_json::to_vec(&serde_json::json!({"signed_offer":second})).unwrap();
+    let auth = token(&buyer, &url, "PUT", Some(&body));
+    assert_eq!(
+        request(&app, &host, "PUT", &provision_path, Some(&auth), body)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let row = state
+        .db
+        .private_job_repo(tenant, &buyer.public_key().to_hex(), &job)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.offer_id, second.id.to_hex());
+    // Only the buyer may move it: a seller-signed provision with a third id is denied.
+    let third = EventBuilder::new(Kind::from(3401), "")
+        .allow_self_tagging()
+        .tags(first.tags.iter().cloned())
+        .custom_created_at(nostr::Timestamp::from(first.created_at.as_secs() + 2))
+        .sign_with_keys(&buyer)
+        .unwrap();
+    let body = serde_json::to_vec(&serde_json::json!({"signed_offer":third})).unwrap();
+    let auth = token(&seller, &url, "PUT", Some(&body));
+    assert!(
+        !request(&app, &host, "PUT", &provision_path, Some(&auth), body)
+            .await
+            .status()
+            .is_success()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PRIVATE_JOB_TEST_DATABASE_URL and PRIVATE_JOB_TEST_REDIS_URL"]
 async fn private_http_acl_precedes_manifest_cache_and_provision_replay_is_rejected() {
     let buyer = Keys::generate();
     let seller = Keys::generate();
