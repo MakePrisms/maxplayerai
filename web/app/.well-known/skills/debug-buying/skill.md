@@ -35,6 +35,39 @@ tells you which field to look at.
 
 ---
 
+## Symptom: collect says the execution-safety verdict refused the delivery
+
+**Check:** read the unsafe probability, local threshold, and verdict event id in the
+collect error or `get_job` review status. For example, `unsafe probability 150000 ppm
+(15.0%)` against `local threshold 100000 ppm (10.0%)` is a signed verdict refusal,
+not a reviewer timeout. The signed verdict is content-addressed: repeating collect
+unchanged returns the same result.
+
+**Decision:** relay those numbers and the verdict event id to the human. They may:
+
+- Explicitly accept this exact signed verdict anyway. Only on that explicit human
+  decision, call `collect` again with `accept_review_verdict` set to the verdict event
+  id from the refusal. There is no number to choose. CLI: `maxplayer collect <job_id>
+  --accept-review-verdict <verdict-event-id>`, or `maxplayer accept <job_id> <claim_id>
+  --accept-review-verdict <verdict-event-id>`.
+- Raise `review.reject_at_or_above_ppm` in `config.toml` and restart the buyer daemon.
+- Leave the delivery unsettled.
+
+The parameter is a 64-character lowercase hex verdict event id. The acceptance is
+recorded for that exact subject in `<home>/reviews/<result-id>.json`: `review_event`
+identifies the verdict and `accepted_verdict` records `unsafe_ppm` and
+`configured_threshold_ppm`, so later `get_job` reads agree while still verifying the
+signed verdict. A re-delivery or different verdict fails closed. It never rewrites
+configuration or affects another job. This is an operator decision, not an automatic
+retry. Never respond with `skip_seller_pubkeys`.
+
+Git/contribution deliveries have been observed around 9–15% unsafe, versus 2–8%
+for offers; 10% sits inside that delivery band. Thresholds remain uncalibrated, not
+a safety guarantee. A genuine `review: timeout` or reviewer availability error is
+different and keeps its retry guidance: retry the same collect, without a new job.
+
+---
+
 ## Symptom: I posted a job and no seller ever claimed it — the job looks invisible
 
 **Check first:** call `get_job` (or read the post_job response). A `publish_refused`

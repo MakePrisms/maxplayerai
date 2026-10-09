@@ -257,9 +257,9 @@ impl wire::Transport for Transport<'_> {
                         // lifetime generously, or a later attempt reads a published
                         // reply as "no response" (#1115). A reply older than this is
                         // still collected by any retry within 30 minutes of it.
-                        Timestamp::now().as_secs().saturating_sub(
-                            pc::transport::TIMESTAMP_TWEAK_SECS + 1800,
-                        ),
+                        Timestamp::now()
+                            .as_secs()
+                            .saturating_sub(pc::transport::TIMESTAMP_TWEAK_SECS + 1800),
                     ))
                     .limit(128),
                 std::time::Duration::from_secs(2),
@@ -308,6 +308,19 @@ pub async fn check(
     request: &Request,
     counterparty: &str,
 ) -> Result<Option<String>, String> {
+    check_detailed(home, client, identity, request, counterparty, None)
+        .await
+        .map(|pass| pass.map(|p| p.event_id))
+}
+
+pub async fn check_detailed(
+    home: &MaxplayerHome,
+    client: &Client,
+    identity: Identity<'_>,
+    request: &Request,
+    counterparty: &str,
+    accepted_verdict: Option<&str>,
+) -> Result<Option<super::Pass>, String> {
     let config = &home.config.review;
     if !config.enabled(request.subject.kind, counterparty)? {
         return Ok(None);
@@ -331,13 +344,14 @@ pub async fn check(
         reviewer: PublicKey::from_hex(reviewer).map_err(|_| "review: invalid reviewer key")?,
     };
     // Reuse the exact decision/retry contract, but only with the encrypted transport.
-    wire::check(
+    wire::check_detailed(
         &transport,
         config,
         &home.config.relay_url,
         &request.subject,
         counterparty,
         false,
+        accepted_verdict,
     )
     .await
 }

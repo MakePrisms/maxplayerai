@@ -12,6 +12,7 @@ const USAGE_ERROR: i32 = 1;
 const RUNTIME_ERROR: i32 = 2;
 
 struct Opts {
+    accept_review_verdict: Option<String>,
     job_id: String,
     out: Option<String>,
     home: Option<PathBuf>,
@@ -21,6 +22,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
     let mut job_id: Option<String> = None;
     let mut out: Option<String> = None;
     let mut home: Option<PathBuf> = None;
+    let mut accept_review_verdict = None;
     let mut idx = 0;
     while idx < args.len() {
         match args[idx].as_str() {
@@ -28,9 +30,19 @@ fn parse(args: &[String]) -> Result<Opts, String> {
                 idx += 1;
                 out = Some(args.get(idx).ok_or("--out requires a value")?.clone());
             }
+            "--accept-review-verdict" => {
+                idx += 1;
+                let id = args
+                    .get(idx)
+                    .ok_or("--accept-review-verdict requires a value")?;
+                maxplayer_core::review::validate_accept_review_verdict(Some(id))?;
+                accept_review_verdict = Some(id.clone());
+            }
             "--home" => {
                 idx += 1;
-                home = Some(PathBuf::from(args.get(idx).ok_or("--home requires a value")?));
+                home = Some(PathBuf::from(
+                    args.get(idx).ok_or("--home requires a value")?,
+                ));
             }
             other if other.starts_with('-') => return Err(format!("unknown flag {other}")),
             other if job_id.is_none() => job_id = Some(other.to_owned()),
@@ -39,6 +51,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         idx += 1;
     }
     Ok(Opts {
+        accept_review_verdict,
         job_id: job_id.ok_or("collect requires <job_id>")?,
         out,
         home,
@@ -49,7 +62,7 @@ fn usage(err: &mut dyn Write) {
     let _ = writeln!(
         err,
         "Usage:\n\
-         \x20 maxplayer collect <job_id> [--out <folder>] [--home <path>]\n\
+         \x20 maxplayer collect <job_id> [--out <folder>] [--accept-review-verdict <verdict-event-id>] [--home <path>]\n\
          \n\
          Accepts the delivered claim if no bind exists yet, verifies the delivery integrity\n\
          (delivered branch must tip at the accepted commit), settles under the payment mode the\n\
@@ -105,7 +118,7 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         }
     };
 
-    let params = serde_json::json!({ "job_id": opts.job_id, "out": opts.out });
+    let params = serde_json::json!({ "job_id": opts.job_id, "out": opts.out, "accept_review_verdict": opts.accept_review_verdict });
     let body = match crate::daemon::ensure_then_call(&home, "collect", params) {
         Ok(body) => body,
         Err(message) => {
@@ -139,4 +152,25 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     }
     let _ = writeln!(err, "maxplayer collect requires the wallet feature");
     USAGE_ERROR
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn accept_review_verdict_flag_parsing() {
+        let args = ["job", "--accept-review-verdict", &"a".repeat(64)].map(String::from);
+        assert_eq!(
+            parse(&args).unwrap().accept_review_verdict,
+            Some("a".repeat(64))
+        );
+        let args = ["job"].map(String::from);
+        assert_eq!(parse(&args).unwrap().accept_review_verdict, None);
+        for value in ["no", "0.5", "-1", "1000001"] {
+            let args = ["job", "--accept-review-verdict", value].map(String::from);
+            assert!(parse(&args).err().unwrap().contains("64 lowercase hex"));
+        }
+        let args = ["job", "--accept-review-verdict"].map(String::from);
+        assert!(parse(&args).err().unwrap().contains("requires a value"));
+    }
 }

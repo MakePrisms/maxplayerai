@@ -514,6 +514,7 @@ pub struct AcceptedContribution {
 /// Inputs for accepting a seller claim (and binding the matching result).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AcceptClaimRequest {
+    pub accept_review_verdict: Option<String>,
     pub job_id: String,
     pub claim_id: String,
     /// Optional explicit result id; otherwise the newest git result from the claim seller.
@@ -1678,6 +1679,8 @@ pub async fn accept_claim_async(
     home: &MaxplayerHome,
     request: AcceptClaimRequest,
 ) -> Result<AcceptClaimOutcome, JobLifecycleError> {
+    crate::review::validate_accept_review_verdict(request.accept_review_verdict.as_deref())
+    .map_err(JobLifecycleError::Input)?;
     let timeout = Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS);
     let keys = buyer_keys(home)?;
     // Injected `now` derives the claim status: past the offer deadline a claim reads `expired`
@@ -1719,20 +1722,38 @@ pub async fn accept_claim_async(
         kind: crate::kinds::JOB_RESULT_KIND, commit: result.commit_oid.clone(),
     };
     let review_id = if load_accepted_bind(home, &request.job_id)?.is_none() {
-        crate::review::check_buyer(home, &keys, &review_subject, &claim.seller_pubkey, result.private_evidence.as_ref())
-            .await.map_err(JobLifecycleError::Input)?
-    } else { None };
-    let private_verified = result.private_evidence.as_ref().map(|evidence| {
-        let policy = crate::private_content::runtime::Policy::for_evidence(home, evidence)
-            .map_err(|e| JobLifecycleError::Input(e.to_string()))?;
-        if evidence.offer.id.to_hex() != request.job_id
-            || evidence.claim.id.to_hex() != request.claim_id
-            || evidence.result.id.to_hex() != result.result_id {
-            return Err(JobLifecycleError::Input("private result selection mismatch".into()));
-        }
-        evidence.validate(&keys.public_key().to_hex(), &policy)
-            .map_err(|e| JobLifecycleError::Input(e.to_string()))
-    }).transpose()?;
+        crate::review::check_buyer_detailed(
+            home,
+            &keys,
+            &review_subject,
+            &claim.seller_pubkey,
+            result.private_evidence.as_ref(),
+            request.accept_review_verdict.as_deref(),
+        )
+        .await
+        .map_err(JobLifecycleError::Input)?
+    } else {
+        None
+    };
+    let private_verified = result
+        .private_evidence
+        .as_ref()
+        .map(|evidence| {
+            let policy = crate::private_content::runtime::Policy::for_evidence(home, evidence)
+                .map_err(|e| JobLifecycleError::Input(e.to_string()))?;
+            if evidence.offer.id.to_hex() != request.job_id
+                || evidence.claim.id.to_hex() != request.claim_id
+                || evidence.result.id.to_hex() != result.result_id
+            {
+                return Err(JobLifecycleError::Input(
+                    "private result selection mismatch".into(),
+                ));
+            }
+            evidence
+                .validate(&keys.public_key().to_hex(), &policy)
+                .map_err(|e| JobLifecycleError::Input(e.to_string()))
+        })
+        .transpose()?;
 
     // Finding W: hold a per-job advisory lock across the single-settlement check→durable-bind-write
     // so two concurrent accepts for DIFFERENT results of one job cannot both observe "no bind" and
@@ -1741,8 +1762,23 @@ pub async fn accept_claim_async(
     // THIS job releases. Held until the function returns (past the pending + finalized bind writes),
     // so the loser re-reads the winner's bind and refuses at `assert_single_settlement`.
     let _job_lock = acquire_job_lock(home, &request.job_id)?;
-    if let Some(id) = review_id {
-        crate::review::record_pass(home, &review_subject, &id).map_err(JobLifecycleError::Input)?;
+    if let Some(pass) = review_id {
+        let id = &pass.event_id;
+        let cfg = home.config.review.reject_at_or_above_ppm;
+        let accepted = pass
+            .accepted_unsafe_ppm
+            .map(|unsafe_ppm| crate::review::AcceptedVerdict {
+                unsafe_ppm,
+                configured_threshold_ppm: cfg,
+            });
+        crate::review::record_pass(home, &review_subject, id, accepted)
+            .map_err(JobLifecycleError::Input)?;
+        if let Some(unsafe_ppm) = pass.accepted_unsafe_ppm {
+            let result_id = &review_subject.event;
+            crate::opline!(
+                "review: {result_id}: delivery accepted by explicit buyer decision on verdict {id} (unsafe {unsafe_ppm} ppm; configured threshold {cfg} ppm unchanged)"
+            );
+        }
     }
 
 
@@ -2122,6 +2158,7 @@ pub async fn accept_claim_async(
 pub async fn accept_for_collect_async(
     home: &MaxplayerHome,
     job_id: &str,
+    accept_review_verdict: Option<String>,
 ) -> Result<AcceptedBind, JobLifecycleError> {
     let timeout = Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS);
     let keys = buyer_keys(home)?;
@@ -2158,6 +2195,7 @@ pub async fn accept_for_collect_async(
     let outcome = accept_claim_async(
         home,
         AcceptClaimRequest {
+            accept_review_verdict,
             job_id: job_id.to_owned(),
             claim_id,
             result_id: None,
@@ -4293,6 +4331,7 @@ mod tests {
             assert!(!client.send_event(event).await.unwrap().success.is_empty());
         }
         let request = || AcceptClaimRequest {
+            accept_review_verdict: None,
             job_id: job.clone(),
             claim_id: claim.id.to_hex(),
             result_id: Some(result.id.to_hex()),
@@ -6750,6 +6789,7 @@ mod tests {
         let err = accept_claim(
             &home,
             AcceptClaimRequest {
+                accept_review_verdict: None,
                 job_id: "aa".repeat(32),
                 claim_id: "bb".repeat(32),
                 result_id: None,

@@ -6929,7 +6929,7 @@ impl SellerNodeRunner {
                             kind: crate::kinds::JOB_OFFER_KIND,
                             commit: None,
                         };
-                        crate::review::record_pass(home, &subject, id)?;
+                        crate::review::record_pass(home, &subject, id, None)?;
                     }
                     Ok(true)
                 }

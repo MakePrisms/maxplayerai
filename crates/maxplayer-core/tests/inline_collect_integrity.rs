@@ -101,6 +101,7 @@ async fn collect_refuses_to_pay_when_the_answer_does_not_reproduce_the_bound_dig
         &home,
         Some(&mut gate),
         CollectRequest {
+            accept_review_verdict: None,
             job_id: job_id.clone(),
             out: None,
         },
@@ -151,6 +152,7 @@ async fn a_free_inline_collect_materializes_the_answer_and_records_it() {
         &home,
         None,
         CollectRequest {
+            accept_review_verdict: None,
             job_id: job_id.clone(),
             out: None,
         },
@@ -192,6 +194,7 @@ async fn a_bind_that_contradicts_its_own_delivery_mode_is_refused() {
         &home,
         Some(&mut gate),
         CollectRequest {
+            accept_review_verdict: None,
             job_id: job_id.clone(),
             out: None,
         },

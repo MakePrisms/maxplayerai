@@ -56,7 +56,9 @@ impl ReviewConfig {
         // synchronously. The default stays 300: a timeout ends the wait, not the
         // job, and a later retry collects the worker's persisted late result.
         if self.reject_at_or_above_ppm > 1_000_000 || !(1..=3600).contains(&self.timeout_seconds) {
-            return Err("review: invalid probability threshold or timeout (1..3600 seconds)".into());
+            return Err(
+                "review: invalid probability threshold or timeout (1..3600 seconds)".into(),
+            );
         }
         if self
             .skip_buyer_pubkeys
@@ -407,7 +409,7 @@ pub mod wire {
         }
         Ok(())
     }
-    /// Bounded wait, one request per attempt, reuse prior authenticated result.
+    /// Compatibility wrapper for callers that only need the signed event id.
     pub async fn check<T: Transport>(
         transport: &T,
         config: &ReviewConfig,
@@ -416,6 +418,28 @@ pub mod wire {
         counterparty: &str,
         private: bool,
     ) -> Result<Option<String>, String> {
+        check_detailed(
+            transport,
+            config,
+            relay,
+            subject,
+            counterparty,
+            private,
+            None,
+        )
+        .await
+        .map(|pass| pass.map(|p| p.event_id))
+    }
+    /// Bounded wait, one request per attempt, reuse prior authenticated result.
+    pub async fn check_detailed<T: Transport>(
+        transport: &T,
+        config: &ReviewConfig,
+        relay: &str,
+        subject: &Subject,
+        counterparty: &str,
+        private: bool,
+        accepted_verdict: Option<&str>,
+    ) -> Result<Option<Pass>, String> {
         if !config.enabled(subject.kind, counterparty)? {
             return Ok(None);
         }
@@ -464,8 +488,18 @@ pub mod wire {
                 }
                 if let Some((r, id)) = accepted {
                     return match r.decision(subject, config.reject_at_or_above_ppm)? {
-                        Decision::Passed => Ok(Some(id)),
+                        Decision::Passed => Ok(Some(Pass {
+                            event_id: id,
+                            accepted_unsafe_ppm: None,
+                        })),
                         Decision::Refused { unsafe_ppm } => {
+                            if accepted_verdict == Some(id.as_str()) {
+                                return Ok(Some(Pass {
+                                    event_id: id,
+                                    accepted_unsafe_ppm: Some(unsafe_ppm),
+                                }));
+                            }
+                            let mismatch = accepted_verdict.map(|given| format!("; accept_review_verdict {given} does not match this verdict")).unwrap_or_default();
                             let target = if subject.kind == JOB_RESULT_KIND {
                                 "delivery"
                             } else {
@@ -475,7 +509,7 @@ pub mod wire {
                             let pct = unsafe_ppm as f64 / 10_000.0;
                             let tpct = threshold as f64 / 10_000.0;
                             Err(format!(
-                                "{VERDICT_REFUSED_PREFIX} this {target}: unsafe probability {unsafe_ppm} ppm ({pct:.1}%) is at or above the local threshold {threshold} ppm ({tpct:.1}%); verdict event {id}; the signed verdict is content-addressed, so repeating this check unchanged returns the same result"
+                                "{VERDICT_REFUSED_PREFIX} this {target}: unsafe probability {unsafe_ppm} ppm ({pct:.1}%) is at or above the local threshold {threshold} ppm ({tpct:.1}%); verdict event {id}; the signed verdict is content-addressed, so repeating this check unchanged returns the same result{mismatch}"
                             ))
                         }
                         Decision::Error(code) => {
@@ -521,6 +555,13 @@ pub mod wire {
     }
 }
 
+/// Authenticated review outcome, including a verdict-bound buyer acceptance.
+#[derive(Debug, Clone)]
+pub struct Pass {
+    pub event_id: String,
+    pub accepted_unsafe_ppm: Option<u32>,
+}
+
 #[cfg(feature = "wallet")]
 pub async fn check_buyer(
     home: &crate::home::MaxplayerHome,
@@ -528,7 +569,32 @@ pub async fn check_buyer(
     subject: &Subject,
     counterparty: &str,
     evidence: Option<&crate::private_content::evidence::PrivateEvidence>,
+    accept_review_verdict: Option<&str>,
 ) -> Result<Option<String>, String> {
+    check_buyer_detailed(
+        home,
+        keys,
+        subject,
+        counterparty,
+        evidence,
+        accept_review_verdict,
+    )
+    .await
+    .map(|pass| pass.map(|p| p.event_id))
+}
+
+#[cfg(feature = "wallet")]
+pub async fn check_buyer_detailed(
+    home: &crate::home::MaxplayerHome,
+    keys: &nostr_sdk::Keys,
+    subject: &Subject,
+    counterparty: &str,
+    evidence: Option<&crate::private_content::evidence::PrivateEvidence>,
+    accept_review_verdict: Option<&str>,
+) -> Result<Option<Pass>, String> {
+    validate_accept_review_verdict(accept_review_verdict)?;
+    let recorded = recorded_acceptance(home, subject)?;
+    let accepted_verdict = accept_review_verdict.or(recorded.as_deref());
     if !home.config.review.enabled(subject.kind, counterparty)? {
         state::write(
             &home.root,
@@ -570,36 +636,60 @@ pub async fn check_buyer(
             private::is_private(&e.offer)
         } else {
             use nostr_sdk::prelude::*;
-            let rows = client.fetch_events(Filter::new().id(EventId::from_hex(&subject.offer).map_err(|_| "review: invalid offer id")?), std::time::Duration::from_secs(3))
-                .await.map_err(|_| "review: offer unavailable")?;
-            let offer = rows.into_iter().find(|e| e.id.to_hex() == subject.offer).ok_or("review: offer unavailable")?;
+            let rows = client
+                .fetch_events(
+                    Filter::new().id(EventId::from_hex(&subject.offer)
+                        .map_err(|_| "review: invalid offer id")?),
+                    std::time::Duration::from_secs(3),
+                )
+                .await
+                .map_err(|_| "review: offer unavailable")?;
+            let offer = rows
+                .into_iter()
+                .find(|e| e.id.to_hex() == subject.offer)
+                .ok_or("review: offer unavailable")?;
             offer.verify().map_err(|_| "review: invalid source offer")?;
             private::is_private(&offer)
         };
         if private {
-            let evidence = evidence.ok_or("review: private evidence unavailable; no public fallback")?;
-            let request = private::Request { subject: subject.clone(), offer: evidence.offer.clone(), task_envelope: evidence.task_envelope.clone(), delivery: Some(evidence.clone()) };
-            private::check(home, &client, private::Identity::Buyer(keys), &request, counterparty).await
+            let evidence =
+                evidence.ok_or("review: private evidence unavailable; no public fallback")?;
+            let request = private::Request {
+                subject: subject.clone(),
+                offer: evidence.offer.clone(),
+                task_envelope: evidence.task_envelope.clone(),
+                delivery: Some(evidence.clone()),
+            };
+            private::check_detailed(
+                home,
+                &client,
+                private::Identity::Buyer(keys),
+                &request,
+                counterparty,
+                accepted_verdict,
+            )
+            .await
         } else {
-            wire::check(
-        &wire::RelayTransport {
-            client: &client,
-            relay: &home.config.relay_url,
-        },
-        &home.config.review,
-        &home.config.relay_url,
-        subject,
-        counterparty,
-        false,
-    )
-    .await
+            wire::check_detailed(
+                &wire::RelayTransport {
+                    client: &client,
+                    relay: &home.config.relay_url,
+                },
+                &home.config.review,
+                &home.config.relay_url,
+                subject,
+                counterparty,
+                false,
+                accepted_verdict,
+            )
+            .await
         }
     }.await;
     client.disconnect().await;
-    state::completed(&home.root, subject, &result)?;
+    complete_buyer_review(home, subject, &result)?;
     result
         .map_err(|e| if e.starts_with(VERDICT_REFUSED_PREFIX) {
-            format!("{e}; decide what to do: accept this delivery anyway by repeating collect (or accept) with review_threshold_ppm set above the reported unsafe ppm (this result only, recorded locally), raise review.reject_at_or_above_ppm in config.toml and restart the buyer daemon, or leave the delivery unsettled — repeating collect unchanged returns this same verdict")
+            format!("{e}; decide what to do: accept this delivery anyway by repeating collect (or accept) with accept_review_verdict set to the verdict event id above (this result only, recorded locally), raise review.reject_at_or_above_ppm in config.toml and restart the buyer daemon, or leave the delivery unsettled — repeating collect unchanged returns this same verdict")
         } else {
             format!("{e}; retry the same collect or accept operation (no new job needed)")
         })
@@ -675,6 +765,211 @@ mod tests {
     async fn check(m: &Mock, cfg: &ReviewConfig) -> Result<Option<String>, String> {
         wire::check(m, cfg, "wss://test", &subject(), &"b".repeat(64), false).await
     }
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn verdict_acceptance_validation_and_exact_subject_recording() {
+        for id in [
+            "a".repeat(63),
+            "A".repeat(64),
+            "g".repeat(64),
+            "150001".into(),
+        ] {
+            assert!(
+                validate_accept_review_verdict(Some(&id))
+                    .unwrap_err()
+                    .contains("64 lowercase hex")
+            );
+        }
+        validate_accept_review_verdict(None).unwrap();
+        validate_accept_review_verdict(Some(&"a".repeat(64))).unwrap();
+        let root = std::env::temp_dir().join(format!("review-override-{}", uuid::Uuid::new_v4()));
+        let home = crate::home::bootstrap(&root).unwrap();
+        let mut s = subject();
+        s.kind = JOB_RESULT_KIND;
+        let id = "c".repeat(64);
+        assert_eq!(recorded_acceptance(&home, &s).unwrap(), None);
+        record_pass(&home, &s, &id, None).unwrap();
+        assert_eq!(recorded_acceptance(&home, &s).unwrap(), None);
+        record_pass(
+            &home,
+            &s,
+            &id,
+            Some(AcceptedVerdict {
+                unsafe_ppm: 900_000,
+                configured_threshold_ppm: 500_000,
+            }),
+        )
+        .unwrap();
+        assert_eq!(recorded_acceptance(&home, &s).unwrap(), Some(id.clone()));
+        let evidence: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.join("reviews").join(format!("{}.json", s.event))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            evidence["reject_at_or_above_ppm"],
+            home.config.review.reject_at_or_above_ppm
+        );
+        assert_eq!(evidence["review_event"], id);
+        assert_eq!(evidence["accepted_verdict"]["unsafe_ppm"], 900_000);
+        assert_eq!(
+            evidence["accepted_verdict"]["configured_threshold_ppm"],
+            500_000
+        );
+        let mut mismatch = s.clone();
+        mismatch.offer = "d".repeat(64);
+        assert_eq!(recorded_acceptance(&home, &mismatch).unwrap(), None);
+        let mut mismatch = s.clone();
+        mismatch.kind = JOB_OFFER_KIND;
+        assert_eq!(recorded_acceptance(&home, &mismatch).unwrap(), None);
+        let mut mismatch = s.clone();
+        mismatch.event = "f".repeat(64);
+        assert_eq!(recorded_acceptance(&home, &mismatch).unwrap(), None);
+        let mut mismatch = s.clone();
+        mismatch.commit = Some("e".repeat(40));
+        assert_eq!(recorded_acceptance(&home, &mismatch).unwrap(), None);
+        assert_eq!(
+            crate::home::bootstrap(&root)
+                .unwrap()
+                .config
+                .review
+                .reject_at_or_above_ppm,
+            home.config.review.reject_at_or_above_ppm
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn verdict_bound_acceptance_matches_only_exact_signed_verdict() {
+        let keys = Keys::generate();
+        let event = signed(&answer(0.15), &keys);
+        let id = event.id.to_hex();
+        let m = mock(vec![event], vec![]);
+        let mut cfg = config(&keys);
+        cfg.reject_at_or_above_ppm = 100_000;
+        let error = check(&m, &cfg).await.unwrap_err();
+        assert!(error.contains("150000 ppm"), "{error}");
+        assert!(error.contains("100000 ppm"), "{error}");
+        for wrong in ["f".repeat(64), "bad".into(), "Z".repeat(64)] {
+            let error = wire::check_detailed(
+                &m,
+                &cfg,
+                "wss://test",
+                &subject(),
+                &"b".repeat(64),
+                false,
+                Some(&wrong),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.starts_with(VERDICT_REFUSED_PREFIX));
+            assert!(error.contains(&format!(
+                "accept_review_verdict {wrong} does not match this verdict"
+            )));
+        }
+        let pass = wire::check_detailed(
+            &m,
+            &cfg,
+            "wss://test",
+            &subject(),
+            &"b".repeat(64),
+            false,
+            Some(&id),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(pass.event_id, id);
+        assert_eq!(pass.accepted_unsafe_ppm, Some(150_000));
+        cfg.reject_at_or_above_ppm = 500_000;
+        let pass = wire::check_detailed(
+            &m,
+            &cfg,
+            "wss://test",
+            &subject(),
+            &"b".repeat(64),
+            false,
+            Some(&"f".repeat(64)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(pass.accepted_unsafe_ppm, None);
+        assert_eq!(m.requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(feature = "wallet")]
+    #[tokio::test]
+    async fn recorded_verdict_acceptance_rechecks_signature_and_records_status() {
+        let root = std::env::temp_dir().join(format!("review-verdict-{}", uuid::Uuid::new_v4()));
+        let home = crate::home::bootstrap(&root).unwrap();
+        let keys = Keys::generate();
+        let mut review = answer(0.9);
+        review.subject.kind = JOB_RESULT_KIND;
+        let s = &review.subject;
+        let event = signed(&review, &keys);
+        let id = event.id.to_hex();
+        let m = mock(vec![event], vec![]);
+        let cfg = config(&keys);
+        let pass =
+            wire::check_detailed(&m, &cfg, "wss://test", s, &"b".repeat(64), false, Some(&id))
+                .await
+                .unwrap()
+                .unwrap();
+        complete_buyer_review(&home, s, &Ok(Some(pass.clone()))).unwrap();
+        let status: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.join("review-status").join(format!("{}.json", s.event))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status["state"], "passed");
+        assert_eq!(
+            status["detail"],
+            format!(
+                "{id}; accepted by explicit buyer decision despite unsafe 900000 ppm (configured threshold 500000 ppm unchanged)"
+            )
+        );
+        record_pass(
+            &home,
+            s,
+            &id,
+            Some(AcceptedVerdict {
+                unsafe_ppm: pass.accepted_unsafe_ppm.unwrap(),
+                configured_threshold_ppm: 500_000,
+            }),
+        )
+        .unwrap();
+        let recorded = recorded_acceptance(&home, s).unwrap();
+        let given: Option<&str> = None;
+        let later = wire::check_detailed(
+            &m,
+            &cfg,
+            "wss://test",
+            s,
+            &"b".repeat(64),
+            false,
+            given.or(recorded.as_deref()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(later.event_id, id);
+        assert_eq!(later.accepted_unsafe_ppm, Some(900_000));
+        let other = mock(vec![signed(&review, &Keys::generate())], vec![]);
+        assert!(
+            wire::check_detailed(
+                &other,
+                &cfg,
+                "wss://test",
+                s,
+                &"b".repeat(64),
+                false,
+                recorded.as_deref()
+            )
+            .await
+            .is_err()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn verdict_refusal_surfaces_probability_threshold_and_event() {
         let keys = Keys::generate();
@@ -759,7 +1054,8 @@ mod tests {
             async fn request(&self, _: EventDraft) -> Result<(), String> {
                 Err("review: relay refused the review request: invalid: event timestamp too far \
                      from server time"
-                    .into())
+                        .into(),
+                )
             }
         }
         let keys = Keys::generate();
@@ -785,9 +1081,10 @@ mod tests {
             failed: std::collections::HashMap::new(),
         };
         let relay = nostr_sdk::prelude::RelayUrl::parse("wss://relay.test").unwrap();
-        output
-            .failed
-            .insert(relay.clone(), "invalid: content exceeds maximum size".into());
+        output.failed.insert(
+            relay.clone(),
+            "invalid: content exceeds maximum size".into(),
+        );
         let error = wire::request_refused(&output).unwrap_err();
         assert!(error.contains("invalid: content exceeds maximum size"), "{error}");
         output.success.insert(relay);
@@ -1042,12 +1339,89 @@ pub fn evaluate<C: Classifier>(
     Ok(result)
 }
 
-/// Local evidence is not a substitute for signature verification on a later attempt.
+/// Validate at RPC/CLI boundaries before any network or payment work.
+pub fn validate_accept_review_verdict(id: Option<&str>) -> Result<(), String> {
+    if id.is_some_and(|id| !hex_id(id)) {
+        return Err("accept_review_verdict must be 64 lowercase hex characters".into());
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcceptedVerdict {
+    pub unsafe_ppm: u32,
+    pub configured_threshold_ppm: u32,
+}
+
+#[cfg(feature = "wallet")]
+fn complete_buyer_review(
+    home: &crate::home::MaxplayerHome,
+    subject: &Subject,
+    result: &Result<Option<Pass>, String>,
+) -> Result<(), String> {
+    if let Ok(Some(Pass {
+        event_id,
+        accepted_unsafe_ppm: Some(unsafe_ppm),
+    })) = result
+    {
+        let cfg = home.config.review.reject_at_or_above_ppm;
+        state::write(
+            &home.root,
+            subject,
+            "passed",
+            &format!(
+                "{event_id}; accepted by explicit buyer decision despite unsafe {unsafe_ppm} ppm (configured threshold {cfg} ppm unchanged)"
+            ),
+        )
+    } else {
+        state::completed(
+            &home.root,
+            subject,
+            &result
+                .as_ref()
+                .map(|p| p.as_ref().map(|p| p.event_id.clone()))
+                .map_err(Clone::clone),
+        )
+    }
+}
+
+/// A recorded decision is bound to the full subject and still requires a signed verdict.
+#[cfg(feature = "wallet")]
+pub fn recorded_acceptance(
+    home: &crate::home::MaxplayerHome,
+    subject: &Subject,
+) -> Result<Option<String>, String> {
+    subject.validate()?;
+    let bytes = match std::fs::read(
+        home.root
+            .join("reviews")
+            .join(format!("{}.json", subject.event)),
+    ) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("review: evidence read: {e}")),
+    };
+    #[derive(Deserialize)]
+    struct Evidence {
+        subject: Subject,
+        review_event: String,
+        accepted_verdict: Option<AcceptedVerdict>,
+    }
+    let evidence: Evidence =
+        serde_json::from_slice(&bytes).map_err(|e| format!("review: invalid evidence: {e}"))?;
+    if evidence.subject != *subject || evidence.accepted_verdict.is_none() {
+        return Ok(None);
+    }
+    validate_accept_review_verdict(Some(&evidence.review_event))?;
+    Ok(Some(evidence.review_event))
+}
+
 #[cfg(feature = "wallet")]
 pub fn record_pass(
     home: &crate::home::MaxplayerHome,
     subject: &Subject,
     event_id: &str,
+    accepted_verdict: Option<AcceptedVerdict>,
 ) -> Result<(), String> {
     subject.validate()?;
     if !hex_id(event_id) {
@@ -1055,9 +1429,12 @@ pub fn record_pass(
     }
     let dir = home.root.join("reviews");
     std::fs::create_dir_all(&dir).map_err(|e| format!("review: evidence directory: {e}"))?;
-    let evidence = serde_json::json!({"subject": subject, "review_event": event_id,
+    let mut evidence = serde_json::json!({"subject": subject, "review_event": event_id,
         "relay": home.config.relay_url, "reviewer": home.config.review.reviewers.get(&home.config.relay_url),
         "reject_at_or_above_ppm": home.config.review.reject_at_or_above_ppm});
+    if let Some(accepted) = accepted_verdict {
+        evidence["accepted_verdict"] = serde_json::to_value(accepted).map_err(|e| e.to_string())?;
+    }
     let bytes = serde_json::to_vec(&evidence).map_err(|e| e.to_string())?;
     crate::durable::write_atomic(&dir, &dir.join(format!("{}.json", subject.event)), &bytes)
         .map_err(|e| format!("review: evidence write: {e}"))
@@ -1131,6 +1508,7 @@ pub async fn protect_job_view(
                             &subject,
                             &result.seller_pubkey,
                             result.private_evidence.as_ref(),
+                            None,
                         )
                         .await
                     }

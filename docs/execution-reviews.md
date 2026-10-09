@@ -133,12 +133,12 @@ while the review is pending. The offer must still be eligible; expired/claimed o
 cannot be revived by a review retry. A policy refusal/conflict is not an availability
 retry. The command does not reroll unsafe results.
 
-Buyer: repeat the same `collect` MCP call/CLI command or explicit `accept` command
+Buyer availability errors: repeat the same `collect` MCP call/CLI command or explicit `accept` command
 for the same job/result. Do not post a new job or ask the seller to redeliver unchanged
 content. `maxplayer review status <result-id>` shows the local review state.
 The error itself explains this recovery path. The automatic buyer settlement watcher
 holds a failed review instead of repeatedly initiating paid checks. An explicit
-collect retries; a new RESULT from the awarded seller starts a new review. Accepted
+collect retries availability errors (verdict refusals require the decision below); a new RESULT from the awarded seller starts a new review. Accepted
 payment obligations are never held by this local review status.
 
 `get_job` returns `review_status`. It reviews the newest delivery from the awarded
@@ -147,6 +147,44 @@ retain identifying metadata but withhold inline answers, repository/branch strin
 agent/model strings, and contribution metadata. Collect independently checks the
 selected result before acceptance. Already-accepted obligations keep payment recovery;
 review changes do not retroactively cancel a payment obligation.
+
+### Verdict refusals (buyer)
+
+A signed verdict refusal is not a reviewer timeout. The message includes the measured
+probability, inclusive local threshold, and signed verdict event id, for example:
+
+```text
+review: execution-safety verdict refused this delivery: unsafe probability 150000 ppm (15.0%) is at or above the local threshold 100000 ppm (10.0%); verdict event <event-id>; the signed verdict is content-addressed, so repeating this check unchanged returns the same result
+```
+
+The buyer appends decision guidance. Verdicts are content-addressed: repeating collect
+or accept unchanged returns the same refusal. Choose one of three actions:
+
+- Accept this exact signed verdict anyway: MCP `collect` accepts `accept_review_verdict`
+  set to the verdict event id from the message. CLI equivalents are
+  `maxplayer collect <job_id> --accept-review-verdict <verdict-event-id>` and
+  `maxplayer accept <job_id> <claim_id> --accept-review-verdict <verdict-event-id>`.
+- Raise `review.reject_at_or_above_ppm` in `config.toml` and restart the buyer daemon
+  to change the policy for future checks generally.
+- Leave this delivery unsettled.
+
+`accept_review_verdict` is a 64-character lowercase hex event id: “I have seen this
+exact signed verdict and accept this delivery anyway.” There is no threshold to choose.
+It is an operator decision, not a retry or a review skip. A refused verdict accepted
+this way is recorded in `<home>/reviews/<result-id>.json`: `review_event` identifies
+that verdict, and `accepted_verdict` records `unsafe_ppm` and
+`configured_threshold_ppm`. The record is bound to the exact offer, result event,
+kind, and commit. Later `get_job` checks use the decision while still verifying the
+signed verdict. A different verdict or re-delivery fails closed; a mismatched supplied
+id leaves a refused verdict refused and names the mismatch. Below-threshold verdicts
+still pass normally. Configuration is never rewritten and other jobs are unaffected.
+An explicit per-call id takes precedence over a recorded acceptance.
+
+Timeouts and reviewer availability errors retain the retry guidance above; a genuine
+verdict refusal does not. Do not use `skip_seller_pubkeys` to handle a verdict refusal.
+Observed git/contribution deliveries scored roughly 9–15% unsafe versus 2–8% for
+offers (#1122), placing a 10% threshold inside the observed delivery band. These
+thresholds remain **uncalibrated**; these observations are not a safety guarantee.
 
 ## Relay-owner worker
 
