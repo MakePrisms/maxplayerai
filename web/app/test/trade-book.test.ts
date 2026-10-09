@@ -357,9 +357,6 @@ test("completed trades never count a quarantined or stranger-closed lot", () => 
 });
 
 test("the lot popup docks to the clicked side, never the middle", () => {
-  assert.equal(dockSide("lots", 1300, 1440), "left");
-  assert.equal(dockSide("recent", 10, 1440), "right");
-  assert.equal(dockSide("done", 200, 1440), "left");
-  assert.equal(dockSide("done", 720, 1440), "right");
-  assert.equal(dockSide("done", null, 1440), "left");
+  assert.equal(dockSide("lots"), "left");
+  assert.equal(dockSide("recent"), "right");
 });

@@ -163,7 +163,7 @@ test("the live market ships at /market and the homepage links it", () => {
 
 test("/tokens ships its own read-only bundle and stays unlisted", () => {
   const tokens = readFileSync(join(root, "dist", "tokens.html"), "utf8");
-  for (const id of ["tokens", "lots", "recent", "done", "windows", "statgrid", "conn", "utc-clock", "trade-detail"]) {
+  for (const id of ["tokens", "lots", "recent", "windows", "statgrid", "conn", "utc-clock", "trade-detail"]) {
     assert.ok(tokens.includes(`id="${id}"`), `tokens.html carries #${id}`);
   }
   assert.ok(!tokens.includes("terminal.js"), "the jobs bundle is not loaded on /tokens");
@@ -172,6 +172,7 @@ test("/tokens ships its own read-only bundle and stays unlisted", () => {
   // Lot details open in /market's popup window, not inline under the board.
   assert.match(tokens, /<aside class="dock dock-(left|right) pinned" id="trade-detail"[^>]*hidden>/);
   assert.ok(!/dock-mid/.test(tokens), "the lot popup never opens in the middle");
+  assert.ok(!tokens.includes('id="done"'), "no completed-trades table under the board (bob)");
   assert.ok(tokens.indexOf('id="trade-detail"') > tokens.indexOf("</footer>"), "the popup lives outside the page flow");
   // Team link only (bob): nothing on the public site points at it.
   for (const page of ["index.html", "market.html", "sell.html", "tokens.html", "llms.txt", "skill.md"]) {

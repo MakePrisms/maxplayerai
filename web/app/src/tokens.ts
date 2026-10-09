@@ -79,24 +79,7 @@ function wireWindows(onChange: () => void): void {
   });
 }
 
-function doneItem(r: LotRow, t: number): KeyedItem {
-  const s = seller(r.lot.maker);
-  return {
-    key: r.id,
-    className: "row done-grid",
-    tabIndex: 0,
-    data: { lot: r.id },
-    html:
-      `<span class="when" data-ts="${r.updated_at}" title="${esc(stamp(r.updated_at))}">${ago(r.updated_at, t)}</span>` +
-      `<span class="leg">${legHtml(r.lot.give.net, r.lot.give.mint_url)}</span>` +
-      `<span class="leg">${legHtml(r.lot.want.net, r.lot.want.mint_url)}</span>` +
-      `<span class="num">${esc(rate(r.price))}</span>` +
-      `<span class="person col-seller" title="${esc(s.npub)}">${esc(s.short)}</span>` +
-      `<span class="num">${esc(duration(r.updated_at - r.lot.created_at))}</span>`,
-  };
-}
-
-function renderStats(v: BookView, t: number, answered: boolean): void {
+function renderStats(v: BookView, t: number): void {
   const w = WINDOWS.find((x) => x.key === windowKey) ?? WINDOWS[0]!;
   const c = completedStats(v, t, w.seconds);
   const cells: [string, string, boolean][] = [
@@ -108,9 +91,6 @@ function renderStats(v: BookView, t: number, answered: boolean): void {
     ["Median fill", c.medianFill == null ? "—" : duration(c.medianFill), false],
   ];
   el("statgrid").innerHTML = cells.map(([k, val, neon]) => `<div><dt>${k}</dt><dd${neon ? ' class="neon"' : ""}>${esc(val)}</dd></div>`).join("");
-  el("done-meta").textContent = `${c.trades} · ${w.label.toLowerCase()}`;
-  if (c.rows.length) reconcileList(el("done"), c.rows.slice(0, 500).map((r) => doneItem(r, t)));
-  else if (answered) reconcileList(el("done"), [{ key: "-empty", className: "empty", html: "No completed trades in this period." }]);
   const notes: string[] = [`${c.cancelled} cancelled and ${c.expired} expired in this period`];
   if (v.quarantined.length) notes.push(`${v.quarantined.length} listing${v.quarantined.length === 1 ? "" : "s"} hidden: broken or forked status history`);
   if (v.rejected) notes.push(`${v.rejected} invalid listing${v.rejected === 1 ? "" : "s"} ignored`);
@@ -150,7 +130,7 @@ function render(v: BookView, answered: boolean): void {
   const t = now();
   // An empty book is a conclusion; the skeletons hold until a relay has answered.
   if (!answered && v.open.length + v.closed.length === 0) return;
-  renderStats(v, t, answered);
+  renderStats(v, t);
   const recent = v.closed.filter((r) => r.updated_at >= t - 2 * 86400);
   el("lots-meta").textContent = `${v.open.length} open`;
   el("recent-meta").textContent = `${recent.length} in 48h`;
@@ -204,8 +184,7 @@ function boot(): void {
     ev.preventDefault();
     selected = row.dataset.lot ?? null;
     const list = row.closest("ol")?.id ?? "";
-    const x = ev instanceof MouseEvent && ev.detail > 0 ? ev.clientX : null;
-    const side = dockSide(list, x, window.innerWidth);
+    const side = dockSide(list);
     const box = el("trade-detail");
     box.classList.toggle("dock-left", side === "left");
     box.classList.toggle("dock-right", side === "right");
@@ -214,7 +193,7 @@ function boot(): void {
     el("trade-detail-body").scrollTop = 0;
     el("trade-detail-close").focus();
   };
-  for (const id of ["lots", "recent", "done"]) {
+  for (const id of ["lots", "recent"]) {
     el(id).addEventListener("click", pick);
     el(id).addEventListener("keydown", pick);
   }
@@ -231,7 +210,7 @@ function boot(): void {
   setInterval(() => {
     const t = now();
     for (const n of document.querySelectorAll<HTMLElement>("[data-expires]")) n.textContent = timeLeft(Number(n.dataset.expires) - t);
-    for (const n of document.querySelectorAll<HTMLElement>("#recent [data-ts], #done [data-ts]")) n.textContent = ago(Number(n.dataset.ts), t);
+    for (const n of document.querySelectorAll<HTMLElement>("#recent [data-ts]")) n.textContent = ago(Number(n.dataset.ts), t);
   }, 1000);
   setInterval(paint, 60_000);
 }
