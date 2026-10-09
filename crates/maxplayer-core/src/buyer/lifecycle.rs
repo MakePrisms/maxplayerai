@@ -248,9 +248,33 @@ pub fn claim_meets_capability_request(
     advertised: &crate::heartbeat::SeatCapability,
     filters: &AwardFilters,
 ) -> Result<(), CapabilityRefusal> {
+    capability_meets_request(
+        advertised,
+        &CapabilityRequest {
+            requested_agent: filters.requested_agent.map(str::to_owned),
+            requested_harness_family: filters.requested_harness_family.map(str::to_owned),
+            requested_model: filters.requested_model.map(str::to_owned),
+            required_capabilities: filters.required_capabilities.to_vec(),
+        },
+    )
+}
+
+/// Shared signed-offer requirements for seller admission and buyer award checks.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CapabilityRequest {
+    pub requested_agent: Option<String>,
+    pub requested_harness_family: Option<String>,
+    pub requested_model: Option<String>,
+    pub required_capabilities: Vec<String>,
+}
+
+pub fn capability_meets_request(
+    advertised: &crate::heartbeat::SeatCapability,
+    request: &CapabilityRequest,
+) -> Result<(), CapabilityRefusal> {
     // Validate the REQUEST before judging the claim. A malformed request judged against a claim
     // produces a claim-blaming refusal for a defect the claim had nothing to do with.
-    if let Some(unknown) = filters
+    if let Some(unknown) = request
         .required_capabilities
         .iter()
         .find(|token| !crate::capability::CAPABILITIES.contains(&token.as_str()))
@@ -264,7 +288,7 @@ pub fn claim_meets_capability_request(
     // Only the stated family needs this. A DERIVED one comes from `harness_family_for_preset`, whose
     // range is `HARNESS_FAMILIES` by construction — asserted in `agent_presets` — so validating it
     // here would be checking a value this crate produced rather than one the wire supplied.
-    if let Some(requested) = filters.requested_harness_family {
+    if let Some(requested) = request.requested_harness_family.as_deref() {
         if !crate::agent_presets::HARNESS_FAMILIES.contains(&requested) {
             return Err(CapabilityRefusal::UnknownHarnessFamily {
                 requested: requested.to_owned(),
@@ -279,8 +303,8 @@ pub fn claim_meets_capability_request(
     // therefore describes a harness this job will not run on, and a multi-harness seat would satisfy
     // the filter and then execute something else. Refusing here is what keeps the offer's request and
     // the seat's dispatch the same statement.
-    let preset = crate::seller_agents::normalize_request(filters.requested_agent);
-    if let Some(requested_model) = filters.requested_model {
+    let preset = crate::seller_agents::normalize_request(request.requested_agent.as_deref());
+    if let Some(requested_model) = request.requested_model.as_deref() {
         if preset.is_none() {
             return Err(CapabilityRefusal::ModelWithoutHarnessPreset {
                 requested: requested_model.to_owned(),
@@ -292,13 +316,13 @@ pub fn claim_meets_capability_request(
     if let Some(preset_name) = preset.as_deref() {
         // A bare preset constrains nothing about the family — `claim_serves_requested_agent` already
         // enforces it, and a seat naming that preset is by definition able to run it.
-        if filters.requested_harness_family.is_some() || filters.requested_model.is_some() {
+        if request.requested_harness_family.is_some() || request.requested_model.is_some() {
             let Some(preset_family) = preset_family else {
                 return Err(CapabilityRefusal::PresetHasNoKnownFamily {
                     preset: preset_name.to_owned(),
                 });
             };
-            if let Some(requested) = filters.requested_harness_family {
+            if let Some(requested) = request.requested_harness_family.as_deref() {
                 if requested != preset_family {
                     return Err(CapabilityRefusal::HarnessFamilyContradictsPreset {
                         preset: preset_name.to_owned(),
@@ -312,9 +336,9 @@ pub fn claim_meets_capability_request(
     // The family this request actually binds to: stated outright, or DERIVED from the preset when a
     // model needs one to pair against. Deriving rather than demanding both keeps `agent` + `model`
     // — the shape a buyer reaches for first — a valid request instead of a refusal.
-    let effective_family: Option<&str> = match filters.requested_harness_family {
+    let effective_family: Option<&str> = match request.requested_harness_family.as_deref() {
         Some(stated) => Some(stated),
-        None if filters.requested_model.is_some() => preset_family,
+        None if request.requested_model.is_some() => preset_family,
         None => None,
     };
     // Family first: when a claim fails both, the family refusal is the actionable one — a model
@@ -324,7 +348,7 @@ pub fn claim_meets_capability_request(
             return Err(CapabilityRefusal::HarnessFamily { requested: requested.to_owned() });
         }
     }
-    if let Some(requested_model) = filters.requested_model {
+    if let Some(requested_model) = request.requested_model.as_deref() {
         // Some by construction: a model requires a preset, and a preset that constrains the harness
         // must map to a family or it was refused above.
         let Some(family) = effective_family else {
@@ -345,7 +369,7 @@ pub fn claim_meets_capability_request(
             });
         }
     }
-    let missing: Vec<String> = filters
+    let missing: Vec<String> = request
         .required_capabilities
         .iter()
         .filter(|required| !advertised.capabilities.iter().any(|have| have == *required))
@@ -1541,6 +1565,70 @@ pub fn plan_missing_offer(
 pub const PARK_REASON_OFFER_ABSENT: &str =
     "relay answered our read and returned no offer for this job";
 
+/// A terminal relay refusal of the offer's publication parks the auto-award NOW.
+///
+/// The view still carries the local offer, so the loop would otherwise spin to the
+/// offer deadline and then park with a reason that blames missing claims — false in
+/// every clause, since no seller could ever see the job (#1115). Guarded on "no
+/// claims, nothing accepted": a claim proves some signed copy of the offer reached
+/// the public record after all, and that job must keep its normal money path.
+pub fn publish_refused_park_reason(view: &crate::job_lifecycle::JobView) -> Option<String> {
+    let refusal = view.publish_refused.as_deref()?;
+    if !view.claims.is_empty() || view.accepted.is_some() {
+        return None;
+    }
+    Some(format!(
+        "offer publication refused by the relay: {refusal}; the offer never became visible — \
+         post the job again (a new post publishes a fresh offer)"
+    ))
+}
+
+#[cfg(test)]
+mod publish_refused_tests {
+    use super::*;
+    fn view(publish_refused: Option<&str>) -> crate::job_lifecycle::JobView {
+        crate::job_lifecycle::JobView {
+            job_id: "a".repeat(64),
+            offer: None,
+            claims: vec![],
+            results: vec![],
+            live_claim_id: None,
+            accepted: None,
+            pending: true,
+            read_confirmed: false,
+            publish_refused: publish_refused.map(str::to_owned),
+        }
+    }
+    #[test]
+    fn refused_publication_parks_with_the_relay_reason_and_the_recovery_step() {
+        let reason =
+            publish_refused_park_reason(&view(Some("invalid: event timestamp too far from server time")))
+                .unwrap();
+        assert!(reason.contains("invalid: event timestamp too far"), "{reason}");
+        assert!(reason.contains("post the job again"), "{reason}");
+        assert!(publish_refused_park_reason(&view(None)).is_none());
+    }
+    #[test]
+    fn a_claim_or_an_accept_outranks_the_refusal_record() {
+        // A claim proves a signed offer copy became public after all; the normal
+        // money path must keep running for it.
+        let mut claimed = view(Some("invalid: refused"));
+        claimed.claims.push(crate::job_lifecycle::ClaimView {
+            claim_id: "c".repeat(64),
+            created_at: 1,
+            seller_pubkey: "5".repeat(64),
+            display_name: None,
+            status: "processing".into(),
+            live: true,
+            creq: None,
+            agents: Vec::new(),
+            capability: Default::default(),
+            payment_mode: Default::default(),
+        });
+        assert!(publish_refused_park_reason(&claimed).is_none());
+    }
+}
+
 /// Park reason for [`MissingOfferAction::ParkUnreadable`].
 ///
 /// The wording lives beside the decision, not at the call site, so the reason a row carries and the
@@ -1726,6 +1814,7 @@ mod tests {
             accepted: None,
             pending: false,
             read_confirmed: true,
+            publish_refused: None,
         }
     }
 
@@ -1742,6 +1831,82 @@ mod tests {
             requested_model: None,
             required_capabilities: &[],
         }
+    }
+
+    #[tokio::test]
+    async fn incompatible_newer_claim_does_not_hide_matching_claim_or_double_reserve() {
+        let job = "a".repeat(64);
+        let mints = vec![DEFAULT_MINT_URL.to_owned()];
+        let mut matching = claim(&job, false, 40, &mints);
+        matching.agents = vec!["claude".into()];
+        matching.capability.harness_families = vec!["claude-code".into()];
+        matching.capability.capabilities = vec!["rust".into()];
+        let mut incompatible = matching.clone();
+        incompatible.claim_id = "d".repeat(64);
+        incompatible.seller_pubkey = "f".repeat(64);
+        incompatible.created_at = 2;
+        incompatible.capability.capabilities.clear();
+        let mut view = view_with(&job, 40, vec![incompatible, matching]);
+        view.live_claim_id =
+            crate::job_lifecycle::derive_claim_liveness(&mut view.claims, &[], Some(100), 50);
+        let required = vec!["rust".into()];
+        let mut f = filters(40, 100);
+        f.requested_agent = Some("claude");
+        f.required_capabilities = &required;
+        let selected = select_awardable_claim(&view, &f).expect("older matching claim");
+        assert_eq!(selected, "c".repeat(64));
+        assert!(named_claim_awardable(&view, &selected, &f).is_ok());
+        assert!(matches!(
+            named_claim_awardable(&view, &"d".repeat(64), &f),
+            Err(NamedAwardRefused::Capability { .. })
+        ));
+
+        let (store, path) = fresh_store("older-matching-claim");
+        let outcome = award_with_reservation(
+            &store,
+            &job,
+            40,
+            MintCeiling::pooled(100),
+            50,
+            no_relay,
+            || async {
+                let mut prepared = fake_prepared(&job);
+                prepared.claim_id = selected.clone();
+                Ok(prepared)
+            },
+            send_acked,
+            None,
+        )
+        .await
+        .expect("award selected claim");
+        assert!(matches!(outcome, AwardOutcome::Published(_)));
+        let retry = award_with_reservation(
+            &store,
+            &job,
+            40,
+            MintCeiling::pooled(100),
+            51,
+            no_relay,
+            no_prepare,
+            no_send,
+            None,
+        )
+        .await
+        .expect("retry is idempotent");
+        assert!(matches!(retry, AwardOutcome::AlreadyAwarded(_)));
+        assert_eq!(store.reserved_in_flight().unwrap(), 40);
+        assert_eq!(
+            store.award_record(&job).unwrap().unwrap().claim_id,
+            selected
+        );
+
+        crate::job_lifecycle::derive_claim_liveness(&mut view.claims, &[], Some(100), 101);
+        assert_eq!(select_awardable_claim(&view, &f), None);
+        assert!(matches!(
+            named_claim_awardable(&view, &selected, &f),
+            Err(NamedAwardRefused::NotLive { .. })
+        ));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -4857,6 +5022,7 @@ mod free_lane_tests {
             accepted: None,
             pending: false,
             read_confirmed: true,
+            publish_refused: None,
         }
     }
 

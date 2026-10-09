@@ -1694,6 +1694,16 @@ async fn drive_auto_award(
             return Ok(());
         };
         unconfirmed_reads = 0;
+        // A terminal relay refusal of the offer's publication ends the loop NOW. The
+        // local offer makes the view look alive, but no seller can ever see this job:
+        // the relay refused the exact signed bytes and the outbox stopped resending
+        // them. Before this park the loop span the offer's whole deadline window and
+        // then parked with a reason that blamed missing claims (#1115).
+        if let Some(reason) = lifecycle::publish_refused_park_reason(&view) {
+            crate::opline!("{}", auto_award_park_line(job_id, &reason));
+            let _ = context.store.mark_award_parked(job_id, &reason, now_unix());
+            return Ok(());
+        }
         // THE SAME constructor the manual award path uses, so the two cannot apply different filters.
         // Both selection entry points then consult `claim_meets_capability_request`:
         // `select_awardable_claim` here, `named_claim_awardable` on the manual path.
@@ -5950,6 +5960,7 @@ mod tests {
             accepted: None,
             pending: false,
             read_confirmed: true,
+            publish_refused: None,
         };
         let record = store::AwardRecord {
             job_id: "a".repeat(64),
@@ -6071,6 +6082,7 @@ mod tests {
                 accepted: None,
                 pending: false,
                 read_confirmed: true,
+            publish_refused: None,
             },
             Some(award()),
         );
@@ -6110,6 +6122,7 @@ mod tests {
                 }),
                 pending: false,
                 read_confirmed: true,
+            publish_refused: None,
             },
             Some(award()),
         );
@@ -6152,6 +6165,7 @@ mod tests {
                 }),
                 pending: false,
                 read_confirmed: true,
+            publish_refused: None,
             },
             Some(award()),
         );
@@ -6170,6 +6184,7 @@ mod tests {
                 accepted: None,
                 pending: false,
                 read_confirmed: true,
+            publish_refused: None,
             },
             Some(award()),
         );
@@ -6188,6 +6203,7 @@ mod tests {
                 accepted: None,
                 pending: false,
                 read_confirmed: true,
+            publish_refused: None,
             },
             Some(award()),
         );
@@ -6206,6 +6222,7 @@ mod tests {
                 accepted: None,
                 pending: false,
                 read_confirmed: true,
+            publish_refused: None,
             },
             Some(award()),
         );
@@ -6224,6 +6241,7 @@ mod tests {
                 accepted: None,
                 pending: false,
                 read_confirmed: true,
+            publish_refused: None,
             },
             Some(award()),
         );
@@ -6242,6 +6260,7 @@ mod tests {
                 accepted: None,
                 pending: false,
                 read_confirmed: true,
+            publish_refused: None,
             },
             None,
         );

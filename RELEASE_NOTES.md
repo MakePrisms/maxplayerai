@@ -1,3 +1,87 @@
+## v0.6.1-rc8
+
+Eighth release candidate for 0.6.1, including seller claim filtering (#1113),
+completed-send reconciliation (#1114), and review/private-posting reliability
+and contribution-base validation (#1116, addresses #1115). Once published, install
+with `npm install -g maxplayer@0.6.1-rc8`. Publish on npm `rc`; leave stable
+`latest` unchanged.
+
+### Changes since v0.6.1-rc7
+
+- Sellers check requested model, harness family and capabilities against their
+  live serving roster before claiming. Each claim remains independently eligible,
+  so a newer incompatible claim no longer hides an older matching claim from
+  automatic or manual award selection. Queued offers retain their requirements
+  across restarts (additive seller schema v14).
+- Wallet cleanup reconciles stale input-proof bindings for completed sends that
+  have an exact outgoing transaction mapping. It clears them only after complete
+  mint evidence confirms all inputs are spent, preserving transaction history and
+  recipient token outputs. This does not add recipient-redemption tracking for
+  pending output proofs (#314), reclaim tokens, or resend payments.
+
+- Review requests are never silently lost again, in either direction:
+  - The client checks the relay's OK on its own review-request publication and
+    returns `review: relay refused the review request: <reason>` immediately.
+  - The reviewer worker answers every authentic refused request with a signed
+    terminal error review (`stale_request`, `rate_limited`, `queue_full`,
+    `invalid_subject`, `relay_configuration`, `review_store`), encrypted to the
+    requester on the private lane. Replies are budgeted (60/minute); only
+    unauthorized or unparseable requests stay unanswered. A poisoned request or
+    store row no longer ends the worker. The worker logs its version at start.
+  - A review timeout whose request the relay accepted now says that, and points
+    at the operator's `maxplayer reviewer serve` log.
+- Private offers survive slow input preparation:
+  - A buyer re-signs the prepared offer (fresh timestamp, same task envelope
+    and uploads) when preparation exceeds 10 minutes, and moves the per-job
+    repository binding to the new offer id. The relay permits that re-bind only
+    while the job is unawarded, not closed, and the old offer id was never
+    published.
+  - A permanent relay refusal of a carrier (`invalid:`/`blocked:`) stops the
+    retry loop and is recorded with the relay's reason. `post_job` and
+    `get_job` surface it as `publish_refused`, and the auto-award parks with
+    that reason instead of polling to the job deadline.
+- Contribution-base readability is enforced at post time: an open-pool or
+  public contribution job whose base sellers cannot read (a per-job private
+  repository, or a source that refuses anonymous reads) is refused before the
+  wallet opens, with the targeted-private alternative named in the error. The
+  open-pool buyer also fetches the base with seller-equivalent (anonymous)
+  identity, so buyer-only readability can no longer slip through. See
+  docs/PRIVATE-JOBS.md (contribution bases).
+- Public contribution posts validate their base by fetching it once before
+  publication, with the identity a seller will use: a missing `base_oid` or a
+  repository above the relay quotas is refused at post time with the cause
+  named, instead of surfacing as a seller execution failure after the deadline
+  started. The validated objects seed the delivery store for the later collect
+  verify fetch. Public posts therefore take roughly one clone of the base.
+
+- Time budgets widened for large repositories:
+  - The reviewer's per-request processing budget is configurable
+    (`window_seconds` in the worker JSON, 60..=3600) and its default rose from
+    300 to 600 seconds, so a quota-sized Git fetch no longer consumes the whole
+    window. The budget is also the worst-case provider spend per request.
+  - `review.timeout_seconds` on clients now accepts up to 3600 (default still
+    300); a timeout still ends only the wait, and a retry collects the worker's
+    persisted late result (the private reply scan now looks back 30 minutes).
+  - Pack uploads scale their whole-request ceiling with pack size (300 s floor,
+    one second per 128 KiB, 30-minute cap), and the relay's receive-pack window
+    rose from 300 to 1800 seconds. A 1 GiB base now needs a ~0.6 MB/s uplink
+    instead of a sustained 3.5 MB/s. Serving fetches keeps the 300-second bound.
+
+### Operator notes
+
+- Upgrade and restart buyer/seller daemons and MCP servers to load the new client.
+  Seller storage gains an additive schema migration; preserve the existing home,
+  wallet and keys. Installing the package alone does not restart running processes.
+- The full reliability changes also require the relay and reviewer updates below;
+  publishing this client release does not deploy either service.
+
+- Deploy the relay before buyers to enable offer re-binding; older relays
+  refuse the re-provision and buyers fall back to the previous behavior (now
+  loudly surfaced instead of silently retried).
+- Redeploy the reviewer worker so refused requests answer with signed errors
+  instead of log-only drops, and set `window_seconds` if the default 600 does
+  not fit your repositories or provider budget.
+
 ## v0.6.1-rc7
 
 Seventh release candidate for 0.6.1, prepared from main with credits-first buyer

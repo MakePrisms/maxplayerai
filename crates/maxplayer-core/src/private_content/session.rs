@@ -9,13 +9,34 @@ use std::{collections::BTreeMap, future::Future, time::Duration};
 const WINDOW_LIMIT: usize = 128;
 const COPY_TIMEOUT: Duration = Duration::from_secs(2);
 const IO_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Why one send did not land. `permanent` means the relay refused these exact
+/// signed bytes with a terminal NIP-01 prefix (`invalid:`/`blocked:`): a resend of
+/// the same event can never succeed, so the caller must stop retrying it and keep
+/// the reason. Everything else stays retryable.
+#[derive(Debug)]
+pub struct SendFailure {
+    pub permanent: bool,
+    pub reason: String,
+}
+impl From<super::Error> for SendFailure {
+    fn from(error: super::Error) -> Self {
+        Self {
+            permanent: false,
+            reason: error.to_string(),
+        }
+    }
+}
 pub trait ContentSender {
-    fn send(&mut self, event: Event) -> impl Future<Output = Result<()>> + Send;
+    fn send(&mut self, event: Event)
+    -> impl Future<Output = std::result::Result<(), SendFailure>> + Send;
 }
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct FlushReport {
     pub accepted: usize,
     pub pending: usize,
+    /// Carriers the relay refused permanently this pass; they left the retry set.
+    pub refused: usize,
 }
 /// Each copy gets an independent attempt. An unavailable service recipient does not
 /// prevent buyer/seller copies, and failed copies survive restart in the same outbox.
@@ -60,14 +81,26 @@ pub async fn flush<S: ContentSender>(
             continue;
         };
         db.carrier_attempted(&event)?;
-        if matches!(
-            tokio::time::timeout(remaining.min(COPY_TIMEOUT), sender.send(event.clone())).await,
-            Ok(Ok(()))
-        ) {
-            db.carrier_accepted(&event)?;
-            report.accepted += 1;
-        } else {
-            report.pending += 1;
+        match tokio::time::timeout(remaining.min(COPY_TIMEOUT), sender.send(event.clone())).await {
+            Ok(Ok(())) => {
+                db.carrier_accepted(&event)?;
+                report.accepted += 1;
+            }
+            // Terminal refusal of these exact signed bytes: record the reason, leave
+            // the retry set. Before this, a refused offer was retried forever and the
+            // only trace was a once-per-tick relay read that came back empty (#1115).
+            Ok(Err(failure)) if failure.permanent => {
+                db.carrier_refused(&event, &failure.reason, nostr_sdk::Timestamp::now().as_secs())?;
+                crate::opline!(
+                    "content carrier {} permanently refused by the relay: {}",
+                    event.id,
+                    failure.reason
+                );
+                report.refused += 1;
+            }
+            _ => {
+                report.pending += 1;
+            }
         }
     }
     Ok(report)
@@ -231,14 +264,22 @@ impl AuthenticatedContentRelay {
     }
 }
 impl ContentSender for AuthenticatedContentRelay {
-    async fn send(&mut self, event: Event) -> Result<()> {
+    async fn send(&mut self, event: Event) -> std::result::Result<(), SendFailure> {
         let sent = self
             .client
             .send_event(&event)
             .await
             .map_err(|_| Error("content publication failed"))?;
         if sent.success.is_empty() {
-            return Err(Error("content publication refused"));
+            let reason = sent
+                .failed
+                .values()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| "content publication refused".into());
+            // NIP-01 terminal prefixes. `rate-limited:`/`error:` stay retryable.
+            let permanent = reason.starts_with("invalid:") || reason.starts_with("blocked:");
+            return Err(SendFailure { permanent, reason });
         }
         Ok(())
     }
@@ -535,14 +576,23 @@ pub async fn flush_actor<S: ContentSender>(
             continue;
         };
         db.carrier_attempted(&event)?;
-        if matches!(
-            tokio::time::timeout(remaining.min(COPY_TIMEOUT), sender.send(event.clone())).await,
-            Ok(Ok(()))
-        ) {
-            db.carrier_accepted(&event)?;
-            report.accepted += 1;
-        } else {
-            report.pending += 1;
+        match tokio::time::timeout(remaining.min(COPY_TIMEOUT), sender.send(event.clone())).await {
+            Ok(Ok(())) => {
+                db.carrier_accepted(&event)?;
+                report.accepted += 1;
+            }
+            Ok(Err(failure)) if failure.permanent => {
+                db.carrier_refused(&event, &failure.reason, nostr_sdk::Timestamp::now().as_secs())?;
+                crate::opline!(
+                    "content carrier {} permanently refused by the relay: {}",
+                    event.id,
+                    failure.reason
+                );
+                report.refused += 1;
+            }
+            _ => {
+                report.pending += 1;
+            }
         }
     }
     Ok(report)

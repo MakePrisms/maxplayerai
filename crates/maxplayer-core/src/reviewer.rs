@@ -35,6 +35,15 @@ pub struct ServiceConfig {
     pub private_git_base: Option<String>,
     #[serde(default = "model_default")]
     pub model: String,
+    /// Per-request processing budget in seconds: input acquisition (including the
+    /// Git fetch of the delivery) plus every provider call. This is also the
+    /// worst-case provider spend per request — fragments stop at the window — and
+    /// the worst-case head-of-line delay, since the worker is serial. 60..=3600.
+    #[serde(default = "window_default")]
+    pub window_seconds: u64,
+}
+fn window_default() -> u64 {
+    600
 }
 /// Every mint that a client can use by default: the real default mint, and the test
 /// mint that a seller uses when real mints are off or its config names no mint. The
@@ -250,6 +259,13 @@ fn root_is(event: &Event, offer: &str) -> bool {
     roots.len() == 1 && roots[0].as_slice().get(1).map(String::as_str) == Some(offer)
 }
 pub fn validate_request(request: &Event, reviewer: &PublicKey) -> Result<Subject, String> {
+    let subject = validate_request_content(request, reviewer)?;
+    request_freshness(request)?;
+    Ok(subject)
+}
+
+/// Signature, kind, size and tag bindings — everything except freshness.
+fn validate_request_content(request: &Event, reviewer: &PublicKey) -> Result<Subject, String> {
     request.verify().map_err(|_| "invalid_request")?;
     if request.kind != Kind::Custom(REVIEW_REQUEST_KIND) || request.content.len() > 60 * 1024 {
         return Err("invalid_request".into());
@@ -279,13 +295,20 @@ pub fn validate_request(request: &Event, reviewer: &PublicKey) -> Result<Subject
             return Err("invalid_request".into());
         }
     }
+    Ok(subject)
+}
+
+/// Freshness alone, separated so intake can still answer a stale-but-authentic
+/// request with a signed `stale_request` error instead of a silent drop. A silent
+/// drop reads as a plain client timeout, which hides the recovery path (#1115).
+fn request_freshness(request: &Event) -> Result<(), String> {
     let now = Timestamp::now().as_secs();
     if request.created_at.as_secs() > now + 60
         || request.created_at.as_secs().saturating_add(REQUEST_MAX_AGE_SECS) < now
     {
         return Err("stale_request".into());
     }
-    Ok(subject)
+    Ok(())
 }
 
 fn verify_object(
@@ -771,6 +794,9 @@ async fn signed(
 /// Single worker deliberately serializes requests; queued equivalents reuse the persisted event.
 /// Separate client waits do not cancel this worker: a late signed result is available on retry.
 pub async fn run(config: ServiceConfig) -> Result<(), String> {
+    if !(60..=3600).contains(&config.window_seconds) {
+        return Err("invalid_window_seconds (60..=3600)".into());
+    }
     let keys = Keys::parse(&read_secret(&config.signer_file)?).map_err(|_| "invalid_signer")?;
     let provider = TypeSafe::new(read_secret(&config.provider_key_file)?)?;
     run_worker(config, keys, provider).await
@@ -905,8 +931,74 @@ fn log_drop(request: &Event, code: &str) {
     }
 }
 
+/// Signed error replies for refused-but-authentic requests are bounded so request
+/// floods cannot turn the worker into a signing oracle. Beyond the budget the
+/// refusal degrades to a log-only drop, never to extra work.
+const ERROR_REPLIES_PER_MINUTE: u32 = 60;
+static REPLY_BUDGET: std::sync::Mutex<DropLog> = std::sync::Mutex::new(DropLog {
+    window: None,
+    lines: 0,
+    suppressed: 0,
+});
+fn error_reply_allowed() -> bool {
+    let Ok(mut budget) = REPLY_BUDGET.lock() else {
+        return false;
+    };
+    let now = std::time::Instant::now();
+    if budget
+        .window
+        .is_none_or(|start| now.duration_since(start) >= Duration::from_secs(60))
+    {
+        *budget = DropLog {
+            window: Some(now),
+            lines: 0,
+            suppressed: 0,
+        };
+    }
+    if budget.lines >= ERROR_REPLIES_PER_MINUTE {
+        return false;
+    }
+    budget.lines += 1;
+    true
+}
+
+/// A request the worker refuses still deserves a signed error review addressed to
+/// its authenticated author. Before this reply existed, every refusal — stale
+/// request, rate limit, full queue, invalid private bundle — looked identical to
+/// the client: a plain timeout with no recovery hint (#1115). The reply carries
+/// only the subject the requester already knows and a terminal error code.
+async fn reply_refusal(
+    client: &Client,
+    relay: &str,
+    keys: &Keys,
+    request: &Event,
+    subject: &Subject,
+    code: &str,
+) {
+    log_drop(request, code);
+    if !error_reply_allowed() {
+        return;
+    }
+    let error = error_review(subject, input_digest(request.content.as_bytes()), code);
+    match signed(keys, &error, request, None).await {
+        Ok(event) => {
+            // Only the requester: an unvalidated bundle's recipient list is untrusted.
+            let requester = [request.pubkey.to_hex()];
+            let recipients = crate::review::private::is_private(request).then_some(&requester[..]);
+            publish_or_log(client, relay, keys, &event, recipients, request).await;
+        }
+        Err(code) => log_drop(request, &code),
+    }
+}
+
 async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Result<(), String> {
     let store = Store::open(&config.database)?;
+    // Version skew between deployed worker and clients has produced silent drops
+    // before; the version in the journal makes that check a one-line grep.
+    crate::opline!(
+        "reviewer: worker start (maxplayer-core {})",
+        env!("CARGO_PKG_VERSION")
+    );
     let client = Client::new(keys.clone());
     client.automatic_authentication(true);
     client
@@ -991,6 +1083,8 @@ async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Re
             }
         }
     });
+    let intake_client = client.clone();
+    let intake_relay = config.relay.clone();
     intake.spawn(async move {
         loop {
             let notification = match notifications.recv().await {
@@ -1046,18 +1140,31 @@ async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Re
                 }
                 request
             };
-            let Ok(subject) =
-                validate_request(&request, &reviewer).inspect_err(|code| log_drop(&request, code))
+            let Ok(subject) = validate_request_content(&request, &reviewer)
+                .inspect_err(|code| log_drop(&request, code))
             else {
                 continue;
             };
+            // A stale-but-authentic request still gets a signed `stale_request`
+            // reply from the worker loop, after the per-requester admission check.
+            let precheck = request_freshness(&request).err();
             let Some(flight) = Flight::reserve(&flights, &subject) else {
                 crate::opline_verbose!("reviewer: a request for this subject is already in flight");
                 continue;
             };
-            // A full queue drops the reservation too. Clients remain blocked and can retry.
-            if let Err(full) = sender.try_send((flight, request, subject)) {
-                log_drop(&full.into_inner().1, "queue_full");
+            // A full queue drops the reservation too. Clients can retry explicitly;
+            // the signed `queue_full` reply tells them that, instead of a timeout.
+            if let Err(full) = sender.try_send((flight, request, subject, precheck)) {
+                let (_, request, subject, _) = full.into_inner();
+                reply_refusal(
+                    &intake_client,
+                    &intake_relay,
+                    &intake_keys,
+                    &request,
+                    &subject,
+                    "queue_full",
+                )
+                .await;
             }
         }
     });
@@ -1069,31 +1176,48 @@ async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Re
             }
             request = inbox.recv() => request,
         };
-        let Some((_flight, request, subject)) = next else {
+        let Some((_flight, request, subject, precheck)) = next else {
             return Err("intake_stopped".into());
         };
         if let Err(code) = store.admit(&request.pubkey.to_hex(), Timestamp::now().as_secs()) {
-            log_drop(&request, &code);
+            reply_refusal(&client, &config.relay, &keys, &request, &subject, &code).await;
+            continue;
+        }
+        if let Some(code) = precheck {
+            reply_refusal(&client, &config.relay, &keys, &request, &subject, &code).await;
             continue;
         }
         let private_request = if crate::review::private::is_private(&request) {
-            let Ok(bundle) = serde_json::from_str::<crate::review::private::Request>(&request.content) else { continue; };
+            let Ok(bundle) = serde_json::from_str::<crate::review::private::Request>(&request.content) else {
+                log_drop(&request, "invalid_request");
+                continue;
+            };
             let policy = match &private {
                 Ok(policy) => policy,
                 Err(code) => {
-                    log_drop(&request, code);
+                    reply_refusal(&client, &config.relay, &keys, &request, &subject, code).await;
                     continue;
                 }
             };
-            let Ok(recipients) = bundle
-                .validate(&request.pubkey, policy)
-                .inspect_err(|code| log_drop(&request, code))
-            else {
-                continue;
+            let recipients = match bundle.validate(&request.pubkey, policy) {
+                Ok(recipients) => recipients,
+                // Do not confirm anything to a stranger; every other refusal gets a
+                // signed error so the requester is not left with a bare timeout.
+                Err(code) if code == "unauthorized_request" => {
+                    log_drop(&request, &code);
+                    continue;
+                }
+                Err(code) => {
+                    reply_refusal(&client, &config.relay, &keys, &request, &subject, &code).await;
+                    continue;
+                }
             };
             Some((bundle, policy, recipients))
         } else { None };
-        let deadline = tokio::time::Instant::now() + WINDOW;
+        // Defensive clamp beside the `run()` validation: `run_worker` is also an
+        // internal/test entry point and must never run unbounded or sub-second.
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_secs(config.window_seconds.clamp(60, 3600));
         let body = match tokio::time::timeout_at(
             deadline,
             async {
@@ -1148,13 +1272,18 @@ async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Re
             )
             .as_bytes(),
         );
+        // One request's store or signing failure must not end the worker: a crash
+        // loop over one poisoned row silently times out EVERY later client (#1115).
         let event = match store.begin(&cache_key, &request.id.to_hex()) {
             Ok(Some(event)) => {
-                let review = crate::review::wire::verify(&event, &keys.public_key(), &subject)?;
-                if review.input_sha256 != digest {
-                    return Err("review_store".into());
+                match crate::review::wire::verify(&event, &keys.public_key(), &subject) {
+                    Ok(review) if review.input_sha256 == digest => event,
+                    _ => {
+                        reply_refusal(&client, &config.relay, &keys, &request, &subject, "review_store")
+                            .await;
+                        continue;
+                    }
                 }
-                event
             }
             Ok(None) => {
                 let (review, model) = match body.classify(&provider, &subject, deadline).await
@@ -1162,8 +1291,19 @@ async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Re
                     Ok((review, model)) => (review, Some(model)),
                     Err(code) => (error_review(&subject, digest, &code), None),
                 };
-                let event = signed(&keys, &review, &request, model.as_deref()).await?;
-                store.finish(&cache_key, &event)?;
+                let event = match signed(&keys, &review, &request, model.as_deref()).await {
+                    Ok(event) => event,
+                    Err(code) => {
+                        log_drop(&request, &code);
+                        continue;
+                    }
+                };
+                // Persistence precedes publication; an unpersisted result must not
+                // be published, or a restart could rebill the provider for it.
+                if let Err(code) = store.finish(&cache_key, &event) {
+                    reply_refusal(&client, &config.relay, &keys, &request, &subject, &code).await;
+                    continue;
+                }
                 event
             }
             Err(code) if code == "provider_outcome_unknown" => {
@@ -1176,7 +1316,10 @@ async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Re
                     }
                 }
             }
-            Err(e) => return Err(e),
+            Err(code) => {
+                reply_refusal(&client, &config.relay, &keys, &request, &subject, &code).await;
+                continue;
+            }
         };
         let recipients = private_request.as_ref().map(|(_, _, r)| r.as_slice());
         publish_or_log(&client, &config.relay, &keys, &event, recipients, &request).await;
@@ -1207,6 +1350,8 @@ mod tests {
         let mints = &config.accepted_mints;
         assert!(mints.contains(&crate::home::DEFAULT_MINIBITS_MINT_URL.to_string()));
         assert!(mints.contains(&crate::home::DEFAULT_MINT_URL.to_string()));
+        // An omitted window uses the shipped default; `run()` bounds explicit ones.
+        assert_eq!(config.window_seconds, 600);
     }
     fn temp() -> PathBuf {
         let p = std::env::temp_dir().join(format!("review-{}", uuid::Uuid::new_v4()));
@@ -1559,7 +1704,7 @@ mod integration_tests {
             let root=std::env::temp_dir().join(format!("review-e2e-{}",uuid::Uuid::new_v4()));std::fs::create_dir_all(&root).unwrap();let root=root.canonicalize().unwrap();
             let reviewer=Keys::generate();let buyer=Keys::generate();let client=Client::new(buyer.clone());client.add_relay(&url).await.unwrap();client.connect().await;client.wait_for_connection(Duration::from_secs(5)).await;
             let mut provider=TypeSafe::new("fixture".into()).unwrap();provider.endpoint=format!("http://{addr}");
-            let config=ServiceConfig {relay:url.clone(),signer_file:root.join("unused"),provider_key_file:root.join("unused"),database:root.join("reviews.db"),repositories:BTreeMap::new(),accepted_mints:review_mints(),private_git_base:None,model:"fixture".into()};
+            let config=ServiceConfig {relay:url.clone(),signer_file:root.join("unused"),provider_key_file:root.join("unused"),database:root.join("reviews.db"),repositories:BTreeMap::new(),accepted_mints:review_mints(),private_git_base:None,model:"fixture".into(),window_seconds:300};
             let worker=tokio::task::spawn_local(run_worker(config,reviewer.clone(),provider));
             let draft=crate::gateway::OfferDraft::untargeted("ordinary work","text/plain",0,Timestamp::now().as_secs()+600).to_event_draft();
             let offer=crate::gateway::nostr::event_builder(&draft).unwrap().sign_with_keys(&buyer).unwrap();client.send_event(&offer).await.unwrap();
@@ -1639,6 +1784,7 @@ mod snapshot_tests {
             accepted_mints: review_mints(),
             private_git_base: None,
             model: "fixture".into(),
+            window_seconds: 300,
         };
         let draft = request_draft(&subject, &reviewer.public_key().to_hex()).unwrap();
         let request = crate::gateway::nostr::event_builder(&draft)

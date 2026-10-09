@@ -157,6 +157,10 @@ pub struct PostJobOutcome {
     pub relay_url: String,
     pub task: String,
     pub output: String,
+    /// A terminal relay refusal observed on the first publication attempt. The job
+    /// is tracked locally but never became visible to sellers; post it again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publish_refused: Option<String>,
 }
 
 /// Inputs for reading job state from the relay.
@@ -209,6 +213,7 @@ pub struct JobView {
     pub offer: Option<OfferView>,
     pub claims: Vec<ClaimView>,
     pub results: Vec<ResultView>,
+    /// Newest live claim for display/wait summaries; not the only award candidate.
     pub live_claim_id: Option<String>,
     #[serde(serialize_with="serialize_accepted_view")]
     pub accepted: Option<AcceptedBind>,
@@ -228,6 +233,12 @@ pub struct JobView {
     /// `false` on every view not built by a confirmed read, so the unsafe direction is the one you
     /// have to opt into.
     pub read_confirmed: bool,
+    /// The relay's terminal refusal of this job's offer publication, when one was
+    /// recorded (for example `invalid: event timestamp too far from server time`).
+    /// The offer never became visible and no seller can ever claim it; the job must
+    /// be posted again. Set only on views of locally queued private offers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_refused: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -322,6 +333,7 @@ pub struct ClaimView {
     /// Cosmetic kind-0 `name` for this claim's `seller_pubkey` (untrusted).
     pub display_name: Option<String>,
     pub status: String,
+    /// This claim remains active independently of other sellers' claims.
     pub live: bool,
     /// The seller-authored NUT-18 payment request (`creqA…`) string read from the
     /// claim's `["creq", …]` tag, when present. `None` for a claim that carries none — the
@@ -711,6 +723,25 @@ pub async fn post_job_async(
         JobKind::FromScratch => None,
         JobKind::Contribution(spec) => Some(contribution_offer_from_spec(spec)?),
     };
+    // Sellers read the pinned base THEMSELVES on every open-pool post (bidders check
+    // the source before claiming) and on every public post (no base is uploaded).
+    // A base only the buyer can read makes such a job unservable: it would burn the
+    // posting work and the deadline with no claim, or strand the selected seller.
+    // Refuse it here, before the wallet opens and before any slow preparation.
+    if let Some(contribution) = &contribution {
+        let public = visibility == crate::private_content::wire::Visibility::Public;
+        if request.untargeted || public {
+            assert_base_readable_by_sellers(home, contribution.target.clone_url()).await?;
+        }
+        // A public post uploads nothing, so no later step would catch a missing
+        // base_oid or an over-quota repository before a seller burns the deadline
+        // on it. Validate by fetching once, exactly the way a seller will; the
+        // fetched objects seed the delivery store for the later verify fetch.
+        // (Private posts validate all of this in their own base import.)
+        if public {
+            validate_public_contribution_base(home, contribution).await?;
+        }
+    }
     let deadline_unix = resolve_post_deadline(request.deadline_unix, now_unix_secs()?)?;
 
     // Refuse a post whose amount exceeds the per-job budget cap AT POST — a job you
@@ -790,7 +821,152 @@ pub async fn post_job_async(
         relay_url: home.config.relay_url.clone(),
         task: request.task,
         output: request.output,
+        publish_refused: None,
     })
+}
+
+/// The one documented exception in the contribution matrix: a base repository that
+/// sellers cannot read on their own cannot back an open-pool or public job. The
+/// text names the two working alternatives; docs/PRIVATE-JOBS.md carries the rule.
+pub const SELLER_UNREADABLE_BASE: &str =
+    "contribution base is not readable by sellers: on an open-pool or public job every \
+     prospective seller reads target_repo_url itself before claiming, and a private \
+     repository blocks that. Make the repository public, or post a targeted private job \
+     (set seller_pubkey) — the buyer uploads the base for its chosen seller there, and a \
+     private local source can use base_local_path. See docs/PRIVATE-JOBS.md (contribution bases)";
+
+/// Refuse a post whose pinned base the selling side cannot read (fail-closed, at
+/// post time, before any wallet or slow preparation work).
+#[cfg(feature = "wallet")]
+async fn assert_base_readable_by_sellers(
+    home: &MaxplayerHome,
+    url: &str,
+) -> Result<(), JobLifecycleError> {
+    if let Some(base) = home.config.privacy.git_base.as_deref() {
+        // A per-job private repository under the configured private Git host is
+        // readable only by that one job's participants, never by bidders. No
+        // network is needed to refuse it.
+        let host = crate::private_content::wire::HostPolicy {
+            git_prefix: base.to_owned(),
+            accepted_mints: Vec::new(),
+        };
+        if host.repo(url).is_ok() {
+            return Err(JobLifecycleError::Input(SELLER_UNREADABLE_BASE.into()));
+        }
+        // Every other repository on the CONFIGURED relay host is member-readable,
+        // and sellers authenticate there with their own keys; an anonymous probe
+        // from here would test the wrong identity. A `/git/` URL on a FOREIGN host
+        // gets no seller credential either, so it takes the anonymous probe below.
+        if url.starts_with(base) {
+            return Ok(());
+        }
+    }
+    let probe_url = url.to_owned();
+    let listed =
+        tokio::task::spawn_blocking(move || crate::git_transport::ls_remote(&probe_url, None))
+            .await
+            .map_err(|_| {
+                JobLifecycleError::Input("contribution base probe worker unavailable".into())
+            })?;
+    match listed {
+        Ok(_) => Ok(()),
+        Err(crate::git_transport::TransportError::Auth(_)) => {
+            Err(JobLifecycleError::Input(SELLER_UNREADABLE_BASE.into()))
+        }
+        Err(error) => Err(JobLifecycleError::Relay(format!(
+            "could not verify that sellers can read the contribution base ({error}); the post \
+             was not published — retry it, or post a targeted private job"
+        ))),
+    }
+}
+
+/// A public contribution post fetches its pinned base once, pre-publication, with
+/// the identity a seller will use. This is the only point that can refuse a
+/// missing `base_oid` or an over-quota repository BEFORE money and a deadline are
+/// committed: public posts upload nothing, so nothing later checks the base until
+/// a seller fails at execution. The validated objects are kept as a delivery-store
+/// seed so the later collect verify fetch transfers only new commits.
+#[cfg(feature = "wallet")]
+async fn validate_public_contribution_base(
+    home: &MaxplayerHome,
+    contribution: &crate::contribution::ContributionOffer,
+) -> Result<(), JobLifecycleError> {
+    let url = contribution.target.clone_url().to_owned();
+    let oid = contribution.base.oid().to_owned();
+    // Sign only for the configured relay host, where sellers are members too.
+    // Every other source is fetched anonymously, the way a seller fetches it.
+    let mint: Option<crate::git_transport::AuthMinter> =
+        match home.config.privacy.git_base.as_deref() {
+            Some(base) if url.starts_with(base) => {
+                let keys = buyer_keys(home)?;
+                let intended = url.clone();
+                Some(std::sync::Arc::new(move |destination: &str| {
+                    if !crate::git_transport::same_destination(&intended, destination) {
+                        return Err("wrong contribution base destination".into());
+                    }
+                    crate::git_transport::nip98_authorization_header_with_keys(
+                        destination, &keys, None, None,
+                    )
+                    .map_err(|e| e.to_string())
+                }))
+            }
+            _ => None,
+        };
+    let root = home.root.clone();
+    let store = crate::collect::delivery_store_path(home);
+    tokio::task::spawn_blocking(move || {
+        let staging = tempfile::Builder::new()
+            .prefix(".public-base-validate-")
+            .tempdir_in(&root)
+            .map_err(|e| JobLifecycleError::Input(format!("base validation staging: {e}")))?;
+        let repo = git2::Repository::init_bare(staging.path())
+            .map_err(|e| JobLifecycleError::Input(format!("base validation staging: {e}")))?;
+        crate::git_transport::fetch_private_input_base(&repo, &url, &oid, mint)
+            .map_err(|error| base_validation_refusal(&error, &oid))?;
+        finish_public_base_validation(&repo, &oid, &store)
+    })
+    .await
+    .map_err(|_| JobLifecycleError::Input("base validation worker unavailable".into()))?
+}
+
+/// An auth-shaped failure is the documented exception (sellers cannot read the
+/// base); anything else is stated as a validation failure and stays retryable.
+#[cfg(feature = "wallet")]
+fn base_validation_refusal(
+    error: &crate::git_transport::TransportError,
+    oid: &str,
+) -> JobLifecycleError {
+    match error {
+        crate::git_transport::TransportError::Auth(_) => {
+            JobLifecycleError::Input(SELLER_UNREADABLE_BASE.into())
+        }
+        error => JobLifecycleError::Relay(format!(
+            "contribution base validation failed ({error}): every seller must be able to fetch \
+             base_oid {oid} from target_repo_url, and this fetch could not — the job was not \
+             posted; fix the pin (or the host) and post again"
+        )),
+    }
+}
+
+/// Quota gate plus the advisory seed write, split out so an offline test can run
+/// it against a local repository without the network fetch above.
+#[cfg(feature = "wallet")]
+fn finish_public_base_validation(
+    repo: &git2::Repository,
+    oid: &str,
+    store: &std::path::Path,
+) -> Result<(), JobLifecycleError> {
+    crate::private_content::repositories::check_object_quotas(repo).map_err(|error| {
+        JobLifecycleError::Input(format!(
+            "contribution base exceeds the relay repository quotas ({error}); a seller could \
+             not deliver against it — the job was not posted"
+        ))
+    })?;
+    // Advisory only: a failure makes the later verify fetch slower, never wrong.
+    if let Err(error) = crate::store_seed::write(store, repo.path(), oid) {
+        crate::opline!("public base seed not kept ({error}); collect fetches unseeded");
+    }
+    Ok(())
 }
 
 fn now_unix_secs() -> Result<u64, JobLifecycleError> {
@@ -2685,7 +2861,8 @@ fn delivery_pay_deadline(results: &[ResultView], seller_pubkey: &str) -> Option<
 ///
 /// Both reclassifications are DERIVED — never stored, never read from the wall clock inside this
 /// function (tests pass a fixed `now`). `claims` must be pre-sorted newest-first; the newest claim
-/// that is still `processing` or `delivered` becomes the live one.
+/// that is still `processing` or `delivered` supplies the summary id. Every such claim
+/// is independently live; a newer incompatible seller must not hide an older candidate.
 ///
 /// `offer_deadline_unix == None` (offer not yet on the relay) means expiry cannot be derived,
 /// so status-based liveness is preserved unchanged.
@@ -2710,7 +2887,7 @@ pub(crate) fn derive_claim_liveness(
         .find(|claim| claim.status == "processing" || claim.status == CLAIM_STATUS_DELIVERED)
         .map(|claim| claim.claim_id.clone());
     for claim in claims.iter_mut() {
-        claim.live = live_claim_id.as_deref() == Some(claim.claim_id.as_str());
+        claim.live = claim.status == "processing" || claim.status == CLAIM_STATUS_DELIVERED;
     }
     live_claim_id
 }
@@ -3402,6 +3579,10 @@ pub(crate) async fn fetch_job_view_async(
             let mut view = private_view_from_events(home, &mut context, &original, Vec::new(), Vec::new(), Vec::new(), now)?;
             view.pending = true;
             view.read_confirmed = false;
+            // A recorded terminal refusal explains the absence: the relay refused the
+            // offer's exact signed bytes, publication retries stopped, and no seller
+            // can ever see this job. Surface the reason instead of a silent pending.
+            view.publish_refused = context.store.refusal_for_event(job_id).ok().flatten();
             return Ok(view);
         }
     }
@@ -3521,6 +3702,7 @@ pub(crate) async fn fetch_job_view_async(
         accepted,
         pending: false,
         read_confirmed,
+        publish_refused: None,
     };
     Ok(view)
 }
@@ -3824,7 +4006,8 @@ fn private_view_from_events(
     results.sort_by_key(|r| std::cmp::Reverse(r.created_at));
     let live_claim_id = derive_claim_liveness(&mut claims, &results, Some(offer.deadline_unix), now);
     Ok(JobView { job_id: job_id.clone(), offer: Some(offer), claims, results, live_claim_id,
-        accepted: load_accepted_bind(home, &job_id)?, pending: false, read_confirmed: true })
+        accepted: load_accepted_bind(home, &job_id)?, pending: false, read_confirmed: true,
+        publish_refused: None })
 }
 
 /// Collect hex pubkeys for cosmetic kind-0 enrichment (never for pay/targeting).
@@ -5610,6 +5793,7 @@ mod tests {
             accepted: None,
             pending: false,
             read_confirmed: true,
+            publish_refused: None,
         }
     }
 
@@ -5935,7 +6119,7 @@ mod tests {
     }
 
     #[test]
-    fn processing_claim_before_deadline_is_live_newest_wins() {
+    fn processing_claims_are_independently_live_newest_is_summary() {
         let deadline = 1_700_000_000u64;
         let mut claims = vec![
             claim_view("newest", 200, "processing"),
@@ -5943,7 +6127,7 @@ mod tests {
         ];
         let live = derive_claim_liveness(&mut claims, &[], Some(deadline), deadline - 10);
         assert_eq!(live.as_deref(), Some("newest"), "newest processing claim is live");
-        assert!(claims[0].live && !claims[1].live);
+        assert!(claims[0].live && claims[1].live);
         assert_eq!(claims[0].status, "processing", "not expired before the deadline");
     }
 
@@ -6007,6 +6191,155 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("base_local_path only works for a direct job"), "{msg}");
         assert!(msg.contains("seller_pubkey"), "{msg}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The documented exception: a base repository sellers cannot read on their own
+    /// cannot back an open-pool or public contribution job. A per-job private
+    /// repository URL is the statically detectable case — refused with no network.
+    #[test]
+    fn post_job_refuses_seller_unreadable_private_base_for_open_pool_and_public() {
+        let root = std::env::temp_dir().join(format!(
+            "maxplayer-jobs-private-base-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+        let git_base = home
+            .config
+            .privacy
+            .git_base
+            .clone()
+            .expect("fresh home has a private git base");
+        let private_job_repo = format!("{git_base}{}/{}", "11".repeat(32), "22".repeat(32));
+        // Open-pool (untargeted) post, default private visibility.
+        let request = contribution_post_request(
+            &"aa".repeat(32),
+            &private_job_repo,
+            "main",
+            &"bb".repeat(20),
+            None,
+        );
+        assert!(request.untargeted);
+        let msg = post_job(&home, request)
+            .expect_err("open-pool private base refused")
+            .to_string();
+        assert!(msg.contains("not readable by sellers"), "{msg}");
+        assert!(msg.contains("targeted private job"), "{msg}");
+        assert!(msg.contains("docs/PRIVATE-JOBS.md"), "{msg}");
+        // Public post, targeted: sellers still read the source themselves.
+        let mut request = contribution_post_request(
+            &"aa".repeat(32),
+            &private_job_repo,
+            "main",
+            &"bb".repeat(20),
+            None,
+        );
+        request.visibility = Some(crate::private_content::wire::Visibility::Public);
+        request.untargeted = false;
+        request.seller_pubkey = Some("cc".repeat(32));
+        let msg = post_job(&home, request)
+            .expect_err("public private-base post refused")
+            .to_string();
+        assert!(msg.contains("not readable by sellers"), "{msg}");
+        // A targeted PRIVATE job with the same base stays allowed by this gate: the
+        // buyer uploads the base for its chosen seller. (It fails LATER, at the
+        // network fetch, which this offline test must not reach — the distinct
+        // error text proves the gate did not fire.)
+        let mut request = contribution_post_request(
+            &"aa".repeat(32),
+            &private_job_repo,
+            "main",
+            &"bb".repeat(20),
+            None,
+        );
+        request.visibility = Some(crate::private_content::wire::Visibility::Private);
+        request.untargeted = false;
+        request.seller_pubkey = Some("cc".repeat(32));
+        request.output_category = Some(crate::private_content::wire::Output::Code);
+        let msg = post_job(&home, request)
+            .expect_err("offline test cannot complete a private post")
+            .to_string();
+        assert!(!msg.contains("not readable by sellers"), "{msg}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The public-post base validation refuses pre-publication, with the exception
+    /// message for auth failures and a retryable statement for everything else.
+    #[test]
+    fn public_base_validation_maps_auth_to_the_exception_and_checks_quota_and_seed() {
+        use crate::git_transport::TransportError;
+        let oid = "bb".repeat(20);
+        let auth = base_validation_refusal(&TransportError::Auth("403".into()), &oid).to_string();
+        assert!(auth.contains("not readable by sellers"), "{auth}");
+        let io = base_validation_refusal(&TransportError::Io("connect refused".into()), &oid)
+            .to_string();
+        assert!(io.contains("contribution base validation failed"), "{io}");
+        assert!(io.contains(&oid), "{io}");
+        assert!(io.contains("post again"), "{io}");
+
+        // Quota gate + advisory seed on a real local repository.
+        let dir = std::env::temp_dir().join(format!(
+            "maxplayer-base-validate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let repo = git2::Repository::init_bare(dir.join("base")).unwrap();
+        let blob = repo.blob(b"base file").unwrap();
+        let mut tree = repo.treebuilder(None).unwrap();
+        tree.insert("file.txt", blob, 0o100644).unwrap();
+        let tree = repo.find_tree(tree.write().unwrap()).unwrap();
+        let sig = git2::Signature::now("test", "test@example.test").unwrap();
+        let commit = repo
+            .commit(Some("refs/heads/main"), &sig, &sig, "base", &tree, &[])
+            .unwrap()
+            .to_string();
+        let store = dir.join("store");
+        // The seed write is advisory and copies PACK files; this loose-object
+        // fixture has none, so validation must still pass (a real network fetch
+        // always lands a pack, and `store_seed` has its own coverage).
+        finish_public_base_validation(&repo, &commit, &store).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Gate order: a public contribution post against an unreachable host refuses
+    /// loudly BEFORE publication (the probe), never with a silent or generic path.
+    #[test]
+    fn post_job_public_contribution_refuses_unreachable_base_before_publication() {
+        let root = std::env::temp_dir().join(format!(
+            "maxplayer-jobs-unreachable-base-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+        let mut request = contribution_post_request(
+            &"aa".repeat(32),
+            "https://127.0.0.1:1/base.git",
+            "main",
+            &"bb".repeat(20),
+            None,
+        );
+        request.untargeted = false;
+        request.seller_pubkey = Some("cc".repeat(32));
+        let msg = post_job(&home, request)
+            .expect_err("unreachable base refused")
+            .to_string();
+        assert!(
+            msg.contains("could not verify that sellers can read")
+                || msg.contains("contribution base validation failed"),
+            "{msg}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -6109,6 +6442,7 @@ mod tests {
             accepted: None,
             pending: false,
             read_confirmed: true,
+            publish_refused: None,
         };
         assert!(!view_is_ready(&view, WaitFor::Claim));
         assert!(!view_is_ready(&view, WaitFor::Result));
@@ -8055,6 +8389,7 @@ mod review_exposure_tests {
             accepted: None,
             pending: false,
             read_confirmed: true,
+            publish_refused: None,
         };
         let states = crate::review::protect_job_view(&home, &mut view, None).await;
         assert!(states[&result.result_id].contains("withheld"));

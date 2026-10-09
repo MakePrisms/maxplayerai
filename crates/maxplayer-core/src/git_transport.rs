@@ -1208,6 +1208,7 @@ impl NostrHttp {
             request_body: Vec::new(),
             streaming_body: None,
             response: None,
+            timeout_override: None,
         })
     }
 }
@@ -1243,6 +1244,10 @@ struct HttpStream {
     request_body: Vec<u8>,
     streaming_body: Option<reqwest::blocking::Body>,
     response: Option<reqwest::blocking::Response>,
+    /// Per-request whole-request ceiling, above the chosen client's own timeout.
+    /// Set only by callers that know the body size (the pack-forward upload), so a
+    /// large pack on a slow-but-steady uplink is not cut off at a fixed 300s.
+    timeout_override: Option<Duration>,
 }
 
 impl HttpStream {
@@ -1296,6 +1301,9 @@ impl HttpStream {
         };
         // identity encoding: never hand libgit2 a gzip stream it did not negotiate.
         request = request.header("Accept-Encoding", "identity");
+        if let Some(ceiling) = self.timeout_override {
+            request = request.timeout(ceiling);
+        }
         // Mint HERE, not when the operation was set up: this is the last instruction before the
         // request leaves, so whatever the operation waited on — the delivery lock, an earlier leg,
         // a previous attempt — is already behind us and the token's window starts now. libgit2
@@ -1660,6 +1668,7 @@ mod tests {
                         request_body: vec![],
                         streaming_body: None,
                         response: None,
+            timeout_override: None,
                     };
                     stream
                         .send()
@@ -1748,6 +1757,7 @@ mod tests {
             request_body: vec![0x5a; 16 * 1024 * 1024],
             streaming_body: None,
             response: None,
+            timeout_override: None,
         };
         let start = std::time::Instant::now();
         let mut upload = || {
@@ -2152,6 +2162,7 @@ mod tests {
             request_body: vec![],
             streaming_body: None,
             response: Some(response),
+            timeout_override: None,
         };
         let mut received = Vec::new();
         assert!(stream.read_to_end(&mut received).is_err());
