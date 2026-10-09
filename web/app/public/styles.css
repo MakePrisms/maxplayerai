@@ -1207,14 +1207,9 @@ button.chip { cursor: pointer; }
 .tag[data-s="cancelled"] { color: var(--muted); }
 .tag[data-s="expired"] { color: var(--faint); }
 .tag[data-s="quarantined"] { color: var(--warn); border-color: rgba(255, 138, 61, 0.4); }
-.trade-detail { border-top: 1px solid var(--line); background: var(--bg-2); }
-.trade-detail[hidden] { display: none; }
-.trade-detail .col-bar { align-items: center; }
-.trade-detail .dock-close { min-width: 44px; min-height: 44px; background: transparent; border: 0; color: var(--muted); font-size: 20px; cursor: pointer; }
-.trade-detail .dock-close:hover { color: var(--neon); }
-.trade-detail-body { padding: 14px 16px 18px; }
-.trade-detail-body code { overflow-wrap: anywhere; }
 .trades-foot { padding: 0 16px 18px; }
+#trade-detail-body code { overflow-wrap: anywhere; }
+#trade-detail-body .kv dd { min-width: 0; }
 @media (max-width: 980px) {
   .trades-book { grid-template-columns: 1fr; }
   .trades-page .col.mid { grid-column: auto; grid-row: auto; }
@@ -1226,7 +1221,6 @@ button.chip { cursor: pointer; }
   .trades-page .market-bar .col-meta { text-align: left; }
 }
 @media (min-width: 981px) {
-  /* the detail panel and footnote sit under the board, which keeps its viewport height */
   .trades-page.market-page { height: auto; min-height: 0; }
   .trades-page .book { height: calc(100svh - var(--nav-h) - 120px); min-height: 420px; flex: none; }
 }

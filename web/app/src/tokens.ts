@@ -204,13 +204,21 @@ function boot(): void {
     ev.preventDefault();
     selected = row.dataset.lot ?? null;
     renderDetail();
-    el("trade-detail").scrollIntoView({ block: "nearest", behavior: "smooth" });
+    // Opened like /market's event dock: the popup takes focus at the top.
+    el("trade-detail-body").scrollTop = 0;
+    el("trade-detail-close").focus();
   };
   for (const id of ["lots", "recent", "done"]) {
     el(id).addEventListener("click", pick);
     el(id).addEventListener("keydown", pick);
   }
-  el("trade-detail-close").addEventListener("click", () => { selected = null; renderDetail(); });
+  const closeDetail = () => {
+    if (selected == null) return;
+    selected = null;
+    renderDetail();
+  };
+  el("trade-detail-close").addEventListener("click", closeDetail);
+  document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") closeDetail(); });
 
   // Time left and ages tick in place; a full re-derive each minute moves
   // lots across the expiry line without waiting for an event.

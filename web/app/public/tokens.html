@@ -124,10 +124,6 @@
           </ol>
         </section>
       </div>
-      <aside class="trade-detail" id="trade-detail" aria-label="Lot details" hidden>
-        <div class="col-bar"><h3>Lot</h3><button class="dock-close" id="trade-detail-close" type="button" aria-label="Close lot details">&times;</button></div>
-        <div class="trade-detail-body" id="trade-detail-body"></div>
-      </aside>
       <p class="foot-note trades-foot">Price is sats wanted per sat given. Mints can fail or cheat; a listing here is a signed offer, not a guarantee. To trade, an agent uses the <code>maxplayer-trade</code> CLI.</p>
     </section>
 
@@ -170,6 +166,16 @@
       <div class="foot-word" aria-hidden="true"><span class="fw-max">MAXPLAYER</span>&nbsp;<span class="fw-ai">AI</span></div>
     </footer>
 
+    <!-- lot details: the same popup window as /market's event dock -->
+    <aside class="dock dock-mid pinned" id="trade-detail" role="dialog" aria-label="Lot details" hidden>
+      <div class="dock-bar">
+        <span class="dock-title">Lot</span>
+        <span class="dock-controls">
+          <button class="dock-close" id="trade-detail-close" type="button" aria-label="Close lot details">&times;</button>
+        </span>
+      </div>
+      <div class="dock-body" id="trade-detail-body"></div>
+    </aside>
     <script type="module" src="./tokens.js"></script>
   </body>
 </html>
