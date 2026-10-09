@@ -54,6 +54,13 @@ pub struct Faults {
     pub omit_dleq: std::sync::atomic::AtomicBool,
     pub missing_nut: std::sync::atomic::AtomicU64,
     pub clock_offset: std::sync::atomic::AtomicU64,
+    /// 503 on every NUT-07 /checkstate (own-mint outage that refuses fast).
+    pub reject_checkstate: std::sync::atomic::AtomicBool,
+    /// Accept /checkstate but never answer (black hole; client RPC timeout applies).
+    pub blackhole_checkstate: std::sync::atomic::AtomicBool,
+    /// Process the melt POST, then answer 503 to every later request.
+    pub die_after_melt: std::sync::atomic::AtomicBool,
+    pub dead: std::sync::atomic::AtomicBool,
 }
 pub struct MintFixture {
     pub faults: Arc<Faults>,
@@ -126,6 +133,15 @@ impl MintFixture {
                     use axum::response::IntoResponse;
                     use std::sync::atomic::Ordering::SeqCst;
                     let path = req.uri().path().to_owned();
+                    if control.dead.load(SeqCst) {
+                        return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    }
+                    if path.ends_with("/checkstate") && control.reject_checkstate.load(SeqCst) {
+                        return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    }
+                    if path.ends_with("/checkstate") && control.blackhole_checkstate.load(SeqCst) {
+                        std::future::pending::<()>().await;
+                    }
                     if path.ends_with("/keysets") && control.hang_keysets.load(SeqCst) {
                         std::future::pending::<()>().await;
                     }
@@ -201,6 +217,9 @@ impl MintFixture {
                         } else {
                             next.run(req).await
                         };
+                    if path.ends_with("/melt/bolt11") && control.die_after_melt.load(SeqCst) {
+                        control.dead.store(true, SeqCst);
+                    }
                     if path.ends_with("/checkstate")
                         && control.hold_checkstate_reply.swap(false, SeqCst)
                     {

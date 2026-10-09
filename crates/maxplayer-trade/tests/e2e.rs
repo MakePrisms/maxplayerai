@@ -298,9 +298,19 @@ async fn exact_lock_validation_rejects_wrong_hash_key_deadline_dleq_and_net() {
     let proofs = mint::lock(&f.taker, &j, &id, &p, &c, coordinator::now() + 60)
         .await
         .unwrap();
-    mint::validate(&f.maker, &f.b.url, &proofs, 24, &c, p.ppk, p.keyset)
-        .await
-        .unwrap();
+    mint::validate(
+        &f.maker,
+        &f.b.url,
+        &proofs,
+        24,
+        p.gross,
+        p.claim_fee,
+        &c,
+        p.ppk,
+        p.keyset,
+    )
+    .await
+    .unwrap();
     for wrong in [
         mint::conditions(
             &"ac".repeat(32),
@@ -325,36 +335,86 @@ async fn exact_lock_validation_rejects_wrong_hash_key_deadline_dleq_and_net() {
         .unwrap(),
     ] {
         assert!(
-            mint::validate(&f.maker, &f.b.url, &proofs, 24, &wrong, p.ppk, p.keyset)
-                .await
-                .is_err()
+            mint::validate(
+                &f.maker,
+                &f.b.url,
+                &proofs,
+                24,
+                p.gross,
+                p.claim_fee,
+                &wrong,
+                p.ppk,
+                p.keyset
+            )
+            .await
+            .is_err()
         );
     }
     let mut missing = proofs.clone();
     missing[0].dleq = None;
     assert!(
-        mint::validate(&f.maker, &f.b.url, &missing, 24, &c, p.ppk, p.keyset)
-            .await
-            .is_err()
+        mint::validate(
+            &f.maker,
+            &f.b.url,
+            &missing,
+            24,
+            p.gross,
+            p.claim_fee,
+            &c,
+            p.ppk,
+            p.keyset
+        )
+        .await
+        .is_err()
     );
     let mut forged = proofs.clone();
     forged[0].c = cashu::nuts::SecretKey::generate().public_key();
     assert!(
-        mint::validate(&f.maker, &f.b.url, &forged, 24, &c, p.ppk, p.keyset)
-            .await
-            .is_err()
+        mint::validate(
+            &f.maker,
+            &f.b.url,
+            &forged,
+            24,
+            p.gross,
+            p.claim_fee,
+            &c,
+            p.ppk,
+            p.keyset
+        )
+        .await
+        .is_err()
     );
     assert!(
-        mint::validate(&f.maker, &f.b.url, &proofs, 25, &c, p.ppk, p.keyset)
-            .await
-            .is_err()
+        mint::validate(
+            &f.maker,
+            &f.b.url,
+            &proofs,
+            25,
+            p.gross,
+            p.claim_fee,
+            &c,
+            p.ppk,
+            p.keyset
+        )
+        .await
+        .is_err()
     );
     let mut duplicate = proofs.clone();
     duplicate.push(proofs[0].clone());
     assert!(
-        mint::validate(&f.maker, &f.b.url, &duplicate, 24, &c, p.ppk, p.keyset)
-            .await
-            .is_err()
+        mint::validate(
+            &f.maker,
+            &f.b.url,
+            &duplicate,
+            24,
+            p.gross,
+            p.claim_fee,
+            &c,
+            p.ppk,
+            p.keyset
+        )
+        .await
+        .is_err()
     );
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

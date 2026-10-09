@@ -508,6 +508,8 @@ async fn handle_message(home: &Path, j: &Journal, m: &Market, e: &Event) -> Resu
                     &q.lot.want.asset.mint_url,
                     &p,
                     q.lot.want.net,
+                    q.request.funding.gross,
+                    q.request.funding.claim_fee,
                     &c,
                     q.request.funding.ppk,
                     q.request.funding.keyset,
@@ -527,6 +529,8 @@ async fn handle_message(home: &Path, j: &Journal, m: &Market, e: &Event) -> Resu
                     &q.lot.give.asset.mint_url,
                     &p,
                     q.lot.give.net,
+                    q.give.gross,
+                    q.give.claim_fee,
                     &c,
                     q.give.ppk,
                     q.give.keyset,
@@ -730,83 +734,30 @@ async fn advance_inner(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Re
         ]
         .contains(&s.state.as_str())
     {
-        let mut refund_id = if s.refund_generation == 0 {
-            format!("{}-refund", s.id)
-        } else {
-            format!("{}-refund-{}", s.id, s.refund_generation)
-        };
-        if s.preimage.is_none() {
-            if let Some(pre) = mint::refund_preimage(j, &refund_id, &q.request.hash).await? {
-                s.preimage = Some(pre);
-                s.state = "claiming".into();
-                save(j, s).await?;
-            }
+        // Own-mint refund work and the counterparty claim get SEPARATE budgets, and no
+        // own-mint failure propagates past the claim: an outage or black hole on one
+        // mint must never starve or skip the other (live claims stay claimable).
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(PHASE_BUDGET_SECONDS),
+            maker_refund(home, j, s, &q, &own_mint),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("maker refund phase {}: {e}", s.id),
+            Err(_) => eprintln!("maker refund phase {}: budget exhausted", s.id),
         }
-        if s.preimage.is_none() {
-            match mint::witness(&own_mint, &s.outgoing, &q.request.hash).await {
-                Ok(Some(pre)) => {
-                    s.preimage = Some(pre);
-                    s.state = "claiming".into();
-                    save(j, s).await?;
-                }
-                Ok(None) => {}
-                Err(e) => eprintln!("witness {}: {e}", s.id),
-            }
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(PHASE_BUDGET_SECONDS),
+            maker_claim(home, j, m, s, &q, &claim_id),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("maker claim {}: {e}", s.id),
+            Err(_) => eprintln!("maker claim {}: budget exhausted", s.id),
         }
-        let mut refund_started = j
-            .get::<mint::Attempt>("attempt", &refund_id)
-            .await?
-            .is_some();
-        if refund_started {
-            if let Err(e) = mint::execute(home, j, &refund_id).await {
-                eprintln!("refund recovery {}: {e}", s.id);
-                let retired = match mint::failed_refund(j, &refund_id, &q.request.hash).await {
-                    Ok(pre) => pre.is_some(),
-                    Err(e) => {
-                        eprintln!("refund evidence {}: {e}", s.id);
-                        false
-                    }
-                };
-                // Positive witness knowledge is useful even when absence is ambiguous.
-                // Never let a restore outage discard a preimage already observed this tick.
-                if s.preimage.is_none() {
-                    if let Some(pre) = mint::refund_preimage(j, &refund_id, &q.request.hash).await?
-                    {
-                        s.preimage = Some(pre);
-                        s.state = "claiming".into();
-                        save(j, s).await?;
-                    }
-                }
-                if retired {
-                    // Preserve the failed attempt forever; a durable generation selects fresh inputs.
-                    s.refund_generation = s
-                        .refund_generation
-                        .checked_add(1)
-                        .context("refund generation overflow")?;
-                    save(j, s).await?;
-                    refund_id = format!("{}-refund-{}", s.id, s.refund_generation);
-                    refund_started = false;
-                }
-            }
-        }
-        let time = wallet::refund_time(&own_mint).await?;
-        if !refund_started && time > q.short + q.margin {
-            let remaining = mint::refundable(&own_mint, &s.outgoing).await?;
-            if !remaining.is_empty() {
-                if let Err(e) = mint::redeem(
-                    home, j, &refund_id, &own_mint, &remaining, &s.key, "", s.max_fees, None,
-                )
-                .await
-                {
-                    eprintln!("maker refund {}: {e}", s.id);
-                }
-            }
-        }
-        // Refund our own mint before touching the counterparty mint: a stalled
-        // incoming claim must not consume the refund's recovery budget.
-        if let Err(e) = maker_claim(home, j, m, s, &q, &claim_id).await {
-            eprintln!("maker claim {}: {e}", s.id);
-        }
+        let refund_id = refund_attempt_id(s);
         let all_spent = mint::states(&own_mint, &s.outgoing)
             .await?
             .states
@@ -1157,6 +1108,98 @@ fn canonical_key(key: &str) -> Result<()> {
     Ok(())
 }
 
+/// Per-phase budget inside one maker advance; two phases fit the 120 s item budget.
+const PHASE_BUDGET_SECONDS: u64 = 50;
+fn refund_attempt_id(s: &Swap) -> String {
+    if s.refund_generation == 0 {
+        format!("{}-refund", s.id)
+    } else {
+        format!("{}-refund-{}", s.id, s.refund_generation)
+    }
+}
+/// Own-mint refund phase. Only journal errors propagate; every own-mint RPC failure
+/// is logged so the caller always proceeds to the claim phase.
+async fn maker_refund(
+    home: &Path,
+    j: &Journal,
+    s: &mut Swap,
+    q: &Quote,
+    own_mint: &str,
+) -> Result<()> {
+    let mut refund_id = refund_attempt_id(s);
+    if s.preimage.is_none() {
+        if let Some(pre) = mint::refund_preimage(j, &refund_id, &q.request.hash).await? {
+            s.preimage = Some(pre);
+            s.state = "claiming".into();
+            save(j, s).await?;
+        }
+    }
+    if s.preimage.is_none() {
+        match mint::witness(own_mint, &s.outgoing, &q.request.hash).await {
+            Ok(Some(pre)) => {
+                s.preimage = Some(pre);
+                s.state = "claiming".into();
+                save(j, s).await?;
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("witness {}: {e}", s.id),
+        }
+    }
+    let mut refund_started = j
+        .get::<mint::Attempt>("attempt", &refund_id)
+        .await?
+        .is_some();
+    if refund_started {
+        if let Err(e) = mint::execute(home, j, &refund_id).await {
+            eprintln!("refund recovery {}: {e}", s.id);
+            let retired = match mint::failed_refund(j, &refund_id, &q.request.hash).await {
+                Ok(pre) => pre.is_some(),
+                Err(e) => {
+                    eprintln!("refund evidence {}: {e}", s.id);
+                    false
+                }
+            };
+            // Positive witness knowledge is useful even when absence is ambiguous.
+            // Never let a restore outage discard a preimage already observed this tick.
+            if s.preimage.is_none() {
+                if let Some(pre) = mint::refund_preimage(j, &refund_id, &q.request.hash).await? {
+                    s.preimage = Some(pre);
+                    s.state = "claiming".into();
+                    save(j, s).await?;
+                }
+            }
+            if retired {
+                // Preserve the failed attempt forever; a durable generation selects fresh inputs.
+                s.refund_generation = s
+                    .refund_generation
+                    .checked_add(1)
+                    .context("refund generation overflow")?;
+                save(j, s).await?;
+                refund_id = format!("{}-refund-{}", s.id, s.refund_generation);
+                refund_started = false;
+            }
+        }
+    }
+    let time = wallet::refund_time(own_mint).await?;
+    if !refund_started && time > q.short + q.margin {
+        // A NUT-07 failure on our own mint is logged, never propagated: the claim
+        // phase runs next on the same tick regardless.
+        match mint::refundable(own_mint, &s.outgoing).await {
+            Ok(remaining) if !remaining.is_empty() => {
+                if let Err(e) = mint::redeem(
+                    home, j, &refund_id, own_mint, &remaining, &s.key, "", s.max_fees, None,
+                )
+                .await
+                {
+                    eprintln!("maker refund {}: {e}", s.id);
+                }
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("refundable {}: {e}", s.id),
+        }
+    }
+    Ok(())
+}
 async fn maker_claim(
     home: &Path,
     j: &Journal,

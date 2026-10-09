@@ -28,9 +28,11 @@ whole-command deadline. Items are handled sequentially and relay/setup/publicati
 work is additional. A timeout does not undo a delivered RPC or release reservations.
 
 - **0:** successful command; recovery has all items terminal, no deferred work or quarantine.
-- **1:** command error or terminal unpaid/refused withdrawal; inspect the state.
+- **1:** command error, or a withdrawal refused/unpaid with no unresolved submission;
+  inspect the state. Exit 1 is never proof that a submitted withdrawal was refused.
 - **2:** CLI syntax/usage error only.
-- **3:** non-final withdrawal, unresolved/deferred recovery, or item error/timeout.
+- **3:** non-final withdrawal (including a submitted one whose mint failed after the
+  POST), unresolved/deferred recovery, or item error/timeout.
   Preserve authorization; keep `serve` running for live locks and retry with backoff.
 - **4:** terminal manual-recovery quarantine (unresolved work takes precedence as 3).
 

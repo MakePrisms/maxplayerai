@@ -598,11 +598,14 @@ pub async fn execute(home: &Path, j: &Journal, id: &str) -> Result<Proofs> {
         .map(|(p, _)| p)
         .collect())
 }
+#[allow(clippy::too_many_arguments)]
 pub async fn validate(
     home: &Path,
     mint: &str,
     p: &Proofs,
     net: u64,
+    gross: u64,
+    claim_fee: u64,
     c: &SpendingConditions,
     ppk: u64,
     keyset: Id,
@@ -654,6 +657,13 @@ pub async fn validate(
             .total,
     );
     ensure!(total.checked_sub(cost) == Some(net), "incorrect net amount");
+    // The claim later pins exactly the quoted fee. Reject any other split NOW, before
+    // the receiver locks its own leg or reveals anything: a non-canonical sender split
+    // would otherwise leave a live claim permanently failing the pinned-fee check.
+    ensure!(
+        total == gross && cost == claim_fee,
+        "non-canonical lock split: claim fee differs from quote"
+    );
     unspent(mint, p).await
 }
 pub fn matches_preimage(preimage: &str, hash: &str) -> bool {

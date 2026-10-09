@@ -746,3 +746,229 @@ async fn r5_cli_terminal_quarantine_is_exit_four() {
         "SAFETY: quarantine not reported successful"
     );
 }
+// ---------------------------------------------------------------------------
+// Round 6 (re-review of b3372b1): N1, N2, L1, L2.
+// ---------------------------------------------------------------------------
+/// Test-only malicious client: lock `amount` on `mint` under `c` with an explicit,
+/// NON-canonical split. Models a dishonest counterparty; production code has no switch.
+async fn noncanonical_lock(
+    home: &std::path::Path,
+    mint_url: &str,
+    amount: u64,
+    split: &[u64],
+    c: &cashu::nuts::SpendingConditions,
+) -> cashu::nuts::Proofs {
+    use cashu::nuts::{PreMintSecrets, SwapRequest, SwapResponse};
+    use cdk::amount::SplitTarget;
+    fund(home, mint_url, 64).await;
+    let w = wallet::wallet(home, mint_url).await.unwrap();
+    let inputs = w.get_unspent_proofs().await.unwrap();
+    let keyset = w.fetch_active_keyset().await.unwrap().id;
+    let f = w.get_keyset_fees_and_amounts_by_id(keyset).await.unwrap();
+    let fee = u64::from(w.get_proofs_fee(&inputs).await.unwrap().total);
+    let total: u64 = inputs.iter().map(|p| u64::from(p.amount)).sum();
+    let locked = PreMintSecrets::with_conditions(
+        keyset,
+        amount.into(),
+        &SplitTarget::Values(split.iter().map(|v| cdk::Amount::from(*v)).collect()),
+        c,
+        &f,
+    )
+    .unwrap();
+    let change = PreMintSecrets::random(
+        keyset,
+        (total - fee - amount).into(),
+        &SplitTarget::default(),
+        &f,
+    )
+    .unwrap();
+    let mut outputs = locked.blinded_messages();
+    outputs.extend(change.blinded_messages());
+    let r: SwapResponse = mint::rpc(mint_url, "swap", &SwapRequest::new(inputs, outputs))
+        .await
+        .unwrap();
+    let keys = w.load_keyset_keys(keyset).await.unwrap();
+    cashu::dhke::construct_proofs(
+        r.signatures[..locked.len()].to_vec(),
+        locked.rs(),
+        locked.secrets(),
+        &keys,
+    )
+    .unwrap()
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r6_noncanonical_sender_split_rejected_before_maker_locks() {
+    use nostr_sdk::prelude::*;
+    // Maker gives A (0 ppk) 32, wants B (100 ppk) 24: quoted gross 25, claim_fee 1.
+    let mut f = asymmetric_fees(0, 100).await;
+    let lot = f.list(false).await;
+    let id = f.start(&lot).await;
+    f.step(true).await; // maker: request -> quote
+    f.step(false).await; // taker: quote -> accepted -> honest first lock sent
+    let honest = tokio::time::timeout(std::time::Duration::from_secs(10), f.mm.inbox.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut env = f.mm.decode(&honest).unwrap();
+    assert_eq!(env.step, "first");
+    let q =
+        f.jt.get::<Swap>("swap", &id)
+            .await
+            .unwrap()
+            .unwrap()
+            .quote
+            .unwrap();
+    assert_eq!(
+        (q.request.funding.gross, q.request.funding.claim_fee),
+        (25, 1)
+    );
+    let c = mint::conditions(&q.request.hash, &q.maker_key, &q.request.taker_key, q.long).unwrap();
+    // 26 sats in 11 proofs: fee ceil(11*100/1000) = 2, net 24 still "correct".
+    let evil = noncanonical_lock(
+        &f.root.path().join("attacker"),
+        &f.b.url,
+        26,
+        &[8, 4, 4, 2, 2, 1, 1, 1, 1, 1, 1],
+        &c,
+    )
+    .await;
+    assert_eq!(evil.len(), 11);
+    env.request_id = uuid::Uuid::new_v4().to_string();
+    env.body = serde_json::to_value(&evil).unwrap();
+    let maker = f.mm.keys.public_key();
+    let content = nip44::encrypt(
+        f.mt.keys.secret_key(),
+        &maker,
+        serde_json::to_string(&env).unwrap(),
+        nip44::Version::V2,
+    )
+    .unwrap();
+    let forged = EventBuilder::new(Kind::Custom(maxplayer_trade::TRADE), content)
+        .tags([
+            Tag::public_key(maker),
+            Tag::hashtag("maxplayer"),
+            Tag::parse(["v", "1"]).unwrap(),
+        ])
+        .sign_with_keys(&f.mt.keys)
+        .unwrap();
+    let result = coordinator::handle(&f.maker, &f.jm, &f.mm, &forged).await;
+    assert_eq!(
+        f.state(true, &id).await.as_deref(),
+        Some("quoted"),
+        "SAFETY: lock rejected at validation (maker must not accept a non-canonical split)"
+    );
+    assert!(
+        f.jm.get::<serde_json::Value>("attempt", &format!("{id}-lock"))
+            .await
+            .unwrap()
+            .is_none(),
+        "SAFETY: lock rejected at validation (maker never locks its own leg)"
+    );
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("non-canonical lock split"), "{error}");
+}
+#[cfg(feature = "lab")]
+async fn own_mint_outage_still_claims(blackhole: bool) {
+    let (f, id) = partial_claim_fixture().await;
+    let mut s = f.jm.get::<Swap>("swap", &id).await.unwrap().unwrap();
+    wait_past(s.quote.as_ref().unwrap().short + s.quote.as_ref().unwrap().margin).await;
+    // Own mint A: NUT-07 down. Counterparty B healthy. Preimage known, state claiming.
+    if blackhole {
+        f.a.faults.blackhole_checkstate.store(true, SeqCst);
+    } else {
+        f.a.faults.reject_checkstate.store(true, SeqCst);
+    }
+    let result = coordinator::advance(&f.maker, &f.jm, &f.mm, &mut s).await;
+    assert_eq!(
+        balance(&f.maker, &f.b.url).await,
+        24,
+        "SAFETY: own-mint NUT-07 outage must not skip the live maker claim"
+    );
+    assert_eq!(s.state, "settling");
+    // Own-mint settlement bookkeeping may still report the outage; the claim landed.
+    let _ = result;
+}
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r6_own_mint_checkstate_503_still_claims() {
+    own_mint_outage_still_claims(false).await;
+}
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r6_own_mint_checkstate_blackhole_still_claims() {
+    own_mint_outage_still_claims(true).await;
+}
+#[tokio::test]
+async fn r6_expired_quote_created_is_refused_and_same_invoice_retries() {
+    let h = tempfile::tempdir().unwrap();
+    let m = MintFixture::start(0).await;
+    let j = Journal::open(h.path()).await.unwrap();
+    let inv = invoice(31);
+    assert!(money::withdraw(h.path(), &j, &m.url, &inv).await.is_err());
+    let a = j
+        .all::<Withdrawal>("withdrawal")
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    // Crash-retained, never-submitted QuoteCreated whose quote has expired.
+    let mut v = serde_json::to_value(&a).unwrap();
+    v["state"] = "quote_created".into();
+    if v["quote"].is_object() {
+        v["quote"]["expiry"] = 1.into();
+    }
+    j.put("withdrawal", &a.id, &v).await.unwrap();
+    fund(h.path(), &m.url, 128).await;
+    let first = money::withdraw(h.path(), &j, &m.url, &inv).await;
+    let saved: Withdrawal = j.get("withdrawal", &a.id).await.unwrap().unwrap();
+    assert_eq!(
+        saved.state,
+        MeltState::Refused,
+        "SAFETY: expired unsent quote is refused (retryable), not unpaid_released"
+    );
+    assert!(
+        m.faults.melt_requests.lock().unwrap().is_empty(),
+        "SAFETY: expired quote never submitted"
+    );
+    assert_eq!(first.unwrap().state, MeltState::Refused);
+    assert_eq!(
+        money::withdraw(h.path(), &j, &m.url, &inv)
+            .await
+            .unwrap()
+            .state,
+        MeltState::Done,
+        "same invoice retries with a fresh quote"
+    );
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r6_cli_mint_dropped_after_post_is_exit_three() {
+    let h = tempfile::tempdir().unwrap();
+    let m = MintFixture::start(0).await;
+    fund(h.path(), &m.url, 128).await;
+    m.faults.die_after_melt.store(true, SeqCst);
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
+        .args([
+            "--home",
+            h.path().to_str().unwrap(),
+            "withdraw",
+            &m.url,
+            "--invoice",
+            &invoice(31),
+            "--max-debit",
+            "62",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(
+        m.faults.melt_requests.lock().unwrap().len(),
+        1,
+        "fixture: the POST reached the mint before it dropped"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "SAFETY: submitted-but-unresolved withdrawal must exit 3, never 1 (refusal); stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

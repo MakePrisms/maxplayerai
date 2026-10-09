@@ -35,9 +35,19 @@ async fn c1_sender_witness_rejected_and_sanitized_both_directions() {
             ));
         }
         assert!(
-            mint::validate(receiver, url, &proofs, 24, &c, p.ppk, p.keyset)
-                .await
-                .is_err(),
+            mint::validate(
+                receiver,
+                url,
+                &proofs,
+                24,
+                p.gross,
+                p.claim_fee,
+                &c,
+                p.ppk,
+                p.keyset
+            )
+            .await
+            .is_err(),
             "C1 admission must reject sender witness"
         );
         mint::redeem(

@@ -236,14 +236,29 @@ async fn execute() -> Result<()> {
         ..
     } = cli.command
     {
-        let a = maxplayer_trade::money::withdraw_bounded(
+        let a = match maxplayer_trade::money::withdraw_bounded(
             &cli.home,
             &money_journal,
             mint,
             invoice,
             max_debit,
         )
-        .await?;
+        .await
+        {
+            Ok(a) => a,
+            Err(error) => {
+                // A submitted withdrawal whose resolution failed (mint unreachable after
+                // POST, change not yet restorable) is unresolved work, never a refusal.
+                if maxplayer_trade::money::submitted_unresolved(&money_journal, invoice)
+                    .await
+                    .unwrap_or(true)
+                {
+                    eprintln!("{error}");
+                    return Err(coordinator::RecoveryIncomplete.into());
+                }
+                return Err(error);
+            }
+        };
         println!("{}", a.summary());
         if !a.terminal() {
             return Err(coordinator::RecoveryIncomplete.into());

@@ -362,6 +362,25 @@ impl Withdrawal {
         )
     }
 }
+/// True when a withdrawal for this invoice's payment hash was SUBMITTED (past
+/// QuoteCreated) and is not yet terminal. Such a record is unresolved work, never a
+/// refusal, even if the command that drove it returned an error.
+pub async fn submitted_unresolved(j: &Journal, invoice: &str) -> Result<bool> {
+    // An unparsable invoice never created a record: that is a plain command error.
+    let Ok(parsed) = invoice.parse::<cashu::Bolt11Invoice>() else {
+        return Ok(false);
+    };
+    let hash = parsed.payment_hash().to_owned();
+    for a in j.all::<Withdrawal>("withdrawal").await? {
+        let Ok(prior) = a.invoice.parse::<cashu::Bolt11Invoice>() else {
+            continue;
+        };
+        if *prior.payment_hash() == hash && a.state != MeltState::QuoteCreated && !a.terminal() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 pub async fn withdraw(home: &Path, j: &Journal, url: &str, invoice: &str) -> Result<Withdrawal> {
     withdraw_bounded(home, j, url, invoice, None).await
 }
@@ -632,10 +651,12 @@ async fn resume_withdraw_inner(
             .is_none_or(|q| q.expiry <= cdk::util::unix_time().saturating_add(60))
         {
             // No POST can have occurred: RequestSent is persisted before that effect.
+            // Classify as Refused (never submitted), which dedupe skips, so the same
+            // invoice can be retried explicitly with a fresh quote.
             if !a.inputs.is_empty() {
                 mint::unspent(&a.mint, &a.inputs).await?;
             }
-            a.state = MeltState::UnpaidReleased;
+            a.state = MeltState::Refused;
             j.put("withdrawal", &a.id, a).await?;
             database(home, &a.mint)
                 .await?

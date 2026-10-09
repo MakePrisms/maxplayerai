@@ -16,13 +16,16 @@ Earlier dated verification sections are historical snapshots, not current covera
   refunds run before counterparty claims. Missing mint info time does not block refunds;
   mint-enforced locktime remains authoritative. Known-preimage claims survive refund quarantine.
 - Withdrawal reserve: max(32 sats, ceil(invoice sats × 2%)); 100,000 sats permits 2,000.
-  `--max-debit` enforces invoice + input fee + reserve. Invalid/lost/refused quotes are
-  terminal, retryable explicitly with the same invoice. No passive recovery submits an
+  `--max-debit` enforces invoice + input fee + reserve. Invalid/lost/refused quotes, and
+  never-submitted quotes that expired, are terminal `refused`, retryable explicitly with the same invoice. No passive recovery submits an
   unsent quote; an explicitly failed pre-POST withdrawal cannot pay later on a serve tick.
   Submitted ambiguity retains exact authorization and replays it until definitive.
 - Read-only `status` and `balance` use SQLite snapshots without the writer lock. Keep
-  serve alive from second lock through settlement. Exits: 0 success, 1 command/refusal,
-  2 usage, 3 unresolved work, 4 terminal manual recovery. Non-final withdrawals never exit 0.
+  serve alive from second lock through settlement. Exits: 0 success, 1 command error or
+  pre-submission refusal, 2 usage, 3 unresolved work, 4 terminal manual recovery. Non-final
+  withdrawals never exit 0; a submitted (past `quote_created`) non-terminal withdrawal always
+  exits 3, even when the mint fails after the POST. Exit 1 is never proof that a submitted
+  withdrawal was refused: check `status` before paying the obligation another way.
 - Funding preflight adds enabled NUT-04/20; withdrawal adds NUT-05; trading adds NUT-11.
   Paid funding issuance retains keyset/DLEQ verification without new admission gates.
   Expired fresh-UNPAID funding becomes terminal after 60 seconds grace, still charged
@@ -71,7 +74,7 @@ sections below describe their dated runs, not current coverage totals.
   key after strict locktime plus clock margin. Maker recovery polls every three seconds and
   refunds after its short deadline +60 seconds when the mint is reachable. A claim that wins
   the refund race is reconciled through its witness. Refund outputs survive a process exit.
-- `recover` makes one bounded pass over existing authorizations; it does not admit new requests or wait for deadlines. Exit **3** and status `recovery_incomplete` mean retained items need a later pass; exit 0 means all money authorizations are terminal, exit 1 is a command error. Each funding/withdrawal/swap attempt has a 120-second budget, independent of other items. HTTP requests may already have landed at timeout: the exact journal remains authoritative; no timeout releases funds.
+- `recover` makes one bounded pass over existing authorizations; it does not admit new requests or wait for deadlines. Exit **3** and status `recovery_incomplete` mean retained items need a later pass; exit 0 means all money authorizations are terminal, exit 1 is a command error (never proof that a submitted withdrawal was refused). Each funding/withdrawal/swap attempt has a 120-second budget, independent of other items. HTTP requests may already have landed at timeout: the exact journal remains authoritative; no timeout releases funds.
   `serve` continuously accepts quotes and recovers swaps. **Keep a watcher running while funds
   are locked.** Use read-only `status`/`balance` without stopping it; never stop between `second_locked` and `settling`. Do not delete a trade home.
 
