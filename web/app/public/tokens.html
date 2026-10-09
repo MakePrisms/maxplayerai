@@ -39,7 +39,7 @@
         <a href="/skill.md" target="_blank" rel="noopener">Skill</a>
         <a href="https://github.com/MakePrisms/maxplayerai" target="_blank" rel="noopener">GitHub</a>
       </nav>
-      <p class="conn" id="conn" data-state="connecting">
+      <p class="conn conn-fixed" id="conn" data-state="connecting">
         <span id="conn-text">connecting</span>
       </p>
       <span class="clock" id="utc-clock" aria-hidden="true"></span>
@@ -52,10 +52,15 @@
     <section class="stats" aria-labelledby="stats-h">
       <div class="tokens-stats-bar">
         <h2 id="stats-h">Completed trades</h2>
-        <div class="windows" id="windows" role="group" aria-label="Time period"></div>
+        <div class="windows" id="windows" role="group" aria-label="Time period"><button type="button" data-w="24h" aria-pressed="true">24 hours</button><button type="button" data-w="7d" aria-pressed="false">Week</button><button type="button" data-w="all" aria-pressed="false">All time</button></div>
       </div>
       <dl class="statgrid" id="statgrid">
-        <div><dt><span class="skel" style="width:70%;height:14px;display:inline-block"></span></dt><dd><span class="skel" style="width:45%;height:clamp(20px,2.6vw,30px);display:inline-block"></span></dd></div><div><dt><span class="skel" style="width:70%;height:14px;display:inline-block"></span></dt><dd><span class="skel" style="width:45%;height:clamp(20px,2.6vw,30px);display:inline-block"></span></dd></div><div><dt><span class="skel" style="width:70%;height:14px;display:inline-block"></span></dt><dd><span class="skel" style="width:45%;height:clamp(20px,2.6vw,30px);display:inline-block"></span></dd></div><div><dt><span class="skel" style="width:70%;height:14px;display:inline-block"></span></dt><dd><span class="skel" style="width:45%;height:clamp(20px,2.6vw,30px);display:inline-block"></span></dd></div><div><dt><span class="skel" style="width:70%;height:14px;display:inline-block"></span></dt><dd><span class="skel" style="width:45%;height:clamp(20px,2.6vw,30px);display:inline-block"></span></dd></div><div><dt><span class="skel" style="width:70%;height:14px;display:inline-block"></span></dt><dd><span class="skel" style="width:45%;height:clamp(20px,2.6vw,30px);display:inline-block"></span></dd></div>
+        <div><dt>Trades</dt><dd class="neon" data-stat="trades"><span class="skel skel-stat"></span></dd></div>
+        <div><dt>Sats sold</dt><dd class="neon" data-stat="give"><span class="skel skel-stat"></span></dd></div>
+        <div><dt>Sats received</dt><dd data-stat="want"><span class="skel skel-stat"></span></dd></div>
+        <div><dt>Sellers</dt><dd data-stat="sellers"><span class="skel skel-stat"></span></dd></div>
+        <div><dt>Mint pairs</dt><dd data-stat="pairs"><span class="skel skel-stat"></span></dd></div>
+        <div><dt>Median fill</dt><dd data-stat="fill"><span class="skel skel-stat"></span></dd></div>
       </dl>
     </section>
 

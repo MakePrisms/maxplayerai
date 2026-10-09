@@ -169,6 +169,14 @@ test("/tokens ships its own read-only bundle and stays unlisted", () => {
   assert.ok(!tokens.includes("terminal.js"), "the jobs bundle is not loaded on /tokens");
   assert.ok(!readFileSync(join(root, "dist", "terminal.js"), "utf8").includes("offchain.pub"), "the jobs bundle carries no trade reader");
   assert.match(tokens, /<meta name="robots" content="noindex, nofollow">/);
+  // bob: the skeleton is the real frame. Inline styles are dropped by the
+  // /tokens CSP (style-src 'self'), so none may carry layout; the stat labels
+  // and period buttons are static, and only the values shimmer.
+  assert.ok(!/\sstyle="/.test(tokens), "no inline style attributes (CSP drops them)");
+  assert.deepEqual([...tokens.matchAll(/data-w="([^"]+)"/g)].map((m) => m[1]), ["24h", "7d", "all"]);
+  assert.match(tokens, /data-w="24h" aria-pressed="true"/);
+  assert.deepEqual([...tokens.matchAll(/data-stat="([^"]+)"/g)].map((m) => m[1]), ["trades", "give", "want", "sellers", "pairs", "fill"]);
+  assert.equal((tokens.match(/class="skel skel-stat"/g) ?? []).length, 6);
   // Lot details open in /market's popup window, not inline under the board.
   assert.match(tokens, /<aside class="dock dock-(left|right) pinned" id="trade-detail"[^>]*hidden>/);
   assert.ok(!/dock-mid/.test(tokens), "the lot popup never opens in the middle");

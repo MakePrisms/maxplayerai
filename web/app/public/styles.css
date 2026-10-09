@@ -1231,3 +1231,9 @@ button.chip { cursor: pointer; }
 .trades-page .rows { flex: 1; height: auto; min-height: 0; }
 @media (max-width: 980px) { .trades-book { grid-template-rows: 1fr 1fr; } }
 .tokens-stats-bar { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+/* /tokens stat skeleton: a block exactly one line of the value font tall, so
+   the cell is the same height before and after the numbers land. */
+.statgrid .skel-stat { display: block; width: 45%; height: 1em; }
+/* /tokens: the status word grows from "syncing" to "live · 3/3 relays"; a
+   fixed slot keeps the rest of the nav from sliding when it does. */
+.conn-fixed { min-width: 21ch; justify-content: flex-end; }

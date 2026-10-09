@@ -66,10 +66,12 @@ function closedItem(r: LotRow, t: number): KeyedItem {
 }
 
 let windowKey = "24h";
+/** After the first relay answers, wait at most this long for the others before painting. */
+const SETTLE_MS = 2500;
 
+/** The buttons are static HTML (painted before JS); this only wires them. */
 function wireWindows(onChange: () => void): void {
   const box = el("windows");
-  box.innerHTML = WINDOWS.map((w) => `<button type="button" data-w="${w.key}" aria-pressed="${w.key === windowKey}">${w.label}</button>`).join("");
   box.addEventListener("click", (ev) => {
     const b = (ev.target as HTMLElement).closest<HTMLElement>("button[data-w]");
     if (!b) return;
@@ -79,18 +81,22 @@ function wireWindows(onChange: () => void): void {
   });
 }
 
+/** Fills the static stat cells in place: labels never re-render, so nothing moves. */
 function renderStats(v: BookView, t: number): void {
   const w = WINDOWS.find((x) => x.key === windowKey) ?? WINDOWS[0]!;
   const c = completedStats(v, t, w.seconds);
-  const cells: [string, string, boolean][] = [
-    ["Trades", nf.format(c.trades), true],
-    ["Sats sold", nf.format(c.giveSats), true],
-    ["Sats received", nf.format(c.wantSats), false],
-    ["Sellers", nf.format(c.sellers), false],
-    ["Mint pairs", nf.format(c.pairs), false],
-    ["Median fill", c.medianFill == null ? "—" : duration(c.medianFill), false],
-  ];
-  el("statgrid").innerHTML = cells.map(([k, val, neon]) => `<div><dt>${k}</dt><dd${neon ? ' class="neon"' : ""}>${esc(val)}</dd></div>`).join("");
+  const values: Record<string, string> = {
+    trades: nf.format(c.trades),
+    give: nf.format(c.giveSats),
+    want: nf.format(c.wantSats),
+    sellers: nf.format(c.sellers),
+    pairs: nf.format(c.pairs),
+    fill: c.medianFill == null ? "—" : duration(c.medianFill),
+  };
+  for (const dd of el("statgrid").querySelectorAll<HTMLElement>("dd[data-stat]")) {
+    const val = values[dd.dataset.stat ?? ""];
+    if (val != null && dd.textContent !== val) dd.textContent = val;
+  }
 }
 
 let selected: string | null = null;
@@ -118,11 +124,12 @@ function renderDetail(): void {
     `</dl>`;
 }
 
-function render(v: BookView, answered: boolean): void {
+function render(v: BookView, answered: boolean, settled: boolean): void {
   lastView = v;
   const t = now();
-  // An empty book is a conclusion; the skeletons hold until a relay has answered.
-  if (!answered && v.open.length + v.closed.length === 0) return;
+  // bob: skeleton -> data in ONE swap. Painting each relay's answer as it
+  // lands reshuffled the rows two or three times in the first second.
+  if (!settled) return;
   renderStats(v, t);
   const recent = v.closed.filter((r) => r.updated_at >= t - 2 * 86400);
   el("lots-meta").textContent = `${v.open.length} open`;
@@ -140,8 +147,12 @@ function boot(): void {
   const book = createBook();
   const states = new Map<string, RelayState>();
   let answered = false;
+  /** Relays that have finished (or failed) their first read. */
+  const firstRead = new Set<string>();
+  let graceOver = false;
+  const settled = () => answered && (firstRead.size >= DEFAULT_TRADE_RELAYS.length || graceOver);
   const live = () => [...states].filter(([, s]) => s === "live").map(([u]) => u);
-  const paint = () => render(book.view(now(), live()), answered);
+  const paint = () => render(book.view(now(), live()), answered, settled());
   wireWindows(() => paint());
 
   const conn = el("conn");
@@ -165,7 +176,15 @@ function boot(): void {
       onEvent: (e) => { if (book.ingest(e)) schedule(); },
       onStatusesRead: (ids, relay) => { book.markHistoryRead(ids, relay); schedule(); },
       onRelayState: (relay, state) => { states.set(relay, state); showConn(); },
-      onRound: (relay) => { if (states.get(relay) === "live") answered = true; schedule(); },
+      onRound: (relay) => {
+        firstRead.add(relay);
+        if (states.get(relay) === "live" && !answered) {
+          answered = true;
+          // A slow relay must not hold the page: show what we have after this.
+          setTimeout(() => { graceOver = true; schedule(); }, SETTLE_MS);
+        }
+        schedule();
+      },
     },
   );
   reader.start();

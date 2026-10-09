@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 /**
  * The /trades book and relay reader: validated state, quarantine, expiry,
  * relay paging and the read-only contract — driven without a network.
@@ -8,7 +9,7 @@ import { schnorr } from "@noble/curves/secp256k1";
 import { sha256 } from "@noble/hashes/sha256";
 import { bytesToHex } from "@noble/hashes/utils";
 import { TRADE_LOT, TRADE_STATUS } from "../src/model/kinds.js";
-import { completedStats, createBook } from "../src/trade/book.js";
+import { WINDOWS, completedStats, createBook } from "../src/trade/book.js";
 import { lifecycle, parseLot, type NostrEvent } from "../src/trade/validate.js";
 import { allowedRelay, createTradeReader, drain, liveFilters, lotFilter, NUDGE_MS, statusFilters, STATUS_CHUNK } from "../src/trade/relays.js";
 import { dockSide, mintLabel, rate, timeLeft } from "../src/trade/format.js";
@@ -427,4 +428,10 @@ test("reader: keeps a live feed open; new events land at once, new listings get 
   reader.stop();
   const types = new Set(sockets.flatMap((s) => s.sent.map((f) => f[0])));
   assert.deepEqual([...types].sort(), ["CLOSE", "REQ"]);
+});
+
+test("the static period buttons match the windows the stats use", () => {
+  const html = readFileSync(new URL("../public/tokens.html", import.meta.url), "utf8");
+  const buttons = [...html.matchAll(/data-w="([^"]+)"[^>]*>([^<]+)</g)].map((m) => [m[1], m[2]]);
+  assert.deepEqual(buttons, WINDOWS.map((w) => [w.key, w.label]));
 });
