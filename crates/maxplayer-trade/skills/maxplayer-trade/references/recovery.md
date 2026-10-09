@@ -103,10 +103,12 @@ serve/recover/market commands; a post-POST timeout is still unresolved, not fail
 | `prepared` | Journaled, swap not yet sent. Recovery sends exactly the journaled swap. |
 | `submitted` | Swap may have reached the mint. Recovery restores (NUT-09) the same outputs and replays only the identical swap; never import the token again elsewhere. |
 | `done` | Terminal: DLEQ-verified proofs credited; check `balance`. |
-| `refused` | Terminal: the mint returned a NUT error and the inputs stayed UNSPENT. Nothing credited, not charged to the cap. |
-| `already_spent` | Terminal: inputs SPENT and none of our outputs restorable. Nothing credited, not charged. |
-| `quarantined` | Terminal manual recovery (exit 4): our outputs were signed but lack valid DLEQ; never credited. Preserve the home and escalate. |
+| `refused` | Terminal (exit 1): the mint returned a parsed NUT error (HTTP 400, JSON `code` + `detail`), a fresh restore found none of our outputs and the inputs stayed UNSPENT. Nothing credited, not charged to the cap. Any other 400 or transport refusal stays `submitted`. |
+| `already_spent` | Terminal (exit 1): inputs SPENT and none of our outputs restorable. Nothing credited, not charged. |
+| `quarantined` | Terminal manual recovery (exit 4): our outputs were signed but lack valid DLEQ; never credited, not spendable, but still occupies the cap. Preserve the home and escalate. |
 
+Cap: Funding intents plus charged receives (gross) share one 100,000-sat cap per mint per home; `refused`/`already_spent` receives do not count; `prepared`/`submitted`/`done`/`quarantined` ones do.
+Exits: 0 `done`, 1 `refused`/`already_spent`, 3 `prepared`/`submitted` (or a failed journal write), 4 `quarantined`.
 Inputs reported PENDING keep the attempt unresolved. A lost swap reply is never
 answered with replacement outputs.
 
