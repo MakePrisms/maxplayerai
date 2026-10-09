@@ -1167,6 +1167,8 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
 /// Params for the `collect` RPC.
 #[derive(Debug, Deserialize)]
 struct CollectParams {
+    #[serde(default)]
+    accept_review_verdict: Option<String>,
     job_id: String,
     #[serde(default)]
     out: Option<String>,
@@ -1213,7 +1215,14 @@ async fn settle_job(
     context: &BuyerContext,
     job_id: &str,
     out: Option<String>,
+    accept_review_verdict: Option<String>,
 ) -> Result<collect::CollectOutcome, SettleJobError> {
+    crate::review::validate_accept_review_verdict(accept_review_verdict.as_deref())
+    .map_err(|e| {
+        SettleJobError::Pay(collect::CollectError::Lifecycle(
+            job_lifecycle::JobLifecycleError::Input(e),
+        ))
+    })?;
     // Serialize with award + other collects: at most one wallet-melting op in flight daemon-wide.
     let _guard = context.money_lock.lock().await;
 
@@ -1232,9 +1241,11 @@ async fn settle_job(
     // in-closure accept produced, so the wire code and operator line are unchanged.
     let bind = match job_lifecycle::load_accepted_bind(&context.home, job_id) {
         Ok(Some(bind)) => bind,
-        Ok(None) => job_lifecycle::accept_for_collect_async(&context.home, job_id)
-            .await
-            .map_err(|error| SettleJobError::Pay(collect::CollectError::Lifecycle(error)))?,
+        Ok(None) => {
+            job_lifecycle::accept_for_collect_async(&context.home, job_id, accept_review_verdict.clone())
+                .await
+                .map_err(|error| SettleJobError::Pay(collect::CollectError::Lifecycle(error)))?
+        }
         Err(error) => return Err(SettleJobError::Pay(collect::CollectError::Lifecycle(error))),
     };
 
@@ -1249,6 +1260,7 @@ async fn settle_job(
         )
     };
     let request = CollectRequest {
+        accept_review_verdict,
         job_id: job_id.to_owned(),
         out,
     };
@@ -1380,10 +1392,23 @@ fn collect_pay_response(pay: &collect::CollectPayment) -> Value {
 async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
     let params: CollectParams = match serde_json::from_value(params) {
         Ok(params) => params,
-        Err(error) => return Response::err(id, CODE_METHOD_NOT_FOUND, format!("collect params: {error}")),
+        Err(error) => {
+            return Response::err(
+                id,
+                CODE_METHOD_NOT_FOUND,
+                format!("collect params: {error}"),
+            );
+        }
     };
 
-    match settle_job(context, &params.job_id, params.out).await {
+    match settle_job(
+        context,
+        &params.job_id,
+        params.out,
+        params.accept_review_verdict,
+    )
+    .await
+    {
         Ok(outcome) => Response::ok(
             id,
             json!({
@@ -2819,7 +2844,7 @@ async fn settle_awarded(context: &Arc<BuyerContext>, wake: Option<&nostr_sdk::Ev
                 Ok(None) => {}
             }
         }
-        match settle_job(context, &job_id, None).await {
+        match settle_job(context, &job_id, None, None).await {
             // `agent=` is the seller-claimed attribution off the settled result (#261);
             // "unreported" is honest absence, never a guess at what was requested. Rendered
             // through `log_safe_agent`: this is the one place seller-authored free text reaches
@@ -7342,5 +7367,21 @@ mod tests {
             "a PAID collect still reports the total, and reports the one the pay path returned"
         );
         assert_eq!(paid["amount_sats"], 21);
+    }
+}
+
+#[cfg(test)]
+mod review_verdict_params_tests {
+    use super::CollectParams;
+    #[test]
+    fn collect_params_optional_review_verdict() {
+        let plain: CollectParams =
+            serde_json::from_value(serde_json::json!({"job_id":"job"})).unwrap();
+        assert_eq!(plain.accept_review_verdict, None);
+        let explicit: CollectParams = serde_json::from_value(
+            serde_json::json!({"job_id":"job", "accept_review_verdict":"a".repeat(64)}),
+        )
+        .unwrap();
+        assert_eq!(explicit.accept_review_verdict, Some("a".repeat(64)));
     }
 }

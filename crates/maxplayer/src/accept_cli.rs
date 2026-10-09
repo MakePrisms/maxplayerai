@@ -12,6 +12,7 @@ const USAGE_ERROR: i32 = 1;
 const RUNTIME_ERROR: i32 = 2;
 
 struct Opts {
+    accept_review_verdict: Option<String>,
     job_id: String,
     claim_id: String,
     result_id: Option<String>,
@@ -22,6 +23,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
     let mut result_id = None;
     let mut home = None;
     let mut positional: Vec<String> = Vec::new();
+    let mut accept_review_verdict = None;
     let mut idx = 0;
     while idx < args.len() {
         match args[idx].as_str() {
@@ -29,9 +31,19 @@ fn parse(args: &[String]) -> Result<Opts, String> {
                 idx += 1;
                 result_id = Some(args.get(idx).ok_or("--result-id requires a value")?.clone());
             }
+            "--accept-review-verdict" => {
+                idx += 1;
+                let id = args
+                    .get(idx)
+                    .ok_or("--accept-review-verdict requires a value")?;
+                maxplayer_core::review::validate_accept_review_verdict(Some(id))?;
+                accept_review_verdict = Some(id.clone());
+            }
             "--home" => {
                 idx += 1;
-                home = Some(PathBuf::from(args.get(idx).ok_or("--home requires a value")?));
+                home = Some(PathBuf::from(
+                    args.get(idx).ok_or("--home requires a value")?,
+                ));
             }
             other if other.starts_with('-') => return Err(format!("unknown flag {other}")),
             other => positional.push(other.to_owned()),
@@ -43,6 +55,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         _ => return Err("accept requires <job_id> <claim_id>".into()),
     };
     Ok(Opts {
+        accept_review_verdict,
         job_id,
         claim_id,
         result_id,
@@ -54,7 +67,7 @@ fn usage(err: &mut dyn Write) {
     let _ = writeln!(
         err,
         "Usage:\n\
-         \x20 maxplayer accept <job_id> <claim_id> [--result-id <id>] [--home <path>]\n\
+         \x20 maxplayer accept <job_id> <claim_id> [--result-id <id>] [--accept-review-verdict <verdict-event-id>] [--home <path>]\n\
          \n\
          Records the local co-signed pay-bind for a delivered result. Optional; `maxplayer collect`\n\
          accepts the delivered claim itself when no bind exists. Never echoes the secret key.\n\
@@ -102,6 +115,7 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let outcome = match job_lifecycle::accept_claim(
         &home,
         AcceptClaimRequest {
+            accept_review_verdict: opts.accept_review_verdict,
             job_id: opts.job_id,
             claim_id: opts.claim_id,
             result_id: opts.result_id,
@@ -142,4 +156,25 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     }
     let _ = writeln!(err, "maxplayer accept requires the wallet feature");
     USAGE_ERROR
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn accept_review_verdict_flag_parsing() {
+        let args = ["job", "claim", "--accept-review-verdict", &"a".repeat(64)].map(String::from);
+        assert_eq!(
+            parse(&args).unwrap().accept_review_verdict,
+            Some("a".repeat(64))
+        );
+        let args = ["job", "claim"].map(String::from);
+        assert_eq!(parse(&args).unwrap().accept_review_verdict, None);
+        for value in ["no", "0.5", "-1", "1000001"] {
+            let args = ["job", "claim", "--accept-review-verdict", value].map(String::from);
+            assert!(parse(&args).err().unwrap().contains("64 lowercase hex"));
+        }
+        let args = ["job", "claim", "--accept-review-verdict"].map(String::from);
+        assert!(parse(&args).err().unwrap().contains("requires a value"));
+    }
 }

@@ -407,7 +407,9 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert_eq!(
             review.decision(&subject(), 500_000).unwrap(),
-            Decision::Refused
+            Decision::Refused {
+                unsafe_ppm: 900_000
+            }
         );
         assert_eq!(review.input_sha256, plan.digest);
     }

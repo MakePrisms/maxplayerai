@@ -139,6 +139,7 @@ async fn scenario(targeted: bool, delivery: bool, provider_failure: bool) {
             &subject,
             &key(2).public_key().to_hex(),
             Some(&evidence),
+            None,
         )
         .await
     } else {

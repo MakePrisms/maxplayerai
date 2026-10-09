@@ -50,6 +50,7 @@ use crate::job_lifecycle::{self, AcceptedBind, JobLifecycleError};
 /// Inputs for [`collect_async`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CollectRequest {
+    pub accept_review_verdict: Option<String>,
     /// Offer event id (hex). A prior accept_claim bind is used when present; otherwise collect
     /// accepts the delivered claim itself.
     pub job_id: String,
@@ -156,6 +157,8 @@ pub async fn collect_async(
     gate: Option<&mut BudgetGate>,
     request: CollectRequest,
 ) -> Result<CollectOutcome, CollectError> {
+    crate::review::validate_accept_review_verdict(request.accept_review_verdict.as_deref())
+    .map_err(|e| CollectError::Lifecycle(job_lifecycle::JobLifecycleError::Input(e)))?;
     // 1. Load the buyer's accept-bind — the delivered commit + pay terms it recorded at accept.
     // Never caller input, so collect always settles the accepted, tip-matched delivery. When no bind
     // exists yet, run the accept step ITSELF (fetch the delivered result, record the co-signed
@@ -165,9 +168,13 @@ pub async fn collect_async(
         .map_err(CollectError::Lifecycle)?
     {
         Some(bind) => bind,
-        None => job_lifecycle::accept_for_collect_async(home, &request.job_id)
-            .await
-            .map_err(CollectError::Lifecycle)?,
+        None => job_lifecycle::accept_for_collect_async(
+            home,
+            &request.job_id,
+            request.accept_review_verdict,
+        )
+        .await
+        .map_err(CollectError::Lifecycle)?,
     };
 
     // Resolve + validate the destination BEFORE spending, so a bad `out` name never pays then fails.
@@ -616,6 +623,7 @@ mod tests {
             &home,
             Some(&mut gate),
             CollectRequest {
+                accept_review_verdict: None,
                 job_id: "a".repeat(64),
                 out: None,
             },
@@ -785,6 +793,7 @@ mod tests {
             &home,
             Some(&mut gate),
             CollectRequest {
+                accept_review_verdict: None,
                 job_id: bind.job_id.clone(),
                 out: None,
             },
@@ -910,6 +919,7 @@ mod tests {
             &home,
             Some(&mut gate),
             CollectRequest {
+                accept_review_verdict: None,
                 job_id: offer_id.clone(),
                 out: None,
             },

@@ -341,7 +341,8 @@ fn tools() -> Value {
                 "type": "object",
                 "properties": {
                     "job_id": { "type": "string", "description": "Offer event id (hex)" },
-                    "out": { "type": "string", "description": "Optional folder NAME (no path separators) under <home>/results" }
+                    "out": { "type": "string", "description": "Optional folder NAME (no path separators) under <home>/results" },
+                    "accept_review_verdict": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Explicit buyer decision: I have seen this exact signed verdict and accept this delivery anyway. Pass the verdict event id from the refusal. Recorded only for this exact result; a different verdict or re-delivery fails closed. Never rewrites config or affects other jobs; an operator decision, not a retry." }
                 },
                 "required": ["job_id"],
                 "additionalProperties": false
@@ -911,6 +912,28 @@ mod tests {
             .map(|tool| tool["name"].as_str().expect("name"))
             .collect();
         assert_eq!(names, vec!["post_job", "get_job", "collect", "award_claim"]);
+    }
+
+    #[test]
+    fn collect_review_verdict_schema_is_hex_and_optional() {
+        let tools = tools();
+        let collect = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "collect")
+            .unwrap();
+        let schema = &collect["inputSchema"];
+        let threshold = &schema["properties"]["accept_review_verdict"];
+        assert_eq!(threshold["type"], "string");
+        assert_eq!(threshold["pattern"], "^[0-9a-f]{64}$");
+        assert_eq!(schema["required"], json!(["job_id"]));
+        assert!(
+            threshold["description"]
+                .as_str()
+                .unwrap()
+                .contains("operator decision, not a retry")
+        );
     }
 
     #[test]

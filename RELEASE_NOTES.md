@@ -1,3 +1,14 @@
+## Unreleased
+
+- Buyer execution-safety refusals surface the unsafe probability, local threshold,
+  and signed verdict event id, with deterministic-refusal guidance distinct from
+  retryable reviewer timeouts (#1122).
+
+- Collect/accept support an explicit verdict-bound `accept_review_verdict` decision:
+  accept the exact signed verdict by event id, recorded with its unsafe probability
+  and configured threshold for later get_job reads. No policy or other jobs change;
+  a different verdict or re-delivery fails closed. CLI: `--accept-review-verdict`.
+
 ## v0.6.1-rc8
 
 Eighth release candidate for 0.6.1, including seller claim filtering (#1113),
