@@ -153,6 +153,7 @@ pub async fn fund(home: &Path, j: &Journal, url: &str, amount: u64) -> Result<Fu
         amount > 0 && amount <= crate::real_money::CAP,
         "funding cap exceeded"
     );
+    let received = crate::receive::charged(j, url).await?;
     let total = j
         .all::<Funding>("funding")
         .await?
@@ -161,14 +162,20 @@ pub async fn fund(home: &Path, j: &Journal, url: &str, amount: u64) -> Result<Fu
         .try_fold(0u64, |s, f| {
             s.checked_add(f.amount).context("funding overflow")
         })?
-        .checked_add(crate::receive::charged(j, url).await?)
+        .checked_add(received)
         .context("funding overflow")?;
-    ensure!(
-        total
-            .checked_add(amount)
-            .is_some_and(|n| n <= crate::real_money::CAP),
-        "cumulative funding exceeds 100,000 sats"
-    );
+    if !total
+        .checked_add(amount)
+        .is_some_and(|n| n <= crate::real_money::CAP)
+    {
+        if received > 0 {
+            anyhow::bail!(
+                "cumulative funding and receives exceed 100,000 sats for this mint \
+                 ({received} sats held by receives, gross, including unresolved or quarantined)"
+            );
+        }
+        anyhow::bail!("cumulative funding exceeds 100,000 sats");
+    }
     crate::wallet::preflight_for(url, Some("fund")).await?;
     let mut f = Funding {
         id: uuid::Uuid::new_v4().to_string(),

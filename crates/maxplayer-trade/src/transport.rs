@@ -218,14 +218,24 @@ async fn nostr_call(
     tokio::time::timeout(NOSTR_OUTER, c.call_raw(operation, body))
         .await
         .map_err(|_| anyhow!("mint {mint} {path}: no answer within the nostr bound (ambiguous)"))?
-        .map_err(|e| {
-            if nostr_nut_refusal(&e) {
-                // Same wording as an HTTP NUT refusal, so `receive` treats both transports alike.
-                anyhow!("mint {mint} {path}: HTTP 400 Bad Request (mint NUT error, body withheld)")
-            } else {
-                anyhow!("mint {mint} {path}: {e} (no mint NUT error; ambiguous)")
-            }
+        .map_err(|e| match nostr_refusal(e) {
+            // The typed refusal, exactly as an HTTP NUT error body yields; never "HTTP 400" text.
+            Ok(refusal) => anyhow::Error::new(refusal).context(format!("mint {mint} {path}")),
+            Err(e) => anyhow!("mint {mint} {path}: {e} (no mint NUT error; ambiguous)"),
         })
+}
+
+/// A [`crate::mint::MintRefusal`] for the mint's own definitive NUT error over nostr, else the
+/// error back unchanged (ambiguous). See [`nostr_nut_refusal`].
+fn nostr_refusal(e: cdk::Error) -> std::result::Result<crate::mint::MintRefusal, cdk::Error> {
+    if !nostr_nut_refusal(&e) {
+        return Err(e);
+    }
+    let r = cdk::error::ErrorResponse::from(e);
+    Ok(crate::mint::MintRefusal::new(
+        u64::from(r.code.to_code()),
+        &r.detail,
+    ))
 }
 
 /// Whether a nostr mint call failed with the mint's OWN NUT error (numeric wire `code`, mapped by
@@ -270,6 +280,11 @@ pub async fn post<T: DeserializeOwned>(
         .await?;
     let status = r.status();
     let text = r.text().await?;
+    if let Some(refusal) = crate::mint::MintRefusal::parse(status.as_u16(), &text) {
+        return Err(
+            anyhow::Error::new(refusal).context(format!("mint {mint} {path}: HTTP {status}"))
+        );
+    }
     ensure!(
         status.is_success(),
         "mint {mint} {path}: HTTP {status} (body withheld)"
@@ -460,6 +475,15 @@ mod tests {
             })
         };
         assert!(nostr_nut_refusal(&nut(11001)), "token already spent");
+        assert_eq!(
+            nostr_refusal(nut(11001)).map(|r| r.code).ok(),
+            Some(11001),
+            "typed refusal carries the mint's NUT code"
+        );
+        assert!(
+            nostr_refusal(named(code::EXPIRED)).is_err(),
+            "SAFETY: expired never typed"
+        );
         assert!(nostr_nut_refusal(&nut(11005)), "transaction unbalanced");
         assert!(
             !nostr_nut_refusal(&nut(11002)),

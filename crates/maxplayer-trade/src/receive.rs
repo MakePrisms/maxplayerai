@@ -363,16 +363,33 @@ async fn restore(r: &Receipt) -> Result<Option<Vec<BlindSignature>>> {
         .map(Some)
 }
 
-/// A well-formed NUT error (HTTP 400) is a refusal of THIS request; transport errors,
-/// timeouts, 429 and 5xx are ambiguous. `mint::rpc` withholds the body.
-fn nut_error(e: &anyhow::Error) -> bool {
-    e.chain()
-        .all(|c| c.downcast_ref::<reqwest::Error>().is_none())
-        && e.to_string().contains(" swap: HTTP 400 ")
+/// Definitive refusal of THIS request: only a parsed Cashu NUT error
+/// ([`mint::MintRefusal`]). Any other 400 (unparsable body, no numeric code), every
+/// transport-level refusal, timeout, 429 and 5xx is ambiguous and keeps the attempt.
+pub(crate) fn nut_error(e: &anyhow::Error) -> bool {
+    mint::MintRefusal::of(e).is_some()
 }
 
+/// Persist `state` FIRST; only then let the caller-visible record change. A failed
+/// journal write returns the error and leaves `r` at its previous (journaled) state.
 async fn finish(j: &Journal, r: &mut Receipt, state: ReceiveState) -> Result<()> {
-    r.state = state;
+    let mut next = r.clone();
+    next.state = state;
+    persist(j, &next).await?;
+    *r = next;
+    Ok(())
+}
+
+async fn persist(j: &Journal, r: &Receipt) -> Result<()> {
+    #[cfg(feature = "lab")]
+    if r.terminal()
+        && std::env::var("TRADE_FAIL_RECEIVE_TERMINAL_WRITE")
+            .ok()
+            .as_deref()
+            == Some("1")
+    {
+        anyhow::bail!("lab fault: receive journal write failed");
+    }
     j.put("receive", &r.id, r).await
 }
 
@@ -465,9 +482,11 @@ pub async fn resume(home: &Path, j: &Journal, r: &mut Receipt) -> Result<()> {
             r.outputs.iter().map(|o| o.secret.clone()).collect(),
             &keys,
         )?;
-        r.result = Some(proofs);
-        r.state = ReceiveState::Submitted;
-        j.put("receive", &r.id, r).await?;
+        let mut next = r.clone();
+        next.result = Some(proofs);
+        next.state = ReceiveState::Submitted;
+        persist(j, &next).await?;
+        *r = next;
         #[cfg(feature = "lab")]
         if std::env::var("TRADE_CRASH_AFTER_RECEIVE_SWAP")
             .ok()
@@ -616,6 +635,16 @@ mod tests {
         assert!(
             inspect(mint, &token(vec![proof(locked)])).is_err(),
             "SAFETY: P2PK refused"
+        );
+        let htlc: Secret = cashu::nuts::nut10::Secret::from(
+            SpendingConditions::new_htlc_hash(&"ab".repeat(32), None).unwrap(),
+        )
+        .try_into()
+        .unwrap();
+        assert!(
+            inspect(mint, &token(vec![proof(htlc)]))
+                .is_err_and(|e| e.to_string().contains("locked")),
+            "SAFETY: HTLC refused"
         );
         let s = Secret::generate();
         let dup = inspect(mint, &token(vec![proof(s.clone()), proof(s)]));

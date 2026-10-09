@@ -58,11 +58,11 @@ Never use a lab-feature binary for the human's funds.
   admission claims use the pinned quote fee, not the receiver’s outgoing budget. Refund/recovery may
   incur mint fees; disclose this rather than promising a fully refunded balance.
 - No platform/trade fee. Do not equate no platform fee with no mint/Lightning fees.
-- Hard cap: 100,000 sats gross per lock; 100,000 cumulative funding per mint per home.
+- Hard cap: 100,000 sats gross per lock. Funding intents plus charged receives (gross) share one 100,000-sat cap per mint per home; `refused`/`already_spent` receives do not count; `prepared`/`submitted`/`done`/`quarantined` ones do.
   Each withdrawal invoice is also capped at 100,000 sats (millisatoshis rounded up
   to sats). Funding counts all retained intents, including pending ones.
   None of these limits is permission to spend that amount. Never split operations or rotate homes
-  to bypass limits. Withdrawing does not reset cumulative funding authority.
+  to bypass limits. Withdrawing does not reset this cumulative cap.
 
 Example: a lot gives 32 A for 24 B. If the human approves **at most 27 B total**,
 **at least 32 A net**, and **3 B fee sats**, use `take <lot> --max-give 27
@@ -102,17 +102,19 @@ Cashu token. Refused **before anything is journaled**: a token whose mint is not
 exactly `<mint>` after canonicalization, multi-mint tokens, non-sat units, P2PK/HTLC
 or other NUT-10 locked proofs, more than 128 or duplicate proofs, an invalid incoming
 DLEQ (when present), a token above **100,000 sats**, or one that would push this
-mint's cumulative funding + receives past **100,000 sats** (receives and `fund`
-share that lifetime cap; definitively refused/already-spent receives are not
-charged). Common preflight runs, then NUT-07 must report every proof UNSPENT.
+mint past the shared cap. Funding intents plus charged receives (gross) share one 100,000-sat cap per mint per home; `refused`/`already_spent` receives do not count; `prepared`/`submitted`/`done`/`quarantined` ones do. A quarantined receive is not spendable but
+still occupies the cap. Common preflight runs, then NUT-07 must report every proof UNSPENT.
 
 One swap into fresh home-owned outputs; token, inputs, outputs and secrets are
 journaled before the POST. The mint input fee is deducted: `net = amount - fee`.
 Only DLEQ-verified result proofs are credited. Output is one JSON line with
 `receive` (attempt id), `mint`, `state`, `amount`, `fee`, `net`, `credited`; never
 the token or proofs. Repeating the same token (any encoding) resumes the same
-attempt and never swaps twice. Exit 0 `done`; 3 unresolved (`prepared`/`submitted`);
-1 pre-journal refusal, `refused` or `already_spent`; 4 `quarantined`.
+attempt and never swaps twice. Exit 0 `done`; 3 unresolved (`prepared`/`submitted`,
+or the state could not be journaled); 1 pre-journal refusal, `refused` or
+`already_spent`; 4 `quarantined`. Only a parsed mint NUT error (HTTP 400 with JSON
+`code` and `detail`) yields `refused`; any other 400 or transport refusal stays
+`submitted` (exit 3) and the identical swap is replayed.
 
 ## Withdrawal: enforcement before execution
 

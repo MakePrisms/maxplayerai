@@ -55,7 +55,65 @@ pub const RPC_TIMEOUT_SECONDS: u64 = crate::transport::HTTP_RPC_TIMEOUT.as_secs(
 // `transport::abandon_grace_seconds`).
 pub const ABANDON_GRACE_SECONDS: u64 = 3 * RPC_TIMEOUT_SECONDS;
 
-/// One mint request through the transport dispatch (HTTP or `nostr://`). Signature unchanged.
+/// A definitive Cashu NUT error from the mint: HTTP 400 whose body is a JSON object
+/// with a numeric `code` and a string `detail` (NUT-00 error response). This is the
+/// ONLY error a caller may treat as "the mint processed and refused this request".
+///
+/// Everything else stays ambiguous: transport errors, timeouts, 429/5xx, a 400 whose
+/// body is not parseable or has no numeric code, and any transport-level refusal such
+/// as a Nostr connector's `expired`/`bad_request` ("not executed"). A transport must
+/// construct this type only for a real NUT error the mint itself returned.
+///
+/// `detail` is sanitized (printable ASCII, at most [`MintRefusal::MAX_DETAIL`] bytes);
+/// the raw body is never kept or logged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MintRefusal {
+    pub code: u64,
+    pub detail: String,
+}
+impl MintRefusal {
+    pub const MAX_DETAIL: usize = 120;
+    /// Build from a NUT error code and an untrusted detail string (sanitized here).
+    pub fn new(code: u64, detail: &str) -> Self {
+        let mut detail: String = detail
+            .chars()
+            .map(|c| {
+                if c.is_ascii_graphic() || c == ' ' {
+                    c
+                } else {
+                    '?'
+                }
+            })
+            .collect();
+        detail.truncate(Self::MAX_DETAIL);
+        Self { code, detail }
+    }
+    /// Parse an HTTP reply. `Some` only for status 400 with a NUT error body.
+    pub fn parse(status: u16, body: &str) -> Option<Self> {
+        if status != 400 {
+            return None;
+        }
+        let v: serde_json::Value = serde_json::from_str(body).ok()?;
+        Some(Self::new(
+            v.get("code")?.as_u64()?,
+            v.get("detail")?.as_str()?,
+        ))
+    }
+    /// The typed refusal anywhere in an error's chain, if any.
+    pub fn of(e: &anyhow::Error) -> Option<&Self> {
+        e.chain().find_map(|c| c.downcast_ref::<Self>())
+    }
+}
+impl std::fmt::Display for MintRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "mint NUT error {}: {}", self.code, self.detail)
+    }
+}
+impl std::error::Error for MintRefusal {}
+
+/// One mint request through the transport dispatch (HTTP or `nostr://`). A NUT error reply is
+/// returned as a [`MintRefusal`] in the error chain (built by `transport`); every other failure is
+/// an untyped (ambiguous) error.
 pub async fn rpc<T: serde::de::DeserializeOwned>(
     mint: &str,
     op: &str,
@@ -1043,4 +1101,39 @@ async fn owned_commit_evidence(a: &Attempt) -> Result<bool> {
         .states
         .iter()
         .all(|s| s.state == State::Spent))
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::MintRefusal;
+    #[test]
+    fn only_a_400_nut_error_body_is_a_refusal() {
+        let ok = MintRefusal::parse(400, r#"{"code":11001,"detail":"Token already spent"}"#);
+        assert_eq!(ok, Some(MintRefusal::new(11001, "Token already spent")));
+        for (status, body) in [
+            (400, "<html>bad request</html>"),
+            (400, r#"{"detail":"no code"}"#),
+            (400, r#"{"code":"11001","detail":"string code"}"#),
+            (400, r#"{"code":11001}"#),
+            (400, r#"{"error":"expired","detail":"x"}"#),
+            (400, ""),
+            (500, r#"{"code":11001,"detail":"x"}"#),
+            (429, r#"{"code":11001,"detail":"x"}"#),
+        ] {
+            assert_eq!(
+                MintRefusal::parse(status, body),
+                None,
+                "SAFETY: {status} {body}"
+            );
+        }
+    }
+    #[test]
+    fn detail_is_bounded_and_sanitized() {
+        let r = MintRefusal::new(1, &format!("a\nb\u{1b}[31m{}", "x".repeat(500)));
+        assert!(r.detail.len() <= MintRefusal::MAX_DETAIL);
+        assert!(r.detail.chars().all(|c| c.is_ascii_graphic() || c == ' '));
+        let e = anyhow::Error::new(r.clone()).context("outer");
+        assert_eq!(MintRefusal::of(&e), Some(&r));
+        assert!(MintRefusal::of(&anyhow::anyhow!("mint x swap: HTTP 400 Bad Request")).is_none());
+    }
 }

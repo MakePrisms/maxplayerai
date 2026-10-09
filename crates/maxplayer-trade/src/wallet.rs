@@ -199,6 +199,11 @@ pub fn read_status(home: &std::path::Path) -> Result<serde_json::Value> {
         let v: serde_json::Value = serde_json::from_slice(&bytes)?;
         let public = if kind == "withdrawal" {
             serde_json::from_slice::<crate::money::Withdrawal>(&bytes)?.summary()
+        } else if kind == "receive" {
+            // Same public view as `recover`; the token is never part of it.
+            let mut s = serde_json::from_slice::<crate::receive::Receipt>(&bytes)?.summary();
+            s["kind"] = kind.clone().into();
+            s
         } else {
             serde_json::json!({"kind":kind,"id":v["id"],"state":v["state"],"done":v["done"],"expired_unpaid":v["expired_unpaid"]})
         };

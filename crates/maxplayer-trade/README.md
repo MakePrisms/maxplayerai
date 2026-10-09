@@ -663,13 +663,17 @@ never argv) imports one token, e.g. one written by `maxplayer-mint issue`. Code:
 
 - Refused before any journal write: token mint not exactly `<mint>` after canonicalization,
   multi-mint, non-sat, NUT-10 locked (P2PK/HTLC), > 128 or duplicate proofs, invalid incoming
-  DLEQ (when present), > 100,000 sats, or cumulative funding + receives for that mint above
-  100,000 sats. Common preflight and NUT-07 UNSPENT are required before the journal write.
+  DLEQ (when present), > 100,000 sats, or a receive that would exceed the shared cap below. Common preflight and NUT-07 UNSPENT are required before the journal write.
 - One swap into fresh home-owned outputs; token, inputs, blinded outputs and secrets are
   journaled before the POST. Ambiguity → NUT-09 restore of the same outputs and identical
   replay only. A NUT error with inputs UNSPENT is terminal `refused`; SPENT inputs with nothing
   of ours restorable is terminal `already_spent`. Only DLEQ-verified proofs are credited;
   missing/invalid DLEQ on our outputs is terminal `quarantined` (exit 4).
+- Cap: Funding intents plus charged receives (gross) share one 100,000-sat cap per mint per home; `refused`/`already_spent` receives do not count; `prepared`/`submitted`/`done`/`quarantined` ones do. A quarantined receive is not spendable but still occupies the cap.
+- Exits: 0 `done`; 1 pre-journal refusal, `refused` or `already_spent`; 3 unresolved
+  (`prepared`/`submitted`, or a journal write failed); 4 `quarantined`.
+- Only a parsed NUT error (HTTP 400, JSON `code` + `detail`; `mint::MintRefusal`) can make a
+  receive `refused`; any other 400 or transport refusal stays `submitted` and replays.
 - Idempotent per Y-set (sha256 of the sorted proof Ys): repeats resume the existing attempt.
 - The mint input fee is deducted; output reports `amount`, `fee`, `net`, `credited`, state and
   attempt id only. `recover`/`serve` resume receives under the same 120 s item budget.
@@ -683,7 +687,7 @@ This path is **not a production safety certification**. Public-mint results, if 
 its separate run report; the historical test counts above predate this change.
 
 - Each lock gross is capped at **100,000 sats**, at both planning and submission.
-- Funding on every mint is capped at **100,000 sats cumulatively per mint per home**. The journal charges
+- Funding on every mint is capped at **100,000 sats cumulatively per mint per home**: Funding intents plus charged receives (gross) share one 100,000-sat cap per mint per home; `refused`/`already_spent` receives do not count; `prepared`/`submitted`/`done`/`quarantined` ones do. The journal charges
   an intent before creating the mint quote; pending, failed, issued and lost-reply intents
   stay charged across restarts. A lost quote response is deliberately not auto-replaced.
 - `fund` locks the quote to a private NUT-20 key and requires the mint to echo that
