@@ -135,6 +135,7 @@ mod tests {
             task: "task".to_owned(),
             deadline_unix: 9_999,
             targeted: true,
+            capability_request: Some(Default::default()),
             requested_agent: None,
             output: Some("text/plain".to_owned()),
             accepts_delivery: Vec::new(),
