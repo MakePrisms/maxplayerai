@@ -47,6 +47,8 @@ static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 struct Seen {
     op: String,
     exp: u64,
+    /// `exp - created_at`: the connector window this request was published with.
+    window: u64,
     count: u32,
 }
 #[derive(Debug, Default)]
@@ -86,6 +88,7 @@ impl Tap {
                             .or_insert(Seen {
                                 op: r.op,
                                 exp: r.exp,
+                                window: r.exp.saturating_sub(event.created_at.as_secs()),
                                 count: 0,
                             })
                             .count += 1;
@@ -522,8 +525,14 @@ async fn nostr_nostr_trade_completes_through_lost_swap_replies() {
         "SAFETY: no sat created or lost on either nostr mint: {held:?} ({maker}/{taker})"
     );
     let swaps = e.tap.swaps();
+    // A lost reply is recovered by re-sending the IDENTICAL event (count >= 2). The only
+    // exception: a deadline-clamped window shorter than one re-send interval (lab deadlines),
+    // where the call ends ambiguous and recovery restores instead of publishing anything new.
+    let resend = maxplayer_core::nostr_mint::DEFAULT_RESEND_EVERY.as_secs();
     assert!(
-        swaps.iter().all(|s| s.count >= 2),
+        swaps
+            .iter()
+            .all(|s| s.count >= 2 || (lab && s.window <= resend)),
         "SAFETY: each lost reply was recovered by re-sending the IDENTICAL event: {swaps:?}"
     );
     if (maker.as_str(), taker.as_str()) == ("complete", "complete") {
