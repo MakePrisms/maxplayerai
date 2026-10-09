@@ -6,7 +6,10 @@ use nostr_sdk::prelude::*;
 use serde_json::{Value, json};
 use std::{
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 use tokio::{net::TcpListener, task::JoinHandle};
@@ -19,6 +22,8 @@ struct RelayFixture {
     task: JoinHandle<()>,
     stop: tokio::sync::watch::Sender<bool>,
     reqs: Arc<Mutex<Vec<bool>>>,
+    reject_writes: Arc<AtomicBool>,
+    writes: Arc<AtomicUsize>,
 }
 impl RelayFixture {
     async fn new() -> Self {
@@ -31,6 +36,10 @@ impl RelayFixture {
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let backend_url = backend.url().await.to_string();
         let (stop, rx) = tokio::sync::watch::channel(false);
+        let reject_writes = Arc::new(AtomicBool::new(false));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let rejects = reject_writes.clone();
+        let published = writes.clone();
         let recorded = reqs.clone();
         let public_url = url.clone();
         let task = tokio::spawn(async move {
@@ -38,13 +47,15 @@ impl RelayFixture {
                 let (socket, _) = listener.accept().await.unwrap();
                 let backend_url = backend_url.clone();
                 let reqs = recorded.clone();
+                let reject_writes = rejects.clone();
+                let writes = published.clone();
                 let mut rx = rx.clone();
                 let url = public_url.clone();
                 tokio::spawn(async move {
                     let mut front = tokio_tungstenite::accept_async(socket).await.unwrap();
                     let (mut back, _) =
                         tokio_tungstenite::connect_async(backend_url).await.unwrap();
-                    let challenge = "chat-fixture-challenge";
+                    let mut challenge = "chat-fixture-challenge";
                     front
                         .send(json!(["AUTH", challenge]).to_string().into())
                         .await
@@ -58,6 +69,15 @@ impl RelayFixture {
                                     authenticated=event.verify().is_ok() && event.kind==Kind::Authentication && event.tags.iter().any(|t|t.as_slice()==["challenge",challenge]) && event.tags.iter().any(|t|t.as_slice()==["relay",url.as_str()]);
                                     front.send(json!(["OK",event.id.to_hex(),authenticated,""]).to_string().into()).await.unwrap();
                                 }else{if v[0]=="REQ"{reqs.lock().unwrap().push(authenticated);if !authenticated{front.send(json!(["CLOSED",v[1],"restricted: auth first"]).to_string().into()).await.unwrap();continue;}}
+                                    if v[0]=="EVENT" {
+                                        writes.fetch_add(1,Ordering::SeqCst);
+                                        if reject_writes.load(Ordering::SeqCst) {
+                                            front.send(json!(["OK",v[1]["id"],false,"auth-required: test refusal"]).to_string().into()).await.unwrap();
+                                            challenge="chat-fixture-rechallenge";
+                                            let _=front.send(json!(["AUTH",challenge]).to_string().into()).await;
+                                            continue;
+                                        }
+                                    }
                                     if back.send(frame).await.is_err(){break}
                                 }
                             },
@@ -73,6 +93,8 @@ impl RelayFixture {
             task,
             stop,
             reqs,
+            reject_writes,
+            writes,
         }
     }
     async fn restart(self) -> Self {
@@ -312,6 +334,22 @@ async fn a5_cap() {
             .contains("50")
     );
     h.send(&relay.url, "other", "unaffected").await.unwrap();
+    assert_eq!(h.entries().unwrap().len(), 51);
+    relay.reject_writes.store(true, Ordering::SeqCst);
+    let before = relay.writes.load(Ordering::SeqCst);
+    let failure = tokio::time::timeout(
+        Duration::from_secs(5),
+        h.send(&relay.url, "other", "refused once"),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(failure.to_string().contains("auth-required: test refusal"));
+    assert_eq!(
+        relay.writes.load(Ordering::SeqCst),
+        before + 1,
+        "one EVENT, even on auth-required rejection"
+    );
     assert_eq!(h.entries().unwrap().len(), 51);
     h.reserve_send(&p, Timestamp::now().as_secs() + 86400)
         .unwrap();

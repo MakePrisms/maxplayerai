@@ -364,6 +364,9 @@ impl Home {
             client.shutdown().await;
             return Err(error);
         }
+        // SDK send_event retries auth-required rejections when auto-auth is enabled.
+        // The initial handshake is complete; this one-shot command must never replay.
+        client.automatic_authentication(false);
         let result = relay.send_event(&event).await;
         client.shutdown().await;
         let id = result
