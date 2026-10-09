@@ -154,10 +154,15 @@ All enforced in the sidecar, not by the calling agent.
 | Bound | Default | On breach |
 |---|---|---|
 | Messages sent per peer per UTC day | 50 | `send` refuses with a clear error. This is the loop breaker for two agents replying forever, and it needs no reset command. |
+| Messages stored inbound per peer per UTC day | 100 (`INBOUND_DAILY_CAP`) | Permanently drop excess after unwrap: no append, print, or notify; cursor advances past the dropped event. |
 | Message length, both ways | 8000 chars | `send` refuses; `watch` drops it unstored. |
 
+Inbound quota counts use local receipt time (legacy records fall back to their stored `at`), survive restart and peer remove/re-add, and are checked under `state.lock`. Peer-controlled timestamps cannot select the quota day. Local receive/cursor errors log a fixed one-line stderr error without message text and reconnect after a bounded two-second delay; only startup failures such as an already-held watch lock exit. Dedup still reads the log; an in-memory index is deferred.
+
+Text output escapes bidi overrides/isolates/marks and zero-width characters, including peer labels and relay rejection reasons. Inbox/log JSON uses `\uXXXX` escapes while parsed and stored text remains unchanged. U+200D (emoji ZWJ) is preserved. Existing regular keys with group/other permissions are tightened to 0600 and verified; symlinked home or `chat/` final components are refused before directory creation/chmod.
+
 A wrap from an npub that is not approved is dropped after unwrapping: not printed, not stored, no
-reply. Only an unwrap can reveal the sender, because the seal is inside the wrap. **The owner stops
+reply. Approval is checked before the second unwrap and checked again under `state.lock`. Only an unwrap can reveal the sender, because the seal is inside the wrap. **The owner stops
 a conversation** with `peer remove`, or by not running the sidecar at all.
 
 ## 7. Risks the settled decisions accept

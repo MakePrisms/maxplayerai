@@ -27,9 +27,18 @@ struct RelayFixture {
 }
 impl RelayFixture {
     async fn new() -> Self {
-        let backend = LocalRelay::new(RelayBuilder::default().auth_dm(false));
-        backend.run().await.unwrap();
-        Self::start(backend, 0, Arc::default()).await
+        // The SDK probes a free port and then binds it separately. Retry only that
+        // allocation race, with a fresh relay/address and a bounded attempt count.
+        for attempt in 0..8 {
+            let backend = LocalRelay::new(RelayBuilder::default().auth_dm(false));
+            match backend.run().await {
+                Ok(()) => return Self::start(backend, 0, Arc::default()).await,
+                Err(nostr_relay_builder::Error::IO(e))
+                    if e.kind() == std::io::ErrorKind::AddrInUse && attempt < 7 => {}
+                Err(e) => panic!("local relay startup failed: {e}"),
+            }
+        }
+        unreachable!()
     }
     async fn start(backend: LocalRelay, port: u16, reqs: Arc<Mutex<Vec<bool>>>) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
@@ -72,7 +81,7 @@ impl RelayFixture {
                                     if v[0]=="EVENT" {
                                         writes.fetch_add(1,Ordering::SeqCst);
                                         if reject_writes.load(Ordering::SeqCst) {
-                                            front.send(json!(["OK",v[1]["id"],false,"auth-required: test refusal"]).to_string().into()).await.unwrap();
+                                            front.send(json!(["OK",v[1]["id"],false,"auth-required: test refusal\u{202e}\u{200b}"]).to_string().into()).await.unwrap();
                                             challenge="chat-fixture-rechallenge";
                                             let _=front.send(json!(["AUTH",challenge]).to_string().into()).await;
                                             continue;
@@ -834,4 +843,215 @@ fn advisor_bad_argv_creates_no_home() {
         assert!(!cli(&root, &args).status.success());
         assert!(!root.exists(), "invalid argv initialized a home");
     }
+}
+
+#[tokio::test]
+async fn security_inbound_cap_is_per_peer_and_advances_cursor() {
+    let (_d, h) = home();
+    let sender = Keys::generate();
+    let other = Keys::generate();
+    h.add_peer(&sender.public_key().to_hex(), "sender").unwrap();
+    h.add_peer(&other.public_key().to_hex(), "other").unwrap();
+    for i in 0..maxplayer_chat::INBOUND_DAILY_CAP {
+        // Old outer timestamps must still consume today's local receipt quota.
+        let event = manual_rumor(&sender, h.keys.public_key(), false, i as u64 + 1, 1).await;
+        assert!(h.receive(&event).await.unwrap().is_some());
+    }
+    // Reopening and remove/re-add must not reset the local receipt-day count.
+    h.remove_peer("sender").unwrap();
+    h.add_peer(&sender.public_key().to_hex(), "sender").unwrap();
+    let h = Home::open(&h.root).unwrap();
+    std::fs::write(h.root.join("chat/cursor"), "0").unwrap();
+    let event = manual_rumor(&sender, h.keys.public_key(), false, 10001, 1).await;
+    let dropped_id = UnwrappedGift::from_gift_wrap(&h.keys, &event)
+        .await
+        .unwrap()
+        .rumor
+        .id
+        .unwrap()
+        .to_hex();
+    assert!(
+        h.receive(&event).await.unwrap().is_none(),
+        "cap+1 must be dropped"
+    );
+    assert_eq!(h.cursor().unwrap(), 1, "quota drop must advance cursor");
+    assert!(
+        injected(&h, &other, envelope("other peer unaffected").unwrap())
+            .await
+            .is_some()
+    );
+    let entries = h.entries().unwrap();
+    assert_eq!(entries.len(), maxplayer_chat::INBOUND_DAILY_CAP + 1);
+    assert!(!entries.iter().any(|e| e.rumor_id == dropped_id));
+}
+
+#[tokio::test]
+async fn security_watch_recovers_from_append_failure() {
+    use std::os::unix::fs::symlink;
+    let relay = RelayFixture::new().await;
+    let (_a, a) = home();
+    let (_b, b) = home();
+    approve(&a, &b, "B");
+    approve(&b, &a, "A");
+    let wb = watcher(&b, &relay.url, vec![]);
+    a.send(&relay.url, "B", "initial").await.unwrap();
+    wait_entries(&b, 1).await;
+    let log = b.root.join("chat/log.jsonl");
+    let saved = b.root.join("chat/saved-log");
+    std::fs::rename(&log, &saved).unwrap();
+    symlink(&saved, &log).unwrap(); // Read succeeds; O_NOFOLLOW append fails, even as root.
+    let reqs = relay.reqs.lock().unwrap().len();
+    a.send(&relay.url, "B", "failed append").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            assert!(!wb.is_finished(), "append failure ended watch");
+            if relay.reqs.lock().unwrap().len() > reqs {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("watch must reconnect after append failure");
+    assert_eq!(b.entries().unwrap().len(), 1);
+    std::fs::remove_file(&log).unwrap();
+    std::fs::rename(&saved, &log).unwrap();
+    a.send(&relay.url, "B", "later valid").await.unwrap();
+    wait_entries(&b, 2).await;
+    tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            assert!(!wb.is_finished());
+            if b.entries().unwrap().iter().any(|e| e.text == "later valid") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        b.entries()
+            .unwrap()
+            .iter()
+            .filter(|e| e.text == "later valid")
+            .count(),
+        1
+    );
+    wb.abort();
+}
+
+const VISUAL_TEXT: &str = "hello\u{202e}\u{200b}\u{200d}world";
+
+#[tokio::test]
+async fn security_text_and_labels_escape_visual_formats() {
+    let (_d, h) = home();
+    let sender = Keys::generate();
+    h.add_peer(&sender.public_key().to_hex(), "p\u{202e}\u{200b}")
+        .unwrap();
+    injected(&h, &sender, envelope(VISUAL_TEXT).unwrap()).await;
+    for args in [
+        vec!["inbox"],
+        vec!["log", &sender.public_key().to_hex()],
+        vec!["peer", "list"],
+    ] {
+        let output = cli(&h.root, &args);
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        assert!(!text.contains(['\u{202e}', '\u{200b}']));
+        assert!(text.contains("\\u{202e}") && text.contains("\\u{200b}"));
+        if args[0] != "peer" {
+            assert!(text.contains('\u{200d}'));
+        }
+    }
+    for c in [
+        '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}',
+        '\u{2068}', '\u{2069}', '\u{200e}', '\u{200f}', '\u{061c}', '\u{200b}', '\u{200c}',
+        '\u{feff}', '\u{2060}',
+    ] {
+        assert_eq!(
+            maxplayer_chat::display_text(&c.to_string()),
+            c.escape_default().to_string()
+        );
+    }
+}
+
+#[tokio::test]
+async fn security_json_escapes_preserve_original_text() {
+    let (_d, h) = home();
+    let sender = Keys::generate();
+    h.add_peer(&sender.public_key().to_hex(), "p\u{202e}")
+        .unwrap();
+    injected(&h, &sender, envelope(VISUAL_TEXT).unwrap()).await;
+    for args in [vec!["inbox", "--json"], vec!["log", "p\u{202e}", "--json"]] {
+        let output = cli(&h.root, &args);
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        assert!(!text.contains(['\u{202e}', '\u{200b}']));
+        assert!(text.contains("\\u202e") && text.contains("\\u200b"));
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["untrusted"], true);
+        assert_eq!(value["text"], VISUAL_TEXT);
+    }
+    assert_eq!(h.entries().unwrap()[0].text, VISUAL_TEXT);
+}
+
+#[test]
+fn security_whoami_tightens_existing_key() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_d, h) = home();
+    let key = h.root.join("key");
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(cli(&h.root, &["whoami"]).status.success());
+    assert_eq!(
+        std::fs::metadata(key).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn security_symlink_directories_are_refused_before_mutation() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    for chat in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let root = dir.path().join("home");
+        if chat {
+            std::fs::create_dir(&root).unwrap();
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+            symlink(&target, root.join("chat")).unwrap();
+        } else {
+            symlink(&target, &root).unwrap();
+        }
+        assert!(Home::open(&root).is_err(), "symlink must be refused");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+        if chat {
+            assert_eq!(
+                std::fs::metadata(root).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn security_relay_rejection_is_display_safe() {
+    let relay = RelayFixture::new().await;
+    relay.reject_writes.store(true, Ordering::SeqCst);
+    let (_a, a) = home();
+    let (_b, b) = home();
+    approve(&a, &b, "B");
+    let output = async_cli(&a.root, &["--relay", &relay.url, "send", "B", "hello"]).await;
+    assert!(!output.status.success());
+    let text = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(text.lines().count(), 1);
+    assert!(!text.contains(['\u{202e}', '\u{200b}']));
+    assert!(text.contains("\\u{202e}") && text.contains("\\u{200b}"));
 }

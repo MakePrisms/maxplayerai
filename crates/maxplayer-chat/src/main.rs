@@ -75,7 +75,11 @@ async fn run() -> Result<()> {
         ["peer", "remove", peer] => home.remove_peer(peer)?,
         ["peer", "list"] => {
             for peer in home.peers()? {
-                println!("{} {}", peer.pubkey, peer.name)
+                println!(
+                    "{} {}",
+                    peer.pubkey,
+                    maxplayer_chat::display_text(&peer.name)
+                )
             }
         }
         ["inbox"] | ["inbox", "--json"] => {

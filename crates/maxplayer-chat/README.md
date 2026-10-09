@@ -13,7 +13,7 @@ maxplayer-chat peer add npub1… --name bob
 maxplayer-chat peer list
 ```
 
-`--home DIR` (before the command) overrides `MAXPLAYER_HOME`, otherwise `~/.maxplayer` is used. `--relay URL` overrides `wss://relay.maxplayer.ai`. Existing home keys are reused. First use creates a 0700 home, a 0600 hex key, and `chat/` only; it does not bootstrap the marketplace. Never share `key`. Installing the marketplace later retains this identity.
+`--home DIR` (before the command) overrides `MAXPLAYER_HOME`, otherwise `~/.maxplayer` is used. `--relay URL` overrides `wss://relay.maxplayer.ai`. Existing home keys are reused, with loose group/other permissions tightened to 0600. A symlink at the home root or `chat/` is refused before either directory is changed. First use creates a 0700 home, a 0600 hex key, and `chat/` only; it does not bootstrap the marketplace. Never share `key`. Installing the marketplace later retains this identity.
 
 ## Keep receiving
 
@@ -47,7 +47,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now maxplayer-chat
 ```
 
-Only one watcher per home can hold `chat/watch.lock`. It authenticates before subscribing and reconnects with timestamp overlap. `inbox` works offline and warns when no watcher is running.
+Only one watcher per home can hold `chat/watch.lock`. It authenticates before subscribing and reconnects with timestamp overlap. Local receive or cursor errors produce a fixed one-line stderr diagnostic (no message text) and reconnect after a bounded two-second backoff; startup errors such as a held watch lock still exit. `inbox` works offline and warns when no watcher is running.
 
 ```sh
 maxplayer-chat inbox --json
@@ -56,7 +56,7 @@ maxplayer-chat log bob
 maxplayer-chat peer remove bob
 ```
 
-`inbox` consumes unread messages after successfully writing output. JSON is one object per line with `untrusted: true`; text output labels incoming words untrusted. `log` is non-consuming. Removing a peer immediately stops accepting their messages and hides their unread messages; it does not erase history. Message bodies must contain 1–8000 Unicode characters. Each peer has a 50-send UTC-day limit. Attempts are reserved before publication, so an ambiguous failed acknowledgement also uses a slot. There is no retry/outbox; inspect delivery before resending by hand.
+`inbox` consumes unread messages after successfully writing output. JSON is one object per line with `untrusted: true`; text output labels incoming words untrusted. `log` is non-consuming. Text output (including peer labels and relay rejection reasons) visibly escapes bidi controls/marks and zero-width format characters; JSON emits the same characters as `\uXXXX`, preserving the original text when parsed and in storage. Emoji ZWJ (U+200D) is preserved. Removing a peer immediately stops accepting their messages and hides their unread messages; it does not erase history. Message bodies must contain 1–8000 Unicode characters. Each peer has a 50-send UTC-day limit and a 100-stored-inbound-message UTC-day limit (`INBOUND_DAILY_CAP`). Inbound counts use local receipt time, survive restart and peer remove/re-add, and do not affect other peers. Excess messages are permanently dropped without storing, printing, or notifying; the cursor advances past them. Existing records without receipt time use their stored timestamp for quota accounting. Attempts are reserved before publication, so an ambiguous failed acknowledgement also uses a slot. There is no retry/outbox; inspect delivery before resending by hand.
 
 State lives in `chat/`: `peers.toml`, `log.jsonl`, `cursor`, `read`, `sent-today`, `watch.lock`, and `state.lock` (short file transactions), with atomic-write temporary files in that same directory. Relay rejection errors never print decrypted bodies. Transcripts are plaintext local files: protect the home and only approve people you trust.
 

@@ -14,10 +14,10 @@ use std::{
     time::Duration,
 };
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
-fn display_text(text: &str) -> String {
+pub fn display_text(text: &str) -> String {
     text.chars()
         .flat_map(|c| {
-            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') || visual_format(c) {
                 c.escape_default().collect::<Vec<_>>()
             } else {
                 vec![c]
@@ -25,6 +25,25 @@ fn display_text(text: &str) -> String {
         })
         .collect()
 }
+fn visual_format(c: char) -> bool {
+    matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        | '\u{200e}' | '\u{200f}' | '\u{061c}' | '\u{200b}' | '\u{200c}'
+        | '\u{feff}' | '\u{2060}')
+}
+fn display_json(value: serde_json::Value) -> String {
+    value
+        .to_string()
+        .chars()
+        .map(|c| {
+            if visual_format(c) {
+                format!("\\u{:04x}", c as u32)
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+pub const INBOUND_DAILY_CAP: usize = 100;
 pub const DEFAULT_RELAY: &str = "wss://relay.maxplayer.ai";
 
 #[derive(Serialize, Deserialize)]
@@ -64,6 +83,9 @@ pub struct Entry {
     pub dir: String,
     pub at: u64,
     pub text: String,
+    /// Local receipt time for quota accounting; old records fall back to `at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received_at: Option<u64>,
 }
 #[derive(Default, Serialize, Deserialize)]
 struct Sent {
@@ -73,8 +95,21 @@ struct Sent {
 pub struct Home {
     pub root: PathBuf,
     pub keys: Keys,
+    #[cfg(test)]
+    second_unwraps: std::sync::atomic::AtomicUsize,
+}
+fn reject_symlink(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            Err("home directories must not be symlinks".into())
+        }
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 fn private_dir(path: &Path) -> Result<()> {
+    reject_symlink(path)?;
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -165,6 +200,9 @@ fn create_key(
 impl Home {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
+        // Preflight both final components before mutating either directory.
+        reject_symlink(&root)?;
+        reject_symlink(&root.join("chat"))?;
         private_dir(&root)?;
         private_dir(&root.join("chat"))?;
         // Serialize first-use key creation without a marketplace lock or partially-written key reads.
@@ -183,6 +221,12 @@ impl Home {
         if !key_file.metadata()?.is_file() {
             return Err("home key must be a regular file".into());
         }
+        if key_file.metadata()?.permissions().mode() & 0o077 != 0 {
+            key_file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            if key_file.metadata()?.permissions().mode() & 0o077 != 0 {
+                return Err("home key permissions must be private".into());
+            }
+        }
         key_file.read_to_string(&mut secret)?;
         let secret = secret.trim();
         // Same validation as core, deliberately local: no core change at all.
@@ -194,7 +238,12 @@ impl Home {
         }
         let keys = Keys::parse(secret).map_err(|_| "invalid home key")?;
         drop(guard);
-        Ok(Self { root, keys })
+        Ok(Self {
+            root,
+            keys,
+            #[cfg(test)]
+            second_unwraps: Default::default(),
+        })
     }
     fn path(&self, name: &str) -> PathBuf {
         self.root.join("chat").join(name)
@@ -317,6 +366,12 @@ impl Home {
         if env.schema != "maxplayer-chat/1" || validate_text(&env.text).is_err() {
             return Ok(None);
         }
+        if self.peer(&sender.to_hex()).is_err() {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        self.second_unwraps
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // Core authenticated all layers. SDK exposes the verified rumor's logical ID, not wrap ID.
         let Ok(gift) = UnwrappedGift::from_gift_wrap(&self.keys, event).await else {
             return Ok(None);
@@ -329,13 +384,31 @@ impl Home {
         let Ok(peer) = self.peer(&sender.to_hex()) else {
             return Ok(None);
         };
-        if self.entries()?.iter().any(|e| e.rumor_id == rumor_id) {
+        let entries = self.entries()?;
+        if entries.iter().any(|e| e.rumor_id == rumor_id) {
+            return Ok(None);
+        }
+        let now = Timestamp::now().as_secs();
+        let cursor = self.cursor()?.max(event.created_at.as_secs().min(now));
+        if entries
+            .iter()
+            .filter(|e| {
+                e.dir == "in"
+                    && e.peer == peer.pubkey
+                    && e.received_at.unwrap_or(e.at) / 86400 == now / 86400
+            })
+            .count()
+            >= INBOUND_DAILY_CAP
+        {
+            // Quota drops are permanent: advance without storing or notifying.
+            self.write("cursor", &cursor.to_string())?;
             return Ok(None);
         }
         self.append(&Entry {
             rumor_id,
             peer: peer.pubkey,
             dir: "in".into(),
+            received_at: Some(now),
             at: event.created_at.as_secs().min(Timestamp::now().as_secs()),
             text: env.text,
         })?;
@@ -367,13 +440,15 @@ impl Home {
                 writeln!(
                     out,
                     "{}",
-                    serde_json::json!({"from":npub,"name":peer.name,"at":e.at,"untrusted":true,"text":e.text})
+                    display_json(
+                        serde_json::json!({"from":npub,"name":peer.name,"at":e.at,"untrusted":true,"text":e.text})
+                    )
                 )?;
             } else {
                 writeln!(
                     out,
                     "[untrusted message from {}] {}",
-                    peer.name,
+                    display_text(&peer.name),
                     display_text(&e.text)
                 )?;
             }
@@ -393,13 +468,15 @@ impl Home {
                 writeln!(
                     out,
                     "{}",
-                    serde_json::json!({"rumor_id":e.rumor_id,"peer":e.peer,"dir":e.dir,"at":e.at,"untrusted":e.dir=="in","text":e.text})
+                    display_json(
+                        serde_json::json!({"rumor_id":e.rumor_id,"peer":e.peer,"dir":e.dir,"at":e.at,"untrusted":e.dir=="in","text":e.text})
+                    )
                 )?;
             } else if e.dir == "in" {
                 writeln!(
                     out,
                     "in [untrusted message from {}] {}",
-                    peer.name,
+                    display_text(&peer.name),
                     display_text(&e.text)
                 )?;
             } else {
@@ -447,13 +524,18 @@ impl Home {
         client.automatic_authentication(false);
         let result = relay.send_event(&event).await;
         client.shutdown().await;
-        let id = result
-            .map_err(|error| format!("relay did not accept message: {error} (not retried)"))?;
+        let id = result.map_err(|error| {
+            format!(
+                "relay did not accept message: {} (not retried)",
+                display_text(&error.to_string())
+            )
+        })?;
         let _lock = self.lock()?;
         self.append(&Entry {
             rumor_id,
             peer: peer.pubkey,
             dir: "out".into(),
+            received_at: None,
             at: Timestamp::now().as_secs(),
             text: text.into(),
         })?;
@@ -591,10 +673,19 @@ pub async fn watch(home: &Home, url: &str, command: Vec<String>) -> Result<()> {
     loop {
         let connected = connect(&home.keys, url).await;
         if let Ok((client, relay, mut notifications)) = connected {
+            let cursor = match home.cursor() {
+                Ok(cursor) => cursor,
+                Err(_) => {
+                    eprintln!("chat cursor read failed; retrying");
+                    client.shutdown().await;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
             let filter = Filter::new()
                 .kind(Kind::GiftWrap)
                 .pubkey(home.keys.public_key())
-                .since(Timestamp::from(transport::receive_since(home.cursor()?)));
+                .since(Timestamp::from(transport::receive_since(cursor)));
             if relay
                 .subscribe(filter, SubscribeOptions::default())
                 .await
@@ -603,7 +694,11 @@ pub async fn watch(home: &Home, url: &str, command: Vec<String>) -> Result<()> {
                 loop {
                     tokio::select! {
                         notification=notifications.recv()=>match notification {
-                            Ok(RelayNotification::Event{event,..})=>{if let Some(peer)=home.receive(&event).await?{notifier.message(peer);}},
+                            Ok(RelayNotification::Event{event,..})=>match home.receive(&event).await {
+                                Ok(Some(peer))=>notifier.message(peer),
+                                Ok(None)=>{},
+                                Err(_)=>{eprintln!("chat receive failed; retrying");break;},
+                            },
                             Ok(RelayNotification::RelayStatus{status}) if status!=RelayStatus::Connected=>break,
                             Ok(RelayNotification::AuthenticationFailed | RelayNotification::Shutdown)=>break,
                             Ok(RelayNotification::Message{message:RelayMessage::Closed{..}})=>break,
@@ -633,6 +728,40 @@ pub async fn watch(home: &Home, url: &str, command: Vec<String>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn security_unapproved_skips_second_unwrap_and_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = Home::open(dir.path()).unwrap();
+        let sender = Keys::generate();
+        let event = transport::wrap(&sender, h.keys.public_key(), envelope("hello").unwrap())
+            .await
+            .unwrap();
+        // Holding state.lock makes any attempted lock observable as a stuck receive.
+        // Check the second-decrypt counter first via a separate no-lock call.
+        assert!(h.receive(&event).await.unwrap().is_none());
+        assert_eq!(
+            h.second_unwraps.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        let guard = h.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            tx.send(rt.block_on(h.receive(&event)).unwrap()).unwrap();
+        });
+        let result = rx.recv_timeout(Duration::from_secs(2));
+        drop(guard);
+        worker.join().unwrap();
+        assert!(
+            result
+                .expect("unapproved receive took state.lock")
+                .is_none()
+        );
+    }
 
     #[test]
     fn advisor_atomic_key_write_failure_and_publish_race() {
