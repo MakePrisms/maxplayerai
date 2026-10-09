@@ -1191,3 +1191,15 @@ button.chip { cursor: pointer; }
 @keyframes try-nudge { 0%,100% { transform: translateY(0); } 50% { transform: translateY(2px); } }
 @media (max-width: 760px) { .try-float { bottom: max(16px, env(safe-area-inset-bottom)); } }
 @media (prefers-reduced-motion: reduce) { .try-float, .try-float svg { transition: none; animation: none; } }
+
+/* Chat reuses Sell's section rhythm and chrome, with a title-specific width. */
+.h-hero h1.h-title-chat { line-height: 1.02; }
+.chat-page .h-copy code { white-space: normal; overflow-wrap: anywhere; word-break: normal; }
+@media (max-width: 760px) {
+  .h-hero h1.h-title-chat { font-size: min(calc((100vw - 60px) / 12.6), 84px); white-space: nowrap; }
+}
+/* Keep every shared mobile link/control at least one thumb target tall. */
+@media (max-width: 700px) {
+  .nav > .brand, .foot-nav a, .windows button { min-height: 44px; }
+  .h-manual a, .h-faq p a { display: inline-flex; align-items: center; min-height: 44px; }
+}
