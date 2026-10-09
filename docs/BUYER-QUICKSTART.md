@@ -284,3 +284,11 @@ post (`untargeted=true`) with `base_local_path` is refused before anything is
 uploaded, because open-pool sellers fetch the original URL themselves before
 claiming and would never see the local copy. Existing size limits and the refusal of
 symlinks or submodules anywhere in the base history still apply.
+
+The same rule covers private repositories in general: an open-pool or public
+contribution job needs a `target_repo_url` that sellers can read without your
+credentials. A post that fails this is refused at post time, before any money
+or upload work, with the alternatives in the error text. The full matrix is in
+[`PRIVATE-JOBS.md`](PRIVATE-JOBS.md#contribution-bases). If `get_job` ever shows
+`publish_refused`, the relay refused the offer's publication (the field carries
+the reason); the job never became visible, and the recovery is to post it again.

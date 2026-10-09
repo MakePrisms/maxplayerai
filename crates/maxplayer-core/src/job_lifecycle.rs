@@ -157,6 +157,10 @@ pub struct PostJobOutcome {
     pub relay_url: String,
     pub task: String,
     pub output: String,
+    /// A terminal relay refusal observed on the first publication attempt. The job
+    /// is tracked locally but never became visible to sellers; post it again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publish_refused: Option<String>,
 }
 
 /// Inputs for reading job state from the relay.
@@ -228,6 +232,12 @@ pub struct JobView {
     /// `false` on every view not built by a confirmed read, so the unsafe direction is the one you
     /// have to opt into.
     pub read_confirmed: bool,
+    /// The relay's terminal refusal of this job's offer publication, when one was
+    /// recorded (for example `invalid: event timestamp too far from server time`).
+    /// The offer never became visible and no seller can ever claim it; the job must
+    /// be posted again. Set only on views of locally queued private offers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_refused: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -711,6 +721,17 @@ pub async fn post_job_async(
         JobKind::FromScratch => None,
         JobKind::Contribution(spec) => Some(contribution_offer_from_spec(spec)?),
     };
+    // Sellers read the pinned base THEMSELVES on every open-pool post (bidders check
+    // the source before claiming) and on every public post (no base is uploaded).
+    // A base only the buyer can read makes such a job unservable: it would burn the
+    // posting work and the deadline with no claim, or strand the selected seller.
+    // Refuse it here, before the wallet opens and before any slow preparation.
+    if let (Some(contribution), true) = (
+        &contribution,
+        request.untargeted || visibility == crate::private_content::wire::Visibility::Public,
+    ) {
+        assert_base_readable_by_sellers(home, contribution.target.clone_url()).await?;
+    }
     let deadline_unix = resolve_post_deadline(request.deadline_unix, now_unix_secs()?)?;
 
     // Refuse a post whose amount exceeds the per-job budget cap AT POST — a job you
@@ -790,7 +811,63 @@ pub async fn post_job_async(
         relay_url: home.config.relay_url.clone(),
         task: request.task,
         output: request.output,
+        publish_refused: None,
     })
+}
+
+/// The one documented exception in the contribution matrix: a base repository that
+/// sellers cannot read on their own cannot back an open-pool or public job. The
+/// text names the two working alternatives; docs/PRIVATE-JOBS.md carries the rule.
+pub const SELLER_UNREADABLE_BASE: &str =
+    "contribution base is not readable by sellers: on an open-pool or public job every \
+     prospective seller reads target_repo_url itself before claiming, and a private \
+     repository blocks that. Make the repository public, or post a targeted private job \
+     (set seller_pubkey) — the buyer uploads the base for its chosen seller there, and a \
+     private local source can use base_local_path. See docs/PRIVATE-JOBS.md (contribution bases)";
+
+/// Refuse a post whose pinned base the selling side cannot read (fail-closed, at
+/// post time, before any wallet or slow preparation work).
+#[cfg(feature = "wallet")]
+async fn assert_base_readable_by_sellers(
+    home: &MaxplayerHome,
+    url: &str,
+) -> Result<(), JobLifecycleError> {
+    if let Some(base) = home.config.privacy.git_base.as_deref() {
+        // A per-job private repository under the configured private Git host is
+        // readable only by that one job's participants, never by bidders. No
+        // network is needed to refuse it.
+        let host = crate::private_content::wire::HostPolicy {
+            git_prefix: base.to_owned(),
+            accepted_mints: Vec::new(),
+        };
+        if host.repo(url).is_ok() {
+            return Err(JobLifecycleError::Input(SELLER_UNREADABLE_BASE.into()));
+        }
+        // Every other repository on the CONFIGURED relay host is member-readable,
+        // and sellers authenticate there with their own keys; an anonymous probe
+        // from here would test the wrong identity. A `/git/` URL on a FOREIGN host
+        // gets no seller credential either, so it takes the anonymous probe below.
+        if url.starts_with(base) {
+            return Ok(());
+        }
+    }
+    let probe_url = url.to_owned();
+    let listed =
+        tokio::task::spawn_blocking(move || crate::git_transport::ls_remote(&probe_url, None))
+            .await
+            .map_err(|_| {
+                JobLifecycleError::Input("contribution base probe worker unavailable".into())
+            })?;
+    match listed {
+        Ok(_) => Ok(()),
+        Err(crate::git_transport::TransportError::Auth(_)) => {
+            Err(JobLifecycleError::Input(SELLER_UNREADABLE_BASE.into()))
+        }
+        Err(error) => Err(JobLifecycleError::Relay(format!(
+            "could not verify that sellers can read the contribution base ({error}); the post \
+             was not published — retry it, or post a targeted private job"
+        ))),
+    }
 }
 
 fn now_unix_secs() -> Result<u64, JobLifecycleError> {
@@ -3402,6 +3479,10 @@ pub(crate) async fn fetch_job_view_async(
             let mut view = private_view_from_events(home, &mut context, &original, Vec::new(), Vec::new(), Vec::new(), now)?;
             view.pending = true;
             view.read_confirmed = false;
+            // A recorded terminal refusal explains the absence: the relay refused the
+            // offer's exact signed bytes, publication retries stopped, and no seller
+            // can ever see this job. Surface the reason instead of a silent pending.
+            view.publish_refused = context.store.refusal_for_event(job_id).ok().flatten();
             return Ok(view);
         }
     }
@@ -3521,6 +3602,7 @@ pub(crate) async fn fetch_job_view_async(
         accepted,
         pending: false,
         read_confirmed,
+        publish_refused: None,
     };
     Ok(view)
 }
@@ -3824,7 +3906,8 @@ fn private_view_from_events(
     results.sort_by_key(|r| std::cmp::Reverse(r.created_at));
     let live_claim_id = derive_claim_liveness(&mut claims, &results, Some(offer.deadline_unix), now);
     Ok(JobView { job_id: job_id.clone(), offer: Some(offer), claims, results, live_claim_id,
-        accepted: load_accepted_bind(home, &job_id)?, pending: false, read_confirmed: true })
+        accepted: load_accepted_bind(home, &job_id)?, pending: false, read_confirmed: true,
+        publish_refused: None })
 }
 
 /// Collect hex pubkeys for cosmetic kind-0 enrichment (never for pay/targeting).
@@ -5610,6 +5693,7 @@ mod tests {
             accepted: None,
             pending: false,
             read_confirmed: true,
+            publish_refused: None,
         }
     }
 
@@ -6010,6 +6094,80 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The documented exception: a base repository sellers cannot read on their own
+    /// cannot back an open-pool or public contribution job. A per-job private
+    /// repository URL is the statically detectable case — refused with no network.
+    #[test]
+    fn post_job_refuses_seller_unreadable_private_base_for_open_pool_and_public() {
+        let root = std::env::temp_dir().join(format!(
+            "maxplayer-jobs-private-base-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+        let git_base = home
+            .config
+            .privacy
+            .git_base
+            .clone()
+            .expect("fresh home has a private git base");
+        let private_job_repo = format!("{git_base}{}/{}", "11".repeat(32), "22".repeat(32));
+        // Open-pool (untargeted) post, default private visibility.
+        let request = contribution_post_request(
+            &"aa".repeat(32),
+            &private_job_repo,
+            "main",
+            &"bb".repeat(20),
+            None,
+        );
+        assert!(request.untargeted);
+        let msg = post_job(&home, request)
+            .expect_err("open-pool private base refused")
+            .to_string();
+        assert!(msg.contains("not readable by sellers"), "{msg}");
+        assert!(msg.contains("targeted private job"), "{msg}");
+        assert!(msg.contains("docs/PRIVATE-JOBS.md"), "{msg}");
+        // Public post, targeted: sellers still read the source themselves.
+        let mut request = contribution_post_request(
+            &"aa".repeat(32),
+            &private_job_repo,
+            "main",
+            &"bb".repeat(20),
+            None,
+        );
+        request.visibility = Some(crate::private_content::wire::Visibility::Public);
+        request.untargeted = false;
+        request.seller_pubkey = Some("cc".repeat(32));
+        let msg = post_job(&home, request)
+            .expect_err("public private-base post refused")
+            .to_string();
+        assert!(msg.contains("not readable by sellers"), "{msg}");
+        // A targeted PRIVATE job with the same base stays allowed by this gate: the
+        // buyer uploads the base for its chosen seller. (It fails LATER, at the
+        // network fetch, which this offline test must not reach — the distinct
+        // error text proves the gate did not fire.)
+        let mut request = contribution_post_request(
+            &"aa".repeat(32),
+            &private_job_repo,
+            "main",
+            &"bb".repeat(20),
+            None,
+        );
+        request.visibility = Some(crate::private_content::wire::Visibility::Private);
+        request.untargeted = false;
+        request.seller_pubkey = Some("cc".repeat(32));
+        request.output_category = Some(crate::private_content::wire::Output::Code);
+        let msg = post_job(&home, request)
+            .expect_err("offline test cannot complete a private post")
+            .to_string();
+        assert!(!msg.contains("not readable by sellers"), "{msg}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn post_job_refuses_missing_seller_without_untargeted() {
         let root = std::env::temp_dir().join(format!(
@@ -6109,6 +6267,7 @@ mod tests {
             accepted: None,
             pending: false,
             read_confirmed: true,
+            publish_refused: None,
         };
         assert!(!view_is_ready(&view, WaitFor::Claim));
         assert!(!view_is_ready(&view, WaitFor::Result));
@@ -8055,6 +8214,7 @@ mod review_exposure_tests {
             accepted: None,
             pending: false,
             read_confirmed: true,
+            publish_refused: None,
         };
         let states = crate::review::protect_job_view(&home, &mut view, None).await;
         assert!(states[&result.result_id].contains("withheld"));

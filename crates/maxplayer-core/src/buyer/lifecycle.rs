@@ -1541,6 +1541,70 @@ pub fn plan_missing_offer(
 pub const PARK_REASON_OFFER_ABSENT: &str =
     "relay answered our read and returned no offer for this job";
 
+/// A terminal relay refusal of the offer's publication parks the auto-award NOW.
+///
+/// The view still carries the local offer, so the loop would otherwise spin to the
+/// offer deadline and then park with a reason that blames missing claims — false in
+/// every clause, since no seller could ever see the job (#1115). Guarded on "no
+/// claims, nothing accepted": a claim proves some signed copy of the offer reached
+/// the public record after all, and that job must keep its normal money path.
+pub fn publish_refused_park_reason(view: &crate::job_lifecycle::JobView) -> Option<String> {
+    let refusal = view.publish_refused.as_deref()?;
+    if !view.claims.is_empty() || view.accepted.is_some() {
+        return None;
+    }
+    Some(format!(
+        "offer publication refused by the relay: {refusal}; the offer never became visible — \
+         post the job again (a new post publishes a fresh offer)"
+    ))
+}
+
+#[cfg(test)]
+mod publish_refused_tests {
+    use super::*;
+    fn view(publish_refused: Option<&str>) -> crate::job_lifecycle::JobView {
+        crate::job_lifecycle::JobView {
+            job_id: "a".repeat(64),
+            offer: None,
+            claims: vec![],
+            results: vec![],
+            live_claim_id: None,
+            accepted: None,
+            pending: true,
+            read_confirmed: false,
+            publish_refused: publish_refused.map(str::to_owned),
+        }
+    }
+    #[test]
+    fn refused_publication_parks_with_the_relay_reason_and_the_recovery_step() {
+        let reason =
+            publish_refused_park_reason(&view(Some("invalid: event timestamp too far from server time")))
+                .unwrap();
+        assert!(reason.contains("invalid: event timestamp too far"), "{reason}");
+        assert!(reason.contains("post the job again"), "{reason}");
+        assert!(publish_refused_park_reason(&view(None)).is_none());
+    }
+    #[test]
+    fn a_claim_or_an_accept_outranks_the_refusal_record() {
+        // A claim proves a signed offer copy became public after all; the normal
+        // money path must keep running for it.
+        let mut claimed = view(Some("invalid: refused"));
+        claimed.claims.push(crate::job_lifecycle::ClaimView {
+            claim_id: "c".repeat(64),
+            created_at: 1,
+            seller_pubkey: "5".repeat(64),
+            display_name: None,
+            status: "processing".into(),
+            live: true,
+            creq: None,
+            agents: Vec::new(),
+            capability: Default::default(),
+            payment_mode: Default::default(),
+        });
+        assert!(publish_refused_park_reason(&claimed).is_none());
+    }
+}
+
 /// Park reason for [`MissingOfferAction::ParkUnreadable`].
 ///
 /// The wording lives beside the decision, not at the call site, so the reason a row carries and the
@@ -1726,6 +1790,7 @@ mod tests {
             accepted: None,
             pending: false,
             read_confirmed: true,
+            publish_refused: None,
         }
     }
 
@@ -4857,6 +4922,7 @@ mod free_lane_tests {
             accepted: None,
             pending: false,
             read_confirmed: true,
+            publish_refused: None,
         }
     }
 

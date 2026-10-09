@@ -576,14 +576,14 @@ async fn service_publication_failure_retries_same_content_without_blocking_parti
         events: Vec<nostr_sdk::Event>,
     }
     impl ContentSender for Sender {
-        async fn send(&mut self, event: nostr_sdk::Event) -> Result<()> {
+        async fn send(&mut self, event: nostr_sdk::Event) -> std::result::Result<(), session::SendFailure> {
             let refused = self
                 .refuse
                 .as_ref()
                 .is_some_and(|r| event.tags.iter().any(|t| t.as_slice() == ["p", r.as_str()]));
             self.events.push(event);
             if refused {
-                Err(Error("offline"))
+                Err(Error("offline").into())
             } else {
                 Ok(())
             }
@@ -603,7 +603,8 @@ async fn service_publication_failure_retries_same_content_without_blocking_parti
         report,
         session::FlushReport {
             accepted: 2,
-            pending: 1
+            pending: 1,
+            refused: 0
         }
     );
     let old_service = sender
@@ -624,7 +625,8 @@ async fn service_publication_failure_retries_same_content_without_blocking_parti
         report,
         session::FlushReport {
             accepted: 1,
-            pending: 0
+            pending: 0,
+            refused: 0
         }
     );
     let retry = sender.events.last().unwrap();
@@ -1467,9 +1469,9 @@ async fn private_four_identity_targeted_and_open_lifecycle_reorders_and_resumes(
 async fn retry_backlog_rotates_across_restart_and_does_not_starve_participants() {
     struct Sender { service: String, delivered: Vec<nostr_sdk::Event> }
     impl session::ContentSender for Sender {
-        async fn send(&mut self, event: nostr_sdk::Event) -> Result<()> {
+        async fn send(&mut self, event: nostr_sdk::Event) -> std::result::Result<(), session::SendFailure> {
             if event.tags.iter().any(|t| t.as_slice() == ["p", self.service.as_str()]) {
-                return Err(Error("service refused"));
+                return Err(Error("service refused").into());
             }
             self.delivered.push(event);
             Ok(())
@@ -1545,7 +1547,7 @@ fn unbound_inbox_conflicts_and_sender_quota_do_not_abort_other_authors() {
 async fn actor_copy_timeouts_do_not_consume_lifecycle_publication_budget() {
     struct Sender { carriers: usize }
     impl session::ContentSender for Sender {
-        async fn send(&mut self, event: nostr_sdk::Event) -> Result<()> {
+        async fn send(&mut self, event: nostr_sdk::Event) -> std::result::Result<(), session::SendFailure> {
             if event.kind == nostr_sdk::Kind::GiftWrap {
                 std::future::pending::<()>().await;
             }
@@ -1589,7 +1591,7 @@ async fn actor_copy_timeouts_do_not_consume_lifecycle_publication_budget() {
 async fn copy_timeouts_do_not_consume_lifecycle_publication_budget() {
     struct Sender { carriers: usize }
     impl session::ContentSender for Sender {
-        async fn send(&mut self, event: nostr_sdk::Event) -> Result<()> {
+        async fn send(&mut self, event: nostr_sdk::Event) -> std::result::Result<(), session::SendFailure> {
             if event.kind == nostr_sdk::Kind::GiftWrap {
                 std::future::pending::<()>().await;
             }
@@ -1775,4 +1777,122 @@ fn private_invoice_all_mints_guard_now_allows_seller_listed_hop_target() {
         crate::gateway::creq::build_seller_creq(&offer, 100, "sat", &listed, &seller.to_hex())
             .unwrap();
     invoice::validate(&raw, &offer, 100, &seller.to_hex(), &host()).unwrap();
+}
+
+#[test]
+fn resign_offer_changes_only_identity_and_keeps_envelope_and_tags_valid() {
+    use builders::{OfferOptions, prepare_offer, resign_offer};
+    use wire::{Output, Visibility};
+    let service = keys(3).public_key().to_hex();
+    let job = "97".repeat(32);
+    let options = || OfferOptions {
+        visibility: Visibility::Private,
+        category: Output::Other,
+        service: &service,
+        job_id: &job,
+        attachments: vec![],
+        contribution: None,
+    };
+    // Targeted: the task envelope must bind to the re-signed event unchanged.
+    let request = crate::gateway::OfferDraft::new(
+        "re-sign task",
+        "text/plain",
+        5,
+        2_000_000_000,
+        keys(2).public_key().to_hex(),
+    );
+    let prepared = prepare_offer(&keys(1), &request, options(), &host()).unwrap();
+    let fresh = resign_offer(&keys(1), &prepared, &service, &host()).unwrap();
+    assert_ne!(fresh.event.id, prepared.event.id);
+    assert_eq!(fresh.event.tags, prepared.event.tags);
+    assert_eq!(fresh.event.content, prepared.event.content);
+    assert_eq!(
+        fresh.task.as_ref().unwrap().envelope(),
+        prepared.task.as_ref().unwrap().envelope()
+    );
+    // Open-pool: the public task tag re-signs identically.
+    let mut open_request = request.clone();
+    open_request.seller_pubkey = None;
+    let open = prepare_offer(&keys(1), &open_request, options(), &host()).unwrap();
+    let fresh_open = resign_offer(&keys(1), &open, &service, &host()).unwrap();
+    assert_ne!(fresh_open.event.id, open.event.id);
+    assert_eq!(fresh_open.event.tags, open.event.tags);
+    // Only the original signer may re-sign.
+    assert!(resign_offer(&keys(2), &prepared, &service, &host()).is_err());
+}
+
+#[cfg(feature = "wallet")]
+#[tokio::test]
+async fn permanently_refused_carrier_stops_retrying_and_keeps_the_relay_reason() {
+    use session::ContentSender;
+    struct Refusing;
+    impl ContentSender for Refusing {
+        async fn send(
+            &mut self,
+            _: nostr_sdk::Event,
+        ) -> std::result::Result<(), session::SendFailure> {
+            Err(session::SendFailure {
+                permanent: true,
+                reason: "invalid: event timestamp too far from server time".into(),
+            })
+        }
+    }
+    let service = keys(3).public_key().to_hex();
+    let job = "96".repeat(32);
+    let mut request = crate::gateway::OfferDraft::new(
+        "open task",
+        "text/plain",
+        5,
+        2_000_000_000,
+        keys(2).public_key().to_hex(),
+    );
+    request.seller_pubkey = None;
+    let open = builders::prepare_offer(
+        &keys(1),
+        &request,
+        builders::OfferOptions {
+            visibility: wire::Visibility::Private,
+            category: wire::Output::Other,
+            service: &service,
+            job_id: &job,
+            attachments: vec![],
+            contribution: None,
+        },
+        &host(),
+    )
+    .unwrap();
+    let mut db = store::ContentStore::in_memory().unwrap();
+    db.enqueue_open_offer(&open.event, &service, &host()).unwrap();
+    let author = keys(1).public_key().to_hex();
+    assert_eq!(db.pending_carriers(&author, 10).unwrap().len(), 1);
+    let report = session::flush(&mut db, &keys(1), &mut Refusing, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        report,
+        session::FlushReport {
+            accepted: 0,
+            pending: 0,
+            refused: 1
+        }
+    );
+    // The carrier left the retry set; the reason is recorded for the job view.
+    assert!(db.pending_carriers(&author, 10).unwrap().is_empty());
+    let reason = db
+        .refusal_for_event(&open.event.id.to_hex())
+        .unwrap()
+        .unwrap();
+    assert!(reason.contains("timestamp too far"), "{reason}");
+    // A later flush resends nothing: the refusal is terminal for these exact bytes.
+    let again = session::flush(&mut db, &keys(1), &mut Refusing, 10)
+        .await
+        .unwrap();
+    assert_eq!(again, session::FlushReport::default());
+    // Relay acceptance of the same bytes (operator recovery) clears the record.
+    db.carrier_accepted(&open.event).unwrap();
+    assert!(
+        db.refusal_for_event(&open.event.id.to_hex())
+            .unwrap()
+            .is_none()
+    );
 }

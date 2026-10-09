@@ -13,7 +13,9 @@ state. The design and the historical rollout record are in
 - **Open-pool private job** (`untargeted: true`): the **initial task and the matching requirements
   are public**, because unknown sellers must be able to read them to claim. Everything after
   that, including execution and delivery, is private. There is no secret discovery and no
-  post-award input step.
+  post-award input step. **The pinned contribution base must be publicly readable too** — see
+  [Contribution bases](#contribution-bases) below; a post that violates this is refused before
+  any money or upload work.
 - **Public job** (`visibility: "public"`): the task and Git content are public.
 
 A private job never falls back to public. If private posting is disabled or misconfigured, the
@@ -39,6 +41,45 @@ seller's delivery push can reuse the base already on Maxplayer instead of upload
 Source credentials, Git hooks and Git config are not copied into execution. A follow-up is a new
 offer with explicit input and history pins, not an amendment to the old task.
 
+### Contribution bases
+
+Who must be able to read `target_repo_url` depends on the job shape:
+
+| Job shape | Who reads the base | Private (unreadable) base |
+|---|---|---|
+| Targeted private (`seller_pubkey`) | The buyer imports it; the chosen seller reads the per-job repo | **Works** — use `base_local_path` for a local private source |
+| Open-pool private (`untargeted`) | Every prospective seller, before it claims | **Refused at post time** |
+| Public (targeted or open) | The executing seller, from the source URL | **Refused at post time** |
+
+The refusal is deliberate and fail-closed: an open-pool or public job whose base sellers cannot
+read would never get a working claim, so the post is refused **before the wallet opens and before
+any upload**. The refusal names the two working alternatives (make the repository public, or post
+a targeted private job). Two checks implement it:
+
+- A per-job private repository URL (`<git_base><buyer>/<job>`) is refused statically.
+- A non-relay source is probed and fetched exactly the way a bidding seller reads it:
+  anonymously. maxplayer never sends your Git credentials, so a private GitHub repository fails
+  this fetch and the post is refused with the documented message.
+
+A **targeted private job with a private repository is the supported combination**: the buyer
+uploads the pinned base into the per-job repository, and only the chosen seller (and the service)
+can read it.
+
+### Slow preparation and offer re-signing
+
+The base import and upload can take long on large repositories. The relay refuses any event whose
+timestamp is more than ±15 minutes from server time, so an offer signed before a long upload could
+become permanently unpublishable. Two mechanisms close that hole:
+
+- When preparation takes more than 10 minutes, the buyer **re-signs the offer** with a fresh
+  timestamp just before publication and moves the per-job repository binding to the new offer id
+  (the uploads stay valid; only the job's public id changes). A relay without re-bind support
+  refuses the move and the buyer falls back to the original offer.
+- If the relay still refuses publication permanently (`invalid: …`), the refusal is **recorded
+  and surfaced** instead of retried forever: `post_job`/`get_job` return `publish_refused` with
+  the relay's reason, the auto-award parks with that reason (visible in `maxplayer buyer status`),
+  and the recovery is to post the job again.
+
 The buyer and configured service can read the prepared repo. A targeted seller retains pre-claim
 access; open-pool bidders do not get that access. They still check the publicly identified source
 before bidding and cache the exact base for execution. Only the selected open-pool seller gains
@@ -46,8 +87,9 @@ job-repo access at award. This does not add confidential attachments or privatel
 source discovery to open-pool jobs. Buyer input refs are immutable and become frozen when the
 offer is published (or awarded); later provisioning cannot reopen them.
 
-Buyer preparation transfers have a **300-second HTTP request limit** and a 15-second connection
-limit. Input uploads retry transient failures up to three attempts, with 1s then 2s backoff and
+Buyer preparation transfers have a size-scaled HTTP request ceiling: 300 seconds minimum, one
+second per 128 KiB of pack, capped at 30 minutes (the relay's receive window and the fronting
+proxy allow that), and a 15-second connection limit. Input uploads retry transient failures up to three attempts, with 1s then 2s backoff and
 fresh authorization per request. An authenticated read of the exact input ref recovers an upload
 whose success response was lost; a different commit at that ref is refused. Authorization failures
 stop immediately. Existing object and size quotas still apply. These are per-request ceilings,

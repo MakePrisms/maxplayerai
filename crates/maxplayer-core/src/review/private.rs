@@ -251,9 +251,15 @@ impl wire::Transport for Transport<'_> {
                     .kind(Kind::GiftWrap)
                     .pubkey(recipient)
                     .since(Timestamp::from(
-                        Timestamp::now()
-                            .as_secs()
-                            .saturating_sub(pc::transport::TIMESTAMP_TWEAK_SECS + 300),
+                        // A reply can land after this client's wait: the worker holds
+                        // its own processing window (default 600s, configurable) behind
+                        // a 300s request-freshness allowance, plus queueing. Cover that
+                        // lifetime generously, or a later attempt reads a published
+                        // reply as "no response" (#1115). A reply older than this is
+                        // still collected by any retry within 30 minutes of it.
+                        Timestamp::now().as_secs().saturating_sub(
+                            pc::transport::TIMESTAMP_TWEAK_SECS + 1800,
+                        ),
                     ))
                     .limit(128),
                 std::time::Duration::from_secs(2),
@@ -284,11 +290,14 @@ impl wire::Transport for Transport<'_> {
             .identity
             .request(self.request.draft(&self.reviewer.to_hex())?, self.reviewer)
             .await?;
-        self.client
+        let output = self
+            .client
             .send_event_to([self.relay], &outer)
             .await
             .map_err(|_| "review: private request publication failed")?;
-        Ok(())
+        // A relay refusal of the wrapper must surface now; otherwise the client
+        // waits the full window for a response the reviewer can never send.
+        wire::request_refused(&output)
     }
 }
 
