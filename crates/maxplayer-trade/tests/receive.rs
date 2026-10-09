@@ -366,11 +366,20 @@ async fn cli_never_prints_token_and_never_takes_it_as_argv() {
     assert_secret_free(&pending, &token2, &proofs2);
     m.faults.lose_reply.store(false, SeqCst);
     let status = std::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
-        .args(["--home", h.path().to_str().unwrap(), "status"])
+        .args(["--home", h.path().to_str().unwrap(), "status", "--json"])
         .output()
         .unwrap();
     assert_secret_free(&status, &token2, &proofs2);
     assert!(String::from_utf8_lossy(&status.stdout).contains("\"receive\""));
+    // The default readable summary is secret-free too and lists the unresolved receive.
+    let human = std::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
+        .args(["--home", h.path().to_str().unwrap(), "status"])
+        .output()
+        .unwrap();
+    assert_secret_free(&human, &token2, &proofs2);
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(text.starts_with("UNRESOLVED ("), "{text}");
+    assert!(text.contains("receive "), "{text}");
 }
 
 #[cfg(feature = "lab")]

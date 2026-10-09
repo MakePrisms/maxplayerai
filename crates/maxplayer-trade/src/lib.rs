@@ -477,3 +477,8 @@ pub mod wallet;
 pub mod money;
 pub mod real_money;
 pub mod receive;
+
+pub mod dryrun;
+pub mod observe;
+pub mod report;
+pub mod serve;
