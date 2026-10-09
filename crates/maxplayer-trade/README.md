@@ -1,6 +1,7 @@
 # maxplayer-trade — standalone real-money Cashu trades
 
-A fixed-lot CLI, independent of jobs, the maxplayer daemon, core, and `relay.maxplayer.ai`.
+A fixed-lot CLI, independent of jobs and the maxplayer daemon. Market traffic never uses
+`relay.maxplayer.ai`; `nostr://` mint traffic (kinds 23410/23411) may, by Bob's decision of 2026-10-09.
 **A live 32-for-24 trade completed on 2026-10-08**, including both claims, NUT-07 witness
 recovery, fee-inclusive net delivery, and a signed `sold` status. Real-money trading is a normal supported use; this is not a production safety certification
 or an unconditional atomicity guarantee.
@@ -112,9 +113,11 @@ request / 23411 reply per call, identical re-send on a lost reply, request `exp`
 the mint). CDK wallets for such mints are built with that connector and poll subscriptions.
 
 - Relays: repeat `--mint-relay URL` (max 8, `wss://`, `ws://` only on loopback) before the
-  command; default `wss://relay.ditto.pub`, `wss://nostr-pub.wellorder.net`. They carry only
-  kinds 23410/23411; market relays never carry mint traffic. `relay.maxplayer.ai` is refused for
-  mint traffic too (`transport::MINT_RELAY_DENYLIST`, one entry). Both sides must reach a relay
+  command; default `wss://relay.maxplayer.ai`, `wss://relay.ditto.pub`,
+  `wss://nostr-pub.wellorder.net` (`transport::default_mint_relays`), the same list and order a
+  default credits sidecar listens on. They carry only kinds 23410/23411; market relays never carry
+  mint traffic. `relay.maxplayer.ai` is allowed for mint traffic only (Bob, 2026-10-09); the market
+  fence still refuses it for 3410/3411/23412 (`--relay`). Both sides must reach a relay
   the mint listens on; preflight fails (nothing locked) otherwise.
 - Timing: a `nostr://` CDK wallet call is bounded at 40 s (30 s connector window + 10 s margin)
   instead of 15 s; a raw request is bounded by the connector, not the 20 s HTTP timeout. A

@@ -734,22 +734,14 @@ async fn nostr_preflight_refuses_missing_nut_and_cli_canonicalizes() {
         .unwrap();
     assert!(!cli.status.success());
     assert!(String::from_utf8_lossy(&cli.stderr).contains("NUT-14"));
-    let fenced = tokio::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
-        .args([
-            "--home",
-            e.root.path().join("cli").to_str().unwrap(),
-            "--mint-relay",
-            "wss://relay.maxplayer.ai",
-            "preflight",
-            &n.url,
-        ])
-        .output()
-        .await
-        .unwrap();
-    assert!(
-        !fenced.status.success()
-            && String::from_utf8_lossy(&fenced.stderr).contains("not allowed for mint traffic"),
-        "SAFETY: production relay refused for mint traffic"
+}
+
+#[test]
+fn default_mint_relays_match_the_sidecar_defaults() {
+    assert_eq!(
+        transport::default_mint_relays(),
+        maxplayer_mint::home::MintConfig::default().effective_relays(),
+        "the trade CLI asks the relays a default sidecar answers on, in the same order"
     );
 }
 

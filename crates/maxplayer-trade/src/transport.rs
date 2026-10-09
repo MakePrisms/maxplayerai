@@ -47,10 +47,10 @@ const PAYLOAD_MARGIN: usize = 512;
 const MIN_NOSTR_WINDOW: Duration = Duration::from_secs(2);
 /// Most mint relays a home may configure.
 pub const MAX_MINT_RELAYS: usize = 8;
-/// Relay hosts refused for mint traffic (kinds 23410/23411). relay.maxplayer.ai is refused for
-/// market AND mint traffic until Bob decides; allowing it for mint traffic only is deleting this
-/// one entry (the market fence in `market.rs` is separate and stays).
-pub const MINT_RELAY_DENYLIST: &[&str] = &["relay.maxplayer.ai"];
+/// First default mint relay. Bob's decision (2026-10-09): relay.maxplayer.ai carries `nostr://`
+/// mint traffic (kinds 23410/23411) only. The market fence in `market.rs` still refuses it for
+/// 3410/3411/23412.
+pub const DEFAULT_MINT_RELAY: &str = "wss://relay.maxplayer.ai";
 
 static MINT_RELAYS: RwLock<Option<Vec<String>>> = RwLock::new(None);
 
@@ -67,15 +67,10 @@ fn loopback(host: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
-/// One mint relay: `wss://`, or `ws://` on loopback (tests), no credentials/query/fragment, and
-/// not on [`MINT_RELAY_DENYLIST`].
+/// One mint relay: `wss://`, or `ws://` on loopback (tests), no credentials/query/fragment.
 pub fn check_mint_relay(relay: &str) -> Result<()> {
     let u = url::Url::parse(relay).with_context(|| format!("invalid mint relay {relay}"))?;
     let host = u.host_str().context("mint relay without host")?;
-    ensure!(
-        !MINT_RELAY_DENYLIST.contains(&host.trim_end_matches('.')),
-        "mint relay {host} is not allowed for mint traffic"
-    );
     ensure!(
         u.username().is_empty()
             && u.password().is_none()
@@ -90,8 +85,18 @@ pub fn check_mint_relay(relay: &str) -> Result<()> {
     Ok(())
 }
 
-/// Set the relays used for `nostr://` mint traffic. Empty keeps the defaults
-/// ([`FALLBACK_RELAYS`]). Returns the effective list.
+/// The default `nostr://` mint relays: [`DEFAULT_MINT_RELAY`] then core [`FALLBACK_RELAYS`], the
+/// same list in the same order a default credits sidecar listens on (`maxplayer-mint`
+/// `MintConfig::effective_relays`; parity asserted in `tests/nostr.rs`).
+pub fn default_mint_relays() -> Vec<String> {
+    std::iter::once(DEFAULT_MINT_RELAY)
+        .chain(FALLBACK_RELAYS.iter().copied())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Set the relays used for `nostr://` mint traffic. Empty keeps [`default_mint_relays`].
+/// Returns the effective list.
 pub fn configure_mint_relays(relays: &[String]) -> Result<Vec<String>> {
     ensure!(
         relays.len() <= MAX_MINT_RELAYS,
@@ -117,7 +122,7 @@ pub fn mint_relays() -> Vec<String> {
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
-        .unwrap_or_else(|| FALLBACK_RELAYS.iter().map(|r| r.to_string()).collect())
+        .unwrap_or_else(default_mint_relays)
 }
 
 /// Whether every hop to `mint` is loopback (lab-timing fence): the host for HTTP, every
@@ -408,11 +413,9 @@ mod tests {
     }
     #[test]
     fn mint_relays_fenced_and_bounded() {
-        assert!(
-            check_mint_relay("wss://relay.maxplayer.ai").is_err(),
-            "SAFETY: production relay stays refused for mint traffic"
-        );
-        assert!(check_mint_relay("wss://RELAY.MAXPLAYER.AI/").is_err());
+        // Bob, 2026-10-09: mint traffic only (the market fence is tested in tests/relays.rs).
+        assert!(check_mint_relay("wss://relay.maxplayer.ai").is_ok());
+        assert!(check_mint_relay("ws://relay.maxplayer.ai").is_err());
         assert!(check_mint_relay("ws://relay.ditto.pub").is_err());
         assert!(check_mint_relay("wss://u:p@relay.ditto.pub").is_err());
         assert!(check_mint_relay("ws://127.0.0.1:7777").is_ok());
@@ -421,7 +424,12 @@ mod tests {
         assert!(configure_mint_relays(&nine).is_err());
         assert_eq!(
             configure_mint_relays(&[]).unwrap(),
-            vec!["wss://relay.ditto.pub", "wss://nostr-pub.wellorder.net"]
+            vec![
+                "wss://relay.maxplayer.ai",
+                "wss://relay.ditto.pub",
+                "wss://nostr-pub.wellorder.net"
+            ],
+            "relay.maxplayer.ai first, then the core fallbacks"
         );
         assert!(!nostr_op("mint/quote/bolt11").is_some_and(|_| true));
         assert!(require_http("NOSTR://npub1x", "fund").is_err());

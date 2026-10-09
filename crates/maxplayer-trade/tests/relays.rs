@@ -56,6 +56,37 @@ async fn unreachable_is_not_empty_market() {
     let error = dead.discover(None).await.unwrap_err().to_string();
     assert!(error.contains("relays unreachable"), "{error}");
 }
+/// Bob, 2026-10-09: relay.maxplayer.ai carries mint traffic (23410/23411) only. Through the real
+/// CLI, the same host is accepted as `--mint-relay` and refused as `--relay`. Both checks run
+/// before any socket opens, so this never contacts the real relay.
+#[test]
+fn production_relay_carries_mint_traffic_but_never_market_traffic() {
+    for url in ["wss://relay.maxplayer.ai", "wss://RELAY.MAXPLAYER.AI/"] {
+        let home = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
+            .arg("--home")
+            .arg(home.path())
+            .args(["--relay", url, "--mint-relay", url, "discover"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success() && stderr.contains("production relay forbidden"),
+            "SAFETY: market traffic to {url} refused: {stderr}"
+        );
+        assert!(
+            !stderr.contains("mint relay"),
+            "mint traffic to {url} allowed: {stderr}"
+        );
+        let mint_only = std::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
+            .arg("--home")
+            .arg(home.path())
+            .args(["--mint-relay", url, "status"])
+            .output()
+            .unwrap();
+        assert!(mint_only.status.success(), "mint relay {url} accepted");
+    }
+}
 #[tokio::test]
 async fn production_relay_is_forbidden() {
     assert!(

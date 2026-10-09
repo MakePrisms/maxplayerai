@@ -9,8 +9,9 @@ backoff with jitter, at most 12 attempts per event/relay and a 24-hour age cutof
 Rate limiting pauses a relay for at least five minutes.
 A separate repeated global `--mint-relay <url>` (max 8; `wss://`, `ws://` only on loopback)
 carries `nostr://` mint requests only (kinds 23410/23411), never market traffic; it defaults
-to `wss://relay.ditto.pub` and `wss://nostr-pub.wellorder.net`. `relay.maxplayer.ai` is refused
-for both relay sets. Preserve the same mint-relay set during recovery of a `nostr://` trade.
+to `wss://relay.maxplayer.ai`, `wss://relay.ditto.pub` and `wss://nostr-pub.wellorder.net`, the
+default credits sidecar's own list. `relay.maxplayer.ai` is allowed as a `--mint-relay` only; as a
+`--relay` (market) it is refused. Preserve the same mint-relay set during recovery of a `nostr://` trade.
 Relay ACK is not proof of stored readback or trade success. Respect backoff; do not
 restart loops or generate fresh identities to evade rate limits.
 
