@@ -219,21 +219,32 @@ async fn nostr_call(
         .await
         .map_err(|_| anyhow!("mint {mint} {path}: no answer within the nostr bound (ambiguous)"))?
         .map_err(|e| {
-            // Same wording as an HTTP NUT refusal, so callers that classify a definitive refusal
-            // (e.g. `receive`) treat both transports alike: a mint NUT error, or a pre-execution
-            // `bad_request`/`expired` refusal. Everything else (timeout, 5xx, 429, unknown codes)
-            // stays ambiguous. Body/detail withheld as for HTTP.
-            let refusal = match &e {
-                cdk::Error::HttpError(Some(code), _) => *code == 400,
-                cdk::Error::HttpError(None, _) => false,
-                other => other.is_definitive_failure(),
-            };
-            if refusal {
-                anyhow!("mint {mint} {path}: HTTP 400 Bad Request (nostr refusal, body withheld)")
+            if nostr_nut_refusal(&e) {
+                // Same wording as an HTTP NUT refusal, so `receive` treats both transports alike.
+                anyhow!("mint {mint} {path}: HTTP 400 Bad Request (mint NUT error, body withheld)")
             } else {
-                anyhow!("mint {mint} {path}: {e}")
+                anyhow!("mint {mint} {path}: {e} (no mint NUT error; ambiguous)")
             }
         })
+}
+
+/// Whether a nostr mint call failed with the mint's OWN NUT error (numeric wire `code`, mapped by
+/// core to the cdk error HTTPS would give), which definitively refuses THIS request. Every
+/// transport code stays ambiguous, even though core calls some of them "definitive": `expired`
+/// and `bad_request` (core: HttpError 400; a wallet/mint clock skew can expire a valid request),
+/// `rate_limited` (429), `unsupported` (404), `internal` (500), unknown codes, an oversized
+/// request (413), timeouts and relay failures. Ambiguous means: not executed or unknown, so the
+/// caller keeps the attempt and later replays the identical request. HTTP status codes cannot
+/// tell these apart here, so no `HttpError` is ever a NUT refusal on this transport.
+pub(crate) fn nostr_nut_refusal(e: &cdk::Error) -> bool {
+    !matches!(
+        e,
+        cdk::Error::HttpError(..)
+            | cdk::Error::Timeout
+            | cdk::Error::UnknownErrorResponse(_)
+            | cdk::Error::InvalidMintResponse(_)
+            | cdk::Error::Custom(_)
+    ) && e.is_definitive_failure()
 }
 
 /// POST-equivalent mint request (`checkstate`, `restore`, `swap`, and HTTP-only quote paths).
@@ -411,6 +422,55 @@ mod tests {
         );
         assert!(check_claim_fits("https://mint.example", &lock(129), 8).is_ok());
     }
+    #[test]
+    fn only_a_mint_nut_error_is_a_nostr_refusal() {
+        use maxplayer_core::{
+            mint_wire::{ErrorBody, ErrorCode, code},
+            nostr_mint::map_error,
+        };
+        let named = |name: &str| {
+            map_error(ErrorBody {
+                code: ErrorCode::Named(name.into()),
+                detail: "x".into(),
+            })
+        };
+        for name in [
+            code::EXPIRED,
+            code::BAD_REQUEST,
+            code::RATE_LIMITED,
+            code::UNSUPPORTED,
+            code::INTERNAL,
+            "brand_new_code",
+        ] {
+            assert!(
+                !nostr_nut_refusal(&named(name)),
+                "SAFETY: transport code {name} is not a refusal (not executed or unknown)"
+            );
+        }
+        assert!(!nostr_nut_refusal(&cdk::Error::Timeout));
+        assert!(!nostr_nut_refusal(&cdk::Error::HttpError(None, "x".into())));
+        assert!(!nostr_nut_refusal(&cdk::Error::HttpError(
+            Some(413),
+            "x".into()
+        )));
+        let nut = |n: u16| {
+            map_error(ErrorBody {
+                code: ErrorCode::Nut(n),
+                detail: "x".into(),
+            })
+        };
+        assert!(nostr_nut_refusal(&nut(11001)), "token already spent");
+        assert!(nostr_nut_refusal(&nut(11005)), "transaction unbalanced");
+        assert!(
+            !nostr_nut_refusal(&nut(11002)),
+            "token pending stays ambiguous"
+        );
+        assert!(
+            !nostr_nut_refusal(&nut(65_000)),
+            "unknown NUT code stays ambiguous"
+        );
+    }
+
     #[test]
     fn mint_relays_fenced_and_bounded() {
         // Bob, 2026-10-09: mint traffic only (the market fence is tested in tests/relays.rs).

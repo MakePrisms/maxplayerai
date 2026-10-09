@@ -12,7 +12,10 @@ use cdk::{
     dhke::construct_proofs,
     nuts::{PreMintSecrets, Proofs, SecretKey},
 };
-use maxplayer_core::mint_wire::{REQUEST_KIND, RESPONSE_KIND, Request};
+use maxplayer_core::mint_wire::{
+    ErrorBody, ErrorCode, Outcome, PROTOCOL_VERSION, REQUEST_KIND, RESPONSE_KIND, Request,
+    Response, code,
+};
 use maxplayer_mint::{backend, home::mint_url, issue, server::Server};
 use maxplayer_trade::{
     Asset, LOT, Leg, STATUS, TRADE,
@@ -26,7 +29,7 @@ use nostr_relay_builder::{
     builder::{PolicyResult, RateLimit, WritePolicy},
 };
 use nostr_sdk::nips::nip44;
-use nostr_sdk::prelude::{Event, EventId, Keys};
+use nostr_sdk::prelude::{Client, Event, EventBuilder, EventId, Keys, Kind, Tag};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
@@ -60,6 +63,11 @@ struct Tap {
     delay_next_swap_reply_ms: AtomicU64,
     delivered_swap_replies: AtomicU64,
     misrouted: AtomicU64,
+    /// Answer the next swap request with a mint-signed `expired` reply and never let the sidecar
+    /// see it (every copy of that event is rejected): "not executed", as the mint promises.
+    expire_next_swap: AtomicBool,
+    expired: Mutex<HashSet<EventId>>,
+    relay: Mutex<Option<String>>,
 }
 impl Tap {
     async fn admit(&self, event: &Event, mint_relay: bool) -> PolicyResult {
@@ -81,6 +89,7 @@ impl Tap {
             {
                 if let Ok(plain) = nip44::decrypt(k.secret_key(), &event.pubkey, &event.content) {
                     if let Ok(r) = serde_json::from_str::<Request>(&plain) {
+                        let (swap, request_id) = (r.op == "swap", r.id.clone());
                         self.requests
                             .lock()
                             .unwrap()
@@ -92,6 +101,23 @@ impl Tap {
                                 count: 0,
                             })
                             .count += 1;
+                        if swap {
+                            let mut expired = self.expired.lock().unwrap();
+                            if expired.contains(&event.id) {
+                                return PolicyResult::Reject("tap: expired request".into());
+                            }
+                            if self.expire_next_swap.swap(false, SeqCst) {
+                                expired.insert(event.id);
+                                let relay = self.relay.lock().unwrap().clone().unwrap();
+                                tokio::spawn(answer_expired(
+                                    k.clone(),
+                                    event.clone(),
+                                    request_id,
+                                    relay,
+                                ));
+                                return PolicyResult::Reject("tap: expired request".into());
+                            }
+                        }
                     }
                 }
             }
@@ -140,6 +166,36 @@ impl Tap {
         self.requests.lock().unwrap().clear();
         self.lost.lock().unwrap().clear();
     }
+}
+/// Publish the reply the sidecar gives a request it refuses as `expired` (signed by the mint key,
+/// NIP-44 to the requester, tagged to the request).
+async fn answer_expired(mint: Keys, to: Event, request_id: String, relay: String) {
+    let response = Response {
+        v: PROTOCOL_VERSION,
+        id: request_id,
+        outcome: Outcome::Err(ErrorBody {
+            code: ErrorCode::Named(code::EXPIRED.into()),
+            detail: "request expired".into(),
+        }),
+    };
+    let content = nip44::encrypt(
+        mint.secret_key(),
+        &to.pubkey,
+        serde_json::to_string(&response).unwrap(),
+        nip44::Version::V2,
+    )
+    .unwrap();
+    let reply = EventBuilder::new(Kind::Custom(RESPONSE_KIND), content)
+        .tag(Tag::public_key(to.pubkey))
+        .tag(Tag::event(to.id))
+        .sign_with_keys(&mint)
+        .unwrap();
+    let client = Client::default();
+    client.add_relay(relay.as_str()).await.unwrap();
+    client.connect().await;
+    client.wait_for_connection(Duration::from_secs(5)).await;
+    client.send_event(&reply).await.unwrap();
+    client.disconnect().await;
 }
 #[derive(Debug, Clone)]
 struct Policy(Arc<Tap>, bool);
@@ -200,6 +256,7 @@ async fn env() -> Env {
     );
     mint_relay.run().await.unwrap();
     let mint_relay_url = mint_relay.url().await.to_string();
+    *tap.relay.lock().unwrap() = Some(mint_relay_url.clone());
     transport::configure_mint_relays(std::slice::from_ref(&mint_relay_url)).unwrap();
     let market_relay =
         LocalRelay::new(RelayBuilder::default().write_policy(Policy(tap.clone(), false)));
@@ -734,6 +791,57 @@ async fn nostr_preflight_refuses_missing_nut_and_cli_canonicalizes() {
         .unwrap();
     assert!(!cli.status.success());
     assert!(String::from_utf8_lossy(&cli.stderr).contains("NUT-14"));
+}
+
+/// Advisor HIGH (#1119): a nostr `expired` reply means "not executed", and a skewed clock can
+/// produce it for a valid token. It must leave the receive attempt `submitted` (never
+/// `refused`), and a later pass completes it with the identical swap body.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nostr_expired_swap_reply_during_receive_stays_submitted_then_completes() {
+    let e = env().await;
+    let n = e.nostr_mint().await;
+    let dir = tempfile::tempdir().unwrap();
+    let issued = issue::issue(&n.mint, dir.path(), &n.url, 64).await.unwrap();
+    let token = std::fs::read_to_string(&issued.file).unwrap();
+    e.tap.reset();
+    e.tap.expire_next_swap.store(true, SeqCst);
+    let first = receive::receive(&e.maker, &e.jm, &n.url, &token)
+        .await
+        .unwrap();
+    assert!(
+        !e.tap.expire_next_swap.load(SeqCst) && e.tap.expired.lock().unwrap().len() == 1,
+        "fixture: the receive swap was answered `expired`"
+    );
+    assert_eq!(
+        first.state,
+        receive::ReceiveState::Submitted,
+        "SAFETY: an `expired` reply is not a refusal: {}",
+        first.summary()
+    );
+    assert_eq!(balance(&e.maker, &n.url).await, 0, "nothing credited yet");
+    assert!(
+        !receive::recover(&e.maker, &e.jm).await.unwrap(),
+        "a later pass settles the retained attempt"
+    );
+    let done = receive::receive(&e.maker, &e.jm, &n.url, &token)
+        .await
+        .unwrap();
+    assert_eq!(
+        done.state,
+        receive::ReceiveState::Done,
+        "{}",
+        done.summary()
+    );
+    assert_eq!(
+        balance(&e.maker, &n.url).await,
+        64,
+        "SAFETY: the token credited exactly once"
+    );
+    assert_eq!(
+        e.tap.swaps().len(),
+        2,
+        "SAFETY: the expired request plus one replay; no other swap"
+    );
 }
 
 #[test]
