@@ -248,12 +248,15 @@ pub async fn receive(home: &Path, j: &Journal, mint: &str, raw: &str) -> Result<
         .cloned()
         .collect();
     if !with_dleq.is_empty() {
-        bounded_for(mint, w.verify_token_dleq(&Token::new(
-            MintUrl::from_str(mint)?,
-            with_dleq,
-            None,
-            CurrencyUnit::Sat,
-        )))
+        bounded_for(
+            mint,
+            w.verify_token_dleq(&Token::new(
+                MintUrl::from_str(mint)?,
+                with_dleq,
+                None,
+                CurrencyUnit::Sat,
+            )),
+        )
         .await
         .context("CDK wallet request timed out")?
         .map_err(|_| anyhow!("incoming token DLEQ verification failed"))?;
@@ -481,12 +484,15 @@ pub async fn resume(home: &Path, j: &Journal, r: &mut Receipt) -> Result<()> {
         return finish(j, r, ReceiveState::Quarantined).await;
     }
     let w = wallet(home, &r.mint).await?;
-    match bounded_for(&r.mint, w.verify_token_dleq(&Token::new(
-        MintUrl::from_str(&r.mint)?,
-        result.clone(),
-        None,
-        CurrencyUnit::Sat,
-    )))
+    match bounded_for(
+        &r.mint,
+        w.verify_token_dleq(&Token::new(
+            MintUrl::from_str(&r.mint)?,
+            result.clone(),
+            None,
+            CurrencyUnit::Sat,
+        )),
+    )
     .await
     .context("CDK wallet request timed out")?
     {

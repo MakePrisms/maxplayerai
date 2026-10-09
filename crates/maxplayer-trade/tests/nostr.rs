@@ -11,7 +11,6 @@ use cdk::{
     amount::SplitTarget,
     dhke::construct_proofs,
     nuts::{PreMintSecrets, Proofs, SecretKey},
-    wallet::ReceiveOptions,
 };
 use maxplayer_core::mint_wire::{REQUEST_KIND, RESPONSE_KIND, Request};
 use maxplayer_mint::{backend, home::mint_url, issue, server::Server};
@@ -20,7 +19,7 @@ use maxplayer_trade::{
     coordinator::{self, Swap},
     journal::Journal,
     market::Market,
-    mint, money, transport, wallet,
+    mint, money, receive, transport, wallet,
 };
 use nostr_relay_builder::{
     LocalRelay, RelayBuilder,
@@ -266,21 +265,48 @@ impl Env {
             _dir: dir,
         }
     }
-    /// Operator `issue` into a token file, then a cdk wallet receive into the trade home over
-    /// the relay (the trade CLI's own `receive` lands in a separate PR).
+    /// Operator `issue` into a token file, then the trade CLI's own `receive` (library entry
+    /// point) imports it into the home over the mint relay.
     async fn fund_nostr(&self, home: &Path, m: &NostrMint, amount: u64) {
         let dir = tempfile::tempdir().unwrap();
         let issued = issue::issue(&m.mint, dir.path(), &m.url, amount)
             .await
             .unwrap();
         let token = std::fs::read_to_string(issued.file).unwrap();
-        let got = wallet::wallet(home, &m.url)
-            .await
-            .unwrap()
-            .receive(token.trim(), ReceiveOptions::default())
+        let j = if home == self.maker {
+            &self.jm
+        } else {
+            &self.jt
+        };
+        let r = receive::receive(home, j, &m.url, &token).await.unwrap();
+        assert_eq!(r.state, receive::ReceiveState::Done, "{}", r.summary());
+        assert_eq!(balance(home, &m.url).await, amount, "fee-free sidecar");
+    }
+    /// The same through the built `maxplayer-trade receive --token-file` binary.
+    async fn fund_nostr_cli(&self, home: &Path, m: &NostrMint, amount: u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let issued = issue::issue(&m.mint, dir.path(), &m.url, amount)
             .await
             .unwrap();
-        assert_eq!(u64::from(got), amount);
+        let hex_input = format!("nostr://{}", m.keys.public_key().to_hex());
+        let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
+            .arg("--home")
+            .arg(home)
+            .args(["--mint-relay", &self.mint_relay_url, "receive", &hex_input])
+            .arg("--token-file")
+            .arg(&issued.file)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let summary: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(summary["mint"], m.url.as_str(), "canonical nostr mint");
+        assert_eq!(summary["credited"], amount);
+        assert_eq!(balance(home, &m.url).await, amount);
     }
     async fn list(&self, give: &str, give_net: u64, want: &str, want_net: u64) -> String {
         coordinator::list(
@@ -442,11 +468,12 @@ async fn attempt(j: &Journal, id: &str) -> serde_json::Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn nostr_https_trade_completes_and_mint_traffic_stays_on_mint_relays() {
+async fn nostr_issue_receive_then_https_trade_completes_on_mint_relays_only() {
     let mut e = env().await;
     let n = e.nostr_mint().await;
     let b = MintFixture::start(0).await;
-    e.fund_nostr(&e.maker.clone(), &n, 128).await;
+    // issue -> `maxplayer-trade receive` (CLI) -> trade nostr<->https.
+    e.fund_nostr_cli(&e.maker.clone(), &n, 128).await;
     support::fund(&e.taker, &b.url, 128).await;
     let lot = e.list(&n.url, 32, &b.url, 24).await;
     let id = e.take(&lot, 40, 32).await;
@@ -645,6 +672,8 @@ async fn nostr_preflight_refuses_missing_nut_and_cli_canonicalizes() {
         String::from_utf8_lossy(&ok.stderr).contains(&n.url),
         "CLI canonicalized hex/uppercase to nostr://<npub>"
     );
+    // Fund while the mint is still compliant (`receive` preflights too).
+    e.fund_nostr(&e.maker, &n, 64).await;
     let info = n.mint.mint_info().await.unwrap();
     let nuts = info.nuts.clone().nut14(false);
     n.mint
@@ -659,7 +688,6 @@ async fn nostr_preflight_refuses_missing_nut_and_cli_canonicalizes() {
         "SAFETY: nostr mint without NUT-14 refused: {refused:?}"
     );
     let b = MintFixture::start(0).await;
-    e.fund_nostr(&e.maker, &n, 64).await;
     let listed = coordinator::list(
         &e.maker,
         &e.jm,
