@@ -123,7 +123,7 @@ reservation is spendable. After **any interruption**, use `recover` with the sam
 home and relays before new work. It resumes existing authorizations and does not
 admit new trade requests. It makes **one bounded pass**, at most **120 seconds per
 funding/withdrawal/swap item**, without waiting for lock deadlines: exit **0** means
-all terminal with no deferred work, **3** unresolved/deferred, **4** terminal manual recovery, **1** command error (never proof a submitted withdrawal was refused; a submitted non-terminal withdrawal exits **3**),
+all terminal with no deferred work, **3** unresolved/deferred, **4** terminal manual recovery, **1** command error, pre-submission refusal, or definitive terminal `unpaid_released` (never proof a submitted withdrawal was refused; a submitted non-terminal withdrawal exits **3**),
 **2** CLI usage error.
 Timeout does not undo an RPC or release reservations. Restore `serve` while locks
 are live; a single recovery pass is not a watcher. See the recovery reference for

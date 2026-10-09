@@ -21,8 +21,8 @@ Earlier dated verification sections are historical snapshots, not current covera
   unsent quote; an explicitly failed pre-POST withdrawal cannot pay later on a serve tick.
   Submitted ambiguity retains exact authorization and replays it until definitive.
 - Read-only `status` and `balance` use SQLite snapshots without the writer lock. Keep
-  serve alive from second lock through settlement. Exits: 0 success, 1 command error or
-  pre-submission refusal, 2 usage, 3 unresolved work, 4 terminal manual recovery. Non-final
+  serve alive from second lock through settlement. Exits: 0 success, 1 command error,
+  pre-submission refusal, or definitive terminal `unpaid_released`, 2 usage, 3 unresolved work, 4 terminal manual recovery. Non-final
   withdrawals never exit 0; a submitted (past `quote_created`) non-terminal withdrawal always
   exits 3, even when the mint fails after the POST. Exit 1 is never proof that a submitted
   withdrawal was refused: check `status` before paying the obligation another way.
