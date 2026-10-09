@@ -1191,3 +1191,50 @@ button.chip { cursor: pointer; }
 @keyframes try-nudge { 0%,100% { transform: translateY(0); } 50% { transform: translateY(2px); } }
 @media (max-width: 760px) { .try-float { bottom: max(16px, env(safe-area-inset-bottom)); } }
 @media (prefers-reduced-motion: reduce) { .try-float, .try-float svg { transition: none; animation: none; } }
+
+/* ================= /tokens: the token-trade order book (unlisted) ===
+   Same board chrome as /market; two columns (open lots, recent) instead of
+   three. Everything is scoped to .trades-page so /market cannot change. */
+.trades-page .market-bar .col-meta { white-space: normal; text-align: right; }
+.trades-book { grid-template-columns: 1fr 1fr; }
+.lots-grid { grid-template-columns: minmax(0, 1.3fr) minmax(0, 1.3fr) 64px minmax(0, 1fr) 62px; }
+.recent-grid { grid-template-columns: 74px minmax(0, 1fr) 34px; }
+.trades-page .feed .row.recent-grid { grid-template-columns: 74px minmax(0, 1fr) 34px; }
+.trades-page .leg, .trades-page .col-seller { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.trades-page .person { color: var(--ink-2); }
+.tag[data-s="available"] { color: var(--neon); border-color: rgba(255, 223, 0, 0.35); }
+.tag[data-s="sold"] { color: #0a0a0b; background: var(--blue); border-color: var(--blue); }
+.tag[data-s="cancelled"] { color: var(--muted); }
+.tag[data-s="expired"] { color: var(--faint); }
+.tag[data-s="quarantined"] { color: var(--warn); border-color: rgba(255, 138, 61, 0.4); }
+#trade-detail-body code { overflow-wrap: anywhere; }
+#trade-detail-body .kv dd { min-width: 0; }
+@media (max-width: 980px) {
+  .trades-book { grid-template-columns: 1fr; }
+  .trades-page .col.mid { grid-column: auto; grid-row: auto; }
+}
+@media (max-width: 700px) {
+  /* phones: the seller column goes (it is in the lot details); the two legs keep the width */
+  .lots-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 54px 54px; }
+  .trades-page .col-seller { display: none; }
+  .trades-page .market-bar .col-meta { text-align: left; }
+}
+/* bob: the open lots / recent board is exactly the viewport under the nav,
+   at every width (stacked columns split it on tablets and phones). */
+.trades-page.market-page {
+  display: flex; flex-direction: column;
+  height: calc(100vh - var(--nav-h)); height: calc(100svh - var(--nav-h));
+  min-height: 420px;
+}
+.trades-page .book { flex: 1; min-height: 0; }
+.trades-page .col { display: flex; flex-direction: column; min-height: 0; }
+.trades-page .rows { flex: 1; height: auto; min-height: 0; }
+@media (max-width: 980px) { .trades-book { grid-template-rows: 1fr 1fr; } }
+.tokens-stats-bar { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+/* /tokens stat skeleton: a block exactly one line of the value font tall, so
+   the cell is the same height before and after the numbers land. */
+.statgrid .skel-stat { display: block; width: 45%; height: 1em; }
+/* /tokens: the status word grows from "syncing" to "live · 3/3 relays"; a
+   fixed slot keeps the rest of the nav from sliding when it does. */
+@media (min-width: 701px) { .conn-fixed { min-width: 21ch; justify-content: flex-end; } }
+/* phones hide the status word (dot only), so no slot: it pushed the menu button off-screen */
