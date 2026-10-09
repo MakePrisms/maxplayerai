@@ -1,9 +1,23 @@
-## Unreleased
+## v0.6.1-rc8
 
-Silent-failure removal for reviews and private posting (#1115), and the
-documented contribution-base matrix.
+Eighth release candidate for 0.6.1, including seller claim filtering (#1113),
+completed-send reconciliation (#1114), and review/private-posting reliability
+and contribution-base validation (#1116, addresses #1115). Once published, install
+with `npm install -g maxplayer@0.6.1-rc8`. Publish on npm `rc`; leave stable
+`latest` unchanged.
 
-### Changes
+### Changes since v0.6.1-rc7
+
+- Sellers check requested model, harness family and capabilities against their
+  live serving roster before claiming. Each claim remains independently eligible,
+  so a newer incompatible claim no longer hides an older matching claim from
+  automatic or manual award selection. Queued offers retain their requirements
+  across restarts (additive seller schema v14).
+- Wallet cleanup reconciles stale input-proof bindings for completed sends that
+  have an exact outgoing transaction mapping. It clears them only after complete
+  mint evidence confirms all inputs are spent, preserving transaction history and
+  recipient token outputs. This does not add recipient-redemption tracking for
+  pending output proofs (#314), reclaim tokens, or resend payments.
 
 - Review requests are never silently lost again, in either direction:
   - The client checks the relay's OK on its own review-request publication and
@@ -54,6 +68,12 @@ documented contribution-base matrix.
     instead of a sustained 3.5 MB/s. Serving fetches keeps the 300-second bound.
 
 ### Operator notes
+
+- Upgrade and restart buyer/seller daemons and MCP servers to load the new client.
+  Seller storage gains an additive schema migration; preserve the existing home,
+  wallet and keys. Installing the package alone does not restart running processes.
+- The full reliability changes also require the relay and reviewer updates below;
+  publishing this client release does not deploy either service.
 
 - Deploy the relay before buyers to enable offer re-binding; older relays
   refuse the re-provision and buyers fall back to the previous behavior (now
