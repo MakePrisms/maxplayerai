@@ -261,6 +261,24 @@ async fn a3_domain_separation() {
 fn a4_separate_product_same_identity() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
+    let missing_home = std::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-chat"))
+        .current_dir(dir.path())
+        .env_remove("HOME")
+        .env_remove("MAXPLAYER_HOME")
+        .arg("whoami")
+        .output()
+        .unwrap();
+    assert!(!missing_home.status.success());
+    assert!(!dir.path().join(".maxplayer").exists());
+    let env_root = dir.path().join("env-home");
+    let by_env = std::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-chat"))
+        .env_remove("HOME")
+        .env("MAXPLAYER_HOME", &env_root)
+        .arg("whoami")
+        .output()
+        .unwrap();
+    assert!(by_env.status.success());
+    assert!(env_root.join("key").exists());
     let root = dir.path().join("fresh");
     let out = cli(&root, &["whoami"]);
     assert!(out.status.success());

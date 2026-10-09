@@ -15,11 +15,7 @@ async fn run() -> Result<()> {
         println!("{HELP}");
         return Ok(());
     }
-    let mut root = std::env::var_os("MAXPLAYER_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".maxplayer")
-        });
+    let mut root: Option<PathBuf> = None;
     let mut relay = DEFAULT_RELAY.to_string();
     let i = 0;
     while i < args.len() {
@@ -33,7 +29,7 @@ async fn run() -> Result<()> {
             }
             let value = args.remove(i);
             if flag == "--home" {
-                root = value.into()
+                root = Some(value.into())
             } else {
                 relay = value
             }
@@ -41,6 +37,10 @@ async fn run() -> Result<()> {
             break;
         }
     }
+    let root = match root {
+        Some(root) => root,
+        None => maxplayer_core::home::default_home_dir()?,
+    };
     let home = Home::open(root)?;
     match args
         .iter()
