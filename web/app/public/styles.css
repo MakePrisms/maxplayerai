@@ -1236,4 +1236,5 @@ button.chip { cursor: pointer; }
 .statgrid .skel-stat { display: block; width: 45%; height: 1em; }
 /* /tokens: the status word grows from "syncing" to "live · 3/3 relays"; a
    fixed slot keeps the rest of the nav from sliding when it does. */
-.conn-fixed { min-width: 21ch; justify-content: flex-end; }
+@media (min-width: 701px) { .conn-fixed { min-width: 21ch; justify-content: flex-end; } }
+/* phones hide the status word (dot only), so no slot: it pushed the menu button off-screen */
