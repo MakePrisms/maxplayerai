@@ -65,6 +65,10 @@ pub struct Faults {
     pub delay_ms: std::sync::atomic::AtomicU64,
     /// Count of HTTP requests that reached this mint.
     pub requests: std::sync::atomic::AtomicU64,
+    /// Count of swap POSTs that reached this mint (including ones whose reply is lost).
+    pub swaps: std::sync::atomic::AtomicU64,
+    /// Answer every swap POST with a well-formed NUT error (HTTP 400 + code), unprocessed.
+    pub swap_nut_error: std::sync::atomic::AtomicBool,
 }
 pub struct MintFixture {
     pub faults: Arc<Faults>,
@@ -138,6 +142,16 @@ impl MintFixture {
                     use std::sync::atomic::Ordering::SeqCst;
                     let path = req.uri().path().to_owned();
                     control.requests.fetch_add(1, SeqCst);
+                    if path.ends_with("/swap") {
+                        control.swaps.fetch_add(1, SeqCst);
+                        if control.swap_nut_error.load(SeqCst) {
+                            return (
+                                axum::http::StatusCode::BAD_REQUEST,
+                                axum::Json(serde_json::json!({"code":11001,"detail":"refused"})),
+                            )
+                                .into_response();
+                        }
+                    }
                     let delay = control.delay_ms.load(SeqCst);
                     if delay != 0 {
                         tokio::time::sleep(std::time::Duration::from_millis(delay)).await;

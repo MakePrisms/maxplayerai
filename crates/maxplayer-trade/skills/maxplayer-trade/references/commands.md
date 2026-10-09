@@ -17,6 +17,7 @@ preflight <mint>
 balance <mint>
 status
 fund <mint> --amount <sats> [--quote <quote-id>]
+receive <mint> [--token-file <path>]
 list --give-mint <mint> --give <net-sats> --want-mint <mint> --want <net-sats> --max-fees <sats>
 discover
 serve
@@ -30,7 +31,7 @@ Use `-h` / `--help` at the root or on any application subcommand. The built-in
 `help [COMMAND]` also shows root or command help. There is no version option.
 `--home <HOME>` is required for operational commands; `--relay <RELAY>` is
 repeatable. All command-specific flags in the signatures above are required except
-`--quote`, `--max-debit`, and `--max-fees` (default 16 on list/take). Positional mint arguments are
+`--quote`, `--max-debit`, `--token-file` (stdin when omitted), and `--max-fees` (default 16 on list/take). Positional mint arguments are
 canonical URLs; lot arguments are public lot IDs; `--quote` is a saved funding
 quote for the same mint and amount.
 Never use a lab-feature binary for the human's funds.
@@ -85,6 +86,25 @@ mint and amount, then let the human pay it once from their own wallet. Include a
 external-wallet routing fee budget in the human's approval; this CLI cannot enforce
 fees charged by another wallet. Never assume a real invoice is auto-paid because
 a test mint behaved that way. Reuse the retained quote for the same mint/amount.
+
+## Receive
+
+`receive <mint> --token-file <path>` (or the token on stdin; never argv) imports one
+Cashu token. Refused **before anything is journaled**: a token whose mint is not
+exactly `<mint>` after canonicalization, multi-mint tokens, non-sat units, P2PK/HTLC
+or other NUT-10 locked proofs, more than 128 or duplicate proofs, an invalid incoming
+DLEQ (when present), a token above **100,000 sats**, or one that would push this
+mint's cumulative funding + receives past **100,000 sats** (receives and `fund`
+share that lifetime cap; definitively refused/already-spent receives are not
+charged). Common preflight runs, then NUT-07 must report every proof UNSPENT.
+
+One swap into fresh home-owned outputs; token, inputs, outputs and secrets are
+journaled before the POST. The mint input fee is deducted: `net = amount - fee`.
+Only DLEQ-verified result proofs are credited. Output is one JSON line with
+`receive` (attempt id), `mint`, `state`, `amount`, `fee`, `net`, `credited`; never
+the token or proofs. Repeating the same token (any encoding) resumes the same
+attempt and never swaps twice. Exit 0 `done`; 3 unresolved (`prepared`/`submitted`);
+1 pre-journal refusal, `refused` or `already_spent`; 4 `quarantined`.
 
 ## Withdrawal: enforcement before execution
 

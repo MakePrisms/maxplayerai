@@ -23,7 +23,7 @@ receiver claims remain valid after locktime. Keep the watcher alive.
 ## Bounded pass and exit status
 
 `recover` makes one pass without waiting for future lock deadlines. Each funding,
-withdrawal, and swap attempt has a **120-second** budget; this is not a 120-second
+withdrawal, receive, and swap attempt has a **120-second** budget; this is not a 120-second
 whole-command deadline. Items are handled sequentially and relay/setup/publication
 work is additional. A timeout does not undo a delivered RPC or release reservations.
 
@@ -95,6 +95,20 @@ releases it immediately. An explicit same-invoice command can retry an unexpired
 unsent quote. `refused` permits a same-invoice retry; `unpaid_released` requires a
 new invoice for a new payment. A failed pre-POST withdrawal cannot pay later via
 serve/recover/market commands; a post-POST timeout is still unresolved, not failure. Escalate persistent uncertainty without forcing release.
+
+## Receive states
+
+| State | Meaning and action |
+| --- | --- |
+| `prepared` | Journaled, swap not yet sent. Recovery sends exactly the journaled swap. |
+| `submitted` | Swap may have reached the mint. Recovery restores (NUT-09) the same outputs and replays only the identical swap; never import the token again elsewhere. |
+| `done` | Terminal: DLEQ-verified proofs credited; check `balance`. |
+| `refused` | Terminal: the mint returned a NUT error and the inputs stayed UNSPENT. Nothing credited, not charged to the cap. |
+| `already_spent` | Terminal: inputs SPENT and none of our outputs restorable. Nothing credited, not charged. |
+| `quarantined` | Terminal manual recovery (exit 4): our outputs were signed but lack valid DLEQ; never credited. Preserve the home and escalate. |
+
+Inputs reported PENDING keep the attempt unresolved. A lost swap reply is never
+answered with replacement outputs.
 
 ## Funding and market status are separate
 

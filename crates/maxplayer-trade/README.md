@@ -624,6 +624,27 @@ A mint can still lie, withhold evidence, or process an already-delivered request
   process-exit boundaries and one claim/refund race, not a full model checker.
 
 
+## Receive (import a Cashu token)
+
+`maxplayer-trade --home <home> receive <mint> --token-file <path>` (or the token on stdin;
+never argv) imports one token, e.g. one written by `maxplayer-mint issue`. Code: `src/receive.rs`.
+
+- Refused before any journal write: token mint not exactly `<mint>` after canonicalization,
+  multi-mint, non-sat, NUT-10 locked (P2PK/HTLC), > 128 or duplicate proofs, invalid incoming
+  DLEQ (when present), > 100,000 sats, or cumulative funding + receives for that mint above
+  100,000 sats. Common preflight and NUT-07 UNSPENT are required before the journal write.
+- One swap into fresh home-owned outputs; token, inputs, blinded outputs and secrets are
+  journaled before the POST. Ambiguity → NUT-09 restore of the same outputs and identical
+  replay only. A NUT error with inputs UNSPENT is terminal `refused`; SPENT inputs with nothing
+  of ours restorable is terminal `already_spent`. Only DLEQ-verified proofs are credited;
+  missing/invalid DLEQ on our outputs is terminal `quarantined` (exit 4).
+- Idempotent per Y-set (sha256 of the sorted proof Ys): repeats resume the existing attempt.
+- The mint input fee is deducted; output reports `amount`, `fee`, `net`, `credited`, state and
+  attempt id only. `recover`/`serve` resume receives under the same 120 s item budget.
+- `nostr://` mints: cdk 0.17.2 `MintUrl`/`Token` parse them (unit test
+  `cdk_token_parsing_accepts_nostr_mint_url`), but this crate's `Asset::new` admits only
+  http/https, so a nostr:// receive is refused until the nostr transport branch lands.
+
 ## Funding and withdrawals
 
 This path is **not a production safety certification**. Public-mint results, if any, belong in

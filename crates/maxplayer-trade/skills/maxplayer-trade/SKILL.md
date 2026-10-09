@@ -1,6 +1,6 @@
 ---
 name: maxplayer-trade
-description: Trade Cashu tokens for a human with the standalone maxplayer-trade CLI, including real money. Use for “sell/list X of mint A for Y of mint B”, “buy that lot”, “find listings”, “fund my trade wallet”, “withdraw”, “check balance”, or “something got interrupted”.
+description: Trade Cashu tokens for a human with the standalone maxplayer-trade CLI, including real money. Use for “sell/list X of mint A for Y of mint B”, “buy that lot”, “find listings”, “fund my trade wallet”, “receive this token”, “withdraw”, “check balance”, or “something got interrupted”.
 ---
 
 # Trade Cashu for the human
@@ -53,8 +53,7 @@ or a published listing is not approval for a new operation. State:
   have their own unresolved-payment risk, not a guaranteed 75-minute timeout.
 - A mint can steal its tokens. If the counterparty vanishes, funds stay locked until
   the refund deadline and successful recovery. `serve` must stay running while locks are live (the active `take` also watches its trade).
-  NUT-14 claims remain valid after locktime. Nutshell refund status: round 4 reports a **successful cashu.cz Nutshell/0.21.0
-  refund**; see the version-specific limits in [verification](references/verification.md). NUT-07 advertisement alone does not prove witness emission. The maker relies on
+  NUT-14 claims remain valid after locktime. Nutshell refund status and limits: [verification](references/verification.md). NUT-07 advertisement alone does not prove witness emission. The maker relies on
   the chosen mint reporting the HTLC witness if the taker withholds its notice.
   Mint choice is the buyer’s/seller’s responsibility; there is no rating or verification gate.
 
@@ -77,6 +76,14 @@ interruption use `recover`, and when needed resume that same funding quote with
 or pay a replacement merely because a reply or issuance timed out.
 **Done:** issuance is reconciled and `balance <mint>` confirms the result, or the
 retained quote is reported as unresolved without another payment.
+
+### Receive a token
+
+Needs the human's yes (mint URL, token amount); it charges the per-mint cap.
+Save the token to a private file; run `receive <mint> --token-file <file>` (or
+stdin). Never put a token in argv, chat or logs. Only plain sat proofs from that
+exact mint, at most 100,000 sats; the input fee is deducted. Exit 3 is not failure:
+`recover`, never re-import elsewhere. **Done:** state `done` and `balance <mint>`.
 
 ### Sell/list X of mint A for Y of mint B
 
@@ -122,7 +129,7 @@ or report the retained authorization and recover it without paying again.
 reservation is spendable. After **any interruption**, use `recover` with the same
 home and relays before new work. It resumes existing authorizations and does not
 admit new trade requests. It makes **one bounded pass**, at most **120 seconds per
-funding/withdrawal/swap item**, without waiting for lock deadlines: exit **0** means
+funding/withdrawal/receive/swap item**, without waiting for lock deadlines: exit **0** means
 all terminal with no deferred work, **3** unresolved/deferred, **4** terminal manual recovery, **1** command error, pre-submission refusal, or definitive terminal `unpaid_released` (never proof a submitted withdrawal was refused; a submitted non-terminal withdrawal exits **3**),
 **2** CLI usage error.
 Timeout does not undo an RPC or release reservations. Restore `serve` while locks

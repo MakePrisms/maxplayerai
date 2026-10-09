@@ -155,7 +155,9 @@ pub async fn fund(home: &Path, j: &Journal, url: &str, amount: u64) -> Result<Fu
         .filter(|f| f.mint == url)
         .try_fold(0u64, |s, f| {
             s.checked_add(f.amount).context("funding overflow")
-        })?;
+        })?
+        .checked_add(crate::receive::charged(j, url).await?)
+        .context("funding overflow")?;
     ensure!(
         total
             .checked_add(amount)
@@ -844,7 +846,9 @@ pub async fn recover(home: &Path, j: &Journal) -> Result<bool> {
             );
         }
     }
-    Ok(pending(j).await? || failed)
+    // Receives share the item budget and pass; see receive::RECOVERY_ITEM_SECONDS.
+    let receives = crate::receive::recover(home, j).await?;
+    Ok(pending(j).await? || failed || receives)
 }
 
 pub async fn pending(j: &Journal) -> Result<bool> {
@@ -855,7 +859,8 @@ pub async fn pending(j: &Journal) -> Result<bool> {
         || j.all::<Withdrawal>("withdrawal")
             .await?
             .iter()
-            .any(|a| !a.terminal()))
+            .any(|a| !a.terminal())
+        || crate::receive::pending(j).await?)
 }
 
 impl Withdrawal {
