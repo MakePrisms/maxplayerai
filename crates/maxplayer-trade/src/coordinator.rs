@@ -178,7 +178,26 @@ pub async fn list(
 ) -> Result<String> {
     give.asset.fence()?;
     want.asset.fence()?;
-    let event = lot_event(&m.keys, give, want)?;
+    // A lot id is a hash of second-granular terms: two identical lists in the same second
+    // (back-to-back requests handed to serve) would share an id, and the second journal row
+    // would overwrite the first, orphaning its reservation. Wait for a fresh id instead.
+    let mut event = lot_event(&m.keys, give.clone(), want.clone())?;
+    for _ in 0..3 {
+        if j.get::<Listing>("listing", &event.id.to_hex())
+            .await?
+            .is_none()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        event = lot_event(&m.keys, give.clone(), want.clone())?;
+    }
+    ensure!(
+        j.get::<Listing>("listing", &event.id.to_hex())
+            .await?
+            .is_none(),
+        "an identical lot was just listed; retry"
+    );
     let lot = parse_lot(&event, now())?;
     preflight(&lot).await?;
     let plan = mint::plan(home, &lot.give.asset.mint_url, lot.give.net, max_fees).await?;

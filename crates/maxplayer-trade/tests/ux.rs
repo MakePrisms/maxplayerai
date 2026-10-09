@@ -540,6 +540,7 @@ async fn concurrent_clients_and_serve_never_make_two_writers() {
         "8",
     ];
     let mut ok = 0;
+    let mut outputs = String::new();
     let mut killed = std::collections::BTreeMap::new();
     for round in 0..3 {
         let log = f.root.path().join(format!("serve{round}.log"));
@@ -552,7 +553,11 @@ async fn concurrent_clients_and_serve_never_make_two_writers() {
         let c2 = cmd(&f.maker, &f.relay_url, &list, &env).output();
         let (o1, o2) = tokio::join!(c1, c2);
         for o in [o1.unwrap(), o2.unwrap()] {
-            let (_, stderr) = text(&o);
+            let (stdout, stderr) = text(&o);
+            outputs.push_str(&format!(
+                "round {round} exit {:?}\nstdout: {stdout}\nstderr: {stderr}\n",
+                o.status.code()
+            ));
             if o.status.success() {
                 ok += 1;
             } else {
@@ -610,7 +615,14 @@ async fn concurrent_clients_and_serve_never_make_two_writers() {
     assert_eq!(
         listings.len(),
         ok,
-        "SAFETY: success count equals journaled listings"
+        "SAFETY: success count equals journaled listings\n{outputs}\n{}",
+        (0..3)
+            .map(
+                |r| std::fs::read_to_string(f.root.path().join(format!("serve{r}.log")))
+                    .unwrap_or_default()
+            )
+            .collect::<Vec<_>>()
+            .join("\n---\n")
     );
     let mut ys = BTreeSet::new();
     for l in &listings {
