@@ -61,6 +61,10 @@ pub struct Faults {
     /// Process the melt POST, then answer 503 to every later request.
     pub die_after_melt: std::sync::atomic::AtomicBool,
     pub dead: std::sync::atomic::AtomicBool,
+    /// Slow-but-live mint: delay every request by this many milliseconds.
+    pub delay_ms: std::sync::atomic::AtomicU64,
+    /// Count of HTTP requests that reached this mint.
+    pub requests: std::sync::atomic::AtomicU64,
 }
 pub struct MintFixture {
     pub faults: Arc<Faults>,
@@ -133,6 +137,11 @@ impl MintFixture {
                     use axum::response::IntoResponse;
                     use std::sync::atomic::Ordering::SeqCst;
                     let path = req.uri().path().to_owned();
+                    control.requests.fetch_add(1, SeqCst);
+                    let delay = control.delay_ms.load(SeqCst);
+                    if delay != 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    }
                     if control.dead.load(SeqCst) {
                         return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
                     }
@@ -504,5 +513,59 @@ impl Fixture {
             self.state(true, id).await,
             self.state(false, id).await
         )
+    }
+}
+/// Maker in `claiming` with a known preimage after the taker claimed one outgoing proof;
+/// the rest of the maker's outgoing lock is refundable once past `short + margin`.
+#[cfg(feature = "lab")]
+pub async fn partial_claim_fixture() -> (Fixture, String) {
+    let mut f = Fixture::new(0).await;
+    let lot = coordinator::list(
+        &f.maker,
+        &f.jm,
+        &f.mm,
+        Leg {
+            asset: Asset::new(&f.a.url).unwrap(),
+            net: 24,
+        },
+        Leg {
+            asset: Asset::new(&f.b.url).unwrap(),
+            net: 24,
+        },
+        16,
+    )
+    .await
+    .unwrap();
+    let id = coordinator::start_take(&f.taker, &f.jt, &f.mt, &lot, 40, 24, 16)
+        .await
+        .unwrap();
+    f.step(true).await;
+    f.step(false).await;
+    f.step(true).await;
+    let mut s = f.jm.get::<Swap>("swap", &id).await.unwrap().unwrap();
+    let t = f.jt.get::<Swap>("swap", &id).await.unwrap().unwrap();
+    let chosen = vec![s.outgoing.iter().max_by_key(|p| p.amount).unwrap().clone()];
+    maxplayer_trade::mint::redeem(
+        &f.taker,
+        &f.jt,
+        "partial",
+        &f.a.url,
+        &chosen,
+        &t.key,
+        t.preimage.as_ref().unwrap(),
+        16,
+        None,
+    )
+    .await
+    .unwrap();
+    s.preimage = t.preimage;
+    s.state = "claiming".into();
+    f.jm.put("swap", &id, &s).await.unwrap();
+    (f, id)
+}
+#[cfg(feature = "lab")]
+pub async fn wait_past(t: u64) {
+    while coordinator::now() <= t {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }

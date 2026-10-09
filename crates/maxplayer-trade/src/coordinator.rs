@@ -600,6 +600,8 @@ pub async fn advance(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Resu
     result
 }
 async fn advance_inner(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Result<()> {
+    let (overall_budget, refund_budget) = advance_budgets();
+    let end = tokio::time::Instant::now() + overall_budget;
     if terminal(s) {
         return Ok(());
     }
@@ -734,25 +736,17 @@ async fn advance_inner(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Re
         ]
         .contains(&s.state.as_str())
     {
-        // Own-mint refund work and the counterparty claim get SEPARATE budgets, and no
-        // own-mint failure propagates past the claim: an outage or black hole on one
-        // mint must never starve or skip the other (live claims stay claimable).
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(PHASE_BUDGET_SECONDS),
-            maker_refund(home, j, s, &q, &own_mint),
-        )
-        .await
-        {
+        // One deadline for the whole advance. Own-mint refund work is capped so it can
+        // never starve the claim; the counterparty claim inherits everything the refund
+        // did not use. No own-mint failure propagates past the claim: an outage or black
+        // hole on one mint must never starve or skip the other (live claims stay claimable).
+        let refund_end = (tokio::time::Instant::now() + refund_budget).min(end);
+        match tokio::time::timeout_at(refund_end, maker_refund(home, j, s, &q, &own_mint)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => eprintln!("maker refund phase {}: {e}", s.id),
             Err(_) => eprintln!("maker refund phase {}: budget exhausted", s.id),
         }
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(PHASE_BUDGET_SECONDS),
-            maker_claim(home, j, m, s, &q, &claim_id),
-        )
-        .await
-        {
+        match tokio::time::timeout_at(end, maker_claim(home, j, m, s, &q, &claim_id)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => eprintln!("maker claim {}: {e}", s.id),
             Err(_) => eprintln!("maker claim {}: budget exhausted", s.id),
@@ -1108,8 +1102,40 @@ fn canonical_key(key: &str) -> Result<()> {
     Ok(())
 }
 
-/// Per-phase budget inside one maker advance; two phases fit the 120 s item budget.
-const PHASE_BUDGET_SECONDS: u64 = 50;
+/// Deadline for the maker refund+claim phases of one advance, measured from the start of
+/// the advance. Two budgets enclose an advance: the 120 s recovery item budget
+/// (`recover_pass`) and the 60 s inbound message budget (`run` -> `handle`). 100 s leaves
+/// the trailing own-mint `states()` call (<= 20 s) inside the 120 s item budget. On the
+/// 60 s message path the outer timeout may cut the claim first; `claiming` and the
+/// preimage are saved before that, so the next recovery tick claims with the full budget.
+const ADVANCE_BUDGET_SECONDS: u64 = 100;
+/// Cap on own-mint refund work inside that deadline; the claim gets the remainder.
+const REFUND_BUDGET_SECONDS: u64 = 50;
+#[cfg(feature = "lab")]
+static LAB_ADVANCE_BUDGETS_MS: std::sync::Mutex<Option<(u64, u64)>> = std::sync::Mutex::new(None);
+/// Lab-only: scale the (overall, refund) advance budgets so slow-mint tests stay fast.
+#[cfg(feature = "lab")]
+pub fn lab_set_advance_budgets_ms(budgets: Option<(u64, u64)>) {
+    *LAB_ADVANCE_BUDGETS_MS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = budgets;
+}
+fn advance_budgets() -> (std::time::Duration, std::time::Duration) {
+    #[cfg(feature = "lab")]
+    if let Some((overall, refund)) = *LAB_ADVANCE_BUDGETS_MS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+    {
+        return (
+            std::time::Duration::from_millis(overall),
+            std::time::Duration::from_millis(refund),
+        );
+    }
+    (
+        std::time::Duration::from_secs(ADVANCE_BUDGET_SECONDS),
+        std::time::Duration::from_secs(REFUND_BUDGET_SECONDS),
+    )
+}
 fn refund_attempt_id(s: &Swap) -> String {
     if s.refund_generation == 0 {
         format!("{}-refund", s.id)

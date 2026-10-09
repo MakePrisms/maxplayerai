@@ -354,52 +354,6 @@ async fn r5_expired_unpaid_funding_and_paid_issuance_without_preflight() {
     assert_eq!(balance(h.path(), &m.url).await, 32);
 }
 #[cfg(feature = "lab")]
-async fn partial_claim_fixture() -> (Fixture, String) {
-    let mut f = Fixture::new(0).await;
-    let lot = coordinator::list(
-        &f.maker,
-        &f.jm,
-        &f.mm,
-        Leg {
-            asset: Asset::new(&f.a.url).unwrap(),
-            net: 24,
-        },
-        Leg {
-            asset: Asset::new(&f.b.url).unwrap(),
-            net: 24,
-        },
-        16,
-    )
-    .await
-    .unwrap();
-    let id = coordinator::start_take(&f.taker, &f.jt, &f.mt, &lot, 40, 24, 16)
-        .await
-        .unwrap();
-    f.step(true).await;
-    f.step(false).await;
-    f.step(true).await;
-    let mut s = f.jm.get::<Swap>("swap", &id).await.unwrap().unwrap();
-    let t = f.jt.get::<Swap>("swap", &id).await.unwrap().unwrap();
-    let chosen = vec![s.outgoing.iter().max_by_key(|p| p.amount).unwrap().clone()];
-    mint::redeem(
-        &f.taker,
-        &f.jt,
-        "partial",
-        &f.a.url,
-        &chosen,
-        &t.key,
-        t.preimage.as_ref().unwrap(),
-        16,
-        None,
-    )
-    .await
-    .unwrap();
-    s.preimage = t.preimage;
-    s.state = "claiming".into();
-    f.jm.put("swap", &id, &s).await.unwrap();
-    (f, id)
-}
-#[cfg(feature = "lab")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r5_refund_precedes_stalled_claim() {
     let (f, id) = partial_claim_fixture().await;
@@ -570,12 +524,6 @@ async fn r5_detached_serve_stalled_mint_and_info_less_refund() {
     );
 }
 
-#[cfg(feature = "lab")]
-async fn wait_past(t: u64) {
-    while coordinator::now() <= t {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-}
 #[tokio::test]
 async fn r5_taker_incoming_fee_cap_before_acceptance() {
     let mut f = asymmetric_fees(100, 0).await;
@@ -867,6 +815,91 @@ async fn r6_noncanonical_sender_split_rejected_before_maker_locks() {
     let error = result.unwrap_err().to_string();
     assert!(error.contains("non-canonical lock split"), "{error}");
 }
+/// N-a: mirror of the first-lock test for the taker validating the maker's SECOND lock
+/// (`q.give.*`). Maker gives A at 100 ppk, wants B at 0 ppk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r7_noncanonical_second_lock_rejected_before_taker_claims() {
+    use nostr_sdk::prelude::*;
+    let mut f = asymmetric_fees(100, 0).await;
+    let lot = f.list(false).await;
+    let id = f.start(&lot).await;
+    f.step(true).await; // maker: request -> quote
+    f.step(false).await; // taker: quote -> accepted -> honest first lock sent
+    f.step(true).await; // maker: validates first, locks second, sends "second"
+    assert_eq!(f.state(false, &id).await.as_deref(), Some("first_locked"));
+    let honest = tokio::time::timeout(std::time::Duration::from_secs(10), f.mt.inbox.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut env = f.mt.decode(&honest).unwrap();
+    assert_eq!(env.step, "second");
+    let q =
+        f.jt.get::<Swap>("swap", &id)
+            .await
+            .unwrap()
+            .unwrap()
+            .quote
+            .unwrap();
+    assert_eq!((q.give.gross, q.give.claim_fee), (33, 1));
+    assert_ne!(
+        (q.give.gross, q.give.claim_fee),
+        (q.request.funding.gross, q.request.funding.claim_fee),
+        "fixture: legs must differ so a swapped call site is observable"
+    );
+    let c = mint::conditions(&q.request.hash, &q.request.taker_key, &q.maker_key, q.short).unwrap();
+    // 34 sats in 11 proofs: fee ceil(11*100/1000) = 2, net 32 still "correct".
+    let evil = noncanonical_lock(
+        &f.root.path().join("attacker"),
+        &f.a.url,
+        34,
+        &[16, 4, 4, 2, 2, 1, 1, 1, 1, 1, 1],
+        &c,
+    )
+    .await;
+    assert_eq!(evil.len(), 11);
+    env.request_id = uuid::Uuid::new_v4().to_string();
+    env.body = serde_json::to_value(&evil).unwrap();
+    let taker = f.mt.keys.public_key();
+    let content = nip44::encrypt(
+        f.mm.keys.secret_key(),
+        &taker,
+        serde_json::to_string(&env).unwrap(),
+        nip44::Version::V2,
+    )
+    .unwrap();
+    let forged = EventBuilder::new(Kind::Custom(maxplayer_trade::TRADE), content)
+        .tags([
+            Tag::public_key(taker),
+            Tag::hashtag("maxplayer"),
+            Tag::parse(["v", "1"]).unwrap(),
+        ])
+        .sign_with_keys(&f.mm.keys)
+        .unwrap();
+    let result = coordinator::handle(&f.taker, &f.jt, &f.mt, &forged).await;
+    assert_eq!(
+        f.state(false, &id).await.as_deref(),
+        Some("first_locked"),
+        "SAFETY: second lock rejected at validation (taker must not accept a non-canonical split)"
+    );
+    assert!(
+        f.jt.get::<serde_json::Value>("attempt", &format!("{id}-claim"))
+            .await
+            .unwrap()
+            .is_none(),
+        "SAFETY: second lock rejected at validation (taker never starts a claim on it)"
+    );
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("non-canonical lock split"), "{error}");
+    // The canonical second lock, validated against the MAKER leg's quoted terms (q.give),
+    // is still accepted: a call site passing the taker leg's terms would refuse it.
+    let honest_result = coordinator::handle(&f.taker, &f.jt, &f.mt, &honest).await;
+    assert_ne!(
+        f.state(false, &id).await.as_deref(),
+        Some("first_locked"),
+        "SAFETY: canonical second lock validated against q.give terms is accepted"
+    );
+    honest_result.unwrap();
+}
 #[cfg(feature = "lab")]
 async fn own_mint_outage_still_claims(blackhole: bool) {
     let (f, id) = partial_claim_fixture().await;
@@ -887,6 +920,56 @@ async fn own_mint_outage_still_claims(blackhole: bool) {
     assert_eq!(s.state, "settling");
     // Own-mint settlement bookkeeping may still report the outage; the claim landed.
     let _ = result;
+    // N-b (review probe P3): the refund was postponed, not lost. Once the own mint
+    // recovers, the next ticks refund the unclaimed outgoing proofs and finish.
+    f.a.faults.blackhole_checkstate.store(false, SeqCst);
+    f.a.faults.reject_checkstate.store(false, SeqCst);
+    for _ in 0..5 {
+        let _ = coordinator::advance(&f.maker, &f.jm, &f.mm, &mut s).await;
+        if s.state == "complete" {
+            break;
+        }
+    }
+    assert_eq!(
+        balance(&f.maker, &f.a.url).await,
+        112,
+        "SAFETY: postponed own-mint refund completes once the outage clears"
+    );
+    assert_eq!(
+        s.state, "complete",
+        "SAFETY: swap reaches complete after the outage (refund finished, not lost)"
+    );
+}
+/// Review probe P4: every own-mint endpoint answers 503; the counterparty claim lands.
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r7_own_mint_fully_dead_still_claims() {
+    let (f, id) = partial_claim_fixture().await;
+    let mut s = f.jm.get::<Swap>("swap", &id).await.unwrap().unwrap();
+    wait_past(s.quote.as_ref().unwrap().short + s.quote.as_ref().unwrap().margin).await;
+    f.a.faults.dead.store(true, SeqCst);
+    let result = coordinator::advance(&f.maker, &f.jm, &f.mm, &mut s).await;
+    assert_eq!(
+        balance(&f.maker, &f.b.url).await,
+        24,
+        "SAFETY: all-endpoint own-mint outage must not skip the live maker claim"
+    );
+    assert_eq!(s.state, "settling");
+    assert!(
+        result.is_err(),
+        "own-mint settlement bookkeeping reports the outage"
+    );
+    f.a.faults.dead.store(false, SeqCst);
+    for _ in 0..5 {
+        let _ = coordinator::advance(&f.maker, &f.jm, &f.mm, &mut s).await;
+        if s.state == "complete" {
+            break;
+        }
+    }
+    assert_eq!(
+        s.state, "complete",
+        "SAFETY: refund finishes after full own-mint outage"
+    );
 }
 #[cfg(feature = "lab")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
