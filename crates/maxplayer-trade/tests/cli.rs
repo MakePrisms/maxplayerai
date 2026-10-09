@@ -4,7 +4,6 @@ fn home() -> tempfile::TempDir {
 }
 #[test]
 fn fresh_home_balance_is_zero_and_private() {
-    use std::os::unix::fs::PermissionsExt;
     let h = home();
     let out = Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
         .args([
@@ -23,17 +22,9 @@ fn fresh_home_balance_is_zero_and_private() {
     let balance: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(balance["balance"], 0);
     assert_eq!(balance["mint"], "https://testnut.cashu.space");
-    assert_eq!(
-        std::fs::metadata(h.path()).unwrap().permissions().mode() & 0o777,
-        0o700
-    );
-    assert_eq!(
-        std::fs::metadata(h.path().join("wallet.seed"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o600
+    assert!(
+        !h.path().join("wallet.seed").exists(),
+        "read-only balance must not create a wallet"
     );
     let second = Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
         .args([
@@ -70,7 +61,7 @@ fn real_mint_balance_needs_no_opt_in() {
     );
 }
 #[test]
-fn concurrent_home_is_refused() {
+fn balance_and_status_work_while_writer_owns_home() {
     use fs2::FileExt;
     let h = home();
     let f = std::fs::File::create(h.path().join("owner.lock")).unwrap();
@@ -84,8 +75,16 @@ fn concurrent_home_is_refused() {
         ])
         .output()
         .unwrap();
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("home is already in use"));
+    assert!(
+        out.status.success(),
+        "SAFETY: live watcher must not block read-only balance"
+    );
+    let status = Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
+        .args(["--home", h.path().to_str().unwrap(), "status"])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    assert!(!h.path().join("trade.sqlite").exists());
 }
 #[test]
 fn removed_opt_in_flag_is_not_supported() {

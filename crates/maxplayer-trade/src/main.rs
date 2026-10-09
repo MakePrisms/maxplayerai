@@ -52,9 +52,9 @@ enum Command {
         #[arg(long, default_value_t = 16)]
         max_fees: u64,
     },
-    /// One recovery pass; exit 2 if items remain pending. Does not wait for lock deadlines.
+    /// One recovery pass; exit 3 if items remain pending. Does not wait for lock deadlines.
     Recover,
-    /// Check NUT-07/09/12/14, an active sat keyset, and clock skew <= 60 seconds.
+    /// Check NUT-07/09/11/12/14, an active sat keyset, and clock skew <= 60 seconds.
     Preflight { mint: String },
     /// Create or resume keyed funding; lifetime cap is 100,000 sats per mint/home. Never pays invoices.
     Fund {
@@ -69,15 +69,17 @@ enum Command {
         mint: String,
         #[arg(long)]
         invoice: String,
+        /// Maximum invoice amount + input fee + Lightning reserve, in sats.
+        #[arg(long)]
+        max_debit: Option<u64>,
     },
+    /// Read public journal states without locking the home or advancing payments.
+    Status,
     /// Read spendable wallet balance without submitting existing money authorizations.
     Balance { mint: String },
 }
 use maxplayer_trade::{
-    Asset, Leg, coordinator,
-    journal::Journal,
-    market::Market,
-    wallet::{preflight, wallet},
+    Asset, Leg, coordinator, journal::Journal, market::Market, wallet::preflight,
 };
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
@@ -86,7 +88,9 @@ async fn main() -> std::process::ExitCode {
         Err(error) => {
             eprintln!("{error}");
             std::process::ExitCode::from(if error.is::<coordinator::RecoveryIncomplete>() {
-                2
+                3
+            } else if error.is::<coordinator::ManualRecovery>() {
+                4
             } else {
                 1
             })
@@ -95,6 +99,19 @@ async fn main() -> std::process::ExitCode {
 }
 async fn execute() -> Result<()> {
     let cli = Cli::parse();
+    // Read-only observations remain available while serve owns the writer lock.
+    if let Command::Balance { ref mint } = cli.command {
+        let asset = Asset::new(mint)?;
+        println!(
+            "{}",
+            serde_json::json!({"mint":asset.mint_url,"unit":"sat","balance":maxplayer_trade::wallet::read_balance(&cli.home, &asset.mint_url)?})
+        );
+        return Ok(());
+    }
+    if matches!(cli.command, Command::Status) {
+        println!("{}", maxplayer_trade::wallet::read_status(&cli.home)?);
+        return Ok(());
+    }
     fs::create_dir_all(&cli.home)?;
     fs::set_permissions(&cli.home, fs::Permissions::from_mode(0o700))?;
     let lock = OpenOptions::new()
@@ -213,10 +230,29 @@ async fn execute() -> Result<()> {
     if matches!(cli.command, Command::Preflight { .. }) {
         return preflight(mint).await;
     }
-    if let Command::Withdraw { ref invoice, .. } = cli.command {
-        preflight(mint).await?;
-        let a = maxplayer_trade::money::withdraw(&cli.home, &money_journal, mint, invoice).await?;
+    if let Command::Withdraw {
+        ref invoice,
+        max_debit,
+        ..
+    } = cli.command
+    {
+        let a = maxplayer_trade::money::withdraw_bounded(
+            &cli.home,
+            &money_journal,
+            mint,
+            invoice,
+            max_debit,
+        )
+        .await?;
         println!("{}", a.summary());
+        if !a.terminal() {
+            return Err(coordinator::RecoveryIncomplete.into());
+        }
+        ensure!(
+            a.state == maxplayer_trade::money::MeltState::Done,
+            "withdrawal not paid; terminal {:?}",
+            a.state
+        );
         return Ok(());
     }
     if let Command::Fund {
@@ -227,7 +263,6 @@ async fn execute() -> Result<()> {
             amount > 0 && amount <= maxplayer_trade::real_money::CAP,
             "funding cap exceeds 100,000 sats"
         );
-        preflight(mint).await?;
         let mut f = if let Some(id) = quote {
             money_journal
                 .all::<maxplayer_trade::money::Funding>("funding")
@@ -252,15 +287,5 @@ async fn execute() -> Result<()> {
         anyhow::bail!("funding remains pending; invoice and intent retained; run recover");
     }
 
-    let w = wallet(&cli.home, mint).await?;
-    match cli.command {
-        Command::Balance { .. } => {
-            println!(
-                "{}",
-                serde_json::json!({"mint":mint,"unit":"sat","balance":u64::from(w.total_balance().await?)})
-            );
-            Ok(())
-        }
-        _ => unreachable!(),
-    }
+    unreachable!()
 }

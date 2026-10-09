@@ -5,8 +5,8 @@ description: Trade Cashu tokens for a human with the standalone maxplayer-trade 
 
 # Trade Cashu for the human
 
-> Verified against implementation head **1929972**. Read the scoped evidence and
-> remaining withdrawal bounds in [verification](references/verification.md).
+> Round-five operating policy. Read the scoped evidence and
+> verification limits in [verification](references/verification.md).
 
 ## 1. Establish custody and scope
 
@@ -18,8 +18,9 @@ Choose **one private, persistent absolute home** for this human's trade wallet. 
 `--home <home>` before **every** command. Preserve that same home, keys, databases,
 and journals across restarts. Never delete it while funds, reservations, unresolved
 funding/withdrawals, or trades exist; retain it for historical recovery afterward.
-Never use a fresh home to evade caps. Only one process may own it: stop the watcher
-cleanly before another command, then promptly resume it if obligations remain.
+Never use a fresh home to evade caps. Only one writer may own it. Read-only `status` and `balance` work while `serve` runs.
+**Do not stop serve between `second_locked` and `settling`**; a maker can lose its
+claim window. Defer other writing commands until live obligations settle.
 Never copy its seed into another active wallet.
 
 Never print secrets, seeds, keys, tokens, proofs, preimages, or raw journals; never
@@ -31,11 +32,12 @@ and redacted errors. Invoice delivery belongs in the human's private conversatio
 
 Use `balance <mint>` and `preflight <mint>` for each relevant mint. Passing preflight
 allows a mint, but does not establish honesty or complete compatibility. The CLI
-also preflights before fund/list/take/withdraw: NUT-07/09/12/14, an active sat keyset, reachable
+also preflights before fund/list/take/withdraw: NUT-07/09/11/12/14, an active sat keyset, reachable
 mint, and clock skew at most 60 seconds. Real mints need no opt-in setting. Never
 bypass a failed check. Gross locks and cumulative funding per mint per home are
 capped at **100,000 sats**, as is each withdrawal invoice. The withdrawal Lightning
-fee reserve ceiling is **32 sats**, not a total-fee cap. Fees can make an otherwise
+fee reserve ceiling is **max(32 sats, 2% of invoice sats rounded up)**. Pass
+`--max-debit` to cap invoice amount + Cashu input fee + Lightning reserve. Fees can make an otherwise
 eligible net lock amount too large.
 
 **Before every real-money `fund`, `list`, `take`, or `withdraw`, present the exact
@@ -52,7 +54,9 @@ or a published listing is not approval for a new operation. State:
 - A mint can steal its tokens. If the counterparty vanishes, funds stay locked until
   the refund deadline and successful recovery. `serve` must stay running while locks are live (the active `take` also watches its trade).
   NUT-14 claims remain valid after locktime. Nutshell refund status: round 4 reports a **successful cashu.cz Nutshell/0.21.0
-  refund**; see the version-specific limits in [verification](references/verification.md). NUT-07 advertisement alone does not prove witness emission.
+  refund**; see the version-specific limits in [verification](references/verification.md). NUT-07 advertisement alone does not prove witness emission. The maker relies on
+  the chosen mint reporting the HTLC witness if the taker withholds its notice.
+  Mint choice is the buyer’s/seller’s responsibility; there is no rating or verification gate.
 
 Use the human's price and fee budget, never more permissive limits. If fees are
 unspecified, propose a numeric cap and wait for yes; the CLI default is not consent.
@@ -103,11 +107,13 @@ a timeout. **Done:** verify the terminal result and per-mint balances, or enter 
 ### Withdraw
 
 Use only an invoice the human provides. Validate amount, destination, expiry, and
-fee/debit bounds before confirmation. `withdraw <mint> --invoice <bolt11>` may spend
+fee/debit bounds before confirmation. `withdraw <mint> --invoice <bolt11> --max-debit <approved-sats>` may spend
 immediately; it is **not** a quote preview. Read the withdrawal limitations in the
 command reference first. Non-terminal means payment and/or change remain unresolved,
 not that payment failed. Never create a replacement invoice, withdrawal, or payment
-while one is unresolved. **Done:** `done` and reconciled change/balance are confirmed,
+while a submitted payment is unresolved. A pre-POST refusal cannot pay later via
+recovery; only explicit same-invoice withdrawal can authorize a new attempt.
+`quote_created` is never auto-submitted. A timeout after POST is not a failed payment. **Done:** `done` and reconciled change/balance are confirmed,
 or report the retained authorization and recover it without paying again.
 
 ### Check balance / something got interrupted
@@ -117,7 +123,8 @@ reservation is spendable. After **any interruption**, use `recover` with the sam
 home and relays before new work. It resumes existing authorizations and does not
 admit new trade requests. It makes **one bounded pass**, at most **120 seconds per
 funding/withdrawal/swap item**, without waiting for lock deadlines: exit **0** means
-all terminal with no deferred work, **2** unresolved/deferred, **1** command error.
+all terminal with no deferred work, **3** unresolved/deferred, **4** terminal manual recovery, **1** command error,
+**2** CLI usage error.
 Timeout does not undo an RPC or release reservations. Restore `serve` while locks
 are live; a single recovery pass is not a watcher. See the recovery reference for
 quarantine and errors.
@@ -125,8 +132,8 @@ quarantine and errors.
 
 ## 4. Verify and report
 
-Check public swap/withdrawal state and balances after safely stopping the owner
-process. A zero exit, elapsed deadline, missing listing, or mint saying PAID is not
+Check public swap/withdrawal state with `status` and balances with `balance`
+without stopping the owner process. A zero exit, elapsed deadline, missing listing, or mint saying PAID is not
 by itself reconciled success. Keep the home. Report spent/received amounts and fees
 only when known; distinguish complete, refunded, unresolved, and manual recovery.
 

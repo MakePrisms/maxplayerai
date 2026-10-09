@@ -2,57 +2,29 @@
 
 ## Implementation base and scope
 
-Verified against **19299727e5e25479977cd95dee86a45a16bb3821** on PR #1107.
-The four local skill commits (ec196bb, e33fb25, f4a283b, a9a9df1) were rebased
-onto that head, followed by this final documentation/verification update. The PR
-remains draft; this skill does not certify every mint or authorize money movement.
+Round five updates the policy from reviewed base `1c68714`. This is author-led
+implementation verification, not independent reviewer sign-off or a mint rating.
+The PR remains draft. No real wallets/mints or Maxplayer jobs are used in this pass.
 
-Source checks establish:
+Source checks and named regressions are in `tests/round5.rs`, `tests/money.rs`,
+`tests/cli.rs`, and `tests/relays.rs`:
 
-- `src/real_money.rs`: 100,000-sat gross lock cap.
-- `src/money.rs`: 100,000 cumulative funding per mint/home, including retained
-  pending intents; 100,000 per withdrawal invoice; 32-sat Lightning fee reserve.
-- `src/main.rs`, `src/wallet.rs`, `src/coordinator.rs`: no real-money opt-in;
-  automatic NUT-07/09/12/14, active sat keyset, and at-most-60-second clock-skew
-  preflight for funding/listing/taking/withdrawal.
-- `src/money.rs`, `src/coordinator.rs`, `src/main.rs`: one recovery pass with
-  120-second per-item budgets; exits 0 terminal/no deferred work, 2 unresolved or
-  deferred, 1 command error. Terminal quarantines still require manual recovery.
-- Withdrawal has no user-selectable total-debit/input-fee cap. The command reference
-  retains the rule to stop when the human's approved bounds cannot be enforced.
+- Pinned sender-funded claim fees; incoming caps checked before lock admission.
+- Bounded message handling and CDK calls; own-mint refund before incoming claim.
+- Terminal pre-POST withdrawal refusals; no passive QuoteCreated execution.
+- Reserve ceiling max(32, ceil(amount × 2%)); total-debit bound enforced by the
+  withdrawal debit option, and payment-hash dedupe across mints.
+- Exact journaled melt replay after no reply; definitive NUT errors still require
+  fresh UNPAID/UNSPENT evidence before release; first POST expiry margin 60 seconds.
+- Read-only balance/status without stopping serve; recovery exits 0/1/2/3/4 are
+  distinguished in the recovery reference. Funding/withdrawal preflight includes
+  NUT-04/20 and NUT-05 respectively; trading also requires NUT-11.
 
-The staged CLI-STATE-HANDOFF glossary agrees with the application command/flag
-inventory and swap/withdrawal states. Two qualifications matter: exit 2 can also
-be a Clap usage error, and terminal items alone do not ensure exit 0 if work such
-as listing publication was deferred. Per-item timeouts are not a whole-pass limit.
-Market commands such as discovery also recover prior authorizations before dispatch.
-
-## Checks
-
-Verification uses the default binary, locked standalone manifest, and this checkout's
-separate target directory, not the shared lab runner's binaries. Help checks execute
-only help; no money-moving commands, real wallets, Maxplayer jobs, or lab loops.
-The exhaustive test checks every application command, command-local flags, all skill
-Markdown, and the list/take 16-sat fee default. Help establishes syntax; the source
-checks above establish policy.
-
-Final local results:
-
-- Default binary build: passed (no lab feature).
-- CLI test target: **5 passed, 0 failed**. Non-help cases use disposable empty
-  homes only; no real wallet or money movement. The initial expanded scanner
-  mistook the usage-line global home option for a command-local option; corrected
-  to inspect the Options section, then reran successfully.
-- Exhaustive help check: **10 application commands, 13 distinct long flags,
-  4 Markdown documents**, fee default 16; also checks short help and built-in help.
-  Focused final-document rerun: **1 passed, 0 failed, 4 filtered out**.
-- Standalone trade formatting: passed. Root workspace formatting: failed on
-  **153 untouched files**, outside this task; no unrelated formatting applied.
-- Skill frontmatter, resource links, and diff whitespace: passed.
-
-No full money-path/lab suite or loops were run; those remain the separate runner's
-scope. No real mint fund/withdraw/take/list, real wallets, or Maxplayer jobs were
-used. The shared lab target and the operator's wallet home were not touched.
+The final round-five test counts, mutation outcomes, detached fake-mint refund,
+and exact-head CI receipts are recorded in PR #1107’s round-five section. Earlier
+round-four evidence below remains scoped to its original run. The CLI help check
+covers all application commands and all four Markdown files; it establishes syntax,
+not monetary safety. Fake mints do not establish arbitrary real-mint interoperability.
 
 ## Nutshell evidence available during drafting
 

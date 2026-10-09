@@ -2053,6 +2053,7 @@ dependencies = [
  "nostr-relay-builder",
  "nostr-sdk",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

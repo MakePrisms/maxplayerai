@@ -19,6 +19,14 @@ use std::{
 };
 #[derive(Default)]
 pub struct Faults {
+    pub hang_keysets: std::sync::atomic::AtomicBool,
+    pub melt_error: std::sync::atomic::AtomicU64,
+    pub melt_proxy_error: std::sync::atomic::AtomicBool,
+    pub quote_error: std::sync::atomic::AtomicBool,
+    pub near_expiry: std::sync::atomic::AtomicBool,
+    pub expired_funding: std::sync::atomic::AtomicBool,
+    pub no_time: std::sync::atomic::AtomicBool,
+    pub melt_requests: std::sync::Mutex<Vec<Vec<u8>>>,
     pub prefer_async_melt: std::sync::atomic::AtomicBool,
     pub lose_melt_reply: std::sync::atomic::AtomicBool,
     pub hold_swap: std::sync::atomic::AtomicBool,
@@ -102,6 +110,9 @@ impl MintFixture {
             .build_with_seed(db, &seed)
             .await
             .unwrap();
+        mint.set_quote_ttl(cdk::types::QuoteTTL::new(10000, 10000))
+            .await
+            .unwrap();
         mint.start().await.unwrap();
         let router = cdk_axum::create_mint_router(Arc::new(mint.clone()), vec!["bolt11".into()])
             .await
@@ -115,6 +126,35 @@ impl MintFixture {
                     use axum::response::IntoResponse;
                     use std::sync::atomic::Ordering::SeqCst;
                     let path = req.uri().path().to_owned();
+                    if path.ends_with("/keysets") && control.hang_keysets.load(SeqCst) {
+                        std::future::pending::<()>().await;
+                    }
+                    if path.ends_with("/melt/quote/bolt11") && control.quote_error.load(SeqCst) {
+                        return axum::http::StatusCode::BAD_GATEWAY.into_response();
+                    }
+                    let req = if path.ends_with("/melt/bolt11") {
+                        let (parts, body) = req.into_parts();
+                        let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                        control.melt_requests.lock().unwrap().push(bytes.to_vec());
+                        let code = control.melt_error.load(SeqCst);
+                        if code != 0 {
+                            return (
+                                axum::http::StatusCode::BAD_REQUEST,
+                                axum::Json(serde_json::json!({"code":code})),
+                            )
+                                .into_response();
+                        }
+                        if control.melt_proxy_error.load(SeqCst) {
+                            return (
+                                axum::http::StatusCode::BAD_GATEWAY,
+                                "<html>proxy failure</html>",
+                            )
+                                .into_response();
+                        }
+                        axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes))
+                    } else {
+                        req
+                    };
                     let req = if path.ends_with("/melt/bolt11")
                         && control.prefer_async_melt.load(SeqCst)
                     {
@@ -180,13 +220,30 @@ impl MintFixture {
                     let (parts, body) = response.into_parts();
                     let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
                     if let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        if path.contains("/mint/quote/bolt11")
+                            && control.expired_funding.load(SeqCst)
+                        {
+                            v["state"] = "UNPAID".into();
+                            v["expiry"] = 1.into();
+                        }
+                        if path.ends_with("/melt/quote/bolt11") && control.near_expiry.load(SeqCst)
+                        {
+                            v["expiry"] = (coordinator::now() + 60).into();
+                        }
                         if path.ends_with("/keysets") && control.no_sat_keyset.load(SeqCst) {
                             v["keysets"] = serde_json::json!([]);
                         }
                         if path.ends_with("/info") {
                             let nut = control.missing_nut.load(SeqCst);
                             if nut != 0 {
-                                v["nuts"][nut.to_string()]["supported"] = false.into();
+                                if nut == 4 || nut == 5 {
+                                    v["nuts"][nut.to_string()]["disabled"] = true.into();
+                                } else {
+                                    v["nuts"][nut.to_string()]["supported"] = false.into();
+                                }
+                            }
+                            if control.no_time.load(SeqCst) {
+                                v.as_object_mut().unwrap().remove("time");
                             }
                             if let Some(t) = v["time"].as_u64() {
                                 v["time"] = (t + control.clock_offset.load(SeqCst)).into();

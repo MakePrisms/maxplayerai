@@ -1166,7 +1166,7 @@ async fn persistent_invalid(maker: bool, bad_refund: bool) {
         } else {
             "refunded"
         },
-        "persistent invalid DLEQ must not strand the lock"
+        "SAFETY: persistent invalid DLEQ must not strand the lock"
     );
     let a = j
         .get::<serde_json::Value>("attempt", &format!("{id}-refund"))
@@ -1187,9 +1187,11 @@ async fn persistent_invalid(maker: bool, bad_refund: bool) {
         faults.reject_info.store(true, SeqCst);
         faults.reject_restore.store(true, SeqCst);
         faults.reject_swap.store(true, SeqCst);
-        coordinator::recover_until_settled(home, j, &mut if maker { f.mm } else { f.mt })
-            .await
-            .unwrap();
+        let error =
+            coordinator::recover_until_settled(home, j, &mut if maker { f.mm } else { f.mt })
+                .await
+                .unwrap_err();
+        assert!(error.is::<coordinator::ManualRecovery>());
         assert_eq!(
             j.get::<serde_json::Value>("attempt", &format!("{id}-refund"))
                 .await
@@ -1372,7 +1374,7 @@ async fn preflight_reports_witness_emission_unverified() {
         .await
         .unwrap();
     assert!(out.status.success());
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
     assert!(
         v["nut07_witnesses"]
             .as_str()
@@ -1693,7 +1695,7 @@ async fn r4_recover_unreachable_withdrawal_does_not_block_other_mint_refund_or_e
     .unwrap();
     assert_eq!(
         output.status.code(),
-        Some(2),
+        Some(3),
         "SAFETY: distinct incomplete recovery exit"
     );
     let stdout = String::from_utf8(output.stdout).unwrap();

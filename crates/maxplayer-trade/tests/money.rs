@@ -70,14 +70,13 @@ async fn melt_restore_failure_keeps_change_until_reopen() {
 async fn melt_lost_reply_restores_exact_change() {
     let (h, m, j) = setup().await;
     m.faults.lose_melt_reply.store(true, SeqCst);
-    assert!(
-        money::withdraw(h.path(), &j, &m.url, &invoice(31))
-            .await
-            .is_err()
-    );
+    let a = money::withdraw(h.path(), &j, &m.url, &invoice(31))
+        .await
+        .unwrap();
     assert_eq!(
-        j.all::<Withdrawal>("withdrawal").await.unwrap()[0].state,
-        MeltState::RequestSent
+        a.state,
+        MeltState::Done,
+        "lost reply can reconcile immediately via GET and restore"
     );
     drop(j);
     let j = Journal::open(h.path()).await.unwrap();
@@ -346,7 +345,7 @@ async fn failed_preflight_refuses_funding_before_intent() {
     let h = tempfile::tempdir().unwrap();
     let m = MintFixture::start(0).await;
     let j = Journal::open(h.path()).await.unwrap();
-    for nut in [7, 9, 12, 14] {
+    for nut in [4, 7, 9, 11, 12, 14, 20] {
         m.faults.missing_nut.store(nut, SeqCst);
         assert!(money::fund(h.path(), &j, &m.url, 1).await.is_err());
         assert!(
@@ -403,7 +402,7 @@ async fn recover_reports_unreachable_item_and_reconciles_other_withdrawal() {
     .await
     .expect("SAFETY: money-only recovery must return despite unreachable mint")
     .unwrap();
-    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.status.code(), Some(3));
     assert!(String::from_utf8(output.stdout).unwrap().contains(id));
     assert_eq!(
         j.get::<Withdrawal>("withdrawal", &paid.id)

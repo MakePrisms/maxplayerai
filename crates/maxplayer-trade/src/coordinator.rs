@@ -395,6 +395,10 @@ async fn handle_message(home: &Path, j: &Journal, m: &Market, e: &Event) -> Resu
                     .is_some_and(|n| n <= req.max_fees),
             "fee terms"
         );
+        ensure!(
+            req.funding.claim_fee <= l.max_fees,
+            "incoming claim fee exceeds maker admission cap"
+        );
         preflight(&lot).await?;
         validate_terms(home, &lot.want, &req.funding).await?;
         validate_terms(home, &lot.give, &Terms::from(&l.plan)).await?;
@@ -447,7 +451,10 @@ async fn handle_message(home: &Path, j: &Journal, m: &Market, e: &Event) -> Resu
         e.pubkey.to_hex() == s.peer && msg.lot_id == s.lot.id.to_hex(),
         "peer/lot mismatch"
     );
-    if msg.step == "quote" && s.role == "taker" && s.quote.is_none() {
+    if terminal(&s) {
+        return Ok(());
+    }
+    if msg.step == "quote" && s.role == "taker" && s.state == "requested" && s.quote.is_none() {
         m.require_sent(j, s.peer.parse()?, &s.id, "request").await?;
         let q: Quote = serde_json::from_value(msg.body)?;
         let lot = parse_lot(&s.lot, now())?;
@@ -474,6 +481,10 @@ async fn handle_message(home: &Path, j: &Journal, m: &Market, e: &Event) -> Resu
         ensure!(hash(&q)? == msg.quote_hash, "quote digest");
         let (g, f) = gross(lot.give.net, q.give.ppk)?;
         ensure!(q.give.gross == g && q.give.claim_fee == f, "maker net fees");
+        ensure!(
+            q.give.claim_fee <= s.max_fees,
+            "incoming claim fee exceeds taker admission cap"
+        );
         validate_terms(home, &lot.give, &q.give).await?;
         canonical_key(&q.maker_key)?;
         s.quote = Some(q);
@@ -543,6 +554,9 @@ async fn handle_message(home: &Path, j: &Journal, m: &Market, e: &Event) -> Resu
     advance(home, j, m, &mut s).await
 }
 pub async fn advance(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Result<()> {
+    if terminal(s) {
+        return Ok(());
+    }
     let result = advance_inner(home, j, m, s).await;
     // Run even when redemption returned an error. Persist terminal manual-recovery
     // status before the next tick; never turn a quarantined claim into refund authority.
@@ -557,6 +571,13 @@ pub async fn advance(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Resu
             "refund_quarantined",
         ),
     ] {
+        if state == "refund_quarantined"
+            && s.role == "maker"
+            && s.preimage.is_some()
+            && s.state != "settling"
+        {
+            continue;
+        }
         if j.get::<mint::Attempt>("attempt", &format!("{}-{suffix}", s.id))
             .await?
             .is_some_and(|a| a.quarantined)
@@ -678,7 +699,7 @@ async fn advance_inner(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Re
                 .is_some();
             let time = wallet::action_time(&q.lot.give.asset.mint_url).await?;
             if started || time + q.cutoff < q.short {
-                mint::redeem(
+                mint::redeem_claim(
                     home,
                     j,
                     &claim_id,
@@ -686,7 +707,7 @@ async fn advance_inner(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Re
                     &s.incoming,
                     &s.key,
                     s.preimage.as_ref().context("missing taker preimage")?,
-                    s.max_fees,
+                    q.give.claim_fee,
                     Some(q.short - q.cutoff),
                 )
                 .await?;
@@ -732,10 +753,6 @@ async fn advance_inner(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Re
                 Err(e) => eprintln!("witness {}: {e}", s.id),
             }
         }
-        // Preimage knowledge is monotone, independent of refund outcomes.
-        if let Err(e) = maker_claim(home, j, m, s, &q, &claim_id).await {
-            eprintln!("maker claim {}: {e}", s.id);
-        }
         let mut refund_started = j
             .get::<mint::Attempt>("attempt", &refund_id)
             .await?
@@ -770,12 +787,9 @@ async fn advance_inner(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Re
                     refund_id = format!("{}-refund-{}", s.id, s.refund_generation);
                     refund_started = false;
                 }
-                if let Err(e) = maker_claim(home, j, m, s, &q, &claim_id).await {
-                    eprintln!("maker claim after refund race {}: {e}", s.id);
-                }
             }
         }
-        let time = wallet::action_time(&own_mint).await?;
+        let time = wallet::refund_time(&own_mint).await?;
         if !refund_started && time > q.short + q.margin {
             let remaining = mint::refundable(&own_mint, &s.outgoing).await?;
             if !remaining.is_empty() {
@@ -787,6 +801,11 @@ async fn advance_inner(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Re
                     eprintln!("maker refund {}: {e}", s.id);
                 }
             }
+        }
+        // Refund our own mint before touching the counterparty mint: a stalled
+        // incoming claim must not consume the refund's recovery budget.
+        if let Err(e) = maker_claim(home, j, m, s, &q, &claim_id).await {
+            eprintln!("maker claim {}: {e}", s.id);
         }
         let all_spent = mint::states(&own_mint, &s.outgoing)
             .await?
@@ -834,7 +853,7 @@ async fn advance_inner(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Re
     if taker
         && ["first_locked", "second_validated", "lock_unforwardable"].contains(&s.state.as_str())
     {
-        let time = wallet::action_time(&own_mint).await?;
+        let time = wallet::refund_time(&own_mint).await?;
         // Errors, PENDING, matching claim witnesses or nonempty restores all fail closed.
         if time > q.long + q.margin
             && mint::claim_not_landed(
@@ -894,8 +913,8 @@ pub async fn recover(home: &Path, j: &Journal, m: &Market) -> Result<()> {
 async fn recover_pass(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
     let mut deferred = match crate::money::recover(home, j).await {
         Ok(pending) => pending,
-        Err(_) => {
-            eprintln!("money recovery deferred; journal retained");
+        Err(error) => {
+            eprintln!("money recovery deferred; journal retained: {error}");
             true
         }
     };
@@ -927,7 +946,7 @@ async fn recover_pass(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
                     )
                     .await;
                     if let Err(error) = publication {
-                        deferred = true;
+                        deferred |= !error.is::<crate::market::PublicationAbandoned>();
                         eprintln!("terminal listing publication: {error}");
                     }
                 }
@@ -1019,7 +1038,7 @@ async fn recover_pass(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
         }
         .await;
         if let Err(error) = publication {
-            deferred = true;
+            deferred |= !error.is::<crate::market::PublicationAbandoned>();
             eprintln!("listing recovery: {error}");
         }
     }
@@ -1031,7 +1050,9 @@ async fn recover_pass(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
 pub async fn run(home: &Path, j: &Journal, m: &mut Market, until: Option<&str>) -> Result<()> {
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
     loop {
-        tokio::select! {e=m.inbox.recv()=>{if let Some(e)=e{if let Err(err)=handle(home,j,m,&e).await{eprintln!("trade message rejected: {err}");}}},_=tick.tick()=>recover(home,j,m).await?}
+        tokio::select! {e=m.inbox.recv()=>{if let Some(e)=e{match tokio::time::timeout(std::time::Duration::from_secs(60), handle(home,j,m,&e)).await {
+            Ok(Ok(())) => {}, Ok(Err(err)) => eprintln!("trade message rejected: {err}"), Err(_) => eprintln!("trade message timed out; dropped; journal retained")
+        }}},_=tick.tick()=>recover(home,j,m).await?}
         if let Some(id) = until {
             if let Some(s) = j.get::<Swap>("swap", id).await? {
                 if terminal(&s) {
@@ -1050,8 +1071,12 @@ pub async fn run(home: &Path, j: &Journal, m: &mut Market, until: Option<&str>) 
 
 async fn validate_terms(home: &Path, leg: &Leg, t: &Terms) -> Result<()> {
     let w = wallet::wallet(home, &leg.asset.mint_url).await?;
-    w.refresh_keysets().await?;
-    let active = w.fetch_active_keyset().await?;
+    crate::wallet::bounded(w.refresh_keysets())
+        .await
+        .context("CDK wallet request timed out")??;
+    let active = crate::wallet::bounded(w.fetch_active_keyset())
+        .await
+        .context("CDK wallet request timed out")??;
     ensure!(
         t.keyset == active.id && t.ppk == active.input_fee_ppk,
         "quote keyset/fee schedule mismatch"
@@ -1063,7 +1088,7 @@ async fn validate_terms(home: &Path, leg: &Leg, t: &Terms) -> Result<()> {
     );
     Ok(())
 }
-/// A bounded pass left existing authorizations unresolved. CLI exit code: 2.
+/// A bounded pass left existing authorizations unresolved. CLI exit code: 3.
 #[derive(Debug)]
 pub struct RecoveryIncomplete;
 impl std::fmt::Display for RecoveryIncomplete {
@@ -1078,7 +1103,9 @@ impl std::error::Error for RecoveryIncomplete {}
 
 /// Print only public identifiers and states, never recovery material.
 pub async fn recovery_status(j: &Journal, mut unresolved: bool) -> Result<()> {
+    let mut manual = false;
     for s in j.all::<Swap>("swap").await? {
+        manual |= s.state.ends_with("_quarantined");
         unresolved |= !terminal(&s);
         println!(
             "{}",
@@ -1086,10 +1113,10 @@ pub async fn recovery_status(j: &Journal, mut unresolved: bool) -> Result<()> {
         );
     }
     for f in j.all::<crate::money::Funding>("funding").await? {
-        unresolved |= !f.done;
+        unresolved |= !f.done && !f.expired_unpaid;
         println!(
             "{}",
-            serde_json::json!({"funding_id":f.id,"terminal":f.done})
+            serde_json::json!({"funding_id":f.id,"terminal":f.done || f.expired_unpaid,"expired_unpaid":f.expired_unpaid})
         );
     }
     for a in j.all::<crate::money::Withdrawal>("withdrawal").await? {
@@ -1103,8 +1130,19 @@ pub async fn recovery_status(j: &Journal, mut unresolved: bool) -> Result<()> {
     if unresolved {
         return Err(RecoveryIncomplete.into());
     }
+    if manual {
+        return Err(ManualRecovery.into());
+    }
     Ok(())
 }
+#[derive(Debug)]
+pub struct ManualRecovery;
+impl std::fmt::Display for ManualRecovery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "manual recovery required; quarantined outputs retained")
+    }
+}
+impl std::error::Error for ManualRecovery {}
 
 /// One bounded pass, without admitting fresh requests or waiting for deadlines.
 /// The historical function name is retained for library callers.
@@ -1133,7 +1171,7 @@ async fn maker_claim(
     if s.state == "settling" {
         return Ok(());
     }
-    mint::redeem(
+    mint::redeem_claim(
         home,
         j,
         claim_id,
@@ -1141,7 +1179,7 @@ async fn maker_claim(
         &s.incoming,
         &s.key,
         pre,
-        s.max_fees,
+        q.request.funding.claim_fee,
         None,
     )
     .await?;

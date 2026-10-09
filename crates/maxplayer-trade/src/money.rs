@@ -74,7 +74,9 @@ async fn unblind(
         return Ok(vec![]);
     }
     let w = wallet(home, url).await?;
-    let keys = w.load_keyset_keys(out[0].message.keyset_id).await?;
+    let keys = crate::wallet::bounded(w.load_keyset_keys(out[0].message.keyset_id))
+        .await
+        .context("CDK wallet request timed out")??;
     let proofs = cdk::dhke::construct_proofs(
         sigs,
         out.iter()
@@ -87,13 +89,14 @@ async fn unblind(
         proofs.iter().all(|p| p.dleq.is_some()),
         "change requires DLEQ"
     );
-    w.verify_token_dleq(&Token::new(
+    crate::wallet::bounded(w.verify_token_dleq(&Token::new(
         url.parse()?,
         proofs.clone(),
         None,
         CurrencyUnit::Sat,
-    ))
-    .await?;
+    )))
+    .await
+    .context("CDK wallet request timed out")??;
     Ok(proofs)
 }
 async fn credit(
@@ -133,6 +136,8 @@ pub struct Funding {
     pub quote: Option<String>,
     pub invoice: Option<String>,
     pub done: bool,
+    #[serde(default)]
+    pub expired_unpaid: bool,
     quote_key: String,
     outputs: Vec<Output>,
     result: Option<Proofs>,
@@ -157,7 +162,7 @@ pub async fn fund(home: &Path, j: &Journal, url: &str, amount: u64) -> Result<Fu
             .is_some_and(|n| n <= crate::real_money::CAP),
         "cumulative funding exceeds 100,000 sats"
     );
-    crate::wallet::preflight(url).await?;
+    crate::wallet::preflight_for(url, Some("fund")).await?;
     let mut f = Funding {
         id: uuid::Uuid::new_v4().to_string(),
         mint: url.into(),
@@ -165,6 +170,7 @@ pub async fn fund(home: &Path, j: &Journal, url: &str, amount: u64) -> Result<Fu
         quote: None,
         invoice: None,
         done: false,
+        expired_unpaid: false,
         quote_key: hex::encode(SecretKey::generate().to_secret_bytes()),
         outputs: vec![],
         result: None,
@@ -239,8 +245,16 @@ pub async fn resume_fund(home: &Path, j: &Journal, f: &mut Funding) -> Result<()
         "fund quote ownership changed"
     );
     if q["state"] == "UNPAID" {
+        if q["expiry"]
+            .as_u64()
+            .is_some_and(|exp| cdk::util::unix_time() > exp.saturating_add(60))
+        {
+            f.expired_unpaid = true;
+            j.put("funding", &f.id, f).await?;
+        }
         return Ok(());
     }
+    f.expired_unpaid = false;
     ensure!(
         q["state"] == "PAID" || q["state"] == "ISSUED",
         "unknown funding state"
@@ -251,9 +265,15 @@ pub async fn resume_fund(home: &Path, j: &Journal, f: &mut Funding) -> Result<()
             "issued quote without recorded outputs"
         );
         let w = wallet(home, &f.mint).await?;
-        w.refresh_keysets().await?;
-        let k = w.fetch_active_keyset().await?;
-        let fees = w.get_keyset_fees_and_amounts_by_id(k.id).await?;
+        crate::wallet::bounded(w.refresh_keysets())
+            .await
+            .context("CDK wallet request timed out")??;
+        let k = crate::wallet::bounded(w.fetch_active_keyset())
+            .await
+            .context("CDK wallet request timed out")??;
+        let fees = crate::wallet::bounded(w.get_keyset_fees_and_amounts_by_id(k.id))
+            .await
+            .context("CDK wallet request timed out")??;
         f.outputs = outputs(PreMintSecrets::random(
             k.id,
             f.amount.into(),
@@ -266,7 +286,7 @@ pub async fn resume_fund(home: &Path, j: &Journal, f: &mut Funding) -> Result<()
         let (out, mut sigs) = restore(&f.mint, &f.outputs).await?;
         let selected = if out.is_empty() {
             ensure!(q["state"] == "PAID", "issued outputs not yet restored");
-            crate::wallet::preflight(&f.mint).await?;
+            // Issuing an already-paid quote adds no new exposure. Keyset and DLEQ checks remain.
             let mut request = MintRequest {
                 quote: id.clone(),
                 outputs: f.outputs.iter().map(|o| o.message.clone()).collect(),
@@ -309,6 +329,7 @@ pub async fn resume_fund(home: &Path, j: &Journal, f: &mut Funding) -> Result<()
 #[serde(rename_all = "snake_case")]
 pub enum MeltState {
     QuoteCreated,
+    Refused,
     RequestSent,
     Pending,
     PaidChangeUnreconciled,
@@ -322,6 +343,8 @@ pub struct Withdrawal {
     invoice: String,
     pub state: MeltState,
     quote: Option<MeltQuoteBolt11Response<String>>,
+    #[serde(default)]
+    pub max_debit: Option<u64>,
     pub input_fee: u64,
     inputs: Proofs,
     outputs: Vec<Output>,
@@ -333,26 +356,60 @@ pub struct Withdrawal {
 }
 impl Withdrawal {
     pub fn terminal(&self) -> bool {
-        matches!(self.state, MeltState::Done | MeltState::UnpaidReleased)
+        matches!(
+            self.state,
+            MeltState::Done | MeltState::UnpaidReleased | MeltState::Refused
+        )
     }
 }
 pub async fn withdraw(home: &Path, j: &Journal, url: &str, invoice: &str) -> Result<Withdrawal> {
-    crate::Asset::new(url)?.fence()?;
-    // Never create another payment authorization for the same invoice.
-    if let Some(mut a) = j
-        .all::<Withdrawal>("withdrawal")
-        .await?
-        .into_iter()
-        .find(|a| a.mint == url && a.invoice == invoice)
-    {
-        resume_withdraw(home, j, &mut a).await?;
-        return Ok(a);
-    }
+    withdraw_bounded(home, j, url, invoice, None).await
+}
+pub async fn withdraw_bounded(
+    home: &Path,
+    j: &Journal,
+    url: &str,
+    invoice: &str,
+    max_debit: Option<u64>,
+) -> Result<Withdrawal> {
+    let canonical = crate::Asset::new(url)?;
+    canonical.fence()?;
+    let url = canonical.mint_url.as_str();
     let req = MeltQuoteBolt11Request {
         request: invoice.parse()?,
         unit: CurrencyUnit::Sat,
         options: None,
     };
+    let invoice = req.request.to_string();
+    // The payment hash identifies the obligation across case variants AND mints.
+    for mut a in j.all::<Withdrawal>("withdrawal").await? {
+        let prior = MeltQuoteBolt11Request {
+            request: a.invoice.parse()?,
+            unit: CurrencyUnit::Sat,
+            options: None,
+        };
+        if prior.request.payment_hash() == req.request.payment_hash()
+            && a.state != MeltState::Refused
+        {
+            ensure!(
+                a.mint == url,
+                "invoice already authorized on another mint; resume the original mint"
+            );
+            if let Some(limit) = max_debit {
+                a.max_debit = Some(a.max_debit.map_or(limit, |old| old.min(limit)));
+                if a.state != MeltState::QuoteCreated {
+                    let q = a.quote.as_ref().context("missing quote")?;
+                    ensure!(
+                        u64::from(q.amount) + a.input_fee + u64::from(q.fee_reserve) <= limit,
+                        "existing authorization exceeds max-debit; it may already be paying"
+                    );
+                }
+                j.put("withdrawal", &a.id, &a).await?;
+            }
+            resume_withdraw_inner(home, j, &mut a, true).await?;
+            return Ok(a);
+        }
+    }
     let amount = req
         .request
         .amount_milli_satoshis()
@@ -365,9 +422,10 @@ pub async fn withdraw(home: &Path, j: &Journal, url: &str, invoice: &str) -> Res
     let mut a = Withdrawal {
         id: uuid::Uuid::new_v4().to_string(),
         mint: url.into(),
-        invoice: invoice.into(),
+        invoice: invoice.clone(),
         state: MeltState::QuoteCreated,
         quote: None,
+        max_debit,
         input_fee: 0,
         inputs: vec![],
         outputs: vec![],
@@ -377,27 +435,50 @@ pub async fn withdraw(home: &Path, j: &Journal, url: &str, invoice: &str) -> Res
         change: None,
     };
     j.put("withdrawal", &a.id, &a).await?;
-    let mut q: MeltQuoteBolt11Response<String> = mint::rpc(url, "melt/quote/bolt11", &req).await?;
-    ensure!(
-        u64::from(q.amount) == amount && q.state == MeltQuoteState::Unpaid,
-        "invalid initial melt quote"
-    );
-    ensure!(
-        q.request.as_ref().is_none_or(|v| v == invoice)
-            && q.unit.as_ref().is_none_or(|v| *v == CurrencyUnit::Sat),
-        "quote invoice/unit mismatch"
-    );
-    ensure!(
-        u64::from(q.fee_reserve) <= 32,
-        "withdrawal reserve exceeds 32 sat limit"
-    );
-    q.payment_preimage = None;
-    a.quote = Some(q);
-    j.put("withdrawal", &a.id, &a).await?;
-    prepare_withdraw(home, j, &mut a).await?;
-    resume_withdraw(home, j, &mut a).await?;
+    let validated: Result<MeltQuoteBolt11Response<String>> = async {
+        crate::wallet::preflight_for(url, Some("withdraw")).await?;
+        let mut q: MeltQuoteBolt11Response<String> =
+            mint::rpc(url, "melt/quote/bolt11", &req).await?;
+        ensure!(
+            u64::from(q.amount) == amount && q.state == MeltQuoteState::Unpaid,
+            "invalid initial melt quote"
+        );
+        ensure!(
+            q.request.as_ref().is_none_or(|v| v == &invoice)
+                && q.unit.as_ref().is_none_or(|v| *v == CurrencyUnit::Sat),
+            "quote invoice/unit mismatch"
+        );
+        ensure!(
+            u64::from(q.fee_reserve) <= reserve_ceiling(amount),
+            "withdrawal reserve exceeds max(32 sat, 2%) ceiling"
+        );
+        ensure!(
+            q.expiry > cdk::util::unix_time().saturating_add(60),
+            "melt quote needs more than 60 seconds before expiry"
+        );
+        q.payment_preimage = None;
+        Ok(q)
+    }
+    .await;
+    match validated {
+        Ok(q) => {
+            a.quote = Some(q);
+            j.put("withdrawal", &a.id, &a).await?;
+        }
+        Err(error) => {
+            // No spend authorization or reservation exists, including on a lost quote reply.
+            a.state = MeltState::Refused;
+            j.put("withdrawal", &a.id, &a).await?;
+            return Err(error);
+        }
+    }
+    resume_withdraw_inner(home, j, &mut a, true).await?;
     Ok(a)
 }
+pub fn reserve_ceiling(amount: u64) -> u64 {
+    32.max(amount.div_ceil(50))
+}
+
 async fn prepare_withdraw(home: &Path, j: &Journal, a: &mut Withdrawal) -> Result<()> {
     if !a.inputs.is_empty() {
         return Ok(());
@@ -407,12 +488,16 @@ async fn prepare_withdraw(home: &Path, j: &Journal, a: &mut Withdrawal) -> Resul
         .as_ref()
         .context("melt quote reply lost; no inputs reserved")?;
     ensure!(
-        q.expiry > cdk::util::unix_time(),
+        q.expiry > cdk::util::unix_time().saturating_add(60),
         "melt quote expired before submission"
     );
     let w = wallet(home, &a.mint).await?;
-    w.refresh_keysets().await?;
-    let k = w.fetch_active_keyset().await?;
+    crate::wallet::bounded(w.refresh_keysets())
+        .await
+        .context("CDK wallet request timed out")??;
+    let k = crate::wallet::bounded(w.fetch_active_keyset())
+        .await
+        .context("CDK wallet request timed out")??;
     let db = database(home, &a.mint).await?;
     let mut available = db
         .get_proofs(
@@ -428,7 +513,12 @@ async fn prepare_withdraw(home: &Path, j: &Journal, a: &mut Withdrawal) -> Resul
     for p in available {
         input.push(p.proof);
         let total = u64::from(input.total_amount()?);
-        let input_fee = u64::from(w.get_proofs_fee(&input).await?.total);
+        let input_fee = u64::from(
+            crate::wallet::bounded(w.get_proofs_fee(&input))
+                .await
+                .context("CDK wallet request timed out")??
+                .total,
+        );
         let net_required = u64::from(q.amount)
             .checked_add(input_fee)
             .context("melt amount overflow")?;
@@ -440,6 +530,10 @@ async fn prepare_withdraw(home: &Path, j: &Journal, a: &mut Withdrawal) -> Resul
         // arithmetic alone proves none can exist. A fee-reserve-equals-change
         // zero result cannot be distinguished from delayed mint finalization.
         if total >= required && (total > required || provably_no_change) {
+            ensure!(
+                a.max_debit.is_none_or(|limit| required <= limit),
+                "withdrawal exceeds max-debit"
+            );
             ensure!(input.len() <= 128, "too many melt inputs");
             mint::unspent(&a.mint, &input).await?;
             a.outputs = outputs(PreMintSecrets::blank(
@@ -506,7 +600,7 @@ async fn submit_melt(
         .await
         .context("invalid melt response (body withheld)")?;
     if !status.is_success() {
-        if body["code"].as_u64() == Some(20004) {
+        if status.is_client_error() && body["code"].as_u64().is_some() {
             return Ok(None);
         }
         anyhow::bail!("melt response HTTP {status}; body withheld; intent retained");
@@ -516,6 +610,14 @@ async fn submit_melt(
     ))
 }
 pub async fn resume_withdraw(home: &Path, j: &Journal, a: &mut Withdrawal) -> Result<()> {
+    resume_withdraw_inner(home, j, a, false).await
+}
+async fn resume_withdraw_inner(
+    home: &Path,
+    j: &Journal,
+    a: &mut Withdrawal,
+    explicit: bool,
+) -> Result<()> {
     if a.terminal() {
         database(home, &a.mint)
             .await?
@@ -527,7 +629,7 @@ pub async fn resume_withdraw(home: &Path, j: &Journal, a: &mut Withdrawal) -> Re
     if a.state == MeltState::QuoteCreated {
         if a.quote
             .as_ref()
-            .is_some_and(|q| q.expiry <= cdk::util::unix_time())
+            .is_none_or(|q| q.expiry <= cdk::util::unix_time().saturating_add(60))
         {
             // No POST can have occurred: RequestSent is persisted before that effect.
             if !a.inputs.is_empty() {
@@ -541,27 +643,48 @@ pub async fn resume_withdraw(home: &Path, j: &Journal, a: &mut Withdrawal) -> Re
                 .await?;
             return Ok(());
         }
-        prepare_withdraw(home, j, a).await?;
-        reserve_withdraw(home, a).await?;
+        // Recovery must never turn an unsent failed command into a payment.
+        if !explicit {
+            return Ok(());
+        }
+        if let Err(error) = prepare_withdraw(home, j, a).await {
+            if a.inputs.is_empty() {
+                a.state = MeltState::Refused;
+                j.put("withdrawal", &a.id, a).await?;
+            }
+            return Err(error);
+        }
         let q = a.quote.as_ref().context("missing withdrawal quote")?;
         ensure!(
-            q.expiry > cdk::util::unix_time(),
-            "melt quote expired; reservation retained"
+            a.max_debit.is_none_or(|limit| u64::from(q.amount)
+                .checked_add(a.input_fee)
+                .and_then(|v| v.checked_add(u64::from(q.fee_reserve)))
+                .is_some_and(|debit| debit <= limit)),
+            "withdrawal exceeds max-debit"
         );
+        reserve_withdraw(home, a).await?;
         mint::unspent(&a.mint, &a.inputs).await?;
-        let req = MeltRequest::new(
-            q.quote.clone(),
-            a.inputs.clone(),
-            Some(a.outputs.iter().map(|o| o.message.clone()).collect()),
+        ensure!(
+            q.expiry > cdk::util::unix_time().saturating_add(60),
+            "melt quote expired; reservation retained"
         );
         a.state = MeltState::RequestSent;
         j.put("withdrawal", &a.id, a).await?;
-        let reply = submit_melt(&a.mint, &req).await?;
+    }
+    // RequestSent is already journaled: retry ONLY the identical authorization.
+    // GET/restore runs even if the replay fails, so a lost PAID reply can reconcile.
+    if a.state == MeltState::RequestSent && !a.final_reply && !a.seen_pending {
+        let req = MeltRequest::new(
+            a.quote.as_ref().context("missing quote")?.quote.clone(),
+            a.inputs.clone(),
+            Some(a.outputs.iter().map(|o| o.message.clone()).collect()),
+        );
+        let reply = submit_melt(&a.mint, &req).await;
         #[cfg(feature = "lab")]
         if std::env::var("TRADE_CRASH_AFTER_MELT").ok().as_deref() == Some("1") {
             std::process::exit(86);
         }
-        if let Some(mut reply) = reply {
+        if let Ok(Some(mut reply)) = reply {
             bind(a, &reply)?;
             a.final_reply = matches!(reply.state, MeltQuoteState::Paid | MeltQuoteState::Unpaid);
             reply.payment_preimage = None;
@@ -572,10 +695,15 @@ pub async fn resume_withdraw(home: &Path, j: &Journal, a: &mut Withdrawal) -> Re
                 return j.put("withdrawal", &a.id, a).await;
             }
             a.quote = Some(reply);
-        } else {
-            // NUT-00 error 20004 explicitly says payment failed. Still require
-            // fresh UNPAID and UNSPENT observations before releasing anything.
+        } else if matches!(reply, Ok(None)) {
+            // A well-formed NUT error is definitive. Release still requires fresh
+            // UNPAID and UNSPENT observations, never the error body alone.
             a.final_reply = true;
+        } else {
+            eprintln!(
+                "withdrawal {}: no definitive melt reply; identical request retained",
+                a.id
+            );
         }
         j.put("withdrawal", &a.id, a).await?;
     }
@@ -661,6 +789,9 @@ pub async fn resume_withdraw(home: &Path, j: &Journal, a: &mut Withdrawal) -> Re
 pub async fn recover(home: &Path, j: &Journal) -> Result<bool> {
     let mut failed = false;
     for mut f in j.all::<Funding>("funding").await? {
+        if f.expired_unpaid {
+            continue;
+        }
         if !matches!(
             tokio::time::timeout(
                 std::time::Duration::from_secs(120),
@@ -696,7 +827,10 @@ pub async fn recover(home: &Path, j: &Journal) -> Result<bool> {
 }
 
 pub async fn pending(j: &Journal) -> Result<bool> {
-    Ok(j.all::<Funding>("funding").await?.iter().any(|f| !f.done)
+    Ok(j.all::<Funding>("funding")
+        .await?
+        .iter()
+        .any(|f| !f.done && !f.expired_unpaid)
         || j.all::<Withdrawal>("withdrawal")
             .await?
             .iter()
@@ -719,6 +853,6 @@ impl Withdrawal {
         serde_json::json!({"withdrawal":self.id,"mint":self.mint,"state":self.state,
             "quote":self.quote.as_ref().map(|q| &q.quote), "amount":amount,
             "fee_reserve":self.quote.as_ref().map(|q| u64::from(q.fee_reserve)),
-            "input_total":input,"mint_fee":self.input_fee,"change":self.change,"lightning_fee":fee})
+            "max_debit":self.max_debit,"input_total":input,"mint_fee":self.input_fee,"change":self.change,"lightning_fee":fee})
     }
 }

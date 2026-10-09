@@ -30,6 +30,10 @@ impl Journal {
             .await?;
         Ok(())
     }
+    pub async fn remove(&self, ns: &str, id: &str) -> Result<()> {
+        self.0.kv_remove("trade-v1", ns, id).await?;
+        Ok(())
+    }
     pub async fn all<T: DeserializeOwned>(&self, ns: &str) -> Result<Vec<T>> {
         let mut out = Vec::new();
         for k in self.0.kv_list("trade-v1", ns).await? {

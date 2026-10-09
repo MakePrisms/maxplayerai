@@ -5,12 +5,39 @@ A fixed-lot CLI, independent of jobs, the maxplayer daemon, core, and `relay.max
 recovery, fee-inclusive net delivery, and a signed `sold` status. Real-money trading is a normal supported use; this is not a production safety certification
 or an unconditional atomicity guarantee.
 
-Current operating policy is in [Round 4](#round-4-relay-policy-and-real-money-integration-author-led-verification).
+Current operating policy is in [Round 5](#round-5-final-review-policy).
 Earlier dated verification sections are historical snapshots, not current coverage totals.
+
+## Round 5 final-review policy
+
+- Sender-funded claim fees must equal the pinned quote, not the receiver’s outgoing budget.
+  Incoming fees exceeding the admission cap are refused before a lock is accepted.
+- CDK wallet calls have 15-second budgets; message handling has 60 seconds. Own-mint
+  refunds run before counterparty claims. Missing mint info time does not block refunds;
+  mint-enforced locktime remains authoritative. Known-preimage claims survive refund quarantine.
+- Withdrawal reserve: max(32 sats, ceil(invoice sats × 2%)); 100,000 sats permits 2,000.
+  `--max-debit` enforces invoice + input fee + reserve. Invalid/lost/refused quotes are
+  terminal, retryable explicitly with the same invoice. No passive recovery submits an
+  unsent quote; an explicitly failed pre-POST withdrawal cannot pay later on a serve tick.
+  Submitted ambiguity retains exact authorization and replays it until definitive.
+- Read-only `status` and `balance` use SQLite snapshots without the writer lock. Keep
+  serve alive from second lock through settlement. Exits: 0 success, 1 command/refusal,
+  2 usage, 3 unresolved work, 4 terminal manual recovery. Non-final withdrawals never exit 0.
+- Funding preflight adds enabled NUT-04/20; withdrawal adds NUT-05; trading adds NUT-11.
+  Paid funding issuance retains keyset/DLEQ verification without new admission gates.
+  Expired fresh-UNPAID funding becomes terminal after 60 seconds grace, still charged
+  against the cap and explicitly resumable for late payment.
+- Relay exhaustion is `publication_abandoned`, separate from unresolved money. Retry
+  scans prune completed/expired entries while retaining signed receipts. Inbox peer bursts
+  are limited without a shared 256-message drop queue.
+
+Verification is fake-mint-only, author-led; final counts, mutation results, detached
+serve refund and current-head CI links are in the PR’s round-five section. Historical
+sections below describe their dated runs, not current coverage totals.
 
 ## Implemented
 
-- `list`, `discover`, `cancel`, `serve`, `take`, `recover`, `preflight`, `fund`, `balance`, `withdraw`.
+- `list`, `discover`, `cancel`, `serve`, `take`, `recover`, `preflight`, `fund`, `balance`, `status`, `withdraw`.
 - Immutable signed 3410 lots (24 hours), hash-chained 3411 statuses, signature/content/tag
   validation, fork/gap quarantine, no terminal reopening. Every configured relay is queried;
   discovery unions their results. No EOSE is an error, not an empty market; partial relay
@@ -25,12 +52,14 @@ Earlier dated verification sections are historical snapshots, not current covera
   `--max-fees` defaults to 16 in the relevant asset. No platform/trade fees.
 - Taker generates the secret and locks **first**, for 60 minutes. Maker verifies the first
   lock before locking **second**, for 15 minutes. Both parties preflight both mints (reachable
-  advertised NUT-07/09/12/14, reported clock within 60 seconds), keysets and fees before locking. Each received
+  advertised NUT-07/09/11/12/14, reported clock within 60 seconds), keysets and fees before locking. Each received
   lock must have exact hash/keys/thresholds/SIG_INPUTS/deadline, unique proofs, DLEQ, exact
   net-after-input-fee value, and fresh UNSPENT state. Asset identity is **mint URL + unit**;
   both assets can be `sat`. Taker refuses to initiate a claim with less than three minutes left.
 - Maker settlement reads the preimage from NUT-07 witnesses on **its own outgoing proofs**;
-  the taker's encrypted notice is only an optimization. Maker publishes sold after claiming
+  the taker's encrypted notice supplements this. Without the notice, maker safety
+  relies on the chosen mint reporting the HTLC witness. Mint choice is the buyer’s/seller’s
+  responsibility; there is no witness-verification/rating gate. Maker publishes sold after claiming
   the incoming leg. Locked proofs are never counted as ordinary wallet balance.
 - Private SQLite journal using CDK's KV API; exact inputs, blinded outputs, secrets/blinding
   factors, signed witnesses, results and send deadlines are persisted before mint effects.
@@ -42,19 +71,19 @@ Earlier dated verification sections are historical snapshots, not current covera
   key after strict locktime plus clock margin. Maker recovery polls every three seconds and
   refunds after its short deadline +60 seconds when the mint is reachable. A claim that wins
   the refund race is reconciled through its witness. Refund outputs survive a process exit.
-- `recover` makes one bounded pass over existing authorizations; it does not admit new requests or wait for deadlines. Exit **2** and status `recovery_incomplete` mean retained items need a later pass; exit 0 means all money authorizations are terminal, exit 1 is a command error. Each funding/withdrawal/swap attempt has a 120-second budget, independent of other items. HTTP requests may already have landed at timeout: the exact journal remains authoritative; no timeout releases funds.
+- `recover` makes one bounded pass over existing authorizations; it does not admit new requests or wait for deadlines. Exit **3** and status `recovery_incomplete` mean retained items need a later pass; exit 0 means all money authorizations are terminal, exit 1 is a command error. Each funding/withdrawal/swap attempt has a 120-second budget, independent of other items. HTTP requests may already have landed at timeout: the exact journal remains authoritative; no timeout releases funds.
   `serve` continuously accepts quotes and recovers swaps. **Keep a watcher running while funds
-  are locked.** Stop it before another command uses the same home. Do not delete a trade home.
+  are locked.** Use read-only `status`/`balance` without stopping it; never stop between `second_locked` and `settling`. Do not delete a trade home.
 
-Any canonical HTTPS mint can be used if automatic preflight passes: advertised NUT-07/09/12/14,
+Any canonical HTTPS mint can be used if automatic preflight passes: advertised NUT-07/09/11/12/14,
 an active sat keyset, and clock skew at most 60 seconds. Preflight runs before each `list`,
-`take`, funding quote/issuance and lock submission; successful earlier preflight is not cached
+`take`, funding quotes and lock submission; successful earlier preflight is not cached
 as permission for a later lock. Test mints and loopback HTTP(S) fixtures remain supported.
 HTTP is refused except on loopback, and redirects are disabled. There is no real-money
 opt-in environment variable or allow-list flag. Each lock's gross amount and cumulative
 funding per mint/home are capped at **100,000 sats**, including pending/lost funding intents.
-Each withdrawal invoice is also capped at **100,000 sats**, plus at most 32 sats of
-quoted fee reserve; spendable funds must cover the invoice, input fees and required change.
+Each withdrawal invoice is also capped at **100,000 sats**, plus at most max(32 sats, ceil(invoice amount × 2%)) of
+quoted fee reserve, bounded together with input fees by `--max-debit`; spendable funds must cover the invoice, input fees and required change.
 
 **Risks:** a mint can cheat: an issuer-run mint can steal its users' funds. Capability
 advertisements are not evidence of honest operation. If the counterparty disappears,
@@ -578,7 +607,7 @@ A mint can still lie, withhold evidence, or process an already-delivered request
   48 KiB encrypted plaintext, 256 status revisions, 4,096 events per relay query, eight relays.
 - Two SQLite domains (trade journal and per-mint wallet) are coordinated by durable intents and
   exclusive home ownership, not a cross-database atomic transaction. Other copies of a wallet
-  seed remain outside the single-owner guarantee. No record pruning is implemented.
+  seed remain outside the single-owner guarantee. Money records and receipts are retained; a pruned pending-publication index bounds recurring scans.
 - A persisted client send deadline prevents **resubmitting** an expired mint request; HTTPS
   mints do not offer an enforceable server-side request expiry. Already-delivered requests may
   race refunds. Ambiguous/partial restoration remains held; no automatic unsafe compensation.
@@ -611,31 +640,31 @@ its separate run report; the historical test counts above predate this change.
   proofs and blank change outputs including secrets/blinding factors before submission.
   Same-invoice invocations resume the original authorization rather than paying again.
 - Explicit non-terminal states: `quote_created`, `request_sent`, `pending`, and
-  `paid_change_unreconciled`. A timeout never triggers another melt POST. `PAID` alone does
+  `paid_change_unreconciled`. A no-reply timeout replays only the identical journaled melt POST. `PAID` alone does
   not mean `done`: the mint may commit payment before change signatures. Change is restored
   by the recorded blinded messages, matched against the quote, unblinded, DLEQ-verified,
   fee-bounded and credited before settlement. Empty restore is not proof of zero change.
   Zero change is terminal only when the input/amount/input-fee arithmetic proves it.
-- Definitive UNPAID response or payment-failed error 20004, or a previously observed PENDING
+- Definitive UNPAID response or well-formed numeric NUT error on HTTP 4xx, or a previously observed PENDING
   followed by UNPAID, additionally requires fresh UNSPENT inputs before release. An UNPAID
   snapshot after an ambiguous send is not sufficient: the original POST might still arrive.
 - New proofs are credited **reserved**, then the journal is marked done, then they are
   released. Recovery finishes an interrupted release. Never open a home concurrently or
   spend its proofs outside this tool. The CLI holds the home lock; library callers must too.
-- Withdrawals have a 100,000-sat invoice cap and a 32-sat fee-reserve cap. Input selection requires change to remain positive even
+- Withdrawals have a 100,000-sat invoice cap and a max(32 sats, ceil(invoice sats × 2%)) reserve cap. Input selection requires change to remain positive even
   if the whole reserve is consumed, unless arithmetic proves zero change. Sweep conservatively; do not interpret a `paid_change_unreconciled` result as dust
   or fees. Preserve every funded home and stop for inspection on unresolved state.
   Reserves are mint-specific (live: Minibits/Macadamia 2, cashu.cz 5 sats), not a global
-  constant. An insufficient-funds refusal may leave a pre-send `quote_created` authorization.
-  No cancellation command exists: preserve it, await its natural expiry and resume the exact
-  invoice for `unpaid_released`; do not edit the journal or silently replace it.
+  constant. An insufficient-funds refusal is terminal `refused` and cannot pay later via recovery.
+  Only explicit same-invoice withdrawal advances a crash-retained `quote_created` record;
+  recovery only expires/releases it. Never edit the journal or replace an ambiguous submitted payment.
 - NUT-07 advertisement is insufficient for HTLC refund safety. Check actual spent-proof
   witness emission and parsing on each mint before running the timed refund scenario.
   Never log proofs, tokens, wallet keys, blinding secrets, or HTLC/payment preimages.
 
 `recover` attempts each funding, withdrawal and swap once and reports public IDs and states.
 An unreachable mint or stuck authorization does not stop other items or keep the command
-running indefinitely. Pending items remain non-terminal; exit 2 requests a later pass.
+running indefinitely. Pending items remain non-terminal; exit 3 requests a later pass.
 Use `serve` for continuous recovery while locks are live. Historical round-four harness
 results below predate this bounded-pass fix.
 

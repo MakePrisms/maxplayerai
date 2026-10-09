@@ -12,7 +12,7 @@ pub struct Market {
     pub clients: Vec<Client>,
     pub keys: Keys,
     urls: Vec<String>,
-    pub inbox: tokio::sync::mpsc::Receiver<Event>,
+    pub inbox: tokio::sync::mpsc::UnboundedReceiver<Event>,
 }
 /// Per-event, per-relay receipts survive CLI restarts. An ACK is not a storage proof.
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -31,6 +31,17 @@ struct RelayGate {
     next: u64,
     blocked: bool,
 }
+#[derive(Debug)]
+pub struct PublicationAbandoned;
+impl std::fmt::Display for PublicationAbandoned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "publication_abandoned: relay retry budget exhausted or blocked"
+        )
+    }
+}
+impl std::error::Error for PublicationAbandoned {}
 const MAX_PUBLICATION_ATTEMPTS: u32 = 12;
 fn retry_delay(attempt: u32) -> u64 {
     // Independent random jitter, without ever logging random material.
@@ -52,7 +63,7 @@ pub struct Envelope {
 impl Market {
     pub async fn connect(keys: Keys, urls: &[String]) -> Result<Self> {
         ensure!(!urls.is_empty() && urls.len() <= 8, "relay count");
-        let (tx, inbox) = tokio::sync::mpsc::channel(256);
+        let (tx, inbox) = tokio::sync::mpsc::unbounded_channel();
         let mut clients = vec![];
         for url in urls {
             let u = url::Url::parse(url)?;
@@ -73,6 +84,8 @@ impl Market {
             let mut rx = c.notifications();
             let tx = tx.clone();
             tokio::spawn(async move {
+                // Bound each peer's burst without losing unrelated peers behind it.
+                let mut rates = BTreeMap::new();
                 while let Ok(n) = rx.recv().await {
                     if let RelayPoolNotification::Message {
                         message: RelayMessage::Event { event, .. },
@@ -80,7 +93,19 @@ impl Market {
                     } = n
                     {
                         if event.kind == Kind::Custom(TRADE) {
-                            let _ = tx.try_send(event.into_owned());
+                            let now = crate::coordinator::now();
+                            rates.retain(|_, (start, _): &mut (u64, u32)| {
+                                now < start.saturating_add(60)
+                            });
+                            let entry = rates.entry(event.pubkey).or_insert((now, 0));
+                            entry.1 += 1;
+                            if entry.1 <= 64 {
+                                if tx.send(event.into_owned()).is_err() {
+                                    break;
+                                }
+                            } else if entry.1 == 65 {
+                                eprintln!("trade inbox: peer rate limit (64 messages/minute)");
+                            }
                         }
                     }
                 }
@@ -172,6 +197,7 @@ impl Market {
             pending.push((url, c, event));
         }
         j.put("publication", &id, &row).await?;
+        j.put("publication_pending", &id, &id).await?;
         let mut tasks = tokio::task::JoinSet::new();
         for (url, c, event) in pending {
             tasks.spawn(async move {
@@ -226,6 +252,20 @@ impl Market {
             .filter(|(_, d)| d.ack)
             .map(|(u, _)| u.clone())
             .collect();
+        let mut retryable = false;
+        for (url, d) in &row.relays {
+            let gate = j
+                .get::<RelayGate>("relay_gate", &hex::encode(url))
+                .await?
+                .unwrap_or_default();
+            retryable |= !d.ack && d.attempts < MAX_PUBLICATION_ATTEMPTS && !gate.blocked;
+        }
+        if !retryable {
+            j.remove("publication_pending", &id).await?;
+        }
+        if accepted.is_empty() && !retryable {
+            return Err(PublicationAbandoned.into());
+        }
         ensure!(
             !accepted.is_empty(),
             "relays unreachable: no publication ACK (retained with bounded backoff)"
@@ -234,11 +274,29 @@ impl Market {
     }
     /// Called by the serve/recover tick after active-swap recovery.
     pub async fn retry_publications(&self, j: &Journal) -> Result<()> {
-        for row in j.all::<Publication>("publication").await? {
-            if row.event.created_at.as_secs().saturating_add(86400) < crate::coordinator::now() {
-                continue;
+        // One-time upgrade of old journals. Keep immutable receipts, scan only pending IDs.
+        if j.get::<bool>("meta", "publication_index").await? != Some(true) {
+            for row in j.all::<Publication>("publication").await? {
+                j.put(
+                    "publication_pending",
+                    &row.event.id.to_hex(),
+                    &row.event.id.to_hex(),
+                )
+                .await?;
             }
-            let _ = self.publish_durable(j, &row.event).await;
+            j.put("meta", "publication_index", &true).await?;
+        }
+        for id in j.all::<String>("publication_pending").await? {
+            if let Some(row) = j.get::<Publication>("publication", &id).await? {
+                if row.event.created_at.as_secs().saturating_add(86400) < crate::coordinator::now()
+                {
+                    j.remove("publication_pending", &id).await?;
+                    continue;
+                }
+                let _ = self.publish_durable(j, &row.event).await;
+            } else {
+                j.remove("publication_pending", &id).await?;
+            }
         }
         Ok(())
     }

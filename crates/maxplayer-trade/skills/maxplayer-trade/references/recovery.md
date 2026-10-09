@@ -17,6 +17,9 @@ A vanished peer means waiting for refund; a vanished or dishonest mint can block
 recovery indefinitely. An offline seller can miss its recovery opportunity; NUT-14
 receiver claims remain valid after locktime. Keep the watcher alive.
 
+**Do not stop serve between `second_locked` and `settling`.** Use lock-free
+`status` / `balance` for observation while the writer runs.
+
 ## Bounded pass and exit status
 
 `recover` makes one pass without waiting for future lock deadlines. Each funding,
@@ -24,14 +27,16 @@ withdrawal, and swap attempt has a **120-second** budget; this is not a 120-seco
 whole-command deadline. Items are handled sequentially and relay/setup/publication
 work is additional. A timeout does not undo a delivered RPC or release reservations.
 
-- **0:** all reported items terminal and no work deferred. Quarantines count as
-  terminal, so inspect states and manual-recovery markers even on zero exit.
-- **2:** unresolved or deferred work, including individual item errors/timeouts or
-  deferred publication. Preserve authorization, resume `serve` for live locks or
-  make a later bounded pass with backoff; do not busy-loop or duplicate payments.
-- **1:** command-level error (for example home lock, setup, or journal failure).
-  Diagnose the redacted error; preserve the home. Clap syntax/usage errors can also
-  exit 2, so distinguish those from a recovery-incomplete report.
+- **0:** successful command; recovery has all items terminal, no deferred work or quarantine.
+- **1:** command error or terminal unpaid/refused withdrawal; inspect the state.
+- **2:** CLI syntax/usage error only.
+- **3:** non-final withdrawal, unresolved/deferred recovery, or item error/timeout.
+  Preserve authorization; keep `serve` running for live locks and retry with backoff.
+- **4:** terminal manual-recovery quarantine (unresolved work takes precedence as 3).
+
+Exhausted/blocked relay publication is reported as `publication_abandoned`, not
+unresolved money work. Money records and signed receipts remain; the retry scan
+contains only pending publications, with the 24-hour cutoff and 12-attempt budget.
 
 ## Trade states
 
@@ -72,20 +77,28 @@ maker listing stays held. A human must arrange verified recovery; no automatic
 
 | State | Meaning and action |
 | --- | --- |
-| `quote_created` | Authorization saved; quote/setup may be incomplete. Recover the same authorization; no replacement. |
+| `quote_created` | No POST authorized yet. Recovery only expires/releases it; only explicit `withdraw` with the same invoice may advance it. |
 | `request_sent` | Payment POST may have reached the mint; timeout does not mean failure. Reconcile only. |
 | `pending` | Mint reports payment pending; preserve reservation and wait/recover. |
 | `paid_change_unreconciled` | Invoice reported paid, but change/accounting not proven complete. Never pay again; preserve outputs and recover. |
+| `refused` | Terminal pre-POST refusal; no inputs/payment reserved. Same invoice may be explicitly retried. |
 | `done` | Terminal: paid with reconciled change and wallet accounting. Verify receipt and balance. |
-| `unpaid_released` | Terminal: safe unpaid outcome established and reservation released. Not payment success. Any new payment needs fresh confirmation. |
+| `unpaid_released` | Terminal: safe unpaid outcome established and reservation released. Not payment success. Any new payment needs a new invoice and fresh confirmation. |
 
-Only the last two are terminal. Missing/partial restore, ambiguous UNPAID, unknown
+The last three are terminal. Missing/partial restore, ambiguous UNPAID, unknown
 status, contradictory state, or lost zero-change reply may keep a withdrawal held.
-Never create a replacement while unresolved, even if the invoice expired or the
-recipient requests another. Escalate persistent uncertainty without forcing release.
+Never replace a submitted unresolved payment. For an unsent `quote_created` record,
+let recovery release it when its quote expires; if its reply was lost, recovery
+releases it immediately. An explicit same-invoice command can retry an unexpired
+unsent quote. `refused` permits a same-invoice retry; `unpaid_released` requires a
+new invoice for a new payment. A failed pre-POST withdrawal cannot pay later via
+serve/recover/market commands; a post-POST timeout is still unresolved, not failure. Escalate persistent uncertainty without forcing release.
 
 ## Funding and market status are separate
 
+Fresh UNPAID after funding expiry +60 seconds becomes terminal `expired_unpaid`,
+still charged to the lifetime cap. A late-paid invoice may be resumed explicitly
+with its original funding quote. Never pay the old and a replacement invoice.
 Funding has a retained quote/issuance authorization; invoice paid is not proof of
 wallet credit. Recover or resume that exact quote, never pay a second invoice to
 resolve missing credit. A historical CDK orphan-quote reservation problem needs a

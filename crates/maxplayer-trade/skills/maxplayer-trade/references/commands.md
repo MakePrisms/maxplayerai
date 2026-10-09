@@ -15,13 +15,14 @@ Canonical command signatures (placeholders are not literal values):
 ```text
 preflight <mint>
 balance <mint>
+status
 fund <mint> --amount <sats> [--quote <quote-id>]
 list --give-mint <mint> --give <net-sats> --want-mint <mint> --want <net-sats> --max-fees <sats>
 discover
 serve
 cancel <lot>
 take <lot> --max-give <total-sats> --min-receive <net-sats> --max-fees <sats>
-withdraw <mint> --invoice <bolt11>
+withdraw <mint> --invoice <bolt11> [--max-debit <sats>]
 recover
 ```
 
@@ -29,7 +30,7 @@ Use `-h` / `--help` at the root or on any application subcommand. The built-in
 `help [COMMAND]` also shows root or command help. There is no version option.
 `--home <HOME>` is required for operational commands; `--relay <RELAY>` is
 repeatable. All command-specific flags in the signatures above are required except
-`--quote` and `--max-fees` (default 16 on list/take). Positional mint arguments are
+`--quote`, `--max-debit`, and `--max-fees` (default 16 on list/take). Positional mint arguments are
 canonical URLs; lot arguments are public lot IDs; `--quote` is a saved funding
 quote for the same mint and amount.
 Never use a lab-feature binary for the human's funds.
@@ -43,7 +44,9 @@ Never use a lab-feature binary for the human's funds.
 - `--min-receive`: buyer's minimum net incoming amount.
 - `--max-fees`: outgoing mint preparation + claim fee budget, default **16 sats** on
   list and take. Always pass an explicitly approved cap; this is not a global budget
-  for repeated trades or a guarantee against future refund fees. Refund/recovery may
+  for repeated trades or a guarantee against future refund fees. It also limits the
+  incoming sender-funded claim fee at admission, in that incoming asset; after
+  admission claims use the pinned quote fee, not the receiver’s outgoing budget. Refund/recovery may
   incur mint fees; disclose this rather than promising a fully refunded balance.
 - No platform/trade fee. Do not equate no platform fee with no mint/Lightning fees.
 - Hard cap: 100,000 sats gross per lock; 100,000 cumulative funding per mint per home.
@@ -56,14 +59,19 @@ Example: a lot gives 32 A for 24 B. If the human approves **at most 27 B total**
 **at least 32 A net**, and **3 B fee sats**, use `take <lot> --max-give 27
 --min-receive 32 --max-fees 3`. If they cap total spending at 24, use 24 instead of
 27 and accept refusal when fees make it impossible. For a seller giving 32 A with
-3 A fee sats, confirm a maximum debit of 35 A and exact wanted net receipt.
+3 A fee sats, confirm a maximum debit of 35 A and exact wanted net receipt. Also
+confirm that the incoming B claim fee fits the cap; do not blindly use 3 across
+unequal-fee mints. A larger cap needs the human’s approval, not an automatic retry.
 Never round a spend ceiling upward or a minimum receipt downward.
 
 Automatic preflight before funding, listing, taking, and withdrawal requires
-NUT-07/09/12/14 support, an active sat keyset, and clock skew at most 60 seconds.
-The explicit `preflight <mint>` performs the same checks. No opt-in is required;
+NUT-07/09/11/12/14 support, an active sat keyset, and clock skew at most 60 seconds.
+Funding additionally requires enabled NUT-04 bolt11/sat and NUT-20; withdrawal
+requires enabled NUT-05 bolt11/sat. The explicit `preflight <mint>` checks the
+common trading capabilities. Diagnostic preflight output goes to stderr. No opt-in is required;
 passing advertisement checks is not independent refund interoperability evidence.
-`balance` reads wallet balance without submitting earlier authorizations.
+`balance` and `status` are lock-free read-only SQLite snapshots, available during
+`serve`, without network calls or submission of earlier authorizations.
 Market commands (including `discover` and `cancel`) first recover existing
 authorizations; do not treat them as read-only on a home with pending obligations.
 `serve` continuously accepts trades and recovers obligations; keep it running while
@@ -80,15 +88,19 @@ a test mint behaved that way. Reuse the retained quote for the same mint/amount.
 
 ## Withdrawal: enforcement before execution
 
-The verified interface caps each invoice at **100,000 sats** and the Lightning
-fee reserve at **32 sats**. It has no user-selectable withdrawal fee flag and no
-Cashu input-fee or total-debit cap. The invoice cap is not a gross debit cap.
-Do **not** reuse the trade fee flag on withdrawal. Before invoking withdrawal,
-establish the input-fee/total-debit bound and ensure it and the reserve fit the
-human's numeric approval. A reserve-only cap does not cap Cashu input fees.
-If the approved bounds cannot be established and enforced without executing the
-payment, **stop and escalate; do not call withdrawal as a preview**. This is a
-specific withdrawal limitation, not a missing real-money opt-in policy.
+Each invoice is capped at **100,000 sats**. The Lightning reserve ceiling is
+**max(32 sats, ceil(invoice sats × 2%))**: a 100,000-sat invoice may reserve 2,000.
+Use `withdraw <mint> --invoice <bolt11> --max-debit <approved-sats>` to enforce
+**invoice + input fee + quoted reserve** before reserving inputs/POST. Selected
+proof face value can be larger; the excess is journaled change, not extra fee
+permission. This option is optional in the CLI but required by this skill whenever
+the human supplies a total debit bound. The trade fee flag does not apply.
+Over-ceiling, invalid, lost, near-expiry, or unfundable quotes become terminal
+`refused` without a payment POST. A refusal can be retried explicitly with the
+same invoice; it cannot later pay merely because recovery runs or funds arrive.
+A first POST requires more than 60 seconds of quote lifetime. After a submitted
+request becomes ambiguous, recovery replays exactly the saved inputs/outputs/quote,
+never a replacement authorization. Deduplication uses payment hash across mints.
 
 Require an amount-bearing, unexpired user-supplied BOLT11; do not generate an
 invoice or choose a destination for the human. The receipt must distinguish the
