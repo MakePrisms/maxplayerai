@@ -104,7 +104,7 @@ inactive cancellation is reported; an unresolved lock is never called cancelled.
 ### Find listings / buy that lot
 
 `discover` (per-lot fees or `unknown`), inspect the mint pair
-and lot ID, and match the human's price. Discovery authorizes no purchase. For “X A for at most Y B”,
+and lot ID, and match the human's price. Discovery approves nothing. For “X A for at most Y B”,
 set `--min-receive X` and `--max-give Y` when Y is the total spending ceiling. If Y
 was explicitly a net price plus a separately approved fee F, the total ceiling can
 be Y + F; otherwise never silently add fees. A stricter limit is fine, a looser one

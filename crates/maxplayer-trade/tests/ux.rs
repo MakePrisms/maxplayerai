@@ -905,6 +905,12 @@ fn status_golden(home: &Path) -> String {
             serde_json::from_slice::<money::Withdrawal>(&bytes)
                 .unwrap()
                 .summary()
+        } else if kind == "receive" {
+            let mut s = serde_json::from_slice::<maxplayer_trade::receive::Receipt>(&bytes)
+                .unwrap()
+                .summary();
+            s["kind"] = kind.clone().into();
+            s
         } else {
             serde_json::json!({"kind":kind,"id":v["id"],"state":v["state"],"done":v["done"],"expired_unpaid":v["expired_unpaid"]})
         };
