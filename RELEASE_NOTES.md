@@ -33,6 +33,12 @@ documented contribution-base matrix.
   open-pool buyer also fetches the base with seller-equivalent (anonymous)
   identity, so buyer-only readability can no longer slip through. See
   docs/PRIVATE-JOBS.md (contribution bases).
+- Public contribution posts validate their base by fetching it once before
+  publication, with the identity a seller will use: a missing `base_oid` or a
+  repository above the relay quotas is refused at post time with the cause
+  named, instead of surfacing as a seller execution failure after the deadline
+  started. The validated objects seed the delivery store for the later collect
+  verify fetch. Public posts therefore take roughly one clone of the base.
 
 - Time budgets widened for large repositories:
   - The reviewer's per-request processing budget is configurable

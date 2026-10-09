@@ -726,11 +726,19 @@ pub async fn post_job_async(
     // A base only the buyer can read makes such a job unservable: it would burn the
     // posting work and the deadline with no claim, or strand the selected seller.
     // Refuse it here, before the wallet opens and before any slow preparation.
-    if let (Some(contribution), true) = (
-        &contribution,
-        request.untargeted || visibility == crate::private_content::wire::Visibility::Public,
-    ) {
-        assert_base_readable_by_sellers(home, contribution.target.clone_url()).await?;
+    if let Some(contribution) = &contribution {
+        let public = visibility == crate::private_content::wire::Visibility::Public;
+        if request.untargeted || public {
+            assert_base_readable_by_sellers(home, contribution.target.clone_url()).await?;
+        }
+        // A public post uploads nothing, so no later step would catch a missing
+        // base_oid or an over-quota repository before a seller burns the deadline
+        // on it. Validate by fetching once, exactly the way a seller will; the
+        // fetched objects seed the delivery store for the later verify fetch.
+        // (Private posts validate all of this in their own base import.)
+        if public {
+            validate_public_contribution_base(home, contribution).await?;
+        }
     }
     let deadline_unix = resolve_post_deadline(request.deadline_unix, now_unix_secs()?)?;
 
@@ -868,6 +876,95 @@ async fn assert_base_readable_by_sellers(
              was not published — retry it, or post a targeted private job"
         ))),
     }
+}
+
+/// A public contribution post fetches its pinned base once, pre-publication, with
+/// the identity a seller will use. This is the only point that can refuse a
+/// missing `base_oid` or an over-quota repository BEFORE money and a deadline are
+/// committed: public posts upload nothing, so nothing later checks the base until
+/// a seller fails at execution. The validated objects are kept as a delivery-store
+/// seed so the later collect verify fetch transfers only new commits.
+#[cfg(feature = "wallet")]
+async fn validate_public_contribution_base(
+    home: &MaxplayerHome,
+    contribution: &crate::contribution::ContributionOffer,
+) -> Result<(), JobLifecycleError> {
+    let url = contribution.target.clone_url().to_owned();
+    let oid = contribution.base.oid().to_owned();
+    // Sign only for the configured relay host, where sellers are members too.
+    // Every other source is fetched anonymously, the way a seller fetches it.
+    let mint: Option<crate::git_transport::AuthMinter> =
+        match home.config.privacy.git_base.as_deref() {
+            Some(base) if url.starts_with(base) => {
+                let keys = buyer_keys(home)?;
+                let intended = url.clone();
+                Some(std::sync::Arc::new(move |destination: &str| {
+                    if !crate::git_transport::same_destination(&intended, destination) {
+                        return Err("wrong contribution base destination".into());
+                    }
+                    crate::git_transport::nip98_authorization_header_with_keys(
+                        destination, &keys, None, None,
+                    )
+                    .map_err(|e| e.to_string())
+                }))
+            }
+            _ => None,
+        };
+    let root = home.root.clone();
+    let store = crate::collect::delivery_store_path(home);
+    tokio::task::spawn_blocking(move || {
+        let staging = tempfile::Builder::new()
+            .prefix(".public-base-validate-")
+            .tempdir_in(&root)
+            .map_err(|e| JobLifecycleError::Input(format!("base validation staging: {e}")))?;
+        let repo = git2::Repository::init_bare(staging.path())
+            .map_err(|e| JobLifecycleError::Input(format!("base validation staging: {e}")))?;
+        crate::git_transport::fetch_private_input_base(&repo, &url, &oid, mint)
+            .map_err(|error| base_validation_refusal(&error, &oid))?;
+        finish_public_base_validation(&repo, &oid, &store)
+    })
+    .await
+    .map_err(|_| JobLifecycleError::Input("base validation worker unavailable".into()))?
+}
+
+/// An auth-shaped failure is the documented exception (sellers cannot read the
+/// base); anything else is stated as a validation failure and stays retryable.
+#[cfg(feature = "wallet")]
+fn base_validation_refusal(
+    error: &crate::git_transport::TransportError,
+    oid: &str,
+) -> JobLifecycleError {
+    match error {
+        crate::git_transport::TransportError::Auth(_) => {
+            JobLifecycleError::Input(SELLER_UNREADABLE_BASE.into())
+        }
+        error => JobLifecycleError::Relay(format!(
+            "contribution base validation failed ({error}): every seller must be able to fetch \
+             base_oid {oid} from target_repo_url, and this fetch could not — the job was not \
+             posted; fix the pin (or the host) and post again"
+        )),
+    }
+}
+
+/// Quota gate plus the advisory seed write, split out so an offline test can run
+/// it against a local repository without the network fetch above.
+#[cfg(feature = "wallet")]
+fn finish_public_base_validation(
+    repo: &git2::Repository,
+    oid: &str,
+    store: &std::path::Path,
+) -> Result<(), JobLifecycleError> {
+    crate::private_content::repositories::check_object_quotas(repo).map_err(|error| {
+        JobLifecycleError::Input(format!(
+            "contribution base exceeds the relay repository quotas ({error}); a seller could \
+             not deliver against it — the job was not posted"
+        ))
+    })?;
+    // Advisory only: a failure makes the later verify fetch slower, never wrong.
+    if let Err(error) = crate::store_seed::write(store, repo.path(), oid) {
+        crate::opline!("public base seed not kept ({error}); collect fetches unseeded");
+    }
+    Ok(())
 }
 
 fn now_unix_secs() -> Result<u64, JobLifecycleError> {
@@ -6165,6 +6262,81 @@ mod tests {
             .expect_err("offline test cannot complete a private post")
             .to_string();
         assert!(!msg.contains("not readable by sellers"), "{msg}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The public-post base validation refuses pre-publication, with the exception
+    /// message for auth failures and a retryable statement for everything else.
+    #[test]
+    fn public_base_validation_maps_auth_to_the_exception_and_checks_quota_and_seed() {
+        use crate::git_transport::TransportError;
+        let oid = "bb".repeat(20);
+        let auth = base_validation_refusal(&TransportError::Auth("403".into()), &oid).to_string();
+        assert!(auth.contains("not readable by sellers"), "{auth}");
+        let io = base_validation_refusal(&TransportError::Io("connect refused".into()), &oid)
+            .to_string();
+        assert!(io.contains("contribution base validation failed"), "{io}");
+        assert!(io.contains(&oid), "{io}");
+        assert!(io.contains("post again"), "{io}");
+
+        // Quota gate + advisory seed on a real local repository.
+        let dir = std::env::temp_dir().join(format!(
+            "maxplayer-base-validate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let repo = git2::Repository::init_bare(dir.join("base")).unwrap();
+        let blob = repo.blob(b"base file").unwrap();
+        let mut tree = repo.treebuilder(None).unwrap();
+        tree.insert("file.txt", blob, 0o100644).unwrap();
+        let tree = repo.find_tree(tree.write().unwrap()).unwrap();
+        let sig = git2::Signature::now("test", "test@example.test").unwrap();
+        let commit = repo
+            .commit(Some("refs/heads/main"), &sig, &sig, "base", &tree, &[])
+            .unwrap()
+            .to_string();
+        let store = dir.join("store");
+        // The seed write is advisory and copies PACK files; this loose-object
+        // fixture has none, so validation must still pass (a real network fetch
+        // always lands a pack, and `store_seed` has its own coverage).
+        finish_public_base_validation(&repo, &commit, &store).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Gate order: a public contribution post against an unreachable host refuses
+    /// loudly BEFORE publication (the probe), never with a silent or generic path.
+    #[test]
+    fn post_job_public_contribution_refuses_unreachable_base_before_publication() {
+        let root = std::env::temp_dir().join(format!(
+            "maxplayer-jobs-unreachable-base-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+        let mut request = contribution_post_request(
+            &"aa".repeat(32),
+            "https://127.0.0.1:1/base.git",
+            "main",
+            &"bb".repeat(20),
+            None,
+        );
+        request.untargeted = false;
+        request.seller_pubkey = Some("cc".repeat(32));
+        let msg = post_job(&home, request)
+            .expect_err("unreachable base refused")
+            .to_string();
+        assert!(
+            msg.contains("could not verify that sellers can read")
+                || msg.contains("contribution base validation failed"),
+            "{msg}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

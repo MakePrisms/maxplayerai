@@ -65,6 +65,13 @@ A **targeted private job with a private repository is the supported combination*
 uploads the pinned base into the per-job repository, and only the chosen seller (and the service)
 can read it.
 
+A **public contribution post validates its base by fetching it once**, pre-publication, with the
+identity a seller will use (anonymous off-relay). That is the only point that can refuse a
+missing `base_oid` or a repository above the relay quotas before money and a deadline are
+committed, because a public post uploads nothing. The refusal names the cause; the validated
+objects seed the delivery store, so the later collect verify fetch transfers only new commits.
+Private posts already validate all of this inside their own base import.
+
 ### Slow preparation and offer re-signing
 
 The base import and upload can take long on large repositories. The relay refuses any event whose
