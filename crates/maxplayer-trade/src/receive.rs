@@ -612,9 +612,11 @@ mod tests {
             "SAFETY: P2PK refused"
         );
         let s = Secret::generate();
+        let dup = inspect(mint, &token(vec![proof(s.clone()), proof(s)]));
         assert!(
-            inspect(mint, &token(vec![proof(s.clone()), proof(s)])).is_err(),
-            "SAFETY: duplicate refused"
+            dup.as_ref()
+                .is_err_and(|e| e.to_string().contains("duplicate proof")),
+            "SAFETY: duplicate refused by our own check"
         );
         let many = (0..=MAX_PROOFS)
             .map(|_| proof(Secret::generate()))
@@ -622,6 +624,12 @@ mod tests {
         assert!(
             inspect(mint, &token(many)).is_err(),
             "SAFETY: >128 proofs refused"
+        );
+        let mut big = proof(Secret::generate());
+        big.amount = (crate::real_money::CAP + 1).into();
+        assert!(
+            inspect(mint, &token(vec![big])).is_err(),
+            "SAFETY: >100,000 sats refused statically"
         );
         assert!(inspect(mint, &token(vec![proof(Secret::generate())])).is_ok());
         assert!(

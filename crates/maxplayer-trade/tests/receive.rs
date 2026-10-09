@@ -501,3 +501,21 @@ async fn invalid_returned_dleq_quarantines_without_credit() {
         "SAFETY: quarantine terminal"
     );
 }
+
+#[tokio::test]
+async fn omitted_returned_dleq_quarantines_without_credit() {
+    let m = MintFixture::start(0).await;
+    let (_s, _, token) = issue(&m, 40).await;
+    let (h, j) = home().await;
+    m.faults.omit_dleq.store(true, SeqCst);
+    let r = receive::receive(h.path(), &j, &m.url, &token)
+        .await
+        .unwrap();
+    assert_eq!(
+        r.state,
+        ReceiveState::Quarantined,
+        "SAFETY: never credit proofs without DLEQ"
+    );
+    assert_eq!(balance(h.path(), &m.url).await, 0);
+    assert_eq!(r.summary()["credited"], 0);
+}
