@@ -1026,7 +1026,9 @@ fn security_symlink_directories_are_refused_before_mutation() {
         } else {
             symlink(&target, &root).unwrap();
         }
-        assert!(Home::open(&root).is_err(), "symlink must be refused");
+        for spelling in [root.clone(), root.join(""), root.join(".")] {
+            assert!(Home::open(&spelling).is_err(), "symlink must be refused");
+        }
         assert_eq!(
             std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
             0o755

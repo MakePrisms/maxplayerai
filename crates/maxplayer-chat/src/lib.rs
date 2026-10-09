@@ -99,6 +99,8 @@ pub struct Home {
     second_unwraps: std::sync::atomic::AtomicUsize,
 }
 fn reject_symlink(path: &Path) -> Result<()> {
+    // Strip trailing separators / `.` lexically, without following symlinks.
+    let path: PathBuf = path.components().collect();
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => {
             Err("home directories must not be symlinks".into())
