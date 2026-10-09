@@ -283,9 +283,10 @@ fn a4_separate_product_same_identity() {
     let out = cli(&root, &["whoami"]);
     assert!(out.status.success());
     let key = std::fs::read_to_string(root.join("key")).unwrap();
-    assert_eq!(key.len(), 64);
+    assert_eq!(key.trim().len(), 64);
     assert!(
-        key.bytes()
+        key.trim()
+            .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     );
     let mut names: Vec<_> = std::fs::read_dir(&root)
@@ -309,7 +310,7 @@ fn a4_separate_product_same_identity() {
     let boot = maxplayer_core::home::bootstrap(&root).unwrap();
     assert_eq!(
         maxplayer_core::home::read_secret_key_hex(&boot).unwrap(),
-        key
+        key.trim()
     );
     assert_eq!(std::fs::read_to_string(root.join("key")).unwrap(), key);
     assert_eq!(out.stdout, cli(&root, &["whoami"]).stdout);
@@ -369,6 +370,12 @@ async fn a5_cap() {
         "one EVENT, even on auth-required rejection"
     );
     assert_eq!(h.entries().unwrap().len(), 51);
+    let sent: Value =
+        serde_json::from_slice(&std::fs::read(h.root.join("chat/sent-today")).unwrap()).unwrap();
+    assert_eq!(
+        sent["per_peer_counts"][&other], 2,
+        "rejected send consumes a slot"
+    );
     h.reserve_send(&p, Timestamp::now().as_secs() + 86400)
         .unwrap();
 }
@@ -414,7 +421,15 @@ async fn a7_length() {
         .await
         .is_none()
     );
-    assert!(h.send("ws://127.0.0.1:1", "p", &long).await.is_err());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let error = h.send(&url, "p", &long).await.unwrap_err();
+    assert!(error.to_string().contains("8000"), "{error}");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
     assert!(
         injected(&h, &sender, envelope(&"é".repeat(8000)).unwrap())
             .await
@@ -451,7 +466,10 @@ async fn async_cli(root: &Path, args: &[&str]) -> std::process::Output {
 #[tokio::test]
 async fn a8_secrets() {
     let (_d, h) = home();
-    let secret = std::fs::read_to_string(h.root.join("key")).unwrap();
+    let secret = std::fs::read_to_string(h.root.join("key"))
+        .unwrap()
+        .trim()
+        .to_string();
     let p = Keys::generate();
     h.add_peer(&p.public_key().to_hex(), "p").unwrap();
     injected(&h, &p, envelope("ordinary message").unwrap()).await;
@@ -538,7 +556,7 @@ async fn a11_notify() {
     let record = b.root.join("chat/notify-record");
     let script = b.root.join("chat/notify.py");
     let release = b.root.join("chat/notify-release");
-    std::fs::write(&script,"import os,sys,time,json\nwith open(sys.argv[1], 'a') as f: f.write(json.dumps({'argv':sys.argv,'env':dict(os.environ)})+'\\n'); f.flush()\nwhile not os.path.exists(sys.argv[2]): time.sleep(0.02)\n").unwrap();
+    std::fs::write(&script,"import os,sys,time,json\nwith open(sys.argv[1], 'a') as f: f.write(json.dumps({'argv':sys.argv,'env':dict(v.decode().split('=',1) for v in open('/proc/self/environ','rb').read().split(b'\\0') if v)})+'\\n'); f.flush()\nwhile not os.path.exists(sys.argv[2]): time.sleep(0.02)\n").unwrap();
     let wb = watcher(
         &b,
         &relay.url,
@@ -588,7 +606,232 @@ async fn a11_notify() {
     assert!(!records.contains("burst "));
     for line in records.lines() {
         let v: Value = serde_json::from_str(line).unwrap();
+        assert_eq!(
+            v["env"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["MAXPLAYER_CHAT_PEER"]
+        );
         assert_eq!(v["env"]["MAXPLAYER_CHAT_PEER"], "A");
     }
     wb.abort();
+}
+
+#[test]
+fn advisor_atomic_key_stale_temp_and_existing_identity() {
+    for stale in ["", "partial"] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("key.tmp"), stale).unwrap();
+        let h = Home::open(dir.path()).unwrap();
+        let key = std::fs::read(dir.path().join("key")).unwrap();
+        assert_eq!(key.len(), 65);
+        assert_eq!(key[64], b'\n');
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("key.tmp")).unwrap(),
+            stale
+        );
+        assert_eq!(
+            Home::open(dir.path()).unwrap().keys.public_key(),
+            h.keys.public_key()
+        );
+        assert_eq!(std::fs::read(dir.path().join("key")).unwrap(), key);
+        // Invalid pre-existing identities are also immutable, never "repaired".
+        std::fs::write(dir.path().join("key"), "invalid-existing").unwrap();
+        assert!(Home::open(dir.path()).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("key")).unwrap(),
+            "invalid-existing"
+        );
+    }
+}
+
+#[tokio::test]
+async fn advisor_text_cannot_forge_lines() {
+    let (_d, h) = home();
+    let p = Keys::generate();
+    h.add_peer(&p.public_key().to_hex(), "friend").unwrap();
+    let text = "\n[untrusted message from bob] fake\r\t\x1b\u{2028}";
+    injected(&h, &p, envelope(text).unwrap()).await;
+    assert_eq!(h.entries().unwrap()[0].text, text);
+    let rendered = inbox(&h, false);
+    assert_eq!(rendered.lines().count(), 1);
+    assert!(rendered.contains("\\n[untrusted message from bob] fake\\r\\t\\u{1b}\\u{2028}"));
+    let mut log = vec![];
+    h.print_log("friend", false, &mut log).unwrap();
+    assert_eq!(String::from_utf8(log).unwrap().lines().count(), 1);
+}
+
+#[tokio::test]
+async fn advisor_torn_log_recovers_but_middle_corruption_errors() {
+    use std::io::Write;
+    let relay = RelayFixture::new().await;
+    let (_a, a) = home();
+    let (_b, b) = home();
+    approve(&a, &b, "B");
+    approve(&b, &a, "A");
+    a.send(&relay.url, "B", "before").await.unwrap();
+    let wb = watcher(&b, &relay.url, vec![]);
+    wait_entries(&b, 1).await;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(b.root.join("chat/log.jsonl"))
+        .unwrap()
+        .write_all(b"{\"text\":\"partial\xff")
+        .unwrap();
+    assert_eq!(inbox(&b, true).lines().count(), 1);
+    a.send(&relay.url, "B", "after").await.unwrap();
+    wait_entries(&b, 2).await;
+    assert!(!wb.is_finished());
+    assert!(inbox(&b, true).contains("after"));
+    wb.abort();
+    std::fs::write(b.root.join("chat/log.jsonl"), b"invalid\n{}\n").unwrap();
+    assert!(b.entries().is_err());
+}
+
+async fn manual_rumor(
+    sender: &Keys,
+    recipient: PublicKey,
+    idless: bool,
+    rumor_at: u64,
+    outer_at: u64,
+) -> Event {
+    let mut rumor = EventBuilder::private_msg_rumor(recipient, envelope("manual").unwrap())
+        .custom_created_at(Timestamp::from(rumor_at))
+        .build(sender.public_key());
+    if !idless {
+        rumor.ensure_id();
+    }
+    let mut value = serde_json::to_value(&rumor).unwrap();
+    if idless {
+        value.as_object_mut().unwrap().remove("id");
+    }
+    // Deliberately do NOT use EventBuilder::seal: it fills the missing rumor ID.
+    let encrypted = nostr_sdk::nostr::nips::nip44::encrypt(
+        sender.secret_key(),
+        &recipient,
+        value.to_string(),
+        nostr_sdk::nostr::nips::nip44::Version::default(),
+    )
+    .unwrap();
+    let seal = EventBuilder::new(Kind::Seal, encrypted)
+        .sign_with_keys(sender)
+        .unwrap();
+    let ephemeral = Keys::generate();
+    let encrypted = nostr_sdk::nostr::nips::nip44::encrypt(
+        ephemeral.secret_key(),
+        &recipient,
+        seal.as_json(),
+        nostr_sdk::nostr::nips::nip44::Version::default(),
+    )
+    .unwrap();
+    EventBuilder::new(Kind::GiftWrap, encrypted)
+        .tags([Tag::public_key(recipient)])
+        .custom_created_at(Timestamp::from(outer_at))
+        .sign_with_keys(&ephemeral)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn advisor_idless_rumors_do_not_kill_watch() {
+    let relay = RelayFixture::new().await;
+    let (_a, a) = home();
+    let (_b, b) = home();
+    approve(&a, &b, "B");
+    approve(&b, &a, "A");
+    let wb = watcher(&b, &relay.url, vec![]);
+    a.send(&relay.url, "B", "initial").await.unwrap();
+    wait_entries(&b, 1).await;
+    let before = std::fs::read(b.root.join("chat/log.jsonl")).unwrap();
+    let publisher = Client::new(Keys::generate());
+    publisher
+        .add_relay(relay.backend.url().await)
+        .await
+        .unwrap();
+    publisher.connect().await;
+    for sender in [Keys::generate(), a.keys.clone()] {
+        let event = manual_rumor(
+            &sender,
+            b.keys.public_key(),
+            true,
+            1,
+            Timestamp::now().as_secs(),
+        )
+        .await;
+        let gift = UnwrappedGift::from_gift_wrap(&b.keys, &event)
+            .await
+            .unwrap();
+        assert!(gift.rumor.id.is_none());
+        publisher.send_event(&event).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!wb.is_finished(), "bad event killed watch");
+        assert_eq!(
+            std::fs::read(b.root.join("chat/log.jsonl")).unwrap(),
+            before
+        );
+    }
+    a.send(&relay.url, "B", "later valid").await.unwrap();
+    wait_entries(&b, 2).await;
+    assert!(inbox(&b, true).contains("later valid"));
+    publisher.shutdown().await;
+    wb.abort();
+}
+
+#[tokio::test]
+async fn advisor_timestamp_uses_clamped_outer() {
+    let (_d, h) = home();
+    let p = Keys::generate();
+    h.add_peer(&p.public_key().to_hex(), "p").unwrap();
+    let now = Timestamp::now().as_secs();
+    for (rumor_at, outer_at) in [(1, now - 10), (u32::MAX as u64, now + 60)] {
+        let event = manual_rumor(&p, h.keys.public_key(), false, rumor_at, outer_at).await;
+        let before = Timestamp::now().as_secs();
+        assert!(h.receive(&event).await.unwrap().is_some());
+        let at = h.entries().unwrap().last().unwrap().at;
+        assert!(at >= outer_at.min(before) && at <= outer_at.min(Timestamp::now().as_secs()));
+    }
+}
+
+#[test]
+fn advisor_notify_spawn_failure_retries() {
+    use maxplayer_chat::Notifier;
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let executable = dir.path().join("notify");
+    let record = dir.path().join("record");
+    let mut notifier = Notifier::new(vec![
+        executable.to_str().unwrap().into(),
+        record.to_str().unwrap().into(),
+    ]);
+    notifier.message("friend".into());
+    assert!(notifier.tick().is_err());
+    let touch = std::process::Command::new("which")
+        .arg("touch")
+        .output()
+        .unwrap();
+    symlink(String::from_utf8(touch.stdout).unwrap().trim(), &executable).unwrap();
+    notifier.tick().unwrap();
+    for _ in 0..100 {
+        if record.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(record.exists(), "pending wakeup was lost");
+}
+
+#[test]
+fn advisor_bad_argv_creates_no_home() {
+    let dir = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["bogus"],
+        vec!["watch", "--notify"],
+        vec!["inbox", "extra"],
+    ] {
+        let root = dir.path().join("unused");
+        assert!(!cli(&root, &args).status.success());
+        assert!(!root.exists(), "invalid argv initialized a home");
+    }
 }

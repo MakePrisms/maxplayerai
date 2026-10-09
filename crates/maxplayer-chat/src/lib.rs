@@ -14,6 +14,17 @@ use std::{
     time::Duration,
 };
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+fn display_text(text: &str) -> String {
+    text.chars()
+        .flat_map(|c| {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                c.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
+}
 pub const DEFAULT_RELAY: &str = "wss://relay.maxplayer.ai";
 
 #[derive(Serialize, Deserialize)]
@@ -105,6 +116,52 @@ impl Drop for Lock {
         }
     }
 }
+// The writer boundary lets tests model a failed/short disk write without touching a real identity.
+fn create_key(
+    root: &Path,
+    write_secret: impl FnOnce(&mut File) -> std::io::Result<()>,
+) -> Result<()> {
+    let key_path = root.join("key");
+    // Never reuse or remove a stale temp: it may belong to another creator.
+    let mut tmp = root.join("key.tmp");
+    let mut file = loop {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp)
+        {
+            Ok(file) => break file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                tmp = root.join(format!(
+                    "key.tmp.{}",
+                    Keys::generate().public_key().to_hex()
+                ));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
+    let result = (|| -> Result<()> {
+        write_secret(&mut file)?;
+        file.sync_all()?;
+        // Atomic no-replace publication, including against non-chat key creators.
+        match fs::hard_link(&tmp, &key_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+        File::open(root)?.sync_all()?;
+        Ok(())
+    })();
+    // Only this call's exclusively-created temp is ours to unlink.
+    let cleanup = fs::remove_file(&tmp);
+    result?;
+    cleanup?;
+    File::open(root)?.sync_all()?;
+    Ok(())
+}
+
 impl Home {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
@@ -113,18 +170,10 @@ impl Home {
         // Serialize first-use key creation without a marketplace lock or partially-written key reads.
         let guard = Lock::acquire(&root.join("chat/state.lock"), false)?;
         let key_path = root.join("key");
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&key_path)
-        {
-            Ok(mut file) => {
-                file.write_all(Keys::generate().secret_key().to_secret_hex().as_bytes())?;
-                file.sync_all()?;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e.into()),
+        if !key_path.try_exists()? {
+            create_key(&root, |file| {
+                writeln!(file, "{}", Keys::generate().secret_key().to_secret_hex())
+            })?;
         }
         let mut secret = String::new();
         let mut key_file = OpenOptions::new()
@@ -223,19 +272,35 @@ impl Home {
         self.write("peers.toml", &toml::to_string(&Peers { peer: peers })?)
     }
     pub fn entries(&self) -> Result<Vec<Entry>> {
-        self.read("log.jsonl")?
-            .lines()
-            .map(|s| Ok(serde_json::from_str(s)?))
+        let bytes = match fs::read(self.path("log.jsonl")) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(e) => return Err(e.into()),
+        };
+        // Only newline-terminated records are committed. A torn UTF-8 tail is harmless too.
+        let end = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+        bytes[..end]
+            .split_inclusive(|b| *b == b'\n')
+            .map(|line| Ok(serde_json::from_slice(line)?))
             .collect()
     }
     fn append(&self, entry: &Entry) -> Result<()> {
+        // Callers hold state.lock. Remove an uncommitted tail before appending a new record.
+        let bytes = match fs::read(self.path("log.jsonl")) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
+            Err(e) => return Err(e.into()),
+        };
+        let end = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
         let mut file = OpenOptions::new()
             .append(true)
             .create(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(self.path("log.jsonl"))?;
-        writeln!(file, "{}", serde_json::to_string(entry)?)?;
+        file.set_len(end as u64)?;
+        let line = format!("{}\n", serde_json::to_string(entry)?);
+        file.write_all(line.as_bytes())?;
         file.sync_all()?;
         Ok(())
     }
@@ -253,10 +318,13 @@ impl Home {
             return Ok(None);
         }
         // Core authenticated all layers. SDK exposes the verified rumor's logical ID, not wrap ID.
-        let gift = UnwrappedGift::from_gift_wrap(&self.keys, event)
-            .await
-            .map_err(|_| "invalid rumor")?;
-        let rumor_id = gift.rumor.id.ok_or("missing rumor id")?.to_hex();
+        let Ok(gift) = UnwrappedGift::from_gift_wrap(&self.keys, event).await else {
+            return Ok(None);
+        };
+        let Some(id) = gift.rumor.id else {
+            return Ok(None);
+        };
+        let rumor_id = id.to_hex();
         let _lock = self.lock()?;
         let Ok(peer) = self.peer(&sender.to_hex()) else {
             return Ok(None);
@@ -268,7 +336,7 @@ impl Home {
             rumor_id,
             peer: peer.pubkey,
             dir: "in".into(),
-            at: gift.rumor.created_at.as_secs(),
+            at: event.created_at.as_secs().min(Timestamp::now().as_secs()),
             text: env.text,
         })?;
         // Outer time, never a peer-controlled future rumor timestamp. Only advance after durable append.
@@ -302,7 +370,12 @@ impl Home {
                     serde_json::json!({"from":npub,"name":peer.name,"at":e.at,"untrusted":true,"text":e.text})
                 )?;
             } else {
-                writeln!(out, "[untrusted message from {}] {}", peer.name, e.text)?;
+                writeln!(
+                    out,
+                    "[untrusted message from {}] {}",
+                    peer.name,
+                    display_text(&e.text)
+                )?;
             }
             last = Some(&e.rumor_id);
         }
@@ -323,9 +396,14 @@ impl Home {
                     serde_json::json!({"rumor_id":e.rumor_id,"peer":e.peer,"dir":e.dir,"at":e.at,"untrusted":e.dir=="in","text":e.text})
                 )?;
             } else if e.dir == "in" {
-                writeln!(out, "in [untrusted message from {}] {}", peer.name, e.text)?;
+                writeln!(
+                    out,
+                    "in [untrusted message from {}] {}",
+                    peer.name,
+                    display_text(&e.text)
+                )?;
             } else {
-                writeln!(out, "out {}", e.text)?;
+                writeln!(out, "out {}", display_text(&e.text))?;
             }
         }
         Ok(())
@@ -479,17 +557,21 @@ impl Notifier {
             self.child = None;
         }
         if let Some(peer) = self.pending.take() {
-            self.child = Some(
-                std::process::Command::new(&self.command[0])
-                    .args(&self.command[1..])
-                    .env_clear()
-                    .env("MAXPLAYER_CHAT_PEER", peer)
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
-                    .map_err(|_| "could not run notify command")?,
-            );
+            let child = std::process::Command::new(&self.command[0])
+                .args(&self.command[1..])
+                .env_clear()
+                .env("MAXPLAYER_CHAT_PEER", &peer)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            match child {
+                Ok(child) => self.child = Some(child),
+                Err(_) => {
+                    self.pending = Some(peer);
+                    return Err("could not run notify command".into());
+                }
+            }
         }
         Ok(())
     }
@@ -545,5 +627,38 @@ pub async fn watch(home: &Home, url: &str, command: Vec<String>) -> Result<()> {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advisor_atomic_key_write_failure_and_publish_race() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = create_key(dir.path(), |file| {
+            file.write_all(b"partial")?;
+            assert!(
+                !dir.path().join("key").exists(),
+                "identity published before write finished"
+            );
+            Err(std::io::Error::other("injected disk failure"))
+        });
+        assert!(result.is_err());
+        assert!(!dir.path().join("key").exists());
+        assert!(!dir.path().join("key.tmp").exists());
+        // Another bootstrap can win after our existence check; publication must not replace it.
+        let existing = format!("{}\n", Keys::generate().secret_key().to_secret_hex());
+        create_key(dir.path(), |file| {
+            std::fs::write(dir.path().join("key"), &existing)?;
+            writeln!(file, "{}", Keys::generate().secret_key().to_secret_hex())
+        })
+        .unwrap();
+        assert!(
+            std::fs::read_to_string(dir.path().join("key")).unwrap() == existing,
+            "existing identity was replaced"
+        );
+        assert!(!dir.path().join("key.tmp").exists());
     }
 }

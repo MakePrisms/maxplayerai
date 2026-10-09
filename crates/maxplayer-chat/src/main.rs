@@ -37,6 +37,24 @@ async fn run() -> Result<()> {
             break;
         }
     }
+    let argv: Vec<_> = args.iter().map(String::as_str).collect();
+    let valid = match argv.as_slice() {
+        ["whoami"]
+        | ["peer", "add", _, "--name", _]
+        | ["peer", "remove", _]
+        | ["peer", "list"]
+        | ["inbox"]
+        | ["inbox", "--json"]
+        | ["log", _]
+        | ["log", _, "--json"]
+        | ["send", _, _]
+        | ["watch"] => true,
+        ["watch", "--notify", command @ ..] => !command.is_empty(),
+        _ => false,
+    };
+    if !valid {
+        return Err(HELP.into());
+    }
     let root = match root {
         Some(root) => root,
         None => maxplayer_core::home::default_home_dir()?,
