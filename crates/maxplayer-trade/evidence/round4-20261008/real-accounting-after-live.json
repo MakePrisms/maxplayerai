@@ -1,0 +1,28 @@
+{
+  "at": "2026-10-08T16:29:50.399646+00:00",
+  "balances": {
+    "pair1-maker": {
+      "https://mint.minibits.cash/Bitcoin": 3,
+      "https://mint.macadamia.cash": 6,
+      "https://cashu.cz": 0
+    },
+    "pair1-taker": {
+      "https://mint.minibits.cash/Bitcoin": 3,
+      "https://mint.macadamia.cash": 114,
+      "https://cashu.cz": 0
+    },
+    "pair2-maker": {
+      "https://mint.minibits.cash/Bitcoin": 3,
+      "https://mint.macadamia.cash": 0,
+      "https://cashu.cz": 24
+    },
+    "pair2-taker": {
+      "https://mint.minibits.cash/Bitcoin": 32,
+      "https://mint.macadamia.cash": 0,
+      "https://cashu.cz": 104
+    }
+  },
+  "total": 289,
+  "outstanding_unchanged": true,
+  "outstanding_state": "quote_created"
+}

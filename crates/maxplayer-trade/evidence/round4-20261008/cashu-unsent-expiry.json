@@ -1,0 +1,18 @@
+{
+  "at": "2026-10-08T19:26:23.814402+00:00",
+  "remote_state_before": "UNPAID",
+  "result": {
+    "amount": 21,
+    "change": null,
+    "fee_reserve": 5,
+    "input_total": 0,
+    "lightning_fee": null,
+    "mint": "https://cashu.cz",
+    "mint_fee": 0,
+    "quote": "[retained privately]",
+    "state": "unpaid_released",
+    "withdrawal": "5a9928b3-c20a-45bf-9e81-70a96a6305aa"
+  },
+  "same_authorization": true,
+  "payment_submitted": false
+}

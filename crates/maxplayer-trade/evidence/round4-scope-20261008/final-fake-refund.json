@@ -1,0 +1,124 @@
+{
+  "lot": "a2f54f7056e575ab2e2aed3cf26d9439507140c8d541f447ddebac0db49afe80",
+  "before": {
+    "maker": {
+      "https://testnut.cashudevkit.org": 118,
+      "https://testnut.cashu.space": 6
+    },
+    "taker": {
+      "https://testnut.cashudevkit.org": 6,
+      "https://testnut.cashu.space": 118
+    }
+  },
+  "real": false,
+  "swap": "3bc09d10-a13d-4aaa-95f2-683042a40ef7",
+  "short": 1791492142,
+  "long": 1791494842,
+  "margin": 60,
+  "taker_killed_before_claim": true,
+  "incoming_proofs": 3,
+  "state": "both_refunded",
+  "scheduler_handoff": "Only sleeping parent replaced to remove exec 30-minute timeout; maker process and all journal data untouched.",
+  "after": {
+    "maker": {
+      "https://testnut.cashudevkit.org": 116,
+      "https://testnut.cashu.space": 6
+    },
+    "taker": {
+      "https://testnut.cashudevkit.org": 6,
+      "https://testnut.cashu.space": 116
+    }
+  },
+  "completion_utc": "2026-10-08T22:00:30.266402+00:00",
+  "resume_note": "Original runner and maker exited before deadlines were handled. Both journals remained locked. After both production deadlines, one maker recover then one taker recover exited 0; remote witness and balance audits passed. This proves delayed explicit recovery, not uninterrupted automatic serve refund.",
+  "resume_audits": {
+    "maker": {
+      "state": "refunded",
+      "balances": {
+        "https://testnut.cashudevkit.org": 116,
+        "https://testnut.cashu.space": 6
+      },
+      "audit": {
+        "claimed_witnesses": 0,
+        "long": 1791494842,
+        "margin": 60,
+        "mint": "https://testnut.cashudevkit.org",
+        "missing_or_invalid_witnesses": 0,
+        "outgoing_proofs": 3,
+        "pending": 0,
+        "preimages": "redacted",
+        "refund_witnesses": 3,
+        "role": "maker",
+        "short": 1791492142,
+        "state": "refunded",
+        "swap": "3bc09d10-a13d-4aaa-95f2-683042a40ef7",
+        "unspent": 0,
+        "witness_shapes": [
+          {
+            "preimage": "empty",
+            "signature_count": 1,
+            "signatures": "redacted",
+            "type": "HTLCWitness"
+          },
+          {
+            "preimage": "empty",
+            "signature_count": 1,
+            "signatures": "redacted",
+            "type": "HTLCWitness"
+          },
+          {
+            "preimage": "empty",
+            "signature_count": 1,
+            "signatures": "redacted",
+            "type": "HTLCWitness"
+          }
+        ]
+      },
+      "recover_exit": 0
+    },
+    "taker": {
+      "state": "refunded",
+      "balances": {
+        "https://testnut.cashudevkit.org": 6,
+        "https://testnut.cashu.space": 116
+      },
+      "audit": {
+        "claimed_witnesses": 0,
+        "long": 1791494842,
+        "margin": 60,
+        "mint": "https://testnut.cashu.space",
+        "missing_or_invalid_witnesses": 0,
+        "outgoing_proofs": 3,
+        "pending": 0,
+        "preimages": "redacted",
+        "refund_witnesses": 3,
+        "role": "taker",
+        "short": 1791492142,
+        "state": "refunded",
+        "swap": "3bc09d10-a13d-4aaa-95f2-683042a40ef7",
+        "unspent": 0,
+        "witness_shapes": [
+          {
+            "preimage": "empty",
+            "signature_count": 1,
+            "signatures": "redacted",
+            "type": "HTLCWitness"
+          },
+          {
+            "preimage": "empty",
+            "signature_count": 1,
+            "signatures": "redacted",
+            "type": "HTLCWitness"
+          },
+          {
+            "preimage": "empty",
+            "signature_count": 1,
+            "signatures": "redacted",
+            "type": "HTLCWitness"
+          }
+        ]
+      },
+      "recover_exit": 0
+    }
+  }
+}

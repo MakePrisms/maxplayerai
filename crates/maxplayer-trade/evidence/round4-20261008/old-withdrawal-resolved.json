@@ -1,0 +1,30 @@
+{
+  "at": "2026-10-08T18:22:24.684199+00:00",
+  "withdrawal": "3c1baf7b-c5cd-4577-b499-7f7ca1a636ef",
+  "remote_quote": {
+    "quote": "[retained privately]",
+    "amount": 29,
+    "fee_reserve": 2,
+    "state": "UNPAID",
+    "expiry": 1791442464
+  },
+  "local_state": "quote_created",
+  "input_count": 0,
+  "output_count": 0,
+  "secret_material": "not emitted",
+  "reconciled_at": "2026-10-08T18:22:41.254051+00:00",
+  "result": {
+    "amount": 29,
+    "change": null,
+    "fee_reserve": 2,
+    "input_total": 0,
+    "lightning_fee": null,
+    "mint": "https://mint.minibits.cash/Bitcoin",
+    "mint_fee": 0,
+    "quote": "[retained privately]",
+    "state": "unpaid_released",
+    "withdrawal": "3c1baf7b-c5cd-4577-b499-7f7ca1a636ef"
+  },
+  "same_authorization": true,
+  "replacement_created": false
+}

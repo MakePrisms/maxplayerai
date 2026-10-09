@@ -1,0 +1,22 @@
+[
+  {
+    "suite": "default-cap-final",
+    "exit": 0
+  },
+  {
+    "suite": "clippy-default-cap-final",
+    "exit": 0
+  },
+  {
+    "suite": "lab-cap-final",
+    "exit": 0
+  },
+  {
+    "suite": "clippy-lab-cap-final",
+    "exit": 0
+  },
+  {
+    "suite": "fmt-cap-final",
+    "exit": 0
+  }
+]

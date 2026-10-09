@@ -1,0 +1,130 @@
+[
+  {
+    "suite": "cli",
+    "exit": 0,
+    "seconds": 0.5,
+    "counts": [
+      "5",
+      "0"
+    ],
+    "cpus": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "burners": 2
+  },
+  {
+    "suite": "e2e",
+    "exit": 0,
+    "seconds": 182.32,
+    "counts": [
+      "11",
+      "0"
+    ],
+    "cpus": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "burners": 2
+  },
+  {
+    "suite": "maxplayer-trade",
+    "exit": 0,
+    "seconds": 0.01,
+    "counts": [
+      "0",
+      "0"
+    ],
+    "cpus": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "burners": 2
+  },
+  {
+    "suite": "maxplayer_trade",
+    "exit": 0,
+    "seconds": 0.07,
+    "counts": [
+      "22",
+      "0"
+    ],
+    "cpus": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "burners": 2
+  },
+  {
+    "suite": "money",
+    "exit": 0,
+    "seconds": 16.45,
+    "counts": [
+      "13",
+      "0"
+    ],
+    "cpus": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "burners": 2
+  },
+  {
+    "suite": "pinned_quote_recovery",
+    "exit": 0,
+    "seconds": 0.05,
+    "counts": [
+      "1",
+      "0"
+    ],
+    "cpus": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "burners": 2
+  },
+  {
+    "suite": "relays",
+    "exit": 0,
+    "seconds": 20.62,
+    "counts": [
+      "7",
+      "0"
+    ],
+    "cpus": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "burners": 2
+  },
+  {
+    "suite": "review_regressions",
+    "exit": 0,
+    "seconds": 1018.76,
+    "counts": [
+      "41",
+      "0"
+    ],
+    "cpus": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "burners": 2
+  }
+]

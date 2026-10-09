@@ -1,0 +1,31 @@
+{
+  "lot": "38e07ec69350d9334897d8d5f3fe0db11392dedfd6da97a83a8913fb9faa7990",
+  "before": {
+    "maker": {
+      "https://testnut.cashudevkit.org": 117,
+      "https://testnut.cashu.space": 6
+    },
+    "taker": {
+      "https://testnut.cashudevkit.org": 6,
+      "https://testnut.cashu.space": 117
+    }
+  },
+  "real": false,
+  "swap": "95123d9c-1998-4dc2-9ec2-60db193a8013",
+  "short": 1791473954,
+  "long": 1791476654,
+  "margin": 60,
+  "taker_killed_before_claim": true,
+  "incoming_proofs": 3,
+  "state": "both_refunded",
+  "after": {
+    "maker": {
+      "https://testnut.cashudevkit.org": 115,
+      "https://testnut.cashu.space": 6
+    },
+    "taker": {
+      "https://testnut.cashudevkit.org": 6,
+      "https://testnut.cashu.space": 115
+    }
+  }
+}

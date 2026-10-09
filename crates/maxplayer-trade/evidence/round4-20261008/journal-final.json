@@ -1,0 +1,200 @@
+{
+  "at": "2026-10-08T19:27:27.935205+00:00",
+  "homes": {
+    "pair1-maker": {
+      "swap": [
+        {
+          "id": "5cc221af-b6f9-41e7-b5b2-2a973611a9f0",
+          "role": "maker",
+          "state": "complete"
+        },
+        {
+          "id": "c0104207-d113-4af1-941a-567821d846cc",
+          "role": "maker",
+          "state": "complete"
+        },
+        {
+          "id": "d24b930b-35c0-4711-8010-50c1edcc26bd",
+          "role": "maker",
+          "state": "expired"
+        }
+      ],
+      "withdrawal": [
+        {
+          "id": "bf772369-108b-4233-999b-5e7ac57dcb35",
+          "mint": "https://mint.minibits.cash/Bitcoin",
+          "state": "done",
+          "amount": 116,
+          "input_count": 4,
+          "output_count": 2
+        },
+        {
+          "id": "4155e119-0c9e-4659-a88f-302d441eee70",
+          "mint": "https://mint.minibits.cash/Bitcoin",
+          "state": "done",
+          "amount": 1,
+          "input_count": 1,
+          "output_count": 2
+        },
+        {
+          "id": "02276566-d49b-4ec3-bec6-69c4777af5f0",
+          "mint": "https://mint.macadamia.cash",
+          "state": "done",
+          "amount": 2,
+          "input_count": 2,
+          "output_count": 2
+        }
+      ],
+      "funding": [
+        {
+          "id": "20285356-8271-4b02-b901-1cc86e093586",
+          "mint": "https://mint.minibits.cash/Bitcoin",
+          "amount": 128,
+          "done": true
+        }
+      ]
+    },
+    "pair1-taker": {
+      "swap": [
+        {
+          "id": "5cc221af-b6f9-41e7-b5b2-2a973611a9f0",
+          "role": "taker",
+          "state": "complete"
+        },
+        {
+          "id": "c0104207-d113-4af1-941a-567821d846cc",
+          "role": "taker",
+          "state": "complete"
+        },
+        {
+          "id": "d24b930b-35c0-4711-8010-50c1edcc26bd",
+          "role": "taker",
+          "state": "refunded"
+        },
+        {
+          "id": "e242bfeb-28ee-459e-b700-42624330114c",
+          "role": "maker",
+          "state": "refunded"
+        }
+      ],
+      "withdrawal": [
+        {
+          "id": "ad74a365-fc87-4ece-aabd-a39c59bf7b14",
+          "mint": "https://mint.minibits.cash/Bitcoin",
+          "state": "done",
+          "amount": 5,
+          "input_count": 1,
+          "output_count": 2
+        },
+        {
+          "id": "3957124f-a7b2-4dcc-ad4e-b22a839e214a",
+          "mint": "https://mint.macadamia.cash",
+          "state": "done",
+          "amount": 110,
+          "input_count": 6,
+          "output_count": 2
+        }
+      ],
+      "funding": [
+        {
+          "id": "678f1773-cd8a-455c-8e23-26e380044934",
+          "mint": "https://mint.macadamia.cash",
+          "amount": 128,
+          "done": true
+        }
+      ]
+    },
+    "pair2-maker": {
+      "swap": [
+        {
+          "id": "e6caa229-d39b-49f9-ab05-29b792696d92",
+          "role": "maker",
+          "state": "complete"
+        }
+      ],
+      "withdrawal": [
+        {
+          "id": "d728e25a-beb7-41bb-8130-a285c1ee2312",
+          "mint": "https://mint.minibits.cash/Bitcoin",
+          "state": "done",
+          "amount": 93,
+          "input_count": 2,
+          "output_count": 2
+        },
+        {
+          "id": "5a9928b3-c20a-45bf-9e81-70a96a6305aa",
+          "mint": "https://cashu.cz",
+          "state": "unpaid_released",
+          "amount": 21,
+          "input_count": 0,
+          "output_count": 0
+        },
+        {
+          "id": "1d91fe6c-90a6-4631-8a46-0c39782ae26c",
+          "mint": "https://cashu.cz",
+          "state": "done",
+          "amount": 18,
+          "input_count": 2,
+          "output_count": 3
+        }
+      ],
+      "funding": [
+        {
+          "id": "bcda30e5-91f3-4c01-bb7f-9cd2c82e8e3a",
+          "mint": "https://mint.minibits.cash/Bitcoin",
+          "amount": 128,
+          "done": true
+        }
+      ]
+    },
+    "pair2-taker": {
+      "swap": [
+        {
+          "id": "e6caa229-d39b-49f9-ab05-29b792696d92",
+          "role": "taker",
+          "state": "complete"
+        },
+        {
+          "id": "e242bfeb-28ee-459e-b700-42624330114c",
+          "role": "taker",
+          "state": "refunded"
+        }
+      ],
+      "withdrawal": [
+        {
+          "id": "3c1baf7b-c5cd-4577-b499-7f7ca1a636ef",
+          "mint": "https://mint.minibits.cash/Bitcoin",
+          "state": "unpaid_released",
+          "amount": 29,
+          "input_count": 0,
+          "output_count": 0
+        },
+        {
+          "id": "3dca8fe3-2fdd-457e-ac4b-582a622b3b7b",
+          "mint": "https://mint.minibits.cash/Bitcoin",
+          "state": "done",
+          "amount": 29,
+          "input_count": 1,
+          "output_count": 2
+        },
+        {
+          "id": "6e9d9e3e-5270-4619-b140-22e1de817246",
+          "mint": "https://cashu.cz",
+          "state": "done",
+          "amount": 98,
+          "input_count": 4,
+          "output_count": 3
+        }
+      ],
+      "funding": [
+        {
+          "id": "7fbab891-c5ec-469f-93f5-d2b718b9037a",
+          "mint": "https://cashu.cz",
+          "amount": 128,
+          "done": true
+        }
+      ]
+    }
+  },
+  "all_authorizations_terminal": true
+}

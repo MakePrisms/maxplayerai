@@ -1,0 +1,38 @@
+{
+  "at": "2026-10-08T19:27:26.669170+00:00",
+  "minibits": {
+    "reachable": true,
+    "exit": 0,
+    "version": "cdk-mintd/0.17.7"
+  },
+  "homes": {
+    "pair1-maker": {
+      "https://mint.minibits.cash/Bitcoin": 3,
+      "https://mint.macadamia.cash": 2,
+      "https://cashu.cz": 0
+    },
+    "pair1-taker": {
+      "https://mint.minibits.cash/Bitcoin": 3,
+      "https://mint.macadamia.cash": 2,
+      "https://cashu.cz": 0
+    },
+    "pair2-maker": {
+      "https://mint.minibits.cash/Bitcoin": 3,
+      "https://mint.macadamia.cash": 0,
+      "https://cashu.cz": 3
+    },
+    "pair2-taker": {
+      "https://mint.minibits.cash/Bitcoin": 3,
+      "https://mint.macadamia.cash": 0,
+      "https://cashu.cz": 3
+    }
+  },
+  "wallet": {
+    "https://mint.minibits.cash/Bitcoin": 9125
+  },
+  "homes_total": 22,
+  "original_authorization_present": true,
+  "outstanding_state": "unpaid_released",
+  "authorized_expiry_reconciliation": true,
+  "accounting_scope": "Designated Minibits wallet and four run homes only; unrelated wallet mints excluded."
+}

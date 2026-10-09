@@ -1,0 +1,59 @@
+[
+  {
+    "id": "0e891fc5e0b5cace5c3acf447093b66de58add47a678c31455f317ab00cd0e98",
+    "kind": 3410,
+    "relay": "wss://nos.lol",
+    "signature": "valid"
+  },
+  {
+    "id": "e3f1d1b7eaf36d991f8a9e1066e61d97a52ff92e20c2bc8a8380f1bdc224a58b",
+    "kind": 3411,
+    "relay": "wss://nos.lol",
+    "signature": "valid"
+  },
+  {
+    "id": "8c33a1cf369df8483fa2fb5ac878d9f19a94742f769608ad1b703380ef55f68a",
+    "kind": 3411,
+    "relay": "wss://nos.lol",
+    "signature": "valid"
+  },
+  {
+    "id": "0e891fc5e0b5cace5c3acf447093b66de58add47a678c31455f317ab00cd0e98",
+    "kind": 3410,
+    "relay": "wss://relay.primal.net",
+    "signature": "valid"
+  },
+  {
+    "id": "e3f1d1b7eaf36d991f8a9e1066e61d97a52ff92e20c2bc8a8380f1bdc224a58b",
+    "kind": 3411,
+    "relay": "wss://relay.primal.net",
+    "signature": "valid"
+  },
+  {
+    "id": "8c33a1cf369df8483fa2fb5ac878d9f19a94742f769608ad1b703380ef55f68a",
+    "kind": 3411,
+    "relay": "wss://relay.primal.net",
+    "signature": "valid"
+  },
+  {
+    "id": "0e891fc5e0b5cace5c3acf447093b66de58add47a678c31455f317ab00cd0e98",
+    "kind": 3410,
+    "relay": "wss://offchain.pub",
+    "signature": "valid"
+  },
+  {
+    "id": "8c33a1cf369df8483fa2fb5ac878d9f19a94742f769608ad1b703380ef55f68a",
+    "kind": 3411,
+    "relay": "wss://offchain.pub",
+    "signature": "valid"
+  },
+  {
+    "chain": "valid",
+    "lot_id": "0e891fc5e0b5cace5c3acf447093b66de58add47a678c31455f317ab00cd0e98",
+    "status": "sold",
+    "status_event_ids": [
+      "8c33a1cf369df8483fa2fb5ac878d9f19a94742f769608ad1b703380ef55f68a",
+      "e3f1d1b7eaf36d991f8a9e1066e61d97a52ff92e20c2bc8a8380f1bdc224a58b"
+    ]
+  }
+]

@@ -1,0 +1,20 @@
+{
+  "code_commit": "99eb3de6703137a7703204182d4794beec98f4ed",
+  "production_features": "default; no lab",
+  "source_fingerprints_verified": true,
+  "production_binary_sha256": {
+    "maxplayer-trade": "9f03aa0d687d52a4eba281290d71ee927397f198c59a799c2288a9e51b23d7be",
+    "real_audit": "2dcf98319d1479772765fa6f15ecf4bde470ad6580776e211157d5e237c08267",
+    "read_trade": "2c331f963afb9bdfe632913c72402427394e912b2b39066496d96522a19e5f60"
+  },
+  "lab_binary_sha256": {
+    "pinned_quote_recovery": "c4777bfa98c68fb2741ff485fe763b825ba0d215d8bce73325c9bb841fe92376",
+    "maxplayer_trade": "191ae2507dd227f9d630a97c30851be12b59b5b0594202f3c632a63ff9237855",
+    "maxplayer-trade": "bb7caf7135314fa57ee1e0968619d59a71888fad29134b7bcfc7bc8000c37998",
+    "relays": "58269e38007a968f284be0f1d7226bf6357553f369792b604c507b461d9203b7",
+    "cli": "3d74a3a0954f0ea7dfe0b81411a3de064f60fc728d01071f7421e45607c6c985",
+    "review_regressions": "0415c4c23c79efcd10afcfcb9c2bd9d56673218005c1c0a1f065fdc6357f6099",
+    "money": "7483914d7f9a2e0315db5330fedd213852520ddf396ebe787d3f294d0840c510",
+    "e2e": "00b2422414e09a8d0f294efa345d2cd43899b5fbc021bd7c56ef98f8e4381a8a"
+  }
+}

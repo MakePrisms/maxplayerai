@@ -1,0 +1,25 @@
+{
+  "head": "1e0c30af76465c0576bb5d2e9f53ead1b1968eba",
+  "relays": 2,
+  "trade": "one zero-fee completed trade",
+  "publish_attempts": 38,
+  "unique_events": 10,
+  "attempts_by_kind": {
+    "3410": 2,
+    "3411": 6,
+    "23412": 30
+  },
+  "copies_per_event_sorted": [
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    4,
+    4,
+    8,
+    10
+  ],
+  "expected_fixed_two_relay_attempts": 20
+}

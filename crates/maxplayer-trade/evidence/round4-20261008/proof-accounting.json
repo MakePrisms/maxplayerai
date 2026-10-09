@@ -1,0 +1,137 @@
+[
+  {
+    "at": "2026-10-08T19:27:27.997641+00:00",
+    "home": "pair1-maker",
+    "mint": "https://mint.minibits.cash/Bitcoin",
+    "local_unspent_count": 2,
+    "local_unspent_amount": 3,
+    "held_count": 0,
+    "remote_states": {
+      "UNSPENT": 2
+    }
+  },
+  {
+    "at": "2026-10-08T19:27:28.297580+00:00",
+    "home": "pair1-maker",
+    "mint": "https://mint.macadamia.cash",
+    "local_unspent_count": 1,
+    "local_unspent_amount": 2,
+    "held_count": 0,
+    "remote_states": {
+      "UNSPENT": 1
+    }
+  },
+  {
+    "at": "2026-10-08T19:27:28.646957+00:00",
+    "home": "pair1-maker",
+    "mint": "https://cashu.cz",
+    "local_unspent_count": 0,
+    "local_unspent_amount": 0,
+    "held_count": 0,
+    "remote_states": {}
+  },
+  {
+    "at": "2026-10-08T19:27:28.648015+00:00",
+    "home": "pair1-taker",
+    "mint": "https://mint.minibits.cash/Bitcoin",
+    "local_unspent_count": 2,
+    "local_unspent_amount": 3,
+    "held_count": 0,
+    "remote_states": {
+      "UNSPENT": 2
+    }
+  },
+  {
+    "at": "2026-10-08T19:27:28.946624+00:00",
+    "home": "pair1-taker",
+    "mint": "https://mint.macadamia.cash",
+    "local_unspent_count": 1,
+    "local_unspent_amount": 2,
+    "held_count": 0,
+    "remote_states": {
+      "UNSPENT": 1
+    }
+  },
+  {
+    "at": "2026-10-08T19:27:29.255683+00:00",
+    "home": "pair1-taker",
+    "mint": "https://cashu.cz",
+    "local_unspent_count": 0,
+    "local_unspent_amount": 0,
+    "held_count": 0,
+    "remote_states": {}
+  },
+  {
+    "at": "2026-10-08T19:27:29.257172+00:00",
+    "home": "pair2-maker",
+    "mint": "https://mint.minibits.cash/Bitcoin",
+    "local_unspent_count": 2,
+    "local_unspent_amount": 3,
+    "held_count": 0,
+    "remote_states": {
+      "UNSPENT": 2
+    }
+  },
+  {
+    "at": "2026-10-08T19:27:29.558884+00:00",
+    "home": "pair2-maker",
+    "mint": "https://mint.macadamia.cash",
+    "local_unspent_count": 0,
+    "local_unspent_amount": 0,
+    "held_count": 0,
+    "remote_states": {}
+  },
+  {
+    "at": "2026-10-08T19:27:29.560051+00:00",
+    "home": "pair2-maker",
+    "mint": "https://cashu.cz",
+    "local_unspent_count": 2,
+    "local_unspent_amount": 3,
+    "held_count": 0,
+    "remote_states": {
+      "UNSPENT": 2
+    }
+  },
+  {
+    "at": "2026-10-08T19:27:29.850864+00:00",
+    "home": "pair2-taker",
+    "mint": "https://mint.minibits.cash/Bitcoin",
+    "local_unspent_count": 2,
+    "local_unspent_amount": 3,
+    "held_count": 0,
+    "remote_states": {
+      "UNSPENT": 2
+    }
+  },
+  {
+    "at": "2026-10-08T19:27:30.151538+00:00",
+    "home": "pair2-taker",
+    "mint": "https://mint.macadamia.cash",
+    "local_unspent_count": 0,
+    "local_unspent_amount": 0,
+    "held_count": 0,
+    "remote_states": {}
+  },
+  {
+    "at": "2026-10-08T19:27:30.152826+00:00",
+    "home": "pair2-taker",
+    "mint": "https://cashu.cz",
+    "local_unspent_count": 2,
+    "local_unspent_amount": 3,
+    "held_count": 0,
+    "remote_states": {
+      "UNSPENT": 2
+    }
+  },
+  {
+    "at": "2026-10-08T19:27:30.445502+00:00",
+    "home": "designated maxplayer wallet",
+    "mint": "https://mint.minibits.cash/Bitcoin",
+    "local_unspent_count": 60,
+    "local_unspent_amount": 9125,
+    "held_count": 0,
+    "remote_states": {
+      "UNSPENT": 60
+    }
+  }
+]
