@@ -692,3 +692,120 @@ async fn crash_after_post_before_wallet_commit_then_recover_completes() {
 async fn crash_after_swap_before_file_write_then_recover_rewrites_same_token() {
     crash_then_recover("TRADE_CRASH_BEFORE_SEND_FILE", 85, 1).await;
 }
+
+#[tokio::test]
+async fn non_nut_400_stays_submitted_and_replays_the_same_swap() {
+    let m = MintFixture::start(0).await;
+    let (a, ja) = funded(&m, 32).await;
+    let out = a.path().join("t");
+    // 1: non-JSON 400 body. 2: JSON 400 without a numeric NUT `code` (e.g. a
+    // transport `expired`). Neither proves the mint refused this request.
+    for (bad, swaps) in [(1, 1), (2, 2)] {
+        m.faults.swap_bad_400.store(bad, SeqCst);
+        let r = send::send(a.path(), &ja, &m.url, 8, &out, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            r.state,
+            SendState::Submitted,
+            "SAFETY: a non-NUT 400 ({bad}) is not a definitive refusal"
+        );
+        assert!(!r.terminal());
+        assert_eq!(attempts(&ja).await[0].state, SendState::Submitted);
+        assert_eq!(m.faults.swaps.load(SeqCst), swaps);
+        assert!(!out.exists());
+    }
+    let o = out.to_str().unwrap();
+    let cli_out = cli(
+        a.path(),
+        &["send", &m.url, "--amount", "8", "--out", o],
+        None,
+    )
+    .await;
+    assert_eq!(
+        cli_out.status.code(),
+        Some(3),
+        "SAFETY: ambiguous is exit 3"
+    );
+    m.faults.swap_bad_400.store(0, SeqCst);
+    assert!(!money::recover(a.path(), &ja).await.unwrap());
+    let all = attempts(&ja).await;
+    assert_eq!(all.len(), 1, "SAFETY: no second attempt");
+    assert_eq!(
+        all[0].state,
+        SendState::Sent,
+        "SAFETY: same outputs replayed"
+    );
+    assert_eq!(balance(a.path(), &m.url).await, 24);
+}
+
+#[cfg(feature = "lab")]
+#[tokio::test]
+async fn journal_write_failure_does_not_report_a_false_terminal_state() {
+    let m = MintFixture::start(0).await;
+    let (a, ja) = funded(&m, 32).await;
+    let out = a.path().join("t");
+    let o = out.to_str().unwrap();
+    m.faults.swap_nut_error.store(true, SeqCst);
+    let failed = cli(
+        a.path(),
+        &["send", &m.url, "--amount", "8", "--out", o],
+        Some("TRADE_FAIL_SEND_TERMINAL_WRITE"),
+    )
+    .await;
+    assert_eq!(
+        failed.status.code(),
+        Some(3),
+        "SAFETY: an unpersisted refusal is not reported as refused: {}",
+        String::from_utf8_lossy(&failed.stderr)
+    );
+    let printed: serde_json::Value = serde_json::from_slice(&failed.stdout).unwrap();
+    assert_eq!(
+        printed["state"], "submitted",
+        "SAFETY: printed state = journal"
+    );
+    assert_eq!(attempts(&ja).await[0].state, SendState::Submitted);
+    assert!(
+        balance(a.path(), &m.url).await < 32,
+        "SAFETY: inputs stay held while the refusal is unjournaled"
+    );
+    // Without the fault, recovery journals the refusal and only then releases.
+    assert!(!money::recover(a.path(), &ja).await.unwrap());
+    assert_eq!(attempts(&ja).await[0].state, SendState::Refused);
+    assert_eq!(balance(a.path(), &m.url).await, 32);
+}
+
+#[cfg(feature = "lab")]
+#[tokio::test]
+async fn reclaim_journal_write_failure_is_not_reported_reclaimed() {
+    let m = MintFixture::start(0).await;
+    let (a, ja) = funded(&m, 64).await;
+    let out = a.path().join("t");
+    let r = send::send(a.path(), &ja, &m.url, 32, &out, None)
+        .await
+        .unwrap();
+    let failed = cli(
+        a.path(),
+        &["send", "--reclaim", &r.id],
+        Some("TRADE_FAIL_SEND_TERMINAL_WRITE"),
+    )
+    .await;
+    assert_eq!(
+        failed.status.code(),
+        Some(3),
+        "SAFETY: an unpersisted reclaim is not reported done: {}",
+        String::from_utf8_lossy(&failed.stderr)
+    );
+    let printed: serde_json::Value = serde_json::from_slice(&failed.stdout).unwrap();
+    assert_eq!(
+        printed["state"], "reclaiming",
+        "SAFETY: printed state = journal"
+    );
+    assert_eq!(printed["reclaimed"], 0);
+    assert_eq!(attempts(&ja).await[0].state, SendState::Reclaiming);
+    // Recovery completes it once, without double credit.
+    assert!(!money::recover(a.path(), &ja).await.unwrap());
+    let done = attempts(&ja).await;
+    assert_eq!(done[0].state, SendState::Reclaimed);
+    assert_eq!(balance(a.path(), &m.url).await, 64, "SAFETY: credited once");
+}

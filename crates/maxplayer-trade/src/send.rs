@@ -227,8 +227,39 @@ fn write_token(out: &Path, id: &str, token: &str) -> Result<()> {
     Ok(())
 }
 
+/// Persist `state` FIRST; only then let the caller-visible record change. A failed
+/// journal write returns the error and leaves `r` at its previous (journaled) state.
 async fn finish(j: &Journal, r: &mut SendAttempt, state: SendState) -> Result<()> {
-    r.state = state;
+    let mut next = r.clone();
+    next.state = state;
+    persist(j, &next).await?;
+    *r = next;
+    Ok(())
+}
+
+/// Apply `f` to a copy, persist it, then publish it to `r` (persist-before-report).
+async fn update(
+    j: &Journal,
+    r: &mut SendAttempt,
+    f: impl FnOnce(&mut SendAttempt) -> Result<()>,
+) -> Result<()> {
+    let mut next = r.clone();
+    f(&mut next)?;
+    persist(j, &next).await?;
+    *r = next;
+    Ok(())
+}
+
+async fn persist(j: &Journal, r: &SendAttempt) -> Result<()> {
+    #[cfg(feature = "lab")]
+    if r.terminal()
+        && std::env::var("TRADE_FAIL_SEND_TERMINAL_WRITE")
+            .ok()
+            .as_deref()
+            == Some("1")
+    {
+        bail!("lab fault: send journal write failed");
+    }
     j.put("send", &r.id, r).await
 }
 
@@ -472,7 +503,8 @@ async fn probe(mint: &str, leg: &Leg) -> Result<Probe> {
     }
 }
 
-/// POST the identical journaled swap. Timeouts, 5xx and transport errors are ambiguous.
+/// POST the identical journaled swap. Only a typed [`mint::MintRefusal`] (parsed NUT
+/// error) can be a refusal; any other 400, timeout, 5xx or transport error is ambiguous.
 async fn post(mint: &str, leg: &Leg) -> Result<Probe> {
     let sent: Result<SwapResponse> = mint::rpc(
         mint,
@@ -485,7 +517,7 @@ async fn post(mint: &str, leg: &Leg) -> Result<Probe> {
     .await;
     match sent {
         Ok(reply) => Ok(Probe::Signed(reply.signatures)),
-        Err(error) if crate::receive::nut_error(&error) => {
+        Err(error) if mint::MintRefusal::of(&error).is_some() => {
             if let Some(sigs) = restore(mint, leg).await? {
                 return Ok(Probe::Signed(sigs));
             }
@@ -623,16 +655,20 @@ pub async fn resume(home: &Path, j: &Journal, r: &mut SendAttempt) -> Result<()>
             eprintln!("send {}: missing or invalid DLEQ; quarantined", r.id);
             return finish(j, r, SendState::Quarantined).await;
         };
-        r.swap.result = Some(proofs);
-        let sent = r.sent_proofs()?;
-        ensure!(
-            u64::from(sent.total_amount()?) == r.amount,
-            "sent proofs do not total the send amount"
-        );
-        r.token = Some(
-            Token::new(MintUrl::from_str(&r.mint)?, sent, None, CurrencyUnit::Sat).to_string(),
-        );
-        finish(j, r, SendState::Swapped).await?;
+        update(j, r, |n| {
+            n.swap.result = Some(proofs);
+            let sent = n.sent_proofs()?;
+            ensure!(
+                u64::from(sent.total_amount()?) == n.amount,
+                "sent proofs do not total the send amount"
+            );
+            n.token = Some(
+                Token::new(MintUrl::from_str(&n.mint)?, sent, None, CurrencyUnit::Sat).to_string(),
+            );
+            n.state = SendState::Swapped;
+            Ok(())
+        })
+        .await?;
         lab_crash("TRADE_CRASH_AFTER_SEND_SWAP", 86);
     }
     if !r.committed {
@@ -646,8 +682,12 @@ pub async fn resume(home: &Path, j: &Journal, r: &mut SendAttempt) -> Result<()>
             .map(|(p, _)| p.clone())
             .collect();
         credit(home, &r.mint, change, r.swap.inputs.ys()?).await?;
-        r.committed = true;
-        finish(j, r, SendState::Swapped).await?;
+        update(j, r, |n| {
+            n.committed = true;
+            n.state = SendState::Swapped;
+            Ok(())
+        })
+        .await?;
     }
     lab_crash("TRADE_CRASH_BEFORE_SEND_FILE", 85);
     let token = r.token.clone().context("missing journaled token")?;
@@ -716,7 +756,7 @@ pub async fn reclaim(
     let amounts = bounded(w.get_keyset_fees_and_amounts_by_id(k.id))
         .await
         .context("CDK wallet request timed out")??;
-    r.reclaim = Some(Leg {
+    let leg = Leg {
         inputs,
         outputs: outputs(
             PreMintSecrets::random(
@@ -728,9 +768,14 @@ pub async fn reclaim(
             false,
         ),
         result: None,
-    });
-    r.reclaim_fee = fee;
-    finish(j, &mut r, SendState::Reclaiming).await?;
+    };
+    update(j, &mut r, |n| {
+        n.reclaim = Some(leg);
+        n.reclaim_fee = fee;
+        n.state = SendState::Reclaiming;
+        Ok(())
+    })
+    .await?;
     if let Err(error) = resume(home, j, &mut r).await {
         eprintln!("send {}: {error:#}; reclaim retained", r.id);
     }
@@ -751,18 +796,31 @@ async fn resume_reclaim(home: &Path, j: &Journal, r: &mut SendAttempt) -> Result
             // sent proof is SPENT; otherwise back to `sent` for a fresh reclaim.
             Probe::Spent => {
                 let all = mint::states(&r.mint, &r.sent_proofs()?).await?;
-                r.reclaim = None;
-                r.reclaim_fee = 0;
-                if all.states.iter().all(|s| s.state == State::Spent) {
-                    return finish(j, r, SendState::Redeemed).await;
+                let redeemed = all.states.iter().all(|s| s.state == State::Spent);
+                update(j, r, |n| {
+                    n.reclaim = None;
+                    n.reclaim_fee = 0;
+                    n.state = if redeemed {
+                        SendState::Redeemed
+                    } else {
+                        SendState::Sent
+                    };
+                    Ok(())
+                })
+                .await?;
+                if redeemed {
+                    return Ok(());
                 }
-                finish(j, r, SendState::Sent).await?;
                 bail!("token partially redeemed during reclaim; run reclaim again");
             }
             Probe::Refused => {
-                r.reclaim = None;
-                r.reclaim_fee = 0;
-                finish(j, r, SendState::Sent).await?;
+                update(j, r, |n| {
+                    n.reclaim = None;
+                    n.reclaim_fee = 0;
+                    n.state = SendState::Sent;
+                    Ok(())
+                })
+                .await?;
                 bail!("reclaim refused by the mint; token still outstanding");
             }
             Probe::Unspent => bail!("reclaim neither signed nor refused; retained"),
@@ -772,14 +830,22 @@ async fn resume_reclaim(home: &Path, j: &Journal, r: &mut SendAttempt) -> Result
             return finish(j, r, SendState::ReclaimQuarantined).await;
         };
         leg.result = Some(proofs);
-        r.reclaim = Some(leg.clone());
-        j.put("send", &r.id, r).await?;
+        let journaled = leg.clone();
+        update(j, r, |n| {
+            n.reclaim = Some(journaled);
+            Ok(())
+        })
+        .await?;
     }
     let proofs = leg.result.context("missing reclaim result")?;
     let net = u64::from(proofs.total_amount()?);
     credit(home, &r.mint, proofs, vec![]).await?;
-    r.reclaimed = net;
-    finish(j, r, SendState::Reclaimed).await
+    update(j, r, |n| {
+        n.reclaimed = net;
+        n.state = SendState::Reclaimed;
+        Ok(())
+    })
+    .await
 }
 
 /// One bounded pass over unfinished sends and reclaims. True when any remain unresolved.

@@ -23,15 +23,15 @@ Never use a fresh home to evade caps. One writer owns it. Read-only `status` and
 claim window. Defer other writing commands until live obligations settle.
 Never copy its seed.
 
-Never print secrets, seeds, keys, tokens, proofs, preimages, or raw journals, or
+Never print secrets, seeds, keys, tokens, proofs, preimages or raw journals, or
 attach a home/database to chat. Report only public IDs, mint URLs, amounts, states
 and redacted errors. Invoice delivery belongs in the human's private conversation.
-**Done:** the correct home and authorized mint identities (URL + sat unit) are known.
+**Done:** the home and authorized mint identities (URL + sat unit) are known.
 
 ## 2. Check readiness and get explicit authorization
 
-Use `balance <mint>` and `preflight <mint>` for each relevant mint. Passing preflight
-does not establish honesty or full compatibility. The CLI
+Run `balance <mint>` and `preflight <mint>` per mint. Passing preflight
+proves neither honesty nor full compatibility. The CLI
 also preflights before fund/list/take/withdraw: NUT-07/09/11/12/14, an active sat keyset, reachable
 mint, and clock skew at most 60 seconds. Never bypass a failed check. Gross locks and each withdrawal invoice are capped at
 **100,000 sats**. Funding intents plus charged receives (gross) share one
@@ -101,7 +101,7 @@ ID and keep `serve` running until complete or refunded. Listing authorizes servi
 that fixed lot, not further listings or price changes.
 
 `cancel <lot>` only with **no active quote/swap**; it never revokes an authorized
-HTLC lock. On rejection, continue recovery; never force-release reservations. **Done:** terminal trade state and balances are checked, or a confirmed
+HTLC lock. On rejection, continue recovery; never force-release reservations. **Done:** terminal trade state and balances checked, or a confirmed
 inactive cancellation is reported; an unresolved lock is never called cancelled.
 
 ### Find listings / buy that lot
@@ -110,12 +110,12 @@ inactive cancellation is reported; an unresolved lock is never called cancelled.
 price. Discovery is not purchase consent. For “receive X A for at most Y B”,
 set `--min-receive X` and `--max-give Y` when Y is the total spending ceiling. If Y
 was explicitly a net price plus a separately approved fee F, the total ceiling can
-be Y + F; otherwise never silently add fees. A stricter limit is fine, a looser one
-is not. See the worked example in the command reference.
+be Y + F; otherwise never silently add fees. Stricter limits are fine, looser
+not. See the worked example in the command reference.
 
 After confirmation, `take <lot> --max-give <total-cap> --min-receive <net-minimum>
 --max-fees <cap>`. Keep it running through settlement; never repeat a take after
-a timeout. **Done:** verify the terminal result and per-mint balances, or enter recovery.
+timeout. **Done:** verify the terminal result and per-mint balances, or enter recovery.
 
 ### Withdraw
 
@@ -151,6 +151,6 @@ On `refund_quarantined` or `claim_quarantined`, stop new money actions and escal
 to the human immediately. These are terminal **manual recovery**, not success or
 spendable funds. Never credit/import unverifiable outputs, edit journal records,
 replace attempts, or treat quarantine as refund permission. Persistent RPC failure,
-missing witnesses, unexpected states or accounting gaps also need a human;
+missing witnesses, odd states or accounting gaps also need a human;
 keep safe recovery for other obligations without weakening any check.
 **Done:** the human has an accurate outcome and any unresolved custody obligations.
