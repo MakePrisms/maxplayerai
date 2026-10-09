@@ -1460,7 +1460,12 @@ mod tests {
         let (r, m) = parse_response(&subject(), &a, &response(0.8)).unwrap();
         assert_eq!(r.input_sha256, input_digest(&a));
         assert_eq!(m, "jev-pinned");
-        assert_eq!(r.decision(&subject(), 500000).unwrap(), Decision::Refused);
+        assert_eq!(
+            r.decision(&subject(), 500000).unwrap(),
+            Decision::Refused {
+                unsafe_ppm: 800_000
+            }
+        );
         assert!(parse_response(&subject(),&a,br#"{"model":"x","answers":{"safety":{"type":"choice","choice":"safe","probabilities":{"safe":1,"unsafe":1}}}}"#).is_err());
     }
     #[tokio::test]

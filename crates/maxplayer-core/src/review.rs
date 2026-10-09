@@ -1,9 +1,9 @@
 //! Optional execution-safety reviews. Probability is not payment authority.
 //! Relay service and client gates share the signed immutable review contract.
 #[cfg(feature = "wallet")]
-pub mod state;
-#[cfg(feature = "wallet")]
 pub mod private;
+#[cfg(feature = "wallet")]
+pub mod state;
 use crate::gateway::{EventDraft, MAXPLAYER_TAG, PROTOCOL_VERSION, TagSpec};
 use crate::kinds::{JOB_OFFER_KIND, JOB_RESULT_KIND, REVIEW_KIND, REVIEW_REQUEST_KIND};
 use serde::{Deserialize, Serialize};
@@ -136,10 +136,12 @@ pub struct Review {
     pub results: Vec<Classification>,
     pub error_code: Option<String>,
 }
+pub const VERDICT_REFUSED_PREFIX: &str = "review: execution-safety verdict refused";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     Passed,
-    Refused,
+    Refused { unsafe_ppm: u32 },
     Error(String),
 }
 impl Review {
@@ -202,7 +204,9 @@ impl Review {
             return Err("review: invalid probability distribution".into());
         }
         Ok(if unsafe_p >= threshold as f64 / 1_000_000.0 {
-            Decision::Refused
+            Decision::Refused {
+                unsafe_ppm: (unsafe_p * 1_000_000.0).round() as u32,
+            }
         } else {
             Decision::Passed
         })
@@ -461,9 +465,19 @@ pub mod wire {
                 if let Some((r, id)) = accepted {
                     return match r.decision(subject, config.reject_at_or_above_ppm)? {
                         Decision::Passed => Ok(Some(id)),
-                        Decision::Refused => Err(
-                            "review: execution-safety probability exceeds local threshold".into(),
-                        ),
+                        Decision::Refused { unsafe_ppm } => {
+                            let target = if subject.kind == JOB_RESULT_KIND {
+                                "delivery"
+                            } else {
+                                "offer"
+                            };
+                            let threshold = config.reject_at_or_above_ppm;
+                            let pct = unsafe_ppm as f64 / 10_000.0;
+                            let tpct = threshold as f64 / 10_000.0;
+                            Err(format!(
+                                "{VERDICT_REFUSED_PREFIX} this {target}: unsafe probability {unsafe_ppm} ppm ({pct:.1}%) is at or above the local threshold {threshold} ppm ({tpct:.1}%); verdict event {id}; the signed verdict is content-addressed, so repeating this check unchanged returns the same result"
+                            ))
+                        }
                         Decision::Error(code) => {
                             Err(format!("review: reviewer error ({code}); retry available"))
                         }
@@ -584,7 +598,11 @@ pub async fn check_buyer(
     client.disconnect().await;
     state::completed(&home.root, subject, &result)?;
     result
-        .map_err(|e| format!("{e}; retry the same collect or accept operation (no new job needed)"))
+        .map_err(|e| if e.starts_with(VERDICT_REFUSED_PREFIX) {
+            format!("{e}; decide what to do: accept this delivery anyway by repeating collect (or accept) with review_threshold_ppm set above the reported unsafe ppm (this result only, recorded locally), raise review.reject_at_or_above_ppm in config.toml and restart the buyer daemon, or leave the delivery unsettled — repeating collect unchanged returns this same verdict")
+        } else {
+            format!("{e}; retry the same collect or accept operation (no new job needed)")
+        })
 }
 
 #[cfg(all(test, feature = "gateway"))]
@@ -657,6 +675,30 @@ mod tests {
     async fn check(m: &Mock, cfg: &ReviewConfig) -> Result<Option<String>, String> {
         wire::check(m, cfg, "wss://test", &subject(), &"b".repeat(64), false).await
     }
+    #[tokio::test]
+    async fn verdict_refusal_surfaces_probability_threshold_and_event() {
+        let keys = Keys::generate();
+        let mut review = answer(0.9);
+        review.subject.kind = JOB_RESULT_KIND;
+        let event = signed(&review, &keys);
+        let error = wire::check(
+            &mock(vec![event.clone()], vec![]),
+            &config(&keys),
+            "wss://test",
+            &review.subject,
+            &"b".repeat(64),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("refused this delivery"));
+        for expected in ["900000 ppm", "500000 ppm", "threshold", &event.id.to_hex()] {
+            assert!(error.contains(expected), "{error}");
+        }
+        assert!(error.starts_with(VERDICT_REFUSED_PREFIX));
+        assert!(!error.contains("retry the same collect"));
+        assert!(!error.contains("timeout"));
+    }
     #[tokio::test(start_paused = true)]
     async fn requests_once_then_allows_signed_safe_review() {
         let keys = Keys::generate();
@@ -695,6 +737,7 @@ mod tests {
         let m = mock(vec![], vec![]);
         let error = check(&m, &config(&keys)).await.unwrap_err();
         assert!(error.contains("timeout"), "{error}");
+        assert!(error.contains("retry available"), "{error}");
         // The transport reported no refusal, so the request reached the relay; the
         // message must point at the missing reviewer response, not at the client.
         assert!(error.contains("relay accepted the review request"), "{error}");
@@ -815,11 +858,15 @@ mod tests {
         );
         assert_eq!(
             answer(0.5).decision(&subject(), 500_000).unwrap(),
-            Decision::Refused
+            Decision::Refused {
+                unsafe_ppm: 500_000
+            }
         );
         assert_eq!(
             answer(0.500001).decision(&subject(), 500_000).unwrap(),
-            Decision::Refused
+            Decision::Refused {
+                unsafe_ppm: 500_001
+            }
         );
     }
     #[test]
@@ -923,7 +970,12 @@ mod tests {
             }
         }
         let r = evaluate(&subject(), "context-dump fixture", vec![], &Fixture).unwrap();
-        assert_eq!(r.decision(&subject(), 500_000).unwrap(), Decision::Refused);
+        assert_eq!(
+            r.decision(&subject(), 500_000).unwrap(),
+            Decision::Refused {
+                unsafe_ppm: 900_000
+            }
+        );
         struct Failure;
         impl Classifier for Failure {
             fn classify(&self, _: &[u8]) -> Result<Classification, String> {
@@ -1072,7 +1124,16 @@ pub async fn protect_job_view(
                 })
             } else {
                 match &keys {
-                    Some(keys) => check_buyer(home, keys, &subject, &result.seller_pubkey, result.private_evidence.as_ref()).await,
+                    Some(keys) => {
+                        check_buyer(
+                            home,
+                            keys,
+                            &subject,
+                            &result.seller_pubkey,
+                            result.private_evidence.as_ref(),
+                        )
+                        .await
+                    }
                     None => Err("review: local key unavailable".into()),
                 }
             }

@@ -1,3 +1,9 @@
+## Unreleased
+
+- Buyer execution-safety refusals surface the unsafe probability, local threshold,
+  and signed verdict event id, with deterministic-refusal guidance distinct from
+  retryable reviewer timeouts (#1122).
+
 ## v0.6.1-rc8
 
 Eighth release candidate for 0.6.1, including seller claim filtering (#1113),
