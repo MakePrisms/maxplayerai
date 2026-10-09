@@ -10,7 +10,7 @@ import { bytesToHex } from "@noble/hashes/utils";
 import { TRADE_LOT, TRADE_STATUS } from "../src/model/kinds.js";
 import { completedStats, createBook } from "../src/trade/book.js";
 import { lifecycle, parseLot, type NostrEvent } from "../src/trade/validate.js";
-import { allowedRelay, createTradeReader, drain, lotFilter, statusFilters, STATUS_CHUNK } from "../src/trade/relays.js";
+import { allowedRelay, createTradeReader, drain, liveFilters, lotFilter, NUDGE_MS, statusFilters, STATUS_CHUNK } from "../src/trade/relays.js";
 import { dockSide, mintLabel, rate, timeLeft } from "../src/trade/format.js";
 
 /** The fixture generator's test keys: bytes 0x11… (maker) and 0x22… (other). */
@@ -237,6 +237,11 @@ class FakeSocket {
     });
   }
   close() { this.readyState = 3; }
+  /** Relay-side: a new event arrives on every open live subscription. */
+  push(e: NostrEvent) {
+    for (const f of this.sent) if (f[0] === "REQ" && String(f[1]).startsWith("live")) this.onmessage?.({ data: JSON.stringify(["EVENT", f[1], e]) });
+  }
+  drop() { this.readyState = 3; this.onclose?.(); }
 }
 
 test("reader: unions relays into a validated book and only ever sends REQ and CLOSE", async () => {
@@ -359,4 +364,67 @@ test("completed trades never count a quarantined or stranger-closed lot", () => 
 test("the lot popup docks to the clicked side, never the middle", () => {
   assert.equal(dockSide("lots"), "left");
   assert.equal(dockSide("recent"), "right");
+});
+
+test("reader: keeps a live feed open; new events land at once, new listings get their chain read", async () => {
+  const l1 = lot(MAKER, T0, 64, 48);
+  const s1 = status(l1, 1, l1.id, "available");
+  const store = [l1, s1];
+  const sockets: FakeSocket[] = [];
+  const timers: { fn: () => void; ms: number }[] = [];
+  const states: string[] = [];
+  const book = createBook();
+  let rounds = 0;
+  let wake!: () => void;
+  const next = () => new Promise<void>((r) => { wake = r; });
+  let roundDone = next();
+  const reader = createTradeReader(
+    {
+      relays: ["wss://a.example"],
+      openSocket: (u) => { const s = new FakeSocket(u, store); sockets.push(s); return s as unknown as WebSocket; },
+      now: () => NOW,
+      setTimer: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
+      clearTimer: () => {},
+      knownLots: () => book.known(),
+    },
+    {
+      onEvent: (e) => { book.ingest(e); },
+      onStatusesRead: (ids, relay) => book.markHistoryRead(ids, relay),
+      onRelayState: (_u, st) => states.push(st),
+      onRound: () => { rounds++; wake(); },
+    },
+  );
+  reader.start();
+  await roundDone;
+  const sock = sockets[0]!;
+  const liveReq = sock.sent.find((f) => f[0] === "REQ" && String(f[1]).startsWith("live"))!;
+  assert.deepEqual(liveReq.slice(2), liveFilters(NOW - 120));
+  assert.ok(!sock.sent.some((f) => f[0] === "CLOSE" && f[1] === liveReq[1]), "the live feed is never closed on EOSE");
+
+  // A sale arrives on the feed: it lands without another read.
+  sock.push(status(l1, 2, s1.id, "sold"));
+  assert.deepEqual(book.view(NOW, ["wss://a.example"]).closed.map((r) => [r.id, r.state]), [[l1.id, "sold"]]);
+
+  // A new listing arrives: a quick catch-up read is scheduled for its chain.
+  const l2 = lot(OTHER, T0 + 9, 10, 12);
+  const s2 = status(l2, 1, l2.id, "available", OTHER);
+  store.push(l2, s2);
+  const before = timers.length;
+  sock.push(l2);
+  const nudge = timers.slice(before).find((t) => t.ms === NUDGE_MS)!;
+  assert.ok(nudge, "a catch-up read is scheduled");
+  roundDone = next();
+  nudge.fn();
+  await roundDone;
+  assert.deepEqual(book.view(NOW, ["wss://a.example"]).open.map((r) => r.id), [l2.id]);
+  assert.equal(sockets.length, 1, "the catch-up reuses the open connection");
+
+  // The relay drops the connection: reported, and a reconnect is scheduled.
+  const beforeDrop = timers.length;
+  sock.drop();
+  assert.equal(states.at(-1), "failed");
+  assert.ok(timers.slice(beforeDrop).some((t) => t.ms === 2000), "reconnects with backoff");
+  reader.stop();
+  const types = new Set(sockets.flatMap((s) => s.sent.map((f) => f[0])));
+  assert.deepEqual([...types].sort(), ["CLOSE", "REQ"]);
 });

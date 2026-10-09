@@ -9,6 +9,15 @@
  *     author, so a stranger's status can never quarantine somebody's listing;
  *   - a relay that never sends EOSE is an error, not an empty market.
  *
+ * Live (bob): after the first full read, each relay keeps one subscription
+ * open for new listings and statuses (`#t:[maxplayer]`, since the read), so a
+ * listing or sale shows within a second or two. That live feed is the one
+ * place statuses are not asked for by lot and maker; the book still drops
+ * any status not signed by its lot's maker. A new listing triggers a quick
+ * catch-up read of its full status chain, a dropped feed reconnects with
+ * backoff, and a slow catch-up read every few minutes backstops a relay that
+ * silently stops forwarding.
+ *
  * Never signs, never holds a key, never sends EVENT or AUTH, and never asks
  * for trade negotiation (private, NIP-44 encrypted). The production relay is
  * refused outright, as the CLI refuses it.
@@ -33,7 +42,10 @@ export const DEFAULT_TRADE_RELAYS: readonly string[] = Object.freeze([
 export const HISTORY_FLOOR = 0;
 /** Each refresh re-reads this far below the last one, for late or slow-clocked events. */
 export const OVERLAP_SECONDS = 120;
-export const REFRESH_MS = 30_000;
+/** Backstop catch-up read; the live feed carries everything in between. */
+export const REFRESH_MS = 300_000;
+/** A new listing on the live feed: read its status chain this soon. */
+export const NUDGE_MS = 1_500;
 /** A REQ with no EOSE in this long is a failure (market.rs uses 10s). */
 export const QUERY_TIMEOUT_MS = 12_000;
 /** Lots per status REQ; each filter pairs these ids with their makers. */
@@ -83,6 +95,14 @@ export function lotFilter(since: number, until?: number): Filter {
   return f;
 }
 
+/** The live feed: anything new under the protocol tag, from `since` on. */
+export function liveFilters(since: number): Filter[] {
+  return [
+    { kinds: [TRADE_LOT], "#t": [MAXPLAYER_TAG], since },
+    { kinds: [TRADE_STATUS], "#t": [MAXPLAYER_TAG], since },
+  ];
+}
+
 export function statusFilters(lots: { id: string; maker: string }[], since?: number): Filter[] {
   const out: Filter[] = [];
   for (let i = 0; i < lots.length; i += STATUS_CHUNK) {
@@ -106,6 +126,7 @@ class Conn {
   private ws: WebSocket;
   private pending = new Map<string, { events: NostrEvent[]; done: (e: NostrEvent[]) => void; fail: (err: Error) => void; timer: unknown }>();
   private counter = 0;
+  private liveSub: { sub: string; onEvent: (e: NostrEvent) => void } | null = null;
   readonly opened: Promise<void>;
   dead = false;
 
@@ -131,6 +152,11 @@ class Conn {
     let f: unknown;
     try { f = JSON.parse(String(data)); } catch { return; }
     if (!Array.isArray(f)) return;
+    if (this.liveSub && String(f[1]) === this.liveSub.sub) {
+      if (f[0] === "EVENT" && f[2] && typeof f[2] === "object") this.liveSub.onEvent(f[2] as NostrEvent);
+      else if (f[0] === "CLOSED") this.kill(`relay closed the live feed: ${String(f[2] ?? "")}`);
+      return; // its EOSE only ends the stored backlog; the feed stays open
+    }
     const p = this.pending.get(String(f[1]));
     if (!p) return; // AUTH, NOTICE, OK and strays: we answer none of them.
     if (f[0] === "EVENT") {
@@ -169,9 +195,19 @@ class Conn {
     });
   }
 
+  get live(): boolean { return this.liveSub != null; }
+
+  /** One long-lived REQ, never closed by EOSE; events stream until the socket dies. */
+  subscribe(filters: Filter[], onEvent: (e: NostrEvent) => void): void {
+    if (this.dead) return;
+    this.liveSub = { sub: `live${++this.counter}`, onEvent };
+    this.send(["REQ", this.liveSub.sub, ...filters]);
+  }
+
   kill(why: string): void {
     if (this.dead) return;
     this.dead = true;
+    this.liveSub = null;
     for (const [sub, p] of this.pending) { this.finish(sub); p.fail(new Closed(why)); }
     this.ws.onopen = this.ws.onmessage = this.ws.onerror = this.ws.onclose = null;
     try { this.ws.close(); } catch { /* already gone */ }
@@ -230,18 +266,46 @@ export function createTradeReader(opts: TradeReaderOptions, cb: TradeReaderCallb
     /** Lots whose full status history this relay has delivered. */
     const fullyRead = new Set<string>();
     let lastRound: number | null = null;
+    /** A read is running: socket deaths are its to handle, nudges wait for it. */
+    let busy = false;
+    let again = false;
+    let nudged = false;
 
-    const schedule = (ms: number) => { if (!stopped) timer = setTimer(() => void round(), ms); };
+    const schedule = (ms: number) => {
+      if (stopped) return;
+      if (timer != null) clearTimer(timer);
+      timer = setTimer(() => { timer = null; void round(); }, ms);
+    };
+    const backoff = () => BACKOFF_MS[Math.min(attempt++, BACKOFF_MS.length - 1)] as number;
+    /** The live feed died between reads: report it and reconnect. */
+    const dropped = (c: Conn, why: string) => {
+      if (stopped || busy || conn !== c) return;
+      conn = null;
+      cb.onRelayState(url, "failed", why);
+      cb.onRound(url);
+      schedule(backoff());
+    };
+    /** A listing we have not read the chain of: catch up soon, at most once per read. */
+    const nudge = () => {
+      if (busy) { again = true; return; }
+      if (nudged) return;
+      nudged = true;
+      schedule(NUDGE_MS);
+    };
     loops.push(() => { if (timer != null) clearTimer(timer); conn?.kill("stopped"); });
 
     async function round(): Promise<void> {
       if (stopped) return;
+      busy = true;
+      again = false;
+      nudged = false;
       const started = now();
       try {
         if (!conn || conn.dead) {
           cb.onRelayState(url, "connecting");
-          conn = new Conn(url, openSocket, setTimer, clearTimer, () => {});
-          await conn.opened;
+          const fresh: Conn = new Conn(url, openSocket, setTimer, clearTimer, (why) => dropped(fresh, why));
+          conn = fresh;
+          await fresh.opened;
         }
         if (lastRound == null) cb.onRelayState(url, "syncing");
         const c = conn;
@@ -266,17 +330,25 @@ export function createTradeReader(opts: TradeReaderOptions, cb: TradeReaderCallb
         if (lastRound != null && old.length) {
           for (const f of statusFilters(old, lastRound - OVERLAP_SECONDS)) await drain(req, f, emit);
         }
+        if (!c.live) {
+          c.subscribe(liveFilters(started - OVERLAP_SECONDS), (e) => {
+            emit(e);
+            if (e.kind === TRADE_LOT && typeof e.id === "string" && !fullyRead.has(e.id)) nudge();
+          });
+        }
         lastRound = started;
         attempt = 0;
+        busy = false;
         cb.onRelayState(url, "live");
         cb.onRound(url);
-        schedule(REFRESH_MS);
+        schedule(again ? NUDGE_MS : REFRESH_MS);
       } catch (err) {
         conn?.kill("failed");
         conn = null;
+        busy = false;
         cb.onRelayState(url, "failed", err instanceof Error ? err.message : String(err));
         cb.onRound(url);
-        schedule(BACKOFF_MS[Math.min(attempt++, BACKOFF_MS.length - 1)] as number);
+        schedule(backoff());
       }
     }
     void round();
