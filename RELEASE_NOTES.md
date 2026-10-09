@@ -1,3 +1,9 @@
+## Unreleased
+
+- Buyer execution-safety refusals surface the unsafe probability, local threshold,
+  and signed verdict event id, with deterministic-refusal guidance distinct from
+  retryable reviewer timeouts (#1122).
+
 ## v0.7.3-rc2
 
 Release candidate for 0.7.3, cut so that the session-job fixes for gVisor (`runsc`) seats can be
