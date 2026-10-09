@@ -101,5 +101,19 @@ export const KIND_LABELS: Readonly<Record<number, string>> = Object.freeze({
   [HEARTBEAT]: "heartbeat",
 });
 
+/**
+ * Token-trade fixed-lot listing (crates/maxplayer-trade). Signed, immutable,
+ * valid 24 hours: X sats of mint A for Y sats of mint B. Not a job kind — it is
+ * read only by the /trades page, from the public relays the trade CLI uses.
+ */
+export const TRADE_LOT = 3410;
+/** Hash-chained status revision of a TRADE_LOT: available, then sold or cancelled. */
+export const TRADE_STATUS = 3411;
+/**
+ * The two kinds /trades requests. Trade negotiation (kind 23412) is NIP-44
+ * encrypted and private; it is deliberately absent and is never requested.
+ */
+export const TRADE_KINDS: readonly number[] = Object.freeze([TRADE_LOT, TRADE_STATUS]);
+
 /** NIP-98 HTTP request authentication, never a market event. */
 export const HTTP_AUTH = 27235;

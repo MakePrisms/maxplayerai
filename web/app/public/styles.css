@@ -1191,3 +1191,42 @@ button.chip { cursor: pointer; }
 @keyframes try-nudge { 0%,100% { transform: translateY(0); } 50% { transform: translateY(2px); } }
 @media (max-width: 760px) { .try-float { bottom: max(16px, env(safe-area-inset-bottom)); } }
 @media (prefers-reduced-motion: reduce) { .try-float, .try-float svg { transition: none; animation: none; } }
+
+/* ================= /trades: the token-trade order book =================
+   Same board chrome as /market; two columns (open lots, recent) instead of
+   three. Everything is scoped to .trades-page so /market cannot change. */
+.trades-page .market-bar .col-meta { white-space: normal; text-align: right; }
+.trades-book { grid-template-columns: 1.6fr 1fr; }
+.lots-grid { grid-template-columns: minmax(0, 1.3fr) minmax(0, 1.3fr) 64px minmax(0, 1fr) 62px; }
+.recent-grid { grid-template-columns: 74px minmax(0, 1fr) 34px; }
+.trades-page .feed .row.recent-grid { grid-template-columns: 74px minmax(0, 1fr) 34px; }
+.trades-page .leg, .trades-page .col-seller { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.trades-page .person { color: var(--ink-2); }
+.tag[data-s="available"] { color: var(--neon); border-color: rgba(255, 223, 0, 0.35); }
+.tag[data-s="sold"] { color: #0a0a0b; background: var(--blue); border-color: var(--blue); }
+.tag[data-s="cancelled"] { color: var(--muted); }
+.tag[data-s="expired"] { color: var(--faint); }
+.tag[data-s="quarantined"] { color: var(--warn); border-color: rgba(255, 138, 61, 0.4); }
+.trade-detail { border-top: 1px solid var(--line); background: var(--bg-2); }
+.trade-detail[hidden] { display: none; }
+.trade-detail .col-bar { align-items: center; }
+.trade-detail .dock-close { min-width: 44px; min-height: 44px; background: transparent; border: 0; color: var(--muted); font-size: 20px; cursor: pointer; }
+.trade-detail .dock-close:hover { color: var(--neon); }
+.trade-detail-body { padding: 14px 16px 18px; }
+.trade-detail-body code { overflow-wrap: anywhere; }
+.trades-foot { padding: 0 16px 18px; }
+@media (max-width: 980px) {
+  .trades-book { grid-template-columns: 1fr; }
+  .trades-page .col.mid { grid-column: auto; grid-row: auto; }
+}
+@media (max-width: 700px) {
+  /* phones: the seller column goes (it is in the lot details); the two legs keep the width */
+  .lots-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 54px 54px; }
+  .trades-page .col-seller { display: none; }
+  .trades-page .market-bar .col-meta { text-align: left; }
+}
+@media (min-width: 981px) {
+  /* the detail panel and footnote sit under the board, which keeps its viewport height */
+  .trades-page.market-page { height: auto; min-height: 0; }
+  .trades-page .book { height: calc(100svh - var(--nav-h) - 120px); min-height: 420px; flex: none; }
+}
