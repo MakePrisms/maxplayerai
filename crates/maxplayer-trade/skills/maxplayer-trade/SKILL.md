@@ -26,15 +26,14 @@ Never copy its seed into another active wallet.
 Never print secrets, seeds, keys, tokens, proofs, preimages, or raw journals; never
 attach a home or database to chat. Report only public IDs, mint URLs, amounts, states,
 and redacted errors. Invoice delivery belongs in the human's private conversation.
-**Done:** the correct home and authorized mint identities (URL + sat unit) are known.
+**Done:** the correct home and authorized mint identities (URL or `nostr://<npub>`; sat unit) are known.
 
 ## 2. Check readiness and get explicit authorization
 
 Use `balance <mint>` and `preflight <mint>` for each relevant mint. Passing preflight
 allows a mint, but does not establish honesty or complete compatibility. The CLI
 also preflights before fund/list/take/withdraw: NUT-07/09/11/12/14, an active sat keyset, reachable
-mint, and clock skew at most 60 seconds. A `nostr://<npub>` mint is reached over
-`--mint-relay` relays (defaults built in) and cannot be funded or withdrawn here. Real mints need no opt-in setting. Never
+mint, and clock skew at most 60 seconds. Real mints need no opt-in setting. Never
 bypass a failed check. Gross locks and cumulative funding per mint per home are
 capped at **100,000 sats**, as is each withdrawal invoice. The withdrawal Lightning
 fee reserve ceiling is **max(32 sats, 2% of invoice sats rounded up)**. Pass
@@ -141,7 +140,7 @@ quarantine and errors.
 ## 4. Verify and report
 
 Check public swap/withdrawal state with `status` and balances with `balance`
-without stopping the owner process. A zero exit, elapsed deadline, missing listing, or mint saying PAID is not
+(see step 1). A zero exit, elapsed deadline, missing listing, or mint saying PAID is not
 by itself reconciled success. Keep the home. Report spent/received amounts and fees
 only when known; distinguish complete, refunded, unresolved, and manual recovery.
 
