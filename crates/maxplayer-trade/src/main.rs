@@ -14,6 +14,11 @@ struct Cli {
     /// Relay URL (repeatable); defaults to nos.lol, relay.primal.net and offchain.pub.
     #[arg(long)]
     relay: Vec<String>,
+    /// Relay for nostr:// mint requests only (kinds 23410/23411; repeatable, max 8; wss://, or ws://
+    /// on loopback). Defaults to wss://relay.ditto.pub and wss://nostr-pub.wellorder.net. Never
+    /// used for market traffic; relay.maxplayer.ai is refused for both.
+    #[arg(long = "mint-relay")]
+    mint_relay: Vec<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -106,9 +111,18 @@ async fn main() -> std::process::ExitCode {
 }
 async fn execute() -> Result<()> {
     let cli = Cli::parse();
+    maxplayer_trade::transport::configure_mint_relays(&cli.mint_relay)?;
+    // No home, lock, journal or intent is touched for a path a nostr:// mint cannot serve.
+    match &cli.command {
+        Command::Fund { mint, .. } => maxplayer_trade::transport::require_http(mint, "fund")?,
+        Command::Withdraw { mint, .. } => {
+            maxplayer_trade::transport::require_http(mint, "withdraw")?
+        }
+        _ => {}
+    }
     // Read-only observations remain available while serve owns the writer lock.
     if let Command::Balance { ref mint } = cli.command {
-        let asset = Asset::new(mint)?;
+        let asset = Asset::from_cli(mint)?;
         println!(
             "{}",
             serde_json::json!({"mint":asset.mint_url,"unit":"sat","balance":maxplayer_trade::wallet::read_balance(&cli.home, &asset.mint_url)?})
@@ -181,11 +195,11 @@ async fn execute() -> Result<()> {
                     &j,
                     &m,
                     Leg {
-                        asset: Asset::new(&give_mint)?,
+                        asset: Asset::from_cli(&give_mint)?,
                         net: give,
                     },
                     Leg {
-                        asset: Asset::new(&want_mint)?,
+                        asset: Asset::from_cli(&want_mint)?,
                         net: want,
                     },
                     max_fees,
@@ -233,9 +247,10 @@ async fn execute() -> Result<()> {
         | Command::Receive { mint, .. } => mint,
         _ => unreachable!(),
     };
-    let asset = maxplayer_trade::Asset::new(mint_arg)?;
+    let asset = maxplayer_trade::Asset::from_cli(mint_arg)?;
     asset.fence()?;
     let mint = &asset.mint_url;
+
     if matches!(cli.command, Command::Preflight { .. }) {
         return preflight(mint).await;
     }

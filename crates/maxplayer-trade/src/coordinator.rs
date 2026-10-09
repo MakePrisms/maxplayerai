@@ -118,10 +118,9 @@ fn timing(l: &Lot) -> Result<(u64, u64, u64, u64)> {
     #[cfg(feature = "lab")]
     if std::env::var("TRADE_LAB_SECONDS").is_ok() {
         for a in [&l.give.asset, &l.want.asset] {
-            let u = url::Url::parse(&a.mint_url)?;
             ensure!(
-                u.host_str() == Some("127.0.0.1"),
-                "lab timing requires loopback mints"
+                crate::transport::loopback_only(&a.mint_url),
+                "lab timing requires loopback mints (and loopback mint relays for nostr://)"
             );
         }
         // Debug SQLite/crypto plus the fresh /info RPC took ~2.8s for one
@@ -865,6 +864,7 @@ async fn recover_pass(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
     };
     let swaps = j.all::<Swap>("swap").await?;
     for mut s in swaps {
+        let budget = item_budget(&s);
         let item = async {
             if s.state == "requested" && now() > s.created + 60 {
                 mint::release(home, &s.plan, &s.id).await?;
@@ -930,10 +930,7 @@ async fn recover_pass(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
             }
             advance(home, j, m, &mut s).await
         };
-        if !matches!(
-            tokio::time::timeout(std::time::Duration::from_secs(120), item).await,
-            Ok(Ok(()))
-        ) {
+        if !matches!(tokio::time::timeout(budget, item).await, Ok(Ok(()))) {
             deferred = true;
             eprintln!(
                 "swap {}: recovery deferred (error or timeout); journal retained",
@@ -1016,10 +1013,10 @@ pub async fn run(home: &Path, j: &Journal, m: &mut Market, until: Option<&str>) 
 
 async fn validate_terms(home: &Path, leg: &Leg, t: &Terms) -> Result<()> {
     let w = wallet::wallet(home, &leg.asset.mint_url).await?;
-    crate::wallet::bounded(w.refresh_keysets())
+    crate::wallet::bounded_for(&leg.asset.mint_url, w.refresh_keysets())
         .await
         .context("CDK wallet request timed out")??;
-    let active = crate::wallet::bounded(w.fetch_active_keyset())
+    let active = crate::wallet::bounded_for(&leg.asset.mint_url, w.fetch_active_keyset())
         .await
         .context("CDK wallet request timed out")??;
     ensure!(
@@ -1140,6 +1137,20 @@ fn advance_budgets() -> (std::time::Duration, std::time::Duration) {
         std::time::Duration::from_secs(ADVANCE_BUDGET_SECONDS),
         std::time::Duration::from_secs(REFUND_BUDGET_SECONDS),
     )
+}
+/// Recovery budget for one swap item: 120 s (HTTP), or room for the full advance deadline plus
+/// one trailing `nostr://` call (the own-mint `states()` after the claim phase) when either leg
+/// is on a `nostr://` mint, so that call is never cut inside its connector window.
+fn item_budget(s: &Swap) -> std::time::Duration {
+    let http = std::time::Duration::from_secs(120);
+    let Ok(lot) = serde_json::from_str::<Lot>(&s.lot.content) else {
+        return http;
+    };
+    if lot.give.asset.is_nostr() || lot.want.asset.is_nostr() {
+        http.max(advance_budgets().0 + crate::transport::NOSTR_OUTER)
+    } else {
+        http
+    }
 }
 fn refund_attempt_id(s: &Swap) -> String {
     if s.refund_generation == 0 {

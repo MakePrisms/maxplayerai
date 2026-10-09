@@ -74,7 +74,7 @@ async fn unblind(
         return Ok(vec![]);
     }
     let w = wallet(home, url).await?;
-    let keys = crate::wallet::bounded(w.load_keyset_keys(out[0].message.keyset_id))
+    let keys = crate::wallet::bounded_for(url, w.load_keyset_keys(out[0].message.keyset_id))
         .await
         .context("CDK wallet request timed out")??;
     let proofs = cdk::dhke::construct_proofs(
@@ -89,12 +89,15 @@ async fn unblind(
         proofs.iter().all(|p| p.dleq.is_some()),
         "change requires DLEQ"
     );
-    crate::wallet::bounded(w.verify_token_dleq(&Token::new(
-        url.parse()?,
-        proofs.clone(),
-        None,
-        CurrencyUnit::Sat,
-    )))
+    crate::wallet::bounded_for(
+        url,
+        w.verify_token_dleq(&Token::new(
+            url.parse()?,
+            proofs.clone(),
+            None,
+            CurrencyUnit::Sat,
+        )),
+    )
     .await
     .context("CDK wallet request timed out")??;
     Ok(proofs)
@@ -144,6 +147,8 @@ pub struct Funding {
 }
 pub async fn fund(home: &Path, j: &Journal, url: &str, amount: u64) -> Result<Funding> {
     crate::Asset::new(url)?.fence()?;
+    // Before ANY journal intent: a nostr:// credits mint has no NUT-04/NUT-20 to fund through.
+    crate::transport::require_http(url, "fund")?;
     ensure!(
         amount > 0 && amount <= crate::real_money::CAP,
         "funding cap exceeded"
@@ -211,6 +216,7 @@ pub async fn fund(home: &Path, j: &Journal, url: &str, amount: u64) -> Result<Fu
 }
 async fn get<T: serde::de::DeserializeOwned>(url: &str, path: &str, id: &str) -> Result<T> {
     crate::Asset::new(url)?.fence()?;
+    crate::transport::require_http(url, "quote status")?;
     let mut endpoint = url::Url::parse(&format!("{url}/v1/{path}/"))?;
     endpoint
         .path_segments_mut()
@@ -267,13 +273,13 @@ pub async fn resume_fund(home: &Path, j: &Journal, f: &mut Funding) -> Result<()
             "issued quote without recorded outputs"
         );
         let w = wallet(home, &f.mint).await?;
-        crate::wallet::bounded(w.refresh_keysets())
+        crate::wallet::bounded_for(&f.mint, w.refresh_keysets())
             .await
             .context("CDK wallet request timed out")??;
-        let k = crate::wallet::bounded(w.fetch_active_keyset())
+        let k = crate::wallet::bounded_for(&f.mint, w.fetch_active_keyset())
             .await
             .context("CDK wallet request timed out")??;
-        let fees = crate::wallet::bounded(w.get_keyset_fees_and_amounts_by_id(k.id))
+        let fees = crate::wallet::bounded_for(&f.mint, w.get_keyset_fees_and_amounts_by_id(k.id))
             .await
             .context("CDK wallet request timed out")??;
         f.outputs = outputs(PreMintSecrets::random(
@@ -395,6 +401,8 @@ pub async fn withdraw_bounded(
 ) -> Result<Withdrawal> {
     let canonical = crate::Asset::new(url)?;
     canonical.fence()?;
+    // Before ANY journal intent (including dedupe updates): no NUT-05 melt on a nostr:// mint.
+    crate::transport::require_http(&canonical.mint_url, "withdraw")?;
     let url = canonical.mint_url.as_str();
     let req = MeltQuoteBolt11Request {
         request: invoice.parse()?,
@@ -513,10 +521,10 @@ async fn prepare_withdraw(home: &Path, j: &Journal, a: &mut Withdrawal) -> Resul
         "melt quote expired before submission"
     );
     let w = wallet(home, &a.mint).await?;
-    crate::wallet::bounded(w.refresh_keysets())
+    crate::wallet::bounded_for(&a.mint, w.refresh_keysets())
         .await
         .context("CDK wallet request timed out")??;
-    let k = crate::wallet::bounded(w.fetch_active_keyset())
+    let k = crate::wallet::bounded_for(&a.mint, w.fetch_active_keyset())
         .await
         .context("CDK wallet request timed out")??;
     let db = database(home, &a.mint).await?;
@@ -535,7 +543,7 @@ async fn prepare_withdraw(home: &Path, j: &Journal, a: &mut Withdrawal) -> Resul
         input.push(p.proof);
         let total = u64::from(input.total_amount()?);
         let input_fee = u64::from(
-            crate::wallet::bounded(w.get_proofs_fee(&input))
+            crate::wallet::bounded_for(&a.mint, w.get_proofs_fee(&input))
                 .await
                 .context("CDK wallet request timed out")??
                 .total,
@@ -607,6 +615,7 @@ async fn submit_melt(
     request: &MeltRequest<String>,
 ) -> Result<Option<MeltQuoteBolt11Response<String>>> {
     crate::Asset::new(url)?.fence()?;
+    crate::transport::require_http(url, "melt")?;
     let response = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(mint::RPC_TIMEOUT_SECONDS))

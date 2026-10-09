@@ -7,7 +7,7 @@
 use crate::{
     journal::Journal,
     mint,
-    wallet::{bounded, database, wallet},
+    wallet::{bounded_for, database, wallet},
 };
 use anyhow::{Context, Result, anyhow, ensure};
 use cashu::nuts::nut00::ProofsMethods;
@@ -227,10 +227,10 @@ pub async fn receive(home: &Path, j: &Journal, mint: &str, raw: &str) -> Result<
     check_cap(j, mint, p.amount).await?;
     crate::wallet::preflight(mint).await?;
     let w = wallet(home, mint).await?;
-    bounded(w.refresh_keysets())
+    bounded_for(mint, w.refresh_keysets())
         .await
         .context("CDK wallet request timed out")??;
-    let keysets = bounded(w.get_mint_keysets(KeysetFilter::All))
+    let keysets = bounded_for(mint, w.get_mint_keysets(KeysetFilter::All))
         .await
         .context("CDK wallet request timed out")??;
     let inputs = p
@@ -248,7 +248,7 @@ pub async fn receive(home: &Path, j: &Journal, mint: &str, raw: &str) -> Result<
         .cloned()
         .collect();
     if !with_dleq.is_empty() {
-        bounded(w.verify_token_dleq(&Token::new(
+        bounded_for(mint, w.verify_token_dleq(&Token::new(
             MintUrl::from_str(mint)?,
             with_dleq,
             None,
@@ -259,7 +259,7 @@ pub async fn receive(home: &Path, j: &Journal, mint: &str, raw: &str) -> Result<
         .map_err(|_| anyhow!("incoming token DLEQ verification failed"))?;
     }
     let fee = u64::from(
-        bounded(w.get_proofs_fee(&inputs))
+        bounded_for(mint, w.get_proofs_fee(&inputs))
             .await
             .context("CDK wallet request timed out")??
             .total,
@@ -269,10 +269,10 @@ pub async fn receive(home: &Path, j: &Journal, mint: &str, raw: &str) -> Result<
     mint::unspent(mint, &inputs)
         .await
         .context("token is not UNSPENT at the mint (already spent or pending)")?;
-    let k = bounded(w.fetch_active_keyset())
+    let k = bounded_for(mint, w.fetch_active_keyset())
         .await
         .context("CDK wallet request timed out")??;
-    let amounts = bounded(w.get_keyset_fees_and_amounts_by_id(k.id))
+    let amounts = bounded_for(mint, w.get_keyset_fees_and_amounts_by_id(k.id))
         .await
         .context("CDK wallet request timed out")??;
     let outputs: Vec<Output> =
@@ -450,7 +450,7 @@ pub async fn resume(home: &Path, j: &Journal, r: &mut Receipt) -> Result<()> {
             );
         }
         let w = wallet(home, &r.mint).await?;
-        let keys = bounded(w.load_keyset_keys(r.outputs[0].message.keyset_id))
+        let keys = bounded_for(&r.mint, w.load_keyset_keys(r.outputs[0].message.keyset_id))
             .await
             .context("CDK wallet request timed out")??;
         let proofs = cdk::dhke::construct_proofs(
@@ -481,7 +481,7 @@ pub async fn resume(home: &Path, j: &Journal, r: &mut Receipt) -> Result<()> {
         return finish(j, r, ReceiveState::Quarantined).await;
     }
     let w = wallet(home, &r.mint).await?;
-    match bounded(w.verify_token_dleq(&Token::new(
+    match bounded_for(&r.mint, w.verify_token_dleq(&Token::new(
         MintUrl::from_str(&r.mint)?,
         result.clone(),
         None,

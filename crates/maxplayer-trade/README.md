@@ -78,7 +78,7 @@ sections below describe their dated runs, not current coverage totals.
   `serve` continuously accepts quotes and recovers swaps. **Keep a watcher running while funds
   are locked.** Use read-only `status`/`balance` without stopping it; never stop between `second_locked` and `settling`. Do not delete a trade home.
 
-Any canonical HTTPS mint can be used if automatic preflight passes: advertised NUT-07/09/11/12/14,
+Any canonical HTTPS mint (or a `nostr://<npub>` mint, see below) can be used if automatic preflight passes: advertised NUT-07/09/11/12/14,
 an active sat keyset, and clock skew at most 60 seconds. Preflight runs before each `list`,
 `take`, funding quotes and lock submission; successful earlier preflight is not cached
 as permission for a later lock. Test mints and loopback HTTP(S) fixtures remain supported.
@@ -100,6 +100,35 @@ a guarantee for other deployments or versions.
 Default relays: `wss://nos.lol`, `wss://relay.primal.net`, `wss://offchain.pub`; repeat
 `--relay URL` before the command to configure alternatives. The production relay is
 explicitly forbidden. No production relay writes were made.
+
+### `nostr://` mints (Maxplayer credits sidecar)
+
+A mint may also be `nostr://<npub>`, e.g. a `crates/maxplayer-mint` sidecar. Lots and peer
+messages carry exactly `nostr://<lowercase bech32 npub>` (no slash, path, query or fragment);
+CLI arguments may use a 64-hex key or uppercase and are canonicalized. All mint traffic goes
+through one dispatch (`src/transport.rs`): HTTP(S) mints keep the raw requests used before;
+`nostr://` mints use the reviewed core connector (`maxplayer_core::nostr_mint`, one kind-23410
+request / 23411 reply per call, identical re-send on a lost reply, request `exp` enforced by
+the mint). CDK wallets for such mints are built with that connector and poll subscriptions.
+
+- Relays: repeat `--mint-relay URL` (max 8, `wss://`, `ws://` only on loopback) before the
+  command; default `wss://relay.ditto.pub`, `wss://nostr-pub.wellorder.net`. They carry only
+  kinds 23410/23411; market relays never carry mint traffic. `relay.maxplayer.ai` is refused for
+  mint traffic too (`transport::MINT_RELAY_DENYLIST`, one entry). Both sides must reach a relay
+  the mint listens on; preflight fails (nothing locked) otherwise.
+- Timing: a `nostr://` CDK wallet call is bounded at 40 s (30 s connector window + 10 s margin)
+  instead of 15 s; a raw request is bounded by the connector, not the 20 s HTTP timeout. A
+  deadline-bound swap (lock/claim) is sent with `exp <= send_before`, and not at all with under
+  2 s left. Abandonment grace is 170 s (window 30 + margin 10 + clock skew 60 + 20) instead of
+  60 s. A recovery item touching a `nostr://` leg gets max(120 s, advance deadline 100 s + 40 s).
+  A call that outlives its bound is ambiguous: the journaled attempt is restored, never resent
+  with new outputs and never treated as failed.
+- Size: the sidecar takes at most 128 inputs/outputs and a 65,535-byte NIP-44 plaintext. A
+  `nostr://` lock whose HTLC claim (preimage + signature per input) could exceed either is
+  refused at admission before anything is locked or revealed; own locks are checked the same way.
+- `fund` and `withdraw` refuse `nostr://` mints before touching the home: the sidecar serves no
+  NUT-04/05/20. Credits come from the operator's `maxplayer-mint issue` token file.
+- The sidecar has no configurable input fee (ppk 0).
 
 ## Agent skill
 
@@ -600,7 +629,7 @@ A mint can still lie, withhold evidence, or process an already-delivered request
 
 - Authorized deviation from the integration spec: standalone crate, home/seed/CDK wallets and
   trade SQLite journal; HTTP(S) test mints and public relays; no jobs, budget/ledger, MCP,
-  Nostr-mint transport, sidecar changes, or production-relay deployment. Same-repository PR #1107 stays draft.
+  sidecar changes, or production-relay deployment (`nostr://` mints use the core connector, see above). Same-repository PR #1107 stays draft.
 - Trade swaps use pinned CDK **public lower-level primitives** with explicitly journaled outputs,
   rather than opaque high-level send/receive sagas. Claims and refunds use the same durable
   adapter; refunds include the empty-preimage witness required by pinned CDK. No dependency fork.

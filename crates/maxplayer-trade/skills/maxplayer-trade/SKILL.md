@@ -33,7 +33,8 @@ and redacted errors. Invoice delivery belongs in the human's private conversatio
 Use `balance <mint>` and `preflight <mint>` for each relevant mint. Passing preflight
 allows a mint, but does not establish honesty or complete compatibility. The CLI
 also preflights before fund/list/take/withdraw: NUT-07/09/11/12/14, an active sat keyset, reachable
-mint, and clock skew at most 60 seconds. Real mints need no opt-in setting. Never
+mint, and clock skew at most 60 seconds. A `nostr://<npub>` mint is reached over
+`--mint-relay` relays (defaults built in) and cannot be funded or withdrawn here. Real mints need no opt-in setting. Never
 bypass a failed check. Gross locks and cumulative funding per mint per home are
 capped at **100,000 sats**, as is each withdrawal invoice. The withdrawal Lightning
 fee reserve ceiling is **max(32 sats, 2% of invoice sats rounded up)**. Pass

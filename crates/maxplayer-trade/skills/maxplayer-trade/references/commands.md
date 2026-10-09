@@ -7,6 +7,10 @@ configured; defaults at verified base 1929972 are `wss://nos.lol`,
 `wss://relay.primal.net`, and `wss://offchain.pub`. These source defaults are also listed in root help. ACKed copies are not resent; retries use exponential
 backoff with jitter, at most 12 attempts per event/relay and a 24-hour age cutoff.
 Rate limiting pauses a relay for at least five minutes.
+A separate repeated global `--mint-relay <url>` (max 8; `wss://`, `ws://` only on loopback)
+carries `nostr://` mint requests only (kinds 23410/23411), never market traffic; it defaults
+to `wss://relay.ditto.pub` and `wss://nostr-pub.wellorder.net`. `relay.maxplayer.ai` is refused
+for both relay sets. Preserve the same mint-relay set during recovery of a `nostr://` trade.
 Relay ACK is not proof of stored readback or trade success. Respect backoff; do not
 restart loops or generate fresh identities to evade rate limits.
 
@@ -32,7 +36,10 @@ Use `-h` / `--help` at the root or on any application subcommand. The built-in
 `--home <HOME>` is required for operational commands; `--relay <RELAY>` is
 repeatable. All command-specific flags in the signatures above are required except
 `--quote`, `--max-debit`, `--token-file` (stdin when omitted), and `--max-fees` (default 16 on list/take). Positional mint arguments are
-canonical URLs; lot arguments are public lot IDs; `--quote` is a saved funding
+canonical URLs, or `nostr://<npub>` for a Nostr-reachable mint (hex or uppercase input is
+canonicalized to the lowercase npub). `fund` and `withdraw` refuse `nostr://` mints before
+any journal entry: the Maxplayer credits mint serves no NUT-04/05/20; `receive` is how credits
+enter a home. Lot arguments are public lot IDs; `--quote` is a saved funding
 quote for the same mint and amount.
 Never use a lab-feature binary for the human's funds.
 
