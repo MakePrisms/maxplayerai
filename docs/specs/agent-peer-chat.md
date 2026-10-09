@@ -1,6 +1,6 @@
 # maxplayer-chat: an opt-in mailbox for trusted agent-to-agent chat over Nostr
 
-**Status:** design spec. No code has been written. **Anchor commit: `8c3bf74f87ca4e5d0f7b0bff64c41a7073ac849e`
+**Status:** sidecar implementation in `crates/maxplayer-chat`; acceptance tests A1–A11. **Anchor commit: `8c3bf74f87ca4e5d0f7b0bff64c41a7073ac849e`
 (origin/main when this was written).** Every code citation is `file:line @8c3bf74` and was re-derived
 by grep at that commit. Paths are relative to `crates/` unless noted.
 
@@ -76,7 +76,7 @@ the text is a peer's words, not instructions.
 * **`send` is one-shot.** It connects, publishes once and reports the relay's answer, whether or not
   `watch` is running.
 * **Waking the agent: `--notify <cmd> [args…]`.** After storing a new message, `watch` runs the command
-  directly (no shell) with `MAXPLAYER_CHAT_PEER=<label>` in its environment. **The message text is
+  directly (no shell) with only `MAXPLAYER_CHAT_PEER=<label>` in its environment. **The message text is
   never passed** in argv or env; the agent reads it with `inbox`. Notifications are coalesced: at most
   one run in flight, and a message that arrives during a run triggers one more run afterwards. Without
   `--notify`, the agent sees new messages on its next `inbox` check-in. The README shows how to point
@@ -85,8 +85,9 @@ the text is a peer's words, not instructions.
 ## 3. Identity: the home key, without the marketplace
 
 * If `<home>/key` exists, `maxplayer-chat` reads it directly, trims it and validates it with the same
-  rule `home::read_secret_key_hex` applies (`home.rs:2172`, via `validate_secret_hex` `:2637`; making
-  that one helper `pub` is the only core change). It cannot call `read_secret_key_hex` itself, because
+  rule `home::read_secret_key_hex` applies (`home.rs:2172`, via `validate_secret_hex` `:2637`),
+  reimplemented locally in the sidecar: **no core change at all**. It cannot call
+  `read_secret_key_hex` itself, because
   that takes a `MaxplayerHome`, which only `bootstrap` builds, and `bootstrap` writes the marketplace's
   `config.toml` and `wallet/`. It derives the public key with `nostr_sdk::Keys`, not
   `home::public_key_hex`, which is `wallet`-gated (`home.rs:2185-2186`).
@@ -102,8 +103,8 @@ the text is a peer's words, not instructions.
 
 Unchanged from the earlier draft, and still needed:
 
-* **Outer event:** kind 1059 gift wrap built by `private_content/transport.rs` `wrap` (`:9`), read by
-  `unwrap_message` (`:39`). That unwrap verifies the wrap and the seal and requires a kind-14 rumor
+* **Outer event:** kind 1059 gift wrap using the construction from `private_content/transport.rs`
+  `wrap` (`:9`), retained locally on send to capture the rumor ID, and read by `unwrap_message` (`:39`). That unwrap verifies the wrap and the seal and requires a kind-14 rumor
   with exactly one `p` tag equal to us (`:63-66`). The module builds under the `gateway` feature
   (`maxplayer-core/src/lib.rs:211-212`). **No relay change**: kind 1059 is admitted
   (`buzz/crates/buzz-relay/src/handlers/ingest.rs:279`), must carry a `p` tag (`:1596-1605`), is
@@ -123,8 +124,13 @@ decoder return `Ok(None)` (`seller.rs:721-724`), logging only the event id
 **Delivery.** `watch` deduplicates by rumor id, not wrap id, because outer timestamps are
 randomized (`transport.rs:6,92`). The cursor is `receive_since(last)` with overlap (`:88`). `send`
 publishes once and reports the relay's answer. A lost message is resent by hand. There is no outbox.
+Send slots are reserved before publication;
+an ambiguous failed acknowledgement consumes a slot. The send path builds the same seal/wrap
+locally to retain the outgoing rumor ID (core `wrap` returns only the event).
 
-**Relay.** One relay, the home default or `--relay`. Both peers must use the same one.
+**Relay.** One relay, the home default or `--relay`. Both peers must use the same one. It must issue
+NIP-42 challenges on connect; no challenge or
+failed auth causes a reconnect without a subscription (fail closed).
 
 ## 5. Local state, under `<home>/chat/`
 
@@ -133,7 +139,8 @@ publishes once and reports the relay's answer. A lost message is resent by hand.
   against it.
 * `cursor`: the last receive timestamp (written by `watch`).
 * `read`: the last rumor id `inbox` printed (written by `inbox`).
-* `watch.lock`.
+* `watch.lock`, plus `state.lock` for short file transactions and atomic-write temporary files
+  in this same directory.
 * `sent-today`: `{day, per_peer_counts}` for the cap.
 
 Plain files, no SQLite. A separate directory, so the marketplace never reads or writes it, and the
@@ -179,8 +186,7 @@ a conversation** with `peer remove`, or by not running the sidecar at all.
 `maxplayer` already enables (`maxplayer/Cargo.toml:72-79`), so workspace feature unification adds
 nothing to the `maxplayer` build. `maxplayer-mint` (`crates/maxplayer-mint/Cargo.toml`) is the
 precedent for an opt-in sidecar; this one needs no separate workspace because it brings no new
-features. **No change to `crates/maxplayer` or to `maxplayer-core` beyond, at most, making an existing
-helper `pub`.**
+features. **No core change at all. No change to `crates/maxplayer` or any jobs/marketplace crate.**
 
 Each criterion is a named test that fails if the behavior is removed:
 

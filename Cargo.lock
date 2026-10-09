@@ -2589,6 +2589,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "maxplayer-chat"
+version = "0.6.1-rc7"
+dependencies = [
+ "futures-util",
+ "libc",
+ "maxplayer-core",
+ "nostr-relay-builder",
+ "nostr-sdk",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite",
+ "toml",
+]
+
+[[package]]
 name = "maxplayer-core"
 version = "0.6.1-rc7"
 dependencies = [
