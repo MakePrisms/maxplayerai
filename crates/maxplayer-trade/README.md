@@ -20,7 +20,14 @@ Earlier dated verification sections are historical snapshots, not current covera
   never-submitted quotes that expired, are terminal `refused`, retryable explicitly with the same invoice. No passive recovery submits an
   unsent quote; an explicitly failed pre-POST withdrawal cannot pay later on a serve tick.
   Submitted ambiguity retains exact authorization and replays it until definitive.
-- Read-only `status` and `balance` use SQLite snapshots without the writer lock. Keep
+- Read-only `status` (readable summary; `--json` keeps the raw records byte-for-byte) and
+  `balance` use SQLite snapshots without the writer lock; `discover` reads only relays and
+  mint keysets (per-lot `expected_fees`, `unknown` if a mint is slow) with no lock, home or
+  journal access. While `serve` runs, `list`/`take`/`cancel` hand off to it over
+  `<home>/serve.sock` (0600, same uid, 16 KiB, one request per connection) and serve executes
+  them with the client's exact bounds as the single writer. `list`/`take --dry-run` preview
+  both legs' fees, gross amounts and max total debit with zero side effects. A swap waiting
+  >180 s on its counterparty shows `counterparty_unresponsive` (display only). Keep
   serve alive from second lock through settlement. Exits: 0 success, 1 command error,
   pre-submission refusal, or definitive terminal `unpaid_released`, 2 usage, 3 unresolved work, 4 terminal manual recovery. Non-final
   withdrawals never exit 0; a submitted (past `quote_created`) non-terminal withdrawal always
@@ -40,7 +47,7 @@ sections below describe their dated runs, not current coverage totals.
 
 ## Implemented
 
-- `list`, `discover`, `cancel`, `serve`, `take`, `recover`, `preflight`, `fund`, `balance`, `status`, `withdraw`.
+- `list`, `discover`, `cancel`, `serve`, `take`, `recover`, `preflight`, `fund`, `balance`, `status`, `withdraw`, `receive`.
 - Immutable signed 3410 lots (24 hours), hash-chained 3411 statuses, signature/content/tag
   validation, fork/gap quarantine, no terminal reopening. Every configured relay is queried;
   discovery unions their results. No EOSE is an error, not an empty market; partial relay
@@ -239,6 +246,7 @@ LOT="$(python3 -c 'import json,sys; print([json.loads(l)["lot_id"] for l in sys.
 "$TRADE" --home "$RUN/maker" serve > "$RUN/maker.log" 2>&1 &
 MAKER_PID=$!
 "$TRADE" --home "$RUN/taker" discover
+"$TRADE" --home "$RUN/taker" take "$LOT" --max-give 40 --min-receive 32 --dry-run
 "$TRADE" --home "$RUN/taker" take "$LOT" --max-give 40 --min-receive 32
 # Only stop the maker after both sides are complete; otherwise keep recovery running.
 kill "$MAKER_PID"
