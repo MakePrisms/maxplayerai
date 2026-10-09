@@ -69,6 +69,13 @@ pub struct Faults {
     pub swaps: std::sync::atomic::AtomicU64,
     /// Answer every swap POST with a well-formed NUT error (HTTP 400 + code), unprocessed.
     pub swap_nut_error: std::sync::atomic::AtomicBool,
+    /// Answer every swap POST with an unprocessed HTTP 400 that is NOT a NUT error:
+    /// 1 = non-JSON body, 2 = JSON without a numeric `code`.
+    pub swap_bad_400: std::sync::atomic::AtomicU64,
+    /// On the next swap POST, start reporting UNSPENT inputs as PENDING.
+    pub pending_after_swap: std::sync::atomic::AtomicBool,
+    /// Drop the last output/signature pair from every non-empty restore reply.
+    pub partial_restore: std::sync::atomic::AtomicBool,
 }
 pub struct MintFixture {
     pub faults: Arc<Faults>,
@@ -144,6 +151,26 @@ impl MintFixture {
                     control.requests.fetch_add(1, SeqCst);
                     if path.ends_with("/swap") {
                         control.swaps.fetch_add(1, SeqCst);
+                        if control.pending_after_swap.swap(false, SeqCst) {
+                            control.pending_inputs.store(true, SeqCst);
+                        }
+                        match control.swap_bad_400.load(SeqCst) {
+                            1 => {
+                                return (
+                                    axum::http::StatusCode::BAD_REQUEST,
+                                    "<html>bad request</html>",
+                                )
+                                    .into_response();
+                            }
+                            2 => {
+                                return (
+                                    axum::http::StatusCode::BAD_REQUEST,
+                                    axum::Json(serde_json::json!({"error":"expired","detail":"x"})),
+                                )
+                                    .into_response();
+                            }
+                            _ => {}
+                        }
                         if control.swap_nut_error.load(SeqCst) {
                             return (
                                 axum::http::StatusCode::BAD_REQUEST,
@@ -305,6 +332,13 @@ impl MintFixture {
                                             }
                                         }
                                     }
+                                }
+                            }
+                        }
+                        if path.ends_with("/restore") && control.partial_restore.load(SeqCst) {
+                            for k in ["outputs", "signatures"] {
+                                if let Some(a) = v[k].as_array_mut() {
+                                    a.pop();
                                 }
                             }
                         }

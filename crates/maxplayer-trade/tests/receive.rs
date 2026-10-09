@@ -528,3 +528,271 @@ async fn omitted_returned_dleq_quarantines_without_credit() {
     assert_eq!(balance(h.path(), &m.url).await, 0);
     assert_eq!(r.summary()["credited"], 0);
 }
+
+fn state_of(out: &std::process::Output) -> serde_json::Value {
+    serde_json::from_slice(&out.stdout).unwrap_or(serde_json::Value::Null)
+}
+
+#[tokio::test]
+async fn non_nut_400_stays_submitted_and_a_later_receive_swaps() {
+    let m = MintFixture::start(0).await;
+    let (_s, proofs, token) = issue(&m, 40).await;
+    let (h, j) = home().await;
+    // 1: non-JSON 400 body. 2: JSON 400 without a numeric NUT `code` (e.g. a
+    // transport `expired`). Neither proves the mint refused this request.
+    for (bad, swaps) in [(1, 1), (2, 2)] {
+        m.faults.swap_bad_400.store(bad, SeqCst);
+        let r = receive::receive(h.path(), &j, &m.url, &token)
+            .await
+            .unwrap();
+        assert_eq!(
+            r.state,
+            ReceiveState::Submitted,
+            "SAFETY: a non-NUT 400 ({bad}) is not a definitive refusal"
+        );
+        assert!(!r.terminal());
+        assert_eq!(receipts(&j).await[0].state, ReceiveState::Submitted);
+        assert_eq!(m.faults.swaps.load(SeqCst), swaps);
+    }
+    // The CLI reports it as unresolved (exit 3), never exit 1.
+    let out = cli(h.path(), &m.url, None, Some(&token), None).await;
+    assert_eq!(out.status.code(), Some(3), "SAFETY: ambiguous is exit 3");
+    assert_secret_free(&out, &token, &proofs);
+    m.faults.swap_bad_400.store(0, SeqCst);
+    let r = receive::receive(h.path(), &j, &m.url, &token)
+        .await
+        .unwrap();
+    assert_eq!(r.state, ReceiveState::Done, "SAFETY: same outputs replayed");
+    assert_eq!(balance(h.path(), &m.url).await, 40);
+    assert_eq!(receipts(&j).await.len(), 1);
+}
+
+#[tokio::test]
+async fn pending_inputs_after_nut_error_stay_non_terminal() {
+    let m = MintFixture::start(0).await;
+    let (_s, _, token) = issue(&m, 40).await;
+    let (h, j) = home().await;
+    m.faults.swap_nut_error.store(true, SeqCst);
+    m.faults.pending_after_swap.store(true, SeqCst);
+    let r = receive::receive(h.path(), &j, &m.url, &token)
+        .await
+        .unwrap();
+    assert_eq!(
+        r.state,
+        ReceiveState::Submitted,
+        "SAFETY: PENDING inputs are never terminal"
+    );
+    assert!(money::recover(h.path(), &j).await.unwrap(), "still pending");
+    assert_eq!(receipts(&j).await[0].state, ReceiveState::Submitted);
+    m.faults.pending_inputs.store(false, SeqCst);
+    m.faults.swap_nut_error.store(false, SeqCst);
+    assert!(!money::recover(h.path(), &j).await.unwrap());
+    assert_eq!(receipts(&j).await[0].state, ReceiveState::Done);
+    assert_eq!(balance(h.path(), &m.url).await, 40);
+}
+
+#[tokio::test]
+async fn partial_restore_stays_non_terminal_without_second_swap() {
+    let m = MintFixture::start(0).await;
+    let (_s, _, token) = issue(&m, 63).await; // several outputs
+    let (h, j) = home().await;
+    m.faults.lose_reply.store(true, SeqCst);
+    let r = receive::receive(h.path(), &j, &m.url, &token)
+        .await
+        .unwrap();
+    assert_eq!(r.state, ReceiveState::Submitted);
+    m.faults.lose_reply.store(false, SeqCst);
+    m.faults.partial_restore.store(true, SeqCst);
+    assert!(money::recover(h.path(), &j).await.unwrap(), "unresolved");
+    let r = &receipts(&j).await[0];
+    assert_eq!(r.state, ReceiveState::Submitted, "SAFETY: partial restore");
+    assert_eq!(m.faults.swaps.load(SeqCst), 1, "SAFETY: no second swap");
+    assert_eq!(balance(h.path(), &m.url).await, 0);
+    m.faults.partial_restore.store(false, SeqCst);
+    assert!(!money::recover(h.path(), &j).await.unwrap());
+    assert_eq!(m.faults.swaps.load(SeqCst), 1);
+    assert_eq!(balance(h.path(), &m.url).await, 63, "SAFETY: credited once");
+}
+
+#[tokio::test]
+async fn cap_charges_gross_with_input_fees() {
+    let m = MintFixture::start(100).await;
+    let (_s, _, token) = issue(&m, 100).await;
+    let (h, j) = home().await;
+    let r = receive::receive(h.path(), &j, &m.url, &token)
+        .await
+        .unwrap();
+    assert!(r.fee > 0 && r.net < r.amount, "fixture charges a fee");
+    let e = money::fund(h.path(), &j, &m.url, 100_000 - r.net)
+        .await
+        .err()
+        .expect("SAFETY: the cap counts gross, not net");
+    assert!(format!("{e:#}").contains("receives"), "{e:#}");
+    money::fund(h.path(), &j, &m.url, 100_000 - r.amount)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn quarantined_receive_still_occupies_the_cap() {
+    let m = MintFixture::start(0).await;
+    let (_s, _, token) = issue(&m, 40).await;
+    let (h, j) = home().await;
+    m.faults.omit_dleq.store(true, SeqCst);
+    let r = receive::receive(h.path(), &j, &m.url, &token)
+        .await
+        .unwrap();
+    assert_eq!(r.state, ReceiveState::Quarantined);
+    assert_eq!(balance(h.path(), &m.url).await, 0);
+    m.faults.omit_dleq.store(false, SeqCst);
+    let Err(err) = money::fund(h.path(), &j, &m.url, 99_961).await else {
+        panic!("SAFETY: quarantined receive holds the cap");
+    };
+    assert!(
+        err.to_string().contains("receives"),
+        "cap error names receives: {err}"
+    );
+    money::fund(h.path(), &j, &m.url, 99_960).await.unwrap();
+}
+
+#[tokio::test]
+async fn refused_receive_does_not_consume_the_cap() {
+    let m = MintFixture::start(0).await;
+    let (_s, _, token) = issue(&m, 64).await;
+    let (h, j) = home().await;
+    m.faults.swap_nut_error.store(true, SeqCst);
+    let r = receive::receive(h.path(), &j, &m.url, &token)
+        .await
+        .unwrap();
+    assert_eq!(r.state, ReceiveState::Refused);
+    m.faults.swap_nut_error.store(false, SeqCst);
+    money::fund(h.path(), &j, &m.url, 100_000)
+        .await
+        .expect("refused receives do not count toward the cap");
+}
+
+#[tokio::test]
+async fn overlapping_ys_with_a_charged_receive_are_refused() {
+    let m = MintFixture::start(0).await;
+    let (_s, proofs, token) = issue(&m, 63).await;
+    assert!(proofs.len() > 1);
+    let (h, j) = home().await;
+    m.faults.lose_reply.store(true, SeqCst);
+    let r = receive::receive(h.path(), &j, &m.url, &token)
+        .await
+        .unwrap();
+    assert_eq!(r.state, ReceiveState::Submitted, "charged, unresolved");
+    m.faults.lose_reply.store(false, SeqCst);
+    let subset = encode(&m.url, proofs[..1].to_vec());
+    let swaps = m.faults.swaps.load(SeqCst);
+    let e = receive::receive(h.path(), &j, &m.url, &subset)
+        .await
+        .err()
+        .expect("SAFETY: overlapping Ys refused");
+    assert!(
+        format!("{e:#}").contains("overlaps earlier receive"),
+        "{e:#}"
+    );
+    assert_eq!(receipts(&j).await.len(), 1, "SAFETY: nothing journaled");
+    assert_eq!(m.faults.swaps.load(SeqCst), swaps, "SAFETY: no POST");
+}
+
+#[tokio::test]
+async fn cli_exit_codes_for_journaled_refused_and_quarantined() {
+    let m = MintFixture::start(0).await;
+    let (h, j) = home().await;
+    let (_s, proofs, token) = issue(&m, 40).await;
+    m.faults.swap_nut_error.store(true, SeqCst);
+    let out = cli(h.path(), &m.url, None, Some(&token), None).await;
+    assert_eq!(out.status.code(), Some(1), "SAFETY: refused exits 1");
+    assert_eq!(state_of(&out)["state"], "refused");
+    assert_secret_free(&out, &token, &proofs);
+    assert_eq!(receipts(&j).await[0].state, ReceiveState::Refused);
+    m.faults.swap_nut_error.store(false, SeqCst);
+    let (_s2, proofs2, token2) = issue(&m, 24).await;
+    m.faults.omit_dleq.store(true, SeqCst);
+    let out = cli(h.path(), &m.url, None, Some(&token2), None).await;
+    assert_eq!(out.status.code(), Some(4), "SAFETY: quarantined exits 4");
+    assert_eq!(state_of(&out)["manual_recovery"], true);
+    assert_secret_free(&out, &token2, &proofs2);
+    m.faults.omit_dleq.store(false, SeqCst);
+    // status: same public fields as recover for receives, never the token.
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
+        .args(["--home", h.path().to_str().unwrap(), "status"])
+        .output()
+        .unwrap();
+    assert_secret_free(&status, &token2, &proofs2);
+    let v: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let rec = v["records"].as_array().unwrap();
+    let q = rec.iter().find(|r| r["state"] == "quarantined").unwrap();
+    for k in ["state", "terminal", "manual_recovery", "amount", "credited"] {
+        assert!(!q[k].is_null(), "status receive lacks {k}: {q}");
+    }
+    assert_eq!(
+        (q["kind"].as_str(), q["terminal"].as_bool()),
+        (Some("receive"), Some(true))
+    );
+    assert_eq!(q["manual_recovery"], true);
+    assert_eq!(q["credited"], 0);
+    assert!(q.get("token").is_none() && q.get("inputs").is_none());
+}
+
+#[cfg(feature = "lab")]
+#[tokio::test]
+async fn cli_exit_1_for_journaled_already_spent() {
+    let m = MintFixture::start(0).await;
+    let (_s, proofs, token) = issue(&m, 40).await;
+    let (h, j) = home().await;
+    let out = cli(
+        h.path(),
+        &m.url,
+        None,
+        Some(&token),
+        Some("TRADE_CRASH_BEFORE_RECEIVE_SWAP"),
+    )
+    .await;
+    assert_eq!(out.status.code(), Some(87));
+    let (other, jo) = home().await;
+    receive::receive(other.path(), &jo, &m.url, &token)
+        .await
+        .unwrap();
+    let out = cli(h.path(), &m.url, None, Some(&token), None).await;
+    assert_eq!(out.status.code(), Some(1), "SAFETY: already_spent exits 1");
+    assert_eq!(state_of(&out)["state"], "already_spent");
+    assert_secret_free(&out, &token, &proofs);
+    assert_eq!(receipts(&j).await[0].state, ReceiveState::AlreadySpent);
+}
+
+#[cfg(feature = "lab")]
+#[tokio::test]
+async fn failed_terminal_journal_write_exits_3_and_journal_unchanged() {
+    let m = MintFixture::start(0).await;
+    let (_s, proofs, token) = issue(&m, 40).await;
+    let (h, j) = home().await;
+    m.faults.swap_nut_error.store(true, SeqCst);
+    let out = cli(
+        h.path(),
+        &m.url,
+        None,
+        Some(&token),
+        Some("TRADE_FAIL_RECEIVE_TERMINAL_WRITE"),
+    )
+    .await;
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "SAFETY: an unpersisted refusal is not reported as refused: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        state_of(&out)["state"],
+        "submitted",
+        "SAFETY: printed state = journal"
+    );
+    assert_secret_free(&out, &token, &proofs);
+    assert_eq!(receipts(&j).await[0].state, ReceiveState::Submitted);
+    // Without the fault the refusal is journaled and reported.
+    let out = cli(h.path(), &m.url, None, Some(&token), None).await;
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(receipts(&j).await[0].state, ReceiveState::Refused);
+}
