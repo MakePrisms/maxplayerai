@@ -361,6 +361,52 @@ mod tests {
         assert_eq!(wallet_bound("https://mint.example"), HTTP_WALLET_TIMEOUT);
     }
     #[test]
+    fn nostr_claim_size_bound() {
+        let npub = "nostr://npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d";
+        let key = || SecretKey::generate().public_key().to_string();
+        let c = crate::mint::conditions(&"ab".repeat(32), &key(), &key(), u64::MAX / 2).unwrap();
+        let keyset = Id::from_bytes(&[0, 1, 2, 3, 4, 5, 6, 7]).unwrap();
+        let lock = |n: usize| -> Proofs {
+            (0..n)
+                .map(|_| {
+                    let secret: cashu::nuts::nut10::Secret = c.clone().into();
+                    cashu::nuts::Proof::new(
+                        (1u64 << 40).into(),
+                        keyset,
+                        secret.try_into().unwrap(),
+                        SecretKey::generate().public_key(),
+                    )
+                })
+                .collect()
+        };
+        // Largest lock whose claim fits, found by search; the next one must be refused.
+        let n = (1..=NOSTR_MAX_IO)
+            .take_while(|&n| check_claim_fits(npub, &lock(n), 8).is_ok())
+            .last()
+            .unwrap();
+        assert!(n < NOSTR_MAX_IO, "fixture: size, not count, binds");
+        let over = lock(n + 1);
+        assert!(
+            check_claim_fits(npub, &over, 8).is_err(),
+            "SAFETY: claim of {} proofs refused",
+            n + 1
+        );
+        // The same proofs WITHOUT the claim witness would still fit: the bound must count the
+        // per-input preimage + signature, or an admitted lock could be unclaimable.
+        let blinded = SecretKey::generate().public_key();
+        let bare = SwapRequest::new(
+            over,
+            (0..8)
+                .map(|_| BlindedMessage::new(u64::MAX.into(), keyset, blinded))
+                .collect(),
+        );
+        assert!(
+            check_swap_fits(npub, &bare).is_ok(),
+            "SAFETY: witness bytes must be counted in the claim bound"
+        );
+        assert!(check_claim_fits("https://mint.example", &lock(129), 8).is_ok());
+    }
+    #[test]
     fn mint_relays_fenced_and_bounded() {
         assert!(
             check_mint_relay("wss://relay.maxplayer.ai").is_err(),
