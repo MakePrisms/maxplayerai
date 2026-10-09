@@ -112,6 +112,93 @@ async fn lost_swap_reply_restores_same_outputs_without_second_swap() {
 }
 
 #[tokio::test]
+async fn lost_reply_resolved_by_restore_alone_without_nut07() {
+    let m = MintFixture::start(0).await;
+    let (a, ja) = funded(&m, 64).await;
+    let out = a.path().join("t");
+    m.faults.lose_reply.store(true, SeqCst);
+    let r = send::send(a.path(), &ja, &m.url, 64, &out, None)
+        .await
+        .unwrap();
+    assert_eq!(r.state, SendState::Submitted);
+    m.faults.lose_reply.store(false, SeqCst);
+    // NUT-07 is down: restore of the SAME outputs must settle it on its own.
+    m.faults.reject_checkstate.store(true, SeqCst);
+    let done = send::send(a.path(), &ja, &m.url, 64, &out, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        done.state,
+        SendState::Sent,
+        "SAFETY: restore is checked first"
+    );
+    assert_eq!(m.faults.swaps.load(SeqCst), 1, "SAFETY: no second swap");
+    assert_eq!(Some(read(&out)), journaled_token(&ja, &r.id).await);
+}
+
+#[tokio::test]
+async fn over_cap_refused_even_with_balance() {
+    let m = MintFixture::start(0).await;
+    let (a, ja) = funded(&m, 100_010).await;
+    let out = a.path().join("t");
+    let e = send::send(a.path(), &ja, &m.url, 100_001, &out, None)
+        .await
+        .err()
+        .expect("SAFETY: per-send cap");
+    assert!(format!("{e:#}").contains("100,000"), "{e:#}");
+    assert!(attempts(&ja).await.is_empty() && !out.exists());
+    assert_eq!(m.faults.swaps.load(SeqCst), 0);
+    let ok = send::send(a.path(), &ja, &m.url, 100_000, &out, None)
+        .await
+        .unwrap();
+    assert_eq!(ok.state, SendState::Sent, "cap is inclusive");
+}
+
+#[tokio::test]
+async fn reclaim_after_partial_redemption_returns_only_the_rest() {
+    let m = MintFixture::start(0).await;
+    let (a, ja) = funded(&m, 3).await;
+    let out = a.path().join("t");
+    let r = send::send(a.path(), &ja, &m.url, 3, &out, None)
+        .await
+        .unwrap();
+    let proofs = Token::from_str(&read(&out))
+        .unwrap()
+        .proofs(
+            &wallet::wallet(a.path(), &m.url)
+                .await
+                .unwrap()
+                .get_mint_keysets(cdk::wallet::KeysetFilter::All)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(proofs.len(), 2, "fixture: 1 + 2");
+    let one: Vec<_> = proofs
+        .into_iter()
+        .filter(|p| u64::from(p.amount) == 1)
+        .collect();
+    let part = Token::new(
+        MintUrl::from_str(&m.url).unwrap(),
+        one,
+        None,
+        CurrencyUnit::Sat,
+    );
+    let (b, jb) = home().await;
+    receive::receive(b.path(), &jb, &m.url, &part.to_string())
+        .await
+        .unwrap();
+    let back = send::reclaim(a.path(), &ja, &r.id, None).await.unwrap();
+    assert_eq!(
+        back.state,
+        SendState::Reclaimed,
+        "SAFETY: unspent rest reclaimed"
+    );
+    assert_eq!(back.reclaimed, 2, "SAFETY: only the unredeemed proofs");
+    assert_eq!(balance(a.path(), &m.url).await, 2);
+}
+
+#[tokio::test]
 async fn refusals_have_no_side_effects() {
     let m = MintFixture::start(0).await;
     let (a, ja) = funded(&m, 64).await;
@@ -172,6 +259,14 @@ async fn refusals_have_no_side_effects() {
         locked,
         SecretKey::generate().public_key(),
     );
+    // A row held by another operation but still marked UNSPENT is excluded too.
+    let held_row = Proof::new(
+        2048.into(),
+        rows[0].proof.keyset_id,
+        cashu::secret::Secret::generate(),
+        SecretKey::generate().public_key(),
+    );
+    let op = uuid::Uuid::new_v4();
     db.update_proofs(
         vec![
             ProofInfo::new(
@@ -179,6 +274,15 @@ async fn refusals_have_no_side_effects() {
                 MintUrl::from_str(&m.url).unwrap(),
                 State::Unspent,
                 CurrencyUnit::Sat,
+            )
+            .unwrap(),
+            ProofInfo::new_with_operations(
+                held_row,
+                MintUrl::from_str(&m.url).unwrap(),
+                State::Unspent,
+                CurrencyUnit::Sat,
+                Some(op),
+                Some(op),
             )
             .unwrap(),
         ],
@@ -540,8 +644,41 @@ async fn crash_then_recover(var: &'static str, code: i32, swaps_at_crash: u64) {
 
 #[cfg(feature = "lab")]
 #[tokio::test]
+async fn recovery_never_overwrites_a_path_taken_after_the_crash() {
+    let m = MintFixture::start(0).await;
+    let (a, ja) = funded(&m, 32).await;
+    let out = a.path().join("t");
+    let o = out.to_str().unwrap();
+    let args = ["send", &m.url, "--amount", "8", "--out", o];
+    let crashed = cli(a.path(), &args, Some("TRADE_CRASH_BEFORE_SEND_FILE")).await;
+    assert_eq!(crashed.status.code(), Some(85));
+    std::fs::write(&out, "precious").unwrap();
+    let rec = cli(a.path(), &["recover"], None).await;
+    assert_eq!(
+        rec.status.code(),
+        Some(3),
+        "SAFETY: unresolved, not overwritten"
+    );
+    assert_eq!(read(&out), "precious", "SAFETY: never overwritten");
+    std::fs::remove_file(&out).unwrap();
+    let rec = cli(a.path(), &["recover"], None).await;
+    assert_eq!(rec.status.code(), Some(0));
+    let id = attempts(&ja).await[0].id.clone();
+    assert_eq!(Some(read(&out)), journaled_token(&ja, &id).await);
+    assert_eq!(m.faults.swaps.load(SeqCst), 1);
+}
+
+#[cfg(feature = "lab")]
+#[tokio::test]
 async fn crash_after_journal_before_post_then_recover_completes() {
     crash_then_recover("TRADE_CRASH_BEFORE_SEND_SWAP", 87, 0).await;
+}
+
+#[cfg(feature = "lab")]
+#[tokio::test]
+async fn crash_right_after_journal_before_reservation_then_recover_completes() {
+    // SAFETY: the intent is journaled before ANY wallet effect (reservation or POST).
+    crash_then_recover("TRADE_CRASH_AFTER_SEND_JOURNAL", 84, 0).await;
 }
 
 #[cfg(feature = "lab")]

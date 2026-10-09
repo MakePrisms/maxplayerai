@@ -371,6 +371,7 @@ pub async fn send(
         reclaimed: 0,
     };
     j.put("send", &r.id, &r).await?;
+    lab_crash("TRADE_CRASH_AFTER_SEND_JOURNAL", 84);
     if let Err(error) = reserve(home, &r).await {
         // Nothing was POSTed: record the refusal, then release anything held.
         finish(j, &mut r, SendState::Refused).await?;
