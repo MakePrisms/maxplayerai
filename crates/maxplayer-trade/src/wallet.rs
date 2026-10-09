@@ -192,7 +192,7 @@ pub fn read_status(home: &std::path::Path) -> Result<serde_json::Value> {
     let db =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     db.busy_timeout(std::time::Duration::from_secs(2))?;
-    let mut stmt = db.prepare("SELECT secondary_namespace, value FROM kv_store WHERE primary_namespace='trade-v1' AND secondary_namespace IN ('swap','funding','withdrawal','receive')")?;
+    let mut stmt = db.prepare("SELECT secondary_namespace, value FROM kv_store WHERE primary_namespace='trade-v1' AND secondary_namespace IN ('swap','funding','withdrawal','receive','send')")?;
     let mut records = vec![];
     for row in stmt.query_map([], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
@@ -201,6 +201,8 @@ pub fn read_status(home: &std::path::Path) -> Result<serde_json::Value> {
         let v: serde_json::Value = serde_json::from_slice(&bytes)?;
         let public = if kind == "withdrawal" {
             serde_json::from_slice::<crate::money::Withdrawal>(&bytes)?.summary()
+        } else if kind == "send" {
+            crate::send::public(&bytes)?
         } else {
             serde_json::json!({"kind":kind,"id":v["id"],"state":v["state"],"done":v["done"],"expired_unpaid":v["expired_unpaid"]})
         };

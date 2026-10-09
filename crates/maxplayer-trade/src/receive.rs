@@ -362,7 +362,7 @@ async fn restore(r: &Receipt) -> Result<Option<Vec<BlindSignature>>> {
 
 /// A well-formed NUT error (HTTP 400) is a refusal of THIS request; transport errors,
 /// timeouts, 429 and 5xx are ambiguous. `mint::rpc` withholds the body.
-fn nut_error(e: &anyhow::Error) -> bool {
+pub(crate) fn nut_error(e: &anyhow::Error) -> bool {
     e.chain()
         .all(|c| c.downcast_ref::<reqwest::Error>().is_none())
         && e.to_string().contains(" swap: HTTP 400 ")

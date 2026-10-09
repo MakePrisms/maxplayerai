@@ -645,6 +645,28 @@ never argv) imports one token, e.g. one written by `maxplayer-mint issue`. Code:
   `cdk_token_parsing_accepts_nostr_mint_url`), but this crate's `Asset::new` admits only
   http/https, so a nostr:// receive is refused until the nostr transport branch lands.
 
+## Send (export a Cashu token)
+
+`maxplayer-trade --home <home> send <mint> --amount <sats> --out <path> [--max-fees <sats>]`
+writes one single-mint V4 token for exactly `<amount>` sats to a new 0600 file. It is the
+counterpart to `receive`, for moving funds to another wallet without Lightning. Code: `src/send.rs`.
+
+- Refused before any journal write: amount 0 or > 100,000 sats, insufficient ordinary balance
+  (reserved and locked proofs never count), input fee above `--max-fees` (required unless the
+  fee is 0), an existing `--out` path (never overwritten), failed preflight, non-UNSPENT inputs.
+- One swap of the selected inputs into the exact send outputs plus change. Inputs, blinded
+  outputs and secrets are journaled and the inputs reserved before the POST. Ambiguity → NUT-09
+  restore of the same outputs and identical replay only. A NUT error with inputs UNSPENT is
+  terminal `refused` (inputs released). Missing/invalid DLEQ is `quarantined` (exit 4).
+- The token is built only from DLEQ-verified outputs, journaled, then written (O_EXCL temp,
+  fsync, hard link to `--out`). `recover`/`serve` rewrite that same token after a crash.
+  Rerunning with the same `--out` resumes; it never sends twice. Output: attempt id, mint,
+  state, amount, fee; never the token.
+- `send --reclaim <id>` swaps still-UNSPENT sent proofs back (same journaling); if all are SPENT
+  it reports "redeemed by recipient". `status --check-sends` performs the on-demand NUT-07 check.
+- Mint calls use `mint::rpc`/`states`/`unspent`, `wallet::preflight` and the `wallet()` builder,
+  so the nostr transport branch reroutes send with no send-specific change.
+
 ## Funding and withdrawals
 
 This path is **not a production safety certification**. Public-mint results, if any, belong in

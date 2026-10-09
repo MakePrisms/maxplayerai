@@ -1073,6 +1073,11 @@ pub async fn recovery_status(j: &Journal, mut unresolved: bool) -> Result<()> {
         manual |= r.state == crate::receive::ReceiveState::Quarantined;
         println!("{}", r.summary());
     }
+    for r in j.all::<crate::send::SendAttempt>("send").await? {
+        unresolved |= !r.terminal();
+        manual |= r.manual_recovery();
+        println!("{}", r.summary());
+    }
     println!(
         "{}",
         serde_json::json!({"status":if unresolved {"recovery_incomplete"} else {"recovery_complete"}})

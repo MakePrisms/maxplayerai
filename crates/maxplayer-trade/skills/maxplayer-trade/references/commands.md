@@ -15,9 +15,10 @@ Canonical command signatures (placeholders are not literal values):
 ```text
 preflight <mint>
 balance <mint>
-status
+status [--check-sends]
 fund <mint> --amount <sats> [--quote <quote-id>]
 receive <mint> [--token-file <path>]
+send (<mint> --amount <sats> --out <path> | --reclaim <send-id>) [--max-fees <sats>]
 list --give-mint <mint> --give <net-sats> --want-mint <mint> --want <net-sats> --max-fees <sats>
 discover
 serve
@@ -31,7 +32,7 @@ Use `-h` / `--help` at the root or on any application subcommand. The built-in
 `help [COMMAND]` also shows root or command help. There is no version option.
 `--home <HOME>` is required for operational commands; `--relay <RELAY>` is
 repeatable. All command-specific flags in the signatures above are required except
-`--quote`, `--max-debit`, `--token-file` (stdin when omitted), and `--max-fees` (default 16 on list/take). Positional mint arguments are
+`--quote`, `--max-debit`, `--token-file` (stdin when omitted), `--check-sends`, and `--max-fees` (default 16 on list/take; on send it is required unless the mint's input fee is 0). `send` takes either `<mint> --amount --out` or `--reclaim <send-id>`. Positional mint arguments are
 canonical URLs; lot arguments are public lot IDs; `--quote` is a saved funding
 quote for the same mint and amount.
 Never use a lab-feature binary for the human's funds.
@@ -105,6 +106,31 @@ Only DLEQ-verified result proofs are credited. Output is one JSON line with
 the token or proofs. Repeating the same token (any encoding) resumes the same
 attempt and never swaps twice. Exit 0 `done`; 3 unresolved (`prepared`/`submitted`);
 1 pre-journal refusal, `refused` or `already_spent`; 4 `quarantined`.
+
+## Send (export a token)
+
+`send <mint> --amount <sats> --out <path> --max-fees <sats>` writes one single-mint V4
+token for exactly `<amount>` sats to a NEW file (mode 0600, created exclusively; an
+existing path, including a symlink, is refused). The token is never printed and never
+accepted through argv. Only ordinary unreserved balance is spent: locked HTLC/P2PK
+proofs and proofs reserved by a swap, withdrawal, receive or send are excluded. The
+mint input fee is paid by the sender; `--max-fees` is required unless it is 0. Refused
+**before anything is journaled**: amount above **100,000 sats**, insufficient balance,
+fee above `--max-fees`, existing `--out`, failed preflight or non-UNSPENT inputs.
+
+One swap of the selected inputs into the exact send outputs plus change; inputs,
+outputs and secrets are journaled before the POST. Ambiguity → NUT-09 restore of the
+same outputs and identical replay only. The file is written only after the swap is
+definitive and every output verifies DLEQ; the token is kept in the private journal so
+`recover` rewrites the same token after a crash. Rerunning the same command with the
+same `--out` resumes that attempt; it never sends twice. Output: one JSON line with
+`send` (attempt id), `mint`, `state`, `amount`, `fee`. Exit 0 `sent`; 3 unresolved;
+1 refusal, `refused` or `redeemed`; 4 manual recovery.
+
+Until the recipient redeems it, `send --reclaim <send-id>` swaps the still-UNSPENT
+proofs back (same journaling; fee needs `--max-fees` unless 0). If they are already
+SPENT it reports "redeemed by recipient" and refunds nothing. `status --check-sends`
+asks each mint (NUT-07) whether sent tokens were redeemed; plain `status` is offline.
 
 ## Withdrawal: enforcement before execution
 

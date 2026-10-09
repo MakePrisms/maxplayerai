@@ -23,7 +23,7 @@ receiver claims remain valid after locktime. Keep the watcher alive.
 ## Bounded pass and exit status
 
 `recover` makes one pass without waiting for future lock deadlines. Each funding,
-withdrawal, receive, and swap attempt has a **120-second** budget; this is not a 120-second
+withdrawal, receive, send, and swap attempt has a **120-second** budget; this is not a 120-second
 whole-command deadline. Items are handled sequentially and relay/setup/publication
 work is additional. A timeout does not undo a delivered RPC or release reservations.
 
@@ -109,6 +109,20 @@ serve/recover/market commands; a post-POST timeout is still unresolved, not fail
 
 Inputs reported PENDING keep the attempt unresolved. A lost swap reply is never
 answered with replacement outputs.
+
+## Send states
+
+| State | Meaning and action |
+| --- | --- |
+| `prepared` / `submitted` | Inputs reserved; swap may have reached the mint. Recovery restores (NUT-09) the same outputs and replays only the identical swap. Never start another send for the same funds. |
+| `swapped` | Swap definitive and verified; change commit and/or token file pending. Recovery writes the SAME journaled token to the same `--out`. |
+| `sent` | Token file written; amount left the balance. Reclaimable with `send --reclaim <id>` until redeemed. |
+| `refused` | Terminal: NUT error with inputs UNSPENT; inputs released, nothing sent. |
+| `reclaiming` | Reclaim journaled; recovery restores/replays it identically. |
+| `reclaimed` / `redeemed` | Terminal: unspent proofs came back / recipient redeemed everything, nothing refunded. |
+| `inputs_spent`, `quarantined`, `reclaim_quarantined` | Terminal manual recovery (exit 4): inputs spent without our outputs, or outputs failed DLEQ. No token written or credit made. Preserve the home and escalate. |
+
+If `--out` was moved or replaced before recovery wrote it, the attempt stays unresolved; free the path, never edit the journal.
 
 ## Funding and market status are separate
 

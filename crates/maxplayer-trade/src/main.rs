@@ -80,8 +80,28 @@ enum Command {
         #[arg(long)]
         token_file: Option<PathBuf>,
     },
+    /// Export exactly --amount sats as a Cashu token file (0600, never overwritten; max 100,000), or --reclaim an unredeemed send.
+    Send {
+        #[arg(required_unless_present = "reclaim", conflicts_with = "reclaim")]
+        mint: Option<String>,
+        #[arg(long, required_unless_present = "reclaim", conflicts_with = "reclaim")]
+        amount: Option<u64>,
+        /// New token file; the token is never printed.
+        #[arg(long, required_unless_present = "reclaim", conflicts_with = "reclaim")]
+        out: Option<PathBuf>,
+        /// Maximum mint input fee, in sats; required unless the mint charges none.
+        #[arg(long)]
+        max_fees: Option<u64>,
+        /// Send attempt id whose still-unspent proofs return to this wallet.
+        #[arg(long)]
+        reclaim: Option<String>,
+    },
     /// Read public journal states without locking the home or advancing payments.
-    Status,
+    Status {
+        /// Also ask each mint (NUT-07) whether sent tokens were redeemed.
+        #[arg(long)]
+        check_sends: bool,
+    },
     /// Read spendable wallet balance without submitting existing money authorizations.
     Balance { mint: String },
 }
@@ -115,8 +135,11 @@ async fn execute() -> Result<()> {
         );
         return Ok(());
     }
-    if matches!(cli.command, Command::Status) {
+    if let Command::Status { check_sends } = cli.command {
         println!("{}", maxplayer_trade::wallet::read_status(&cli.home)?);
+        if check_sends {
+            maxplayer_trade::send::check_redeemed(&cli.home).await?;
+        }
         return Ok(());
     }
     fs::create_dir_all(&cli.home)?;
@@ -153,6 +176,7 @@ async fn execute() -> Result<()> {
             | Command::Balance { .. }
             | Command::Withdraw { .. }
             | Command::Receive { .. }
+            | Command::Send { .. }
     ) {
         let keys = maxplayer_trade::wallet::identity(&cli.home)?;
         let relays = if cli.relay.is_empty() {
@@ -224,6 +248,25 @@ async fn execute() -> Result<()> {
             Command::Recover => coordinator::recover_until_settled(&cli.home, &j, &mut m).await,
             _ => unreachable!(),
         };
+    }
+    if let Command::Send {
+        mint,
+        amount,
+        out,
+        max_fees,
+        reclaim,
+    } = &cli.command
+    {
+        return maxplayer_trade::send::command(
+            &cli.home,
+            &money_journal,
+            mint.as_deref(),
+            *amount,
+            out.as_deref(),
+            *max_fees,
+            reclaim.as_deref(),
+        )
+        .await;
     }
     let mint_arg = match &cli.command {
         Command::Preflight { mint }
