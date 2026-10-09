@@ -21,6 +21,9 @@ reopened here:**
    by Bob. It does not appear in v1, and nothing in v1 relies on it. Its absence is a risk named in
    §8.
 4. Jobs (stage 2) and token trading (stage 3) come later.
+5. **Chat uses the home key** (Bob, #chat-feature, 9 Oct 2026 00:43 UTC): "the first thing the bot does
+   is add the chat feature, then upgrade to the job feature", so the identity stays the same. The npub
+   a friend approves for chat is the npub `maxplayer whoami` prints and the one jobs later use.
 
 ---
 
@@ -278,7 +281,7 @@ The draft PR for this spec is docs-only. Its checks are the repo's CI, and no pr
 
 | # | Question | Proposed default |
 |---|---|---|
-| Q1 | Chat identity: the home key, or a dedicated chat key? | **Home key.** The npub you share is the one `whoami` prints and the one stage 2 will trade with. Cost: the chat process holds a key that also derives the P2PK payment key (§4). |
+| ~~Q1~~ | Chat identity | **Decided: home key** (settled input 5). Accepted cost: the chat process holds a key that also derives the P2PK payment key, so it gets the daemons' 0600 handling (§4). |
 | Q2 | Reply engine: direct API call (needs an API key) or an ACP harness in docker with tools denied (works with subscriptions)? | **Direct API call** for v1. A harness path is a follow-up, once we can prove it is tool-less. |
 
 Smaller choices are fixed in the text: only the owner starts a conversation (`chat send`); owner
