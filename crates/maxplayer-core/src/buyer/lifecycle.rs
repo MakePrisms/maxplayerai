@@ -1774,7 +1774,7 @@ mod tests {
         let mints = vec![DEFAULT_MINT_URL.to_owned()];
         let mut matching = claim(&job, false, 40, &mints);
         matching.agents = vec!["claude".into()];
-        matching.capability.harness_families = vec!["claude".into()];
+        matching.capability.harness_families = vec!["claude-code".into()];
         matching.capability.capabilities = vec!["rust".into()];
         let mut incompatible = matching.clone();
         incompatible.claim_id = "d".repeat(64);

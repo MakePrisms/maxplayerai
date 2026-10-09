@@ -10963,7 +10963,7 @@ mod tests {
     fn claim_filtering_survives_capacity_retry_and_restart() {
         let mut asked = offer(5, Some(SELLER), NOW + 600);
         asked.requested_agent = Some("claude".into());
-        asked.requested_harness_family = Some("claude".into());
+        asked.requested_harness_family = Some("claude-code".into());
         asked.requested_model = Some("model-a".into());
         asked.required_capabilities = vec!["rust".into()];
         let root = temp_dir("claim-filter-restart");
