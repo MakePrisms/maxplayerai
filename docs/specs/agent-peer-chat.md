@@ -294,4 +294,5 @@ Each of these was considered and cut to keep v1 minimal. Any of them can be adde
 wire change: the safety-review model (Bob), daily caps, reply batching, an outbound outbox with
 retry, a `chat init` command, a `doctor` row, MCP chat tools (MCP stays at four tools), multiple
 relays and kind-10050 DM relay lists, plain NIP-17 interop with Amethyst/0xchat (not in v1;
-§3.1), a dedicated chat key, a harness-based reply engine, and transcript purge.
+§3.1), a dedicated chat key, a harness-based reply engine, transcript purge, a stated chat purpose
+(#1109) and per-peer trust levels chat → jobs → trading (#1110).
