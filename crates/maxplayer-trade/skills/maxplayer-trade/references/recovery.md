@@ -117,12 +117,16 @@ answered with replacement outputs.
 | State | Meaning and action |
 | --- | --- |
 | `prepared` / `submitted` | Inputs reserved; swap may have reached the mint. Recovery restores (NUT-09) the same outputs and replays only the identical swap. Never start another send for the same funds. |
-| `swapped` | Swap definitive and verified; change commit and/or token file pending. Recovery writes the SAME journaled token to the same `--out`. |
+| `swapped` | Swap definitive and verified; change commit and/or token file pending. Recovery writes the SAME journaled token to the same `--out`. If the file can never be placed (unwritable directory, no hard links), `send --reclaim <id>` takes the value back. |
 | `sent` | Token file written; amount left the balance. Reclaimable with `send --reclaim <id>` until redeemed. |
-| `refused` | Terminal: NUT error with inputs UNSPENT; inputs released, nothing sent. |
+| `refused` | Terminal: definitive NUT error (allowlisted code) with inputs UNSPENT, or a `prepared` send whose inputs another command already spent; inputs released, nothing sent. `50000`, 11002, 11004 and unknown codes stay `submitted`. |
 | `reclaiming` | Reclaim journaled; recovery restores/replays it identically. |
 | `reclaimed` / `redeemed` | Terminal: unspent proofs came back / recipient redeemed everything, nothing refunded. |
-| `inputs_spent`, `quarantined`, `reclaim_quarantined` | Terminal manual recovery (exit 4): inputs spent without our outputs, or outputs failed DLEQ. No token written or credit made. Preserve the home and escalate. |
+| `inputs_spent`, `quarantined` | Terminal manual recovery (exit 4): inputs spent without our outputs, or outputs failed DLEQ. No token written. Preserve the home and escalate. |
+| `reclaim_quarantined` | Terminal manual recovery (exit 4): the send token was already written; the reclaim outputs failed DLEQ and were not credited. Escalate. |
+| `reclaim_unresolved` | Terminal manual recovery (exit 4): every reclaim input is SPENT and our reclaim outputs were absent on two passes (recipient redeemed first, or the mint's restore lags). Reclaim secrets stay journaled for a manual NUT-09 restore. Escalate. |
+
+A reclaim that is refused or races a partial redemption returns to `sent` (exit 1, "still outstanding"): run `send --reclaim <id>` again. `status --check-sends` prints `redeemed`, `unredeemed`, `pending`, `partially_redeemed` (reclaim the rest) or `unknown` (mint not reachable).
 
 If `--out` was moved or replaced before recovery wrote it, the attempt stays unresolved; free the path, never edit the journal.
 

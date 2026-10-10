@@ -355,6 +355,10 @@ pub struct Withdrawal {
     pub change: Option<u64>,
 }
 impl Withdrawal {
+    /// Journaled inputs (selection exclusion for other wallet operations).
+    pub(crate) fn inputs(&self) -> &Proofs {
+        &self.inputs
+    }
     pub fn terminal(&self) -> bool {
         matches!(
             self.state,

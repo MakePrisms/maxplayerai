@@ -103,6 +103,9 @@ pub struct Swap {
     #[serde(default)]
     pub refund_generation: u32,
 }
+pub(crate) fn swap_terminal(s: &Swap) -> bool {
+    terminal(s)
+}
 fn terminal(s: &Swap) -> bool {
     [
         "complete",

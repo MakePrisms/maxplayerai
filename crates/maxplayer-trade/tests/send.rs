@@ -809,3 +809,242 @@ async fn reclaim_journal_write_failure_is_not_reported_reclaimed() {
     assert_eq!(done[0].state, SendState::Reclaimed);
     assert_eq!(balance(a.path(), &m.url).await, 64, "SAFETY: credited once");
 }
+
+// ---- Review round 2 ----
+
+async fn sent(m: &MintFixture, a: &Path, ja: &Journal, n: u64, name: &str) -> SendAttempt {
+    let r = send::send(a, ja, &m.url, n, &a.join(name), None)
+        .await
+        .unwrap();
+    assert_eq!(r.state, SendState::Sent);
+    r
+}
+
+/// Advisor #1: a delivered (removed) token file never authorizes a second send.
+#[tokio::test]
+async fn same_out_after_file_removed_rewrites_same_token_never_resends() {
+    let m = MintFixture::start(0).await;
+    let (a, ja) = funded(&m, 32).await;
+    let r = sent(&m, a.path(), &ja, 8, "t").await;
+    let out = a.path().join("t");
+    let token = read(&out);
+    std::fs::remove_file(&out).unwrap();
+    let again = send::send(a.path(), &ja, &m.url, 8, &out, None)
+        .await
+        .unwrap();
+    assert_eq!(again.id, r.id, "SAFETY: same attempt");
+    assert_eq!(attempts(&ja).await.len(), 1, "SAFETY: no second send");
+    assert_eq!(m.faults.swaps.load(SeqCst), 1, "SAFETY: one swap");
+    assert_eq!(balance(a.path(), &m.url).await, 24, "SAFETY: debited once");
+    assert_eq!(read(&out), token, "SAFETY: same token rewritten");
+    assert_eq!(mode(&out), 0o600);
+    assert!(
+        send::send(a.path(), &ja, &m.url, 9, &out, None)
+            .await
+            .is_err(),
+        "SAFETY: other terms on a used --out refused"
+    );
+    send::reclaim(a.path(), &ja, &r.id, None).await.unwrap();
+    std::fs::remove_file(&out).unwrap();
+    assert!(
+        send::send(a.path(), &ja, &m.url, 8, &out, None)
+            .await
+            .is_err(),
+        "SAFETY: a reclaimed send's --out is never reused"
+    );
+    assert_eq!(balance(a.path(), &m.url).await, 32);
+}
+
+/// Advisor #3: a refused reclaim leaves the token outstanding: exit 1 with clear
+/// text, state `sent`, and a later reclaim succeeds.
+#[tokio::test]
+async fn refused_reclaim_cli_reports_still_outstanding_and_retries() {
+    let m = MintFixture::start(0).await;
+    let (a, ja) = funded(&m, 32).await;
+    let r = sent(&m, a.path(), &ja, 8, "t").await;
+    m.faults.swap_nut_error.store(true, SeqCst);
+    let out = cli(a.path(), &["send", "--reclaim", &r.id], None).await;
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("still outstanding"), "{err}");
+    assert!(!err.contains("unexpected send state"), "{err}");
+    let printed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(printed["state"], "sent");
+    assert_eq!(attempts(&ja).await[0].state, SendState::Sent);
+    m.faults.swap_nut_error.store(false, SeqCst);
+    let out = cli(a.path(), &["send", "--reclaim", &r.id], None).await;
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(balance(a.path(), &m.url).await, 32, "SAFETY: credited once");
+}
+
+/// Advisor #2: inputs SPENT with our reclaim outputs absent never drops the reclaim
+/// leg; after a second absent pass it becomes manual recovery with secrets kept.
+#[tokio::test]
+async fn reclaim_inputs_spent_keeps_secrets_and_needs_manual_recovery() {
+    let m = MintFixture::start(0).await;
+    let (a, ja) = funded(&m, 32).await;
+    let r = sent(&m, a.path(), &ja, 8, "t").await;
+    let token = read(&a.path().join("t"));
+    m.faults.reject_swap.store(true, SeqCst);
+    let pending = send::reclaim(a.path(), &ja, &r.id, None).await.unwrap();
+    assert_eq!(pending.state, SendState::Reclaiming);
+    m.faults.reject_swap.store(false, SeqCst);
+    let (b, jb) = home().await;
+    receive::receive(b.path(), &jb, &m.url, &token)
+        .await
+        .unwrap();
+    let raw = || async {
+        ja.get::<serde_json::Value>("send", &r.id)
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    assert!(money::recover(a.path(), &ja).await.unwrap(), "one pass");
+    assert_eq!(attempts(&ja).await[0].state, SendState::Reclaiming);
+    assert!(
+        !raw().await["reclaim"].is_null(),
+        "SAFETY: leg kept on first absence"
+    );
+    money::recover(a.path(), &ja).await.unwrap();
+    let r2 = &attempts(&ja).await[0];
+    assert_eq!(r2.state, SendState::ReclaimUnresolved);
+    assert!(r2.manual_recovery());
+    let leg = &raw().await["reclaim"];
+    assert!(
+        leg["outputs"].as_array().is_some_and(|o| !o.is_empty()),
+        "SAFETY: reclaim secrets never dropped"
+    );
+    let out = cli(a.path(), &["recover"], None).await;
+    assert_eq!(out.status.code(), Some(4), "manual recovery exit");
+    assert_eq!(balance(a.path(), &m.url).await, 24, "nothing credited");
+}
+
+/// crd M1: a send stuck in `swapped` (token file cannot be placed) is reclaimable.
+#[cfg(feature = "lab")]
+#[tokio::test]
+async fn swapped_send_whose_file_cannot_be_placed_is_reclaimable() {
+    let m = MintFixture::start(0).await;
+    let (a, ja) = funded(&m, 32).await;
+    let out = a.path().join("t");
+    let o = out.to_str().unwrap();
+    let args = ["send", &m.url, "--amount", "8", "--out", o];
+    let crashed = cli(a.path(), &args, Some("TRADE_CRASH_BEFORE_SEND_FILE")).await;
+    assert_eq!(crashed.status.code(), Some(85));
+    std::fs::write(&out, "precious").unwrap();
+    assert!(money::recover(a.path(), &ja).await.unwrap(), "stuck");
+    let id = attempts(&ja).await[0].id.clone();
+    let back = cli(a.path(), &["send", "--reclaim", &id], None).await;
+    assert_eq!(
+        back.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&back.stderr)
+    );
+    assert_eq!(attempts(&ja).await[0].state, SendState::Reclaimed);
+    assert_eq!(
+        balance(a.path(), &m.url).await,
+        32,
+        "SAFETY: value back once"
+    );
+    assert_eq!(read(&out), "precious", "SAFETY: never overwritten");
+    assert!(!money::recover(a.path(), &ja).await.unwrap());
+}
+
+/// crd M2: inputs of a journaled-but-unreserved send are never selected again.
+#[cfg(feature = "lab")]
+#[tokio::test]
+async fn journaled_unreserved_inputs_are_excluded_from_a_new_send() {
+    let m = MintFixture::start(0).await;
+    let (a, ja) = funded(&m, 64).await;
+    let o = a.path().join("t");
+    let args = [
+        "send",
+        &m.url,
+        "--amount",
+        "20",
+        "--out",
+        o.to_str().unwrap(),
+    ];
+    let crashed = cli(a.path(), &args, Some("TRADE_CRASH_AFTER_SEND_JOURNAL")).await;
+    assert_eq!(crashed.status.code(), Some(84));
+    let held = attempts(&ja).await[0].id.clone();
+    // Both selections go smallest-first, so without the exclusion this send would
+    // take the journaled send's unreserved inputs and wedge or refuse it.
+    let other = send::send(a.path(), &ja, &m.url, 8, &a.path().join("u"), None)
+        .await
+        .unwrap();
+    assert_eq!(other.state, SendState::Sent);
+    assert!(!money::recover(a.path(), &ja).await.unwrap());
+    let first = attempts(&ja)
+        .await
+        .into_iter()
+        .find(|r| r.id == held)
+        .unwrap();
+    assert_eq!(
+        first.state,
+        SendState::Sent,
+        "SAFETY: journaled send keeps its inputs"
+    );
+    assert_eq!(balance(a.path(), &m.url).await, 64 - 20 - 8);
+    assert_eq!(m.faults.swaps.load(SeqCst), 2);
+}
+
+/// crd M2 (a): a `prepared` send whose inputs were spent by another command is
+/// refused (nothing was POSTed) instead of wedging forever.
+#[cfg(feature = "lab")]
+#[tokio::test]
+async fn prepared_send_whose_inputs_were_taken_is_refused() {
+    let m = MintFixture::start(0).await;
+    let (a, ja) = funded(&m, 64).await;
+    let o = a.path().join("t");
+    let args = [
+        "send",
+        &m.url,
+        "--amount",
+        "20",
+        "--out",
+        o.to_str().unwrap(),
+    ];
+    let crashed = cli(a.path(), &args, Some("TRADE_CRASH_AFTER_SEND_JOURNAL")).await;
+    assert_eq!(crashed.status.code(), Some(84));
+    let invoice = cdk_fake_wallet::create_fake_invoice(31_000, String::new()).to_string();
+    money::withdraw(a.path(), &ja, &m.url, &invoice)
+        .await
+        .unwrap();
+    money::recover(a.path(), &ja).await.unwrap();
+    assert_eq!(attempts(&ja).await[0].state, SendState::Refused);
+    assert_eq!(m.faults.swaps.load(SeqCst), 0, "SAFETY: never POSTed");
+    assert!(!money::recover(a.path(), &ja).await.unwrap(), "not wedged");
+    assert!(!o.exists());
+}
+
+/// crd L4: a token the recipient's input fee would consume is refused pre-journal.
+#[tokio::test]
+async fn dust_send_refused_before_journal() {
+    let m = MintFixture::start(1000).await;
+    let (a, ja) = funded(&m, 64).await;
+    let Err(e) = send::send(a.path(), &ja, &m.url, 1, &a.path().join("t"), Some(5)).await else {
+        panic!("SAFETY: dust send must be refused");
+    };
+    assert!(e.to_string().contains("uneconomic"), "{e}");
+    assert!(attempts(&ja).await.is_empty());
+    assert_eq!(m.faults.swaps.load(SeqCst), 0);
+}
+
+/// F2 on send: an ambiguous NUT code (50000) never releases the inputs.
+#[tokio::test]
+async fn ambiguous_50000_keeps_send_submitted() {
+    let m = MintFixture::start(0).await;
+    let (a, ja) = funded(&m, 32).await;
+    m.faults.swap_nut_code.store(50000, SeqCst);
+    m.faults.swap_nut_error.store(true, SeqCst);
+    let r = send::send(a.path(), &ja, &m.url, 8, &a.path().join("t"), None)
+        .await
+        .unwrap();
+    assert_eq!(r.state, SendState::Submitted, "SAFETY: 50000 is ambiguous");
+    assert!(balance(a.path(), &m.url).await < 32, "SAFETY: inputs held");
+    m.faults.swap_nut_error.store(false, SeqCst);
+    assert!(!money::recover(a.path(), &ja).await.unwrap());
+    assert_eq!(attempts(&ja).await[0].state, SendState::Sent);
+    assert_eq!(balance(a.path(), &m.url).await, 24);
+}
