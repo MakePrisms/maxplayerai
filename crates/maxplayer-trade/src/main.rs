@@ -304,7 +304,14 @@ async fn execute() -> Result<()> {
             // Journaled done but the credited rows are not yet released: run recover.
             Done => Err(coordinator::RecoveryIncomplete.into()),
             Quarantined => Err(coordinator::ManualRecovery.into()),
-            Refused => anyhow::bail!("receive refused by the mint; nothing credited"),
+            Refused => anyhow::bail!(
+                "receive refused by the mint ({}); final: the token was NOT imported, nothing \
+                 was credited or charged to the cap, and it can be redeemed elsewhere",
+                r.refusal_code
+                    .map_or("NUT code not journaled".to_owned(), |c| format!(
+                        "NUT code {c}"
+                    ))
+            ),
             AlreadySpent => anyhow::bail!("token already spent; nothing credited"),
             Prepared | Submitted => Err(coordinator::RecoveryIncomplete.into()),
         };

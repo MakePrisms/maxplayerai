@@ -1,9 +1,10 @@
 //! Import one plain-sat Cashu token into this home.
 //!
-//! Journal-before-effect: the token's inputs and our fresh blinded outputs with
-//! their secrets are journaled BEFORE the swap POST. Every later pass first restores
-//! (NUT-09) those exact outputs and only ever replays the identical swap; replacement
-//! outputs are never minted. Only DLEQ-verified proofs are credited.
+//! Journal-before-effect: the token's input proofs and our fresh blinded outputs with
+//! their secrets are journaled BEFORE the swap POST (the token text itself is not).
+//! Every later pass first restores (NUT-09) those exact outputs and only ever replays
+//! the identical swap; a second output set is never created. Only DLEQ-verified proofs
+//! are credited. A definitive refusal is FINAL (see [`ReceiveState::Refused`]).
 use crate::{
     journal::Journal,
     mint,
@@ -36,9 +37,12 @@ pub enum ReceiveState {
     Submitted,
     /// Terminal: DLEQ-verified proofs credited.
     Done,
-    /// Terminal for recovery: the mint returned a definitive NUT refusal
-    /// ([`mint::MintRefusal::definitive`]) and inputs remained UNSPENT. Repeating
-    /// `receive` with the same token retries the SAME journaled outputs.
+    /// Terminal and FINAL: the mint returned a definitive NUT refusal
+    /// ([`mint::MintRefusal::definitive`]) and a fresh probe found none of our outputs
+    /// and every input UNSPENT. Nothing is retried (not by `recover`, not by repeating
+    /// `receive`): against cdk 0.17.2 every allowlisted code is deterministic for the
+    /// same inputs and outputs, so the identical swap can never succeed (PR #1119,
+    /// review round 3). The token was not imported and can be redeemed elsewhere.
     Refused,
     /// Terminal: inputs SPENT elsewhere and none of our outputs restorable.
     AlreadySpent,
@@ -72,12 +76,20 @@ pub struct Receipt {
     /// released after `done` is journaled; true once that release ran.
     #[serde(default)]
     released: bool,
+    /// The definitive NUT code that made this record `refused`. `None` on records
+    /// written before round 3 (still final).
+    #[serde(default)]
+    pub refusal_code: Option<u64>,
 }
 
 impl Receipt {
     /// `done` and its credited rows released (spendable).
     pub fn settled(&self) -> bool {
         self.state == ReceiveState::Done && self.released
+    }
+    /// Recovery still owes work: non-terminal, or `done` with the release outstanding.
+    pub fn unresolved(&self) -> bool {
+        !self.terminal() || (self.state == ReceiveState::Done && !self.released)
     }
     pub fn terminal(&self) -> bool {
         matches!(
@@ -100,6 +112,7 @@ impl Receipt {
         serde_json::json!({"receive":self.id,"mint":self.mint,"state":self.state,
             "amount":self.amount,"fee":self.fee,"net":self.net,
             "credited":if self.state == ReceiveState::Done {self.net} else {0},
+            "settled":self.settled(),"refusal_code":self.refusal_code,
             "terminal":self.terminal(),"manual_recovery":self.state == ReceiveState::Quarantined})
     }
 }
@@ -215,8 +228,9 @@ async fn check_cap(j: &Journal, mint: &str, amount: u64) -> Result<()> {
 }
 
 /// Receive `raw` into `mint`. Repeat calls for the same Y-set resume the existing
-/// attempt and never swap twice. Errors before the journal write are refusals
-/// (nothing recorded). After it, the returned record's state is authoritative.
+/// attempt (identical swap only; a `refused` record is final and is returned as is).
+/// Errors before the journal write are refusals (nothing recorded). After it, the
+/// returned record's state is authoritative.
 pub async fn receive(home: &Path, j: &Journal, mint: &str, raw: &str) -> Result<Receipt> {
     let asset = crate::Asset::new(mint)?;
     asset.fence()?;
@@ -233,15 +247,7 @@ pub async fn receive(home: &Path, j: &Journal, mint: &str, raw: &str) -> Result<
         }
     }
     if let Some(mut r) = existing {
-        if r.state == ReceiveState::Refused {
-            // A refusal can be transient for this home (e.g. a keyset rotated while the
-            // attempt was prepared). An explicit repeat retries the SAME journaled
-            // outputs: one record per Y-set, so never two live attempts, and a late
-            // landing of any earlier POST stays restorable. Re-charge the cap first.
-            check_cap(j, mint, r.amount).await?;
-            crate::wallet::preflight(mint).await?;
-            finish(j, &mut r, ReceiveState::Submitted).await?;
-        }
+        // `refused` is terminal, so `resume` below only no-ops: a refusal is final.
         if let Err(error) = resume(home, j, &mut r).await {
             eprintln!("receive {}: {error:#}; attempt retained", r.id);
         }
@@ -331,6 +337,7 @@ pub async fn receive(home: &Path, j: &Journal, mint: &str, raw: &str) -> Result<
         outputs,
         result: None,
         released: false,
+        refusal_code: None,
     };
     j.put("receive", &r.id, &r).await?;
     if let Err(error) = resume(home, j, &mut r).await {
@@ -498,7 +505,14 @@ pub async fn resume(home: &Path, j: &Journal, r: &mut Receipt) -> Result<()> {
                     // our outputs (same probe as above, double restore included).
                     Err(error) if mint::definitive_refusal(&error) => match probe(r).await? {
                         Probe::Signed(s) => s,
-                        Probe::Unspent => return finish(j, r, ReceiveState::Refused).await,
+                        Probe::Unspent => {
+                            let mut next = r.clone();
+                            next.state = ReceiveState::Refused;
+                            next.refusal_code = mint::MintRefusal::of(&error).map(|e| e.code);
+                            persist(j, &next).await?;
+                            *r = next;
+                            return Ok(());
+                        }
                         Probe::Spent => return finish(j, r, ReceiveState::AlreadySpent).await,
                         Probe::Pending => {
                             return Err(error.context("inputs PENDING after refusal; retained"));
@@ -661,7 +675,7 @@ pub async fn pending(j: &Journal) -> Result<bool> {
     Ok(j.all::<Receipt>("receive")
         .await?
         .iter()
-        .any(|r| !r.terminal() || (r.state == ReceiveState::Done && !r.released)))
+        .any(Receipt::unresolved))
 }
 
 #[cfg(test)]
