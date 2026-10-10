@@ -973,6 +973,7 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
                 context.home.config.default_mint(),
                 context.home.config.allow_real_mints,
                 available,
+                &context.home.config.buyer.blocked_sellers,
             );
 
             // Manual award names the claim but applies the SAME hard filters as auto-award —
@@ -1732,6 +1733,7 @@ async fn drive_auto_award(
             context.home.config.default_mint(),
             context.home.config.allow_real_mints,
             available,
+            &context.home.config.buyer.blocked_sellers,
         );
 
         // Built AFTER `filters` so the deadline park can name the capability request that refused
@@ -3492,6 +3494,242 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    #[tokio::test]
+    async fn blocked_sellers_manual_refuses_before_reservation_or_publication() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_sdk::prelude::*;
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.unwrap();
+        for paid in [false, true] {
+            for self_trade in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let mut home = bootstrap_home(root.path()).unwrap();
+                std::fs::write(&home.key_path, format!("{:064x}", 1)).unwrap();
+                home.config.relay_url = relay.url().await.to_string();
+                let (e, buyer) = crate::private_content::public_v2::tests::fixture(paid, self_trade);
+                home.config.buyer.blocked_sellers = vec![e.claim.pubkey.to_hex()];
+                let publisher = Client::new(buyer);
+                publisher.add_relay(&home.config.relay_url).await.unwrap();
+                publisher.connect().await;
+                for event in [&e.offer, &e.claim] {
+                    assert!(
+                        !publisher
+                            .send_event(event)
+                            .await
+                            .unwrap()
+                            .success
+                            .is_empty()
+                    );
+                }
+                let job = e.offer.id.to_hex();
+                let claim = e.claim.id.to_hex();
+                let (_lock, context, _socket) = bootstrap(home).await.unwrap();
+                let response = award(
+                    &context,
+                    json!(1),
+                    json!({"job_id": job, "claim_id": claim}),
+                )
+                .await;
+                let response = serde_json::to_value(response).unwrap();
+                assert_eq!(response["error"]["code"], CODE_REFUSED, "{response}");
+                assert!(
+                    response["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("buyer.blocked_sellers"),
+                    "{response}"
+                );
+                assert!(context.store.reservation(&job).unwrap().is_none());
+                assert!(context.store.award_attempt(&job).unwrap().is_none());
+                assert!(context.store.award_record(&job).unwrap().is_none());
+                // The alternative core entry point cannot sign a new award either.
+                let error = job_lifecycle::prepare_award_async(
+                    &context.home,
+                    job_lifecycle::AwardClaimRequest {
+                        job_id: job.clone(),
+                        claim_id: claim,
+                    },
+                )
+                .await
+                .unwrap_err();
+                assert!(
+                    error.to_string().contains("buyer.blocked_sellers"),
+                    "{error}"
+                );
+                let events = publisher
+                    .fetch_events(
+                        Filter::new()
+                            .kind(Kind::Custom(crate::kinds::JOB_AWARD_KIND))
+                            .event(e.offer.id),
+                        Duration::from_secs(2),
+                    )
+                    .await
+                    .unwrap();
+                assert!(events.is_empty(), "blocked seller must receive no award");
+                publisher.disconnect().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_sellers_do_not_revoke_a_pinned_award_attempt() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_sdk::prelude::*;
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut home = bootstrap_home(root.path()).unwrap();
+        std::fs::write(&home.key_path, format!("{:064x}", 1)).unwrap();
+        home.config.relay_url = relay.url().await.to_string();
+        let (e, buyer) = crate::private_content::public_v2::tests::fixture(false, true);
+        home.config.buyer.blocked_sellers = vec![e.claim.pubkey.to_hex()];
+        let publisher = Client::new(buyer);
+        publisher.add_relay(&home.config.relay_url).await.unwrap();
+        publisher.connect().await;
+        for event in [&e.offer, &e.claim] {
+            assert!(
+                !publisher
+                    .send_event(event)
+                    .await
+                    .unwrap()
+                    .success
+                    .is_empty()
+            );
+        }
+        let job = e.offer.id.to_hex();
+        let (_lock, context, _socket) = bootstrap(home).await.unwrap();
+        context.store.reserve(&job, 0, 0, now_unix()).unwrap();
+        let pinned = store::AwardAttempt {
+            job_id: job.clone(),
+            claim_id: e.claim.id.to_hex(),
+            seller_pubkey: e.claim.pubkey.to_hex(),
+            award_event_id: e.award.id.to_hex(),
+            event_json: e.award.as_json(),
+            amount_sats: 0,
+            quoted_mints_json: "[]".into(),
+            offer_deadline_unix: 2_000_000_000,
+            send_count: 0,
+            relay_url: context.home.config.relay_url.clone(),
+            state: store::AttemptState::Pending,
+            detail: None,
+        };
+        context
+            .store
+            .begin_award_attempt(&pinned, now_unix())
+            .unwrap();
+        let response = award(&context, json!(1), json!({"job_id": job})).await;
+        assert!(response.error.is_none(), "{response:?}");
+        let after = context.store.award_attempt(&job).unwrap().unwrap();
+        assert_eq!(after.award_event_id, pinned.award_event_id);
+        assert_eq!(after.event_json, pinned.event_json);
+        assert_eq!(after.state, store::AttemptState::Confirmed);
+        assert_eq!(
+            context
+                .store
+                .award_record(&job)
+                .unwrap()
+                .unwrap()
+                .seller_pubkey,
+            pinned.seller_pubkey
+        );
+        publisher.disconnect().await;
+    }
+
+    #[tokio::test]
+    async fn blocked_sellers_auto_and_unnamed_manual_award_choose_older_allowed_claim() {
+        use crate::{gateway, private_content::public_v2};
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_sdk::prelude::*;
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.unwrap();
+        for automatic in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let mut home = bootstrap_home(root.path()).unwrap();
+            home.config.relay_url = relay.url().await.to_string();
+            let buyer = buyer_keys(&home).unwrap();
+            let allowed = Keys::generate();
+            // Exclude our own seller, even though its claim is newest.
+            home.config.buyer.blocked_sellers = vec![buyer.public_key().to_hex()];
+            let now = now_unix() as u64;
+            let sign = |keys: &Keys, draft: &gateway::EventDraft, at: u64| {
+                gateway::nostr::event_builder(draft)
+                    .unwrap()
+                    .custom_created_at(Timestamp::from(at))
+                    .sign_with_keys(keys)
+                    .unwrap()
+            };
+            let offer = sign(
+                &buyer,
+                &public_v2::offer_draft(
+                    gateway::OfferDraft::untargeted("blocklist test", "text/plain", 0, now + 600)
+                        .with_payment_mode(gateway::PaymentMode::None)
+                        .to_event_draft(),
+                )
+                .unwrap(),
+                now - 10,
+            );
+            let claim = |seller: &Keys, at| {
+                sign(
+                    seller,
+                    &public_v2::project(
+                        &offer,
+                        gateway::claim_draft(
+                            &offer.id.to_hex(),
+                            &buyer.public_key().to_hex(),
+                            &seller.public_key().to_hex(),
+                            gateway::ClaimPayment::None,
+                            &[],
+                            &Default::default(),
+                        ),
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                    at,
+                )
+            };
+            let older = claim(&allowed, now - 2);
+            let newest = claim(&buyer, now - 1);
+            let publisher = Client::new(buyer.clone());
+            publisher.add_relay(&home.config.relay_url).await.unwrap();
+            publisher.connect().await;
+            for event in [&offer, &older, &newest] {
+                assert!(
+                    !publisher
+                        .send_event(event)
+                        .await
+                        .unwrap()
+                        .success
+                        .is_empty()
+                );
+            }
+            let job = offer.id.to_hex();
+            let view = job_lifecycle::fetch_job_view_async(&home, &buyer, &job, RELAY_TIMEOUT, now)
+                .await
+                .unwrap();
+            assert_eq!(
+                view.claims[0].claim_id,
+                newest.id.to_hex(),
+                "fixture must put blocked claim first"
+            );
+            assert_eq!(view.claims.len(), 2);
+            let (_lock, context, _socket) = bootstrap(home).await.unwrap();
+            if automatic {
+                tokio::time::timeout(Duration::from_secs(30), drive_auto_award(&context, &job, 0))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            } else {
+                let response = award(&context, json!(1), json!({"job_id": job})).await;
+                assert!(response.error.is_none(), "{response:?}");
+            }
+            let record = context.store.award_record(&job).unwrap().unwrap();
+            assert_eq!(record.claim_id, older.id.to_hex());
+            assert_eq!(record.seller_pubkey, allowed.public_key().to_hex());
+            publisher.disconnect().await;
+        }
+    }
 
     // Drive the actual manual handler into a relay connection whose handshake never
     // completes. No sleeps or elapsed-time assertion: receiving the HTTP request is
