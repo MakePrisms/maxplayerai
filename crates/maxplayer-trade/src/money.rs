@@ -148,20 +148,20 @@ pub async fn fund(home: &Path, j: &Journal, url: &str, amount: u64) -> Result<Fu
         amount > 0 && amount <= crate::real_money::CAP,
         "funding cap exceeded"
     );
-    let total = j
-        .all::<Funding>("funding")
-        .await?
-        .iter()
-        .filter(|f| f.mint == url)
-        .try_fold(0u64, |s, f| {
-            s.checked_add(f.amount).context("funding overflow")
-        })?;
-    ensure!(
-        total
-            .checked_add(amount)
-            .is_some_and(|n| n <= crate::real_money::CAP),
-        "cumulative funding exceeds 100,000 sats"
-    );
+    let (funded, received) = crate::receive::cap_used(j, url).await?;
+    let total = funded.checked_add(received).context("funding overflow")?;
+    if !total
+        .checked_add(amount)
+        .is_some_and(|n| n <= crate::real_money::CAP)
+    {
+        if received > 0 {
+            anyhow::bail!(
+                "cumulative funding and receives exceed 100,000 sats for this mint \
+                 ({received} sats held by receives, gross, including unresolved or quarantined)"
+            );
+        }
+        anyhow::bail!("cumulative funding exceeds 100,000 sats");
+    }
     crate::wallet::preflight_for(url, Some("fund")).await?;
     let mut f = Funding {
         id: uuid::Uuid::new_v4().to_string(),
@@ -844,7 +844,9 @@ pub async fn recover(home: &Path, j: &Journal) -> Result<bool> {
             );
         }
     }
-    Ok(pending(j).await? || failed)
+    // Receives share the item budget and pass; see receive::RECOVERY_ITEM_SECONDS.
+    let receives = crate::receive::recover(home, j).await?;
+    Ok(pending(j).await? || failed || receives)
 }
 
 pub async fn pending(j: &Journal) -> Result<bool> {
@@ -855,7 +857,8 @@ pub async fn pending(j: &Journal) -> Result<bool> {
         || j.all::<Withdrawal>("withdrawal")
             .await?
             .iter()
-            .any(|a| !a.terminal()))
+            .any(|a| !a.terminal())
+        || crate::receive::pending(j).await?)
 }
 
 impl Withdrawal {
