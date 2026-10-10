@@ -681,10 +681,21 @@ counterpart to `receive`, for moving funds to another wallet without Lightning. 
   terminal `refused` (inputs released). Missing/invalid DLEQ is `quarantined` (exit 4).
 - The token is built only from DLEQ-verified outputs, journaled, then written (O_EXCL temp,
   fsync, hard link to `--out`). `recover`/`serve` rewrite that same token after a crash.
-  Rerunning with the same `--out` resumes; it never sends twice. Output: attempt id, mint,
-  state, amount, fee; never the token.
-- `send --reclaim <id>` swaps still-UNSPENT sent proofs back (same journaling); if all are SPENT
-  it reports "redeemed by recipient". `status --check-sends` performs the on-demand NUT-07 check.
+  Rerunning with the same `--out` resumes, or after the file was moved/deleted rewrites the
+  same journaled token, only when NUT-07 shows every sent proof UNSPENT (else exit 1, choose
+  another `--out`); a rewrite says no new value was sent and adds `"rewritten": true`. It never
+  sends twice. A used `--out` (other terms, reclaimed/redeemed/manual recovery) is refused;
+  only `refused` frees it. Coin selection skips inputs of any unfinished journaled send,
+  withdrawal, listing or swap. A send the recipient's input fee would consume (dust) is
+  refused before the journal. Output: attempt id, mint, state, amount, fee, `rewritten`;
+  never the token.
+- `send --reclaim <id>` swaps still-UNSPENT sent proofs back (same journaling; `reclaim_submitted`
+  is journaled before each POST). It also works on a `swapped` send whose file could not be
+  placed. Exits: 0 `reclaimed`; 3 `reclaiming`; 1 refused or partially redeemed meanwhile
+  (state back to `sent`; run it again) or `redeemed` (all SPENT, including the race where the
+  recipient redeemed before our leg was POSTed or while it was definitively refused); 4
+  `reclaim_unresolved` only when our leg was POSTed ambiguously and its outputs stayed absent
+  on two passes (secrets kept), or `reclaim_quarantined`. `status --check-sends` performs the on-demand NUT-07 check.
 - Mint calls use `mint::rpc`/`states`/`unspent`, `wallet::preflight` and the `wallet()` builder,
   so the nostr transport branch reroutes send with no send-specific change.
 

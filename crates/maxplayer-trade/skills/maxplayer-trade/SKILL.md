@@ -80,17 +80,17 @@ quote is reported unresolved without another payment.
 
 Needs the human's yes (mint, amount); charges the shared cap (§2).
 Save the token to a private file; run `receive <mint> --token-file <file>` (or
-stdin). Never put a token in argv/chat/logs. Only plain sat proofs of that
+stdin). Never put tokens in argv/chat/logs. Only plain sat proofs of that
 mint; fee deducted. Exit 0 `done`; 1 `refused` (final: not imported;
 redeem elsewhere) or `already_spent`; 3 unresolved/release pending:
 `recover`, never re-import; 4 `quarantined`:
-unspendable, still on the cap; escalate. **Done:** `done` and `balance <mint>`.
+unspendable, on cap; escalate. **Done:** `done` + `balance <mint>`.
 
 ### Send a token / move funds to another wallet
 
-Needs an explicit yes like withdraw (mint, amount, fee cap). Run
-`send <mint> --amount <sats> --out <new-file> --max-fees <cap>`; deliver the file
-privately, never its contents. Exit 3: `recover`; never resend. Until redeemed,
+Needs a yes as for withdraw (mint/amount/fee cap). Run
+`send <mint> --amount <sats> --out <new-file> --max-fees <cap>`; deliver the
+file privately, not its contents. Exit 3: `recover`; never resend. Until redeemed,
 `send --reclaim <id>` takes it back. **Done:** state `sent`.
 
 ### Sell/list X of mint A for Y of mint B

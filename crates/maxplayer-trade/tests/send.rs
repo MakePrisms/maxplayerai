@@ -1048,3 +1048,119 @@ async fn ambiguous_50000_keeps_send_submitted() {
     assert_eq!(attempts(&ja).await[0].state, SendState::Sent);
     assert_eq!(balance(a.path(), &m.url).await, 24);
 }
+
+// ---- Review round 3 ----
+
+/// NEW-1: reusing `--out` of a sent token whose proofs are UNSPENT rewrites the same
+/// token, flags it (`rewritten`, stderr notice) and sends nothing new.
+#[tokio::test]
+async fn reused_out_unredeemed_rewrites_same_token_with_notice() {
+    let m = MintFixture::start(0).await;
+    let (a, _ja) = funded(&m, 32).await;
+    let out = a.path().join("t");
+    let o = out.to_str().unwrap().to_owned();
+    let args = ["send", &m.url, "--amount", "8", "--out", &o];
+    let first = cli(a.path(), &args, None).await;
+    assert_eq!(first.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(v["rewritten"], false);
+    let token = read(&out);
+    std::fs::remove_file(&out).unwrap();
+    let again = cli(a.path(), &args, None).await;
+    let err = String::from_utf8_lossy(&again.stderr);
+    assert_eq!(again.status.code(), Some(0), "{err}");
+    let v: serde_json::Value = serde_json::from_slice(&again.stdout).unwrap();
+    assert_eq!(v["rewritten"], true, "SAFETY: rewrite is flagged");
+    assert!(
+        err.contains("no new value was sent") && err.contains(v["send"].as_str().unwrap()),
+        "{err}"
+    );
+    assert_eq!(read(&out), token, "SAFETY: same token");
+    assert_eq!(m.faults.swaps.load(SeqCst), 1, "SAFETY: one swap");
+    assert_eq!(balance(a.path(), &m.url).await, 24, "SAFETY: debited once");
+}
+
+/// NEW-1 (reviewer's reproduction, inverted): a reused `--out` whose token the
+/// recipient already redeemed is refused (exit 1); the spent token is never re-emitted.
+#[tokio::test]
+async fn reused_out_of_redeemed_token_is_refused() {
+    let m = MintFixture::start(0).await;
+    let (a, _ja) = funded(&m, 32).await;
+    let out = a.path().join("t");
+    let o = out.to_str().unwrap().to_owned();
+    let args = ["send", &m.url, "--amount", "8", "--out", &o];
+    assert!(cli(a.path(), &args, None).await.status.success());
+    let token = read(&out);
+    std::fs::remove_file(&out).unwrap();
+    let (b, jb) = home().await;
+    receive::receive(b.path(), &jb, &m.url, &token)
+        .await
+        .unwrap();
+    let again = cli(a.path(), &args, None).await;
+    let err = String::from_utf8_lossy(&again.stderr);
+    assert_eq!(again.status.code(), Some(1), "SAFETY: refused: {err}");
+    assert!(
+        err.contains("already (partially) redeemed") && err.contains("choose another --out"),
+        "{err}"
+    );
+    assert!(!out.exists(), "SAFETY: spent token not re-emitted");
+    assert_eq!(m.faults.swaps.load(SeqCst), 2, "SAFETY: no new send swap");
+    assert_eq!(balance(a.path(), &m.url).await, 24);
+}
+
+/// NEW-2 (reviewer's reproduction, inverted): the recipient redeems before our
+/// journaled reclaim leg is ever POSTed: `redeemed` (exit 1), never manual recovery.
+#[cfg(feature = "lab")]
+#[tokio::test]
+async fn unposted_reclaim_raced_by_recipient_ends_redeemed() {
+    let m = MintFixture::start(0).await;
+    let (a, ja) = funded(&m, 32).await;
+    let r = sent(&m, a.path(), &ja, 8, "t").await;
+    let token = read(&a.path().join("t"));
+    let swaps = m.faults.swaps.load(SeqCst);
+    let crashed = cli(
+        a.path(),
+        &["send", "--reclaim", &r.id],
+        Some("TRADE_CRASH_BEFORE_RECLAIM_SWAP"),
+    )
+    .await;
+    assert_eq!(crashed.status.code(), Some(87));
+    assert_eq!(m.faults.swaps.load(SeqCst), swaps, "never POSTed");
+    let (b, jb) = home().await;
+    receive::receive(b.path(), &jb, &m.url, &token)
+        .await
+        .unwrap();
+    let out = cli(a.path(), &["send", "--reclaim", &r.id], None).await;
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "SAFETY: redeemed exits 1: {err}"
+    );
+    assert!(err.contains("redeemed by recipient"), "{err}");
+    let r2 = &attempts(&ja).await[0];
+    assert_eq!(
+        r2.state,
+        SendState::Redeemed,
+        "SAFETY: not reclaim_unresolved"
+    );
+    assert!(!r2.manual_recovery());
+    let raw = ja
+        .get::<serde_json::Value>("send", &r.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        raw["reclaim_history"]
+            .as_array()
+            .is_some_and(|h| h.len() == 1),
+        "SAFETY: the unposted leg's secrets are archived, not dropped"
+    );
+    assert_eq!(
+        m.faults.swaps.load(SeqCst),
+        swaps + 1,
+        "only the recipient swapped"
+    );
+    assert!(!money::recover(a.path(), &ja).await.unwrap(), "terminal");
+    assert_eq!(balance(a.path(), &m.url).await, 24, "nothing credited");
+}
