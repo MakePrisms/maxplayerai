@@ -82,7 +82,8 @@ requires enabled NUT-05 bolt11/sat. The explicit `preflight <mint>` checks the
 common trading capabilities. Diagnostic preflight output goes to stderr. No opt-in is required;
 passing advertisement checks is not independent refund interoperability evidence.
 `balance` and `status` are lock-free read-only SQLite snapshots, available during
-`serve`, without network calls or submission of earlier authorizations.
+`serve`, without submission of earlier authorizations; neither makes network calls
+except `status --check-sends` (read-only NUT-07 per sent token).
 Market commands (including `discover` and `cancel`) first recover existing
 authorizations; do not treat them as read-only on a home with pending obligations.
 `serve` continuously accepts trades and recovers obligations; keep it running while
@@ -163,6 +164,14 @@ leg POSTed, with an ambiguous reply or a refusal while every input is SPENT, and
 outputs absent on two passes; secrets kept) or `reclaim_quarantined`. If they are already
 SPENT it reports "redeemed by recipient" and refunds nothing. `status --check-sends`
 asks each mint (NUT-07) whether sent tokens were redeemed; plain `status` is offline.
+
+On a `nostr://` mint send, reclaim and `--check-sends` are supported (no NUT-04/05
+needed). A swap over 128 proofs or the NIP-44 limit is refused **before anything is
+journaled or reserved** (exit 1; send a smaller amount); for a reclaim the token stays
+`sent`. The token names `nostr://npub…`: only a nostr-capable wallet (e.g.
+`maxplayer-trade receive`) can redeem it, not a generic Cashu wallet; `send --reclaim`
+takes it back. Keep the same `--mint-relay` set for reclaim, `recover` and
+`--check-sends`; with the wrong relays they report `unknown`/retain the attempt.
 
 ## Withdrawal: enforcement before execution
 

@@ -10,7 +10,7 @@
 use crate::{
     journal::Journal,
     mint,
-    wallet::{bounded, database, wallet},
+    wallet::{bounded_for, database, wallet},
 };
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use cashu::nuts::nut00::ProofsMethods;
@@ -420,10 +420,10 @@ pub async fn send(
     ensure!(spendable >= amount, "insufficient unreserved balance");
     crate::wallet::preflight(mint).await?;
     let w = wallet(home, mint).await?;
-    bounded(w.refresh_keysets())
+    bounded_for(mint, w.refresh_keysets())
         .await
         .context("CDK wallet request timed out")??;
-    let k = bounded(w.fetch_active_keyset())
+    let k = bounded_for(mint, w.fetch_active_keyset())
         .await
         .context("CDK wallet request timed out")??;
     available.sort_by_key(|p| p.proof.amount);
@@ -433,7 +433,7 @@ pub async fn send(
         inputs.push(p.proof);
         let total = u64::from(inputs.total_amount()?);
         let fee = u64::from(
-            bounded(w.get_proofs_fee(&inputs))
+            bounded_for(mint, w.get_proofs_fee(&inputs))
                 .await
                 .context("CDK wallet request timed out")??
                 .total,
@@ -449,7 +449,7 @@ pub async fn send(
     mint::unspent(mint, &inputs)
         .await
         .context("selected proofs are not UNSPENT at the mint")?;
-    let amounts = bounded(w.get_keyset_fees_and_amounts_by_id(k.id))
+    let amounts = bounded_for(mint, w.get_keyset_fees_and_amounts_by_id(k.id))
         .await
         .context("CDK wallet request timed out")??;
     let mut planned = outputs(
@@ -473,6 +473,16 @@ pub async fn send(
         ));
     }
     ensure!(planned.len() <= MAX_PROOFS, "output limit");
+    let swap = Leg {
+        inputs,
+        outputs: planned,
+        result: None,
+    };
+    // Size the exact request `post` sends BEFORE journaling or reserving: a `nostr://` swap over
+    // the NIP-44 limit is refused locally (413, ambiguous), so a journaled one could never finish.
+    crate::transport::check_swap_fits(mint, &swap_request(&swap)).map_err(|e| {
+        anyhow!("send refused: {e:#}; nothing journaled, reserved or sent; send a smaller amount")
+    })?;
     let mut r = SendAttempt {
         id: uuid::Uuid::new_v4().to_string(),
         mint: mint.into(),
@@ -480,11 +490,7 @@ pub async fn send(
         amount,
         fee,
         out: out_str.into(),
-        swap: Leg {
-            inputs,
-            outputs: planned,
-            result: None,
-        },
+        swap,
         token: None,
         committed: false,
         reclaim: None,
@@ -645,19 +651,19 @@ async fn probe(mint: &str, leg: &Leg) -> Result<Probe> {
     }
 }
 
+/// The exact swap body `post` sends for `leg` (also what admission sizes).
+fn swap_request(leg: &Leg) -> SwapRequest {
+    SwapRequest::new(
+        leg.inputs.clone(),
+        leg.outputs.iter().map(|o| o.message.clone()).collect(),
+    )
+}
+
 /// POST the identical journaled swap. Only a definitive NUT error
 /// ([`mint::definitive_refusal`]: allowlisted code) can be a refusal; `50000`,
 /// TokenPending, unknown codes, any other 400, timeouts and 5xx are ambiguous.
 async fn post(mint: &str, leg: &Leg) -> Result<Probe> {
-    let sent: Result<SwapResponse> = mint::rpc(
-        mint,
-        "swap",
-        &SwapRequest::new(
-            leg.inputs.clone(),
-            leg.outputs.iter().map(|o| o.message.clone()).collect(),
-        ),
-    )
-    .await;
+    let sent: Result<SwapResponse> = mint::rpc(mint, "swap", &swap_request(leg)).await;
     match sent {
         Ok(reply) => Ok(Probe::Signed(reply.signatures)),
         Err(error) if mint::definitive_refusal(&error) => {
@@ -693,7 +699,7 @@ async fn verified(
         );
     }
     let w = wallet(home, mint).await?;
-    let keys = bounded(w.load_keyset_keys(leg.outputs[0].message.keyset_id))
+    let keys = bounded_for(mint, w.load_keyset_keys(leg.outputs[0].message.keyset_id))
         .await
         .context("CDK wallet request timed out")??;
     let proofs = cdk::dhke::construct_proofs(
@@ -708,12 +714,15 @@ async fn verified(
     if proofs.iter().any(|p| p.dleq.is_none()) {
         return Ok(None);
     }
-    match bounded(w.verify_token_dleq(&Token::new(
-        MintUrl::from_str(mint)?,
-        proofs.clone(),
-        None,
-        CurrencyUnit::Sat,
-    )))
+    match bounded_for(
+        mint,
+        w.verify_token_dleq(&Token::new(
+            MintUrl::from_str(mint)?,
+            proofs.clone(),
+            None,
+            CurrencyUnit::Sat,
+        )),
+    )
     .await
     .context("CDK wallet request timed out")?
     {
@@ -916,11 +925,11 @@ pub async fn reclaim(
         return Ok(r);
     }
     let w = wallet(home, &r.mint).await?;
-    bounded(w.refresh_keysets())
+    bounded_for(&r.mint, w.refresh_keysets())
         .await
         .context("CDK wallet request timed out")??;
     let fee = u64::from(
-        bounded(w.get_proofs_fee(&inputs))
+        bounded_for(&r.mint, w.get_proofs_fee(&inputs))
             .await
             .context("CDK wallet request timed out")??
             .total,
@@ -928,10 +937,10 @@ pub async fn reclaim(
     check_fee(fee, max_fees)?;
     let total = u64::from(inputs.total_amount()?);
     ensure!(total > fee, "uneconomic reclaim: input fee consumes it");
-    let k = bounded(w.fetch_active_keyset())
+    let k = bounded_for(&r.mint, w.fetch_active_keyset())
         .await
         .context("CDK wallet request timed out")??;
-    let amounts = bounded(w.get_keyset_fees_and_amounts_by_id(k.id))
+    let amounts = bounded_for(&r.mint, w.get_keyset_fees_and_amounts_by_id(k.id))
         .await
         .context("CDK wallet request timed out")??;
     let leg = Leg {
@@ -947,6 +956,14 @@ pub async fn reclaim(
         ),
         result: None,
     };
+    // Before the Reclaiming state / reclaim_submitted write: an unsendable leg is a plain refusal.
+    ensure!(
+        leg.outputs.len() <= MAX_PROOFS,
+        "reclaim output limit; nothing journaled or sent"
+    );
+    crate::transport::check_swap_fits(&r.mint, &swap_request(&leg)).map_err(|e| {
+        anyhow!("reclaim refused: {e:#}; nothing journaled or sent; the token is still outstanding")
+    })?;
     update(j, &mut r, |n| {
         n.reclaim = Some(leg);
         n.reclaim_fee = fee;

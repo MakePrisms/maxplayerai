@@ -32,7 +32,7 @@ and redacted errors. Invoice delivery belongs in the human's private conversatio
 
 Run `balance <mint>` and `preflight <mint>` per mint. Passing preflight
 proves neither honesty nor full compatibility. The CLI
-also preflights before fund/list/take/withdraw: NUT-07/09/11/12/14, an active sat keyset, reachable
+also preflights before fund/list/take/withdraw/send: NUT-07/09/11/12/14, an active sat keyset, reachable
 mint, and clock skew at most 60 seconds. Never bypass a failed check. Gross locks and each withdrawal invoice are capped at
 **100,000 sats**. Funding intents plus charged receives (gross) share one
 100,000-sat cap per mint per home; `refused`/`already_spent` receives do not
@@ -130,10 +130,10 @@ or report the retained authorization and recover it without paying again.
 
 ### Check balance / something got interrupted
 
-`balance <mint>` is wallet balance, not total wealth or proof reservations are spendable. After **any interruption**, use `recover` with the same
+`balance <mint>` is wallet balance, not total wealth or proof that every reservation is spendable. After **any interruption**, use `recover` with the same
 home and relays before new work. It resumes existing authorizations and does not
 admit new trade requests. It makes **one bounded pass**, at most **120 s per
-funding/withdrawal/receive/swap item** (`nostr://` swap: 140 s), not waiting for lock deadlines: exit **0** means
+item** (any money item; nostr trade swap: 140 s), not waiting for lock deadlines: exit **0** means
 all terminal with no deferred work, **3** unresolved/deferred, **4** terminal manual recovery, **1** command error, pre-submission refusal, or definitive terminal `unpaid_released` (never proof a submitted withdrawal was refused; a submitted non-terminal withdrawal exits **3**),
 **2** CLI usage error.
 Timeout neither undoes an RPC nor releases reservations. Restore `serve` while locks

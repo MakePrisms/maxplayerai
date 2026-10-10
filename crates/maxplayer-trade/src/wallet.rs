@@ -28,17 +28,11 @@ pub async fn refund_time(mint: &str) -> Result<u64> {
         Err(_) => local,
     })
 }
-/// Bound one CDK wallet call against an HTTP mint (15 s). Kept for compatibility; mint-aware
-/// callers use [`bounded_for`], whose bound outlasts one `nostr://` connector call. An enclosing
-/// budget (advance, message, recovery item) can still drop a call mid-window; that is ambiguous,
-/// never a failure: the swap is journaled first and restored before any identical replay.
-pub async fn bounded<T>(
-    f: impl std::future::Future<Output = T>,
-) -> Result<T, tokio::time::error::Elapsed> {
-    tokio::time::timeout(crate::transport::HTTP_WALLET_TIMEOUT, f).await
-}
 /// Bound one CDK wallet call against `mint`: 15 s for HTTP, the connector window plus its outer
-/// margin for `nostr://` (see `transport`). Every in-crate call site uses this.
+/// margin for `nostr://` (see `transport`). The only CDK wallet bound: there is deliberately no
+/// mint-agnostic variant, so a new call site cannot silently get the 15 s HTTP bound on nostr.
+/// An enclosing budget (advance, message, recovery item) can still drop a call mid-window; that
+/// is ambiguous, never a failure: swaps are journaled first and restored before any replay.
 pub async fn bounded_for<T>(
     mint: &str,
     f: impl std::future::Future<Output = T>,

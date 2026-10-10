@@ -748,8 +748,22 @@ counterpart to `receive`, for moving funds to another wallet without Lightning. 
   recipient redeemed before any POST of our leg); 4 `reclaim_unresolved` when our leg was
   POSTed (ambiguous reply, or a refusal while every input is SPENT: the mint may have executed
   it) and its outputs stayed absent on two passes (secrets kept), or `reclaim_quarantined`. `status --check-sends` performs the on-demand NUT-07 check.
-- Mint calls use `mint::rpc`/`states`/`unspent`, `wallet::preflight` and the `wallet()` builder,
-  so the nostr transport branch reroutes send with no send-specific change.
+- `nostr://` mints: send, `send --reclaim` and `status --check-sends` run over the nostr transport
+  (`mint::rpc`/`states`/`unspent`, `wallet::preflight`, the `wallet()` builder; every CDK wallet
+  call uses `wallet::bounded_for`, 40 s on nostr, and the mint-agnostic 15 s `bounded` is gone).
+  Before the `prepared` write and the input reservation, send sizes the exact swap with
+  `transport::check_swap_fits`; reclaim does the same (plus ≤ 128 outputs) before the
+  `reclaiming`/`reclaim_submitted` write. Over the NIP-44 limit is exit 1 with nothing journaled,
+  reserved or published: a journaled one would fail locally with 413 on every pass and, since a
+  local 413 is never a refusal, strand its reserved inputs. Own-secret wallet rows fit with
+  ~9 KB to spare (128/128), so this is a guard, not an expected path. Send/reclaim swaps share
+  receive's refusal gate: nostr `expired`/`bad_request`/`rate_limited`/timeout/413 stay
+  ambiguous. The token names `nostr://npub…`, so only a nostr-capable wallet (this CLI's
+  `receive`) can redeem it. Keep the same `--mint-relay` set for reclaim, `recover` and
+  `--check-sends`. A send recovery item stays 120 s on nostr. Tests (`tests/nostr.rs`):
+  `nostr_send_check_sends_and_reclaim_round_trip`, `nostr_oversized_send_refused_before_journal`,
+  `nostr_oversized_reclaim_refused_before_journal` (oversized rows injected by the test; no CLI
+  path builds them), `nostr_send_survives_slow_keysets_reply` (a 20 s keysets reply).
 
 ## Funding and withdrawals
 
