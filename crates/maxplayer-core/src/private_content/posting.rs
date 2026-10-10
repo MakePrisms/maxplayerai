@@ -10,6 +10,11 @@ use crate::{
 };
 use nostr_sdk::Keys;
 
+/// Re-sign the offer when input preparation delayed publication this long. The
+/// deployed relay refuses events older than 900 seconds; 600 leaves margin for the
+/// provision round trip and the first flush.
+const OFFER_RESIGN_AFTER_SECS: u64 = 600;
+
 pub async fn post(
     home: &MaxplayerHome,
     keys: &Keys,
@@ -58,7 +63,14 @@ pub async fn post(
         if let (Some((source, oid)), Some(base_staging)) = (&imported_base, &base_staging) {
             let base_repo = git2::Repository::init_bare(base_staging.path())
                 .map_err(|_| Error("input staging unavailable"))?;
-            let mint = if crate::delivery_transport::is_relay_git_locator(source) {
+            let open_pool = offer.seller_pubkey.is_none();
+            // An open-pool bidder signs only for the configured relay host and reads
+            // every other source anonymously (seller preflight). Fetch the base with
+            // that same identity, so a base only the BUYER can read fails the post
+            // here instead of leaving an unservable job for the bidders.
+            let buyer_signs = crate::delivery_transport::is_relay_git_locator(source)
+                && (!open_pool || source.starts_with(&ctx.policy.host.git_prefix));
+            let mint = if buyer_signs {
                 let intended = source.clone();
                 let signing = keys.clone();
                 Some(std::sync::Arc::new(move |destination: &str| {
@@ -90,7 +102,17 @@ pub async fn post(
                     &oid,
                     mint,
                 )
-                .map_err(|_| Error("pinned contribution base unavailable"))?;
+                .map_err(|error| match error {
+                    crate::git_transport::TransportError::Auth(_) if open_pool => {
+                        Error(crate::job_lifecycle::SELLER_UNREADABLE_BASE)
+                    }
+                    crate::git_transport::TransportError::Auth(_) => Error(
+                        "pinned contribution base requires authentication and maxplayer never \
+                         sends repository credentials; for a private source use base_local_path \
+                         on a targeted private job",
+                    ),
+                    _ => Error("pinned contribution base unavailable"),
+                })?;
                 let used = repositories::check_objects_after(&base_repo, Default::default())?;
                 // Base and inputs land in one job repository: check their combined quota
                 // before uploading either, not each staging repository alone.
@@ -220,6 +242,43 @@ pub async fn post(
             .map_err(|_| Error("input upload worker unavailable"))??;
         }
     }
+    // Base and input uploads can outlive the relay's ±15-minute event-timestamp
+    // window (a 1 GiB base on a slow uplink takes longer than that). The original
+    // signed offer would then be refused forever while every upload stays valid,
+    // because nothing uploaded commits to the offer event id. Re-sign with a fresh
+    // timestamp and move the repository binding to the new id. A relay without
+    // rebind support refuses the re-provision; keep the original offer then — its
+    // refusal is recorded and surfaced instead of silently retried (#1115).
+    let prepared = {
+        let age = nostr_sdk::Timestamp::now()
+            .as_secs()
+            .saturating_sub(prepared.event.created_at.as_secs());
+        if age <= OFFER_RESIGN_AFTER_SECS {
+            prepared
+        } else {
+            let fresh = builders::resign_offer(keys, &prepared, &ctx.policy.service, &ctx.policy.host)?;
+            let provision =
+                hosting::ProvisionRequest::new(&fresh.event, None, None, &ctx.policy.host)?;
+            let auth = hosting::auth_header(keys, provision.url(), provision.body())?;
+            match provision.send(&auth).await {
+                Ok(_) => {
+                    crate::opline!(
+                        "buyer offer re-signed after {age}s of input preparation; job {} replaces {}",
+                        fresh.event.id,
+                        prepared.event.id
+                    );
+                    fresh
+                }
+                Err(error) => {
+                    crate::opline!(
+                        "buyer offer re-sign not applied (repository rebind refused: {error}); \
+                         publishing the original offer"
+                    );
+                    prepared
+                }
+            }
+        }
+    };
     // From the enqueue on, the outbox may publish this offer even after a crash.
     crate::job_lifecycle::note_offer_before_publication(&prepared.event.id.to_hex())
         .map_err(|_| Error("preparation state unavailable; offer not published"))?;
@@ -238,6 +297,9 @@ pub async fn post(
         transport.disconnect().await;
     }
     let id = prepared.event.id.to_hex();
+    // A terminal refusal recorded by that first flush goes to the caller now, not
+    // only to a later get_job: the post succeeded locally but no seller can see it.
+    let publish_refused = ctx.store.refusal_for_event(&id).ok().flatten();
     Ok(PostJobOutcome {
         job_id: id.clone(),
         job_hash: super::job_hash(&id)?,
@@ -248,6 +310,7 @@ pub async fn post(
         relay_url: home.config.relay_url.clone(),
         task: offer.task,
         output: offer.output,
+        publish_refused,
     })
 }
 

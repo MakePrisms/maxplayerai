@@ -7,6 +7,10 @@ pub struct Status {
     pub state: String,
     pub detail: String,
     pub retry: String,
+    /// When this record was written. Old files read as 0 (never fresh), so the
+    /// read-path throttle in `protect_job_view` cannot trust a stale record.
+    #[serde(default)]
+    pub updated_unix: u64,
 }
 pub fn write(root: &Path, subject: &Subject, state: &str, detail: &str) -> Result<(), String> {
     subject.validate()?;
@@ -21,6 +25,10 @@ pub fn write(root: &Path, subject: &Subject, state: &str, detail: &str) -> Resul
         } else {
             "Retry the same collect or accept operation; no new job or delivery is needed.".into()
         },
+        updated_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
     };
     let mut nonce = [0u8; 16];
     getrandom::fill(&mut nonce).map_err(|_| "review: random source unavailable")?;

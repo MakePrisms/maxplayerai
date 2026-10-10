@@ -50,6 +50,7 @@ relay ──(WebSocket: poll today, stream after the relay upgrade)──▶ sou
 | `src/source/` | The transport seam. `TRANSPORT` in `src/config.ts` is `"poll"` today; flip to `"stream"` the day the relay pushes post-EOSE. Nothing else changes. |
 | `src/store/` | Event cache (dedup by id, addressable/replaceable resolution) + IndexedDB persistence. |
 | `src/market/` | Trade joins, boards, metrics, active-job rules. `engine.ts` recomputes ONLY when events arrive or the window changes — there is no render clock. |
+| `src/trade/`, `src/tokens.ts` | `/tokens`: the token-trade order book — unlisted (no nav/footer/llms.txt link, `noindex`) for the team for now. Its own bundle (`tokens.js`). Reads kinds 3410/3411 from the trade CLI's public relays, never the production relay, and validates every event with a 1:1 port of `crates/maxplayer-trade` `parse_lot`/`lifecycle`, checked against Rust-signed golden cases in `test/fixtures/trade-rust.json` (generator: `test/fixtures/trade-rust.rs`). Read-only: no keys, no wallet. |
 | `src/ui/` | Presentation: keyed row reconciler (unchanged rows are never touched), docks, ticker, streaks. The market modules never touch the DOM. |
 
 **Instant paint contract**: the static chrome is plain HTML painted before a

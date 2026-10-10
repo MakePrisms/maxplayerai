@@ -1743,14 +1743,14 @@ async fn resolve_one_send_saga(
 /// 100-sat sends in the live wallet), so an amount match is not evidence of identity. Direction is
 /// asserted too, since a saga id could otherwise be satisfied by an incoming row.
 ///
-/// ⚠ Refuses on a NON-EMPTY reserved set. A completed send still holding reserved inputs is an
-/// anomaly, and deleting the saga would strand those proofs reserved against a row that no longer
-/// exists — unspendable, with nothing left to explain why. Surfacing beats tidying.
-///
-/// Proofs are deliberately NOT mutated. The inputs of a completed send are already in their final
-/// state (that is why nothing is reserved), and the token's OUTPUT proofs belong to the payee —
-/// they are unreachable from a saga in any case, because `created_by_operation` is never populated
-/// (tracked separately). Retiring here is a row deletion and nothing else.
+/// CDK's `get_reserved_proofs` selects by `used_by_operation`, NOT by proof state.
+/// A normal conditioned send's swap marks its inputs Spent but retains that binding.
+/// Refusing every non-empty set therefore strands ordinary successful sends forever.
+/// Verify non-empty bindings against mint truth, then use the spent-send finalizer:
+/// mark inputs Spent, clear bindings, delete the saga. Never restore/reclaim outputs.
+/// Unspent, pending, mixed, incomplete or unavailable mint evidence leaves it intact.
+/// Empty bindings still need no mint call; this also finishes an interrupted cleanup
+/// after its proof update committed but before its saga deletion did.
 ///
 /// TOCTOU: re-prove state and the transaction immediately before mutating.
 async fn retire_one_mapped_send(
@@ -1790,11 +1790,15 @@ async fn retire_one_mapped_send(
         .await
         .map_err(wallet_error)?;
     if !reserved.is_empty() {
-        return Err(PaymentWalletError::Reconcile(format!(
-            "mapped-send retire refused: send completed but {} proofs are still reserved against \
-             this saga; deleting it would strand them (surface, do not tidy)",
-            reserved.len()
-        )));
+        // Read-only mint evidence is bounded. A mint outage must not park the pay
+        // worker or prevent the retirement pass from attempting later sagas.
+        return tokio::time::timeout(MINT_TOUCH_TIMEOUT, complete_spent_send_saga(wallet, &fresh))
+            .await
+            .map_err(|_| {
+                PaymentWalletError::Reconcile(format!(
+                    "mapped-send reconciliation exceeded {MINT_TOUCH_TIMEOUT:?}; left for retry"
+                ))
+            })?;
     }
     wallet
         .localstore
@@ -4995,12 +4999,14 @@ mod tests {
     #[derive(Clone, Debug, Default)]
     struct CheckStateTransport {
         response: serde_json::Value,
+        hang: bool,
     }
 
     impl CheckStateTransport {
         fn new(response: cashu::CheckStateResponse) -> Self {
             Self {
                 response: serde_json::to_value(response).unwrap(),
+                hang: false,
             }
         }
     }
@@ -5039,6 +5045,9 @@ mod tests {
         {
             if !url.path().ends_with("/v1/checkstate") {
                 return Err(cdk::Error::Custom("unexpected POST".into()));
+            }
+            if self.hang {
+                return std::future::pending().await;
             }
             serde_json::from_value(self.response.clone())
                 .map_err(|error| cdk::Error::Custom(error.to_string()))
@@ -5200,7 +5209,8 @@ mod tests {
         where
             R: DeserializeOwned,
         {
-            Err(cdk::Error::Custom("unexpected GET".into()))
+            serde_json::from_value(serde_json::json!({"keysets": [self.keyset.clone()]}))
+                .map_err(|error| cdk::Error::Custom(error.to_string()))
         }
 
         async fn http_post<P, R>(
@@ -5213,6 +5223,29 @@ mod tests {
             P: Serialize + ?Sized + Send + Sync,
             R: DeserializeOwned,
         {
+            if url.path().ends_with("/v1/checkstate") {
+                let request: cashu::CheckStateRequest =
+                    serde_json::from_value(serde_json::to_value(payload).unwrap()).unwrap();
+                let spent = self.spent_ys.lock().unwrap();
+                let states = request
+                    .ys
+                    .into_iter()
+                    .map(|y| {
+                        ProofState::from((
+                            y,
+                            if spent.contains(&y) {
+                                State::Spent
+                            } else {
+                                State::Unspent
+                            },
+                        ))
+                    })
+                    .collect();
+                return serde_json::from_value(
+                    serde_json::to_value(cashu::CheckStateResponse { states }).unwrap(),
+                )
+                .map_err(|error| cdk::Error::Custom(error.to_string()));
+            }
             if !url.path().ends_with("/v1/swap") {
                 return Err(cdk::Error::Custom(format!(
                     "unexpected POST {}",
@@ -5611,7 +5644,11 @@ mod tests {
                 amount: Amount::from(amount),
                 fee: Amount::ZERO,
                 unit: wallet.unit.clone(),
-                ys: vec![],
+                // CDK keys transactions by their proof Ys. Empty Ys would overwrite
+                // unrelated fixture transactions, losing their saga mappings.
+                ys: vec![
+                    cashu::dhke::hash_to_curve(saga_id.unwrap_or_default().as_bytes()).unwrap(),
+                ],
                 timestamp: 1,
                 memo: None,
                 metadata: HashMap::new(),
@@ -5623,6 +5660,344 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    // Exercise CDK's actual producer, not a hand-built saga: swap marks inputs Spent
+    // but leaves used_by_operation set, so get_reserved_proofs still returns them.
+    #[tokio::test]
+    async fn mapped_send_native_confirm_reconciles_spent_inputs_without_reclaiming_outputs() {
+        let transport = SigningSwapTransport::default();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wallet.sqlite");
+        let store = Arc::new(
+            cdk_sqlite::WalletSqliteDatabase::new(&db_path)
+                .await
+                .unwrap(),
+        );
+        store
+            .add_mint(mint(MINT), Some(MintInfo::new()))
+            .await
+            .unwrap();
+        store
+            .add_mint_keysets(
+                mint(MINT),
+                vec![KeySetInfo {
+                    id: transport.keyset.id,
+                    unit: CurrencyUnit::Sat,
+                    active: true,
+                    input_fee_ppk: 0,
+                    final_expiry: None,
+                }],
+            )
+            .await
+            .unwrap();
+        store.add_keys(transport.keyset.clone()).await.unwrap();
+        let connector = Arc::new(BaseHttpClient::with_transport(
+            mint(MINT),
+            transport.clone(),
+            None,
+        ));
+        let wallet = WalletBuilder::new()
+            .mint_url(mint(MINT))
+            .unit(CurrencyUnit::Sat)
+            .localstore(store)
+            .seed([8; 64])
+            .shared_client(connector.clone())
+            .build()
+            .unwrap();
+        let input = Proof::new(
+            Amount::from(8),
+            transport.keyset.id,
+            Secret::generate(),
+            secret_key(9).public_key(),
+        );
+        let input_y = input.y().unwrap();
+        wallet
+            .localstore
+            .update_proofs(
+                vec![ProofInfo::new(input, mint(MINT), State::Unspent, CurrencyUnit::Sat).unwrap()],
+                vec![],
+            )
+            .await
+            .unwrap();
+        let token = wallet
+            .prepare_send(
+                Amount::from(4),
+                SendOptions {
+                    conditions: Some(SpendingConditions::new_p2pk(
+                        secret_key(1).public_key(),
+                        None,
+                    )),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .confirm(None)
+            .await
+            .unwrap();
+        let txs = wallet
+            .list_transactions(Some(TransactionDirection::Outgoing))
+            .await
+            .unwrap();
+        let saga_id = txs[0].saga_id.unwrap();
+        let bound = wallet
+            .localstore
+            .get_reserved_proofs(&saga_id)
+            .await
+            .unwrap();
+        assert_eq!(bound.len(), 1);
+        assert_eq!(bound[0].y, input_y);
+        assert_eq!(
+            bound[0].state,
+            State::Spent,
+            "CDK already marks the input spent"
+        );
+        let before = all_proof_ys(&wallet).await;
+        let balance = wallet.total_balance().await.unwrap();
+        drop(wallet);
+        // Opening the persisted CDK wallet alone does NOT run recovery.
+        let store = Arc::new(
+            cdk_sqlite::WalletSqliteDatabase::new(&db_path)
+                .await
+                .unwrap(),
+        );
+        let wallet = WalletBuilder::new()
+            .mint_url(mint(MINT))
+            .unit(CurrencyUnit::Sat)
+            .localstore(store)
+            .seed([8; 64])
+            .shared_client(connector)
+            .build()
+            .unwrap();
+        assert_eq!(
+            wallet
+                .localstore
+                .get_reserved_proofs(&saga_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let report = retire_eligible_incomplete_sagas(&wallet).await.unwrap();
+        assert_eq!(
+            report.retired_mapped, 1,
+            "native confirmed send must not stay stuck: {:?}",
+            report.unresolved
+        );
+        assert!(
+            wallet
+                .localstore
+                .get_saga(&saga_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            wallet
+                .localstore
+                .get_reserved_proofs(&saga_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(wallet.total_balance().await.unwrap(), balance);
+        assert_eq!(all_proof_ys(&wallet).await, before);
+        let pending = wallet
+            .localstore
+            .get_proofs(
+                Some(mint(MINT)),
+                Some(CurrencyUnit::Sat),
+                Some(vec![State::PendingSpent]),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.iter().map(|p| p.y).collect::<HashSet<_>>(),
+            txs[0].ys.iter().copied().collect()
+        );
+        assert!(!token.to_string().is_empty());
+        assert_eq!(
+            wallet
+                .list_transactions(Some(TransactionDirection::Outgoing))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            transport.swap_calls.load(Ordering::SeqCst),
+            1,
+            "recovery must not swap or reclaim"
+        );
+        assert_eq!(
+            retire_eligible_incomplete_sagas(&wallet)
+                .await
+                .unwrap()
+                .retired_mapped,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn mapped_send_reconciles_stale_proof_state_and_retries_after_interrupted_cleanup() {
+        for local_state in [State::Reserved, State::PendingSpent, State::Spent] {
+            let proof = p2pk_proof(7, secret_key(1).public_key());
+            let y = proof.y().unwrap();
+            let wallet = send_saga_wallet(
+                65,
+                vec![proof.clone()],
+                vec![ProofState::from((y, State::Spent))],
+            )
+            .await;
+            let saga_id = add_send_saga(&wallet, &[proof]).await;
+            add_tx_for_saga(&wallet, Some(saga_id), TransactionDirection::Outgoing, 7).await;
+            wallet
+                .localstore
+                .update_proofs_state(vec![y], local_state)
+                .await
+                .unwrap();
+            let before = all_proof_ys(&wallet).await;
+            let saved_saga = wallet.localstore.get_saga(&saga_id).await.unwrap().unwrap();
+            let report = retire_eligible_incomplete_sagas(&wallet).await.unwrap();
+            assert_eq!(
+                report.retired_mapped, 1,
+                "{local_state:?}: {:?}",
+                report.unresolved
+            );
+            let proofs = wallet
+                .localstore
+                .get_proofs(None, None, None, None)
+                .await
+                .unwrap();
+            assert_eq!(proofs[0].state, State::Spent);
+            assert_eq!(proofs[0].used_by_operation, None);
+            assert_eq!(all_proof_ys(&wallet).await, before);
+            // Simulate failure/exit between the proof commit and saga deletion. Reinsert
+            // just the saga (the tx survives); committed spent proofs must stay spent.
+            wallet.localstore.add_saga(saved_saga).await.unwrap();
+            assert_eq!(
+                retire_eligible_incomplete_sagas(&wallet)
+                    .await
+                    .unwrap()
+                    .retired_mapped,
+                1
+            );
+            assert_eq!(wallet.total_balance().await.unwrap(), Amount::ZERO);
+        }
+    }
+
+    #[tokio::test]
+    async fn mapped_send_refuses_unspent_pending_mixed_and_incomplete_mint_truth() {
+        let p = p2pk_proof(4, secret_key(1).public_key());
+        let q = p2pk_proof(2, secret_key(1).public_key());
+        let y = p.y().unwrap();
+        let z = q.y().unwrap();
+        for states in [
+            vec![
+                ProofState::from((y, State::Unspent)),
+                ProofState::from((z, State::Unspent)),
+            ],
+            vec![
+                ProofState::from((y, State::Spent)),
+                ProofState::from((z, State::Pending)),
+            ],
+            vec![
+                ProofState::from((y, State::Spent)),
+                ProofState::from((z, State::Unspent)),
+            ],
+            vec![ProofState::from((y, State::Spent))],
+            vec![],
+        ] {
+            let wallet = send_saga_wallet(66, vec![p.clone(), q.clone()], states).await;
+            let saga_id = add_send_saga(&wallet, &[p.clone(), q.clone()]).await;
+            add_tx_for_saga(&wallet, Some(saga_id), TransactionDirection::Outgoing, 6).await;
+            // Even local SPENT is insufficient without complete mint evidence.
+            wallet
+                .localstore
+                .update_proofs_state(vec![y, z], State::Spent)
+                .await
+                .unwrap();
+            let report = retire_eligible_incomplete_sagas(&wallet).await.unwrap();
+            assert_eq!(report.retired_mapped, 0);
+            assert_eq!(report.unresolved.len(), 1);
+            assert!(
+                wallet
+                    .localstore
+                    .get_saga(&saga_id)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                wallet
+                    .localstore
+                    .get_reserved_proofs(&saga_id)
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert_eq!(wallet.total_balance().await.unwrap(), Amount::ZERO);
+        }
+    }
+
+    #[tokio::test]
+    async fn mapped_send_mint_error_or_timeout_preserves_proofs_and_allows_other_cleanup() {
+        for hang in [false, true] {
+            let transport = CheckStateTransport {
+                hang,
+                ..Default::default()
+            };
+            let wallet = seller_wallet_at(MINT, transport, test_keyset()).await;
+            let proof = p2pk_proof(4, secret_key(1).public_key());
+            wallet
+                .localstore
+                .update_proofs(
+                    vec![
+                        ProofInfo::new(
+                            proof.clone(),
+                            mint(MINT),
+                            State::Unspent,
+                            CurrencyUnit::Sat,
+                        )
+                        .unwrap(),
+                    ],
+                    vec![],
+                )
+                .await
+                .unwrap();
+            let saga_id = add_send_saga(&wallet, &[proof]).await;
+            add_tx_for_saga(&wallet, Some(saga_id), TransactionDirection::Outgoing, 4).await;
+            let other = add_send_saga(&wallet, &[]).await;
+            add_tx_for_saga(&wallet, Some(other), TransactionDirection::Outgoing, 0).await;
+            let report = tokio::time::timeout(
+                MINT_TOUCH_TIMEOUT + Duration::from_secs(2),
+                retire_eligible_incomplete_sagas(&wallet),
+            )
+            .await
+            .expect("mint lookup must be bounded")
+            .unwrap();
+            assert_eq!(report.retired_mapped, 1);
+            assert_eq!(report.unresolved.len(), 1);
+            assert!(wallet.localstore.get_saga(&other).await.unwrap().is_none());
+            assert!(
+                wallet
+                    .localstore
+                    .get_saga(&saga_id)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            let bound = wallet
+                .localstore
+                .get_reserved_proofs(&saga_id)
+                .await
+                .unwrap();
+            assert_eq!(bound.len(), 1);
+            assert_eq!(bound[0].state, State::Reserved);
+        }
     }
 
     // #293. A `TokenCreated` send WITH a confirmed outgoing transaction is a COMPLETED send. The
@@ -5733,9 +6108,7 @@ mod tests {
         );
     }
 
-    // A completed send that still holds RESERVED inputs is an anomaly, and deleting its saga would
-    // strand those proofs reserved against a row that no longer exists — unspendable, with nothing
-    // left to say why. Surface it instead of tidying it away.
+    // Bound proofs without complete mint evidence must retain their explanatory saga.
     #[tokio::test]
     async fn a_mapped_send_still_holding_reserved_proofs_refuses_rather_than_stranding_them() {
         let seller = secret_key(1).public_key();
@@ -5755,7 +6128,7 @@ mod tests {
             report
                 .unresolved
                 .iter()
-                .any(|line| line.contains("still reserved")),
+                .any(|line| line.contains("incomplete or mismatched")),
             "the refusal must surface why, got: {:?}",
             report.unresolved
         );

@@ -44,6 +44,12 @@ use buzz_core::TenantContext;
 const INFO_REFS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 /// Timeout for pack operations (upload-pack, receive-pack) — large repos need time.
 const PACK_OPS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// Receive-pack (uploads) gets a longer wall clock than upload-pack: the whole pack
+/// must cross inside ONE streamed request, so this window — not bandwidth alone —
+/// sets the largest pack a slow uplink can ever land (`size / window`). Clients
+/// scale their own request ceiling to the pack size with the same 30-minute cap,
+/// and the fronting proxy allows 3600s. Serving fetches stays at the shorter bound.
+const RECEIVE_PACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
 /// Maximum buffered response bytes for receive-pack status output.
 ///
 /// A receive-pack response is protocol status, not repository contents. One
@@ -1225,7 +1231,12 @@ async fn run_git_spooled_at(
     });
     let body_abort = body_task.abort_handle();
 
-    let timeout_result = tokio::time::timeout(PACK_OPS_TIMEOUT, async {
+    let window = if service == "receive-pack" {
+        RECEIVE_PACK_TIMEOUT
+    } else {
+        PACK_OPS_TIMEOUT
+    };
+    let timeout_result = tokio::time::timeout(window, async {
         let _ = body_task.await;
         child.wait().await
     })
@@ -1234,7 +1245,7 @@ async fn run_git_spooled_at(
     let status = match timeout_result {
         Err(_elapsed) => {
             body_abort.abort();
-            warn!(service = %service, timeout_secs = PACK_OPS_TIMEOUT.as_secs(), "git subprocess timed out");
+            warn!(service = %service, timeout_secs = window.as_secs(), "git subprocess timed out");
             return Err((StatusCode::GATEWAY_TIMEOUT, "git operation timed out").into_response());
         }
         Ok(Err(e)) => {

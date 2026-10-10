@@ -400,6 +400,8 @@ enum SkipReason {
     RateGate,
     /// The offer asked for a harness this node does not run.
     AgentUnavailable,
+    /// The live roster cannot satisfy the signed model/family/capability request.
+    CapabilityUnavailable,
     /// §2.1: the offer states `payment=none` and this seat has not opted in to free work
     /// (`[seller] takes_no_payment = false`, the default).
     ///
@@ -446,6 +448,7 @@ impl SkipReason {
                  accept_offers_only_from)"
             }
             Self::RateGate => "rate-gate refused (untargeted without opt-in / below rate)",
+            Self::CapabilityUnavailable => "requested model, family or capabilities unavailable on this node",
             Self::AgentUnavailable => "requested agent harness not available on this node",
             Self::FreeNotOffered => {
                 "free offer (payment=none) and this seat does not work for free (set [seller] \
@@ -2367,6 +2370,34 @@ mod serialized_bounded_push_tests {
     }
 }
 
+/// Reconstruct only requests we actually retained. Legacy rows are unknown, not unconstrained.
+fn capacity_retry_offer(row: &super::store::Offer, seller_pubkey: &str) -> Option<ParsedOffer> {
+    let request = row.capability_request.as_ref()?;
+    Some(ParsedOffer {
+        task: row.task.clone(),
+        output: row.output.clone().unwrap_or_default(),
+        payment_mode: row.payment_mode,
+        accepts_delivery: row.accepts_delivery.clone(),
+        amount: row.amount_sats,
+        unit: row.unit.clone(),
+        deadline_unix: row.deadline_unix as u64,
+        seller_pubkey: row.targeted.then(|| seller_pubkey.to_owned()),
+        requested_agent: row.requested_agent.clone(),
+        requested_harness_family: request.requested_harness_family.clone(),
+        requested_model: request.requested_model.clone(),
+        required_capabilities: request.required_capabilities.clone(),
+    })
+}
+
+fn offer_capability_request(offer: &ParsedOffer) -> crate::buyer::lifecycle::CapabilityRequest {
+    crate::buyer::lifecycle::CapabilityRequest {
+        requested_agent: offer.requested_agent.clone(),
+        requested_harness_family: offer.requested_harness_family.clone(),
+        requested_model: offer.requested_model.clone(),
+        required_capabilities: offer.required_capabilities.clone(),
+    }
+}
+
 /// The journaled offer facts for a parsed offer — the ONE place a wire offer becomes a stored row.
 ///
 /// Extracted from the claim path so this mapping is reachable by a test. Everything downstream
@@ -2385,6 +2416,7 @@ fn offer_row(job_id: &str, buyer_pubkey: &str, offer: &ParsedOffer) -> super::st
         deadline_unix: offer.deadline_unix as i64,
         targeted: offer.is_targeted(),
         requested_agent: offer.requested_agent.clone(),
+        capability_request: Some(offer_capability_request(offer)),
         // #686: the buyer's declared output type is mandatory on the wire (`parse_offer` refuses an
         // offer without it), so it is always `Some` here. It becomes `None` only for a row written
         // before the column existed.
@@ -2856,6 +2888,12 @@ fn classify_offer(
     }
     if !agents.serves(offer.requested_agent.as_deref()) {
         return ClaimDecision::Skip(SkipReason::AgentUnavailable);
+    }
+    let advertised = agents.advertisement().capability(&Default::default());
+    if crate::buyer::lifecycle::capability_meets_request(
+        &advertised, &offer_capability_request(offer),
+    ).is_err() {
+        return ClaimDecision::Skip(SkipReason::CapabilityUnavailable);
     }
     ClaimDecision::Claim {
         deadline_unix: crate::seller::job_deadline_unix(offer, seller, now_unix),
@@ -5195,23 +5233,9 @@ impl SellerNodeRunner {
             // Reconstruct the parsed offer from the stored row. Only offers that already passed the
             // targeting gate are ever recorded (`rate_gate_allows` refuses a foreign `p`-tag BEFORE
             // `record_offer`), so `targeted ⇒ p-tag == self` and the reconstruction is exact.
-            let offer = ParsedOffer {
-                task: row.task.clone(),
-                output: String::new(),
-                payment_mode: row.payment_mode,
-                accepts_delivery: row.accepts_delivery.clone(),
-                amount: row.amount_sats,
-                unit: row.unit.clone(),
-                deadline_unix: row.deadline_unix as u64,
-                seller_pubkey: row.targeted.then(|| seller_pubkey.clone()),
-                requested_agent: row.requested_agent.clone(),
-                // The seller's own claim decision is capability-blind: the buyer's request filters
-                // which claims may be AWARDED, and it is judged buyer-side against what this seat
-                // advertises. Reconstructing it here would be a second reading of the request that
-                // could disagree with the one that decides.
-                requested_harness_family: None,
-                requested_model: None,
-                required_capabilities: Vec::new(),
+            let Some(offer) = capacity_retry_offer(&row, &seller_pubkey) else {
+                opline!("seller node offer skip id={}: stored capability request unknown; awaiting relay re-ingest", row.offer_id);
+                continue;
             };
             match classify_offer(
                 &offer,
@@ -10878,6 +10902,136 @@ mod tests {
         }
     }
 
+    #[test]
+    fn claim_filtering_checks_live_model_family_and_capabilities() {
+        let roster = claude_only();
+        roster.record_model(0, Some("model-a".into()));
+        roster.record_capabilities(vec!["rust".into()]);
+        let mut asked = offer(5, Some(SELLER), NOW + 600);
+        asked.requested_agent = Some("claude".into());
+        asked.requested_model = Some("model-a".into());
+        asked.required_capabilities = vec!["rust".into()];
+        let classify = |offer: &ParsedOffer| {
+            classify_offer(
+                offer,
+                &seller_cfg(2, false),
+                &roster,
+                SELLER,
+                BUYER,
+                NOW,
+                NOW,
+            )
+        };
+        assert!(matches!(classify(&asked), ClaimDecision::Claim { .. }));
+        let mut bad = asked.clone();
+        bad.requested_model = Some("other-model".into());
+        assert_eq!(
+            classify(&bad),
+            ClaimDecision::Skip(SkipReason::CapabilityUnavailable)
+        );
+        bad = asked.clone();
+        bad.requested_harness_family = Some("codex".into());
+        assert_eq!(
+            classify(&bad),
+            ClaimDecision::Skip(SkipReason::CapabilityUnavailable)
+        );
+        bad = asked.clone();
+        bad.required_capabilities = vec!["python".into()];
+        assert_eq!(
+            classify(&bad),
+            ClaimDecision::Skip(SkipReason::CapabilityUnavailable)
+        );
+        bad.required_capabilities = vec!["not-a-capability".into()];
+        assert_eq!(
+            classify(&bad),
+            ClaimDecision::Skip(SkipReason::CapabilityUnavailable)
+        );
+        bad = asked.clone();
+        bad.requested_agent = None;
+        assert_eq!(
+            classify(&bad),
+            ClaimDecision::Skip(SkipReason::CapabilityUnavailable)
+        );
+        roster.record_model(0, None);
+        assert_eq!(
+            classify(&asked),
+            ClaimDecision::Skip(SkipReason::CapabilityUnavailable)
+        );
+    }
+
+    #[test]
+    fn claim_filtering_survives_capacity_retry_and_restart() {
+        let mut asked = offer(5, Some(SELLER), NOW + 600);
+        asked.requested_agent = Some("claude".into());
+        asked.requested_harness_family = Some("claude-code".into());
+        asked.requested_model = Some("model-a".into());
+        asked.required_capabilities = vec!["rust".into()];
+        let root = temp_dir("claim-filter-restart");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("seller.sqlite");
+        {
+            let store = SellerStore::open(&db).unwrap();
+            store
+                .record_offer(&offer_row("job", BUYER, &asked), NOW as i64)
+                .unwrap();
+        }
+        let store = SellerStore::open(&db).unwrap();
+        let pending = store.offers_awaiting_claim(NOW as i64).unwrap();
+        assert_eq!(pending.len(), 1);
+        let retry = capacity_retry_offer(&pending[0], SELLER).unwrap();
+        assert_eq!(
+            offer_capability_request(&retry),
+            offer_capability_request(&asked)
+        );
+        let roster = claude_only();
+        roster.record_model(0, Some("model-a".into()));
+        roster.record_capabilities(vec!["rust".into()]);
+        assert!(matches!(
+            classify_offer(
+                &retry,
+                &seller_cfg(2, false),
+                &roster,
+                SELLER,
+                BUYER,
+                NOW,
+                NOW
+            ),
+            ClaimDecision::Claim { .. }
+        ));
+        roster.record_model(0, Some("model-b".into()));
+        assert_eq!(
+            classify_offer(
+                &retry,
+                &seller_cfg(2, false),
+                &roster,
+                SELLER,
+                BUYER,
+                NOW,
+                NOW
+            ),
+            ClaimDecision::Skip(SkipReason::CapabilityUnavailable)
+        );
+        // A pre-upgrade row remains unknown, and corrupted JSON never becomes no requirements.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "UPDATE offers SET capability_request = NULL WHERE offer_id = 'job'",
+            [],
+        )
+        .unwrap();
+        let old = store.offers_awaiting_claim(NOW as i64).unwrap();
+        assert!(capacity_retry_offer(&old[0], SELLER).is_none());
+        conn.execute(
+            "UPDATE offers SET capability_request = 'bad json' WHERE offer_id = 'job'",
+            [],
+        )
+        .unwrap();
+        assert!(store.offers_awaiting_claim(NOW as i64).is_err());
+        let mut legacy = pending[0].clone();
+        legacy.capability_request = None;
+        assert!(capacity_retry_offer(&legacy, SELLER).is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     // A fresh, in-rate, targeted offer is claimed and carries the resolved deadline.
     #[test]
     fn claims_fresh_targeted_offer_at_rate() {
@@ -12437,6 +12591,7 @@ mod tests {
                         task: "build a widget".to_owned(),
                         deadline_unix: 2_000_000_000,
                         targeted: true,
+                        capability_request: Some(Default::default()),
                         requested_agent: Some("codex".to_owned()),
                         output: Some("text/plain".to_owned()),
                     },
@@ -14845,6 +15000,7 @@ mod tests {
                     task: "residual".to_owned(),
                     deadline_unix,
                     targeted: true,
+                    capability_request: Some(Default::default()),
                     requested_agent: None,
                     output: Some("text/plain".to_owned()),
                 },
@@ -15863,6 +16019,7 @@ mod tests {
                     task: "build a widget".to_owned(),
                     deadline_unix: 2_000_000_000,
                     targeted: true,
+                    capability_request: Some(Default::default()),
                     requested_agent: None,
                     output: Some("text/plain".to_owned()),
                 },
@@ -15902,6 +16059,7 @@ mod tests {
                     task: "an open-pool job another seat won".to_owned(),
                     deadline_unix: now - 1,
                     targeted: false,
+                    capability_request: Some(Default::default()),
                     requested_agent: None,
                     output: Some("text/plain".to_owned()),
                 },
@@ -16020,6 +16178,7 @@ mod tests {
                             task: "t".to_owned(),
                             deadline_unix: deadline,
                             targeted: true,
+                            capability_request: Some(Default::default()),
                             requested_agent: None,
                             output: Some("text/plain".to_owned()),
                         },
