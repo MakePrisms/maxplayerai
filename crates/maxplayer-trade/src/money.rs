@@ -355,6 +355,10 @@ pub struct Withdrawal {
     pub change: Option<u64>,
 }
 impl Withdrawal {
+    /// Journaled inputs (selection exclusion for other wallet operations).
+    pub(crate) fn inputs(&self) -> &Proofs {
+        &self.inputs
+    }
     pub fn terminal(&self) -> bool {
         matches!(
             self.state,
@@ -846,7 +850,8 @@ pub async fn recover(home: &Path, j: &Journal) -> Result<bool> {
     }
     // Receives share the item budget and pass; see receive::RECOVERY_ITEM_SECONDS.
     let receives = crate::receive::recover(home, j).await?;
-    Ok(pending(j).await? || failed || receives)
+    let sends = crate::send::recover(home, j).await?;
+    Ok(pending(j).await? || failed || receives || sends)
 }
 
 pub async fn pending(j: &Journal) -> Result<bool> {
@@ -858,7 +863,8 @@ pub async fn pending(j: &Journal) -> Result<bool> {
             .await?
             .iter()
             .any(|a| !a.terminal())
-        || crate::receive::pending(j).await?)
+        || crate::receive::pending(j).await?
+        || crate::send::pending(j).await?)
 }
 
 impl Withdrawal {

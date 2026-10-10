@@ -103,6 +103,9 @@ pub struct Swap {
     #[serde(default)]
     pub refund_generation: u32,
 }
+pub(crate) fn swap_terminal(s: &Swap) -> bool {
+    terminal(s)
+}
 fn terminal(s: &Swap) -> bool {
     [
         "complete",
@@ -1071,6 +1074,11 @@ pub async fn recovery_status(j: &Journal, mut unresolved: bool) -> Result<()> {
     for r in j.all::<crate::receive::Receipt>("receive").await? {
         unresolved |= r.unresolved();
         manual |= r.state == crate::receive::ReceiveState::Quarantined;
+        println!("{}", r.summary());
+    }
+    for r in j.all::<crate::send::SendAttempt>("send").await? {
+        unresolved |= !r.terminal();
+        manual |= r.manual_recovery();
         println!("{}", r.summary());
     }
     println!(
