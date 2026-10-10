@@ -787,3 +787,187 @@ async fn failed_terminal_journal_write_exits_3_and_journal_unchanged() {
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(receipts(&j).await[0].state, ReceiveState::Refused);
 }
+
+// ---- Review round 2 ----
+
+/// F1: a refusal answered for a swap that DID land, with the first post-refusal
+/// restore empty. The refusal path must restore again after NUT-07 SPENT.
+#[tokio::test]
+async fn refusal_racing_a_landed_swap_restores_twice_and_credits() {
+    let m = MintFixture::start(0).await;
+    let (_s, _, token) = issue(&m, 40).await;
+    let (h, j) = home().await;
+    m.faults.refuse_after_swap.store(true, SeqCst);
+    let r = receive::receive(h.path(), &j, &m.url, &token)
+        .await
+        .unwrap();
+    assert_eq!(
+        r.state,
+        ReceiveState::Done,
+        "SAFETY: our signed outputs are credited, never already_spent"
+    );
+    assert_eq!(balance(h.path(), &m.url).await, 40, "SAFETY: credited");
+    assert_eq!(m.faults.swaps.load(SeqCst), 1, "SAFETY: one swap");
+}
+
+/// F2: cdk answers transient failures (Internal/Database -> 50000), TokenPending,
+/// OutputsPending and unknown codes as HTTP 400 NUT bodies. None is a refusal.
+#[tokio::test]
+async fn ambiguous_nut_codes_stay_submitted_then_complete() {
+    for code in [50000u64, 11002, 11004, 99999] {
+        let m = MintFixture::start(0).await;
+        let (_s, _, token) = issue(&m, 40).await;
+        let (h, j) = home().await;
+        m.faults.swap_nut_code.store(code, SeqCst);
+        m.faults.swap_nut_error.store(true, SeqCst);
+        let r = receive::receive(h.path(), &j, &m.url, &token)
+            .await
+            .unwrap();
+        assert_eq!(
+            r.state,
+            ReceiveState::Submitted,
+            "SAFETY: NUT code {code} is not a definitive refusal"
+        );
+        assert!(money::recover(h.path(), &j).await.unwrap(), "{code}");
+        assert_eq!(receipts(&j).await[0].state, ReceiveState::Submitted);
+        m.faults.swap_nut_error.store(false, SeqCst);
+        assert!(!money::recover(h.path(), &j).await.unwrap());
+        assert_eq!(receipts(&j).await[0].state, ReceiveState::Done);
+        assert_eq!(balance(h.path(), &m.url).await, 40, "{code}");
+    }
+}
+
+/// F2 straggler: a 50000 answered for a swap that executed stays submitted and the
+/// next pass restores and credits it.
+#[tokio::test]
+async fn transient_50000_for_a_landed_swap_is_credited_on_recover() {
+    let m = MintFixture::start(0).await;
+    let (_s, _, token) = issue(&m, 40).await;
+    let (h, j) = home().await;
+    m.faults.swap_nut_code.store(50000, SeqCst);
+    m.faults.refuse_after_swap.store(true, SeqCst);
+    let r = receive::receive(h.path(), &j, &m.url, &token)
+        .await
+        .unwrap();
+    assert_eq!(r.state, ReceiveState::Submitted, "SAFETY: 50000 ambiguous");
+    assert!(!money::recover(h.path(), &j).await.unwrap());
+    assert_eq!(receipts(&j).await[0].state, ReceiveState::Done);
+    assert_eq!(balance(h.path(), &m.url).await, 40);
+    assert_eq!(m.faults.swaps.load(SeqCst), 1, "SAFETY: one swap");
+}
+
+/// F3: a refused attempt is retried (same journaled outputs, same record) by an
+/// explicit repeat of the same token; recover alone never replays it.
+#[tokio::test]
+async fn repeat_receive_retries_a_refused_attempt_once() {
+    let m = MintFixture::start(0).await;
+    let (_s, _, token) = issue(&m, 40).await;
+    let (h, j) = home().await;
+    m.faults.swap_nut_error.store(true, SeqCst);
+    let r = receive::receive(h.path(), &j, &m.url, &token)
+        .await
+        .unwrap();
+    assert_eq!(r.state, ReceiveState::Refused);
+    m.faults.swap_nut_error.store(false, SeqCst);
+    assert!(!money::recover(h.path(), &j).await.unwrap());
+    assert_eq!(m.faults.swaps.load(SeqCst), 1, "recover does not replay");
+    let r = receive::receive(h.path(), &j, &m.url, &token)
+        .await
+        .unwrap();
+    assert_eq!(r.state, ReceiveState::Done, "explicit retry succeeds");
+    assert_eq!(receipts(&j).await.len(), 1, "SAFETY: one record per Y-set");
+    assert_eq!(balance(h.path(), &m.url).await, 40);
+    let r = receive::receive(h.path(), &j, &m.url, &token)
+        .await
+        .unwrap();
+    assert_eq!(r.state, ReceiveState::Done);
+    assert_eq!(m.faults.swaps.load(SeqCst), 2, "SAFETY: no swap after done");
+    assert_eq!(balance(h.path(), &m.url).await, 40, "SAFETY: credited once");
+}
+
+/// F4: credited rows stay RESERVED (unspendable) until `done` is journaled.
+#[cfg(feature = "lab")]
+#[tokio::test]
+async fn credited_rows_unspendable_until_done_is_journaled() {
+    let m = MintFixture::start(0).await;
+    let (_s, _, token) = issue(&m, 56).await;
+    let (h, j) = home().await;
+    let out = cli(
+        h.path(),
+        &m.url,
+        None,
+        Some(&token),
+        Some("TRADE_CRASH_BEFORE_RECEIVE_DONE"),
+    )
+    .await;
+    assert_eq!(out.status.code(), Some(85));
+    assert_eq!(receipts(&j).await[0].state, ReceiveState::Submitted);
+    assert_eq!(
+        balance(h.path(), &m.url).await,
+        0,
+        "SAFETY: credited rows are not spendable before done"
+    );
+    let invoice = cdk_fake_wallet::create_fake_invoice(20_000, String::new()).to_string();
+    assert!(
+        money::withdraw(h.path(), &j, &m.url, &invoice)
+            .await
+            .is_err(),
+        "SAFETY: withdraw cannot spend undone receive rows"
+    );
+    money::recover(h.path(), &j).await.unwrap();
+    assert_eq!(receipts(&j).await[0].state, ReceiveState::Done);
+    assert!(receipts(&j).await[0].settled());
+    assert_eq!(balance(h.path(), &m.url).await, 56, "SAFETY: credited once");
+    assert_eq!(m.faults.swaps.load(SeqCst), 1);
+}
+
+/// F4: a crash after `done` is journaled but before release leaves the rows reserved;
+/// `recover` (terminal-record pass) releases them exactly once.
+#[cfg(feature = "lab")]
+#[tokio::test]
+async fn crash_after_done_before_release_is_released_by_recover() {
+    let m = MintFixture::start(0).await;
+    let (_s, _, token) = issue(&m, 56).await;
+    let (h, j) = home().await;
+    let out = cli(
+        h.path(),
+        &m.url,
+        None,
+        Some(&token),
+        Some("TRADE_CRASH_AFTER_RECEIVE_DONE"),
+    )
+    .await;
+    assert_eq!(out.status.code(), Some(84));
+    let r = &receipts(&j).await[0];
+    assert!(r.state == ReceiveState::Done && !r.settled());
+    assert_eq!(balance(h.path(), &m.url).await, 0, "still reserved");
+    money::recover(h.path(), &j).await.unwrap();
+    assert!(receipts(&j).await[0].settled());
+    assert_eq!(balance(h.path(), &m.url).await, 56, "SAFETY: released once");
+    assert!(!money::recover(h.path(), &j).await.unwrap());
+    assert_eq!(balance(h.path(), &m.url).await, 56);
+}
+
+/// F3: retrying a refused attempt re-charges the shared cap first.
+#[tokio::test]
+async fn refused_retry_rechecks_the_cap() {
+    let m = MintFixture::start(0).await;
+    let (_s, _, token) = issue(&m, 64).await;
+    let (h, j) = home().await;
+    m.faults.swap_nut_error.store(true, SeqCst);
+    let r = receive::receive(h.path(), &j, &m.url, &token)
+        .await
+        .unwrap();
+    assert_eq!(r.state, ReceiveState::Refused);
+    m.faults.swap_nut_error.store(false, SeqCst);
+    money::fund(h.path(), &j, &m.url, 100_000).await.unwrap();
+    let swaps = m.faults.swaps.load(SeqCst);
+    assert!(
+        receive::receive(h.path(), &j, &m.url, &token)
+            .await
+            .is_err_and(|e| e.to_string().contains("exceed 100,000")),
+        "SAFETY: retry over the cap refused"
+    );
+    assert_eq!(receipts(&j).await[0].state, ReceiveState::Refused);
+    assert_eq!(m.faults.swaps.load(SeqCst), swaps, "SAFETY: no swap");
+}
