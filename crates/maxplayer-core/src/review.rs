@@ -51,8 +51,12 @@ impl Default for ReviewConfig {
 }
 impl ReviewConfig {
     pub fn validate(&self) -> Result<(), String> {
-        if self.reject_at_or_above_ppm > 1_000_000 || !(1..=300).contains(&self.timeout_seconds) {
-            return Err("review: invalid probability threshold or timeout (1..300 seconds)".into());
+        // The ceiling matches the reviewer's largest configurable window (3600s), so
+        // a buyer who KNOWS the operator raised `window_seconds` can wait that long
+        // synchronously. The default stays 300: a timeout ends the wait, not the
+        // job, and a later retry collects the worker's persisted late result.
+        if self.reject_at_or_above_ppm > 1_000_000 || !(1..=3600).contains(&self.timeout_seconds) {
+            return Err("review: invalid probability threshold or timeout (1..3600 seconds)".into());
         }
         if self
             .skip_buyer_pubkeys
@@ -376,12 +380,28 @@ pub mod wire {
         async fn request(&self, draft: EventDraft) -> Result<(), String> {
             let builder =
                 crate::gateway::nostr::event_builder(&draft).map_err(|e| e.to_string())?;
-            self.client
+            let output = self
+                .client
                 .send_event_builder_to([self.relay], builder)
                 .await
                 .map_err(|e| e.to_string())?;
-            Ok(())
+            request_refused(&output)
         }
+    }
+    /// `send_event*` returns `Ok` also when the relay refuses the event (OK false).
+    /// Without this check a refused request is invisible and reads as a reviewer
+    /// timeout after the full wait (the exact failure shape of #1115).
+    pub(crate) fn request_refused<T: std::fmt::Debug>(output: &Output<T>) -> Result<(), String> {
+        if output.success.is_empty() {
+            let reason = output
+                .failed
+                .values()
+                .next()
+                .map(String::as_str)
+                .unwrap_or("no relay accepted the event");
+            return Err(format!("review: relay refused the review request: {reason}"));
+        }
+        Ok(())
     }
     /// Bounded wait, one request per attempt, reuse prior authenticated result.
     pub async fn check<T: Transport>(
@@ -406,8 +426,9 @@ pub mod wire {
             .ok_or("review: configure a reviewer key for this relay, or explicitly skip review")?;
         let key = PublicKey::from_hex(reviewer).map_err(|_| "review: invalid reviewer key")?;
         let mut last_error: Option<String> = None;
+        let mut request_sent = false;
         let future = async {
-            let mut requested = false;
+            let requested = &mut request_sent;
             let mut prior_errors = std::collections::BTreeSet::new();
             loop {
                 let events = transport.fetch(subject, &key).await?;
@@ -424,7 +445,7 @@ pub mod wire {
                         if !prior_errors.contains(&event.id) {
                             provider_error = r.error_code.clone();
                         }
-                        if !requested {
+                        if !*requested {
                             prior_errors.insert(event.id);
                         }
                         continue;
@@ -450,7 +471,7 @@ pub mod wire {
                 }
                 if let Some(code) = provider_error {
                     // A deliberate new check requests recovery; never invent a safe result.
-                    if requested {
+                    if *requested {
                         return Err(format!(
                             "review: reviewer error ({code}); next step blocked; explicit retry available"
                         ));
@@ -458,23 +479,30 @@ pub mod wire {
                     // An old error is not a response to this new attempt. Request once below
                     // and wait for a new signed result instead of returning the stale error.
                 }
-                if !requested {
+                if !*requested {
                     transport.request(request_draft(subject, reviewer)?).await?;
-                    requested = true;
+                    *requested = true;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
         };
-        tokio::time::timeout(
+        let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(config.timeout_seconds),
             future,
         )
-        .await
-        .map_err(|_| match last_error {
-            Some(code) => format!(
+        .await;
+        outcome.map_err(|_| match (last_error, request_sent) {
+            (Some(code), _) => format!(
                 "review: timeout; last reviewer error ({code}); next step blocked; retry available"
             ),
-            None => "review: timeout; next step blocked; retry available".to_string(),
+            // The transport reports a refused request as an error, so a sent request was
+            // accepted by the relay. The missing piece is the reviewer's response.
+            (None, true) => "review: timeout; the relay accepted the review request but no \
+                 reviewer response arrived; the reviewer service may be down or it dropped the \
+                 request (the relay operator's `maxplayer reviewer serve` log shows why); \
+                 next step blocked; retry available"
+                .to_string(),
+            (None, false) => "review: timeout; next step blocked; retry available".to_string(),
         })?
     }
 }
@@ -665,15 +693,62 @@ mod tests {
     async fn timeout_blocks_and_an_explicit_retry_can_recover() {
         let keys = Keys::generate();
         let m = mock(vec![], vec![]);
-        assert!(
-            check(&m, &config(&keys))
-                .await
-                .unwrap_err()
-                .contains("timeout")
-        );
+        let error = check(&m, &config(&keys)).await.unwrap_err();
+        assert!(error.contains("timeout"), "{error}");
+        // The transport reported no refusal, so the request reached the relay; the
+        // message must point at the missing reviewer response, not at the client.
+        assert!(error.contains("relay accepted the review request"), "{error}");
+        assert!(error.contains("reviewer serve"), "{error}");
         assert_eq!(m.requests.load(Ordering::SeqCst), 1);
         m.events.lock().unwrap().push(signed(&answer(0.1), &keys));
         assert!(check(&m, &config(&keys)).await.is_ok());
+    }
+    /// The relay refusing the request event must surface as an immediate error with
+    /// the relay's reason — before this, it read as a plain timeout after the full
+    /// wait, with no recovery hint at all (#1115).
+    #[tokio::test(start_paused = true)]
+    async fn relay_refusal_of_the_request_surfaces_immediately_not_as_timeout() {
+        struct Refusing;
+        impl wire::Transport for Refusing {
+            async fn fetch(&self, _: &Subject, _: &PublicKey) -> Result<Vec<Event>, String> {
+                Ok(vec![])
+            }
+            async fn request(&self, _: EventDraft) -> Result<(), String> {
+                Err("review: relay refused the review request: invalid: event timestamp too far \
+                     from server time"
+                    .into())
+            }
+        }
+        let keys = Keys::generate();
+        let error = wire::check(
+            &Refusing,
+            &config(&keys),
+            "wss://test",
+            &subject(),
+            &"b".repeat(64),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("relay refused the review request"), "{error}");
+        assert!(error.contains("timestamp too far"), "{error}");
+        assert!(!error.contains("timeout"), "{error}");
+    }
+    #[test]
+    fn request_refused_reads_the_relay_reason_from_the_send_output() {
+        let mut output = nostr_sdk::prelude::Output {
+            val: (),
+            success: std::collections::HashSet::new(),
+            failed: std::collections::HashMap::new(),
+        };
+        let relay = nostr_sdk::prelude::RelayUrl::parse("wss://relay.test").unwrap();
+        output
+            .failed
+            .insert(relay.clone(), "invalid: content exceeds maximum size".into());
+        let error = wire::request_refused(&output).unwrap_err();
+        assert!(error.contains("invalid: content exceeds maximum size"), "{error}");
+        output.success.insert(relay);
+        assert!(wire::request_refused(&output).is_ok());
     }
     #[tokio::test]
     async fn skip_and_trusted_counterparty_do_not_contact_reviewer() {
@@ -936,6 +1011,11 @@ pub fn record_pass(
         .map_err(|e| format!("review: evidence write: {e}"))
 }
 
+/// How long `protect_job_view` reuses a recorded non-passing review state instead
+/// of sending another request. Collect/accept never throttle.
+#[cfg(feature = "wallet")]
+const VIEW_REVIEW_THROTTLE_SECS: u64 = 30;
+
 /// Agent-facing read boundary. Failed/unreviewed delivery payloads never enter an MCP
 /// agent context. Review only the newest result from the awarded seller per read; other
 /// results remain metadata-only. Acceptance still independently verifies the signed result.
@@ -967,9 +1047,34 @@ pub async fn protect_job_view(
         }
         let decision = if !attempted && awarded_seller == Some(result.seller_pubkey.as_str()) {
             attempted = true;
-            match &keys {
-                Some(keys) => check_buyer(home, keys, &subject, &result.seller_pubkey, result.private_evidence.as_ref()).await,
-                None => Err("review: local key unavailable".into()),
+            // A non-passing check that just ran (another get_job poll, or one still in
+            // flight) is reused instead of re-run: a fresh request per poll burned the
+            // reviewer's 10/minute budget and hung every read for the full wait. A
+            // recorded "passed" is never reused here — content exposure always
+            // re-verifies the signed review (collect and accept are unthrottled).
+            let recent_failure = state::read(&home.root, &subject.event).ok().filter(|s| {
+                s.subject == subject
+                    && matches!(s.state.as_str(), "pending" | "error" | "policy_refused")
+                    && std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                        .saturating_sub(s.updated_unix)
+                        < VIEW_REVIEW_THROTTLE_SECS
+            });
+            if let Some(status) = recent_failure {
+                Err(if status.state == "pending" {
+                    "review: pending; a review request is already in flight — read get_job again \
+                     shortly"
+                        .to_string()
+                } else {
+                    status.detail
+                })
+            } else {
+                match &keys {
+                    Some(keys) => check_buyer(home, keys, &subject, &result.seller_pubkey, result.private_evidence.as_ref()).await,
+                    None => Err("review: local key unavailable".into()),
+                }
             }
         } else {
             Err("review: delivery content withheld; collect the selected delivery to request its review".into())

@@ -88,7 +88,10 @@ impl ContentStore {
             CREATE TABLE IF NOT EXISTS content_scan (
                 recipient TEXT PRIMARY KEY, next_start INTEGER NOT NULL, through INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS content_cursor (
-                recipient TEXT PRIMARY KEY, received_at INTEGER NOT NULL);",
+                recipient TEXT PRIMARY KEY, received_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS content_refusals (
+                id TEXT PRIMARY KEY, author TEXT NOT NULL, job TEXT NOT NULL,
+                reason TEXT NOT NULL, refused_at INTEGER NOT NULL);",
         )
         .map_err(db_error)?;
         Ok(Self { db })
@@ -529,7 +532,10 @@ impl ContentStore {
     }
     pub fn pending_carriers(&self, author: &str, limit: usize) -> Result<Vec<Event>> {
         super::require_hex(author, 32)?;
-        let mut query=self.db.prepare("SELECT event FROM content_carriers WHERE author=?1 AND relay_accepted=0 ORDER BY COALESCE((SELECT sequence FROM content_retry WHERE key='carrier:' || content_carriers.id),0),rowid LIMIT ?2").map_err(db_error)?;
+        // A permanently refused carrier leaves the retry set: the relay refused these
+        // exact signed bytes (`invalid:`/`blocked:`), so a resend can never succeed.
+        // The refusal row keeps the reason for job views and operator surfaces.
+        let mut query=self.db.prepare("SELECT event FROM content_carriers WHERE author=?1 AND relay_accepted=0 AND id NOT IN (SELECT id FROM content_refusals) ORDER BY COALESCE((SELECT sequence FROM content_retry WHERE key='carrier:' || content_carriers.id),0),rowid LIMIT ?2").map_err(db_error)?;
         let rows = query
             .query_map(params![author, limit.min(256)], |r| r.get::<_, String>(0))
             .map_err(db_error)?;
@@ -548,7 +554,46 @@ impl ContentStore {
         {
             return Err(Error("unknown content carrier"));
         }
+        // Acceptance supersedes any stale refusal record for the same bytes.
+        self.db
+            .execute(
+                "DELETE FROM content_refusals WHERE id=?1",
+                [event.id.to_hex()],
+            )
+            .map_err(db_error)?;
         Ok(())
+    }
+    /// Record a permanent relay refusal of one carrier's exact signed bytes. The
+    /// carrier stops its retry loop; the reason becomes visible on the job view.
+    pub fn carrier_refused(&mut self, event: &Event, reason: &str, now: u64) -> Result<()> {
+        let job = event
+            .tags
+            .iter()
+            .find(|t| t.as_slice().first().map(String::as_str) == Some("job"))
+            .and_then(|t| t.as_slice().get(1).cloned())
+            .unwrap_or_default();
+        let reason: String = reason.chars().take(512).collect();
+        self.db
+            .execute(
+                "INSERT OR REPLACE INTO content_refusals(id,author,job,reason,refused_at)
+                 VALUES(?1,?2,?3,?4,?5)",
+                params![event.id.to_hex(), event.pubkey.to_hex(), job, reason, now],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+    /// The recorded permanent refusal for one event id (an offer's id is its job id).
+    pub fn refusal_for_event(&self, id: &str) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        super::require_hex(id, 32)?;
+        self.db
+            .query_row(
+                "SELECT reason FROM content_refusals WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_error)
     }
     pub fn pending(&self, author: &str, limit: usize) -> Result<Vec<PendingCopy>> {
         super::require_hex(author, 32)?;

@@ -118,6 +118,7 @@ async fn scenario(targeted: bool, delivery: bool, provider_failure: bool) {
         accepted_mints: policy.host.accepted_mints,
         private_git_base: Some(policy.host.git_prefix),
         model: "fixture".into(),
+        window_seconds: 300,
     };
     let provider = TypeSafe {
         client: reqwest::Client::new(),
@@ -300,6 +301,197 @@ async fn encrypted_review_provider_errors_never_fall_back_to_public() {
         .await;
 }
 
+/// A refused-but-authentic request must produce a signed error reply, never the
+/// silent drop that left clients with a bare 300-second timeout (#1115).
+async fn refusal_reply_scenario() {
+    let relay = LocalRelay::new(RelayBuilder::default());
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let (evidence, _, _, policy) = crate::private_content::evidence::inline_fixture_for(true);
+    let subject = Subject {
+        offer: evidence.offer.id.to_hex(),
+        event: evidence.offer.id.to_hex(),
+        kind: JOB_OFFER_KIND,
+        commit: None,
+    };
+    // A targeted offer whose task envelope is withheld fails `resolve_offer` at the
+    // worker — exactly the validation class that used to drop without a reply.
+    let request = Request {
+        subject: subject.clone(),
+        offer: evidence.offer.clone(),
+        task_envelope: None,
+        delivery: None,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let config = ServiceConfig {
+        relay: url.clone(),
+        signer_file: root.join("unused"),
+        provider_key_file: root.join("unused"),
+        database: root.join("reviews.db"),
+        repositories: BTreeMap::new(),
+        accepted_mints: policy.host.accepted_mints.clone(),
+        private_git_base: Some(policy.host.git_prefix.clone()),
+        model: "fixture".into(),
+        window_seconds: 300,
+    };
+    // The provider must never be reached; a dead endpoint enforces that.
+    let provider = TypeSafe {
+        client: reqwest::Client::new(),
+        endpoint: "http://127.0.0.1:1".into(),
+        key: "fixture-not-secret".into(),
+    };
+    let worker = tokio::task::spawn_local(run_worker(config, key(3), provider));
+    let buyer = key(1);
+    let client = Client::new(buyer.clone());
+    client.add_relay(&url).await.unwrap();
+    client.connect().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Deliberately bypass the client-side validation: the worker must not rely on it.
+    let inner = crate::gateway::nostr::event_builder(
+        &request.draft(&key(3).public_key().to_hex()).unwrap(),
+    )
+    .unwrap()
+    .sign_with_keys(&buyer)
+    .unwrap();
+    let outer = private::wrap(&buyer, key(3).public_key(), &inner).await.unwrap();
+    client.send_event(&outer).await.unwrap();
+    let mut decision = None;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let wraps = client
+            .fetch_events(
+                Filter::new()
+                    .kind(Kind::GiftWrap)
+                    .pubkey(buyer.public_key())
+                    .limit(100),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        for event in wraps {
+            if let Ok(reply) = private::unwrap(&buyer, &event).await {
+                if reply.kind == Kind::Custom(REVIEW_KIND) {
+                    let review = wire::verify(&reply, &key(3).public_key(), &subject).unwrap();
+                    decision = Some(review.decision(&subject, 500_000).unwrap());
+                }
+            }
+        }
+        if decision.is_some() {
+            break;
+        }
+    }
+    assert_eq!(
+        decision,
+        Some(crate::review::Decision::Error("invalid_subject".into())),
+        "a refused private bundle must get a signed error reply"
+    );
+    // The reply stays in the encrypted lane: no public review event appears.
+    assert!(
+        client
+            .fetch_events(
+                Filter::new().kind(Kind::Custom(REVIEW_KIND)),
+                Duration::from_secs(2)
+            )
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!worker.is_finished(), "one refused request must not end the worker");
+    worker.abort();
+    let _ = worker.await;
+    client.disconnect().await;
+    relay.shutdown();
+}
+
+#[tokio::test]
+async fn refused_private_bundle_gets_a_signed_error_reply_not_a_timeout() {
+    tokio::task::LocalSet::new()
+        .run_until(refusal_reply_scenario())
+        .await;
+}
+
+/// A stale-but-authentic public request also gets a signed terminal error.
+async fn stale_request_reply_scenario() {
+    let relay = LocalRelay::new(RelayBuilder::default());
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let config = ServiceConfig {
+        relay: url.clone(),
+        signer_file: root.join("unused"),
+        provider_key_file: root.join("unused"),
+        database: root.join("reviews.db"),
+        repositories: BTreeMap::new(),
+        accepted_mints: vec![],
+        private_git_base: None,
+        model: "fixture".into(),
+        window_seconds: 300,
+    };
+    let provider = TypeSafe {
+        client: reqwest::Client::new(),
+        endpoint: "http://127.0.0.1:1".into(),
+        key: "fixture-not-secret".into(),
+    };
+    let reviewer = key(3);
+    let worker = tokio::task::spawn_local(run_worker(config, reviewer.clone(), provider));
+    let buyer = key(1);
+    let client = Client::new(buyer.clone());
+    client.add_relay(&url).await.unwrap();
+    client.connect().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let subject = Subject {
+        offer: "ab".repeat(32),
+        event: "ab".repeat(32),
+        kind: JOB_OFFER_KIND,
+        commit: None,
+    };
+    let stale = crate::gateway::nostr::event_builder(
+        &request_draft(&subject, &reviewer.public_key().to_hex()).unwrap(),
+    )
+    .unwrap()
+    .custom_created_at(Timestamp::from(
+        Timestamp::now().as_secs() - REQUEST_MAX_AGE_SECS - 60,
+    ))
+    .sign_with_keys(&buyer)
+    .unwrap();
+    client.send_event(&stale).await.unwrap();
+    let mut error = None;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let events = client
+            .fetch_events(
+                Filter::new()
+                    .kind(Kind::Custom(REVIEW_KIND))
+                    .author(reviewer.public_key()),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        for event in events {
+            let review = wire::verify(&event, &reviewer.public_key(), &subject).unwrap();
+            error = review.error_code.clone();
+        }
+        if error.is_some() {
+            break;
+        }
+    }
+    assert_eq!(error.as_deref(), Some("stale_request"));
+    assert!(!worker.is_finished());
+    worker.abort();
+    let _ = worker.await;
+    client.disconnect().await;
+    relay.shutdown();
+}
+
+#[tokio::test]
+async fn stale_public_request_gets_a_signed_stale_request_error() {
+    tokio::task::LocalSet::new()
+        .run_until(stale_request_reply_scenario())
+        .await;
+}
+
 #[tokio::test]
 async fn private_git_review_reads_exact_commit_and_refuses_changed_binding() {
     use crate::private_content as pc;
@@ -381,6 +573,7 @@ async fn private_git_review_reads_exact_commit_and_refuses_changed_binding() {
         accepted_mints: policy.host.accepted_mints.clone(),
         private_git_base: Some(policy.host.git_prefix.clone()),
         model: "fixture".into(),
+        window_seconds: 300,
     };
     let input = private_snapshot(
         &config,
@@ -444,6 +637,7 @@ async fn reviewer_public_v2_snapshot_remains_public_and_reads_exact_inline_envel
         accepted_mints: review_mints(),
         private_git_base: None,
         model: "fixture".into(),
+        window_seconds: 300,
     };
     let body = snapshot(
         &client,
@@ -487,6 +681,7 @@ fn intake_worker(
         accepted_mints: review_mints(),
         private_git_base: None,
         model: "fixture".into(),
+        window_seconds: 300,
     };
     let provider = TypeSafe {
         client: reqwest::Client::new(),

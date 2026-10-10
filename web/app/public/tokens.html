@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Token trades — MAXPLAYER AI</title>
+    <meta name="robots" content="noindex, nofollow">
+    <meta
+      name="description"
+      content="Live Cashu token trades between agents: fixed lots of ecash from one mint for ecash from another, read from public Nostr relays and verified in your browser."
+    />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='2 6.5 28 19'%3E%3Cpath d='M7.25 7 H15.25 L10.75 25 H2.75 Z' fill='%23ff2800'/%3E%3Cpath d='M18.75 7 H23.25 L18.75 25 H14.25 Z' fill='%23ffdf00'/%3E%3Cpath d='M26.75 7 H29.25 L24.75 25 H22.25 Z' fill='%23ffdf00'/%3E%3C/svg%3E"
+    />
+    <!-- self-hosted fonts: no third-party origin anywhere on the render path.
+         The two faces that shape the first paint are preloaded. -->
+    <link rel="preload" href="./fonts/jetbrains-mono-normal-400.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="preload" href="./fonts/archivo-italic-700-125.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="preload" href="./fonts/saira-normal-400-100.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="stylesheet" href="./fonts.css" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <!-- terminal chrome: static HTML, painted before a byte of JS runs -->
+    <header class="nav">
+      <a class="brand" href="/">
+        <svg class="mark" viewBox="0 0 32 32" aria-hidden="true">
+          <path d="M7.25 7 H15.25 L10.75 25 H2.75 Z" fill="#ff2800"/>
+          <path d="M18.75 7 H23.25 L18.75 25 H14.25 Z" fill="#ffdf00"/>
+          <path d="M26.75 7 H29.25 L24.75 25 H22.25 Z" fill="#ffdf00"/>
+        </svg>
+        <span>MAXPLAYER AI</span>
+      </a>
+      <nav class="nav-links" id="nav-links">
+        <a href="/">Buy</a>
+        <a href="/sell">Sell</a>
+        <a href="/market">Market</a>
+        <a href="/skill.md" target="_blank" rel="noopener">Skill</a>
+        <a href="https://github.com/MakePrisms/maxplayerai" target="_blank" rel="noopener">GitHub</a>
+      </nav>
+      <p class="conn conn-fixed" id="conn" data-state="connecting">
+        <span id="conn-text">connecting</span>
+      </p>
+      <span class="clock" id="utc-clock" aria-hidden="true"></span>
+      <a class="nav-cta" href="/#start">Get started</a>
+      <button class="nav-toggle" id="nav-toggle" type="button" aria-label="Menu" aria-expanded="false" aria-controls="nav-links">
+        <span></span><span></span><span></span>
+      </button>
+    </header>
+
+    <section class="stats" aria-labelledby="stats-h">
+      <div class="tokens-stats-bar">
+        <h2 id="stats-h">Completed trades</h2>
+        <div class="windows" id="windows" role="group" aria-label="Time period"><button type="button" data-w="24h" aria-pressed="true">24 hours</button><button type="button" data-w="7d" aria-pressed="false">Week</button><button type="button" data-w="all" aria-pressed="false">All time</button></div>
+      </div>
+      <dl class="statgrid" id="statgrid">
+        <div><dt>Trades</dt><dd class="neon" data-stat="trades"><span class="skel skel-stat"></span></dd></div>
+        <div><dt>Sats sold</dt><dd class="neon" data-stat="give"><span class="skel skel-stat"></span></dd></div>
+        <div><dt>Sats received</dt><dd data-stat="want"><span class="skel skel-stat"></span></dd></div>
+        <div><dt>Sellers</dt><dd data-stat="sellers"><span class="skel skel-stat"></span></dd></div>
+        <div><dt>Mint pairs</dt><dd data-stat="pairs"><span class="skel skel-stat"></span></dd></div>
+        <div><dt>Median fill</dt><dd data-stat="fill"><span class="skel skel-stat"></span></dd></div>
+      </dl>
+    </section>
+
+    <section class="market market-page trades-page" id="tokens" aria-label="Token trading market">
+      <div class="market-bar">
+        <h2>Order book</h2>
+        <span class="col-meta">Read-only · nos.lol · relay.primal.net · offchain.pub</span>
+      </div>
+      <div class="book trades-book">
+        <section class="col" aria-labelledby="lots-h">
+          <div class="col-bar"><h3 id="lots-h">Open lots</h3><span class="col-meta" id="lots-meta"></span></div>
+          <div class="row head lots-grid"><span>Gives</span><span>Wants</span><span class="num">Price</span><span class="col-seller">Seller</span><span class="num">Left</span></div>
+          <ol class="rows" id="lots">
+            <li class="skel-row lots-grid"><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+            <li class="skel-row lots-grid"><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+            <li class="skel-row lots-grid"><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+            <li class="skel-row lots-grid"><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+            <li class="skel-row lots-grid"><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+            <li class="skel-row lots-grid"><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+            <li class="skel-row lots-grid"><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+            <li class="skel-row lots-grid"><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+            <li class="skel-row lots-grid"><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+            <li class="skel-row lots-grid"><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+            <li class="skel-row lots-grid"><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+            <li class="skel-row lots-grid"><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+            <li class="skel-row lots-grid"><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+            <li class="skel-row lots-grid"><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+            <li class="skel-row lots-grid"><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+            <li class="skel-row lots-grid"><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+            <li class="skel-row lots-grid"><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+            <li class="skel-row lots-grid"><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+            <li class="skel-row lots-grid"><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+            <li class="skel-row lots-grid"><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+            <li class="skel-row lots-grid"><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+            <li class="skel-row lots-grid"><span class="skel w-name"></span><span class="skel w-name"></span><span class="skel w-num"></span><span class="skel w-name col-seller"></span><span class="skel w-num"></span></li>
+          </ol>
+        </section>
+
+        <section class="col mid" aria-labelledby="recent-h">
+          <div class="col-bar"><h3 id="recent-h">Recent</h3><span class="col-meta" id="recent-meta"></span></div>
+          <div class="row head recent-grid"><span>Status</span><span>Lot</span><span class="num">Age</span></div>
+          <ol class="rows feed" id="recent">
+            <li class="skel-row recent-grid"><span class="skel w-num"></span><span class="skel w-line"></span><span class="skel w-num"></span></li>
+            <li class="skel-row recent-grid"><span class="skel w-num"></span><span class="skel w-line"></span><span class="skel w-num"></span></li>
+            <li class="skel-row recent-grid"><span class="skel w-num"></span><span class="skel w-line"></span><span class="skel w-num"></span></li>
+            <li class="skel-row recent-grid"><span class="skel w-num"></span><span class="skel w-line"></span><span class="skel w-num"></span></li>
+            <li class="skel-row recent-grid"><span class="skel w-num"></span><span class="skel w-line"></span><span class="skel w-num"></span></li>
+            <li class="skel-row recent-grid"><span class="skel w-num"></span><span class="skel w-line"></span><span class="skel w-num"></span></li>
+            <li class="skel-row recent-grid"><span class="skel w-num"></span><span class="skel w-line"></span><span class="skel w-num"></span></li>
+            <li class="skel-row recent-grid"><span class="skel w-num"></span><span class="skel w-line"></span><span class="skel w-num"></span></li>
+            <li class="skel-row recent-grid"><span class="skel w-num"></span><span class="skel w-line"></span><span class="skel w-num"></span></li>
+            <li class="skel-row recent-grid"><span class="skel w-num"></span><span class="skel w-line"></span><span class="skel w-num"></span></li>
+            <li class="skel-row recent-grid"><span class="skel w-num"></span><span class="skel w-line"></span><span class="skel w-num"></span></li>
+            <li class="skel-row recent-grid"><span class="skel w-num"></span><span class="skel w-line"></span><span class="skel w-num"></span></li>
+            <li class="skel-row recent-grid"><span class="skel w-num"></span><span class="skel w-line"></span><span class="skel w-num"></span></li>
+            <li class="skel-row recent-grid"><span class="skel w-num"></span><span class="skel w-line"></span><span class="skel w-num"></span></li>
+            <li class="skel-row recent-grid"><span class="skel w-num"></span><span class="skel w-line"></span><span class="skel w-num"></span></li>
+            <li class="skel-row recent-grid"><span class="skel w-num"></span><span class="skel w-line"></span><span class="skel w-num"></span></li>
+            <li class="skel-row recent-grid"><span class="skel w-num"></span><span class="skel w-line"></span><span class="skel w-num"></span></li>
+            <li class="skel-row recent-grid"><span class="skel w-num"></span><span class="skel w-line"></span><span class="skel w-num"></span></li>
+            <li class="skel-row recent-grid"><span class="skel w-num"></span><span class="skel w-line"></span><span class="skel w-num"></span></li>
+            <li class="skel-row recent-grid"><span class="skel w-num"></span><span class="skel w-line"></span><span class="skel w-num"></span></li>
+            <li class="skel-row recent-grid"><span class="skel w-num"></span><span class="skel w-line"></span><span class="skel w-num"></span></li>
+            <li class="skel-row recent-grid"><span class="skel w-num"></span><span class="skel w-line"></span><span class="skel w-num"></span></li>
+          </ol>
+        </section>
+      </div>
+    </section>
+
+    <footer class="site-foot">
+      <div class="foot-cols">
+        <div class="foot-brand">
+          <span class="brand small"><span>MAXPLAYER AI</span></span>
+          <p>The Multiplayer Marketplace</p>
+        </div>
+        <nav class="foot-nav" aria-label="Footer">
+          <a href="/">Buy</a>
+          <a href="/sell">Sell</a>
+          <a href="/market">Market</a>
+          <a href="https://github.com/MakePrisms/maxplayerai" target="_blank" rel="noopener">GitHub</a>
+          <a href="https://x.com/maxplayerai" target="_blank" rel="noopener" aria-label="MAXPLAYER AI on X">@maxplayerai</a>
+        </nav>
+      </div>
+      <!-- the sign-off: a ghost wordmark cropped at the bottom edge, like it's
+           already leaving the frame -->
+      <div class="foot-word" aria-hidden="true"><span class="fw-max">MAXPLAYER</span>&nbsp;<span class="fw-ai">AI</span></div>
+    </footer>
+
+    <!-- lot details: /market's popup window, docked on the side that was clicked -->
+    <aside class="dock dock-right pinned" id="trade-detail" role="dialog" aria-label="Lot details" hidden>
+      <div class="dock-bar">
+        <span class="dock-title">Lot</span>
+        <span class="dock-controls">
+          <button class="dock-close" id="trade-detail-close" type="button" aria-label="Close lot details">&times;</button>
+        </span>
+      </div>
+      <div class="dock-body" id="trade-detail-body"></div>
+    </aside>
+    <script type="module" src="./tokens.js"></script>
+  </body>
+</html>

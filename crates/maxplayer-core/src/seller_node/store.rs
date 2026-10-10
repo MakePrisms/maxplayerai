@@ -44,7 +44,8 @@ use crate::gateway::EventDraft;
 /// compare-and-set BOUND to the row at admission. The payer pays exactly that quote, by id, and never
 /// raises another for the row; reconciliation of a spending row asks the mint about that quote by id
 /// and releases the row only on a transition naming it ([`SellerStore::release_remittance`]).
-pub const SCHEMA_VERSION: i64 = 13;
+/// v14 retains signed capability requirements for queued-offer admission after restart.
+pub const SCHEMA_VERSION: i64 = 14;
 
 /// The platform fee as journaled so far: what is owed on paper, what has been remitted, and the
 /// figures around them. Returned by [`SellerStore::accrued_fees`]. A query and nothing more — the
@@ -665,6 +666,8 @@ pub struct Offer {
     /// from the claim: a resumed job reads its requested harness from here, so it dispatches to
     /// the harness the buyer asked for and not to whichever one happens to be preferred now.
     pub requested_agent: Option<String>,
+    /// Signed requirements retained for capacity retries; None means a legacy unknown request.
+    pub capability_request: Option<crate::buyer::lifecycle::CapabilityRequest>,
     /// #686: the output type the buyer declared on the offer's `["output", …]` tag — a MIME / output
     /// type (`text/plain`, `application/json`). Mandatory on ingest, so a row this binary wrote always
     /// carries it; `None` ⇒ a row recorded before this column existed (absence, never a default —
@@ -690,6 +693,22 @@ pub struct Offer {
     /// git-only and refuse an answer the buyer asked for. A row written before this column existed
     /// reads NULL ⇒ empty ⇒ git only, which is the fail-closed direction.
     pub accepts_delivery: Vec<String>,
+}
+
+fn capability_request_from_column(
+    value: Option<String>,
+) -> rusqlite::Result<Option<crate::buyer::lifecycle::CapabilityRequest>> {
+    value
+        .map(|value| {
+            serde_json::from_str(&value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    11,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        })
+        .transpose()
 }
 
 /// Serialize the accepted-delivery modes for the `offers.accepts_delivery` column. `None` for an
@@ -1160,6 +1179,9 @@ impl SellerStore {
     /// reads the same as its default. Nothing here rewrites or drops a row: this store holds live
     /// trade state.
     fn migrate(conn: &Connection) -> Result<(), StoreError> {
+        if !Self::column_exists(conn, "offers", "capability_request")? {
+            conn.execute_batch("ALTER TABLE offers ADD COLUMN capability_request TEXT;")?;
+        }
         if !Self::column_exists(conn, "offers", "requested_agent")? {
             conn.execute_batch("ALTER TABLE offers ADD COLUMN requested_agent TEXT;")?;
         }
@@ -1324,8 +1346,8 @@ impl SellerStore {
         let changed = conn.execute(
             "INSERT OR IGNORE INTO offers
                  (offer_id, buyer_pubkey, amount_sats, unit, task, deadline_unix, targeted, created_at_unix,
-                  requested_agent, output, payment, accepts_delivery)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                  requested_agent, output, payment, accepts_delivery, capability_request)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 offer.offer_id,
                 offer.buyer_pubkey,
@@ -1339,6 +1361,7 @@ impl SellerStore {
                 offer.output,
                 offer.payment_mode.as_wire(),
                 accepts_delivery_to_column(&offer.accepts_delivery),
+                offer.capability_request.as_ref().map(|r| serde_json::to_string(r).expect("serialize capability request")),
             ],
         )?;
         Ok(changed == 1)
@@ -1373,7 +1396,7 @@ impl SellerStore {
         let row = conn
             .query_row(
                 "SELECT offer_id, buyer_pubkey, amount_sats, unit, task, deadline_unix, targeted,
-                        requested_agent, output, payment, accepts_delivery
+                        requested_agent, output, payment, accepts_delivery, capability_request
                  FROM offers WHERE offer_id = ?1",
                 [offer_id],
                 |row| {
@@ -1386,6 +1409,7 @@ impl SellerStore {
                         deadline_unix: row.get(5)?,
                         targeted: row.get::<_, i64>(6)? != 0,
                         requested_agent: row.get(7)?,
+                        capability_request: capability_request_from_column(row.get(11)?)?,
                         output: row.get(8)?,
                         // NULL ⇒ `Sat`. Resolved HERE rather than left to the caller so no reader
                         // of this row can accidentally treat "column absent" as a third state.
@@ -1586,7 +1610,7 @@ impl SellerStore {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT offer_id, buyer_pubkey, amount_sats, unit, task, deadline_unix, targeted,
-                    requested_agent, output, payment, accepts_delivery
+                    requested_agent, output, payment, accepts_delivery, capability_request
              FROM offers
              WHERE deadline_unix > ?1
                AND offer_id NOT IN (SELECT job_id FROM claims)",
@@ -1601,6 +1625,7 @@ impl SellerStore {
                 deadline_unix: row.get(5)?,
                 targeted: row.get::<_, i64>(6)? != 0,
                 requested_agent: row.get(7)?,
+                capability_request: capability_request_from_column(row.get(11)?)?,
                 output: row.get(8)?,
                 payment_mode: payment_mode_from_column(row.get::<_, Option<String>>(9)?),
                 accepts_delivery: accepts_delivery_from_column(row.get::<_, Option<String>>(10)?),
@@ -3191,6 +3216,7 @@ mod tests {
             task: "do the thing".to_owned(),
             deadline_unix: 10_000,
             targeted: true,
+            capability_request: Some(Default::default()),
             requested_agent: None,
             output: Some("text/plain".to_owned()),
             accepts_delivery: Vec::new(),
@@ -5268,7 +5294,7 @@ mod tests {
             store.health().expect("health").schema_version,
             SCHEMA_VERSION
         );
-        assert_eq!(SCHEMA_VERSION, 13);
+        assert_eq!(SCHEMA_VERSION, 14);
         let spending = store
             .in_flight_remittance()
             .expect("row")
@@ -5418,6 +5444,7 @@ mod free_lane_tests {
             task: "t".to_owned(),
             deadline_unix: 2_000_000_000,
             targeted: true,
+            capability_request: Some(Default::default()),
             requested_agent: None,
             output: Some("text/plain".to_owned()),
             accepts_delivery: Vec::new(),
@@ -5539,8 +5566,8 @@ mod free_lane_tests {
             SCHEMA_VERSION
         );
         assert_eq!(
-            SCHEMA_VERSION, 13,
-            "v7 was the free lane; v8 added the receipt fee columns; v9 the mint fee; v10 the fee remittance ledger; v11 its ownership and settlement provenance; v12 the spending mark; v13 the quote bound at admission"
+            SCHEMA_VERSION, 14,
+            "v7 was the free lane; v8 added the receipt fee columns; v9 the mint fee; v10 the fee remittance ledger; v11 its ownership and settlement provenance; v12 the spending mark; v13 the quote bound at admission; v14 queued-offer capability requirements"
         );
 
         // The legacy rows SURVIVE and read as PAID — correct by construction, because every job

@@ -23,10 +23,28 @@
         {
           "key": "Permissions-Policy",
           "value": "geolocation=(), microphone=(), camera=()"
-        },
+        }
+      ]
+    },
+    {
+      "source": "/((?!tokens$).*)",
+      "headers": [
         {
           "key": "Content-Security-Policy",
           "value": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data:; media-src 'self'; connect-src 'self' wss://relay.maxplayer.ai https://api.coinbase.com; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+        }
+      ]
+    },
+    {
+      "source": "/tokens",
+      "headers": [
+        {
+          "key": "Content-Security-Policy",
+          "value": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data:; media-src 'self'; connect-src 'self' wss://nos.lol wss://relay.primal.net wss://offchain.pub; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+        },
+        {
+          "key": "X-Robots-Tag",
+          "value": "noindex, nofollow"
         }
       ]
     }
