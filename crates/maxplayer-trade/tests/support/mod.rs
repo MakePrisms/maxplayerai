@@ -204,12 +204,7 @@ impl MintFixture {
                                 .into_response();
                         }
                     }
-                    if path.ends_with("/restore")
-                        && control
-                            .blank_restores
-                            .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
-                            .is_ok()
-                    {
+                    if path.ends_with("/restore") && take_one(&control.blank_restores) {
                         return axum::Json(serde_json::json!({"outputs":[],"signatures":[]}))
                             .into_response();
                     }
@@ -650,4 +645,17 @@ pub async fn wait_past(t: u64) {
     while coordinator::now() <= t {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+}
+
+/// Decrement `n` if positive (a toolchain-neutral `fetch_update`/`try_update`).
+fn take_one(n: &std::sync::atomic::AtomicU64) -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    let mut cur = n.load(SeqCst);
+    while cur > 0 {
+        match n.compare_exchange(cur, cur - 1, SeqCst, SeqCst) {
+            Ok(_) => return true,
+            Err(seen) => cur = seen,
+        }
+    }
+    false
 }
