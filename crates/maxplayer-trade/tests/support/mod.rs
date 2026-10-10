@@ -204,12 +204,14 @@ impl MintFixture {
                                 .into_response();
                         }
                     }
-                    if path.ends_with("/restore")
-                        && control
-                            .blank_restores
-                            .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
-                            .is_ok()
-                    {
+                    if path.ends_with("/restore") && {
+                        let n = control.blank_restores.load(SeqCst);
+                        n > 0
+                            && control
+                                .blank_restores
+                                .compare_exchange(n, n - 1, SeqCst, SeqCst)
+                                .is_ok()
+                    } {
                         return axum::Json(serde_json::json!({"outputs":[],"signatures":[]}))
                             .into_response();
                     }
