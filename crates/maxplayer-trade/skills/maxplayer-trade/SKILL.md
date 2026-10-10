@@ -129,8 +129,8 @@ or report the retained authorization and recover it without paying again.
 `balance <mint>` reports wallet balance, not total wealth or proof that every
 reservation is spendable. After **any interruption**, use `recover` with the same
 home and relays before new work. It resumes existing authorizations and does not
-admit new trade requests. It makes **one bounded pass**, at most **120 seconds per
-funding/withdrawal/receive/swap item**, without waiting for lock deadlines: exit **0** means
+admit new trade requests. It makes **one bounded pass**, at most **120 s per
+funding/withdrawal/receive/swap item** (`nostr://` swap: 140 s), not waiting for lock deadlines: exit **0** means
 all terminal with no deferred work, **3** unresolved/deferred, **4** terminal manual recovery, **1** command error, pre-submission refusal, or definitive terminal `unpaid_released` (never proof a submitted withdrawal was refused; a submitted non-terminal withdrawal exits **3**),
 **2** CLI usage error.
 Timeout neither undoes an RPC nor releases reservations. Restore `serve` while locks

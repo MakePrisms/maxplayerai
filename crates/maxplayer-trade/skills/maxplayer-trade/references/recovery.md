@@ -103,7 +103,7 @@ serve/recover/market commands; a post-POST timeout is still unresolved, not fail
 | `prepared` | Journaled, swap not yet sent. Recovery sends exactly the journaled swap. |
 | `submitted` | Swap may have reached the mint. Recovery restores (NUT-09) the same outputs and replays only the identical swap; never import the token again elsewhere. |
 | `done` | Terminal: DLEQ-verified proofs credited; check `balance`. |
-| `refused` | Terminal (exit 1): the mint returned a parsed NUT error (HTTP 400, JSON `code` + `detail`), a fresh restore found none of our outputs and the inputs stayed UNSPENT. Nothing credited, not charged to the cap. Any other 400 or transport refusal stays `submitted`. |
+| `refused` | Terminal (exit 1): the mint returned its own NUT error (HTTPS: 400 with JSON numeric `code` + `detail`; `nostr://`: numeric NUT `code` in the reply), a fresh restore found none of our outputs and the inputs stayed UNSPENT. Nothing credited, not charged to the cap. Any other 400 and nostr `expired`/`bad_request`/`rate_limited`/timeout/413 stay `submitted` (exit 3). |
 | `already_spent` | Terminal (exit 1): inputs SPENT and none of our outputs restorable. Nothing credited, not charged. |
 | `quarantined` | Terminal manual recovery (exit 4): our outputs were signed but lack valid DLEQ; never credited, not spendable, but still occupies the cap. Preserve the home and escalate. |
 

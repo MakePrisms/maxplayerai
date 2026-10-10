@@ -89,11 +89,21 @@ fn production_relay_carries_mint_traffic_but_never_market_traffic() {
 }
 #[tokio::test]
 async fn production_relay_is_forbidden() {
-    assert!(
-        Market::connect(Keys::generate(), &["wss://relay.maxplayer.ai".into()])
-            .await
-            .is_err()
-    );
+    for url in [
+        "wss://relay.maxplayer.ai",
+        "wss://RELAY.MAXPLAYER.AI/",
+        "wss://relay.maxplayer.ai./",
+        "wss://relay.maxplayer.ai%2e/",
+        "wss://Relay.Maxplayer.Ai.:443/x",
+    ] {
+        let refused = Market::connect(Keys::generate(), &[url.into()]).await;
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("production relay forbidden")),
+            "SAFETY: market traffic to {url} refused"
+        );
+    }
 }
 
 use maxplayer_trade::{journal::Journal, market::Publication};

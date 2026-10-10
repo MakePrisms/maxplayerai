@@ -29,7 +29,9 @@ pub async fn refund_time(mint: &str) -> Result<u64> {
     })
 }
 /// Bound one CDK wallet call against an HTTP mint (15 s). Kept for compatibility; mint-aware
-/// callers use [`bounded_for`], which never cuts a `nostr://` connector call short.
+/// callers use [`bounded_for`], whose bound outlasts one `nostr://` connector call. An enclosing
+/// budget (advance, message, recovery item) can still drop a call mid-window; that is ambiguous,
+/// never a failure: the swap is journaled first and restored before any identical replay.
 pub async fn bounded<T>(
     f: impl std::future::Future<Output = T>,
 ) -> Result<T, tokio::time::error::Elapsed> {

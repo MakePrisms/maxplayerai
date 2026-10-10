@@ -1140,7 +1140,12 @@ fn advance_budgets() -> (std::time::Duration, std::time::Duration) {
 }
 /// Recovery budget for one swap item: 120 s (HTTP), or room for the full advance deadline plus
 /// one trailing `nostr://` call (the own-mint `states()` after the claim phase) when either leg
-/// is on a `nostr://` mint, so that call is never cut inside its connector window.
+/// is on a `nostr://` mint. The enclosing budgets (this one, the 100 s advance, the 50 s refund
+/// phase, the 60 s message path) are not sized per nostr call and can drop one mid-window. A drop
+/// is only ever ambiguous: every swap is journaled before it is sent, its `exp` is capped at
+/// `send_before`, recovery restores the same outputs before replaying the identical request, and
+/// abandonment needs `send_before + NOSTR_ABANDON_GRACE_SECONDS` on the mint clock plus a fresh
+/// not-landed check. The cost is liveness (deferred to the next tick), not money.
 fn item_budget(s: &Swap) -> std::time::Duration {
     let http = std::time::Duration::from_secs(120);
     let Ok(lot) = serde_json::from_str::<Lot>(&s.lot.content) else {

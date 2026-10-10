@@ -67,6 +67,23 @@ fn loopback(host: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
+/// Dedupe key for a relay URL: the parsed, normalized form (host lowercased, trailing dot and
+/// slash dropped); the raw string if it does not parse (it is refused by `check_mint_relay`).
+fn relay_key(relay: &str) -> String {
+    url::Url::parse(relay)
+        .ok()
+        .and_then(|u| {
+            let host = u.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+            Some(format!(
+                "{}://{host}:{}{}",
+                u.scheme(),
+                u.port_or_known_default().unwrap_or(0),
+                u.path().trim_end_matches('/')
+            ))
+        })
+        .unwrap_or_else(|| relay.to_owned())
+}
+
 /// One mint relay: `wss://`, or `ws://` on loopback (tests), no credentials/query/fragment.
 pub fn check_mint_relay(relay: &str) -> Result<()> {
     let u = url::Url::parse(relay).with_context(|| format!("invalid mint relay {relay}"))?;
@@ -98,19 +115,22 @@ pub fn default_mint_relays() -> Vec<String> {
 /// Set the relays used for `nostr://` mint traffic. Empty keeps [`default_mint_relays`].
 /// Returns the effective list.
 pub fn configure_mint_relays(relays: &[String]) -> Result<Vec<String>> {
-    ensure!(
-        relays.len() <= MAX_MINT_RELAYS,
-        "at most {MAX_MINT_RELAYS} mint relays"
-    );
     for relay in relays {
         check_mint_relay(relay)?;
     }
+    // Dedupe on the parsed URL (case, trailing slash), so spellings of one relay count once
+    // against the cap; the operator's first spelling is kept.
     let mut effective: Vec<String> = vec![];
+    let mut seen = std::collections::HashSet::new();
     for relay in relays {
-        if !effective.contains(relay) {
+        if seen.insert(relay_key(relay)) {
             effective.push(relay.clone());
         }
     }
+    ensure!(
+        effective.len() <= MAX_MINT_RELAYS,
+        "at most {MAX_MINT_RELAYS} mint relays"
+    );
     *MINT_RELAYS.write().unwrap_or_else(|e| e.into_inner()) =
         (!effective.is_empty()).then(|| effective.clone());
     Ok(mint_relays())
@@ -132,7 +152,7 @@ pub fn loopback_only(mint: &str) -> bool {
         return mint_relays().iter().all(|r| {
             url::Url::parse(r)
                 .ok()
-                .and_then(|u| u.host_str().map(|h| h == "127.0.0.1" || h == "localhost"))
+                .and_then(|u| u.host_str().map(loopback))
                 .unwrap_or(false)
         });
     }
@@ -342,6 +362,11 @@ pub fn check_swap_fits(mint: &str, request: &SwapRequest) -> Result<()> {
 
 /// Would the HTLC claim of `locked` (each input carrying a 32-byte preimage and one signature,
 /// `outputs` blinded outputs) fit a `nostr://` request? The refund (empty preimage) is smaller.
+///
+/// DLEQ is not counted because it is never sent: the claim/refund is built with cdk
+/// `SwapRequest::new`, which strips every input's DLEQ (`without_dleqs`, cashu 0.17.2 NUT-03),
+/// exactly as here. `nostr_claim_bound_covers_real_signed_claim_with_dleq` pins that against a
+/// really signed claim of DLEQ-carrying proofs at the admission boundary.
 pub fn check_claim_fits(mint: &str, locked: &Proofs, outputs: usize) -> Result<()> {
     if !is_nostr(mint) {
         return Ok(());
@@ -437,6 +462,82 @@ mod tests {
         );
         assert!(check_claim_fits("https://mint.example", &lock(129), 8).is_ok());
     }
+    /// Every lock admission accepts must yield a claim (real preimage + real signature, the
+    /// counterparty's DLEQ still on each proof, as `redeem_inner` builds it) that fits one NIP-44
+    /// request, including the largest admitted 1-sat split.
+    #[test]
+    fn nostr_claim_bound_covers_real_signed_claim_with_dleq() {
+        use cashu::nuts::ProofDleq;
+        let npub = "nostr://npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d";
+        let receiver = SecretKey::generate();
+        let refund = SecretKey::generate().public_key().to_string();
+        let c = crate::mint::conditions(
+            &"ab".repeat(32),
+            &receiver.public_key().to_string(),
+            &refund,
+            u64::MAX / 2,
+        )
+        .unwrap();
+        let keyset = Id::from_bytes(&[0, 1, 2, 3, 4, 5, 6, 7]).unwrap();
+        let lock = |n: usize| -> Proofs {
+            (0..n)
+                .map(|_| {
+                    let secret: cashu::nuts::nut10::Secret = c.clone().into();
+                    let mut p = cashu::nuts::Proof::new(
+                        1u64.into(),
+                        keyset,
+                        secret.try_into().unwrap(),
+                        SecretKey::generate().public_key(),
+                    );
+                    p.dleq = Some(ProofDleq::new(
+                        SecretKey::generate(),
+                        SecretKey::generate(),
+                        SecretKey::generate(),
+                    ));
+                    p
+                })
+                .collect()
+        };
+        let mut admitted = 0;
+        for n in 1..=NOSTR_MAX_IO {
+            let locked = lock(n);
+            let outputs = (n as u64).count_ones() as usize;
+            if check_claim_fits(npub, &locked, outputs).is_err() {
+                break;
+            }
+            admitted = n;
+            let mut inputs = locked.clone();
+            for p in &mut inputs {
+                p.witness = None;
+                p.add_preimage("cd".repeat(32));
+                p.sign_p2pk(receiver.clone()).unwrap();
+            }
+            assert!(
+                inputs.iter().all(|p| p.dleq.is_some()),
+                "fixture: DLEQ kept"
+            );
+            let blinded = SecretKey::generate().public_key();
+            let messages = (0..64)
+                .filter(|b| (n as u64) >> b & 1 == 1)
+                .map(|b| BlindedMessage::new((1u64 << b).into(), keyset, blinded))
+                .collect();
+            let real = SwapRequest::new(inputs, messages);
+            let wire = serde_json::to_string(&real).unwrap();
+            assert!(
+                !wire.contains("dleq"),
+                "SAFETY: the sent claim carries no DLEQ (else the bound must count it)"
+            );
+            let len = envelope_len(op::SWAP, &real).unwrap();
+            assert!(
+                len <= MAX_PLAINTEXT_BYTES,
+                "SAFETY: admitted {n}-proof lock has a {len}-byte claim over the NIP-44 limit"
+            );
+        }
+        assert!(
+            admitted > 1 && admitted < NOSTR_MAX_IO,
+            "fixture: size binds below the I/O cap ({admitted})"
+        );
+    }
     #[test]
     fn only_a_mint_nut_error_is_a_nostr_refusal() {
         use maxplayer_core::{
@@ -515,6 +616,26 @@ mod tests {
             ],
             "relay.maxplayer.ai first, then the core fallbacks"
         );
+        let a = configure_mint_relays(&[
+            "wss://relay.example".into(),
+            "wss://RELAY.EXAMPLE/".into(),
+            "wss://relay.example.:443".into(),
+            "wss://other.example/path".into(),
+        ])
+        .unwrap();
+        assert_eq!(a, ["wss://relay.example", "wss://other.example/path"]);
+        configure_mint_relays(&["ws://[::1]:7777".into(), "ws://127.0.0.1:7777".into()]).unwrap();
+        assert!(loopback_only(
+            "nostr://npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d"
+        ));
+        // Spellings of one relay count once against the cap (F3).
+        let spelled: Vec<String> = ["wss://R0.example/".to_owned()]
+            .into_iter()
+            .chain((0..8).map(|i| format!("wss://r{i}.example")))
+            .collect();
+        assert_eq!(configure_mint_relays(&spelled).unwrap().len(), 8);
+        configure_mint_relays(&[]).unwrap();
+        assert_eq!(mint_relays(), default_mint_relays());
         assert!(!nostr_op("mint/quote/bolt11").is_some_and(|_| true));
         assert!(require_http("NOSTR://npub1x", "fund").is_err());
     }

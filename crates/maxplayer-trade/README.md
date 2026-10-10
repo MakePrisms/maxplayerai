@@ -13,7 +13,8 @@ Earlier dated verification sections are historical snapshots, not current covera
 
 - Sender-funded claim fees must equal the pinned quote, not the receiver’s outgoing budget.
   Incoming fees exceeding the admission cap are refused before a lock is accepted.
-- CDK wallet calls have 15-second budgets; message handling has 60 seconds. Own-mint
+- CDK wallet calls have 15-second budgets against HTTP mints (40 s against `nostr://` mints,
+  see below); message handling has 60 seconds. Own-mint
   refunds run before counterparty claims. Missing mint info time does not block refunds;
   mint-enforced locktime remains authoritative. Known-preimage claims survive refund quarantine.
 - Withdrawal reserve: max(32 sats, ceil(invoice sats × 2%)); 100,000 sats permits 2,000.
@@ -122,13 +123,17 @@ the mint). CDK wallets for such mints are built with that connector and poll sub
 - Timing: a `nostr://` CDK wallet call is bounded at 40 s (30 s connector window + 10 s margin)
   instead of 15 s; a raw request is bounded by the connector, not the 20 s HTTP timeout. A
   deadline-bound swap (lock/claim) is sent with `exp <= send_before`, and not at all with under
-  2 s left. Abandonment grace is 170 s (window 30 + margin 10 + clock skew 60 + 20) instead of
+  2 s left. Abandonment grace is 120 s (window 30 + margin 10 + clock skew 60 + 20) instead of
   60 s. A recovery item touching a `nostr://` leg gets max(120 s, advance deadline 100 s + 40 s).
-  A call that outlives its bound is ambiguous: the journaled attempt is restored, never resent
-  with new outputs and never treated as failed.
+  These bounds are per call: the enclosing advance (100 s), refund-phase (50 s), message (60 s)
+  and recovery-item budgets can still drop a nostr call mid-window on a slow relay. Such a drop,
+  like a call that outlives its bound, is ambiguous: the journaled attempt is restored, never
+  resent with new outputs and never treated as failed; it costs a deferral, not money.
 - Size: the sidecar takes at most 128 inputs/outputs and a 65,535-byte NIP-44 plaintext. A
   `nostr://` lock whose HTLC claim (preimage + signature per input) could exceed either is
   refused at admission before anything is locked or revealed; own locks are checked the same way.
+  The bound counts the claim witness but not DLEQ: cdk's `SwapRequest::new` strips every input's
+  DLEQ before sending (unit test `nostr_claim_bound_covers_real_signed_claim_with_dleq`).
 - `fund` and `withdraw` refuse `nostr://` mints before touching the home: the sidecar serves no
   NUT-04/05/20. Credits come from the operator's `maxplayer-mint issue` token file.
 - The sidecar has no configurable input fee (ppk 0).
@@ -672,14 +677,18 @@ never argv) imports one token, e.g. one written by `maxplayer-mint issue`. Code:
 - Cap: Funding intents plus charged receives (gross) share one 100,000-sat cap per mint per home; `refused`/`already_spent` receives do not count; `prepared`/`submitted`/`done`/`quarantined` ones do. A quarantined receive is not spendable but still occupies the cap.
 - Exits: 0 `done`; 1 pre-journal refusal, `refused` or `already_spent`; 3 unresolved
   (`prepared`/`submitted`, or a journal write failed); 4 `quarantined`.
-- Only a parsed NUT error (HTTP 400, JSON `code` + `detail`; `mint::MintRefusal`) can make a
-  receive `refused`; any other 400 or transport refusal stays `submitted` and replays.
+- Only the mint's own NUT error (`mint::MintRefusal`: over HTTPS a 400 with JSON numeric `code` +
+  `detail`; over `nostr://` a numeric NUT `code` in the mint's reply) can make a receive `refused`,
+  and only after a fresh restore is empty and the inputs are UNSPENT. Any other 400, and nostr
+  `expired`, `bad_request`, `rate_limited`, `unsupported`, `internal`, an oversized request (413),
+  a timeout or relay failure, stays `submitted` (exit 3) and replays the identical swap.
 - Idempotent per Y-set (sha256 of the sorted proof Ys): repeats resume the existing attempt.
 - The mint input fee is deducted; output reports `amount`, `fee`, `net`, `credited`, state and
   attempt id only. `recover`/`serve` resume receives under the same 120 s item budget.
-- `nostr://` mints: cdk 0.17.2 `MintUrl`/`Token` parse them (unit test
-  `cdk_token_parsing_accepts_nostr_mint_url`), but this crate's `Asset::new` admits only
-  http/https, so a nostr:// receive is refused until the nostr transport branch lands.
+- `nostr://` mints: receive works through the nostr transport (see "`nostr://` mints" above); it
+  is the only way to put credits-sidecar tokens in a home (`fund` is refused). Tests:
+  `nostr_issue_receive_then_https_trade_completes_on_mint_relays_only`,
+  `nostr_expired_swap_reply_during_receive_stays_submitted_then_completes`.
 
 ## Funding and withdrawals
 

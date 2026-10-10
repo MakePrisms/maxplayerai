@@ -47,7 +47,8 @@ Never use a lab-feature binary for the human's funds.
 ## Enforced monetary policy
 
 - Asset identity is canonical mint URL plus unit `sat`; equal units do not make two
-  issuers equivalent. Confirm URLs, not just display names. Use HTTPS for real mints.
+  issuers equivalent. Confirm URLs, not just display names. Real mints are HTTPS, or `nostr://<lowercase npub>`
+  for the Maxplayer credits mint.
 - `--give` / `--want`: exact fixed-lot net amounts; no partial-size purchase.
 - `--max-give`: buyer's total outgoing debit including mint fees.
 - `--min-receive`: buyer's minimum net incoming amount.
@@ -112,9 +113,12 @@ Only DLEQ-verified result proofs are credited. Output is one JSON line with
 the token or proofs. Repeating the same token (any encoding) resumes the same
 attempt and never swaps twice. Exit 0 `done`; 3 unresolved (`prepared`/`submitted`,
 or the state could not be journaled); 1 pre-journal refusal, `refused` or
-`already_spent`; 4 `quarantined`. Only a parsed mint NUT error (HTTP 400 with JSON
-`code` and `detail`) yields `refused`; any other 400 or transport refusal stays
-`submitted` (exit 3) and the identical swap is replayed.
+`already_spent`; 4 `quarantined`. Only the mint's own NUT error yields `refused` (HTTPS: a
+400 with JSON numeric `code` and `detail`; `nostr://`: a numeric NUT `code` in the
+mint's reply), and only after a fresh restore is empty and the inputs are UNSPENT.
+Any other 400 and every nostr transport error (`expired`, `bad_request`,
+`rate_limited`, timeout, oversized request) stays `submitted` (exit 3) and the
+identical swap is replayed.
 
 ## Withdrawal: enforcement before execution
 

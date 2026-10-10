@@ -67,8 +67,10 @@ impl Market {
         let mut clients = vec![];
         for url in urls {
             let u = url::Url::parse(url)?;
+            // `url` lowercases and percent-decodes the host but keeps a trailing dot, which
+            // names the same server (`relay.maxplayer.ai.` / `relay.maxplayer.ai%2e`).
             ensure!(
-                u.host_str() != Some("relay.maxplayer.ai"),
+                u.host_str().map(|h| h.trim_end_matches('.')) != Some("relay.maxplayer.ai"),
                 "production relay forbidden"
             );
             ensure!(
