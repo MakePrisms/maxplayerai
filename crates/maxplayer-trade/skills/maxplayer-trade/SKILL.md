@@ -81,12 +81,11 @@ quote is reported unresolved without another payment.
 ### Receive a token
 
 Needs the human's yes (mint URL, amount); charges the shared cap (§2).
-Save the token to a private file; run `receive <mint> --token-file <file>` (or
-stdin). Never put a token in argv/chat/logs. Only plain sat proofs of that
-mint; fee deducted. Exit 0 `done`; 1 `refused` (final; redeem
-elsewhere) or `already_spent`; 3 unresolved or release pending:
-`recover`; 4 `quarantined`:
-unspendable, still on the cap; escalate. **Done:** `done` and `balance <mint>`.
+Save the token in a private file; run `receive <mint> --token-file <file>`
+or stdin. Never put a token in argv/chat/logs. Only plain sat proofs of that
+mint; fee deducted. Exit 0 `done`; 1 pre-journal refusal (nostr: NIP-44
+size), `refused` (final; redeem elsewhere), `already_spent`; 3 `recover`,
+never re-import; 4 `quarantined` (on cap): escalate. **Done:** `done` and `balance <mint>`.
 
 ### Sell/list X of mint A for Y of mint B
 

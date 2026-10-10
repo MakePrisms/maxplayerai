@@ -925,7 +925,7 @@ async fn nostr_oversized_receive_refused_before_journal() {
 
 /// An oversized attempt journaled before admission sized nostr swaps (older branch builds): the
 /// connector refuses it locally (413) every pass, so it is never published, never `refused` and
-/// stays `submitted` holding its cap (documented manual resolution).
+/// stays `submitted` holding its cap until the token is redeemed elsewhere (then `already_spent`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn nostr_preexisting_oversized_receive_is_never_sent() {
     let e = env().await;
@@ -971,7 +971,7 @@ async fn nostr_preexisting_oversized_receive_is_never_sent() {
     assert_eq!(
         receive::cap_used(&e.jm, &n.url).await.unwrap(),
         (0, 128),
-        "it holds its cap until resolved by hand"
+        "it holds its cap until the token is redeemed elsewhere"
     );
     assert_eq!(balance(&e.maker, &n.url).await, 0);
 }

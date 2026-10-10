@@ -175,7 +175,8 @@ It is not installed in the Maxplayer website skill index. The CLI regression
   even if the maker actually refunded. Keep recovery running; persistent omission needs
   human investigation. NUT-07 advertisement must never be reported as compatibility proof.
 - Residual late-lock window: a mint that holds a delivered POST beyond the abandonment grace
-  (`abandon_grace_seconds`: 60 s over HTTPS, 120 s for a `nostr://` mint) and starts it after the final restore/state/release can create a lock
+  (`abandon_grace_seconds`: 60 s over HTTPS, 120 s for a `nostr://` mint) and starts it
+  after the final restore/state/release can create a lock
   on an already-expired swap; automatic recovery cannot close that server-side window.
 
 ## Build and automated tests (historical round-three counts below)
@@ -713,7 +714,9 @@ never argv) imports one token, e.g. one written by `maxplayer-mint issue`. Code:
   check existed (only unreleased builds of this branch) whose swap is over the NIP-44 limit stays
   `submitted` (exit 3): every pass gets the connector's local 413, so it is never published and
   never `refused`; the inputs stay spendable by the token holder, and the record holds its cap
-  until resolved by hand (`nostr_preexisting_oversized_receive_is_never_sent`).
+  (`nostr_preexisting_oversized_receive_is_never_sent`). For that legacy row only, redeem the
+  original token elsewhere: the next `recover` sees the inputs SPENT with none of our outputs,
+  records `already_spent` and frees the cap. Never re-import any other `submitted` receive.
 
 ## Funding and withdrawals
 

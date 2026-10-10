@@ -103,7 +103,8 @@ Cashu token. Refused **before anything is journaled**: a token whose mint is not
 exactly `<mint>` after canonicalization, multi-mint tokens, non-sat units, P2PK/HTLC
 or other NUT-10 locked proofs, more than 128 or duplicate proofs, an invalid incoming
 DLEQ (when present), a token above **100,000 sats**, or one that would push this
-mint past the shared cap. Funding intents plus charged receives (gross) share one 100,000-sat cap per mint per home; `refused`/`already_spent` receives do not count; `prepared`/`submitted`/`done`/`quarantined` ones do. A quarantined receive is not spendable but
+mint past the shared cap, or (`nostr://` mint) whose swap would not fit one NIP-44
+request (error names NIP-44; exit 1, nothing journaled, cap untouched). Funding intents plus charged receives (gross) share one 100,000-sat cap per mint per home; `refused`/`already_spent` receives do not count; `prepared`/`submitted`/`done`/`quarantined` ones do. A quarantined receive is not spendable but
 still occupies the cap. Common preflight runs, then NUT-07 must report every proof UNSPENT.
 
 One swap into fresh home-owned outputs; input proofs, blinded outputs and their
