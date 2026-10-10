@@ -83,8 +83,8 @@ an active sat keyset, and clock skew at most 60 seconds. Preflight runs before e
 `take`, funding quotes and lock submission; successful earlier preflight is not cached
 as permission for a later lock. Test mints and loopback HTTP(S) fixtures remain supported.
 HTTP is refused except on loopback, and redirects are disabled. There is no real-money
-opt-in environment variable or allow-list flag. Each lock's gross amount and cumulative
-funding per mint/home are capped at **100,000 sats**, including pending/lost funding intents.
+opt-in environment variable or allow-list flag. Each lock's gross amount is capped at
+**100,000 sats**. Funding intents plus charged receives (gross) share one 100,000-sat cap per mint per home, including pending/lost funding intents.
 Each withdrawal invoice is also capped at **100,000 sats**, plus at most max(32 sats, ceil(invoice amount × 2%)) of
 quoted fee reserve, bounded together with input fees by `--max-debit`; spendable funds must cover the invoice, input fees and required change.
 
@@ -634,14 +634,24 @@ never argv) imports one token, e.g. one written by `maxplayer-mint issue`. Code:
   DLEQ (when present), > 100,000 sats, or a receive that would exceed the shared cap below. Common preflight and NUT-07 UNSPENT are required before the journal write.
 - One swap into fresh home-owned outputs; token, inputs, blinded outputs and secrets are
   journaled before the POST. Ambiguity → NUT-09 restore of the same outputs and identical
-  replay only. A NUT error with inputs UNSPENT is terminal `refused`; SPENT inputs with nothing
+  replay only. A definitive NUT error with inputs UNSPENT is `refused`; SPENT inputs with nothing
   of ours restorable is terminal `already_spent`. Only DLEQ-verified proofs are credited;
   missing/invalid DLEQ on our outputs is terminal `quarantined` (exit 4).
 - Cap: Funding intents plus charged receives (gross) share one 100,000-sat cap per mint per home; `refused`/`already_spent` receives do not count; `prepared`/`submitted`/`done`/`quarantined` ones do. A quarantined receive is not spendable but still occupies the cap.
 - Exits: 0 `done`; 1 pre-journal refusal, `refused` or `already_spent`; 3 unresolved
   (`prepared`/`submitted`, or a journal write failed); 4 `quarantined`.
-- Only a parsed NUT error (HTTP 400, JSON `code` + `detail`; `mint::MintRefusal`) can make a
-  receive `refused`; any other 400 or transport refusal stays `submitted` and replays.
+- Only a definitive NUT error (HTTP 400, JSON `code` + `detail`, code on the
+  `MintRefusal::DEFINITIVE` allowlist mirroring cdk-common 0.17.2 `is_definitive_failure`)
+  can make a receive `refused`. `50000` (cdk's transient Internal/Database catch-all),
+  11002 TokenPending, 11004 OutputsPending, unknown codes, any other 400 and transport
+  refusals stay `submitted` and replay. Every absence check restores, checks NUT-07 and,
+  on SPENT, restores again before `already_spent`.
+- `refused` is not retried by `recover`; repeating `receive` with the same token retries
+  the same journaled outputs (one record per token, never two live attempts) after
+  re-checking the cap.
+- Credited proofs are stored RESERVED under the receive id and released only after `done`
+  is journaled, so `withdraw`/`send` cannot spend them earlier. Mint error detail text is
+  never printed; only the NUT code.
 - Idempotent per Y-set (sha256 of the sorted proof Ys): repeats resume the existing attempt.
 - The mint input fee is deducted; output reports `amount`, `fee`, `net`, `credited`, state and
   attempt id only. `recover`/`serve` resume receives under the same 120 s item budget.

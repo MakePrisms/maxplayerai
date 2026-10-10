@@ -148,17 +148,8 @@ pub async fn fund(home: &Path, j: &Journal, url: &str, amount: u64) -> Result<Fu
         amount > 0 && amount <= crate::real_money::CAP,
         "funding cap exceeded"
     );
-    let received = crate::receive::charged(j, url).await?;
-    let total = j
-        .all::<Funding>("funding")
-        .await?
-        .iter()
-        .filter(|f| f.mint == url)
-        .try_fold(0u64, |s, f| {
-            s.checked_add(f.amount).context("funding overflow")
-        })?
-        .checked_add(received)
-        .context("funding overflow")?;
+    let (funded, received) = crate::receive::cap_used(j, url).await?;
+    let total = funded.checked_add(received).context("funding overflow")?;
     if !total
         .checked_add(amount)
         .is_some_and(|n| n <= crate::real_money::CAP)
