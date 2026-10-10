@@ -8,7 +8,7 @@
 use crate::{
     journal::Journal,
     mint,
-    wallet::{bounded, database, wallet},
+    wallet::{bounded_for, database, wallet},
 };
 use anyhow::{Context, Result, anyhow, ensure};
 use cashu::nuts::nut00::ProofsMethods;
@@ -261,10 +261,10 @@ pub async fn receive(home: &Path, j: &Journal, mint: &str, raw: &str) -> Result<
     check_cap(j, mint, p.amount).await?;
     crate::wallet::preflight(mint).await?;
     let w = wallet(home, mint).await?;
-    bounded(w.refresh_keysets())
+    bounded_for(mint, w.refresh_keysets())
         .await
         .context("CDK wallet request timed out")??;
-    let keysets = bounded(w.get_mint_keysets(KeysetFilter::All))
+    let keysets = bounded_for(mint, w.get_mint_keysets(KeysetFilter::All))
         .await
         .context("CDK wallet request timed out")??;
     let inputs = p
@@ -282,12 +282,15 @@ pub async fn receive(home: &Path, j: &Journal, mint: &str, raw: &str) -> Result<
         .cloned()
         .collect();
     if !with_dleq.is_empty() {
-        bounded(w.verify_token_dleq(&Token::new(
-            MintUrl::from_str(mint)?,
-            with_dleq,
-            None,
-            CurrencyUnit::Sat,
-        )))
+        bounded_for(
+            mint,
+            w.verify_token_dleq(&Token::new(
+                MintUrl::from_str(mint)?,
+                with_dleq,
+                None,
+                CurrencyUnit::Sat,
+            )),
+        )
         .await
         .context("CDK wallet request timed out")?
         .map_err(|e| match e {
@@ -296,7 +299,7 @@ pub async fn receive(home: &Path, j: &Journal, mint: &str, raw: &str) -> Result<
         })?;
     }
     let fee = u64::from(
-        bounded(w.get_proofs_fee(&inputs))
+        bounded_for(mint, w.get_proofs_fee(&inputs))
             .await
             .context("CDK wallet request timed out")??
             .total,
@@ -306,10 +309,10 @@ pub async fn receive(home: &Path, j: &Journal, mint: &str, raw: &str) -> Result<
     mint::unspent(mint, &inputs)
         .await
         .context("token is not UNSPENT at the mint (already spent or pending)")?;
-    let k = bounded(w.fetch_active_keyset())
+    let k = bounded_for(mint, w.fetch_active_keyset())
         .await
         .context("CDK wallet request timed out")??;
-    let amounts = bounded(w.get_keyset_fees_and_amounts_by_id(k.id))
+    let amounts = bounded_for(mint, w.get_keyset_fees_and_amounts_by_id(k.id))
         .await
         .context("CDK wallet request timed out")??;
     let outputs: Vec<Output> =
@@ -326,6 +329,12 @@ pub async fn receive(home: &Path, j: &Journal, mint: &str, raw: &str) -> Result<
         !outputs.is_empty() && outputs.len() <= MAX_PROOFS,
         "output limit"
     );
+    // A `nostr://` swap must fit one NIP-44 request. Plain secrets are arbitrary strings, so a
+    // token under MAX_TOKEN_BYTES can still build an unsendable swap; journaling it would leave a
+    // `submitted` attempt that can never be sent and that holds the cap. Refuse it here, before
+    // any journal write (exit 1, nothing recorded, cap untouched).
+    crate::transport::check_swap_fits(mint, &swap_request(&inputs, &outputs))
+        .context("token refused: its receive swap cannot be sent to this nostr mint")?;
     let mut r = Receipt {
         id: p.id,
         mint: mint.into(),
@@ -344,6 +353,14 @@ pub async fn receive(home: &Path, j: &Journal, mint: &str, raw: &str) -> Result<
         eprintln!("receive {}: {error:#}; attempt retained", r.id);
     }
     Ok(r)
+}
+
+/// The one receive swap body (DLEQ stripped by `SwapRequest::new`), for sizing and sending.
+fn swap_request(inputs: &Proofs, outputs: &[Output]) -> SwapRequest {
+    SwapRequest::new(
+        inputs.clone(),
+        outputs.iter().map(|o| o.message.clone()).collect(),
+    )
 }
 
 enum Inputs {
@@ -490,15 +507,11 @@ pub async fn resume(home: &Path, j: &Journal, r: &mut Receipt) -> Result<()> {
                 {
                     std::process::exit(87);
                 }
-                let sent: Result<SwapResponse> = mint::rpc(
-                    &r.mint,
-                    "swap",
-                    &SwapRequest::new(
-                        r.inputs.clone(),
-                        r.outputs.iter().map(|o| o.message.clone()).collect(),
-                    ),
-                )
-                .await;
+                // No size gate here: admission sized the swap with headroom, and an older attempt
+                // that does not fit is refused locally by the connector (413, never published),
+                // which stays ambiguous, so it remains `submitted` and is never `refused`.
+                let request = swap_request(&r.inputs, &r.outputs);
+                let sent: Result<SwapResponse> = mint::rpc(&r.mint, "swap", &request).await;
                 match sent {
                     Ok(reply) => reply.signatures,
                     // Definitive only for an allowlisted NUT code AND fresh absence of
@@ -538,7 +551,7 @@ pub async fn resume(home: &Path, j: &Journal, r: &mut Receipt) -> Result<()> {
             );
         }
         let w = wallet(home, &r.mint).await?;
-        let keys = bounded(w.load_keyset_keys(r.outputs[0].message.keyset_id))
+        let keys = bounded_for(&r.mint, w.load_keyset_keys(r.outputs[0].message.keyset_id))
             .await
             .context("CDK wallet request timed out")??;
         let proofs = cdk::dhke::construct_proofs(
@@ -571,12 +584,15 @@ pub async fn resume(home: &Path, j: &Journal, r: &mut Receipt) -> Result<()> {
         return finish(j, r, ReceiveState::Quarantined).await;
     }
     let w = wallet(home, &r.mint).await?;
-    match bounded(w.verify_token_dleq(&Token::new(
-        MintUrl::from_str(&r.mint)?,
-        result.clone(),
-        None,
-        CurrencyUnit::Sat,
-    )))
+    match bounded_for(
+        &r.mint,
+        w.verify_token_dleq(&Token::new(
+            MintUrl::from_str(&r.mint)?,
+            result.clone(),
+            None,
+            CurrencyUnit::Sat,
+        )),
+    )
     .await
     .context("CDK wallet request timed out")?
     {

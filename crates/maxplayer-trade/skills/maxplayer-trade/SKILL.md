@@ -26,7 +26,7 @@ Never copy its seed.
 Never print secrets, seeds, keys, tokens, proofs, preimages or raw journals, or
 attach a home/database to chat. Report only public IDs, mint URLs, amounts, states
 and redacted errors. Invoice delivery belongs in the human's private conversation.
-**Done:** the home and authorized mint identities (URL + sat unit) are known.
+**Done:** home and authorized mints (URL or `nostr://<npub>`; sat unit) are known.
 
 ## 2. Check readiness and get explicit authorization
 
@@ -79,12 +79,11 @@ quote is reported unresolved without another payment.
 ### Receive a token
 
 Needs the human's yes (mint, amount); charges the shared cap (§2).
-Save the token to a private file; run `receive <mint> --token-file <file>` (or
+Save it to a private file; run `receive <mint> --token-file <file>` (or
 stdin). Never put tokens in argv/chat/logs. Only plain sat proofs of that
-mint; fee deducted. Exit 0 `done`; 1 `refused` (final: not imported;
-redeem elsewhere) or `already_spent`; 3 unresolved/release pending:
-`recover`, never re-import; 4 `quarantined`:
-unspendable, on cap; escalate. **Done:** `done` + `balance <mint>`.
+mint; fee deducted. Exit 0 `done`; 1 pre-journal refusal (nostr: NIP-44
+size), `refused` (final; redeem elsewhere), `already_spent`; 3 `recover`,
+never re-import; 4 `quarantined` (on cap): escalate. **Done:** `done` + `balance <mint>`.
 
 ### Send a token / move funds to another wallet
 
@@ -133,8 +132,8 @@ or report the retained authorization and recover it without paying again.
 
 `balance <mint>` is wallet balance, not total wealth or proof reservations are spendable. After **any interruption**, use `recover` with the same
 home and relays before new work. It resumes existing authorizations and does not
-admit new trade requests. It makes **one bounded pass**, at most **120 seconds per
-funding/withdrawal/receive/swap item**, without waiting for lock deadlines: exit **0** means
+admit new trade requests. It makes **one bounded pass**, at most **120 s per
+funding/withdrawal/receive/swap item** (`nostr://` swap: 140 s), not waiting for lock deadlines: exit **0** means
 all terminal with no deferred work, **3** unresolved/deferred, **4** terminal manual recovery, **1** command error, pre-submission refusal, or definitive terminal `unpaid_released` (never proof a submitted withdrawal was refused; a submitted non-terminal withdrawal exits **3**),
 **2** CLI usage error.
 Timeout neither undoes an RPC nor releases reservations. Restore `serve` while locks
