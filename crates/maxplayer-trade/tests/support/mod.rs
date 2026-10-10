@@ -74,6 +74,9 @@ pub struct Faults {
     /// Let the mint EXECUTE the next swap, then answer it with the NUT error above and
     /// blank the next restore (models a lost-reply POST landing around a refusal).
     pub refuse_after_swap: std::sync::atomic::AtomicBool,
+    /// Restores blanked after `refuse_after_swap` (0 = 1; 2 hides the outputs from
+    /// both restores of the refusal path: a lagging restore after a landed swap).
+    pub refuse_after_swap_blanks: std::sync::atomic::AtomicU64,
     /// Answer this many restores with an empty (but well-formed) reply.
     pub blank_restores: std::sync::atomic::AtomicU64,
     /// Answer every swap POST with an unprocessed HTTP 400 that is NOT a NUT error:
@@ -192,7 +195,8 @@ impl MintFixture {
                         if control.refuse_after_swap.swap(false, SeqCst) {
                             let done = next.run(req).await;
                             assert!(done.status().is_success(), "fixture swap must execute");
-                            control.blank_restores.store(1, SeqCst);
+                            let blanks = control.refuse_after_swap_blanks.load(SeqCst).max(1);
+                            control.blank_restores.store(blanks, SeqCst);
                             let code = match control.swap_nut_code.load(SeqCst) {
                                 0 => 11001,
                                 c => c,

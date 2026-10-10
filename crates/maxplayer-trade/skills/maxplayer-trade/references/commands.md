@@ -131,8 +131,8 @@ same outputs and identical replay only. The file is written only after the swap 
 definitive and every output verifies DLEQ; the token is kept in the private journal so
 `recover` rewrites the same token after a crash. Rerunning the same command with the
 same `--out` resumes that attempt, or rewrites the same journaled token if the file was
-moved or deleted (only if NUT-07 shows no sent proof SPENT/PENDING, else exit 1
-"already (partially) redeemed; choose another --out"; a rewrite prints a stderr notice
+moved or deleted (only if NUT-07 shows every sent proof UNSPENT; SPENT, PENDING or an
+unreachable mint exit 1, "already (partially) redeemed or pending; choose another --out"; a rewrite prints a stderr notice
 and `"rewritten": true`); it never sends twice. A `reclaiming` send's `--out` is
 refused: run `send --reclaim <id>`. A used `--out` (other terms, reclaimed/redeemed
 or manual-recovery send) is refused; only a `refused` send frees its path. Coin
@@ -146,9 +146,9 @@ proofs back (same journaling; fee needs `--max-fees` unless 0). It also works on
 `swapped` send whose token file could not be placed. Reclaim exits 0 `reclaimed`; 3
 `reclaiming`; 1 when refused or partially redeemed meanwhile (state stays `sent`,
 token still outstanding: run `send --reclaim <id>` again) or `redeemed` (also when
-the recipient won the race before our leg was POSTed or while it was definitively
-refused); 4 `reclaim_unresolved` (our leg POSTed ambiguously, outputs absent on two
-passes; secrets kept) or `reclaim_quarantined`. If they are already
+the recipient won the race before any POST of our leg); 4 `reclaim_unresolved` (our
+leg POSTed, with an ambiguous reply or a refusal while every input is SPENT, and its
+outputs absent on two passes; secrets kept) or `reclaim_quarantined`. If they are already
 SPENT it reports "redeemed by recipient" and refunds nothing. `status --check-sends`
 asks each mint (NUT-07) whether sent tokens were redeemed; plain `status` is offline.
 

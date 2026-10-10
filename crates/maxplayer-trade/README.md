@@ -693,9 +693,9 @@ counterpart to `receive`, for moving funds to another wallet without Lightning. 
   is journaled before each POST). It also works on a `swapped` send whose file could not be
   placed. Exits: 0 `reclaimed`; 3 `reclaiming`; 1 refused or partially redeemed meanwhile
   (state back to `sent`; run it again) or `redeemed` (all SPENT, including the race where the
-  recipient redeemed before our leg was POSTed or while it was definitively refused); 4
-  `reclaim_unresolved` only when our leg was POSTed ambiguously and its outputs stayed absent
-  on two passes (secrets kept), or `reclaim_quarantined`. `status --check-sends` performs the on-demand NUT-07 check.
+  recipient redeemed before any POST of our leg); 4 `reclaim_unresolved` when our leg was
+  POSTed (ambiguous reply, or a refusal while every input is SPENT: the mint may have executed
+  it) and its outputs stayed absent on two passes (secrets kept), or `reclaim_quarantined`. `status --check-sends` performs the on-demand NUT-07 check.
 - Mint calls use `mint::rpc`/`states`/`unspent`, `wallet::preflight` and the `wallet()` builder,
   so the nostr transport branch reroutes send with no send-specific change.
 

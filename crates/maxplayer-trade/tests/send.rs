@@ -1164,3 +1164,65 @@ async fn unposted_reclaim_raced_by_recipient_ends_redeemed() {
     assert!(!money::recover(a.path(), &ja).await.unwrap(), "terminal");
     assert_eq!(balance(a.path(), &m.url).await, 24, "nothing credited");
 }
+
+/// Review round 4 (advisor Medium, crd R3-0): a reclaim POST that LANDS but is
+/// answered with an allowlisted refusal (11001), its outputs hidden from both
+/// restores of that pass, is possibly posted: never `redeemed` in the same pass.
+/// It stays retained (exit 3), then credits once restore shows the outputs, or
+/// ends `reclaim_unresolved` with secrets kept if they stay absent.
+#[tokio::test]
+async fn landed_reclaim_refused_with_outputs_hidden_twice_is_never_redeemed() {
+    for stay_absent in [false, true] {
+        let m = MintFixture::start(0).await;
+        let (a, ja) = funded(&m, 32).await;
+        let r = sent(&m, a.path(), &ja, 8, "t").await;
+        let swaps = m.faults.swaps.load(SeqCst);
+        m.faults.refuse_after_swap_blanks.store(2, SeqCst);
+        m.faults.refuse_after_swap.store(true, SeqCst);
+        let out = cli(a.path(), &["send", "--reclaim", &r.id], None).await;
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(3), "SAFETY: retained: {err}");
+        assert!(!err.contains("redeemed by recipient"), "{err}");
+        assert_eq!(m.faults.swaps.load(SeqCst), swaps + 1, "the reclaim landed");
+        assert_eq!(
+            m.faults.blank_restores.load(SeqCst),
+            0,
+            "both restores hidden"
+        );
+        let r1 = &attempts(&ja).await[0];
+        assert_eq!(
+            r1.state,
+            SendState::Reclaiming,
+            "SAFETY: a landed reclaim is never written off as redeemed"
+        );
+        if stay_absent {
+            m.faults.blank_restores.store(u64::MAX / 2, SeqCst);
+        }
+        money::recover(a.path(), &ja).await.unwrap();
+        let r2 = &attempts(&ja).await[0];
+        if stay_absent {
+            assert_eq!(r2.state, SendState::ReclaimUnresolved);
+            assert!(r2.manual_recovery());
+            let raw = ja
+                .get::<serde_json::Value>("send", &r.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                raw["reclaim"]["outputs"]
+                    .as_array()
+                    .is_some_and(|o| !o.is_empty()),
+                "SAFETY: reclaim secrets kept"
+            );
+            assert_eq!(balance(a.path(), &m.url).await, 24, "nothing credited");
+        } else {
+            assert_eq!(r2.state, SendState::Reclaimed, "SAFETY: credited later");
+            assert_eq!(balance(a.path(), &m.url).await, 32, "SAFETY: credited once");
+            assert_eq!(
+                m.faults.swaps.load(SeqCst),
+                swaps + 1,
+                "SAFETY: no second swap"
+            );
+        }
+    }
+}

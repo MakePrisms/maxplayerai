@@ -388,8 +388,8 @@ pub async fn send(
         );
         write_token(&out, &r.id, &token)?;
         eprintln!(
-            "send {}: --out belongs to send {} (already sent); rewrote the same token; no new value was sent",
-            r.id, r.id
+            "send {}: --out already belongs to this send; rewrote the same token; no new value was sent",
+            r.id
         );
         r.rewritten = true;
         return Ok(r);
@@ -978,10 +978,16 @@ async fn resume_reclaim(home: &Path, j: &Journal, r: &mut SendAttempt) -> Result
                 })
                 .await?;
             }
-            // `post` returns Spent only after a DEFINITIVE refusal (this POST did not
-            // execute) with every input SPENT and our outputs absent twice.
+            // `post` returns Spent only after an allowlisted refusal with every input
+            // SPENT and our outputs absent twice. A mint may still have executed this
+            // POST (commit, then a refusal reply, then lagging restores), so the leg now
+            // counts as possibly posted.
             outcome = post(&r.mint, &leg).await?;
         }
+        // Recompute after any POST of this pass: `reclaim_submitted` is journaled
+        // `Some(true)` before every POST, so only a leg never POSTed (this pass
+        // included) can take the immediate `redeemed` path below.
+        let possibly_posted = r.reclaim_submitted != Some(false);
         let signatures = match outcome {
             Probe::Signed(s) => s,
             // Inputs SPENT and our outputs absent on a double restore. A swap spends all
@@ -1001,9 +1007,9 @@ async fn resume_reclaim(home: &Path, j: &Journal, r: &mut SendAttempt) -> Result
                         r.id
                     );
                 }
-                if !earlier_post {
-                    // No POST of this leg ever executed (never sent, or definitively
-                    // refused): the recipient redeemed first. Secrets stay archived.
+                if !possibly_posted {
+                    // No POST of this leg was ever made: the recipient redeemed first.
+                    // Secrets stay archived.
                     update(j, r, |n| {
                         archive_reclaim(n);
                         n.state = SendState::Redeemed;
