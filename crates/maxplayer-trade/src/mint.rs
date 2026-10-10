@@ -51,6 +51,98 @@ pub const RPC_TIMEOUT_SECONDS: u64 = 20;
 // Three RPC timeouts: the swap timeout plus two timeouts of scheduling/clock margin.
 pub const ABANDON_GRACE_SECONDS: u64 = 3 * RPC_TIMEOUT_SECONDS;
 
+/// A Cashu NUT error from the mint: HTTP 400 whose body is a JSON object with a
+/// numeric `code` and a string `detail` (NUT-00 error response). Parsing proves only
+/// that the mint answered with a NUT body: cdk 0.17.2 answers HTTP 400 + NUT body for
+/// EVERY error, including transient ones (`50000` for Internal/Database/DHKE/
+/// ConcurrentUpdate and its fallback). Only [`MintRefusal::definitive`] codes may be
+/// treated as "the mint processed and refused this request".
+///
+/// Everything else stays ambiguous: transport errors, timeouts, 429/5xx, a 400 whose
+/// body is not parseable or has no numeric code, and any transport-level refusal such
+/// as a Nostr connector's `expired`/`bad_request` ("not executed"). A transport must
+/// construct this type only for a real NUT error the mint itself returned.
+///
+/// `detail` is sanitized (printable ASCII, at most [`MintRefusal::MAX_DETAIL`] bytes);
+/// the raw body is never kept or logged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MintRefusal {
+    pub code: u64,
+    pub detail: String,
+}
+impl MintRefusal {
+    pub const MAX_DETAIL: usize = 120;
+    /// Build from a NUT error code and an untrusted detail string (sanitized here).
+    pub fn new(code: u64, detail: &str) -> Self {
+        let mut detail: String = detail
+            .chars()
+            .map(|c| {
+                if c.is_ascii_graphic() || c == ' ' {
+                    c
+                } else {
+                    '?'
+                }
+            })
+            .collect();
+        detail.truncate(Self::MAX_DETAIL);
+        Self { code, detail }
+    }
+    /// Parse an HTTP reply. `Some` only for status 400 with a NUT error body.
+    pub fn parse(status: u16, body: &str) -> Option<Self> {
+        if status != 400 {
+            return None;
+        }
+        let v: serde_json::Value = serde_json::from_str(body).ok()?;
+        Some(Self::new(
+            v.get("code")?.as_u64()?,
+            v.get("detail")?.as_str()?,
+        ))
+    }
+    /// NUT codes meaning the mint verified this request and rejected it without
+    /// executing it. A strict SUBSET of cdk-common 0.17.2 `Error::is_definitive_failure`
+    /// for the errors a swap can return; do not "complete the mirror" (11003 and the
+    /// auth codes are deliberately left out). Everything else stays ambiguous: `50000` (cdk's
+    /// transient catch-all), 11002 TokenPending, 11004 OutputsPending, 11003 (our
+    /// outputs are already signed: evidence that the swap landed), auth/rate-limit
+    /// codes and every unknown code.
+    pub const DEFINITIVE: &'static [u64] = &[
+        10001, // TokenNotVerified
+        11001, // TokenAlreadySpent
+        11005, // TransactionUnbalanced
+        11007, // DuplicateInputs
+        11008, // DuplicateOutputs
+        11009, // MultipleUnits
+        11010, // UnitMismatch
+        11013, // UnsupportedUnit
+        11014, // MaxInputsExceeded
+        11015, // MaxOutputsExceeded
+        12001, // KeysetNotFound
+        12002, // KeysetInactive
+        12003, // KeysetExpired
+    ];
+    pub fn definitive(&self) -> bool {
+        Self::DEFINITIVE.contains(&self.code)
+    }
+    /// The typed refusal anywhere in an error's chain, if any.
+    pub fn of(e: &anyhow::Error) -> Option<&Self> {
+        e.chain().find_map(|c| c.downcast_ref::<Self>())
+    }
+}
+impl std::fmt::Display for MintRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Mint-controlled detail text is never displayed or logged; the code only.
+        write!(f, "mint NUT error {}", self.code)
+    }
+}
+impl std::error::Error for MintRefusal {}
+
+/// True only for a [`MintRefusal::definitive`] NUT error in `e`'s chain.
+pub fn definitive_refusal(e: &anyhow::Error) -> bool {
+    MintRefusal::of(e).is_some_and(MintRefusal::definitive)
+}
+
+/// POST a NUT endpoint. A NUT error reply is returned as a [`MintRefusal`] in the
+/// error chain; every other failure is an untyped (ambiguous) error.
 pub async fn rpc<T: serde::de::DeserializeOwned>(
     mint: &str,
     op: &str,
@@ -67,6 +159,9 @@ pub async fn rpc<T: serde::de::DeserializeOwned>(
         .await?;
     let status = r.status();
     let text = r.text().await?;
+    if let Some(refusal) = MintRefusal::parse(status.as_u16(), &text) {
+        return Err(anyhow::Error::new(refusal).context(format!("mint {mint} {op}: HTTP {status}")));
+    }
     ensure!(
         status.is_success(),
         "mint {mint} {op}: HTTP {status} (body withheld)"
@@ -998,4 +1093,61 @@ async fn owned_commit_evidence(a: &Attempt) -> Result<bool> {
         .states
         .iter()
         .all(|s| s.state == State::Spent))
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::MintRefusal;
+    #[test]
+    fn only_a_400_nut_error_body_is_a_refusal() {
+        let ok = MintRefusal::parse(400, r#"{"code":11001,"detail":"Token already spent"}"#);
+        assert_eq!(ok, Some(MintRefusal::new(11001, "Token already spent")));
+        for (status, body) in [
+            (400, "<html>bad request</html>"),
+            (400, r#"{"detail":"no code"}"#),
+            (400, r#"{"code":"11001","detail":"string code"}"#),
+            (400, r#"{"code":11001}"#),
+            (400, r#"{"error":"expired","detail":"x"}"#),
+            (400, ""),
+            (500, r#"{"code":11001,"detail":"x"}"#),
+            (429, r#"{"code":11001,"detail":"x"}"#),
+        ] {
+            assert_eq!(
+                MintRefusal::parse(status, body),
+                None,
+                "SAFETY: {status} {body}"
+            );
+        }
+    }
+    #[test]
+    fn only_allowlisted_codes_are_definitive() {
+        for code in [11001, 11005, 12001, 12002, 12003] {
+            assert!(MintRefusal::new(code, "x").definitive(), "{code}");
+        }
+        // cdk 0.17.2: Internal/Database/DHKE/ConcurrentUpdate/fallback -> 50000.
+        for code in [50000, 11002, 11003, 11004, 31004, 20005, 0, 1, 99999] {
+            assert!(
+                !MintRefusal::new(code, "x").definitive(),
+                "SAFETY: {code} is ambiguous"
+            );
+        }
+        let e = anyhow::Error::new(MintRefusal::new(50000, "busy")).context("outer");
+        assert!(MintRefusal::of(&e).is_some() && !super::definitive_refusal(&e));
+        let e = anyhow::Error::new(MintRefusal::new(11001, "spent")).context("outer");
+        assert!(super::definitive_refusal(&e));
+    }
+    #[test]
+    fn display_withholds_mint_detail() {
+        let r = MintRefusal::new(11001, "secret-looking-detail");
+        assert_eq!(r.to_string(), "mint NUT error 11001");
+    }
+    #[test]
+    fn detail_is_bounded_and_sanitized() {
+        let r = MintRefusal::new(1, &format!("a\nb\u{1b}[31m{}", "x".repeat(500)));
+        assert!(r.detail.len() <= MintRefusal::MAX_DETAIL);
+        assert!(r.detail.chars().all(|c| c.is_ascii_graphic() || c == ' '));
+        let e = anyhow::Error::new(r.clone()).context("outer");
+        assert_eq!(MintRefusal::of(&e), Some(&r));
+        assert!(MintRefusal::of(&anyhow::anyhow!("mint x swap: HTTP 400 Bad Request")).is_none());
+    }
 }

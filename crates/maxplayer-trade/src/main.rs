@@ -73,6 +73,13 @@ enum Command {
         #[arg(long)]
         max_debit: Option<u64>,
     },
+    /// Import one plain-sat Cashu token (max 100,000 sats) from a file or stdin; never argv.
+    Receive {
+        mint: String,
+        /// File holding the token; omit to read the token from stdin.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+    },
     /// Read public journal states without locking the home or advancing payments.
     Status,
     /// Read spendable wallet balance without submitting existing money authorizations.
@@ -145,6 +152,7 @@ async fn execute() -> Result<()> {
             | Command::Fund { .. }
             | Command::Balance { .. }
             | Command::Withdraw { .. }
+            | Command::Receive { .. }
     ) {
         let keys = maxplayer_trade::wallet::identity(&cli.home)?;
         let relays = if cli.relay.is_empty() {
@@ -221,7 +229,8 @@ async fn execute() -> Result<()> {
         Command::Preflight { mint }
         | Command::Fund { mint, .. }
         | Command::Balance { mint }
-        | Command::Withdraw { mint, .. } => mint,
+        | Command::Withdraw { mint, .. }
+        | Command::Receive { mint, .. } => mint,
         _ => unreachable!(),
     };
     let asset = maxplayer_trade::Asset::new(mint_arg)?;
@@ -269,6 +278,43 @@ async fn execute() -> Result<()> {
             a.state
         );
         return Ok(());
+    }
+    if let Command::Receive { ref token_file, .. } = cli.command {
+        use std::io::Read;
+        let limit = maxplayer_trade::receive::MAX_TOKEN_BYTES as u64 + 1;
+        let mut raw = String::new();
+        match token_file {
+            Some(path) => fs::File::open(path)
+                .context("cannot open token file")?
+                .take(limit)
+                .read_to_string(&mut raw)
+                .context("token file is not readable UTF-8")?,
+            None => std::io::stdin()
+                .take(limit)
+                .read_to_string(&mut raw)
+                .context("stdin token is not readable UTF-8")?,
+        };
+        let r = maxplayer_trade::receive::receive(&cli.home, &money_journal, mint, &raw).await;
+        drop(raw);
+        let r = r?;
+        println!("{}", r.summary());
+        use maxplayer_trade::receive::ReceiveState::*;
+        return match r.state {
+            Done if r.settled() => Ok(()),
+            // Journaled done but the credited rows are not yet released: run recover.
+            Done => Err(coordinator::RecoveryIncomplete.into()),
+            Quarantined => Err(coordinator::ManualRecovery.into()),
+            Refused => anyhow::bail!(
+                "receive refused by the mint ({}); final: the token was NOT imported, nothing \
+                 was credited or charged to the cap, and it can be redeemed elsewhere",
+                r.refusal_code
+                    .map_or("NUT code not journaled".to_owned(), |c| format!(
+                        "NUT code {c}"
+                    ))
+            ),
+            AlreadySpent => anyhow::bail!("token already spent; nothing credited"),
+            Prepared | Submitted => Err(coordinator::RecoveryIncomplete.into()),
+        };
     }
     if let Command::Fund {
         amount, ref quote, ..
