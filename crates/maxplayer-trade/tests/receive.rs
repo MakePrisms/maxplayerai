@@ -716,9 +716,9 @@ async fn cli_exit_codes_for_journaled_refused_and_quarantined() {
     assert_eq!(state_of(&out)["manual_recovery"], true);
     assert_secret_free(&out, &token2, &proofs2);
     m.faults.omit_dleq.store(false, SeqCst);
-    // status: same public fields as recover for receives, never the token.
+    // status --json: same public fields as recover for receives, never the token.
     let status = std::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
-        .args(["--home", h.path().to_str().unwrap(), "status"])
+        .args(["--home", h.path().to_str().unwrap(), "status", "--json"])
         .output()
         .unwrap();
     assert_secret_free(&status, &token2, &proofs2);
