@@ -113,12 +113,13 @@ Only DLEQ-verified result proofs are credited. Output is one JSON line with
 the token or proofs. Repeating the same token (any encoding) resumes the same
 attempt and never swaps twice. Exit 0 `done`; 3 unresolved (`prepared`/`submitted`,
 or the state could not be journaled); 1 pre-journal refusal, `refused` or
-`already_spent`; 4 `quarantined`. Only the mint's own NUT error yields `refused` (HTTPS: a
-400 with JSON numeric `code` and `detail`; `nostr://`: a numeric NUT `code` in the
-mint's reply), and only after a fresh restore is empty and the inputs are UNSPENT.
-Any other 400 and every nostr transport error (`expired`, `bad_request`,
-`rate_limited`, timeout, oversized request) stays `submitted` (exit 3) and the
-identical swap is replayed.
+`already_spent`; 4 `quarantined`. Only a definitive mint NUT error (allowlisted code
+such as 11001/11005/12001-12003; HTTPS: a 400 with JSON `code` + `detail`; `nostr://`:
+a numeric NUT `code` in the mint's reply) yields `refused`; `50000`, 11002, 11004,
+unknown codes, any other 400 and every nostr transport error (`expired`,
+`bad_request`, `rate_limited`, timeout, oversized request) stay `submitted` (exit 3)
+and the identical swap is replayed. Repeating `receive` with the same token retries a
+`refused` attempt with the same journaled outputs.
 
 ## Withdrawal: enforcement before execution
 

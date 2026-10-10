@@ -594,6 +594,26 @@ mod tests {
             !nostr_nut_refusal(&nut(65_000)),
             "unknown NUT code stays ambiguous"
         );
+        // The receive-side definitive-code allowlist (`MintRefusal::DEFINITIVE`) also governs
+        // nostr refusals: build the error exactly as `nostr_call` does and ask the receive gate.
+        let as_call = |e: cdk::Error| match nostr_refusal(e) {
+            Ok(r) => anyhow::Error::new(r).context("mint m swap"),
+            Err(e) => anyhow!("mint m swap: {e} (ambiguous)"),
+        };
+        for code in [11001u16, 11005, 12001, 11002, 11004, 50_000, 65_000] {
+            let definitive = crate::mint::definitive_refusal(&as_call(nut(code)));
+            assert!(
+                !definitive || crate::mint::MintRefusal::DEFINITIVE.contains(&u64::from(code)),
+                "SAFETY: nostr NUT {code} is definitive only if allowlisted"
+            );
+            if [11002, 11004, 50_000, 65_000].contains(&code) {
+                assert!(!definitive, "SAFETY: nostr NUT {code} stays ambiguous");
+            }
+        }
+        assert!(crate::mint::definitive_refusal(&as_call(nut(11001))));
+        assert!(!crate::mint::definitive_refusal(&as_call(named(
+            code::EXPIRED
+        ))));
     }
 
     #[test]

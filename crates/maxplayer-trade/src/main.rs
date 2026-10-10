@@ -316,7 +316,9 @@ async fn execute() -> Result<()> {
         println!("{}", r.summary());
         use maxplayer_trade::receive::ReceiveState::*;
         return match r.state {
-            Done => Ok(()),
+            Done if r.settled() => Ok(()),
+            // Journaled done but the credited rows are not yet released: run recover.
+            Done => Err(coordinator::RecoveryIncomplete.into()),
             Quarantined => Err(coordinator::ManualRecovery.into()),
             Refused => anyhow::bail!("receive refused by the mint; nothing credited"),
             AlreadySpent => anyhow::bail!("token already spent; nothing credited"),
