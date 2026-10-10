@@ -1066,7 +1066,7 @@ pub async fn recovery_status(j: &Journal, mut unresolved: bool) -> Result<()> {
         println!("{}", a.summary());
     }
     for r in j.all::<crate::receive::Receipt>("receive").await? {
-        unresolved |= !r.terminal();
+        unresolved |= r.unresolved();
         manual |= r.state == crate::receive::ReceiveState::Quarantined;
         println!("{}", r.summary());
     }

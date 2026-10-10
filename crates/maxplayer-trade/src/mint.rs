@@ -103,8 +103,9 @@ impl MintRefusal {
         ))
     }
     /// NUT codes meaning the mint verified this request and rejected it without
-    /// executing it. Mirrors cdk-common 0.17.2 `Error::is_definitive_failure` for the
-    /// errors a swap can return. Everything else stays ambiguous: `50000` (cdk's
+    /// executing it. A strict SUBSET of cdk-common 0.17.2 `Error::is_definitive_failure`
+    /// for the errors a swap can return; do not "complete the mirror" (11003 and the
+    /// auth codes are deliberately left out). Everything else stays ambiguous: `50000` (cdk's
     /// transient catch-all), 11002 TokenPending, 11004 OutputsPending, 11003 (our
     /// outputs are already signed: evidence that the swap landed), auth/rate-limit
     /// codes and every unknown code.

@@ -106,20 +106,23 @@ DLEQ (when present), a token above **100,000 sats**, or one that would push this
 mint past the shared cap. Funding intents plus charged receives (gross) share one 100,000-sat cap per mint per home; `refused`/`already_spent` receives do not count; `prepared`/`submitted`/`done`/`quarantined` ones do. A quarantined receive is not spendable but
 still occupies the cap. Common preflight runs, then NUT-07 must report every proof UNSPENT.
 
-One swap into fresh home-owned outputs; token, inputs, outputs and secrets are
-journaled before the POST. The mint input fee is deducted: `net = amount - fee`.
+One swap into fresh home-owned outputs; input proofs, blinded outputs and their
+secrets are journaled before the POST (not the token text). The mint input fee is deducted: `net = amount - fee`.
 Only DLEQ-verified result proofs are credited. Output is one JSON line with
 `receive` (attempt id), `mint`, `state`, `amount`, `fee`, `net`, `credited`; never
-the token or proofs. Repeating the same token (any encoding) resumes the same
-attempt and never swaps twice. Exit 0 `done`; 3 unresolved (`prepared`/`submitted`,
-or the state could not be journaled); 1 pre-journal refusal, `refused` or
+the token or proofs; also `settled` and `refusal_code`. Repeating the same token
+(any encoding) resumes the same attempt and only replays its identical swap; a
+second output set is never created. Exit 0 `done` and released; 3 unresolved
+(`prepared`/`submitted`, `done` with release outstanding, or the state could not
+be journaled); 1 pre-journal refusal, `refused` or
 `already_spent`; 4 `quarantined`. Only a definitive mint NUT error (allowlisted code
 such as 11001/11005/12001-12003; HTTPS: a 400 with JSON `code` + `detail`; `nostr://`:
-a numeric NUT `code` in the mint's reply) yields `refused`; `50000`, 11002, 11004,
-unknown codes, any other 400 and every nostr transport error (`expired`,
-`bad_request`, `rate_limited`, timeout, oversized request) stay `submitted` (exit 3)
-and the identical swap is replayed. Repeating `receive` with the same token retries a
-`refused` attempt with the same journaled outputs.
+a numeric NUT `code` in the mint's reply) yields `refused`; `50000`, 11002, 11003
+(outputs already signed: evidence of a landing), 11004, unknown codes, any other 400
+and every nostr transport error (`expired`, `bad_request`, `rate_limited`, timeout,
+oversized request) stay `submitted` (exit 3) and the identical swap is replayed.
+`refused` is FINAL: no command retries it, the token was not imported and can be
+redeemed elsewhere, and it does not occupy the cap.
 
 ## Withdrawal: enforcement before execution
 
