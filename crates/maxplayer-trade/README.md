@@ -174,8 +174,8 @@ It is not installed in the Maxplayer website skill index. The CLI regression
   At refund time a missing/ambiguous SPENT witness fails closed: no taker refund that tick,
   even if the maker actually refunded. Keep recovery running; persistent omission needs
   human investigation. NUT-07 advertisement must never be reported as compatibility proof.
-- Residual late-lock window: a mint that holds a delivered POST beyond the 60-second
-  abandonment grace and starts it after the final restore/state/release can create a lock
+- Residual late-lock window: a mint that holds a delivered POST beyond the abandonment grace
+  (`abandon_grace_seconds`: 60 s over HTTPS, 120 s for a `nostr://` mint) and starts it after the final restore/state/release can create a lock
   on an already-expired swap; automatic recovery cannot close that server-side window.
 
 ## Build and automated tests (historical round-three counts below)
@@ -668,7 +668,10 @@ never argv) imports one token, e.g. one written by `maxplayer-mint issue`. Code:
 
 - Refused before any journal write: token mint not exactly `<mint>` after canonicalization,
   multi-mint, non-sat, NUT-10 locked (P2PK/HTLC), > 128 or duplicate proofs, invalid incoming
-  DLEQ (when present), > 100,000 sats, or a receive that would exceed the shared cap below. Common preflight and NUT-07 UNSPENT are required before the journal write.
+  DLEQ (when present), > 100,000 sats, a receive that would exceed the shared cap below, or (on a
+  `nostr://` mint) a receive swap that would not fit one NIP-44 request (long plain secrets can do
+  this under the token size limit). Common preflight and NUT-07 UNSPENT are required before the
+  journal write.
 - One swap into fresh home-owned outputs; token, inputs, blinded outputs and secrets are
   journaled before the POST. Ambiguity → NUT-09 restore of the same outputs and identical
   replay only. A definitive NUT error with inputs UNSPENT is `refused`; SPENT inputs with nothing
@@ -698,7 +701,12 @@ never argv) imports one token, e.g. one written by `maxplayer-mint issue`. Code:
 - `nostr://` mints: receive works through the nostr transport (see "`nostr://` mints" above); it
   is the only way to put credits-sidecar tokens in a home (`fund` is refused). Tests:
   `nostr_issue_receive_then_https_trade_completes_on_mint_relays_only`,
-  `nostr_expired_swap_reply_during_receive_stays_submitted_then_completes`.
+  `nostr_expired_swap_reply_during_receive_stays_submitted_then_completes`,
+  `nostr_oversized_receive_refused_before_journal`. An attempt journaled before that admission
+  check existed (only unreleased builds of this branch) whose swap is over the NIP-44 limit stays
+  `submitted` (exit 3): every pass gets the connector's local 413, so it is never published and
+  never `refused`; the inputs stay spendable by the token holder, and the record holds its cap
+  until resolved by hand (`nostr_preexisting_oversized_receive_is_never_sent`).
 
 ## Funding and withdrawals
 

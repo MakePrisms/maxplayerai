@@ -70,7 +70,7 @@ impl Market {
             // `url` lowercases and percent-decodes the host but keeps a trailing dot, which
             // names the same server (`relay.maxplayer.ai.` / `relay.maxplayer.ai%2e`).
             ensure!(
-                u.host_str().map(|h| h.trim_end_matches('.')) != Some("relay.maxplayer.ai"),
+                crate::transport::normalized_host(&u).as_deref() != Some("relay.maxplayer.ai"),
                 "production relay forbidden"
             );
             ensure!(

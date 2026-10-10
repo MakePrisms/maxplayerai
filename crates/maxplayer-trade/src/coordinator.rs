@@ -1105,9 +1105,10 @@ fn canonical_key(key: &str) -> Result<()> {
 }
 
 /// Deadline for the maker refund+claim phases of one advance, measured from the start of
-/// the advance. Two budgets enclose an advance: the 120 s recovery item budget
-/// (`recover_pass`) and the 60 s inbound message budget (`run` -> `handle`). 100 s leaves
-/// the trailing own-mint `states()` call (<= 20 s) inside the 120 s item budget. On the
+/// the advance. Two budgets enclose an advance: the recovery item budget (`recover_pass`,
+/// [`item_budget`]: 120 s, or 140 s with a `nostr://` leg) and the 60 s inbound message budget
+/// (`run` -> `handle`). 100 s leaves the trailing own-mint `states()` call (<= 20 s over HTTP,
+/// <= `NOSTR_OUTER` = 40 s over nostr) inside the item budget. On the
 /// 60 s message path the outer timeout may cut the claim first; `claiming` and the
 /// preimage are saved before that, so the next recovery tick claims with the full budget.
 const ADVANCE_BUDGET_SECONDS: u64 = 100;

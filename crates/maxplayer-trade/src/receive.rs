@@ -323,6 +323,12 @@ pub async fn receive(home: &Path, j: &Journal, mint: &str, raw: &str) -> Result<
         !outputs.is_empty() && outputs.len() <= MAX_PROOFS,
         "output limit"
     );
+    // A `nostr://` swap must fit one NIP-44 request. Plain secrets are arbitrary strings, so a
+    // token under MAX_TOKEN_BYTES can still build an unsendable swap; journaling it would leave a
+    // `submitted` attempt that can never be sent and that holds the cap. Refuse it here, before
+    // any journal write (exit 1, nothing recorded, cap untouched).
+    crate::transport::check_swap_fits(mint, &swap_request(&inputs, &outputs))
+        .context("token refused: its receive swap cannot be sent to this nostr mint")?;
     let mut r = Receipt {
         id: p.id,
         mint: mint.into(),
@@ -340,6 +346,14 @@ pub async fn receive(home: &Path, j: &Journal, mint: &str, raw: &str) -> Result<
         eprintln!("receive {}: {error:#}; attempt retained", r.id);
     }
     Ok(r)
+}
+
+/// The one receive swap body (DLEQ stripped by `SwapRequest::new`), for sizing and sending.
+fn swap_request(inputs: &Proofs, outputs: &[Output]) -> SwapRequest {
+    SwapRequest::new(
+        inputs.clone(),
+        outputs.iter().map(|o| o.message.clone()).collect(),
+    )
 }
 
 enum Inputs {
@@ -486,15 +500,11 @@ pub async fn resume(home: &Path, j: &Journal, r: &mut Receipt) -> Result<()> {
                 {
                     std::process::exit(87);
                 }
-                let sent: Result<SwapResponse> = mint::rpc(
-                    &r.mint,
-                    "swap",
-                    &SwapRequest::new(
-                        r.inputs.clone(),
-                        r.outputs.iter().map(|o| o.message.clone()).collect(),
-                    ),
-                )
-                .await;
+                // No size gate here: admission sized the swap with headroom, and an older attempt
+                // that does not fit is refused locally by the connector (413, never published),
+                // which stays ambiguous, so it remains `submitted` and is never `refused`.
+                let request = swap_request(&r.inputs, &r.outputs);
+                let sent: Result<SwapResponse> = mint::rpc(&r.mint, "swap", &request).await;
                 match sent {
                     Ok(reply) => reply.signatures,
                     // Definitive only for an allowlisted NUT code AND fresh absence of

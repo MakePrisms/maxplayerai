@@ -67,13 +67,22 @@ fn loopback(host: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
+/// The host of a parsed relay URL as one server name: lowercased (`url` already lowercases and
+/// percent-decodes `ws`/`wss` hosts) with trailing dots dropped. Shared by the market's
+/// production-relay fence and the mint-relay dedupe key so the two cannot drift apart.
+pub fn normalized_host(u: &url::Url) -> Option<String> {
+    Some(u.host_str()?.trim_end_matches('.').to_ascii_lowercase())
+}
+
 /// Dedupe key for a relay URL: the parsed, normalized form (host lowercased, trailing dot and
 /// slash dropped); the raw string if it does not parse (it is refused by `check_mint_relay`).
+/// The scheme stays in the key on purpose: `ws://h` and `wss://h` are different endpoints (and
+/// ports), so they count as two relays. Do not fold them.
 fn relay_key(relay: &str) -> String {
     url::Url::parse(relay)
         .ok()
         .and_then(|u| {
-            let host = u.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+            let host = normalized_host(&u)?;
             Some(format!(
                 "{}://{host}:{}{}",
                 u.scheme(),
@@ -600,13 +609,15 @@ mod tests {
             Ok(r) => anyhow::Error::new(r).context("mint m swap"),
             Err(e) => anyhow!("mint m swap: {e} (ambiguous)"),
         };
-        for code in [11001u16, 11005, 12001, 11002, 11004, 50_000, 65_000] {
+        for code in [11001u16, 11005, 12001, 11002, 11003, 11004, 50_000, 65_000] {
             let definitive = crate::mint::definitive_refusal(&as_call(nut(code)));
             assert!(
                 !definitive || crate::mint::MintRefusal::DEFINITIVE.contains(&u64::from(code)),
                 "SAFETY: nostr NUT {code} is definitive only if allowlisted"
             );
-            if [11002, 11004, 50_000, 65_000].contains(&code) {
+            // 11003 is the one code core counts as definitive (`nostr_nut_refusal` types it)
+            // but the allowlist does not: it is evidence the swap landed, never `refused`.
+            if [11002, 11003, 11004, 50_000, 65_000].contains(&code) {
                 assert!(!definitive, "SAFETY: nostr NUT {code} stays ambiguous");
             }
         }

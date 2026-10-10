@@ -101,7 +101,7 @@ serve/recover/market commands; a post-POST timeout is still unresolved, not fail
 | State | Meaning and action |
 | --- | --- |
 | `prepared` | Journaled, swap not yet sent. Recovery sends exactly the journaled swap. |
-| `submitted` | Swap may have reached the mint. Recovery restores (NUT-09) the same outputs and replays only the identical swap; never import the token again elsewhere. |
+| `submitted` | Swap may have reached the mint. Recovery restores (NUT-09) the same outputs and replays only the identical swap; never import the token again elsewhere. A `nostr://` attempt whose swap is over the NIP-44 limit (journaled before admission checked it) fails locally with 413 on every pass, was never published, and holds its cap until resolved by hand. |
 | `done` | Terminal: DLEQ-verified proofs credited (held reserved until `done` is journaled, then released; `recover` finishes a pending release); check `balance`. |
 | `refused` | Exit 1: the mint returned a definitive NUT error (allowlisted code, HTTPS or `nostr://` numeric code; `50000`, 11002, 11004 and unknown codes are not), a fresh restore found none of our outputs and the inputs stayed UNSPENT. Nothing credited, not charged to the cap. `recover` does not retry it; repeating `receive` with the same token retries the same outputs. Any other 400 and nostr `expired`/`bad_request`/`rate_limited`/timeout/413 stay `submitted` (exit 3). |
 | `already_spent` | Terminal (exit 1): inputs SPENT and none of our outputs restorable. Nothing credited, not charged. |

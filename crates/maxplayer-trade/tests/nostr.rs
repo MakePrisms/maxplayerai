@@ -844,6 +844,138 @@ async fn nostr_expired_swap_reply_during_receive_stays_submitted_then_completes(
     );
 }
 
+/// `count` one-sat plain proofs signed by `m`, each with a `secret_len`-character plain secret.
+async fn plain_proofs(m: &NostrMint, secret_len: usize, count: usize) -> Proofs {
+    let keyset = backend::active_keyset(&m.mint).unwrap();
+    let keys = m.mint.keyset(&keyset).unwrap().keys;
+    let secrets = (0..count)
+        .map(|_| {
+            // 64 random hex characters (a normal wallet secret), padded to `secret_len`.
+            let base = hex::encode(SecretKey::generate().to_secret_bytes());
+            let pad = "a".repeat(secret_len - base.len());
+            cdk::secret::Secret::new(format!("{base}{pad}"))
+        })
+        .collect::<Vec<_>>();
+    let pre =
+        PreMintSecrets::from_secrets(keyset, vec![cdk::Amount::from(1); count], secrets).unwrap();
+    let sigs = m.mint.blind_sign(pre.blinded_messages()).await.unwrap();
+    construct_proofs(sigs, pre.rs(), pre.secrets(), &keys).unwrap()
+}
+fn token_of(m: &NostrMint, proofs: Proofs) -> String {
+    cdk::nuts::Token::new(
+        std::str::FromStr::from_str(&m.url).unwrap(),
+        proofs,
+        None,
+        cdk::nuts::CurrencyUnit::Sat,
+    )
+    .to_string()
+}
+
+/// Review round 2 N1: plain secrets are arbitrary strings, so a token far under MAX_TOKEN_BYTES
+/// can build a receive swap over the NIP-44 limit. It must be refused at admission: nothing
+/// journaled, cap untouched, no swap published. A normal 64-character-secret token still passes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nostr_oversized_receive_refused_before_journal() {
+    let e = env().await;
+    let n = e.nostr_mint().await;
+    let long = token_of(&n, plain_proofs(&n, 400, 128).await);
+    assert!(
+        long.len() < receive::MAX_TOKEN_BYTES,
+        "fixture: under the token limit"
+    );
+    e.tap.reset();
+    let refused = receive::receive(&e.maker, &e.jm, &n.url, &long).await;
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| format!("{e:#}").contains("NIP-44")),
+        "SAFETY: an unsendable nostr receive must be refused at admission: {:?}",
+        refused.as_ref().map(|r| r.summary())
+    );
+    assert!(
+        e.jm.all::<serde_json::Value>("receive")
+            .await
+            .unwrap()
+            .is_empty(),
+        "SAFETY: nothing journaled"
+    );
+    assert_eq!(
+        receive::cap_used(&e.jm, &n.url).await.unwrap(),
+        (0, 0),
+        "SAFETY: cap untouched"
+    );
+    assert!(e.tap.swaps().is_empty(), "SAFETY: no swap published");
+    assert!(!receive::pending(&e.jm).await.unwrap());
+    let normal = token_of(&n, plain_proofs(&n, 64, 128).await);
+    let done = receive::receive(&e.maker, &e.jm, &n.url, &normal)
+        .await
+        .unwrap();
+    assert_eq!(
+        done.state,
+        receive::ReceiveState::Done,
+        "{}",
+        done.summary()
+    );
+    assert_eq!(
+        balance(&e.maker, &n.url).await,
+        128,
+        "normal token credited"
+    );
+}
+
+/// An oversized attempt journaled before admission sized nostr swaps (older branch builds): the
+/// connector refuses it locally (413) every pass, so it is never published, never `refused` and
+/// stays `submitted` holding its cap (documented manual resolution).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nostr_preexisting_oversized_receive_is_never_sent() {
+    let e = env().await;
+    let n = e.nostr_mint().await;
+    let inputs = plain_proofs(&n, 400, 128).await;
+    let keyset = backend::active_keyset(&n.mint).unwrap();
+    let pre = PreMintSecrets::random(
+        keyset,
+        128.into(),
+        &SplitTarget::default(),
+        &backend::fee_and_amounts(),
+    )
+    .unwrap();
+    let outputs: Vec<_> = pre
+        .secrets
+        .iter()
+        .map(|o| {
+            serde_json::json!({"message":o.blinded_message,"secret":o.secret,
+                "r":hex::encode(o.r.to_secret_bytes())})
+        })
+        .collect();
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let record = serde_json::json!({"id":id,"mint":n.url,"state":"submitted","amount":128,
+        "fee":0,"net":128,"inputs":inputs,"outputs":outputs,"result":null,"released":false});
+    e.jm.put("receive", &id, &record).await.unwrap();
+    e.tap.reset();
+    for _ in 0..2 {
+        assert!(
+            receive::recover(&e.maker, &e.jm).await.unwrap(),
+            "the oversized attempt stays unresolved"
+        );
+    }
+    let now =
+        e.jm.get::<serde_json::Value>("receive", &id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        now["state"], "submitted",
+        "SAFETY: a local 413 is never a refusal"
+    );
+    assert!(e.tap.swaps().is_empty(), "SAFETY: never published");
+    assert_eq!(
+        receive::cap_used(&e.jm, &n.url).await.unwrap(),
+        (0, 128),
+        "it holds its cap until resolved by hand"
+    );
+    assert_eq!(balance(&e.maker, &n.url).await, 0);
+}
+
 #[test]
 fn default_mint_relays_match_the_sidecar_defaults() {
     assert_eq!(
