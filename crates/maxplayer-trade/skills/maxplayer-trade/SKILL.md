@@ -5,33 +5,33 @@ description: Trade Cashu tokens for a human with the standalone maxplayer-trade 
 
 # Trade Cashu for the human
 
-> Round-five operating policy. Scoped evidence and limits:
-> [verification](references/verification.md).
+> Evidence and limits: [verification](references/verification.md).
 
 ## 1. Establish custody and scope
 
-Use the standalone binary, not Maxplayer jobs or the Maxplayer wallet/daemon. Read
-[commands and limits](references/commands.md) before constructing a command and
+Use the standalone binary, not Maxplayer jobs or wallet/daemon. Read
+[commands](references/commands.md) before a command and
 [recovery](references/recovery.md) before handling an interruption.
 
 Choose **one private, persistent absolute home** for this human's trade wallet. Put
 `--home <home>` before **every** command. Preserve that same home, keys, databases,
 and journals across restarts. Never delete it while funds, reservations, unresolved
 funding/withdrawals, or trades exist; retain it for historical recovery afterward.
-Never use a fresh home to evade caps. Only one writer may own it. Read-only `status` and `balance` work while `serve` runs.
+Never use a fresh home to evade caps. Only one writer owns it: while `serve` runs,
+`list`/`take`/`cancel` hand off to it, exact bounds; `status`, `balance`,
+`discover` are lock-free. Don't stop serve to look.
 **Do not stop serve between `second_locked` and `settling`**; a maker can lose its
 claim window. Defer other writing commands until live obligations settle.
 Never copy its seed into another active wallet.
 
-Never print secrets, seeds, keys, tokens, proofs, preimages, or raw journals; never
-attach a home or database to chat. Report only public IDs, mint URLs, amounts, states,
-and redacted errors. Invoice delivery belongs in the human's private conversation.
+Never print or attach secrets, seeds, keys, tokens, proofs, preimages, raw journals,
+homes or databases. Report only public IDs, mints, amounts, states, redacted errors. Invoice delivery belongs in the human's private conversation.
 **Done:** the correct home and authorized mint identities (URL + sat unit) are known.
 
 ## 2. Check readiness and get explicit authorization
 
-Use `balance <mint>` and `preflight <mint>` for each relevant mint. Passing preflight
-allows a mint, but does not establish honesty or complete compatibility. The CLI
+Run `balance <mint>` and `preflight <mint>` per mint. Passing preflight
+does not establish honesty or full compatibility. The CLI
 also preflights before fund/list/take/withdraw: NUT-07/09/11/12/14, an active sat keyset, reachable
 mint, and clock skew at most 60 seconds. Real mints need no opt-in setting. Never
 bypass a failed check. Gross locks and each withdrawal invoice are capped at
@@ -39,12 +39,13 @@ bypass a failed check. Gross locks and each withdrawal invoice are capped at
 100,000-sat cap per mint per home; `refused`/`already_spent` receives do not
 count; `prepared`/`submitted`/`done`/`quarantined` ones do. The withdrawal Lightning
 fee reserve ceiling is **max(32 sats, 2% of invoice sats rounded up)**. Pass
-`--max-debit` to cap invoice amount + Cashu input fee + Lightning reserve. Fees can make an otherwise
-eligible net lock amount too large.
+`--max-debit` to cap invoice amount + Cashu input fee + Lightning reserve. Fees can push a net lock over the cap.
 
 **Before every real-money `fund`, `list`, `take`, or `withdraw`, present the exact
-operation and get an explicit yes.** A broad “trade for me”, earlier approval
-or a published listing does not approve a new operation. State:
+operation and get an explicit yes.** For `list`/`take`, first show the
+same command's `--dry-run` fees, gross amounts and max debit (changes nothing).
+A broad “trade for me”, earlier approval or a published listing does not approve
+a new operation. State:
 
 - Both mint URLs and direction (or the single funding/withdrawal mint and destination).
 - Exact net amounts, maximum total debit, minimum receipt, and fee cap in sats.
@@ -52,7 +53,7 @@ or a published listing does not approve a new operation. State:
 - Worst-case normal trade lock budget: **about 75 minutes**, not a guaranteed release
   time. Protocol locks are 60/15 minutes plus margins; outages or ambiguous evidence
   can hold funds longer, indefinitely with a dishonest mint. Funding and withdrawal
-  have their own unresolved-payment risk, not a guaranteed 75-minute timeout.
+  have their own unresolved-payment risk.
 - A mint can steal its tokens. If the counterparty vanishes, funds stay locked until
   the refund deadline and successful recovery. `serve` must stay running while locks are live (the active `take` also watches its trade).
   NUT-14 claims remain valid after locktime. Nutshell refund status and limits: [verification](references/verification.md). NUT-07 advertisement alone does not prove witness emission. The maker relies on
@@ -90,7 +91,7 @@ unspendable yet still on the cap; escalate. **Done:** `done` and `balance <mint>
 ### Sell/list X of mint A for Y of mint B
 
 After confirmation, `list --give-mint <A> --give <X> --want-mint <B> --want <Y>
---max-fees <cap>`. X and Y are net lot amounts, not interchangeable “bitcoin” assets.
+--max-fees <cap>`. X and Y are net lot amounts; mints are not interchangeable.
 The seller's maximum debit is X plus the approved outgoing fee cap. Record the lot
 ID and keep `serve` running until complete or refunded. Listing authorizes serving
 that fixed lot, not further listings or price changes.
@@ -102,16 +103,16 @@ inactive cancellation is reported; an unresolved lock is never called cancelled.
 
 ### Find listings / buy that lot
 
-`discover`, inspect the exact mint pair and public lot ID, and match the human's
-price. Discovery alone authorizes no purchase. For “receive X A for at most Y B”,
+`discover` (per-lot fees or `unknown`), inspect the mint pair
+and lot ID, and match the human's price. Discovery approves nothing. For “X A for at most Y B”,
 set `--min-receive X` and `--max-give Y` when Y is the total spending ceiling. If Y
 was explicitly a net price plus a separately approved fee F, the total ceiling can
 be Y + F; otherwise never silently add fees. A stricter limit is fine, a looser one
 is not. See the worked example in the command reference.
 
 After confirmation, `take <lot> --max-give <total-cap> --min-receive <net-minimum>
---max-fees <cap>`. Keep it running through settlement. Never repeat a take to “fix”
-a timeout. **Done:** verify the terminal result and per-mint balances, or enter recovery.
+--max-fees <cap>`. Keep it (or serve) running through settlement. Never repeat a take
+to “fix” a timeout. `counterparty_unresponsive` is only a warning; keep serving. **Done:** verify the terminal result and per-mint balances, or enter recovery.
 
 ### Withdraw
 
@@ -140,8 +141,7 @@ quarantine and errors.
 
 ## 4. Verify and report
 
-Check public state with `status` and balances with `balance` without stopping
-the owner process. A zero exit, elapsed deadline, missing listing or PAID mint is not
+Check `status` (`--json` raw) and `balance` without stopping serve. A zero exit, elapsed deadline, missing listing or PAID mint is not
 reconciled success by itself. Keep the home. Report spent/received amounts and fees
 only when known; distinguish complete, refunded, unresolved, and manual recovery.
 

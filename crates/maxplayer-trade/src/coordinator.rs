@@ -103,7 +103,7 @@ pub struct Swap {
     #[serde(default)]
     pub refund_generation: u32,
 }
-fn terminal(s: &Swap) -> bool {
+pub fn terminal(s: &Swap) -> bool {
     [
         "complete",
         "complete_unclaimed",
@@ -178,7 +178,26 @@ pub async fn list(
 ) -> Result<String> {
     give.asset.fence()?;
     want.asset.fence()?;
-    let event = lot_event(&m.keys, give, want)?;
+    // A lot id is a hash of second-granular terms: two identical lists in the same second
+    // (back-to-back requests handed to serve) would share an id, and the second journal row
+    // would overwrite the first, orphaning its reservation. Wait for a fresh id instead.
+    let mut event = lot_event(&m.keys, give.clone(), want.clone())?;
+    for _ in 0..3 {
+        if j.get::<Listing>("listing", &event.id.to_hex())
+            .await?
+            .is_none()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        event = lot_event(&m.keys, give.clone(), want.clone())?;
+    }
+    ensure!(
+        j.get::<Listing>("listing", &event.id.to_hex())
+            .await?
+            .is_none(),
+        "an identical lot was just listed; retry"
+    );
     let lot = parse_lot(&event, now())?;
     preflight(&lot).await?;
     let plan = mint::plan(home, &lot.give.asset.mint_url, lot.give.net, max_fees).await?;
@@ -993,11 +1012,33 @@ async fn recover_pass(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
     Ok(deferred)
 }
 pub async fn run(home: &Path, j: &Journal, m: &mut Market, until: Option<&str>) -> Result<()> {
+    run_with(home, j, m, until, None).await
+}
+/// [`run`], also executing requests handed to `serve` over its local socket. Every request
+/// runs here, in this one loop, between inbox messages and recovery ticks: serve stays the
+/// single writer and each request keeps journal-before-effect ordering.
+pub async fn run_with(
+    home: &Path,
+    j: &Journal,
+    m: &mut Market,
+    until: Option<&str>,
+    mut jobs: Option<tokio::sync::mpsc::Receiver<crate::serve::Job>>,
+) -> Result<()> {
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
+    let mut warned = crate::observe::Warned::default();
     loop {
         tokio::select! {e=m.inbox.recv()=>{if let Some(e)=e{match tokio::time::timeout(std::time::Duration::from_secs(60), handle(home,j,m,&e)).await {
             Ok(Ok(())) => {}, Ok(Err(err)) => eprintln!("trade message rejected: {err}"), Err(_) => eprintln!("trade message timed out; dropped; journal retained")
-        }}},_=tick.tick()=>recover(home,j,m).await?}
+        }}},
+        Some(job) = async { match jobs.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => crate::serve::execute(home, j, m, job).await,
+        _=tick.tick()=>{
+            recover(home,j,m).await?;
+            // Display only: derived from the journal, never fed back into the state machine.
+            let now = now();
+            for u in warned.due(&crate::observe::unresponsive(home, now).unwrap_or_default()) {
+                eprintln!("{}", u.json(now));
+            }
+        }}
         if let Some(id) = until {
             if let Some(s) = j.get::<Swap>("swap", id).await? {
                 if terminal(&s) {

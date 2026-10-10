@@ -15,14 +15,14 @@ Canonical command signatures (placeholders are not literal values):
 ```text
 preflight <mint>
 balance <mint>
-status
+status [--json]
 fund <mint> --amount <sats> [--quote <quote-id>]
 receive <mint> [--token-file <path>]
-list --give-mint <mint> --give <net-sats> --want-mint <mint> --want <net-sats> --max-fees <sats>
+list --give-mint <mint> --give <net-sats> --want-mint <mint> --want <net-sats> --max-fees <sats> [--dry-run]
 discover
 serve
 cancel <lot>
-take <lot> --max-give <total-sats> --min-receive <net-sats> --max-fees <sats>
+take <lot> --max-give <total-sats> --min-receive <net-sats> --max-fees <sats> [--dry-run]
 withdraw <mint> --invoice <bolt11> [--max-debit <sats>]
 recover
 ```
@@ -31,7 +31,8 @@ Use `-h` / `--help` at the root or on any application subcommand. The built-in
 `help [COMMAND]` also shows root or command help. There is no version option.
 `--home <HOME>` is required for operational commands; `--relay <RELAY>` is
 repeatable. All command-specific flags in the signatures above are required except
-`--quote`, `--max-debit`, `--token-file` (stdin when omitted), and `--max-fees` (default 16 on list/take). Positional mint arguments are
+`--quote`, `--max-debit`, `--token-file` (stdin when omitted), `--dry-run`, `--json`,
+and `--max-fees` (default 16 on list/take). Positional mint arguments are
 canonical URLs; lot arguments are public lot IDs; `--quote` is a saved funding
 quote for the same mint and amount.
 Never use a lab-feature binary for the human's funds.
@@ -72,9 +73,45 @@ requires enabled NUT-05 bolt11/sat. The explicit `preflight <mint>` checks the
 common trading capabilities. Diagnostic preflight output goes to stderr. No opt-in is required;
 passing advertisement checks is not independent refund interoperability evidence.
 `balance` and `status` are lock-free read-only SQLite snapshots, available during
-`serve`, without network calls or submission of earlier authorizations.
-Market commands (including `discover` and `cancel`) first recover existing
-authorizations; do not treat them as read-only on a home with pending obligations.
+`serve`, without network calls or submission of earlier authorizations. `status`
+prints one readable line per lot/swap/funding/withdrawal/receive, unresolved items
+first, any `counterparty_unresponsive` warning, and the exit-code meanings;
+`status --json` prints the unchanged raw public records for scripts.
+
+`discover` is lock-free and read-only too: it reads relays only, with a throwaway
+relay identity, never runs recovery, never takes the home lock, never creates or
+touches the home or journal, and works while `serve` or `take` runs. Each listing
+carries `expected_fees` per leg (`net`, `ppk`, `gross`, `claim_fee`) from the
+mints' published keysets, or `"unknown"` when a mint did not answer within ~5 s
+(discover never blocks on a mint). The taker's own lock fee depends on its inputs:
+use `take --dry-run`. Relay union, EOSE and `timeout_or_partial` reporting are unchanged.
+
+## Fee preview: `--dry-run`
+
+`list ... --dry-run` and `take ... --dry-run` run the normal preflight, then print one
+JSON object: `you_give` (keyset, ppk, net, gross, `lock_fee`, `claim_fee`, `debit`,
+inputs that would be selected), `you_receive` (incoming leg's gross/claim fee, funded
+by the counterparty), `max_total_debit` and `fees_total`. The numbers use the same
+arithmetic and input selection as the real command against the current wallet and
+the mints' published keysets. Nothing is journaled, reserved, locked, created or
+published, and no quote request reaches the maker. Exit 0 when the real command
+would pass the same bounds; exit 1 with the reason (e.g. `maximum give cap`,
+`fee cap exceeded`, insufficient balance, or `cannot solve bounded fee-inclusive
+split` for an amount with no exact fee-inclusive gross) otherwise. Run it before
+asking for approval, then run the identical command without `--dry-run`. Balances
+can change in between; the real command enforces your bounds again.
+
+## Hand-off to a running serve
+
+While `serve` owns the home, `list`, `take` and `cancel` hand their request to it
+over `<home>/serve.sock` (mode 0600, same user only) and print serve's result with
+the usual output and exit codes. serve executes it with exactly the bounds given;
+it never fills in defaults. Use the same `--relay` set as serve or the request is
+refused. A handed-off `take` prints its swap id and that serve is watching it, then
+streams states until settlement; if the command is interrupted, serve keeps driving
+the swap (check `status`). Without a running serve these commands behave as before.
+`recover` and the money commands still need the home lock; stop serve first.
+`cancel` first recovers existing authorizations when it runs without serve.
 `serve` continuously accepts trades and recovers obligations; keep it running while
 locks are live. `recover` is a bounded single pass, not a replacement watcher;
 see [recovery](recovery.md) for exit codes and states.
