@@ -856,10 +856,68 @@ async fn transient_50000_for_a_landed_swap_is_credited_on_recover() {
     assert_eq!(m.faults.swaps.load(SeqCst), 1, "SAFETY: one swap");
 }
 
-/// F3: a refused attempt is retried (same journaled outputs, same record) by an
-/// explicit repeat of the same token; recover alone never replays it.
+/// Round 3 (Bob's decision (a), limited retry): against cdk 0.17.2 no allowlisted code
+/// can succeed on an identical replay, so the retryable set is EMPTY and every refusal
+/// is final. Here an output-side code (12002 KeysetInactive, the reviewer's rotated
+/// keyset case) is journaled; a repeat `receive` (even after the fault clears) never
+/// POSTs again, stays `refused`, exits 1 with "not imported" and frees the cap.
 #[tokio::test]
-async fn repeat_receive_retries_a_refused_attempt_once() {
+async fn output_side_refusal_is_final_frees_cap_and_exits_1() {
+    let m = MintFixture::start(0).await;
+    let (_s, proofs, token) = issue(&m, 40).await;
+    let (h, j) = home().await;
+    m.faults.swap_nut_code.store(12002, SeqCst);
+    m.faults.swap_nut_error.store(true, SeqCst);
+    let out = cli(h.path(), &m.url, None, Some(&token), None).await;
+    assert_eq!(out.status.code(), Some(1), "SAFETY: final refusal exits 1");
+    assert_eq!(state_of(&out)["state"], "refused");
+    assert_eq!(state_of(&out)["refusal_code"], 12002);
+    assert_secret_free(&out, &token, &proofs);
+    let r = &receipts(&j).await[0];
+    assert_eq!(
+        (r.state, r.refusal_code),
+        (ReceiveState::Refused, Some(12002))
+    );
+    m.faults.swap_nut_error.store(false, SeqCst);
+    let swaps = m.faults.swaps.load(SeqCst);
+    let out = cli(h.path(), &m.url, None, Some(&token), None).await;
+    assert_eq!(out.status.code(), Some(1), "SAFETY: repeat stays final");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("NOT imported") && err.contains("redeemed elsewhere"),
+        "final refusal says so: {err}"
+    );
+    assert_eq!(
+        m.faults.swaps.load(SeqCst),
+        swaps,
+        "SAFETY: a final refusal is never replayed"
+    );
+    assert!(!money::recover(h.path(), &j).await.unwrap(), "terminal");
+    assert_eq!(
+        m.faults.swaps.load(SeqCst),
+        swaps,
+        "SAFETY: recover neither"
+    );
+    assert_eq!(receipts(&j).await[0].state, ReceiveState::Refused);
+    assert_eq!(
+        balance(h.path(), &m.url).await,
+        0,
+        "SAFETY: nothing credited"
+    );
+    money::fund(h.path(), &j, &m.url, 100_000)
+        .await
+        .expect("SAFETY: a final refusal frees the cap");
+    // The token was not imported here: another home redeems it.
+    let (other, jo) = home().await;
+    let r = receive::receive(other.path(), &jo, &m.url, &token)
+        .await
+        .unwrap();
+    assert_eq!(r.state, ReceiveState::Done, "token redeemable elsewhere");
+}
+
+/// A `refused` record written before round 3 has no journaled code: still final.
+#[tokio::test]
+async fn legacy_refused_record_without_code_is_final() {
     let m = MintFixture::start(0).await;
     let (_s, _, token) = issue(&m, 40).await;
     let (h, j) = home().await;
@@ -867,22 +925,26 @@ async fn repeat_receive_retries_a_refused_attempt_once() {
     let r = receive::receive(h.path(), &j, &m.url, &token)
         .await
         .unwrap();
-    assert_eq!(r.state, ReceiveState::Refused);
+    assert_eq!(
+        (r.state, r.refusal_code),
+        (ReceiveState::Refused, Some(11001))
+    );
     m.faults.swap_nut_error.store(false, SeqCst);
-    assert!(!money::recover(h.path(), &j).await.unwrap());
-    assert_eq!(m.faults.swaps.load(SeqCst), 1, "recover does not replay");
-    let r = receive::receive(h.path(), &j, &m.url, &token)
+    // Rewrite the record as the old head stored it: no `refusal_code` field.
+    let mut v = serde_json::to_value(&r).unwrap();
+    v.as_object_mut().unwrap().remove("refusal_code");
+    j.put("receive", &r.id, &v).await.unwrap();
+    assert_eq!(receipts(&j).await[0].refusal_code, None);
+    let swaps = m.faults.swaps.load(SeqCst);
+    let out = cli(h.path(), &m.url, None, Some(&token), None).await;
+    assert_eq!(out.status.code(), Some(1), "SAFETY: legacy refusal final");
+    assert!(state_of(&out)["refusal_code"].is_null());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not journaled"));
+    assert_eq!(m.faults.swaps.load(SeqCst), swaps, "SAFETY: no replay");
+    assert_eq!(receipts(&j).await[0].state, ReceiveState::Refused);
+    money::fund(h.path(), &j, &m.url, 100_000)
         .await
-        .unwrap();
-    assert_eq!(r.state, ReceiveState::Done, "explicit retry succeeds");
-    assert_eq!(receipts(&j).await.len(), 1, "SAFETY: one record per Y-set");
-    assert_eq!(balance(h.path(), &m.url).await, 40);
-    let r = receive::receive(h.path(), &j, &m.url, &token)
-        .await
-        .unwrap();
-    assert_eq!(r.state, ReceiveState::Done);
-    assert_eq!(m.faults.swaps.load(SeqCst), 2, "SAFETY: no swap after done");
-    assert_eq!(balance(h.path(), &m.url).await, 40, "SAFETY: credited once");
+        .expect("SAFETY: legacy refusal frees the cap");
 }
 
 /// F4: credited rows stay RESERVED (unspendable) until `done` is journaled.
@@ -946,28 +1008,4 @@ async fn crash_after_done_before_release_is_released_by_recover() {
     assert_eq!(balance(h.path(), &m.url).await, 56, "SAFETY: released once");
     assert!(!money::recover(h.path(), &j).await.unwrap());
     assert_eq!(balance(h.path(), &m.url).await, 56);
-}
-
-/// F3: retrying a refused attempt re-charges the shared cap first.
-#[tokio::test]
-async fn refused_retry_rechecks_the_cap() {
-    let m = MintFixture::start(0).await;
-    let (_s, _, token) = issue(&m, 64).await;
-    let (h, j) = home().await;
-    m.faults.swap_nut_error.store(true, SeqCst);
-    let r = receive::receive(h.path(), &j, &m.url, &token)
-        .await
-        .unwrap();
-    assert_eq!(r.state, ReceiveState::Refused);
-    m.faults.swap_nut_error.store(false, SeqCst);
-    money::fund(h.path(), &j, &m.url, 100_000).await.unwrap();
-    let swaps = m.faults.swaps.load(SeqCst);
-    assert!(
-        receive::receive(h.path(), &j, &m.url, &token)
-            .await
-            .is_err_and(|e| e.to_string().contains("exceed 100,000")),
-        "SAFETY: retry over the cap refused"
-    );
-    assert_eq!(receipts(&j).await[0].state, ReceiveState::Refused);
-    assert_eq!(m.faults.swaps.load(SeqCst), swaps, "SAFETY: no swap");
 }

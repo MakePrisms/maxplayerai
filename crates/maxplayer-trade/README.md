@@ -632,27 +632,34 @@ never argv) imports one token, e.g. one written by `maxplayer-mint issue`. Code:
 - Refused before any journal write: token mint not exactly `<mint>` after canonicalization,
   multi-mint, non-sat, NUT-10 locked (P2PK/HTLC), > 128 or duplicate proofs, invalid incoming
   DLEQ (when present), > 100,000 sats, or a receive that would exceed the shared cap below. Common preflight and NUT-07 UNSPENT are required before the journal write.
-- One swap into fresh home-owned outputs; token, inputs, blinded outputs and secrets are
-  journaled before the POST. Ambiguity → NUT-09 restore of the same outputs and identical
+- One swap into fresh home-owned outputs; input proofs (with secrets), blinded outputs and
+  their secrets are journaled before the POST (the token text is not). A second output set
+  is never created. Ambiguity → NUT-09 restore of the same outputs and identical
   replay only. A definitive NUT error with inputs UNSPENT is `refused`; SPENT inputs with nothing
   of ours restorable is terminal `already_spent`. Only DLEQ-verified proofs are credited;
   missing/invalid DLEQ on our outputs is terminal `quarantined` (exit 4).
 - Cap: Funding intents plus charged receives (gross) share one 100,000-sat cap per mint per home; `refused`/`already_spent` receives do not count; `prepared`/`submitted`/`done`/`quarantined` ones do. A quarantined receive is not spendable but still occupies the cap.
-- Exits: 0 `done`; 1 pre-journal refusal, `refused` or `already_spent`; 3 unresolved
-  (`prepared`/`submitted`, or a journal write failed); 4 `quarantined`.
+- Exits: 0 `done` with its credited rows released; 1 pre-journal refusal, `refused` or
+  `already_spent`; 3 unresolved (`prepared`/`submitted`, `done` whose release is still
+  outstanding, or a journal write failed; run `recover`); 4 `quarantined`.
 - Only a definitive NUT error (HTTP 400, JSON `code` + `detail`, code on the
-  `MintRefusal::DEFINITIVE` allowlist mirroring cdk-common 0.17.2 `is_definitive_failure`)
+  `MintRefusal::DEFINITIVE` allowlist, a strict subset of cdk-common 0.17.2
+  `is_definitive_failure`: 11003 OutputsAlreadySigned and auth codes are deliberately left out)
   can make a receive `refused`. `50000` (cdk's transient Internal/Database catch-all),
-  11002 TokenPending, 11004 OutputsPending, unknown codes, any other 400 and transport
+  11002 TokenPending, 11003, 11004 OutputsPending, unknown codes, any other 400 and transport
   refusals stay `submitted` and replay. Every absence check restores, checks NUT-07 and,
   on SPENT, restores again before `already_spent`.
-- `refused` is not retried by `recover`; repeating `receive` with the same token retries
-  the same journaled outputs (one record per token, never two live attempts) after
-  re-checking the cap.
+- `refused` is FINAL and journals its NUT code (`refusal_code`). Neither `recover` nor a
+  repeated `receive` replays it: against cdk 0.17.2 every allowlisted code is deterministic
+  for the same inputs and outputs (output-keyset codes 12001-12003, 11008, 11015, fee-based
+  11005 included), so no retryable code exists. The token was not imported, nothing is
+  charged to the cap, and it can be redeemed elsewhere. A record without a code (written
+  before this rule) is final too. `status`/`recover` lines carry `settled` and `refusal_code`.
 - Credited proofs are stored RESERVED under the receive id and released only after `done`
   is journaled, so `withdraw`/`send` cannot spend them earlier. Mint error detail text is
   never printed; only the NUT code.
-- Idempotent per Y-set (sha256 of the sorted proof Ys): repeats resume the existing attempt.
+- Idempotent per Y-set (sha256 of the sorted proof Ys): repeats resume the existing attempt
+  and only ever replay its identical swap.
 - The mint input fee is deducted; output reports `amount`, `fee`, `net`, `credited`, state and
   attempt id only. `recover`/`serve` resume receives under the same 120 s item budget.
 - `nostr://` mints: cdk 0.17.2 `MintUrl`/`Token` parse them (unit test

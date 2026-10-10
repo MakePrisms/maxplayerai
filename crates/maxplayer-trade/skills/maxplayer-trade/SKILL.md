@@ -80,10 +80,11 @@ quote is reported unresolved without another payment.
 
 Needs the human's yes (mint, amount); charges the shared cap (§2).
 Save the token to a private file; run `receive <mint> --token-file <file>` (or
-stdin). Never put a token in argv, chat or logs. Only plain sat proofs of that
-mint; input fee deducted. Exit 0 `done`; 1 refused/`already_spent`;
-3 unresolved, not failure: `recover`, never re-import elsewhere; 4 `quarantined`:
-unspendable yet still on the cap; escalate. **Done:** `done` and `balance <mint>`.
+stdin). Never put a token in argv/chat/logs. Only plain sat proofs of that
+mint; fee deducted. Exit 0 `done`; 1 `refused` (final: not imported;
+redeem elsewhere) or `already_spent`; 3 unresolved/release pending:
+`recover`, never re-import; 4 `quarantined`:
+unspendable, still on the cap; escalate. **Done:** `done` and `balance <mint>`.
 
 ### Send a token / move funds to another wallet
 
