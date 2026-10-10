@@ -65,6 +65,24 @@ pub struct Faults {
     pub delay_ms: std::sync::atomic::AtomicU64,
     /// Count of HTTP requests that reached this mint.
     pub requests: std::sync::atomic::AtomicU64,
+    /// Count of swap POSTs that reached this mint (including ones whose reply is lost).
+    pub swaps: std::sync::atomic::AtomicU64,
+    /// Answer every swap POST with a well-formed NUT error (HTTP 400 + code), unprocessed.
+    pub swap_nut_error: std::sync::atomic::AtomicBool,
+    /// NUT code used by `swap_nut_error` / `refuse_after_swap` (0 = 11001).
+    pub swap_nut_code: std::sync::atomic::AtomicU64,
+    /// Let the mint EXECUTE the next swap, then answer it with the NUT error above and
+    /// blank the next restore (models a lost-reply POST landing around a refusal).
+    pub refuse_after_swap: std::sync::atomic::AtomicBool,
+    /// Answer this many restores with an empty (but well-formed) reply.
+    pub blank_restores: std::sync::atomic::AtomicU64,
+    /// Answer every swap POST with an unprocessed HTTP 400 that is NOT a NUT error:
+    /// 1 = non-JSON body, 2 = JSON without a numeric `code`.
+    pub swap_bad_400: std::sync::atomic::AtomicU64,
+    /// On the next swap POST, start reporting UNSPENT inputs as PENDING.
+    pub pending_after_swap: std::sync::atomic::AtomicBool,
+    /// Drop the last output/signature pair from every non-empty restore reply.
+    pub partial_restore: std::sync::atomic::AtomicBool,
 }
 pub struct MintFixture {
     pub faults: Arc<Faults>,
@@ -138,6 +156,65 @@ impl MintFixture {
                     use std::sync::atomic::Ordering::SeqCst;
                     let path = req.uri().path().to_owned();
                     control.requests.fetch_add(1, SeqCst);
+                    if path.ends_with("/swap") {
+                        control.swaps.fetch_add(1, SeqCst);
+                        if control.pending_after_swap.swap(false, SeqCst) {
+                            control.pending_inputs.store(true, SeqCst);
+                        }
+                        match control.swap_bad_400.load(SeqCst) {
+                            1 => {
+                                return (
+                                    axum::http::StatusCode::BAD_REQUEST,
+                                    "<html>bad request</html>",
+                                )
+                                    .into_response();
+                            }
+                            2 => {
+                                return (
+                                    axum::http::StatusCode::BAD_REQUEST,
+                                    axum::Json(serde_json::json!({"error":"expired","detail":"x"})),
+                                )
+                                    .into_response();
+                            }
+                            _ => {}
+                        }
+                        if control.swap_nut_error.load(SeqCst) {
+                            let code = match control.swap_nut_code.load(SeqCst) {
+                                0 => 11001,
+                                c => c,
+                            };
+                            return (
+                                axum::http::StatusCode::BAD_REQUEST,
+                                axum::Json(serde_json::json!({"code":code,"detail":"refused"})),
+                            )
+                                .into_response();
+                        }
+                        if control.refuse_after_swap.swap(false, SeqCst) {
+                            let done = next.run(req).await;
+                            assert!(done.status().is_success(), "fixture swap must execute");
+                            control.blank_restores.store(1, SeqCst);
+                            let code = match control.swap_nut_code.load(SeqCst) {
+                                0 => 11001,
+                                c => c,
+                            };
+                            return (
+                                axum::http::StatusCode::BAD_REQUEST,
+                                axum::Json(serde_json::json!({"code":code,"detail":"refused"})),
+                            )
+                                .into_response();
+                        }
+                    }
+                    if path.ends_with("/restore") && {
+                        let n = control.blank_restores.load(SeqCst);
+                        n > 0
+                            && control
+                                .blank_restores
+                                .compare_exchange(n, n - 1, SeqCst, SeqCst)
+                                .is_ok()
+                    } {
+                        return axum::Json(serde_json::json!({"outputs":[],"signatures":[]}))
+                            .into_response();
+                    }
                     let delay = control.delay_ms.load(SeqCst);
                     if delay != 0 {
                         tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
@@ -291,6 +368,13 @@ impl MintFixture {
                                             }
                                         }
                                     }
+                                }
+                            }
+                        }
+                        if path.ends_with("/restore") && control.partial_restore.load(SeqCst) {
+                            for k in ["outputs", "signatures"] {
+                                if let Some(a) = v[k].as_array_mut() {
+                                    a.pop();
                                 }
                             }
                         }

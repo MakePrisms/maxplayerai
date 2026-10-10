@@ -7,6 +7,11 @@ configured; defaults at verified base 1929972 are `wss://nos.lol`,
 `wss://relay.primal.net`, and `wss://offchain.pub`. These source defaults are also listed in root help. ACKed copies are not resent; retries use exponential
 backoff with jitter, at most 12 attempts per event/relay and a 24-hour age cutoff.
 Rate limiting pauses a relay for at least five minutes.
+A separate repeated global `--mint-relay <url>` (max 8; `wss://`, `ws://` only on loopback)
+carries `nostr://` mint requests only (kinds 23410/23411), never market traffic; it defaults
+to `wss://relay.maxplayer.ai`, `wss://relay.ditto.pub` and `wss://nostr-pub.wellorder.net`, the
+default credits sidecar's own list. `relay.maxplayer.ai` is allowed as a `--mint-relay` only; as a
+`--relay` (market) it is refused. Preserve the same mint-relay set during recovery of a `nostr://` trade.
 Relay ACK is not proof of stored readback or trade success. Respect backoff; do not
 restart loops or generate fresh identities to evade rate limits.
 
@@ -17,6 +22,7 @@ preflight <mint>
 balance <mint>
 status
 fund <mint> --amount <sats> [--quote <quote-id>]
+receive <mint> [--token-file <path>]
 list --give-mint <mint> --give <net-sats> --want-mint <mint> --want <net-sats> --max-fees <sats>
 discover
 serve
@@ -30,15 +36,19 @@ Use `-h` / `--help` at the root or on any application subcommand. The built-in
 `help [COMMAND]` also shows root or command help. There is no version option.
 `--home <HOME>` is required for operational commands; `--relay <RELAY>` is
 repeatable. All command-specific flags in the signatures above are required except
-`--quote`, `--max-debit`, and `--max-fees` (default 16 on list/take). Positional mint arguments are
-canonical URLs; lot arguments are public lot IDs; `--quote` is a saved funding
+`--quote`, `--max-debit`, `--token-file` (stdin when omitted), and `--max-fees` (default 16 on list/take). Positional mint arguments are
+canonical URLs, or `nostr://<npub>` for a Nostr-reachable mint (hex or uppercase input is
+canonicalized to the lowercase npub). `fund` and `withdraw` refuse `nostr://` mints before
+any journal entry: the Maxplayer credits mint serves no NUT-04/05/20; `receive` is how credits
+enter a home. Lot arguments are public lot IDs; `--quote` is a saved funding
 quote for the same mint and amount.
 Never use a lab-feature binary for the human's funds.
 
 ## Enforced monetary policy
 
 - Asset identity is canonical mint URL plus unit `sat`; equal units do not make two
-  issuers equivalent. Confirm URLs, not just display names. Use HTTPS for real mints.
+  issuers equivalent. Confirm URLs, not just display names. Real mints are HTTPS, or `nostr://<lowercase npub>`
+  for the Maxplayer credits mint.
 - `--give` / `--want`: exact fixed-lot net amounts; no partial-size purchase.
 - `--max-give`: buyer's total outgoing debit including mint fees.
 - `--min-receive`: buyer's minimum net incoming amount.
@@ -49,11 +59,11 @@ Never use a lab-feature binary for the human's funds.
   admission claims use the pinned quote fee, not the receiver’s outgoing budget. Refund/recovery may
   incur mint fees; disclose this rather than promising a fully refunded balance.
 - No platform/trade fee. Do not equate no platform fee with no mint/Lightning fees.
-- Hard cap: 100,000 sats gross per lock; 100,000 cumulative funding per mint per home.
+- Hard cap: 100,000 sats gross per lock. Funding intents plus charged receives (gross) share one 100,000-sat cap per mint per home; `refused`/`already_spent` receives do not count; `prepared`/`submitted`/`done`/`quarantined` ones do.
   Each withdrawal invoice is also capped at 100,000 sats (millisatoshis rounded up
   to sats). Funding counts all retained intents, including pending ones.
   None of these limits is permission to spend that amount. Never split operations or rotate homes
-  to bypass limits. Withdrawing does not reset cumulative funding authority.
+  to bypass limits. Withdrawing does not reset this cumulative cap.
 
 Example: a lot gives 32 A for 24 B. If the human approves **at most 27 B total**,
 **at least 32 A net**, and **3 B fee sats**, use `take <lot> --max-give 27
@@ -85,6 +95,34 @@ mint and amount, then let the human pay it once from their own wallet. Include a
 external-wallet routing fee budget in the human's approval; this CLI cannot enforce
 fees charged by another wallet. Never assume a real invoice is auto-paid because
 a test mint behaved that way. Reuse the retained quote for the same mint/amount.
+
+## Receive
+
+`receive <mint> --token-file <path>` (or the token on stdin; never argv) imports one
+Cashu token. Refused **before anything is journaled**: a token whose mint is not
+exactly `<mint>` after canonicalization, multi-mint tokens, non-sat units, P2PK/HTLC
+or other NUT-10 locked proofs, more than 128 or duplicate proofs, an invalid incoming
+DLEQ (when present), a token above **100,000 sats**, or one that would push this
+mint past the shared cap. Funding intents plus charged receives (gross) share one 100,000-sat cap per mint per home; `refused`/`already_spent` receives do not count; `prepared`/`submitted`/`done`/`quarantined` ones do. A quarantined receive is not spendable but
+still occupies the cap. Common preflight runs, then NUT-07 must report every proof UNSPENT.
+
+One swap into fresh home-owned outputs; input proofs, blinded outputs and their
+secrets are journaled before the POST (not the token text). The mint input fee is deducted: `net = amount - fee`.
+Only DLEQ-verified result proofs are credited. Output is one JSON line with
+`receive` (attempt id), `mint`, `state`, `amount`, `fee`, `net`, `credited`; never
+the token or proofs; also `settled` and `refusal_code`. Repeating the same token
+(any encoding) resumes the same attempt and only replays its identical swap; a
+second output set is never created. Exit 0 `done` and released; 3 unresolved
+(`prepared`/`submitted`, `done` with release outstanding, or the state could not
+be journaled); 1 pre-journal refusal, `refused` or
+`already_spent`; 4 `quarantined`. Only a definitive mint NUT error (allowlisted code
+such as 11001/11005/12001-12003; HTTPS: a 400 with JSON `code` + `detail`; `nostr://`:
+a numeric NUT `code` in the mint's reply) yields `refused`; `50000`, 11002, 11003
+(outputs already signed: evidence of a landing), 11004, unknown codes, any other 400
+and every nostr transport error (`expired`, `bad_request`, `rate_limited`, timeout,
+oversized request) stay `submitted` (exit 3) and the identical swap is replayed.
+`refused` is FINAL: no command retries it, the token was not imported and can be
+redeemed elsewhere, and it does not occupy the cap.
 
 ## Withdrawal: enforcement before execution
 

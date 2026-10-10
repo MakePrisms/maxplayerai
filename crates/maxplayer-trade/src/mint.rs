@@ -47,31 +47,125 @@ pub struct Attempt {
     #[serde(default)]
     pub observed_preimage: Option<String>,
 }
-pub const RPC_TIMEOUT_SECONDS: u64 = 20;
+/// HTTP per-request timeout (unchanged). A `nostr://` request is bounded by the connector window
+/// instead; see `crate::transport`.
+pub const RPC_TIMEOUT_SECONDS: u64 = crate::transport::HTTP_RPC_TIMEOUT.as_secs();
 // Three RPC timeouts: the swap timeout plus two timeouts of scheduling/clock margin.
+// HTTP mints only; `nostr://` mints use `transport::NOSTR_ABANDON_GRACE_SECONDS` (see
+// `transport::abandon_grace_seconds`).
 pub const ABANDON_GRACE_SECONDS: u64 = 3 * RPC_TIMEOUT_SECONDS;
 
+/// A Cashu NUT error from the mint: HTTP 400 whose body is a JSON object with a
+/// numeric `code` and a string `detail` (NUT-00 error response). Parsing proves only
+/// that the mint answered with a NUT body: cdk 0.17.2 answers HTTP 400 + NUT body for
+/// EVERY error, including transient ones (`50000` for Internal/Database/DHKE/
+/// ConcurrentUpdate and its fallback). Only [`MintRefusal::definitive`] codes may be
+/// treated as "the mint processed and refused this request".
+///
+/// Everything else stays ambiguous: transport errors, timeouts, 429/5xx, a 400 whose
+/// body is not parseable or has no numeric code, and any transport-level refusal such
+/// as a Nostr connector's `expired`/`bad_request` ("not executed"). A transport must
+/// construct this type only for a real NUT error the mint itself returned.
+///
+/// `detail` is sanitized (printable ASCII, at most [`MintRefusal::MAX_DETAIL`] bytes);
+/// the raw body is never kept or logged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MintRefusal {
+    pub code: u64,
+    pub detail: String,
+}
+impl MintRefusal {
+    pub const MAX_DETAIL: usize = 120;
+    /// Build from a NUT error code and an untrusted detail string (sanitized here).
+    pub fn new(code: u64, detail: &str) -> Self {
+        let mut detail: String = detail
+            .chars()
+            .map(|c| {
+                if c.is_ascii_graphic() || c == ' ' {
+                    c
+                } else {
+                    '?'
+                }
+            })
+            .collect();
+        detail.truncate(Self::MAX_DETAIL);
+        Self { code, detail }
+    }
+    /// Parse an HTTP reply. `Some` only for status 400 with a NUT error body.
+    pub fn parse(status: u16, body: &str) -> Option<Self> {
+        if status != 400 {
+            return None;
+        }
+        let v: serde_json::Value = serde_json::from_str(body).ok()?;
+        Some(Self::new(
+            v.get("code")?.as_u64()?,
+            v.get("detail")?.as_str()?,
+        ))
+    }
+    /// NUT codes meaning the mint verified this request and rejected it without
+    /// executing it. A strict SUBSET of cdk-common 0.17.2 `Error::is_definitive_failure`
+    /// for the errors a swap can return; do not "complete the mirror" (11003 and the
+    /// auth codes are deliberately left out). Everything else stays ambiguous: `50000` (cdk's
+    /// transient catch-all), 11002 TokenPending, 11004 OutputsPending, 11003 (our
+    /// outputs are already signed: evidence that the swap landed), auth/rate-limit
+    /// codes and every unknown code.
+    pub const DEFINITIVE: &'static [u64] = &[
+        10001, // TokenNotVerified
+        11001, // TokenAlreadySpent
+        11005, // TransactionUnbalanced
+        11007, // DuplicateInputs
+        11008, // DuplicateOutputs
+        11009, // MultipleUnits
+        11010, // UnitMismatch
+        11013, // UnsupportedUnit
+        11014, // MaxInputsExceeded
+        11015, // MaxOutputsExceeded
+        12001, // KeysetNotFound
+        12002, // KeysetInactive
+        12003, // KeysetExpired
+    ];
+    pub fn definitive(&self) -> bool {
+        Self::DEFINITIVE.contains(&self.code)
+    }
+    /// The typed refusal anywhere in an error's chain, if any.
+    pub fn of(e: &anyhow::Error) -> Option<&Self> {
+        e.chain().find_map(|c| c.downcast_ref::<Self>())
+    }
+}
+impl std::fmt::Display for MintRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Mint-controlled detail text is never displayed or logged; the code only.
+        write!(f, "mint NUT error {}", self.code)
+    }
+}
+impl std::error::Error for MintRefusal {}
+
+/// True only for a [`MintRefusal::definitive`] NUT error in `e`'s chain. Applies to both
+/// transports: a `nostr://` refusal is the same typed [`MintRefusal`] (built in `transport`).
+pub fn definitive_refusal(e: &anyhow::Error) -> bool {
+    MintRefusal::of(e).is_some_and(MintRefusal::definitive)
+}
+
+/// One mint request through the transport dispatch (HTTP or `nostr://`). A NUT error reply is
+/// returned as a [`MintRefusal`] in the error chain (built by `transport`); every other failure is
+/// an untyped (ambiguous) error.
 pub async fn rpc<T: serde::de::DeserializeOwned>(
     mint: &str,
     op: &str,
     body: &impl Serialize,
 ) -> Result<T> {
     crate::Asset::new(mint)?.fence()?;
-    let r = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(RPC_TIMEOUT_SECONDS))
-        .build()?
-        .post(format!("{mint}/v1/{op}"))
-        .json(body)
-        .send()
-        .await?;
-    let status = r.status();
-    let text = r.text().await?;
-    ensure!(
-        status.is_success(),
-        "mint {mint} {op}: HTTP {status} (body withheld)"
-    );
-    serde_json::from_str(&text).with_context(|| format!("mint {mint} {op}: invalid response"))
+    crate::transport::post(mint, op, body, None).await
+}
+/// [`rpc`] for a deadline-bound effect: a `nostr://` request's `exp` never passes `not_after`.
+pub async fn rpc_until<T: serde::de::DeserializeOwned>(
+    mint: &str,
+    op: &str,
+    body: &impl Serialize,
+    not_after: Option<u64>,
+) -> Result<T> {
+    crate::Asset::new(mint)?.fence()?;
+    crate::transport::post(mint, op, body, not_after).await
 }
 pub async fn states(mint: &str, proofs: &Proofs) -> Result<CheckStateResponse> {
     let ys = proofs.ys()?;
@@ -98,10 +192,10 @@ pub async fn unspent(mint: &str, p: &Proofs) -> Result<()> {
 }
 pub async fn plan(home: &Path, mint: &str, net: u64, max_fee: u64) -> Result<Plan> {
     let w = wallet(home, mint).await?;
-    crate::wallet::bounded(w.refresh_keysets())
+    crate::wallet::bounded_for(mint, w.refresh_keysets())
         .await
         .context("CDK wallet request timed out")??;
-    let k = crate::wallet::bounded(w.fetch_active_keyset())
+    let k = crate::wallet::bounded_for(mint, w.fetch_active_keyset())
         .await
         .context("CDK wallet request timed out")??;
     let (gross, claim_fee) = gross(net, k.input_fee_ppk)?;
@@ -125,7 +219,7 @@ pub async fn plan(home: &Path, mint: &str, net: u64, max_fee: u64) -> Result<Pla
             .checked_add(u64::from(p.proof.amount))
             .context("overflow")?;
         ppks.push(
-            crate::wallet::bounded(w.get_keyset_fees_by_id(p.proof.keyset_id))
+            crate::wallet::bounded_for(mint, w.get_keyset_fees_by_id(p.proof.keyset_id))
                 .await
                 .context("CDK wallet request timed out")??,
         );
@@ -216,11 +310,11 @@ pub async fn lock(
     if j.get::<Attempt>("attempt", id).await?.is_none() {
         crate::wallet::preflight(&p.mint).await?;
         let w = wallet(home, &p.mint).await?;
-        crate::wallet::bounded(w.refresh_keysets())
+        crate::wallet::bounded_for(&p.mint, w.refresh_keysets())
             .await
             .context("CDK wallet request timed out")??;
         ensure!(
-            crate::wallet::bounded(w.get_keyset_fees_by_id(p.keyset))
+            crate::wallet::bounded_for(&p.mint, w.get_keyset_fees_by_id(p.keyset))
                 .await
                 .context("CDK wallet request timed out")??
                 == p.ppk,
@@ -228,7 +322,7 @@ pub async fn lock(
         );
         ensure!(
             u64::from(
-                crate::wallet::bounded(w.get_proofs_fee(&p.inputs))
+                crate::wallet::bounded_for(&p.mint, w.get_proofs_fee(&p.inputs))
                     .await
                     .context("CDK wallet request timed out")??
                     .total
@@ -236,7 +330,7 @@ pub async fn lock(
             "input fee changed"
         );
         unspent(&p.mint, &p.inputs).await?;
-        let f = crate::wallet::bounded(w.get_keyset_fees_and_amounts_by_id(p.keyset))
+        let f = crate::wallet::bounded_for(&p.mint, w.get_keyset_fees_and_amounts_by_id(p.keyset))
             .await
             .context("CDK wallet request timed out")??;
         let mut out = outputs(
@@ -262,6 +356,28 @@ pub async fn lock(
             ));
         }
         ensure!(out.len() <= 128, "output limit");
+        // nostr:// only: the lock swap itself, and the counterparty's later claim (or our refund)
+        // of the locked outputs, must each fit one NIP-44 request. Checked before the intent.
+        crate::transport::check_swap_fits(
+            &p.mint,
+            &SwapRequest::new(
+                p.inputs.clone(),
+                out.iter().map(|o| o.message.clone()).collect(),
+            ),
+        )?;
+        let locked: Proofs = out
+            .iter()
+            .filter(|o| !o.owned)
+            .map(|o| {
+                Proof::new(
+                    o.message.amount,
+                    o.message.keyset_id,
+                    o.secret.clone(),
+                    o.message.blinded_secret,
+                )
+            })
+            .collect();
+        crate::transport::check_claim_fits(&p.mint, &locked, claim_outputs(p.net))?;
         j.put(
             "attempt",
             id,
@@ -346,17 +462,17 @@ async fn redeem_inner(
 ) -> Result<Proofs> {
     if j.get::<Attempt>("attempt", id).await?.is_none() {
         let w = wallet(home, mint).await?;
-        crate::wallet::bounded(w.refresh_keysets())
+        crate::wallet::bounded_for(mint, w.refresh_keysets())
             .await
             .context("CDK wallet request timed out")??;
-        let k = crate::wallet::bounded(w.fetch_active_keyset())
+        let k = crate::wallet::bounded_for(mint, w.fetch_active_keyset())
             .await
             .context("CDK wallet request timed out")??;
-        let f = crate::wallet::bounded(w.get_keyset_fees_and_amounts_by_id(k.id))
+        let f = crate::wallet::bounded_for(mint, w.get_keyset_fees_and_amounts_by_id(k.id))
             .await
             .context("CDK wallet request timed out")??;
         let cost = u64::from(
-            crate::wallet::bounded(w.get_proofs_fee(proofs))
+            crate::wallet::bounded_for(mint, w.get_proofs_fee(proofs))
                 .await
                 .context("CDK wallet request timed out")??
                 .total,
@@ -421,8 +537,9 @@ pub async fn execute(home: &Path, j: &Journal, id: &str) -> Result<Proofs> {
                 } else {
                     cdk::util::unix_time()
                 };
+                let grace = crate::transport::abandon_grace_seconds(&a.mint);
                 if a.send_before
-                    .is_some_and(|exp| now > exp.saturating_add(ABANDON_GRACE_SECONDS))
+                    .is_some_and(|exp| now > exp.saturating_add(grace))
                 {
                     let hash = a.inputs.first().and_then(|p| {
                         let secret: cashu::nuts::nut10::Secret = (&p.secret).try_into().ok()?;
@@ -467,12 +584,10 @@ pub async fn execute(home: &Path, j: &Journal, id: &str) -> Result<Proofs> {
                 if std::env::var("TRADE_CRASH_BEFORE_SWAP").ok().as_deref() == Some(id) {
                     std::process::exit(87);
                 }
-                let r: SwapResponse = rpc(
-                    &a.mint,
-                    "swap",
-                    &SwapRequest::new(a.inputs.clone(), messages.clone()),
-                )
-                .await?;
+                let request = SwapRequest::new(a.inputs.clone(), messages.clone());
+                crate::transport::check_swap_fits(&a.mint, &request)?;
+                // A nostr:// swap's `exp` never passes send_before (mint-enforced expiry).
+                let r: SwapResponse = rpc_until(&a.mint, "swap", &request, a.send_before).await?;
                 r.signatures
             } else {
                 ensure!(
@@ -497,9 +612,12 @@ pub async fn execute(home: &Path, j: &Journal, id: &str) -> Result<Proofs> {
                 "signature count mismatch"
             );
             let w = wallet(home, &a.mint).await?;
-            let keys = crate::wallet::bounded(w.load_keyset_keys(a.outputs[0].message.keyset_id))
-                .await
-                .context("CDK wallet request timed out")??;
+            let keys = crate::wallet::bounded_for(
+                &a.mint,
+                w.load_keyset_keys(a.outputs[0].message.keyset_id),
+            )
+            .await
+            .context("CDK wallet request timed out")??;
             for (s, o) in signatures.iter().zip(&a.outputs) {
                 ensure!(
                     s.amount == o.message.amount && s.keyset_id == o.message.keyset_id,
@@ -530,7 +648,8 @@ pub async fn execute(home: &Path, j: &Journal, id: &str) -> Result<Proofs> {
         // Persist first; a missing DLEQ must not hide recoverable owned outputs.
         let w = wallet(home, &a.mint).await?;
         if result.iter().any(|p| p.dleq.is_some()) {
-            let verified = crate::wallet::bounded(
+            let verified = crate::wallet::bounded_for(
+                &a.mint,
                 w.verify_token_dleq(&Token::new(
                     a.mint.parse()?,
                     result
@@ -611,12 +730,19 @@ pub async fn validate(
     keyset: Id,
 ) -> Result<()> {
     ensure!(!p.is_empty() && p.len() <= 128, "proof count");
+    // A nostr:// leg must stay claimable AND refundable through one NIP-44 request. Refuse at
+    // admission, before any network call and before we lock or reveal anything.
+    crate::transport::check_claim_fits(
+        mint,
+        p,
+        claim_outputs(total(p)?.saturating_sub(claim_fee)),
+    )?;
     let w = wallet(home, mint).await?;
-    crate::wallet::bounded(w.refresh_keysets())
+    crate::wallet::bounded_for(mint, w.refresh_keysets())
         .await
         .context("CDK wallet request timed out")??;
     ensure!(
-        crate::wallet::bounded(w.get_keyset_fees_by_id(keyset))
+        crate::wallet::bounded_for(mint, w.get_keyset_fees_by_id(keyset))
             .await
             .context("CDK wallet request timed out")??
             == ppk,
@@ -641,17 +767,20 @@ pub async fn validate(
         ensure!(tags == wanted, "HTLC conditions are not exact");
         ensure!(proof.dleq.is_some(), "DLEQ missing");
     }
-    crate::wallet::bounded(w.verify_token_dleq(&Token::new(
-        mint.parse()?,
-        p.clone(),
-        None,
-        CurrencyUnit::Sat,
-    )))
+    crate::wallet::bounded_for(
+        mint,
+        w.verify_token_dleq(&Token::new(
+            mint.parse()?,
+            p.clone(),
+            None,
+            CurrencyUnit::Sat,
+        )),
+    )
     .await
     .context("CDK wallet request timed out")??;
     let total = total(p)?;
     let cost = u64::from(
-        crate::wallet::bounded(w.get_proofs_fee(p))
+        crate::wallet::bounded_for(mint, w.get_proofs_fee(p))
             .await
             .context("CDK wallet request timed out")??
             .total,
@@ -707,6 +836,10 @@ pub async fn refundable(mint: &str, proofs: &Proofs) -> Result<Proofs> {
         .collect()
 }
 
+/// Outputs a claim or refund of `amount` creates (one per set bit, `SplitTarget::default()`).
+fn claim_outputs(amount: u64) -> usize {
+    amount.count_ones().max(1) as usize
+}
 fn total(proofs: &Proofs) -> Result<u64> {
     proofs.iter().try_fold(0u64, |sum, p| {
         sum.checked_add(u64::from(p.amount))
@@ -790,9 +923,10 @@ pub async fn claim_not_landed(
         "claim input binding mismatch"
     );
     let time = crate::wallet::action_time(mint).await?;
+    let grace = crate::transport::abandon_grace_seconds(mint);
     if !a
         .send_before
-        .is_some_and(|exp| time > exp.saturating_add(ABANDON_GRACE_SECONDS))
+        .is_some_and(|exp| time > exp.saturating_add(grace))
     {
         return Ok(false);
     }
@@ -901,9 +1035,10 @@ pub async fn settle_unforwardable(home: &Path, j: &Journal, id: &str) -> Result<
         })
         .collect::<Result<Vec<_>>>()?;
     let w = wallet(home, &a.mint).await?;
-    let keys = crate::wallet::bounded(w.load_keyset_keys(a.outputs[0].message.keyset_id))
-        .await
-        .context("CDK wallet request timed out")??;
+    let keys =
+        crate::wallet::bounded_for(&a.mint, w.load_keyset_keys(a.outputs[0].message.keyset_id))
+            .await
+            .context("CDK wallet request timed out")??;
     let result = cdk::dhke::construct_proofs(
         signatures,
         a.outputs
@@ -920,12 +1055,15 @@ pub async fn settle_unforwardable(home: &Path, j: &Journal, id: &str) -> Result<
         .cloned()
         .collect();
     if !present.is_empty() {
-        crate::wallet::bounded(w.verify_token_dleq(&Token::new(
-            a.mint.parse()?,
-            present,
-            None,
-            CurrencyUnit::Sat,
-        )))
+        crate::wallet::bounded_for(
+            &a.mint,
+            w.verify_token_dleq(&Token::new(
+                a.mint.parse()?,
+                present,
+                None,
+                CurrencyUnit::Sat,
+            )),
+        )
         .await
         .context("CDK wallet request timed out")??;
     }
@@ -998,4 +1136,61 @@ async fn owned_commit_evidence(a: &Attempt) -> Result<bool> {
         .states
         .iter()
         .all(|s| s.state == State::Spent))
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::MintRefusal;
+    #[test]
+    fn only_a_400_nut_error_body_is_a_refusal() {
+        let ok = MintRefusal::parse(400, r#"{"code":11001,"detail":"Token already spent"}"#);
+        assert_eq!(ok, Some(MintRefusal::new(11001, "Token already spent")));
+        for (status, body) in [
+            (400, "<html>bad request</html>"),
+            (400, r#"{"detail":"no code"}"#),
+            (400, r#"{"code":"11001","detail":"string code"}"#),
+            (400, r#"{"code":11001}"#),
+            (400, r#"{"error":"expired","detail":"x"}"#),
+            (400, ""),
+            (500, r#"{"code":11001,"detail":"x"}"#),
+            (429, r#"{"code":11001,"detail":"x"}"#),
+        ] {
+            assert_eq!(
+                MintRefusal::parse(status, body),
+                None,
+                "SAFETY: {status} {body}"
+            );
+        }
+    }
+    #[test]
+    fn only_allowlisted_codes_are_definitive() {
+        for code in [11001, 11005, 12001, 12002, 12003] {
+            assert!(MintRefusal::new(code, "x").definitive(), "{code}");
+        }
+        // cdk 0.17.2: Internal/Database/DHKE/ConcurrentUpdate/fallback -> 50000.
+        for code in [50000, 11002, 11003, 11004, 31004, 20005, 0, 1, 99999] {
+            assert!(
+                !MintRefusal::new(code, "x").definitive(),
+                "SAFETY: {code} is ambiguous"
+            );
+        }
+        let e = anyhow::Error::new(MintRefusal::new(50000, "busy")).context("outer");
+        assert!(MintRefusal::of(&e).is_some() && !super::definitive_refusal(&e));
+        let e = anyhow::Error::new(MintRefusal::new(11001, "spent")).context("outer");
+        assert!(super::definitive_refusal(&e));
+    }
+    #[test]
+    fn display_withholds_mint_detail() {
+        let r = MintRefusal::new(11001, "secret-looking-detail");
+        assert_eq!(r.to_string(), "mint NUT error 11001");
+    }
+    #[test]
+    fn detail_is_bounded_and_sanitized() {
+        let r = MintRefusal::new(1, &format!("a\nb\u{1b}[31m{}", "x".repeat(500)));
+        assert!(r.detail.len() <= MintRefusal::MAX_DETAIL);
+        assert!(r.detail.chars().all(|c| c.is_ascii_graphic() || c == ' '));
+        let e = anyhow::Error::new(r.clone()).context("outer");
+        assert_eq!(MintRefusal::of(&e), Some(&r));
+        assert!(MintRefusal::of(&anyhow::anyhow!("mint x swap: HTTP 400 Bad Request")).is_none());
+    }
 }

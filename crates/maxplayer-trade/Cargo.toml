@@ -30,6 +30,9 @@ url = "2"
 
 uuid = { version = "1", features = ["v4", "serde"] }
 bitcoin = "0.32"
+# nostr:// mint transport (kinds 23410/23411): the reviewed core connector and wire contract,
+# exactly as crates/maxplayer-mint uses them. Path dependency; this crate stays its own workspace.
+maxplayer-core = { path = "../maxplayer-core", features = ["wallet"] }
 
 [dev-dependencies]
 cdk = { version = "=0.17.2", default-features = false, features = ["mint", "wallet"] }
@@ -40,3 +43,6 @@ axum = "0.8"
 nostr-relay-builder = "=0.44.0"
 tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
+# tests/nostr.rs: the real Maxplayer credits sidecar (its own workspace) served in-process on a
+# local relay. Test-only; production trading never links the mint.
+maxplayer-mint = { path = "../maxplayer-mint" }

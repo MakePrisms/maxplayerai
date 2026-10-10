@@ -23,7 +23,7 @@ receiver claims remain valid after locktime. Keep the watcher alive.
 ## Bounded pass and exit status
 
 `recover` makes one pass without waiting for future lock deadlines. Each funding,
-withdrawal, and swap attempt has a **120-second** budget; this is not a 120-second
+withdrawal, receive, and swap attempt has a **120-second** budget; this is not a 120-second
 whole-command deadline. Items are handled sequentially and relay/setup/publication
 work is additional. A timeout does not undo a delivered RPC or release reservations.
 
@@ -95,6 +95,22 @@ releases it immediately. An explicit same-invoice command can retry an unexpired
 unsent quote. `refused` permits a same-invoice retry; `unpaid_released` requires a
 new invoice for a new payment. A failed pre-POST withdrawal cannot pay later via
 serve/recover/market commands; a post-POST timeout is still unresolved, not failure. Escalate persistent uncertainty without forcing release.
+
+## Receive states
+
+| State | Meaning and action |
+| --- | --- |
+| `prepared` | Journaled, swap not yet sent. Recovery sends exactly the journaled swap. |
+| `submitted` | Swap may have reached the mint. Recovery restores (NUT-09) the same outputs and replays only the identical swap; never import the token again elsewhere. A `nostr://` attempt whose swap is over the NIP-44 limit (journaled before admission checked it) fails locally with 413 on every pass, was never published, and holds its cap until resolved by hand. |
+| `done` | Terminal: DLEQ-verified proofs credited (held reserved until `done` is journaled, then released; `recover` finishes a pending release); check `balance`. |
+| `refused` | Exit 1: the mint returned a definitive NUT error (allowlisted code, HTTPS or `nostr://` numeric code; `50000`, 11002, 11003, 11004 and unknown codes are not), a fresh restore found none of our outputs and the inputs stayed UNSPENT. FINAL: nothing credited, not charged to the cap, `refusal_code` journaled; neither `recover` nor a repeated `receive` retries it. The token was not imported; it can be redeemed elsewhere. Any other 400 and nostr `expired`/`bad_request`/`rate_limited`/timeout/413 stay `submitted` (exit 3). |
+| `already_spent` | Terminal (exit 1): inputs SPENT and none of our outputs restorable. Nothing credited, not charged. |
+| `quarantined` | Terminal manual recovery (exit 4): our outputs were signed but lack valid DLEQ; never credited, not spendable, but still occupies the cap. Preserve the home and escalate. |
+
+Cap: Funding intents plus charged receives (gross) share one 100,000-sat cap per mint per home; `refused`/`already_spent` receives do not count; `prepared`/`submitted`/`done`/`quarantined` ones do.
+Exits: 0 `done` and released, 1 `refused`/`already_spent`, 3 `prepared`/`submitted`, `done` with release outstanding (run `recover`) or a failed journal write, 4 `quarantined`.
+Inputs reported PENDING keep the attempt unresolved. A lost swap reply is never
+answered with replacement outputs.
 
 ## Funding and market status are separate
 

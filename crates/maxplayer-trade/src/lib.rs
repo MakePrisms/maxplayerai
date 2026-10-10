@@ -16,8 +16,49 @@ pub struct Asset {
     pub mint_url: String,
     pub unit: String,
 }
+/// Canonical `nostr://<lowercase bech32 npub>` for a CLI-supplied nostr mint: accepts any scheme
+/// case, a hex or bech32 key in any case, and one trailing slash. Never used for peer/lot data.
+fn canonical_nostr(mint: &str) -> Result<String> {
+    ensure!(transport::is_nostr(mint), "not a nostr:// mint");
+    let key = mint[mint_wire_scheme_len()..].trim_end_matches('/');
+    ensure!(
+        !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric()),
+        "nostr mint must be nostr://<npub or 64-hex key> with no path, query or fragment"
+    );
+    let key = key.to_ascii_lowercase();
+    let pk = if key.len() == 64 {
+        PublicKey::from_hex(&key)?
+    } else {
+        PublicKey::from_bech32(&key)?
+    };
+    Ok(format!("nostr://{}", pk.to_bech32()?))
+}
+fn mint_wire_scheme_len() -> usize {
+    maxplayer_core::mint_wire::NOSTR_MINT_SCHEME.len()
+}
 impl Asset {
+    /// Canonicalize a mint the operator typed: `nostr://` input may use hex or uppercase. Lots and
+    /// peer messages go through [`Asset::new`]/[`Asset::validate`], which accept canonical only.
+    pub fn from_cli(mint: &str) -> Result<Self> {
+        if transport::is_nostr(mint) {
+            return Self::new(&canonical_nostr(mint)?);
+        }
+        Self::new(mint)
+    }
     pub fn new(mint: &str) -> Result<Self> {
+        if transport::is_nostr(mint) {
+            // Strict: exactly `nostr://<lowercase npub>` (what the market site also accepts).
+            ensure!(
+                maxplayer_core::mint_wire::nostr_mint_npub(mint)
+                    .is_some_and(|npub| mint.len() == mint_wire_scheme_len() + npub.len())
+                    && canonical_nostr(mint).is_ok_and(|c| c == mint),
+                "noncanonical nostr mint (expected nostr://<lowercase npub>)"
+            );
+            return Ok(Self {
+                mint_url: mint.into(),
+                unit: "sat".into(),
+            });
+        }
         let u = url::Url::parse(mint)?;
         ensure!(
             u.username().is_empty()
@@ -46,8 +87,15 @@ impl Asset {
         ensure!(Self::new(&self.mint_url)? == *self, "noncanonical asset");
         Ok(())
     }
+    pub fn is_nostr(&self) -> bool {
+        transport::is_nostr(&self.mint_url)
+    }
     pub fn fence(&self) -> Result<()> {
         self.validate()?;
+        if self.is_nostr() {
+            // Authenticated by the npub; relays are fenced in `transport::check_mint_relay`.
+            return Ok(());
+        }
         let u = url::Url::parse(&self.mint_url)?;
         let h = u.host_str().context("missing mint host")?;
         let local = h == "localhost"
@@ -289,6 +337,49 @@ mod tests {
         }
     }
     #[test]
+    fn nostr_mint_canonical_form() {
+        let npub = "npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d";
+        let canonical = format!("nostr://{npub}");
+        let a = Asset::new(&canonical).unwrap();
+        a.fence().unwrap();
+        assert_eq!(a.mint_url, canonical);
+        let hex = PublicKey::from_bech32(npub).unwrap().to_hex();
+        // CLI input canonicalizes hex, uppercase and a trailing slash.
+        for input in [
+            format!("nostr://{hex}"),
+            format!("NOSTR://{}", npub.to_uppercase()),
+            format!("nostr://{}", hex.to_uppercase()),
+            format!("{canonical}/"),
+        ] {
+            assert_eq!(Asset::from_cli(&input).unwrap(), a, "{input}");
+        }
+        // Lots and peers are strict: only the canonical spelling validates.
+        for bad in [
+            format!("nostr://{hex}"),
+            format!("NOSTR://{npub}"),
+            format!("nostr://{}", npub.to_uppercase()),
+            format!("{canonical}/"),
+            format!("{canonical}/path"),
+            format!("{canonical}?relay=wss://x"),
+            format!("{canonical}#f"),
+            "nostr://npub1invalid".to_string(),
+        ] {
+            assert!(Asset::new(&bad).is_err(), "SAFETY: {bad} must be refused");
+            let forged = Asset {
+                mint_url: bad.clone(),
+                unit: "sat".into(),
+            };
+            assert!(forged.validate().is_err(), "SAFETY: lot asset {bad}");
+        }
+        for bad in [
+            format!("{canonical}/path"),
+            format!("{canonical}?x=1"),
+            "nostr://".into(),
+        ] {
+            assert!(Asset::from_cli(&bad).is_err(), "{bad}");
+        }
+    }
+    #[test]
     fn nonloopback_http_denied() {
         assert!(Asset::new("http://mint.example").unwrap().fence().is_err());
     }
@@ -476,3 +567,5 @@ pub mod wallet;
 
 pub mod money;
 pub mod real_money;
+pub mod receive;
+pub mod transport;

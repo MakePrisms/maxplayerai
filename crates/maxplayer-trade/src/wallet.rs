@@ -13,18 +13,7 @@ use std::{
 };
 async fn info(mint: &str) -> Result<serde_json::Value> {
     crate::Asset::new(mint)?.fence()?;
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?;
-    let info: serde_json::Value = client
-        .get(format!("{}/v1/info", mint.trim_end_matches('/')))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    Ok(info)
+    crate::transport::get(mint, "info").await
 }
 pub async fn action_time(mint: &str) -> Result<u64> {
     let info = info(mint).await?;
@@ -39,10 +28,22 @@ pub async fn refund_time(mint: &str) -> Result<u64> {
         Err(_) => local,
     })
 }
+/// Bound one CDK wallet call against an HTTP mint (15 s). Kept for compatibility; mint-aware
+/// callers use [`bounded_for`], whose bound outlasts one `nostr://` connector call. An enclosing
+/// budget (advance, message, recovery item) can still drop a call mid-window; that is ambiguous,
+/// never a failure: the swap is journaled first and restored before any identical replay.
 pub async fn bounded<T>(
     f: impl std::future::Future<Output = T>,
 ) -> Result<T, tokio::time::error::Elapsed> {
-    tokio::time::timeout(std::time::Duration::from_secs(15), f).await
+    tokio::time::timeout(crate::transport::HTTP_WALLET_TIMEOUT, f).await
+}
+/// Bound one CDK wallet call against `mint`: 15 s for HTTP, the connector window plus its outer
+/// margin for `nostr://` (see `transport`). Every in-crate call site uses this.
+pub async fn bounded_for<T>(
+    mint: &str,
+    f: impl std::future::Future<Output = T>,
+) -> Result<T, tokio::time::error::Elapsed> {
+    tokio::time::timeout(crate::transport::wallet_bound(mint), f).await
 }
 pub async fn preflight(mint: &str) -> Result<()> {
     preflight_for(mint, None).await
@@ -87,16 +88,7 @@ pub async fn preflight_for(mint: &str, operation: Option<&str>) -> Result<()> {
         now.abs_diff(time) <= 60,
         "mint clock skew exceeds 60 seconds"
     );
-    let keysets: serde_json::Value = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?
-        .get(format!("{}/v1/keysets", mint.trim_end_matches('/')))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let keysets = crate::transport::get(mint, "keysets").await?;
     ensure!(
         keysets["keysets"].as_array().is_some_and(|sets| sets
             .iter()
@@ -138,12 +130,20 @@ pub async fn wallet(home: &std::path::Path, mint: &str) -> Result<Wallet> {
         .mode(0o600)
         .open(&db_path)?;
     let db = cdk_sqlite::WalletSqliteDatabase::new(db_path).await?;
-    Ok(WalletBuilder::new()
+    let builder = WalletBuilder::new()
         .mint_url(mint.parse()?)
         .unit(CurrencyUnit::Sat)
         .localstore(Arc::new(db))
-        .seed(seed)
-        .build()?)
+        .seed(seed);
+    if crate::transport::is_nostr(mint) {
+        // Same construction as maxplayer_core::nostr_mint::build_wallet_with_relays, over the
+        // configured mint relays. cdk's WebSocket subscriptions cannot address a nostr:// URL.
+        return Ok(builder
+            .client(crate::transport::connector(mint)?)
+            .use_http_subscription()
+            .build()?);
+    }
+    Ok(builder.build()?)
 }
 
 pub async fn database(
@@ -192,7 +192,7 @@ pub fn read_status(home: &std::path::Path) -> Result<serde_json::Value> {
     let db =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     db.busy_timeout(std::time::Duration::from_secs(2))?;
-    let mut stmt = db.prepare("SELECT secondary_namespace, value FROM kv_store WHERE primary_namespace='trade-v1' AND secondary_namespace IN ('swap','funding','withdrawal')")?;
+    let mut stmt = db.prepare("SELECT secondary_namespace, value FROM kv_store WHERE primary_namespace='trade-v1' AND secondary_namespace IN ('swap','funding','withdrawal','receive')")?;
     let mut records = vec![];
     for row in stmt.query_map([], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
@@ -201,6 +201,11 @@ pub fn read_status(home: &std::path::Path) -> Result<serde_json::Value> {
         let v: serde_json::Value = serde_json::from_slice(&bytes)?;
         let public = if kind == "withdrawal" {
             serde_json::from_slice::<crate::money::Withdrawal>(&bytes)?.summary()
+        } else if kind == "receive" {
+            // Same public view as `recover`; the token is never part of it.
+            let mut s = serde_json::from_slice::<crate::receive::Receipt>(&bytes)?.summary();
+            s["kind"] = kind.clone().into();
+            s
         } else {
             serde_json::json!({"kind":kind,"id":v["id"],"state":v["state"],"done":v["done"],"expired_unpaid":v["expired_unpaid"]})
         };

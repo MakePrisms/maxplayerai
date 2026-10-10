@@ -14,6 +14,12 @@ struct Cli {
     /// Relay URL (repeatable); defaults to nos.lol, relay.primal.net and offchain.pub.
     #[arg(long)]
     relay: Vec<String>,
+    /// Relay for nostr:// mint requests only (kinds 23410/23411; repeatable, max 8; wss://, or ws://
+    /// on loopback). Defaults to wss://relay.maxplayer.ai, wss://relay.ditto.pub and
+    /// wss://nostr-pub.wellorder.net. Never used for market traffic; relay.maxplayer.ai carries
+    /// mint traffic only and is refused as a --relay.
+    #[arg(long = "mint-relay")]
+    mint_relay: Vec<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -73,6 +79,13 @@ enum Command {
         #[arg(long)]
         max_debit: Option<u64>,
     },
+    /// Import one plain-sat Cashu token (max 100,000 sats) from a file or stdin; never argv.
+    Receive {
+        mint: String,
+        /// File holding the token; omit to read the token from stdin.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+    },
     /// Read public journal states without locking the home or advancing payments.
     Status,
     /// Read spendable wallet balance without submitting existing money authorizations.
@@ -99,9 +112,18 @@ async fn main() -> std::process::ExitCode {
 }
 async fn execute() -> Result<()> {
     let cli = Cli::parse();
+    maxplayer_trade::transport::configure_mint_relays(&cli.mint_relay)?;
+    // No home, lock, journal or intent is touched for a path a nostr:// mint cannot serve.
+    match &cli.command {
+        Command::Fund { mint, .. } => maxplayer_trade::transport::require_http(mint, "fund")?,
+        Command::Withdraw { mint, .. } => {
+            maxplayer_trade::transport::require_http(mint, "withdraw")?
+        }
+        _ => {}
+    }
     // Read-only observations remain available while serve owns the writer lock.
     if let Command::Balance { ref mint } = cli.command {
-        let asset = Asset::new(mint)?;
+        let asset = Asset::from_cli(mint)?;
         println!(
             "{}",
             serde_json::json!({"mint":asset.mint_url,"unit":"sat","balance":maxplayer_trade::wallet::read_balance(&cli.home, &asset.mint_url)?})
@@ -145,6 +167,7 @@ async fn execute() -> Result<()> {
             | Command::Fund { .. }
             | Command::Balance { .. }
             | Command::Withdraw { .. }
+            | Command::Receive { .. }
     ) {
         let keys = maxplayer_trade::wallet::identity(&cli.home)?;
         let relays = if cli.relay.is_empty() {
@@ -173,11 +196,11 @@ async fn execute() -> Result<()> {
                     &j,
                     &m,
                     Leg {
-                        asset: Asset::new(&give_mint)?,
+                        asset: Asset::from_cli(&give_mint)?,
                         net: give,
                     },
                     Leg {
-                        asset: Asset::new(&want_mint)?,
+                        asset: Asset::from_cli(&want_mint)?,
                         net: want,
                     },
                     max_fees,
@@ -221,12 +244,14 @@ async fn execute() -> Result<()> {
         Command::Preflight { mint }
         | Command::Fund { mint, .. }
         | Command::Balance { mint }
-        | Command::Withdraw { mint, .. } => mint,
+        | Command::Withdraw { mint, .. }
+        | Command::Receive { mint, .. } => mint,
         _ => unreachable!(),
     };
-    let asset = maxplayer_trade::Asset::new(mint_arg)?;
+    let asset = maxplayer_trade::Asset::from_cli(mint_arg)?;
     asset.fence()?;
     let mint = &asset.mint_url;
+
     if matches!(cli.command, Command::Preflight { .. }) {
         return preflight(mint).await;
     }
@@ -269,6 +294,43 @@ async fn execute() -> Result<()> {
             a.state
         );
         return Ok(());
+    }
+    if let Command::Receive { ref token_file, .. } = cli.command {
+        use std::io::Read;
+        let limit = maxplayer_trade::receive::MAX_TOKEN_BYTES as u64 + 1;
+        let mut raw = String::new();
+        match token_file {
+            Some(path) => fs::File::open(path)
+                .context("cannot open token file")?
+                .take(limit)
+                .read_to_string(&mut raw)
+                .context("token file is not readable UTF-8")?,
+            None => std::io::stdin()
+                .take(limit)
+                .read_to_string(&mut raw)
+                .context("stdin token is not readable UTF-8")?,
+        };
+        let r = maxplayer_trade::receive::receive(&cli.home, &money_journal, mint, &raw).await;
+        drop(raw);
+        let r = r?;
+        println!("{}", r.summary());
+        use maxplayer_trade::receive::ReceiveState::*;
+        return match r.state {
+            Done if r.settled() => Ok(()),
+            // Journaled done but the credited rows are not yet released: run recover.
+            Done => Err(coordinator::RecoveryIncomplete.into()),
+            Quarantined => Err(coordinator::ManualRecovery.into()),
+            Refused => anyhow::bail!(
+                "receive refused by the mint ({}); final: the token was NOT imported, nothing \
+                 was credited or charged to the cap, and it can be redeemed elsewhere",
+                r.refusal_code
+                    .map_or("NUT code not journaled".to_owned(), |c| format!(
+                        "NUT code {c}"
+                    ))
+            ),
+            AlreadySpent => anyhow::bail!("token already spent; nothing credited"),
+            Prepared | Submitted => Err(coordinator::RecoveryIncomplete.into()),
+        };
     }
     if let Command::Fund {
         amount, ref quote, ..
