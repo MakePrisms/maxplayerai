@@ -1,6 +1,7 @@
 # maxplayer-trade — standalone real-money Cashu trades
 
-A fixed-lot CLI, independent of jobs, the maxplayer daemon, core, and `relay.maxplayer.ai`.
+A fixed-lot CLI, independent of jobs and the maxplayer daemon. Market traffic never uses
+`relay.maxplayer.ai`; `nostr://` mint traffic (kinds 23410/23411) may, by Bob's decision of 2026-10-09.
 **A live 32-for-24 trade completed on 2026-10-08**, including both claims, NUT-07 witness
 recovery, fee-inclusive net delivery, and a signed `sold` status. Real-money trading is a normal supported use; this is not a production safety certification
 or an unconditional atomicity guarantee.
@@ -12,7 +13,8 @@ Earlier dated verification sections are historical snapshots, not current covera
 
 - Sender-funded claim fees must equal the pinned quote, not the receiver’s outgoing budget.
   Incoming fees exceeding the admission cap are refused before a lock is accepted.
-- CDK wallet calls have 15-second budgets; message handling has 60 seconds. Own-mint
+- CDK wallet calls have 15-second budgets against HTTP mints (40 s against `nostr://` mints,
+  see below); message handling has 60 seconds. Own-mint
   refunds run before counterparty claims. Missing mint info time does not block refunds;
   mint-enforced locktime remains authoritative. Known-preimage claims survive refund quarantine.
 - Withdrawal reserve: max(32 sats, ceil(invoice sats × 2%)); 100,000 sats permits 2,000.
@@ -85,13 +87,13 @@ sections below describe their dated runs, not current coverage totals.
   `serve` continuously accepts quotes and recovers swaps. **Keep a watcher running while funds
   are locked.** Use read-only `status`/`balance` without stopping it; never stop between `second_locked` and `settling`. Do not delete a trade home.
 
-Any canonical HTTPS mint can be used if automatic preflight passes: advertised NUT-07/09/11/12/14,
+Any canonical HTTPS mint (or a `nostr://<npub>` mint, see below) can be used if automatic preflight passes: advertised NUT-07/09/11/12/14,
 an active sat keyset, and clock skew at most 60 seconds. Preflight runs before each `list`,
 `take`, funding quotes and lock submission; successful earlier preflight is not cached
 as permission for a later lock. Test mints and loopback HTTP(S) fixtures remain supported.
 HTTP is refused except on loopback, and redirects are disabled. There is no real-money
-opt-in environment variable or allow-list flag. Each lock's gross amount and cumulative
-funding per mint/home are capped at **100,000 sats**, including pending/lost funding intents.
+opt-in environment variable or allow-list flag. Each lock's gross amount is capped at
+**100,000 sats**. Funding intents plus charged receives (gross) share one 100,000-sat cap per mint per home, including pending/lost funding intents.
 Each withdrawal invoice is also capped at **100,000 sats**, plus at most max(32 sats, ceil(invoice amount × 2%)) of
 quoted fee reserve, bounded together with input fees by `--max-debit`; spendable funds must cover the invoice, input fees and required change.
 
@@ -107,6 +109,41 @@ a guarantee for other deployments or versions.
 Default relays: `wss://nos.lol`, `wss://relay.primal.net`, `wss://offchain.pub`; repeat
 `--relay URL` before the command to configure alternatives. The production relay is
 explicitly forbidden. No production relay writes were made.
+
+### `nostr://` mints (Maxplayer credits sidecar)
+
+A mint may also be `nostr://<npub>`, e.g. a `crates/maxplayer-mint` sidecar. Lots and peer
+messages carry exactly `nostr://<lowercase bech32 npub>` (no slash, path, query or fragment);
+CLI arguments may use a 64-hex key or uppercase and are canonicalized. All mint traffic goes
+through one dispatch (`src/transport.rs`): HTTP(S) mints keep the raw requests used before;
+`nostr://` mints use the reviewed core connector (`maxplayer_core::nostr_mint`, one kind-23410
+request / 23411 reply per call, identical re-send on a lost reply, request `exp` enforced by
+the mint). CDK wallets for such mints are built with that connector and poll subscriptions.
+
+- Relays: repeat `--mint-relay URL` (max 8, `wss://`, `ws://` only on loopback) before the
+  command; default `wss://relay.maxplayer.ai`, `wss://relay.ditto.pub`,
+  `wss://nostr-pub.wellorder.net` (`transport::default_mint_relays`), the same list and order a
+  default credits sidecar listens on. They carry only kinds 23410/23411; market relays never carry
+  mint traffic. `relay.maxplayer.ai` is allowed for mint traffic only (Bob, 2026-10-09); the market
+  fence still refuses it for 3410/3411/23412 (`--relay`). Both sides must reach a relay
+  the mint listens on; preflight fails (nothing locked) otherwise.
+- Timing: a `nostr://` CDK wallet call is bounded at 40 s (30 s connector window + 10 s margin)
+  instead of 15 s; a raw request is bounded by the connector, not the 20 s HTTP timeout. A
+  deadline-bound swap (lock/claim) is sent with `exp <= send_before`, and not at all with under
+  2 s left. Abandonment grace is 120 s (window 30 + margin 10 + clock skew 60 + 20) instead of
+  60 s. A recovery item touching a `nostr://` leg gets max(120 s, advance deadline 100 s + 40 s).
+  These bounds are per call: the enclosing advance (100 s), refund-phase (50 s), message (60 s)
+  and recovery-item budgets can still drop a nostr call mid-window on a slow relay. Such a drop,
+  like a call that outlives its bound, is ambiguous: the journaled attempt is restored, never
+  resent with new outputs and never treated as failed; it costs a deferral, not money.
+- Size: the sidecar takes at most 128 inputs/outputs and a 65,535-byte NIP-44 plaintext. A
+  `nostr://` lock whose HTLC claim (preimage + signature per input) could exceed either is
+  refused at admission before anything is locked or revealed; own locks are checked the same way.
+  The bound counts the claim witness but not DLEQ: cdk's `SwapRequest::new` strips every input's
+  DLEQ before sending (unit test `nostr_claim_bound_covers_real_signed_claim_with_dleq`).
+- `fund` and `withdraw` refuse `nostr://` mints before touching the home: the sidecar serves no
+  NUT-04/05/20. Credits come from the operator's `maxplayer-mint issue` token file.
+- The sidecar has no configurable input fee (ppk 0).
 
 ## Agent skill
 
@@ -144,8 +181,9 @@ It is not installed in the Maxplayer website skill index. The CLI regression
   At refund time a missing/ambiguous SPENT witness fails closed: no taker refund that tick,
   even if the maker actually refunded. Keep recovery running; persistent omission needs
   human investigation. NUT-07 advertisement must never be reported as compatibility proof.
-- Residual late-lock window: a mint that holds a delivered POST beyond the 60-second
-  abandonment grace and starts it after the final restore/state/release can create a lock
+- Residual late-lock window: a mint that holds a delivered POST beyond the abandonment grace
+  (`abandon_grace_seconds`: 60 s over HTTPS, 120 s for a `nostr://` mint) and starts it
+  after the final restore/state/release can create a lock
   on an already-expired swap; automatic recovery cannot close that server-side window.
 
 ## Build and automated tests (historical round-three counts below)
@@ -608,7 +646,7 @@ A mint can still lie, withhold evidence, or process an already-delivered request
 
 - Authorized deviation from the integration spec: standalone crate, home/seed/CDK wallets and
   trade SQLite journal; HTTP(S) test mints and public relays; no jobs, budget/ledger, MCP,
-  Nostr-mint transport, sidecar changes, or production-relay deployment. Same-repository PR #1107 stays draft.
+  sidecar changes, or production-relay deployment (`nostr://` mints use the core connector, see above). Same-repository PR #1107 stays draft.
 - Trade swaps use pinned CDK **public lower-level primitives** with explicitly journaled outputs,
   rather than opaque high-level send/receive sagas. Claims and refunds use the same durable
   adapter; refunds include the empty-preimage witness required by pinned CDK. No dependency fork.
@@ -639,23 +677,101 @@ never argv) imports one token, e.g. one written by `maxplayer-mint issue`. Code:
 
 - Refused before any journal write: token mint not exactly `<mint>` after canonicalization,
   multi-mint, non-sat, NUT-10 locked (P2PK/HTLC), > 128 or duplicate proofs, invalid incoming
-  DLEQ (when present), > 100,000 sats, or a receive that would exceed the shared cap below. Common preflight and NUT-07 UNSPENT are required before the journal write.
-- One swap into fresh home-owned outputs; token, inputs, blinded outputs and secrets are
-  journaled before the POST. Ambiguity → NUT-09 restore of the same outputs and identical
-  replay only. A NUT error with inputs UNSPENT is terminal `refused`; SPENT inputs with nothing
+  DLEQ (when present), > 100,000 sats, a receive that would exceed the shared cap below, or (on a
+  `nostr://` mint) a receive swap that would not fit one NIP-44 request (long plain secrets can do
+  this under the token size limit). Common preflight and NUT-07 UNSPENT are required before the
+  journal write.
+- One swap into fresh home-owned outputs; input proofs (with secrets), blinded outputs and
+  their secrets are journaled before the POST (the token text is not). A second output set
+  is never created. Ambiguity → NUT-09 restore of the same outputs and identical
+  replay only. A definitive NUT error with inputs UNSPENT is `refused`; SPENT inputs with nothing
   of ours restorable is terminal `already_spent`. Only DLEQ-verified proofs are credited;
   missing/invalid DLEQ on our outputs is terminal `quarantined` (exit 4).
 - Cap: Funding intents plus charged receives (gross) share one 100,000-sat cap per mint per home; `refused`/`already_spent` receives do not count; `prepared`/`submitted`/`done`/`quarantined` ones do. A quarantined receive is not spendable but still occupies the cap.
-- Exits: 0 `done`; 1 pre-journal refusal, `refused` or `already_spent`; 3 unresolved
-  (`prepared`/`submitted`, or a journal write failed); 4 `quarantined`.
-- Only a parsed NUT error (HTTP 400, JSON `code` + `detail`; `mint::MintRefusal`) can make a
-  receive `refused`; any other 400 or transport refusal stays `submitted` and replays.
-- Idempotent per Y-set (sha256 of the sorted proof Ys): repeats resume the existing attempt.
+- Exits: 0 `done` with its credited rows released; 1 pre-journal refusal, `refused` or
+  `already_spent`; 3 unresolved (`prepared`/`submitted`, `done` whose release is still
+  outstanding, or a journal write failed; run `recover`); 4 `quarantined`.
+- Only a definitive mint NUT error (`mint::MintRefusal` with a code on the
+  `MintRefusal::DEFINITIVE` allowlist, a strict subset of cdk-common 0.17.2
+  `is_definitive_failure`: 11003 OutputsAlreadySigned and auth codes are deliberately left out)
+  can make a receive `refused`: over HTTPS a 400 with JSON numeric `code` + `detail`, over
+  `nostr://` a numeric NUT `code` in the mint's reply (same allowlist). `50000` (cdk's transient
+  Internal/Database catch-all), 11002 TokenPending, 11003, 11004 OutputsPending, unknown codes,
+  any other 400, and nostr `expired`, `bad_request`, `rate_limited`, `unsupported`, `internal`, an
+  oversized request (413), a timeout or relay failure stay `submitted` (exit 3) and replay the
+  identical swap. Every absence check restores, checks NUT-07 and, on SPENT, restores again
+  before `already_spent`.
+- `refused` is FINAL and journals its NUT code (`refusal_code`). Neither `recover` nor a
+  repeated `receive` replays it: against cdk 0.17.2 every allowlisted code is deterministic
+  for the same inputs and outputs (output-keyset codes 12001-12003, 11008, 11015, fee-based
+  11005 included), so no retryable code exists. The token was not imported, nothing is
+  charged to the cap, and it can be redeemed elsewhere. A record without a code (written
+  before this rule) is final too. `status`/`recover` lines carry `settled` and `refusal_code`.
+- Credited proofs are stored RESERVED under the receive id and released only after `done`
+  is journaled, so `withdraw`/`send` cannot spend them earlier. Mint error detail text is
+  never printed; only the NUT code.
+- Idempotent per Y-set (sha256 of the sorted proof Ys): repeats resume the existing attempt
+  and only ever replay its identical swap.
 - The mint input fee is deducted; output reports `amount`, `fee`, `net`, `credited`, state and
   attempt id only. `recover`/`serve` resume receives under the same 120 s item budget.
-- `nostr://` mints: cdk 0.17.2 `MintUrl`/`Token` parse them (unit test
-  `cdk_token_parsing_accepts_nostr_mint_url`), but this crate's `Asset::new` admits only
-  http/https, so a nostr:// receive is refused until the nostr transport branch lands.
+- `nostr://` mints: receive works through the nostr transport (see "`nostr://` mints" above); it
+  is the only way to put credits-sidecar tokens in a home (`fund` is refused). Tests:
+  `nostr_issue_receive_then_https_trade_completes_on_mint_relays_only`,
+  `nostr_expired_swap_reply_during_receive_stays_submitted_then_completes`,
+  `nostr_oversized_receive_refused_before_journal`. An attempt journaled before that admission
+  check existed (only unreleased builds of this branch) whose swap is over the NIP-44 limit stays
+  `submitted` (exit 3): every pass gets the connector's local 413, so it is never published and
+  never `refused`; the inputs stay spendable by the token holder, and the record holds its cap
+  (`nostr_preexisting_oversized_receive_is_never_sent`). For that legacy row only, redeem the
+  original token elsewhere: the next `recover` sees the inputs SPENT with none of our outputs,
+  records `already_spent` and frees the cap. Never re-import any other `submitted` receive.
+
+## Send (export a Cashu token)
+
+`maxplayer-trade --home <home> send <mint> --amount <sats> --out <path> [--max-fees <sats>]`
+writes one single-mint V4 token for exactly `<amount>` sats to a new 0600 file. It is the
+counterpart to `receive`, for moving funds to another wallet without Lightning. Code: `src/send.rs`.
+
+- Refused before any journal write: amount 0 or > 100,000 sats, insufficient ordinary balance
+  (reserved and locked proofs never count), input fee above `--max-fees` (required unless the
+  fee is 0), an existing `--out` path (never overwritten), failed preflight, non-UNSPENT inputs.
+- One swap of the selected inputs into the exact send outputs plus change. Inputs, blinded
+  outputs and secrets are journaled and the inputs reserved before the POST. Ambiguity → NUT-09
+  restore of the same outputs and identical replay only. A NUT error with inputs UNSPENT is
+  terminal `refused` (inputs released). Missing/invalid DLEQ is `quarantined` (exit 4).
+- The token is built only from DLEQ-verified outputs, journaled, then written (O_EXCL temp,
+  fsync, hard link to `--out`). `recover`/`serve` rewrite that same token after a crash.
+  Rerunning with the same `--out` resumes, or after the file was moved/deleted rewrites the
+  same journaled token, only when NUT-07 shows every sent proof UNSPENT (else exit 1, choose
+  another `--out`); a rewrite says no new value was sent and adds `"rewritten": true`. It never
+  sends twice. A used `--out` (other terms, reclaimed/redeemed/manual recovery) is refused;
+  only `refused` frees it. Coin selection skips inputs of any unfinished journaled send,
+  withdrawal, listing or swap. A send the recipient's input fee would consume (dust) is
+  refused before the journal. Output: attempt id, mint, state, amount, fee, `rewritten`;
+  never the token.
+- `send --reclaim <id>` swaps still-UNSPENT sent proofs back (same journaling; `reclaim_submitted`
+  is journaled before each POST). It also works on a `swapped` send whose file could not be
+  placed. Exits: 0 `reclaimed`; 3 `reclaiming`; 1 refused or partially redeemed meanwhile
+  (state back to `sent`; run it again) or `redeemed` (all SPENT, including the race where the
+  recipient redeemed before any POST of our leg); 4 `reclaim_unresolved` when our leg was
+  POSTed (ambiguous reply, or a refusal while every input is SPENT: the mint may have executed
+  it) and its outputs stayed absent on two passes (secrets kept), or `reclaim_quarantined`. `status --check-sends` performs the on-demand NUT-07 check.
+- `nostr://` mints: send, `send --reclaim` and `status --check-sends` run over the nostr transport
+  (`mint::rpc`/`states`/`unspent`, `wallet::preflight`, the `wallet()` builder; every CDK wallet
+  call uses `wallet::bounded_for`, 40 s on nostr, and the mint-agnostic 15 s `bounded` is gone).
+  Before the `prepared` write and the input reservation, send sizes the exact swap with
+  `transport::check_swap_fits`; reclaim does the same (plus ≤ 128 outputs) before the
+  `reclaiming`/`reclaim_submitted` write. Over the NIP-44 limit is exit 1 with nothing journaled,
+  reserved or published: a journaled one would fail locally with 413 on every pass and, since a
+  local 413 is never a refusal, strand its reserved inputs. Own-secret wallet rows fit with
+  ~9 KB to spare (128/128), so this is a guard, not an expected path. Send/reclaim swaps share
+  receive's refusal gate: nostr `expired`/`bad_request`/`rate_limited`/timeout/413 stay
+  ambiguous. The token names `nostr://npub…`, so only a nostr-capable wallet (this CLI's
+  `receive`) can redeem it. Keep the same `--mint-relay` set for reclaim, `recover` and
+  `--check-sends`. A send recovery item stays 120 s on nostr. Tests (`tests/nostr.rs`):
+  `nostr_send_check_sends_and_reclaim_round_trip`, `nostr_oversized_send_refused_before_journal`,
+  `nostr_oversized_reclaim_refused_before_journal` (oversized rows injected by the test; no CLI
+  path builds them), `nostr_send_survives_slow_keysets_reply` (a 20 s keysets reply).
 
 ## Funding and withdrawals
 

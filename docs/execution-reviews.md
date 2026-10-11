@@ -98,8 +98,26 @@ for verifying signed reviews on the next check.
 
 ## Timeouts and actual retry actions
 
-A client wait defaults to 300 seconds. Existing explicit shorter timeouts remain in effect. **A timeout ends that review wait, not the job.**
+A client wait defaults to 300 seconds and `review.timeout_seconds` accepts up to 3600, matching the worker's largest window. Existing explicit shorter timeouts remain in effect. **A timeout ends that review wait, not the job.**
 It does not claim, accept, reject, pay, bypass the check, or extend job deadlines.
+
+**A plain timeout is no longer the catch-all failure shape.** Three separate changes remove the
+silent paths that all used to read as "timeout" at the client (#1115):
+
+- The client checks the relay's OK on its own review-request publication. A refused request
+  (size, timestamp, policy) returns immediately as
+  `review: relay refused the review request: <relay reason>` instead of a full-window wait.
+- The worker answers every *authentic* refused request with a signed terminal error review:
+  `stale_request`, `rate_limited`, `queue_full`, `invalid_subject`, `relay_configuration`,
+  `review_store`. Private requests get the reply encrypted to the requester only. Only
+  unauthorized requests (`unauthorized_request`) and unparseable events stay unanswered, and
+  signed error replies are budgeted (at most 60 per minute) so floods degrade to log-only drops.
+  One poisoned request or store row no longer ends the worker process.
+- A timeout whose request WAS accepted by the relay now says so:
+  `the relay accepted the review request but no reviewer response arrived; the reviewer service
+  may be down or it dropped the request`. That points at the operator's
+  `maxplayer reviewer serve` log (the worker logs its `maxplayer-core` version at start, so
+  client/worker version skew is a one-line check).
 
 Seller:
 
@@ -140,7 +158,8 @@ Example `reviewer.json` (paths are operator-managed; no credentials in this file
   "signer_file": "/run/secrets/reviewer-signing-key",
   "provider_key_file": "/run/secrets/typesafe-api-key",
   "database": "/var/lib/maxplayer-review/reviews.sqlite",
-  "model": "jev-latest"
+  "model": "jev-latest",
+  "window_seconds": 600
 }
 ```
 
@@ -264,7 +283,7 @@ hooks, builds or execution. Scratch data is removed after success or failure.
 A process crash can leave scratch directories under the OS temporary directory;
 normal host temporary-file cleanup should reclaim them.
 
-Git reads share the request's 300-second deadline, with a 10-second maximum per
+Git reads share the request's processing window (`window_seconds`), with a 10-second maximum per
 HTTP leg. The aggregate HTTP-response cap uses the shared Git transfer budget: the 5 GiB
 uncompressed repository quota plus framing/compression allowance (64 bytes per allowed object
 and 64 KiB fixed overhead). Relay upload-pack responses and client private-input
@@ -293,11 +312,11 @@ Relay-level admission controls are still needed against identity churn.
 
 ## Provider retries, deduplication, and crashes
 
-The worker has a 300-second processing budget including input acquisition. Each
+The worker has a configurable per-request processing budget — `window_seconds` in the worker JSON, default 600 seconds, accepted range 60..=3600 — including input acquisition. The window is also the worst-case provider spend and head-of-line delay per request, since the worker is serial and fragments stop at the window. Each
 provider request has a 30-second HTTP timeout and **at most three attempts**:
 initial call plus two retries. Larger review inputs use bounded batches
 with at most four concurrent provider requests; the whole batch set shares the
-same 300-second deadline. Only
+same window deadline. Only
 transport failures, HTTP 408/429, and server errors are transient. Other HTTP errors,
 invalid JSON/probabilities, and oversized responses stop immediately. Redirects and
 hidden HTTP retries are disabled. Backoff honors numeric `Retry-After`; date-form or
@@ -355,7 +374,7 @@ of the complete review. Spools are reclaimed when handles close, including after
 a crash. Git fetch scratch directories retain the cleanup behavior described above.
 
 These defaults are admission ceilings, **not a guarantee that a near-5-GiB review
-finishes within the 300-second processing window or a reasonable provider bill**.
+finishes within the processing window or a reasonable provider bill**.
 Provider requests remain bounded and an incomplete review fails closed. No paid
 full-ceiling review has been benchmarked. Changed binary blobs, symlinks and
 submodules are unsupported; unchanged files are outside the diff review scope.

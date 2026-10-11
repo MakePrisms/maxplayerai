@@ -69,6 +69,16 @@ pub struct Faults {
     pub swaps: std::sync::atomic::AtomicU64,
     /// Answer every swap POST with a well-formed NUT error (HTTP 400 + code), unprocessed.
     pub swap_nut_error: std::sync::atomic::AtomicBool,
+    /// NUT code used by `swap_nut_error` / `refuse_after_swap` (0 = 11001).
+    pub swap_nut_code: std::sync::atomic::AtomicU64,
+    /// Let the mint EXECUTE the next swap, then answer it with the NUT error above and
+    /// blank the next restore (models a lost-reply POST landing around a refusal).
+    pub refuse_after_swap: std::sync::atomic::AtomicBool,
+    /// Restores blanked after `refuse_after_swap` (0 = 1; 2 hides the outputs from
+    /// both restores of the refusal path: a lagging restore after a landed swap).
+    pub refuse_after_swap_blanks: std::sync::atomic::AtomicU64,
+    /// Answer this many restores with an empty (but well-formed) reply.
+    pub blank_restores: std::sync::atomic::AtomicU64,
     /// Answer every swap POST with an unprocessed HTTP 400 that is NOT a NUT error:
     /// 1 = non-JSON body, 2 = JSON without a numeric `code`.
     pub swap_bad_400: std::sync::atomic::AtomicU64,
@@ -172,12 +182,42 @@ impl MintFixture {
                             _ => {}
                         }
                         if control.swap_nut_error.load(SeqCst) {
+                            let code = match control.swap_nut_code.load(SeqCst) {
+                                0 => 11001,
+                                c => c,
+                            };
                             return (
                                 axum::http::StatusCode::BAD_REQUEST,
-                                axum::Json(serde_json::json!({"code":11001,"detail":"refused"})),
+                                axum::Json(serde_json::json!({"code":code,"detail":"refused"})),
                             )
                                 .into_response();
                         }
+                        if control.refuse_after_swap.swap(false, SeqCst) {
+                            let done = next.run(req).await;
+                            assert!(done.status().is_success(), "fixture swap must execute");
+                            let blanks = control.refuse_after_swap_blanks.load(SeqCst).max(1);
+                            control.blank_restores.store(blanks, SeqCst);
+                            let code = match control.swap_nut_code.load(SeqCst) {
+                                0 => 11001,
+                                c => c,
+                            };
+                            return (
+                                axum::http::StatusCode::BAD_REQUEST,
+                                axum::Json(serde_json::json!({"code":code,"detail":"refused"})),
+                            )
+                                .into_response();
+                        }
+                    }
+                    if path.ends_with("/restore") && {
+                        let n = control.blank_restores.load(SeqCst);
+                        n > 0
+                            && control
+                                .blank_restores
+                                .compare_exchange(n, n - 1, SeqCst, SeqCst)
+                                .is_ok()
+                    } {
+                        return axum::Json(serde_json::json!({"outputs":[],"signatures":[]}))
+                            .into_response();
                     }
                     let delay = control.delay_ms.load(SeqCst);
                     if delay != 0 {

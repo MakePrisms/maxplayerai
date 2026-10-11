@@ -7,6 +7,11 @@ configured; defaults at verified base 1929972 are `wss://nos.lol`,
 `wss://relay.primal.net`, and `wss://offchain.pub`. These source defaults are also listed in root help. ACKed copies are not resent; retries use exponential
 backoff with jitter, at most 12 attempts per event/relay and a 24-hour age cutoff.
 Rate limiting pauses a relay for at least five minutes.
+A separate repeated global `--mint-relay <url>` (max 8; `wss://`, `ws://` only on loopback)
+carries `nostr://` mint requests only (kinds 23410/23411), never market traffic; it defaults
+to `wss://relay.maxplayer.ai`, `wss://relay.ditto.pub` and `wss://nostr-pub.wellorder.net`, the
+default credits sidecar's own list. `relay.maxplayer.ai` is allowed as a `--mint-relay` only; as a
+`--relay` (market) it is refused. Preserve the same mint-relay set during recovery of a `nostr://` trade.
 Relay ACK is not proof of stored readback or trade success. Respect backoff; do not
 restart loops or generate fresh identities to evade rate limits.
 
@@ -15,9 +20,10 @@ Canonical command signatures (placeholders are not literal values):
 ```text
 preflight <mint>
 balance <mint>
-status [--json]
+status [--json] [--check-sends]
 fund <mint> --amount <sats> [--quote <quote-id>]
 receive <mint> [--token-file <path>]
+send (<mint> --amount <sats> --out <path> | --reclaim <send-id>) [--max-fees <sats>]
 list --give-mint <mint> --give <net-sats> --want-mint <mint> --want <net-sats> --max-fees <sats> [--dry-run]
 discover
 serve
@@ -31,16 +37,20 @@ Use `-h` / `--help` at the root or on any application subcommand. The built-in
 `help [COMMAND]` also shows root or command help. There is no version option.
 `--home <HOME>` is required for operational commands; `--relay <RELAY>` is
 repeatable. All command-specific flags in the signatures above are required except
-`--quote`, `--max-debit`, `--token-file` (stdin when omitted), `--dry-run`, `--json`,
-and `--max-fees` (default 16 on list/take). Positional mint arguments are
-canonical URLs; lot arguments are public lot IDs; `--quote` is a saved funding
+`--quote`, `--max-debit`, `--token-file` (stdin when omitted), `--dry-run`, `--json`, `--check-sends`,
+and `--max-fees` (default 16 on list/take; on send it is required unless the mint's input fee is 0). `send` takes either `<mint> --amount --out` or `--reclaim <send-id>`. Positional mint arguments are
+canonical URLs, or `nostr://<npub>` for a Nostr-reachable mint (hex or uppercase input is
+canonicalized to the lowercase npub). `fund` and `withdraw` refuse `nostr://` mints before
+any journal entry: the Maxplayer credits mint serves no NUT-04/05/20; `receive` is how credits
+enter a home. Lot arguments are public lot IDs; `--quote` is a saved funding
 quote for the same mint and amount.
 Never use a lab-feature binary for the human's funds.
 
 ## Enforced monetary policy
 
 - Asset identity is canonical mint URL plus unit `sat`; equal units do not make two
-  issuers equivalent. Confirm URLs, not just display names. Use HTTPS for real mints.
+  issuers equivalent. Confirm URLs, not just display names. Real mints are HTTPS, or `nostr://<lowercase npub>`
+  for the Maxplayer credits mint.
 - `--give` / `--want`: exact fixed-lot net amounts; no partial-size purchase.
 - `--max-give`: buyer's total outgoing debit including mint fees.
 - `--min-receive`: buyer's minimum net incoming amount.
@@ -73,7 +83,8 @@ requires enabled NUT-05 bolt11/sat. The explicit `preflight <mint>` checks the
 common trading capabilities. Diagnostic preflight output goes to stderr. No opt-in is required;
 passing advertisement checks is not independent refund interoperability evidence.
 `balance` and `status` are lock-free read-only SQLite snapshots, available during
-`serve`, without network calls or submission of earlier authorizations. `status`
+`serve`, without submission of earlier authorizations; neither makes network calls
+except `status --check-sends` (read-only NUT-07 per sent token). `status`
 prints one readable line per lot/swap/funding/withdrawal/receive, unresolved items
 first, any `counterparty_unresponsive` warning, and the exit-code meanings;
 `status --json` prints the unchanged raw public records for scripts.
@@ -131,19 +142,73 @@ Cashu token. Refused **before anything is journaled**: a token whose mint is not
 exactly `<mint>` after canonicalization, multi-mint tokens, non-sat units, P2PK/HTLC
 or other NUT-10 locked proofs, more than 128 or duplicate proofs, an invalid incoming
 DLEQ (when present), a token above **100,000 sats**, or one that would push this
-mint past the shared cap. Funding intents plus charged receives (gross) share one 100,000-sat cap per mint per home; `refused`/`already_spent` receives do not count; `prepared`/`submitted`/`done`/`quarantined` ones do. A quarantined receive is not spendable but
+mint past the shared cap, or (`nostr://` mint) whose swap would not fit one NIP-44
+request (error names NIP-44; exit 1, nothing journaled, cap untouched). Funding intents plus charged receives (gross) share one 100,000-sat cap per mint per home; `refused`/`already_spent` receives do not count; `prepared`/`submitted`/`done`/`quarantined` ones do. A quarantined receive is not spendable but
 still occupies the cap. Common preflight runs, then NUT-07 must report every proof UNSPENT.
 
-One swap into fresh home-owned outputs; token, inputs, outputs and secrets are
-journaled before the POST. The mint input fee is deducted: `net = amount - fee`.
+One swap into fresh home-owned outputs; input proofs, blinded outputs and their
+secrets are journaled before the POST (not the token text). The mint input fee is deducted: `net = amount - fee`.
 Only DLEQ-verified result proofs are credited. Output is one JSON line with
 `receive` (attempt id), `mint`, `state`, `amount`, `fee`, `net`, `credited`; never
-the token or proofs. Repeating the same token (any encoding) resumes the same
-attempt and never swaps twice. Exit 0 `done`; 3 unresolved (`prepared`/`submitted`,
-or the state could not be journaled); 1 pre-journal refusal, `refused` or
-`already_spent`; 4 `quarantined`. Only a parsed mint NUT error (HTTP 400 with JSON
-`code` and `detail`) yields `refused`; any other 400 or transport refusal stays
-`submitted` (exit 3) and the identical swap is replayed.
+the token or proofs; also `settled` and `refusal_code`. Repeating the same token
+(any encoding) resumes the same attempt and only replays its identical swap; a
+second output set is never created. Exit 0 `done` and released; 3 unresolved
+(`prepared`/`submitted`, `done` with release outstanding, or the state could not
+be journaled); 1 pre-journal refusal, `refused` or
+`already_spent`; 4 `quarantined`. Only a definitive mint NUT error (allowlisted code
+such as 11001/11005/12001-12003; HTTPS: a 400 with JSON `code` + `detail`; `nostr://`:
+a numeric NUT `code` in the mint's reply) yields `refused`; `50000`, 11002, 11003
+(outputs already signed: evidence of a landing), 11004, unknown codes, any other 400
+and every nostr transport error (`expired`, `bad_request`, `rate_limited`, timeout,
+oversized request) stay `submitted` (exit 3) and the identical swap is replayed.
+`refused` is FINAL: no command retries it, the token was not imported and can be
+redeemed elsewhere, and it does not occupy the cap.
+
+## Send (export a token)
+
+`send <mint> --amount <sats> --out <path> --max-fees <sats>` writes one single-mint V4
+token for exactly `<amount>` sats to a NEW file (mode 0600, created exclusively; an
+existing path, including a symlink, is refused). The token is never printed and never
+accepted through argv. Only ordinary unreserved balance is spent: locked HTLC/P2PK
+proofs and proofs reserved by a swap, withdrawal, receive or send are excluded. The
+mint input fee is paid by the sender; `--max-fees` is required unless it is 0. Refused
+**before anything is journaled**: amount above **100,000 sats**, insufficient balance,
+fee above `--max-fees`, existing `--out`, failed preflight or non-UNSPENT inputs.
+
+One swap of the selected inputs into the exact send outputs plus change; inputs,
+outputs and secrets are journaled before the POST. Ambiguity → NUT-09 restore of the
+same outputs and identical replay only. The file is written only after the swap is
+definitive and every output verifies DLEQ; the token is kept in the private journal so
+`recover` rewrites the same token after a crash. Rerunning the same command with the
+same `--out` resumes that attempt, or rewrites the same journaled token if the file was
+moved or deleted (only if NUT-07 shows every sent proof UNSPENT; SPENT, PENDING or an
+unreachable mint exit 1, "already (partially) redeemed or pending; choose another --out"; a rewrite prints a stderr notice
+and `"rewritten": true`); it never sends twice. A `reclaiming` send's `--out` is
+refused: run `send --reclaim <id>`. A used `--out` (other terms, reclaimed/redeemed
+or manual-recovery send) is refused; only a `refused` send frees its path. Coin
+selection skips inputs of any unfinished journaled send, withdrawal, listing or swap.
+A send the recipient's input fee would consume is refused before the journal. Output: one JSON line with
+`send` (attempt id), `mint`, `state`, `amount`, `fee`. Exit 0 `sent`; 3 unresolved;
+1 refusal, `refused` or `redeemed`; 4 manual recovery.
+
+Until the recipient redeems it, `send --reclaim <send-id>` swaps the still-UNSPENT
+proofs back (same journaling; fee needs `--max-fees` unless 0). It also works on a
+`swapped` send whose token file could not be placed. Reclaim exits 0 `reclaimed`; 3
+`reclaiming`; 1 when refused or partially redeemed meanwhile (state stays `sent`,
+token still outstanding: run `send --reclaim <id>` again) or `redeemed` (also when
+the recipient won the race before any POST of our leg); 4 `reclaim_unresolved` (our
+leg POSTed, with an ambiguous reply or a refusal while every input is SPENT, and its
+outputs absent on two passes; secrets kept) or `reclaim_quarantined`. If they are already
+SPENT it reports "redeemed by recipient" and refunds nothing. `status --check-sends`
+asks each mint (NUT-07) whether sent tokens were redeemed; plain `status` is offline.
+
+On a `nostr://` mint send, reclaim and `--check-sends` are supported (no NUT-04/05
+needed). A swap over 128 proofs or the NIP-44 limit is refused **before anything is
+journaled or reserved** (exit 1; send a smaller amount); for a reclaim the token stays
+`sent`. The token names `nostr://npub…`: only a nostr-capable wallet (e.g.
+`maxplayer-trade receive`) can redeem it, not a generic Cashu wallet; `send --reclaim`
+takes it back. Keep the same `--mint-relay` set for reclaim, `recover` and
+`--check-sends`; with the wrong relays they report `unknown`/retain the attempt.
 
 ## Withdrawal: enforcement before execution
 

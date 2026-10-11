@@ -35,7 +35,7 @@ take or stop serve because of it.
 ## Bounded pass and exit status
 
 `recover` makes one pass without waiting for future lock deadlines. Each funding,
-withdrawal, receive, and swap attempt has a **120-second** budget; this is not a 120-second
+withdrawal, receive, send, and swap attempt has a **120-second** budget; this is not a 120-second
 whole-command deadline. Items are handled sequentially and relay/setup/publication
 work is additional. A timeout does not undo a delivered RPC or release reservations.
 
@@ -113,16 +113,34 @@ serve/recover/market commands; a post-POST timeout is still unresolved, not fail
 | State | Meaning and action |
 | --- | --- |
 | `prepared` | Journaled, swap not yet sent. Recovery sends exactly the journaled swap. |
-| `submitted` | Swap may have reached the mint. Recovery restores (NUT-09) the same outputs and replays only the identical swap; never import the token again elsewhere. |
-| `done` | Terminal: DLEQ-verified proofs credited; check `balance`. |
-| `refused` | Terminal (exit 1): the mint returned a parsed NUT error (HTTP 400, JSON `code` + `detail`), a fresh restore found none of our outputs and the inputs stayed UNSPENT. Nothing credited, not charged to the cap. Any other 400 or transport refusal stays `submitted`. |
+| `submitted` | Swap may have reached the mint. Recovery restores (NUT-09) the same outputs and replays only the identical swap; never import the token again elsewhere. A `nostr://` attempt whose swap is over the NIP-44 limit (journaled before admission checked it) fails locally with 413 on every pass, was never published, and holds its cap. For that legacy row only, redeem the original token elsewhere (the swap never left this process); the next `recover` sees the inputs SPENT with none of our outputs, records `already_spent` and frees the cap. Never re-import any other `submitted` receive. |
+| `done` | Terminal: DLEQ-verified proofs credited (held reserved until `done` is journaled, then released; `recover` finishes a pending release); check `balance`. |
+| `refused` | Exit 1: the mint returned a definitive NUT error (allowlisted code, HTTPS or `nostr://` numeric code; `50000`, 11002, 11003, 11004 and unknown codes are not), a fresh restore found none of our outputs and the inputs stayed UNSPENT. FINAL: nothing credited, not charged to the cap, `refusal_code` journaled; neither `recover` nor a repeated `receive` retries it. The token was not imported; it can be redeemed elsewhere. Any other 400 and nostr `expired`/`bad_request`/`rate_limited`/timeout/413 stay `submitted` (exit 3). |
 | `already_spent` | Terminal (exit 1): inputs SPENT and none of our outputs restorable. Nothing credited, not charged. |
 | `quarantined` | Terminal manual recovery (exit 4): our outputs were signed but lack valid DLEQ; never credited, not spendable, but still occupies the cap. Preserve the home and escalate. |
 
 Cap: Funding intents plus charged receives (gross) share one 100,000-sat cap per mint per home; `refused`/`already_spent` receives do not count; `prepared`/`submitted`/`done`/`quarantined` ones do.
-Exits: 0 `done`, 1 `refused`/`already_spent`, 3 `prepared`/`submitted` (or a failed journal write), 4 `quarantined`.
+Exits: 0 `done` and released, 1 `refused`/`already_spent`, 3 `prepared`/`submitted`, `done` with release outstanding (run `recover`) or a failed journal write, 4 `quarantined`.
 Inputs reported PENDING keep the attempt unresolved. A lost swap reply is never
 answered with replacement outputs.
+
+## Send states
+
+| State | Meaning and action |
+| --- | --- |
+| `prepared` / `submitted` | Inputs reserved; swap may have reached the mint. Recovery restores (NUT-09) the same outputs and replays only the identical swap. Never start another send for the same funds. |
+| `swapped` | Swap definitive and verified; change commit and/or token file pending. Recovery writes the SAME journaled token to the same `--out`. If the file can never be placed (unwritable directory, no hard links), `send --reclaim <id>` takes the value back. |
+| `sent` | Token final and journaled (normally written; after a refused reclaim of a `swapped` send it may not be, and the same command writes it); amount left the balance. Reclaimable with `send --reclaim <id>` until redeemed. |
+| `refused` | Terminal: definitive NUT error (allowlisted code) with inputs UNSPENT, or a `prepared` send whose inputs another command already spent; inputs released, nothing sent. `50000`, 11002, 11003, 11004 and unknown codes, any other 400, and nostr `expired`/`bad_request`/`rate_limited`/timeout/413 stay `submitted` (exit 3). An over-limit `nostr://` swap is refused before the journal, so never reaches this table. |
+| `reclaiming` | Reclaim journaled; recovery restores/replays it identically. |
+| `reclaimed` / `redeemed` | Terminal: unspent proofs came back / recipient redeemed everything, nothing refunded. |
+| `inputs_spent`, `quarantined` | Terminal manual recovery (exit 4): inputs spent without our outputs, or outputs failed DLEQ. No token written. Preserve the home and escalate. |
+| `reclaim_quarantined` | Terminal manual recovery (exit 4): the send token was already written; the reclaim outputs failed DLEQ and were not credited. Escalate. |
+| `reclaim_unresolved` | Terminal manual recovery (exit 4): every reclaim input is SPENT, our reclaim leg was POSTed (an ambiguous reply, or a refusal while every input is SPENT: the mint may still have executed it) and its outputs were absent on two passes (the mint's restore may lag). Only a leg never POSTed, raced by the recipient, ends `redeemed` (exit 1). Reclaim secrets stay journaled for a manual NUT-09 restore. Escalate. |
+
+A reclaim that is refused or races a partial redemption returns to `sent` (exit 1, "still outstanding"): run `send --reclaim <id>` again. `status --check-sends` prints `redeemed`, `unredeemed`, `pending`, `partially_redeemed` (reclaim the rest) or `unknown` (mint not reachable, or no configured mint relay reaches a `nostr://` mint).
+
+While the send is still `swapped`, `recover` writes the SAME journaled token to a moved or deleted `--out`; for a `sent` row only the same `send` command rewrites it (`recover` just releases). Neither sends twice. If the path now holds other content, recovery stops for that attempt: move that file away (never edit the journal); never start a new send on another path while the journaled attempt is live. Rerunning the same command after delivery first checks NUT-07: unless every sent proof is UNSPENT (SPENT, PENDING or an unreachable mint) it refuses with "already (partially) redeemed or pending; choose another --out" (exit 1), otherwise it rewrites the same token, prints that no new value was sent and adds `"rewritten": true`.
 
 ## Funding and market status are separate
 

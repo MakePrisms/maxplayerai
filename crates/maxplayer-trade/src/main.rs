@@ -14,6 +14,12 @@ struct Cli {
     /// Relay URL (repeatable); defaults to nos.lol, relay.primal.net and offchain.pub.
     #[arg(long)]
     relay: Vec<String>,
+    /// Relay for nostr:// mint requests only (kinds 23410/23411; repeatable, max 8; wss://, or ws://
+    /// on loopback). Defaults to wss://relay.maxplayer.ai, wss://relay.ditto.pub and
+    /// wss://nostr-pub.wellorder.net. Never used for market traffic; relay.maxplayer.ai carries
+    /// mint traffic only and is refused as a --relay.
+    #[arg(long = "mint-relay")]
+    mint_relay: Vec<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -86,11 +92,30 @@ enum Command {
         #[arg(long)]
         token_file: Option<PathBuf>,
     },
+    /// Export exactly --amount sats as a Cashu token file (0600, never overwritten; max 100,000), or --reclaim an unredeemed send.
+    Send {
+        #[arg(required_unless_present = "reclaim", conflicts_with = "reclaim")]
+        mint: Option<String>,
+        #[arg(long, required_unless_present = "reclaim", conflicts_with = "reclaim")]
+        amount: Option<u64>,
+        /// New token file; the token is never printed.
+        #[arg(long, required_unless_present = "reclaim", conflicts_with = "reclaim")]
+        out: Option<PathBuf>,
+        /// Maximum mint input fee, in sats; required unless the mint charges none.
+        #[arg(long)]
+        max_fees: Option<u64>,
+        /// Send attempt id whose still-unspent proofs return to this wallet.
+        #[arg(long)]
+        reclaim: Option<String>,
+    },
     /// Summarize lots, swaps and money records without locking the home or advancing payments.
     Status {
         /// Print the raw public records (machine-readable) instead of the summary.
         #[arg(long)]
         json: bool,
+        /// Also ask each mint (NUT-07) whether sent tokens were redeemed.
+        #[arg(long)]
+        check_sends: bool,
     },
     /// Read spendable wallet balance without submitting existing money authorizations.
     Balance { mint: String },
@@ -119,20 +144,32 @@ async fn main() -> std::process::ExitCode {
 }
 async fn execute() -> Result<()> {
     let cli = Cli::parse();
+    maxplayer_trade::transport::configure_mint_relays(&cli.mint_relay)?;
+    // No home, lock, journal or intent is touched for a path a nostr:// mint cannot serve.
+    match &cli.command {
+        Command::Fund { mint, .. } => maxplayer_trade::transport::require_http(mint, "fund")?,
+        Command::Withdraw { mint, .. } => {
+            maxplayer_trade::transport::require_http(mint, "withdraw")?
+        }
+        _ => {}
+    }
     // Read-only observations remain available while serve owns the writer lock.
     if let Command::Balance { ref mint } = cli.command {
-        let asset = Asset::new(mint)?;
+        let asset = Asset::from_cli(mint)?;
         println!(
             "{}",
             serde_json::json!({"mint":asset.mint_url,"unit":"sat","balance":maxplayer_trade::wallet::read_balance(&cli.home, &asset.mint_url)?})
         );
         return Ok(());
     }
-    if let Command::Status { json } = cli.command {
+    if let Command::Status { json, check_sends } = cli.command {
         if json {
             println!("{}", maxplayer_trade::wallet::read_status(&cli.home)?);
         } else {
             println!("{}", maxplayer_trade::report::render(&cli.home)?);
+        }
+        if check_sends {
+            maxplayer_trade::send::check_redeemed(&cli.home).await?;
         }
         return Ok(());
     }
@@ -275,6 +312,7 @@ async fn execute() -> Result<()> {
             | Command::Balance { .. }
             | Command::Withdraw { .. }
             | Command::Receive { .. }
+            | Command::Send { .. }
     ) {
         let keys = maxplayer_trade::wallet::identity(&cli.home)?;
         let j = Journal::open(&cli.home).await?;
@@ -296,11 +334,11 @@ async fn execute() -> Result<()> {
                     &j,
                     &m,
                     Leg {
-                        asset: Asset::new(&give_mint)?,
+                        asset: Asset::from_cli(&give_mint)?,
                         net: give,
                     },
                     Leg {
-                        asset: Asset::new(&want_mint)?,
+                        asset: Asset::from_cli(&want_mint)?,
                         net: want,
                     },
                     max_fees,
@@ -333,6 +371,25 @@ async fn execute() -> Result<()> {
             _ => unreachable!(),
         };
     }
+    if let Command::Send {
+        mint,
+        amount,
+        out,
+        max_fees,
+        reclaim,
+    } = &cli.command
+    {
+        return maxplayer_trade::send::command(
+            &cli.home,
+            &money_journal,
+            mint.as_deref(),
+            *amount,
+            out.as_deref(),
+            *max_fees,
+            reclaim.as_deref(),
+        )
+        .await;
+    }
     let mint_arg = match &cli.command {
         Command::Preflight { mint }
         | Command::Fund { mint, .. }
@@ -341,9 +398,10 @@ async fn execute() -> Result<()> {
         | Command::Receive { mint, .. } => mint,
         _ => unreachable!(),
     };
-    let asset = maxplayer_trade::Asset::new(mint_arg)?;
+    let asset = maxplayer_trade::Asset::from_cli(mint_arg)?;
     asset.fence()?;
     let mint = &asset.mint_url;
+
     if matches!(cli.command, Command::Preflight { .. }) {
         return preflight(mint).await;
     }
@@ -408,9 +466,18 @@ async fn execute() -> Result<()> {
         println!("{}", r.summary());
         use maxplayer_trade::receive::ReceiveState::*;
         return match r.state {
-            Done => Ok(()),
+            Done if r.settled() => Ok(()),
+            // Journaled done but the credited rows are not yet released: run recover.
+            Done => Err(coordinator::RecoveryIncomplete.into()),
             Quarantined => Err(coordinator::ManualRecovery.into()),
-            Refused => anyhow::bail!("receive refused by the mint; nothing credited"),
+            Refused => anyhow::bail!(
+                "receive refused by the mint ({}); final: the token was NOT imported, nothing \
+                 was credited or charged to the cap, and it can be redeemed elsewhere",
+                r.refusal_code
+                    .map_or("NUT code not journaled".to_owned(), |c| format!(
+                        "NUT code {c}"
+                    ))
+            ),
             AlreadySpent => anyhow::bail!("token already spent; nothing credited"),
             Prepared | Submitted => Err(coordinator::RecoveryIncomplete.into()),
         };

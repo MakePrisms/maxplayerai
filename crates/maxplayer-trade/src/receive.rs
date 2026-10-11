@@ -1,13 +1,14 @@
 //! Import one plain-sat Cashu token into this home.
 //!
-//! Journal-before-effect: the token, its inputs and our fresh blinded outputs with
-//! their secrets are journaled BEFORE the swap POST. Every later pass first restores
-//! (NUT-09) those exact outputs and only ever replays the identical swap; replacement
-//! outputs are never minted. Only DLEQ-verified proofs are credited.
+//! Journal-before-effect: the token's input proofs and our fresh blinded outputs with
+//! their secrets are journaled BEFORE the swap POST (the token text itself is not).
+//! Every later pass first restores (NUT-09) those exact outputs and only ever replays
+//! the identical swap; a second output set is never created. Only DLEQ-verified proofs
+//! are credited. A definitive refusal is FINAL (see [`ReceiveState::Refused`]).
 use crate::{
     journal::Journal,
     mint,
-    wallet::{bounded, database, wallet},
+    wallet::{bounded_for, database, wallet},
 };
 use anyhow::{Context, Result, anyhow, ensure};
 use cashu::nuts::nut00::ProofsMethods;
@@ -36,7 +37,12 @@ pub enum ReceiveState {
     Submitted,
     /// Terminal: DLEQ-verified proofs credited.
     Done,
-    /// Terminal: the mint definitively refused the swap; inputs remained UNSPENT.
+    /// Terminal and FINAL: the mint returned a definitive NUT refusal
+    /// ([`mint::MintRefusal::definitive`]) and a fresh probe found none of our outputs
+    /// and every input UNSPENT. Nothing is retried (not by `recover`, not by repeating
+    /// `receive`): against cdk 0.17.2 every allowlisted code is deterministic for the
+    /// same inputs and outputs, so the identical swap can never succeed (PR #1119,
+    /// review round 3). The token was not imported and can be redeemed elsewhere.
     Refused,
     /// Terminal: inputs SPENT elsewhere and none of our outputs restorable.
     AlreadySpent,
@@ -63,13 +69,28 @@ pub struct Receipt {
     pub fee: u64,
     /// Credited amount on success (amount - fee).
     pub net: u64,
-    token: String,
     inputs: Proofs,
     outputs: Vec<Output>,
     result: Option<Proofs>,
+    /// Credited rows are inserted RESERVED under this receipt's operation id and only
+    /// released after `done` is journaled; true once that release ran.
+    #[serde(default)]
+    released: bool,
+    /// The definitive NUT code that made this record `refused`. `None` on records
+    /// written before round 3 (still final).
+    #[serde(default)]
+    pub refusal_code: Option<u64>,
 }
 
 impl Receipt {
+    /// `done` and its credited rows released (spendable).
+    pub fn settled(&self) -> bool {
+        self.state == ReceiveState::Done && self.released
+    }
+    /// Recovery still owes work: non-terminal, or `done` with the release outstanding.
+    pub fn unresolved(&self) -> bool {
+        !self.terminal() || (self.state == ReceiveState::Done && !self.released)
+    }
     pub fn terminal(&self) -> bool {
         matches!(
             self.state,
@@ -91,6 +112,7 @@ impl Receipt {
         serde_json::json!({"receive":self.id,"mint":self.mint,"state":self.state,
             "amount":self.amount,"fee":self.fee,"net":self.net,
             "credited":if self.state == ReceiveState::Done {self.net} else {0},
+            "settled":self.settled(),"refusal_code":self.refusal_code,
             "terminal":self.terminal(),"manual_recovery":self.state == ReceiveState::Quarantined})
     }
 }
@@ -178,8 +200,9 @@ pub async fn charged(j: &Journal, mint: &str) -> Result<u64> {
         })
 }
 
-/// Shared lifetime cap: funding intents + charged receives + this receive <= 100,000.
-async fn check_cap(j: &Journal, mint: &str, amount: u64) -> Result<()> {
+/// The one shared-cap rule: (funding intents, charged receives) on `mint`, gross.
+/// `fund` and `receive` both check `funded + received + new <= 100,000`.
+pub async fn cap_used(j: &Journal, mint: &str) -> Result<(u64, u64)> {
     let funded = j
         .all::<crate::money::Funding>("funding")
         .await?
@@ -188,9 +211,15 @@ async fn check_cap(j: &Journal, mint: &str, amount: u64) -> Result<()> {
         .try_fold(0u64, |s, f| {
             s.checked_add(f.amount).context("funding overflow")
         })?;
+    Ok((funded, charged(j, mint).await?))
+}
+
+/// Shared lifetime cap: funding intents + charged receives + this receive <= 100,000.
+async fn check_cap(j: &Journal, mint: &str, amount: u64) -> Result<()> {
+    let (funded, received) = cap_used(j, mint).await?;
     ensure!(
         funded
-            .checked_add(charged(j, mint).await?)
+            .checked_add(received)
             .and_then(|n| n.checked_add(amount))
             .is_some_and(|n| n <= crate::real_money::CAP),
         "cumulative funding and receives exceed 100,000 sats for this mint"
@@ -199,25 +228,30 @@ async fn check_cap(j: &Journal, mint: &str, amount: u64) -> Result<()> {
 }
 
 /// Receive `raw` into `mint`. Repeat calls for the same Y-set resume the existing
-/// attempt and never swap twice. Errors before the journal write are refusals
-/// (nothing recorded). After it, the returned record's state is authoritative.
+/// attempt (identical swap only; a `refused` record is final and is returned as is).
+/// Errors before the journal write are refusals (nothing recorded). After it, the
+/// returned record's state is authoritative.
 pub async fn receive(home: &Path, j: &Journal, mint: &str, raw: &str) -> Result<Receipt> {
     let asset = crate::Asset::new(mint)?;
     asset.fence()?;
     let mint = asset.mint_url.as_str();
     let p = inspect(mint, raw)?;
     let ys: HashSet<_> = p.ys.iter().copied().collect();
-    for mut r in j.all::<Receipt>("receive").await? {
+    let mut existing = None;
+    for r in j.all::<Receipt>("receive").await? {
         if r.id == p.id {
             ensure!(r.mint == mint, "token already journaled for another mint");
-            if let Err(error) = resume(home, j, &mut r).await {
-                eprintln!("receive {}: {error:#}; attempt retained", r.id);
-            }
-            return Ok(r);
-        }
-        if r.charged() && r.inputs.ys()?.iter().any(|y| ys.contains(y)) {
+            existing = Some(r);
+        } else if r.charged() && r.inputs.ys()?.iter().any(|y| ys.contains(y)) {
             anyhow::bail!("token overlaps earlier receive {}", r.id);
         }
+    }
+    if let Some(mut r) = existing {
+        // `refused` is terminal, so `resume` below only no-ops: a refusal is final.
+        if let Err(error) = resume(home, j, &mut r).await {
+            eprintln!("receive {}: {error:#}; attempt retained", r.id);
+        }
+        return Ok(r);
     }
     let db = database(home, mint).await?;
     ensure!(
@@ -227,10 +261,10 @@ pub async fn receive(home: &Path, j: &Journal, mint: &str, raw: &str) -> Result<
     check_cap(j, mint, p.amount).await?;
     crate::wallet::preflight(mint).await?;
     let w = wallet(home, mint).await?;
-    bounded(w.refresh_keysets())
+    bounded_for(mint, w.refresh_keysets())
         .await
         .context("CDK wallet request timed out")??;
-    let keysets = bounded(w.get_mint_keysets(KeysetFilter::All))
+    let keysets = bounded_for(mint, w.get_mint_keysets(KeysetFilter::All))
         .await
         .context("CDK wallet request timed out")??;
     let inputs = p
@@ -248,18 +282,24 @@ pub async fn receive(home: &Path, j: &Journal, mint: &str, raw: &str) -> Result<
         .cloned()
         .collect();
     if !with_dleq.is_empty() {
-        bounded(w.verify_token_dleq(&Token::new(
-            MintUrl::from_str(mint)?,
-            with_dleq,
-            None,
-            CurrencyUnit::Sat,
-        )))
+        bounded_for(
+            mint,
+            w.verify_token_dleq(&Token::new(
+                MintUrl::from_str(mint)?,
+                with_dleq,
+                None,
+                CurrencyUnit::Sat,
+            )),
+        )
         .await
         .context("CDK wallet request timed out")?
-        .map_err(|_| anyhow!("incoming token DLEQ verification failed"))?;
+        .map_err(|e| match e {
+            cdk::Error::CouldNotVerifyDleq => anyhow!("incoming token DLEQ verification failed"),
+            e => anyhow!("incoming token DLEQ check could not run: {e}"),
+        })?;
     }
     let fee = u64::from(
-        bounded(w.get_proofs_fee(&inputs))
+        bounded_for(mint, w.get_proofs_fee(&inputs))
             .await
             .context("CDK wallet request timed out")??
             .total,
@@ -269,10 +309,10 @@ pub async fn receive(home: &Path, j: &Journal, mint: &str, raw: &str) -> Result<
     mint::unspent(mint, &inputs)
         .await
         .context("token is not UNSPENT at the mint (already spent or pending)")?;
-    let k = bounded(w.fetch_active_keyset())
+    let k = bounded_for(mint, w.fetch_active_keyset())
         .await
         .context("CDK wallet request timed out")??;
-    let amounts = bounded(w.get_keyset_fees_and_amounts_by_id(k.id))
+    let amounts = bounded_for(mint, w.get_keyset_fees_and_amounts_by_id(k.id))
         .await
         .context("CDK wallet request timed out")??;
     let outputs: Vec<Output> =
@@ -289,6 +329,12 @@ pub async fn receive(home: &Path, j: &Journal, mint: &str, raw: &str) -> Result<
         !outputs.is_empty() && outputs.len() <= MAX_PROOFS,
         "output limit"
     );
+    // A `nostr://` swap must fit one NIP-44 request. Plain secrets are arbitrary strings, so a
+    // token under MAX_TOKEN_BYTES can still build an unsendable swap; journaling it would leave a
+    // `submitted` attempt that can never be sent and that holds the cap. Refuse it here, before
+    // any journal write (exit 1, nothing recorded, cap untouched).
+    crate::transport::check_swap_fits(mint, &swap_request(&inputs, &outputs))
+        .context("token refused: its receive swap cannot be sent to this nostr mint")?;
     let mut r = Receipt {
         id: p.id,
         mint: mint.into(),
@@ -296,16 +342,25 @@ pub async fn receive(home: &Path, j: &Journal, mint: &str, raw: &str) -> Result<
         amount: p.amount,
         fee,
         net,
-        token: raw.trim().into(),
         inputs,
         outputs,
         result: None,
+        released: false,
+        refusal_code: None,
     };
     j.put("receive", &r.id, &r).await?;
     if let Err(error) = resume(home, j, &mut r).await {
         eprintln!("receive {}: {error:#}; attempt retained", r.id);
     }
     Ok(r)
+}
+
+/// The one receive swap body (DLEQ stripped by `SwapRequest::new`), for sizing and sending.
+fn swap_request(inputs: &Proofs, outputs: &[Output]) -> SwapRequest {
+    SwapRequest::new(
+        inputs.clone(),
+        outputs.iter().map(|o| o.message.clone()).collect(),
+    )
 }
 
 enum Inputs {
@@ -360,11 +415,50 @@ async fn restore(r: &Receipt) -> Result<Option<Vec<BlindSignature>>> {
         .map(Some)
 }
 
-/// Definitive refusal of THIS request: only a parsed Cashu NUT error
-/// ([`mint::MintRefusal`]). Any other 400 (unparsable body, no numeric code), every
-/// transport-level refusal, timeout, 429 and 5xx is ambiguous and keeps the attempt.
-pub(crate) fn nut_error(e: &anyhow::Error) -> bool {
-    mint::MintRefusal::of(e).is_some()
+enum Probe {
+    /// Our outputs are signed: use these signatures.
+    Signed(Vec<BlindSignature>),
+    Unspent,
+    Spent,
+    Pending,
+}
+
+/// The ONE absence check for every path: restore; when absent, NUT-07; when SPENT,
+/// restore AGAIN before calling our outputs absent (a swap may land during NUT-07,
+/// and CDK writes signatures and SPENT in one transaction).
+async fn probe(r: &Receipt) -> Result<Probe> {
+    if let Some(s) = restore(r).await? {
+        return Ok(Probe::Signed(s));
+    }
+    Ok(match inputs_state(r).await? {
+        Inputs::Unspent => Probe::Unspent,
+        Inputs::Pending => Probe::Pending,
+        Inputs::Spent => match restore(r).await? {
+            Some(s) => Probe::Signed(s),
+            None => Probe::Spent,
+        },
+    })
+}
+
+/// Operation id of the reserved credit rows (the 128-bit receipt id).
+fn operation(r: &Receipt) -> Result<uuid::Uuid> {
+    uuid::Uuid::parse_str(&r.id).context("receive id is not a 128-bit hex id")
+}
+
+/// Make credited rows spendable. Only after `done` is journaled; idempotent.
+async fn release(home: &Path, j: &Journal, r: &mut Receipt) -> Result<()> {
+    if r.state != ReceiveState::Done || r.released {
+        return Ok(());
+    }
+    database(home, &r.mint)
+        .await?
+        .release_proofs(&operation(r)?)
+        .await?;
+    let mut next = r.clone();
+    next.released = true;
+    j.put("receive", &next.id, &next).await?;
+    *r = next;
+    Ok(())
 }
 
 /// Persist `state` FIRST; only then let the caller-visible record change. A failed
@@ -393,65 +487,55 @@ async fn persist(j: &Journal, r: &Receipt) -> Result<()> {
 /// Advance one attempt. Terminal outcomes return Ok with the terminal state set.
 pub async fn resume(home: &Path, j: &Journal, r: &mut Receipt) -> Result<()> {
     if r.terminal() {
-        return Ok(());
+        return release(home, j, r).await;
     }
     crate::Asset::new(&r.mint)?.fence()?;
     if r.result.is_none() {
-        let signatures = if let Some(s) = restore(r).await? {
-            s
-        } else {
-            match inputs_state(r).await? {
-                Inputs::Pending => anyhow::bail!("token inputs PENDING at the mint; retained"),
-                Inputs::Spent => {
-                    // A swap may land during NUT-07; never infer absence from one restore.
-                    if let Some(s) = restore(r).await? {
-                        s
-                    } else {
-                        return finish(j, r, ReceiveState::AlreadySpent).await;
-                    }
+        let signatures = match probe(r).await? {
+            Probe::Signed(s) => s,
+            Probe::Pending => anyhow::bail!("token inputs PENDING at the mint; retained"),
+            Probe::Spent => return finish(j, r, ReceiveState::AlreadySpent).await,
+            Probe::Unspent => {
+                if r.state != ReceiveState::Submitted {
+                    finish(j, r, ReceiveState::Submitted).await?;
                 }
-                Inputs::Unspent => {
-                    if r.state != ReceiveState::Submitted {
-                        finish(j, r, ReceiveState::Submitted).await?;
-                    }
-                    #[cfg(feature = "lab")]
-                    if std::env::var("TRADE_CRASH_BEFORE_RECEIVE_SWAP")
-                        .ok()
-                        .as_deref()
-                        == Some("1")
-                    {
-                        std::process::exit(87);
-                    }
-                    let sent: Result<SwapResponse> = mint::rpc(
-                        &r.mint,
-                        "swap",
-                        &SwapRequest::new(
-                            r.inputs.clone(),
-                            r.outputs.iter().map(|o| o.message.clone()).collect(),
-                        ),
-                    )
-                    .await;
-                    match sent {
-                        Ok(reply) => reply.signatures,
-                        Err(error) if nut_error(&error) => {
-                            // Definitive only with fresh absence of our outputs.
-                            if let Some(s) = restore(r).await? {
-                                s
-                            } else {
-                                return match inputs_state(r).await? {
-                                    Inputs::Unspent => finish(j, r, ReceiveState::Refused).await,
-                                    Inputs::Spent => finish(j, r, ReceiveState::AlreadySpent).await,
-                                    Inputs::Pending => {
-                                        Err(error.context("inputs PENDING after refusal; retained"))
-                                    }
-                                };
-                            }
+                #[cfg(feature = "lab")]
+                if std::env::var("TRADE_CRASH_BEFORE_RECEIVE_SWAP")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+                {
+                    std::process::exit(87);
+                }
+                // No size gate here: admission sized the swap with headroom, and an older attempt
+                // that does not fit is refused locally by the connector (413, never published),
+                // which stays ambiguous, so it remains `submitted` and is never `refused`.
+                let request = swap_request(&r.inputs, &r.outputs);
+                let sent: Result<SwapResponse> = mint::rpc(&r.mint, "swap", &request).await;
+                match sent {
+                    Ok(reply) => reply.signatures,
+                    // Definitive only for an allowlisted NUT code AND fresh absence of
+                    // our outputs (same probe as above, double restore included).
+                    Err(error) if mint::definitive_refusal(&error) => match probe(r).await? {
+                        Probe::Signed(s) => s,
+                        Probe::Unspent => {
+                            let mut next = r.clone();
+                            next.state = ReceiveState::Refused;
+                            next.refusal_code = mint::MintRefusal::of(&error).map(|e| e.code);
+                            persist(j, &next).await?;
+                            *r = next;
+                            return Ok(());
                         }
-                        Err(error) => {
-                            return Err(error.context(
-                                "no definitive swap reply; identical swap retained for replay",
-                            ));
+                        Probe::Spent => return finish(j, r, ReceiveState::AlreadySpent).await,
+                        Probe::Pending => {
+                            return Err(error.context("inputs PENDING after refusal; retained"));
                         }
+                    },
+                    // 50000, TokenPending, unknown codes, non-NUT 400s, 429/5xx, timeouts.
+                    Err(error) => {
+                        return Err(error.context(
+                            "no definitive swap reply; identical swap retained for replay",
+                        ));
                     }
                 }
             }
@@ -467,7 +551,7 @@ pub async fn resume(home: &Path, j: &Journal, r: &mut Receipt) -> Result<()> {
             );
         }
         let w = wallet(home, &r.mint).await?;
-        let keys = bounded(w.load_keyset_keys(r.outputs[0].message.keyset_id))
+        let keys = bounded_for(&r.mint, w.load_keyset_keys(r.outputs[0].message.keyset_id))
             .await
             .context("CDK wallet request timed out")??;
         let proofs = cdk::dhke::construct_proofs(
@@ -500,12 +584,15 @@ pub async fn resume(home: &Path, j: &Journal, r: &mut Receipt) -> Result<()> {
         return finish(j, r, ReceiveState::Quarantined).await;
     }
     let w = wallet(home, &r.mint).await?;
-    match bounded(w.verify_token_dleq(&Token::new(
-        MintUrl::from_str(&r.mint)?,
-        result.clone(),
-        None,
-        CurrencyUnit::Sat,
-    )))
+    match bounded_for(
+        &r.mint,
+        w.verify_token_dleq(&Token::new(
+            MintUrl::from_str(&r.mint)?,
+            result.clone(),
+            None,
+            CurrencyUnit::Sat,
+        )),
+    )
     .await
     .context("CDK wallet request timed out")?
     {
@@ -532,16 +619,45 @@ pub async fn resume(home: &Path, j: &Journal, r: &mut Receipt) -> Result<()> {
     if !missing.is_empty() {
         mint::unspent(&r.mint, &missing).await?;
         let url = MintUrl::from_str(&r.mint)?;
+        let op = operation(r)?;
+        // RESERVED under this receipt until `done` is journaled: withdraw/send select
+        // only unreserved UNSPENT rows, so nothing can spend them before that.
         db.update_proofs(
             missing
                 .into_iter()
-                .map(|p| ProofInfo::new(p, url.clone(), State::Unspent, CurrencyUnit::Sat))
+                .map(|p| {
+                    ProofInfo::new_with_operations(
+                        p,
+                        url.clone(),
+                        State::Reserved,
+                        CurrencyUnit::Sat,
+                        Some(op),
+                        Some(op),
+                    )
+                })
                 .collect::<std::result::Result<Vec<_>, _>>()?,
             vec![],
         )
         .await?;
     }
-    finish(j, r, ReceiveState::Done).await
+    #[cfg(feature = "lab")]
+    if std::env::var("TRADE_CRASH_BEFORE_RECEIVE_DONE")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        std::process::exit(85);
+    }
+    finish(j, r, ReceiveState::Done).await?;
+    #[cfg(feature = "lab")]
+    if std::env::var("TRADE_CRASH_AFTER_RECEIVE_DONE")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        std::process::exit(84);
+    }
+    release(home, j, r).await
 }
 
 /// One bounded pass over non-terminal receives. True when any remain unresolved.
@@ -549,6 +665,10 @@ pub async fn recover(home: &Path, j: &Journal) -> Result<bool> {
     let mut failed = false;
     for mut r in j.all::<Receipt>("receive").await? {
         if r.terminal() {
+            if let Err(error) = release(home, j, &mut r).await {
+                failed = true;
+                eprintln!("receive {}: release deferred: {error:#}", r.id);
+            }
             continue;
         }
         let item = tokio::time::timeout(
@@ -571,7 +691,7 @@ pub async fn pending(j: &Journal) -> Result<bool> {
     Ok(j.all::<Receipt>("receive")
         .await?
         .iter()
-        .any(|r| !r.terminal()))
+        .any(Receipt::unresolved))
 }
 
 #[cfg(test)]

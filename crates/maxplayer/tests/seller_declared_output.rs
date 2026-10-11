@@ -50,6 +50,7 @@ fn offer(output: &str) -> Offer {
         task: "write the report".to_owned(),
         deadline_unix: DEADLINE as i64,
         targeted: true,
+        capability_request: Some(Default::default()),
         requested_agent: None,
         payment_mode: maxplayer_core::gateway::PaymentMode::Sat,
         output: Some(output.to_owned()),

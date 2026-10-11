@@ -201,6 +201,16 @@ fn status(bytes: &[u8], reference: &str) -> Result<(), TransportError> {
     }
     Ok(())
 }
+/// Whole-request ceiling for one streamed pack upload, scaled to its size. The
+/// fixed 300s client timeout set a hard floor of `size / 300s` on the uplink: a
+/// 1 GiB base needed a sustained 3.5 MB/s or the post could NEVER succeed. Assume
+/// a 128 KiB/s floor instead, keep 300s as the minimum, and cap at 30 minutes —
+/// the relay's receive-pack window and the fronting proxy both allow that.
+pub(super) fn upload_timeout(bytes: u64) -> Duration {
+    let scaled = Duration::from_secs(60 + bytes / (128 * 1024));
+    scaled.clamp(LARGE_TRANSFER_HTTP_LEG_TIMEOUT, Duration::from_secs(1800))
+}
+
 pub(super) fn push(
     url: &str,
     reference: &str,
@@ -211,6 +221,7 @@ pub(super) fn push(
     let prefix = command(reference, oid);
     let length = prefix.len() as u64 + file.metadata().map_err(io_error)?.len();
     let mut leg = stream(url, mint, Service::ReceivePack)?;
+    leg.timeout_override = Some(upload_timeout(length));
     leg.streaming_body = Some(reqwest::blocking::Body::sized(
         Cursor::new(prefix).chain(file),
         length,
@@ -225,6 +236,19 @@ mod tests {
     use super::*;
     fn pkt(s: &str) -> String {
         format!("{:04x}{s}", s.len() + 4)
+    }
+    #[test]
+    fn upload_timeout_scales_with_size_between_the_old_floor_and_the_proxy_cap() {
+        // Small packs keep the old 300s behavior exactly.
+        assert_eq!(upload_timeout(0), Duration::from_secs(300));
+        assert_eq!(upload_timeout(10 * 1024 * 1024), Duration::from_secs(300));
+        // A 1 GiB pack gets time for a 128 KiB/s uplink, capped at 30 minutes.
+        assert_eq!(upload_timeout(1024 * 1024 * 1024), Duration::from_secs(1800));
+        // Mid-size scales linearly: 93 MiB (the agicash pack) ≈ 60s + 744s.
+        assert_eq!(
+            upload_timeout(93 * 1024 * 1024),
+            Duration::from_secs(60 + 93 * 8)
+        );
     }
     #[test]
     fn forward_status_requires_exact_success() {
