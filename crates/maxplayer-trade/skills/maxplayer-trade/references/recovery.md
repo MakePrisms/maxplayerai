@@ -18,7 +18,19 @@ recovery indefinitely. An offline seller can miss its recovery opportunity; NUT-
 receiver claims remain valid after locktime. Keep the watcher alive.
 
 **Do not stop serve between `second_locked` and `settling`.** Use lock-free
-`status` / `balance` for observation while the writer runs.
+`status` / `balance` / `discover` for observation while the writer runs; hand new
+`list`/`take`/`cancel` to it instead of stopping it.
+
+### `counterparty_unresponsive`
+
+When a swap has waited more than 180 seconds for its counterparty (taker in
+`requested` awaiting a quote or in `first_locked` awaiting the maker's lock; maker in
+`quoted` awaiting the taker's lock or in `second_locked` awaiting the claim), `take`'s
+live output, serve's log and `status` show `counterparty_unresponsive` with the
+elapsed time and, once our own lock exists, when its refund becomes available. It is
+display only: no state, deadline, lock time (60/15 min) or refund rule changes. Keep
+serve running; settlement or the timed refund proceeds as usual. Do not start another
+take or stop serve because of it.
 
 ## Bounded pass and exit status
 
