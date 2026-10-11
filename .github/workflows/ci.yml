@@ -254,6 +254,53 @@ jobs:
             exit 1
           fi
 
+  # The standalone Cashu trade CLI. It is its OWN cargo workspace (`[workspace]` in its manifest)
+  # with its own Cargo.lock, so no root-workspace job above builds or tests it: before this job a
+  # green CI said nothing about crates/maxplayer-trade. Its integration dev-dependencies start
+  # in-process CDK fake-wallet mints (cdk `mint` -> cdk-signatory), so the tests need protoc even
+  # though production trading is wallet-only. No test here reaches a real mint, wallet or relay:
+  # every mint is a loopback fixture, and `lab` timing controls refuse non-loopback mints.
+  #
+  # Clippy runs with -D warnings. The -A list names the lint classes that were already present
+  # when this job was added (collapsible `if`, wide money-path signatures, one no-op struct update,
+  # fixture slice clones, one constant assertion); allowing them by name keeps every OTHER lint a
+  # hard failure without restyling reviewed money code in the same change.
+  #
+  # The lab suite (`--features lab`, TRADE_LAB_SECONDS=1 short deadlines) is where refund/claim
+  # recovery, slow/dead-mint and deadline regressions live; the default suite compiles them out.
+  maxplayer-trade:
+    name: maxplayer-trade (fmt, clippy, default + lab tests)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      TRADE_MANIFEST: crates/maxplayer-trade/Cargo.toml
+      TRADE_CLIPPY_ALLOW: >-
+        -A clippy::collapsible_if -A clippy::too_many_arguments -A clippy::needless_update
+        -A clippy::cloned_ref_to_slice_refs -A clippy::assertions_on_constants
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/maxplayer-trade -> target
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: cargo fmt --check
+        run: cargo fmt --manifest-path "$TRADE_MANIFEST" --check
+      - name: Clippy (default features)
+        run: cargo clippy --manifest-path "$TRADE_MANIFEST" --locked --all-targets --no-deps -- -D warnings $TRADE_CLIPPY_ALLOW
+      - name: Clippy (lab)
+        run: cargo clippy --manifest-path "$TRADE_MANIFEST" --locked --all-targets --features lab --no-deps -- -D warnings $TRADE_CLIPPY_ALLOW
+      - name: Test (default features)
+        run: cargo test --manifest-path "$TRADE_MANIFEST" --locked -- --test-threads=1
+      - name: Test (lab, short deadlines)
+        env:
+          TRADE_LAB_SECONDS: "1"
+        run: cargo test --manifest-path "$TRADE_MANIFEST" --locked --features lab -- --test-threads=1
+
   # The release workflow triggers only on a tag, so no pull request ever exercises it. What CI can
   # check is that the gates keeping it from publishing are still in place — otherwise the property
   # holds only until somebody edits the file, and nothing would say so.

@@ -1,0 +1,46 @@
+[
+  {
+    "balance": 0,
+    "mint": "https://testnut.cashudevkit.org"
+  },
+  {
+    "balance": 126,
+    "mint": "https://testnut.cashu.space"
+  },
+  {
+    "claimed_witnesses": 0,
+    "long": 1791500608,
+    "margin": 60,
+    "mint": "https://testnut.cashu.space",
+    "missing_or_invalid_witnesses": 0,
+    "outgoing_proofs": 3,
+    "pending": 0,
+    "preimages": "redacted",
+    "refund_witnesses": 3,
+    "role": "taker",
+    "short": 1791497908,
+    "state": "refunded",
+    "swap": "16802081-bba2-4de0-ac6d-3e3eb6a37dcc",
+    "unspent": 0,
+    "witness_shapes": [
+      {
+        "preimage": "empty",
+        "signature_count": 1,
+        "signatures": "redacted",
+        "type": "HTLCWitness"
+      },
+      {
+        "preimage": "empty",
+        "signature_count": 1,
+        "signatures": "redacted",
+        "type": "HTLCWitness"
+      },
+      {
+        "preimage": "empty",
+        "signature_count": 1,
+        "signatures": "redacted",
+        "type": "HTLCWitness"
+      }
+    ]
+  }
+]

@@ -1,0 +1,27 @@
+{
+  "passed": {
+    "default": {
+      "lib": 22,
+      "cli": 5,
+      "e2e": 6,
+      "money": 12,
+      "pinned_quote": 1,
+      "relays": 7,
+      "review_regressions": 13
+    },
+    "lab": {
+      "lib": 22,
+      "cli": 5,
+      "e2e": 11,
+      "money": 13,
+      "pinned_quote": 1,
+      "relays": 7,
+      "review_regressions": 41
+    }
+  },
+  "failed": 0,
+  "threads": 1,
+  "default_total": 66,
+  "lab_total": 100,
+  "contention_total": 100
+}

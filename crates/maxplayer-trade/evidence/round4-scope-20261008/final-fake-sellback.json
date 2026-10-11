@@ -1,0 +1,32 @@
+{
+  "lot": "c55eab600349e31b9b28aaa73a66127a898c537bf8cff6893b35272e31fd354e",
+  "states": {
+    "maker": "complete",
+    "taker": "complete"
+  },
+  "before": {
+    "maker": {
+      "https://testnut.cashu.space": 24,
+      "https://testnut.cashudevkit.org": 94
+    },
+    "taker": {
+      "https://testnut.cashu.space": 102,
+      "https://testnut.cashudevkit.org": 32
+    }
+  },
+  "after": {
+    "maker": {
+      "https://testnut.cashu.space": 6,
+      "https://testnut.cashudevkit.org": 118
+    },
+    "taker": {
+      "https://testnut.cashu.space": 118,
+      "https://testnut.cashudevkit.org": 6
+    }
+  },
+  "readback_relays": [
+    "wss://nos.lol",
+    "wss://relay.primal.net",
+    "wss://offchain.pub"
+  ]
+}
