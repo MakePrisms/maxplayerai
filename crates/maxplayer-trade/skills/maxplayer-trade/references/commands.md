@@ -1,6 +1,9 @@
 # Commands and monetary bounds
 
 Every invocation starts `maxplayer-trade --home <private-absolute-home>`.
+Build the production binary as in the crate README's "Build and automated tests" section:
+the crate is its own Cargo workspace, so `cargo build -p maxplayer-trade` from the repository
+root fails; build it by manifest path, release profile, locked (no protoc needed for the binary).
 Optional repeated global `--relay <url>` goes before the subcommand; preserve the
 same relay set during recovery. Use the binary's default relays unless deliberately
 configured; defaults at verified base 1929972 are `wss://nos.lol`,
