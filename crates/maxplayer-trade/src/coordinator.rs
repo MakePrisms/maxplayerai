@@ -880,7 +880,10 @@ async fn recover_pass(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
     let mut deferred = match crate::money::recover(home, j).await {
         Ok(pending) => pending,
         Err(error) => {
-            eprintln!("money recovery deferred; journal retained: {error}");
+            eprintln!(
+                "money recovery deferred; journal retained: {}",
+                crate::redact_reason(&format!("{error:#}"))
+            );
             true
         }
     };
@@ -952,11 +955,13 @@ async fn recover_pass(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
             }
             advance(home, j, m, &mut s).await
         };
-        if !matches!(tokio::time::timeout(budget, item).await, Ok(Ok(()))) {
+        let item = tokio::time::timeout(budget, item).await;
+        if !matches!(item, Ok(Ok(()))) {
             deferred = true;
             eprintln!(
-                "swap {}: recovery deferred (error or timeout); journal retained",
-                s.id
+                "swap {}: recovery deferred ({}); journal retained",
+                s.id,
+                crate::deferral_reason(&item, budget.as_secs())
             );
         }
     }

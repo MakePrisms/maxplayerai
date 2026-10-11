@@ -88,8 +88,8 @@ passing advertisement checks is not independent refund interoperability evidence
 `balance` and `status` are lock-free read-only SQLite snapshots, available during
 `serve`, without submission of earlier authorizations; neither makes network calls
 except `status --check-sends` (read-only NUT-07 per sent token). `status`
-prints one readable line per lot/swap/funding/withdrawal/receive, unresolved items
-first, any `counterparty_unresponsive` warning, and the exit-code meanings;
+prints one readable line per lot/swap/funding/withdrawal/receive/send, unresolved items
+first (non-terminal and manual-recovery sends included, so reserved send inputs are visible), any `counterparty_unresponsive` warning, and the exit-code meanings;
 `status --json` prints the unchanged raw public records for scripts.
 
 `discover` is lock-free and read-only too: it reads relays only, with a throwaway

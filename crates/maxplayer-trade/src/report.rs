@@ -1,4 +1,4 @@
-//! Human-readable `status`: one line per lot, swap, funding, withdrawal and receive.
+//! Human-readable `status`: one line per lot, swap, funding, withdrawal, receive and send.
 //!
 //! Read-only (see [`observe`]); prints only public identifiers, mints, states and amounts —
 //! never keys, preimages, proofs, tokens, quotes' secrets or invoices.
@@ -8,6 +8,7 @@ use crate::{
     money::{Funding, Withdrawal},
     observe,
     receive::{Receipt, ReceiveState},
+    send::{SendAttempt, SendState},
 };
 use anyhow::Result;
 use std::path::Path;
@@ -60,6 +61,38 @@ fn swap_line(home: &Path, s: &Swap) -> String {
         line.push_str("; MANUAL RECOVERY: quarantined outputs retained");
     }
     line
+}
+
+/// One readable line for a send, plus (unresolved, needs manual recovery). Non-terminal sends
+/// hold reserved inputs (or an in-flight reclaim), so they are unresolved; manual-recovery
+/// states are terminal but listed as unresolved, like quarantined swaps and receives.
+fn send_line(a: &SendAttempt) -> (String, bool, bool) {
+    let s = a.summary();
+    let state = s["state"].as_str().unwrap_or("?");
+    let reclaim = match a.state {
+        SendState::Reclaiming => "in flight",
+        SendState::Reclaimed => "done",
+        SendState::ReclaimQuarantined | SendState::ReclaimUnresolved => "manual recovery",
+        SendState::Redeemed => "not possible (redeemed by recipient)",
+        SendState::Sent => "available until redeemed",
+        _ => "none",
+    };
+    let mut line = format!(
+        "send {} {} {state}: token {} sats; fee {}; reclaimed {}; reclaim fee {}; reclaim {reclaim}",
+        a.id, a.mint, a.amount, a.fee, a.reclaimed, a.reclaim_fee
+    );
+    match a.state {
+        SendState::Prepared | SendState::Submitted => {
+            line.push_str("; inputs reserved until resolved (keep serve running or run recover)")
+        }
+        SendState::Swapped => line.push_str("; token file pending (run recover or rerun the send)"),
+        _ => {}
+    }
+    let manual = a.manual_recovery();
+    if manual {
+        line.push_str("; MANUAL RECOVERY: journaled legs and secrets retained");
+    }
+    (line, !a.terminal() || manual, manual)
 }
 
 pub fn render(home: &Path) -> Result<String> {
@@ -175,6 +208,19 @@ pub fn render(home: &Path) -> Result<String> {
             settled.push(line)
         } else {
             unresolved.push(line)
+        }
+    }
+    for (_, v, _) in observe::journal_rows(home, "send")? {
+        let Ok(a) = serde_json::from_slice::<SendAttempt>(&v) else {
+            unresolved.push("send record unreadable by this version".to_string());
+            continue;
+        };
+        let (line, is_unresolved, is_manual) = send_line(&a);
+        manual += usize::from(is_manual);
+        if is_unresolved {
+            unresolved.push(line)
+        } else {
+            settled.push(line)
         }
     }
     let warnings = observe::unresponsive(home, now)?;

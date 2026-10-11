@@ -296,8 +296,104 @@ pub fn gross(net: u64, ppk: u64) -> Result<(u64, u64)> {
     }
     bail!("cannot solve bounded fee-inclusive split")
 }
+
+/// Why a bounded recovery item was deferred, safe to print: "timeout after Ns", or the
+/// error chain (`{:#}`) with anything that could be secret material redacted. Cashu
+/// tokens (`cashuA…`/`cashuB…`) and long hex runs (secrets, preimages, proof `C`
+/// points, blinded messages, signatures: 32+ hex chars) never reach the output.
+pub fn deferral_reason<T>(
+    item: &std::result::Result<Result<T>, tokio::time::error::Elapsed>,
+    seconds: u64,
+) -> String {
+    match item {
+        Err(_) => format!("timeout after {seconds}s"),
+        Ok(Err(error)) => redact_reason(&format!("{error:#}")),
+        Ok(Ok(_)) => "item still non-terminal after this pass".into(),
+    }
+}
+
+/// Redact token- and secret-shaped substrings from a human-readable reason.
+pub fn redact_reason(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let rest: String = chars[i..chars.len().min(i + 6)].iter().collect();
+        if rest.starts_with("cashuA") || rest.starts_with("cashuB") {
+            let mut k = i;
+            while k < chars.len()
+                && (chars[k].is_ascii_alphanumeric()
+                    || matches!(chars[k], '-' | '_' | '=' | '+' | '/'))
+            {
+                k += 1;
+            }
+            out.push_str("<redacted token>");
+            i = k;
+            continue;
+        }
+        if chars[i].is_ascii_hexdigit() {
+            let mut k = i;
+            while k < chars.len() && chars[k].is_ascii_hexdigit() {
+                k += 1;
+            }
+            if k - i >= 32 {
+                out.push_str("<redacted hex>");
+            } else {
+                out.extend(&chars[i..k]);
+            }
+            i = k;
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    const MAX: usize = 600;
+    if out.chars().count() > MAX {
+        out = out.chars().take(MAX).collect::<String>() + "…";
+    }
+    out
+}
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deferral_reason_names_timeout_and_redacts_secrets() {
+        let elapsed: std::result::Result<Result<()>, _> = Err(tokio_elapsed());
+        assert_eq!(deferral_reason(&elapsed, 40), "timeout after 40s");
+        let secret = "ab".repeat(32);
+        let token = "cashuBo2FteBtodHRwOi8vMTI3LjAuMC4xOjF-sat_+/=";
+        let e: std::result::Result<Result<()>, tokio::time::error::Elapsed> = Ok(Err(
+            anyhow::anyhow!("mint said no for {secret} in {token}").context("restore failed"),
+        ));
+        let reason = deferral_reason(&e, 40);
+        assert!(
+            reason.starts_with("restore failed: mint said no for"),
+            "{reason}"
+        );
+        assert!(
+            !reason.contains(&secret) && !reason.contains("cashuB"),
+            "{reason}"
+        );
+        assert!(reason.contains("<redacted hex>") && reason.contains("<redacted token>"));
+        // Short hex (keyset ids, ports, codes) stays readable.
+        assert_eq!(
+            redact_reason("keyset 009a1f293253e41e code 11001"),
+            "keyset 009a1f293253e41e code 11001"
+        );
+    }
+    fn tokio_elapsed() -> tokio::time::error::Elapsed {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(1),
+                    std::future::pending::<()>(),
+                )
+                .await
+            })
+            .unwrap_err()
+    }
     use super::*;
     #[test]
     fn asset_identity_includes_mint() {

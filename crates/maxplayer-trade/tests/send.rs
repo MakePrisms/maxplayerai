@@ -1226,3 +1226,134 @@ async fn landed_reclaim_refused_with_outputs_hidden_twice_is_never_redeemed() {
         }
     }
 }
+
+// ---- readable `status` lists sends (a non-terminal send must never read "UNRESOLVED: none") ----
+
+/// (unresolved count, manual count) as `status --json` states them, for comparison with the text.
+fn json_counts(out: &std::process::Output) -> (usize, usize) {
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let recs = v["records"].as_array().unwrap();
+    let manual = |r: &&serde_json::Value| r["manual_recovery"].as_bool() == Some(true);
+    let unresolved = recs
+        .iter()
+        .filter(|r| r["terminal"].as_bool() == Some(false) || manual(r))
+        .count();
+    (unresolved, recs.iter().filter(manual).count())
+}
+
+/// Rewrite one send's journaled state (test-only; models the live stuck `prepared` record).
+async fn force_state(j: &Journal, id: &str, state: &str) {
+    let mut v = j
+        .get::<serde_json::Value>("send", id)
+        .await
+        .unwrap()
+        .unwrap();
+    v["state"] = state.into();
+    j.put("send", id, &v).await.unwrap();
+}
+
+#[tokio::test]
+async fn readable_status_lists_unresolved_and_settled_sends_with_json_matching_counts() {
+    let m = MintFixture::start(0).await;
+    let (a, ja) = funded(&m, 128).await;
+    // Terminal `sent` (reclaimable) and terminal `reclaimed`.
+    let sent_ok = send::send(a.path(), &ja, &m.url, 8, &a.path().join("s1"), None)
+        .await
+        .unwrap();
+    let to_reclaim = send::send(a.path(), &ja, &m.url, 8, &a.path().join("s2"), None)
+        .await
+        .unwrap();
+    let reclaimed = send::reclaim(a.path(), &ja, &to_reclaim.id, None)
+        .await
+        .unwrap();
+    assert_eq!(reclaimed.state, SendState::Reclaimed);
+    // Non-terminal: submitted (lost reply), and a reclaim left in flight (lost reply).
+    let to_reclaim2 = send::send(a.path(), &ja, &m.url, 8, &a.path().join("s3"), None)
+        .await
+        .unwrap();
+    m.faults.lose_reply.store(true, SeqCst);
+    let submitted = send::send(a.path(), &ja, &m.url, 8, &a.path().join("s4"), None)
+        .await
+        .unwrap();
+    assert_eq!(submitted.state, SendState::Submitted);
+    let reclaiming = send::reclaim(a.path(), &ja, &to_reclaim2.id, None)
+        .await
+        .unwrap();
+    assert_eq!(reclaiming.state, SendState::Reclaiming);
+    m.faults.lose_reply.store(false, SeqCst);
+    // `prepared` (the live repro) and a manual-recovery state, by journal rewrite.
+    let prepared = send::send(a.path(), &ja, &m.url, 8, &a.path().join("s5"), None)
+        .await
+        .unwrap();
+    force_state(&ja, &prepared.id, "prepared").await;
+    let manual = send::send(a.path(), &ja, &m.url, 8, &a.path().join("s6"), None)
+        .await
+        .unwrap();
+    force_state(&ja, &manual.id, "inputs_spent").await;
+
+    let human = cli(a.path(), &["status"], None).await;
+    assert!(human.status.success());
+    let text = String::from_utf8_lossy(&human.stdout).to_string();
+    // The UNRESOLVED block is its header plus the indented lines after it; the rest is settled.
+    let head: String = text
+        .lines()
+        .skip_while(|l| !l.starts_with("UNRESOLVED ("))
+        .skip(1)
+        .take_while(|l| l.starts_with("  "))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let settled: String = text
+        .lines()
+        .filter(|l| !l.starts_with("  "))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let (head, settled) = (head.as_str(), settled.as_str());
+    let line_of = |hay: &str, id: &str| hay.lines().find(|l| l.contains(id)).map(str::to_owned);
+    for (id, state) in [
+        (&prepared.id, "prepared"),
+        (&submitted.id, "submitted"),
+        (&reclaiming.id, "reclaiming"),
+        (&manual.id, "inputs_spent"),
+    ] {
+        let line = line_of(head, id)
+            .unwrap_or_else(|| panic!("SAFETY: {state} send not unresolved:\n{text}"));
+        assert!(
+            line.contains(&format!("send {id} {} {state}", m.url)),
+            "{line}"
+        );
+    }
+    assert!(
+        line_of(head, &manual.id)
+            .unwrap()
+            .contains("MANUAL RECOVERY")
+    );
+    for (id, state) in [(&sent_ok.id, "sent"), (&reclaimed.id, "reclaimed")] {
+        assert!(
+            line_of(head, id).is_none(),
+            "terminal {state} send listed as unresolved:\n{text}"
+        );
+        let line = line_of(settled, id).unwrap_or_else(|| panic!("{state} send missing:\n{text}"));
+        assert!(
+            line.contains(&format!(" {state}: token 8 sats; fee ")),
+            "{line}"
+        );
+    }
+    assert!(
+        line_of(settled, &reclaimed.id)
+            .unwrap()
+            .contains("reclaimed 8")
+    );
+    assert!(!text.contains("UNRESOLVED: none"), "{text}");
+
+    let json = cli(a.path(), &["status", "--json"], None).await;
+    let (unresolved, manual_n) = json_counts(&json);
+    assert_eq!((unresolved, manual_n), (4, 1));
+    assert!(
+        text.contains(&format!(
+            "summary: {unresolved} unresolved, {manual_n} need manual recovery"
+        )),
+        "summary must match status --json:\n{text}"
+    );
+    // The readable view never prints the journaled token.
+    assert_secret_free(&human, &read(&a.path().join("s1")));
+}

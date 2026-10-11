@@ -1018,3 +1018,46 @@ async fn crash_after_done_before_release_is_released_by_recover() {
     assert!(!money::recover(h.path(), &j).await.unwrap());
     assert_eq!(balance(h.path(), &m.url).await, 56);
 }
+
+/// `recover` names WHY a receive was deferred (live nostr runs deferred three times with no
+/// cause), and the reason never carries the token, a proof secret or a proof `C`.
+#[tokio::test]
+async fn recover_prints_redacted_deferral_reason_for_receive() {
+    let m = MintFixture::start(0).await;
+    let (_s, proofs, token) = issue(&m, 24).await;
+    let (h, j) = home().await;
+    m.faults.lose_reply.store(true, SeqCst);
+    let r = receive::receive(h.path(), &j, &m.url, &token)
+        .await
+        .unwrap();
+    assert_eq!(r.state, ReceiveState::Submitted);
+    m.faults.lose_reply.store(false, SeqCst);
+    drop(j);
+    m.faults.dead.store(true, SeqCst);
+    let home_path = h.path().to_owned();
+    let out = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
+            .args(["--home", home_path.to_str().unwrap(), "recover"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    m.faults.dead.store(false, SeqCst);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "unresolved: {err}");
+    let line = err
+        .lines()
+        .find(|l| l.starts_with(&format!("receive {}: recovery deferred (", r.id)))
+        .unwrap_or_else(|| panic!("no deferral line:\n{err}"));
+    assert!(
+        !line.contains("(error or timeout)"),
+        "reason dropped: {line}"
+    );
+    assert!(
+        line.contains("503") || line.contains("timeout after") || line.len() > 60,
+        "reason must say what failed: {line}"
+    );
+    assert_secret_free(&out, &token, &proofs);
+}

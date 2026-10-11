@@ -826,34 +826,32 @@ pub async fn recover(home: &Path, j: &Journal) -> Result<bool> {
         if f.expired_unpaid {
             continue;
         }
-        if !matches!(
-            tokio::time::timeout(
-                std::time::Duration::from_secs(120),
-                resume_fund(home, j, &mut f)
-            )
-            .await,
-            Ok(Ok(()))
-        ) {
+        let item = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            resume_fund(home, j, &mut f),
+        )
+        .await;
+        if !matches!(item, Ok(Ok(()))) {
             failed = true;
             eprintln!(
-                "funding {}: recovery deferred (error or timeout); authorization retained",
-                f.id
+                "funding {}: recovery deferred ({}); authorization retained",
+                f.id,
+                crate::deferral_reason(&item, 120)
             );
         }
     }
     for mut a in j.all::<Withdrawal>("withdrawal").await? {
-        if !matches!(
-            tokio::time::timeout(
-                std::time::Duration::from_secs(120),
-                resume_withdraw(home, j, &mut a)
-            )
-            .await,
-            Ok(Ok(()))
-        ) {
+        let item = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            resume_withdraw(home, j, &mut a),
+        )
+        .await;
+        if !matches!(item, Ok(Ok(()))) {
             failed = true;
             eprintln!(
-                "withdrawal {}: recovery deferred (error or timeout); authorization retained",
-                a.id
+                "withdrawal {}: recovery deferred ({}); authorization retained",
+                a.id,
+                crate::deferral_reason(&item, 120)
             );
         }
     }
