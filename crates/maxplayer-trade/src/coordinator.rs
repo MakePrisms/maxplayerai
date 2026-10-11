@@ -582,7 +582,13 @@ pub async fn advance(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Resu
     if terminal(s) {
         return Ok(());
     }
-    let result = advance_inner(home, j, m, s).await;
+    // A claim phase near its deadline is never delayed by mint backoff or pacing.
+    let result = match claim_deadline(s) {
+        Some(deadline) => {
+            crate::backoff::with_deadline(deadline, advance_inner(home, j, m, s)).await
+        }
+        None => advance_inner(home, j, m, s).await,
+    };
     // Run even when redemption returned an error. Persist terminal manual-recovery
     // status before the next tick; never turn a quarantined claim into refund authority.
     for (suffix, state) in [
@@ -619,6 +625,32 @@ pub async fn advance(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Resu
         }
     }
     result
+}
+/// The moment after which this swap's pending claim can lose funds, if it has one:
+/// - maker (claiming the taker's lock with the learned preimage, or still watching its own
+///   lock's NUT-07 witness for it): `long`, the taker's refund locktime;
+/// - taker (claiming the maker's lock): `short - cutoff`, its claim send deadline.
+///
+/// Taker refunds (after `long + margin`) and maker refunds (after `short + margin`) have no
+/// such moment: the refund path stays open, so a later refund loses nothing.
+pub fn claim_deadline(s: &Swap) -> Option<u64> {
+    let q = s.quote.as_ref()?;
+    match (s.role.as_str(), s.state.as_str()) {
+        ("maker", "second_locked" | "claiming" | "lock_unforwardable") => Some(q.long),
+        ("taker", "second_validated") => Some(q.short.saturating_sub(q.cutoff)),
+        _ => None,
+    }
+}
+/// The mints one swap's recovery may contact.
+fn swap_mints(s: &Swap) -> Vec<&str> {
+    let mut mints = vec![s.plan.mint.as_str()];
+    if let Some(q) = &s.quote {
+        mints.push(&q.lot.give.asset.mint_url);
+        mints.push(&q.lot.want.asset.mint_url);
+    }
+    mints.sort_unstable();
+    mints.dedup();
+    mints
 }
 async fn advance_inner(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Result<()> {
     let (overall_budget, refund_budget) = advance_budgets();
@@ -884,8 +916,18 @@ async fn recover_pass(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
             true
         }
     };
-    let swaps = j.all::<Swap>("swap").await?;
+    let mut swaps = j.all::<Swap>("swap").await?;
+    crate::backoff::order(&mut swaps, |s| &s.id);
     for mut s in swaps {
+        // Pacing: a live swap whose mints are at their request budget waits (recover) or is
+        // left for a later tick (serve). Near its claim deadline it is never paced.
+        if !terminal(&s)
+            && s.quote.is_some()
+            && !crate::backoff::ready(&s.id, &swap_mints(&s), claim_deadline(&s)).await
+        {
+            deferred = true;
+            continue;
+        }
         let budget = item_budget(&s);
         let item = async {
             if s.state == "requested" && now() > s.created + 60 {

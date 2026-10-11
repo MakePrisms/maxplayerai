@@ -221,16 +221,26 @@ async fn get<T: serde::de::DeserializeOwned>(url: &str, path: &str, id: &str) ->
         .map_err(|_| anyhow::anyhow!("invalid endpoint"))?
         .pop_if_empty()
         .push(id);
-    Ok(reqwest::Client::builder()
+    let request = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(20))
         .build()?
-        .get(endpoint)
-        .send()
+        .get(endpoint);
+    Ok(crate::backoff::send(url, request)
         .await?
         .error_for_status()?
         .json()
         .await?)
+}
+/// `fund` polls its quote this many times, [`fund_poll`] apart.
+pub const FUND_POLLS: u32 = 6;
+/// Interval between `fund` quote polls: 5 s (1 s on loopback test mints).
+pub fn fund_poll(mint: &str) -> std::time::Duration {
+    std::time::Duration::from_secs(if crate::transport::loopback_only(mint) {
+        1
+    } else {
+        5
+    })
 }
 pub async fn resume_fund(home: &Path, j: &Journal, f: &mut Funding) -> Result<()> {
     if f.done {
@@ -618,14 +628,15 @@ async fn submit_melt(
 ) -> Result<Option<MeltQuoteBolt11Response<String>>> {
     crate::Asset::new(url)?.fence()?;
     crate::transport::require_http(url, "melt")?;
-    let response = reqwest::Client::builder()
+    let request = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(mint::RPC_TIMEOUT_SECONDS))
         .build()?
         .post(format!("{url}/v1/melt/bolt11"))
-        .json(request)
-        .send()
-        .await?;
+        .json(request);
+    // A deferred melt is never sent: RequestSent stays journaled and the identical
+    // authorization is replayed (or reconciled by quote GET) on a later pass.
+    let response = crate::backoff::send(url, request).await?;
     let status = response.status();
     let body: serde_json::Value = response
         .json()
@@ -826,6 +837,10 @@ pub async fn recover(home: &Path, j: &Journal) -> Result<bool> {
         if f.expired_unpaid {
             continue;
         }
+        if !crate::backoff::ready(&f.id, &[&f.mint], None).await {
+            failed = true;
+            continue;
+        }
         if !matches!(
             tokio::time::timeout(
                 std::time::Duration::from_secs(120),
@@ -842,6 +857,10 @@ pub async fn recover(home: &Path, j: &Journal) -> Result<bool> {
         }
     }
     for mut a in j.all::<Withdrawal>("withdrawal").await? {
+        if !a.terminal() && !crate::backoff::ready(&a.id, &[&a.mint], None).await {
+            failed = true;
+            continue;
+        }
         if !matches!(
             tokio::time::timeout(
                 std::time::Duration::from_secs(120),

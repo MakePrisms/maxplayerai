@@ -86,6 +86,10 @@ pub struct Faults {
     pub pending_after_swap: std::sync::atomic::AtomicBool,
     /// Drop the last output/signature pair from every non-empty restore reply.
     pub partial_restore: std::sync::atomic::AtomicBool,
+    /// Answer every request with HTTP 429 (rate limited), unprocessed.
+    pub rate_limit: std::sync::atomic::AtomicBool,
+    /// `Retry-After` seconds sent with `rate_limit` (0 = no header).
+    pub retry_after: std::sync::atomic::AtomicU64,
 }
 pub struct MintFixture {
     pub faults: Arc<Faults>,
@@ -159,6 +163,15 @@ impl MintFixture {
                     use std::sync::atomic::Ordering::SeqCst;
                     let path = req.uri().path().to_owned();
                     control.requests.fetch_add(1, SeqCst);
+                    if control.rate_limit.load(SeqCst) {
+                        let mut r = axum::http::StatusCode::TOO_MANY_REQUESTS.into_response();
+                        let after = control.retry_after.load(SeqCst);
+                        if after != 0 {
+                            r.headers_mut()
+                                .insert(axum::http::header::RETRY_AFTER, after.into());
+                        }
+                        return r;
+                    }
                     if path.ends_with("/swap") {
                         control.swaps.fetch_add(1, SeqCst);
                         if control.pending_after_swap.swap(false, SeqCst) {

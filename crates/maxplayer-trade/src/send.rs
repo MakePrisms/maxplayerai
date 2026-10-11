@@ -1120,6 +1120,10 @@ pub async fn recover(home: &Path, j: &Journal) -> Result<bool> {
             }
             continue;
         }
+        if !crate::backoff::ready(&r.id, &[&r.mint], None).await {
+            failed = true;
+            continue;
+        }
         let item = tokio::time::timeout(
             std::time::Duration::from_secs(RECOVERY_ITEM_SECONDS),
             resume(home, j, &mut r),

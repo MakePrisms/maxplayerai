@@ -127,6 +127,35 @@ the swap (check `status`). Without a running serve these commands behave as befo
 locks are live. `recover` is a bounded single pass, not a replacement watcher;
 see [recovery](recovery.md) for exit codes and states.
 
+**One process per home, no recover loops.** Run exactly one `serve` per home. Never run
+parallel `recover` loops, a `recover` loop beside a `take`, or several serve/take processes
+against the same mints: each process paces and backs off only its own requests, so parallel
+processes multiply the load a rate-limited or blocking mint sees (a live run kept a 429 and
+a TCP block alive for 9+ hours this way). If a mint is backing off, wait for serve; rerun
+`recover` at most every few minutes, not in a tight loop.
+
+## Mint backoff and pacing
+
+Every request to a mint (HTTP or `nostr://`) passes a per-mint gate shared by all items
+in one process:
+
+- **Backoff:** on HTTP 429 or 503, a refused/reset connection or a timeout, that mint is
+  not contacted again for 5 s, doubling per consecutive failure with 0-25 % jitter, up to
+  10 min. A `Retry-After` header (seconds) is honoured up to 15 min. Any other answer
+  clears it. serve/recover log `mint <url> backing off <N>s (429|503|refused|timeout)` once
+  per state change and `mint <url> answered; backoff cleared` when it ends.
+- **Pacing (no backoff):** each request adds 6 s of per-mint debt; an item starts only
+  while that debt is at most 30 s ahead. Steady state: at most ~1 request / 6 s
+  (10/min) per mint per process, after a short burst. serve skips a paced item until a
+  later tick; `recover` waits for it. Items take turns, oldest-served first.
+- **What it never does:** a backed-off request is simply not sent and counts as "no
+  answer" (exit 3 / deferred): journals, reservations and money-step order are unchanged,
+  nothing is marked refused or failed. A claim near its deadline (maker: before the
+  taker's refund locktime; taker: before its claim cutoff) ignores backoff and pacing
+  from two abandonment graces (120 s over HTTP) before the deadline, and logs
+  `would pass a claim's safe window` / `last safe moment, trying now`.
+- `fund` polls its quote every 5 s (6 polls), not every second.
+
 ## Funding
 
 The printed invoice is a request for payment, not proof of issuance. Confirm the

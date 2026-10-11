@@ -46,6 +46,8 @@ work is additional. A timeout does not undo a delivered RPC or release reservati
 - **3:** non-final withdrawal (including a submitted one whose mint failed after the
   POST), unresolved/deferred recovery, or item error/timeout.
   Preserve authorization; keep `serve` running for live locks and retry with backoff.
+  A `mint <url> backing off` line means the request was not sent this pass (see
+  [commands](commands.md#mint-backoff-and-pacing)); do not rerun `recover` in a loop.
 - **4:** terminal manual-recovery quarantine (unresolved work takes precedence as 3).
 
 Exhausted/blocked relay publication is reported as `publication_abandoned`, not

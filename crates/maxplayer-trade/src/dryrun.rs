@@ -27,12 +27,12 @@ impl Keysets {
 
 pub async fn keysets(mint: &str, timeout: Duration) -> Result<Keysets> {
     Asset::new(mint)?.fence()?;
-    let v: serde_json::Value = reqwest::Client::builder()
+    let request = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(timeout)
         .build()?
-        .get(format!("{}/v1/keysets", mint.trim_end_matches('/')))
-        .send()
+        .get(format!("{}/v1/keysets", mint.trim_end_matches('/')));
+    let v: serde_json::Value = crate::backoff::send(mint, request)
         .await?
         .error_for_status()?
         .json()
