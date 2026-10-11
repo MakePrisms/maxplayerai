@@ -718,6 +718,53 @@ never argv) imports one token, e.g. one written by `maxplayer-mint issue`. Code:
   original token elsewhere: the next `recover` sees the inputs SPENT with none of our outputs,
   records `already_spent` and frees the cap. Never re-import any other `submitted` receive.
 
+## Send (export a Cashu token)
+
+`maxplayer-trade --home <home> send <mint> --amount <sats> --out <path> [--max-fees <sats>]`
+writes one single-mint V4 token for exactly `<amount>` sats to a new 0600 file. It is the
+counterpart to `receive`, for moving funds to another wallet without Lightning. Code: `src/send.rs`.
+
+- Refused before any journal write: amount 0 or > 100,000 sats, insufficient ordinary balance
+  (reserved and locked proofs never count), input fee above `--max-fees` (required unless the
+  fee is 0), an existing `--out` path (never overwritten), failed preflight, non-UNSPENT inputs.
+- One swap of the selected inputs into the exact send outputs plus change. Inputs, blinded
+  outputs and secrets are journaled and the inputs reserved before the POST. Ambiguity → NUT-09
+  restore of the same outputs and identical replay only. A NUT error with inputs UNSPENT is
+  terminal `refused` (inputs released). Missing/invalid DLEQ is `quarantined` (exit 4).
+- The token is built only from DLEQ-verified outputs, journaled, then written (O_EXCL temp,
+  fsync, hard link to `--out`). `recover`/`serve` rewrite that same token after a crash.
+  Rerunning with the same `--out` resumes, or after the file was moved/deleted rewrites the
+  same journaled token, only when NUT-07 shows every sent proof UNSPENT (else exit 1, choose
+  another `--out`); a rewrite says no new value was sent and adds `"rewritten": true`. It never
+  sends twice. A used `--out` (other terms, reclaimed/redeemed/manual recovery) is refused;
+  only `refused` frees it. Coin selection skips inputs of any unfinished journaled send,
+  withdrawal, listing or swap. A send the recipient's input fee would consume (dust) is
+  refused before the journal. Output: attempt id, mint, state, amount, fee, `rewritten`;
+  never the token.
+- `send --reclaim <id>` swaps still-UNSPENT sent proofs back (same journaling; `reclaim_submitted`
+  is journaled before each POST). It also works on a `swapped` send whose file could not be
+  placed. Exits: 0 `reclaimed`; 3 `reclaiming`; 1 refused or partially redeemed meanwhile
+  (state back to `sent`; run it again) or `redeemed` (all SPENT, including the race where the
+  recipient redeemed before any POST of our leg); 4 `reclaim_unresolved` when our leg was
+  POSTed (ambiguous reply, or a refusal while every input is SPENT: the mint may have executed
+  it) and its outputs stayed absent on two passes (secrets kept), or `reclaim_quarantined`. `status --check-sends` performs the on-demand NUT-07 check.
+- `nostr://` mints: send, `send --reclaim` and `status --check-sends` run over the nostr transport
+  (`mint::rpc`/`states`/`unspent`, `wallet::preflight`, the `wallet()` builder; every CDK wallet
+  call uses `wallet::bounded_for`, 40 s on nostr, and the mint-agnostic 15 s `bounded` is gone).
+  Before the `prepared` write and the input reservation, send sizes the exact swap with
+  `transport::check_swap_fits`; reclaim does the same (plus ≤ 128 outputs) before the
+  `reclaiming`/`reclaim_submitted` write. Over the NIP-44 limit is exit 1 with nothing journaled,
+  reserved or published: a journaled one would fail locally with 413 on every pass and, since a
+  local 413 is never a refusal, strand its reserved inputs. Own-secret wallet rows fit with
+  ~9 KB to spare (128/128), so this is a guard, not an expected path. Send/reclaim swaps share
+  receive's refusal gate: nostr `expired`/`bad_request`/`rate_limited`/timeout/413 stay
+  ambiguous. The token names `nostr://npub…`, so only a nostr-capable wallet (this CLI's
+  `receive`) can redeem it. Keep the same `--mint-relay` set for reclaim, `recover` and
+  `--check-sends`. A send recovery item stays 120 s on nostr. Tests (`tests/nostr.rs`):
+  `nostr_send_check_sends_and_reclaim_round_trip`, `nostr_oversized_send_refused_before_journal`,
+  `nostr_oversized_reclaim_refused_before_journal` (oversized rows injected by the test; no CLI
+  path builds them), `nostr_send_survives_slow_keysets_reply` (a 20 s keysets reply).
+
 ## Funding and withdrawals
 
 This path is **not a production safety certification**. Public-mint results, if any, belong in

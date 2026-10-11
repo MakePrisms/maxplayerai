@@ -1,6 +1,6 @@
 use std::process::Command;
 fn home() -> tempfile::TempDir {
-    tempfile::tempdir_in(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target")).unwrap()
+    tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap()
 }
 #[test]
 fn fresh_home_balance_is_zero_and_private() {

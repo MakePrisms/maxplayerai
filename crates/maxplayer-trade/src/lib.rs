@@ -568,4 +568,5 @@ pub mod wallet;
 pub mod money;
 pub mod real_money;
 pub mod receive;
+pub mod send;
 pub mod transport;

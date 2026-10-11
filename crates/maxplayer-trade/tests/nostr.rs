@@ -22,7 +22,7 @@ use maxplayer_trade::{
     coordinator::{self, Swap},
     journal::Journal,
     market::Market,
-    mint, money, receive, transport, wallet,
+    mint, money, receive, send, transport, wallet,
 };
 use nostr_relay_builder::{
     LocalRelay, RelayBuilder,
@@ -68,6 +68,9 @@ struct Tap {
     expire_next_swap: AtomicBool,
     expired: Mutex<HashSet<EventId>>,
     relay: Mutex<Option<String>>,
+    /// One-shot: skip `n` replies to `op`, then delay the next one by `ms` (e.g. the CDK wallet's
+    /// `keysets` read after preflight's own).
+    delay_op_reply: Mutex<Option<(String, u32, u64)>>,
 }
 impl Tap {
     async fn admit(&self, event: &Event, mint_relay: bool) -> PolicyResult {
@@ -122,6 +125,24 @@ impl Tap {
                 }
             }
         } else if kind == RESPONSE_KIND {
+            let op = event
+                .tags
+                .event_ids()
+                .find_map(|id| self.requests.lock().unwrap().get(id).map(|s| s.op.clone()));
+            let delay = {
+                let mut d = self.delay_op_reply.lock().unwrap();
+                match d.as_mut() {
+                    Some((o, skip, _)) if op.as_deref() == Some(o.as_str()) && *skip > 0 => {
+                        *skip -= 1;
+                        None
+                    }
+                    Some((o, _, _)) if op.as_deref() == Some(o.as_str()) => d.take(),
+                    _ => None,
+                }
+            };
+            if let Some((_, _, ms)) = delay {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+            }
             let swap = event.tags.event_ids().find_map(|id| {
                 self.requests
                     .lock()
@@ -1307,4 +1328,246 @@ async fn nostr_counterparty_unreachable_refund_still_lands() {
         "SAFETY: refund settled"
     );
     assert!(result.is_ok(), "advance bounded by its deadline");
+}
+
+// ---- send x nostr:// (PR #1123 integration review) ----
+
+/// Run the built CLI against `home` over the test mint relay; (exit code, stdout, stderr).
+async fn cli(e: &Env, home: &Path, args: &[&str]) -> (i32, String, String) {
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
+        .arg("--home")
+        .arg(home)
+        .args(["--mint-relay", &e.mint_relay_url])
+        .args(args)
+        .output()
+        .await
+        .unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Every Unspent wallet row on `mint` and whether any is reserved by an operation.
+async fn rows(home: &Path, mint: &str) -> (usize, bool) {
+    use cdk::cdk_database::WalletDatabase;
+    let db = wallet::database(home, mint).await.unwrap();
+    let p = db
+        .get_proofs(Some(mint.parse().unwrap()), None, None, None)
+        .await
+        .unwrap();
+    (p.len(), p.iter().any(|p| p.used_by_operation.is_some()))
+}
+
+/// Integration review (advisor Medium / crd L2): send, `status --check-sends` and both reclaim
+/// outcomes complete on a nostr:// mint over the credits sidecar, mint traffic on mint relays only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nostr_send_check_sends_and_reclaim_round_trip() {
+    let e = env().await;
+    let n = e.nostr_mint().await;
+    e.fund_nostr(&e.maker, &n, 128).await;
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("first.token");
+    let r = send::send(&e.maker, &e.jm, &n.url, 37, &first, None)
+        .await
+        .unwrap();
+    assert_eq!(r.state, send::SendState::Sent, "{}", r.summary());
+    assert_eq!(balance(&e.maker, &n.url).await, 91, "SAFETY: debited once");
+    let token = std::fs::read_to_string(&first).unwrap();
+    assert!(token.starts_with("cashuB"), "token file written");
+    let got = receive::receive(&e.taker, &e.jt, &n.url, &token)
+        .await
+        .unwrap();
+    assert_eq!(got.state, receive::ReceiveState::Done, "{}", got.summary());
+    assert_eq!(balance(&e.taker, &n.url).await, 37);
+    let second = dir.path().join("second.token");
+    let r2 = send::send(&e.maker, &e.jm, &n.url, 20, &second, None)
+        .await
+        .unwrap();
+    assert_eq!(r2.state, send::SendState::Sent, "{}", r2.summary());
+    assert_eq!(balance(&e.maker, &n.url).await, 71);
+    // `status --check-sends` is read-only NUT-07 over the mint relay.
+    let (code, out, err) = cli(&e, &e.maker, &["status", "--check-sends"]).await;
+    assert_eq!(code, 0, "{err}");
+    let line = |id: &str| -> serde_json::Value {
+        out.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["send"] == id)
+            .unwrap_or_else(|| panic!("no check-sends line for {id}: {out}"))
+    };
+    assert_eq!(line(&r.id)["redeemed"], "redeemed");
+    assert_eq!(line(&r2.id)["redeemed"], "unredeemed");
+    // Reclaim the redeemed send: nothing comes back. Reclaim the outstanding one: it does.
+    let gone = send::reclaim(&e.maker, &e.jm, &r.id, None).await.unwrap();
+    assert_eq!(gone.state, send::SendState::Redeemed);
+    let back = send::reclaim(&e.maker, &e.jm, &r2.id, None).await.unwrap();
+    assert_eq!(back.state, send::SendState::Reclaimed, "{}", back.summary());
+    assert_eq!(
+        balance(&e.maker, &n.url).await,
+        91,
+        "SAFETY: reclaimed exactly once"
+    );
+    assert!(!send::pending(&e.jm).await.unwrap());
+    assert!(!rows(&e.maker, &n.url).await.1, "nothing left reserved");
+    assert_eq!(
+        e.tap.misrouted.load(SeqCst),
+        0,
+        "SAFETY: no misrouted kinds"
+    );
+    assert!(e.tap.swaps().len() >= 3, "fixture: swaps went over nostr");
+}
+
+/// Integration review (advisor High / crd L1): a send whose exact swap exceeds the NIP-44 limit
+/// is refused before the journal (exit 1): nothing journaled, nothing reserved, nothing published.
+/// The oversized wallet rows (128 one-sat proofs with 400-character plain secrets, signed by the
+/// sidecar) are written straight into the CDK wallet database: test-only, no CLI path builds them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nostr_oversized_send_refused_before_journal() {
+    use cdk::cdk_database::WalletDatabase;
+    let e = env().await;
+    let n = e.nostr_mint().await;
+    let long = plain_proofs(&n, 400, 128).await;
+    let db = wallet::database(&e.maker, &n.url).await.unwrap();
+    let url: cdk::mint_url::MintUrl = n.url.parse().unwrap();
+    db.update_proofs(
+        long.into_iter()
+            .map(|p| {
+                cdk_common::wallet::ProofInfo::new(
+                    p,
+                    url.clone(),
+                    cdk::nuts::State::Unspent,
+                    cdk::nuts::CurrencyUnit::Sat,
+                )
+                .unwrap()
+            })
+            .collect(),
+        vec![],
+    )
+    .await
+    .unwrap();
+    drop(db);
+    assert_eq!(
+        balance(&e.maker, &n.url).await,
+        128,
+        "fixture: rows imported"
+    );
+    e.tap.reset();
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("big.token");
+    let (code, stdout, err) = cli(
+        &e,
+        &e.maker,
+        &[
+            "send",
+            &n.url,
+            "--amount",
+            "127",
+            "--out",
+            out.to_str().unwrap(),
+        ],
+    )
+    .await;
+    assert!(
+        err.contains("NIP-44") && err.contains("nothing journaled"),
+        "clear refusal: {err}"
+    );
+    assert_eq!(
+        code, 1,
+        "SAFETY: a refusal, not a retained attempt: {stdout}"
+    );
+    assert!(
+        e.jm.all::<serde_json::Value>("send")
+            .await
+            .unwrap()
+            .is_empty(),
+        "SAFETY: nothing journaled"
+    );
+    assert_eq!(
+        rows(&e.maker, &n.url).await,
+        (128, false),
+        "SAFETY: nothing reserved"
+    );
+    assert!(e.tap.swaps().is_empty(), "SAFETY: no swap published");
+    assert!(!out.exists(), "no token file");
+    assert!(!send::pending(&e.jm).await.unwrap());
+    assert_eq!(balance(&e.maker, &n.url).await, 128);
+}
+
+/// The same for a reclaim: a sent token whose proofs carry long plain secrets (a journal row
+/// injected by the test; own sends cannot produce it) is refused before the Reclaiming /
+/// reclaim_submitted write, so the token stays `sent` and no swap is published.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nostr_oversized_reclaim_refused_before_journal() {
+    let e = env().await;
+    let n = e.nostr_mint().await;
+    let sent = plain_proofs(&n, 400, 128).await;
+    let keyset = backend::active_keyset(&n.mint).unwrap();
+    let pre = PreMintSecrets::random(
+        keyset,
+        128.into(),
+        &SplitTarget::Value(cdk::Amount::from(1)),
+        &backend::fee_and_amounts(),
+    )
+    .unwrap();
+    let outputs: Vec<_> = pre
+        .secrets
+        .iter()
+        .map(|o| {
+            serde_json::json!({"message":o.blinded_message,"secret":o.secret,
+                "r":hex::encode(o.r.to_secret_bytes()),"send":true})
+        })
+        .collect();
+    assert_eq!(
+        outputs.len(),
+        sent.len(),
+        "fixture: one output per sent proof"
+    );
+    let id = uuid::Uuid::new_v4().to_string();
+    let record = serde_json::json!({"id":id,"mint":n.url,"state":"sent","amount":128,"fee":0,
+        "out":e.root.path().join("sent.token"),"swap":{"inputs":[],"outputs":outputs,
+        "result":sent},"token":"cashuB-fixture","committed":true,"released":true});
+    e.jm.put("send", &id, &record).await.unwrap();
+    e.tap.reset();
+    let (code, stdout, err) = cli(&e, &e.maker, &["send", "--reclaim", &id]).await;
+    assert!(
+        err.contains("NIP-44") && err.contains("nothing journaled"),
+        "clear refusal: {err}"
+    );
+    assert_eq!(
+        code, 1,
+        "SAFETY: a refusal, not a retained reclaim: {stdout}"
+    );
+    let now: serde_json::Value = e.jm.get("send", &id).await.unwrap().unwrap();
+    assert_eq!(now["state"], "sent", "SAFETY: no Reclaiming write");
+    assert!(now["reclaim"].is_null(), "SAFETY: no reclaim leg journaled");
+    assert!(
+        now["reclaim_submitted"].is_null(),
+        "SAFETY: reclaim_submitted never written"
+    );
+    assert!(e.tap.swaps().is_empty(), "SAFETY: no swap published");
+    assert!(!send::pending(&e.jm).await.unwrap());
+}
+
+/// crd M1: a CDK wallet read (keysets) answered after 20 s, inside the 30 s connector window,
+/// must not fail a nostr send: send's wallet calls use the 40 s nostr bound, not 15 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nostr_send_survives_slow_keysets_reply() {
+    let e = env().await;
+    let n = e.nostr_mint().await;
+    e.fund_nostr(&e.maker, &n, 64).await;
+    // Skip preflight's keysets read; delay the CDK wallet's (refresh_keysets) by 20 s.
+    *e.tap.delay_op_reply.lock().unwrap() = Some(("keysets".into(), 1, 20_000));
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("slow.token");
+    let started = Instant::now();
+    let r = send::send(&e.maker, &e.jm, &n.url, 24, &out, None).await;
+    *e.tap.delay_op_reply.lock().unwrap() = None;
+    let r = r.unwrap();
+    assert!(
+        started.elapsed() >= Duration::from_secs(20),
+        "fixture: a keysets reply was delayed"
+    );
+    assert_eq!(r.state, send::SendState::Sent, "{}", r.summary());
+    assert_eq!(balance(&e.maker, &n.url).await, 40, "SAFETY: debited once");
 }

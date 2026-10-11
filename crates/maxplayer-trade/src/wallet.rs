@@ -28,17 +28,11 @@ pub async fn refund_time(mint: &str) -> Result<u64> {
         Err(_) => local,
     })
 }
-/// Bound one CDK wallet call against an HTTP mint (15 s). Kept for compatibility; mint-aware
-/// callers use [`bounded_for`], whose bound outlasts one `nostr://` connector call. An enclosing
-/// budget (advance, message, recovery item) can still drop a call mid-window; that is ambiguous,
-/// never a failure: the swap is journaled first and restored before any identical replay.
-pub async fn bounded<T>(
-    f: impl std::future::Future<Output = T>,
-) -> Result<T, tokio::time::error::Elapsed> {
-    tokio::time::timeout(crate::transport::HTTP_WALLET_TIMEOUT, f).await
-}
 /// Bound one CDK wallet call against `mint`: 15 s for HTTP, the connector window plus its outer
-/// margin for `nostr://` (see `transport`). Every in-crate call site uses this.
+/// margin for `nostr://` (see `transport`). The only CDK wallet bound: there is deliberately no
+/// mint-agnostic variant, so a new call site cannot silently get the 15 s HTTP bound on nostr.
+/// An enclosing budget (advance, message, recovery item) can still drop a call mid-window; that
+/// is ambiguous, never a failure: swaps are journaled first and restored before any replay.
 pub async fn bounded_for<T>(
     mint: &str,
     f: impl std::future::Future<Output = T>,
@@ -192,7 +186,7 @@ pub fn read_status(home: &std::path::Path) -> Result<serde_json::Value> {
     let db =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     db.busy_timeout(std::time::Duration::from_secs(2))?;
-    let mut stmt = db.prepare("SELECT secondary_namespace, value FROM kv_store WHERE primary_namespace='trade-v1' AND secondary_namespace IN ('swap','funding','withdrawal','receive')")?;
+    let mut stmt = db.prepare("SELECT secondary_namespace, value FROM kv_store WHERE primary_namespace='trade-v1' AND secondary_namespace IN ('swap','funding','withdrawal','receive','send')")?;
     let mut records = vec![];
     for row in stmt.query_map([], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
@@ -201,6 +195,8 @@ pub fn read_status(home: &std::path::Path) -> Result<serde_json::Value> {
         let v: serde_json::Value = serde_json::from_slice(&bytes)?;
         let public = if kind == "withdrawal" {
             serde_json::from_slice::<crate::money::Withdrawal>(&bytes)?.summary()
+        } else if kind == "send" {
+            crate::send::public(&bytes)?
         } else if kind == "receive" {
             // Same public view as `recover`; the token is never part of it.
             let mut s = serde_json::from_slice::<crate::receive::Receipt>(&bytes)?.summary();

@@ -20,9 +20,10 @@ Canonical command signatures (placeholders are not literal values):
 ```text
 preflight <mint>
 balance <mint>
-status
+status [--check-sends]
 fund <mint> --amount <sats> [--quote <quote-id>]
 receive <mint> [--token-file <path>]
+send (<mint> --amount <sats> --out <path> | --reclaim <send-id>) [--max-fees <sats>]
 list --give-mint <mint> --give <net-sats> --want-mint <mint> --want <net-sats> --max-fees <sats>
 discover
 serve
@@ -36,7 +37,7 @@ Use `-h` / `--help` at the root or on any application subcommand. The built-in
 `help [COMMAND]` also shows root or command help. There is no version option.
 `--home <HOME>` is required for operational commands; `--relay <RELAY>` is
 repeatable. All command-specific flags in the signatures above are required except
-`--quote`, `--max-debit`, `--token-file` (stdin when omitted), and `--max-fees` (default 16 on list/take). Positional mint arguments are
+`--quote`, `--max-debit`, `--token-file` (stdin when omitted), `--check-sends`, and `--max-fees` (default 16 on list/take; on send it is required unless the mint's input fee is 0). `send` takes either `<mint> --amount --out` or `--reclaim <send-id>`. Positional mint arguments are
 canonical URLs, or `nostr://<npub>` for a Nostr-reachable mint (hex or uppercase input is
 canonicalized to the lowercase npub). `fund` and `withdraw` refuse `nostr://` mints before
 any journal entry: the Maxplayer credits mint serves no NUT-04/05/20; `receive` is how credits
@@ -81,7 +82,8 @@ requires enabled NUT-05 bolt11/sat. The explicit `preflight <mint>` checks the
 common trading capabilities. Diagnostic preflight output goes to stderr. No opt-in is required;
 passing advertisement checks is not independent refund interoperability evidence.
 `balance` and `status` are lock-free read-only SQLite snapshots, available during
-`serve`, without network calls or submission of earlier authorizations.
+`serve`, without submission of earlier authorizations; neither makes network calls
+except `status --check-sends` (read-only NUT-07 per sent token).
 Market commands (including `discover` and `cancel`) first recover existing
 authorizations; do not treat them as read-only on a home with pending obligations.
 `serve` continuously accepts trades and recovers obligations; keep it running while
@@ -124,6 +126,52 @@ and every nostr transport error (`expired`, `bad_request`, `rate_limited`, timeo
 oversized request) stay `submitted` (exit 3) and the identical swap is replayed.
 `refused` is FINAL: no command retries it, the token was not imported and can be
 redeemed elsewhere, and it does not occupy the cap.
+
+## Send (export a token)
+
+`send <mint> --amount <sats> --out <path> --max-fees <sats>` writes one single-mint V4
+token for exactly `<amount>` sats to a NEW file (mode 0600, created exclusively; an
+existing path, including a symlink, is refused). The token is never printed and never
+accepted through argv. Only ordinary unreserved balance is spent: locked HTLC/P2PK
+proofs and proofs reserved by a swap, withdrawal, receive or send are excluded. The
+mint input fee is paid by the sender; `--max-fees` is required unless it is 0. Refused
+**before anything is journaled**: amount above **100,000 sats**, insufficient balance,
+fee above `--max-fees`, existing `--out`, failed preflight or non-UNSPENT inputs.
+
+One swap of the selected inputs into the exact send outputs plus change; inputs,
+outputs and secrets are journaled before the POST. Ambiguity → NUT-09 restore of the
+same outputs and identical replay only. The file is written only after the swap is
+definitive and every output verifies DLEQ; the token is kept in the private journal so
+`recover` rewrites the same token after a crash. Rerunning the same command with the
+same `--out` resumes that attempt, or rewrites the same journaled token if the file was
+moved or deleted (only if NUT-07 shows every sent proof UNSPENT; SPENT, PENDING or an
+unreachable mint exit 1, "already (partially) redeemed or pending; choose another --out"; a rewrite prints a stderr notice
+and `"rewritten": true`); it never sends twice. A `reclaiming` send's `--out` is
+refused: run `send --reclaim <id>`. A used `--out` (other terms, reclaimed/redeemed
+or manual-recovery send) is refused; only a `refused` send frees its path. Coin
+selection skips inputs of any unfinished journaled send, withdrawal, listing or swap.
+A send the recipient's input fee would consume is refused before the journal. Output: one JSON line with
+`send` (attempt id), `mint`, `state`, `amount`, `fee`. Exit 0 `sent`; 3 unresolved;
+1 refusal, `refused` or `redeemed`; 4 manual recovery.
+
+Until the recipient redeems it, `send --reclaim <send-id>` swaps the still-UNSPENT
+proofs back (same journaling; fee needs `--max-fees` unless 0). It also works on a
+`swapped` send whose token file could not be placed. Reclaim exits 0 `reclaimed`; 3
+`reclaiming`; 1 when refused or partially redeemed meanwhile (state stays `sent`,
+token still outstanding: run `send --reclaim <id>` again) or `redeemed` (also when
+the recipient won the race before any POST of our leg); 4 `reclaim_unresolved` (our
+leg POSTed, with an ambiguous reply or a refusal while every input is SPENT, and its
+outputs absent on two passes; secrets kept) or `reclaim_quarantined`. If they are already
+SPENT it reports "redeemed by recipient" and refunds nothing. `status --check-sends`
+asks each mint (NUT-07) whether sent tokens were redeemed; plain `status` is offline.
+
+On a `nostr://` mint send, reclaim and `--check-sends` are supported (no NUT-04/05
+needed). A swap over 128 proofs or the NIP-44 limit is refused **before anything is
+journaled or reserved** (exit 1; send a smaller amount); for a reclaim the token stays
+`sent`. The token names `nostr://npub…`: only a nostr-capable wallet (e.g.
+`maxplayer-trade receive`) can redeem it, not a generic Cashu wallet; `send --reclaim`
+takes it back. Keep the same `--mint-relay` set for reclaim, `recover` and
+`--check-sends`; with the wrong relays they report `unknown`/retain the attempt.
 
 ## Withdrawal: enforcement before execution
 
