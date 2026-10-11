@@ -26,11 +26,16 @@ impl Lab {
             urgent_margin: Some(Duration::from_secs(urgent_margin)),
             loopback: true,
         }));
+        // These tests call `coordinator::recover` directly; give it the CLI `recover`
+        // semantics (wait for pacing) so an item is never skipped because a fast runner
+        // left pacing debt from the fixture's own setup requests.
+        backoff::set_wait_for_pacing(true);
         Lab
     }
 }
 impl Drop for Lab {
     fn drop(&mut self) {
+        backoff::set_wait_for_pacing(false);
         backoff::lab_configure(None);
     }
 }
