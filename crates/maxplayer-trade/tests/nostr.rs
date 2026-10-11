@@ -77,9 +77,14 @@ struct Tap {
     /// replies to the same request are dropped. Each nostr:// call then takes >= this long.
     delay_replies_ms: AtomicU64,
     delayed: Mutex<HashSet<EventId>>,
+    /// The delay (ms) each delayed reply got, in order.
+    delays: Mutex<Vec<u64>>,
     released: Mutex<HashSet<EventId>>,
     /// Market relay down for writes: refuse every event published to the market relay.
     reject_market_writes: AtomicBool,
+    /// `(n, ms)`: once the n-th distinct swap request is seen, set `delay_replies_ms` to `ms`
+    /// (e.g. slow every reply from the maker's lock swap on, after both locks raced their deadlines).
+    slow_after_swaps: Mutex<Option<(usize, u64)>>,
 }
 impl Tap {
     async fn admit(&self, event: &Event, mint_relay: bool) -> PolicyResult {
@@ -117,6 +122,21 @@ impl Tap {
                             })
                             .count += 1;
                         if swap {
+                            let mut slow = self.slow_after_swaps.lock().unwrap();
+                            if let Some((n, ms)) = *slow {
+                                let seen = self
+                                    .requests
+                                    .lock()
+                                    .unwrap()
+                                    .values()
+                                    .filter(|s| s.op == "swap")
+                                    .count();
+                                if seen >= n {
+                                    self.delay_replies_ms.store(ms, SeqCst);
+                                    *slow = None;
+                                }
+                            }
+                            drop(slow);
                             let mut expired = self.expired.lock().unwrap();
                             if expired.contains(&event.id) {
                                 return PolicyResult::Reject("tap: expired request".into());
@@ -141,6 +161,7 @@ impl Tap {
             if !self.released.lock().unwrap().remove(&event.id) && delay > 0 {
                 if let Some(request) = event.tags.event_ids().next().copied() {
                     if self.delayed.lock().unwrap().insert(request) {
+                        self.delays.lock().unwrap().push(delay);
                         self.released.lock().unwrap().insert(event.id);
                         let relay = self.relay.lock().unwrap().clone().unwrap();
                         tokio::spawn(republish(event.clone(), relay, delay));
@@ -1851,8 +1872,9 @@ async fn serve(e: &Env, home: &Path, market: &str) -> (tokio::process::Child, Pa
 
 /// Bug 3: an all-nostr trade completes end to end through two `serve` processes on a slow mint
 /// relay. Every mint reply is 0.6 s late while the locks race their 40/60 s send deadlines, then
-/// 6 s late from the maker's lock on, so the taker's `second` message (validation 4 calls + claim
-/// 12 calls, >= 96 s) outlasts the old 60 s HTTP message budget; no message may be dropped.
+/// 6 s late from the maker's lock swap on (switched by the tap, not by polling), so the taker's
+/// `second` message (>= 10 delayed calls before and after its claim swap, >= 60 s) outlasts the old
+/// 60 s HTTP message budget; no message may be dropped.
 #[cfg(not(feature = "lab"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn nostr_serve_completes_all_nostr_trade_on_slow_relay() {
@@ -1864,6 +1886,8 @@ async fn nostr_serve_completes_all_nostr_trade_on_slow_relay() {
     let market = e._market_relay.url().await.to_string();
     e.tap.reset();
     e.tap.delay_replies_ms.store(600, SeqCst);
+    *e.tap.slow_after_swaps.lock().unwrap() = Some((2, 6_000));
+    let serve_started = Instant::now();
     let (mut maker, maker_log) = serve(&e, &e.maker, &market).await;
     let (mut taker, taker_log) = serve(&e, &e.taker, &market).await;
     let field = |out: &str, key: &str| {
@@ -1945,13 +1969,8 @@ async fn nostr_serve_completes_all_nostr_trade_on_slow_relay() {
             .unwrap_or_default()
     };
     let started = Instant::now();
-    let mut slowed = false;
     loop {
         let (m, t) = (state(&e.maker), state(&e.taker));
-        if !slowed && !["", "quoted", "first_validated"].contains(&m.as_str()) {
-            e.tap.delay_replies_ms.store(6_000, SeqCst);
-            slowed = true;
-        }
         if m == "complete" && t == "complete" {
             break;
         }
@@ -1967,9 +1986,16 @@ async fn nostr_serve_completes_all_nostr_trade_on_slow_relay() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    let slowed = e.tap.slow_after_swaps.lock().unwrap().is_none()
+        && e.tap.delay_replies_ms.load(SeqCst) == 6_000;
+    let delays = e.tap.delays.lock().unwrap().clone();
+    let delayed = delays.iter().filter(|d| **d == 6_000).count();
     eprintln!(
-        "bug3 serve: complete after {:?} (slowed={slowed})",
-        started.elapsed()
+        "bug3 serve: complete {:?} after the taker journaled the swap, {:?} after serve start \
+         (slowed={slowed}, {} delayed replies, {delayed} of them by 6 s)",
+        started.elapsed(),
+        serve_started.elapsed(),
+        delays.len()
     );
     let _ = take.wait().await;
     maker.kill().await.unwrap();
@@ -1981,6 +2007,10 @@ async fn nostr_serve_completes_all_nostr_trade_on_slow_relay() {
         .map(|l| l.matches("trade message timed out").count())
         .sum::<usize>();
     assert!(slowed, "fixture: the claim phases ran on the 6 s relay");
+    assert!(
+        delayed >= 20,
+        "fixture: the trade's mint calls ran on the 6 s relay ({delayed} replies delayed 6 s)"
+    );
     assert_eq!(
         dropped, 0,
         "a nostr:// trade message must not hit the HTTP-sized 60 s message budget"
