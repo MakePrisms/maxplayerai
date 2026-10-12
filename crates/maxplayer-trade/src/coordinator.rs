@@ -398,6 +398,13 @@ pub async fn handle(home: &Path, j: &Journal, m: &Market, e: &Event) -> Result<(
 // Narrow legacy compatibility bridge, authorized for recorded unanswered/timeout errors only.
 // Never match arbitrary occurrences of "timeout" in peer-provided terms or mint details.
 fn legacy_unanswered(reason: &str) -> bool {
+    // Older raw-Nostr errors wrapped the typed CDK display in this exact local context.
+    // Inspect its leading type, never a timeout-looking suffix inside arbitrary detail.
+    let cause = reason
+        .strip_prefix("mint ")
+        .and_then(|s| s.split_once(": ").map(|(_, cause)| cause))
+        .and_then(|s| s.strip_suffix(" (no mint NUT error; ambiguous)"))
+        .unwrap_or(reason);
     [
         "Http transport error None: ",
         "Http transport error Some(429): ",
@@ -406,13 +413,12 @@ fn legacy_unanswered(reason: &str) -> bool {
         "Http transport error Some(504): ",
     ]
     .iter()
-    .any(|prefix| reason.starts_with(prefix))
-        || reason == "Operation timeout"
+    .any(|prefix| cause.starts_with(prefix))
+        || cause == "Operation timeout"
         || reason == "CDK wallet request not answered"
         || reason == "no answer within the CDK wallet bound"
         || reason.starts_with("mint ")
-            && (reason.ends_with("Operation timeout (no mint NUT error; ambiguous)")
-                || reason.ends_with("no answer within the nostr bound (ambiguous)")
+            && (reason.ends_with("no answer within the nostr bound (ambiguous)")
                 || reason.ends_with("keysets: timed out")
                 || reason.ends_with("no answer within the HTTP bound (ambiguous)"))
         || reason.starts_with("mint ")
@@ -1898,6 +1904,7 @@ mod initial_retry_tests {
             "CDK wallet request not answered",
             "Http transport error None: no relay reachable for mint nostr://example",
             "Http transport error Some(503): unavailable",
+            "mint nostr://example keysets: Http transport error None: no relay reachable (no mint NUT error; ambiguous)",
             "mint https://example checkstate: HTTP 503 Service Unavailable (body withheld)",
             "mint nostr://example backing off (timeout), 30s left; request not sent",
             "mint nostr://example backing off (429), 2s left; request not sent",
@@ -1913,6 +1920,7 @@ mod initial_retry_tests {
             "timeout",
             "bad terms timeout",
             "Http transport error Some(400): bad request",
+            "mint nostr://example keysets: Http transport error Some(400): Operation timeout (no mint NUT error; ambiguous)",
             "Http transport error Some(500): internal",
             "mint https://example checkstate: HTTP 400 Bad Request (body withheld)",
             "mint example backing off (bad terms), 30s left; request not sent",
