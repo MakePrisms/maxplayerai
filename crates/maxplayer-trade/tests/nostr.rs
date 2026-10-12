@@ -1626,6 +1626,112 @@ async fn nostr_send_survives_slow_keysets_reply() {
     assert_eq!(balance(&e.maker, &n.url).await, 40, "SAFETY: debited once");
 }
 
+/// The BUILT binary's `list --dry-run`, `discover` and `take --dry-run` price lots on `nostr://`
+/// mints: their keysets reads go through the mint transport (kind 23410 `keysets` on the mint
+/// relay), never a raw HTTP GET of `nostr://…/v1/keysets`. The library-level `list`/`take`
+/// helpers above bypass this lock-free CLI path, so only the binary covers it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nostr_cli_dry_runs_and_discover_price_lots() {
+    let e = env().await;
+    let n1 = e.nostr_mint().await;
+    let n2 = e.nostr_mint().await;
+    e.fund_nostr(&e.maker, &n1, 128).await;
+    e.fund_nostr(&e.taker, &n2, 128).await;
+    let market = e._market_relay.url().await.to_string();
+    e.tap.reset();
+    let keysets_reads = |tap: &Tap| {
+        tap.requests
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|s| s.op == "keysets")
+            .count()
+    };
+    let (code, out, err) = cli(
+        &e,
+        &e.maker,
+        &[
+            "--relay",
+            &market,
+            "list",
+            "--give-mint",
+            &n1.url,
+            "--give",
+            "32",
+            "--want-mint",
+            &n2.url,
+            "--want",
+            "24",
+            "--dry-run",
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "list --dry-run on nostr mints: {err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(v["you_give"]["mint"], n1.url.as_str());
+    assert!(v["you_give"]["error"].is_null(), "{v}");
+    assert_eq!(v["you_give"]["net"], 32);
+    assert_eq!(v["you_receive"]["leg"]["net"], 24, "{v}");
+    assert!(
+        keysets_reads(&e.tap) >= 2,
+        "SAFETY: both legs' keysets read over the mint relay"
+    );
+    assert!(!rows(&e.maker, &n1.url).await.1, "dry run reserves nothing");
+
+    let lot = e.list(&n1.url, 32, &n2.url, 24).await;
+    let (code, out, err) = cli(&e, &e.taker, &["--relay", &market, "discover"]).await;
+    assert_eq!(code, 0, "discover: {err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    let listing = v["listings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["lot_id"] == lot.as_str())
+        .expect("listed lot discovered")
+        .clone();
+    assert_eq!(listing["expected_fees"]["give"]["net"], 32, "{listing}");
+    assert_eq!(listing["expected_fees"]["want"]["net"], 24, "{listing}");
+
+    e.tap.reset();
+    let (code, out, err) = cli(
+        &e,
+        &e.taker,
+        &[
+            "--relay",
+            &market,
+            "take",
+            &lot,
+            "--max-give",
+            "40",
+            "--min-receive",
+            "32",
+            "--dry-run",
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "take --dry-run on nostr mints: {err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(v["lot_id"], lot.as_str());
+    assert_eq!(v["you_give"]["mint"], n2.url.as_str());
+    assert!(v["you_give"]["error"].is_null(), "{v}");
+    assert_eq!(v["you_receive"]["leg"]["net"], 32, "{v}");
+    assert!(
+        keysets_reads(&e.tap) >= 2,
+        "SAFETY: keysets over the mint relay"
+    );
+    assert!(
+        e.jt.all::<Swap>("swap").await.unwrap().is_empty(),
+        "SAFETY: take --dry-run journals no swap"
+    );
+    assert_eq!(
+        e.tap.misrouted.load(SeqCst),
+        0,
+        "SAFETY: no misrouted kinds"
+    );
+}
+
 /// Bug 2 (external tester): a maker swap whose lock swap never executed must reach `expired` and
 /// stop blocking that taker ("taker quote limit"). The lock swap is answered `expired` and never
 /// reaches the mint; past `send_before + NOSTR_ABANDON_GRACE_SECONDS` maker recovery runs with

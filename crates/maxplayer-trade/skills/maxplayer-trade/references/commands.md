@@ -1,6 +1,9 @@
 # Commands and monetary bounds
 
 Every invocation starts `maxplayer-trade --home <private-absolute-home>`.
+Build the production binary as in the crate README's "Build and automated tests" section:
+the crate is its own Cargo workspace, so `cargo build -p maxplayer-trade` from the repository
+root fails; build it by manifest path, release profile, locked (no protoc needed for the binary).
 Optional repeated global `--relay <url>` goes before the subcommand; preserve the
 same relay set during recovery. Use the binary's default relays unless deliberately
 configured; defaults at verified base 1929972 are `wss://nos.lol`,
@@ -42,7 +45,9 @@ and `--max-fees` (default 16 on list/take; on send it is required unless the min
 canonical URLs, or `nostr://<npub>` for a Nostr-reachable mint (hex or uppercase input is
 canonicalized to the lowercase npub). `fund` and `withdraw` refuse `nostr://` mints before
 any journal entry: the Maxplayer credits mint serves no NUT-04/05/20; `receive` is how credits
-enter a home. Lot arguments are public lot IDs; `--quote` is a saved funding
+enter a home. A zero `--amount`, `--give`, `--want`, `--max-give` or `--max-debit` is refused
+before anything else (no home, lock, relay or mint) with `amount must be at least 1 sat
+(<flag> 0)`; `--min-receive 0` and `--max-fees 0` stay valid bounds. Lot arguments are public lot IDs; `--quote` is a saved funding
 quote for the same mint and amount.
 Never use a lab-feature binary for the human's funds.
 
@@ -85,8 +90,8 @@ passing advertisement checks is not independent refund interoperability evidence
 `balance` and `status` are lock-free read-only SQLite snapshots, available during
 `serve`, without submission of earlier authorizations; neither makes network calls
 except `status --check-sends` (read-only NUT-07 per sent token). `status`
-prints one readable line per lot/swap/funding/withdrawal/receive, unresolved items
-first, any `counterparty_unresponsive` warning, and the exit-code meanings;
+prints one readable line per lot/swap/funding/withdrawal/receive/send, unresolved items
+first (non-terminal and manual-recovery sends included, so reserved send inputs are visible), any `counterparty_unresponsive` warning, and the exit-code meanings;
 `status --json` prints the unchanged raw public records for scripts.
 
 `discover` is lock-free and read-only too: it reads relays only, with a throwaway
@@ -128,6 +133,9 @@ locks are live. `recover` is a bounded single pass, not a replacement watcher;
 see [recovery](recovery.md) for exit codes and states.
 
 ## Funding
+
+`fund <mint> --amount 0` is refused with `amount must be at least 1 sat (--amount 0)`;
+above 100,000 sats it is `funding cap exceeds 100,000 sats`.
 
 The printed invoice is a request for payment, not proof of issuance. Confirm the
 mint and amount, then let the human pay it once from their own wallet. Include any
@@ -172,7 +180,7 @@ existing path, including a symlink, is refused). The token is never printed and 
 accepted through argv. Only ordinary unreserved balance is spent: locked HTLC/P2PK
 proofs and proofs reserved by a swap, withdrawal, receive or send are excluded. The
 mint input fee is paid by the sender; `--max-fees` is required unless it is 0. Refused
-**before anything is journaled**: amount above **100,000 sats**, insufficient balance,
+**before anything is journaled**: amount 0 or above **100,000 sats**, insufficient balance,
 fee above `--max-fees`, existing `--out`, failed preflight or non-UNSPENT inputs.
 
 One swap of the selected inputs into the exact send outputs plus change; inputs,
@@ -225,6 +233,13 @@ same invoice; it cannot later pay merely because recovery runs or funds arrive.
 A first POST requires more than 60 seconds of quote lifetime. After a submitted
 request becomes ambiguous, recovery replays exactly the saved inputs/outputs/quote,
 never a replacement authorization. Deduplication uses payment hash across mints.
+
+Refused before any mint request, reservation or journal entry (exit 1): a
+non-mainnet invoice (`invoice is for testnet; this mint pays Bitcoin mainnet invoices;
+nothing was journaled or sent`), an invoice already expired (`invoice expired at
+<UTC>; nothing was journaled or sent`) or expiring within 30 seconds (`invoice expires
+at <UTC>, within 30 s; …`), an amountless, zero-amount or over-cap invoice. Resuming an
+invoice that is already journaled skips these checks and continues the saved authorization.
 
 Require an amount-bearing, unexpired user-supplied BOLT11; do not generate an
 invoice or choose a destination for the human. The receipt must distinguish the

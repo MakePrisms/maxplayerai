@@ -296,9 +296,151 @@ pub fn gross(net: u64, ppk: u64) -> Result<(u64, u64)> {
     }
     bail!("cannot solve bounded fee-inclusive split")
 }
+
+/// Why a bounded recovery item was deferred, safe to print: "timeout after Ns", or the
+/// error chain (`{:#}`) with anything that could be secret material redacted. Cashu
+/// tokens (`cashuA…`/`cashuB…`) and long hex runs (secrets, preimages, proof `C`
+/// points, blinded messages, signatures: 32+ hex chars) never reach the output.
+pub fn deferral_reason<T>(
+    item: &std::result::Result<Result<T>, tokio::time::error::Elapsed>,
+    seconds: u64,
+) -> String {
+    match item {
+        Err(_) => format!("timeout after {seconds}s"),
+        Ok(Err(error)) => redact_reason(&format!("{error:#}")),
+        Ok(Ok(_)) => "item still non-terminal after this pass".into(),
+    }
+}
+
+/// Does a `cashuA`/`cashuB` prefix (any case: QR alphanumeric mode upper-cases it) start at `at`?
+fn token_prefix_at(bytes: &[u8], at: usize) -> bool {
+    bytes.len() - at >= 6
+        && (bytes[at..at + 6].eq_ignore_ascii_case(b"cashua")
+            || bytes[at..at + 6].eq_ignore_ascii_case(b"cashub"))
+}
+
+/// Redact token- and secret-shaped substrings from a human-readable reason: `cashuA`/`cashuB`
+/// runs (any case; base64, base64url and `%`-encoded bodies) and hex runs of 32+ characters.
+/// Keyset ids (16 hex), codes, mint URLs and npubs stay readable. Truncated to 600 characters.
+pub fn redact_reason(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if token_prefix_at(bytes, i) {
+            let mut k = i + 6;
+            while k < bytes.len()
+                && (bytes[k].is_ascii_alphanumeric()
+                    || matches!(bytes[k], b'-' | b'_' | b'=' | b'+' | b'/' | b'%'))
+            {
+                k += 1;
+            }
+            out.push_str("<redacted token>");
+            i = k;
+            continue;
+        }
+        if bytes[i].is_ascii_hexdigit() {
+            let mut k = i;
+            while k < bytes.len() && bytes[k].is_ascii_hexdigit() && !token_prefix_at(bytes, k) {
+                k += 1;
+            }
+            if k - i >= 32 {
+                out.push_str("<redacted hex>");
+            } else {
+                out.push_str(&text[i..k]);
+            }
+            i = k;
+            continue;
+        }
+        // `i` is always on a char boundary: every run above ends on an ASCII byte.
+        let ch = text[i..].chars().next().expect("index within text");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    const MAX: usize = 600;
+    if out.chars().count() > MAX {
+        out = out.chars().take(MAX).collect::<String>() + "…";
+    }
+    out
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn deferral_reason_names_timeout_and_redacts_secrets() {
+        let elapsed: std::result::Result<Result<()>, _> = Err(tokio_elapsed());
+        assert_eq!(deferral_reason(&elapsed, 40), "timeout after 40s");
+        let secret = "ab".repeat(32);
+        let token = "cashuBo2FteBtodHRwOi8vMTI3LjAuMC4xOjF-sat_+/=";
+        let e: std::result::Result<Result<()>, tokio::time::error::Elapsed> = Ok(Err(
+            anyhow::anyhow!("mint said no for {secret} in {token}").context("restore failed"),
+        ));
+        let reason = deferral_reason(&e, 40);
+        assert!(
+            reason.starts_with("restore failed: mint said no for"),
+            "{reason}"
+        );
+        assert!(
+            !reason.contains(&secret) && !reason.contains("cashuB"),
+            "{reason}"
+        );
+        assert!(reason.contains("<redacted hex>") && reason.contains("<redacted token>"));
+        // Short hex (keyset ids, ports, codes) stays readable.
+        assert_eq!(
+            redact_reason("keyset 009a1f293253e41e code 11001"),
+            "keyset 009a1f293253e41e code 11001"
+        );
+    }
+    #[test]
+    fn redact_reason_covers_prefix_variants_alphabets_case_and_truncation() {
+        let cases: &[(&str, &str)] = &[
+            // Standard base64 alphabet (`+/=`) and base64url (`-_`).
+            ("x cashuAeyJ0+b2/tZW4i= y", "x <redacted token> y"),
+            ("x cashuBo2F-te_Bt y", "x <redacted token> y"),
+            // Uppercase (QR alphanumeric mode) and mixed case.
+            ("x CASHUBO2FTEBTODHRW y", "x <redacted token> y"),
+            ("x CashuAeyJ0b2 y", "x <redacted token> y"),
+            // Percent-encoded: the run continues past `%`, nothing after it leaks.
+            ("x cashuB%2Fo2F%3DteBt%2B y", "x <redacted token> y"),
+            // Token at the very end, and glued to a short hex word.
+            ("token: cashuBo2FteBt", "token: <redacted token>"),
+            ("beefcashuBo2F", "beef<redacted token>"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(redact_reason(input), *want, "{input}");
+        }
+        // Uppercase and mixed-case hex runs of 32+ are redacted; 31 stays.
+        let upper = "AB".repeat(33);
+        let mixed = "aB".repeat(16);
+        let short = "a".repeat(31);
+        assert_eq!(
+            redact_reason(&format!("C {upper} s {mixed} k {short}")),
+            format!("C <redacted hex> s <redacted hex> k {short}")
+        );
+        // Mint URLs, npubs and non-ASCII text stay readable.
+        let keep = "mint https://mint.minibits.cash/Bitcoin nostr://npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d — ok";
+        assert_eq!(redact_reason(keep), keep);
+        // Truncation at 600 characters, after redaction (a long token never survives truncation).
+        let long = format!("{} cashuB{}", "é".repeat(700), "Q".repeat(100));
+        let red = redact_reason(&long);
+        assert_eq!(red.chars().count(), 601, "600 chars plus the ellipsis");
+        assert!(red.ends_with('…') && !red.contains("cashuB"));
+        assert_eq!(redact_reason(&"z".repeat(600)), "z".repeat(600));
+    }
+    fn tokio_elapsed() -> tokio::time::error::Elapsed {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(1),
+                    std::future::pending::<()>(),
+                )
+                .await
+            })
+            .unwrap_err()
+    }
     #[test]
     fn asset_identity_includes_mint() {
         assert_ne!(
