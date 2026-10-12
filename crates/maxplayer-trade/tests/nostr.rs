@@ -90,6 +90,7 @@ struct Tap {
     silent: AtomicBool,
     silenced: AtomicU64,
     info_mode: AtomicU64,
+    info_mint: Mutex<Option<nostr_sdk::prelude::PublicKey>>,
     rewritten: Mutex<HashSet<EventId>>,
 }
 impl Tap {
@@ -185,6 +186,11 @@ impl Tap {
                 .find_map(|id| self.requests.lock().unwrap().get(id).map(|s| s.op.clone()));
             let mode = self.info_mode.load(SeqCst);
             if op.as_deref() == Some("info")
+                && self
+                    .info_mint
+                    .lock()
+                    .unwrap()
+                    .is_none_or(|key| key == event.pubkey)
                 && mode > 0
                 && !self.rewritten.lock().unwrap().remove(&event.id)
             {
@@ -1698,6 +1704,7 @@ async fn cli(e: &Env, home: &Path, args: &[&str]) -> (i32, String, String) {
         .arg(home)
         .args(["--mint-relay", &e.mint_relay_url])
         .args(args)
+        .kill_on_drop(true)
         .output()
         .await
         .unwrap();
@@ -2785,7 +2792,17 @@ async fn incompatible_counterparty_blocks_cli_and_ipc_before_new_effects() {
     e.fund_nostr(&e.taker, &n2, 128).await;
     let lot = e.list(&n1.url, 32, &n2.url, 24).await;
     e.tap.info_mode.store(1, SeqCst);
+    *e.tap.info_mint.lock().unwrap() = Some(n1.keys.public_key());
     e.tap.reset();
+    maxplayer_trade::backoff::set_wait_for_pacing(true);
+    let error = coordinator::start_take(&e.taker, &e.jt, &e.mt, &lot, 40, 32, 16)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("upgrade the mint sidecar"));
+    assert!(
+        e.jt.all::<Swap>("swap").await.unwrap().is_empty(),
+        "counterparty gate precedes all new effects"
+    );
     let (code, _, err) = cli(
         &e,
         &e.taker,
@@ -2854,7 +2871,7 @@ async fn incompatible_counterparty_blocks_cli_and_ipc_before_new_effects() {
         assert!(
             diagnostics
                 .iter()
-                .any(|l| l.contains(&n2.url) && l.contains("incompatible")),
+                .any(|l| l.contains(&n2.url) && l.contains("supported_advertised")),
             "both reports forwarded, even on refusal"
         );
     };
@@ -2868,6 +2885,7 @@ async fn incompatible_counterparty_blocks_cli_and_ipc_before_new_effects() {
     .unwrap();
     assert!(e.jt.all::<Swap>("swap").await.unwrap().is_empty());
     assert!(e.tap.swaps().is_empty());
+    maxplayer_trade::backoff::set_wait_for_pacing(false);
 }
 
 #[cfg(feature = "lab")]

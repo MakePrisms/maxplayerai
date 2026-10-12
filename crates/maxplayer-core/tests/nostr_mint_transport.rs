@@ -568,6 +568,12 @@ async fn diagnostics_control_frames_require_event_and_subscription_correlation()
             "unrelated CLOSED must not poison this subscription"
         );
         assert_eq!(r.notice, mode == "notice");
+        if mode == "refused" {
+            assert!(
+                r.publish_failed,
+                "retain the failed pooled publish Output, not only raw OK"
+            );
+        }
         if mode == "auth_failed" {
             assert_eq!(r.auth, "failed");
         }
