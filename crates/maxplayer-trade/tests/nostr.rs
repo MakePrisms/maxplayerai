@@ -3006,3 +3006,29 @@ async fn initial_unanswered_queue_is_bounded_and_rechecks_lot_availability() {
     assert_eq!(retained_rows(&e.jm).await, 64);
     assert!(e.jm.all::<Swap>("swap").await.unwrap().is_empty());
 }
+
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compatibility_advertisement_never_strands_admitted_trade() {
+    let mut e = env().await;
+    let _lab = SilentLab::new();
+    let n1 = e.nostr_mint().await;
+    let n2 = e.nostr_mint().await;
+    e.fund_nostr(&e.maker.clone(), &n1, 128).await;
+    e.fund_nostr(&e.taker.clone(), &n2, 128).await;
+    let lot = e.list(&n1.url, 32, &n2.url, 24).await;
+    let id = e.take(&lot, 40, 32).await;
+    e.step_until(true, &id, "quoted").await;
+    e.tap.info_mode.store(1, SeqCst);
+    maxplayer_trade::backoff::set_wait_for_pacing(true);
+    assert!(
+        wallet::preflight_admission(&n1.url).await.is_err(),
+        "new admission is blocked"
+    );
+    // This authorized swap already exists. Only its original protocol/timing checks apply.
+    e.step_until(false, &id, "first_locked").await;
+    e.step_until(true, &id, "second_locked").await;
+    let (maker, taker) = e.pump_terminal(&id).await;
+    assert_eq!(maker, "complete");
+    assert_eq!(taker, "complete");
+}
