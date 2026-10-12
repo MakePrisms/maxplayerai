@@ -71,6 +71,20 @@ struct Tap {
     /// One-shot: skip `n` replies to `op`, then delay the next one by `ms` (e.g. the CDK wallet's
     /// `keysets` read after preflight's own).
     delay_op_reply: Mutex<Option<(String, u32, u64)>>,
+    /// Slow mint relay: every mint reply (kind 23411) reaches the wallet this long after the mint
+    /// sent it. The first reply to a request is refused and the identical mint-signed event is
+    /// re-published after the delay (nothing blocks the sidecar or the relay connection); later
+    /// replies to the same request are dropped. Each nostr:// call then takes >= this long.
+    delay_replies_ms: AtomicU64,
+    delayed: Mutex<HashSet<EventId>>,
+    /// The delay (ms) each delayed reply got, in order.
+    delays: Mutex<Vec<u64>>,
+    released: Mutex<HashSet<EventId>>,
+    /// Market relay down for writes: refuse every event published to the market relay.
+    reject_market_writes: AtomicBool,
+    /// `(n, ms)`: once the n-th distinct swap request is seen, set `delay_replies_ms` to `ms`
+    /// (e.g. slow every reply from the maker's lock swap on, after both locks raced their deadlines).
+    slow_after_swaps: Mutex<Option<(usize, u64)>>,
 }
 impl Tap {
     async fn admit(&self, event: &Event, mint_relay: bool) -> PolicyResult {
@@ -78,6 +92,9 @@ impl Tap {
         if !mint_relay {
             if kind == REQUEST_KIND || kind == RESPONSE_KIND {
                 self.misrouted.fetch_add(1, SeqCst);
+            }
+            if self.reject_market_writes.load(SeqCst) {
+                return PolicyResult::Reject("tap: market relay down".into());
             }
             return PolicyResult::Accept;
         }
@@ -105,6 +122,21 @@ impl Tap {
                             })
                             .count += 1;
                         if swap {
+                            let mut slow = self.slow_after_swaps.lock().unwrap();
+                            if let Some((n, ms)) = *slow {
+                                let seen = self
+                                    .requests
+                                    .lock()
+                                    .unwrap()
+                                    .values()
+                                    .filter(|s| s.op == "swap")
+                                    .count();
+                                if seen >= n {
+                                    self.delay_replies_ms.store(ms, SeqCst);
+                                    *slow = None;
+                                }
+                            }
+                            drop(slow);
                             let mut expired = self.expired.lock().unwrap();
                             if expired.contains(&event.id) {
                                 return PolicyResult::Reject("tap: expired request".into());
@@ -125,6 +157,18 @@ impl Tap {
                 }
             }
         } else if kind == RESPONSE_KIND {
+            let delay = self.delay_replies_ms.load(SeqCst);
+            if !self.released.lock().unwrap().remove(&event.id) && delay > 0 {
+                if let Some(request) = event.tags.event_ids().next().copied() {
+                    if self.delayed.lock().unwrap().insert(request) {
+                        self.delays.lock().unwrap().push(delay);
+                        self.released.lock().unwrap().insert(event.id);
+                        let relay = self.relay.lock().unwrap().clone().unwrap();
+                        tokio::spawn(republish(event.clone(), relay, delay));
+                    }
+                    return PolicyResult::Reject("tap: reply delayed".into());
+                }
+            }
             let op = event
                 .tags
                 .event_ids()
@@ -216,6 +260,16 @@ async fn answer_expired(mint: Keys, to: Event, request_id: String, relay: String
     client.connect().await;
     client.wait_for_connection(Duration::from_secs(5)).await;
     client.send_event(&reply).await.unwrap();
+    client.disconnect().await;
+}
+/// Publish `event` (already signed) to `relay` after `delay_ms`.
+async fn republish(event: Event, relay: String, delay_ms: u64) {
+    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+    let client = Client::default();
+    client.add_relay(relay.as_str()).await.unwrap();
+    client.connect().await;
+    client.wait_for_connection(Duration::from_secs(5)).await;
+    let _ = client.send_event(&event).await;
     client.disconnect().await;
 }
 #[derive(Debug, Clone)]
@@ -1670,6 +1724,412 @@ async fn nostr_cli_dry_runs_and_discover_price_lots() {
     assert!(
         e.jt.all::<Swap>("swap").await.unwrap().is_empty(),
         "SAFETY: take --dry-run journals no swap"
+    );
+    assert_eq!(
+        e.tap.misrouted.load(SeqCst),
+        0,
+        "SAFETY: no misrouted kinds"
+    );
+}
+
+/// Bug 2 (external tester): a maker swap whose lock swap never executed must reach `expired` and
+/// stop blocking that taker ("taker quote limit"). The lock swap is answered `expired` and never
+/// reaches the mint; past `send_before + NOSTR_ABANDON_GRACE_SECONDS` maker recovery runs with
+/// every mint reply delayed `reply_delay_ms`, and/or with the market relay refusing writes. Returns
+/// the maker swap state after each recovery tick and the same taker's next quote request result.
+#[cfg(feature = "lab")]
+async fn abandoned_maker_lock_case(reply_delay_ms: u64, market_down: bool) {
+    let mut e = env().await;
+    let n1 = e.nostr_mint().await;
+    let n2 = e.nostr_mint().await;
+    e.fund_nostr(&e.maker.clone(), &n1, 128).await;
+    // A second maker proof, so a second lot can be listed while the first lot's input is reserved.
+    let dir = tempfile::tempdir().unwrap();
+    let issued = issue::issue(&n1.mint, dir.path(), &n1.url, 64)
+        .await
+        .unwrap();
+    let token = std::fs::read_to_string(issued.file).unwrap();
+    receive::receive(&e.maker, &e.jm, &n1.url, &token)
+        .await
+        .unwrap();
+    e.fund_nostr(&e.taker.clone(), &n2, 128).await;
+    let lot = e.list(&n1.url, 32, &n2.url, 24).await;
+    let lot2 = e.list(&n1.url, 16, &n2.url, 8).await;
+    let id = e.take(&lot, 40, 32).await;
+    e.step_until(true, &id, "quoted").await;
+    e.step_until(false, &id, "first_locked").await;
+    e.tap.reset();
+    e.tap.expire_next_swap.store(true, SeqCst);
+    e.step_until(true, &id, "first_validated").await;
+    let lock_id = format!("{id}-lock");
+    let lock = attempt(&e.jm, &lock_id).await;
+    assert!(
+        lock["done"] == false && lock["abandoned"] == false && lock["result"].is_null(),
+        "fixture: lock journaled and unanswered: {lock}"
+    );
+    assert_eq!(
+        e.tap.expired.lock().unwrap().len(),
+        1,
+        "fixture: the maker's lock swap never reached the mint"
+    );
+    let q =
+        e.jm.get::<Swap>("swap", &id)
+            .await
+            .unwrap()
+            .unwrap()
+            .quote
+            .unwrap();
+    let send_before = q.exp.min(q.short - q.cutoff);
+    assert_eq!(lock["send_before"], send_before, "fixture: lock deadline");
+    until(send_before + transport::NOSTR_ABANDON_GRACE_SECONDS).await;
+    // The taker's own lock refunds after long + margin; it may then take another lot.
+    coordinator::recover(&e.taker, &e.jt, &e.mt).await.unwrap();
+    assert_eq!(e.state(false, &id).await.as_deref(), Some("refunded"));
+    e.tap.delay_replies_ms.store(reply_delay_ms, SeqCst);
+    e.tap.reject_market_writes.store(market_down, SeqCst);
+    let mut observed = vec![];
+    for _ in 0..2 {
+        let started = Instant::now();
+        coordinator::recover(&e.maker, &e.jm, &e.mm).await.unwrap();
+        let state = e.state(true, &id).await.unwrap_or_default();
+        observed.push(format!("{state} after {:?}", started.elapsed()));
+        if state == "expired" {
+            break;
+        }
+    }
+    let expired_while_degraded = e.state(true, &id).await;
+    e.tap.delay_replies_ms.store(0, SeqCst);
+    e.tap.reject_market_writes.store(false, SeqCst);
+    let id2 = e.take(&lot2, 24, 16).await;
+    let mut admission = None;
+    for _ in 0..100 {
+        if let Ok(Some(ev)) =
+            tokio::time::timeout(Duration::from_millis(200), e.mm.inbox.recv()).await
+        {
+            if e.mm.decode(&ev).is_ok_and(|m| m.swap_id == id2) {
+                admission = Some(
+                    coordinator::handle(&e.maker, &e.jm, &e.mm, &ev)
+                        .await
+                        .map_err(|x| format!("{x:#}")),
+                );
+                break;
+            }
+        }
+    }
+    eprintln!(
+        "bug2 (reply delay {reply_delay_ms} ms, market down {market_down}): maker swap per recovery tick {observed:?}; the same taker's next request: {admission:?}"
+    );
+    let lock = attempt(&e.jm, &lock_id).await;
+    assert!(
+        lock["done"] == false && lock["result"].is_null(),
+        "SAFETY: the abandoned lock never executed: {lock}"
+    );
+    assert_eq!(
+        balance(&e.taker, &n1.url).await,
+        0,
+        "SAFETY: nothing paid out"
+    );
+    // Unspent proofs, reserved or not (lot 2 still reserves its input): every sat stays the maker's.
+    let held: u64 = {
+        use cdk::cdk_database::WalletDatabase;
+        let db = wallet::database(&e.maker, &n1.url).await.unwrap();
+        db.get_proofs(Some(n1.url.parse().unwrap()), None, None, None)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p.state,
+                    cdk::nuts::State::Unspent | cdk::nuts::State::Reserved
+                )
+            })
+            .map(|p| u64::from(p.proof.amount))
+            .sum()
+    };
+    assert_eq!(held, 192, "SAFETY: maker keeps every sat");
+    assert_eq!(
+        expired_while_degraded.as_deref(),
+        Some("expired"),
+        "an abandoned, not-landed maker lock must expire: {observed:?}"
+    );
+    // Admission passed the per-taker guard once the swap is journaled `quoted`. Sending the quote
+    // may still fail while the market relay's publication backoff from the outage runs.
+    assert!(
+        admission
+            .as_ref()
+            .is_some_and(|r| r.as_ref().err().is_none_or(|x| !x.contains("quote limit"))),
+        "the taker must no longer be refused: {admission:?}"
+    );
+    assert_eq!(e.state(true, &id2).await.as_deref(), Some("quoted"));
+}
+/// Every mint reply 19 s late: the expiry chain (9 calls, >= 171 s) outran the old 140 s item budget.
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nostr_abandoned_maker_lock_expires_on_slow_relay_and_frees_the_taker() {
+    abandoned_maker_lock_case(19_000, false).await;
+}
+/// Market relay down: the cancelled-listing publication must not keep the swap open.
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nostr_abandoned_maker_lock_expires_while_market_relay_is_down() {
+    abandoned_maker_lock_case(0, true).await;
+}
+
+/// Bug 3: on a slow relay (every mint reply 2.5 s late) the taker's claim runs into its deadline. Safe
+/// either way: no swap sent before the maker's refund locktime outlives `short - cutoff` unless
+/// the trade completed, and no sat is created or lost on either mint.
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nostr_slow_relay_near_deadline_claim_stays_safe() {
+    let mut e = env().await;
+    let n1 = e.nostr_mint().await;
+    let n2 = e.nostr_mint().await;
+    e.fund_nostr(&e.maker.clone(), &n1, 128).await;
+    e.fund_nostr(&e.taker.clone(), &n2, 128).await;
+    let lot = e.list(&n1.url, 32, &n2.url, 24).await;
+    let id = e.take(&lot, 40, 32).await;
+    e.step_until(true, &id, "quoted").await;
+    e.step_until(false, &id, "first_locked").await;
+    e.step_until(true, &id, "second_locked").await;
+    let q =
+        e.jm.get::<Swap>("swap", &id)
+            .await
+            .unwrap()
+            .unwrap()
+            .quote
+            .unwrap();
+    let send_before = q.short - q.cutoff;
+    e.tap.reset();
+    e.tap.delay_replies_ms.store(2_500, SeqCst);
+    let (maker, taker) = e.pump_terminal(&id).await;
+    e.tap.delay_replies_ms.store(0, SeqCst);
+    let held = [
+        balance(&e.maker, &n1.url).await,
+        balance(&e.taker, &n1.url).await,
+        balance(&e.maker, &n2.url).await,
+        balance(&e.taker, &n2.url).await,
+    ];
+    let swaps = e.tap.swaps();
+    let claim =
+        e.jt.get::<serde_json::Value>("attempt", &format!("{id}-claim"))
+            .await
+            .unwrap();
+    eprintln!(
+        "bug3 near-deadline: {maker}/{taker} {held:?}; send_before {send_before}; claim attempt {}; swaps {swaps:?}",
+        claim.is_some()
+    );
+    assert!(
+        held[0] + held[1] == 128 && held[2] + held[3] == 128,
+        "SAFETY: no sat created or lost: {held:?}"
+    );
+    if let Some(c) = &claim {
+        assert_eq!(
+            c["send_before"], send_before,
+            "SAFETY: claim bound to short - cutoff"
+        );
+    }
+    match (maker.as_str(), taker.as_str()) {
+        ("complete", "complete") => assert_eq!(held, [96, 32, 24, 104]),
+        ("refunded", "refunded") => {
+            assert_eq!(held, [128, 0, 0, 128], "SAFETY: both legs refunded in full");
+            assert!(
+                swaps
+                    .iter()
+                    .all(|s| s.exp - s.window > q.short || s.exp <= send_before),
+                "SAFETY: a claim swap never outlives short - cutoff ({send_before}): {swaps:?}"
+            );
+        }
+        other => panic!("SAFETY: mixed outcome {other:?} {held:?}"),
+    }
+}
+
+/// Start `maxplayer-trade serve` for `home` over the test relays; returns the child and its log.
+#[cfg(not(feature = "lab"))]
+async fn serve(e: &Env, home: &Path, market: &str) -> (tokio::process::Child, PathBuf) {
+    let log = e.root.path().join(format!(
+        "{}-serve.log",
+        home.file_name().unwrap().to_string_lossy()
+    ));
+    let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
+        .arg("--home")
+        .arg(home)
+        .args([
+            "--mint-relay",
+            &e.mint_relay_url,
+            "--relay",
+            market,
+            "serve",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&log).unwrap())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    while !std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .contains("{\"serve_socket\":\"")
+    {
+        assert!(started.elapsed() < Duration::from_secs(30), "serve socket");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    (child, log)
+}
+
+/// Bug 3: an all-nostr trade completes end to end through two `serve` processes on a slow mint
+/// relay. Every mint reply is 0.6 s late while the locks race their 40/60 s send deadlines, then
+/// 6 s late from the maker's lock swap on (switched by the tap, not by polling), so the taker's
+/// `second` message (>= 10 delayed calls before and after its claim swap, >= 60 s) outlasts the old
+/// 60 s HTTP message budget; no message may be dropped.
+#[cfg(not(feature = "lab"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nostr_serve_completes_all_nostr_trade_on_slow_relay() {
+    let e = env().await;
+    let n1 = e.nostr_mint().await;
+    let n2 = e.nostr_mint().await;
+    e.fund_nostr(&e.maker, &n1, 128).await;
+    e.fund_nostr(&e.taker, &n2, 128).await;
+    let market = e._market_relay.url().await.to_string();
+    e.tap.reset();
+    e.tap.delay_replies_ms.store(600, SeqCst);
+    *e.tap.slow_after_swaps.lock().unwrap() = Some((2, 6_000));
+    let serve_started = Instant::now();
+    let (mut maker, maker_log) = serve(&e, &e.maker, &market).await;
+    let (mut taker, taker_log) = serve(&e, &e.taker, &market).await;
+    let field = |out: &str, key: &str| {
+        out.lines()
+            .find_map(|l| {
+                serde_json::from_str::<serde_json::Value>(l)
+                    .ok()?
+                    .get(key)?
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| panic!("no {key} in {out}"))
+    };
+    let (code, out, err) = cli(
+        &e,
+        &e.maker,
+        &[
+            "--relay",
+            &market,
+            "list",
+            "--give-mint",
+            &n1.url,
+            "--give",
+            "32",
+            "--want-mint",
+            &n2.url,
+            "--want",
+            "24",
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "list via serve: {err}");
+    let lot = field(&out, "lot_id");
+    // `take` handed to serve streams until the swap is terminal: run it in the background.
+    let mut take = tokio::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
+        .arg("--home")
+        .arg(&e.taker)
+        .args([
+            "--mint-relay",
+            &e.mint_relay_url,
+            "--relay",
+            &market,
+            "take",
+            &lot,
+        ])
+        .args(["--max-give", "40", "--min-receive", "32"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let swap_id = || {
+        wallet::read_status(&e.taker).ok().and_then(|v| {
+            v["records"].as_array()?.iter().find_map(|r| {
+                (r["kind"] == "swap").then(|| r["id"].as_str().unwrap_or_default().to_owned())
+            })
+        })
+    };
+    let waited = Instant::now();
+    let id = loop {
+        if let Some(id) = swap_id() {
+            break id;
+        }
+        assert!(
+            waited.elapsed() < Duration::from_secs(60),
+            "take journaled no swap"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let state = |home: &Path| {
+        wallet::read_status(home)
+            .ok()
+            .and_then(|v| {
+                v["records"].as_array()?.iter().find_map(|r| {
+                    (r["kind"] == "swap" && r["id"] == id.as_str())
+                        .then(|| r["state"].as_str().unwrap_or_default().to_owned())
+                })
+            })
+            .unwrap_or_default()
+    };
+    let started = Instant::now();
+    loop {
+        let (m, t) = (state(&e.maker), state(&e.taker));
+        if m == "complete" && t == "complete" {
+            break;
+        }
+        if started.elapsed() > Duration::from_secs(900)
+            || TERMINAL.contains(&m.as_str()) && TERMINAL.contains(&t.as_str())
+        {
+            panic!(
+                "slow-relay serve trade ended {m}/{t} after {:?}\nmaker:\n{}\ntaker:\n{}",
+                started.elapsed(),
+                std::fs::read_to_string(&maker_log).unwrap_or_default(),
+                std::fs::read_to_string(&taker_log).unwrap_or_default()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let slowed = e.tap.slow_after_swaps.lock().unwrap().is_none()
+        && e.tap.delay_replies_ms.load(SeqCst) == 6_000;
+    let delays = e.tap.delays.lock().unwrap().clone();
+    let delayed = delays.iter().filter(|d| **d == 6_000).count();
+    eprintln!(
+        "bug3 serve: complete {:?} after the taker journaled the swap, {:?} after serve start \
+         (slowed={slowed}, {} delayed replies, {delayed} of them by 6 s)",
+        started.elapsed(),
+        serve_started.elapsed(),
+        delays.len()
+    );
+    let _ = take.wait().await;
+    maker.kill().await.unwrap();
+    taker.kill().await.unwrap();
+    e.tap.delay_replies_ms.store(0, SeqCst);
+    let logs = [&maker_log, &taker_log].map(|l| std::fs::read_to_string(l).unwrap_or_default());
+    let dropped = logs
+        .iter()
+        .map(|l| l.matches("trade message timed out").count())
+        .sum::<usize>();
+    assert!(slowed, "fixture: the claim phases ran on the 6 s relay");
+    assert!(
+        delayed >= 20,
+        "fixture: the trade's mint calls ran on the 6 s relay ({delayed} replies delayed 6 s)"
+    );
+    assert_eq!(
+        dropped, 0,
+        "a nostr:// trade message must not hit the HTTP-sized 60 s message budget"
+    );
+    assert_eq!(
+        [
+            balance(&e.maker, &n1.url).await,
+            balance(&e.taker, &n1.url).await,
+            balance(&e.maker, &n2.url).await,
+            balance(&e.taker, &n2.url).await,
+        ],
+        [96, 32, 24, 104],
+        "SAFETY: completed trade balances"
     );
     assert_eq!(
         e.tap.misrouted.load(SeqCst),

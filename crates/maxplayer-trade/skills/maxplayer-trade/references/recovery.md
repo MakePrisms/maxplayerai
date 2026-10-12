@@ -35,8 +35,9 @@ take or stop serve because of it.
 ## Bounded pass and exit status
 
 `recover` makes one pass without waiting for future lock deadlines. Each funding,
-withdrawal, receive, send, and swap attempt has a **120-second** budget; this is not a 120-second
-whole-command deadline. Items are handled sequentially and relay/setup/publication
+withdrawal, receive, send, and swap attempt has a **120-second** budget (a swap with a
+`nostr://` leg: up to 1040 seconds, sized for its worst-case count of 40-second nostr mint calls);
+this is not a whole-command deadline. Items are handled sequentially and relay/setup/publication
 work is additional. A timeout does not undo a delivered RPC or release reservations.
 
 - **0:** successful command; recovery has all items terminal, no deferred work or quarantine.
