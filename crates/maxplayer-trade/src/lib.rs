@@ -312,18 +312,26 @@ pub fn deferral_reason<T>(
     }
 }
 
-/// Redact token- and secret-shaped substrings from a human-readable reason.
+/// Does a `cashuA`/`cashuB` prefix (any case: QR alphanumeric mode upper-cases it) start at `at`?
+fn token_prefix_at(bytes: &[u8], at: usize) -> bool {
+    bytes.len() - at >= 6
+        && (bytes[at..at + 6].eq_ignore_ascii_case(b"cashua")
+            || bytes[at..at + 6].eq_ignore_ascii_case(b"cashub"))
+}
+
+/// Redact token- and secret-shaped substrings from a human-readable reason: `cashuA`/`cashuB`
+/// runs (any case; base64, base64url and `%`-encoded bodies) and hex runs of 32+ characters.
+/// Keyset ids (16 hex), codes, mint URLs and npubs stay readable. Truncated to 600 characters.
 pub fn redact_reason(text: &str) -> String {
+    let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
-    let chars: Vec<char> = text.chars().collect();
     let mut i = 0;
-    while i < chars.len() {
-        let rest: String = chars[i..chars.len().min(i + 6)].iter().collect();
-        if rest.starts_with("cashuA") || rest.starts_with("cashuB") {
-            let mut k = i;
-            while k < chars.len()
-                && (chars[k].is_ascii_alphanumeric()
-                    || matches!(chars[k], '-' | '_' | '=' | '+' | '/'))
+    while i < bytes.len() {
+        if token_prefix_at(bytes, i) {
+            let mut k = i + 6;
+            while k < bytes.len()
+                && (bytes[k].is_ascii_alphanumeric()
+                    || matches!(bytes[k], b'-' | b'_' | b'=' | b'+' | b'/' | b'%'))
             {
                 k += 1;
             }
@@ -331,21 +339,23 @@ pub fn redact_reason(text: &str) -> String {
             i = k;
             continue;
         }
-        if chars[i].is_ascii_hexdigit() {
+        if bytes[i].is_ascii_hexdigit() {
             let mut k = i;
-            while k < chars.len() && chars[k].is_ascii_hexdigit() {
+            while k < bytes.len() && bytes[k].is_ascii_hexdigit() && !token_prefix_at(bytes, k) {
                 k += 1;
             }
             if k - i >= 32 {
                 out.push_str("<redacted hex>");
             } else {
-                out.extend(&chars[i..k]);
+                out.push_str(&text[i..k]);
             }
             i = k;
             continue;
         }
-        out.push(chars[i]);
-        i += 1;
+        // `i` is always on a char boundary: every run above ends on an ASCII byte.
+        let ch = text[i..].chars().next().expect("index within text");
+        out.push(ch);
+        i += ch.len_utf8();
     }
     const MAX: usize = 600;
     if out.chars().count() > MAX {
@@ -355,6 +365,7 @@ pub fn redact_reason(text: &str) -> String {
 }
 #[cfg(test)]
 mod tests {
+    use super::*;
     #[test]
     fn deferral_reason_names_timeout_and_redacts_secrets() {
         let elapsed: std::result::Result<Result<()>, _> = Err(tokio_elapsed());
@@ -380,6 +391,42 @@ mod tests {
             "keyset 009a1f293253e41e code 11001"
         );
     }
+    #[test]
+    fn redact_reason_covers_prefix_variants_alphabets_case_and_truncation() {
+        let cases: &[(&str, &str)] = &[
+            // Standard base64 alphabet (`+/=`) and base64url (`-_`).
+            ("x cashuAeyJ0+b2/tZW4i= y", "x <redacted token> y"),
+            ("x cashuBo2F-te_Bt y", "x <redacted token> y"),
+            // Uppercase (QR alphanumeric mode) and mixed case.
+            ("x CASHUBO2FTEBTODHRW y", "x <redacted token> y"),
+            ("x CashuAeyJ0b2 y", "x <redacted token> y"),
+            // Percent-encoded: the run continues past `%`, nothing after it leaks.
+            ("x cashuB%2Fo2F%3DteBt%2B y", "x <redacted token> y"),
+            // Token at the very end, and glued to a short hex word.
+            ("token: cashuBo2FteBt", "token: <redacted token>"),
+            ("beefcashuBo2F", "beef<redacted token>"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(redact_reason(input), *want, "{input}");
+        }
+        // Uppercase and mixed-case hex runs of 32+ are redacted; 31 stays.
+        let upper = "AB".repeat(33);
+        let mixed = "aB".repeat(16);
+        let short = "a".repeat(31);
+        assert_eq!(
+            redact_reason(&format!("C {upper} s {mixed} k {short}")),
+            format!("C <redacted hex> s <redacted hex> k {short}")
+        );
+        // Mint URLs, npubs and non-ASCII text stay readable.
+        let keep = "mint https://mint.minibits.cash/Bitcoin nostr://npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d — ok";
+        assert_eq!(redact_reason(keep), keep);
+        // Truncation at 600 characters, after redaction (a long token never survives truncation).
+        let long = format!("{} cashuB{}", "é".repeat(700), "Q".repeat(100));
+        let red = redact_reason(&long);
+        assert_eq!(red.chars().count(), 601, "600 chars plus the ellipsis");
+        assert!(red.ends_with('…') && !red.contains("cashuB"));
+        assert_eq!(redact_reason(&"z".repeat(600)), "z".repeat(600));
+    }
     fn tokio_elapsed() -> tokio::time::error::Elapsed {
         tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -394,7 +441,6 @@ mod tests {
             })
             .unwrap_err()
     }
-    use super::*;
     #[test]
     fn asset_identity_includes_mint() {
         assert_ne!(

@@ -1350,7 +1350,7 @@ async fn readable_status_lists_unresolved_and_settled_sends_with_json_matching_c
     assert_eq!((unresolved, manual_n), (4, 1));
     assert!(
         text.contains(&format!(
-            "summary: {unresolved} unresolved, {manual_n} need manual recovery"
+            "summary: {unresolved} unresolved ({manual_n} of them need manual recovery)"
         )),
         "summary must match status --json:\n{text}"
     );

@@ -260,9 +260,63 @@ pub fn render(home: &Path) -> Result<String> {
         out.push_str(&format!("{l}\n"));
     }
     out.push_str(&format!(
-        "summary: {} unresolved, {} need manual recovery. Exit codes: recover/take exit 3 while unresolved items remain (keep serve running or rerun recover), 4 when manual recovery is needed, 0 when everything is settled. status itself always exits 0; use status --json for machine-readable records.",
+        "summary: {} unresolved ({} of them need manual recovery). Exit codes: recover/take exit 3 while unresolved items remain (keep serve running or rerun recover), 4 when manual recovery is needed, 0 when everything is settled. status itself always exits 0; use status --json for machine-readable records.",
         unresolved.len(),
         manual
     ));
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn attempt(state: &str) -> SendAttempt {
+        serde_json::from_value(serde_json::json!({
+            "id": "s1", "mint": "http://127.0.0.1:1", "state": state, "amount": 8, "fee": 0,
+            "out": "t", "swap": {"inputs": [], "outputs": [], "result": null}, "token": null
+        }))
+        .expect("send attempt fixture")
+    }
+
+    /// Every send state against `send_line`'s (unresolved, manual) flags, pinned independently of
+    /// `terminal()`/`manual_recovery()` so a change to either rule is caught.
+    #[test]
+    fn send_line_flags_every_state() {
+        use SendState::*;
+        let table = [
+            (Prepared, "prepared", true, false),
+            (Submitted, "submitted", true, false),
+            (Swapped, "swapped", true, false),
+            (Reclaiming, "reclaiming", true, false),
+            (Sent, "sent", false, false),
+            (Refused, "refused", false, false),
+            (Reclaimed, "reclaimed", false, false),
+            (Redeemed, "redeemed", false, false),
+            (InputsSpent, "inputs_spent", true, true),
+            (Quarantined, "quarantined", true, true),
+            (ReclaimQuarantined, "reclaim_quarantined", true, true),
+            (ReclaimUnresolved, "reclaim_unresolved", true, true),
+        ];
+        for (state, label, unresolved, manual) in table {
+            // Exhaustive: a new state fails to compile here until it is added to the table.
+            match state {
+                Prepared | Submitted | Swapped | Sent | Refused | InputsSpent | Quarantined
+                | Reclaiming | Reclaimed | Redeemed | ReclaimQuarantined | ReclaimUnresolved => {}
+            }
+            let a = attempt(label);
+            assert_eq!(a.state, state, "{label}");
+            let (line, is_unresolved, is_manual) = send_line(&a);
+            assert_eq!(
+                (is_unresolved, is_manual),
+                (unresolved, manual),
+                "{label}: {line}"
+            );
+            assert!(
+                line.starts_with(&format!("send s1 http://127.0.0.1:1 {label}: ")),
+                "{line}"
+            );
+            assert_eq!(line.contains("MANUAL RECOVERY"), manual, "{line}");
+        }
+    }
 }
