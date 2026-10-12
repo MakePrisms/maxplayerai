@@ -1,6 +1,9 @@
 # Commands and monetary bounds
 
 Every invocation starts `maxplayer-trade --home <private-absolute-home>`.
+Build the production binary as in the crate README's "Build and automated tests" section:
+the crate is its own Cargo workspace, so `cargo build -p maxplayer-trade` from the repository
+root fails; build it by manifest path, release profile, locked (no protoc needed for the binary).
 Optional repeated global `--relay <url>` goes before the subcommand; preserve the
 same relay set during recovery. Use the binary's default relays unless deliberately
 configured; defaults at verified base 1929972 are `wss://nos.lol`,
@@ -87,8 +90,8 @@ passing advertisement checks is not independent refund interoperability evidence
 `balance` and `status` are lock-free read-only SQLite snapshots, available during
 `serve`, without submission of earlier authorizations; neither makes network calls
 except `status --check-sends` (read-only NUT-07 per sent token). `status`
-prints one readable line per lot/swap/funding/withdrawal/receive, unresolved items
-first, any `counterparty_unresponsive` warning, and the exit-code meanings;
+prints one readable line per lot/swap/funding/withdrawal/receive/send, unresolved items
+first (non-terminal and manual-recovery sends included, so reserved send inputs are visible), any `counterparty_unresponsive` warning, and the exit-code meanings;
 `status --json` prints the unchanged raw public records for scripts.
 
 `discover` is lock-free and read-only too: it reads relays only, with a throwaway
