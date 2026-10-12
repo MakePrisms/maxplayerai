@@ -638,6 +638,12 @@ impl NostrMintConnector {
             return None;
         }
         observation.envelope_version = value["v"].as_u64();
+        if observation.envelope_version.is_none() {
+            observation.outcome = "invalid_response".into();
+            return Some(Err(Error::InvalidMintResponse(
+                "missing or malformed envelope version".into(),
+            )));
+        }
         if observation.envelope_version != Some(u64::from(PROTOCOL_VERSION)) {
             observation.outcome = "unsupported_protocol".into();
             return Some(Err(Error::InvalidMintResponse(

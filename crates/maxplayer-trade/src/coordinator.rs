@@ -398,7 +398,16 @@ pub async fn handle(home: &Path, j: &Journal, m: &Market, e: &Event) -> Result<(
 // Narrow legacy compatibility bridge, authorized for recorded unanswered/timeout errors only.
 // Never match arbitrary occurrences of "timeout" in peer-provided terms or mint details.
 fn legacy_unanswered(reason: &str) -> bool {
-    reason == "Operation timeout"
+    [
+        "Http transport error None: ",
+        "Http transport error Some(429): ",
+        "Http transport error Some(502): ",
+        "Http transport error Some(503): ",
+        "Http transport error Some(504): ",
+    ]
+    .iter()
+    .any(|prefix| reason.starts_with(prefix))
+        || reason == "Operation timeout"
         || reason == "CDK wallet request not answered"
         || reason == "no answer within the CDK wallet bound"
         || reason.starts_with("mint ")
@@ -1887,6 +1896,8 @@ mod initial_retry_tests {
             "mint https://example keysets: timed out",
             "no answer within the CDK wallet bound",
             "CDK wallet request not answered",
+            "Http transport error None: no relay reachable for mint nostr://example",
+            "Http transport error Some(503): unavailable",
             "mint https://example checkstate: HTTP 503 Service Unavailable (body withheld)",
             "mint nostr://example backing off (timeout), 30s left; request not sent",
             "mint nostr://example backing off (429), 2s left; request not sent",
@@ -1901,6 +1912,8 @@ mod initial_retry_tests {
             "mint example swap: NUT 50000 timeout",
             "timeout",
             "bad terms timeout",
+            "Http transport error Some(400): bad request",
+            "Http transport error Some(500): internal",
             "mint https://example checkstate: HTTP 400 Bad Request (body withheld)",
             "mint example backing off (bad terms), 30s left; request not sent",
             "mint example backing off (timeout), nonsense s left; request not sent",

@@ -36,6 +36,8 @@ enum Mode {
     /// Never answer.
     Silent,
     WrongVersion,
+    MissingVersion,
+    NonNumericVersion,
     Malformed,
     NutError,
     /// Answer every request with a transport error code.
@@ -145,6 +147,8 @@ async fn start_mint(relay_url: &str, mode: Mode) -> Mint {
             match mode {
                 Mode::Silent => {}
                 Mode::WrongVersion => reply(&c, &k, &event, &request.id, json!({"v":9,"id":request.id,"ok":{}}).to_string(), event.id).await,
+                Mode::MissingVersion => reply(&c, &k, &event, &request.id, json!({"id":request.id,"ok":{}}).to_string(), event.id).await,
+                Mode::NonNumericVersion => reply(&c, &k, &event, &request.id, json!({"v":"secret","id":request.id,"ok":{}}).to_string(), event.id).await,
                 Mode::Malformed => reply(&c, &k, &event, &request.id, "{not json".into(), event.id).await,
                 Mode::NutError => reply(&c, &k, &event, &request.id, json!({"v":1,"id":request.id,"err":{"code":50000,"detail":"secret\u{001b}[31m"}}).to_string(), event.id).await,
                 Mode::Answer => reply(&c, &k, &event, &request.id, ok, event.id).await,
@@ -436,6 +440,8 @@ async fn diagnostics_distinguish_signed_errors_versions_and_accepted_silence() {
     let (_relay, url) = relay().await;
     for (mode, expected) in [
         (Mode::WrongVersion, "unsupported_protocol"),
+        (Mode::MissingVersion, "invalid_response"),
+        (Mode::NonNumericVersion, "invalid_response"),
         (Mode::Malformed, "invalid_response"),
         (Mode::NutError, "nut_error"),
         (Mode::Err("internal"), "internal"),
@@ -465,6 +471,9 @@ async fn diagnostics_distinguish_signed_errors_versions_and_accepted_silence() {
                 .contains("private_named_error")
         );
         assert!(!format!("{evidence:?}").contains("secret"));
+        if matches!(mode, Mode::WrongVersion | Mode::MissingVersion | Mode::NonNumericVersion | Mode::Malformed) {
+            assert!(!result.as_ref().unwrap_err().is_definitive_failure());
+        }
         if mode == Mode::NutError {
             assert_eq!(evidence.nut_code, Some(50000));
             assert!(!result.unwrap_err().is_definitive_failure());
