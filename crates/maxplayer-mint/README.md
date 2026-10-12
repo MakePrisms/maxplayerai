@@ -151,7 +151,7 @@ maxplayer wallet mints add nostr://npub1…
 maxplayer wallet receive --token-file <id>.token
 ```
 
-`--token-file` (or piping the token on stdin) keeps the token out of shell history and the
+`--token-file` (or `-` with the token piped on stdin) keeps the token out of shell history and the
 process list; avoid passing it as a command-line argument.
 
 The buyer can then hire any seller that accepts your mint. Credits count against the buyer's
