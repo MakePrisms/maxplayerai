@@ -14,7 +14,7 @@ Use the standalone binary, not Maxplayer jobs or wallet/daemon. Read
 [recovery](references/recovery.md) for any interruption.
 
 Choose **one private, persistent absolute home** for this human. Put
-`--home <home>` before **every** command. Preserve that home, keys, databases and
+`--home <home>` before every command except wallet-free `doctor`. Preserve that home, keys, databases and
 journals across restarts. Never delete it while funds, reservations, unresolved
 funding/withdrawals, or trades exist; keep it afterward for recovery.
 Never use a fresh home to evade caps. Only one writer owns it: while `serve` runs,
@@ -30,7 +30,8 @@ homes or databases. Report only public IDs, mints, amounts, states, redacted err
 
 ## 2. Check readiness and get explicit authorization
 
-Run `balance <mint>` and `preflight <mint>` per mint. Passing preflight
+Run `balance <mint>` and `preflight <mint>` per mint. For a Nostr mint/relay diagnosis,
+use wallet-free `doctor` ([contract](references/commands.md#doctor-and-admission-diagnostics)). Passing preflight
 proves neither honesty nor full compatibility. The CLI
 also preflights before fund/list/take/withdraw/send: NUT-07/09/11/12/14, an active sat keyset, reachable
 mint, and clock skew at most 60 seconds. Never
@@ -131,14 +132,15 @@ or report the retained authorization and recover it without paying again.
 
 ### Check balance / something got interrupted
 
-`balance <mint>` is wallet balance, not total wealth or proof every reservation is spendable. After **any interruption**, use `recover` with the same
-home and relays before new work. It resumes existing authorizations and does not
-admit new trade requests. It makes **one bounded pass**, at most **120 s per
-item** (any money item; nostr trade swap: 140 s), not waiting for lock deadlines: exit **0** means
-all terminal with no deferred work, **3** unresolved/deferred, **4** terminal manual recovery, **1** command error, pre-submission refusal, or definitive terminal `unpaid_released` (never proof a submitted withdrawal was refused; a submitted non-terminal withdrawal exits **3**),
-**2** CLI usage error.
-Timeout neither undoes an RPC nor releases reservations. Restore `serve` while locks
-are live; one pass is not a watcher. Quarantine and errors: recovery reference.
+`balance <mint>` is spendable wallet balance, not total wealth. After an interruption,
+run `recover` with the same home and relays before new work. It resumes stored
+authorizations (including retained initial requests), not fresh relay requests.
+It makes one bounded pass, without waiting for lock deadlines: HTTP items up to
+120 s; a Nostr trade item up to 1040 s. Exit 0: all terminal, no deferred work;
+3: unresolved/deferred; 4: manual recovery; 1: error/refusal, never proof a submitted
+payment failed; 2: CLI usage error. Read [recovery](references/recovery.md) for exact states.
+Timeout never undoes an RPC or releases reservations. Keep `serve` running while
+locks are live; one recovery pass is not a watcher.
 **Done:** every outcome classified per the recovery reference.
 
 ## 4. Verify and report
