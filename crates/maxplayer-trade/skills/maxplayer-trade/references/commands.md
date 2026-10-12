@@ -139,11 +139,11 @@ a TCP block alive for 9+ hours this way). If a mint is backing off, wait for ser
 Every request to a mint (HTTP or `nostr://`) passes a per-mint gate shared by all items
 in one process:
 
-- **Backoff:** on HTTP 429 or 503, a refused/reset connection or a timeout, that mint is
+- **Backoff:** on HTTP 429, 502, 503 or 504, a refused/reset connection or a timeout, that mint is
   not contacted again for 5 s, doubling per consecutive failure with 0-25 % jitter, up to
   10 min. A `Retry-After` header (seconds or an HTTP date) is honoured up to 15 min. Any
   other answer clears it; a failure long after a backoff ended starts again at 5 s.
-  serve/recover log `mint <url> backing off <N>s (429|503|refused|timeout)` once per state
+  serve/recover log `mint <url> backing off <N>s (429|503|502/504|refused|timeout)` once per state
   change and `mint <url> answered; backoff cleared` when it ends.
 - **Pacing (no backoff):** each request adds 6 s of per-mint debt; a recovery item starts
   only while that debt is at most 30 s ahead. This bounds only the recovery loop (serve

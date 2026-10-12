@@ -76,7 +76,7 @@ async fn unblind(
     let w = wallet(home, url).await?;
     let keys = crate::wallet::bounded_for(url, w.load_keyset_keys(out[0].message.keyset_id))
         .await
-        .context("CDK wallet request timed out")??;
+        .context("CDK wallet request not answered")??;
     let proofs = cdk::dhke::construct_proofs(
         sigs,
         out.iter()
@@ -99,7 +99,7 @@ async fn unblind(
         )),
     )
     .await
-    .context("CDK wallet request timed out")??;
+    .context("CDK wallet request not answered")??;
     Ok(proofs)
 }
 async fn credit(
@@ -283,13 +283,13 @@ pub async fn resume_fund(home: &Path, j: &Journal, f: &mut Funding) -> Result<()
         let w = wallet(home, &f.mint).await?;
         crate::wallet::bounded_for(&f.mint, w.refresh_keysets())
             .await
-            .context("CDK wallet request timed out")??;
+            .context("CDK wallet request not answered")??;
         let k = crate::wallet::bounded_for(&f.mint, w.fetch_active_keyset())
             .await
-            .context("CDK wallet request timed out")??;
+            .context("CDK wallet request not answered")??;
         let fees = crate::wallet::bounded_for(&f.mint, w.get_keyset_fees_and_amounts_by_id(k.id))
             .await
-            .context("CDK wallet request timed out")??;
+            .context("CDK wallet request not answered")??;
         f.outputs = outputs(PreMintSecrets::random(
             k.id,
             f.amount.into(),
@@ -535,10 +535,10 @@ async fn prepare_withdraw(home: &Path, j: &Journal, a: &mut Withdrawal) -> Resul
     let w = wallet(home, &a.mint).await?;
     crate::wallet::bounded_for(&a.mint, w.refresh_keysets())
         .await
-        .context("CDK wallet request timed out")??;
+        .context("CDK wallet request not answered")??;
     let k = crate::wallet::bounded_for(&a.mint, w.fetch_active_keyset())
         .await
-        .context("CDK wallet request timed out")??;
+        .context("CDK wallet request not answered")??;
     let db = database(home, &a.mint).await?;
     let mut available = db
         .get_proofs(
@@ -557,7 +557,7 @@ async fn prepare_withdraw(home: &Path, j: &Journal, a: &mut Withdrawal) -> Resul
         let input_fee = u64::from(
             crate::wallet::bounded_for(&a.mint, w.get_proofs_fee(&input))
                 .await
-                .context("CDK wallet request timed out")??
+                .context("CDK wallet request not answered")??
                 .total,
         );
         let net_required = u64::from(q.amount)

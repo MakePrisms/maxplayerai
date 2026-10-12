@@ -1113,10 +1113,10 @@ async fn validate_terms(home: &Path, leg: &Leg, t: &Terms) -> Result<()> {
     let w = wallet::wallet(home, &leg.asset.mint_url).await?;
     crate::wallet::bounded_for(&leg.asset.mint_url, w.refresh_keysets())
         .await
-        .context("CDK wallet request timed out")??;
+        .context("CDK wallet request not answered")??;
     let active = crate::wallet::bounded_for(&leg.asset.mint_url, w.fetch_active_keyset())
         .await
-        .context("CDK wallet request timed out")??;
+        .context("CDK wallet request not answered")??;
     ensure!(
         t.keyset == active.id && t.ppk == active.input_fee_ppk,
         "quote keyset/fee schedule mismatch"

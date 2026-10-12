@@ -6,7 +6,7 @@
 //! first and reports its outcome back (HTTP status, connection error, timeout).
 //!
 //! **Backoff** (per mint URL, per process, shared by all items):
-//! - trigger: HTTP 429 or 503 (an integer `Retry-After` is honoured, capped at 15 min), a refused
+//! - trigger: HTTP 429, 502, 503 or 504 (`Retry-After` is honoured, capped at 15 min), a refused
 //!   or reset connection, or a timeout (HTTP request, CDK wallet call, or the `nostr://` bound);
 //! - delay: 5 s, doubling per consecutive failure, plus 0–25 % jitter, capped at 10 min; a longer
 //!   `Retry-After` wins (up to 15 min);
@@ -95,6 +95,8 @@ pub const CLAIM_MARGIN_SECONDS: u64 = 600;
 pub enum Reason {
     RateLimited,
     Unavailable,
+    /// HTTP 502 or 504 (a gateway in front of the mint).
+    Gateway,
     Refused,
     Timeout,
 }
@@ -103,6 +105,7 @@ impl Reason {
         match self {
             Reason::RateLimited => "429",
             Reason::Unavailable => "503",
+            Reason::Gateway => "502/504",
             Reason::Refused => "refused",
             Reason::Timeout => "timeout",
         }
@@ -112,7 +115,7 @@ impl Reason {
 /// The outcome of one request, as far as mint health goes.
 #[derive(Clone, Copy, Debug)]
 pub enum Outcome {
-    /// The mint answered (any status other than 429/503, NUT errors included).
+    /// The mint answered (any status other than 429/502/503/504, NUT errors included).
     Answered,
     Failed(Reason, Option<Duration>),
 }
@@ -280,8 +283,10 @@ impl Book {
                 m.failures = 0;
                 m.until = None;
                 m.reason = None;
-                m.warned = None;
-                m.round = None;
+                // `round` and `warned` survive an answer: a mint that answers restore/NUT-07
+                // but rate-limits the swap POST must not get a fresh claim round (and a fresh
+                // warning) on every serve tick. A stale round is only consulted while backing
+                // off with a possible claim, and an expired one is replaced (review r2, M-A).
             }
             Outcome::Failed(reason, retry_after) => {
                 // A backoff that expired more than `cap` ago is history: start again at `base`
@@ -386,6 +391,10 @@ pub fn margin(mint: &str) -> u64 {
 
 /// Run `f` as an advance whose claim to `mint` must land before `deadline` (unix seconds, mint
 /// clock). Only requests to `mint` get claim rounds; every other mint keeps normal backoff.
+///
+/// The scope is a tokio task-local: it does NOT cross `tokio::spawn` (or a `JoinSet`). Nothing
+/// on the claim path spawns today; a request moved into a spawned task would silently lose its
+/// claim rounds and fall back to normal backoff.
 pub async fn with_claim<F: std::future::Future>(deadline: u64, mint: &str, f: F) -> F::Output {
     CLAIM.scope((deadline, key(mint)), f).await
 }
@@ -449,6 +458,8 @@ pub fn record_status(mint: &str, status: u16, retry_after: Option<Duration>) {
         match status {
             429 => Outcome::Failed(Reason::RateLimited, retry_after),
             503 => Outcome::Failed(Reason::Unavailable, retry_after),
+            // A CDN or proxy in front of an overloaded mint (review r2, N-3).
+            502 | 504 => Outcome::Failed(Reason::Gateway, retry_after),
             _ => Outcome::Answered,
         },
     );
@@ -488,6 +499,7 @@ fn classify_cdk(e: &cdk::Error) -> Option<Reason> {
     Some(match e {
         cdk::Error::HttpError(Some(429), _) => Reason::RateLimited,
         cdk::Error::HttpError(Some(503), _) => Reason::Unavailable,
+        cdk::Error::HttpError(Some(502 | 504), _) => Reason::Gateway,
         cdk::Error::Timeout => Reason::Timeout,
         cdk::Error::HttpError(None, msg) if msg.contains("error sending request") => {
             Reason::Refused
@@ -987,6 +999,73 @@ mod tests {
             "steady state <= ~10/min: {per_minute:?}"
         );
         assert!(per_minute[0] <= 18, "burst bounded: {}", per_minute[0]);
+    }
+
+    /// M-A (review r2): a claim mint that answers restore and NUT-07 but rate-limits the swap
+    /// POST (Retry-After 900). Serve ticks every 3 s for 60 s; each tick's claim attempt is
+    /// restore (answered), NUT-07 (answered), swap (429). The answers must not reset the claim
+    /// round: one round per 30 s, so at most 2 rounds (6 requests, 2 swaps) in 60 s, not a
+    /// fresh round on every tick (60 requests, 20 swaps before the fix).
+    #[test]
+    fn answered_requests_do_not_reset_the_claim_round() {
+        let mut b = Book::default();
+        let t0 = Instant::now();
+        let mut log = vec![];
+        let u = Urgency {
+            deadline: 100_000,
+            now_unix: 100_000 - 3_600,
+            margin: 600,
+        };
+        fail(&mut b, t0, Reason::RateLimited, Some(900), &mut log);
+        let (mut sent, mut swaps) = (0, 0);
+        for tick in 0..20u64 {
+            let now = t0 + Duration::from_secs(1 + 3 * tick);
+            for step in 0..3 {
+                if b.admit(&T, M, now, true, Some(u), &mut log).is_err() {
+                    break;
+                }
+                sent += 1;
+                if step < 2 {
+                    b.record(&T, M, now, Outcome::Answered, 1.0, &mut log);
+                } else {
+                    swaps += 1;
+                    fail(&mut b, now, Reason::RateLimited, Some(900), &mut log);
+                }
+            }
+        }
+        assert!(
+            sent <= 6,
+            "{sent} requests ({swaps} swaps) in 60 s: {log:?}"
+        );
+        assert_eq!(swaps, 2, "one swap per 30 s round, never idle: {log:?}");
+        assert_eq!(
+            log.iter()
+                .filter(|l| l.contains("a claim to it is possible"))
+                .count(),
+            1,
+            "warned once, not per round: {log:?}"
+        );
+    }
+
+    /// N-3 (review r2): 502/504 from a gateway in front of the mint back off like 503; other
+    /// errors (500, NUT 400) are answers. Global state; unique mint URLs.
+    #[test]
+    fn gateway_errors_back_off() {
+        for (status, backs_off) in [
+            (502, true),
+            (504, true),
+            (503, true),
+            (500, false),
+            (400, false),
+        ] {
+            let mint = format!("https://status-{status}.gateway-errors.example");
+            record_status(&mint, status, None);
+            assert_eq!(remaining(&mint).is_some(), backs_off, "{status}");
+        }
+        assert_eq!(
+            classify_cdk(&cdk::Error::HttpError(Some(504), String::new())),
+            Some(Reason::Gateway)
+        );
     }
 
     #[test]

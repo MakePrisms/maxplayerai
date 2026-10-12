@@ -135,11 +135,15 @@ async fn no_request_storm() {
     let m = MintFixture::start(0).await;
     m.faults.rate_limit.store(true, SeqCst);
     let start = Instant::now();
-    let mut attempts = 0;
+    let (mut attempts, mut deferred) = (0, 0);
     while start.elapsed() < Duration::from_secs(3) {
         for _ in 0..4 {
             // Four items in one process, each retrying every 10 ms.
-            let _ = transport::get(&m.url, "info").await;
+            if let Err(e) = transport::get(&m.url, "info").await
+                && backoff::deferred(&e)
+            {
+                deferred += 1;
+            }
             attempts += 1;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -150,9 +154,14 @@ async fn no_request_storm() {
         sent <= 5,
         "{sent} requests reached a 429ing mint ({attempts} attempts)"
     );
-    // Each deferred attempt still builds a TLS client (debug build: several ms), so count
-    // attempts rather than assume a rate; they must far exceed what reached the mint.
-    assert!(attempts >= 40, "fixture: callers retried hard ({attempts})");
+    // Each deferred attempt still builds a TLS client (debug build: ~25 ms on a 4-vCPU box),
+    // so the attempt rate is host-dependent: assert relative to what reached the mint (review
+    // r2, N-1). Callers kept retrying, and most attempts were stopped locally.
+    assert!(sent >= 1, "fixture: the 429 reached the mint once");
+    assert!(
+        deferred >= 2 * sent,
+        "fixture: callers retried hard ({attempts} attempts, {deferred} deferred, {sent} sent)"
+    );
 
     // Healthy mint, no backoff: pacing bounds a tight polling loop to ~1 request / interval.
     m.faults.rate_limit.store(false, SeqCst);
@@ -291,8 +300,10 @@ async fn maker_claim_retried_through_rate_limit_before_long() {
     let at_final = at_final.unwrap();
     let rounds = at_final - b_before;
     let secs = final_at - start;
+    // Lower bound with slack (review r2, N-1): each serve tick's pass on a slow debug host
+    // stretches a 2 s round; idle-for-the-backoff would be ~0 rounds.
     assert!(
-        rounds >= secs / 2 - 1,
+        rounds >= secs / 3,
         "claim rounds every 2 s, not idle for the 900 s backoff: {rounds} in {secs} s"
     );
     assert!(
@@ -335,4 +346,117 @@ async fn maker_claim_retried_through_rate_limit_before_long() {
         "{log:?}"
     );
     assert!(log.iter().any(|l| l.contains("final stretch")), "{log:?}");
+}
+
+/// M-A (review r2): the claim mint answers restore and NUT-07 but answers every swap POST with
+/// 429 + `Retry-After: 900` (a stricter limit on transaction endpoints). The answers must not
+/// reset the claim round: one claim attempt per 2 s lab round (30 s production), not one per
+/// serve tick. Then the mint accepts swaps again and the claim lands within about one round.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn swap_only_rate_limit_keeps_claim_rounds() {
+    assert!(
+        std::env::var("TRADE_LAB_SECONDS").is_ok(),
+        "run with TRADE_LAB_SECONDS=1"
+    );
+    // Final stretch 1 s: the whole window below runs at the 2 s claim cadence.
+    let _lab = Lab::new(1);
+    let mut f = Fixture::new(0).await;
+    let lot = f.list(false).await;
+    let id = f.start(&lot).await;
+    for _ in 0..30 {
+        f.step(true).await;
+        f.step(false).await;
+        if f.state(false, &id).await.as_deref() == Some("claimed") {
+            break;
+        }
+    }
+    assert_eq!(f.state(false, &id).await.as_deref(), Some("claimed"));
+    assert_eq!(f.state(true, &id).await.as_deref(), Some("second_locked"));
+    let long =
+        f.jm.get::<Swap>("swap", &id)
+            .await
+            .unwrap()
+            .unwrap()
+            .quote
+            .unwrap()
+            .long;
+    let pre =
+        f.jt.get::<Swap>("swap", &id)
+            .await
+            .unwrap()
+            .unwrap()
+            .preimage;
+    let mut s = f.jm.get::<Swap>("swap", &id).await.unwrap().unwrap();
+    s.preimage = pre;
+    s.state = "claiming".into();
+    f.jm.put("swap", &id, &s).await.unwrap();
+    let window = 8;
+    assert!(
+        coordinator::now() + window + 4 < long,
+        "fixture: the window ends before long"
+    );
+    backoff::set_wait_for_pacing(false);
+    f.b.faults.retry_after.store(900, SeqCst);
+    f.b.faults.rate_limit_swap.store(true, SeqCst);
+    let swaps = f.b.faults.swaps.load(SeqCst);
+    let requests = f.b.faults.requests.load(SeqCst);
+    // Serve ticks every 250 ms for `window` seconds.
+    let start = Instant::now();
+    let mut ticks = 0;
+    while start.elapsed() < Duration::from_secs(window) {
+        coordinator::recover(&f.maker, &f.jm, &f.mm).await.unwrap();
+        ticks += 1;
+        assert_eq!(
+            f.state(true, &id).await.as_deref(),
+            Some("claiming"),
+            "SAFETY: nothing refused or released while swaps are refused"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let secs = start.elapsed().as_secs();
+    let limited = f.b.faults.limited_swaps.load(SeqCst);
+    let sent = f.b.faults.requests.load(SeqCst) - requests;
+    eprintln!("swap-only 429: {limited} swaps, {sent} requests in {secs} s ({ticks} ticks)");
+    assert!(
+        backoff::remaining(&f.b.url).unwrap() > Duration::from_secs(800),
+        "the swap 429 started the 900 s backoff"
+    );
+    // The first attempt (no backoff yet) + one per 2 s round. Before the fix: one per tick.
+    assert!(
+        limited <= secs / 2 + 2,
+        "one swap per claim round, not per tick: {limited} swaps / {sent} requests in {secs} s ({ticks} ticks)"
+    );
+    assert!(
+        limited >= 2,
+        "never idle for the 900 s Retry-After: {limited} swaps in {secs} s"
+    );
+    assert!(
+        sent <= 6 * (secs / 2 + 2),
+        "a round's restore/NUT-07 answers do not open more rounds: {sent} requests in {secs} s"
+    );
+    assert_eq!(f.b.faults.swaps.load(SeqCst), swaps, "no swap processed");
+    let log = backoff::lab_log();
+    assert_eq!(
+        log.iter()
+            .filter(|l| l.contains("a claim to it is possible"))
+            .count(),
+        1,
+        "warned once, not per round: {log:?}"
+    );
+    // Swaps are accepted again (still inside the 900 s Retry-After): the claim lands.
+    f.b.faults.rate_limit_swap.store(false, SeqCst);
+    let recovered = Instant::now();
+    while !matches!(
+        f.state(true, &id).await.as_deref(),
+        Some("settling" | "complete")
+    ) {
+        assert!(
+            recovered.elapsed() < Duration::from_secs(4),
+            "claim must land within about one round once swaps are accepted"
+        );
+        coordinator::recover(&f.maker, &f.jm, &f.mm).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(coordinator::now() < long, "claimed before long");
+    assert_eq!(balance(&f.maker, &f.b.url).await, 24);
 }

@@ -90,6 +90,11 @@ pub struct Faults {
     pub rate_limit: std::sync::atomic::AtomicBool,
     /// `Retry-After` seconds sent with `rate_limit` (0 = no header).
     pub retry_after: std::sync::atomic::AtomicU64,
+    /// Answer only swap POSTs with HTTP 429 (+ `retry_after`), unprocessed; everything else
+    /// is answered normally (a mint with a stricter limit on transaction endpoints).
+    pub rate_limit_swap: std::sync::atomic::AtomicBool,
+    /// Swap POSTs answered 429 by `rate_limit_swap` (not counted in `swaps`).
+    pub limited_swaps: std::sync::atomic::AtomicU64,
 }
 pub struct MintFixture {
     pub faults: Arc<Faults>,
@@ -163,7 +168,12 @@ impl MintFixture {
                     use std::sync::atomic::Ordering::SeqCst;
                     let path = req.uri().path().to_owned();
                     control.requests.fetch_add(1, SeqCst);
-                    if control.rate_limit.load(SeqCst) {
+                    let swap_limited =
+                        path.ends_with("/swap") && control.rate_limit_swap.load(SeqCst);
+                    if swap_limited {
+                        control.limited_swaps.fetch_add(1, SeqCst);
+                    }
+                    if control.rate_limit.load(SeqCst) || swap_limited {
                         let mut r = axum::http::StatusCode::TOO_MANY_REQUESTS.into_response();
                         let after = control.retry_after.load(SeqCst);
                         if after != 0 {
