@@ -237,6 +237,10 @@ impl RequestObservation {
                     "Mint answered: {other}. Check mint/tool compatibility, clock and operator logs"
                 ),
             }
+        } else if self.relays.values().any(|r| r.auth == "failed") {
+            "Relay authentication failed. Check relay authorization; response visibility on this path is uncertain".into()
+        } else if self.relays.values().any(|r| r.closed) {
+            "Relay closed this mint-reply subscription. Check relay authorization and sidecar/client connection; cannot observe a response on this path".into()
         } else if self.relays.values().any(|r| r.acceptance == "accepted") {
             "Relay accepted the request, but mint did not answer. Offline, incompatible, unsubscribed mint or lost reply cannot be distinguished. Ask the operator to check the sidecar and selected relay; run doctor before a new take".into()
         } else if self.relays.values().any(|r| r.refused) {
@@ -253,8 +257,9 @@ impl RequestObservation {
         } else {
             "No relay acknowledgement; request acceptance unknown. Check relay health; do not assume the mint never received it".into()
         };
+        let paths = self.relays.iter().map(|(url, r)| format!("{url}={}", r.acceptance)).collect::<Vec<_>>().join(", ");
         format!(
-            "mint {} {} after {:.1}s: {evidence}. Execution outcome is independent; retain submitted operations and use status/recover",
+            "mint {} {} after {:.1}s: {evidence}. Relays: [{paths}]. Execution outcome is independent; retain submitted operations and use status/recover",
             self.mint,
             self.op,
             self.elapsed_ms as f64 / 1000.0

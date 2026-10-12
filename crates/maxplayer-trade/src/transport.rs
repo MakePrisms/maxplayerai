@@ -264,6 +264,15 @@ async fn nostr_call(
     body: serde_json::Value,
     not_after: Option<u64>,
 ) -> Result<serde_json::Value> {
+    nostr_call_observed(mint, path, body, not_after, None).await
+}
+async fn nostr_call_observed(
+    mint: &str,
+    path: &str,
+    body: serde_json::Value,
+    not_after: Option<u64>,
+    observation_out: Option<&mut Option<maxplayer_core::nostr_mint::RequestObservation>>,
+) -> Result<serde_json::Value> {
     let operation = nostr_op(path)
         .with_context(|| format!("mint {mint} {path}: not served over nostr://; nothing sent"))?;
     let mut c = connector(mint)?;
@@ -285,6 +294,9 @@ async fn nostr_call(
         crate::backoff::record(mint, crate::backoff::Outcome::Failed(crate::backoff::Reason::Timeout, None));
         crate::backoff::NoAnswer(format!("mint {mint} {path}: unanswered within the nostr bound; acceptance unknown. Check relay/operator; retain submitted operations and use status/recover"))
     })?;
+    if let Some(out) = observation_out {
+        *out = Some(observation.clone());
+    }
     if observation.reply_ms.is_some()
         && !result
             .as_ref()
@@ -397,6 +409,19 @@ pub async fn get(mint: &str, path: &str) -> Result<serde_json::Value> {
         .error_for_status()?
         .json()
         .await?)
+}
+
+/// The existing read plus its exact connector evidence, without an extra probe.
+pub async fn get_observed(
+    mint: &str,
+    path: &str,
+    observation: &mut Option<maxplayer_core::nostr_mint::RequestObservation>,
+) -> Result<serde_json::Value> {
+    if is_nostr(mint) {
+        nostr_call_observed(mint, path, serde_json::Value::Null, None, Some(observation)).await
+    } else {
+        get(mint, path).await
+    }
 }
 
 /// Plaintext bytes of the envelope that would carry `body` as `op` (the NIP-44 input).

@@ -99,7 +99,14 @@ async fn preflight_impl(
     admission: bool,
 ) -> Result<serde_json::Value> {
     let started = std::time::Instant::now();
-    let info = match info(mint).await {
+    let mut observation = None;
+    let result = if admission {
+        crate::Asset::new(mint)?.fence()?;
+        crate::transport::get_observed(mint, "info", &mut observation).await
+    } else {
+        info(mint).await
+    };
+    let info = match result {
         Ok(info) => info,
         Err(error) => {
             if admission {
@@ -110,7 +117,15 @@ async fn preflight_impl(
             return Err(error);
         }
     };
-    let elapsed = started.elapsed().as_millis();
+    if let Some(time) = info["time"].as_u64() {
+        crate::backoff::observe_time(mint, time);
+    }
+    // A slow warning describes the matched reply, not bounded disconnect cleanup afterward.
+    let elapsed = observation
+        .as_ref()
+        .and_then(|o| o.reply_ms)
+        .map(u128::from)
+        .unwrap_or_else(|| started.elapsed().as_millis());
     let compatibility = crate::compatibility::assess(&info);
     if admission {
         crate::diagnostics::emit(
