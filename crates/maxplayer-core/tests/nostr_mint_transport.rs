@@ -441,6 +441,7 @@ async fn diagnostics_distinguish_signed_errors_versions_and_accepted_silence() {
         (Mode::Err("internal"), "internal"),
         (Mode::Err("expired"), "expired"),
         (Mode::Err("rate_limited"), "rate_limited"),
+        (Mode::Err("private_named_error"), "unknown_protocol_error"),
         (Mode::Silent, "unanswered"),
     ] {
         let mint = start_mint(&url, mode).await;
@@ -455,6 +456,15 @@ async fn diagnostics_distinguish_signed_errors_versions_and_accepted_silence() {
             assert!(evidence.relays.values().any(|r| r.acceptance == "accepted"));
             assert!(evidence.message().contains("cannot be distinguished"));
         }
+        assert!(!result.as_ref().unwrap_err().to_string().contains("secret"));
+        assert!(
+            !result
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("private_named_error")
+        );
+        assert!(!format!("{evidence:?}").contains("secret"));
         if mode == Mode::NutError {
             assert_eq!(evidence.nut_code, Some(50000));
             assert!(!result.unwrap_err().is_definitive_failure());

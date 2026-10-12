@@ -689,25 +689,26 @@ impl NostrMintConnector {
 }
 
 /// Map a wire error to the cdk error the same failure would produce over HTTPS. Definitive only
-/// where the mint provably did not execute the request.
+/// where the mint provably did not execute the request. Arbitrary wire detail stays in the
+/// observation's non-serialized ErrorBody, never in a CDK error a caller might display.
 pub fn map_error(error: ErrorBody) -> Error {
     match error.code {
         ErrorCode::Nut(nut) => Error::from(ErrorResponse {
             code: NutErrorCode::from_code(nut),
-            detail: error.detail,
+            detail: format!("mint answered NUT {nut}; inspect sidecar logs"),
         }),
         ErrorCode::Named(name) => match name.as_str() {
             code::UNSUPPORTED => {
-                Error::HttpError(Some(404), format!("unsupported: {}", error.detail))
+                Error::HttpError(Some(404), "mint answered unsupported; upgrade the mint sidecar".into())
             }
             code::RATE_LIMITED => {
-                Error::HttpError(Some(429), format!("rate limited: {}", error.detail))
+                Error::HttpError(Some(429), "mint answered rate_limited; respect retry backoff".into())
             }
             code::BAD_REQUEST | code::EXPIRED => {
-                Error::HttpError(Some(400), format!("{name}: {}", error.detail))
+                Error::HttpError(Some(400), format!("mint answered {name}; check clock and request timing"))
             }
-            code::INTERNAL => Error::HttpError(Some(500), format!("internal: {}", error.detail)),
-            _ => Error::UnknownErrorResponse(format!("{name}: {}", error.detail)),
+            code::INTERNAL => Error::HttpError(Some(500), "mint answered internal; inspect sidecar logs".into()),
+            _ => Error::UnknownErrorResponse("mint answered an unknown protocol error; check build compatibility".into()),
         },
     }
 }
