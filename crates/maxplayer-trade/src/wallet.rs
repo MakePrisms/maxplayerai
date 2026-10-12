@@ -87,7 +87,21 @@ pub async fn preflight(mint: &str) -> Result<()> {
     preflight_for(mint, None).await
 }
 pub async fn preflight_for(mint: &str, operation: Option<&str>) -> Result<()> {
+    preflight_impl(mint, operation, false).await.map(|_| ())
+}
+/// New list/take admission only. Recovery uses the original preflight without this gate.
+pub async fn preflight_admission(mint: &str) -> Result<serde_json::Value> {
+    preflight_impl(mint, None, true).await
+}
+async fn preflight_impl(mint: &str, operation: Option<&str>, admission: bool) -> Result<serde_json::Value> {
+    let started = std::time::Instant::now();
     let info = info(mint).await?;
+    let elapsed = started.elapsed().as_millis();
+    let compatibility = crate::compatibility::assess(&info);
+    if admission {
+        eprintln!("{}", serde_json::json!({"mint":mint,"op":"info","reachability":"answered","elapsed_ms":elapsed,"latency":if elapsed > 5000 {"slow (warning threshold 5s)"} else {"normal"},"compatibility":compatibility}));
+        ensure!(compatibility["status"] != "incompatible", "{}; missing {}", compatibility["message"].as_str().unwrap_or("upgrade the mint sidecar"), compatibility["missing"]);
+    }
     ensure!(
         info["nuts"]["9"]["supported"] == true && info["nuts"]["12"]["supported"] == true,
         "mint does not advertise NUT-09 and NUT-12"
@@ -137,7 +151,7 @@ pub async fn preflight_for(mint: &str, operation: Option<&str>) -> Result<()> {
         "{}",
         serde_json::json!({"mint":mint,"version":info["version"],"nut07":true,"nut07_witnesses":"unverified: requires a known spent HTLC; advertisement is not emission evidence","nut14":true,"clock_skew_seconds":now.abs_diff(time)})
     );
-    Ok(())
+    Ok(keysets)
 }
 pub async fn wallet(home: &std::path::Path, mint: &str) -> Result<Wallet> {
     crate::Asset::new(mint)?.fence()?;

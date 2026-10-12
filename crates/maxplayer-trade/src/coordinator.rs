@@ -155,10 +155,13 @@ fn timing(l: &Lot) -> Result<(u64, u64, u64, u64)> {
     Ok((LONG_SECONDS, SHORT_SECONDS, CLAIM_CUTOFF_SECONDS, 60))
 }
 async fn preflight(l: &Lot) -> Result<()> {
-    for a in [&l.give.asset, &l.want.asset] {
-        a.fence()?;
-        wallet::preflight(&a.mint_url).await?;
-    }
+    for a in [&l.give.asset, &l.want.asset] { a.fence()?; }
+    let (give, want) = tokio::join!(wallet::preflight_admission(&l.give.asset.mint_url), wallet::preflight_admission(&l.want.asset.mint_url));
+    give?; want?;
+    Ok(())
+}
+async fn recovery_preflight(l: &Lot) -> Result<()> {
+    for a in [&l.give.asset, &l.want.asset] { wallet::preflight(&a.mint_url).await?; }
     Ok(())
 }
 async fn save(j: &Journal, s: &Swap) -> Result<()> {
@@ -911,7 +914,7 @@ async fn advance_inner(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Re
                     now() < q.exp && now() + q.cutoff < q.short,
                     "quote expired before lock"
                 );
-                preflight(&q.lot).await?;
+                recovery_preflight(&q.lot).await?;
             }
             let c = if taker {
                 mint::conditions(&q.request.hash, &q.maker_key, &q.request.taker_key, q.long)?
