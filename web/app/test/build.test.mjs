@@ -161,7 +161,7 @@ test("the live market ships at /market and the homepage links it", () => {
   assert.ok(!home.includes("<script>"), "no inline scripts in the browser-key origin");
 });
 
-test("/tokens ships its own read-only bundle and is linked as Labs", () => {
+test("/tokens ships its own read-only bundle and is linked from the footer", () => {
   const tokens = readFileSync(join(root, "dist", "tokens.html"), "utf8");
   for (const id of ["tokens", "lots", "recent", "windows", "statgrid", "conn", "utc-clock", "trade-detail"]) {
     assert.ok(tokens.includes(`id="${id}"`), `tokens.html carries #${id}`);
@@ -183,14 +183,15 @@ test("/tokens ships its own read-only bundle and is linked as Labs", () => {
   assert.ok(!tokens.includes('id="done"'), "no completed-trades table under the board (bob)");
   assert.ok(!tokens.includes('id="stats-note"') && !tokens.includes("Mints can fail"), "no footnotes (bob)");
   assert.ok(tokens.indexOf('id="trade-detail"') > tokens.indexOf("</footer>"), "the popup lives outside the page flow");
-  // bob: linked from the nav, always flagged experimental (Labs pill), and
-  // the page says so itself for anyone arriving from a shared link.
+  // bob: linked from the footer only, never the top nav, and no on-page banner.
   for (const page of ["index.html", "market.html", "sell.html", "tokens.html"]) {
     const text = readFileSync(join(root, "dist", page), "utf8");
-    assert.match(text, /<a href="\/tokens"( aria-current="page")?>Tokens <span class="labs-pill">Labs<\/span><\/a>/, `${page} links /tokens as Labs`);
+    const nav = text.slice(text.indexOf('id="nav-links"'), text.indexOf("</nav>", text.indexOf('id="nav-links"')));
+    const foot = text.slice(text.indexOf('class="foot-nav"'), text.indexOf("</nav>", text.indexOf('class="foot-nav"')));
+    assert.ok(!nav.includes('href="/tokens"'), `${page}: /tokens is not in the top nav`);
+    assert.match(foot, /<a href="\/tokens">Tokens<\/a>/, `${page}: /tokens is in the footer`);
   }
-  assert.match(tokens, /<a href="\/tokens" aria-current="page">/);
-  assert.match(tokens, /class="labs-strip" role="note"><span class="labs-pill">Experimental<\/span>/);
+  assert.ok(!tokens.includes("labs-"), "no Labs pill or strip (bob)");
   // Agent-facing docs stay about the jobs market.
   for (const page of ["llms.txt", "skill.md"]) {
     const text = readFileSync(join(root, "dist", page), "utf8");
