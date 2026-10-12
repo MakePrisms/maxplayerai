@@ -306,6 +306,24 @@ mod tests {
     }
 
     #[test]
+    fn invite_ttl_at_limit_is_granted_uncapped() {
+        // Literal fixture at the documented MAX_INVITE_TTL_SECS (30 days), NOT
+        // derived from the constant. Requesting exactly 30 days must be granted
+        // as-is (the clamp must not lower it): if the ceiling is lowered below
+        // 30 days, the requested 30 days is clamped down and this fails; a
+        // legitimate raise keeps 30 days granted as-is and the test stays green
+        // (issue #933 property 2).
+        let key = test_key();
+        let requested = 30 * 24 * 60 * 60; // exactly the documented 30-day bound
+        let (_, expires_at) = mint_invite(&key, community(), requested);
+        let granted = expires_at.saturating_sub(now_unix());
+        assert!(
+            granted >= 30 * 24 * 60 * 60 - 60,
+            "the 30-day bound must be granted, not clamped lower: granted {granted}s"
+        );
+    }
+
+    #[test]
     fn signed_role_other_than_member_rejected() {
         // Even a *correctly signed* payload with an elevated role must fail
         // verification (defense against a future buggy mint caller).

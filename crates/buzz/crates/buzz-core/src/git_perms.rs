@@ -1000,4 +1000,36 @@ mod tests {
         assert_eq!(denials.len(), 1);
         assert_eq!(denials[0].ref_name, "refs/heads/main");
     }
+
+    #[test]
+    fn pattern_length_at_limit_is_accepted() {
+        // Literal fixture at the documented MAX_PATTERN_LENGTH (256), NOT derived
+        // from the constant and NOT constant-equality. "refs/" is 5 chars, so
+        // 251 more make exactly 256. The documented bound must be an accepted
+        // capacity: if the bound is lowered below 256, this 256-char pattern is
+        // refused and the test fails; a legitimate raise keeps it accepted and
+        // the test stays green (issue #933 property 2).
+        let at_limit = format!("refs/{}", "a".repeat(251));
+        assert_eq!(at_limit.len(), 256);
+        assert!(RefPattern::parse(&at_limit).is_ok());
+    }
+
+    #[test]
+    fn protection_rule_count_at_limit_is_accepted() {
+        // Literal fixture at the documented MAX_PROTECTION_RULES (50), NOT derived
+        // from the constant. Exactly 50 valid protection tags must be an accepted
+        // capacity: if the bound is lowered below 50, the 50th is refused and the
+        // test fails; a legitimate raise keeps 50 accepted and the test stays
+        // green (issue #933 property 2).
+        let mut tags: Vec<Vec<String>> = Vec::new();
+        for i in 0..50 {
+            tags.push(vec![
+                "buzz-protect".to_string(),
+                format!("refs/heads/rule{i}"),
+                "push:admin".to_string(),
+            ]);
+        }
+        let parsed = parse_protection_tags(&tags).unwrap();
+        assert_eq!(parsed.rules.len(), 50); // fixture size control: exactly 50
+    }
 }

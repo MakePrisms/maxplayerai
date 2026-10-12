@@ -761,6 +761,22 @@ mod tests {
     }
 
     #[test]
+    fn safe_json_integer_at_limit_is_accepted() {
+        // Literal fixture at the documented MAX_SAFE_JSON_INTEGER ((1<<53)-1),
+        // NOT derived from the constant. Generation exactly at the bound must be
+        // an accepted capacity for a minimal inactive lease: if the bound is
+        // lowered below (1<<53)-1, this generation is refused and the test
+        // fails; a legitimate raise keeps it accepted and the test stays green
+        // (issue #933 property 2).
+        let at_bound = parse_plaintext(
+            &format!(r##"{{"v":1,"origin":"o","generation":{},"active":false}}"##, (1_u64 << 53) - 1),
+            4096,
+        )
+        .unwrap();
+        assert!(validate_plaintext(&at_bound, &limits()).is_ok());
+    }
+
+    #[test]
     fn urgent_is_limited_by_event_kind() {
         let body = parse_plaintext(r##"{"v":1,"origin":"o","generation":1,"active":true,"app_profile":"p","transport":"apns","endpoint":"token","subscriptions":[{"filter":{"kinds":[9],"#p":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]},"class":"urgent"}]}"##, 4096).unwrap();
         assert_eq!(
