@@ -93,14 +93,28 @@ pub async fn preflight_for(mint: &str, operation: Option<&str>) -> Result<()> {
 pub async fn preflight_admission(mint: &str) -> Result<serde_json::Value> {
     preflight_impl(mint, None, true).await
 }
-async fn preflight_impl(mint: &str, operation: Option<&str>, admission: bool) -> Result<serde_json::Value> {
+async fn preflight_impl(
+    mint: &str,
+    operation: Option<&str>,
+    admission: bool,
+) -> Result<serde_json::Value> {
     let started = std::time::Instant::now();
     let info = info(mint).await?;
     let elapsed = started.elapsed().as_millis();
     let compatibility = crate::compatibility::assess(&info);
     if admission {
-        eprintln!("{}", serde_json::json!({"mint":mint,"op":"info","reachability":"answered","elapsed_ms":elapsed,"latency":if elapsed > 5000 {"slow (warning threshold 5s)"} else {"normal"},"compatibility":compatibility}));
-        ensure!(compatibility["status"] != "incompatible", "{}; missing {}", compatibility["message"].as_str().unwrap_or("upgrade the mint sidecar"), compatibility["missing"]);
+        eprintln!(
+            "{}",
+            serde_json::json!({"mint":mint,"op":"info","reachability":"answered","elapsed_ms":elapsed,"latency":if elapsed > 5000 {"slow (warning threshold 5s)"} else {"normal"},"compatibility":compatibility})
+        );
+        ensure!(
+            compatibility["status"] != "incompatible",
+            "{}; missing {}",
+            compatibility["message"]
+                .as_str()
+                .unwrap_or("upgrade the mint sidecar"),
+            compatibility["missing"]
+        );
     }
     ensure!(
         info["nuts"]["9"]["supported"] == true && info["nuts"]["12"]["supported"] == true,

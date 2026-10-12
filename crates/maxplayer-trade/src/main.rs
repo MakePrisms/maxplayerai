@@ -9,7 +9,7 @@ use std::{
 #[derive(Parser)]
 struct Cli {
     /// Private, exclusively owned journal and wallet directory. Never delete a funded home.
-    #[arg(long)]
+    #[arg(long, default_value = "")]
     home: PathBuf,
     /// Relay URL (repeatable); defaults to nos.lol, relay.primal.net and offchain.pub.
     #[arg(long)]
@@ -25,6 +25,17 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// One read-only info request to an explicit mint/relay pair; no wallet or journal.
+    Doctor {
+        mint: String,
+        #[arg(long = "mint-relay")]
+        mint_relay: String,
+        #[arg(long)]
+        json: bool,
+        /// Read-only probe budget; does not change monetary request windows.
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=300))]
+        timeout_seconds: u64,
+    },
     /// Publish a fixed lot and reserve its inputs; preflights both mints.
     List {
         #[arg(long)]
@@ -128,6 +139,9 @@ async fn main() -> std::process::ExitCode {
     match execute().await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
+            if let Some(f) = error.downcast_ref::<DoctorExit>() {
+                return std::process::ExitCode::from(f.0);
+            }
             if let Some(f) = error.downcast_ref::<maxplayer_trade::serve::Forwarded>() {
                 return std::process::ExitCode::from(f.0);
             }
@@ -144,6 +158,19 @@ async fn main() -> std::process::ExitCode {
 }
 async fn execute() -> Result<()> {
     let cli = Cli::parse();
+    if let Command::Doctor {
+        mint,
+        mint_relay,
+        json,
+        timeout_seconds,
+    } = &cli.command
+    {
+        return doctor(mint, mint_relay, *json, *timeout_seconds).await;
+    }
+    ensure!(
+        !cli.home.as_os_str().is_empty(),
+        "--home is required for this command"
+    );
     maxplayer_trade::transport::configure_mint_relays(&cli.mint_relay)?;
     // No home, lock, journal or intent is touched for a path a nostr:// mint cannot serve.
     match &cli.command {
@@ -569,12 +596,15 @@ mod lockfree {
         println!("{}", serde_json::json!({"status":"ok","listings":listings}));
         Ok(())
     }
-    async fn preflight(mints: [&str; 2]) -> Result<()> {
+    async fn preflight(mints: [&str; 2]) -> Result<[dryrun::Keysets; 2]> {
         for mint in mints {
             Asset::new(mint)?.fence()?;
-            wallet::preflight(mint).await?;
         }
-        Ok(())
+        let (a, b) = tokio::join!(
+            wallet::preflight_admission(mints[0]),
+            wallet::preflight_admission(mints[1])
+        );
+        Ok([dryrun::parse_keysets(&a?)?, dryrun::parse_keysets(&b?)?])
     }
     fn finish(out: serde_json::Value, refusal: Option<String>) -> Result<()> {
         println!("{out}");
@@ -593,9 +623,7 @@ mod lockfree {
     ) -> Result<()> {
         let (give_asset, want_asset) = (Asset::new(give_mint)?, Asset::new(want_mint)?);
         ensure!(give_asset != want_asset, "same-asset swap");
-        preflight([&give_asset.mint_url, &want_asset.mint_url]).await?;
-        let gks = dryrun::keysets(&give_asset.mint_url, std::time::Duration::from_secs(15)).await?;
-        let wks = dryrun::keysets(&want_asset.mint_url, std::time::Duration::from_secs(15)).await?;
+        let [gks, wks] = preflight([&give_asset.mint_url, &want_asset.mint_url]).await?;
         let p = dryrun::plan(
             &dryrun::spendable(home, &give_asset.mint_url)?,
             &gks,
@@ -649,11 +677,7 @@ mod lockfree {
             .ok()
             .and_then(|k| nostr_sdk::Keys::parse(&k).ok());
         ensure!(own.is_none_or(|k| k.public_key() != e.pubkey), "self trade");
-        preflight([&l.give.asset.mint_url, &l.want.asset.mint_url]).await?;
-        let gks =
-            dryrun::keysets(&l.give.asset.mint_url, std::time::Duration::from_secs(15)).await?;
-        let wks =
-            dryrun::keysets(&l.want.asset.mint_url, std::time::Duration::from_secs(15)).await?;
+        let [gks, wks] = preflight([&l.give.asset.mint_url, &l.want.asset.mint_url]).await?;
         let p = dryrun::plan(
             &dryrun::spendable(home, &l.want.asset.mint_url)?,
             &wks,
@@ -737,5 +761,80 @@ mod lab_trace {
                 line(p, "release");
             }
         }
+    }
+}
+
+#[derive(Debug)]
+struct DoctorExit(u8);
+impl std::fmt::Display for DoctorExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "doctor exit {}", self.0)
+    }
+}
+impl std::error::Error for DoctorExit {}
+async fn doctor(mint: &str, relay: &str, json_output: bool, seconds: u64) -> Result<()> {
+    use maxplayer_core::nostr_mint::NostrMintConnector;
+    use std::time::Duration;
+    let asset = Asset::from_cli(mint)?;
+    ensure!(
+        maxplayer_trade::transport::is_nostr(&asset.mint_url),
+        "doctor requires a nostr:// mint and one explicit --mint-relay"
+    );
+    maxplayer_trade::transport::configure_mint_relays(&[relay.to_owned()])?;
+    let window = Duration::from_secs(seconds);
+    let connector = NostrMintConnector::new(&asset.mint_url.parse()?, vec![relay.to_owned()])?
+        .with_timing(
+            window,
+            window + Duration::from_secs(1),
+            Duration::from_secs(5).min(window),
+        );
+    eprintln!(
+        "Waiting for mint info (read-only budget {seconds}s); no wallet, journal or trade is opened"
+    );
+    let (result, evidence) = connector
+        .call_observed("info", serde_json::Value::Null)
+        .await;
+    let compatibility = result
+        .as_ref()
+        .ok()
+        .map(maxplayer_trade::compatibility::assess);
+    let incompatible = evidence.outcome == "unsupported_protocol"
+        || compatibility
+            .as_ref()
+            .is_some_and(|c| c["status"] == "incompatible");
+    let usable = result
+        .as_ref()
+        .is_ok_and(|v| v.is_object() && v["nuts"].is_object());
+    let exit = if incompatible {
+        1
+    } else if usable {
+        0
+    } else {
+        2
+    };
+    let slow = evidence.reply_ms.is_some_and(|ms| ms > 5000);
+    let report = serde_json::json!({"observation":evidence,"compatibility":compatibility,
+        "latency":if evidence.reply_ms.is_none() {"unknown"} else if slow {"slow"} else {"normal"},
+        "slow_warning_threshold_ms":5000,"exit":exit,
+        "scope":"info only; keysets, swap, restore and witness emission not tested"});
+    if json_output {
+        println!("{report}");
+    } else {
+        println!("{}", evidence.message());
+        if let Some(c) = compatibility {
+            println!(
+                "{}",
+                c["message"].as_str().unwrap_or("compatibility unknown")
+            );
+        }
+        if slow {
+            println!("WARNING: slow reply (warning threshold 5s); this is not a refusal");
+        }
+        println!("Info only; no guarantee of later claims or refunds.");
+    }
+    if exit == 0 {
+        Ok(())
+    } else {
+        Err(DoctorExit(exit))
     }
 }

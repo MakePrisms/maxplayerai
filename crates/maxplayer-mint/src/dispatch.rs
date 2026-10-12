@@ -117,8 +117,14 @@ mod diagnostics_tests {
             overlay_implementation(&mut info);
             assert_eq!(info["name"], "operator");
             assert_eq!(info["contact"][0][1], "operator@example.invalid");
-            assert_eq!(info["version"], format!("maxplayer-mint/{}", env!("CARGO_PKG_VERSION")));
-            assert_eq!(info["maxplayer_mint"]["build"], env!("MAXPLAYER_MINT_BUILD"));
+            assert_eq!(
+                info["version"],
+                format!("maxplayer-mint/{}", env!("CARGO_PKG_VERSION"))
+            );
+            assert_eq!(
+                info["maxplayer_mint"]["build"],
+                env!("MAXPLAYER_MINT_BUILD")
+            );
             let _: cdk::nuts::MintInfo = serde_json::from_value(info).unwrap();
         }
     }

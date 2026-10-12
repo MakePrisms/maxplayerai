@@ -290,7 +290,9 @@ async fn nostr_call(
     } else if let Err(e) = &result {
         crate::backoff::record_cdk(mint, e);
     }
-    if path == "info" { eprintln!("{}", serde_json::to_string(&observation)?); }
+    if path == "info" {
+        eprintln!("{}", serde_json::to_string(&observation)?);
+    }
     let message = observation.message();
     result.map_err(|e| match nostr_refusal(e) {
         Ok(refusal) => anyhow::Error::new(refusal).context(message),

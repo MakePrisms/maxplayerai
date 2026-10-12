@@ -155,13 +155,21 @@ fn timing(l: &Lot) -> Result<(u64, u64, u64, u64)> {
     Ok((LONG_SECONDS, SHORT_SECONDS, CLAIM_CUTOFF_SECONDS, 60))
 }
 async fn preflight(l: &Lot) -> Result<()> {
-    for a in [&l.give.asset, &l.want.asset] { a.fence()?; }
-    let (give, want) = tokio::join!(wallet::preflight_admission(&l.give.asset.mint_url), wallet::preflight_admission(&l.want.asset.mint_url));
-    give?; want?;
+    for a in [&l.give.asset, &l.want.asset] {
+        a.fence()?;
+    }
+    let (give, want) = tokio::join!(
+        wallet::preflight_admission(&l.give.asset.mint_url),
+        wallet::preflight_admission(&l.want.asset.mint_url)
+    );
+    give?;
+    want?;
     Ok(())
 }
 async fn recovery_preflight(l: &Lot) -> Result<()> {
-    for a in [&l.give.asset, &l.want.asset] { wallet::preflight(&a.mint_url).await?; }
+    for a in [&l.give.asset, &l.want.asset] {
+        wallet::preflight(&a.mint_url).await?;
+    }
     Ok(())
 }
 async fn save(j: &Journal, s: &Swap) -> Result<()> {
@@ -355,7 +363,8 @@ pub async fn handle(home: &Path, j: &Journal, m: &Market, e: &Event) -> Result<(
             digest == hash(&message)?,
             "conflicting rejected request-id reuse"
         );
-        if message.step == "request" && legacy_unanswered(&reason)
+        if message.step == "request"
+            && legacy_unanswered(&reason)
             && j.get::<Swap>("swap", &message.swap_id).await?.is_none()
         {
             // Preserve the old digest BEFORE removing its rejection, including across a crash.
@@ -372,8 +381,11 @@ pub async fn handle(home: &Path, j: &Journal, m: &Market, e: &Event) -> Result<(
     if let Err(ref error) = result {
         if crate::backoff::unanswered(error) {
             retain(j, e, &message).await?;
-        } else if message.step == "request" && j.get::<Swap>("swap", &message.swap_id).await?.is_none() {
-            j.put("rejected", &key, &(hash(&message)?, error.to_string())).await?;
+        } else if message.step == "request"
+            && j.get::<Swap>("swap", &message.swap_id).await?.is_none()
+        {
+            j.put("rejected", &key, &(hash(&message)?, error.to_string()))
+                .await?;
         }
     }
     result
@@ -383,17 +395,24 @@ pub async fn handle(home: &Path, j: &Journal, m: &Market, e: &Event) -> Result<(
 // Never match arbitrary occurrences of "timeout" in peer-provided terms or mint details.
 fn legacy_unanswered(reason: &str) -> bool {
     reason == "no answer within the CDK wallet bound"
-        || reason.starts_with("mint ") && (
-            reason.ends_with("Operation timeout (no mint NUT error; ambiguous)")
-            || reason.ends_with("no answer within the nostr bound (ambiguous)")
-            || reason.ends_with("keysets: timed out")
-            || reason.ends_with("no answer within the HTTP bound (ambiguous)"))
+        || reason.starts_with("mint ")
+            && (reason.ends_with("Operation timeout (no mint NUT error; ambiguous)")
+                || reason.ends_with("no answer within the nostr bound (ambiguous)")
+                || reason.ends_with("keysets: timed out")
+                || reason.ends_with("no answer within the HTTP bound (ambiguous)"))
 }
 
 async fn request_retry_live(j: &Journal, e: &Event, msg: &Envelope) -> Result<bool> {
-    if msg.step != "request" || msg.exp <= now() { return Ok(false); }
-    let Some(l) = j.get::<Listing>("listing", &msg.lot_id).await? else { return Ok(false); };
-    if l.cancelled || l.active.is_some() || l.published == 0 || parse_lot(&l.event, now()).is_err() { return Ok(false); }
+    if msg.step != "request" || msg.exp <= now() {
+        return Ok(false);
+    }
+    let Some(l) = j.get::<Listing>("listing", &msg.lot_id).await? else {
+        return Ok(false);
+    };
+    if l.cancelled || l.active.is_some() || l.published == 0 || parse_lot(&l.event, now()).is_err()
+    {
+        return Ok(false);
+    }
     let key = format!("{}_{}", e.pubkey, msg.request_id);
     Ok(j.get::<String>("inbox", &key).await?.as_ref() == Some(&hash(msg)?))
 }
@@ -444,18 +463,23 @@ fn retry_until(s: &Swap, step: &str) -> u64 {
 async fn retain(j: &Journal, e: &Event, msg: &Envelope) -> Result<bool> {
     let swap = j.get::<Swap>("swap", &msg.swap_id).await?;
     if swap.is_none() {
-        if !request_retry_live(j, e, msg).await? { return Ok(false); }
+        if !request_retry_live(j, e, msg).await? {
+            return Ok(false);
+        }
         let rows = j.all::<Retained>("inbox_retry").await?;
         if !rows.iter().any(|r| r.event.id == e.id) {
-            ensure!(rows.len() < 64 && rows.iter().filter(|r| r.event.pubkey == e.pubkey).count() < 4,
-                "initial request retry queue full; retry after pending requests expire");
+            ensure!(
+                rows.len() < 64 && rows.iter().filter(|r| r.event.pubkey == e.pubkey).count() < 4,
+                "initial request retry queue full; retry after pending requests expire"
+            );
         }
     }
-    if swap.as_ref().is_some_and(|s| terminal(s)
-        || s.peer != e.pubkey.to_hex()
-        || awaiting(&msg.step, &s.role) != Some(s.state.as_str())
-        || now() >= retry_until(s, &msg.step))
-    {
+    if swap.as_ref().is_some_and(|s| {
+        terminal(s)
+            || s.peer != e.pubkey.to_hex()
+            || awaiting(&msg.step, &s.role) != Some(s.state.as_str())
+            || now() >= retry_until(s, &msg.step)
+    }) {
         return Ok(false);
     }
     let id = e.id.to_hex();
@@ -513,12 +537,15 @@ async fn replay_retained(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
         let s = j.get::<Swap>("swap", &r.swap_id).await?;
         let request_live = if s.is_none() {
             request_retry_live(j, &r.event, &m.decode(&r.event)?).await?
-        } else { false };
-        let live = request_live || s.as_ref().is_some_and(|s| {
-            !terminal(s)
-                && awaiting(&r.step, &s.role) == Some(s.state.as_str())
-                && now() < retry_until(s, &r.step)
-        });
+        } else {
+            false
+        };
+        let live = request_live
+            || s.as_ref().is_some_and(|s| {
+                !terminal(s)
+                    && awaiting(&r.step, &s.role) == Some(s.state.as_str())
+                    && now() < retry_until(s, &r.step)
+            });
         if !live {
             j.remove("inbox_retry", &id).await?;
             continue;
@@ -533,9 +560,10 @@ async fn replay_retained(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
             }
             Ok(Err(e))
                 if crate::backoff::unanswered(&e)
-                    && (request_live || j.get::<Swap>("swap", &r.swap_id)
-                        .await?
-                        .is_some_and(|s| awaiting(&r.step, &s.role) == Some(s.state.as_str()))) =>
+                    && (request_live
+                        || j.get::<Swap>("swap", &r.swap_id).await?.is_some_and(|s| {
+                            awaiting(&r.step, &s.role) == Some(s.state.as_str())
+                        })) =>
             {
                 pending = true;
                 eprintln!(

@@ -47,6 +47,10 @@ pub async fn keysets(mint: &str, timeout: Duration) -> Result<Keysets> {
     )
     .await
     .with_context(|| format!("mint {mint} keysets: timed out"))??;
+    parse_keysets(&v)
+}
+/// Reuse the keysets already read by admission; previews must not probe again.
+pub fn parse_keysets(v: &serde_json::Value) -> Result<Keysets> {
     let mut out = BTreeMap::new();
     for k in v["keysets"].as_array().context("no keysets")? {
         if k["unit"] != "sat" {
