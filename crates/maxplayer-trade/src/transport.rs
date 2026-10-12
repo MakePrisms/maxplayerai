@@ -304,12 +304,10 @@ async fn nostr_call(
             Ok(refusal) => anyhow::Error::new(refusal).context(format!("mint {mint} {path}")),
             // No reply in the window, no relay reachable, rate limited or unavailable: the mint
             // did not answer this request (`backoff::unanswered`).
-            Err(e) if crate::backoff::cdk_unanswered(&e) => {
-                crate::backoff::NoAnswer(format!(
-                    "mint {mint} {path}: {e} (no mint NUT error; ambiguous)"
-                ))
-                .into()
-            }
+            Err(e) if crate::backoff::cdk_unanswered(&e) => crate::backoff::NoAnswer(format!(
+                "mint {mint} {path}: {e} (no mint NUT error; ambiguous)"
+            ))
+            .into(),
             Err(e) => anyhow!("mint {mint} {path}: {e} (no mint NUT error; ambiguous)"),
         })
 }

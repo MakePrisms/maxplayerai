@@ -1552,8 +1552,7 @@ async fn nostr_verification_and_witness_not_starved_by_backoff() {
     let started = Instant::now();
     for _ in 0..20 {
         coordinator::recover(&e.maker, &e.jm, &e.mm).await.unwrap();
-        if e
-            .state(true, &id)
+        if e.state(true, &id)
             .await
             .is_some_and(|s| ["settling", "complete"].contains(&s.as_str()))
         {

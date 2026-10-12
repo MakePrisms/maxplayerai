@@ -1142,7 +1142,9 @@ mod tests {
         assert!(unanswered(&deferred.context("check second lock")));
         let elapsed: Result<(), crate::wallet::Bound> = Err(crate::wallet::Bound::Elapsed);
         assert!(unanswered(
-            &elapsed.context("CDK wallet request not answered").unwrap_err()
+            &elapsed
+                .context("CDK wallet request not answered")
+                .unwrap_err()
         ));
         assert!(unanswered(&anyhow::Error::new(cdk::Error::Timeout)));
         assert!(unanswered(&anyhow::Error::new(cdk::Error::HttpError(
