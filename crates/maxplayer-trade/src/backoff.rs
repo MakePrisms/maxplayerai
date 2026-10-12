@@ -17,17 +17,27 @@
 //!
 //! **Pacing** (no backoff active): every request to a mint adds 6 s of debt; a recovery item that
 //! needs the mint starts only while that debt is at most 30 s ahead of now. An admitted item runs
-//! its whole sequence (restore, NUT-07, swap are never split by pacing). Long run: at most one
-//! request per 6 s per mint per process (10/min), after a burst of at most 5 requests plus one
-//! item's sequence. `serve` skips a paced item until a later tick; `recover` (one bounded pass)
-//! waits for it. Items take turns: the one served longest ago goes first.
+//! its whole sequence (restore, NUT-07, swap are never split by pacing). Pacing bounds ONLY the
+//! recovery loop (the `serve` tick and `recover` items): there, at most one request per 6 s per
+//! mint per process (10/min) long run, after a burst of at most 5 requests plus one item's
+//! sequence. Message-driven advances (one per inbound trade message), CDK wallet calls and other
+//! processes on the same host are NOT paced; they are bounded only by backoff, which stops them
+//! as soon as the mint answers 429/503 or stops answering. `serve` skips a paced item until a
+//! later tick; `recover` (one bounded pass) waits for it. Items take turns: the one served
+//! longest ago goes first.
 //!
-//! **Deadline safety:** a claim phase runs inside [`with_deadline`] (maker: the taker's refund
-//! locktime `long`; taker: the claim send deadline `short - cutoff`). From `deadline - margin`
-//! (margin: two abandonment graces, 120 s over HTTP) its requests ignore backoff and pacing: the
-//! claim is tried at the last safe moment however long the backoff. Earlier, when the backoff
-//! would run past that moment, that is logged once. Backoff never reorders, skips, releases or
-//! refuses anything: it only delays a request, exactly as an outage would.
+//! **Claims are never idle:** a swap whose claim is possible (maker: preimage known, until the
+//! taker's refund locktime `long`; taker: in `second_validated`, until its claim send deadline
+//! `short - cutoff`) runs its advance inside [`with_claim`], keyed by that deadline AND the claim
+//! mint. Requests to the claim mint (and only to it: refund and own-mint traffic keep normal
+//! backoff) ignore a longer backoff or `Retry-After`: they are retried in rounds, one round per
+//! 30 s ([`Timing::claim_retry`]), from the moment the claim is possible. In the final stretch
+//! ([`margin`]: 10 min before the deadline) a round starts every 10 s. Each round sends until the
+//! first failure, so a mint that keeps refusing sees at most one failed request per round. The
+//! deadline is judged on the MINT clock (last observed `info.time` skew; an unobserved mint is
+//! assumed 2 min ahead). An item with a possible claim is never paced. Past `deadline + margin`
+//! normal backoff applies again (still retried, never dropped). Backoff never reorders, skips,
+//! releases or refuses anything: it only delays a request, exactly as an outage would.
 use std::{
     collections::HashMap,
     sync::{LazyLock, Mutex, MutexGuard, RwLock},
@@ -47,8 +57,15 @@ pub struct Timing {
     pub interval: Duration,
     /// Debt allowed ahead of now before a paced item must wait.
     pub burst: Duration,
-    /// Urgency margin before a claim deadline; `None` = two abandonment graces for the mint.
+    /// Final stretch before a claim deadline (mint clock); `None` = [`CLAIM_MARGIN_SECONDS`]
+    /// (at least two abandonment graces for the mint).
     pub urgent_margin: Option<Duration>,
+    /// While a claim to a backing-off mint is possible: one attempt round per this interval.
+    pub claim_retry: Duration,
+    /// The same inside the final stretch.
+    pub final_retry: Duration,
+    /// Mint clock lead assumed for a mint whose `info.time` has not been observed yet.
+    pub unknown_skew: Duration,
     /// Apply backoff and pacing to loopback (test) mints too.
     pub loopback: bool,
 }
@@ -60,9 +77,18 @@ impl Timing {
         interval: Duration::from_secs(6),
         burst: Duration::from_secs(30),
         urgent_margin: None,
+        claim_retry: Duration::from_secs(30),
+        final_retry: Duration::from_secs(10),
+        unknown_skew: Duration::from_secs(120),
         loopback: false,
     };
 }
+
+/// Final stretch before a claim deadline, in seconds of mint time. 10 min: one claim attempt
+/// over HTTP is bounded by about 20 s per request, so the stretch holds ~60 rounds at
+/// [`Timing::final_retry`] (and a serve tick or item budget misalignment costs one round, not
+/// the claim). A clock skew under 10 min past the observed one still leaves the claim tried.
+pub const CLAIM_MARGIN_SECONDS: u64 = 600;
 
 /// Why a mint is being backed off. The label is what the log shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,7 +143,7 @@ pub fn deferred(e: &anyhow::Error) -> bool {
     e.chain().any(|c| c.is::<Deferred>())
 }
 
-/// A claim deadline, as seen by one request.
+/// A claim deadline, as seen by one request to the claim mint. `now_unix` is mint time.
 #[derive(Clone, Copy, Debug)]
 struct Urgency {
     deadline: u64,
@@ -125,14 +151,22 @@ struct Urgency {
     margin: u64,
 }
 impl Urgency {
-    /// The bypass window is `[deadline - margin, deadline + margin)`. After it, normal backoff
-    /// applies again (still retried, never dropped), so a stuck claim cannot hammer forever.
+    /// Claim rounds run until `deadline + margin`. After it, normal backoff applies again
+    /// (still retried, never dropped), so a stuck claim cannot hammer forever.
     fn over(&self) -> bool {
         self.now_unix >= self.deadline.saturating_add(self.margin)
     }
-    fn due(&self) -> bool {
+    /// `[deadline - margin, deadline + margin)`: rounds at the shorter final cadence.
+    fn final_stretch(&self) -> bool {
         !self.over() && self.now_unix.saturating_add(self.margin) >= self.deadline
     }
+}
+
+/// One claim retry round against a backing-off mint: requests pass until the first failure.
+#[derive(Clone, Copy, Debug)]
+struct Round {
+    start: Instant,
+    open: bool,
 }
 
 #[derive(Default)]
@@ -141,8 +175,12 @@ struct MintState {
     until: Option<Instant>,
     reason: Option<Reason>,
     debt: Option<Instant>,
-    /// (deadline, stage) of the last deadline warning: 1 = "would pass", 2 = "trying now".
+    /// (deadline, stage) of the last claim warning: 1 = claim rounds, 2 = final stretch.
     warned: Option<(u64, u8)>,
+    /// The current claim retry round while backing off.
+    round: Option<Round>,
+    /// Last observed `info.time - local unix time`, seconds.
+    skew: Option<i64>,
 }
 
 #[derive(Default)]
@@ -169,36 +207,50 @@ impl Book {
         if let (Some(until), Some(reason)) = (m.until, m.reason) {
             if now < until {
                 let remaining = until - now;
-                let deferred = || Deferred {
+                let deferred = |remaining| Deferred {
                     mint: mint.to_owned(),
                     reason,
                     remaining,
                 };
                 let Some(u) = urgent.filter(|u| !u.over()) else {
-                    return Err(deferred());
+                    return Err(deferred(remaining));
                 };
-                let last_safe = u.deadline.saturating_sub(u.margin);
-                if u.now_unix < last_safe {
-                    if u.now_unix.saturating_add(remaining.as_secs()) >= last_safe
-                        && m.warned < Some((u.deadline, 1))
-                    {
-                        m.warned = Some((u.deadline, 1));
-                        log.push(format!(
-                            "mint {mint} backoff ({}, {}s left) would pass a claim's safe window: the claim will be tried anyway at the last safe moment (unix {last_safe}, deadline {})",
-                            reason.label(),
-                            remaining.as_secs(),
-                            u.deadline
-                        ));
+                let (every, stage) = if u.final_stretch() {
+                    (t.final_retry, 2)
+                } else {
+                    (t.claim_retry, 1)
+                };
+                match m.round {
+                    Some(r) if now < r.start + every => {
+                        if !r.open {
+                            return Err(deferred((r.start + every - now).min(remaining)));
+                        }
                     }
-                    return Err(deferred());
-                }
-                if m.warned < Some((u.deadline, 2)) {
-                    m.warned = Some((u.deadline, 2));
-                    log.push(format!(
-                        "mint {mint} backing off ({}) but a claim must reach it before unix {}: last safe moment, trying now",
-                        reason.label(),
-                        u.deadline
-                    ));
+                    _ => {
+                        m.round = Some(Round {
+                            start: now,
+                            open: true,
+                        });
+                        if m.warned < Some((u.deadline, stage)) {
+                            m.warned = Some((u.deadline, stage));
+                            log.push(if stage == 1 {
+                                format!(
+                                    "mint {mint} backing off ({}, {}s left) but a claim to it is possible: retrying it every {}s until its deadline (unix {}, mint clock)",
+                                    reason.label(),
+                                    remaining.as_secs(),
+                                    every.as_secs_f64(),
+                                    u.deadline
+                                )
+                            } else {
+                                format!(
+                                    "mint {mint} backing off ({}) and a claim to it is due before unix {} (mint clock): final stretch, retrying it every {}s",
+                                    reason.label(),
+                                    u.deadline,
+                                    every.as_secs_f64()
+                                )
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -229,8 +281,20 @@ impl Book {
                 m.until = None;
                 m.reason = None;
                 m.warned = None;
+                m.round = None;
             }
             Outcome::Failed(reason, retry_after) => {
+                // A backoff that expired more than `cap` ago is history: start again at `base`
+                // instead of jumping straight to the cap on one blip hours later.
+                if m.until.is_some_and(|u| now >= u + t.cap) {
+                    m.failures = 0;
+                    m.reason = None;
+                    m.warned = None;
+                }
+                // The failure ends the current claim round; the next one starts on cadence.
+                if let Some(r) = &mut m.round {
+                    r.open = false;
+                }
                 m.failures = m.failures.saturating_add(1);
                 let factor = 1u32.checked_shl(m.failures - 1).unwrap_or(u32::MAX);
                 let exp = t.base.saturating_mul(factor).min(t.cap);
@@ -261,6 +325,21 @@ impl Book {
             .unwrap_or_default()
     }
 
+    fn observe(&mut self, mint: &str, local: u64, mint_time: u64) {
+        let skew = i64::try_from(mint_time).unwrap_or(i64::MAX) - i64::try_from(local).unwrap_or(0);
+        self.mints.entry(key(mint)).or_default().skew = Some(skew);
+    }
+
+    /// The mint's clock: local time plus its last observed lead (a mint behind us counts as
+    /// on time; an unobserved one as [`Timing::unknown_skew`] ahead).
+    fn mint_now(&self, t: &Timing, mint: &str, local: u64) -> u64 {
+        let lead = match self.mints.get(&key(mint)).and_then(|m| m.skew) {
+            Some(skew) => u64::try_from(skew.max(0)).unwrap_or(0),
+            None => t.unknown_skew.as_secs(),
+        };
+        local.saturating_add(lead)
+    }
+
     fn remaining(&self, mint: &str, now: Instant) -> Option<Duration> {
         let until = self.mints.get(&key(mint))?.until?;
         (until > now).then(|| until - now)
@@ -274,7 +353,8 @@ static WAIT_FOR_PACING: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 static LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 tokio::task_local! {
-    static DEADLINE: u64;
+    /// (deadline, claim mint key) of the claim the current advance may have to land.
+    static CLAIM: (u64, String);
 }
 
 fn book() -> MutexGuard<'static, Book> {
@@ -294,24 +374,40 @@ fn exempt(mint: &str) -> bool {
     crate::transport::loopback_only(mint) && !timing().loopback
 }
 
-/// Seconds before a claim deadline from which backoff and pacing no longer delay its requests.
+/// Final stretch before a claim deadline to `mint`, in seconds of mint time.
 pub fn margin(mint: &str) -> u64 {
     timing()
         .urgent_margin
         .map(|m| m.as_secs())
-        .unwrap_or_else(|| 2 * crate::transport::abandon_grace_seconds(mint))
+        .unwrap_or_else(|| {
+            CLAIM_MARGIN_SECONDS.max(2 * crate::transport::abandon_grace_seconds(mint))
+        })
 }
 
-/// Run `f` as a claim phase that must reach its mint before `deadline` (unix seconds).
-pub async fn with_deadline<F: std::future::Future>(deadline: u64, f: F) -> F::Output {
-    DEADLINE.scope(deadline, f).await
+/// Run `f` as an advance whose claim to `mint` must land before `deadline` (unix seconds, mint
+/// clock). Only requests to `mint` get claim rounds; every other mint keeps normal backoff.
+pub async fn with_claim<F: std::future::Future>(deadline: u64, mint: &str, f: F) -> F::Output {
+    CLAIM.scope((deadline, key(mint)), f).await
+}
+
+/// Record a mint's `info.time` (its clock), observed now.
+pub fn observe_time(mint: &str, mint_time: u64) {
+    book().observe(mint, crate::coordinator::now(), mint_time);
+}
+
+/// `mint`'s clock as far as claim deadlines go (see [`Book::mint_now`]).
+pub fn mint_now(mint: &str) -> u64 {
+    book().mint_now(&timing(), mint, crate::coordinator::now())
 }
 
 fn urgency(mint: &str) -> Option<Urgency> {
-    let deadline = DEADLINE.try_with(|d| *d).ok()?;
+    let deadline = CLAIM
+        .try_with(|(deadline, claim_mint)| (*claim_mint == key(mint)).then_some(*deadline))
+        .ok()
+        .flatten()?;
     Some(Urgency {
         deadline,
-        now_unix: crate::coordinator::now(),
+        now_unix: mint_now(mint),
         margin: margin(mint),
     })
 }
@@ -328,14 +424,9 @@ pub fn admit(mint: &str, charge: bool) -> Result<(), Deferred> {
         return Ok(());
     }
     let mut log = vec![];
-    let result = book().admit(
-        &timing(),
-        mint,
-        Instant::now(),
-        charge,
-        urgency(mint),
-        &mut log,
-    );
+    // Before taking the book: `urgency` reads it too (the mutex is not reentrant).
+    let urgent = urgency(mint);
+    let result = book().admit(&timing(), mint, Instant::now(), charge, urgent, &mut log);
     emit(log);
     result
 }
@@ -391,30 +482,48 @@ pub fn record_reqwest(mint: &str, e: &reqwest::Error) {
     }
 }
 
-/// Report a CDK (wallet or `nostr://` connector) failure. Successes are not reported here: a CDK
-/// call may be answered from its cache without reaching the mint.
-pub fn record_cdk(mint: &str, e: &cdk::Error) {
-    let reason = match e {
+/// CDK flattens a transport failure to `HttpError(None, reqwest_error.to_string())`; the text
+/// match is pinned by `cdk_connection_refused_is_recognised`.
+fn classify_cdk(e: &cdk::Error) -> Option<Reason> {
+    Some(match e {
         cdk::Error::HttpError(Some(429), _) => Reason::RateLimited,
         cdk::Error::HttpError(Some(503), _) => Reason::Unavailable,
         cdk::Error::Timeout => Reason::Timeout,
         cdk::Error::HttpError(None, msg) if msg.contains("error sending request") => {
             Reason::Refused
         }
-        _ => return,
-    };
-    record(mint, Outcome::Failed(reason, None));
+        _ => return None,
+    })
+}
+
+/// Report a CDK (wallet or `nostr://` connector) failure. Successes are not reported here: a CDK
+/// call may be answered from its cache without reaching the mint. CDK does not expose response
+/// headers, so a 429 on this path never carries a `Retry-After`: exponential backoff applies.
+pub fn record_cdk(mint: &str, e: &cdk::Error) {
+    if let Some(reason) = classify_cdk(e) {
+        record(mint, Outcome::Failed(reason, None));
+    }
+}
+
+/// `Retry-After` as delay-seconds or an HTTP-date (RFC 9110); a past date means now. The 15 min
+/// cap is applied when recording.
+fn parse_retry_after(value: &str, now: std::time::SystemTime) -> Option<Duration> {
+    let value = value.trim();
+    if let Ok(secs) = value.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    let at = httpdate::parse_http_date(value).ok()?;
+    Some(at.duration_since(now).unwrap_or(Duration::ZERO))
 }
 
 fn retry_after(r: &reqwest::Response) -> Option<Duration> {
-    r.headers()
-        .get(reqwest::header::RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .map(Duration::from_secs)
+    parse_retry_after(
+        r.headers()
+            .get(reqwest::header::RETRY_AFTER)?
+            .to_str()
+            .ok()?,
+        std::time::SystemTime::now(),
+    )
 }
 
 /// Send one HTTP request to `mint` through the gate, recording its outcome.
@@ -436,19 +545,17 @@ pub async fn send(
 }
 
 /// Pacing gate for one recovery item touching `mints`. True: run it now. False (serve): skip it
-/// this tick. `recover` waits instead of returning false. An item whose claim deadline is within
-/// [`margin`] is never paced.
-pub async fn ready(item: &str, mints: &[&str], deadline: Option<u64>) -> bool {
+/// this tick. `recover` waits instead of returning false. An item with a possible claim
+/// (`claim`: its deadline and claim mint) is never paced until `deadline + margin`.
+pub async fn ready(item: &str, mints: &[&str], claim: Option<(u64, &str)>) -> bool {
     let mints: Vec<&str> = mints.iter().copied().filter(|m| !exempt(m)).collect();
-    let urgent = deadline.is_some_and(|deadline| {
-        mints.iter().any(|m| {
-            Urgency {
-                deadline,
-                now_unix: crate::coordinator::now(),
-                margin: margin(m),
-            }
-            .due()
-        })
+    let urgent = claim.is_some_and(|(deadline, mint)| {
+        !Urgency {
+            deadline,
+            now_unix: mint_now(mint),
+            margin: margin(mint),
+        }
+        .over()
     });
     loop {
         let wait = if urgent {
@@ -600,54 +707,250 @@ mod tests {
         );
     }
 
+    /// H1: a claim to a backing-off mint is retried in 30 s rounds from the moment it is
+    /// possible (not only near the deadline), one failed request per round however long the
+    /// backoff or `Retry-After`, and every 10 s in the final stretch.
     #[test]
-    fn claim_tried_at_last_safe_moment_despite_backoff() {
+    fn claim_retried_on_short_cadence_however_long_the_backoff() {
         let mut b = Book::default();
-        let now = Instant::now();
+        let t0 = Instant::now();
         let mut log = vec![];
-        fail(&mut b, now, Reason::RateLimited, Some(900), &mut log);
-        let deadline = 10_000;
+        fail(&mut b, t0, Reason::RateLimited, Some(900), &mut log);
+        let deadline = 100_000;
         let at = |unix| Urgency {
             deadline,
             now_unix: unix,
-            margin: 120,
+            margin: 600,
         };
-        // Far from the deadline: deferred; the backoff ends long before the last safe moment.
+        // A mint that keeps answering 429 (Retry-After 900) for 15 minutes, an hour before
+        // the deadline: the claim reaches it once per 30 s, never more, never idle.
+        let mut sent = vec![];
+        for ms in (0..900_000u64).step_by(500) {
+            let now = t0 + Duration::from_millis(ms);
+            let unix = deadline - 3_600 + ms / 1000;
+            // Bounded: a round that a failure does not close would admit forever.
+            for _ in 0..3 {
+                if b.admit(&T, M, now, true, Some(at(unix)), &mut log).is_err() {
+                    break;
+                }
+                sent.push(ms);
+                fail(&mut b, now, Reason::RateLimited, Some(900), &mut log);
+            }
+            // Refund or watch traffic to the same mint (no claim) keeps the backoff.
+            assert!(b.admit(&T, M, now, true, None, &mut log).is_err());
+        }
+        assert_eq!(sent.len(), 30, "{sent:?}");
         assert!(
-            b.admit(&T, M, now, true, Some(at(5_000)), &mut log)
-                .is_err()
+            sent.windows(2).all(|w| w[1] - w[0] == 30_000),
+            "every 30 s: {sent:?}"
         );
-        assert_eq!(log.len(), 1, "no deadline warning yet");
-        // The 900 s backoff would run past 9_880: warned once, still deferred until then.
         assert!(
-            b.admit(&T, M, now, true, Some(at(9_000)), &mut log)
-                .is_err()
-        );
-        assert!(
-            b.admit(&T, M, now, true, Some(at(9_879)), &mut log)
-                .is_err()
-        );
-        assert_eq!(log.len(), 2);
-        assert!(
-            log[1].contains("would pass a claim's safe window"),
+            log.iter()
+                .any(|l| l.contains("a claim to it is possible: retrying it every 30s")),
             "{log:?}"
         );
-        // At the last safe moment the claim goes out despite the backoff, logged once.
-        assert!(b.admit(&T, M, now, true, Some(at(9_880)), &mut log).is_ok());
-        assert!(b.admit(&T, M, now, true, Some(at(9_990)), &mut log).is_ok());
+        // A round sends until its first failure: the claim's several requests all pass.
+        let later = t0 + Duration::from_secs(10_000);
+        fail(&mut b, later, Reason::RateLimited, Some(900), &mut log);
+        let later = later + Duration::from_secs(31);
+        for _ in 0..5 {
+            assert!(
+                b.admit(&T, M, later, true, Some(at(deadline - 1_000)), &mut log)
+                    .is_ok()
+            );
+        }
+        // Final stretch (mint clock within `margin` of the deadline): every 10 s.
+        fail(&mut b, later, Reason::RateLimited, Some(900), &mut log);
+        let near = deadline - 300;
+        // The round above started at `later` (+31 s from the failure before it).
+        let ok = |b: &mut Book, s: u64, log: &mut Vec<String>| {
+            b.admit(
+                &T,
+                M,
+                later + Duration::from_secs(s),
+                true,
+                Some(at(near)),
+                log,
+            )
+            .is_ok()
+        };
+        assert!(!ok(&mut b, 9, &mut log), "round closed by the failure");
+        assert!(ok(&mut b, 10, &mut log), "final stretch: 10 s rounds");
         assert!(
-            b.admit(&T, M, now, true, Some(at(10_119)), &mut log)
-                .is_ok()
+            log.iter()
+                .any(|l| l.contains("final stretch, retrying it every 10s")),
+            "{log:?}"
         );
-        assert_eq!(log.len(), 3);
-        assert!(log[2].contains("last safe moment, trying now"), "{log:?}");
-        // Past deadline + margin the bypass ends: normal backoff again (no endless hammering).
+        // Past deadline + margin the rounds end: normal backoff (no endless hammering).
+        fail(&mut b, later, Reason::RateLimited, Some(900), &mut log);
         assert!(
-            b.admit(&T, M, now, true, Some(at(10_120)), &mut log)
+            b.admit(
+                &T,
+                M,
+                later + Duration::from_secs(60),
+                true,
+                Some(at(deadline + 600)),
+                &mut log
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn production_claim_margin_is_wide() {
+        assert_eq!(T.claim_retry, Duration::from_secs(30));
+        assert_eq!(T.final_retry, Duration::from_secs(10));
+        assert_eq!(margin("https://mint.example"), 600);
+        assert!(margin("https://mint.example") >= 5 * 120);
+        let npub = "nostr://npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d";
+        assert!(margin(npub) >= 2 * crate::transport::NOSTR_ABANDON_GRACE_SECONDS);
+    }
+
+    #[test]
+    fn mint_clock_from_observed_skew() {
+        let mut b = Book::default();
+        // Unobserved: assumed `unknown_skew` (2 min) ahead.
+        assert_eq!(b.mint_now(&T, M, 1_000), 1_120);
+        b.observe(M, 1_000, 1_300);
+        assert_eq!(b.mint_now(&T, "HTTPS://mint.example/", 2_000), 2_300);
+        // A mint behind us counts as on time (local is the lower bound).
+        b.observe(M, 1_000, 900);
+        assert_eq!(b.mint_now(&T, M, 2_000), 2_000);
+    }
+
+    /// The claim mint's clock decides the window: ahead by 15 min, the final stretch (and its
+    /// end) come 15 min earlier in local time. Global state; unique mint URLs.
+    #[tokio::test]
+    async fn claim_window_judged_on_mint_clock() {
+        let ahead = "https://ahead.claim-clock.example";
+        let even = "https://even.claim-clock.example";
+        let local = crate::coordinator::now();
+        observe_time(ahead, local + 900);
+        observe_time(even, local);
+        let deadline = local + 100;
+        for mint in [ahead, even] {
+            record_status(mint, 429, Some(Duration::from_secs(900)));
+        }
+        let (a, e) = with_claim(deadline, ahead, async { (urgency(ahead), mint_now(ahead)) }).await;
+        let a = a.expect("claim mint");
+        assert!(e >= local + 900 && a.now_unix >= local + 900);
+        assert!(a.over(), "mint time is past deadline + margin");
+        assert!(
+            with_claim(deadline, ahead, async { admit(ahead, true) })
+                .await
                 .is_err()
         );
-        // The backoff itself is untouched for every other request.
-        assert!(b.admit(&T, M, now, true, None, &mut log).is_err());
+        let e = with_claim(deadline, even, async { urgency(even) })
+            .await
+            .unwrap();
+        assert!(e.final_stretch() && !e.over());
+        assert!(
+            with_claim(deadline, even, async { admit(even, true) })
+                .await
+                .is_ok()
+        );
+        // Far from the deadline on local time but inside the final stretch on the mint's.
+        let early = local + 1_000;
+        let ahead2 = "https://ahead2.claim-clock.example";
+        observe_time(ahead2, local + 900);
+        let u = with_claim(early, ahead2, async { urgency(ahead2) })
+            .await
+            .unwrap();
+        assert!(u.final_stretch(), "{u:?}");
+    }
+
+    /// M2: only the claim mint gets claim rounds; refund and own-mint traffic in the same
+    /// advance keeps its backoff. Global state; unique mint URLs.
+    #[tokio::test]
+    async fn claim_rounds_only_for_the_claim_mint() {
+        let claim = "https://claim.claim-scope.example";
+        let own = "https://own.claim-scope.example";
+        for mint in [claim, own] {
+            observe_time(mint, crate::coordinator::now());
+            record_status(mint, 429, Some(Duration::from_secs(900)));
+        }
+        let deadline = crate::coordinator::now() + 3_000;
+        let (c, o) = with_claim(deadline, "HTTPS://claim.claim-scope.example/", async {
+            (admit(claim, true), admit(own, true))
+        })
+        .await;
+        assert!(c.is_ok(), "claim mint: claim round");
+        let o = o.expect_err("own mint keeps its backoff");
+        assert!(o.remaining > Duration::from_secs(800), "{o}");
+        assert!(admit(claim, true).is_err(), "outside the claim scope");
+        assert!(urgency(claim).is_none());
+    }
+
+    #[test]
+    fn stale_failure_count_decays_after_backoff_expires() {
+        let mut b = Book::default();
+        let now = Instant::now();
+        let mut log = vec![];
+        for _ in 0..8 {
+            fail(&mut b, now, Reason::Timeout, None, &mut log);
+        }
+        let until = now + b.remaining(M, now).unwrap();
+        assert_eq!(b.remaining(M, now).unwrap(), T.cap);
+        // A blip soon after expiry still escalates…
+        let soon = until + Duration::from_secs(1);
+        fail(&mut b, soon, Reason::Timeout, None, &mut log);
+        assert_eq!(b.remaining(M, soon).unwrap(), T.cap);
+        // …but one hours later starts again at the base delay (+ jitter).
+        let until = soon + T.cap;
+        let hours = until + Duration::from_secs(3 * 3600);
+        fail(&mut b, hours, Reason::Timeout, None, &mut log);
+        assert_eq!(b.remaining(M, hours).unwrap().as_millis(), 6250);
+    }
+
+    #[test]
+    fn retry_after_http_date() {
+        let at = httpdate::parse_http_date("Wed, 21 Oct 2026 07:28:00 GMT").unwrap();
+        let now = at - Duration::from_secs(120);
+        assert_eq!(
+            parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT", now),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(
+            parse_retry_after(" 42 ", now),
+            Some(Duration::from_secs(42))
+        );
+        assert_eq!(
+            parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT", at + Duration::from_secs(5)),
+            Some(Duration::ZERO),
+            "a past date means now"
+        );
+        assert_eq!(parse_retry_after("soon", now), None);
+        // A far date is capped at 15 min when recorded.
+        let mut b = Book::default();
+        let mut log = vec![];
+        let i = Instant::now();
+        let far = parse_retry_after(
+            "Wed, 21 Oct 2026 07:28:00 GMT",
+            at - Duration::from_secs(86_400),
+        );
+        b.record(
+            &T,
+            M,
+            i,
+            Outcome::Failed(Reason::RateLimited, far),
+            0.0,
+            &mut log,
+        );
+        assert_eq!(b.remaining(M, i).unwrap().as_secs(), 900);
+    }
+
+    /// L3: pin the CDK transport-error text `classify_cdk` matches (cdk 0.17.2 flattens the
+    /// reqwest error with `to_string()`). Loopback port with nothing listening; no real mint.
+    #[tokio::test]
+    async fn cdk_connection_refused_is_recognised() {
+        use cdk::wallet::MintConnector;
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let client = cdk::wallet::HttpClient::new(url.parse().unwrap(), None);
+        let e = client.get_mint_info().await.expect_err("nothing listens");
+        assert!(matches!(e, cdk::Error::HttpError(None, _)), "{e:?}");
+        assert_eq!(classify_cdk(&e), Some(Reason::Refused), "{e:?}");
     }
 
     /// The live incident: one item polling NUT-07 on every 3 s tick. Over a simulated hour the

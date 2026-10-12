@@ -141,19 +141,27 @@ in one process:
 
 - **Backoff:** on HTTP 429 or 503, a refused/reset connection or a timeout, that mint is
   not contacted again for 5 s, doubling per consecutive failure with 0-25 % jitter, up to
-  10 min. A `Retry-After` header (seconds) is honoured up to 15 min. Any other answer
-  clears it. serve/recover log `mint <url> backing off <N>s (429|503|refused|timeout)` once
-  per state change and `mint <url> answered; backoff cleared` when it ends.
-- **Pacing (no backoff):** each request adds 6 s of per-mint debt; an item starts only
-  while that debt is at most 30 s ahead. Steady state: at most ~1 request / 6 s
-  (10/min) per mint per process, after a short burst. serve skips a paced item until a
+  10 min. A `Retry-After` header (seconds or an HTTP date) is honoured up to 15 min. Any
+  other answer clears it; a failure long after a backoff ended starts again at 5 s.
+  serve/recover log `mint <url> backing off <N>s (429|503|refused|timeout)` once per state
+  change and `mint <url> answered; backoff cleared` when it ends.
+- **Pacing (no backoff):** each request adds 6 s of per-mint debt; a recovery item starts
+  only while that debt is at most 30 s ahead. This bounds only the recovery loop (serve
+  tick, `recover`): there, at most ~1 request / 6 s (10/min) per mint per process, after a
+  short burst. Advances driven by inbound trade messages, CDK wallet calls and other
+  processes are not paced; only backoff bounds them. serve skips a paced item until a
   later tick; `recover` waits for it. Items take turns, oldest-served first.
 - **What it never does:** a backed-off request is simply not sent and counts as "no
   answer" (exit 3 / deferred): journals, reservations and money-step order are unchanged,
-  nothing is marked refused or failed. A claim near its deadline (maker: before the
-  taker's refund locktime; taker: before its claim cutoff) ignores backoff and pacing
-  from two abandonment graces (120 s over HTTP) before the deadline, and logs
-  `would pass a claim's safe window` / `last safe moment, trying now`.
+  nothing is marked refused or failed.
+- **Claims are never idle:** once a claim is possible (maker: preimage known, until the
+  taker's refund locktime; taker: second lock validated, until its claim cutoff), the
+  claim mint is retried once per 30 s round however long its backoff or `Retry-After`
+  (one failed request per round at most), and every 10 s in the last 10 min before the
+  deadline. Deadlines are judged on the mint's clock (its `info.time`; an unseen mint is
+  assumed 2 min ahead). Only the claim mint: refund and own-mint requests keep normal
+  backoff. Logs `a claim to it is possible: retrying it every 30s` / `final stretch`. The
+  taker's claim is still never sent past its cutoff.
 - `fund` polls its quote every 5 s (6 polls), not every second.
 
 ## Funding

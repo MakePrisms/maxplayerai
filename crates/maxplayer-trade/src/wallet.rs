@@ -13,7 +13,12 @@ use std::{
 };
 async fn info(mint: &str) -> Result<serde_json::Value> {
     crate::Asset::new(mint)?.fence()?;
-    crate::transport::get(mint, "info").await
+    let info = crate::transport::get(mint, "info").await?;
+    // The mint's clock decides claim deadlines (backoff claim rounds).
+    if let Some(time) = info["time"].as_u64() {
+        crate::backoff::observe_time(mint, time);
+    }
+    Ok(info)
 }
 pub async fn action_time(mint: &str) -> Result<u64> {
     let info = info(mint).await?;

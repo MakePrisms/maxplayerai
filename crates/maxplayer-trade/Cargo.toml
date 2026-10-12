@@ -27,6 +27,8 @@ hex = "0.4"
 fs2 = "0.4"
 rusqlite = "=0.31.0"
 url = "2"
+# Retry-After as an HTTP-date (already in the lock through hyper/reqwest).
+httpdate = "1"
 
 uuid = { version = "1", features = ["v4", "serde"] }
 bitcoin = "0.32"

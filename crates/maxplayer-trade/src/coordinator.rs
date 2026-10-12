@@ -582,10 +582,11 @@ pub async fn advance(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Resu
     if terminal(s) {
         return Ok(());
     }
-    // A claim phase near its deadline is never delayed by mint backoff or pacing.
-    let result = match claim_deadline(s) {
-        Some(deadline) => {
-            crate::backoff::with_deadline(deadline, advance_inner(home, j, m, s)).await
+    // While a claim may have to land, its requests to the claim mint (only that mint) are
+    // retried on a short cadence however long that mint's backoff (see `backoff`).
+    let result = match claim_deadline(s).map(|(deadline, mint)| (deadline, mint.to_owned())) {
+        Some((deadline, mint)) => {
+            crate::backoff::with_claim(deadline, &mint, advance_inner(home, j, m, s)).await
         }
         None => advance_inner(home, j, m, s).await,
     };
@@ -626,20 +627,31 @@ pub async fn advance(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Resu
     }
     result
 }
-/// The moment after which this swap's pending claim can lose funds, if it has one:
-/// - maker (claiming the taker's lock with the learned preimage, or still watching its own
-///   lock's NUT-07 witness for it): `long`, the taker's refund locktime;
-/// - taker (claiming the maker's lock): `short - cutoff`, its claim send deadline.
+/// The claim this swap may have to land, with the moment (mint clock) after which it can lose
+/// funds, and the claim mint:
+/// - maker (claiming the taker's lock on the want mint with the learned preimage, or still
+///   watching its own lock's NUT-07 witness for it): `long`, the taker's refund locktime;
+/// - taker (claiming the maker's lock on the give mint): `short - cutoff`, its send deadline.
 ///
 /// Taker refunds (after `long + margin`) and maker refunds (after `short + margin`) have no
 /// such moment: the refund path stays open, so a later refund loses nothing.
-pub fn claim_deadline(s: &Swap) -> Option<u64> {
+pub fn claim_deadline(s: &Swap) -> Option<(u64, &str)> {
     let q = s.quote.as_ref()?;
     match (s.role.as_str(), s.state.as_str()) {
-        ("maker", "second_locked" | "claiming" | "lock_unforwardable") => Some(q.long),
-        ("taker", "second_validated") => Some(q.short.saturating_sub(q.cutoff)),
+        ("maker", "second_locked" | "claiming" | "lock_unforwardable") => {
+            Some((q.long, q.lot.want.asset.mint_url.as_str()))
+        }
+        ("taker", "second_validated") => Some((
+            q.short.saturating_sub(q.cutoff),
+            q.lot.give.asset.mint_url.as_str(),
+        )),
         _ => None,
     }
+}
+/// [`claim_deadline`] once the claim is possible now (a maker knows the preimage): such an item
+/// is never paced. A maker still watching for the preimage is paced like any other item.
+fn claim_possible(s: &Swap) -> Option<(u64, &str)> {
+    claim_deadline(s).filter(|_| s.role == "taker" || s.preimage.is_some())
 }
 /// The mints one swap's recovery may contact.
 fn swap_mints(s: &Swap) -> Vec<&str> {
@@ -920,10 +932,10 @@ async fn recover_pass(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
     crate::backoff::order(&mut swaps, |s| &s.id);
     for mut s in swaps {
         // Pacing: a live swap whose mints are at their request budget waits (recover) or is
-        // left for a later tick (serve). Near its claim deadline it is never paced.
+        // left for a later tick (serve). An item whose claim is possible is never paced.
         if !terminal(&s)
             && s.quote.is_some()
-            && !crate::backoff::ready(&s.id, &swap_mints(&s), claim_deadline(&s)).await
+            && !crate::backoff::ready(&s.id, &swap_mints(&s), claim_possible(&s)).await
         {
             deferred = true;
             continue;

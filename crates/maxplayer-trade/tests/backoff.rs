@@ -13,10 +13,15 @@ use std::{
 };
 use support::*;
 
+/// Backoff state, timing and the pacing mode are process-global: one lab test at a time even
+/// under a parallel `cargo test`.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Scaled lab timing; restores production timing (and clears state) when dropped.
-struct Lab;
+struct Lab(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
 impl Lab {
     fn new(urgent_margin: u64) -> Self {
+        let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         backoff::lab_configure(Some(Timing {
             base: Duration::from_millis(300),
             cap: Duration::from_secs(2),
@@ -24,13 +29,16 @@ impl Lab {
             interval: Duration::from_millis(100),
             burst: Duration::from_millis(500),
             urgent_margin: Some(Duration::from_secs(urgent_margin)),
+            claim_retry: Duration::from_secs(2),
+            final_retry: Duration::from_secs(1),
+            unknown_skew: Duration::ZERO,
             loopback: true,
         }));
         // These tests call `coordinator::recover` directly; give it the CLI `recover`
         // semantics (wait for pacing) so an item is never skipped because a fast runner
         // left pacing debt from the fixture's own setup requests.
         backoff::set_wait_for_pacing(true);
-        Lab
+        Lab(serial)
     }
 }
 impl Drop for Lab {
@@ -171,17 +179,22 @@ async fn no_request_storm() {
     assert!(sent >= 20, "pacing must not stall polling: {sent}");
 }
 
-/// A maker whose claim mint is backing off (900 s Retry-After) does not claim early, never marks
-/// anything refused or releases anything, and still claims at the last safe moment before the
-/// taker's refund locktime.
+/// H1 + serve semantics. A maker whose claim mint answers 429 with `Retry-After: 900` on every
+/// request, from the moment the preimage is known until inside the final stretch, and whose
+/// clock runs 3 s ahead of ours:
+/// - (serve) a paced item without a possible claim is skipped; the claim item never is;
+/// - the claim mint sees one request per claim round (2 s lab, 30 s production), never idle for
+///   the backoff, never hammered; one per 1 s round in the final stretch;
+/// - nothing is refused or released; once the mint answers, the claim lands within about one
+///   round, before `long` on the MINT's clock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn claim_near_deadline_still_happens() {
+async fn maker_claim_retried_through_rate_limit_before_long() {
     assert!(
         std::env::var("TRADE_LAB_SECONDS").is_ok(),
         "run with TRADE_LAB_SECONDS=1"
     );
-    // Lab deadlines: long = issue + 48 s. Urgent from long - 30 s.
-    let _lab = Lab::new(30);
+    // Lab deadlines: long = issue + 48 s. Final stretch: 8 s (mint clock) before long.
+    let _lab = Lab::new(8);
     let mut f = Fixture::new(0).await;
     let lot = f.list(false).await;
     let id = f.start(&lot).await;
@@ -194,52 +207,132 @@ async fn claim_near_deadline_still_happens() {
     }
     assert_eq!(f.state(false, &id).await.as_deref(), Some("claimed"));
     assert_eq!(f.state(true, &id).await.as_deref(), Some("second_locked"));
-    // The maker's claim mint (b) rate-limits once with a 900 s Retry-After, then recovers:
-    // only our own backoff now stands between the maker and its claim.
+    let long =
+        f.jm.get::<Swap>("swap", &id)
+            .await
+            .unwrap()
+            .unwrap()
+            .quote
+            .unwrap()
+            .long;
+    // The claim mint's clock runs 3 s ahead; the maker sees it in `info.time`.
+    let skew = 3;
+    f.b.faults.clock_offset.store(skew, SeqCst);
+    maxplayer_trade::wallet::action_time(&f.b.url)
+        .await
+        .unwrap();
+    assert!(backoff::mint_now(&f.b.url) >= coordinator::now() + skew);
+    assert!(
+        coordinator::now() + 20 < long,
+        "fixture: time before the final stretch"
+    );
+    // Serve semantics from here on: a paced item is skipped, not waited for.
+    backoff::set_wait_for_pacing(false);
+    let own_debt = || {
+        for _ in 0..40 {
+            backoff::admit(&f.a.url, true).unwrap();
+        }
+    };
+    // (a) No claim possible yet (preimage unknown): the paced item is skipped this tick.
+    own_debt();
+    let a_before = f.a.faults.requests.load(SeqCst);
+    coordinator::recover(&f.maker, &f.jm, &f.mm).await.unwrap();
+    assert_eq!(f.state(true, &id).await.as_deref(), Some("second_locked"));
+    assert_eq!(
+        f.a.faults.requests.load(SeqCst),
+        a_before,
+        "paced item skipped in serve: no request"
+    );
+    // The maker learns the preimage (as the taker's `claimed` message delivers it) while the
+    // claim mint starts answering 429 with a 900 s Retry-After to everything.
+    let pre =
+        f.jt.get::<Swap>("swap", &id)
+            .await
+            .unwrap()
+            .unwrap()
+            .preimage;
+    let mut s = f.jm.get::<Swap>("swap", &id).await.unwrap().unwrap();
+    s.preimage = pre;
+    s.state = "claiming".into();
+    f.jm.put("swap", &id, &s).await.unwrap();
+    let swaps = f.b.faults.swaps.load(SeqCst);
     f.b.faults.rate_limit.store(true, SeqCst);
     f.b.faults.retry_after.store(900, SeqCst);
+    // One HTTP answer carries the 900 s Retry-After (CDK-path 429s carry none and only
+    // extend it); every later request is refused the same way.
     assert!(transport::get(&f.b.url, "info").await.is_err());
-    f.b.faults.rate_limit.store(false, SeqCst);
-    let swaps = f.b.faults.swaps.load(SeqCst);
-    let s = f.jm.get::<Swap>("swap", &id).await.unwrap().unwrap();
-    let long = s.quote.as_ref().unwrap().long;
-    assert!(
-        coordinator::now() + 30 < long,
-        "fixture: before the last safe moment"
-    );
+    assert!(backoff::remaining(&f.b.url).unwrap() > Duration::from_secs(800));
+    // (b) The same pacing debt never skips an item whose claim is possible.
+    own_debt();
+    let b_before = f.b.faults.requests.load(SeqCst);
     coordinator::recover(&f.maker, &f.jm, &f.mm).await.unwrap();
-    assert_eq!(
-        f.state(true, &id).await.as_deref(),
-        Some("claiming"),
-        "preimage learned on the healthy own mint; claim deferred, nothing refused"
+    assert!(
+        f.b.faults.requests.load(SeqCst) > b_before,
+        "claim item ran despite pacing"
+    );
+    assert!(backoff::remaining(&f.b.url).unwrap() > Duration::from_secs(800));
+    // Serve ticks every 250 ms while the mint keeps refusing, into the final stretch.
+    let final_at = long - skew - 8; // local time of mint-clock `long - 8`
+    let refuse_until = long - skew - 5;
+    let start = coordinator::now();
+    let mut at_final = None;
+    while coordinator::now() < refuse_until {
+        if at_final.is_none() && coordinator::now() >= final_at {
+            at_final = Some(f.b.faults.requests.load(SeqCst));
+        }
+        coordinator::recover(&f.maker, &f.jm, &f.mm).await.unwrap();
+        assert_eq!(
+            f.state(true, &id).await.as_deref(),
+            Some("claiming"),
+            "SAFETY: nothing refused or released while the mint refuses"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let at_final = at_final.unwrap();
+    let rounds = at_final - b_before;
+    let secs = final_at - start;
+    assert!(
+        rounds >= secs / 2 - 1,
+        "claim rounds every 2 s, not idle for the 900 s backoff: {rounds} in {secs} s"
+    );
+    assert!(
+        rounds <= secs / 2 + 3,
+        "one request per round, not every tick: {rounds} in {secs} s"
+    );
+    let finals = f.b.faults.requests.load(SeqCst) - at_final;
+    eprintln!("claim rounds: {rounds} in {secs} s; final stretch: {finals}");
+    assert!(
+        (1..=6).contains(&finals),
+        "final stretch: one request per 1 s round: {finals}"
     );
     assert_eq!(
         f.b.faults.swaps.load(SeqCst),
         swaps,
-        "no claim sent during backoff"
+        "every claim request refused while rate limited"
     );
-    assert_eq!(balance(&f.maker, &f.b.url).await, 0);
+    // The mint answers again (still inside its 900 s Retry-After): the claim lands at once.
+    f.b.faults.rate_limit.store(false, SeqCst);
+    let recovered = Instant::now();
+    while !matches!(
+        f.state(true, &id).await.as_deref(),
+        Some("settling" | "complete")
+    ) {
+        assert!(
+            recovered.elapsed() < Duration::from_secs(4),
+            "claim must land within about one round once the mint answers"
+        );
+        coordinator::recover(&f.maker, &f.jm, &f.mm).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
     assert!(
-        backoff::lab_log()
-            .iter()
-            .any(|l| l.contains("would pass a claim's safe window")),
-        "{:?}",
-        backoff::lab_log()
+        coordinator::now() + skew < long,
+        "claimed before long on the mint's clock"
     );
-    // At the last safe moment the claim goes out despite the 900 s backoff.
-    wait_past(long - 30).await;
-    coordinator::recover(&f.maker, &f.jm, &f.mm).await.unwrap();
-    assert!(
-        coordinator::now() < long,
-        "claimed before the taker could refund"
-    );
-    assert_eq!(f.state(true, &id).await.as_deref(), Some("complete"));
     assert_eq!(balance(&f.maker, &f.b.url).await, 24);
+    let log = backoff::lab_log();
     assert!(
-        backoff::lab_log()
-            .iter()
-            .any(|l| l.contains("last safe moment, trying now")),
-        "{:?}",
-        backoff::lab_log()
+        log.iter().any(|l| l.contains("a claim to it is possible")),
+        "{log:?}"
     );
+    assert!(log.iter().any(|l| l.contains("final stretch")), "{log:?}");
 }
