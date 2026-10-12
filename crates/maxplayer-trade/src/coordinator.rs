@@ -399,7 +399,8 @@ fn retry_until(s: &Swap, step: &str) -> u64 {
         return s.created + QUOTE_SECONDS;
     };
     match step {
-        "first" | "second" => q.short.saturating_sub(q.cutoff),
+        "first" => q.exp.min(q.short.saturating_sub(q.cutoff)),
+        "second" => q.short.saturating_sub(q.cutoff),
         "claimed" => q.long,
         _ => q.exp,
     }
@@ -450,7 +451,10 @@ fn verification_scope(q: &Quote, step: &str) -> Option<(u64, String)> {
     crate::transport::is_nostr(mint).then(|| (q.short.saturating_sub(q.cutoff), mint.clone()))
 }
 /// Run `f` with claim rounds for `scope` (see [`crate::backoff::with_claim`]), or plainly.
+/// Boxed: the wrapped mint futures are large and these run inside already large state machines
+/// (debug builds overflowed the test thread's stack without it).
 async fn with_scope<F: std::future::Future>(scope: Option<(u64, String)>, f: F) -> F::Output {
+    let f = Box::pin(f);
     match scope {
         Some((deadline, mint)) => crate::backoff::with_claim(deadline, &mint, f).await,
         None => f.await,
@@ -477,12 +481,17 @@ async fn replay_retained(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
             continue;
         }
         let budget = s.as_ref().map_or(std::time::Duration::from_secs(120), item_budget);
-        match tokio::time::timeout(budget, handle(home, j, m, &r.event)).await {
+        match tokio::time::timeout(budget, Box::pin(handle(home, j, m, &r.event))).await {
             Ok(Ok(())) => {
                 j.remove("inbox_retry", &id).await?;
                 eprintln!("swap {}: retained {} message handled", r.swap_id, r.step);
             }
-            Ok(Err(e)) if crate::backoff::unanswered(&e) => {
+            Ok(Err(e))
+                if crate::backoff::unanswered(&e)
+                    && j.get::<Swap>("swap", &r.swap_id)
+                        .await?
+                        .is_some_and(|s| awaiting(&r.step, &s.role) == Some(s.state.as_str())) =>
+            {
                 pending = true;
                 eprintln!(
                     "swap {}: retained {} message still waits for its mint: {e}",
@@ -490,8 +499,10 @@ async fn replay_retained(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
                 );
             }
             Ok(Err(e)) => {
+                // A refusal, or the message was handled and a later step of the advance failed
+                // (that step is retried by the swap's own recovery).
                 j.remove("inbox_retry", &id).await?;
-                eprintln!("swap {}: retained {} message rejected: {e}", r.swap_id, r.step);
+                eprintln!("swap {}: retained {} message done: {e}", r.swap_id, r.step);
             }
             Err(_) => {
                 pending = true;

@@ -71,6 +71,10 @@ struct Tap {
     /// One-shot: skip `n` replies to `op`, then delay the next one by `ms` (e.g. the CDK wallet's
     /// `keysets` read after preflight's own).
     delay_op_reply: Mutex<Option<(String, u32, u64)>>,
+    /// Silent mint: refuse every request event on the mint relay, so no mint ever sees it (the
+    /// live outages: no answer at all, relays up). Counted in `silenced`.
+    silent: AtomicBool,
+    silenced: AtomicU64,
 }
 impl Tap {
     async fn admit(&self, event: &Event, mint_relay: bool) -> PolicyResult {
@@ -83,6 +87,10 @@ impl Tap {
         }
         if [LOT, STATUS, TRADE].contains(&kind) {
             self.misrouted.fetch_add(1, SeqCst);
+        }
+        if kind == REQUEST_KIND && self.silent.load(SeqCst) {
+            self.silenced.fetch_add(1, SeqCst);
+            return PolicyResult::Reject("tap: mint silent".into());
         }
         if kind == REQUEST_KIND {
             let mints = self.mints.lock().unwrap().clone();
@@ -261,6 +269,7 @@ struct Env {
     mt: Market,
     _mint_relay: LocalRelay,
     _market_relay: LocalRelay,
+    _market_url: String,
     root: tempfile::TempDir,
     _serial: tokio::sync::MutexGuard<'static, ()>,
 }
@@ -311,6 +320,7 @@ async fn env() -> Env {
         mt,
         _mint_relay: mint_relay,
         _market_relay: market_relay,
+        _market_url: market_url,
         root,
         _serial: serial,
     }
@@ -1328,6 +1338,249 @@ async fn nostr_counterparty_unreachable_refund_still_lands() {
         "SAFETY: refund settled"
     );
     assert!(result.is_ok(), "advance bounded by its deadline");
+}
+
+// ---- a briefly silent nostr:// mint during the lock exchange ----
+
+/// Lab timing for the silent-mint cases: 4 s nostr windows on the loopback mint relay and
+/// deadlines with room for several unanswered calls before the taker's claim cutoff. Restores
+/// production timing, backoff and pacing on drop.
+#[cfg(feature = "lab")]
+struct SilentLab;
+#[cfg(feature = "lab")]
+impl SilentLab {
+    fn new() -> Self {
+        transport::lab_set_nostr_window(Some(Duration::from_secs(4)));
+        // (long, short, cutoff, margin): claim cutoff 70 s after the quote.
+        coordinator::lab_set_deadlines(Some((300, 90, 20, 1)));
+        SilentLab
+    }
+}
+#[cfg(feature = "lab")]
+impl Drop for SilentLab {
+    fn drop(&mut self) {
+        transport::lab_set_nostr_window(None);
+        coordinator::lab_set_deadlines(None);
+        maxplayer_trade::backoff::set_wait_for_pacing(false);
+        maxplayer_trade::backoff::lab_configure(None);
+    }
+}
+#[cfg(feature = "lab")]
+async fn retained_rows(j: &Journal) -> usize {
+    j.all::<coordinator::Retained>("inbox_retry")
+        .await
+        .unwrap()
+        .len()
+}
+/// Maker gives 32 credits on a `nostr://` mint, taker gives 24 on an HTTPS mint; both lock.
+/// Returns (https mint, nostr mint, swap id) with the maker in `second_locked` and its `second`
+/// message unread by the taker.
+#[cfg(feature = "lab")]
+async fn through_second_lock(e: &mut Env) -> (MintFixture, NostrMint, String) {
+    let a = MintFixture::start(0).await;
+    let n = e.nostr_mint().await;
+    e.fund_nostr(&e.maker.clone(), &n, 128).await;
+    support::fund(&e.taker, &a.url, 128).await;
+    let lot = e.list(&n.url, 32, &a.url, 24).await;
+    let id = e.take(&lot, 40, 32).await;
+    e.step_until(true, &id, "quoted").await;
+    e.step_until(false, &id, "first_locked").await;
+    e.step_until(true, &id, "second_locked").await;
+    (a, n, id)
+}
+
+/// The live failure (2026-10-11 23:58, 2026-10-12 10:50:39 and 14:54:57 UTC, two different
+/// `nostr://` mints): the claim-side mint goes silent right after the maker locks, so the taker's
+/// check of the maker's `second` lock gets no answer. The message used to be logged as rejected
+/// and dropped (the maker's re-send is a no-op), and both legs refunded although the mint answered
+/// again minutes before the claim cutoff. Now it is journaled and retried on the recovery tick:
+/// the trade completes. `restart`: the taker process restarts while the message is retained and
+/// never reads its inbox again; the journal alone carries the retry.
+#[cfg(feature = "lab")]
+async fn silent_claim_mint_after_second_lock(restart: bool) {
+    let mut e = env().await;
+    let _lab = SilentLab::new();
+    let (a, n, id) = through_second_lock(&mut e).await;
+    e.tap.silent.store(true, SeqCst);
+    for _ in 0..20 {
+        e.step(false).await;
+        if retained_rows(&e.jt).await > 0 {
+            break;
+        }
+    }
+    assert!(
+        e.tap.silenced.load(SeqCst) > 0,
+        "fixture: the taker's check reached the silent mint"
+    );
+    assert_eq!(e.state(false, &id).await.as_deref(), Some("first_locked"));
+    assert_eq!(
+        retained_rows(&e.jt).await,
+        1,
+        "the unanswered `second` is retained, not dropped"
+    );
+    // Still silent across a recovery tick: retried, still retained, nothing else changes.
+    let tried = e.tap.silenced.load(SeqCst);
+    coordinator::recover(&e.taker, &e.jt, &e.mt).await.unwrap();
+    assert!(e.tap.silenced.load(SeqCst) > tried, "retried on the tick");
+    assert_eq!(retained_rows(&e.jt).await, 1);
+    assert_eq!(e.state(false, &id).await.as_deref(), Some("first_locked"));
+    if restart {
+        e.mt = Market::connect(
+            wallet::identity(&e.taker).unwrap(),
+            std::slice::from_ref(&e._market_url),
+        )
+        .await
+        .unwrap();
+        e.jt = Journal::open(&e.taker).await.unwrap();
+    }
+    let q =
+        e.jt.get::<Swap>("swap", &id)
+            .await
+            .unwrap()
+            .unwrap()
+            .quote
+            .unwrap();
+    // The mint answers again, well before the taker's claim cutoff.
+    e.tap.silent.store(false, SeqCst);
+    let mut next = Instant::now();
+    loop {
+        e.step(true).await;
+        if !restart {
+            e.step(false).await;
+        }
+        if Instant::now() >= next {
+            coordinator::recover(&e.maker, &e.jm, &e.mm).await.unwrap();
+            coordinator::recover(&e.taker, &e.jt, &e.mt).await.unwrap();
+            next = Instant::now() + Duration::from_secs(1);
+        }
+        let (m, t) = (
+            e.state(true, &id).await.unwrap_or_default(),
+            e.state(false, &id).await.unwrap_or_default(),
+        );
+        if TERMINAL.contains(&m.as_str()) && TERMINAL.contains(&t.as_str()) {
+            break;
+        }
+        assert!(
+            t != "first_locked" || coordinator::now() < q.short - q.cutoff,
+            "SAFETY/liveness: the taker never verified the maker's lock before its claim cutoff \
+             (message lost); maker={m} taker={t}"
+        );
+        assert!(
+            coordinator::now() < q.long,
+            "never terminal: maker={m} taker={t}"
+        );
+    }
+    assert_eq!(e.state(true, &id).await.as_deref(), Some("complete"));
+    assert_eq!(
+        e.state(false, &id).await.as_deref(),
+        Some("complete"),
+        "the trade completes, not refunds"
+    );
+    assert_eq!(balance(&e.taker, &n.url).await, 32, "taker claimed");
+    assert_eq!(balance(&e.maker, &a.url).await, 24, "maker claimed");
+    assert_eq!(retained_rows(&e.jt).await, 0, "retry entry cleared");
+}
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nostr_silent_claim_mint_after_second_lock_completes() {
+    silent_claim_mint_after_second_lock(false).await;
+}
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nostr_silent_claim_mint_after_second_lock_survives_restart() {
+    silent_claim_mint_after_second_lock(true).await;
+}
+
+/// The taker's check of the maker's lock and the maker's watch for the claim witness are
+/// claim-critical reads on a `nostr://` mint: however long that mint's backoff (here minutes, as
+/// live: 173 s then 386 s), they are tried in claim rounds (2 s lab, 30 s production), never
+/// deferred past them. Only that mint: the HTTPS mint's backoff is untouched.
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nostr_verification_and_witness_not_starved_by_backoff() {
+    use maxplayer_trade::backoff::{self, Outcome, Reason, Timing};
+    let mut e = env().await;
+    let _lab = SilentLab::new();
+    let (a, n, id) = through_second_lock(&mut e).await;
+    backoff::lab_configure(Some(Timing {
+        base: Duration::from_secs(20),
+        cap: Duration::from_secs(600),
+        retry_after_cap: Duration::from_secs(900),
+        interval: Duration::from_millis(100),
+        burst: Duration::from_millis(500),
+        urgent_margin: Some(Duration::from_secs(5)),
+        claim_retry: Duration::from_secs(2),
+        final_retry: Duration::from_secs(1),
+        unknown_skew: Duration::ZERO,
+        loopback: true,
+    }));
+    backoff::set_wait_for_pacing(true);
+    let silence = || {
+        for _ in 0..4 {
+            backoff::record(&n.url, Outcome::Failed(Reason::Timeout, None));
+        }
+        assert!(backoff::remaining(&n.url).unwrap() > Duration::from_secs(120));
+    };
+    // The nostr mint answers again after four timeouts: its backoff now runs for minutes.
+    silence();
+    let started = Instant::now();
+    for _ in 0..40 {
+        e.step(false).await;
+        if e.state(false, &id).await.as_deref() == Some("claimed") {
+            break;
+        }
+        coordinator::recover(&e.taker, &e.jt, &e.mt).await.unwrap();
+        if e.state(false, &id).await.as_deref() == Some("claimed") {
+            break;
+        }
+    }
+    assert_eq!(
+        e.state(false, &id).await.as_deref(),
+        Some("claimed"),
+        "the taker verified and claimed through the backoff"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "within claim rounds, not the backoff: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(balance(&e.taker, &n.url).await, 32);
+    assert!(backoff::remaining(&a.url).is_none(), "HTTPS mint untouched");
+    // Maker: the `claimed` message is never read; the witness on its own (backing-off) nostr
+    // mint is how it learns the preimage, and it must not wait out the backoff for it.
+    silence();
+    let started = Instant::now();
+    for _ in 0..20 {
+        coordinator::recover(&e.maker, &e.jm, &e.mm).await.unwrap();
+        if e
+            .state(true, &id)
+            .await
+            .is_some_and(|s| ["settling", "complete"].contains(&s.as_str()))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(
+        e.state(true, &id)
+            .await
+            .is_some_and(|s| ["settling", "complete"].contains(&s.as_str())),
+        "maker learned the preimage from the witness and claimed: {:?}",
+        e.state(true, &id).await
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "within claim rounds, not the backoff: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(balance(&e.maker, &a.url).await, 24, "maker claimed");
+    assert!(
+        backoff::lab_log()
+            .iter()
+            .any(|l| l.contains("a claim to it is possible")),
+        "{:?}",
+        backoff::lab_log()
+    );
 }
 
 // ---- send x nostr:// (PR #1123 integration review) ----

@@ -1129,6 +1129,39 @@ mod tests {
         assert!(b.wait(&T, &[M], now + Duration::from_secs(48)).is_zero());
     }
 
+    /// Only an unanswered mint request makes a trade message retryable; a mint's own refusal and
+    /// every local validation failure stay refusals.
+    #[test]
+    fn unanswered_is_only_no_answer() {
+        use anyhow::Context;
+        let deferred = anyhow::Error::new(Deferred {
+            mint: M.into(),
+            reason: Reason::Timeout,
+            remaining: Duration::from_secs(5),
+        });
+        assert!(unanswered(&deferred.context("check second lock")));
+        let elapsed: Result<(), crate::wallet::Bound> = Err(crate::wallet::Bound::Elapsed);
+        assert!(unanswered(
+            &elapsed.context("CDK wallet request not answered").unwrap_err()
+        ));
+        assert!(unanswered(&anyhow::Error::new(cdk::Error::Timeout)));
+        assert!(unanswered(&anyhow::Error::new(cdk::Error::HttpError(
+            None,
+            "no relay reachable".into()
+        ))));
+        assert!(unanswered(&anyhow::Error::new(NoAnswer("x".into()))));
+        assert!(!unanswered(&anyhow::anyhow!("wrong hash lock")));
+        assert!(!unanswered(&anyhow::anyhow!("proof is not UNSPENT")));
+        assert!(!unanswered(
+            &anyhow::Error::new(crate::mint::MintRefusal::new(11001, "spent"))
+                .context("mint m checkstate")
+        ));
+        assert!(!unanswered(&anyhow::Error::new(cdk::Error::HttpError(
+            Some(400),
+            "bad".into()
+        ))));
+    }
+
     #[test]
     fn keys_fold_case_and_trailing_slash() {
         assert_eq!(key("HTTPS://Mint.Example/"), key(M));
