@@ -287,7 +287,9 @@ async fn nostr_call(
     })?;
     if observation.reply_ms.is_some() {
         crate::backoff::record(mint, crate::backoff::Outcome::Answered);
-    } else if let Err(e) = &result {
+    }
+    // Reachability and retry policy are independent: a signed rate-limit answer still paces.
+    if let Err(e) = &result {
         crate::backoff::record_cdk(mint, e);
     }
     if path == "info" {

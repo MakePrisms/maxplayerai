@@ -99,7 +99,18 @@ async fn preflight_impl(
     admission: bool,
 ) -> Result<serde_json::Value> {
     let started = std::time::Instant::now();
-    let info = info(mint).await?;
+    let info = match info(mint).await {
+        Ok(info) => info,
+        Err(error) => {
+            if admission {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"mint":mint,"op":"info","reachability":if crate::backoff::deferred(&error) {"not_checked_backoff"} else {"unsuccessful"},"elapsed_ms":started.elapsed().as_millis(),"compatibility":"not_checked"})
+                );
+            }
+            return Err(error);
+        }
+    };
     let elapsed = started.elapsed().as_millis();
     let compatibility = crate::compatibility::assess(&info);
     if admission {

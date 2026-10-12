@@ -162,6 +162,9 @@ pub struct RequestObservation {
     pub reply_relay: Option<String>,
     pub outcome: String,
     pub nut_code: Option<u16>,
+    /// Exact authenticated body for trusted callers; never serialize or display arbitrary detail.
+    #[serde(skip)]
+    pub mint_error: Option<ErrorBody>,
     pub envelope_version: Option<u64>,
     pub evidence_lost: bool,
     pub relays: std::collections::BTreeMap<String, RelayEvidence>,
@@ -272,7 +275,7 @@ impl NostrMintConnector {
         let mut observation = RequestObservation {
             mint: self.mint_url.to_string(), op: operation.into(), checked_at: unix_now_ms() / 1000,
             elapsed_ms: 0, budget_ms: self.window.as_millis() as u64, attempts: 0,
-            reply_ms: None, reply_relay: None, outcome: "unanswered".into(), nut_code: None,
+            reply_ms: None, reply_relay: None, outcome: "unanswered".into(), nut_code: None, mint_error: None,
             envelope_version: None, evidence_lost: false,
             relays: self.relays.iter().map(|r| (r.trim_end_matches('/').to_owned(), RelayEvidence::default())).collect(),
         };
@@ -361,7 +364,7 @@ impl NostrMintConnector {
         let mut publish = None;
         let outcome = loop {
             for (url, receiver) in &mut lifecycle {
-                loop {
+                for _ in 0..1024 {
                     match receiver.try_recv() {
                         Ok(RelayNotification::Authenticated) => observation.relays.entry(url.clone()).or_default().auth = "authenticated",
                         Ok(RelayNotification::AuthenticationFailed) => observation.relays.entry(url.clone()).or_default().auth = "failed",
@@ -458,6 +461,7 @@ impl NostrMintConnector {
         Some(match response.outcome {
             Outcome::Ok(value) => { observation.outcome = "ok".into(); Ok(value) },
             Outcome::Err(error) => {
+                observation.mint_error = Some(error.clone());
                 match &error.code {
                     ErrorCode::Nut(n) => { observation.outcome = "nut_error".into(); observation.nut_code = Some(*n); }
                     ErrorCode::Named(n) => observation.outcome = match n.as_str() {

@@ -835,6 +835,6 @@ async fn doctor(mint: &str, relay: &str, json_output: bool, seconds: u64) -> Res
     if exit == 0 {
         Ok(())
     } else {
-        Err(DoctorExit(exit))
+        Err(DoctorExit(exit).into())
     }
 }

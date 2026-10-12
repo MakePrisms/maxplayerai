@@ -29,7 +29,7 @@ enum Mode {
     /// Ignore the FIRST delivery of each request event (a lost reply), answer later ones.
     DropFirst,
     /// Before the real answer, publish decoys: forged signer, wrong request id, wrong e-tag,
-    /// malformed JSON.
+    /// unrelated subscription data.
     DecoysThenAnswer,
     /// Publish only decoys, never a real answer.
     DecoysOnly,
@@ -141,7 +141,6 @@ async fn start_mint(relay_url: &str, mode: Mode) -> Mint {
                     EventId::all_zeros(),
                 )
                 .await;
-
             };
             match mode {
                 Mode::Silent => {}
@@ -426,9 +425,19 @@ async fn nostr_mint_wallet_polls_through_the_connector_instead_of_websocket() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn diagnostics_distinguish_signed_errors_versions_and_accepted_silence() {
     let (_relay, url) = relay().await;
-    for (mode, expected) in [(Mode::WrongVersion, "unsupported_protocol"), (Mode::Malformed, "invalid_response"), (Mode::NutError, "nut_error"), (Mode::Err("internal"), "internal"), (Mode::Err("expired"), "expired"), (Mode::Err("rate_limited"), "rate_limited"), (Mode::Silent, "unanswered")] {
+    for (mode, expected) in [
+        (Mode::WrongVersion, "unsupported_protocol"),
+        (Mode::Malformed, "invalid_response"),
+        (Mode::NutError, "nut_error"),
+        (Mode::Err("internal"), "internal"),
+        (Mode::Err("expired"), "expired"),
+        (Mode::Err("rate_limited"), "rate_limited"),
+        (Mode::Silent, "unanswered"),
+    ] {
         let mint = start_mint(&url, mode).await;
-        let (result, evidence) = connector(&mint, &url, 1200, 300).call_observed("info", Value::Null).await;
+        let (result, evidence) = connector(&mint, &url, 1200, 300)
+            .call_observed("info", Value::Null)
+            .await;
         assert!(result.is_err());
         assert_eq!(evidence.outcome, expected);
         assert_eq!(evidence.reply_ms.is_some(), mode != Mode::Silent);
@@ -445,4 +454,139 @@ async fn diagnostics_distinguish_signed_errors_versions_and_accepted_silence() {
         assert!(!public.contains("secret"));
         assert!(!evidence.message().contains("secret"));
     }
+}
+
+/// Minimal loopback relay control frames, independent of the builder's policy implementation.
+/// Nothing can leave loopback, and raw text must never enter public diagnostics.
+async fn control_relay(mode: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+    use futures_util::{SinkExt, StreamExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        while let Some(Ok(message)) = ws.next().await {
+            let Ok(text) = message.to_text() else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<Value>(text) else {
+                continue;
+            };
+            let frames = match v[0].as_str() {
+                Some("REQ") => match mode {
+                    "closed" => vec![json!(["CLOSED", v[1], "auth-required: secret\u{001b}[31m"])],
+                    "unrelated_closed" => vec![json!(["CLOSED", "unrelated", "secret"])],
+                    "notice" => vec![json!(["NOTICE", "secret\u{001b}[31m"])],
+                    _ => vec![json!(["EOSE", v[1]])],
+                },
+                Some("EVENT") => match mode {
+                    "refused" => vec![json!([
+                        "OK",
+                        v[1]["id"],
+                        false,
+                        "blocked: secret\u{001b}[31m"
+                    ])],
+                    "unrelated_ok" => vec![json!(["OK", EventId::all_zeros().to_hex(), true, ""])],
+                    "accepted" | "disconnect" => vec![json!(["OK", v[1]["id"], true, ""])],
+                    _ => vec![],
+                },
+                _ => vec![],
+            };
+            for frame in frames {
+                if ws
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        frame.to_string().into(),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            if mode == "disconnect" && v[0] == "EVENT" {
+                let _ = ws.close(None).await;
+                return;
+            }
+        }
+    });
+    (url, task)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diagnostics_control_frames_require_event_and_subscription_correlation() {
+    for mode in [
+        "refused",
+        "accepted",
+        "no_ack",
+        "unrelated_ok",
+        "closed",
+        "unrelated_closed",
+        "notice",
+        "disconnect",
+    ] {
+        let (url, task) = control_relay(mode).await;
+        let mint = MintUrl::from_str(&format!(
+            "nostr://{}",
+            Keys::generate().public_key().to_bech32().unwrap()
+        ))
+        .unwrap();
+        let c = NostrMintConnector::new(&mint, vec![url])
+            .unwrap()
+            .with_timing(
+                Duration::from_millis(700),
+                Duration::from_secs(2),
+                Duration::from_millis(300),
+            );
+        let (result, obs) = c.call_observed("info", Value::Null).await;
+        assert!(result.is_err());
+        assert!(
+            obs.reply_ms.is_none(),
+            "ACK/NOTICE/CLOSED never prove a mint answer: {mode}"
+        );
+        let r = obs.relays.values().next().unwrap();
+        assert_eq!(
+            r.acceptance,
+            match mode {
+                "refused" => "refused",
+                "accepted" | "disconnect" => "accepted",
+                _ => "unknown",
+            },
+            "{mode}"
+        );
+        assert_eq!(
+            r.closed,
+            mode == "closed",
+            "unrelated CLOSED must not poison this subscription"
+        );
+        assert_eq!(r.notice, mode == "notice");
+        assert!(!serde_json::to_string(&obs).unwrap().contains("secret"));
+        assert!(
+            !result.unwrap_err().is_definitive_failure(),
+            "relay evidence cannot clear money"
+        );
+        task.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diagnostics_reply_wins_while_another_relay_withholds_ack() {
+    let (_relay, url) = relay().await;
+    let (silent_url, task) = control_relay("no_ack").await;
+    let mint = start_mint(&url, Mode::Answer).await;
+    let c = NostrMintConnector::new(&mint.url.parse().unwrap(), vec![url, silent_url])
+        .unwrap()
+        .with_timing(
+            Duration::from_secs(3),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+    let (result, obs) = c.call_observed("info", Value::Null).await;
+    assert!(
+        result.is_ok(),
+        "a held pooled publish cannot hide a real answer"
+    );
+    assert!(obs.reply_ms.unwrap() < 2000);
+    assert_eq!(obs.relays.len(), 2);
+    assert!(obs.relays.values().any(|r| r.acceptance == "unknown"));
+    task.abort();
 }
