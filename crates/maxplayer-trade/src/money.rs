@@ -149,10 +149,8 @@ pub async fn fund(home: &Path, j: &Journal, url: &str, amount: u64) -> Result<Fu
     crate::Asset::new(url)?.fence()?;
     // Before ANY journal intent: a nostr:// credits mint has no NUT-04/NUT-20 to fund through.
     crate::transport::require_http(url, "fund")?;
-    ensure!(
-        amount > 0 && amount <= crate::real_money::CAP,
-        "funding cap exceeded"
-    );
+    ensure!(amount > 0, "amount must be at least 1 sat");
+    ensure!(amount <= crate::real_money::CAP, "funding cap exceeded");
     let (funded, received) = crate::receive::cap_used(j, url).await?;
     let total = funded.checked_add(received).context("funding overflow")?;
     if !total
@@ -441,13 +439,16 @@ pub async fn withdraw_bounded(
             return Ok(a);
         }
     }
+    // A new authorization only: before any mint request, reservation or journal entry.
+    check_invoice(&req.request, cdk::util::unix_time())?;
     let amount = req
         .request
         .amount_milli_satoshis()
         .context("amountless invoices refused")?
         .div_ceil(1000);
+    ensure!(amount > 0, "invoice amount must be at least 1 sat");
     ensure!(
-        amount > 0 && amount <= crate::real_money::CAP,
+        amount <= crate::real_money::CAP,
         "withdrawal exceeds 100,000-sat invoice cap"
     );
     let mut a = Withdrawal {
@@ -505,6 +506,36 @@ pub async fn withdraw_bounded(
     }
     resume_withdraw_inner(home, j, &mut a, true).await?;
     Ok(a)
+}
+/// An invoice this tool would never get paid: refused before any quote or journal entry.
+pub const INVOICE_EXPIRY_MARGIN_SECS: u64 = 30;
+pub fn check_invoice(invoice: &cashu::Bolt11Invoice, now: u64) -> Result<()> {
+    use cashu::lightning_invoice::Currency;
+    let network = match invoice.currency() {
+        Currency::Bitcoin => None,
+        Currency::BitcoinTestnet => Some("testnet"),
+        Currency::Regtest => Some("regtest"),
+        Currency::Simnet => Some("simnet"),
+        Currency::Signet => Some("signet"),
+    };
+    if let Some(network) = network {
+        anyhow::bail!(
+            "invoice is for {network}; this mint pays Bitcoin mainnet invoices; nothing was \
+             journaled or sent"
+        );
+    }
+    let expires = invoice.expires_at().map_or(u64::MAX, |t| t.as_secs());
+    let at = nostr_sdk::Timestamp::from(expires).to_human_datetime();
+    ensure!(
+        expires > now,
+        "invoice expired at {at}; nothing was journaled or sent"
+    );
+    ensure!(
+        expires > now.saturating_add(INVOICE_EXPIRY_MARGIN_SECS),
+        "invoice expires at {at}, within {INVOICE_EXPIRY_MARGIN_SECS} s; nothing was \
+         journaled or sent"
+    );
+    Ok(())
 }
 pub fn reserve_ceiling(amount: u64) -> u64 {
     32.max(amount.div_ceil(50))

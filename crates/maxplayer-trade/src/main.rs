@@ -153,6 +153,23 @@ async fn execute() -> Result<()> {
         }
         _ => {}
     }
+    // A zero amount can never succeed: refuse it before any cap check, home, lock or mint.
+    let zero = match &cli.command {
+        Command::Fund { amount, .. }
+        | Command::Send {
+            amount: Some(amount),
+            ..
+        } => (*amount == 0).then_some("--amount"),
+        Command::List { give, want, .. } => (*give == 0)
+            .then_some("--give")
+            .or((*want == 0).then_some("--want")),
+        Command::Take { max_give, .. } => (*max_give == 0).then_some("--max-give"),
+        Command::Withdraw { max_debit, .. } => (*max_debit == Some(0)).then_some("--max-debit"),
+        _ => None,
+    };
+    if let Some(flag) = zero {
+        anyhow::bail!("amount must be at least 1 sat ({flag} 0)");
+    }
     // Read-only observations remain available while serve owns the writer lock.
     if let Command::Balance { ref mint } = cli.command {
         let asset = Asset::from_cli(mint)?;
