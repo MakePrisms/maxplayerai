@@ -1,0 +1,27 @@
+[package]
+name = "wallet-roundtrip"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# A tested example (brief item C) that doubles as the runtime-toolchain proof (advisor F1): it is
+# NOT prebuilt into the image. `cashu-toolchain-check` copies this crate into a writable dir and
+# compiles it with `cargo build --offline --locked`, so a successful run proves the image really
+# carries a Rust toolchain and a CDK dependency cache rather than only a precompiled binary.
+[dependencies]
+cdk = { version = "=0.17.2", default-features = false, features = ["wallet"] }
+cdk-sqlite = "=0.17.2"
+# Ranged here, EXACT in the committed Cargo.lock — `--locked` is what fixes the graph, and pinning
+# both places would only add a second thing to keep in step.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+rand = "0.9"
+anyhow = "1"
+
+[[bin]]
+name = "wallet-roundtrip"
+path = "src/main.rs"
+
+# Standalone crate root. These image-local crates are deliberately NOT members of the
+# product workspace: adding them there would drag image tooling into every product build, and
+# an empty [workspace] table is the supported way to say "this is its own root".
+[workspace]
