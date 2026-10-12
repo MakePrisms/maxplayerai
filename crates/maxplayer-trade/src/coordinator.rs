@@ -582,7 +582,14 @@ pub async fn advance(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Resu
     if terminal(s) {
         return Ok(());
     }
-    let result = advance_inner(home, j, m, s).await;
+    // While a claim may have to land, its requests to the claim mint (only that mint) are
+    // retried on a short cadence however long that mint's backoff (see `backoff`).
+    let result = match claim_deadline(s).map(|(deadline, mint)| (deadline, mint.to_owned())) {
+        Some((deadline, mint)) => {
+            crate::backoff::with_claim(deadline, &mint, advance_inner(home, j, m, s)).await
+        }
+        None => advance_inner(home, j, m, s).await,
+    };
     // Run even when redemption returned an error. Persist terminal manual-recovery
     // status before the next tick; never turn a quarantined claim into refund authority.
     for (suffix, state) in [
@@ -619,6 +626,43 @@ pub async fn advance(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Resu
         }
     }
     result
+}
+/// The claim this swap may have to land, with the moment (mint clock) after which it can lose
+/// funds, and the claim mint:
+/// - maker (claiming the taker's lock on the want mint with the learned preimage, or still
+///   watching its own lock's NUT-07 witness for it): `long`, the taker's refund locktime;
+/// - taker (claiming the maker's lock on the give mint): `short - cutoff`, its send deadline.
+///
+/// Taker refunds (after `long + margin`) and maker refunds (after `short + margin`) have no
+/// such moment: the refund path stays open, so a later refund loses nothing.
+pub fn claim_deadline(s: &Swap) -> Option<(u64, &str)> {
+    let q = s.quote.as_ref()?;
+    match (s.role.as_str(), s.state.as_str()) {
+        ("maker", "second_locked" | "claiming" | "lock_unforwardable") => {
+            Some((q.long, q.lot.want.asset.mint_url.as_str()))
+        }
+        ("taker", "second_validated") => Some((
+            q.short.saturating_sub(q.cutoff),
+            q.lot.give.asset.mint_url.as_str(),
+        )),
+        _ => None,
+    }
+}
+/// [`claim_deadline`] once the claim is possible now (a maker knows the preimage): such an item
+/// is never paced. A maker still watching for the preimage is paced like any other item.
+fn claim_possible(s: &Swap) -> Option<(u64, &str)> {
+    claim_deadline(s).filter(|_| s.role == "taker" || s.preimage.is_some())
+}
+/// The mints one swap's recovery may contact.
+fn swap_mints(s: &Swap) -> Vec<&str> {
+    let mut mints = vec![s.plan.mint.as_str()];
+    if let Some(q) = &s.quote {
+        mints.push(&q.lot.give.asset.mint_url);
+        mints.push(&q.lot.want.asset.mint_url);
+    }
+    mints.sort_unstable();
+    mints.dedup();
+    mints
 }
 async fn advance_inner(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Result<()> {
     let (overall_budget, refund_budget) = advance_budgets();
@@ -887,8 +931,18 @@ async fn recover_pass(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
             true
         }
     };
-    let swaps = j.all::<Swap>("swap").await?;
+    let mut swaps = j.all::<Swap>("swap").await?;
+    crate::backoff::order(&mut swaps, |s| &s.id);
     for mut s in swaps {
+        // Pacing: a live swap whose mints are at their request budget waits (recover) or is
+        // left for a later tick (serve). An item whose claim is possible is never paced.
+        if !terminal(&s)
+            && s.quote.is_some()
+            && !crate::backoff::ready(&s.id, &swap_mints(&s), claim_possible(&s)).await
+        {
+            deferred = true;
+            continue;
+        }
         let budget = item_budget(&s);
         let item = async {
             if s.state == "requested" && now() > s.created + 60 {
@@ -1064,10 +1118,10 @@ async fn validate_terms(home: &Path, leg: &Leg, t: &Terms) -> Result<()> {
     let w = wallet::wallet(home, &leg.asset.mint_url).await?;
     crate::wallet::bounded_for(&leg.asset.mint_url, w.refresh_keysets())
         .await
-        .context("CDK wallet request timed out")??;
+        .context("CDK wallet request not answered")??;
     let active = crate::wallet::bounded_for(&leg.asset.mint_url, w.fetch_active_keyset())
         .await
-        .context("CDK wallet request timed out")??;
+        .context("CDK wallet request not answered")??;
     ensure!(
         t.keyset == active.id && t.ppk == active.input_fee_ppk,
         "quote keyset/fee schedule mismatch"

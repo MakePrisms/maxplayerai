@@ -13,7 +13,12 @@ use std::{
 };
 async fn info(mint: &str) -> Result<serde_json::Value> {
     crate::Asset::new(mint)?.fence()?;
-    crate::transport::get(mint, "info").await
+    let info = crate::transport::get(mint, "info").await?;
+    // The mint's clock decides claim deadlines (backoff claim rounds).
+    if let Some(time) = info["time"].as_u64() {
+        crate::backoff::observe_time(mint, time);
+    }
+    Ok(info)
 }
 pub async fn action_time(mint: &str) -> Result<u64> {
     let info = info(mint).await?;
@@ -33,11 +38,50 @@ pub async fn refund_time(mint: &str) -> Result<u64> {
 /// mint-agnostic variant, so a new call site cannot silently get the 15 s HTTP bound on nostr.
 /// An enclosing budget (advance, message, recovery item) can still drop a call mid-window; that
 /// is ambiguous, never a failure: swaps are journaled first and restored before any replay.
+/// Gated by [`crate::backoff`]: while `mint` backs off the call is not started ([`Bound::Deferred`]);
+/// a timeout or a 429/503/connection failure starts or extends the backoff.
 pub async fn bounded_for<T>(
     mint: &str,
-    f: impl std::future::Future<Output = T>,
-) -> Result<T, tokio::time::error::Elapsed> {
-    tokio::time::timeout(crate::transport::wallet_bound(mint), f).await
+    f: impl std::future::Future<Output = Result<T, cdk::Error>>,
+) -> Result<Result<T, cdk::Error>, Bound> {
+    crate::backoff::admit(mint, false).map_err(Bound::Deferred)?;
+    match tokio::time::timeout(crate::transport::wallet_bound(mint), f).await {
+        Err(_) => {
+            crate::backoff::record(
+                mint,
+                crate::backoff::Outcome::Failed(crate::backoff::Reason::Timeout, None),
+            );
+            Err(Bound::Elapsed)
+        }
+        Ok(r) => {
+            if let Err(e) = &r {
+                crate::backoff::record_cdk(mint, e);
+            }
+            Ok(r)
+        }
+    }
+}
+/// Why [`bounded_for`] produced no CDK result. Both are ambiguous (no answer), never refusals.
+#[derive(Debug)]
+pub enum Bound {
+    Elapsed,
+    Deferred(crate::backoff::Deferred),
+}
+impl std::fmt::Display for Bound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Bound::Elapsed => write!(f, "no answer within the CDK wallet bound"),
+            Bound::Deferred(d) => d.fmt(f),
+        }
+    }
+}
+impl std::error::Error for Bound {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Bound::Elapsed => None,
+            Bound::Deferred(d) => Some(d),
+        }
+    }
 }
 pub async fn preflight(mint: &str) -> Result<()> {
     preflight_for(mint, None).await

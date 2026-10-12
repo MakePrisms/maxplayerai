@@ -263,10 +263,10 @@ pub async fn receive(home: &Path, j: &Journal, mint: &str, raw: &str) -> Result<
     let w = wallet(home, mint).await?;
     bounded_for(mint, w.refresh_keysets())
         .await
-        .context("CDK wallet request timed out")??;
+        .context("CDK wallet request not answered")??;
     let keysets = bounded_for(mint, w.get_mint_keysets(KeysetFilter::All))
         .await
-        .context("CDK wallet request timed out")??;
+        .context("CDK wallet request not answered")??;
     let inputs = p
         .token
         .proofs(&keysets)
@@ -292,7 +292,7 @@ pub async fn receive(home: &Path, j: &Journal, mint: &str, raw: &str) -> Result<
             )),
         )
         .await
-        .context("CDK wallet request timed out")?
+        .context("CDK wallet request not answered")?
         .map_err(|e| match e {
             cdk::Error::CouldNotVerifyDleq => anyhow!("incoming token DLEQ verification failed"),
             e => anyhow!("incoming token DLEQ check could not run: {e}"),
@@ -301,7 +301,7 @@ pub async fn receive(home: &Path, j: &Journal, mint: &str, raw: &str) -> Result<
     let fee = u64::from(
         bounded_for(mint, w.get_proofs_fee(&inputs))
             .await
-            .context("CDK wallet request timed out")??
+            .context("CDK wallet request not answered")??
             .total,
     );
     ensure!(p.amount > fee, "uneconomic token: input fee consumes it");
@@ -311,10 +311,10 @@ pub async fn receive(home: &Path, j: &Journal, mint: &str, raw: &str) -> Result<
         .context("token is not UNSPENT at the mint (already spent or pending)")?;
     let k = bounded_for(mint, w.fetch_active_keyset())
         .await
-        .context("CDK wallet request timed out")??;
+        .context("CDK wallet request not answered")??;
     let amounts = bounded_for(mint, w.get_keyset_fees_and_amounts_by_id(k.id))
         .await
-        .context("CDK wallet request timed out")??;
+        .context("CDK wallet request not answered")??;
     let outputs: Vec<Output> =
         PreMintSecrets::random(k.id, net.into(), &SplitTarget::default(), &amounts)?
             .secrets
@@ -553,7 +553,7 @@ pub async fn resume(home: &Path, j: &Journal, r: &mut Receipt) -> Result<()> {
         let w = wallet(home, &r.mint).await?;
         let keys = bounded_for(&r.mint, w.load_keyset_keys(r.outputs[0].message.keyset_id))
             .await
-            .context("CDK wallet request timed out")??;
+            .context("CDK wallet request not answered")??;
         let proofs = cdk::dhke::construct_proofs(
             signatures,
             r.outputs
@@ -594,7 +594,7 @@ pub async fn resume(home: &Path, j: &Journal, r: &mut Receipt) -> Result<()> {
         )),
     )
     .await
-    .context("CDK wallet request timed out")?
+    .context("CDK wallet request not answered")?
     {
         Ok(()) => {}
         Err(cdk::Error::CouldNotVerifyDleq) => {
@@ -669,6 +669,10 @@ pub async fn recover(home: &Path, j: &Journal) -> Result<bool> {
                 failed = true;
                 eprintln!("receive {}: release deferred: {error:#}", r.id);
             }
+            continue;
+        }
+        if !crate::backoff::ready(&r.id, &[&r.mint], None).await {
+            failed = true;
             continue;
         }
         let item = tokio::time::timeout(

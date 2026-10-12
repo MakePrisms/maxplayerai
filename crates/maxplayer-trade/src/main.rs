@@ -306,6 +306,8 @@ async fn execute() -> Result<()> {
     } else {
         None
     };
+    // `recover` is one bounded pass: it waits for mint pacing instead of skipping an item.
+    maxplayer_trade::backoff::set_wait_for_pacing(matches!(cli.command, Command::Recover));
     let money_journal = Journal::open(&cli.home).await?;
     // Inspection must not submit an earlier payment authorization. Newly credited
     // money proofs remain reserved until explicit recovery settles their journal.
@@ -521,12 +523,13 @@ async fn execute() -> Result<()> {
             "{}",
             serde_json::json!({"quote":f.quote,"invoice":f.invoice,"amount":f.amount,"note":"pay externally; tool never auto-pays"})
         );
-        for _ in 0..30 {
+        // Quote polling: one status GET per FUND_POLL (about 30 s in total).
+        for _ in 0..maxplayer_trade::money::FUND_POLLS {
             maxplayer_trade::money::resume_fund(&cli.home, &money_journal, &mut f).await?;
             if f.done {
                 return Ok(());
             }
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            tokio::time::sleep(maxplayer_trade::money::fund_poll(&f.mint)).await;
         }
         anyhow::bail!("funding remains pending; invoice and intent retained; run recover");
     }

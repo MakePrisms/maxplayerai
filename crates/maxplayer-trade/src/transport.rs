@@ -244,8 +244,21 @@ async fn nostr_call(
             c = c.with_timing(left, DEFAULT_RESEND_EVERY, DEFAULT_CONNECT_TIMEOUT);
         }
     }
-    tokio::time::timeout(NOSTR_OUTER, c.call_raw(operation, body))
-        .await
+    crate::backoff::admit(mint, true)?;
+    let answer = tokio::time::timeout(NOSTR_OUTER, c.call_raw(operation, body)).await;
+    match &answer {
+        Err(_) => crate::backoff::record(
+            mint,
+            crate::backoff::Outcome::Failed(crate::backoff::Reason::Timeout, None),
+        ),
+        // The mint's own NUT error is an answer; transport failures may start a backoff.
+        Ok(Err(e)) if nostr_nut_refusal(e) => {
+            crate::backoff::record(mint, crate::backoff::Outcome::Answered)
+        }
+        Ok(Err(e)) => crate::backoff::record_cdk(mint, e),
+        Ok(Ok(_)) => crate::backoff::record(mint, crate::backoff::Outcome::Answered),
+    }
+    answer
         .map_err(|_| anyhow!("mint {mint} {path}: no answer within the nostr bound (ambiguous)"))?
         .map_err(|e| match nostr_refusal(e) {
             // The typed refusal, exactly as an HTTP NUT error body yields; never "HTTP 400" text.
@@ -299,14 +312,14 @@ pub async fn post<T: DeserializeOwned>(
         return serde_json::from_value(value)
             .with_context(|| format!("mint {mint} {path}: invalid response"));
     }
-    let r = reqwest::Client::builder()
+    let request = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(HTTP_RPC_TIMEOUT)
         .build()?
         .post(format!("{mint}/v1/{path}"))
-        .json(body)
-        .send()
-        .await?;
+        .json(body);
+    // Gated: refused locally (nothing sent) while this mint backs off; outcome recorded.
+    let r = crate::backoff::send(mint, request).await?;
     let status = r.status();
     let text = r.text().await?;
     if let Some(refusal) = crate::mint::MintRefusal::parse(status.as_u16(), &text) {
@@ -326,12 +339,12 @@ pub async fn get(mint: &str, path: &str) -> Result<serde_json::Value> {
     if is_nostr(mint) {
         return nostr_call(mint, path, serde_json::Value::Null, None).await;
     }
-    Ok(reqwest::Client::builder()
+    let request = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(HTTP_WALLET_TIMEOUT)
         .build()?
-        .get(format!("{}/v1/{path}", mint.trim_end_matches('/')))
-        .send()
+        .get(format!("{}/v1/{path}", mint.trim_end_matches('/')));
+    Ok(crate::backoff::send(mint, request)
         .await?
         .error_for_status()?
         .json()

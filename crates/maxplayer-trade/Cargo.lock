@@ -2208,6 +2208,7 @@ dependencies = [
  "clap",
  "fs2",
  "hex",
+ "httpdate",
  "maxplayer-core",
  "maxplayer-mint",
  "nostr-relay-builder",

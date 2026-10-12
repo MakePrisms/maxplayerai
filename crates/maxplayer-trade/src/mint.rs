@@ -194,10 +194,10 @@ pub async fn plan(home: &Path, mint: &str, net: u64, max_fee: u64) -> Result<Pla
     let w = wallet(home, mint).await?;
     crate::wallet::bounded_for(mint, w.refresh_keysets())
         .await
-        .context("CDK wallet request timed out")??;
+        .context("CDK wallet request not answered")??;
     let k = crate::wallet::bounded_for(mint, w.fetch_active_keyset())
         .await
-        .context("CDK wallet request timed out")??;
+        .context("CDK wallet request not answered")??;
     let (gross, claim_fee) = gross(net, k.input_fee_ppk)?;
     crate::real_money::check_lock_gross(gross)?;
     let db = database(home, mint).await?;
@@ -221,7 +221,7 @@ pub async fn plan(home: &Path, mint: &str, net: u64, max_fee: u64) -> Result<Pla
         ppks.push(
             crate::wallet::bounded_for(mint, w.get_keyset_fees_by_id(p.proof.keyset_id))
                 .await
-                .context("CDK wallet request timed out")??,
+                .context("CDK wallet request not answered")??,
         );
         inputs.push(p.proof);
         let lock_fee = fee(ppks.clone())?;
@@ -312,11 +312,11 @@ pub async fn lock(
         let w = wallet(home, &p.mint).await?;
         crate::wallet::bounded_for(&p.mint, w.refresh_keysets())
             .await
-            .context("CDK wallet request timed out")??;
+            .context("CDK wallet request not answered")??;
         ensure!(
             crate::wallet::bounded_for(&p.mint, w.get_keyset_fees_by_id(p.keyset))
                 .await
-                .context("CDK wallet request timed out")??
+                .context("CDK wallet request not answered")??
                 == p.ppk,
             "fee schedule changed"
         );
@@ -324,7 +324,7 @@ pub async fn lock(
             u64::from(
                 crate::wallet::bounded_for(&p.mint, w.get_proofs_fee(&p.inputs))
                     .await
-                    .context("CDK wallet request timed out")??
+                    .context("CDK wallet request not answered")??
                     .total
             ) == p.lock_fee,
             "input fee changed"
@@ -332,7 +332,7 @@ pub async fn lock(
         unspent(&p.mint, &p.inputs).await?;
         let f = crate::wallet::bounded_for(&p.mint, w.get_keyset_fees_and_amounts_by_id(p.keyset))
             .await
-            .context("CDK wallet request timed out")??;
+            .context("CDK wallet request not answered")??;
         let mut out = outputs(
             PreMintSecrets::with_conditions(
                 p.keyset,
@@ -464,17 +464,17 @@ async fn redeem_inner(
         let w = wallet(home, mint).await?;
         crate::wallet::bounded_for(mint, w.refresh_keysets())
             .await
-            .context("CDK wallet request timed out")??;
+            .context("CDK wallet request not answered")??;
         let k = crate::wallet::bounded_for(mint, w.fetch_active_keyset())
             .await
-            .context("CDK wallet request timed out")??;
+            .context("CDK wallet request not answered")??;
         let f = crate::wallet::bounded_for(mint, w.get_keyset_fees_and_amounts_by_id(k.id))
             .await
-            .context("CDK wallet request timed out")??;
+            .context("CDK wallet request not answered")??;
         let cost = u64::from(
             crate::wallet::bounded_for(mint, w.get_proofs_fee(proofs))
                 .await
-                .context("CDK wallet request timed out")??
+                .context("CDK wallet request not answered")??
                 .total,
         );
         if pinned_claim {
@@ -617,7 +617,7 @@ pub async fn execute(home: &Path, j: &Journal, id: &str) -> Result<Proofs> {
                 w.load_keyset_keys(a.outputs[0].message.keyset_id),
             )
             .await
-            .context("CDK wallet request timed out")??;
+            .context("CDK wallet request not answered")??;
             for (s, o) in signatures.iter().zip(&a.outputs) {
                 ensure!(
                     s.amount == o.message.amount && s.keyset_id == o.message.keyset_id,
@@ -662,7 +662,7 @@ pub async fn execute(home: &Path, j: &Journal, id: &str) -> Result<Proofs> {
                 )),
             )
             .await
-            .context("CDK wallet request timed out")?;
+            .context("CDK wallet request not answered")?;
             if let Err(e) = verified {
                 a.unforwardable = a.outputs.iter().any(|o| !o.owned);
                 // Only a cryptographic failure is terminal, not unavailable keys/RPCs.
@@ -740,11 +740,11 @@ pub async fn validate(
     let w = wallet(home, mint).await?;
     crate::wallet::bounded_for(mint, w.refresh_keysets())
         .await
-        .context("CDK wallet request timed out")??;
+        .context("CDK wallet request not answered")??;
     ensure!(
         crate::wallet::bounded_for(mint, w.get_keyset_fees_by_id(keyset))
             .await
-            .context("CDK wallet request timed out")??
+            .context("CDK wallet request not answered")??
             == ppk,
         "fee schedule changed"
     );
@@ -777,12 +777,12 @@ pub async fn validate(
         )),
     )
     .await
-    .context("CDK wallet request timed out")??;
+    .context("CDK wallet request not answered")??;
     let total = total(p)?;
     let cost = u64::from(
         crate::wallet::bounded_for(mint, w.get_proofs_fee(p))
             .await
-            .context("CDK wallet request timed out")??
+            .context("CDK wallet request not answered")??
             .total,
     );
     ensure!(total.checked_sub(cost) == Some(net), "incorrect net amount");
@@ -1038,7 +1038,7 @@ pub async fn settle_unforwardable(home: &Path, j: &Journal, id: &str) -> Result<
     let keys =
         crate::wallet::bounded_for(&a.mint, w.load_keyset_keys(a.outputs[0].message.keyset_id))
             .await
-            .context("CDK wallet request timed out")??;
+            .context("CDK wallet request not answered")??;
     let result = cdk::dhke::construct_proofs(
         signatures,
         a.outputs
@@ -1065,7 +1065,7 @@ pub async fn settle_unforwardable(home: &Path, j: &Journal, id: &str) -> Result<
             )),
         )
         .await
-        .context("CDK wallet request timed out")??;
+        .context("CDK wallet request not answered")??;
     }
     let owned: Proofs = result
         .iter()

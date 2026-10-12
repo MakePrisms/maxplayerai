@@ -76,7 +76,7 @@ async fn unblind(
     let w = wallet(home, url).await?;
     let keys = crate::wallet::bounded_for(url, w.load_keyset_keys(out[0].message.keyset_id))
         .await
-        .context("CDK wallet request timed out")??;
+        .context("CDK wallet request not answered")??;
     let proofs = cdk::dhke::construct_proofs(
         sigs,
         out.iter()
@@ -99,7 +99,7 @@ async fn unblind(
         )),
     )
     .await
-    .context("CDK wallet request timed out")??;
+    .context("CDK wallet request not answered")??;
     Ok(proofs)
 }
 async fn credit(
@@ -219,16 +219,26 @@ async fn get<T: serde::de::DeserializeOwned>(url: &str, path: &str, id: &str) ->
         .map_err(|_| anyhow::anyhow!("invalid endpoint"))?
         .pop_if_empty()
         .push(id);
-    Ok(reqwest::Client::builder()
+    let request = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(20))
         .build()?
-        .get(endpoint)
-        .send()
+        .get(endpoint);
+    Ok(crate::backoff::send(url, request)
         .await?
         .error_for_status()?
         .json()
         .await?)
+}
+/// `fund` polls its quote this many times, [`fund_poll`] apart.
+pub const FUND_POLLS: u32 = 6;
+/// Interval between `fund` quote polls: 5 s (1 s on loopback test mints).
+pub fn fund_poll(mint: &str) -> std::time::Duration {
+    std::time::Duration::from_secs(if crate::transport::loopback_only(mint) {
+        1
+    } else {
+        5
+    })
 }
 pub async fn resume_fund(home: &Path, j: &Journal, f: &mut Funding) -> Result<()> {
     if f.done {
@@ -271,13 +281,13 @@ pub async fn resume_fund(home: &Path, j: &Journal, f: &mut Funding) -> Result<()
         let w = wallet(home, &f.mint).await?;
         crate::wallet::bounded_for(&f.mint, w.refresh_keysets())
             .await
-            .context("CDK wallet request timed out")??;
+            .context("CDK wallet request not answered")??;
         let k = crate::wallet::bounded_for(&f.mint, w.fetch_active_keyset())
             .await
-            .context("CDK wallet request timed out")??;
+            .context("CDK wallet request not answered")??;
         let fees = crate::wallet::bounded_for(&f.mint, w.get_keyset_fees_and_amounts_by_id(k.id))
             .await
-            .context("CDK wallet request timed out")??;
+            .context("CDK wallet request not answered")??;
         f.outputs = outputs(PreMintSecrets::random(
             k.id,
             f.amount.into(),
@@ -556,10 +566,10 @@ async fn prepare_withdraw(home: &Path, j: &Journal, a: &mut Withdrawal) -> Resul
     let w = wallet(home, &a.mint).await?;
     crate::wallet::bounded_for(&a.mint, w.refresh_keysets())
         .await
-        .context("CDK wallet request timed out")??;
+        .context("CDK wallet request not answered")??;
     let k = crate::wallet::bounded_for(&a.mint, w.fetch_active_keyset())
         .await
-        .context("CDK wallet request timed out")??;
+        .context("CDK wallet request not answered")??;
     let db = database(home, &a.mint).await?;
     let mut available = db
         .get_proofs(
@@ -578,7 +588,7 @@ async fn prepare_withdraw(home: &Path, j: &Journal, a: &mut Withdrawal) -> Resul
         let input_fee = u64::from(
             crate::wallet::bounded_for(&a.mint, w.get_proofs_fee(&input))
                 .await
-                .context("CDK wallet request timed out")??
+                .context("CDK wallet request not answered")??
                 .total,
         );
         let net_required = u64::from(q.amount)
@@ -649,14 +659,15 @@ async fn submit_melt(
 ) -> Result<Option<MeltQuoteBolt11Response<String>>> {
     crate::Asset::new(url)?.fence()?;
     crate::transport::require_http(url, "melt")?;
-    let response = reqwest::Client::builder()
+    let request = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(mint::RPC_TIMEOUT_SECONDS))
         .build()?
         .post(format!("{url}/v1/melt/bolt11"))
-        .json(request)
-        .send()
-        .await?;
+        .json(request);
+    // A deferred melt is never sent: RequestSent stays journaled and the identical
+    // authorization is replayed (or reconciled by quote GET) on a later pass.
+    let response = crate::backoff::send(url, request).await?;
     let status = response.status();
     let body: serde_json::Value = response
         .json()
@@ -857,6 +868,10 @@ pub async fn recover(home: &Path, j: &Journal) -> Result<bool> {
         if f.expired_unpaid {
             continue;
         }
+        if !crate::backoff::ready(&f.id, &[&f.mint], None).await {
+            failed = true;
+            continue;
+        }
         let item = tokio::time::timeout(
             std::time::Duration::from_secs(120),
             resume_fund(home, j, &mut f),
@@ -872,6 +887,10 @@ pub async fn recover(home: &Path, j: &Journal) -> Result<bool> {
         }
     }
     for mut a in j.all::<Withdrawal>("withdrawal").await? {
+        if !a.terminal() && !crate::backoff::ready(&a.id, &[&a.mint], None).await {
+            failed = true;
+            continue;
+        }
         let item = tokio::time::timeout(
             std::time::Duration::from_secs(120),
             resume_withdraw(home, j, &mut a),

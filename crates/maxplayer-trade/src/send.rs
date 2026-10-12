@@ -423,10 +423,10 @@ pub async fn send(
     let w = wallet(home, mint).await?;
     bounded_for(mint, w.refresh_keysets())
         .await
-        .context("CDK wallet request timed out")??;
+        .context("CDK wallet request not answered")??;
     let k = bounded_for(mint, w.fetch_active_keyset())
         .await
-        .context("CDK wallet request timed out")??;
+        .context("CDK wallet request not answered")??;
     available.sort_by_key(|p| p.proof.amount);
     let mut inputs = vec![];
     let mut chosen = None;
@@ -436,7 +436,7 @@ pub async fn send(
         let fee = u64::from(
             bounded_for(mint, w.get_proofs_fee(&inputs))
                 .await
-                .context("CDK wallet request timed out")??
+                .context("CDK wallet request not answered")??
                 .total,
         );
         if total >= amount.checked_add(fee).context("fee overflow")? {
@@ -452,7 +452,7 @@ pub async fn send(
         .context("selected proofs are not UNSPENT at the mint")?;
     let amounts = bounded_for(mint, w.get_keyset_fees_and_amounts_by_id(k.id))
         .await
-        .context("CDK wallet request timed out")??;
+        .context("CDK wallet request not answered")??;
     let mut planned = outputs(
         PreMintSecrets::random(k.id, amount.into(), &SplitTarget::default(), &amounts)?,
         true,
@@ -702,7 +702,7 @@ async fn verified(
     let w = wallet(home, mint).await?;
     let keys = bounded_for(mint, w.load_keyset_keys(leg.outputs[0].message.keyset_id))
         .await
-        .context("CDK wallet request timed out")??;
+        .context("CDK wallet request not answered")??;
     let proofs = cdk::dhke::construct_proofs(
         signatures,
         leg.outputs
@@ -725,7 +725,7 @@ async fn verified(
         )),
     )
     .await
-    .context("CDK wallet request timed out")?
+    .context("CDK wallet request not answered")?
     {
         Ok(()) => Ok(Some(proofs)),
         Err(cdk::Error::CouldNotVerifyDleq) => Ok(None),
@@ -928,11 +928,11 @@ pub async fn reclaim(
     let w = wallet(home, &r.mint).await?;
     bounded_for(&r.mint, w.refresh_keysets())
         .await
-        .context("CDK wallet request timed out")??;
+        .context("CDK wallet request not answered")??;
     let fee = u64::from(
         bounded_for(&r.mint, w.get_proofs_fee(&inputs))
             .await
-            .context("CDK wallet request timed out")??
+            .context("CDK wallet request not answered")??
             .total,
     );
     check_fee(fee, max_fees)?;
@@ -940,10 +940,10 @@ pub async fn reclaim(
     ensure!(total > fee, "uneconomic reclaim: input fee consumes it");
     let k = bounded_for(&r.mint, w.fetch_active_keyset())
         .await
-        .context("CDK wallet request timed out")??;
+        .context("CDK wallet request not answered")??;
     let amounts = bounded_for(&r.mint, w.get_keyset_fees_and_amounts_by_id(k.id))
         .await
-        .context("CDK wallet request timed out")??;
+        .context("CDK wallet request not answered")??;
     let leg = Leg {
         inputs,
         outputs: outputs(
@@ -1119,6 +1119,10 @@ pub async fn recover(home: &Path, j: &Journal) -> Result<bool> {
                 failed = true;
                 eprintln!("send {}: release deferred: {error:#}", r.id);
             }
+            continue;
+        }
+        if !crate::backoff::ready(&r.id, &[&r.mint], None).await {
+            failed = true;
             continue;
         }
         let item = tokio::time::timeout(
