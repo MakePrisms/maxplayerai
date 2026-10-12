@@ -419,9 +419,9 @@ impl NostrMintConnector {
                 .map(|r| (r.trim_end_matches('/').to_owned(), RelayEvidence::default()))
                 .collect(),
         };
-        let result = self
-            .call_evidenced(operation, body, &mut observation, start)
-            .await;
+        // Keep the relay state machine off callers' stacks: admission and recovery compose
+        // several request futures, including in deeply nested debug-build test futures.
+        let result = Box::pin(self.call_evidenced(operation, body, &mut observation, start)).await;
         observation.elapsed_ms = start.elapsed().as_millis() as u64;
         observation.reachability = if observation.outcome == "local_refusal" {
             "not_checked"
@@ -1112,6 +1112,21 @@ mod tests {
         collect_lifecycle(&mut receivers, &mut observation);
         assert_eq!(observation.relays[&url].connection_generation, 2);
         assert_eq!(reason_category("blocked: secret\u{001b}[31m"), "policy");
+    }
+
+    #[test]
+    fn observed_request_future_is_bounded() {
+        let connector = NostrMintConnector::new(
+            &MintUrl::from_str(&format!("nostr://{G_NPUB}")).unwrap(),
+            vec!["ws://127.0.0.1:1".into()],
+        )
+        .unwrap();
+        let request = connector.call_observed(op::INFO, Value::Null);
+        let size = std::mem::size_of_val(&request);
+        assert!(
+            size < 4096,
+            "observed request future occupies {size} bytes on callers' stacks"
+        );
     }
 
     #[test]

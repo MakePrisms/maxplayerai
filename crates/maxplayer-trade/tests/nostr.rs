@@ -2557,13 +2557,7 @@ async fn initial_unanswered_request_survives_restart_and_legacy_retry() {
     e.jm.put(
         "rejected",
         &key,
-        &(
-            digest.clone(),
-            format!(
-                "mint {} keysets: Operation timeout (no mint NUT error; ambiguous)",
-                n.url
-            ),
-        ),
+        &(digest.clone(), "CDK wallet request not answered".to_owned()),
     )
     .await
     .unwrap();
@@ -3047,4 +3041,40 @@ async fn compatibility_advertisement_never_strands_admitted_trade() {
     let (maker, taker) = e.pump_terminal(&id).await;
     assert_eq!(maker, "complete");
     assert_eq!(taker, "complete");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn signed_trade_error_retains_evidence_without_reflecting_payload() {
+    let e = env().await;
+    let n = e.nostr_mint().await;
+    e.tap.info_mode.store(4, SeqCst);
+    let error = maxplayer_trade::transport::get(&n.url, "info")
+        .await
+        .unwrap_err();
+    let observed = error
+        .downcast_ref::<maxplayer_trade::transport::ObservedMintError>()
+        .expect("trade error must retain typed request evidence");
+    assert_eq!(observed.0.outcome, "internal");
+    assert!(observed.0.reply_ms.is_some());
+    assert_eq!(
+        observed.0.mint_error.as_ref().unwrap().detail,
+        "private payload must not echo"
+    );
+    assert!(!format!("{error:#}").contains("private payload"));
+    assert!(!format!("{error:?}").contains("private payload"));
+    assert!(
+        !serde_json::to_string(&observed.0)
+            .unwrap()
+            .contains("private payload")
+    );
+    assert!(
+        !maxplayer_trade::backoff::unanswered(&error),
+        "signed internal error is an answer, not silence"
+    );
+    assert!(
+        error
+            .downcast_ref::<maxplayer_trade::mint::MintRefusal>()
+            .is_none(),
+        "internal remains financially ambiguous"
+    );
 }

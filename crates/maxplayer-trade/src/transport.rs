@@ -25,6 +25,17 @@ use maxplayer_core::{
 use serde::{Serialize, de::DeserializeOwned};
 use std::{sync::RwLock, time::Duration};
 
+/// Structured evidence retained on the error chain; independent of the financial cause.
+/// Debug/Display are payload-free; trusted callers may inspect the authenticated body in `0`.
+#[derive(Debug)]
+pub struct ObservedMintError(pub maxplayer_core::nostr_mint::RequestObservation);
+impl std::fmt::Display for ObservedMintError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0.message())
+    }
+}
+impl std::error::Error for ObservedMintError {}
+
 /// Per-request bound for an HTTP mint POST (unchanged from before this module existed).
 pub const HTTP_RPC_TIMEOUT: Duration = Duration::from_secs(20);
 /// Bound for one CDK wallet call (metadata, fees, DLEQ keys) against an HTTP mint.
@@ -313,11 +324,15 @@ async fn nostr_call_observed(
         crate::diagnostics::emit(serde_json::to_string(&observation)?);
     }
     let message = observation.message();
-    result.map_err(|e| match nostr_refusal(e) {
-        Ok(refusal) => anyhow::Error::new(refusal).context(message),
-        Err(e) if crate::backoff::cdk_unanswered(&e) => crate::backoff::NoAnswer(message).into(),
-        Err(_) => anyhow!(message),
-    })
+    result
+        .map_err(|e| match nostr_refusal(e) {
+            Ok(refusal) => anyhow::Error::new(refusal).context(message),
+            Err(e) if crate::backoff::cdk_unanswered(&e) => {
+                crate::backoff::NoAnswer(message).into()
+            }
+            Err(_) => anyhow!(message),
+        })
+        .map_err(|error| error.context(ObservedMintError(observation)))
 }
 
 /// A [`crate::mint::MintRefusal`] for the mint's own definitive NUT error over nostr, else the

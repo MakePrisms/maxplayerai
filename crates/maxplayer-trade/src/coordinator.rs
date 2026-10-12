@@ -399,12 +399,32 @@ pub async fn handle(home: &Path, j: &Journal, m: &Market, e: &Event) -> Result<(
 // Never match arbitrary occurrences of "timeout" in peer-provided terms or mint details.
 fn legacy_unanswered(reason: &str) -> bool {
     reason == "Operation timeout"
+        || reason == "CDK wallet request not answered"
         || reason == "no answer within the CDK wallet bound"
         || reason.starts_with("mint ")
             && (reason.ends_with("Operation timeout (no mint NUT error; ambiguous)")
                 || reason.ends_with("no answer within the nostr bound (ambiguous)")
                 || reason.ends_with("keysets: timed out")
                 || reason.ends_with("no answer within the HTTP bound (ambiguous)"))
+        || reason.starts_with("mint ")
+            && (reason.rsplit_once(": HTTP ").is_some_and(|(_, status)| {
+                matches!(
+                    status,
+                    "429 Too Many Requests (body withheld)"
+                        | "502 Bad Gateway (body withheld)"
+                        | "503 Service Unavailable (body withheld)"
+                        | "504 Gateway Timeout (body withheld)"
+                )
+            }) || reason
+                .rsplit_once(" backing off (")
+                .is_some_and(|(_, suffix)| {
+                    suffix.split_once("), ").is_some_and(|(cause, wait)| {
+                        matches!(cause, "429" | "503" | "502/504" | "refused" | "timeout")
+                            && wait
+                                .strip_suffix("s left; request not sent")
+                                .is_some_and(|n| n.parse::<u64>().is_ok())
+                    })
+                }))
 }
 
 async fn request_retry_live(j: &Journal, e: &Event, msg: &Envelope) -> Result<bool> {
@@ -1866,6 +1886,10 @@ mod initial_retry_tests {
             "mint nostr://example keysets: Operation timeout (no mint NUT error; ambiguous)",
             "mint https://example keysets: timed out",
             "no answer within the CDK wallet bound",
+            "CDK wallet request not answered",
+            "mint https://example checkstate: HTTP 503 Service Unavailable (body withheld)",
+            "mint nostr://example backing off (timeout), 30s left; request not sent",
+            "mint nostr://example backing off (429), 2s left; request not sent",
         ] {
             assert!(legacy_unanswered(text), "{text}");
         }
@@ -1877,6 +1901,9 @@ mod initial_retry_tests {
             "mint example swap: NUT 50000 timeout",
             "timeout",
             "bad terms timeout",
+            "mint https://example checkstate: HTTP 400 Bad Request (body withheld)",
+            "mint example backing off (bad terms), 30s left; request not sent",
+            "mint example backing off (timeout), nonsense s left; request not sent",
         ] {
             assert!(!legacy_unanswered(text), "{text}");
         }
