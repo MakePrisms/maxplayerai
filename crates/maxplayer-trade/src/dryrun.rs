@@ -1,6 +1,7 @@
 //! Fee previews: `list --dry-run`, `take --dry-run` and the per-lot fees in `discover`.
 //!
-//! Read-only by construction: published keysets come from the mint's `/v1/keysets`, input
+//! Read-only by construction: published keysets come from the mint's `/v1/keysets` (or the
+//! `keysets` op of a `nostr://` mint, through `transport`), input
 //! selection reads the wallet SQLite file with `SQLITE_OPEN_READ_ONLY`, and the lot comes from a
 //! relay query. Nothing is journaled, reserved, locked, created, published or sent to a maker.
 //! The arithmetic is the coordinator's own (`gross`, `fee`, `check_lock_gross`) applied in the
@@ -25,18 +26,27 @@ impl Keysets {
     }
 }
 
+/// Bound for one keysets read: `http` for an HTTP mint, [`crate::transport::NOSTR_OUTER`] for a
+/// `nostr://` mint (the connector's full window plus its margin; an HTTP-sized bound would cut
+/// every nostr read short).
+pub fn keysets_bound(mint: &str, http: Duration) -> Duration {
+    if crate::transport::is_nostr(mint) {
+        crate::transport::NOSTR_OUTER
+    } else {
+        http
+    }
+}
+
+/// Published keysets through the mint transport (`/v1/keysets` over HTTP, the `keysets` op over
+/// the configured mint relays for `nostr://`), bounded by [`keysets_bound`].
 pub async fn keysets(mint: &str, timeout: Duration) -> Result<Keysets> {
     Asset::new(mint)?.fence()?;
-    let v: serde_json::Value = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(timeout)
-        .build()?
-        .get(format!("{}/v1/keysets", mint.trim_end_matches('/')))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let v = tokio::time::timeout(
+        keysets_bound(mint, timeout),
+        crate::transport::get(mint, "keysets"),
+    )
+    .await
+    .with_context(|| format!("mint {mint} keysets: timed out"))??;
     let mut out = BTreeMap::new();
     for k in v["keysets"].as_array().context("no keysets")? {
         if k["unit"] != "sat" {
@@ -169,7 +179,7 @@ pub async fn discover_fees(lots: &[Lot]) -> Vec<serde_json::Value> {
     for mint in mints.keys().cloned() {
         tasks.spawn(async move {
             let ks = tokio::time::timeout(
-                Duration::from_secs(6),
+                keysets_bound(&mint, Duration::from_secs(5)) + Duration::from_secs(1),
                 keysets(&mint, Duration::from_secs(5)),
             )
             .await;
