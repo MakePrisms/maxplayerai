@@ -1239,13 +1239,15 @@ button.chip { cursor: pointer; }
    fixed slot keeps the rest of the nav from sliding when it does. */
 @media (min-width: 701px) { .conn-fixed { min-width: 21ch; justify-content: flex-end; } }
 /* phones hide the status word (dot only), so no slot: it pushed the menu button off-screen */
-/* /tokens is experimental: a small dim "Lab" superscript on its footer link,
+/* /tokens is experimental: a small yellow boxed "Lab" superscript on its footer link,
    and a plain notice strip at the top of the page (no hazard stripe, per bob). */
 .lab-sup {
-  margin-left: 3px; font-size: 0.7em; letter-spacing: 0.06em;
-  color: var(--faint); vertical-align: super; line-height: 0;
+  display: inline-block; margin-left: 4px; vertical-align: super;
+  font-size: 0.62em; font-weight: 700; letter-spacing: 0.1em; line-height: 1;
+  padding: 2px 4px 1px;
+  color: var(--neon); border: 1px solid rgba(255, 223, 0, 0.55); border-radius: 2px;
 }
-.foot-nav a:hover .lab-sup { color: inherit; }
+.foot-nav a:hover .lab-sup { border-color: var(--neon); }
 .labs-strip {
   display: flex; align-items: center; gap: 10px;
   margin: 0; min-height: 34px; padding: 8px 16px;
