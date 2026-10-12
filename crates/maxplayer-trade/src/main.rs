@@ -766,6 +766,24 @@ impl std::fmt::Display for DoctorExit {
 }
 impl std::error::Error for DoctorExit {}
 async fn doctor(mint: &str, relay: &str, json_output: bool, seconds: u64) -> Result<()> {
+    match doctor_inner(mint, relay, json_output, seconds).await {
+        Err(error) if !error.is::<DoctorExit>() => {
+            let message =
+                "Diagnostic not started: check the mint identifier and explicit relay URL";
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({"exit":2,"observation":{"reachability":"not_checked"},"error":message})
+                );
+            } else {
+                eprintln!("{message}");
+            }
+            Err(DoctorExit(2).into())
+        }
+        result => result,
+    }
+}
+async fn doctor_inner(mint: &str, relay: &str, json_output: bool, seconds: u64) -> Result<()> {
     use maxplayer_core::nostr_mint::NostrMintConnector;
     use std::time::Duration;
     let asset = Asset::from_cli(mint)?;
