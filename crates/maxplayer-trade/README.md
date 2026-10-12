@@ -189,10 +189,24 @@ It is not installed in the Maxplayer website skill index. The CLI regression
 ## Build and automated tests (historical round-three counts below)
 
 This crate is its **own Cargo workspace**, with pinned CDK/Cashu 0.17.2 and Nostr SDK 0.44.1.
-Do not add it to the root workspace. From the repository root:
+Do not add it to the root workspace. Because it is not a root-workspace member,
+`cargo build -p maxplayer-trade` from the repository root fails with
+``package ID specification `maxplayer-trade` did not match any packages``; always pass
+`--manifest-path`. To build (or install) the production CLI from the repository root:
 
 ```sh
-# Tests/examples enable the real CDK mint dev-dependencies; protoc is required.
+# protoc is NOT needed for the production binary; it only builds the wallet-side CDK.
+cargo build --release --manifest-path crates/maxplayer-trade/Cargo.toml --locked
+# -> crates/maxplayer-trade/target/release/maxplayer-trade (or $CARGO_TARGET_DIR/release/...)
+# or put it on PATH:
+cargo install --locked --path crates/maxplayer-trade
+```
+
+Tests and examples are different. From the repository root:
+
+```sh
+# Tests/examples enable the real CDK mint dev-dependencies (cdk `mint` -> cdk-signatory),
+# whose build script needs protoc.
 export PROTOC="$(find /nix/store -maxdepth 3 -path '*/bin/protoc' -print -quit)"
 cargo build --manifest-path crates/maxplayer-trade/Cargo.toml --locked --bins --examples
 cargo test --manifest-path crates/maxplayer-trade/Cargo.toml --locked -- --test-threads=1

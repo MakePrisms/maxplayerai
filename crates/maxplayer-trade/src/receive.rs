@@ -683,8 +683,9 @@ pub async fn recover(home: &Path, j: &Journal) -> Result<bool> {
         if !matches!(item, Ok(Ok(()))) || !r.terminal() {
             failed = true;
             eprintln!(
-                "receive {}: recovery deferred (error or timeout); attempt retained",
-                r.id
+                "receive {}: recovery deferred ({}); attempt retained",
+                r.id,
+                crate::deferral_reason(&item, RECOVERY_ITEM_SECONDS)
             );
         }
     }

@@ -332,8 +332,9 @@ pub async fn send(
     out: &Path,
     max_fees: Option<u64>,
 ) -> Result<SendAttempt> {
+    ensure!(amount > 0, "amount must be at least 1 sat");
     ensure!(
-        amount > 0 && amount <= crate::real_money::CAP,
+        amount <= crate::real_money::CAP,
         "send exceeds 100,000-sat cap"
     );
     let asset = crate::Asset::new(mint)?;
@@ -1132,8 +1133,9 @@ pub async fn recover(home: &Path, j: &Journal) -> Result<bool> {
         if !matches!(item, Ok(Ok(()))) || !r.terminal() {
             failed = true;
             eprintln!(
-                "send {}: recovery deferred (error or timeout); attempt retained",
-                r.id
+                "send {}: recovery deferred ({}); attempt retained",
+                r.id,
+                crate::deferral_reason(&item, RECOVERY_ITEM_SECONDS)
             );
         }
     }
