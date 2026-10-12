@@ -189,9 +189,12 @@ test("/tokens ships its own read-only bundle and is linked from the footer", () 
     const nav = text.slice(text.indexOf('id="nav-links"'), text.indexOf("</nav>", text.indexOf('id="nav-links"')));
     const foot = text.slice(text.indexOf('class="foot-nav"'), text.indexOf("</nav>", text.indexOf('class="foot-nav"')));
     assert.ok(!nav.includes('href="/tokens"'), `${page}: /tokens is not in the top nav`);
-    assert.match(foot, /<a href="\/tokens">Tokens<\/a>/, `${page}: /tokens is in the footer`);
+    assert.match(foot, /<a href="\/tokens">Tokens<sup class="lab-sup">Lab<\/sup><\/a>/, `${page}: /tokens is in the footer, marked Lab`);
   }
-  assert.ok(!tokens.includes("labs-"), "no Labs pill or strip (bob)");
+  // bob: the experimental notice is back, without the hazard stripe.
+  assert.match(tokens, /class="labs-strip" role="note"><span class="labs-pill">Experimental<\/span>/);
+  const css = readFileSync(join(root, "dist", "styles.css"), "utf8");
+  assert.ok(!/repeating-linear-gradient/.test(css.slice(css.indexOf(".labs-strip"))), "no hazard stripe (bob)");
   // Agent-facing docs stay about the jobs market.
   for (const page of ["llms.txt", "skill.md"]) {
     const text = readFileSync(join(root, "dist", page), "utf8");
