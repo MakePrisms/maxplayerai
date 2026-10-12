@@ -182,12 +182,27 @@ pub struct RelayEvidence {
     pub notice: bool,
 }
 impl Default for RelayEvidence {
-    fn default() -> Self { Self { connected: false, ever_connected: false, publish_failed: false, acceptance: "unknown", refused: false, auth: "unknown", closed: false, notice: false } }
+    fn default() -> Self {
+        Self {
+            connected: false,
+            ever_connected: false,
+            publish_failed: false,
+            acceptance: "unknown",
+            refused: false,
+            auth: "unknown",
+            closed: false,
+            notice: false,
+        }
+    }
 }
 impl std::fmt::Debug for RequestObservation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // ErrorBody details are retained for trusted callers, never for diagnostics/logs.
-        write!(f, "{}", serde_json::to_string(self).map_err(|_| std::fmt::Error)?)
+        write!(
+            f,
+            "{}",
+            serde_json::to_string(self).map_err(|_| std::fmt::Error)?
+        )
     }
 }
 impl RequestObservation {
@@ -195,14 +210,23 @@ impl RequestObservation {
         let evidence = if self.reply_ms.is_some() {
             match self.outcome.as_str() {
                 "ok" => "Mint answered successfully".to_owned(),
-                "unsupported_protocol" => format!("Mint answered using envelope v{}; this tool supports v1. Use compatible tool/mint builds", self.envelope_version.unwrap_or(0)),
-                "nut_error" => format!("Mint answered with NUT {}. Operator: inspect sidecar logs", self.nut_code.unwrap_or(0)),
-                other => format!("Mint answered: {other}. Check mint/tool compatibility, clock and operator logs"),
+                "unsupported_protocol" => format!(
+                    "Mint answered using envelope v{}; this tool supports v1. Use compatible tool/mint builds",
+                    self.envelope_version.unwrap_or(0)
+                ),
+                "nut_error" => format!(
+                    "Mint answered with NUT {}. Operator: inspect sidecar logs",
+                    self.nut_code.unwrap_or(0)
+                ),
+                other => format!(
+                    "Mint answered: {other}. Check mint/tool compatibility, clock and operator logs"
+                ),
             }
         } else if self.relays.values().any(|r| r.acceptance == "accepted") {
             "Relay accepted the request, but mint did not answer. Offline, incompatible, unsubscribed mint or lost reply cannot be distinguished. Ask the operator to check the sidecar and selected relay; run doctor before a new take".into()
         } else if self.relays.values().any(|r| r.refused) {
-            "Relay refused the request; mint response not observed. Check relay access/auth policy".into()
+            "Relay refused the request; mint response not observed. Check relay access/auth policy"
+                .into()
         } else if self.relays.values().any(|r| r.auth == "failed" || r.closed) {
             "Relay authentication failed or reply subscription closed. Check relay authorization; cannot observe the mint response on this path".into()
         } else if !self.relays.values().any(|r| r.connected) {
@@ -210,7 +234,12 @@ impl RequestObservation {
         } else {
             "No relay acknowledgement; request acceptance unknown. Check relay health; do not assume the mint never received it".into()
         };
-        format!("mint {} {} after {:.1}s: {evidence}. Execution outcome is independent; retain submitted operations and use status/recover", self.mint, self.op, self.elapsed_ms as f64 / 1000.0)
+        format!(
+            "mint {} {} after {:.1}s: {evidence}. Execution outcome is independent; retain submitted operations and use status/recover",
+            self.mint,
+            self.op,
+            self.elapsed_ms as f64 / 1000.0
+        )
     }
 }
 
@@ -286,29 +315,69 @@ impl NostrMintConnector {
     }
 
     /// The same request and financial mapping, with independently retained diagnostic evidence.
-    pub async fn call_observed(&self, operation: &str, body: Value) -> (Result<Value, Error>, RequestObservation) {
+    pub async fn call_observed(
+        &self,
+        operation: &str,
+        body: Value,
+    ) -> (Result<Value, Error>, RequestObservation) {
         let start = Instant::now();
         let mut observation = RequestObservation {
-            mint: self.mint_url.to_string(), op: operation.into(), checked_at: unix_now_ms() / 1000,
-            elapsed_ms: 0, budget_ms: self.window.as_millis() as u64, attempts: 0,
-            reply_ms: None, reply_relay: None, outcome: "unanswered".into(), reachability: "unanswered", nut_code: None, mint_error: None,
-            envelope_version: None, evidence_lost: false,
-            relays: self.relays.iter().map(|r| (r.trim_end_matches('/').to_owned(), RelayEvidence::default())).collect(),
+            mint: self.mint_url.to_string(),
+            op: operation.into(),
+            checked_at: unix_now_ms() / 1000,
+            elapsed_ms: 0,
+            budget_ms: self.window.as_millis() as u64,
+            attempts: 0,
+            reply_ms: None,
+            reply_relay: None,
+            outcome: "unanswered".into(),
+            reachability: "unanswered",
+            nut_code: None,
+            mint_error: None,
+            envelope_version: None,
+            evidence_lost: false,
+            relays: self
+                .relays
+                .iter()
+                .map(|r| (r.trim_end_matches('/').to_owned(), RelayEvidence::default()))
+                .collect(),
         };
-        let result = self.call_evidenced(operation, body, &mut observation, start).await;
+        let result = self
+            .call_evidenced(operation, body, &mut observation, start)
+            .await;
         observation.elapsed_ms = start.elapsed().as_millis() as u64;
-        observation.reachability = if observation.reply_ms.is_some() { "answered" }
-            else if observation.relays.values().any(|r| r.auth == "failed") { "auth_failed" }
-            else if observation.relays.values().any(|r| r.closed) { "subscription_closed" }
-            else if observation.relays.values().any(|r| r.acceptance == "accepted") { "unanswered" }
-            else if observation.relays.values().any(|r| r.refused) { "relay_refused" }
-            else if !observation.relays.values().any(|r| r.ever_connected) { "relay_unreachable" }
-            else { "acceptance_unknown" };
-        if let Ok(mut last) = self.last_observation.lock() { *last = Some(observation.clone()); }
+        observation.reachability = if observation.reply_ms.is_some() {
+            "answered"
+        } else if observation.relays.values().any(|r| r.auth == "failed") {
+            "auth_failed"
+        } else if observation.relays.values().any(|r| r.closed) {
+            "subscription_closed"
+        } else if observation
+            .relays
+            .values()
+            .any(|r| r.acceptance == "accepted")
+        {
+            "unanswered"
+        } else if observation.relays.values().any(|r| r.refused) {
+            "relay_refused"
+        } else if !observation.relays.values().any(|r| r.ever_connected) {
+            "relay_unreachable"
+        } else {
+            "acceptance_unknown"
+        };
+        if let Ok(mut last) = self.last_observation.lock() {
+            *last = Some(observation.clone());
+        }
         (result, observation)
     }
 
-    async fn call_evidenced(&self, operation: &str, body: Value, observation: &mut RequestObservation, start: Instant) -> Result<Value, Error> {
+    async fn call_evidenced(
+        &self,
+        operation: &str,
+        body: Value,
+        observation: &mut RequestObservation,
+        start: Instant,
+    ) -> Result<Value, Error> {
         let started_unix_ms = unix_now_ms();
         let deadline = Instant::now() + self.window;
         let request = Request {
@@ -348,7 +417,10 @@ impl NostrMintConnector {
         // drained without spawning tasks, so cancellation cannot leak collectors.
         let mut lifecycle = Vec::new();
         for (url, relay) in client.relays().await {
-            lifecycle.push((url.to_string().trim_end_matches('/').to_owned(), relay.notifications()));
+            lifecycle.push((
+                url.to_string().trim_end_matches('/').to_owned(),
+                relay.notifications(),
+            ));
         }
         let mut notifications = client.notifications();
         client.connect().await;
@@ -361,7 +433,10 @@ impl NostrMintConnector {
             .values()
             .any(|relay| relay.is_connected());
         for (url, relay) in client.relays().await {
-            let evidence = observation.relays.entry(url.to_string().trim_end_matches('/').to_owned()).or_default();
+            let evidence = observation
+                .relays
+                .entry(url.to_string().trim_end_matches('/').to_owned())
+                .or_default();
             evidence.connected = relay.is_connected();
             evidence.ever_connected |= evidence.connected;
         }
@@ -384,7 +459,11 @@ impl NostrMintConnector {
             .pubkey(keys.public_key())
             .author(self.mint_pk)
             .since(Timestamp::now() - Duration::from_secs(10));
-        let _ = tokio::time::timeout(remaining(deadline), client.subscribe_with_id(subscription.clone(), filter, None)).await;
+        let _ = tokio::time::timeout(
+            remaining(deadline),
+            client.subscribe_with_id(subscription.clone(), filter, None),
+        )
+        .await;
 
         let mut next_send = Instant::now();
         let mut publish = None;
@@ -392,21 +471,33 @@ impl NostrMintConnector {
             for (url, receiver) in &mut lifecycle {
                 for _ in 0..1024 {
                     match receiver.try_recv() {
-                        Ok(RelayNotification::Authenticated) => observation.relays.entry(url.clone()).or_default().auth = "authenticated",
-                        Ok(RelayNotification::AuthenticationFailed) => observation.relays.entry(url.clone()).or_default().auth = "failed",
+                        Ok(RelayNotification::Authenticated) => {
+                            observation.relays.entry(url.clone()).or_default().auth =
+                                "authenticated"
+                        }
+                        Ok(RelayNotification::AuthenticationFailed) => {
+                            observation.relays.entry(url.clone()).or_default().auth = "failed"
+                        }
                         Ok(RelayNotification::RelayStatus { status }) => {
                             let evidence = observation.relays.entry(url.clone()).or_default();
-                            evidence.connected = status == nostr_sdk::prelude::RelayStatus::Connected;
+                            evidence.connected =
+                                status == nostr_sdk::prelude::RelayStatus::Connected;
                             evidence.ever_connected |= evidence.connected;
-                            if !evidence.connected && evidence.auth == "authenticated" { evidence.auth = "unknown"; }
+                            if !evidence.connected && evidence.auth == "authenticated" {
+                                evidence.auth = "unknown";
+                            }
                         }
-                        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => observation.evidence_lost = true,
+                        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                            observation.evidence_lost = true
+                        }
                         Err(_) => break,
                         _ => {}
                     }
                 }
             }
-            if Instant::now() >= deadline { break Err(Error::Timeout); }
+            if Instant::now() >= deadline {
+                break Err(Error::Timeout);
+            }
             if publish.is_none() && Instant::now() >= next_send {
                 observation.attempts += 1;
                 publish = Some(Box::pin(client.send_event(&event)));
@@ -478,28 +569,54 @@ impl NostrMintConnector {
         let plain = nip44::decrypt(keys.secret_key(), &self.mint_pk, &reply.content).ok()?;
         let value: Value = match serde_json::from_str(&plain) {
             Ok(value) => value,
-            Err(_) => { observation.outcome = "invalid_response".into(); return Some(Err(Error::InvalidMintResponse("authenticated malformed response".into()))); }
+            Err(_) => {
+                observation.outcome = "invalid_response".into();
+                return Some(Err(Error::InvalidMintResponse(
+                    "authenticated malformed response".into(),
+                )));
+            }
         };
-        if value["id"].as_str() != Some(request_id) { return None; }
+        if value["id"].as_str() != Some(request_id) {
+            return None;
+        }
         observation.envelope_version = value["v"].as_u64();
         if observation.envelope_version != Some(u64::from(PROTOCOL_VERSION)) {
             observation.outcome = "unsupported_protocol".into();
-            return Some(Err(Error::InvalidMintResponse("unsupported envelope version".into())));
+            return Some(Err(Error::InvalidMintResponse(
+                "unsupported envelope version".into(),
+            )));
         }
         let response: Response = match serde_json::from_value(value) {
             Ok(response) => response,
-            Err(_) => { observation.outcome = "invalid_response".into(); return Some(Err(Error::InvalidMintResponse("authenticated malformed response".into()))); }
+            Err(_) => {
+                observation.outcome = "invalid_response".into();
+                return Some(Err(Error::InvalidMintResponse(
+                    "authenticated malformed response".into(),
+                )));
+            }
         };
         Some(match response.outcome {
-            Outcome::Ok(value) => { observation.outcome = "ok".into(); Ok(value) },
+            Outcome::Ok(value) => {
+                observation.outcome = "ok".into();
+                Ok(value)
+            }
             Outcome::Err(error) => {
                 observation.mint_error = Some(error.clone());
                 match &error.code {
-                    ErrorCode::Nut(n) => { observation.outcome = "nut_error".into(); observation.nut_code = Some(*n); }
-                    ErrorCode::Named(n) => observation.outcome = match n.as_str() {
-                        code::INTERNAL | code::EXPIRED | code::RATE_LIMITED | code::UNSUPPORTED | code::BAD_REQUEST => n.clone(),
-                        _ => "unknown_protocol_error".into(),
-                    },
+                    ErrorCode::Nut(n) => {
+                        observation.outcome = "nut_error".into();
+                        observation.nut_code = Some(*n);
+                    }
+                    ErrorCode::Named(n) => {
+                        observation.outcome = match n.as_str() {
+                            code::INTERNAL
+                            | code::EXPIRED
+                            | code::RATE_LIMITED
+                            | code::UNSUPPORTED
+                            | code::BAD_REQUEST => n.clone(),
+                            _ => "unknown_protocol_error".into(),
+                        }
+                    }
                 }
                 Err(map_error(error))
             }
