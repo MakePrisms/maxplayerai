@@ -1077,6 +1077,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn diagnostics_lifecycle_lag_and_connection_generation_are_explicit() {
+        use nostr_sdk::prelude::RelayStatus;
+        let connector = NostrMintConnector::new(
+            &MintUrl::from_str(&format!("nostr://{G_NPUB}")).unwrap(),
+            vec!["ws://127.0.0.1:1".into()],
+        ).unwrap().with_timing(Duration::from_millis(2), Duration::from_secs(1), Duration::from_millis(1));
+        let (_, mut observation) = connector.call_observed(op::INFO, Value::Null).await;
+        let (tx, rx) = tokio::sync::broadcast::channel(1);
+        let url = "ws://127.0.0.1:1".to_owned();
+        let mut receivers = vec![(url.clone(), rx)];
+        tx.send(RelayNotification::Authenticated).unwrap();
+        tx.send(RelayNotification::AuthenticationFailed).unwrap();
+        collect_lifecycle(&mut receivers, &mut observation);
+        assert!(observation.evidence_lost);
+        assert_eq!(observation.relays[&url].auth, "failed");
+        tx.send(RelayNotification::RelayStatus {status:RelayStatus::Connected}).unwrap();
+        collect_lifecycle(&mut receivers, &mut observation);
+        tx.send(RelayNotification::Authenticated).unwrap();
+        collect_lifecycle(&mut receivers, &mut observation);
+        assert_eq!(observation.relays[&url].auth_generation, Some(1));
+        tx.send(RelayNotification::RelayStatus {status:RelayStatus::Disconnected}).unwrap();
+        collect_lifecycle(&mut receivers, &mut observation);
+        assert_eq!(observation.relays[&url].auth, "unknown");
+        assert_eq!(observation.relays[&url].auth_generation, None);
+        tx.send(RelayNotification::RelayStatus {status:RelayStatus::Connected}).unwrap();
+        collect_lifecycle(&mut receivers, &mut observation);
+        assert_eq!(observation.relays[&url].connection_generation, 2);
+        assert_eq!(reason_category("blocked: secret\u{001b}[31m"), "policy");
+    }
+
     #[test]
     fn nostr_request_exp_is_never_later_than_the_wait() {
         // Start 0.2s into a second: the wait ends at …030.2, exp = …030, and the mint refuses from

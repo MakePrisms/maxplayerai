@@ -381,7 +381,16 @@ async fn nostr_mint_all_relays_down_is_a_clean_error() {
         Duration::from_secs(1),
     );
     let started = std::time::Instant::now();
-    let error = c.get_mint_info().await.expect_err("no relay");
+    let (result, observation) = c.call_observed("info", Value::Null).await;
+    let error = result.expect_err("no relay");
+    assert_eq!(observation.reachability, "relay_unreachable");
+    assert!(observation.reply_ms.is_none());
+    assert!(
+        observation
+            .relays
+            .values()
+            .all(|r| r.acceptance == "unknown")
+    );
     assert!(matches!(error, Error::HttpError(None, _)), "{error:?}");
     assert!(started.elapsed() < Duration::from_secs(5));
 }

@@ -552,9 +552,10 @@ async fn replay_retained(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
             j.remove("inbox_retry", &id).await?;
             continue;
         }
-        let budget = s
-            .as_ref()
-            .map_or(std::time::Duration::from_secs(120), item_budget);
+        let budget = match s.as_ref() {
+            Some(s) => item_budget(s),
+            None => message_budget(j, m, &r.event).await,
+        };
         match tokio::time::timeout(budget, Box::pin(handle(home, j, m, &r.event))).await {
             Ok(Ok(())) => {
                 j.remove("inbox_retry", &id).await?;
