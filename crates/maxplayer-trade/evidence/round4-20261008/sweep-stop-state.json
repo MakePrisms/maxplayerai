@@ -1,0 +1,23 @@
+{
+  "home": "pair2-maker",
+  "mint": "https://cashu.cz",
+  "withdrawal": "5a9928b3-c20a-45bf-9e81-70a96a6305aa",
+  "state": "quote_created",
+  "input_count": 0,
+  "input_total": 0,
+  "input_fee": 0,
+  "output_count": 0,
+  "result_count": null,
+  "change": null,
+  "quote": {
+    "quote": "[retained privately]",
+    "amount": 21,
+    "fee_reserve": 5,
+    "state": "UNPAID",
+    "expiry": 1791487581
+  },
+  "advertised_change_count": 0,
+  "matched_error_categories": [
+    "insufficient unreserved funds"
+  ]
+}

@@ -1380,6 +1380,14 @@ pub async fn prepare_award_async(
         .iter()
         .find(|claim| claim.claim_id == request.claim_id)
         .ok_or_else(|| JobLifecycleError::NotFound(format!("claim {}", request.claim_id)))?;
+    // Alternate callers must obey the same buyer policy before signing a NEW award.
+    // Do not gate send_signed_award_async: retries of pinned awards are existing obligations.
+    if home.config.buyer.blocked_sellers.contains(&claim.seller_pubkey) {
+        return Err(JobLifecycleError::Input(format!(
+            "award refused: seller {} is blocked by buyer.blocked_sellers",
+            claim.seller_pubkey
+        )));
+    }
     if claim.status != "processing" {
         return Err(JobLifecycleError::Input(format!(
             "claim {} status is {}, expected processing",
@@ -8413,6 +8421,66 @@ mod private_flow_tests {
     use crate::private_content::{channel::ContentContext, evidence::inline_fixture, PreparedContent};
 
     #[test]
+    fn blocked_sellers_private_paid_and_free_claims_are_ineligible() {
+        use crate::buyer::lifecycle::{
+            NamedAwardRefused, award_filters_for_offer, named_claim_awardable, select_awardable_claim,
+        };
+        for paid in [false, true] {
+            for targeted in [false, true] {
+                let (e, _, buyer, policy) =
+                    crate::private_content::evidence::inline_fixture_with_mints(targeted, paid, 2_000_000_000, vec![home::DEFAULT_MINT_URL.into()]);
+                let root = tempfile::tempdir().unwrap();
+                let mut home = home::bootstrap(root.path()).unwrap();
+                home.config.privacy.service_pubkey = Some(policy.service);
+                home.config.privacy.git_base = Some(policy.host.git_prefix);
+                home.config.buyer.blocked_sellers = vec![e.claim.pubkey.to_hex()];
+                let mut ctx = ContentContext::open(&home, &buyer.public_key().to_hex()).unwrap();
+                if let Some(raw) = &e.task_envelope {
+                    ctx.stage(&PreparedContent::decode(raw).unwrap(), now_unix())
+                        .unwrap();
+                }
+                let view = private_view_from_events(
+                    &home,
+                    &mut ctx,
+                    &e.offer,
+                    vec![e.claim.clone()],
+                    vec![],
+                    vec![],
+                    now_unix(),
+                )
+                .unwrap();
+                let filters = award_filters_for_offer(
+                    view.offer.as_ref().unwrap(),
+                    10,
+                    home::DEFAULT_MINT_URL,
+                    false,
+                    &[],
+                    &home.config.buyer.blocked_sellers,
+                );
+                assert_eq!(select_awardable_claim(&view, &filters), None);
+                assert_eq!(
+                    named_claim_awardable(&view, &e.claim.id.to_hex(), &filters),
+                    Err(NamedAwardRefused::BlockedSeller {
+                        seller_pubkey: e.claim.pubkey.to_hex()
+                    })
+                );
+                let allowed = award_filters_for_offer(
+                    view.offer.as_ref().unwrap(),
+                    10,
+                    home::DEFAULT_MINT_URL,
+                    false,
+                    &[],
+                    &[],
+                );
+                assert_eq!(
+                    select_awardable_claim(&view, &allowed),
+                    Some(e.claim.id.to_hex())
+                );
+            }
+        }
+    }
+
+    #[test]
     fn private_content_missing_selection_dependencies_are_unknown_not_absent() {
         use crate::private_content::{evidence, builders, public_v2};
         for targeted in [true, false] {
@@ -8542,6 +8610,7 @@ mod private_flow_tests {
             10,
             approved,
             true,
+            &[],
             &[],
         );
         let claim = crate::buyer::lifecycle::select_awardable_claim(&view, &f).unwrap();

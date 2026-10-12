@@ -91,9 +91,10 @@ test("every asset URL in shipped HTML and CSS carries the deploy stamp", () => {
   assert.match(stamp, /^[0-9a-f]{12}$/);
 
   const html = readFileSync(join(root, "dist", "index.html"), "utf8");
-  for (const page of ["index.html", "market.html", "sell.html", "chat.html"]) {
+  for (const page of ["index.html", "market.html", "sell.html", "chat.html", "tokens.html"]) {
     const pageHtml = readFileSync(join(root, "dist", page), "utf8");
-    for (const asset of ["styles.css", "fonts.css", "terminal.js"]) {
+    const script = page === "tokens.html" ? "tokens.js" : "terminal.js";
+    for (const asset of ["styles.css", "fonts.css", script]) {
       assert.ok(pageHtml.includes(`./${asset}?v=${stamp}`), `${asset} is stamped in ${page}`);
       assert.ok(!pageHtml.includes(`"./${asset}"`), `no unstamped ${asset} reference remains in ${page}`);
     }
@@ -161,7 +162,7 @@ test("the live market ships at /market and the homepage links it", () => {
 });
 
 test("all site pages share navigation and footer links, with a current page and no inline scripts", () => {
-  const pages = ["index.html", "sell.html", "chat.html", "market.html"];
+  const pages = ["index.html", "sell.html", "chat.html", "market.html", "tokens.html"];
   let expectedNav;
   let expectedFooter;
   for (const page of pages) {
@@ -169,18 +170,74 @@ test("all site pages share navigation and footer links, with a current page and 
     const nav = html.match(/<nav class="nav-links"[^>]*>([\s\S]*?)<\/nav>/)?.[1];
     const footer = html.match(/<nav class="foot-nav"[^>]*>([\s\S]*?)<\/nav>/)?.[1];
     assert.ok(nav && footer, `${page} has shared chrome`);
-    const links = (markup) => [...markup.matchAll(/href="([^"]+)"[^>]*>([^<]+)<\/a>/g)].map((m) => [m[1], m[2]]);
+    const links = (markup) =>
+      [...markup.matchAll(/<a href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g)].map((m) => [m[1], m[2].replace(/<[^>]+>/g, "")]);
     expectedNav ??= links(nav);
     expectedFooter ??= links(footer);
     assert.deepEqual(links(nav), expectedNav, `${page} nav matches`);
     assert.deepEqual(links(footer), expectedFooter, `${page} footer matches`);
-    assert.match(nav, /href="\/sell"[^>]*>Sell<\/a>\s*<a href="\/chat"[^>]*>Chat<\/a>/);
-    const route = page === "index.html" ? "/" : `/${page.replace(".html", "")}`;
-    assert.ok(nav.includes(`href="${route}" aria-current="page"`), `${page} marks itself current`);
-    assert.equal([...nav.matchAll(/aria-current="page"/g)].length, 1);
+    // bob: Chat is linked from the footer only (marked Lab, like Tokens), never the top nav.
+    assert.ok(!nav.includes('href="/chat"'), `${page}: /chat is not in the top nav`);
+    assert.match(footer, /href="\/market">Market<\/a>\s*<a href="\/chat">Chat<sup class="lab-sup">Lab<\/sup><\/a>/, `${page}: /chat is in the footer after Market, marked Lab`);
+    const current = [...nav.matchAll(/aria-current="page"/g)].length;
+    if (page === "chat.html" || page === "tokens.html") {
+      assert.equal(current, 0, `${page} is not in the top nav, so nothing there is current`);
+    } else {
+      const route = page === "index.html" ? "/" : `/${page.replace(".html", "")}`;
+      assert.ok(nav.includes(`href="${route}" aria-current="page"`), `${page} marks itself current`);
+      assert.equal(current, 1);
+    }
     for (const script of html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/g)) {
       assert.match(script[1], /\bsrc="/);
       assert.equal(script[2].trim(), "", `${page} has no inline script`);
     }
   }
+});
+
+test("/tokens ships its own read-only bundle and stays unlisted", () => {
+  const tokens = readFileSync(join(root, "dist", "tokens.html"), "utf8");
+  for (const id of ["tokens", "lots", "recent", "windows", "statgrid", "conn", "utc-clock", "trade-detail"]) {
+    assert.ok(tokens.includes(`id="${id}"`), `tokens.html carries #${id}`);
+  }
+  assert.ok(!tokens.includes("terminal.js"), "the jobs bundle is not loaded on /tokens");
+  assert.ok(!readFileSync(join(root, "dist", "terminal.js"), "utf8").includes("offchain.pub"), "the jobs bundle carries no trade reader");
+  assert.match(tokens, /<meta name="robots" content="noindex, nofollow">/);
+  // bob: the skeleton is the real frame. Inline styles are dropped by the
+  // /tokens CSP (style-src 'self'), so none may carry layout; the stat labels
+  // and period buttons are static, and only the values shimmer.
+  assert.ok(!/\sstyle="/.test(tokens), "no inline style attributes (CSP drops them)");
+  assert.deepEqual([...tokens.matchAll(/data-w="([^"]+)"/g)].map((m) => m[1]), ["24h", "7d", "all"]);
+  assert.match(tokens, /data-w="24h" aria-pressed="true"/);
+  assert.deepEqual([...tokens.matchAll(/data-stat="([^"]+)"/g)].map((m) => m[1]), ["trades", "give", "want", "sellers", "pairs", "fill"]);
+  assert.equal((tokens.match(/class="skel skel-stat"/g) ?? []).length, 6);
+  // Lot details open in /market's popup window, not inline under the board.
+  assert.match(tokens, /<aside class="dock dock-(left|right) pinned" id="trade-detail"[^>]*hidden>/);
+  assert.ok(!/dock-mid/.test(tokens), "the lot popup never opens in the middle");
+  assert.ok(!tokens.includes('id="done"'), "no completed-trades table under the board (bob)");
+  assert.ok(!tokens.includes('id="stats-note"') && !tokens.includes("Mints can fail"), "no footnotes (bob)");
+  assert.ok(tokens.indexOf('id="trade-detail"') > tokens.indexOf("</footer>"), "the popup lives outside the page flow");
+  // Team link only (bob): nothing on the public site points at it.
+  for (const page of ["index.html", "market.html", "sell.html", "tokens.html", "llms.txt", "skill.md"]) {
+    const text = readFileSync(join(root, "dist", page), "utf8");
+    assert.ok(!/href="\/(tokens|trades)"|\]\(\/(tokens|trades)\)/.test(text), `${page} does not link the token page`);
+  }
+});
+
+test("the /tokens CSP opens only the trade relays, only on /tokens, and is noindex", () => {
+  const { headers } = JSON.parse(readFileSync(join(root, "vercel.json"), "utf8"));
+  const matching = (path) => headers.filter((h) => new RegExp(`^${h.source.replace(/^\//, "\\/")}$`).test(path));
+  const csp = (path) => matching(path).flatMap((h) => h.headers.filter((x) => x.key === "Content-Security-Policy").map((x) => x.value));
+  for (const path of ["/", "/market", "/sell", "/terminal.js", "/tokens.js", "/tokensx"]) {
+    const [v, ...rest] = csp(path);
+    assert.equal(rest.length, 0, `${path} gets exactly one CSP`);
+    assert.match(v, /connect-src 'self' wss:\/\/relay\.maxplayer\.ai https:\/\/api\.coinbase\.com;/, path);
+    assert.ok(!v.includes("nos.lol"), `${path} does not open the trade relays`);
+  }
+  const [t, ...more] = csp("/tokens");
+  assert.equal(more.length, 0, "/tokens gets exactly one CSP");
+  assert.match(t, /connect-src 'self' wss:\/\/nos\.lol wss:\/\/relay\.primal\.net wss:\/\/offchain\.pub;/);
+  assert.ok(!t.includes("relay.maxplayer.ai"), "/tokens cannot reach the production relay");
+  assert.match(t, /script-src 'self';/);
+  const robots = matching("/tokens").flatMap((h) => h.headers.filter((x) => x.key === "X-Robots-Tag").map((x) => x.value));
+  assert.deepEqual(robots, ["noindex, nofollow"]);
 });

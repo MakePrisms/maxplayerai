@@ -33,7 +33,7 @@ MAXPLAYER_HOME=$A maxplayer-mint init              # then mint.toml: relays = ["
 MAXPLAYER_HOME=$A maxplayer-mint run &
 MAXPLAYER_HOME=$BUYER maxplayer whoami             # bootstraps; set relay_url, accepted_mints = [A]
 MAXPLAYER_HOME=$A maxplayer-mint issue 300
-MAXPLAYER_HOME=$BUYER maxplayer wallet receive "$(cat $A/mint/issued/<id>.token)"
+MAXPLAYER_HOME=$BUYER maxplayer wallet receive --token-file $A/mint/issued/<id>.token
 MAXPLAYER_HOME=$B maxplayer whoami                 # relay_url; accepted_mints = [<lightning mint>, A]
 MAXPLAYER_HOME=$B maxplayer wallet mints add <A's nostr:// URL>   # so B's wallet can spend what it earns at A
 MAXPLAYER_HOME=$B maxplayer seller --agent-argv node --agent-argv $PWD/stub-acp-agent.mjs \
