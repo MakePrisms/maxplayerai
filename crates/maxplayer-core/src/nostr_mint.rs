@@ -158,6 +158,9 @@ pub struct RequestObservation {
     pub elapsed_ms: u64,
     pub budget_ms: u64,
     pub attempts: u32,
+    /// SDK authentication retransmissions are not counted as wire sends.
+    pub wire_sends: Option<u32>,
+    pub request_event: Option<String>,
     pub reply_ms: Option<u64>,
     pub reply_relay: Option<String>,
     pub outcome: String,
@@ -178,6 +181,11 @@ pub struct RelayEvidence {
     pub acceptance: &'static str,
     pub refused: bool,
     pub auth: &'static str,
+    pub connection_generation: u32,
+    pub auth_generation: Option<u32>,
+    pub refusal_category: Option<&'static str>,
+    pub closed_category: Option<&'static str>,
+    pub eose: bool,
     pub closed: bool,
     pub notice: bool,
 }
@@ -190,6 +198,11 @@ impl Default for RelayEvidence {
             acceptance: "unknown",
             refused: false,
             auth: "unknown",
+            connection_generation: 0,
+            auth_generation: None,
+            refusal_category: None,
+            closed_category: None,
+            eose: false,
             closed: false,
             notice: false,
         }
@@ -207,7 +220,9 @@ impl std::fmt::Debug for RequestObservation {
 }
 impl RequestObservation {
     pub fn message(&self) -> String {
-        let evidence = if self.reply_ms.is_some() {
+        let evidence = if self.outcome == "local_refusal" {
+            "Request refused locally before publication; reduce request size".into()
+        } else if self.reply_ms.is_some() {
             match self.outcome.as_str() {
                 "ok" => "Mint answered successfully".to_owned(),
                 "unsupported_protocol" => format!(
@@ -229,6 +244,10 @@ impl RequestObservation {
                 .into()
         } else if self.relays.values().any(|r| r.auth == "failed" || r.closed) {
             "Relay authentication failed or reply subscription closed. Check relay authorization; cannot observe the mint response on this path".into()
+        } else if !self.relays.values().any(|r| r.connected)
+            && self.relays.values().any(|r| r.ever_connected)
+        {
+            "Relay disconnected while awaiting reply; acceptance unknown. Check network and selected mint relays".into()
         } else if !self.relays.values().any(|r| r.connected) {
             "No configured mint relay reachable. Check network and selected mint-relay URLs".into()
         } else {
@@ -240,6 +259,57 @@ impl RequestObservation {
             self.op,
             self.elapsed_ms as f64 / 1000.0
         )
+    }
+}
+
+// Untrusted relay text is reduced to an allowlisted NIP-01 prefix, never echoed.
+fn reason_category(reason: &str) -> &'static str {
+    match reason.split(':').next().unwrap_or_default() {
+        "auth-required" | "restricted" => "auth",
+        "rate-limited" => "rate_limit",
+        "blocked" | "pow" => "policy",
+        "invalid" => "invalid",
+        _ => "unknown",
+    }
+}
+fn collect_lifecycle(
+    receivers: &mut [(String, tokio::sync::broadcast::Receiver<RelayNotification>)],
+    observation: &mut RequestObservation,
+) {
+    for (url, receiver) in receivers {
+        for _ in 0..1024 {
+            let evidence = observation.relays.entry(url.clone()).or_default();
+            match receiver.try_recv() {
+                Ok(RelayNotification::Authenticated) => {
+                    evidence.auth = "authenticated";
+                    evidence.auth_generation = Some(evidence.connection_generation);
+                }
+                Ok(RelayNotification::AuthenticationFailed) => {
+                    evidence.auth = "failed";
+                    evidence.auth_generation = Some(evidence.connection_generation);
+                }
+                Ok(RelayNotification::RelayStatus { status }) => {
+                    let connected = status == nostr_sdk::prelude::RelayStatus::Connected;
+                    if connected && !evidence.connected {
+                        evidence.connection_generation =
+                            evidence.connection_generation.saturating_add(1);
+                    }
+                    evidence.connected = connected;
+                    evidence.ever_connected |= connected;
+                    if !connected {
+                        evidence.auth_generation = None;
+                        if evidence.auth == "authenticated" {
+                            evidence.auth = "unknown";
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                    observation.evidence_lost = true
+                }
+                Err(_) => break,
+                _ => {}
+            }
+        }
     }
 }
 
@@ -328,6 +398,8 @@ impl NostrMintConnector {
             elapsed_ms: 0,
             budget_ms: self.window.as_millis() as u64,
             attempts: 0,
+            wire_sends: None,
+            request_event: None,
             reply_ms: None,
             reply_relay: None,
             outcome: "unanswered".into(),
@@ -346,7 +418,9 @@ impl NostrMintConnector {
             .call_evidenced(operation, body, &mut observation, start)
             .await;
         observation.elapsed_ms = start.elapsed().as_millis() as u64;
-        observation.reachability = if observation.reply_ms.is_some() {
+        observation.reachability = if observation.outcome == "local_refusal" {
+            "not_checked"
+        } else if observation.reply_ms.is_some() {
             "answered"
         } else if observation.relays.values().any(|r| r.auth == "failed") {
             "auth_failed"
@@ -390,6 +464,7 @@ impl NostrMintConnector {
         let plaintext = serde_json::to_string(&request)
             .map_err(|error| Error::Custom(format!("encode {operation} request: {error}")))?;
         if plaintext.len() > MAX_PLAINTEXT_BYTES {
+            observation.outcome = "local_refusal".into();
             // Nothing was published, so a definitive refusal is honest.
             return Err(Error::HttpError(
                 Some(413),
@@ -408,6 +483,7 @@ impl NostrMintConnector {
             .sign_with_keys(&keys)
             .map_err(|error| Error::Custom(format!("sign {operation} request: {error}")))?;
 
+        observation.request_event = Some(event.id.to_hex());
         let client = Client::new(keys.clone());
         client.automatic_authentication(true);
         for relay in &self.relays {
@@ -440,6 +516,7 @@ impl NostrMintConnector {
             evidence.connected = relay.is_connected();
             evidence.ever_connected |= evidence.connected;
         }
+        collect_lifecycle(&mut lifecycle, observation);
         if !connected {
             disconnect(&client).await;
             // Same class as an unreachable HTTPS mint today (connection refused): ambiguous.
@@ -468,33 +545,7 @@ impl NostrMintConnector {
         let mut next_send = Instant::now();
         let mut publish = None;
         let outcome = loop {
-            for (url, receiver) in &mut lifecycle {
-                for _ in 0..1024 {
-                    match receiver.try_recv() {
-                        Ok(RelayNotification::Authenticated) => {
-                            observation.relays.entry(url.clone()).or_default().auth =
-                                "authenticated"
-                        }
-                        Ok(RelayNotification::AuthenticationFailed) => {
-                            observation.relays.entry(url.clone()).or_default().auth = "failed"
-                        }
-                        Ok(RelayNotification::RelayStatus { status }) => {
-                            let evidence = observation.relays.entry(url.clone()).or_default();
-                            evidence.connected =
-                                status == nostr_sdk::prelude::RelayStatus::Connected;
-                            evidence.ever_connected |= evidence.connected;
-                            if !evidence.connected && evidence.auth == "authenticated" {
-                                evidence.auth = "unknown";
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
-                            observation.evidence_lost = true
-                        }
-                        Err(_) => break,
-                        _ => {}
-                    }
-                }
-            }
+            collect_lifecycle(&mut lifecycle, observation);
             if Instant::now() >= deadline {
                 break Err(Error::Timeout);
             }
@@ -531,11 +582,12 @@ impl NostrMintConnector {
                     Ok(RelayPoolNotification::Message { relay_url, message }) => {
                         let r = observation.relays.entry(relay_url.to_string().trim_end_matches('/').to_owned()).or_default();
                         match message {
-                            RelayMessage::Ok { event_id, status, .. } if event_id == event.id => {
+                            RelayMessage::Ok { event_id, status, message } if event_id == event.id => {
                                 if status { r.acceptance = "accepted"; }
-                                else { r.refused = true; if r.acceptance != "accepted" { r.acceptance = "refused"; } }
+                                else { r.refused = true; r.refusal_category = Some(reason_category(&message)); if r.acceptance != "accepted" { r.acceptance = "refused"; } }
                             }
-                            RelayMessage::Closed { subscription_id, .. } if subscription_id.as_ref() == &subscription => r.closed = true,
+                            RelayMessage::Closed { subscription_id, message } if subscription_id.as_ref() == &subscription => { r.closed = true; r.closed_category = Some(reason_category(&message)); },
+                            RelayMessage::EndOfStoredEvents(id) if id.as_ref() == &subscription => r.eose = true,
                             RelayMessage::Notice(_) => r.notice = true,
                             _ => {}
                         }
@@ -545,6 +597,7 @@ impl NostrMintConnector {
             }
         };
         drop(publish);
+        collect_lifecycle(&mut lifecycle, observation);
         disconnect(&client).await;
         outcome
     }

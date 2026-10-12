@@ -2948,6 +2948,20 @@ async fn initial_unanswered_queue_is_bounded_and_rechecks_lot_availability() {
     assert!(e.jm.get::<Swap>("swap", &id).await.unwrap().is_none());
     listing.cancelled = false;
     e.jm.put("listing", &lot, &listing).await.unwrap();
+    // Loopback fixtures normally bypass pacing. Enable it explicitly here so filling the
+    // queue exercises Deferred retention, not 65 full windows that outlive request expiry.
+    maxplayer_trade::backoff::lab_configure(Some(maxplayer_trade::backoff::Timing {
+        base: Duration::from_secs(300),
+        cap: Duration::from_secs(300),
+        interval: Duration::ZERO,
+        burst: Duration::ZERO,
+        loopback: true,
+        ..maxplayer_trade::backoff::Timing::PRODUCTION
+    }));
+    maxplayer_trade::backoff::record(
+        &n.url,
+        maxplayer_trade::backoff::Outcome::Failed(maxplayer_trade::backoff::Reason::Timeout, None),
+    );
     // One peer is limited to four persisted retries; global limit is 64, across peers.
     for i in 0..65 {
         let mut msg = original.clone();
