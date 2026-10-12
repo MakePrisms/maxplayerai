@@ -595,6 +595,63 @@ async fn h2_maker_abandoned_lock_releases_listing() {
             .is_empty()
     );
 }
+/// An abandoned maker lock releases the listing's inputs only after a FRESH not-landed proof
+/// (restore, NUT-07, restore). While that proof cannot be obtained (restore outage) the swap stays
+/// `lock_reconciling`, the listing stays live and its inputs stay reserved; once it succeeds the
+/// swap expires and the reservation is released.
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h2_maker_abandoned_lock_keeps_reservation_until_not_landed_proof() {
+    use cdk::cdk_database::WalletDatabase;
+    let mut f = Fixture::new(0).await;
+    let lot = f.list(false).await;
+    let id = f.start(&lot).await;
+    f.step(true).await;
+    f.step(false).await;
+    f.a.faults.reject_swap.store(true, SeqCst);
+    f.step(true).await;
+    // Durable abandonment boundary, then make the mandatory fresh recheck fail.
+    let aid = format!("{id}-lock");
+    let raw: serde_json::Value = f.jm.get("attempt", &aid).await.unwrap().unwrap();
+    assert!(
+        raw["result"].is_null() && raw["done"] == false,
+        "fixture: lock never executed: {raw}"
+    );
+    let mut a: mint::Attempt = f.jm.get("attempt", &aid).await.unwrap().unwrap();
+    a.abandoned = true;
+    f.jm.put("attempt", &aid, &a).await.unwrap();
+    f.a.faults
+        .clock_offset
+        .store(60 + mint::ABANDON_GRACE_SECONDS, SeqCst);
+    f.a.faults.reject_restore.store(true, SeqCst);
+    coordinator::recover(&f.maker, &f.jm, &f.mm).await.unwrap();
+    let reserved = async |l: &Listing| {
+        maxplayer_trade::wallet::database(&f.maker, &f.a.url)
+            .await
+            .unwrap()
+            .get_reserved_proofs(&l.reservation.parse().unwrap())
+            .await
+            .unwrap()
+            .len()
+    };
+    let l = f.jm.get::<Listing>("listing", &lot).await.unwrap().unwrap();
+    assert_eq!(
+        f.state(true, &id).await.as_deref(),
+        Some("lock_reconciling"),
+        "no fresh not-landed proof: the swap must stay retryable"
+    );
+    assert!(!l.cancelled && l.active.is_some(), "listing untouched");
+    assert!(
+        reserved(&l).await > 0,
+        "SAFETY: lock inputs stay reserved until a fresh not-landed proof"
+    );
+    f.a.faults.reject_restore.store(false, SeqCst);
+    coordinator::recover(&f.maker, &f.jm, &f.mm).await.unwrap();
+    assert_eq!(f.state(true, &id).await.as_deref(), Some("expired"));
+    let l = f.jm.get::<Listing>("listing", &lot).await.unwrap().unwrap();
+    assert!(l.cancelled && l.active.is_none());
+    assert_eq!(reserved(&l).await, 0, "released after the proof");
+}
 
 #[cfg(feature = "lab")]
 async fn second_event(f: &mut Fixture, id: &str) -> nostr_sdk::Event {
@@ -770,6 +827,19 @@ async fn n2_late_lock_after_abandonment_is_restored_and_refunded() {
         Some("expired"),
         "N2 lock cannot expire without post-abandonment restore"
     );
+    {
+        use cdk::cdk_database::WalletDatabase;
+        assert!(
+            !maxplayer_trade::wallet::database(&f.taker, &f.b.url)
+                .await
+                .unwrap()
+                .get_reserved_proofs(&id.parse().unwrap())
+                .await
+                .unwrap()
+                .is_empty(),
+            "SAFETY: N2 lock inputs stay reserved until a fresh not-landed proof"
+        );
+    }
     f.b.faults.swap_release.notify_one();
     f.b.faults.swap_finished.notified().await;
     f.b.faults.reject_restore.store(false, SeqCst);

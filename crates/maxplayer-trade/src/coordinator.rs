@@ -220,6 +220,7 @@ pub async fn list(
         "an identical lot was just listed; retry"
     );
     let lot = parse_lot(&event, now())?;
+    check_nostr_timing(&lot)?;
     preflight(&lot).await?;
     let plan = mint::plan(home, &lot.give.asset.mint_url, lot.give.net, max_fees).await?;
     let initial = status_event(&m.keys, event.id, 1, event.id, Status::Available)?;
@@ -306,6 +307,7 @@ pub async fn start_take(
     let l = parse_lot(&lot, now())?;
     ensure!(lot.pubkey != m.keys.public_key(), "self trade");
     ensure!(l.give.net >= min_receive, "minimum receive cap");
+    check_nostr_timing(&l)?;
     preflight(&l).await?;
     let plan = mint::plan(home, &l.want.asset.mint_url, l.want.net, max_fees).await?;
     ensure!(plan.debit <= max_give, "maximum give cap");
@@ -848,7 +850,7 @@ fn swap_mints(s: &Swap) -> Vec<&str> {
     mints
 }
 async fn advance_inner(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Result<()> {
-    let (overall_budget, refund_budget) = advance_budgets();
+    let (overall_budget, refund_budget) = advance_budgets(swap_is_nostr(s));
     let end = tokio::time::Instant::now() + overall_budget;
     if terminal(s) {
         return Ok(());
@@ -929,7 +931,16 @@ async fn advance_inner(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Re
                         l.cancelled = true;
                         l.active = None;
                         j.put("listing", &s.lot.id.to_hex(), &l).await?;
-                        finish_listing(j, m, &mut l, Status::Cancelled).await?;
+                        // The money is settled (fresh not-landed proof, inputs released): expire
+                        // NOW. Publishing the cancelled status is market bookkeeping that listing
+                        // recovery retries (`cancelled && Available`); a market outage must never
+                        // keep this swap, and the per-taker guard on it, open forever.
+                        s.state = "expired".into();
+                        save(j, s).await?;
+                        if let Err(e) = finish_listing(j, m, &mut l, Status::Cancelled).await {
+                            eprintln!("expired lock {} listing publication: {e}", s.id);
+                        }
+                        return Ok(());
                     }
                     s.state = "expired".into();
                     save(j, s).await?;
@@ -1107,7 +1118,10 @@ async fn recover_pass(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
     let mut deferred = match crate::money::recover(home, j).await {
         Ok(pending) => pending,
         Err(error) => {
-            eprintln!("money recovery deferred; journal retained: {error}");
+            eprintln!(
+                "money recovery deferred; journal retained: {}",
+                crate::redact_reason(&format!("{error:#}"))
+            );
             true
         }
     };
@@ -1196,11 +1210,13 @@ async fn recover_pass(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
             }
             advance(home, j, m, &mut s).await
         };
-        if !matches!(tokio::time::timeout(budget, item).await, Ok(Ok(()))) {
+        let item = tokio::time::timeout(budget, item).await;
+        if !matches!(item, Ok(Ok(()))) {
             deferred = true;
             eprintln!(
-                "swap {}: recovery deferred (error or timeout); journal retained",
-                s.id
+                "swap {}: recovery deferred ({}); journal retained",
+                s.id,
+                crate::deferral_reason(&item, budget.as_secs())
             );
         }
     }
@@ -1271,7 +1287,7 @@ pub async fn run_with(
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
     let mut warned = crate::observe::Warned::default();
     loop {
-        tokio::select! {e=m.inbox.recv()=>{if let Some(e)=e{match tokio::time::timeout(std::time::Duration::from_secs(60), handle(home,j,m,&e)).await {
+        tokio::select! {e=m.inbox.recv()=>{if let Some(e)=e{match tokio::time::timeout(message_budget(j,m,&e).await, handle(home,j,m,&e)).await {
             Ok(Ok(())) => {},
             Ok(Err(err)) if retained(j, &e).await => eprintln!("trade message waits for its mint (no answer); retained, retried on the recovery tick: {err}"),
             Ok(Err(err)) => eprintln!("trade message rejected: {err}"),
@@ -1409,16 +1425,58 @@ fn canonical_key(key: &str) -> Result<()> {
     Ok(())
 }
 
-/// Deadline for the maker refund+claim phases of one advance, measured from the start of
-/// the advance. Two budgets enclose an advance: the recovery item budget (`recover_pass`,
-/// [`item_budget`]: 120 s, or 140 s with a `nostr://` leg) and the 60 s inbound message budget
-/// (`run` -> `handle`). 100 s leaves the trailing own-mint `states()` call (<= 20 s over HTTP,
-/// <= `NOSTR_OUTER` = 40 s over nostr) inside the item budget. On the
-/// 60 s message path the outer timeout may cut the claim first; `claiming` and the
-/// preimage are saved before that, so the next recovery tick claims with the full budget.
+/// Phase budgets. HTTP-only swaps keep the historical numbers: 60 s per inbound message (`run`
+/// -> `handle`), 100 s per maker advance (refund + claim), of which own-mint refund work may use
+/// at most 50 s, and 120 s per recovery item.
+///
+/// A swap with a `nostr://` leg gets budgets derived from the most `nostr://` mint calls each
+/// phase can make, every call bounded by `transport::NOSTR_OUTER` (connector window 30 s + outer
+/// margin 10 s = 40 s; CDK wallet calls get the same bound through `wallet::bounded_for`). CDK
+/// reads after `refresh_keysets` hit the wallet's metadata cache, so only the calls below reach
+/// the mint. A budget that is too short cuts a call mid-window; that stays ambiguous and never
+/// costs money (journaled first, `exp` capped at `send_before`, restore before replay), but on a
+/// slow relay it can repeat on every tick and nothing advances. So the budgets cover the worst
+/// case:
+///
+/// - refund phase, [`NOSTR_REFUND_CALLS`] = 17: witness 1; resume a started refund (restore,
+///   NUT-07, swap, NUT-07 = 4) and, if it failed, its evidence (restore, NUT-07, restore = 3);
+///   refund time 1; refundable 1; a fresh refund (refresh_keysets: info + keysets + keys = 3,
+///   then restore, NUT-07, swap, NUT-07 = 4) 7. 17 x 40 s = 680 s.
+/// - claim phase, [`NOSTR_CLAIM_CALLS`] = 8: refresh_keysets 3; restore, NUT-07, swap, NUT-07 4;
+///   plus one slot for the listing publication. 8 x 40 s = 320 s.
+/// - advance = refund + claim = 25 calls = 1000 s, so the refund cap still never starves the claim.
+/// - recovery item = advance + the trailing own-mint NUT-07 ([`NOSTR_TRAILING_CALLS`] = 1) =
+///   1040 s. This also covers the largest single message step, the maker's `first` (validate 4,
+///   preflight of both mints 4, lock 14 = [`NOSTR_FIRST_STEP_CALLS`] = 22 = 880 s), and the
+///   abandoned-lock expiry (execute: restore, mint time, restore, NUT-07, restore;
+///   `lock_not_landed`: restore, NUT-07, restore; release NUT-07 = 9 calls = 360 s; the old
+///   140 s fit only ~15 s per call).
+/// - message = item, since the maker's `claimed` step runs a whole advance.
+///
+/// Claims stay safe with these larger budgets because no budget decides WHEN a claim may land:
+/// the taker's claim is sent only while mint time + cutoff < short and its `exp` is capped at
+/// `short - cutoff`; the maker claims until `long`. [`nostr_timing_fits`] checks at list/take that
+/// both claim chains fit their windows with every call at its bound.
+///
+/// Serve runs messages and recovery items one at a time, so on a slow relay one swap can hold
+/// the loop for up to 1040 s. That delays other swaps (liveness); their deadlines stay
+/// mint-enforced, so a late claim is never sent, and the trade refunds.
 const ADVANCE_BUDGET_SECONDS: u64 = 100;
-/// Cap on own-mint refund work inside that deadline; the claim gets the remainder.
+/// HTTP cap on own-mint refund work inside that deadline; the claim gets the remainder.
 const REFUND_BUDGET_SECONDS: u64 = 50;
+const HTTP_ITEM_BUDGET_SECONDS: u64 = 120;
+const HTTP_MESSAGE_BUDGET_SECONDS: u64 = 60;
+pub const NOSTR_REFUND_CALLS: u64 = 17;
+pub const NOSTR_CLAIM_CALLS: u64 = 8;
+pub const NOSTR_TRAILING_CALLS: u64 = 1;
+pub const NOSTR_FIRST_STEP_CALLS: u64 = 22;
+/// `nostr://` calls before the taker's claim swap is sent, counted from the `second` message:
+/// validation (refresh_keysets 3, NUT-07 1) then the claim (mint time 1, refresh_keysets 3,
+/// restore 1, mint time 1, NUT-07 1, mint time 1).
+pub const NOSTR_TAKER_CLAIM_CALLS: u64 = 12;
+/// Longest one market send may take before the counterparty can act on it (one 12 s relay ACK
+/// wait, `Market::publish_durable`).
+const MARKET_SEND_SECONDS: u64 = 12;
 #[cfg(feature = "lab")]
 static LAB_ADVANCE_BUDGETS_MS: std::sync::Mutex<Option<(u64, u64)>> = std::sync::Mutex::new(None);
 /// Lab-only: scale the (overall, refund) advance budgets so slow-mint tests stay fast.
@@ -1428,7 +1486,11 @@ pub fn lab_set_advance_budgets_ms(budgets: Option<(u64, u64)>) {
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = budgets;
 }
-fn advance_budgets() -> (std::time::Duration, std::time::Duration) {
+fn nostr_secs(calls: u64) -> u64 {
+    calls * crate::transport::NOSTR_OUTER.as_secs()
+}
+/// (overall, refund) advance budgets for a swap with (`nostr`) or without a `nostr://` leg.
+pub fn advance_budgets(nostr: bool) -> (std::time::Duration, std::time::Duration) {
     #[cfg(feature = "lab")]
     if let Some((overall, refund)) = *LAB_ADVANCE_BUDGETS_MS
         .lock()
@@ -1439,29 +1501,104 @@ fn advance_budgets() -> (std::time::Duration, std::time::Duration) {
             std::time::Duration::from_millis(refund),
         );
     }
+    let (overall, refund) = if nostr {
+        (
+            nostr_secs(NOSTR_REFUND_CALLS + NOSTR_CLAIM_CALLS),
+            nostr_secs(NOSTR_REFUND_CALLS),
+        )
+    } else {
+        (ADVANCE_BUDGET_SECONDS, REFUND_BUDGET_SECONDS)
+    };
     (
-        std::time::Duration::from_secs(ADVANCE_BUDGET_SECONDS),
-        std::time::Duration::from_secs(REFUND_BUDGET_SECONDS),
+        std::time::Duration::from_secs(overall),
+        std::time::Duration::from_secs(refund),
     )
 }
-/// Recovery budget for one swap item: 120 s (HTTP), or room for the full advance deadline plus
-/// one trailing `nostr://` call (the own-mint `states()` after the claim phase) when either leg
-/// is on a `nostr://` mint. The enclosing budgets (this one, the 100 s advance, the 50 s refund
-/// phase, the 60 s message path) are not sized per nostr call and can drop one mid-window. A drop
-/// is only ever ambiguous: every swap is journaled before it is sent, its `exp` is capped at
-/// `send_before`, recovery restores the same outputs before replaying the identical request, and
-/// abandonment needs `send_before + NOSTR_ABANDON_GRACE_SECONDS` on the mint clock plus a fresh
-/// not-landed check. The cost is liveness (deferred to the next tick), not money.
-fn item_budget(s: &Swap) -> std::time::Duration {
-    let http = std::time::Duration::from_secs(120);
-    let Ok(lot) = serde_json::from_str::<Lot>(&s.lot.content) else {
-        return http;
-    };
-    if lot.give.asset.is_nostr() || lot.want.asset.is_nostr() {
-        http.max(advance_budgets().0 + crate::transport::NOSTR_OUTER)
-    } else {
-        http
+/// Recovery budget for one swap item (see [`ADVANCE_BUDGET_SECONDS`] for the arithmetic).
+pub fn item_budget_for(nostr: bool) -> std::time::Duration {
+    if !nostr {
+        return std::time::Duration::from_secs(HTTP_ITEM_BUDGET_SECONDS);
     }
+    (advance_budgets(true).0 + std::time::Duration::from_secs(nostr_secs(NOSTR_TRAILING_CALLS)))
+        .max(std::time::Duration::from_secs(nostr_secs(
+            NOSTR_FIRST_STEP_CALLS,
+        )))
+}
+/// Budget for one inbound trade message: 60 s, or the recovery item budget for a `nostr://` swap.
+pub fn message_budget_for(nostr: bool) -> std::time::Duration {
+    if nostr {
+        item_budget_for(true)
+    } else {
+        std::time::Duration::from_secs(HTTP_MESSAGE_BUDGET_SECONDS)
+    }
+}
+fn lot_is_nostr(content: &str) -> bool {
+    serde_json::from_str::<Lot>(content)
+        .is_ok_and(|l| l.give.asset.is_nostr() || l.want.asset.is_nostr())
+}
+fn swap_is_nostr(s: &Swap) -> bool {
+    lot_is_nostr(&s.lot.content)
+}
+fn item_budget(s: &Swap) -> std::time::Duration {
+    item_budget_for(swap_is_nostr(s))
+}
+/// The budget for the swap (or, for a fresh request, the listing) this message names.
+async fn message_budget(j: &Journal, m: &Market, e: &Event) -> std::time::Duration {
+    let lot = async {
+        let msg = m.decode(e).ok()?;
+        if let Some(s) = j.get::<Swap>("swap", &msg.swap_id).await.ok()? {
+            return Some(s.lot.content);
+        }
+        Some(
+            j.get::<Listing>("listing", &msg.lot_id)
+                .await
+                .ok()??
+                .event
+                .content,
+        )
+    }
+    .await;
+    message_budget_for(lot.as_deref().is_some_and(lot_is_nostr))
+}
+/// Whether both claims of a swap with a `nostr://` leg fit their windows with every mint call at
+/// its bound (`long`, `short`, `cutoff` in seconds after the quote is issued):
+/// - taker: the maker's lock is sent before `QUOTE_SECONDS` and answered within `NOSTR_OUTER`,
+///   `second` reaches the taker within one market send, then [`NOSTR_TAKER_CLAIM_CALLS`] calls
+///   precede the claim swap, which must be sent before `short - cutoff`. Production:
+///   60 + 40 + 12 + 12 x 40 = 592 <= 900 - 180 = 720.
+/// - maker: the preimage can be revealed as late as `short - cutoff`; the maker learns it within
+///   one market send (or its next advance's NUT-07 witness) and claims within one full advance and
+///   one recovery item, before the taker can refund at `long`. Production:
+///   720 + 12 + 1040 + 1040 = 2812 <= 3600.
+pub fn nostr_timing_fits(long: u64, short: u64, cutoff: u64) -> Result<()> {
+    let outer = crate::transport::NOSTR_OUTER.as_secs();
+    let taker = QUOTE_SECONDS + outer + MARKET_SEND_SECONDS + nostr_secs(NOSTR_TAKER_CLAIM_CALLS);
+    ensure!(
+        short > cutoff && taker <= short - cutoff,
+        "refused: a nostr:// leg's worst-case claim ({taker} s of mint calls) does not fit before \
+         the claim deadline ({} s); nothing was reserved or sent",
+        short.saturating_sub(cutoff)
+    );
+    let maker = short - cutoff + MARKET_SEND_SECONDS + 2 * item_budget_for(true).as_secs();
+    ensure!(
+        maker <= long,
+        "refused: a nostr:// leg's worst-case maker claim ({maker} s) does not fit before the \
+         taker's refund locktime ({long} s); nothing was reserved or sent"
+    );
+    Ok(())
+}
+/// [`nostr_timing_fits`] for a lot with a `nostr://` leg (no-op otherwise). Lab short deadlines
+/// are exempt: they deliberately overrun to exercise the refund paths.
+fn check_nostr_timing(l: &Lot) -> Result<()> {
+    if !(l.give.asset.is_nostr() || l.want.asset.is_nostr()) {
+        return Ok(());
+    }
+    #[cfg(feature = "lab")]
+    if std::env::var("TRADE_LAB_SECONDS").is_ok() {
+        return Ok(());
+    }
+    let (long, short, cutoff, _) = timing(l)?;
+    nostr_timing_fits(long, short, cutoff)
 }
 fn refund_attempt_id(s: &Swap) -> String {
     if s.refund_generation == 0 {
@@ -1589,4 +1726,54 @@ async fn maker_claim(
         .await?
         .context("missing listing")?;
     finish_listing(j, m, &mut l, Status::Sold).await
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use std::time::Duration;
+    #[test]
+    fn http_budgets_unchanged() {
+        assert_eq!(
+            advance_budgets(false),
+            (Duration::from_secs(100), Duration::from_secs(50))
+        );
+        assert_eq!(item_budget_for(false), Duration::from_secs(120));
+        assert_eq!(message_budget_for(false), Duration::from_secs(60));
+    }
+    #[test]
+    fn nostr_budgets_cover_worst_case_calls() {
+        let outer = crate::transport::NOSTR_OUTER;
+        assert_eq!(outer, Duration::from_secs(40));
+        let (advance, refund) = advance_budgets(true);
+        assert_eq!(refund, outer * 17, "refund phase: 17 calls");
+        assert_eq!(advance, outer * 25, "refund 17 + claim 8 calls");
+        assert!(
+            advance - refund >= outer * NOSTR_CLAIM_CALLS as u32,
+            "the claim always keeps its own worst case"
+        );
+        let item = item_budget_for(true);
+        assert_eq!(item, Duration::from_secs(1040));
+        assert!(
+            item >= advance + outer,
+            "item covers advance + trailing NUT-07"
+        );
+        assert!(item >= outer * 22, "item covers the maker's first step");
+        assert!(
+            item >= outer * 9,
+            "item covers the abandoned-lock expiry chain"
+        );
+        assert_eq!(message_budget_for(true), item);
+    }
+    #[test]
+    fn production_nostr_claims_fit_and_short_windows_are_refused() {
+        nostr_timing_fits(LONG_SECONDS, SHORT_SECONDS, CLAIM_CUTOFF_SECONDS).unwrap();
+        // Taker: 60 + 40 + 12 + 480 = 592 s must fit before short - cutoff.
+        assert!(nostr_timing_fits(LONG_SECONDS, 771, 180).is_err());
+        nostr_timing_fits(LONG_SECONDS, 772, 180).unwrap();
+        // Maker: (short - cutoff) + 12 + 2 x 1040 must fit before long.
+        let e = nostr_timing_fits(2811, SHORT_SECONDS, CLAIM_CUTOFF_SECONDS).unwrap_err();
+        assert!(e.to_string().contains("refused"), "{e}");
+        nostr_timing_fits(2812, SHORT_SECONDS, CLAIM_CUTOFF_SECONDS).unwrap();
+    }
 }

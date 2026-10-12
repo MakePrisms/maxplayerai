@@ -1,4 +1,4 @@
-//! Human-readable `status`: one line per lot, swap, funding, withdrawal and receive.
+//! Human-readable `status`: one line per lot, swap, funding, withdrawal, receive and send.
 //!
 //! Read-only (see [`observe`]); prints only public identifiers, mints, states and amounts —
 //! never keys, preimages, proofs, tokens, quotes' secrets or invoices.
@@ -8,6 +8,7 @@ use crate::{
     money::{Funding, Withdrawal},
     observe,
     receive::{Receipt, ReceiveState},
+    send::{SendAttempt, SendState},
 };
 use anyhow::Result;
 use std::path::Path;
@@ -60,6 +61,38 @@ fn swap_line(home: &Path, s: &Swap) -> String {
         line.push_str("; MANUAL RECOVERY: quarantined outputs retained");
     }
     line
+}
+
+/// One readable line for a send, plus (unresolved, needs manual recovery). Non-terminal sends
+/// hold reserved inputs (or an in-flight reclaim), so they are unresolved; manual-recovery
+/// states are terminal but listed as unresolved, like quarantined swaps and receives.
+fn send_line(a: &SendAttempt) -> (String, bool, bool) {
+    let s = a.summary();
+    let state = s["state"].as_str().unwrap_or("?");
+    let reclaim = match a.state {
+        SendState::Reclaiming => "in flight",
+        SendState::Reclaimed => "done",
+        SendState::ReclaimQuarantined | SendState::ReclaimUnresolved => "manual recovery",
+        SendState::Redeemed => "not possible (redeemed by recipient)",
+        SendState::Sent => "available until redeemed",
+        _ => "none",
+    };
+    let mut line = format!(
+        "send {} {} {state}: token {} sats; fee {}; reclaimed {}; reclaim fee {}; reclaim {reclaim}",
+        a.id, a.mint, a.amount, a.fee, a.reclaimed, a.reclaim_fee
+    );
+    match a.state {
+        SendState::Prepared | SendState::Submitted => {
+            line.push_str("; inputs reserved until resolved (keep serve running or run recover)")
+        }
+        SendState::Swapped => line.push_str("; token file pending (run recover or rerun the send)"),
+        _ => {}
+    }
+    let manual = a.manual_recovery();
+    if manual {
+        line.push_str("; MANUAL RECOVERY: journaled legs and secrets retained");
+    }
+    (line, !a.terminal() || manual, manual)
 }
 
 pub fn render(home: &Path) -> Result<String> {
@@ -177,6 +210,19 @@ pub fn render(home: &Path) -> Result<String> {
             unresolved.push(line)
         }
     }
+    for (_, v, _) in observe::journal_rows(home, "send")? {
+        let Ok(a) = serde_json::from_slice::<SendAttempt>(&v) else {
+            unresolved.push("send record unreadable by this version".to_string());
+            continue;
+        };
+        let (line, is_unresolved, is_manual) = send_line(&a);
+        manual += usize::from(is_manual);
+        if is_unresolved {
+            unresolved.push(line)
+        } else {
+            settled.push(line)
+        }
+    }
     let warnings = observe::unresponsive(home, now)?;
     let mut out = String::new();
     for w in &warnings {
@@ -214,9 +260,63 @@ pub fn render(home: &Path) -> Result<String> {
         out.push_str(&format!("{l}\n"));
     }
     out.push_str(&format!(
-        "summary: {} unresolved, {} need manual recovery. Exit codes: recover/take exit 3 while unresolved items remain (keep serve running or rerun recover), 4 when manual recovery is needed, 0 when everything is settled. status itself always exits 0; use status --json for machine-readable records.",
+        "summary: {} unresolved ({} of them need manual recovery). Exit codes: recover/take exit 3 while unresolved items remain (keep serve running or rerun recover), 4 when manual recovery is needed, 0 when everything is settled. status itself always exits 0; use status --json for machine-readable records.",
         unresolved.len(),
         manual
     ));
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn attempt(state: &str) -> SendAttempt {
+        serde_json::from_value(serde_json::json!({
+            "id": "s1", "mint": "http://127.0.0.1:1", "state": state, "amount": 8, "fee": 0,
+            "out": "t", "swap": {"inputs": [], "outputs": [], "result": null}, "token": null
+        }))
+        .expect("send attempt fixture")
+    }
+
+    /// Every send state against `send_line`'s (unresolved, manual) flags, pinned independently of
+    /// `terminal()`/`manual_recovery()` so a change to either rule is caught.
+    #[test]
+    fn send_line_flags_every_state() {
+        use SendState::*;
+        let table = [
+            (Prepared, "prepared", true, false),
+            (Submitted, "submitted", true, false),
+            (Swapped, "swapped", true, false),
+            (Reclaiming, "reclaiming", true, false),
+            (Sent, "sent", false, false),
+            (Refused, "refused", false, false),
+            (Reclaimed, "reclaimed", false, false),
+            (Redeemed, "redeemed", false, false),
+            (InputsSpent, "inputs_spent", true, true),
+            (Quarantined, "quarantined", true, true),
+            (ReclaimQuarantined, "reclaim_quarantined", true, true),
+            (ReclaimUnresolved, "reclaim_unresolved", true, true),
+        ];
+        for (state, label, unresolved, manual) in table {
+            // Exhaustive: a new state fails to compile here until it is added to the table.
+            match state {
+                Prepared | Submitted | Swapped | Sent | Refused | InputsSpent | Quarantined
+                | Reclaiming | Reclaimed | Redeemed | ReclaimQuarantined | ReclaimUnresolved => {}
+            }
+            let a = attempt(label);
+            assert_eq!(a.state, state, "{label}");
+            let (line, is_unresolved, is_manual) = send_line(&a);
+            assert_eq!(
+                (is_unresolved, is_manual),
+                (unresolved, manual),
+                "{label}: {line}"
+            );
+            assert!(
+                line.starts_with(&format!("send s1 http://127.0.0.1:1 {label}: ")),
+                "{line}"
+            );
+            assert_eq!(line.contains("MANUAL RECOVERY"), manual, "{line}");
+        }
+    }
 }
