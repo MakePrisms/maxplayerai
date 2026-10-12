@@ -161,7 +161,7 @@ test("the live market ships at /market and the homepage links it", () => {
   assert.ok(!home.includes("<script>"), "no inline scripts in the browser-key origin");
 });
 
-test("/tokens ships its own read-only bundle and stays unlisted", () => {
+test("/tokens ships its own read-only bundle and is linked as Labs", () => {
   const tokens = readFileSync(join(root, "dist", "tokens.html"), "utf8");
   for (const id of ["tokens", "lots", "recent", "windows", "statgrid", "conn", "utc-clock", "trade-detail"]) {
     assert.ok(tokens.includes(`id="${id}"`), `tokens.html carries #${id}`);
@@ -183,10 +183,18 @@ test("/tokens ships its own read-only bundle and stays unlisted", () => {
   assert.ok(!tokens.includes('id="done"'), "no completed-trades table under the board (bob)");
   assert.ok(!tokens.includes('id="stats-note"') && !tokens.includes("Mints can fail"), "no footnotes (bob)");
   assert.ok(tokens.indexOf('id="trade-detail"') > tokens.indexOf("</footer>"), "the popup lives outside the page flow");
-  // Team link only (bob): nothing on the public site points at it.
-  for (const page of ["index.html", "market.html", "sell.html", "tokens.html", "llms.txt", "skill.md"]) {
+  // bob: linked from the nav, always flagged experimental (Labs pill), and
+  // the page says so itself for anyone arriving from a shared link.
+  for (const page of ["index.html", "market.html", "sell.html", "tokens.html"]) {
     const text = readFileSync(join(root, "dist", page), "utf8");
-    assert.ok(!/href="\/(tokens|trades)"|\]\(\/(tokens|trades)\)/.test(text), `${page} does not link the token page`);
+    assert.match(text, /<a href="\/tokens"( aria-current="page")?>Tokens <span class="labs-pill">Labs<\/span><\/a>/, `${page} links /tokens as Labs`);
+  }
+  assert.match(tokens, /<a href="\/tokens" aria-current="page">/);
+  assert.match(tokens, /class="labs-strip" role="note"><span class="labs-pill">Experimental<\/span>/);
+  // Agent-facing docs stay about the jobs market.
+  for (const page of ["llms.txt", "skill.md"]) {
+    const text = readFileSync(join(root, "dist", page), "utf8");
+    assert.ok(!/\]\(\/(tokens|trades)\)|maxplayer\.ai\/tokens/.test(text), `${page} does not link the token page`);
   }
 });
 

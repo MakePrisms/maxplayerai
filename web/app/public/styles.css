@@ -1239,3 +1239,23 @@ button.chip { cursor: pointer; }
    fixed slot keeps the rest of the nav from sliding when it does. */
 @media (min-width: 701px) { .conn-fixed { min-width: 21ch; justify-content: flex-end; } }
 /* phones hide the status word (dot only), so no slot: it pushed the menu button off-screen */
+/* Labs: experimental sections. A small outlined pill on the nav link, and a
+   hazard-striped strip at the top of the page itself. */
+.labs-pill {
+  display: inline-block; vertical-align: 1px; margin-left: 4px;
+  font-size: 8.5px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase;
+  line-height: 1; padding: 3px 5px 2px;
+  color: var(--neon); border: 1px solid rgba(255, 223, 0, 0.55); border-radius: 2px;
+}
+.nav-links a:hover .labs-pill { border-color: var(--neon); }
+.labs-strip {
+  position: relative; display: flex; align-items: center; gap: 10px;
+  margin: 0; min-height: 34px; padding: 8px 16px 8px 30px;
+  font-size: 11.5px; color: var(--ink-2);
+  background: var(--panel); border-bottom: 1px solid var(--line);
+}
+.labs-strip::before {
+  content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 14px;
+  background: repeating-linear-gradient(-45deg, var(--neon) 0 6px, #0a0a0b 6px 12px);
+}
+.labs-strip .labs-pill { margin-left: 0; flex: none; }
