@@ -101,7 +101,7 @@ pub fn overlay_implementation(info: &mut Value) {
     info["version"] = format!("maxplayer-mint/{}", env!("CARGO_PKG_VERSION")).into();
     info["maxplayer_mint"] = serde_json::json!({
         "schema":1, "implementation":"maxplayer-mint", "version":env!("CARGO_PKG_VERSION"),
-        "build":env!("MAXPLAYER_MINT_BUILD"), "envelope_versions":[1],
+        "build":env!("MINT_SIDECAR_BUILD"), "envelope_versions":[1],
         "holder_ops":["info","keys","keyset","keysets","swap","checkstate","restore"],
         "durable_replay":true, "expiry_rule":"now_gte_exp", "nut07_witnesses":"unverified"
     });
@@ -123,7 +123,7 @@ mod diagnostics_tests {
             );
             assert_eq!(
                 info["maxplayer_mint"]["build"],
-                env!("MAXPLAYER_MINT_BUILD")
+                env!("MINT_SIDECAR_BUILD")
             );
             let _: cdk::nuts::MintInfo = serde_json::from_value(info).unwrap();
         }

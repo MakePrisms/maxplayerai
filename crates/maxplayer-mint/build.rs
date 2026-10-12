@@ -8,7 +8,8 @@ fn git(args: &[&str]) -> Option<String> {
         .map(|s| s.trim().to_owned())
 }
 fn main() {
-    println!("cargo:rerun-if-env-changed=MAXPLAYER_MINT_BUILD");
+    // Cargo also exports rustc-env to test processes; avoid the root CLI config prefix.
+    println!("cargo:rerun-if-env-changed=MINT_SIDECAR_BUILD");
     println!("cargo:rerun-if-changed=src");
     if let Some(head) = git(&["rev-parse", "--git-path", "HEAD"]) {
         println!("cargo:rerun-if-changed={head}");
@@ -18,7 +19,7 @@ fn main() {
             println!("cargo:rerun-if-changed={path}");
         }
     }
-    let revision = std::env::var("MAXPLAYER_MINT_BUILD")
+    let revision = std::env::var("MINT_SIDECAR_BUILD")
         .ok()
         .or_else(|| {
             git(&["rev-parse", "HEAD"]).map(|mut revision| {
@@ -29,5 +30,5 @@ fn main() {
             })
         })
         .unwrap_or_else(|| "unknown".into());
-    println!("cargo:rustc-env=MAXPLAYER_MINT_BUILD={}", revision.trim());
+    println!("cargo:rustc-env=MINT_SIDECAR_BUILD={}", revision.trim());
 }

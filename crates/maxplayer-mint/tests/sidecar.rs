@@ -1374,7 +1374,7 @@ async fn live_info_overlay_survives_restart_preserving_metadata_and_keyset() {
         );
         assert_eq!(
             info["maxplayer_mint"]["build"],
-            env!("MAXPLAYER_MINT_BUILD")
+            env!("MINT_SIDECAR_BUILD")
         );
         assert_eq!(info["maxplayer_mint"]["durable_replay"], true);
         assert_eq!(active_keyset(&h.mint), keyset);

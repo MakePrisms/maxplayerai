@@ -166,6 +166,6 @@ budget like sats, and your mint charges no fee.
 Live `info` overlays `version: maxplayer-mint/<package version>` and `maxplayer_mint`
 (schema 1, implementation/version/build, envelope versions, holder operations, durable
 replay and expiry enforcement) on stored metadata. Operator name/contact/other fields
-are preserved. `MAXPLAYER_MINT_BUILD` may pin build provenance when building outside Git;
+are preserved. `MINT_SIDECAR_BUILD` may pin build provenance when building outside Git;
 otherwise the build embeds the checkout revision. Capabilities are advertisements, not
 proof of spent-witness emission or future availability.
