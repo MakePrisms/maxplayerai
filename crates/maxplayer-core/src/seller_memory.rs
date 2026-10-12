@@ -31,9 +31,13 @@ pub const MEMORY_DIR_NAME: &str = "memory";
 /// The cost is prompt tokens on every job, paid by the seller who chose to write the file, so it is
 /// self-limiting. The section is appended LAST, so a larger block never pushes the buyer's task down.
 ///
-/// An index over this bound is REFUSED at the injection site — [`read_on_start_section`] returns
-/// `InvalidData` instead of inlining it, and the daemon degrades to running the job without memory
-/// (the seam never blocks a job).
+/// An index over this bound is TRUNCATED at the injection site — [`read_on_start_section`] inlines
+/// the head up to the last complete line at or before the budget that survives trimming (or, when
+/// no such line exists, as much text as fits on a char boundary), plus a marker line saying what
+/// was dropped, see [`fit_index_to_budget`] for the exact rule, and
+/// stays `Ok(Some(..))`, so the seat keeps its specialization head rather than silently running
+/// every job as a generalist. The daemon warns on the console (per job, and once at boot), and
+/// `maxplayer doctor` reports it; the seam never blocks a job.
 pub const MAX_MEMORY_INDEX_BYTES: usize = 64 * 1024;
 /// The index file loaded at job start.
 pub const MEMORY_INDEX_FILE: &str = "MEMORY.md";
@@ -150,15 +154,109 @@ fn render(template: &str, substitutions: &[(&str, &str)]) -> String {
     out
 }
 
+/// What the injection site cut from an over-budget index. Carried out to the daemon so the console
+/// warning can name the real numbers, and rendered INTO the injected text as a marker line so the
+/// agent knows it is reading a fragment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexTruncation {
+    /// Bytes of `MEMORY.md` that reached the prompt (the marker line is on top of this).
+    pub shown_bytes: usize,
+    /// Bytes `MEMORY.md` actually holds on disk.
+    pub total_bytes: usize,
+}
+
+/// The rendered read-on-start section plus what, if anything, was cut to fit it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadOnStart {
+    /// The section text to inline into the job prompt.
+    pub section: String,
+    /// `Some` when the index was over [`MAX_MEMORY_INDEX_BYTES`] and its tail was dropped.
+    pub truncation: Option<IndexTruncation>,
+}
+
+/// The marker line appended inside a truncated index so the agent reads it as a fragment, never as
+/// the whole file. Always ONE line: the line-boundary cut above it depends on that.
+pub fn truncation_marker(shown_bytes: usize, total_bytes: usize) -> String {
+    format!(
+        "[maxplayer: MEMORY.md truncated to the {MAX_MEMORY_INDEX_BYTES}-byte injection budget — \
+         {shown_bytes} of {total_bytes} bytes shown, tail dropped]"
+    )
+}
+
+/// Fit an index into [`MAX_MEMORY_INDEX_BYTES`]. An index at or under the budget comes back
+/// trailing-trimmed and untouched. An index over it is cut at the LAST COMPLETE LINE at or before
+/// the budget WHOSE HEAD SURVIVES TRIMMING — the head is `trim_end`ed after the cut, so the line is
+/// chosen by what is left standing, not by where a newline happens to sit — and
+/// [`truncation_marker`] is appended as the final line. When no such line exists — a single line
+/// longer than the budget, or a file whose in-budget newlines all sit inside an all-whitespace
+/// opening (one LF, two LFs, a CRLF blank line, an indented blank line: the head would trim to
+/// empty and the seat would inject zero specialization) — the long-line fallback applies: the cut
+/// lands on the nearest lower char boundary, never mid-UTF-8-character, and the file's own opening
+/// bytes are kept as-is rather than skipped. An index whose whole in-budget window is whitespace
+/// has no non-empty head to keep and gets none: no byte-bounded rule can reach text that starts
+/// beyond the budget. The marker's bytes are reserved BEFORE the cut, so the returned text is
+/// always `<= MAX_MEMORY_INDEX_BYTES` including the marker; the bound covers the index text plus
+/// the marker, not the surrounding prompt template.
+pub fn fit_index_to_budget(index: &str) -> (String, Option<IndexTruncation>) {
+    let total_bytes = index.len();
+    if total_bytes <= MAX_MEMORY_INDEX_BYTES {
+        return (index.trim_end().to_owned(), None);
+    }
+    // Reserve the marker at its LONGEST: `shown <= total`, so a marker rendered with `total` in both
+    // slots has at least as many digits as the real one will. Plus one byte for the newline that
+    // joins the surviving head to the marker.
+    let reserve = truncation_marker(total_bytes, total_bytes).len() + 1;
+    let content_budget = MAX_MEMORY_INDEX_BYTES.saturating_sub(reserve);
+    let head = &index[..line_boundary_cut(index, content_budget)];
+    let head = head.trim_end();
+    let truncation = IndexTruncation {
+        shown_bytes: head.len(),
+        total_bytes,
+    };
+    let marker = truncation_marker(truncation.shown_bytes, truncation.total_bytes);
+    let fitted = format!("{head}\n{marker}");
+    debug_assert!(fitted.len() <= MAX_MEMORY_INDEX_BYTES);
+    (fitted, Some(truncation))
+}
+
+/// The byte offset to cut `text` at so the result is at most `budget` bytes: just after the last
+/// newline at or before the budget whose head SURVIVES `trim_end` (so the cut lands on a complete
+/// line and the head still carries specialization), else the nearest char boundary at or below the
+/// budget — the long-line fallback, which covers both a single line longer than the whole budget
+/// and a file whose in-budget newlines all sit inside an all-whitespace opening.
+fn line_boundary_cut(text: &str, budget: usize) -> usize {
+    let budget = budget.min(text.len());
+    let window = &text.as_bytes()[..budget];
+    if let Some(newline) = window.iter().rposition(|&byte| byte == b'\n') {
+        // CONTENT, not offset. The caller trims the head, so a newline is only a usable complete-line
+        // cut when what precedes it is not all whitespace — `text[..newline]` is exactly that head
+        // minus its own trailing LF, and `head.trim_end()` is empty iff this is. Checking the
+        // RIGHTMOST newline decides every one of them: each earlier newline's prefix is a prefix of
+        // this one, so if this prefix is all whitespace, so are all of theirs. That covers a lone
+        // leading LF (offset 0), two LFs, `\r\n`, and any indented blank opening alike. Contract:
+        // PR #983 addendum 1 as revised by the round-2 verdict.
+        if !text[..newline].trim_end().is_empty() {
+            return newline + 1;
+        }
+    }
+    let mut cut = budget;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    cut
+}
+
 /// Render the read-on-start memory section to inline into the job prompt, or `None` when there is
 /// no non-empty index to inline. `template_path` overrides the in-repo default (read-on-start seam).
 ///
-/// An index over [`MAX_MEMORY_INDEX_BYTES`] is refused with `InvalidData` — never silently
-/// injected — so a runaway `MEMORY.md` cannot bloat every job prompt unnoticed.
-pub fn read_on_start_section(
+/// An index over [`MAX_MEMORY_INDEX_BYTES`] is TRUNCATED, not refused: the surviving head plus a
+/// marker line is injected (see [`fit_index_to_budget`]) and `truncation` reports what was cut, so
+/// the daemon can warn where the operator will see it. This call never fails over size; the only
+/// `Err` is an index that exists and cannot be read.
+pub fn read_on_start(
     memory_dir: &Path,
     template_path: Option<&Path>,
-) -> io::Result<Option<String>> {
+) -> io::Result<Option<ReadOnStart>> {
     let index_path = memory_dir.join(MEMORY_INDEX_FILE);
     let index = match fs::read_to_string(&index_path) {
         Ok(text) if !text.trim().is_empty() => text,
@@ -166,28 +264,76 @@ pub fn read_on_start_section(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    if index.len() > MAX_MEMORY_INDEX_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "memory index {} is {} bytes, over the {MAX_MEMORY_INDEX_BYTES}-byte injection \
-                 bound — refusing to inject; shorten MEMORY.md itself. Moving detail into linked \
-                 topic files only helps a HOST job: under a container policy the linked files are \
-                 outside the job's mount namespace, so this file's own content is all that loads",
-                index_path.display(),
-                index.len()
-            ),
-        ));
-    }
+    let (index, truncation) = fit_index_to_budget(&index);
     let template = load_template(template_path, DEFAULT_READ_ON_START_TEMPLATE);
-    let rendered = render(
+    let section = render(
         &template,
         &[
             (TOKEN_MEMORY_DIR, memory_dir.display().to_string().as_str()),
-            (TOKEN_MEMORY_INDEX, index.trim_end()),
+            (TOKEN_MEMORY_INDEX, index.as_str()),
         ],
     );
-    Ok(Some(rendered))
+    Ok(Some(ReadOnStart {
+        section,
+        truncation,
+    }))
+}
+
+/// [`read_on_start`] without the truncation report — the rendered section alone.
+pub fn read_on_start_section(
+    memory_dir: &Path,
+    template_path: Option<&Path>,
+) -> io::Result<Option<String>> {
+    read_on_start(memory_dir, template_path).map(|read| read.map(|read| read.section))
+}
+
+/// What the operator surfaces (boot warning, `maxplayer doctor`) see when they look at the index.
+/// Read-only: inspecting never creates `memory/` or anything in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexState {
+    /// No `memory/` directory at all — the state of nearly every seat. Nothing to say.
+    NoMemoryDir,
+    /// `memory/` exists but holds no `MEMORY.md`: the seat injects nothing.
+    NoIndex,
+    /// `MEMORY.md` exists but is empty or whitespace: the seat injects nothing.
+    Empty,
+    /// The index fits the budget and is injected whole.
+    Fits { bytes: usize },
+    /// The index is over [`MAX_MEMORY_INDEX_BYTES`]: every job prompt gets a truncated copy.
+    OverBudget { bytes: usize },
+}
+
+impl IndexState {
+    /// Bytes still available under the budget for a fitting index (`None` otherwise).
+    pub fn headroom_bytes(self) -> Option<usize> {
+        match self {
+            IndexState::Fits { bytes } => Some(MAX_MEMORY_INDEX_BYTES - bytes),
+            _ => None,
+        }
+    }
+}
+
+/// Inspect the index at `memory_dir` for the operator surfaces. Reads only; a missing directory or
+/// file is a state, not an error, and the only `Err` is an index that exists and cannot be read.
+pub fn inspect_index(memory_dir: &Path) -> io::Result<IndexState> {
+    if !memory_dir.is_dir() {
+        return Ok(IndexState::NoMemoryDir);
+    }
+    let index_path = memory_dir.join(MEMORY_INDEX_FILE);
+    let index = match fs::read_to_string(&index_path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(IndexState::NoIndex),
+        Err(error) => return Err(error),
+    };
+    if index.trim().is_empty() {
+        return Ok(IndexState::Empty);
+    }
+    let bytes = index.len();
+    if bytes > MAX_MEMORY_INDEX_BYTES {
+        Ok(IndexState::OverBudget { bytes })
+    } else {
+        Ok(IndexState::Fits { bytes })
+    }
 }
 
 /// Compose the retro/distiller prompt (retro seam). `template_path` overrides the in-repo default.
@@ -367,28 +513,457 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// An index a single byte over [`MAX_MEMORY_INDEX_BYTES`] is REFUSED (`InvalidData`), not
-    /// silently injected. This test goes red if the bound check is removed — the call would
-    /// then return `Ok(Some(..))`.
+    /// A template that is the bare `{memory_index}` token, so the rendered section IS the injected
+    /// index text and its length can be held against the budget directly.
+    fn bare_index_template(root: &Path) -> PathBuf {
+        let template = root.join("bare-index.tmpl");
+        fs::write(&template, TOKEN_MEMORY_INDEX).expect("write bare template");
+        template
+    }
+
+    /// The injected index text of a rendered bare-template section, split into the surviving head
+    /// and the marker line (the marker is always the LAST line).
+    fn split_head_and_marker(injected: &str) -> (&str, &str) {
+        injected
+            .rsplit_once('\n')
+            .expect("a truncated index is at least head + marker line")
+    }
+
+    /// An index a single byte over [`MAX_MEMORY_INDEX_BYTES`] is TRUNCATED and still injected — never
+    /// refused, never dropped. The property this protects is unchanged from the refusal it replaces:
+    /// a runaway `MEMORY.md` cannot bloat every job prompt, because the injected text (marker
+    /// included) stays within the budget. This goes red if the bound check is removed — the injected
+    /// text would then exceed the budget and carry no marker.
     #[test]
-    fn read_on_start_refuses_index_over_size_bound() {
+    fn read_on_start_truncates_index_over_size_bound() {
         let root = temp_dir("ros-overbound");
         let dir = memory_dir(&root);
         fs::create_dir_all(&dir).expect("mkdir");
         let oversized = "x".repeat(MAX_MEMORY_INDEX_BYTES + 1);
         fs::write(dir.join(MEMORY_INDEX_FILE), &oversized).expect("write index");
+        let template = bare_index_template(&root);
 
-        let error = read_on_start_section(&dir, None).expect_err("over-bound index must be refused");
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        let message = error.to_string();
-        assert!(
-            message.contains(&MAX_MEMORY_INDEX_BYTES.to_string()),
-            "error names the bound: {message}"
+        let read = read_on_start(&dir, Some(&template))
+            .expect("an over-bound index is not an error")
+            .expect("and it still injects");
+        let truncation = read.truncation.expect("the read reports what it cut");
+        assert_eq!(
+            truncation.total_bytes,
+            MAX_MEMORY_INDEX_BYTES + 1,
+            "the real size is reported"
         );
         assert!(
-            message.contains(&(MAX_MEMORY_INDEX_BYTES + 1).to_string()),
-            "error names the actual size: {message}"
+            read.section.len() <= MAX_MEMORY_INDEX_BYTES,
+            "injected text incl. marker is {} bytes, over the {MAX_MEMORY_INDEX_BYTES} budget",
+            read.section.len()
         );
+        let (head, marker) = split_head_and_marker(&read.section);
+        assert_eq!(
+            head.len(),
+            truncation.shown_bytes,
+            "shown_bytes is the surviving head"
+        );
+        assert!(
+            head.chars().all(|c| c == 'x') && !head.is_empty(),
+            "the head is the file's own text"
+        );
+        assert_eq!(
+            marker,
+            truncation_marker(truncation.shown_bytes, truncation.total_bytes)
+        );
+        assert!(
+            marker.contains(&MAX_MEMORY_INDEX_BYTES.to_string()),
+            "marker names the budget"
+        );
+        assert!(
+            marker.contains(&(MAX_MEMORY_INDEX_BYTES + 1).to_string()),
+            "marker names the actual size: {marker}"
+        );
+        // The section-only wrapper sees the same text.
+        assert_eq!(
+            read_on_start_section(&dir, Some(&template))
+                .expect("read")
+                .as_deref(),
+            Some(read.section.as_str())
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A 3x-over index: the cut lands on a LINE boundary (the last content line is a complete fixture
+    /// line), the marker is present and last, and the whole injected text fits the budget.
+    #[test]
+    fn read_on_start_cuts_a_3x_over_index_on_a_line_boundary_within_budget() {
+        let root = temp_dir("ros-3x");
+        let dir = memory_dir(&root);
+        fs::create_dir_all(&dir).expect("mkdir");
+        // Every fixture line ends in a sentinel so a mid-line cut is detectable.
+        let mut index = String::from("# Memory\n\nAcme brand: headings in Söhne.|\n");
+        let mut n = 0usize;
+        while index.len() < 3 * MAX_MEMORY_INDEX_BYTES {
+            index.push_str(&format!(
+                "- topic line {n:06}: durable lesson text, kept short on purpose |\n"
+            ));
+            n += 1;
+        }
+        fs::write(dir.join(MEMORY_INDEX_FILE), &index).expect("write index");
+        let template = bare_index_template(&root);
+
+        let read = read_on_start(&dir, Some(&template))
+            .expect("read")
+            .expect("injects");
+        let truncation = read.truncation.expect("truncated");
+        assert_eq!(truncation.total_bytes, index.len());
+        assert!(
+            read.section.len() <= MAX_MEMORY_INDEX_BYTES,
+            "3x-over input must render to <= budget incl. marker, got {}",
+            read.section.len()
+        );
+        let (head, marker) = split_head_and_marker(&read.section);
+        assert!(
+            head.starts_with("# Memory\n\nAcme brand: headings in Söhne.|"),
+            "head is the file's start"
+        );
+        assert!(
+            head.ends_with('|'),
+            "cut is on a line boundary — the last kept line is complete: {:?}",
+            &head[head.len().saturating_sub(80)..]
+        );
+        assert!(index.starts_with(head), "the head is a prefix of the file");
+        assert_eq!(
+            marker,
+            truncation_marker(truncation.shown_bytes, truncation.total_bytes)
+        );
+        assert!(
+            marker.starts_with("[maxplayer: MEMORY.md truncated"),
+            "marker is the last line"
+        );
+        // Most of the budget is used: a cut that threw away far more than one line is a bug.
+        assert!(
+            read.section.len() > MAX_MEMORY_INDEX_BYTES - 256,
+            "the cut left {} unused bytes under the budget",
+            MAX_MEMORY_INDEX_BYTES - read.section.len()
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A single-line multi-byte index over the budget is cut at a CHAR boundary: the result is a
+    /// valid `String` (slicing mid-character would panic), fits the budget, and keeps the marker.
+    #[test]
+    fn read_on_start_cuts_multibyte_utf8_on_a_char_boundary() {
+        let root = temp_dir("ros-utf8");
+        let dir = memory_dir(&root);
+        fs::create_dir_all(&dir).expect("mkdir");
+        // 3-byte characters, one line, no newline anywhere: every cut candidate but one in three is
+        // mid-character. Sized so the budget lands off a boundary whatever the marker length is.
+        let glyph = "日";
+        assert_eq!(glyph.len(), 3);
+        let index = glyph.repeat(MAX_MEMORY_INDEX_BYTES / 3 + 500);
+        assert!(index.len() > MAX_MEMORY_INDEX_BYTES);
+        fs::write(dir.join(MEMORY_INDEX_FILE), &index).expect("write index");
+        let template = bare_index_template(&root);
+
+        let read = read_on_start(&dir, Some(&template))
+            .expect("read")
+            .expect("injects");
+        let truncation = read.truncation.expect("truncated");
+        assert!(read.section.len() <= MAX_MEMORY_INDEX_BYTES);
+        let (head, marker) = split_head_and_marker(&read.section);
+        assert!(
+            head.chars().all(|c| c == '日') && !head.is_empty(),
+            "head is whole characters only"
+        );
+        assert_eq!(
+            head.len() % 3,
+            0,
+            "head length is a whole number of 3-byte chars"
+        );
+        assert_eq!(head.len(), truncation.shown_bytes);
+        assert_eq!(
+            marker,
+            truncation_marker(truncation.shown_bytes, truncation.total_bytes)
+        );
+        // Also directly: the pure fitter produces a String that round-trips as valid UTF-8 bytes.
+        let (fitted, _) = fit_index_to_budget(&index);
+        assert!(std::str::from_utf8(fitted.as_bytes()).is_ok());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An index whose ONLY newline at or before the budget sits at offset 0 (one LF, then one
+    /// 65,536-byte line): the last-complete-line rule would leave an EMPTY head, so the long-line
+    /// fallback applies — the head is non-empty, cut on a char boundary inside the second line, the
+    /// marker is the final line and the whole result fits the budget as valid UTF-8.
+    #[test]
+    fn read_on_start_leading_blank_line_then_overlong_line_keeps_a_non_empty_head() {
+        let root = temp_dir("ros-leading-lf");
+        let dir = memory_dir(&root);
+        fs::create_dir_all(&dir).expect("mkdir");
+        let mut index = String::from("\n");
+        index.push_str(&"x".repeat(MAX_MEMORY_INDEX_BYTES));
+        assert_eq!(index.len(), MAX_MEMORY_INDEX_BYTES + 1);
+        assert_eq!(index.find('\n'), Some(0), "the only newline is at offset 0");
+        fs::write(dir.join(MEMORY_INDEX_FILE), &index).expect("write index");
+        let template = bare_index_template(&root);
+
+        let read = read_on_start(&dir, Some(&template))
+            .expect("a leading blank line is not an error")
+            .expect("and the index still injects");
+        let truncation = read.truncation.expect("truncated");
+        assert_eq!(truncation.total_bytes, index.len());
+        assert!(
+            read.section.len() <= MAX_MEMORY_INDEX_BYTES,
+            "result incl. marker is {} bytes, over the budget",
+            read.section.len()
+        );
+        assert!(
+            std::str::from_utf8(read.section.as_bytes()).is_ok(),
+            "valid UTF-8"
+        );
+        let (head, marker) = split_head_and_marker(&read.section);
+        assert_eq!(
+            marker,
+            truncation_marker(truncation.shown_bytes, truncation.total_bytes)
+        );
+        assert!(
+            marker.starts_with("[maxplayer: MEMORY.md truncated"),
+            "marker is the final line"
+        );
+        // Non-empty head, cut inside the second line: the head keeps the file's leading LF and then
+        // a run of `x` from the second line — NOT the empty string an offset-0 cut would have given.
+        assert!(
+            !head.trim().is_empty(),
+            "the head carries specialization, not an empty line"
+        );
+        assert!(
+            head.starts_with('\n'),
+            "the head is a prefix of the file, incl. its leading LF"
+        );
+        let second_line = &head[1..];
+        assert!(
+            !second_line.is_empty(),
+            "the cut landed inside the second line"
+        );
+        assert!(
+            second_line.chars().all(|c| c == 'x'),
+            "and kept only that line's own bytes"
+        );
+        assert!(
+            index.is_char_boundary(head.len()),
+            "the cut is on a char boundary"
+        );
+        assert_eq!(head.len(), truncation.shown_bytes);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Every all-whitespace opening — two LFs, a `\r\n` blank line, indented blank lines — followed by
+    /// one over-budget line takes the same long-line fallback the single leading LF takes. The head is
+    /// the file's OWN opening bytes plus a run of its long line, never the empty string a
+    /// newline-offset rule would have selected (round-2 finding 1). Each case checks retained
+    /// specialization, prefix identity, the marker as final line, UTF-8 validity and the total bound.
+    /// This goes red if `line_boundary_cut` ever decides on a newline's offset instead of on whether
+    /// the head it selects survives trimming.
+    #[test]
+    fn read_on_start_whitespace_opening_then_overlong_line_keeps_the_files_own_head() {
+        // (label, opening bytes) — every one trims away to nothing, so none of their newlines is a
+        // usable complete-line cut.
+        let openings = [
+            ("two-lf", "\n\n"),
+            ("crlf-blank-line", "\r\n"),
+            ("indented-blanks", " \n\t\n"),
+            ("lf-space-lf", "\n \n"),
+            ("many-lf", "\n\n\n\n"),
+        ];
+        for (label, opening) in openings {
+            assert!(
+                opening.trim_end().is_empty(),
+                "{label}: the fixture opening must be all whitespace"
+            );
+            let root = temp_dir(&format!("ros-ws-open-{label}"));
+            let dir = memory_dir(&root);
+            fs::create_dir_all(&dir).expect("mkdir");
+            let mut index = String::from(opening);
+            index.push_str(&"x".repeat(MAX_MEMORY_INDEX_BYTES));
+            fs::write(dir.join(MEMORY_INDEX_FILE), &index).expect("write index");
+            let template = bare_index_template(&root);
+
+            let read = read_on_start(&dir, Some(&template))
+                .expect("a whitespace opening is not an error")
+                .expect("and the index still injects");
+            let truncation = read
+                .truncation
+                .unwrap_or_else(|| panic!("{label}: an over-budget index reports its truncation"));
+            assert_eq!(truncation.total_bytes, index.len(), "{label}: real size");
+            assert!(
+                read.section.len() <= MAX_MEMORY_INDEX_BYTES,
+                "{label}: result incl. marker is {} bytes, over the {MAX_MEMORY_INDEX_BYTES}-byte budget",
+                read.section.len()
+            );
+            assert!(
+                std::str::from_utf8(read.section.as_bytes()).is_ok(),
+                "{label}: valid UTF-8"
+            );
+
+            let (head, marker) = split_head_and_marker(&read.section);
+            assert_eq!(
+                marker,
+                truncation_marker(truncation.shown_bytes, truncation.total_bytes),
+                "{label}: marker is the final line and reports the real numbers"
+            );
+            assert!(
+                !head.trim().is_empty(),
+                "{label}: the head carries specialization, not an all-whitespace opening"
+            );
+            assert!(
+                head.contains('x'),
+                "{label}: the head reaches into the long line"
+            );
+            assert!(
+                index.as_bytes().starts_with(head.as_bytes()),
+                "{label}: the head is a PREFIX of the file — no text skipped or reordered"
+            );
+            assert!(
+                head.starts_with(opening),
+                "{label}: the file's own opening bytes are kept, not skipped"
+            );
+            assert!(
+                index.is_char_boundary(head.len()),
+                "{label}: the cut is on a char boundary"
+            );
+            assert_eq!(
+                head.len(),
+                truncation.shown_bytes,
+                "{label}: shown_bytes is the surviving head"
+            );
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    /// The complement of the fallback: when a blank opening IS followed by in-budget content lines, a
+    /// complete line still wins — the fix decides on surviving content, so it must not push ordinary
+    /// indexes onto the char-boundary path. The head keeps the file's blank opening and ends on a whole
+    /// fixture line.
+    #[test]
+    fn read_on_start_blank_opening_still_cuts_on_a_complete_line() {
+        const LINE: &str = "- alpha: the seat's own specialization line\n";
+        let root = temp_dir("ros-blank-then-lines");
+        let dir = memory_dir(&root);
+        fs::create_dir_all(&dir).expect("mkdir");
+        let mut index = String::from("\n\n");
+        while index.len() < MAX_MEMORY_INDEX_BYTES * 2 {
+            index.push_str(LINE);
+        }
+        fs::write(dir.join(MEMORY_INDEX_FILE), &index).expect("write index");
+        let template = bare_index_template(&root);
+
+        let read = read_on_start(&dir, Some(&template))
+            .expect("read")
+            .expect("injects");
+        let truncation = read.truncation.expect("truncated");
+        assert!(
+            read.section.len() <= MAX_MEMORY_INDEX_BYTES,
+            "within budget"
+        );
+        let (head, marker) = split_head_and_marker(&read.section);
+        assert_eq!(
+            marker,
+            truncation_marker(truncation.shown_bytes, truncation.total_bytes)
+        );
+        assert!(
+            index.as_bytes().starts_with(head.as_bytes()) && head.starts_with("\n\n"),
+            "the head is the file's own prefix, blank opening included"
+        );
+        assert!(
+            head.ends_with(LINE.trim_end()),
+            "the cut landed on a COMPLETE line, not inside one: {:?}",
+            &head[head.len().saturating_sub(48)..]
+        );
+        assert!(
+            head[2..].lines().all(|line| line == LINE.trim_end()),
+            "and kept only whole fixture lines"
+        );
+        assert_eq!(head.len(), truncation.shown_bytes);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The documented limit, stated so nobody reads the non-empty-head rule as a promise it cannot
+    /// keep: when the whole in-budget window is whitespace, the content starts BEYOND the budget and no
+    /// byte-bounded rule can reach it. The index is still injected with its marker and still fits the
+    /// bound — it just has no head.
+    #[test]
+    fn read_on_start_all_whitespace_in_budget_window_has_no_head_to_keep() {
+        let root = temp_dir("ros-ws-window");
+        let dir = memory_dir(&root);
+        fs::create_dir_all(&dir).expect("mkdir");
+        let mut index = " \n".repeat(MAX_MEMORY_INDEX_BYTES);
+        index.push_str("tail-content-past-the-budget");
+        assert!(
+            !index.trim().is_empty(),
+            "the file as a whole is not blank, so the seam accepts it"
+        );
+        fs::write(dir.join(MEMORY_INDEX_FILE), &index).expect("write index");
+        let template = bare_index_template(&root);
+
+        let read = read_on_start(&dir, Some(&template))
+            .expect("read")
+            .expect("injects");
+        let truncation = read.truncation.expect("truncated");
+        assert_eq!(
+            truncation.shown_bytes, 0,
+            "no non-empty head exists within the budget, and none is manufactured"
+        );
+        assert!(
+            read.section.len() <= MAX_MEMORY_INDEX_BYTES,
+            "within budget"
+        );
+        assert!(std::str::from_utf8(read.section.as_bytes()).is_ok());
+        let (head, marker) = split_head_and_marker(&read.section);
+        assert!(head.is_empty(), "the head is empty: {head:?}");
+        assert_eq!(
+            marker,
+            truncation_marker(0, index.len()),
+            "the marker is still the final line and still tells the truth"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The operator-surface inspector reports each state and creates nothing.
+    #[test]
+    fn inspect_index_reports_every_state_and_creates_nothing() {
+        let root = temp_dir("inspect");
+        let dir = memory_dir(&root);
+        assert_eq!(
+            inspect_index(&dir).expect("no dir"),
+            IndexState::NoMemoryDir
+        );
+        assert!(!dir.exists(), "inspecting must not create memory/");
+
+        fs::create_dir_all(&dir).expect("mkdir");
+        assert_eq!(inspect_index(&dir).expect("no index"), IndexState::NoIndex);
+        assert!(
+            !dir.join(MEMORY_INDEX_FILE).exists(),
+            "inspecting must not create MEMORY.md"
+        );
+
+        fs::write(dir.join(MEMORY_INDEX_FILE), "  \n\t\n").expect("write blank");
+        assert_eq!(inspect_index(&dir).expect("blank"), IndexState::Empty);
+
+        fs::write(dir.join(MEMORY_INDEX_FILE), "# index\nline\n").expect("write small");
+        let fits = inspect_index(&dir).expect("fits");
+        assert_eq!(fits, IndexState::Fits { bytes: 13 });
+        assert_eq!(fits.headroom_bytes(), Some(MAX_MEMORY_INDEX_BYTES - 13));
+
+        fs::write(
+            dir.join(MEMORY_INDEX_FILE),
+            "z".repeat(MAX_MEMORY_INDEX_BYTES + 7),
+        )
+        .expect("write big");
+        let over = inspect_index(&dir).expect("over");
+        assert_eq!(
+            over,
+            IndexState::OverBudget {
+                bytes: MAX_MEMORY_INDEX_BYTES + 7
+            }
+        );
+        assert_eq!(over.headroom_bytes(), None);
         let _ = fs::remove_dir_all(&root);
     }
 
