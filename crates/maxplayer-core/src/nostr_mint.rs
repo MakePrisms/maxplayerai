@@ -39,7 +39,7 @@ use cdk::{
 use nostr_sdk::nips::nip44::{self, Version};
 use nostr_sdk::prelude::{
     Client, Event, EventBuilder, EventId, Filter, Keys, Kind, PublicKey, RelayPoolNotification,
-    Tag, Timestamp,
+    Tag, Timestamp, RelayMessage, RelayNotification, SubscriptionId,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -149,6 +149,59 @@ pub fn build_wallet_with_relays(
         .build()
 }
 
+/// Payload-free evidence for one request. Acceptance never establishes execution outcome.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RequestObservation {
+    pub mint: String,
+    pub op: String,
+    pub checked_at: u64,
+    pub elapsed_ms: u64,
+    pub budget_ms: u64,
+    pub attempts: u32,
+    pub reply_ms: Option<u64>,
+    pub reply_relay: Option<String>,
+    pub outcome: String,
+    pub nut_code: Option<u16>,
+    pub envelope_version: Option<u64>,
+    pub evidence_lost: bool,
+    pub relays: std::collections::BTreeMap<String, RelayEvidence>,
+}
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RelayEvidence {
+    pub connected: bool,
+    pub acceptance: &'static str,
+    pub refused: bool,
+    pub auth: &'static str,
+    pub closed: bool,
+    pub notice: bool,
+}
+impl Default for RelayEvidence {
+    fn default() -> Self { Self { connected: false, acceptance: "unknown", refused: false, auth: "unknown", closed: false, notice: false } }
+}
+impl RequestObservation {
+    pub fn message(&self) -> String {
+        let evidence = if self.reply_ms.is_some() {
+            match self.outcome.as_str() {
+                "ok" => "Mint answered successfully".to_owned(),
+                "unsupported_protocol" => format!("Mint answered using envelope v{}; this tool supports v1. Use compatible tool/mint builds", self.envelope_version.unwrap_or(0)),
+                "nut_error" => format!("Mint answered with NUT {}. Operator: inspect sidecar logs", self.nut_code.unwrap_or(0)),
+                other => format!("Mint answered: {other}. Check mint/tool compatibility, clock and operator logs"),
+            }
+        } else if self.relays.values().any(|r| r.acceptance == "accepted") {
+            "Relay accepted the request, but mint did not answer. Offline, incompatible, unsubscribed mint or lost reply cannot be distinguished. Ask the operator to check the sidecar and selected relay; run doctor before a new take".into()
+        } else if self.relays.values().any(|r| r.refused) {
+            "Relay refused the request; mint response not observed. Check relay access/auth policy".into()
+        } else if self.relays.values().any(|r| r.auth == "failed" || r.closed) {
+            "Relay authentication failed or reply subscription closed. Check relay authorization; cannot observe the mint response on this path".into()
+        } else if !self.relays.values().any(|r| r.connected) {
+            "No configured mint relay reachable. Check network and selected mint-relay URLs".into()
+        } else {
+            "No relay acknowledgement; request acceptance unknown. Check relay health; do not assume the mint never received it".into()
+        };
+        format!("mint {} {} after {:.1}s: {evidence}. Execution outcome is independent; retain submitted operations and use status/recover", self.mint, self.op, self.elapsed_ms as f64 / 1000.0)
+    }
+}
+
 /// A cdk mint connector that talks to a `nostr://<npub>` mint over Nostr relays.
 #[derive(Debug, Clone)]
 pub struct NostrMintConnector {
@@ -210,6 +263,25 @@ impl NostrMintConnector {
     /// `MAX_CLOCK_SKEW_SECS` can still execute it until then; recovery's `REQUEST_SETTLE` hold is
     /// what covers that. Nothing past the deadline is awaited except a bounded disconnect.
     pub async fn call_raw(&self, operation: &str, body: Value) -> Result<Value, Error> {
+        self.call_observed(operation, body).await.0
+    }
+
+    /// The same request and financial mapping, with independently retained diagnostic evidence.
+    pub async fn call_observed(&self, operation: &str, body: Value) -> (Result<Value, Error>, RequestObservation) {
+        let start = Instant::now();
+        let mut observation = RequestObservation {
+            mint: self.mint_url.to_string(), op: operation.into(), checked_at: unix_now_ms() / 1000,
+            elapsed_ms: 0, budget_ms: self.window.as_millis() as u64, attempts: 0,
+            reply_ms: None, reply_relay: None, outcome: "unanswered".into(), nut_code: None,
+            envelope_version: None, evidence_lost: false,
+            relays: self.relays.iter().map(|r| (r.trim_end_matches('/').to_owned(), RelayEvidence::default())).collect(),
+        };
+        let result = self.call_evidenced(operation, body, &mut observation, start).await;
+        observation.elapsed_ms = start.elapsed().as_millis() as u64;
+        (result, observation)
+    }
+
+    async fn call_evidenced(&self, operation: &str, body: Value, observation: &mut RequestObservation, start: Instant) -> Result<Value, Error> {
         let started_unix_ms = unix_now_ms();
         let deadline = Instant::now() + self.window;
         let request = Request {
@@ -245,6 +317,13 @@ impl NostrMintConnector {
         for relay in &self.relays {
             let _ = client.add_relay(relay.as_str()).await;
         }
+        // Subscribe to lifecycle notifications before connection/auth starts. Receivers are
+        // drained without spawning tasks, so cancellation cannot leak collectors.
+        let mut lifecycle = Vec::new();
+        for (url, relay) in client.relays().await {
+            lifecycle.push((url.to_string().trim_end_matches('/').to_owned(), relay.notifications()));
+        }
+        let mut notifications = client.notifications();
         client.connect().await;
         client
             .wait_for_connection(self.connect_timeout.min(remaining(deadline)))
@@ -254,6 +333,9 @@ impl NostrMintConnector {
             .await
             .values()
             .any(|relay| relay.is_connected());
+        for (url, relay) in client.relays().await {
+            observation.relays.entry(url.to_string().trim_end_matches('/').to_owned()).or_default().connected = relay.is_connected();
+        }
         if !connected {
             disconnect(&client).await;
             // Same class as an unreachable HTTPS mint today (connection refused): ambiguous.
@@ -267,44 +349,76 @@ impl NostrMintConnector {
         }
 
         // Subscribe BEFORE publishing, so a fast reply isn't missed.
-        let mut notifications = client.notifications();
+        let subscription = SubscriptionId::generate();
         let filter = Filter::new()
             .kind(Kind::Custom(RESPONSE_KIND))
             .pubkey(keys.public_key())
             .author(self.mint_pk)
             .since(Timestamp::now() - Duration::from_secs(10));
-        let _ = tokio::time::timeout(remaining(deadline), client.subscribe(filter, None)).await;
+        let _ = tokio::time::timeout(remaining(deadline), client.subscribe_with_id(subscription.clone(), filter, None)).await;
 
         let mut next_send = Instant::now();
+        let mut publish = None;
         let outcome = loop {
-            let now = Instant::now();
-            if now >= deadline {
-                break Err(Error::Timeout);
-            }
-            if now >= next_send {
-                // A publish error is not a result; keep waiting and re-send. Bounded by the deadline
-                // so a slow relay OK cannot carry the call past `exp`.
-                let _ = tokio::time::timeout(remaining(deadline), client.send_event(&event)).await;
-                next_send = Instant::now() + self.resend_every;
-            }
-            let wait = next_send
-                .min(deadline)
-                .saturating_duration_since(Instant::now())
-                .max(Duration::from_millis(1));
-            match tokio::time::timeout(wait, notifications.recv()).await {
-                Err(_) => continue,
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
-                    break Err(Error::HttpError(None, "relay pool closed".into()));
-                }
-                Ok(Ok(RelayPoolNotification::Event { event: reply, .. })) => {
-                    if let Some(result) = self.accept(&reply, &event.id, &keys, &request.id) {
-                        break result;
+            for (url, receiver) in &mut lifecycle {
+                loop {
+                    match receiver.try_recv() {
+                        Ok(RelayNotification::Authenticated) => observation.relays.entry(url.clone()).or_default().auth = "authenticated",
+                        Ok(RelayNotification::AuthenticationFailed) => observation.relays.entry(url.clone()).or_default().auth = "failed",
+                        Ok(RelayNotification::RelayStatus { status }) => {
+                            observation.relays.entry(url.clone()).or_default().connected = status == nostr_sdk::prelude::RelayStatus::Connected;
+                        }
+                        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => observation.evidence_lost = true,
+                        Err(_) => break,
+                        _ => {}
                     }
                 }
-                Ok(Ok(_)) => continue,
+            }
+            if Instant::now() >= deadline { break Err(Error::Timeout); }
+            if publish.is_none() && Instant::now() >= next_send {
+                observation.attempts += 1;
+                publish = Some(Box::pin(client.send_event(&event)));
+            }
+            tokio::select! {
+                result = async { publish.as_mut().unwrap().await }, if publish.is_some() => {
+                    if let Ok(output) = result {
+                        for url in output.success {
+                            observation.relays.entry(url.to_string().trim_end_matches('/').to_owned()).or_default().acceptance = "accepted";
+                        }
+                        // Failure text is untrusted and is never reflected. Raw matching OK=false
+                        // below proves refusal; an SDK failure alone does not.
+                    }
+                    publish = None;
+                    next_send = Instant::now() + self.resend_every;
+                }
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {},
+                notification = notifications.recv() => match notification {
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => observation.evidence_lost = true,
+                    Err(_) => break Err(Error::HttpError(None, "relay pool closed".into())),
+                    Ok(RelayPoolNotification::Event { event: reply, relay_url, .. }) => {
+                        if let Some(result) = self.accept(&reply, &event.id, &keys, &request.id, observation) {
+                            observation.reply_ms = Some(start.elapsed().as_millis() as u64);
+                            observation.reply_relay = Some(relay_url.to_string());
+                            break result;
+                        }
+                    }
+                    Ok(RelayPoolNotification::Message { relay_url, message }) => {
+                        let r = observation.relays.entry(relay_url.to_string().trim_end_matches('/').to_owned()).or_default();
+                        match message {
+                            RelayMessage::Ok { event_id, status, .. } if event_id == event.id => {
+                                if status { r.acceptance = "accepted"; }
+                                else { r.refused = true; if r.acceptance != "accepted" { r.acceptance = "refused"; } }
+                            }
+                            RelayMessage::Closed { subscription_id, .. } if subscription_id.as_ref() == &subscription => r.closed = true,
+                            RelayMessage::Notice(_) => r.notice = true,
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
             }
         };
+        drop(publish);
         disconnect(&client).await;
         outcome
     }
@@ -317,6 +431,7 @@ impl NostrMintConnector {
         request_event: &EventId,
         keys: &Keys,
         request_id: &str,
+        observation: &mut RequestObservation,
     ) -> Option<Result<Value, Error>> {
         if reply.kind != Kind::Custom(RESPONSE_KIND) || reply.pubkey != self.mint_pk {
             return None;
@@ -326,13 +441,32 @@ impl NostrMintConnector {
         }
         reply.verify().ok()?;
         let plain = nip44::decrypt(keys.secret_key(), &self.mint_pk, &reply.content).ok()?;
-        let response: Response = serde_json::from_str(&plain).ok()?;
-        if response.v != PROTOCOL_VERSION || response.id != request_id {
-            return None;
+        let value: Value = match serde_json::from_str(&plain) {
+            Ok(value) => value,
+            Err(_) => { observation.outcome = "invalid_response".into(); return Some(Err(Error::InvalidMintResponse("authenticated malformed response".into()))); }
+        };
+        if value["id"].as_str() != Some(request_id) { return None; }
+        observation.envelope_version = value["v"].as_u64();
+        if observation.envelope_version != Some(u64::from(PROTOCOL_VERSION)) {
+            observation.outcome = "unsupported_protocol".into();
+            return Some(Err(Error::InvalidMintResponse("unsupported envelope version".into())));
         }
+        let response: Response = match serde_json::from_value(value) {
+            Ok(response) => response,
+            Err(_) => { observation.outcome = "invalid_response".into(); return Some(Err(Error::InvalidMintResponse("authenticated malformed response".into()))); }
+        };
         Some(match response.outcome {
-            Outcome::Ok(value) => Ok(value),
-            Outcome::Err(error) => Err(map_error(error)),
+            Outcome::Ok(value) => { observation.outcome = "ok".into(); Ok(value) },
+            Outcome::Err(error) => {
+                match &error.code {
+                    ErrorCode::Nut(n) => { observation.outcome = "nut_error".into(); observation.nut_code = Some(*n); }
+                    ErrorCode::Named(n) => observation.outcome = match n.as_str() {
+                        code::INTERNAL | code::EXPIRED | code::RATE_LIMITED | code::UNSUPPORTED | code::BAD_REQUEST => n.clone(),
+                        _ => "unknown_protocol_error".into(),
+                    },
+                }
+                Err(map_error(error))
+            }
         })
     }
 

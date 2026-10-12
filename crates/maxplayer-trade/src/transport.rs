@@ -280,36 +280,23 @@ async fn nostr_call(
         }
     }
     crate::backoff::admit(mint, true)?;
-    let answer = tokio::time::timeout(nostr_outer(mint), c.call_raw(operation, body)).await;
-    match &answer {
-        Err(_) => crate::backoff::record(
-            mint,
-            crate::backoff::Outcome::Failed(crate::backoff::Reason::Timeout, None),
-        ),
-        // The mint's own NUT error is an answer; transport failures may start a backoff.
-        Ok(Err(e)) if nostr_nut_refusal(e) => {
-            crate::backoff::record(mint, crate::backoff::Outcome::Answered)
-        }
-        Ok(Err(e)) => crate::backoff::record_cdk(mint, e),
-        Ok(Ok(_)) => crate::backoff::record(mint, crate::backoff::Outcome::Answered),
+    let answer = tokio::time::timeout(nostr_outer(mint), c.call_observed(operation, body)).await;
+    let (result, observation) = answer.map_err(|_| {
+        crate::backoff::record(mint, crate::backoff::Outcome::Failed(crate::backoff::Reason::Timeout, None));
+        crate::backoff::NoAnswer(format!("mint {mint} {path}: unanswered within the nostr bound; acceptance unknown. Check relay/operator; retain submitted operations and use status/recover"))
+    })?;
+    if observation.reply_ms.is_some() {
+        crate::backoff::record(mint, crate::backoff::Outcome::Answered);
+    } else if let Err(e) = &result {
+        crate::backoff::record_cdk(mint, e);
     }
-    answer
-        .map_err(|_| {
-            crate::backoff::NoAnswer(format!(
-                "mint {mint} {path}: no answer within the nostr bound (ambiguous)"
-            ))
-        })?
-        .map_err(|e| match nostr_refusal(e) {
-            // The typed refusal, exactly as an HTTP NUT error body yields; never "HTTP 400" text.
-            Ok(refusal) => anyhow::Error::new(refusal).context(format!("mint {mint} {path}")),
-            // No reply in the window, no relay reachable, rate limited or unavailable: the mint
-            // did not answer this request (`backoff::unanswered`).
-            Err(e) if crate::backoff::cdk_unanswered(&e) => crate::backoff::NoAnswer(format!(
-                "mint {mint} {path}: {e} (no mint NUT error; ambiguous)"
-            ))
-            .into(),
-            Err(e) => anyhow!("mint {mint} {path}: {e} (no mint NUT error; ambiguous)"),
-        })
+    if path == "info" { eprintln!("{}", serde_json::to_string(&observation)?); }
+    let message = observation.message();
+    result.map_err(|e| match nostr_refusal(e) {
+        Ok(refusal) => anyhow::Error::new(refusal).context(message),
+        Err(e) if crate::backoff::cdk_unanswered(&e) => crate::backoff::NoAnswer(message).into(),
+        Err(_) => anyhow!(message),
+    })
 }
 
 /// A [`crate::mint::MintRefusal`] for the mint's own definitive NUT error over nostr, else the

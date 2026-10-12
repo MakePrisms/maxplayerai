@@ -35,6 +35,9 @@ enum Mode {
     DecoysOnly,
     /// Never answer.
     Silent,
+    WrongVersion,
+    Malformed,
+    NutError,
     /// Answer every request with a transport error code.
     Err(&'static str),
 }
@@ -138,12 +141,13 @@ async fn start_mint(relay_url: &str, mode: Mode) -> Mint {
                     EventId::all_zeros(),
                 )
                 .await;
-                reply(&c, &k, &event, &request.id, "{not json".into(), event.id).await;
-                let wrong_v = json!({"v":9,"id":request.id,"ok":canned(&request.op)}).to_string();
-                reply(&c, &k, &event, &request.id, wrong_v, event.id).await;
+
             };
             match mode {
                 Mode::Silent => {}
+                Mode::WrongVersion => reply(&c, &k, &event, &request.id, json!({"v":9,"id":request.id,"ok":{}}).to_string(), event.id).await,
+                Mode::Malformed => reply(&c, &k, &event, &request.id, "{not json".into(), event.id).await,
+                Mode::NutError => reply(&c, &k, &event, &request.id, json!({"v":1,"id":request.id,"err":{"code":50000,"detail":"secret\u{001b}[31m"}}).to_string(), event.id).await,
                 Mode::Answer => reply(&c, &k, &event, &request.id, ok, event.id).await,
                 Mode::DropFirst => {
                     if nth >= 2 {
@@ -262,7 +266,7 @@ async fn nostr_mint_every_holder_op_round_trips_through_the_connector() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn nostr_mint_forged_wrong_id_wrong_tag_malformed_and_wrong_version_replies_are_ignored() {
+async fn nostr_mint_forged_wrong_id_and_wrong_tag_replies_are_ignored() {
     let (_relay, relay_url) = relay().await;
     let mint = start_mint(&relay_url, Mode::DecoysThenAnswer).await;
     let c = connector(&mint, &relay_url, 5_000, 1_000);
@@ -417,4 +421,28 @@ async fn nostr_mint_wallet_polls_through_the_connector_instead_of_websocket() {
             .map(|(_, r)| r.op.clone())
             .collect::<Vec<_>>()
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diagnostics_distinguish_signed_errors_versions_and_accepted_silence() {
+    let (_relay, url) = relay().await;
+    for (mode, expected) in [(Mode::WrongVersion, "unsupported_protocol"), (Mode::Malformed, "invalid_response"), (Mode::NutError, "nut_error"), (Mode::Err("internal"), "internal"), (Mode::Err("expired"), "expired"), (Mode::Err("rate_limited"), "rate_limited"), (Mode::Silent, "unanswered")] {
+        let mint = start_mint(&url, mode).await;
+        let (result, evidence) = connector(&mint, &url, 1200, 300).call_observed("info", Value::Null).await;
+        assert!(result.is_err());
+        assert_eq!(evidence.outcome, expected);
+        assert_eq!(evidence.reply_ms.is_some(), mode != Mode::Silent);
+        assert_eq!(evidence.budget_ms, 1200);
+        if mode == Mode::Silent {
+            assert!(evidence.relays.values().any(|r| r.acceptance == "accepted"));
+            assert!(evidence.message().contains("cannot be distinguished"));
+        }
+        if mode == Mode::NutError {
+            assert_eq!(evidence.nut_code, Some(50000));
+            assert!(!result.unwrap_err().is_definitive_failure());
+        }
+        let public = serde_json::to_string(&evidence).unwrap();
+        assert!(!public.contains("secret"));
+        assert!(!evidence.message().contains("secret"));
+    }
 }
