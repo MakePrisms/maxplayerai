@@ -166,7 +166,14 @@ in one process:
   deadline. Deadlines are judged on the mint's clock (its `info.time`; an unseen mint is
   assumed 2 min ahead). Only the claim mint: refund and own-mint requests keep normal
   backoff. Logs `a claim to it is possible: retrying it every 30s` / `final stretch`. The
-  taker's claim is still never sent past its cutoff.
+  taker's claim is still never sent past its cutoff. The same rounds (`nostr://` mints
+  only) cover the checks a claim depends on: the taker's check of the maker's lock (until
+  its claim cutoff) and the maker's NUT-07 watch for the claim witness (until `long`).
+- **Unanswered trade messages are kept:** a counterparty message (quote, lock, claim
+  notice) whose check fails only because a mint did not answer is journaled and retried
+  on every serve/recover tick (also after a restart) until it is handled, refused by
+  the mint or by validation, superseded, or past its deadline. serve logs `trade message
+  waits for its mint (no answer); retained`. Validation failures are still rejected.
 - `fund` polls its quote every 5 s (6 polls), not every second.
 
 ## Funding

@@ -146,6 +146,33 @@ pub fn deferred(e: &anyhow::Error) -> bool {
     e.chain().any(|c| c.is::<Deferred>())
 }
 
+/// A mint request that got no usable answer: no reply within its bound, or HTTP 429/502/503/504.
+/// Ambiguous like [`Deferred`]; the text is the whole message.
+#[derive(Debug)]
+pub struct NoAnswer(pub String);
+impl std::fmt::Display for NoAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for NoAnswer {}
+
+/// Whether `e` failed only because a mint did not answer: not sent while it backs off
+/// ([`Deferred`]), no reply within a CDK wallet or transport bound, a refused/reset connection, or
+/// 429/502/503/504 (exactly the failures that start a backoff). The same request may succeed
+/// later. A mint's own answer (a NUT error included) and every local validation failure are NOT
+/// unanswered: they are refusals.
+pub fn unanswered(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.is::<Deferred>()
+            || c.is::<NoAnswer>()
+            || c.is::<crate::wallet::Bound>()
+            || c.downcast_ref::<cdk::Error>().is_some_and(cdk_unanswered)
+            || c.downcast_ref::<reqwest::Error>()
+                .is_some_and(|e| classify_reqwest(e).is_some())
+    })
+}
+
 /// A claim deadline, as seen by one request to the claim mint. `now_unix` is mint time.
 #[derive(Clone, Copy, Debug)]
 struct Urgency {
@@ -358,8 +385,9 @@ static WAIT_FOR_PACING: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 static LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 tokio::task_local! {
-    /// (deadline, claim mint key) of the claim the current advance may have to land.
-    static CLAIM: (u64, String);
+    /// (deadline, mint key) of every claim (or claim-critical read) the current task may have to
+    /// land. Nested [`with_claim`] scopes add to it.
+    static CLAIM: Vec<(u64, String)>;
 }
 
 fn book() -> MutexGuard<'static, Book> {
@@ -395,8 +423,14 @@ pub fn margin(mint: &str) -> u64 {
 /// The scope is a tokio task-local: it does NOT cross `tokio::spawn` (or a `JoinSet`). Nothing
 /// on the claim path spawns today; a request moved into a spawned task would silently lose its
 /// claim rounds and fall back to normal backoff.
+///
+/// Scopes nest: an inner scope adds its (deadline, mint) to the outer ones (a maker watching its
+/// own `nostr://` mint for the claim witness inside the advance that may claim on the other mint).
+/// A mint named by several scopes uses the latest deadline.
 pub async fn with_claim<F: std::future::Future>(deadline: u64, mint: &str, f: F) -> F::Output {
-    CLAIM.scope((deadline, key(mint)), f).await
+    let mut scope = CLAIM.try_with(Clone::clone).unwrap_or_default();
+    scope.push((deadline, key(mint)));
+    CLAIM.scope(scope, f).await
 }
 
 /// Record a mint's `info.time` (its clock), observed now.
@@ -410,8 +444,15 @@ pub fn mint_now(mint: &str) -> u64 {
 }
 
 fn urgency(mint: &str) -> Option<Urgency> {
+    let mint_key = key(mint);
     let deadline = CLAIM
-        .try_with(|(deadline, claim_mint)| (*claim_mint == key(mint)).then_some(*deadline))
+        .try_with(|scope| {
+            scope
+                .iter()
+                .filter(|(_, claim_mint)| *claim_mint == mint_key)
+                .map(|(deadline, _)| *deadline)
+                .max()
+        })
         .ok()
         .flatten()?;
     Some(Urgency {
@@ -506,6 +547,12 @@ fn classify_cdk(e: &cdk::Error) -> Option<Reason> {
         }
         _ => return None,
     })
+}
+
+/// Whether a CDK (wallet or `nostr://` connector) error means the mint did not answer: a backoff
+/// trigger, or any transport failure without an HTTP status (no relay reachable, pool closed).
+pub fn cdk_unanswered(e: &cdk::Error) -> bool {
+    classify_cdk(e).is_some() || matches!(e, cdk::Error::HttpError(None, _))
 }
 
 /// Report a CDK (wallet or `nostr://` connector) failure. Successes are not reported here: a CDK
@@ -1080,6 +1127,41 @@ mod tests {
         assert!(b.wait(&T, &["https://other.example"], now).is_zero());
         assert!(!b.wait(&T, &["https://other.example", M], now).is_zero());
         assert!(b.wait(&T, &[M], now + Duration::from_secs(48)).is_zero());
+    }
+
+    /// Only an unanswered mint request makes a trade message retryable; a mint's own refusal and
+    /// every local validation failure stay refusals.
+    #[test]
+    fn unanswered_is_only_no_answer() {
+        use anyhow::Context;
+        let deferred = anyhow::Error::new(Deferred {
+            mint: M.into(),
+            reason: Reason::Timeout,
+            remaining: Duration::from_secs(5),
+        });
+        assert!(unanswered(&deferred.context("check second lock")));
+        let elapsed: Result<(), crate::wallet::Bound> = Err(crate::wallet::Bound::Elapsed);
+        assert!(unanswered(
+            &elapsed
+                .context("CDK wallet request not answered")
+                .unwrap_err()
+        ));
+        assert!(unanswered(&anyhow::Error::new(cdk::Error::Timeout)));
+        assert!(unanswered(&anyhow::Error::new(cdk::Error::HttpError(
+            None,
+            "no relay reachable".into()
+        ))));
+        assert!(unanswered(&anyhow::Error::new(NoAnswer("x".into()))));
+        assert!(!unanswered(&anyhow::anyhow!("wrong hash lock")));
+        assert!(!unanswered(&anyhow::anyhow!("proof is not UNSPENT")));
+        assert!(!unanswered(
+            &anyhow::Error::new(crate::mint::MintRefusal::new(11001, "spent"))
+                .context("mint m checkstate")
+        ));
+        assert!(!unanswered(&anyhow::Error::new(cdk::Error::HttpError(
+            Some(400),
+            "bad".into()
+        ))));
     }
 
     #[test]

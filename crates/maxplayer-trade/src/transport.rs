@@ -173,10 +173,36 @@ pub fn loopback_only(mint: &str) -> bool {
 /// Bound for one CDK wallet call against `mint`.
 pub fn wallet_bound(mint: &str) -> Duration {
     if is_nostr(mint) {
-        NOSTR_OUTER
+        nostr_outer(mint)
     } else {
         HTTP_WALLET_TIMEOUT
     }
+}
+
+#[cfg(feature = "lab")]
+static LAB_NOSTR_WINDOW: RwLock<Option<Duration>> = RwLock::new(None);
+/// Lab-only: shorten the `nostr://` connector window (re-send every quarter window) for mints
+/// whose relays are all loopback, so a silent lab mint costs seconds instead of 30 s. The outer
+/// bound keeps [`OUTER_MARGIN`] past it. `None` restores production timing.
+#[cfg(feature = "lab")]
+pub fn lab_set_nostr_window(window: Option<Duration>) {
+    *LAB_NOSTR_WINDOW.write().unwrap_or_else(|e| e.into_inner()) = window;
+}
+fn lab_window(mint: &str) -> Option<Duration> {
+    #[cfg(feature = "lab")]
+    if let Some(w) = *LAB_NOSTR_WINDOW.read().unwrap_or_else(|e| e.into_inner()) {
+        if loopback_only(mint) {
+            return Some(w);
+        }
+    }
+    let _ = mint;
+    None
+}
+fn nostr_window(mint: &str) -> Duration {
+    lab_window(mint).unwrap_or(DEFAULT_WINDOW)
+}
+fn nostr_outer(mint: &str) -> Duration {
+    lab_window(mint).map_or(NOSTR_OUTER, |w| w + OUTER_MARGIN)
 }
 
 /// How long after a swap's `send_before` an unanswered attempt must stay unabandoned.
@@ -191,7 +217,16 @@ pub fn abandon_grace_seconds(mint: &str) -> u64 {
 /// The wallet connector for a `nostr://` mint over the configured mint relays.
 pub fn connector(mint: &str) -> Result<NostrMintConnector> {
     let url: MintUrl = mint.parse()?;
-    NostrMintConnector::new(&url, mint_relays()).map_err(|e| anyhow!("nostr mint {mint}: {e}"))
+    let c = NostrMintConnector::new(&url, mint_relays())
+        .map_err(|e| anyhow!("nostr mint {mint}: {e}"))?;
+    Ok(match lab_window(mint) {
+        Some(w) => c.with_timing(
+            w,
+            (w / 4).max(Duration::from_millis(250)),
+            DEFAULT_CONNECT_TIMEOUT.min(w),
+        ),
+        None => c,
+    })
 }
 
 /// Refuse a path that has no `nostr://` equivalent (NUT-04/05/20 are not served by the sidecar).
@@ -240,12 +275,12 @@ async fn nostr_call(
             left >= MIN_NOSTR_WINDOW,
             "mint {mint} {path}: too close to the attempt deadline; nothing sent"
         );
-        if left < DEFAULT_WINDOW {
+        if left < nostr_window(mint) {
             c = c.with_timing(left, DEFAULT_RESEND_EVERY, DEFAULT_CONNECT_TIMEOUT);
         }
     }
     crate::backoff::admit(mint, true)?;
-    let answer = tokio::time::timeout(NOSTR_OUTER, c.call_raw(operation, body)).await;
+    let answer = tokio::time::timeout(nostr_outer(mint), c.call_raw(operation, body)).await;
     match &answer {
         Err(_) => crate::backoff::record(
             mint,
@@ -259,10 +294,20 @@ async fn nostr_call(
         Ok(Ok(_)) => crate::backoff::record(mint, crate::backoff::Outcome::Answered),
     }
     answer
-        .map_err(|_| anyhow!("mint {mint} {path}: no answer within the nostr bound (ambiguous)"))?
+        .map_err(|_| {
+            crate::backoff::NoAnswer(format!(
+                "mint {mint} {path}: no answer within the nostr bound (ambiguous)"
+            ))
+        })?
         .map_err(|e| match nostr_refusal(e) {
             // The typed refusal, exactly as an HTTP NUT error body yields; never "HTTP 400" text.
             Ok(refusal) => anyhow::Error::new(refusal).context(format!("mint {mint} {path}")),
+            // No reply in the window, no relay reachable, rate limited or unavailable: the mint
+            // did not answer this request (`backoff::unanswered`).
+            Err(e) if crate::backoff::cdk_unanswered(&e) => crate::backoff::NoAnswer(format!(
+                "mint {mint} {path}: {e} (no mint NUT error; ambiguous)"
+            ))
+            .into(),
             Err(e) => anyhow!("mint {mint} {path}: {e} (no mint NUT error; ambiguous)"),
         })
 }
@@ -326,6 +371,13 @@ pub async fn post<T: DeserializeOwned>(
         return Err(
             anyhow::Error::new(refusal).context(format!("mint {mint} {path}: HTTP {status}"))
         );
+    }
+    if matches!(status.as_u16(), 429 | 502 | 503 | 504) {
+        // Rate limited or unavailable: no answer to this request (`backoff::unanswered`).
+        return Err(crate::backoff::NoAnswer(format!(
+            "mint {mint} {path}: HTTP {status} (body withheld)"
+        ))
+        .into());
     }
     ensure!(
         status.is_success(),

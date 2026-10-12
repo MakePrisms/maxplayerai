@@ -117,7 +117,26 @@ pub fn terminal(s: &Swap) -> bool {
     ]
     .contains(&s.state.as_str())
 }
+#[cfg(feature = "lab")]
+static LAB_DEADLINES: std::sync::Mutex<Option<(u64, u64, u64, u64)>> = std::sync::Mutex::new(None);
+/// Lab-only: (long, short, cutoff, margin) lock timing for loopback mints, overriding
+/// `TRADE_LAB_SECONDS` (tests that need room for several silent `nostr://` calls before the
+/// cutoff). `None` restores the default.
+#[cfg(feature = "lab")]
+pub fn lab_set_deadlines(t: Option<(u64, u64, u64, u64)>) {
+    *LAB_DEADLINES.lock().unwrap_or_else(|e| e.into_inner()) = t;
+}
 fn timing(l: &Lot) -> Result<(u64, u64, u64, u64)> {
+    #[cfg(feature = "lab")]
+    if let Some(t) = *LAB_DEADLINES.lock().unwrap_or_else(|e| e.into_inner()) {
+        for a in [&l.give.asset, &l.want.asset] {
+            ensure!(
+                crate::transport::loopback_only(&a.mint_url),
+                "lab timing requires loopback mints (and loopback mint relays for nostr://)"
+            );
+        }
+        return Ok(t);
+    }
     #[cfg(feature = "lab")]
     if std::env::var("TRADE_LAB_SECONDS").is_ok() {
         for a in [&l.give.asset, &l.want.asset] {
@@ -340,9 +359,165 @@ pub async fn handle(home: &Path, j: &Journal, m: &Market, e: &Event) -> Result<(
         if message.step == "request" && j.get::<Swap>("swap", &message.swap_id).await?.is_none() {
             j.put("rejected", &key, &(hash(&message)?, error.to_string()))
                 .await?;
+        } else if crate::backoff::unanswered(error) {
+            retain(j, e, &message).await?;
         }
     }
     result
+}
+
+/// An inbound trade message whose handling failed only because a mint did not answer
+/// (`backoff::unanswered`), kept so the recovery tick can handle it again.
+///
+/// Why: before this, such a message was logged as "trade message rejected" and dropped. The
+/// counterparty's re-send of the same signed event is a no-op (relays already acked it and never
+/// re-deliver a stored event to a live subscription), so one unanswered verification call lost
+/// the message for good and both legs refunded. Seen live on two `nostr://` mints
+/// (2026-10-11 23:58, 2026-10-12 10:50:39 and 14:54:57 UTC): a taker's check of the maker's
+/// `second` lock got no answer and the mint answered again minutes before the claim cutoff.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Retained {
+    pub event: Event,
+    pub swap_id: String,
+    pub step: String,
+    pub since: u64,
+}
+/// The swap state in which `step` (from the counterparty of a `role` swap) still has work to do.
+/// Any other state means the message was handled or superseded.
+fn awaiting(step: &str, role: &str) -> Option<&'static str> {
+    Some(match (step, role) {
+        ("quote", "taker") => "requested",
+        ("first", "maker") => "quoted",
+        ("second", "taker") => "first_locked",
+        ("claimed", "maker") => "second_locked",
+        _ => return None,
+    })
+}
+/// Unix time (local) after which handling `step` can no longer help this swap: the taker's claim
+/// send deadline for its check of the maker's lock, the maker's late-first-lock bound for its
+/// check of the taker's lock, the quote expiry, or the taker's refund locktime for a `claimed`.
+fn retry_until(s: &Swap, step: &str) -> u64 {
+    let Some(q) = &s.quote else {
+        return s.created + QUOTE_SECONDS;
+    };
+    match step {
+        "first" => q.exp.min(q.short.saturating_sub(q.cutoff)),
+        "second" => q.short.saturating_sub(q.cutoff),
+        "claimed" => q.long,
+        _ => q.exp,
+    }
+}
+/// Journal `e` for retry (keyed by event id: relay duplicates collapse) when its swap still
+/// awaits it. Returns whether it is retained.
+async fn retain(j: &Journal, e: &Event, msg: &Envelope) -> Result<bool> {
+    let Some(s) = j.get::<Swap>("swap", &msg.swap_id).await? else {
+        return Ok(false);
+    };
+    if terminal(&s)
+        || s.peer != e.pubkey.to_hex()
+        || awaiting(&msg.step, &s.role) != Some(s.state.as_str())
+        || now() >= retry_until(&s, &msg.step)
+    {
+        return Ok(false);
+    }
+    let id = e.id.to_hex();
+    if j.get::<Retained>("inbox_retry", &id).await?.is_none() {
+        j.put(
+            "inbox_retry",
+            &id,
+            &Retained {
+                event: e.clone(),
+                swap_id: msg.swap_id.clone(),
+                step: msg.step.clone(),
+                since: now(),
+            },
+        )
+        .await?;
+    }
+    Ok(true)
+}
+/// [`retain`] for a message whose handling ran out of its time budget (no result at all).
+async fn retain_timed_out(j: &Journal, m: &Market, e: &Event) -> Result<bool> {
+    let msg = m.decode(e)?;
+    retain(j, e, &msg).await
+}
+/// The verification step of `step`, as a claim-critical read: the mint it reads and the moment
+/// after which the claim it enables can no longer be sent. Only `nostr://` mints: their outages
+/// were silence for minutes, and a long backoff after them ate the claim margin.
+fn verification_scope(q: &Quote, step: &str) -> Option<(u64, String)> {
+    let mint = match step {
+        "second" => &q.lot.give.asset.mint_url,
+        "first" => &q.lot.want.asset.mint_url,
+        _ => return None,
+    };
+    crate::transport::is_nostr(mint).then(|| (q.short.saturating_sub(q.cutoff), mint.clone()))
+}
+/// Run `f` with claim rounds for `scope` (see [`crate::backoff::with_claim`]), or plainly.
+/// Boxed: the wrapped mint futures are large and these run inside already large state machines
+/// (debug builds overflowed the test thread's stack without it).
+async fn with_scope<F: std::future::Future>(scope: Option<(u64, String)>, f: F) -> F::Output {
+    let f = Box::pin(f);
+    match scope {
+        Some((deadline, mint)) => crate::backoff::with_claim(deadline, &mint, f).await,
+        None => f.await,
+    }
+}
+/// Handle every retained message again (one bounded attempt each). An entry is dropped once its
+/// swap is gone, terminal or past the step, once its deadline passed, or once handling it
+/// succeeds or fails for any reason other than an unanswered mint (a refusal stays a refusal).
+/// Returns whether any entry is still retained.
+async fn replay_retained(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
+    let mut pending = false;
+    let mut rows = j.all::<Retained>("inbox_retry").await?;
+    rows.sort_by_key(|r| r.since);
+    for r in rows {
+        let id = r.event.id.to_hex();
+        let s = j.get::<Swap>("swap", &r.swap_id).await?;
+        let live = s.as_ref().is_some_and(|s| {
+            !terminal(s)
+                && awaiting(&r.step, &s.role) == Some(s.state.as_str())
+                && now() < retry_until(s, &r.step)
+        });
+        if !live {
+            j.remove("inbox_retry", &id).await?;
+            continue;
+        }
+        let budget = s
+            .as_ref()
+            .map_or(std::time::Duration::from_secs(120), item_budget);
+        match tokio::time::timeout(budget, Box::pin(handle(home, j, m, &r.event))).await {
+            Ok(Ok(())) => {
+                j.remove("inbox_retry", &id).await?;
+                eprintln!("swap {}: retained {} message handled", r.swap_id, r.step);
+            }
+            Ok(Err(e))
+                if crate::backoff::unanswered(&e)
+                    && j.get::<Swap>("swap", &r.swap_id)
+                        .await?
+                        .is_some_and(|s| awaiting(&r.step, &s.role) == Some(s.state.as_str())) =>
+            {
+                pending = true;
+                eprintln!(
+                    "swap {}: retained {} message still waits for its mint: {e}",
+                    r.swap_id, r.step
+                );
+            }
+            Ok(Err(e)) => {
+                // A refusal, or the message was handled and a later step of the advance failed
+                // (that step is retried by the swap's own recovery).
+                j.remove("inbox_retry", &id).await?;
+                eprintln!("swap {}: retained {} message done: {e}", r.swap_id, r.step);
+            }
+            Err(_) => {
+                pending = true;
+                eprintln!(
+                    "swap {}: retained {} message timed out; kept",
+                    r.swap_id, r.step
+                );
+            }
+        }
+    }
+    Ok(pending)
 }
 async fn handle_message(home: &Path, j: &Journal, m: &Market, e: &Event) -> Result<()> {
     let msg = m.decode(e)?;
@@ -526,16 +701,19 @@ async fn handle_message(home: &Path, j: &Journal, m: &Market, e: &Event) -> Resu
                 let p: Proofs = serde_json::from_value(msg.body)?;
                 let c =
                     mint::conditions(&q.request.hash, &q.maker_key, &q.request.taker_key, q.long)?;
-                mint::validate(
-                    home,
-                    &q.lot.want.asset.mint_url,
-                    &p,
-                    q.lot.want.net,
-                    q.request.funding.gross,
-                    q.request.funding.claim_fee,
-                    &c,
-                    q.request.funding.ppk,
-                    q.request.funding.keyset,
+                with_scope(
+                    verification_scope(q, "first"),
+                    mint::validate(
+                        home,
+                        &q.lot.want.asset.mint_url,
+                        &p,
+                        q.lot.want.net,
+                        q.request.funding.gross,
+                        q.request.funding.claim_fee,
+                        &c,
+                        q.request.funding.ppk,
+                        q.request.funding.keyset,
+                    ),
                 )
                 .await?;
                 s.incoming = p;
@@ -547,16 +725,21 @@ async fn handle_message(home: &Path, j: &Journal, m: &Market, e: &Event) -> Resu
                 let p: Proofs = serde_json::from_value(msg.body)?;
                 let c =
                     mint::conditions(&q.request.hash, &q.request.taker_key, &q.maker_key, q.short)?;
-                mint::validate(
-                    home,
-                    &q.lot.give.asset.mint_url,
-                    &p,
-                    q.lot.give.net,
-                    q.give.gross,
-                    q.give.claim_fee,
-                    &c,
-                    q.give.ppk,
-                    q.give.keyset,
+                // The claim this check enables must be sent before `short - cutoff`: a silent
+                // `nostr://` mint gets claim rounds here, never a backoff past that margin.
+                with_scope(
+                    verification_scope(q, "second"),
+                    mint::validate(
+                        home,
+                        &q.lot.give.asset.mint_url,
+                        &p,
+                        q.lot.give.net,
+                        q.give.gross,
+                        q.give.claim_fee,
+                        &c,
+                        q.give.ppk,
+                        q.give.keyset,
+                    ),
                 )
                 .await?;
                 s.incoming = p;
@@ -942,6 +1125,13 @@ async fn recover_pass(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
             true
         }
     };
+    match replay_retained(home, j, m).await {
+        Ok(pending) => deferred |= pending,
+        Err(error) => {
+            deferred = true;
+            eprintln!("retained message replay deferred: {error}");
+        }
+    }
     let mut swaps = j.all::<Swap>("swap").await?;
     crate::backoff::order(&mut swaps, |s| &s.id);
     for mut s in swaps {
@@ -1098,7 +1288,13 @@ pub async fn run_with(
     let mut warned = crate::observe::Warned::default();
     loop {
         tokio::select! {e=m.inbox.recv()=>{if let Some(e)=e{match tokio::time::timeout(message_budget(j,m,&e).await, handle(home,j,m,&e)).await {
-            Ok(Ok(())) => {}, Ok(Err(err)) => eprintln!("trade message rejected: {err}"), Err(_) => eprintln!("trade message timed out; dropped; journal retained")
+            Ok(Ok(())) => {},
+            Ok(Err(err)) if retained(j, &e).await => eprintln!("trade message waits for its mint (no answer); retained, retried on the recovery tick: {err}"),
+            Ok(Err(err)) => eprintln!("trade message rejected: {err}"),
+            Err(_) => match retain_timed_out(j, m, &e).await {
+                Ok(true) => eprintln!("trade message timed out; retained, retried on the recovery tick"),
+                _ => eprintln!("trade message timed out; dropped; journal retained"),
+            }
         }}},
         Some(job) = async { match jobs.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => crate::serve::execute(home, j, m, job).await,
         _=tick.tick()=>{
@@ -1123,6 +1319,12 @@ pub async fn run_with(
             }
         }
     }
+}
+
+async fn retained(j: &Journal, e: &Event) -> bool {
+    j.get::<Retained>("inbox_retry", &e.id.to_hex())
+        .await
+        .is_ok_and(|r| r.is_some())
 }
 
 async fn validate_terms(home: &Path, leg: &Leg, t: &Terms) -> Result<()> {
@@ -1423,7 +1625,10 @@ async fn maker_refund(
         }
     }
     if s.preimage.is_none() {
-        match mint::witness(own_mint, &s.outgoing, &q.request.hash).await {
+        // The witness is how the maker learns the preimage it must claim with before `long`.
+        // On a `nostr://` own mint, poll it in claim rounds (this mint only; refunds keep backoff).
+        let scope = crate::transport::is_nostr(own_mint).then(|| (q.long, own_mint.to_owned()));
+        match with_scope(scope, mint::witness(own_mint, &s.outgoing, &q.request.hash)).await {
             Ok(Some(pre)) => {
                 s.preimage = Some(pre);
                 s.state = "claiming".into();
