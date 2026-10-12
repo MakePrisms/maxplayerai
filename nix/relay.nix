@@ -35,10 +35,11 @@ let
     BUZZ_BIND_ADDR = cfg.bindAddr;
     DATABASE_URL = "postgresql:///${cfg.database}?host=/run/postgresql&user=${cfg.user}";
 
-    # Schema: buzz applies its OWN, via the embedded sqlx migrator (sqlx::migrate!(migrations/), 24
-    # files 0001_initial_schema..0024) when this is enabled — main.rs gates db.migrate() on it. The
-    # migration set is the COMPLETE source of truth (git_* is 0002, the replica fence floor is 0021);
-    # schema/schema.sql is only the initial snapshot and is deliberately NOT applied. "1" = on.
+    # Schema: buzz applies its OWN, via the embedded sqlx migrator (migrations/: upstream's
+    # 0001..0060 plus Maxplayer's 100025..100026) when this is enabled — main.rs gates db.migrate()
+    # on it, before the relay binds. The migration set is the COMPLETE source of truth (git_* is
+    # 0002, the replica fence floor is 0021); schema/ is upstream's desired-state schema, read by
+    # tests and deliberately NOT applied. Upgrade notes: crates/buzz/README.md. "1" = on.
     BUZZ_AUTO_MIGRATE = "1";
     REDIS_URL = "redis://127.0.0.1:6379";
     RELAY_URL = cfg.relayUrl;

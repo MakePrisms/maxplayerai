@@ -5,85 +5,127 @@ The code under `crates/buzz/` is a vendored subset of the Buzz communications
 platform, copied so the maxplayerai project can own, build, and deploy the
 events + git + payments relay directly.
 
-    Upstream:  github.com/gudnuf/buzz  (a fork of github.com/block/buzz)
-    Branch:    sync/upstream-recarry-2026-07-24
-    Commit:    e18020a63
+    Upstream:  github.com/block/buzz
+    Branch:    main
+    Commit:    30873ba46b5e08602ae61a2a0592ecedd37f7289 (2026-10-11)
     License:   Apache-2.0 (see ./LICENSE)
+
+The previous copy came from the github.com/gudnuf/buzz fork (branch
+sync/upstream-recarry-2026-07-24, commit e18020a63, based on block/buzz
+3bd3a014c). This copy merges upstream into it, so that fork's open-relay
+changes (A below) and the Maxplayer changes (B) carry over.
 
 Buzz is Copyright the Buzz / Block authors, licensed under the Apache License,
 Version 2.0. maxplayerai is MIT-OR-Apache-2.0; vendoring Apache-2.0 code in is
-compatible. This NOTICE and the per-file notes below satisfy Apache-2.0 §4(b)
-("You must cause any modified files to carry prominent notices stating that You
-changed the files").
+compatible. This NOTICE satisfies Apache-2.0 §4(b) ("You must cause any
+modified files to carry prominent notices stating that You changed the
+files").
 
-MODIFICATIONS relative to the upstream branch above
----------------------------------------------------
-Every file under `crates/buzz/` is a byte-verbatim copy of the upstream source
-EXCEPT the four changes below. The layout mirrors the upstream repo root (its
-`crates/`, `migrations/`, `Dockerfile`, `LICENSE`) so `git diff` against
-block/buzz stays meaningful and upstream commits remain scannable/pullable.
+WHAT IS COPIED
+--------------
+From upstream, in its own layout so `git diff` against block/buzz stays
+meaningful: `Cargo.toml`, `Cargo.lock`, `Dockerfile`, `LICENSE`,
+`migrations/`, `schema/`, and the relay with every workspace crate it depends
+on: buzz-relay, buzz-audit, buzz-auth, buzz-conformance, buzz-core,
+buzz-datastore-tracing, buzz-db, buzz-deletion, buzz-media, buzz-pubsub,
+buzz-relay-mesh, buzz-sdk, buzz-search and buzz-workflow. Also three single
+files: `docs/nips/NIP-MP.fixtures.json` and
+`scripts/reconcile-schema-after-pgschema.sql`, which tests read, and
+`docs/thread-window-deployment.md`, which migration 0049 refers operators to.
 
-1. `Cargo.toml` — workspace `members` trimmed from the upstream ~27-crate set to
-   the 12-crate transitive `[dependencies]` closure of `buzz-relay`, so the
-   relay compiles standalone. `exclude = ["desktop/src-tauri"]` dropped (desktop
-   not vendored). No dependency versions or `[patch.crates-io]` entries changed.
+Maxplayer's own: `crates/maxplayer-private-protocol/` (MIT OR Apache-2.0),
+`NOTICE`, `README.md` and `.gitignore`.
 
-2. `rust-toolchain.toml` (upstream pins channel 1.95.0) intentionally NOT
-   vendored — maxplayerai supplies the Rust toolchain via nix. NOTE: the relay's
-   sqlx 0.9 requires rustc >= 1.94, which is newer than the maxplayerai nix
-   devShell default (nixos-25.11 -> 1.91.1); the build toolchain must provide
-   >= 1.94.
+Left behind (the relay does not build them): the AI-agent harness, push
+gateway, device pairing, desktop / mobile / web clients, CLIs, and the other
+upstream crates, scripts and docs.
 
-3. `crates/buzz-relay/src/handlers/ingest.rs` — two additions, each marked inline
-   with a comment:
-   (a) the kind superset from maxplayer-core (formerly attributed to the Mobee crate): `KIND_MOBEE_*` consts plus
-       `required_scope_for_kind` arms — the trade block 3401-3406, execution review kinds 3408/3409
-       (PR #1022), and the seller heartbeat 30340 -> `MessagesWrite`; the self-describing discovery/config
-       kinds (NIP-89 handler 31990, NIP-17 DM-relay list 10050) -> `UsersWrite`
-       (kind-0's class) — with the scope test rewritten to assert the mobee
-       numbers. The fork's original DVM arms (3400/5109/6109/7000) are untouched.
-   (b) the MakePrisms/maxplayerai #397 payment/DoS bound on NIP-17 events: the
-       gift wrap (1059) and the DM-relay list (10050) are capped at 128 KB of
-       content, and the gift wrap must additionally carry at least one `p` tag.
+MODIFICATIONS relative to block/buzz 30873ba46
+----------------------------------------------
+Every copied upstream file not named below is byte-verbatim. Paths under
+`crates/buzz-relay/src/` are shortened (`config.rs`, `api/git/transport.rs`).
 
-4. Git push tokens — the maxplayerai seller delivery path. A seller delivers a hired
-   job as a git push to the relay, authenticated with a NIP-98 (kind:27235) bearer
-   token. Two additions serve that path, each marked inline with a comment:
-   (a) `crates/buzz-relay/src/api/git/{transport.rs,hook.rs,policy.rs}` (PR #929) — a
-       push token MAY carry one `["ref", "<refname>"]` tag naming the single ref it may
-       write. `transport.rs` reads the FIRST such tag after signature verification, the
-       pre-receive hook carries it in its environment, its length-prefixed HMAC input,
-       and its callback body, and the policy endpoint denies the push (403) when any ref
-       update is not an EXACT match. A token with no `ref` tag keeps today's behaviour.
-   (b) `crates/buzz-auth/src/nip98.rs` plus `crates/buzz-relay/src/{config.rs,nip11.rs}`
-       and the transport call site — a scope-conditional freshness rule.
-       `verify_nip98_event_with_policy` grants a scoped token that also carries a NIP-40
-       `["expiration", <unix>]` tag a life up to
-       `BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS` (default 21600 s = 6 h), and rejects one
-       that asks for more. `verify_nip98_event` keeps the ±60 s window, so every caller
-       outside the git transport is unchanged. The effective cap is advertised in the
-       NIP-11 `limitation` object as `scoped_token_max_lifetime_secs`. The ref-name
-       validator moved from `policy.rs` to `buzz-auth` so one definition serves both the
-       freshness rule and the push-time enforcement. While the cap is non-zero the git
-       legs also refuse a `ref` tag that is not a valid ref name rather than reading it
-       as an absent scope.
+Build and layout
+- `Cargo.toml`: workspace `members` trimmed to the crates above plus
+  `crates/maxplayer-private-protocol`; `exclude = ["desktop/src-tauri"]`
+  dropped. Upstream's `[patch.crates-io]` entry pinning `sqlx-sqlite` to a
+  launchbadge/sqlx git revision (for MeshLLM, not vendored) is removed: it put
+  a second `sqlx-core 0.9.0` into the lock, which nixpkgs' fetchCargoVendor
+  cannot vendor, and the relay never builds sqlx-sqlite. No other dependency or
+  patch entry changed.
+- `Cargo.lock`: upstream's lock, pruned to this workspace. Every version is
+  upstream's except `sqlx-sqlite 0.9.0` and `libsqlite3-sys 0.37.0`, now from
+  crates.io (both unbuilt), and the added `maxplayer-private-protocol`.
+- `crates/buzz-relay/Cargo.toml`: depends on `maxplayer-private-protocol`.
+- `crates/buzz-db/src/runtime/migration.rs`: two upstream tests skip the paths
+  that are not vendored (`.github/workflows`, `crates/buzz-push-gateway`).
 
-5. Private job delivery foundations (default-off provisioning): Maxplayer-owned
-   `crates/maxplayer-private-protocol` shares closed v2 schemas with the client;
-   `buzz-db::private_jobs` and migration 0025 hold immutable tenant/buyer/job ACLs;
-   Git transport/policy/provisioning and announcement handling enforce those ACLs,
-   immutable refs and quotas. Buyers can prepare both targeted and open-pool repos
-   before publication; open-pool read access still requires selection, and publishing
-   freezes buyer inputs. Private repositories never emit public ref-state
-   announcements. See `docs/specs/private-offers-implementation.md` in the parent
-   Maxplayer repository for rollout status and remaining integration.
+A. Open-relay fork (gudnuf/buzz)
+- `BUZZ_OPEN_READ` (`config.rs`, `connection.rs`, `handlers/req.rs`,
+  `api/bridge.rs`): an unauthenticated WebSocket connection may read stored
+  history outside channels. It gets EOSE but no live subscription, an
+  `#h`-scoped request gets an empty history, and the NIP-42 auth timeout does
+  not close it. HTTP `/query` skips the relay-membership check; its
+  authentication and channel checks still apply. Writes still need auth.
+- `BUZZ_GIT_PUBLIC_READ` (off by default; `config.rs`, `api/bridge.rs`,
+  `api/git/transport.rs`): git reads skip the relay-membership check, and HTTP
+  `/query` serves repository events (kinds 30617/30618) to authenticated
+  non-members from a channel-less fetch.
+- `BUZZ_OPEN_INGEST` (off by default; `handlers/ingest.rs`): admit unknown
+  event kinds with the messages-write scope.
+- DVM job kinds 3400, 5109, 6109 and 7000 (`handlers/ingest.rs`).
+- Git upload-pack fails closed (HTTP 500) on a non-zero exit or empty output,
+  instead of a silent empty 200 (`api/git/transport.rs`).
 
-Vendored (the 12-crate relay build closure): buzz-relay, buzz-core,
-buzz-conformance, buzz-db, buzz-pubsub, buzz-auth, buzz-search, buzz-audit,
-buzz-workflow, buzz-media, buzz-sdk, buzz-relay-mesh.
+B. Maxplayer
+- Kinds (`handlers/ingest.rs`): the trade block 3401–3406, execution reviews
+  3408/3409 and the seller heartbeat 30340 need messages-write; the NIP-89
+  handler 31990 and the NIP-17 DM-relay list 10050 need users-write. Gift wraps
+  (1059) and DM-relay lists are capped at 128 KB of content, and a gift wrap
+  must carry a `p` tag (maxplayerai #397).
+- Branch-scoped push tokens (maxplayerai #929): a NIP-98 git token may carry
+  one `["ref", <refname>]` tag; the pre-receive policy then refuses any ref
+  update that does not name exactly that ref (`api/git/transport.rs`,
+  `api/git/hook.rs`, `api/git/policy.rs`). A scoped token with a NIP-40
+  expiration lives up to `BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS` (default 6 h);
+  unscoped tokens keep the ±60 s window (`crates/buzz-auth/src/nip98.rs`,
+  `crates/buzz-auth/src/lib.rs`, `config.rs`). NIP-11 advertises the cap as
+  `limitation.scoped_token_max_lifetime_secs` (`nip11.rs`).
+- Private job repositories: the shared wire schemas
+  (`crates/maxplayer-private-protocol/`), job ACLs
+  (`crates/buzz-db/src/private_jobs.rs`, `crates/buzz-db/src/lib.rs`),
+  provisioning and quotas (`api/git/private_jobs.rs`, `api/git/quota.rs`,
+  `api/git/mod.rs`), and enforcement in `api/git/transport.rs` and
+  `api/git/policy.rs`. A private repository never gets a relay-signed
+  ref-state event (kind 30618; `api/git/transport.rs`), and a public
+  announcement cannot use a private repository's id
+  (`handlers/side_effects.rs`). Settings:
+  `MAXPLAYER_PRIVATE_JOB_REPOS`, `MAXPLAYER_PRIVATE_SERVICE_PUBKEY`
+  (`config.rs`). Upload-pack output is spooled to a file rather than held in
+  memory. See `docs/specs/private-offers-implementation.md` in maxplayerai.
+- Incomplete history is never reported complete: a row that cannot be decoded
+  fails the query (`crates/buzz-db/src/store/event.rs`), and the REQ handler
+  then ends the subscription with `CLOSED` ("error: historical query
+  failed"), never EOSE (`handlers/req.rs`).
+- Tests: `api/git/private_jobs_http_tests.rs`,
+  `api/git/private_quota_cas_tests.rs`, `handlers/req_maxplayer_tests.rs`,
+  `crates/buzz-db/src/store/history_failure_tests.rs`, and a test helper in
+  `state.rs`.
 
-Left behind (not in the relay's build closure): the AI-agent harness (buzz-acp,
-buzz-agent, buzz-dev-mcp, buzz-persona), device pairing (buzz-pair-relay,
-buzz-pairing-cli), desktop / mobile / web clients, CLIs (buzz-cli, buzz-admin),
-buzz-push-gateway, buzz-test-client, buzz-ws-client, sprig, the git-*-nostr
-credential helpers, and examples/countdown-bot.
+C. This sync
+- Migrations: upstream's 0025 is `relay_invites`, so the private-job table
+  migration (formerly 0025) ships byte for byte as
+  `migrations/100025_private_job_repositories.sql`, and
+  `migrations/100026_private_job_repositories_write_fence.sql` attaches
+  upstream's community write fence to the table. Before migrating,
+  `crates/buzz-db/src/runtime/migration.rs` moves a database's version-25
+  record to 100025 when its stored checksum is that migration's; any other
+  version-25 record is left for sqlx to reject. Maxplayer migrations use
+  versions from 100000 up. The table joins the deletion catalog
+  (`crates/buzz-db/src/store/deletion.rs`) and the desired-state schema
+  (`schema/schema.sql`, `schema/tables/public/private_job_repositories.sql`,
+  `schema/triggers/private_job_repositories.sql`).
+- Upstream's git read gate (SEC-005) denies a repository not bound to a
+  channel. Maxplayer binds none, so those stay readable to every caller the git
+  auth admits; channel-bound repositories keep upstream's membership gate, and
+  private job repositories keep their job ACL (`api/git/transport.rs`).

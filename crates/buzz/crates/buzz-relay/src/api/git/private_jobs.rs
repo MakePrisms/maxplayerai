@@ -1,18 +1,19 @@
 //! Private-job repository provisioning and mandatory pre-hydration authorization.
 use crate::state::AppState;
 use axum::{
-    Json,
     body::Bytes,
     extract::{OriginalUri, Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
+    Json,
 };
 use base64::Engine;
 use buzz_core::TenantContext;
 use buzz_db::private_jobs::PrivateJobRepo;
 use maxplayer_private_protocol::{
-    is_hex, strict_json, MAX_FILE_BYTES, MAX_OBJECTS, MAX_REPO_BYTES,
+    is_hex, strict_json,
     wire::{self, HostPolicy},
+    MAX_FILE_BYTES, MAX_OBJECTS, MAX_REPO_BYTES,
 };
 use nostr::{Event, JsonUtil};
 use serde::Deserialize;
@@ -112,7 +113,7 @@ pub async fn provision(
     .await
     .map_err(|_| deny())?;
     let url = crate::api::bridge::nip98_expected_url(&state.config.relay_url, &tenant, uri.path());
-    let (pubkey, event_id) = crate::api::bridge::verify_bridge_auth_with_options(
+    let verified = crate::api::bridge::verify_bridge_auth_with_options(
         &headers,
         "PUT",
         &url,
@@ -121,6 +122,7 @@ pub async fn provision(
         true,
     )
     .map_err(IntoResponse::into_response)?;
+    let (pubkey, event_id) = (verified.pubkey, verified.event_id_bytes);
     let token = headers
         .get("authorization")
         .and_then(|h| h.to_str().ok())
@@ -153,6 +155,7 @@ pub async fn provision(
         tenant.community(),
         pubkey.as_bytes(),
         auth_tag,
+        verified.signed_created_at,
     )
     .await
     .map_err(|_| deny())?;
@@ -273,7 +276,7 @@ pub async fn enforce_quota(repo: &std::path::Path) -> Result<(), Response> {
 /// All smart-HTTP responses are authenticated. Never place packs, ref advertisements
 /// or even authorization errors in an intermediary cache shared with another key.
 pub async fn no_store(mut response: Response) -> Response {
-    use axum::http::{HeaderValue, header};
+    use axum::http::{header, HeaderValue};
     response.headers_mut().insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("private, no-store"),
@@ -284,23 +287,20 @@ pub async fn no_store(mut response: Response) -> Response {
     response
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::process::Command;
     fn git(path: &std::path::Path, args: &[&str]) {
-        assert!(
-            Command::new("git")
-                .current_dir(path)
-                .args(args)
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .output()
-                .unwrap()
-                .status
-                .success()
-        );
+        assert!(Command::new("git")
+            .current_dir(path)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap()
+            .status
+            .success());
     }
     fn repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
