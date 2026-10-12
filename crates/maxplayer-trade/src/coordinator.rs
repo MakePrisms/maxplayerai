@@ -373,6 +373,9 @@ pub async fn handle(home: &Path, j: &Journal, m: &Market, e: &Event) -> Result<(
                 ensure!(prior == digest, "conflicting request-id reuse");
             }
             j.put("inbox", &key, &digest).await?;
+            // Persist the authenticated event before removing the legacy marker, so a crash
+            // during the one-time reopening cannot lose the only replayable copy.
+            retain(j, e, &message).await?;
             j.remove("rejected", &key).await?;
         } else {
             anyhow::bail!("recorded rejection: {reason}");

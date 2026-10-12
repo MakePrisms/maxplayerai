@@ -2652,14 +2652,16 @@ async fn doctor_info_only_no_home_no_fallback_and_live_metadata() {
         1
     );
     assert!(!home.exists(), "doctor creates no home/seed/journal");
-    let requests = e.tap.requests.lock().unwrap();
-    assert_eq!(
-        requests.len(),
-        1,
-        "exactly one logical request, no extra probes"
-    );
-    assert!(requests.values().all(|r| r.op == "info" && r.count == 1));
-    drop(requests);
+    {
+        let requests = e.tap.requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "exactly one logical request, no extra probes"
+        );
+        assert!(requests.values().all(|r| r.op == "info" && r.count == 1));
+    }
+
     let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
         .args([
             "doctor",

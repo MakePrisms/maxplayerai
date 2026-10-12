@@ -187,7 +187,7 @@ async fn preflight_impl(
     );
     eprintln!(
         "{}",
-        serde_json::json!({"mint":mint,"version":info["version"],"nut07":true,"nut07_witnesses":"unverified: requires a known spent HTLC; advertisement is not emission evidence","nut14":true,"clock_skew_seconds":now.abs_diff(time)})
+        serde_json::json!({"mint":mint,"version":compatibility["version"],"nut07":true,"nut07_witnesses":"unverified: requires a known spent HTLC; advertisement is not emission evidence","nut14":true,"clock_skew_seconds":now.abs_diff(time)})
     );
     Ok(keysets)
 }
