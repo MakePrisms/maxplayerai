@@ -1,0 +1,33 @@
+{
+  "name": "after",
+  "url": "http://127.0.0.1:8791/samples/redesign/after/",
+  "viewport": "desktop",
+  "engine": "axe-core 4.11.4",
+  "tags": [
+    "wcag2a",
+    "wcag2aa",
+    "wcag21a",
+    "wcag21aa",
+    "wcag22aa"
+  ],
+  "generatedAt": "2026-09-09T04:10:04.038Z",
+  "loadProof": {
+    "title": "Invoices — Meridian",
+    "elements": 103,
+    "textLength": 1045,
+    "stylesheets": 3,
+    "url": "http://127.0.0.1:8791/samples/redesign/after/",
+    "rulesConsidered": 62,
+    "httpStatus": 200
+  },
+  "counts": {
+    "violations": 0,
+    "passes": 29,
+    "incomplete": 0,
+    "inapplicable": 33,
+    "rulesConsidered": 62,
+    "nodesFlagged": 0
+  },
+  "violations": [],
+  "incompleteIds": []
+}

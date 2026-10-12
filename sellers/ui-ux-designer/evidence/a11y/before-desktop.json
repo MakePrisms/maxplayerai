@@ -1,0 +1,93 @@
+{
+  "name": "before",
+  "url": "http://127.0.0.1:8791/samples/redesign/before/",
+  "viewport": "desktop",
+  "engine": "axe-core 4.11.4",
+  "tags": [
+    "wcag2a",
+    "wcag2aa",
+    "wcag21a",
+    "wcag21aa",
+    "wcag22aa"
+  ],
+  "generatedAt": "2026-09-09T04:10:03.063Z",
+  "loadProof": {
+    "title": "Meridian",
+    "elements": 70,
+    "textLength": 698,
+    "stylesheets": 2,
+    "url": "http://127.0.0.1:8791/samples/redesign/before/",
+    "rulesConsidered": 64,
+    "httpStatus": 200
+  },
+  "counts": {
+    "violations": 4,
+    "passes": 13,
+    "incomplete": 0,
+    "inapplicable": 47,
+    "rulesConsidered": 64,
+    "nodesFlagged": 37
+  },
+  "violations": [
+    {
+      "id": "button-name",
+      "impact": "critical",
+      "help": "Buttons must have discernible text",
+      "helpUrl": "https://dequeuniversity.com/rules/axe/4.11/button-name?application=playwright",
+      "tags": [
+        "wcag2a",
+        "wcag412"
+      ],
+      "nodeCount": 1,
+      "sampleTargets": [
+        ".icobtn"
+      ]
+    },
+    {
+      "id": "color-contrast",
+      "impact": "serious",
+      "help": "Elements must meet minimum color contrast ratio thresholds",
+      "helpUrl": "https://dequeuniversity.com/rules/axe/4.11/color-contrast?application=playwright",
+      "tags": [
+        "wcag2aa",
+        "wcag143"
+      ],
+      "nodeCount": 34,
+      "sampleTargets": [
+        "a:nth-child(1)",
+        "a:nth-child(2)",
+        "a:nth-child(3)",
+        "a:nth-child(4)"
+      ]
+    },
+    {
+      "id": "html-has-lang",
+      "impact": "serious",
+      "help": "<html> element must have a lang attribute",
+      "helpUrl": "https://dequeuniversity.com/rules/axe/4.11/html-has-lang?application=playwright",
+      "tags": [
+        "wcag2a",
+        "wcag311"
+      ],
+      "nodeCount": 1,
+      "sampleTargets": [
+        "html"
+      ]
+    },
+    {
+      "id": "image-alt",
+      "impact": "critical",
+      "help": "Images must have alternative text",
+      "helpUrl": "https://dequeuniversity.com/rules/axe/4.11/image-alt?application=playwright",
+      "tags": [
+        "wcag2a",
+        "wcag111"
+      ],
+      "nodeCount": 1,
+      "sampleTargets": [
+        "img"
+      ]
+    }
+  ],
+  "incompleteIds": []
+}

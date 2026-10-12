@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Authored for this package. Plainsong mark: four staff lines and a rising figure, drawn on the
+     4px grid, in accent-600 / ink-900 / ink-300 from tokens.json. No third-party artwork. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="240" height="96" viewBox="0 0 240 96" role="img"
+     aria-labelledby="mark-title">
+  <title id="mark-title">Plainsong</title>
+  <rect width="240" height="96" fill="#FFFFFF"/>
+  <g stroke="#868F9C" stroke-width="2">
+    <line x1="16" y1="24" x2="224" y2="24"/>
+    <line x1="16" y1="40" x2="224" y2="40"/>
+    <line x1="16" y1="56" x2="224" y2="56"/>
+    <line x1="16" y1="72" x2="224" y2="72"/>
+  </g>
+  <g fill="#1F5FD0">
+    <circle cx="40" cy="72" r="8"/>
+    <circle cx="76" cy="56" r="8"/>
+    <circle cx="112" cy="40" r="8"/>
+  </g>
+  <circle cx="148" cy="24" r="8" fill="#17499E"/>
+  <path d="M40 72 L76 56 L112 40 L148 24" fill="none" stroke="#14181D" stroke-width="4"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="176" y="16" width="48" height="16" rx="4" fill="#E4EDFC"/>
+  <rect x="176" y="40" width="32" height="16" rx="4" fill="#E4EDFC"/>
+  <rect x="176" y="64" width="40" height="16" rx="4" fill="#E4EDFC"/>
+</svg>
