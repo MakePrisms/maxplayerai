@@ -465,6 +465,13 @@ async fn control_relay(mode: &'static str) -> (String, tokio::task::JoinHandle<(
     let task = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        if mode == "auth_failed" {
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                json!(["AUTH", "loopback-challenge"]).to_string().into(),
+            ))
+            .await
+            .unwrap();
+        }
         while let Some(Ok(message)) = ws.next().await {
             let Ok(text) = message.to_text() else {
                 continue;
@@ -479,6 +486,7 @@ async fn control_relay(mode: &'static str) -> (String, tokio::task::JoinHandle<(
                     "notice" => vec![json!(["NOTICE", "secret\u{001b}[31m"])],
                     _ => vec![json!(["EOSE", v[1]])],
                 },
+                Some("AUTH") => vec![json!(["OK", v[1]["id"], false, "restricted: secret"])],
                 Some("EVENT") => match mode {
                     "refused" => vec![json!([
                         "OK",
@@ -523,6 +531,7 @@ async fn diagnostics_control_frames_require_event_and_subscription_correlation()
         "unrelated_closed",
         "notice",
         "disconnect",
+        "auth_failed",
     ] {
         let (url, task) = control_relay(mode).await;
         let mint = MintUrl::from_str(&format!(
@@ -559,6 +568,9 @@ async fn diagnostics_control_frames_require_event_and_subscription_correlation()
             "unrelated CLOSED must not poison this subscription"
         );
         assert_eq!(r.notice, mode == "notice");
+        if mode == "auth_failed" {
+            assert_eq!(r.auth, "failed");
+        }
         assert!(!serde_json::to_string(&obs).unwrap().contains("secret"));
         assert!(
             !result.unwrap_err().is_definitive_failure(),

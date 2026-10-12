@@ -285,7 +285,12 @@ async fn nostr_call(
         crate::backoff::record(mint, crate::backoff::Outcome::Failed(crate::backoff::Reason::Timeout, None));
         crate::backoff::NoAnswer(format!("mint {mint} {path}: unanswered within the nostr bound; acceptance unknown. Check relay/operator; retain submitted operations and use status/recover"))
     })?;
-    if observation.reply_ms.is_some() {
+    if observation.reply_ms.is_some()
+        && !result
+            .as_ref()
+            .err()
+            .is_some_and(crate::backoff::cdk_unanswered)
+    {
         crate::backoff::record(mint, crate::backoff::Outcome::Answered);
     }
     // Reachability and retry policy are independent: a signed rate-limit answer still paces.
@@ -293,7 +298,7 @@ async fn nostr_call(
         crate::backoff::record_cdk(mint, e);
     }
     if path == "info" {
-        eprintln!("{}", serde_json::to_string(&observation)?);
+        crate::diagnostics::emit(serde_json::to_string(&observation)?);
     }
     let message = observation.message();
     result.map_err(|e| match nostr_refusal(e) {

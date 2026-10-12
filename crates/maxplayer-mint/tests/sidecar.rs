@@ -1341,3 +1341,43 @@ async fn credits_first_https_hop_child() {
     assert_eq!(held(&retry, &credit), 5);
     assert_eq!(gate.spent(), spent, "no second budget charge");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_info_overlay_survives_restart_preserving_metadata_and_keyset() {
+    let mut h = harness(1, 1000).await;
+    let keyset = active_keyset(&h.mint);
+    let mut stored = h.mint.mint_info().await.unwrap();
+    stored.name = Some("operator configured name".into());
+    stored.version = None;
+    h.mint.set_mint_info(stored).await.unwrap();
+    for restart in [false, true] {
+        if restart {
+            h.restart().await;
+        }
+        let mut raw = h.raw().await;
+        let (_, event) = raw.request(
+            if restart {
+                "after-restart"
+            } else {
+                "before-restart"
+            },
+            op::INFO,
+            Value::Null,
+            exp(),
+        );
+        let response = raw.call(&event).await;
+        let info = ok(&response);
+        assert_eq!(info["name"], "operator configured name");
+        assert_eq!(
+            info["version"],
+            format!("maxplayer-mint/{}", env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            info["maxplayer_mint"]["build"],
+            env!("MAXPLAYER_MINT_BUILD")
+        );
+        assert_eq!(info["maxplayer_mint"]["durable_replay"], true);
+        assert_eq!(active_keyset(&h.mint), keyset);
+        let _: cdk::nuts::MintInfo = serde_json::from_value(info.clone()).unwrap();
+    }
+}

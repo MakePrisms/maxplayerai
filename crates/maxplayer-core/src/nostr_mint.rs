@@ -150,7 +150,7 @@ pub fn build_wallet_with_relays(
 }
 
 /// Payload-free evidence for one request. Acceptance never establishes execution outcome.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 pub struct RequestObservation {
     pub mint: String,
     pub op: String,
@@ -161,6 +161,7 @@ pub struct RequestObservation {
     pub reply_ms: Option<u64>,
     pub reply_relay: Option<String>,
     pub outcome: String,
+    pub reachability: &'static str,
     pub nut_code: Option<u16>,
     /// Exact authenticated body for trusted callers; never serialize or display arbitrary detail.
     #[serde(skip)]
@@ -172,6 +173,8 @@ pub struct RequestObservation {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RelayEvidence {
     pub connected: bool,
+    pub ever_connected: bool,
+    pub publish_failed: bool,
     pub acceptance: &'static str,
     pub refused: bool,
     pub auth: &'static str,
@@ -179,7 +182,13 @@ pub struct RelayEvidence {
     pub notice: bool,
 }
 impl Default for RelayEvidence {
-    fn default() -> Self { Self { connected: false, acceptance: "unknown", refused: false, auth: "unknown", closed: false, notice: false } }
+    fn default() -> Self { Self { connected: false, ever_connected: false, publish_failed: false, acceptance: "unknown", refused: false, auth: "unknown", closed: false, notice: false } }
+}
+impl std::fmt::Debug for RequestObservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // ErrorBody details are retained for trusted callers, never for diagnostics/logs.
+        write!(f, "{}", serde_json::to_string(self).map_err(|_| std::fmt::Error)?)
+    }
 }
 impl RequestObservation {
     pub fn message(&self) -> String {
@@ -214,6 +223,7 @@ pub struct NostrMintConnector {
     window: Duration,
     resend_every: Duration,
     connect_timeout: Duration,
+    last_observation: Arc<std::sync::Mutex<Option<RequestObservation>>>,
 }
 
 impl NostrMintConnector {
@@ -236,6 +246,7 @@ impl NostrMintConnector {
             window: DEFAULT_WINDOW,
             resend_every: DEFAULT_RESEND_EVERY,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            last_observation: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -250,6 +261,11 @@ impl NostrMintConnector {
         self.resend_every = resend_every;
         self.connect_timeout = connect;
         self
+    }
+
+    /// Bounded diagnostic side-channel for CDK users; this is never a financial result.
+    pub fn last_observation(&self) -> Option<RequestObservation> {
+        self.last_observation.lock().ok().and_then(|v| v.clone())
     }
 
     /// The mint's Nostr public key (the npub in its URL).
@@ -275,12 +291,20 @@ impl NostrMintConnector {
         let mut observation = RequestObservation {
             mint: self.mint_url.to_string(), op: operation.into(), checked_at: unix_now_ms() / 1000,
             elapsed_ms: 0, budget_ms: self.window.as_millis() as u64, attempts: 0,
-            reply_ms: None, reply_relay: None, outcome: "unanswered".into(), nut_code: None, mint_error: None,
+            reply_ms: None, reply_relay: None, outcome: "unanswered".into(), reachability: "unanswered", nut_code: None, mint_error: None,
             envelope_version: None, evidence_lost: false,
             relays: self.relays.iter().map(|r| (r.trim_end_matches('/').to_owned(), RelayEvidence::default())).collect(),
         };
         let result = self.call_evidenced(operation, body, &mut observation, start).await;
         observation.elapsed_ms = start.elapsed().as_millis() as u64;
+        observation.reachability = if observation.reply_ms.is_some() { "answered" }
+            else if observation.relays.values().any(|r| r.auth == "failed") { "auth_failed" }
+            else if observation.relays.values().any(|r| r.closed) { "subscription_closed" }
+            else if observation.relays.values().any(|r| r.acceptance == "accepted") { "unanswered" }
+            else if observation.relays.values().any(|r| r.refused) { "relay_refused" }
+            else if !observation.relays.values().any(|r| r.ever_connected) { "relay_unreachable" }
+            else { "acceptance_unknown" };
+        if let Ok(mut last) = self.last_observation.lock() { *last = Some(observation.clone()); }
         (result, observation)
     }
 
@@ -337,7 +361,9 @@ impl NostrMintConnector {
             .values()
             .any(|relay| relay.is_connected());
         for (url, relay) in client.relays().await {
-            observation.relays.entry(url.to_string().trim_end_matches('/').to_owned()).or_default().connected = relay.is_connected();
+            let evidence = observation.relays.entry(url.to_string().trim_end_matches('/').to_owned()).or_default();
+            evidence.connected = relay.is_connected();
+            evidence.ever_connected |= evidence.connected;
         }
         if !connected {
             disconnect(&client).await;
@@ -369,7 +395,10 @@ impl NostrMintConnector {
                         Ok(RelayNotification::Authenticated) => observation.relays.entry(url.clone()).or_default().auth = "authenticated",
                         Ok(RelayNotification::AuthenticationFailed) => observation.relays.entry(url.clone()).or_default().auth = "failed",
                         Ok(RelayNotification::RelayStatus { status }) => {
-                            observation.relays.entry(url.clone()).or_default().connected = status == nostr_sdk::prelude::RelayStatus::Connected;
+                            let evidence = observation.relays.entry(url.clone()).or_default();
+                            evidence.connected = status == nostr_sdk::prelude::RelayStatus::Connected;
+                            evidence.ever_connected |= evidence.connected;
+                            if !evidence.connected && evidence.auth == "authenticated" { evidence.auth = "unknown"; }
                         }
                         Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => observation.evidence_lost = true,
                         Err(_) => break,
@@ -387,6 +416,9 @@ impl NostrMintConnector {
                     if let Ok(output) = result {
                         for url in output.success {
                             observation.relays.entry(url.to_string().trim_end_matches('/').to_owned()).or_default().acceptance = "accepted";
+                        }
+                        for url in output.failed.keys() {
+                            observation.relays.entry(url.to_string().trim_end_matches('/').to_owned()).or_default().publish_failed = true;
                         }
                         // Failure text is untrusted and is never reflected. Raw matching OK=false
                         // below proves refusal; an SDK failure alone does not.

@@ -89,6 +89,8 @@ struct Tap {
     /// live outages: no answer at all, relays up). Counted in `silenced`.
     silent: AtomicBool,
     silenced: AtomicU64,
+    info_mode: AtomicU64,
+    rewritten: Mutex<HashSet<EventId>>,
 }
 impl Tap {
     async fn admit(&self, event: &Event, mint_relay: bool) -> PolicyResult {
@@ -181,6 +183,57 @@ impl Tap {
                 .tags
                 .event_ids()
                 .find_map(|id| self.requests.lock().unwrap().get(id).map(|s| s.op.clone()));
+            let mode = self.info_mode.load(SeqCst);
+            if op.as_deref() == Some("info")
+                && mode > 0
+                && !self.rewritten.lock().unwrap().remove(&event.id)
+            {
+                let mint = self
+                    .mints
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|k| k.public_key() == event.pubkey)
+                    .cloned()
+                    .unwrap();
+                let peer = event.tags.public_keys().next().unwrap();
+                let plain = nip44::decrypt(mint.secret_key(), peer, &event.content).unwrap();
+                let mut response: serde_json::Value = serde_json::from_str(&plain).unwrap();
+                match mode {
+                    1 => response["ok"]["maxplayer_mint"]["holder_ops"]
+                        .as_array_mut()
+                        .unwrap()
+                        .retain(|v| v != "restore"),
+                    2 => {
+                        response["ok"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("maxplayer_mint");
+                        response["ok"]["version"] = serde_json::Value::Null;
+                    }
+                    3 => response["v"] = 2.into(),
+                    4 => {
+                        response.as_object_mut().unwrap().remove("ok");
+                        response["err"] = serde_json::json!({"code":"internal","detail":"private payload must not echo"});
+                    }
+                    _ => unreachable!(),
+                }
+                let content = nip44::encrypt(
+                    mint.secret_key(),
+                    peer,
+                    response.to_string(),
+                    nip44::Version::V2,
+                )
+                .unwrap();
+                let changed = EventBuilder::new(Kind::Custom(RESPONSE_KIND), content)
+                    .tags(event.tags.iter().cloned())
+                    .sign_with_keys(&mint)
+                    .unwrap();
+                self.rewritten.lock().unwrap().insert(changed.id);
+                let relay = self.relay.lock().unwrap().clone().unwrap();
+                tokio::spawn(republish(changed, relay, 0));
+                return PolicyResult::Reject("tap: replaced info fixture".into());
+            }
             let delay = {
                 let mut d = self.delay_op_reply.lock().unwrap();
                 match d.as_mut() {
@@ -2430,6 +2483,69 @@ async fn initial_unanswered_request_survives_restart_and_legacy_retry() {
     let msg = e.mm.decode(&row.event).unwrap();
     let key = format!("{}_{}", row.event.pubkey, msg.request_id);
     let digest = hex::encode(Sha256::digest(serde_json::to_vec(&msg).unwrap()));
+    // Persisted expiry is checked BEFORE attempting any work or creating a rejection.
+    let mut expired = msg.clone();
+    expired.request_id = uuid::Uuid::new_v4().to_string();
+    expired.swap_id = uuid::Uuid::new_v4().to_string();
+    expired.exp = coordinator::now().saturating_sub(1);
+    let expired_event = sealed_trade(&e, &expired);
+    let expired_key = format!("{}_{}", expired_event.pubkey, expired.request_id);
+    let expired_digest = hex::encode(Sha256::digest(serde_json::to_vec(&expired).unwrap()));
+    e.jm.put("inbox", &expired_key, &expired_digest)
+        .await
+        .unwrap();
+    e.jm.put(
+        "inbox_retry",
+        &expired_event.id.to_hex(),
+        &coordinator::Retained {
+            event: expired_event.clone(),
+            swap_id: expired.swap_id.clone(),
+            step: "request".into(),
+            since: row.since,
+        },
+    )
+    .await
+    .unwrap();
+    coordinator::recover(&e.maker, &e.jm, &e.mm).await.unwrap();
+    assert!(
+        e.jm.get::<coordinator::Retained>("inbox_retry", &expired_event.id.to_hex())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        e.jm.get::<(String, String)>("rejected", &expired_key)
+            .await
+            .unwrap()
+            .is_none(),
+        "expired retry is discarded without re-handling"
+    );
+    assert_eq!(retained_rows(&e.jm).await, 1);
+    // Genuine admission errors remain permanent, even during a mint outage.
+    let mut bad = msg.clone();
+    bad.request_id = uuid::Uuid::new_v4().to_string();
+    bad.swap_id = uuid::Uuid::new_v4().to_string();
+    bad.body["max_give"] = 0.into();
+    let bad_event = sealed_trade(&e, &bad);
+    let bad_key = format!("{}_{}", bad_event.pubkey, bad.request_id);
+    assert!(
+        coordinator::handle(&e.maker, &e.jm, &e.mm, &bad_event)
+            .await
+            .is_err()
+    );
+    assert!(
+        e.jm.get::<(String, String)>("rejected", &bad_key)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        coordinator::handle(&e.maker, &e.jm, &e.mm, &bad_event)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("recorded rejection")
+    );
     // Recreate a pre-upgrade rejection. Its digest remains binding after reopening.
     e.jm.put(
         "rejected",
@@ -2573,4 +2689,302 @@ async fn doctor_info_only_no_home_no_fallback_and_live_metadata() {
         n.mint.mint_info().await.unwrap().name.as_deref(),
         Some("operator preserved")
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn doctor_signed_error_incompatibility_unknown_and_slow_are_distinct() {
+    let e = env().await;
+    let n = e.nostr_mint().await;
+    for (mode, exit, compatibility) in [
+        (1, 1, "incompatible"),
+        (2, 0, "unknown"),
+        (3, 1, ""),
+        (4, 2, ""),
+    ] {
+        e.tap.info_mode.store(mode, SeqCst);
+        let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
+            .args([
+                "doctor",
+                &n.url,
+                "--mint-relay",
+                &e.mint_relay_url,
+                "--json",
+                "--timeout-seconds",
+                "3",
+            ])
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(exit),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report["observation"]["reachability"], "answered");
+        if !compatibility.is_empty() {
+            assert_eq!(report["compatibility"]["status"], compatibility);
+        }
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("private payload"));
+    }
+    e.tap.info_mode.store(0, SeqCst);
+    e.tap.delay_replies_ms.store(8000, SeqCst);
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
+        .args([
+            "doctor",
+            &n.url,
+            "--mint-relay",
+            &e.mint_relay_url,
+            "--json",
+            "--timeout-seconds",
+            "12",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["latency"], "slow");
+    assert!(report["observation"]["reply_ms"].as_u64().unwrap() >= 8000);
+    n.task.abort();
+    e.tap.delay_replies_ms.store(0, SeqCst);
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
+        .args([
+            "doctor",
+            &n.url,
+            "--mint-relay",
+            &e.mint_relay_url,
+            "--json",
+            "--timeout-seconds",
+            "1",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["observation"]["reachability"], "unanswered");
+    assert_eq!(
+        report["latency"], "unknown",
+        "ACK-only is never healthy/slow-but-answering"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn incompatible_counterparty_blocks_cli_and_ipc_before_new_effects() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let e = env().await;
+    let n1 = e.nostr_mint().await;
+    let n2 = e.nostr_mint().await;
+    e.fund_nostr(&e.maker, &n1, 128).await;
+    e.fund_nostr(&e.taker, &n2, 128).await;
+    let lot = e.list(&n1.url, 32, &n2.url, 24).await;
+    e.tap.info_mode.store(1, SeqCst);
+    e.tap.reset();
+    let (code, _, err) = cli(
+        &e,
+        &e.taker,
+        &[
+            "--relay",
+            &e._market_url,
+            "take",
+            &lot,
+            "--max-give",
+            "40",
+            "--min-receive",
+            "32",
+        ],
+    )
+    .await;
+    assert_eq!(code, 1);
+    assert!(err.contains("upgrade the mint sidecar"), "{err}");
+    assert!(e.jt.all::<Swap>("swap").await.unwrap().is_empty());
+    assert!(e.tap.swaps().is_empty());
+    assert!(!rows(&e.taker, &n2.url).await.1, "no reservation");
+
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(e.taker.join("owner.lock"))
+        .unwrap();
+    fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+    let mut jobs = maxplayer_trade::serve::bind(&e.taker, vec![e._market_url.clone()]).unwrap();
+    let request = maxplayer_trade::serve::Request {
+        v: 1,
+        relays: vec![e._market_url.clone()],
+        command: maxplayer_trade::serve::Command::Take {
+            lot: lot.clone(),
+            max_give: 40,
+            min_receive: 32,
+            max_fees: 16,
+        },
+    };
+    let client = async {
+        let mut stream = tokio::net::UnixStream::connect(e.taker.join("serve.sock"))
+            .await
+            .unwrap();
+        stream
+            .write_all(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes())
+            .await
+            .unwrap();
+        let mut lines = BufReader::new(stream).lines();
+        let mut diagnostics = Vec::new();
+        while let Some(line) = lines.next_line().await.unwrap() {
+            match serde_json::from_str::<maxplayer_trade::serve::Reply>(&line).unwrap() {
+                maxplayer_trade::serve::Reply::Stderr(line) => diagnostics.push(line),
+                maxplayer_trade::serve::Reply::Exit { code, error } => {
+                    assert_eq!(code, 1);
+                    assert!(error.unwrap().contains("upgrade the mint sidecar"));
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            diagnostics
+                .iter()
+                .any(|l| l.contains(&n1.url) && l.contains("incompatible"))
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|l| l.contains(&n2.url) && l.contains("incompatible")),
+            "both reports forwarded, even on refusal"
+        );
+    };
+    let server = async {
+        maxplayer_trade::serve::execute(&e.taker, &e.jt, &e.mt, jobs.recv().await.unwrap()).await;
+    };
+    tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(client, server);
+    })
+    .await
+    .unwrap();
+    assert!(e.jt.all::<Swap>("swap").await.unwrap().is_empty());
+    assert!(e.tap.swaps().is_empty());
+}
+
+#[cfg(feature = "lab")]
+fn sealed_trade(e: &Env, message: &maxplayer_trade::market::Envelope) -> Event {
+    let content = nip44::encrypt(
+        e.mt.keys.secret_key(),
+        &e.mm.keys.public_key(),
+        serde_json::to_string(message).unwrap(),
+        nip44::Version::V2,
+    )
+    .unwrap();
+    EventBuilder::new(Kind::Custom(TRADE), content)
+        .tags([
+            Tag::public_key(e.mm.keys.public_key()),
+            Tag::hashtag("maxplayer"),
+            Tag::parse(["v", "1"]).unwrap(),
+        ])
+        .sign_with_keys(&e.mt.keys)
+        .unwrap()
+}
+
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn initial_unanswered_queue_is_bounded_and_rechecks_lot_availability() {
+    let mut e = env().await;
+    let _lab = SilentLab::new();
+    let a = MintFixture::start(0).await;
+    let n = e.nostr_mint().await;
+    e.fund_nostr(&e.maker.clone(), &n, 128).await;
+    support::fund(&e.taker, &a.url, 128).await;
+    let lot = e.list(&n.url, 32, &a.url, 24).await;
+    let id = e.take(&lot, 40, 32).await;
+    e.tap.silent.store(true, SeqCst);
+    for _ in 0..20 {
+        e.step(true).await;
+        if retained_rows(&e.jm).await > 0 {
+            break;
+        }
+    }
+    assert_eq!(retained_rows(&e.jm).await, 1);
+    let row =
+        e.jm.all::<coordinator::Retained>("inbox_retry")
+            .await
+            .unwrap()
+            .remove(0);
+    let original = e.mm.decode(&row.event).unwrap();
+    let mut listing =
+        e.jm.get::<coordinator::Listing>("listing", &lot)
+            .await
+            .unwrap()
+            .unwrap();
+    listing.cancelled = true;
+    e.jm.put("listing", &lot, &listing).await.unwrap();
+    coordinator::recover(&e.maker, &e.jm, &e.mm).await.unwrap();
+    assert_eq!(
+        retained_rows(&e.jm).await,
+        0,
+        "a lot no longer available cannot be revived"
+    );
+    assert!(e.jm.get::<Swap>("swap", &id).await.unwrap().is_none());
+    listing.cancelled = false;
+    e.jm.put("listing", &lot, &listing).await.unwrap();
+    // One peer is limited to four persisted retries; global limit is 64, across peers.
+    for i in 0..65 {
+        let mut msg = original.clone();
+        msg.request_id = uuid::Uuid::new_v4().to_string();
+        msg.swap_id = uuid::Uuid::new_v4().to_string();
+        let signer = if i < 5 {
+            e.mt.keys.clone()
+        } else {
+            Keys::generate()
+        };
+        let content = nip44::encrypt(
+            signer.secret_key(),
+            &e.mm.keys.public_key(),
+            serde_json::to_string(&msg).unwrap(),
+            nip44::Version::V2,
+        )
+        .unwrap();
+        let event = EventBuilder::new(Kind::Custom(TRADE), content)
+            .tags([
+                Tag::public_key(e.mm.keys.public_key()),
+                Tag::hashtag("maxplayer"),
+                Tag::parse(["v", "1"]).unwrap(),
+            ])
+            .sign_with_keys(&signer)
+            .unwrap();
+        let result = coordinator::handle(&e.maker, &e.jm, &e.mm, &event).await;
+        assert!(result.is_err());
+        if i == 4 {
+            assert_eq!(retained_rows(&e.jm).await, 4, "per-peer bound");
+        }
+    }
+    assert_eq!(retained_rows(&e.jm).await, 64);
+    let mut extra = original.clone();
+    extra.request_id = uuid::Uuid::new_v4().to_string();
+    extra.swap_id = uuid::Uuid::new_v4().to_string();
+    let signer = Keys::generate();
+    let content = nip44::encrypt(
+        signer.secret_key(),
+        &e.mm.keys.public_key(),
+        serde_json::to_string(&extra).unwrap(),
+        nip44::Version::V2,
+    )
+    .unwrap();
+    let event = EventBuilder::new(Kind::Custom(TRADE), content)
+        .tags([
+            Tag::public_key(e.mm.keys.public_key()),
+            Tag::hashtag("maxplayer"),
+            Tag::parse(["v", "1"]).unwrap(),
+        ])
+        .sign_with_keys(&signer)
+        .unwrap();
+    let error = coordinator::handle(&e.maker, &e.jm, &e.mm, &event)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("queue full"));
+    assert_eq!(retained_rows(&e.jm).await, 64);
+    assert!(e.jm.all::<Swap>("swap").await.unwrap().is_empty());
 }

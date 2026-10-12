@@ -720,3 +720,5 @@ pub mod report;
 pub mod serve;
 
 pub mod compatibility;
+
+pub mod diagnostics;

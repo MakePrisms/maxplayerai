@@ -155,6 +155,7 @@ fn timing(l: &Lot) -> Result<(u64, u64, u64, u64)> {
     Ok((LONG_SECONDS, SHORT_SECONDS, CLAIM_CUTOFF_SECONDS, 60))
 }
 async fn preflight(l: &Lot) -> Result<()> {
+    crate::diagnostics::notice();
     for a in [&l.give.asset, &l.want.asset] {
         a.fence()?;
     }
@@ -394,7 +395,8 @@ pub async fn handle(home: &Path, j: &Journal, m: &Market, e: &Event) -> Result<(
 // Narrow legacy compatibility bridge, authorized for recorded unanswered/timeout errors only.
 // Never match arbitrary occurrences of "timeout" in peer-provided terms or mint details.
 fn legacy_unanswered(reason: &str) -> bool {
-    reason == "no answer within the CDK wallet bound"
+    reason == "Operation timeout"
+        || reason == "no answer within the CDK wallet bound"
         || reason.starts_with("mint ")
             && (reason.ends_with("Operation timeout (no mint NUT error; ambiguous)")
                 || reason.ends_with("no answer within the nostr bound (ambiguous)")
@@ -1848,5 +1850,31 @@ mod budget_tests {
         let e = nostr_timing_fits(2811, SHORT_SECONDS, CLAIM_CUTOFF_SECONDS).unwrap_err();
         assert!(e.to_string().contains("refused"), "{e}");
         nostr_timing_fits(2812, SHORT_SECONDS, CLAIM_CUTOFF_SECONDS).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod initial_retry_tests {
+    use super::*;
+    #[test]
+    fn legacy_timeout_bridge_never_reopens_genuine_refusals() {
+        for text in [
+            "mint nostr://example keysets: Operation timeout (no mint NUT error; ambiguous)",
+            "mint https://example keysets: timed out",
+            "no answer within the CDK wallet bound",
+        ] {
+            assert!(legacy_unanswered(text), "{text}");
+        }
+        for text in [
+            "no funds",
+            "caps",
+            "fee terms",
+            "conflicting request-id reuse",
+            "mint example swap: NUT 50000 timeout",
+            "timeout",
+            "bad terms timeout",
+        ] {
+            assert!(!legacy_unanswered(text), "{text}");
+        }
     }
 }

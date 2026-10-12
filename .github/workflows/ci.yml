@@ -224,7 +224,14 @@ jobs:
       # Keep the live job_lifecycle pre-publish fee-floor check enabled here (#720).
       # The payment_wallet worker-send tests now run offline with plain `wallet`;
       # their keyset fixture no longer depends on testnut's HTTP availability.
+      # PR verification is loopback-only: publishing a diagnostic fix must not probe a real
+      # mint or interfere with a concurrently running operator experiment. Main retains the
+      # existing explicit live-mint gate. All offline money-path assertions run in both.
+      - name: Test maxplayer-core (money-path suite, PR loopback-only)
+        if: github.event_name == 'pull_request'
+        run: cargo test -p maxplayer-core --release --no-default-features --features gateway,git-delivery,wallet --locked
       - name: Test maxplayer-core (money-path suite)
+        if: github.event_name != 'pull_request'
         run: cargo test -p maxplayer-core --release --no-default-features --features gateway,git-delivery,wallet,live-mints --locked
 
   # The seller-credits mint sidecar (docs/specs/seller-credits.md stage 2). It is its OWN cargo

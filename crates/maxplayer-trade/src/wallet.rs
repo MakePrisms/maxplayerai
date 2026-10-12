@@ -103,9 +103,8 @@ async fn preflight_impl(
         Ok(info) => info,
         Err(error) => {
             if admission {
-                eprintln!(
-                    "{}",
-                    serde_json::json!({"mint":mint,"op":"info","reachability":if crate::backoff::deferred(&error) {"not_checked_backoff"} else {"unsuccessful"},"elapsed_ms":started.elapsed().as_millis(),"compatibility":"not_checked"})
+                crate::diagnostics::emit(
+                    serde_json::json!({"mint":mint,"op":"info","reachability":if crate::backoff::deferred(&error) {"not_checked_backoff"} else {"unsuccessful"},"elapsed_ms":started.elapsed().as_millis(),"compatibility":"not_checked"}),
                 );
             }
             return Err(error);
@@ -114,9 +113,8 @@ async fn preflight_impl(
     let elapsed = started.elapsed().as_millis();
     let compatibility = crate::compatibility::assess(&info);
     if admission {
-        eprintln!(
-            "{}",
-            serde_json::json!({"mint":mint,"op":"info","reachability":"answered","elapsed_ms":elapsed,"latency":if elapsed > 5000 {"slow (warning threshold 5s)"} else {"normal"},"compatibility":compatibility})
+        crate::diagnostics::emit(
+            serde_json::json!({"mint":mint,"op":"info","reachability":"answered","elapsed_ms":elapsed,"latency":if elapsed > 5000 {"slow (warning threshold 5s)"} else {"normal"},"compatibility":compatibility}),
         );
         ensure!(
             compatibility["status"] != "incompatible",
