@@ -2590,7 +2590,7 @@ dependencies = [
 
 [[package]]
 name = "maxplayer-chat"
-version = "0.6.1-rc8"
+version = "0.6.1-rc9"
 dependencies = [
  "futures-util",
  "libc",
