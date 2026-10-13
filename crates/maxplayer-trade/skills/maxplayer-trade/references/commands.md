@@ -106,8 +106,8 @@ confirm that the incoming B claim fee fits the cap; do not blindly use 3 across
 unequal-fee mints. A larger cap needs the human’s approval, not an automatic retry.
 Never round a spend ceiling upward or a minimum receipt downward.
 
-Automatic preflight before funding, listing, taking, and withdrawal requires
-NUT-07/09/11/12/14 support, an active sat keyset, and clock skew at most 60 seconds.
+Automatic preflight before funding, listing, taking, sending and withdrawal requires
+a reachable mint, NUT-07/09/11/12/14 support, an active sat keyset, and clock skew at most 60 seconds.
 Funding additionally requires enabled NUT-04 bolt11/sat and NUT-20; withdrawal
 requires enabled NUT-05 bolt11/sat. The explicit `preflight <mint>` checks the
 common trading capabilities. Diagnostic preflight output goes to stderr. No opt-in is required;
