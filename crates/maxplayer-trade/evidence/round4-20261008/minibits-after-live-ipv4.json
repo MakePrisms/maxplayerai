@@ -1,0 +1,6 @@
+{
+  "at": "2026-10-08T16:28:17.498036+00:00",
+  "ipv4": true,
+  "exit": 7,
+  "error": "curl: (7) Failed to connect to mint.minibits.cash port 443 after 94 ms: Couldn't connect to server"
+}

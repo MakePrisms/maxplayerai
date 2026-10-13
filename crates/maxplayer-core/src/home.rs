@@ -43,6 +43,7 @@
 //! | `seller_heartbeat.interval_secs` | `MAXPLAYER_SELLER_HEARTBEAT__INTERVAL_SECS` |
 //! | `seller_preflight.boot_push_preflight` | `MAXPLAYER_SELLER_PREFLIGHT__BOOT_PUSH_PREFLIGHT` |
 //! | `platform_fee.auto_remit` | `MAXPLAYER_PLATFORM_FEE__AUTO_REMIT` |
+//! | `buyer.blocked_sellers` | `MAXPLAYER_BUYER__BLOCKED_SELLERS` (comma-separated) |
 //! | `buyer.hop_fee_buffer_multiplier` | `MAXPLAYER_BUYER__HOP_FEE_BUFFER_MULTIPLIER` |
 //! | `contribution.allowed_paths` (list) | `MAXPLAYER_CONTRIBUTION__ALLOWED_PATHS=…` |
 //!
@@ -1652,7 +1653,7 @@ pub struct AgentPresetConfig {
     pub argv: Vec<String>,
 }
 
-/// `[buyer]` hop planner knobs.
+/// `[buyer]` new-award policy and hop planner knobs.
 ///
 /// The fee-buffer multiplier is applied at hop **plan time** to the record's authorized cost
 /// (quoted cost + multiplier × the source mint's own melt fee reserve). Recovery still compares
@@ -1662,6 +1663,14 @@ pub struct AgentPresetConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BuyerConfig {
+    /// Seller public identities excluded from NEW awards, including this buyer's own seller.
+    /// Canonical lowercase 64-character hex; existing awards/recovery remain binding.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_blocked_sellers"
+    )]
+    pub blocked_sellers: Vec<String>,
     /// Multiplier on the source mint's melt fee reserve, added to the hop record's authorized
     /// cost at plan time. Default **2**. **0** restores exact quoted-cost authorization.
     #[serde(default = "default_hop_fee_buffer_multiplier")]
@@ -1671,6 +1680,7 @@ pub struct BuyerConfig {
 impl Default for BuyerConfig {
     fn default() -> Self {
         Self {
+            blocked_sellers: Vec::new(),
             hop_fee_buffer_multiplier: default_hop_fee_buffer_multiplier(),
         }
     }
@@ -1682,6 +1692,24 @@ impl BuyerConfig {
     fn is_default(&self) -> bool {
         *self == Self::default()
     }
+}
+
+/// Validate at deserialization so both file and environment config layers fail closed.
+fn deserialize_blocked_sellers<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    let sellers = Vec::<String>::deserialize(deserializer)?;
+    for (index, seller) in sellers.iter().enumerate() {
+        let valid = buyer_pubkey_is_wire_shaped(seller);
+        #[cfg(feature = "gateway")]
+        let valid = valid && buyer_pubkey_is_reachable(seller);
+        if !valid {
+            return Err(serde::de::Error::custom(format!(
+                "buyer.blocked_sellers[{index}] must be a seller public key in canonical lowercase 64-character hex (not a name, npub, or secret key)"
+            )));
+        }
+    }
+    Ok(sellers)
 }
 
 /// serde default for [`BuyerConfig::hop_fee_buffer_multiplier`] — 2× the mint's melt fee reserve.
@@ -1805,7 +1833,7 @@ pub struct MaxplayerConfig {
     /// Defaults (feature OFF) when absent.
     #[serde(default, skip_serializing_if = "BuyerReservationFloorConfig::is_default")]
     pub buyer_reservation_floor: BuyerReservationFloorConfig,
-    /// `[buyer]` hop planner knobs. Defaults (fee-buffer multiplier 2) when absent.
+    /// `[buyer]` new-award policy and hop planner knobs. Defaults (fee-buffer multiplier 2) when absent.
     #[serde(default, skip_serializing_if = "BuyerConfig::is_default")]
     pub buyer: BuyerConfig,
     /// Optional buyer-side contribution content policy (the content-policy hook). Absent
@@ -2241,6 +2269,7 @@ const RESERVED_ENV_VARS: &[&str] = &[
 /// resolved (lowercase, `.`-nested) config path. `agents.<name>.argv` is intentionally absent: the
 /// map keys are dynamic and cannot be pre-registered, so multi-token agent argv is file-only.
 const LIST_ENV_KEYS: &[&str] = &[
+    "buyer.blocked_sellers",
     "accepted_mints",
     "extra_mints",
     "seller.agent_command",
@@ -3859,6 +3888,58 @@ mod tests {
         );
         assert_eq!(seller_cfg.rate_sats, 3);
         assert_eq!(seller_cfg.git_remote, "https://relay.example/git/x/y.git");
+    }
+
+    #[test]
+    fn blocked_sellers_validate_file_and_environment_layers() {
+        let seller = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let config =
+            parse_config_toml(&format!("[buyer]\nblocked_sellers = [\"{seller}\"]\n")).unwrap();
+        assert_eq!(config.buyer.blocked_sellers, vec![seller]);
+        assert_eq!(
+            apply_env_layer(&config, HashMap::new())
+                .unwrap()
+                .buyer
+                .blocked_sellers,
+            vec![seller]
+        );
+        let mut env = HashMap::new();
+        env.insert(
+            "MAXPLAYER_BUYER__BLOCKED_SELLERS".into(),
+            format!("{seller},{seller}"),
+        );
+        assert_eq!(
+            apply_env_layer(&MaxplayerConfig::default(), env)
+                .unwrap()
+                .buyer
+                .blocked_sellers,
+            vec![seller, seller]
+        );
+        let mut env = HashMap::new();
+        env.insert(
+            "MAXPLAYER_BUYER__BLOCKED_SELLERS".into(),
+            "not-an-identity".into(),
+        );
+        assert!(
+            apply_env_layer(&config, env)
+                .unwrap_err()
+                .to_string()
+                .contains("buyer.blocked_sellers")
+        );
+        assert!(
+            parse_config_toml("[buyer]\nblocked_sellers = []")
+                .unwrap()
+                .buyer
+                .blocked_sellers
+                .is_empty()
+        );
+        assert!(
+            parse_config_toml("")
+                .unwrap()
+                .buyer
+                .blocked_sellers
+                .is_empty()
+        );
     }
 
     #[test]

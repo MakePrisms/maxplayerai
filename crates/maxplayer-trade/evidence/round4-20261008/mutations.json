@@ -1,0 +1,23 @@
+[
+  {
+    "mutation": "publish",
+    "test": "r4_missing_quote_ack_cannot_authorize_maker_lock",
+    "mutant_exit": 101,
+    "assertion": "SAFETY: missing ACK must not advance maker money state",
+    "restored_exit": 0
+  },
+  {
+    "mutation": "withdraw",
+    "test": "melt_restore_failure_keeps_change_until_reopen",
+    "mutant_exit": 101,
+    "assertion": "SAFETY: restore failure must not mark done",
+    "restored_exit": 0
+  },
+  {
+    "mutation": "fence",
+    "test": "cli_requires_both_exact_url_and_environment",
+    "mutant_exit": 101,
+    "assertion": "SAFETY: real mint requires BOTH exact URL and environment opt-in",
+    "restored_exit": 0
+  }
+]

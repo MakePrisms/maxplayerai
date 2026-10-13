@@ -694,6 +694,7 @@ mod tests {
             publish_refused: None,
         };
         let neutral = AwardFilters {
+            blocked_sellers: &[],
             offer_amount_sats: 10,
             max_sats: 10,
             buyer_mint: DEFAULT_MINT_URL,

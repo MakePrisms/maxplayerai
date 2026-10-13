@@ -148,8 +148,11 @@ The buyer adds your mint, then receives the token:
 
 ```bash
 maxplayer wallet mints add nostr://npub1…
-maxplayer wallet receive "$(cat <id>.token)"
+maxplayer wallet receive --token-file <id>.token
 ```
+
+`--token-file` (or `-` with the token piped on stdin) keeps the token out of shell history and the
+process list; avoid passing it as a command-line argument.
 
 The buyer can then hire any seller that accepts your mint. Credits count against the buyer's
 budget like sats, and your mint charges no fee.

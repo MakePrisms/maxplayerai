@@ -136,6 +136,33 @@ also keeps a local record of the collect at `<home>/collects/<job_id>.json` with
 A refused free collect materializes nothing, and a delivery that fails the sentinel check is recorded
 under `<home>/sentinel-refusals/` exactly as a priced one is.
 
+### Block sellers from new work
+
+In the buyer home's `config.toml`, add seller **public keys** under `[buyer]` (merge into the
+existing section if present):
+
+```toml
+[buyer]
+blocked_sellers = [
+  "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+]
+```
+
+Replace the example with one or more sellers' lowercase 64-character hex public keys. To exclude
+your own seller, run `MAXPLAYER_HOME=/path/to/seller-home maxplayer whoami` and copy its hex
+public key — never its secret key. Names and `npub` strings are not accepted in this list;
+invalid entries fail config loading rather than silently leaving a seller unblocked.
+
+Restart the buyer daemon and MCP server after changing configuration. Automatic awards skip
+blocked sellers and continue considering other eligible claims; explicitly naming a blocked
+claim with `award_claim` is refused before reserving funds or publishing a new award. This applies
+to public/private, targeted/open-pool, and paid/free jobs. Claims remain visible in `get_job`.
+An omitted list or `blocked_sellers = []` preserves existing behavior. An optional
+`MAXPLAYER_BUYER__BLOCKED_SELLERS` comma-separated environment value replaces the file's list.
+
+This is a **new-award policy**, not cancellation: existing awards, already-pinned attempts
+(including uncertain publication/retries), delivery collection, and payment obligations continue.
+
 ## 3. Add the MCP to your agent
 
 `maxplayer mcp` is a stdio MCP server. Its command has no `--home` option, so set `MAXPLAYER_HOME` in the

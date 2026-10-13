@@ -32,6 +32,8 @@ use crate::gateway::PaymentMode;
 /// carries the payable terms + accepted mints, and the claim's `agents` tag carries the
 /// harnesses the seller can run.
 pub struct AwardFilters<'a> {
+    /// Buyer-local policy for new awards; never applied to pinned award recovery.
+    pub blocked_sellers: &'a [String],
     /// The offer's signed amount — authority for the price. A claim whose `creq` quotes a
     /// different amount can never be accepted (the accept gate requires exact equality), so it
     /// cannot be paid and is skipped.
@@ -91,16 +93,18 @@ pub struct AwardFilters<'a> {
 /// have. There is now nothing to drift from, which is why this is a constructor rather than a
 /// stronger test.
 ///
-/// Everything filterable comes from the OFFER; only the money context is passed in, because the
-/// buyer's mint and its real-mint policy are properties of the buyer rather than of the job.
+/// Job requirements come from the OFFER; money context and the seller blocklist come from
+/// the buyer configuration. Neither can be overridden by manual award parameters.
 pub fn award_filters_for_offer<'a>(
     offer: &'a OfferView,
     max_sats: u64,
     buyer_mint: &'a str,
     allow_real_mints: bool,
     balances: &'a [crate::wallet_ops::MintBalance],
+    blocked_sellers: &'a [String],
 ) -> AwardFilters<'a> {
     AwardFilters {
+        blocked_sellers,
         offer_amount_sats: offer.amount_sats,
         max_sats,
         buyer_mint,
@@ -125,6 +129,7 @@ pub fn select_awardable_claim(view: &JobView, filters: &AwardFilters) -> Option<
         .iter()
         .find(|claim| {
             claim.live
+                && !filters.blocked_sellers.contains(&claim.seller_pubkey)
                 && claim_serves_requested_agent(&claim.agents, filters.requested_agent)
                 && claim_meets_capability_request(&claim.capability, filters).is_ok()
                 && claim_is_settleable(claim.payment_mode, &view.job_id, claim.creq.as_deref(), filters)
@@ -445,6 +450,7 @@ pub fn unsatisfiable_capability_request(
     // only the request axes. Zeroes rather than plausible amounts, so nothing here can be mistaken
     // for a price this function decides anything about.
     let filters = AwardFilters {
+        blocked_sellers: &[],
         offer_amount_sats: 0,
         max_sats: 0,
         buyer_mint: "",
@@ -570,6 +576,8 @@ pub fn claim_serves_requested_agent(claim_agents: &[String], requested: Option<&
 /// otherwise `max_sats` and mint/price compatibility would be dead input on the manual path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NamedAwardRefused {
+    /// The buyer explicitly excludes this seller from new work.
+    BlockedSeller { seller_pubkey: String },
     /// The offer price exceeds the buyer's `max_sats` ceiling for this award.
     OverMax { offer_amount_sats: u64, max_sats: u64 },
     /// No claim with that id is on the relay for this job.
@@ -598,6 +606,9 @@ pub enum NamedAwardRefused {
 impl std::fmt::Display for NamedAwardRefused {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::BlockedSeller { seller_pubkey } => write!(
+                formatter, "award refused: seller {seller_pubkey} is blocked by buyer.blocked_sellers"
+            ),
             Self::OverMax { offer_amount_sats, max_sats } => write!(
                 formatter,
                 "award refused: offer price {offer_amount_sats} sat exceeds max_sats {max_sats}"
@@ -652,6 +663,9 @@ pub fn named_claim_awardable(
         .iter()
         .find(|claim| claim.claim_id == claim_id)
         .ok_or_else(|| NamedAwardRefused::NotFound { claim_id: claim_id.to_owned() })?;
+    if filters.blocked_sellers.contains(&claim.seller_pubkey) {
+        return Err(NamedAwardRefused::BlockedSeller { seller_pubkey: claim.seller_pubkey.clone() });
+    }
     if !claim.live {
         return Err(NamedAwardRefused::NotLive { claim_id: claim_id.to_owned() });
     }
@@ -1820,6 +1834,7 @@ mod tests {
 
     fn filters<'a>(offer_amount: u64, max_sats: u64) -> AwardFilters<'a> {
         AwardFilters {
+            blocked_sellers: &[],
             payment_mode: crate::gateway::PaymentMode::Sat,
             offer_amount_sats: offer_amount,
             max_sats,
@@ -1907,6 +1922,48 @@ mod tests {
             Err(NamedAwardRefused::NotLive { .. })
         ));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn blocked_sellers_skip_newest_and_allow_older_paid_and_free_claims() {
+        for free in [false, true] {
+            let amount = if free { 0 } else { 10 };
+            let mut allowed = claim("job", true, amount, &[DEFAULT_MINT_URL.into()]);
+            if free {
+                allowed.payment_mode = PaymentMode::None;
+                allowed.creq = None;
+            }
+            let mut blocked = allowed.clone();
+            blocked.claim_id = "d".repeat(64);
+            blocked.seller_pubkey = "e".repeat(64);
+            blocked.created_at = allowed.created_at + 1;
+            // A second blocked identity proves this is a list, not a single-seller switch.
+            let blocked_sellers = vec!["f".repeat(64), blocked.seller_pubkey.clone()];
+            let view = view_with("job", amount, vec![blocked.clone(), allowed.clone()]);
+            let mut filters = filters(amount, 100);
+            filters.payment_mode = allowed.payment_mode;
+            assert_eq!(
+                select_awardable_claim(&view, &filters),
+                Some(blocked.claim_id.clone())
+            );
+            filters.blocked_sellers = &blocked_sellers;
+            assert_eq!(
+                select_awardable_claim(&view, &filters),
+                Some(allowed.claim_id.clone())
+            );
+            assert_eq!(
+                named_claim_awardable(&view, &allowed.claim_id, &filters),
+                Ok(())
+            );
+            assert_eq!(
+                named_claim_awardable(&view, &blocked.claim_id, &filters),
+                Err(NamedAwardRefused::BlockedSeller {
+                    seller_pubkey: blocked.seller_pubkey.clone()
+                })
+            );
+            let all_blocked = view_with("job", amount, vec![blocked]);
+            assert_eq!(select_awardable_claim(&all_blocked, &filters), None);
+        }
     }
 
     #[test]
@@ -4343,7 +4400,7 @@ mod tests {
     /// predicate, and the fix in both cases is to call the real thing rather than to test the copy
     /// harder.
     fn filters_from_offer<'a>(offer: &'a OfferView, max_sats: u64) -> AwardFilters<'a> {
-        award_filters_for_offer(offer, max_sats, DEFAULT_MINT_URL, false, &[])
+        award_filters_for_offer(offer, max_sats, DEFAULT_MINT_URL, false, &[], &[])
     }
 
     // THE ACCEPTANCE TEST FOR #897, both axes through BOTH selection entry points.
@@ -5030,7 +5087,7 @@ mod free_lane_tests {
     /// path that reached `plan_payment` with these would refuse, so a free award that succeeds here
     /// has provably not touched one.
     fn walletless_filters(offer: &OfferView) -> AwardFilters<'_> {
-        award_filters_for_offer(offer, 0, "", false, &[])
+        award_filters_for_offer(offer, 0, "", false, &[], &[])
     }
 
     /// PROPERTY 1 — THE BOTH-ENDS RULE, at the award. All four combinations, in one test so no
@@ -5071,7 +5128,7 @@ mod free_lane_tests {
         assert_eq!(
             select_awardable_claim(
                 &view(priced.clone(), claim_view(PaymentMode::None, None)),
-                &award_filters_for_offer(&priced, 21, MINT, false, &[])
+                &award_filters_for_offer(&priced, 21, MINT, false, &[], &[])
             ),
             None,
             "offer=absent / claim=none must REFUSE: a seller cannot make a priced job free"
@@ -5085,7 +5142,7 @@ mod free_lane_tests {
                     priced.clone(),
                     claim_view(PaymentMode::Sat, Some(paid_creq))
                 ),
-                &award_filters_for_offer(&priced, 21, MINT, false, &[])
+                &award_filters_for_offer(&priced, 21, MINT, false, &[], &[])
             )
             .as_deref(),
             Some("c".repeat(64).as_str()),

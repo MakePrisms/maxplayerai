@@ -1,0 +1,10 @@
+{
+  "real-list.log": {
+    "https://mint.macadamia.cash": "cdk-mintd/0.18.1",
+    "https://cashu.cz": "Nutshell/0.21.0"
+  },
+  "fake-forward-list.log": {
+    "https://testnut.cashudevkit.org": "cdk-mintd/0.18.0",
+    "https://testnut.cashu.space": "cdk-mintd/0.17.0-rc.3"
+  }
+}
