@@ -33,6 +33,8 @@ pub(crate) enum Verdict {
     Eose,
     /// Refused, with the full reason string (prefix included).
     Closed(String),
+    /// Never answered: the test withheld the relay's EOSE for a kind this REQ asked for.
+    Withheld,
 }
 
 /// One `REQ` as the relay saw it.
@@ -57,6 +59,8 @@ pub(crate) struct ReqRecord {
 /// what a publish path put here, so the fixture that used to reply OK and DROP the event now keeps it.
 #[derive(Debug, Clone)]
 pub(crate) struct PublishedEvent {
+    /// The event id. A retried publication must arrive with the same one.
+    pub id: String,
     pub kind: u64,
     /// The event's tags, as they arrived. Kept because "advertised" is not only a claim about which
     /// kinds reached the wire but about what they SAID: the #747 terminal beat is an ordinary
@@ -107,11 +111,35 @@ struct Controls {
     /// When set, the relay answers each AUTH with `OK false`, and the socket stays
     /// unauthenticated. The deployed relay sends no second challenge after that.
     refuse_auth: std::sync::atomic::AtomicBool,
+    /// EVENT kinds the relay records but never answers with `OK` — a relay that stopped
+    /// acknowledging publications, which is what a stuck outbox drain waits on.
+    withheld_ok_kinds: std::sync::Mutex<Vec<u64>>,
+    /// REQ kinds the relay never answers with `EOSE` (nor `CLOSED`) — an incomplete history read,
+    /// or a liveness probe the relay no longer serves.
+    withheld_eose_kinds: std::sync::Mutex<Vec<u64>>,
 }
 
 impl Controls {
     fn auth_refused(&self) -> bool {
         self.refuse_auth.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn ok_withheld(&self, kind: Option<u64>) -> bool {
+        kind.is_some_and(|kind| {
+            self.withheld_ok_kinds
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .contains(&kind)
+        })
+    }
+
+    fn eose_withheld(&self, filters: &[&Value]) -> bool {
+        let withheld = self
+            .withheld_eose_kinds
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        !withheld.is_empty() && !asks_no_gated_kind(filters, &withheld)
     }
 }
 
@@ -237,6 +265,26 @@ impl PGateRelay {
 
     pub(crate) fn url(&self) -> String {
         self.url.clone()
+    }
+
+    /// Record, but never acknowledge, EVENTs of these kinds from now on. An empty list restores
+    /// normal `OK`s.
+    pub(crate) fn withhold_ok_for(&self, kinds: &[u64]) {
+        *self
+            .controls
+            .withheld_ok_kinds
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = kinds.to_vec();
+    }
+
+    /// Never answer (no `EOSE`, no `CLOSED`) a REQ asking for any of these kinds, from now on. An
+    /// empty list restores normal answers.
+    pub(crate) fn withhold_eose_for(&self, kinds: &[u64]) {
+        *self
+            .controls
+            .withheld_eose_kinds
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = kinds.to_vec();
     }
 
     /// Answer every later AUTH with `OK false`.
@@ -400,7 +448,8 @@ async fn serve_connection(
                 let id = event.get("id").and_then(Value::as_str).unwrap_or_default();
                 // Record what was published, by kind, BEFORE the OK: what reaches the wire is exactly
                 // the property the pre-advertise gate is asserted against (#357).
-                if let Some(kind) = event.get("kind").and_then(Value::as_u64) {
+                let kind = event.get("kind").and_then(Value::as_u64);
+                if let Some(kind) = kind {
                     let tags = event
                         .get("tags")
                         .and_then(Value::as_array)
@@ -416,7 +465,14 @@ async fn serve_connection(
                                 .collect()
                         })
                         .unwrap_or_default();
-                    events.lock().await.push(PublishedEvent { kind, tags });
+                    events.lock().await.push(PublishedEvent {
+                        id: id.to_owned(),
+                        kind,
+                        tags,
+                    });
+                }
+                if controls.ok_withheld(kind) {
+                    continue;
                 }
                 send(&writer, json!(["OK", id, true, ""])).await?;
             }
@@ -452,15 +508,19 @@ async fn serve_connection(
                     .as_ref()
                     .is_some_and(|gated| asks_no_gated_kind(&filters, gated));
 
-                let verdict = decide(
-                    &subscription_id,
-                    &pinned,
-                    authed_pubkey.as_deref(),
-                    stale,
-                    open_read_ungated,
-                    &controls,
-                )
-                .await;
+                let verdict = if controls.eose_withheld(&filters) {
+                    Verdict::Withheld
+                } else {
+                    decide(
+                        &subscription_id,
+                        &pinned,
+                        authed_pubkey.as_deref(),
+                        stale,
+                        open_read_ungated,
+                        &controls,
+                    )
+                    .await
+                };
 
                 transcript.lock().await.push(ReqRecord {
                     subscription_id: subscription_id.clone(),
@@ -481,6 +541,7 @@ async fn serve_connection(
                     Verdict::Closed(reason) => {
                         send(&writer, json!(["CLOSED", subscription_id, reason])).await?;
                     }
+                    Verdict::Withheld => {}
                 }
             }
             _ => {}

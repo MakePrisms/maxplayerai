@@ -163,7 +163,13 @@ impl AuthenticatedContentRelay {
 
     /// Fetch a complete interval, including author self-copies. The Message lane is
     /// deliberate: RelayNotification::Event suppresses events sent by this client.
-    async fn window(&self, recipient: PublicKey, start: u64, end: u64) -> Result<Vec<Event>> {
+    async fn window(
+        &self,
+        recipient: PublicKey,
+        start: u64,
+        end: u64,
+        timeout: Duration,
+    ) -> Result<Vec<Event>> {
         let id = SubscriptionId::generate();
         let filter = Filter::new()
             .kind(Kind::GiftWrap)
@@ -177,7 +183,7 @@ impl AuthenticatedContentRelay {
             .await
             .map_err(|_| Error("content subscription failed"))?;
         let result = tokio::time::timeout(
-            IO_TIMEOUT,
+            timeout,
             collect_window(&mut notifications, &id, recipient, start, end),
         )
         .await
@@ -198,7 +204,7 @@ impl AuthenticatedContentRelay {
         keys: &Keys,
         through: u64,
     ) -> Result<usize> {
-        self.backfill_using(db, keys.public_key(), through, |event| async move {
+        self.backfill_using(db, keys.public_key(), through, None, |event| async move {
             super::transport::unwrap_content(keys, &event).await
         })
         .await
@@ -209,9 +215,22 @@ impl AuthenticatedContentRelay {
         signer: &crate::seller_node::signer::SignerHandle,
         through: u64,
     ) -> Result<usize> {
+        self.backfill_actor_within(db, signer, through, None).await
+    }
+    /// [`Self::backfill_actor`] bounded as a WHOLE by `deadline`, not only per query interval: no
+    /// interval starts once it has passed, and the one in flight gets only the time left. Running
+    /// out of time is an error, never a short success — the cursor keeps only the intervals that
+    /// completed, so the next call resumes where this one stopped.
+    pub async fn backfill_actor_within(
+        &self,
+        db: &mut ContentStore,
+        signer: &crate::seller_node::signer::SignerHandle,
+        through: u64,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<usize> {
         let recipient = PublicKey::from_hex(signer.public_key_hex())
             .map_err(|_| Error("invalid content recipient"))?;
-        self.backfill_using(db, recipient, through, |event| async move {
+        self.backfill_using(db, recipient, through, deadline, |event| async move {
             signer
                 .unwrap_private_content(event)
                 .await
@@ -224,6 +243,7 @@ impl AuthenticatedContentRelay {
         db: &mut ContentStore,
         recipient_key: PublicKey,
         through: u64,
+        deadline: Option<tokio::time::Instant>,
         unwrap: F,
     ) -> Result<usize>
     where
@@ -242,7 +262,15 @@ impl AuthenticatedContentRelay {
             let Some((start, end)) = ranges.pop() else {
                 break;
             };
-            let events = self.window(recipient_key, start, end).await?;
+            let timeout = match deadline {
+                None => IO_TIMEOUT,
+                Some(deadline) => deadline
+                    .checked_duration_since(tokio::time::Instant::now())
+                    .filter(|remaining| !remaining.is_zero())
+                    .ok_or(Error("content backfill budget exhausted"))?
+                    .min(IO_TIMEOUT),
+            };
+            let events = self.window(recipient_key, start, end, timeout).await?;
             if events.len() == WINDOW_LIMIT {
                 if start == end {
                     return Err(Error("content backfill timestamp saturated"));
@@ -542,8 +570,25 @@ pub async fn flush_actor<S: ContentSender>(
     sender: &mut S,
     limit: usize,
 ) -> Result<FlushReport> {
+    flush_actor_within(db, signer, sender, limit, None).await
+}
+
+/// [`flush_actor`] bounded as a WHOLE by `deadline` (each phase still keeps its own
+/// [`IO_TIMEOUT`]). Copies and carriers the pass does not reach stay pending, exactly as a failed
+/// send leaves them, and rotate ahead of the ones it attempted.
+pub async fn flush_actor_within<S: ContentSender>(
+    db: &mut ContentStore,
+    signer: &crate::seller_node::signer::SignerHandle,
+    sender: &mut S,
+    limit: usize,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<FlushReport> {
+    let phase_deadline = || {
+        let phase = tokio::time::Instant::now() + IO_TIMEOUT;
+        deadline.map_or(phase, |overall| phase.min(overall))
+    };
     let mut report = FlushReport::default();
-    let deadline = tokio::time::Instant::now() + IO_TIMEOUT;
+    let deadline = phase_deadline();
     for copy in db.pending(signer.public_key_hex(), limit.min(64))? {
         let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()).filter(|remaining| !remaining.is_zero()) else {
             report.pending += 1;
@@ -569,7 +614,7 @@ pub async fn flush_actor<S: ContentSender>(
             report.pending += 1;
         }
     }
-    let deadline = tokio::time::Instant::now() + IO_TIMEOUT;
+    let deadline = phase_deadline();
     for event in db.pending_carriers(signer.public_key_hex(), limit.min(64))? {
         let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()).filter(|remaining| !remaining.is_zero()) else {
             report.pending += 1;

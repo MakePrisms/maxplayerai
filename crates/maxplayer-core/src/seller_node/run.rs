@@ -56,7 +56,8 @@ use crate::seller_exec::{
 use crate::seller_roster::{ExecutionFailure, Fault, LiveRoster, MissingCapability, Unavailable};
 use crate::seller_git::{self, DeliveryAgentIdentity};
 
-use super::outbox::drain_once;
+use super::outbox::{drain_key, drain_within, DrainLimits};
+use super::stored_read::{read_stored, StoredRead};
 use super::publisher::RelayPublisher;
 use super::shutdown;
 use super::{now_unix, NodeError, SellerNode};
@@ -6252,8 +6253,13 @@ impl SellerNodeRunner {
     /// only periodic line a healthy idle node produces, which makes it the positive liveness signal
     /// external supervision has — a parked process satisfies pid-presence, so absence of failures is
     /// not evidence of health. Do not make it conditional to reduce noise.
-    async fn run_wrap_backfill(&self) {
-        self.sync_private_content(true).await;
+    ///
+    /// Returns whether the pass read COMPLETE history (relay EOSE for the wraps, and the private
+    /// content read when that is live). `false` is never "nothing there": the caller retries soon, the
+    /// private cursor keeps only the windows that completed, and the wrap cursor is store-derived
+    /// (receipts/deliveries), so an incomplete read cannot move it past an unread payment.
+    async fn run_wrap_backfill(&self) -> bool {
+        let private_complete = self.backfill_private_content().await;
         self.report_status();
         let since = match resolve_backfill_since(
             self.node.store().last_receipt_unix(),
@@ -6265,7 +6271,7 @@ impl SellerNodeRunner {
                     "seller node wrap backfill: ABORT — cursor read failed (retrying next cycle, \
                      NOT defaulting to since=0): {error}"
                 );
-                return;
+                return false;
             }
         };
         opline!("seller node wrap backfill (periodic): fetching stored kind-1059(s) since ts={since}");
@@ -6273,33 +6279,38 @@ impl SellerNodeRunner {
             .kind(Kind::GiftWrap)
             .pubkey(self.seller_pubkey)
             .since(nostr_sdk::Timestamp::from(since));
-        match tokio::time::timeout(
-            WRAP_BACKFILL_FETCH_TIMEOUT,
-            self.client
-                .fetch_events(filter, WRAP_BACKFILL_FETCH_TIMEOUT / 2),
-        )
-        .await
-        {
-            Ok(Ok(events)) => {
+        let relay = match self.own_relay().await {
+            Ok(relay) => relay,
+            Err(error) => {
+                opline!("seller node WARN: wrap backfill INCOMPLETE (retry pending): {error}");
+                return false;
+            }
+        };
+        let read = read_stored(&relay, vec![filter], WRAP_BACKFILL_FETCH_TIMEOUT).await;
+        let complete = read.is_complete();
+        let events = match read {
+            StoredRead::Complete(events) => {
                 opline!(
                     "seller node wrap backfill (periodic): {} stored kind-1059(s) returned since ts={since}",
                     events.len()
                 );
-                for event in events {
-                    self.on_gift_wrap(&event).await;
-                }
-                self.drain().await;
+                events
             }
-            Ok(Err(error)) => opline!(
-                "seller node WARN: wrap backfill fetch failed (continuing; live 1059 subscription \
-                 active): {error}"
-            ),
-            Err(_) => opline!(
-                "seller node WARN: wrap backfill fetch timed out after {}s (continuing; live 1059 \
-                 subscription active)",
-                WRAP_BACKFILL_FETCH_TIMEOUT.as_secs()
-            ),
+            StoredRead::Incomplete { events, reason } => {
+                opline!(
+                    "seller node WARN: wrap backfill INCOMPLETE since ts={since}: {reason}; {} \
+                     kind-1059(s) arrived first (processed), more may exist — retry pending (live \
+                     1059 subscription active)",
+                    events.len()
+                );
+                events
+            }
+        };
+        // Every wrap goes through the normal pay-once guards; a partial read is safe to ingest.
+        for event in events {
+            self.on_gift_wrap(&event).await;
         }
+        complete && private_complete
     }
 
     /// Re-ask the relay for stored job OFFERS and ingest whatever comes back — the offers analog of
@@ -6323,7 +6334,7 @@ impl SellerNodeRunner {
     /// included — bounded to [`resolve_offer_backfill_since`]. `report_status` is left to the wrap
     /// backfill that precedes it on the shared tick, so the pair emits one status line, not two; the
     /// "fetching" line here is still emitted UNCONDITIONALLY, as the positive signal this leg ran.
-    async fn run_offer_backfill(&self) {
+    async fn run_offer_backfill(&self) -> bool {
         let open_pool = self.claim_open_pool();
         let now = now_unix().max(0) as u64;
         let offer_backfill_secs = self
@@ -6348,15 +6359,17 @@ impl SellerNodeRunner {
             since.as_secs(),
             filters.len()
         );
+        let relay = match self.own_relay().await {
+            Ok(relay) => relay,
+            Err(error) => {
+                opline!("seller node WARN: offer backfill INCOMPLETE (retry pending): {error}");
+                return false;
+            }
+        };
+        let mut complete = true;
         for filter in filters {
-            match tokio::time::timeout(
-                OFFER_BACKFILL_FETCH_TIMEOUT,
-                self.client
-                    .fetch_events(filter, OFFER_BACKFILL_FETCH_TIMEOUT / 2),
-            )
-            .await
-            {
-                Ok(Ok(events)) => {
+            match read_stored(&relay, vec![filter], OFFER_BACKFILL_FETCH_TIMEOUT).await {
+                StoredRead::Complete(events) => {
                     opline!(
                         "seller node offer backfill (periodic): {} stored kind-{}(s) returned",
                         events.len(),
@@ -6365,19 +6378,34 @@ impl SellerNodeRunner {
                     for event in events {
                         self.on_offer(&event).await;
                     }
-                    self.drain().await;
                 }
-                Ok(Err(error)) => opline!(
-                    "seller node WARN: offer backfill fetch failed (continuing; live offer \
-                     subscription active): {error}"
-                ),
-                Err(_) => opline!(
-                    "seller node WARN: offer backfill fetch timed out after {}s (continuing; live \
-                     offer subscription active)",
-                    OFFER_BACKFILL_FETCH_TIMEOUT.as_secs()
-                ),
+                StoredRead::Incomplete { events, reason } => {
+                    complete = false;
+                    opline!(
+                        "seller node WARN: offer backfill INCOMPLETE: {reason}; {} kind-{}(s) arrived \
+                         first (processed), more may exist — retry pending (live offer subscription \
+                         active)",
+                        events.len(),
+                        JOB_OFFER_KIND
+                    );
+                    for event in events {
+                        self.on_offer(&event).await;
+                    }
+                }
             }
         }
+        complete
+    }
+
+    /// The pool's handle for our one relay (the same `Relay` across reconnects).
+    async fn own_relay(&self) -> Result<nostr_sdk::Relay, String> {
+        let url = RelayUrl::parse(&self.relay_url).map_err(|error| format!("parse relay url: {error}"))?;
+        self.client
+            .relays()
+            .await
+            .get(&url)
+            .cloned()
+            .ok_or_else(|| "relay missing from the client pool".to_owned())
     }
 
     /// Publish one own-heartbeat (kind-30340) — best-effort liveness/discovery + the watchdog's
@@ -7303,8 +7331,9 @@ impl SellerNodeRunner {
             // accepted claim id arrives in the same event, so ask the identity question directly.
             Ok(None) => {
                 // Ensure our claim is on the wire, then read its published id for the win check —
-                // the same order `on_award` uses, for the same reason.
-                self.drain().await;
+                // the same order `on_award` uses, for the same reason. Only OUR claim's row: a
+                // backlog behind a slow relay must not stand between the award and the check.
+                self.publish_now(&format!("claim:{job_id}")).await;
                 let our_claim_id = match self.node.store().outbox_row(&format!("claim:{job_id}")) {
                     Ok(Some((_, _, published))) => published,
                     _ => None,
@@ -7560,8 +7589,9 @@ impl SellerNodeRunner {
             }
         }
 
-        // Ensure our claim is on the wire, then read its published id for the win check.
-        self.drain().await;
+        // Ensure our claim is on the wire, then read its published id for the win check. Only OUR
+        // claim's row: a backlog behind a slow relay must not stand between the award and the check.
+        self.publish_now(&format!("claim:{job_id}")).await;
         let our_claim_id = match self.node.store().outbox_row(&format!("claim:{job_id}")) {
             Ok(Some((_, _, published))) => published,
             _ => None,
@@ -8842,6 +8872,7 @@ impl SellerNodeRunner {
                 return;
             }
         }
+        self.publish_now(&format!("result:{job_id}")).await;
         self.drain().await;
     }
 
@@ -9476,6 +9507,7 @@ impl SellerNodeRunner {
                 return;
             }
         }
+        self.publish_now(&format!("result:{job_id}")).await;
         self.drain().await;
     }
 
@@ -9687,6 +9719,7 @@ impl SellerNodeRunner {
                 return;
             }
         }
+        self.publish_now(&format!("result:{job_id}")).await;
         self.drain().await;
     }
 
@@ -10179,34 +10212,113 @@ impl SellerNodeRunner {
             .await;
     }
 
-    async fn sync_private_content(&self, backfill: bool) {
+    /// One bounded pass over pending private-content copies (no history read). `None` when private
+    /// content is off or the socket is not authenticated yet — nothing was attempted.
+    async fn flush_private_content(&self) -> Option<crate::private_content::session::FlushReport> {
         if !self.node.home().config.privacy.private_content_v2
-            || !self.private_authenticated.load(std::sync::atomic::Ordering::Relaxed) { return; }
+            || !self.private_authenticated.load(std::sync::atomic::Ordering::Relaxed) { return None; }
+        let deadline = tokio::time::Instant::now() + PRIVATE_FLUSH_BUDGET;
         let result = async {
             let mut ctx = crate::private_content::channel::ContentContext::open(self.node.home(), &self.seller_pubkey.to_hex())?;
             let mut transport = crate::private_content::session::AuthenticatedContentRelay::shared(self.client.clone(), &self.relay_url, AuthWait::Authenticated).await?;
-            crate::private_content::session::flush_actor(&mut ctx.store, self.node.signer(), &mut transport, 64).await?;
-            if backfill { transport.backfill_actor(&mut ctx.store, self.node.signer(), now_unix().max(0) as u64).await?; }
-            Ok::<_, crate::private_content::Error>(())
+            crate::private_content::session::flush_actor_within(&mut ctx.store, self.node.signer(), &mut transport, 64, Some(deadline)).await
         }.await;
-        if let Err(e) = result { opline!("seller private content retry pending: {e}"); }
+        match result {
+            Ok(report) => Some(report),
+            Err(e) => {
+                opline!("seller private content retry pending: {e}");
+                Some(crate::private_content::session::FlushReport { pending: 1, ..Default::default() })
+            }
+        }
     }
 
-    /// One outbox drain pass over the shared authenticated client. Log-and-continue: a publish
-    /// failure leaves the row pending for the next tick (never wedges the loop).
-    async fn drain(&self) {
+    /// Flush, then read private-content history, bounded as a whole by [`PRIVATE_BACKFILL_BUDGET`].
+    /// `false` = the history read did not complete: the cursor kept only the windows that did, and
+    /// the caller retries. Off / not-yet-authenticated counts as complete (nothing to read yet; the
+    /// authenticated socket triggers the next pass).
+    async fn backfill_private_content(&self) -> bool {
+        if !self.node.home().config.privacy.private_content_v2
+            || !self.private_authenticated.load(std::sync::atomic::Ordering::Relaxed) { return true; }
+        let deadline = tokio::time::Instant::now() + PRIVATE_BACKFILL_BUDGET;
+        let result = async {
+            let mut ctx = crate::private_content::channel::ContentContext::open(self.node.home(), &self.seller_pubkey.to_hex())?;
+            let mut transport = crate::private_content::session::AuthenticatedContentRelay::shared(self.client.clone(), &self.relay_url, AuthWait::Authenticated).await?;
+            crate::private_content::session::flush_actor_within(&mut ctx.store, self.node.signer(), &mut transport, 64, Some(deadline)).await?;
+            transport.backfill_actor_within(&mut ctx.store, self.node.signer(), now_unix().max(0) as u64, Some(deadline)).await?;
+            Ok::<_, crate::private_content::Error>(())
+        }.await;
+        match result {
+            Ok(()) => true,
+            Err(e) => {
+                opline!("seller private content retry pending: {e}");
+                false
+            }
+        }
+    }
+
+    /// One BOUNDED outbox pass plus one bounded private-content flush, over the shared authenticated
+    /// client. Log-and-continue: an unconfirmed row stays pending (same signed event, same id) for
+    /// the next pass. The returned counts drive the run loop's pacing; nothing here can hold the
+    /// caller longer than [`OUTBOX_PASS_BUDGET`] + [`PRIVATE_FLUSH_BUDGET`] (plus one signer call).
+    async fn drain(&self) -> DrainCounts {
         let now = now_unix();
-        match drain_once(self.node.store(), &self.publisher, now).await {
-            Ok(report) if report.confirmed > 0 || report.failed > 0 => opline!(
-                "seller node outbox drain: confirmed={} failed={} expired={}",
-                report.confirmed, report.failed, report.expired
-            ),
-            Ok(_) => {}
+        let mut counts = DrainCounts::default();
+        let limits = DrainLimits::within(OUTBOX_PASS_BUDGET, OUTBOX_PASS_ROWS);
+        match drain_within(self.node.store(), &self.publisher, now, limits).await {
+            Ok(report) => {
+                if report.confirmed > 0 || report.failed > 0 {
+                    opline!(
+                        "seller node outbox drain: confirmed={} failed={} expired={} deferred={}",
+                        report.confirmed, report.failed, report.expired, report.deferred
+                    );
+                }
+                counts.confirmed += report.confirmed;
+                counts.unconfirmed += report.failed + report.deferred;
+            }
             Err(error) => opline!("seller node outbox drain error (continuing): {error}"),
         }
-        self.sync_private_content(false).await;
+        if let Some(flush) = self.flush_private_content().await {
+            counts.confirmed += flush.accepted;
+            counts.unconfirmed += flush.pending;
+        }
+        counts
+    }
+
+    /// Publish the ONE pending outbox row `dedup_key` now (bounded by [`TARGETED_PUBLISH_BUDGET`]),
+    /// for a caller that must not wait behind — or be cut off by — the rest of the outbox: an award
+    /// must read OUR claim's published id, a delivery wants its result on the wire first. A row that
+    /// is absent or already confirmed is a no-op.
+    async fn publish_now(&self, dedup_key: &str) {
+        let limits = DrainLimits::within(TARGETED_PUBLISH_BUDGET, 1);
+        match drain_key(self.node.store(), &self.publisher, dedup_key, now_unix(), limits).await {
+            Ok(report) if report.failed > 0 || report.deferred > 0 => opline!(
+                "seller node publish {dedup_key}: not confirmed yet (stays pending, retried with the same event id)"
+            ),
+            Ok(_) => {}
+            Err(error) => opline!("seller node publish {dedup_key} error (continuing): {error}"),
+        }
     }
 }
+
+/// What one run-loop drain pass achieved — the input to [`schedule::OutboxPacing`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DrainCounts {
+    confirmed: usize,
+    /// Failed, cut short, or never reached: still pending.
+    unconfirmed: usize,
+}
+
+/// Whole-pass budget for one routine outbox drain: one SDK publish (10 s OK wait) plus an AUTH retry
+/// fits; a backlog behind a dead relay costs this, not rows × 10 s.
+const OUTBOX_PASS_BUDGET: Duration = Duration::from_secs(15);
+/// Rows one routine pass may try.
+const OUTBOX_PASS_ROWS: usize = 256;
+/// Budget for publishing one named row (claim before an award check, result after delivery).
+const TARGETED_PUBLISH_BUDGET: Duration = Duration::from_secs(30);
+/// Whole-pass budget for one private-content flush on the routine drain.
+const PRIVATE_FLUSH_BUDGET: Duration = Duration::from_secs(10);
+/// Whole-pass budget for flush + history read of private content on a backfill pass.
+const PRIVATE_BACKFILL_BUDGET: Duration = Duration::from_secs(45);
 
 #[cfg(test)]
 mod slot_gate_tests {

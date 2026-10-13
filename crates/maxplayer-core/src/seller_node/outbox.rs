@@ -8,10 +8,16 @@
 //! idempotent at the relay: the same event id is sent again and the relay collapses it. That is what
 //! lets the publisher retry freely without ever double-paying or double-delivering.
 //!
+//! A drain PASS is bounded ([`DrainLimits`]): a relay that stops acknowledging publications used to
+//! cost one SDK OK timeout per pending row, serially, so a backlog of 120 rows held the caller for 20
+//! minutes. A pass now stops at its deadline, and the rows it did not reach go first next time.
+//!
 //! The concrete relay transport (sign via the signer actor, send over a nostr client) is the
 //! deployable [`EventPublisher`] the node wires at cutover; this module owns the durable-drain logic
 //! and is exercised here against a fake publisher so the retry/confirm/expire behavior is pinned
 //! independent of the network.
+
+use std::time::Duration;
 
 use super::store::{OutboxItem, SellerStore, StoreError};
 
@@ -32,32 +38,166 @@ pub struct DrainReport {
     pub confirmed: usize,
     pub failed: usize,
     pub expired: usize,
+    /// Rows the pass never reached because its deadline arrived first. They are untouched — still
+    /// `pending`, attempt count unchanged — and are tried before the rows this pass attempted.
+    pub deferred: usize,
 }
 
-/// Run one drain pass: first expire rows past their retry window, then publish every remaining
-/// pending row. A confirmed publish is marked `confirmed`; a failed one bumps its attempt count and
-/// stays `pending` for the next pass.
+/// Bounds for ONE drain pass, so a slow relay costs the caller a bounded slice of time rather than
+/// (pending rows × the SDK's per-publish OK timeout).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrainLimits {
+    /// No publish starts at or after this instant, and a publish still waiting on the relay when it
+    /// arrives is abandoned. An abandoned publish counts as a failed attempt and its row stays
+    /// `pending`: the event may already have landed, so the retry re-sends the SAME signed event
+    /// (fixed `created_at`, therefore the same id) and the relay collapses the duplicate. `None`
+    /// means no deadline.
+    pub deadline: Option<tokio::time::Instant>,
+    /// At most this many rows are tried in one pass.
+    pub max_rows: usize,
+}
+
+impl DrainLimits {
+    /// A pass that may run for `budget` from now and try at most `max_rows` rows.
+    pub fn within(budget: Duration, max_rows: usize) -> Self {
+        Self {
+            deadline: Some(tokio::time::Instant::now() + budget),
+            max_rows,
+        }
+    }
+
+    /// No bound at all: every pending row, however long each publish takes — the shape
+    /// [`drain_once`] always had. The node's run loop never drains this way.
+    pub fn unbounded() -> Self {
+        Self {
+            deadline: None,
+            max_rows: usize::MAX,
+        }
+    }
+}
+
+/// Run one unbounded drain pass: first expire rows past their retry window, then publish every
+/// remaining pending row. A confirmed publish is marked `confirmed`; a failed one bumps its attempt
+/// count and stays `pending` for the next pass.
 pub async fn drain_once<P: EventPublisher>(
     store: &SellerStore,
     publisher: &P,
     now_unix: i64,
 ) -> Result<DrainReport, StoreError> {
+    drain_within(store, publisher, now_unix, DrainLimits::unbounded()).await
+}
+
+/// Run one BOUNDED drain pass: expire rows past their retry window, then publish pending rows in
+/// [`SellerStore::pending_outbox_batch`] order — never-attempted rows first, then the least recently
+/// attempted — until every row of the batch has been tried or `limits.deadline` arrives.
+///
+/// The order is what makes the bound fair. A row the relay keeps failing is recorded as attempted
+/// and rotates behind the rows a pass did not reach, so neither a failing backlog nor one hung
+/// publish can take the head of every pass, and a fresh publication — a claim a buyer is waiting
+/// on — gets its first attempt on the very next pass.
+///
+/// Cancel-safe: the store is only written after a publish settles, so dropping this future leaves
+/// every row exactly as a failed send would (`pending`, retried with the same event id).
+pub async fn drain_within<P: EventPublisher>(
+    store: &SellerStore,
+    publisher: &P,
+    now_unix: i64,
+    limits: DrainLimits,
+) -> Result<DrainReport, StoreError> {
     let mut report = DrainReport::default();
     report.expired = store.expire_outbox(now_unix)?;
 
-    for item in store.pending_outbox(now_unix)? {
-        match publisher.publish(&item).await {
-            Ok(event_id) => {
-                store.mark_confirmed(item.id, &event_id, now_unix)?;
-                report.confirmed += 1;
+    let batch = store.pending_outbox_batch(now_unix, limits.max_rows)?;
+    let total = batch.len();
+    for (tried, item) in batch.into_iter().enumerate() {
+        match publish_one(store, publisher, &item, now_unix, limits.deadline, &mut report).await? {
+            Published::Settled => {}
+            Published::NotStarted => {
+                report.deferred = total - tried;
+                break;
             }
-            Err(_) => {
-                store.record_attempt(item.id, now_unix)?;
-                report.failed += 1;
+            Published::CutShort => {
+                report.deferred = total - tried - 1;
+                break;
             }
         }
     }
     Ok(report)
+}
+
+/// Publish the ONE pending row with `dedup_key` now, within `limits.deadline` — for a caller that
+/// must read that row's published id next (an award names the claim it selects), and must not wait
+/// behind, or be cut off by, whatever else the outbox holds. A row that is absent, already
+/// confirmed or expired is left alone and the report is empty.
+pub async fn drain_key<P: EventPublisher>(
+    store: &SellerStore,
+    publisher: &P,
+    dedup_key: &str,
+    now_unix: i64,
+    limits: DrainLimits,
+) -> Result<DrainReport, StoreError> {
+    let mut report = DrainReport::default();
+    if let Some(item) = store.pending_outbox_row(dedup_key, now_unix)? {
+        if publish_one(store, publisher, &item, now_unix, limits.deadline, &mut report).await?
+            == Published::NotStarted
+        {
+            report.deferred = 1;
+        }
+    }
+    Ok(report)
+}
+
+/// How one row's publish ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Published {
+    /// Confirmed or failed on its own; the pass may continue.
+    Settled,
+    /// The deadline had already arrived: nothing was sent and nothing recorded.
+    NotStarted,
+    /// The deadline arrived mid-publish: recorded as a failed attempt, and the pass is over.
+    CutShort,
+}
+
+async fn publish_one<P: EventPublisher>(
+    store: &SellerStore,
+    publisher: &P,
+    item: &OutboxItem,
+    now_unix: i64,
+    deadline: Option<tokio::time::Instant>,
+    report: &mut DrainReport,
+) -> Result<Published, StoreError> {
+    let outcome = match deadline {
+        None => Ok(publisher.publish(item).await),
+        Some(deadline) => {
+            let Some(remaining) = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+            else {
+                return Ok(Published::NotStarted);
+            };
+            tokio::time::timeout(remaining, publisher.publish(item)).await
+        }
+    };
+    match outcome {
+        Ok(Ok(event_id)) => {
+            store.mark_confirmed(item.id, &event_id, now_unix)?;
+            report.confirmed += 1;
+            Ok(Published::Settled)
+        }
+        Ok(Err(_)) => {
+            store.record_attempt(item.id, now_unix)?;
+            report.failed += 1;
+            Ok(Published::Settled)
+        }
+        Err(_) => {
+            // The send may already have reached the relay, so the row stays pending for a retry of
+            // the same event. Recording the attempt rotates it behind the rows this pass never
+            // reached: a row that hangs must not take the head of every later pass.
+            store.record_attempt(item.id, now_unix)?;
+            report.failed += 1;
+            Ok(Published::CutShort)
+        }
+    }
 }
 
 #[cfg(test)]
