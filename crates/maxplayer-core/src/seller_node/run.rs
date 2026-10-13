@@ -16870,13 +16870,13 @@ mod tests {
         assert_eq!(stall_threshold_secs(300, 3), 900);
         assert_eq!(stall_threshold_secs(0, 0), 1, "each factor clamped ≥1 so the product is never 0");
         // Judged at the START of the tick whose own legs failed: with a 300s interval and 3 missed
-        // intervals, the third unconfirmed tick (600s after the last confirmation) trips — not the
-        // fourth (900s), which is what the old after-publish clock delivered (outage=1229s).
+        // intervals, the third missed tick (900s after the last confirmation) trips — not the
+        // fourth (1200s), which is what the old after-publish clock delivered (outage=1229s).
         let (interval, threshold) = (Duration::from_secs(300), Duration::from_secs(900));
         let trips = |secs| schedule::watchdog_tripped(Duration::from_secs(secs), threshold, interval);
-        assert!(!trips(300), "second missed tick ⇒ live");
-        assert!(trips(600), "third missed tick ⇒ stalled");
-        assert!(!trips(449), "tick jitter below half an interval cannot trip early");
+        assert!(!trips(600), "second missed tick ⇒ live");
+        assert!(trips(900), "third missed tick ⇒ stalled");
+        assert!(!trips(749), "tick jitter below half an interval cannot trip early");
         assert!(trips(751), "nor delay a trip");
     }
 
