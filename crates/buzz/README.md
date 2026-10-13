@@ -8,16 +8,15 @@ of modifications.
 
 ## Decision record
 
-### Source branch
-`sync/upstream-recarry-2026-07-24` @ `e18020a63`, from `github.com/gudnuf/buzz`
-(fork of `block/buzz`).
+### Source
+block/buzz `main` @ `30873ba46` (2026-10-11), merged into the previous copy so
+the open-relay fork's changes and every Maxplayer change carry over. The merge
+took in 1,056 upstream commits.
 
-Chosen over `metadex/mobee-kind-scope` (`c2499afd9`) because:
-- It **fully contains** the metadex kind commit (0 commits are metadex-only; it
-  is 447 commits ahead), so nothing is lost.
-- It sits **147 commits behind** upstream `block/buzz` vs metadex's 584 — i.e. it
-  is the fresher base, closest to what orveth actually deploys.
-- Both branches carry the **identical** Mobee kind set.
+The previous copy was gudnuf/buzz `sync/upstream-recarry-2026-07-24` @
+`e18020a63` (based on block/buzz `3bd3a014c`, 2026-07-24). It had been chosen
+over `metadex/mobee-kind-scope` (`c2499afd9`) because it fully contained that
+branch's kind commit on a fresher base.
 
 ### Mobee kinds accepted
 Both families below are defined as consts in
@@ -75,34 +74,43 @@ git-repo announcement mobee also emits are **already** scoped by the relay
 > relay, where every authed key holds all scopes.)
 
 ### Crates taken vs left
-Taken (12 = the relay's transitive `[dependencies]` closure):
-`buzz-relay, buzz-core, buzz-conformance, buzz-db, buzz-pubsub, buzz-auth,
-buzz-search, buzz-audit, buzz-workflow, buzz-media, buzz-sdk, buzz-relay-mesh`.
+Taken: `buzz-relay` and every workspace crate it depends on — `buzz-audit,
+buzz-auth, buzz-conformance, buzz-core, buzz-datastore-tracing, buzz-db,
+buzz-deletion, buzz-media, buzz-pubsub, buzz-relay-mesh, buzz-sdk,
+buzz-search, buzz-workflow` — plus Maxplayer's `maxplayer-private-protocol`.
 
 `buzz-search` (typesense) and `buzz-workflow` are **hard** `[dependencies]` of
 the relay and cannot be dropped without editing relay source, so they are in
-despite being client/harness-adjacent. The AI-agent harness, device pairing,
-desktop/mobile/web clients, and CLIs are left behind (see `NOTICE`).
+despite being client/harness-adjacent. `buzz-deletion` and
+`buzz-datastore-tracing` became relay dependencies upstream after the previous
+copy. The AI-agent harness, push gateway, device pairing, desktop/mobile/web
+clients, and CLIs are left behind (see `NOTICE`).
 
-Also vendored (verbatim, DB artifacts the relay's schema layer needs):
-`migrations/` (embedded at compile time by `buzz-db`'s
-`sqlx::migrate!("../../migrations")`) and `schema/schema.sql` (the canonical
-fresh-database schema; drift-checked against `migrations/0001_initial_schema.sql`).
+Also vendored from upstream, verbatim:
+- `migrations/`, embedded at compile time by `buzz-db`'s migrator. Maxplayer's
+  own migrations use versions from 100000 up, so upstream's four-digit
+  sequence never collides with them.
+- `schema/`, upstream's desired-state schema. Tests check it against the
+  migrations; production never applies it.
+- `Dockerfile`, `docs/nips/NIP-MP.fixtures.json` and
+  `scripts/reconcile-schema-after-pgschema.sql`, which tests read, and
+  `docs/thread-window-deployment.md` (see Upgrading).
 
 ### Dependency alignment
-- **nostr-sdk: no collision.** maxplayerai `maxplayer-core` declares `nostr-sdk 0.44.1`;
-  this vendored relay resolves `nostr 0.44.x` / `nostr-sdk 0.44.1`. Both on 0.44.
-- sqlx 0.9, tokio 1, axum 0.8 resolve from the vendored `Cargo.lock`.
+- **nostr: no collision.** The relay's lock resolves `nostr 0.44.7`; the
+  maxplayerai root lock has `nostr 0.44.4` / `nostr-sdk 0.44.1`. Separate
+  locks, same 0.44 line.
+- Everything else resolves from the vendored `Cargo.lock`.
 
 ### Isolation approach
 `crates/buzz/` is a **self-contained nested Cargo workspace** (its own
 `Cargo.toml` with `[workspace]`, its own `Cargo.lock`, `resolver = 2`,
 `edition = 2021`). maxplayerai's root workspace lists members explicitly and does
 **not** glob, so the vendored workspace is invisible to it and needs no
-reconciliation of the maxplayerai root manifest. This deliberately sidesteps
-dep-version reconciliation (nostr/sqlx/tokio) for the initial vendor-in; unifying
-into a single workspace, if ever wanted, is a separate follow-up owned by nix/dep
-reconciliation.
+reconciliation of the maxplayerai root manifest. The one link is
+`maxplayer-core`'s path dependency on `crates/maxplayer-private-protocol`,
+which the root workspace builds with its own lock. Unifying into a single
+workspace, if ever wanted, is a separate follow-up.
 
 ### License
 Upstream is Apache-2.0; its `LICENSE` is kept here and `NOTICE` records the
@@ -115,7 +123,7 @@ native code by market-orch — this vendor does **not** add a namespace/`t`-tag
 predicate; the kind allowlist is the scoping.
 
 ### Branch-scoped push tokens and their lifetime
-Two changes serve the maxplayer seller delivery push (see `NOTICE` item 4):
+Two changes serve the maxplayer seller delivery push (see `NOTICE`, part B):
 
 1. **Scope (PR #929).** A NIP-98 push token may carry one `["ref", "<refname>"]` tag.
    The pre-receive policy endpoint denies the push (403) unless every ref update
@@ -138,18 +146,86 @@ credential. Work order:
 
 ## Building
 
-The relay's `sqlx 0.9` requires **rustc >= 1.94**. The maxplayerai nix devShell
-(nixos-25.11) currently provides 1.91.1, so overlay a newer toolchain:
+The relay needs **rustc >= 1.94** (sqlx 0.9). From the maxplayerai repo root:
 
 ```sh
-# from the maxplayerai repo root
-nix develop -c nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#pkg-config nixpkgs#cmake -c \
-  cargo build --manifest-path crates/buzz/Cargo.toml -p buzz-relay
+nix build .#maxplayer-relay   # the deployed package, built with the flake's rustc 1.96
+# or, with rustc >= 1.94, pkg-config and cmake (for aws-lc-sys):
+cargo build --manifest-path crates/buzz/Cargo.toml --locked -p buzz-relay --bin buzz-relay
 ```
 
-**For nix packaging / deploy (market-orch):** the relay needs its own
-`buildRustPackage` derivation with `cargoLock.lockFile = ./crates/buzz/Cargo.lock`
-and `cargoBuildFlags = ["-p", "buzz-relay"]`, built with rustc >= 1.94 and
-`nativeBuildInputs = [ pkg-config cmake ]` (cmake for aws-lc-sys via rustls). The
-`[patch.crates-io]` `aws-creds` git fork in the vendored `Cargo.toml` must be
-preserved.
+`flake.nix` vendors the dependencies under a fixed `cargoHash`. After a
+`Cargo.lock` change, set it to `pkgs.lib.fakeHash`, build once, and copy in the
+hash nix reports. Keep the lock free of two crates with the same name and
+version: fetchCargoVendor cannot vendor them.
+
+## Testing
+
+```sh
+cargo test --manifest-path crates/buzz/Cargo.toml --locked --workspace --lib --tests
+```
+
+A few `api::media` tests need Postgres at `DATABASE_URL`, built from
+`schema/schema.sql` (`psql -f schema.sql` from `schema/`), and Redis at
+`REDIS_URL`. The tests marked
+`#[ignore = "requires Postgres"]` run through upstream's
+`scripts/postgres-test-run.sh`, which is not vendored and gives each test its
+own database: run them in a block/buzz checkout that carries this tree (see
+Syncing upstream again). The private-job HTTP tests run here, against a
+disposable database and Redis:
+
+```sh
+PRIVATE_JOB_TEST_DATABASE_URL=postgres://… PRIVATE_JOB_TEST_REDIS_URL=redis://… \
+  cargo test --manifest-path crates/buzz/Cargo.toml -p buzz-relay --lib \
+  private_jobs_http_tests -- --include-ignored --test-threads=1
+```
+
+## Upgrading a deployed relay
+
+With `BUZZ_AUTO_MIGRATE=1` the relay migrates its database at startup, before
+it binds its port. Each migration runs in its own transaction; if one fails,
+the relay exits without serving and the next start retries it.
+
+- A database migrated by the relay before this sync records the private-job
+  migration as version 25. The relay moves that record to 100025, then applies
+  upstream's 0025–0060 and Maxplayer's 100026.
+- The upgrade is one-way: the earlier relay then refuses to start ("migration
+  26 was previously applied but is missing in the resolved migrations"). Back
+  up right before switching; rolling back means restoring that backup.
+- Migration 0033 rewrites `events` (every partition) under an exclusive lock,
+  so the first start takes longer the bigger `events` is. Because it is
+  partitioned, `pg_total_relation_size('events')` reports 0 bytes; measure it
+  with `SELECT pg_size_pretty(sum(pg_total_relation_size(relid))) FROM
+  pg_partition_tree('events')`.
+- Migration 0049 stops after a 1 s lock wait or a 5 s index build rather than
+  block writes. If `thread_metadata` is large
+  (`SELECT pg_size_pretty(pg_total_relation_size('thread_metadata'))`),
+  prebuild the index first, while the current relay runs, as
+  `docs/thread-window-deployment.md` describes.
+- Several new migrations wait at most 5 s for a table lock. Start the relay
+  while nothing else holds one, for example not during a `pg_dump`.
+- The writer pool default grew from 20 to 50 connections
+  (`BUZZ_DB_POOL_SIZE`).
+- The relocation logs at `buzz_db` info, which the default log filter
+  (`buzz_relay=info`) hides. To check the result, `SELECT version, description
+  FROM _sqlx_migrations WHERE version IN (25, 100025, 100026)` lists `relay
+  invites`, `private job repositories` and `private job repositories write
+  fence`.
+
+## Syncing upstream again
+
+The merge base for the next sync is block/buzz `30873ba46`.
+
+1. In a block/buzz clone, branch from `30873ba46`, copy this directory over it
+   (`cp -a crates/buzz/. <clone>/`) and commit. That commit is the Maxplayer
+   delta.
+2. Merge the new upstream commit. Keep ours for `NOTICE`, `README.md`,
+   `.gitignore` and the trimmed `members`, adding any crate the relay newly
+   depends on. Take upstream's `Cargo.lock` and let cargo prune it, then check
+   that every version left is upstream's, apart from the sqlite exception
+   NOTICE names. Upstream migrations keep their numbers.
+3. Build and test there; the Postgres tests need that full checkout.
+4. Replace this directory with the result: `git rm -rq crates/buzz`, then
+   `mkdir crates/buzz && git -C <clone> archive HEAD -- <paths in NOTICE> |
+   tar -x -C crates/buzz` and `git add crates/buzz`. Update the commit in
+   `NOTICE` and refresh `cargoHash`.

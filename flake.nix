@@ -25,7 +25,7 @@
         let
           pkgs = nixpkgs.legacyPackages.${system};
 
-          # rustc 1.96 for the vendored buzz relay: the recarry branch's floor is >= 1.94 (sqlx 0.9),
+          # rustc 1.96 for the vendored buzz relay: its floor is >= 1.94 (sqlx 0.9),
           # and stock nixpkgs-25.11 ships ~1.91 which will NOT compile it. Scoped to the relay package
           # via its own rust-overlay toolchain so the other packages keep stock nixpkgs rust untouched.
           buzzRust =
@@ -127,24 +127,23 @@
           # subtree with buzz's own lock. Nested isolation leaves the mp lock untouched and sidesteps
           # cross-workspace dep reconciliation.
           #
-          # Toolchain = buzzRustPlatform (rustc 1.96): the recarry branch needs >= 1.94 (sqlx 0.9) and
+          # Toolchain = buzzRustPlatform (rustc 1.96): the relay needs >= 1.94 (sqlx 0.9) and
           # stock nixpkgs-25.11 (~1.91) will not compile it. nativeBuildInputs = pkg-config + cmake
           # (cmake builds aws-lc-sys, pulled by buzz's [patch.crates-io] aws-creds fork that the vendor
-          # preserves; the recarry branch links aws-lc, so there is no openssl input).
+          # preserves; the relay links aws-lc, so there is no openssl input).
           #
-          # cargoHash (FOD vendor) rather than cargoLock.lockFile: buzz's own lock carries 40 git deps
-          # — the aws-creds [patch.crates-io] fork (a real dep) + 39 mesh-llm/skippy AI crates (dev-deps,
-          # vendored but NOT compiled: doCheck is off and they are off buzz-relay's build graph).
-          # importCargoLock would need one outputHash per git dep (40 entries); the FOD needs a single
-          # hash and is proven to vendor buzz's deps (all PUBLIC). If the vendor later strips the mesh-llm
-          # dev-deps from the lock, this can return to hermetic cargoLock + one aws-creds outputHash.
+          # cargoHash (FOD vendor) rather than cargoLock.lockFile. Since the 2026-10 upstream sync the
+          # pruned lock has one git source, the rust-s3 fork behind the aws-creds [patch.crates-io]
+          # entry, so cargoLock.lockFile with one outputHash would also work. fetchCargoVendor cannot
+          # vendor two crates with the same name and version (it failed on a second sqlx-core 0.9.0
+          # from git); crates/buzz/NOTICE says why that patch was dropped.
           maxplayer-relay = buzzRustPlatform.buildRustPackage {
             pname = "maxplayer-relay";
             version = "0.1.0";
             src = ./crates/buzz;
-            # cargoHash of buzz's full vendored dep set (crates.io + the 2 public git sources:
-            # rust-s3/aws-creds build dep + mesh-llm dev-deps). Recompute if crates/buzz/Cargo.lock changes.
-            cargoHash = "sha256-xvrX4w1KC4TlU7+h+k9vJnwiDNpNaP+pYma6H29gaTQ=";
+            # cargoHash of buzz's vendored dep set (crates.io + the rust-s3 git source). Recompute it
+            # whenever crates/buzz/Cargo.lock changes: set pkgs.lib.fakeHash, build, copy the reported hash.
+            cargoHash = "sha256-brugeyc7Y39ouHpFNV8jV00B3wj/6fE/U/dDNP2X3Hs=";
             cargoBuildFlags = [
               "-p"
               "buzz-relay"
