@@ -261,5 +261,6 @@ test("/mint explains the seller mint with the shared page layout", () => {
   for (const cmd of ["cargo install --path crates/maxplayer-mint --locked", "maxplayer-mint init", "maxplayer-mint run", "maxplayer-mint issue 1000", "maxplayer wallet mints add nostr://"]) {
     assert.ok(mint.includes(cmd), `shows ${cmd}`);
   }
+  assert.match(mint, /<\/header>\s*<!--[^>]*-->\s*<p class="labs-strip" role="note"><span class="labs-pill">Experimental<\/span>/, "experimental strip under the nav, like /tokens");
   assert.match(mint, /Are my tokens bitcoin\?<\/summary><p>No\./, "seller tokens are distinguished from bitcoin");
 });
