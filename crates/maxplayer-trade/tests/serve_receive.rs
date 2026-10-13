@@ -823,7 +823,8 @@ async fn slow_mint_receive_releases_serve_loop_and_is_recovered() {
         "SAFETY: in doubt, not failed: {stderr}"
     );
     assert!(
-        started.elapsed() < Duration::from_secs(60),
+        // Under the 20 s HTTP RPC timeout: serve's own budget (3 s here) released the loop.
+        started.elapsed() < Duration::from_secs(15),
         "SAFETY: a stuck mint held serve's loop"
     );
     assert_eq!(outcome(&stderr).as_deref(), Some("in_doubt"), "{stderr}");
