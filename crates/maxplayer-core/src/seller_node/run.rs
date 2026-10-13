@@ -10448,7 +10448,7 @@ impl SellerNodeRunner {
         done
     }
 
-    async fn dispatch_event(&self, event: &nostr_sdk::Event) {
+    async fn dispatch_event(self: &Arc<Self>, event: &nostr_sdk::Event) {
         match event.kind {
             k if k.as_u16() == JOB_OFFER_KIND => self.on_offer(event).await,
             k if k.as_u16() == JOB_AWARD_KIND => self.on_award(event).await,
