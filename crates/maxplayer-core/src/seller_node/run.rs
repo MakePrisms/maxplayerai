@@ -18529,6 +18529,280 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // ---- Work lane / supervision loop teeth (seller-daemon resilience) -------------------------
+
+    /// A home for the loop teeth below: fixture relay, one-second heartbeats.
+    fn lane_home(root: &std::path::Path, fixture: &PGateRelay) -> crate::home::MaxplayerHome {
+        let mut home = crate::home::bootstrap(root).expect("bootstrap home");
+        home.config.relay_url = fixture.url();
+        home.config.seller = Some(seller_cfg(1, false));
+        home.config.seller_heartbeat.enabled = true;
+        home.config.seller_heartbeat.interval_secs = 1;
+        home
+    }
+
+    /// Journal one claim (and its outbox row) for `n` through a second connection to the node's
+    /// ledger; returns the outbox dedup key.
+    fn seed_claim(store: &crate::seller_node::store::SellerStore, n: u8) -> String {
+        let job = format!("{n:02x}").repeat(32);
+        let draft = claim_draft(
+            &job,
+            &"b".repeat(64),
+            &"c".repeat(64),
+            crate::gateway::ClaimPayment::Sat("creq-lane"),
+            &[],
+            &Default::default(),
+        );
+        let now = now_unix();
+        store
+            .claim_and_enqueue(&job, &job, Some("creq-lane"), &draft, now, now + 3_600, now)
+            .expect("seed claim");
+        format!("claim:{job}")
+    }
+
+    fn lane_store(root: &std::path::Path) -> crate::seller_node::store::SellerStore {
+        crate::seller_node::store::SellerStore::open(root.join(crate::seller_node::STATE_DB_FILE))
+            .expect("open store")
+    }
+
+    async fn wait_for_row_state(
+        store: &crate::seller_node::store::SellerStore,
+        key: &str,
+        state: &str,
+        timeout: Duration,
+    ) -> bool {
+        tokio::time::timeout(timeout, async {
+            loop {
+                if store
+                    .outbox_row(key)
+                    .expect("outbox row")
+                    .is_some_and(|row| row.0 == state)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    /// L1 — a relay that never acknowledges our claims holds neither the heartbeat nor a shutdown.
+    /// A backlog of claims is pending and the relay withholds every kind-3402 `OK`: heartbeats keep
+    /// reaching the relay, a requested shutdown returns within 10 s, and the rows stay `pending`.
+    /// Once the relay answers again (after a restart), every row is confirmed with the SAME event id
+    /// it carried while unacknowledged: three claims, three distinct ids on the wire, ever.
+    ///
+    /// RED ON REVERT: await the routine drain inline in the loop (or drop the settle bound in
+    /// `run_loop`) and the heartbeats stall behind the OK timeouts / the shutdown waits out the
+    /// whole pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn withheld_claim_oks_hold_neither_heartbeats_nor_shutdown_and_retries_reuse_the_event_id() {
+        use_fast_backfill_tick();
+        let claim_kind = u64::from(crate::kinds::JOB_CLAIM_KIND);
+        let beat_kind = u64::from(crate::heartbeat::SELLER_HEARTBEAT_KIND);
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("lane-l1-withheld-claim-oks");
+        let home = lane_home(&root, &fixture);
+        let keys: Vec<String> = {
+            let store = lane_store(&root);
+            (1..=3).map(|n| seed_claim(&store, n)).collect()
+        };
+        fixture.withhold_ok_for(&[claim_kind]);
+
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+        let shutdown = runner.shutdown_handle();
+        let local = tokio::task::LocalSet::new();
+        let loop_handle = local.spawn_local(async move { runner.run().await });
+        let (stop_took, joined) = local
+            .run_until(async {
+                assert!(
+                    fixture
+                        .wait_until_published(FIXTURE_WAIT, |events| events
+                            .iter()
+                            .any(|event| event.kind == claim_kind))
+                        .await,
+                    "harness check: the backlog must reach the relay (unacknowledged)"
+                );
+                let beats = fixture.event_kind_count(beat_kind).await;
+                assert!(
+                    fixture
+                        .wait_until_published(FIXTURE_WAIT, |events| events
+                            .iter()
+                            .filter(|event| event.kind == beat_kind)
+                            .count()
+                            >= beats + 2)
+                        .await,
+                    "heartbeats must keep publishing while the relay withholds claim OKs"
+                );
+                let asked = tokio::time::Instant::now();
+                assert!(shutdown.request("L1 stop"), "the loop must accept a shutdown request");
+                let joined = tokio::time::timeout(FIXTURE_WAIT, loop_handle).await;
+                (asked.elapsed(), joined)
+            })
+            .await;
+        let outcome = joined
+            .expect("the run loop must RETURN on a shutdown request")
+            .expect("the loop task must not panic");
+        assert!(outcome.is_ok(), "a requested shutdown is a clean exit: {outcome:?}");
+        assert!(
+            stop_took < Duration::from_secs(10),
+            "shutdown took {stop_took:?} behind a relay that withholds OKs"
+        );
+        let store = lane_store(&root);
+        for key in &keys {
+            let row = store.outbox_row(key).expect("row").expect("row exists");
+            assert_eq!(row.0, "pending", "{key}: an unacknowledged claim stays pending");
+        }
+        // Claim key -> the event id the relay saw (unacknowledged) before the restart.
+        let unacknowledged: std::collections::HashMap<String, String> = fixture
+            .events()
+            .await
+            .iter()
+            .filter(|event| event.kind == claim_kind)
+            .filter_map(|event| {
+                event.tag_value("e").map(|job| (format!("claim:{job}"), event.id.clone()))
+            })
+            .collect();
+        assert!(!unacknowledged.is_empty(), "harness check: a claim reached the wire unacknowledged");
+        drop(local);
+
+        // The relay answers again; a restarted node retries the backlog.
+        fixture.withhold_ok_for(&[]);
+        let runner = SellerNodeRunner::boot(lane_home(&root, &fixture))
+            .await
+            .expect("reboot runner");
+        let shutdown = runner.shutdown_handle();
+        let local = tokio::task::LocalSet::new();
+        let loop_handle = local.spawn_local(async move { runner.run().await });
+        local
+            .run_until(async {
+                for key in &keys {
+                    assert!(
+                        wait_for_row_state(&store, key, "confirmed", Duration::from_secs(30)).await,
+                        "{key}: the retry must be confirmed once the relay answers"
+                    );
+                }
+                assert!(shutdown.request("L1 stop 2"));
+                let _ = tokio::time::timeout(FIXTURE_WAIT, loop_handle).await;
+            })
+            .await;
+        for key in &keys {
+            let row = store.outbox_row(key).expect("row").expect("row exists");
+            let id = row.2.expect("a confirmed row records its event id");
+            if let Some(seen) = unacknowledged.get(key) {
+                assert_eq!(&id, seen, "{key}: the retry must carry the event id the relay already saw");
+            }
+        }
+        let wire: std::collections::HashSet<String> = fixture
+            .events()
+            .await
+            .iter()
+            .filter(|event| event.kind == claim_kind)
+            .map(|event| event.id.clone())
+            .collect();
+        assert_eq!(wire.len(), keys.len(), "one event id per claim across every retry: {wire:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// L2 — a wrap backfill whose read never completes (no EOSE for kind 1059) reports INCOMPLETE
+    /// (`false`, so the loop schedules a retry) instead of "0 returned", and complete again once the
+    /// relay answers.
+    ///
+    /// RED ON REVERT: return `private_complete` alone (or read with the SDK's `fetch_events`) and the
+    /// silent relay reads as an empty, complete history.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wrap_backfill_without_eose_is_incomplete_until_the_relay_answers() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("lane-l2-wrap-backfill");
+        let runner = boot_against(&root, &fixture, false).await;
+        assert!(
+            runner.run_wrap_backfill().await,
+            "harness check: an answering relay gives a complete backfill"
+        );
+        fixture.withhold_eose_for(&[1059]);
+        assert!(
+            !runner.run_wrap_backfill().await,
+            "a read the relay never finished must not count as a complete (empty) history"
+        );
+        fixture.withhold_eose_for(&[]);
+        assert!(runner.run_wrap_backfill().await, "complete again once the relay answers");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// L3 — the relay serves heartbeats but never answers the liveness probe, so the watchdog trips
+    /// and recovers. Supervision is single-flight: a probe that waits out its timeout is never
+    /// stacked under more probes or recoveries (ticks are skipped while one is in flight), and the
+    /// work lane keeps publishing beside it.
+    ///
+    /// RED ON REVERT: drop `supervision.is_none()` from the heartbeat arm and a new probe starts every
+    /// tick (one per second here, against at most one per probe timeout).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_hung_liveness_probe_recovers_one_at_a_time_while_the_lane_keeps_publishing() {
+        use_fast_backfill_tick();
+        let beat_kind = u64::from(crate::heartbeat::SELLER_HEARTBEAT_KIND);
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("lane-l3-hung-probe");
+        let runner = SellerNodeRunner::boot(lane_home(&root, &fixture))
+            .await
+            .expect("boot runner");
+        let shutdown = runner.shutdown_handle();
+        let store = lane_store(&root);
+        let local = tokio::task::LocalSet::new();
+        let loop_handle = local.spawn_local(async move { runner.run().await });
+        local
+            .run_until(async {
+                assert!(
+                    fixture
+                        .wait_until(FIXTURE_WAIT, |reqs| served_authed(reqs, LIVENESS_PROBE_SUB_ID) > 0)
+                        .await,
+                    "harness check: the probe is served before the outage"
+                );
+                fixture.withhold_eose_for(&[beat_kind]);
+                let started = tokio::time::Instant::now();
+                let connections = fixture.connections();
+                let probes = fixture.reqs_for(LIVENESS_PROBE_SUB_ID).await.len();
+
+                let recovered = tokio::time::timeout(Duration::from_secs(45), async {
+                    while fixture.connections() == connections {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                })
+                .await
+                .is_ok();
+                assert!(recovered, "the watchdog must trip and reconnect on an unanswered probe");
+
+                // The lane still serves while supervision is busy: a fresh claim is published.
+                let key = seed_claim(&store, 9);
+                assert!(
+                    wait_for_row_state(&store, &key, "confirmed", Duration::from_secs(30)).await,
+                    "the work lane must keep publishing during probe outages and recoveries"
+                );
+
+                let window = Duration::from_secs(40);
+                if let Some(rest) = window.checked_sub(started.elapsed()) {
+                    tokio::time::sleep(rest).await;
+                }
+                let elapsed = started.elapsed();
+                let probes = fixture.reqs_for(LIVENESS_PROBE_SUB_ID).await.len() - probes;
+                let reconnects = fixture.connections() - connections;
+                let ceiling = (elapsed.as_secs() / LIVENESS_PROBE_TIMEOUT.as_secs()) as usize + 2;
+                assert!(
+                    probes <= ceiling,
+                    "{probes} probes in {elapsed:?}: supervision must be single-flight (at most \
+                     {ceiling})"
+                );
+                assert!(
+                    reconnects <= probes + 1,
+                    "{reconnects} reconnects for {probes} probes: recoveries must not stack"
+                );
+                assert!(shutdown.request("L3 stop"));
+                let _ = tokio::time::timeout(FIXTURE_WAIT, loop_handle).await;
+            })
+            .await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Budget for one challenge-roll to re-authenticate the live socket and for the fix to re-issue
     /// the long-lived legs on that completed auth. Generous; the REVERT path never re-issues, so it
     /// spends the whole budget then trips — a slow but unambiguous red.
