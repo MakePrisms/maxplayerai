@@ -30,12 +30,3 @@ export const pct = (x: number | null | undefined): string =>
 export const stamp = (ts: number): string =>
   new Date(ts * 1000).toISOString().replace("T", " ").slice(0, 19) + "Z";
 
-/**
- * Harness names carry packaging the reader does not need — `claude-agent-acp`
- * is the same runtime as `claude` as far as a buyer is concerned. The full
- * string stays in the title attribute.
- */
-export function shortHarness(name: string): string {
-  const first = String(name).split(/[-_]/)[0] ?? "";
-  return first.length > 9 ? first.slice(0, 9) : first;
-}
