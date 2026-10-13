@@ -1,6 +1,6 @@
 # Commands and monetary bounds
 
-Every invocation starts `maxplayer-trade --home <private-absolute-home>`.
+Every invocation except wallet-free `doctor` starts `maxplayer-trade --home <private-absolute-home>`.
 Build the production binary as in the crate README's "Build and automated tests" section:
 the crate is its own Cargo workspace, so `cargo build -p maxplayer-trade` from the repository
 root fails; build it by manifest path, release profile, locked (no protoc needed for the binary).
@@ -21,6 +21,7 @@ restart loops or generate fresh identities to evade rate limits.
 Canonical command signatures (placeholders are not literal values):
 
 ```text
+doctor <mint> --mint-relay <url> [--json] [--timeout-seconds <seconds>]
 preflight <mint>
 balance <mint>
 status [--json] [--check-sends]
@@ -40,7 +41,7 @@ Use `-h` / `--help` at the root or on any application subcommand. The built-in
 `help [COMMAND]` also shows root or command help. There is no version option.
 `--home <HOME>` is required for operational commands; `--relay <RELAY>` is
 repeatable. All command-specific flags in the signatures above are required except
-`--quote`, `--max-debit`, `--token-file` (stdin when omitted), `--dry-run`, `--json`, `--check-sends`,
+`--timeout-seconds` (doctor: default 30 seconds), `--quote`, `--max-debit`, `--token-file` (stdin when omitted), `--dry-run`, `--json`, `--check-sends`,
 and `--max-fees` (default 16 on list/take; on send it is required unless the mint's input fee is 0). `send` takes either `<mint> --amount --out` or `--reclaim <send-id>`. Positional mint arguments are
 canonical URLs, or `nostr://<npub>` for a Nostr-reachable mint (hex or uppercase input is
 canonicalized to the lowercase npub). `fund` and `withdraw` refuse `nostr://` mints before
@@ -50,6 +51,30 @@ before anything else (no home, lock, relay or mint) with `amount must be at leas
 (<flag> 0)`; `--min-receive 0` and `--max-fees 0` stay valid bounds. Lot arguments are public lot IDs; `--quote` is a saved funding
 quote for the same mint and amount.
 Never use a lab-feature binary for the human's funds.
+
+## Doctor and admission diagnostics
+
+`doctor <mint> --mint-relay <url> --json` makes one read-only info request to that
+explicit nostr mint/relay pair. It needs no home and creates no seed or journal; no
+market connection, keysets, swap, checkstate or restore probe. It re-sends the identical
+event every 5 s, like trade admission. `--timeout-seconds`
+changes only this read-only budget, never monetary windows.
+
+Doctor exits **0** for usable info (unknown compatibility warns), **1** for proven
+incompatibility, **2** for an unsuccessful diagnostic. A missing relay ACK means
+acceptance unknown, not unsent. An accepted request without a mint reply cannot
+distinguish an offline, incompatible, unsubscribed mint or lost reply. Signed errors
+are reported separately; error-body text is withheld. A reply in an unsupported envelope
+version is ignored (exit 1 once the budget ends without a usable reply).
+A real reply above 5 seconds warns about slowness, never refuses on that basis.
+
+List/take admission, including previews and serve IPC, reuse existing info/keysets
+reads. A recognised schema-1 block missing a required capability refuses new effects:
+upgrade the mint sidecar and repeat preflight. A missing version, or a capability schema
+this tool does not recognise, produces **WARNING: compatibility unknown**, not a refusal
+or an invented historical minimum. The new gate
+never blocks existing-trade recovery. Both mints must remain reachable throughout a
+trade; info is no guarantee of later claims, refunds or spent-witness emission.
 
 ## Enforced monetary policy
 
@@ -81,8 +106,8 @@ confirm that the incoming B claim fee fits the cap; do not blindly use 3 across
 unequal-fee mints. A larger cap needs the human’s approval, not an automatic retry.
 Never round a spend ceiling upward or a minimum receipt downward.
 
-Automatic preflight before funding, listing, taking, and withdrawal requires
-NUT-07/09/11/12/14 support, an active sat keyset, and clock skew at most 60 seconds.
+Automatic preflight before funding, listing, taking, sending and withdrawal requires
+a reachable mint, NUT-07/09/11/12/14 support, an active sat keyset, and clock skew at most 60 seconds.
 Funding additionally requires enabled NUT-04 bolt11/sat and NUT-20; withdrawal
 requires enabled NUT-05 bolt11/sat. The explicit `preflight <mint>` checks the
 common trading capabilities. Diagnostic preflight output goes to stderr. No opt-in is required;
@@ -174,6 +199,8 @@ in one process:
   on every serve/recover tick (also after a restart) until it is handled, refused by
   the mint or by validation, superseded, or past its deadline. serve logs `trade message
   waits for its mint (no answer); retained`. Validation failures are still rejected.
+  An initial request that failed only because a mint did not answer is not queued and
+  not recorded as rejected: a later delivery of the same event is handled fresh.
 - `fund` polls its quote every 5 s (6 polls), not every second.
 
 ## Funding

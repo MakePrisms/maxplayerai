@@ -155,8 +155,20 @@ fn timing(l: &Lot) -> Result<(u64, u64, u64, u64)> {
     Ok((LONG_SECONDS, SHORT_SECONDS, CLAIM_CUTOFF_SECONDS, 60))
 }
 async fn preflight(l: &Lot) -> Result<()> {
+    crate::diagnostics::notice();
     for a in [&l.give.asset, &l.want.asset] {
         a.fence()?;
+    }
+    let (give, want) = tokio::join!(
+        wallet::preflight_admission(&l.give.asset.mint_url),
+        wallet::preflight_admission(&l.want.asset.mint_url)
+    );
+    give?;
+    want?;
+    Ok(())
+}
+async fn recovery_preflight(l: &Lot) -> Result<()> {
+    for a in [&l.give.asset, &l.want.asset] {
         wallet::preflight(&a.mint_url).await?;
     }
     Ok(())
@@ -177,7 +189,7 @@ fn envelope(s: &Swap, step: &str, body: serde_json::Value) -> Result<Envelope> {
             .quote
             .as_ref()
             .map(|q| q.long + 86400)
-            .unwrap_or(s.created + 60),
+            .unwrap_or(s.created + QUOTE_SECONDS),
     })
 }
 async fn send(
@@ -357,8 +369,14 @@ pub async fn handle(home: &Path, j: &Journal, m: &Market, e: &Event) -> Result<(
     let result = handle_message(home, j, m, e).await;
     if let Err(ref error) = result {
         if message.step == "request" && j.get::<Swap>("swap", &message.swap_id).await?.is_none() {
-            j.put("rejected", &key, &(hash(&message)?, error.to_string()))
-                .await?;
+            // A refusal is permanent. A mint that did not answer is not a refusal: record
+            // nothing, so a re-delivery of this same signed event (a serve restart re-reads the
+            // last hour) is handled again while it is unexpired. Not queued: only a serving
+            // maker admits requests, and `inbox` keeps the request id bound to this digest.
+            if !crate::backoff::unanswered(error) {
+                j.put("rejected", &key, &(hash(&message)?, error.to_string()))
+                    .await?;
+            }
         } else if crate::backoff::unanswered(error) {
             retain(j, e, &message).await?;
         }
@@ -556,6 +574,14 @@ async fn handle_message(home: &Path, j: &Journal, m: &Market, e: &Event) -> Resu
         );
         let lot = parse_lot(&l.event, now())?;
         let swaps = j.all::<Swap>("swap").await?;
+        // The swap row, not `listing.active`, decides busy-ness: a message timeout between
+        // `save(swap)` and the listing write below leaves `active` unset until the next tick.
+        ensure!(
+            !swaps
+                .iter()
+                .any(|s| s.role == "maker" && s.lot.id.to_hex() == msg.lot_id && !terminal(s)),
+            "lot busy or terminal"
+        );
         ensure!(
             swaps
                 .iter()
@@ -869,7 +895,7 @@ async fn advance_inner(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Re
                     now() < q.exp && now() + q.cutoff < q.short,
                     "quote expired before lock"
                 );
-                preflight(&q.lot).await?;
+                recovery_preflight(&q.lot).await?;
             }
             let c = if taker {
                 mint::conditions(&q.request.hash, &q.maker_key, &q.request.taker_key, q.long)?
@@ -1146,7 +1172,7 @@ async fn recover_pass(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
         }
         let budget = item_budget(&s);
         let item = async {
-            if s.state == "requested" && now() > s.created + 60 {
+            if s.state == "requested" && now() > s.created + QUOTE_SECONDS {
                 mint::release(home, &s.plan, &s.id).await?;
                 s.state = "expired".into();
                 save(j, &s).await?;

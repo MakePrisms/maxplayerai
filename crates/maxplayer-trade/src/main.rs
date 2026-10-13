@@ -10,7 +10,7 @@ use std::{
 struct Cli {
     /// Private, exclusively owned journal and wallet directory. Never delete a funded home.
     #[arg(long)]
-    home: PathBuf,
+    home: Option<PathBuf>,
     /// Relay URL (repeatable); defaults to nos.lol, relay.primal.net and offchain.pub.
     #[arg(long)]
     relay: Vec<String>,
@@ -25,6 +25,17 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// One read-only info request to an explicit mint/relay pair; no wallet or journal.
+    Doctor {
+        mint: String,
+        #[arg(long = "mint-relay")]
+        mint_relay: String,
+        #[arg(long)]
+        json: bool,
+        /// Read-only probe budget; does not change monetary request windows.
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=300))]
+        timeout_seconds: u64,
+    },
     /// Publish a fixed lot and reserve its inputs; preflights both mints.
     List {
         #[arg(long)]
@@ -128,6 +139,9 @@ async fn main() -> std::process::ExitCode {
     match execute().await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
+            if let Some(f) = error.downcast_ref::<DoctorExit>() {
+                return std::process::ExitCode::from(f.0);
+            }
             if let Some(f) = error.downcast_ref::<maxplayer_trade::serve::Forwarded>() {
                 return std::process::ExitCode::from(f.0);
             }
@@ -144,6 +158,19 @@ async fn main() -> std::process::ExitCode {
 }
 async fn execute() -> Result<()> {
     let cli = Cli::parse();
+    if let Command::Doctor {
+        mint,
+        mint_relay,
+        json,
+        timeout_seconds,
+    } = &cli.command
+    {
+        return doctor(mint, mint_relay, *json, *timeout_seconds).await;
+    }
+    let home = cli
+        .home
+        .as_ref()
+        .context("--home is required for this command")?;
     maxplayer_trade::transport::configure_mint_relays(&cli.mint_relay)?;
     // No home, lock, journal or intent is touched for a path a nostr:// mint cannot serve.
     match &cli.command {
@@ -175,18 +202,18 @@ async fn execute() -> Result<()> {
         let asset = Asset::from_cli(mint)?;
         println!(
             "{}",
-            serde_json::json!({"mint":asset.mint_url,"unit":"sat","balance":maxplayer_trade::wallet::read_balance(&cli.home, &asset.mint_url)?})
+            serde_json::json!({"mint":asset.mint_url,"unit":"sat","balance":maxplayer_trade::wallet::read_balance(home, &asset.mint_url)?})
         );
         return Ok(());
     }
     if let Command::Status { json, check_sends } = cli.command {
         if json {
-            println!("{}", maxplayer_trade::wallet::read_status(&cli.home)?);
+            println!("{}", maxplayer_trade::wallet::read_status(home)?);
         } else {
-            println!("{}", maxplayer_trade::report::render(&cli.home)?);
+            println!("{}", maxplayer_trade::report::render(home)?);
         }
         if check_sends {
-            maxplayer_trade::send::check_redeemed(&cli.home).await?;
+            maxplayer_trade::send::check_redeemed(home).await?;
         }
         return Ok(());
     }
@@ -209,7 +236,7 @@ async fn execute() -> Result<()> {
             max_fees,
             dry_run: true,
         } => {
-            return lockfree::list(&cli.home, give_mint, *give, want_mint, *want, *max_fees).await;
+            return lockfree::list(home, give_mint, *give, want_mint, *want, *max_fees).await;
         }
         Command::Take {
             lot,
@@ -218,8 +245,7 @@ async fn execute() -> Result<()> {
             max_fees,
             dry_run: true,
         } => {
-            return lockfree::take(&cli.home, &relays, lot, *max_give, *min_receive, *max_fees)
-                .await;
+            return lockfree::take(home, &relays, lot, *max_give, *min_receive, *max_fees).await;
         }
         _ => {}
     }
@@ -262,21 +288,21 @@ async fn execute() -> Result<()> {
         command,
     });
     if let Some(request) = &handoff {
-        if cli.home.is_dir() {
-            if let Some(code) = maxplayer_trade::serve::forward(&cli.home, request).await? {
+        if home.is_dir() {
+            if let Some(code) = maxplayer_trade::serve::forward(home, request).await? {
                 return forwarded(code);
             }
         }
     }
-    fs::create_dir_all(&cli.home)?;
-    fs::set_permissions(&cli.home, fs::Permissions::from_mode(0o700))?;
+    fs::create_dir_all(home)?;
+    fs::set_permissions(home, fs::Permissions::from_mode(0o700))?;
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .mode(0o600)
-        .open(cli.home.join("owner.lock"))?;
+        .open(home.join("owner.lock"))?;
     if let Err(busy) = lock.try_lock_exclusive() {
         // Another process owns the home: a serve (possibly still binding its socket) gets the
         // request; a short-lived writer such as recover is waited out. Never two writers.
@@ -285,7 +311,7 @@ async fn execute() -> Result<()> {
         };
         let end = tokio::time::Instant::now() + maxplayer_trade::serve::CONNECT_WAIT;
         loop {
-            if let Some(code) = maxplayer_trade::serve::forward(&cli.home, request).await? {
+            if let Some(code) = maxplayer_trade::serve::forward(home, request).await? {
                 return forwarded(code);
             }
             if lock.try_lock_exclusive().is_ok() {
@@ -302,13 +328,13 @@ async fn execute() -> Result<()> {
     // Bind while holding owner.lock (an existing socket file is stale) and before the startup
     // recovery pass, so hand-offs queue instead of failing while serve recovers.
     let mut jobs = if matches!(cli.command, Command::Serve) {
-        Some(maxplayer_trade::serve::bind(&cli.home, relays.clone())?)
+        Some(maxplayer_trade::serve::bind(home, relays.clone())?)
     } else {
         None
     };
     // `recover` is one bounded pass: it waits for mint pacing instead of skipping an item.
     maxplayer_trade::backoff::set_wait_for_pacing(matches!(cli.command, Command::Recover));
-    let money_journal = Journal::open(&cli.home).await?;
+    let money_journal = Journal::open(home).await?;
     // Inspection must not submit an earlier payment authorization. Newly credited
     // money proofs remain reserved until explicit recovery settles their journal.
     if matches!(cli.command, Command::Recover)
@@ -321,7 +347,7 @@ async fn execute() -> Result<()> {
             .await?
             .is_empty()
     {
-        let pending = maxplayer_trade::money::recover(&cli.home, &money_journal).await?;
+        let pending = maxplayer_trade::money::recover(home, &money_journal).await?;
         return coordinator::recovery_status(&money_journal, pending).await;
     }
     if !matches!(
@@ -333,11 +359,11 @@ async fn execute() -> Result<()> {
             | Command::Receive { .. }
             | Command::Send { .. }
     ) {
-        let keys = maxplayer_trade::wallet::identity(&cli.home)?;
-        let j = Journal::open(&cli.home).await?;
+        let keys = maxplayer_trade::wallet::identity(home)?;
+        let j = Journal::open(home).await?;
         let mut m = Market::connect(keys, &relays).await?;
         if !matches!(cli.command, Command::Recover) {
-            coordinator::recover(&cli.home, &j, &m).await?;
+            coordinator::recover(home, &j, &m).await?;
         }
         return match cli.command {
             Command::List {
@@ -349,7 +375,7 @@ async fn execute() -> Result<()> {
                 ..
             } => {
                 coordinator::list(
-                    &cli.home,
+                    home,
                     &j,
                     &m,
                     Leg {
@@ -365,7 +391,7 @@ async fn execute() -> Result<()> {
                 .await?;
                 Ok(())
             }
-            Command::Cancel { lot } => coordinator::cancel(&cli.home, &j, &m, &lot).await,
+            Command::Cancel { lot } => coordinator::cancel(home, &j, &m, &lot).await,
             Command::Take {
                 lot,
                 max_give,
@@ -373,20 +399,13 @@ async fn execute() -> Result<()> {
                 max_fees,
                 ..
             } => {
-                let id = coordinator::start_take(
-                    &cli.home,
-                    &j,
-                    &m,
-                    &lot,
-                    max_give,
-                    min_receive,
-                    max_fees,
-                )
-                .await?;
-                coordinator::run(&cli.home, &j, &mut m, Some(&id)).await
+                let id =
+                    coordinator::start_take(home, &j, &m, &lot, max_give, min_receive, max_fees)
+                        .await?;
+                coordinator::run(home, &j, &mut m, Some(&id)).await
             }
-            Command::Serve => coordinator::run_with(&cli.home, &j, &mut m, None, jobs.take()).await,
-            Command::Recover => coordinator::recover_until_settled(&cli.home, &j, &mut m).await,
+            Command::Serve => coordinator::run_with(home, &j, &mut m, None, jobs.take()).await,
+            Command::Recover => coordinator::recover_until_settled(home, &j, &mut m).await,
             _ => unreachable!(),
         };
     }
@@ -399,7 +418,7 @@ async fn execute() -> Result<()> {
     } = &cli.command
     {
         return maxplayer_trade::send::command(
-            &cli.home,
+            home,
             &money_journal,
             mint.as_deref(),
             *amount,
@@ -431,7 +450,7 @@ async fn execute() -> Result<()> {
     } = cli.command
     {
         let a = match maxplayer_trade::money::withdraw_bounded(
-            &cli.home,
+            home,
             &money_journal,
             mint,
             invoice,
@@ -479,7 +498,7 @@ async fn execute() -> Result<()> {
                 .read_to_string(&mut raw)
                 .context("stdin token is not readable UTF-8")?,
         };
-        let r = maxplayer_trade::receive::receive(&cli.home, &money_journal, mint, &raw).await;
+        let r = maxplayer_trade::receive::receive(home, &money_journal, mint, &raw).await;
         drop(raw);
         let r = r?;
         println!("{}", r.summary());
@@ -517,7 +536,7 @@ async fn execute() -> Result<()> {
                 .find(|f| f.quote.as_ref() == Some(id) && f.mint == *mint && f.amount == amount)
                 .context("quote not journaled for this mint and amount")?
         } else {
-            maxplayer_trade::money::fund(&cli.home, &money_journal, mint, amount).await?
+            maxplayer_trade::money::fund(home, &money_journal, mint, amount).await?
         };
         println!(
             "{}",
@@ -525,7 +544,7 @@ async fn execute() -> Result<()> {
         );
         // Quote polling: one status GET per FUND_POLL (about 30 s in total).
         for _ in 0..maxplayer_trade::money::FUND_POLLS {
-            maxplayer_trade::money::resume_fund(&cli.home, &money_journal, &mut f).await?;
+            maxplayer_trade::money::resume_fund(home, &money_journal, &mut f).await?;
             if f.done {
                 return Ok(());
             }
@@ -569,12 +588,16 @@ mod lockfree {
         println!("{}", serde_json::json!({"status":"ok","listings":listings}));
         Ok(())
     }
-    async fn preflight(mints: [&str; 2]) -> Result<()> {
+    async fn preflight(mints: [&str; 2]) -> Result<[dryrun::Keysets; 2]> {
+        maxplayer_trade::diagnostics::notice();
         for mint in mints {
             Asset::new(mint)?.fence()?;
-            wallet::preflight(mint).await?;
         }
-        Ok(())
+        let (a, b) = tokio::join!(
+            wallet::preflight_admission(mints[0]),
+            wallet::preflight_admission(mints[1])
+        );
+        Ok([dryrun::parse_keysets(&a?)?, dryrun::parse_keysets(&b?)?])
     }
     fn finish(out: serde_json::Value, refusal: Option<String>) -> Result<()> {
         println!("{out}");
@@ -593,9 +616,7 @@ mod lockfree {
     ) -> Result<()> {
         let (give_asset, want_asset) = (Asset::new(give_mint)?, Asset::new(want_mint)?);
         ensure!(give_asset != want_asset, "same-asset swap");
-        preflight([&give_asset.mint_url, &want_asset.mint_url]).await?;
-        let gks = dryrun::keysets(&give_asset.mint_url, std::time::Duration::from_secs(15)).await?;
-        let wks = dryrun::keysets(&want_asset.mint_url, std::time::Duration::from_secs(15)).await?;
+        let [gks, wks] = preflight([&give_asset.mint_url, &want_asset.mint_url]).await?;
         let p = dryrun::plan(
             &dryrun::spendable(home, &give_asset.mint_url)?,
             &gks,
@@ -649,11 +670,7 @@ mod lockfree {
             .ok()
             .and_then(|k| nostr_sdk::Keys::parse(&k).ok());
         ensure!(own.is_none_or(|k| k.public_key() != e.pubkey), "self trade");
-        preflight([&l.give.asset.mint_url, &l.want.asset.mint_url]).await?;
-        let gks =
-            dryrun::keysets(&l.give.asset.mint_url, std::time::Duration::from_secs(15)).await?;
-        let wks =
-            dryrun::keysets(&l.want.asset.mint_url, std::time::Duration::from_secs(15)).await?;
+        let [gks, wks] = preflight([&l.give.asset.mint_url, &l.want.asset.mint_url]).await?;
         let p = dryrun::plan(
             &dryrun::spendable(home, &l.want.asset.mint_url)?,
             &wks,
@@ -737,5 +754,100 @@ mod lab_trace {
                 line(p, "release");
             }
         }
+    }
+}
+
+#[derive(Debug)]
+struct DoctorExit(u8);
+impl std::fmt::Display for DoctorExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "doctor exit {}", self.0)
+    }
+}
+impl std::error::Error for DoctorExit {}
+async fn doctor(mint: &str, relay: &str, json_output: bool, seconds: u64) -> Result<()> {
+    match doctor_inner(mint, relay, json_output, seconds).await {
+        Err(error) if !error.is::<DoctorExit>() => {
+            let message =
+                "Diagnostic not started: check the mint identifier and explicit relay URL";
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({"exit":2,"observation":{"reachability":"not_checked"},"error":message})
+                );
+            } else {
+                eprintln!("{message}");
+            }
+            Err(DoctorExit(2).into())
+        }
+        result => result,
+    }
+}
+async fn doctor_inner(mint: &str, relay: &str, json_output: bool, seconds: u64) -> Result<()> {
+    use maxplayer_core::nostr_mint::NostrMintConnector;
+    use std::time::Duration;
+    let asset = Asset::from_cli(mint)?;
+    ensure!(
+        maxplayer_trade::transport::is_nostr(&asset.mint_url),
+        "doctor requires a nostr:// mint and one explicit --mint-relay"
+    );
+    maxplayer_trade::transport::configure_mint_relays(&[relay.to_owned()])?;
+    let window = Duration::from_secs(seconds);
+    let connector = NostrMintConnector::new(&asset.mint_url.parse()?, vec![relay.to_owned()])?
+        // Resend the identical event on the production cadence, so a first delivery lost on
+        // the way is retried exactly as list/take admission would retry it.
+        .with_timing(
+            window,
+            maxplayer_core::nostr_mint::DEFAULT_RESEND_EVERY,
+            Duration::from_secs(5).min(window),
+        );
+    eprintln!(
+        "Waiting for mint info (read-only budget {seconds}s); no wallet, journal or trade is opened"
+    );
+    let (result, evidence) = connector
+        .call_observed("info", serde_json::Value::Null)
+        .await;
+    let compatibility = result
+        .as_ref()
+        .ok()
+        .map(maxplayer_trade::compatibility::assess);
+    let incompatible = evidence.outcome == "unsupported_protocol"
+        || compatibility
+            .as_ref()
+            .is_some_and(|c| c["status"] == "incompatible");
+    let usable = result
+        .as_ref()
+        .is_ok_and(|v| v.is_object() && v["nuts"].is_object());
+    let exit = if incompatible {
+        1
+    } else if usable {
+        0
+    } else {
+        2
+    };
+    let slow = evidence.reply_ms.is_some_and(|ms| ms > 5000);
+    let report = serde_json::json!({"observation":evidence,"compatibility":compatibility,
+        "latency":if evidence.reply_ms.is_none() {"unknown"} else if slow {"slow"} else {"normal"},
+        "slow_warning_threshold_ms":5000,"exit":exit,
+        "scope":"info only; keysets, swap, restore and witness emission not tested"});
+    if json_output {
+        println!("{report}");
+    } else {
+        println!("{}", evidence.message());
+        if let Some(c) = compatibility {
+            println!(
+                "{}",
+                c["message"].as_str().unwrap_or("compatibility unknown")
+            );
+        }
+        if slow {
+            println!("WARNING: slow reply (warning threshold 5s); this is not a refusal");
+        }
+        println!("Info only; no guarantee of later claims or refunds.");
+    }
+    if exit == 0 {
+        Ok(())
+    } else {
+        Err(DoctorExit(exit).into())
     }
 }

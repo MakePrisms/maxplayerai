@@ -248,3 +248,26 @@ fn skill_commands_and_flags_match_binary_help() {
         docs.len()
     );
 }
+
+#[test]
+fn doctor_configuration_failure_is_diagnostic_exit_two() {
+    for (mint, relay) in [
+        ("http://127.0.0.1:1", "ws://127.0.0.1:1"),
+        ("not-a-mint", "ws://127.0.0.1:1"),
+        (
+            "nostr://npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d",
+            "wss://user:private-fixture@localhost",
+        ),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
+            .args(["doctor", mint, "--mint-relay", relay, "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report["exit"], 2);
+        assert_eq!(report["observation"]["reachability"], "not_checked");
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("private-fixture"));
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("private-fixture"));
+    }
+}

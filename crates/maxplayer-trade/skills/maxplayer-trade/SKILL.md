@@ -14,7 +14,7 @@ Use the standalone binary, not Maxplayer jobs or wallet/daemon. Read
 [recovery](references/recovery.md) for any interruption.
 
 Choose **one private, persistent absolute home** for this human. Put
-`--home <home>` before **every** command. Preserve that home, keys, databases and
+`--home <home>` before every command but `doctor`. Preserve that home, keys, databases and
 journals across restarts. Never delete it while funds, reservations, unresolved
 funding/withdrawals, or trades exist; keep it afterward for recovery.
 Never use a fresh home to evade caps. Only one writer owns it: while `serve` runs,
@@ -32,14 +32,11 @@ homes or databases. Report only public IDs, mints, amounts, states, redacted err
 
 Run `balance <mint>` and `preflight <mint>` per mint. Passing preflight
 proves neither honesty nor full compatibility. The CLI
-also preflights before fund/list/take/withdraw/send: NUT-07/09/11/12/14, an active sat keyset, reachable
-mint, and clock skew at most 60 seconds. Never
-bypass a failed check. Gross locks and each withdrawal invoice are capped at
+also preflights before fund/list/take/withdraw/send
+([checks](references/commands.md#enforced-monetary-policy)). Never bypass a failed check. Gross locks and each withdrawal invoice are capped at
 **100,000 sats**. Funding intents plus charged receives (gross) share one
-100,000-sat cap per mint per home; `refused`/`already_spent` receives do not
-count; `prepared`/`submitted`/`done`/`quarantined` ones do. The withdrawal Lightning
-fee reserve ceiling is **max(32 sats, 2% of invoice sats rounded up)**. Pass
-`--max-debit` to cap invoice amount + Cashu input fee + Lightning reserve. Fees can push a net lock over the cap.
+100,000-sat cap per mint per home (what counts: [commands](references/commands.md#enforced-monetary-policy)). Pass `--max-debit`
+to cap invoice + Cashu input fee + Lightning reserve ([reserve ceiling](references/commands.md#withdrawal-enforcement-before-execution)). Fees can push a net lock over the cap.
 
 **Before every real-money `fund`, `list`, `take`, `withdraw`, or `send`, present
 the exact operation and get an explicit yes.** For `list`/`take`, first show the
@@ -55,7 +52,7 @@ operation. State:
   can hold funds longer, indefinitely with a dishonest mint. Funding and withdrawal
   have their own unresolved-payment risk.
 - A mint can steal its tokens. If the counterparty vanishes, funds stay locked until
-  the refund deadline and successful recovery. `serve` must stay running while locks are live (an active `take` watches its trade).
+  the refund deadline and successful recovery; keep `serve` (or the active `take`) running.
   NUT-14 claims remain valid after locktime. Nutshell refund limits: [verification](references/verification.md). NUT-07 advertisement alone does not prove witness emission. The maker relies on
   the chosen mint reporting the HTLC witness if the taker withholds its notice.
   Mint choice is the human's responsibility; there is no rating gate.
@@ -83,9 +80,8 @@ quote is reported unresolved without another payment.
 Needs the human's yes (mint, amount); charges the shared cap (§2).
 Save it to a private file; run `receive <mint> --token-file <file>` (or
 stdin). Never put tokens in argv/chat/logs. Only plain sat proofs of that
-mint; fee deducted. Exit 0 `done`; 1 pre-journal refusal (nostr: NIP-44
-size), `refused` (final; redeem elsewhere), `already_spent`; 3 `recover`,
-never re-import; 4 `quarantined` (on cap): escalate. **Done:** `done` + `balance <mint>`.
+mint; fee deducted. Exit 3: `recover`, never re-import; 4 `quarantined`: escalate; other exits:
+[commands](references/commands.md#receive). **Done:** `done` + `balance <mint>`.
 
 ### Send a token / move funds to another wallet
 
@@ -124,9 +120,8 @@ to “fix” a timeout. `counterparty_unresponsive` is only a warning; keep serv
 Use only the human's invoice; validate amount, destination, expiry and
 fee/debit bounds before confirmation. `withdraw <mint> --invoice <bolt11> --max-debit <approved-sats>` may spend
 immediately; it is **not** a quote preview. Read the command reference's withdrawal limits first. Non-terminal is unresolved, not failed. Never create a replacement invoice, withdrawal, or payment
-while a submitted payment is unresolved. A pre-POST refusal cannot pay later via
-recovery; only explicit same-invoice withdrawal can authorize a new attempt.
-`quote_created` is never auto-submitted. A post-POST timeout is not a failed payment. **Done:** `done` and reconciled change/balance are confirmed,
+while a submitted payment is unresolved. A post-POST timeout is not a failed payment;
+pre-POST/`quote_created` rules: [withdrawal states](references/recovery.md#withdrawal-states). **Done:** `done` and reconciled change/balance are confirmed,
 or report the retained authorization and recover it without paying again.
 
 ### Check balance / something got interrupted
@@ -134,9 +129,10 @@ or report the retained authorization and recover it without paying again.
 `balance <mint>` is wallet balance, not total wealth or proof every reservation is spendable. After **any interruption**, use `recover` with the same
 home and relays before new work. It resumes existing authorizations and does not
 admit new trade requests. It makes **one bounded pass**, at most **120 s per
-item** (any money item; nostr trade swap: 140 s), not waiting for lock deadlines: exit **0** means
-all terminal with no deferred work, **3** unresolved/deferred, **4** terminal manual recovery, **1** command error, pre-submission refusal, or definitive terminal `unpaid_released` (never proof a submitted withdrawal was refused; a submitted non-terminal withdrawal exits **3**),
-**2** CLI usage error.
+item** (`nostr://` swap: longer, see recovery), not waiting for lock deadlines: exit **0**
+all terminal, no deferred work; **3** unresolved/deferred; **4** manual recovery; 1/2 and
+withdrawal cases: [recovery](references/recovery.md#bounded-pass-and-exit-status). Exit 1
+never proves a submitted withdrawal was refused.
 Timeout neither undoes an RPC nor releases reservations. Restore `serve` while locks
 are live; one pass is not a watcher. Quarantine and errors: recovery reference.
 **Done:** every outcome classified per the recovery reference.

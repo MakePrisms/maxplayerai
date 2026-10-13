@@ -48,6 +48,9 @@ fn retry_delay(attempt: u32) -> u64 {
     let jitter = u64::from(uuid::Uuid::new_v4().as_bytes()[0]) % 6;
     (3u64.saturating_mul(1u64 << attempt.min(7))).min(300) + jitter
 }
+/// Clock-skew allowance on a `request` envelope's expiry past `QUOTE_SECONDS`: the 60 s skew
+/// preflight accepts between this host and a mint.
+pub const REQUEST_EXP_SKEW_SECONDS: u64 = 60;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Envelope {
@@ -448,6 +451,17 @@ impl Market {
         EventId::from_hex(&m.lot_id)?;
         if !["request", "quote", "first", "second", "claimed", "done"].contains(&m.step.as_str()) {
             bail!("unknown step")
+        }
+        if m.step == "request" {
+            // Honest takers send `exp = created + QUOTE_SECONDS`. Allow the clock skew preflight
+            // tolerates on top, from both the signed creation time and our own clock, so a
+            // request cannot stay admissible (e.g. re-read after a restart) past that window.
+            let bound = crate::QUOTE_SECONDS + REQUEST_EXP_SKEW_SECONDS;
+            ensure!(
+                m.exp <= e.created_at.as_secs().saturating_add(bound)
+                    && m.exp <= crate::coordinator::now().saturating_add(bound),
+                "request expiry exceeds the quote window"
+            );
         }
         Ok(m)
     }

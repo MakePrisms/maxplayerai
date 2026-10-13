@@ -718,3 +718,7 @@ pub mod dryrun;
 pub mod observe;
 pub mod report;
 pub mod serve;
+
+pub mod compatibility;
+
+pub mod diagnostics;

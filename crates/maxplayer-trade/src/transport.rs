@@ -25,6 +25,17 @@ use maxplayer_core::{
 use serde::{Serialize, de::DeserializeOwned};
 use std::{sync::RwLock, time::Duration};
 
+/// Structured evidence retained on the error chain; independent of the financial cause.
+/// Debug/Display are payload-free; trusted callers may inspect the authenticated body in `0`.
+#[derive(Debug)]
+pub struct ObservedMintError(pub maxplayer_core::nostr_mint::RequestObservation);
+impl std::fmt::Display for ObservedMintError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0.message())
+    }
+}
+impl std::error::Error for ObservedMintError {}
+
 /// Per-request bound for an HTTP mint POST (unchanged from before this module existed).
 pub const HTTP_RPC_TIMEOUT: Duration = Duration::from_secs(20);
 /// Bound for one CDK wallet call (metadata, fees, DLEQ keys) against an HTTP mint.
@@ -264,6 +275,15 @@ async fn nostr_call(
     body: serde_json::Value,
     not_after: Option<u64>,
 ) -> Result<serde_json::Value> {
+    nostr_call_observed(mint, path, body, not_after, None).await
+}
+async fn nostr_call_observed(
+    mint: &str,
+    path: &str,
+    body: serde_json::Value,
+    not_after: Option<u64>,
+    observation_out: Option<&mut Option<maxplayer_core::nostr_mint::RequestObservation>>,
+) -> Result<serde_json::Value> {
     let operation = nostr_op(path)
         .with_context(|| format!("mint {mint} {path}: not served over nostr://; nothing sent"))?;
     let mut c = connector(mint)?;
@@ -280,36 +300,39 @@ async fn nostr_call(
         }
     }
     crate::backoff::admit(mint, true)?;
-    let answer = tokio::time::timeout(nostr_outer(mint), c.call_raw(operation, body)).await;
-    match &answer {
-        Err(_) => crate::backoff::record(
-            mint,
-            crate::backoff::Outcome::Failed(crate::backoff::Reason::Timeout, None),
-        ),
-        // The mint's own NUT error is an answer; transport failures may start a backoff.
-        Ok(Err(e)) if nostr_nut_refusal(e) => {
-            crate::backoff::record(mint, crate::backoff::Outcome::Answered)
-        }
-        Ok(Err(e)) => crate::backoff::record_cdk(mint, e),
-        Ok(Ok(_)) => crate::backoff::record(mint, crate::backoff::Outcome::Answered),
+    let answer = tokio::time::timeout(nostr_outer(mint), c.call_observed(operation, body)).await;
+    let (result, observation) = answer.map_err(|_| {
+        crate::backoff::record(mint, crate::backoff::Outcome::Failed(crate::backoff::Reason::Timeout, None));
+        crate::backoff::NoAnswer(format!("mint {mint} {path}: unanswered within the nostr bound; acceptance unknown. Check relay/operator; retain submitted operations and use status/recover"))
+    })?;
+    if let Some(out) = observation_out {
+        *out = Some(observation.clone());
     }
-    answer
-        .map_err(|_| {
-            crate::backoff::NoAnswer(format!(
-                "mint {mint} {path}: no answer within the nostr bound (ambiguous)"
-            ))
-        })?
+    if observation.reply_ms.is_some()
+        && !result
+            .as_ref()
+            .err()
+            .is_some_and(crate::backoff::cdk_unanswered)
+    {
+        crate::backoff::record(mint, crate::backoff::Outcome::Answered);
+    }
+    // Reachability and retry policy are independent: a signed rate-limit answer still paces.
+    if let Err(e) = &result {
+        crate::backoff::record_cdk(mint, e);
+    }
+    if path == "info" {
+        crate::diagnostics::emit(serde_json::to_string(&observation)?);
+    }
+    let message = observation.message();
+    result
         .map_err(|e| match nostr_refusal(e) {
-            // The typed refusal, exactly as an HTTP NUT error body yields; never "HTTP 400" text.
-            Ok(refusal) => anyhow::Error::new(refusal).context(format!("mint {mint} {path}")),
-            // No reply in the window, no relay reachable, rate limited or unavailable: the mint
-            // did not answer this request (`backoff::unanswered`).
-            Err(e) if crate::backoff::cdk_unanswered(&e) => crate::backoff::NoAnswer(format!(
-                "mint {mint} {path}: {e} (no mint NUT error; ambiguous)"
-            ))
-            .into(),
-            Err(e) => anyhow!("mint {mint} {path}: {e} (no mint NUT error; ambiguous)"),
+            Ok(refusal) => anyhow::Error::new(refusal).context(message),
+            Err(e) if crate::backoff::cdk_unanswered(&e) => {
+                crate::backoff::NoAnswer(message).into()
+            }
+            Err(_) => anyhow!(message),
         })
+        .map_err(|error| error.context(ObservedMintError(observation)))
 }
 
 /// A [`crate::mint::MintRefusal`] for the mint's own definitive NUT error over nostr, else the
@@ -401,6 +424,19 @@ pub async fn get(mint: &str, path: &str) -> Result<serde_json::Value> {
         .error_for_status()?
         .json()
         .await?)
+}
+
+/// The existing read plus its exact connector evidence, without an extra probe.
+pub async fn get_observed(
+    mint: &str,
+    path: &str,
+    observation: &mut Option<maxplayer_core::nostr_mint::RequestObservation>,
+) -> Result<serde_json::Value> {
+    if is_nostr(mint) {
+        nostr_call_observed(mint, path, serde_json::Value::Null, None, Some(observation)).await
+    } else {
+        get(mint, path).await
+    }
 }
 
 /// Plaintext bytes of the envelope that would carry `body` as `op` (the NIP-44 input).
