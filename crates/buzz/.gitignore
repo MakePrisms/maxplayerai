@@ -1,3 +1,5 @@
 # Vendored Buzz workspace build output. The maxplayerai root .gitignore only
 # anchors `/target` at the repo root, so this nested workspace needs its own.
 /target/
+# The maxplayerai root .gitignore ignores *.jsonl; these are upstream test fixtures.
+!/crates/buzz-conformance/tests/fixtures/*.jsonl

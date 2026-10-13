@@ -7,10 +7,10 @@ use super::{
     store::GitStore,
 };
 use axum::{
-    Router,
-    body::{Body, to_bytes},
+    body::{to_bytes, Body},
     http::{Method, Request, StatusCode},
     response::{IntoResponse, Response},
+    Router,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -35,7 +35,15 @@ fn git(path: &Path, args: &[&str]) {
 }
 async fn enforce_quota(path: &Path) -> Result<(), Response> {
     // Exercise the real scanner at a small test budget, not a 5 GiB allocation.
-    enforce_with_limits(path, true, Limits { bytes: 100 * 1024 * 1024, ..Limits::default() }).await
+    enforce_with_limits(
+        path,
+        true,
+        Limits {
+            bytes: 100 * 1024 * 1024,
+            ..Limits::default()
+        },
+    )
+    .await
 }
 fn snapshot(label: u8) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
@@ -124,7 +132,15 @@ async fn private_quota_cas_race_keeps_one_snapshot_and_rechecks_the_losers_retry
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    let store = GitStore::new(&endpoint, "test-key", "test-secret", "test", "test").unwrap();
+    let store = GitStore::new(
+        &endpoint,
+        "test-key",
+        "test-secret",
+        "test",
+        "test",
+        buzz_media::config::S3AddressingStyle::Path,
+    )
+    .unwrap();
     let tenant = buzz_core::TenantContext::resolved(
         buzz_core::CommunityId::from_uuid(uuid::Uuid::new_v4()),
         "test.example.invalid",
