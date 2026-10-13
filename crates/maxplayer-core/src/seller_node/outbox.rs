@@ -291,6 +291,147 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    fn enqueue_claim(store: &SellerStore, n: u8, now: i64) -> String {
+        let job = format!("{n:02x}").repeat(32);
+        store
+            .claim_and_enqueue(&job, &"o".repeat(64), Some("creqA"), &claim_draft(), 1, 9_999, now)
+            .expect("claim");
+        format!("claim:{job}")
+    }
+
+    /// Per-row behavior: rows in `hang` never get an answer, rows in `fail` are refused, the rest are
+    /// confirmed. Every call is recorded with the item it was handed.
+    #[derive(Default)]
+    struct ScriptedPublisher {
+        calls: RefCell<Vec<OutboxItem>>,
+        hang: RefCell<Vec<String>>,
+        fail: RefCell<Vec<String>>,
+    }
+
+    impl ScriptedPublisher {
+        fn keys(&self) -> Vec<String> {
+            self.calls.borrow().iter().map(|item| item.dedup_key.clone()).collect()
+        }
+    }
+
+    impl EventPublisher for ScriptedPublisher {
+        async fn publish(&self, item: &OutboxItem) -> Result<String, String> {
+            self.calls.borrow_mut().push(item.clone());
+            if self.hang.borrow().contains(&item.dedup_key) {
+                std::future::pending::<()>().await;
+            }
+            if self.fail.borrow().contains(&item.dedup_key) {
+                return Err("refused".into());
+            }
+            Ok(format!("evt-{}", item.dedup_key))
+        }
+    }
+
+    /// A pass stops at its deadline: the hung publish is cut short and recorded as one attempt, and
+    /// the rows behind it are untouched (still pending, zero attempts) and counted as deferred.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn bounded_pass_stops_at_its_deadline_and_leaves_unreached_rows_untouched() {
+        let (store, path) = fresh_store("budget");
+        let hung = enqueue_claim(&store, 1, 10);
+        let behind: Vec<String> = (2..5).map(|n| enqueue_claim(&store, n, 11)).collect();
+        let publisher = ScriptedPublisher::default();
+        publisher.hang.borrow_mut().push(hung.clone());
+
+        let started = tokio::time::Instant::now();
+        let limits = DrainLimits::within(Duration::from_secs(15), 256);
+        let report = drain_within(&store, &publisher, 20, limits).await.expect("drain");
+        assert_eq!(started.elapsed(), Duration::from_secs(15), "the pass ends at its deadline");
+        assert_eq!(report, DrainReport { confirmed: 0, failed: 1, expired: 0, deferred: 3 });
+        assert_eq!(publisher.keys(), vec![hung.clone()]);
+        assert_eq!(store.outbox_row(&hung).expect("row").expect("exists").0, "pending");
+        assert_eq!(store.outbox_row(&hung).expect("row").expect("exists").1, 1);
+        for key in &behind {
+            let row = store.outbox_row(key).expect("row").expect("exists");
+            assert_eq!((row.0.as_str(), row.1), ("pending", 0), "{key} was never reached");
+        }
+
+        // A deadline already past starts nothing and records nothing.
+        let calls = publisher.calls.borrow().len();
+        let spent = DrainLimits {
+            deadline: Some(tokio::time::Instant::now()),
+            max_rows: 256,
+            fresh_only: false,
+        };
+        let report = drain_within(&store, &publisher, 21, spent).await.expect("drain");
+        assert_eq!(report.deferred, 4);
+        assert_eq!(publisher.calls.borrow().len(), calls, "a spent budget publishes nothing");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The next pass starts with the rows the last one never reached, so a row that hangs every time
+    /// cannot starve the rows behind it; the hung row is retried as the SAME signed event.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_hung_row_rotates_behind_rows_the_last_pass_never_reached() {
+        let (store, path) = fresh_store("rotate");
+        let hung = enqueue_claim(&store, 1, 10);
+        let fresh = enqueue_claim(&store, 2, 11);
+        let publisher = ScriptedPublisher::default();
+        publisher.hang.borrow_mut().push(hung.clone());
+
+        let limits = || DrainLimits::within(Duration::from_secs(15), 256);
+        let first = drain_within(&store, &publisher, 20, limits()).await.expect("first");
+        assert_eq!((first.failed, first.deferred), (1, 1));
+        let second = drain_within(&store, &publisher, 30, limits()).await.expect("second");
+        assert_eq!(second.confirmed, 1, "the row behind the hung one is published next pass");
+        assert_eq!(store.outbox_row(&fresh).expect("row").expect("exists").0, "confirmed");
+        assert_eq!(publisher.keys(), vec![hung.clone(), fresh.clone(), hung.clone()]);
+
+        // The relay answers again: the retry carries the same draft and authored-at second, so it
+        // signs to the same event id.
+        publisher.hang.borrow_mut().clear();
+        let third = drain_within(&store, &publisher, 40, limits()).await.expect("third");
+        assert_eq!(third.confirmed, 1);
+        let calls = publisher.calls.borrow();
+        let attempts: Vec<&OutboxItem> = calls.iter().filter(|item| item.dedup_key == hung).collect();
+        assert_eq!(attempts.len(), 3);
+        for retry in &attempts[1..] {
+            assert_eq!(retry.id, attempts[0].id);
+            assert_eq!(retry.draft, attempts[0].draft);
+            assert_eq!(retry.created_at_unix, attempts[0].created_at_unix);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A refused row is recorded as attempted and moves behind a row enqueued later, so a backlog
+    /// the relay keeps refusing never sits ahead of a fresh claim.
+    #[tokio::test(flavor = "current_thread")]
+    async fn never_attempted_rows_go_first() {
+        let (store, path) = fresh_store("fresh-first");
+        let old = enqueue_claim(&store, 1, 10);
+        let publisher = ScriptedPublisher::default();
+        publisher.fail.borrow_mut().push(old.clone());
+        drain_within(&store, &publisher, 20, DrainLimits::unbounded()).await.expect("first");
+        let fresh = enqueue_claim(&store, 2, 30);
+        publisher.calls.borrow_mut().clear();
+        drain_within(&store, &publisher, 40, DrainLimits::unbounded()).await.expect("second");
+        assert_eq!(publisher.keys(), vec![fresh, old]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// While routine drains are paused, a fresh-only pass tries never-attempted rows and leaves the
+    /// paced backlog alone.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fresh_only_pass_skips_rows_already_attempted() {
+        let (store, path) = fresh_store("fresh-only");
+        let old = enqueue_claim(&store, 1, 10);
+        let publisher = ScriptedPublisher::default();
+        publisher.fail.borrow_mut().push(old.clone());
+        drain_within(&store, &publisher, 20, DrainLimits::unbounded()).await.expect("first");
+        let fresh = enqueue_claim(&store, 2, 30);
+        publisher.calls.borrow_mut().clear();
+        let limits = DrainLimits::fresh_within(Duration::from_secs(15), 256);
+        let report = drain_within(&store, &publisher, 40, limits).await.expect("fresh-only");
+        assert_eq!(report, DrainReport { confirmed: 1, failed: 0, expired: 0, deferred: 0 });
+        assert_eq!(publisher.keys(), vec![fresh]);
+        assert_eq!(store.outbox_row(&old).expect("row").expect("exists").1, 1, "backlog untouched");
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn expired_rows_are_not_published() {
         let (store, path) = fresh_store("expire");
