@@ -137,7 +137,10 @@ use maxplayer_trade::{
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     match execute().await {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+        Ok(()) => {
+            maxplayer_trade::shutdown::finished(0, None);
+            std::process::ExitCode::SUCCESS
+        }
         Err(error) => {
             if let Some(f) = error.downcast_ref::<DoctorExit>() {
                 return std::process::ExitCode::from(f.0);
@@ -146,13 +149,18 @@ async fn main() -> std::process::ExitCode {
                 return std::process::ExitCode::from(f.0);
             }
             eprintln!("{error}");
-            std::process::ExitCode::from(if error.is::<coordinator::RecoveryIncomplete>() {
+            let code = if error.is::<coordinator::RecoveryIncomplete>() {
                 3
             } else if error.is::<coordinator::ManualRecovery>() {
                 4
+            } else if error.is::<maxplayer_trade::shutdown::Stopped>() {
+                maxplayer_trade::shutdown::EXIT_STOPPED
             } else {
                 1
-            })
+            };
+            // serve only: the final lifecycle line (reason, exit code, unfinished work).
+            maxplayer_trade::shutdown::finished(code, Some(&error));
+            std::process::ExitCode::from(code)
         }
     }
 }
@@ -328,6 +336,7 @@ async fn execute() -> Result<()> {
     // Bind while holding owner.lock (an existing socket file is stale) and before the startup
     // recovery pass, so hand-offs queue instead of failing while serve recovers.
     let mut jobs = if matches!(cli.command, Command::Serve) {
+        maxplayer_trade::shutdown::start(home, &relays)?;
         Some(maxplayer_trade::serve::bind(home, relays.clone())?)
     } else {
         None
@@ -363,7 +372,8 @@ async fn execute() -> Result<()> {
         let j = Journal::open(home).await?;
         let mut m = Market::connect(keys, &relays).await?;
         if !matches!(cli.command, Command::Recover) {
-            coordinator::recover(home, &j, &m).await?;
+            // serve: a stop signal lets this pass finish within the grace (shutdown module).
+            maxplayer_trade::shutdown::bounded(coordinator::recover(home, &j, &m)).await?;
         }
         return match cli.command {
             Command::List {
