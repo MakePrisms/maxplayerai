@@ -73,9 +73,16 @@ pub fn read_status(root: &Path) -> Result<WatchStatus> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(error) => return Err(error.into()),
     };
+    // A new watcher holds the lock briefly before replacing the previous process's file;
+    // a status written by a dead pid must never read as this watcher's health.
+    // SAFETY: signal 0 only checks that the pid exists.
+    let writer_alive = status.pid != 0 && unsafe { libc::kill(status.pid as libc::pid_t, 0) } == 0;
     if !running {
         status.state = "unhealthy".into();
         status.last_error = Some("watch not running (lock not held)".into());
+    } else if !writer_alive {
+        status.state = "starting".into();
+        status.last_error = Some("status written by a previous watch process".into());
     } else if Timestamp::now().as_secs().saturating_sub(status.updated_at) > 90 {
         status.state = "unhealthy".into();
         status.last_error = Some("stale status file (>90s)".into());

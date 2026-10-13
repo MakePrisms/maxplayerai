@@ -55,7 +55,15 @@ impl RelayFixture {
         // The SDK probes a free port and then binds it separately. Retry only that
         // allocation race, with a fresh relay/address and a bounded attempt count.
         for attempt in 0..8 {
-            let backend = LocalRelay::new(RelayBuilder::default().auth_dm(false).max_filter_limit(1000).rate_limit(nostr_relay_builder::builder::RateLimit { max_reqs: 500, notes_per_minute: 10000 }));
+            let backend = LocalRelay::new(
+                RelayBuilder::default()
+                    .auth_dm(false)
+                    .max_filter_limit(1000)
+                    .rate_limit(nostr_relay_builder::builder::RateLimit {
+                        max_reqs: 500,
+                        notes_per_minute: 10000,
+                    }),
+            );
             match backend.run().await {
                 Ok(()) => return Self::start(backend, 0, Arc::default()).await,
                 Err(nostr_relay_builder::Error::IO(e))
@@ -922,8 +930,16 @@ async fn security_inbound_cap_is_per_peer_without_advancing_checkpoint() {
         h.receive(&event).await.unwrap().is_none(),
         "cap+1 must be dropped"
     );
-    assert_eq!(h.cursor().unwrap(), 0, "quota drop must not advance checkpoint");
-    assert!(std::fs::read_to_string(h.root.join("chat/dropped.json")).unwrap().contains(&dropped_id));
+    assert_eq!(
+        h.cursor().unwrap(),
+        0,
+        "quota drop must not advance checkpoint"
+    );
+    assert!(
+        std::fs::read_to_string(h.root.join("chat/dropped.json"))
+            .unwrap()
+            .contains(&dropped_id)
+    );
     assert!(
         injected(&h, &other, envelope("other peer unaffected").unwrap())
             .await
@@ -1118,8 +1134,14 @@ fn fast_options() -> maxplayer_chat::WatchOptions {
     }
 }
 async fn wait_healthy(h: &Home) {
+    wait_healthy_pid(h, None).await
+}
+async fn wait_healthy_pid(h: &Home, pid: Option<u32>) {
     tokio::time::timeout(Duration::from_secs(30), async {
-        while !h.status().is_ok_and(|s| s.state == "healthy") {
+        while !h
+            .status()
+            .is_ok_and(|s| s.state == "healthy" && pid.is_none_or(|p| s.pid == p))
+        {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
@@ -1181,11 +1203,11 @@ async fn health_cli_ready_logs_status_and_process_restart_catchup() {
             .unwrap();
     }
     let second = watch_process(&b, &relay.url, "10");
-    wait_healthy(&b).await;
+    wait_healthy_pid(&b, Some(second.0.id())).await;
     assert_eq!(b.entries().unwrap().len(), 4);
     drop(second);
     let third = watch_process(&b, &relay.url, "10");
-    wait_healthy(&b).await;
+    wait_healthy_pid(&b, Some(third.0.id())).await;
     assert_eq!(
         b.entries().unwrap().len(),
         4,
@@ -1610,4 +1632,24 @@ async fn catchup_upgrade_rechecks_legacy_cursor_skipped_history() {
         "2"
     );
     drop(process);
+}
+
+#[tokio::test]
+async fn health_status_from_dead_previous_process_is_not_healthy() {
+    let (_d, h) = home();
+    // Lock held (new watcher just started), but the file is a fresh "healthy" from a dead pid.
+    let _lock = h.watch_lock().unwrap();
+    let mut dead = std::process::Command::new("true").spawn().unwrap();
+    let dead_pid = dead.id();
+    dead.wait().unwrap();
+    let json = json!({"state":"healthy","pid":dead_pid,"relay":"ws://x","last_healthy_at":1,
+        "consecutive_failures":0,"last_error":null,"updated_at":Timestamp::now().as_secs()});
+    std::fs::write(h.root.join("chat/status.json"), json.to_string()).unwrap();
+    let status = h.status().unwrap();
+    assert_ne!(
+        status.state, "healthy",
+        "stale file from a dead watcher read as healthy"
+    );
+    let out = cli(&h.root, &["status"]);
+    assert!(!out.status.success());
 }
