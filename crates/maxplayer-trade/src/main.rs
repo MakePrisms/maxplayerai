@@ -794,9 +794,11 @@ async fn doctor_inner(mint: &str, relay: &str, json_output: bool, seconds: u64) 
     maxplayer_trade::transport::configure_mint_relays(&[relay.to_owned()])?;
     let window = Duration::from_secs(seconds);
     let connector = NostrMintConnector::new(&asset.mint_url.parse()?, vec![relay.to_owned()])?
+        // Resend the identical event on the production cadence, so a first delivery lost on
+        // the way is retried exactly as list/take admission would retry it.
         .with_timing(
             window,
-            window + Duration::from_secs(1),
+            maxplayer_core::nostr_mint::DEFAULT_RESEND_EVERY,
             Duration::from_secs(5).min(window),
         );
     eprintln!(

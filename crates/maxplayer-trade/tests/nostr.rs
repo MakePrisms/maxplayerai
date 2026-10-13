@@ -90,6 +90,8 @@ struct Tap {
     silent: AtomicBool,
     silenced: AtomicU64,
     info_mode: AtomicU64,
+    /// Lose the first reply to each info request (a lost first delivery); later ones pass.
+    drop_first_info: AtomicBool,
     info_mint: Mutex<Option<nostr_sdk::prelude::PublicKey>>,
     rewritten: Mutex<HashSet<EventId>>,
 }
@@ -184,6 +186,13 @@ impl Tap {
                 .tags
                 .event_ids()
                 .find_map(|id| self.requests.lock().unwrap().get(id).map(|s| s.op.clone()));
+            if op.as_deref() == Some("info") && self.drop_first_info.load(SeqCst) {
+                if let Some(request) = event.tags.event_ids().next().copied() {
+                    if self.lost.lock().unwrap().insert(request) {
+                        return PolicyResult::Reject("tap: first info reply lost".into());
+                    }
+                }
+            }
             let mode = self.info_mode.load(SeqCst);
             if op.as_deref() == Some("info")
                 && self
@@ -218,6 +227,7 @@ impl Tap {
                         response["ok"]["version"] = serde_json::Value::Null;
                     }
                     3 => response["v"] = 2.into(),
+                    5 => response["ok"]["maxplayer_mint"]["schema"] = 2.into(),
                     4 => {
                         response.as_object_mut().unwrap().remove("ok");
                         response["err"] = serde_json::json!({"code":"internal","detail":"private payload must not echo"});
@@ -2452,162 +2462,6 @@ async fn nostr_serve_completes_all_nostr_trade_on_slow_relay() {
     );
 }
 
-#[cfg(feature = "lab")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn initial_unanswered_request_survives_restart_and_legacy_retry() {
-    let mut e = env().await;
-    let _lab = SilentLab::new();
-    let a = MintFixture::start(0).await;
-    let n = e.nostr_mint().await;
-    e.fund_nostr(&e.maker.clone(), &n, 128).await;
-    support::fund(&e.taker, &a.url, 128).await;
-    let lot = e.list(&n.url, 32, &a.url, 24).await;
-    let id = e.take(&lot, 40, 32).await;
-    e.tap.silent.store(true, SeqCst);
-    for _ in 0..20 {
-        e.step(true).await;
-        if retained_rows(&e.jm).await > 0 {
-            break;
-        }
-    }
-    assert_eq!(
-        retained_rows(&e.jm).await,
-        1,
-        "pre-Swap request must persist"
-    );
-    assert!(e.jm.get::<Swap>("swap", &id).await.unwrap().is_none());
-    assert!(
-        e.jm.all::<(String, String)>("rejected")
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    let row =
-        e.jm.all::<coordinator::Retained>("inbox_retry")
-            .await
-            .unwrap()
-            .remove(0);
-    let msg = e.mm.decode(&row.event).unwrap();
-    let key = format!("{}_{}", row.event.pubkey, msg.request_id);
-    let digest = hex::encode(Sha256::digest(serde_json::to_vec(&msg).unwrap()));
-    // Persisted expiry is checked BEFORE attempting any work or creating a rejection.
-    let mut expired = msg.clone();
-    expired.request_id = uuid::Uuid::new_v4().to_string();
-    expired.swap_id = uuid::Uuid::new_v4().to_string();
-    expired.exp = coordinator::now().saturating_sub(1);
-    let expired_event = sealed_trade(&e, &expired);
-    let expired_key = format!("{}_{}", expired_event.pubkey, expired.request_id);
-    let expired_digest = hex::encode(Sha256::digest(serde_json::to_vec(&expired).unwrap()));
-    e.jm.put("inbox", &expired_key, &expired_digest)
-        .await
-        .unwrap();
-    e.jm.put(
-        "inbox_retry",
-        &expired_event.id.to_hex(),
-        &coordinator::Retained {
-            event: expired_event.clone(),
-            swap_id: expired.swap_id.clone(),
-            step: "request".into(),
-            since: row.since,
-        },
-    )
-    .await
-    .unwrap();
-    coordinator::recover(&e.maker, &e.jm, &e.mm).await.unwrap();
-    assert!(
-        e.jm.get::<coordinator::Retained>("inbox_retry", &expired_event.id.to_hex())
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        e.jm.get::<(String, String)>("rejected", &expired_key)
-            .await
-            .unwrap()
-            .is_none(),
-        "expired retry is discarded without re-handling"
-    );
-    assert_eq!(retained_rows(&e.jm).await, 1);
-    // Genuine admission errors remain permanent, even during a mint outage.
-    let mut bad = msg.clone();
-    bad.request_id = uuid::Uuid::new_v4().to_string();
-    bad.swap_id = uuid::Uuid::new_v4().to_string();
-    bad.body["max_give"] = 0.into();
-    let bad_event = sealed_trade(&e, &bad);
-    let bad_key = format!("{}_{}", bad_event.pubkey, bad.request_id);
-    assert!(
-        coordinator::handle(&e.maker, &e.jm, &e.mm, &bad_event)
-            .await
-            .is_err()
-    );
-    assert!(
-        e.jm.get::<(String, String)>("rejected", &bad_key)
-            .await
-            .unwrap()
-            .is_some()
-    );
-    assert!(
-        coordinator::handle(&e.maker, &e.jm, &e.mm, &bad_event)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("recorded rejection")
-    );
-    // Recreate a pre-upgrade rejection. Its digest remains binding after reopening.
-    e.jm.put(
-        "rejected",
-        &key,
-        &(digest.clone(), "CDK wallet request not answered".to_owned()),
-    )
-    .await
-    .unwrap();
-    e.jm = Journal::open(&e.maker).await.unwrap();
-    let mut changed = msg.clone();
-    changed.body["max_fees"] = serde_json::json!(999);
-    let content = nip44::encrypt(
-        e.mt.keys.secret_key(),
-        &e.mm.keys.public_key(),
-        serde_json::to_string(&changed).unwrap(),
-        nip44::Version::V2,
-    )
-    .unwrap();
-    let conflict = EventBuilder::new(Kind::Custom(TRADE), content)
-        .tags([
-            Tag::public_key(e.mm.keys.public_key()),
-            Tag::hashtag("maxplayer"),
-            Tag::parse(["v", "1"]).unwrap(),
-        ])
-        .sign_with_keys(&e.mt.keys)
-        .unwrap();
-    let error = coordinator::handle(&e.maker, &e.jm, &e.mm, &conflict)
-        .await
-        .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("conflicting rejected request-id reuse")
-    );
-    assert!(e.jm.get::<Swap>("swap", &id).await.unwrap().is_none());
-    e.tap.silent.store(false, SeqCst);
-    maxplayer_trade::backoff::set_wait_for_pacing(true);
-    coordinator::recover(&e.maker, &e.jm, &e.mm).await.unwrap();
-    assert_eq!(e.state(true, &id).await.as_deref(), Some("quoted"));
-    assert_eq!(retained_rows(&e.jm).await, 0);
-    assert_eq!(e.jm.all::<Swap>("swap").await.unwrap().len(), 1);
-    assert_eq!(
-        e.jm.get::<String>("inbox", &key).await.unwrap(),
-        Some(digest)
-    );
-    coordinator::handle(&e.maker, &e.jm, &e.mm, &row.event)
-        .await
-        .unwrap();
-    assert_eq!(
-        e.jm.all::<Swap>("swap").await.unwrap().len(),
-        1,
-        "replay creates no second Swap"
-    );
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn doctor_info_only_no_home_no_fallback_and_live_metadata() {
     let e = env().await;
@@ -2703,6 +2557,7 @@ async fn doctor_signed_error_incompatibility_unknown_and_slow_are_distinct() {
         (2, 0, "unknown"),
         (3, 1, ""),
         (4, 2, ""),
+        (5, 0, "unknown"),
     ] {
         e.tap.info_mode.store(mode, SeqCst);
         let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
@@ -2725,7 +2580,20 @@ async fn doctor_signed_error_incompatibility_unknown_and_slow_are_distinct() {
             String::from_utf8_lossy(&out.stderr)
         );
         let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(report["observation"]["reachability"], "answered");
+        // A v2 reply is ignored, not an answer: the probe waits out its budget (M1).
+        assert_eq!(
+            report["observation"]["reachability"],
+            if mode == 3 {
+                "unusable_reply"
+            } else {
+                "answered"
+            },
+            "mode {mode}"
+        );
+        if mode == 3 {
+            assert_eq!(report["observation"]["outcome"], "unsupported_protocol");
+            assert!(report["observation"]["reply_ms"].is_null());
+        }
         if !compatibility.is_empty() {
             assert_eq!(report["compatibility"]["status"], compatibility);
         }
@@ -2905,120 +2773,6 @@ fn sealed_trade(e: &Env, message: &maxplayer_trade::market::Envelope) -> Event {
 
 #[cfg(feature = "lab")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn initial_unanswered_queue_is_bounded_and_rechecks_lot_availability() {
-    let mut e = env().await;
-    let _lab = SilentLab::new();
-    let a = MintFixture::start(0).await;
-    let n = e.nostr_mint().await;
-    e.fund_nostr(&e.maker.clone(), &n, 128).await;
-    support::fund(&e.taker, &a.url, 128).await;
-    let lot = e.list(&n.url, 32, &a.url, 24).await;
-    let id = e.take(&lot, 40, 32).await;
-    e.tap.silent.store(true, SeqCst);
-    for _ in 0..20 {
-        e.step(true).await;
-        if retained_rows(&e.jm).await > 0 {
-            break;
-        }
-    }
-    assert_eq!(retained_rows(&e.jm).await, 1);
-    let row =
-        e.jm.all::<coordinator::Retained>("inbox_retry")
-            .await
-            .unwrap()
-            .remove(0);
-    let original = e.mm.decode(&row.event).unwrap();
-    let mut listing =
-        e.jm.get::<coordinator::Listing>("listing", &lot)
-            .await
-            .unwrap()
-            .unwrap();
-    listing.cancelled = true;
-    e.jm.put("listing", &lot, &listing).await.unwrap();
-    coordinator::recover(&e.maker, &e.jm, &e.mm).await.unwrap();
-    assert_eq!(
-        retained_rows(&e.jm).await,
-        0,
-        "a lot no longer available cannot be revived"
-    );
-    assert!(e.jm.get::<Swap>("swap", &id).await.unwrap().is_none());
-    listing.cancelled = false;
-    e.jm.put("listing", &lot, &listing).await.unwrap();
-    // Loopback fixtures normally bypass pacing. Enable it explicitly here so filling the
-    // queue exercises Deferred retention, not 65 full windows that outlive request expiry.
-    maxplayer_trade::backoff::lab_configure(Some(maxplayer_trade::backoff::Timing {
-        base: Duration::from_secs(300),
-        cap: Duration::from_secs(300),
-        interval: Duration::ZERO,
-        burst: Duration::ZERO,
-        loopback: true,
-        ..maxplayer_trade::backoff::Timing::PRODUCTION
-    }));
-    maxplayer_trade::backoff::record(
-        &n.url,
-        maxplayer_trade::backoff::Outcome::Failed(maxplayer_trade::backoff::Reason::Timeout, None),
-    );
-    // One peer is limited to four persisted retries; global limit is 64, across peers.
-    for i in 0..65 {
-        let mut msg = original.clone();
-        msg.request_id = uuid::Uuid::new_v4().to_string();
-        msg.swap_id = uuid::Uuid::new_v4().to_string();
-        let signer = if i < 5 {
-            e.mt.keys.clone()
-        } else {
-            Keys::generate()
-        };
-        let content = nip44::encrypt(
-            signer.secret_key(),
-            &e.mm.keys.public_key(),
-            serde_json::to_string(&msg).unwrap(),
-            nip44::Version::V2,
-        )
-        .unwrap();
-        let event = EventBuilder::new(Kind::Custom(TRADE), content)
-            .tags([
-                Tag::public_key(e.mm.keys.public_key()),
-                Tag::hashtag("maxplayer"),
-                Tag::parse(["v", "1"]).unwrap(),
-            ])
-            .sign_with_keys(&signer)
-            .unwrap();
-        let result = coordinator::handle(&e.maker, &e.jm, &e.mm, &event).await;
-        assert!(result.is_err());
-        if i == 4 {
-            assert_eq!(retained_rows(&e.jm).await, 4, "per-peer bound");
-        }
-    }
-    assert_eq!(retained_rows(&e.jm).await, 64);
-    let mut extra = original.clone();
-    extra.request_id = uuid::Uuid::new_v4().to_string();
-    extra.swap_id = uuid::Uuid::new_v4().to_string();
-    let signer = Keys::generate();
-    let content = nip44::encrypt(
-        signer.secret_key(),
-        &e.mm.keys.public_key(),
-        serde_json::to_string(&extra).unwrap(),
-        nip44::Version::V2,
-    )
-    .unwrap();
-    let event = EventBuilder::new(Kind::Custom(TRADE), content)
-        .tags([
-            Tag::public_key(e.mm.keys.public_key()),
-            Tag::hashtag("maxplayer"),
-            Tag::parse(["v", "1"]).unwrap(),
-        ])
-        .sign_with_keys(&signer)
-        .unwrap();
-    let error = coordinator::handle(&e.maker, &e.jm, &e.mm, &event)
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("queue full"));
-    assert_eq!(retained_rows(&e.jm).await, 64);
-    assert!(e.jm.all::<Swap>("swap").await.unwrap().is_empty());
-}
-
-#[cfg(feature = "lab")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn compatibility_advertisement_never_strands_admitted_trade() {
     let mut e = env().await;
     let _lab = SilentLab::new();
@@ -3076,5 +2830,208 @@ async fn signed_trade_error_retains_evidence_without_reflecting_payload() {
             .downcast_ref::<maxplayer_trade::mint::MintRefusal>()
             .is_none(),
         "internal remains financially ambiguous"
+    );
+}
+
+/// Doctor resends the identical info event on the production 5 s cadence: a lost first
+/// delivery does not make a healthy mint look unanswered (nemo M6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn doctor_resends_like_admission_after_a_lost_first_reply() {
+    let e = env().await;
+    let n = e.nostr_mint().await;
+    e.tap.reset();
+    e.tap.drop_first_info.store(true, SeqCst);
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
+        .args([
+            "doctor",
+            &n.url,
+            "--mint-relay",
+            &e.mint_relay_url,
+            "--json",
+            "--timeout-seconds",
+            "12",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["observation"]["outcome"], "ok");
+    let requests = e.tap.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1, "one logical request (one event id)");
+    assert!(requests.values().all(|r| r.op == "info" && r.count >= 2));
+}
+
+/// An unrecognised (newer) capability schema warns and proceeds; it never refuses (M3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unknown_capability_schema_warns_and_admission_proceeds() {
+    let e = env().await;
+    let n = e.nostr_mint().await;
+    e.tap.info_mode.store(5, SeqCst);
+    let info = wallet::preflight_admission(&n.url)
+        .await
+        .expect("schema 2 is unknown, not incompatible");
+    assert!(info["keysets"].is_array());
+    e.tap.info_mode.store(1, SeqCst);
+    assert!(
+        wallet::preflight_admission(&n.url).await.is_err(),
+        "a recognised schema-1 block missing restore still refuses"
+    );
+    e.tap.info_mode.store(0, SeqCst);
+}
+
+/// A signed reply in another envelope version is ignored: the trade read ends unanswered
+/// (retained and retried like silence), never a plain error that drops the message (M1).
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unusable_signed_reply_stays_unanswered_for_trade_retry() {
+    let e = env().await;
+    let _lab = SilentLab::new();
+    let n = e.nostr_mint().await;
+    e.tap.info_mode.store(3, SeqCst);
+    let error = maxplayer_trade::transport::get(&n.url, "info")
+        .await
+        .unwrap_err();
+    assert!(
+        maxplayer_trade::backoff::unanswered(&error),
+        "unusable reply keeps the base unanswered classification: {error:#}"
+    );
+    assert!(
+        error
+            .downcast_ref::<maxplayer_trade::mint::MintRefusal>()
+            .is_none()
+    );
+    let observed = error
+        .downcast_ref::<maxplayer_trade::transport::ObservedMintError>()
+        .expect("evidence retained");
+    assert_eq!(observed.0.outcome, "unsupported_protocol");
+    assert!(observed.0.reply_ms.is_none());
+    assert!(observed.0.ignored_reply_ms.is_some());
+    e.tap.info_mode.store(0, SeqCst);
+}
+
+/// T1, minimal: an initial request the maker could not handle only because a mint did not
+/// answer is not journaled as rejected, so the SAME signed event is handled fresh when it is
+/// delivered again (e.g. serve restarts and re-reads the last hour). Nothing queues it: a
+/// recovery pass admits nothing. Genuine refusals and request-id digests stay as on main.
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unanswered_initial_request_is_not_rejected_and_redelivery_is_handled_fresh() {
+    let mut e = env().await;
+    let _lab = SilentLab::new();
+    let a = MintFixture::start(0).await;
+    let n = e.nostr_mint().await;
+    e.fund_nostr(&e.maker.clone(), &n, 128).await;
+    support::fund(&e.taker, &a.url, 128).await;
+    let lot = e.list(&n.url, 32, &a.url, 24).await;
+    let id = e.take(&lot, 40, 32).await;
+    let event = loop {
+        let ev = tokio::time::timeout(Duration::from_secs(10), e.mm.inbox.recv())
+            .await
+            .expect("taker request reaches the maker")
+            .unwrap();
+        if e.mm.decode(&ev).is_ok_and(|m| m.step == "request") {
+            break ev;
+        }
+    };
+    let msg = e.mm.decode(&event).unwrap();
+    let key = format!("{}_{}", event.pubkey, msg.request_id);
+    e.tap.silent.store(true, SeqCst);
+    let error = coordinator::handle(&e.maker, &e.jm, &e.mm, &event)
+        .await
+        .unwrap_err();
+    assert!(
+        maxplayer_trade::backoff::unanswered(&error),
+        "fixture: the maker's mint read went unanswered: {error:#}"
+    );
+    assert!(
+        e.jm.get::<(String, String)>("rejected", &key)
+            .await
+            .unwrap()
+            .is_none(),
+        "an unanswered mint is not a permanent rejection"
+    );
+    assert_eq!(retained_rows(&e.jm).await, 0, "no initial-request queue");
+    assert!(e.jm.get::<Swap>("swap", &id).await.unwrap().is_none());
+    let digest = hex::encode(Sha256::digest(serde_json::to_vec(&msg).unwrap()));
+    assert_eq!(
+        e.jm.get::<String>("inbox", &key).await.unwrap(),
+        Some(digest),
+        "request id stays bound to its digest"
+    );
+    // A genuine refusal stays permanent, even during the outage.
+    let mut bad = msg.clone();
+    bad.request_id = uuid::Uuid::new_v4().to_string();
+    bad.swap_id = uuid::Uuid::new_v4().to_string();
+    bad.body["max_give"] = 0.into();
+    let bad_event = sealed_trade(&e, &bad);
+    let bad_key = format!("{}_{}", bad_event.pubkey, bad.request_id);
+    assert!(
+        coordinator::handle(&e.maker, &e.jm, &e.mm, &bad_event)
+            .await
+            .is_err()
+    );
+    assert!(
+        e.jm.get::<(String, String)>("rejected", &bad_key)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let again = coordinator::handle(&e.maker, &e.jm, &e.mm, &bad_event)
+        .await
+        .unwrap_err();
+    assert!(
+        again.to_string().contains("recorded rejection"),
+        "{again:#}"
+    );
+    // A request whose expiry exceeds the quote window is refused at decode (exp cap).
+    let mut stale = msg.clone();
+    stale.request_id = uuid::Uuid::new_v4().to_string();
+    stale.swap_id = uuid::Uuid::new_v4().to_string();
+    stale.exp = coordinator::now() + 600;
+    let error = coordinator::handle(&e.maker, &e.jm, &e.mm, &sealed_trade(&e, &stale))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("request expiry exceeds the quote window"),
+        "{error:#}"
+    );
+    // The mint answers again. A recovery pass (recover / the pass before list, cancel, take)
+    // admits nothing: no swap, no quote.
+    e.tap.silent.store(false, SeqCst);
+    maxplayer_trade::backoff::set_wait_for_pacing(true);
+    coordinator::recover(&e.maker, &e.jm, &e.mm).await.unwrap();
+    assert!(
+        e.jm.all::<Swap>("swap").await.unwrap().is_empty(),
+        "recovery never admits a request"
+    );
+    // Re-delivery of the identical signed event is handled fresh and quoted once.
+    coordinator::handle(&e.maker, &e.jm, &e.mm, &event)
+        .await
+        .unwrap();
+    assert_eq!(e.state(true, &id).await.as_deref(), Some("quoted"));
+    coordinator::handle(&e.maker, &e.jm, &e.mm, &event)
+        .await
+        .unwrap();
+    assert_eq!(
+        e.jm.all::<Swap>("swap").await.unwrap().len(),
+        1,
+        "a duplicate delivery re-sends the quote, never a second swap"
+    );
+    // Same request id, different body: refused by the digest binding.
+    let mut changed = msg.clone();
+    changed.body["max_fees"] = serde_json::json!(999);
+    let error = coordinator::handle(&e.maker, &e.jm, &e.mm, &sealed_trade(&e, &changed))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("conflicting request-id reuse"),
+        "{error:#}"
     );
 }

@@ -121,10 +121,7 @@ mod diagnostics_tests {
                 info["version"],
                 format!("maxplayer-mint/{}", env!("CARGO_PKG_VERSION"))
             );
-            assert_eq!(
-                info["maxplayer_mint"]["build"],
-                env!("MINT_SIDECAR_BUILD")
-            );
+            assert_eq!(info["maxplayer_mint"]["build"], env!("MINT_SIDECAR_BUILD"));
             let _: cdk::nuts::MintInfo = serde_json::from_value(info).unwrap();
         }
     }

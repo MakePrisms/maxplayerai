@@ -29,7 +29,7 @@ enum Mode {
     /// Ignore the FIRST delivery of each request event (a lost reply), answer later ones.
     DropFirst,
     /// Before the real answer, publish decoys: forged signer, wrong request id, wrong e-tag,
-    /// unrelated subscription data.
+    /// malformed JSON, wrong envelope version.
     DecoysThenAnswer,
     /// Publish only decoys, never a real answer.
     DecoysOnly,
@@ -143,6 +143,9 @@ async fn start_mint(relay_url: &str, mode: Mode) -> Mint {
                     EventId::all_zeros(),
                 )
                 .await;
+                reply(&c, &k, &event, &request.id, "{not json".into(), event.id).await;
+                let wrong_v = json!({"v":9,"id":request.id,"ok":canned(&request.op)}).to_string();
+                reply(&c, &k, &event, &request.id, wrong_v, event.id).await;
             };
             match mode {
                 Mode::Silent => {}
@@ -269,7 +272,7 @@ async fn nostr_mint_every_holder_op_round_trips_through_the_connector() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn nostr_mint_forged_wrong_id_and_wrong_tag_replies_are_ignored() {
+async fn nostr_mint_forged_wrong_id_wrong_tag_malformed_and_wrong_version_replies_are_ignored() {
     let (_relay, relay_url) = relay().await;
     let mint = start_mint(&relay_url, Mode::DecoysThenAnswer).await;
     let c = connector(&mint, &relay_url, 5_000, 1_000);
@@ -451,12 +454,37 @@ async fn diagnostics_distinguish_signed_errors_versions_and_accepted_silence() {
         (Mode::Silent, "unanswered"),
     ] {
         let mint = start_mint(&url, mode).await;
+        let started = std::time::Instant::now();
         let (result, evidence) = connector(&mint, &url, 1200, 300)
             .call_observed("info", Value::Null)
             .await;
         assert!(result.is_err());
         assert_eq!(evidence.outcome, expected);
-        assert_eq!(evidence.reply_ms.is_some(), mode != Mode::Silent);
+        let ignored = matches!(
+            mode,
+            Mode::WrongVersion | Mode::MissingVersion | Mode::NonNumericVersion | Mode::Malformed
+        );
+        // Only a usable reply is an answer. Malformed or other-version replies are evidence:
+        // the call waits out its window and ends `Timeout`, exactly as before diagnostics.
+        assert_eq!(
+            evidence.reply_ms.is_some(),
+            mode != Mode::Silent && !ignored,
+            "{mode:?}"
+        );
+        assert_eq!(evidence.ignored_reply_ms.is_some(), ignored, "{mode:?}");
+        if ignored {
+            assert!(
+                matches!(result.as_ref().unwrap_err(), Error::Timeout),
+                "{mode:?}: {result:?}"
+            );
+            assert!(started.elapsed() >= Duration::from_millis(1200), "{mode:?}");
+            assert_eq!(evidence.reachability, "unusable_reply");
+            assert!(
+                evidence.message().contains("ignored"),
+                "{}",
+                evidence.message()
+            );
+        }
         assert_eq!(evidence.budget_ms, 1200);
         if mode == Mode::Silent {
             assert!(evidence.relays.values().any(|r| r.acceptance == "accepted"));
@@ -471,7 +499,10 @@ async fn diagnostics_distinguish_signed_errors_versions_and_accepted_silence() {
                 .contains("private_named_error")
         );
         assert!(!format!("{evidence:?}").contains("secret"));
-        if matches!(mode, Mode::WrongVersion | Mode::MissingVersion | Mode::NonNumericVersion | Mode::Malformed) {
+        if matches!(
+            mode,
+            Mode::WrongVersion | Mode::MissingVersion | Mode::NonNumericVersion | Mode::Malformed
+        ) {
             assert!(!result.as_ref().unwrap_err().is_definitive_failure());
         }
         if mode == Mode::NutError {
@@ -611,6 +642,42 @@ async fn diagnostics_control_frames_require_event_and_subscription_correlation()
             "relay evidence cannot clear money"
         );
         task.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diagnostics_summary_uses_the_best_relay_path() {
+    // One relay accepted the request with its reply subscription open, another failed AUTH or
+    // closed the subscription: the mint stayed silent on a path that could have shown an answer.
+    for other in ["auth_failed", "closed", "refused"] {
+        let (accepted, a) = control_relay("accepted").await;
+        let (worse, b) = control_relay(other).await;
+        let mint = MintUrl::from_str(&format!(
+            "nostr://{}",
+            Keys::generate().public_key().to_bech32().unwrap()
+        ))
+        .unwrap();
+        let c = NostrMintConnector::new(&mint, vec![worse, accepted])
+            .unwrap()
+            .with_timing(
+                Duration::from_millis(1500),
+                Duration::from_secs(5),
+                Duration::from_millis(500),
+            );
+        let (result, obs) = c.call_observed("info", Value::Null).await;
+        assert!(matches!(result, Err(Error::Timeout)), "{other}: {result:?}");
+        assert!(
+            obs.relays.values().any(|r| r.acceptance == "accepted"),
+            "{other}: {obs:?}"
+        );
+        assert_eq!(obs.reachability, "unanswered", "{other}: {obs:?}");
+        assert!(
+            obs.message().contains("Relay accepted the request"),
+            "{other}: {}",
+            obs.message()
+        );
+        a.abort();
+        b.abort();
     }
 }
 

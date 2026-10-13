@@ -364,97 +364,24 @@ pub async fn handle(home: &Path, j: &Journal, m: &Market, e: &Event) -> Result<(
             digest == hash(&message)?,
             "conflicting rejected request-id reuse"
         );
-        if message.step == "request"
-            && legacy_unanswered(&reason)
-            && j.get::<Swap>("swap", &message.swap_id).await?.is_none()
-        {
-            // Preserve the old digest BEFORE removing its rejection, including across a crash.
-            if let Some(prior) = j.get::<String>("inbox", &key).await? {
-                ensure!(prior == digest, "conflicting request-id reuse");
-            }
-            j.put("inbox", &key, &digest).await?;
-            // Persist the authenticated event before removing the legacy marker, so a crash
-            // during the one-time reopening cannot lose the only replayable copy.
-            retain(j, e, &message).await?;
-            j.remove("rejected", &key).await?;
-        } else {
-            anyhow::bail!("recorded rejection: {reason}");
-        }
+        anyhow::bail!("recorded rejection: {reason}");
     }
     let result = handle_message(home, j, m, e).await;
     if let Err(ref error) = result {
-        if crate::backoff::unanswered(error) {
+        if message.step == "request" && j.get::<Swap>("swap", &message.swap_id).await?.is_none() {
+            // A refusal is permanent. A mint that did not answer is not a refusal: record
+            // nothing, so a re-delivery of this same signed event (a serve restart re-reads the
+            // last hour) is handled again while it is unexpired. Not queued: only a serving
+            // maker admits requests, and `inbox` keeps the request id bound to this digest.
+            if !crate::backoff::unanswered(error) {
+                j.put("rejected", &key, &(hash(&message)?, error.to_string()))
+                    .await?;
+            }
+        } else if crate::backoff::unanswered(error) {
             retain(j, e, &message).await?;
-        } else if message.step == "request"
-            && j.get::<Swap>("swap", &message.swap_id).await?.is_none()
-        {
-            j.put("rejected", &key, &(hash(&message)?, error.to_string()))
-                .await?;
         }
     }
     result
-}
-
-// Narrow legacy compatibility bridge, authorized for recorded unanswered/timeout errors only.
-// Never match arbitrary occurrences of "timeout" in peer-provided terms or mint details.
-fn legacy_unanswered(reason: &str) -> bool {
-    // Older raw-Nostr errors wrapped the typed CDK display in this exact local context.
-    // Inspect its leading type, never a timeout-looking suffix inside arbitrary detail.
-    let cause = reason
-        .strip_prefix("mint ")
-        .and_then(|s| s.split_once(": ").map(|(_, cause)| cause))
-        .and_then(|s| s.strip_suffix(" (no mint NUT error; ambiguous)"))
-        .unwrap_or(reason);
-    [
-        "Http transport error None: ",
-        "Http transport error Some(429): ",
-        "Http transport error Some(502): ",
-        "Http transport error Some(503): ",
-        "Http transport error Some(504): ",
-    ]
-    .iter()
-    .any(|prefix| cause.starts_with(prefix))
-        || cause == "Operation timeout"
-        || reason == "CDK wallet request not answered"
-        || reason == "no answer within the CDK wallet bound"
-        || reason.starts_with("mint ")
-            && (reason.ends_with("no answer within the nostr bound (ambiguous)")
-                || reason.ends_with("keysets: timed out")
-                || reason.ends_with("no answer within the HTTP bound (ambiguous)"))
-        || reason.starts_with("mint ")
-            && (reason.rsplit_once(": HTTP ").is_some_and(|(_, status)| {
-                matches!(
-                    status,
-                    "429 Too Many Requests (body withheld)"
-                        | "502 Bad Gateway (body withheld)"
-                        | "503 Service Unavailable (body withheld)"
-                        | "504 Gateway Timeout (body withheld)"
-                )
-            }) || reason
-                .rsplit_once(" backing off (")
-                .is_some_and(|(_, suffix)| {
-                    suffix.split_once("), ").is_some_and(|(cause, wait)| {
-                        matches!(cause, "429" | "503" | "502/504" | "refused" | "timeout")
-                            && wait
-                                .strip_suffix("s left; request not sent")
-                                .is_some_and(|n| n.parse::<u64>().is_ok())
-                    })
-                }))
-}
-
-async fn request_retry_live(j: &Journal, e: &Event, msg: &Envelope) -> Result<bool> {
-    if msg.step != "request" || msg.exp <= now() {
-        return Ok(false);
-    }
-    let Some(l) = j.get::<Listing>("listing", &msg.lot_id).await? else {
-        return Ok(false);
-    };
-    if l.cancelled || l.active.is_some() || l.published == 0 || parse_lot(&l.event, now()).is_err()
-    {
-        return Ok(false);
-    }
-    let key = format!("{}_{}", e.pubkey, msg.request_id);
-    Ok(j.get::<String>("inbox", &key).await?.as_ref() == Some(&hash(msg)?))
 }
 
 /// An inbound trade message whose handling failed only because a mint did not answer
@@ -501,25 +428,14 @@ fn retry_until(s: &Swap, step: &str) -> u64 {
 /// Journal `e` for retry (keyed by event id: relay duplicates collapse) when its swap still
 /// awaits it. Returns whether it is retained.
 async fn retain(j: &Journal, e: &Event, msg: &Envelope) -> Result<bool> {
-    let swap = j.get::<Swap>("swap", &msg.swap_id).await?;
-    if swap.is_none() {
-        if !request_retry_live(j, e, msg).await? {
-            return Ok(false);
-        }
-        let rows = j.all::<Retained>("inbox_retry").await?;
-        if !rows.iter().any(|r| r.event.id == e.id) {
-            ensure!(
-                rows.len() < 64 && rows.iter().filter(|r| r.event.pubkey == e.pubkey).count() < 4,
-                "initial request retry queue full; retry after pending requests expire"
-            );
-        }
-    }
-    if swap.as_ref().is_some_and(|s| {
-        terminal(s)
-            || s.peer != e.pubkey.to_hex()
-            || awaiting(&msg.step, &s.role) != Some(s.state.as_str())
-            || now() >= retry_until(s, &msg.step)
-    }) {
+    let Some(s) = j.get::<Swap>("swap", &msg.swap_id).await? else {
+        return Ok(false);
+    };
+    if terminal(&s)
+        || s.peer != e.pubkey.to_hex()
+        || awaiting(&msg.step, &s.role) != Some(s.state.as_str())
+        || now() >= retry_until(&s, &msg.step)
+    {
         return Ok(false);
     }
     let id = e.id.to_hex();
@@ -575,25 +491,18 @@ async fn replay_retained(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
     for r in rows {
         let id = r.event.id.to_hex();
         let s = j.get::<Swap>("swap", &r.swap_id).await?;
-        let request_live = if s.is_none() {
-            request_retry_live(j, &r.event, &m.decode(&r.event)?).await?
-        } else {
-            false
-        };
-        let live = request_live
-            || s.as_ref().is_some_and(|s| {
-                !terminal(s)
-                    && awaiting(&r.step, &s.role) == Some(s.state.as_str())
-                    && now() < retry_until(s, &r.step)
-            });
+        let live = s.as_ref().is_some_and(|s| {
+            !terminal(s)
+                && awaiting(&r.step, &s.role) == Some(s.state.as_str())
+                && now() < retry_until(s, &r.step)
+        });
         if !live {
             j.remove("inbox_retry", &id).await?;
             continue;
         }
-        let budget = match s.as_ref() {
-            Some(s) => item_budget(s),
-            None => message_budget(j, m, &r.event).await,
-        };
+        let budget = s
+            .as_ref()
+            .map_or(std::time::Duration::from_secs(120), item_budget);
         match tokio::time::timeout(budget, Box::pin(handle(home, j, m, &r.event))).await {
             Ok(Ok(())) => {
                 j.remove("inbox_retry", &id).await?;
@@ -601,10 +510,9 @@ async fn replay_retained(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
             }
             Ok(Err(e))
                 if crate::backoff::unanswered(&e)
-                    && (request_live
-                        || j.get::<Swap>("swap", &r.swap_id).await?.is_some_and(|s| {
-                            awaiting(&r.step, &s.role) == Some(s.state.as_str())
-                        })) =>
+                    && j.get::<Swap>("swap", &r.swap_id)
+                        .await?
+                        .is_some_and(|s| awaiting(&r.step, &s.role) == Some(s.state.as_str())) =>
             {
                 pending = true;
                 eprintln!(
@@ -711,10 +619,6 @@ async fn handle_message(home: &Path, j: &Journal, m: &Market, e: &Event) -> Resu
         validate_terms(home, &lot.want, &req.funding).await?;
         validate_terms(home, &lot.give, &Terms::from(&l.plan)).await?;
         mint::unspent(&l.plan.mint, &l.plan.inputs).await?;
-        // Reads may have occupied a full mint-aware budget. Recheck admission deadlines
-        // immediately before the first durable quote, not only before those reads.
-        ensure!(msg.exp > now(), "expired request after mint checks");
-        parse_lot(&l.event, now())?;
         let key = secret();
         let (long, short, cutoff, margin) = timing(&lot)?;
         let issued = now();
@@ -1889,44 +1793,5 @@ mod budget_tests {
         let e = nostr_timing_fits(2811, SHORT_SECONDS, CLAIM_CUTOFF_SECONDS).unwrap_err();
         assert!(e.to_string().contains("refused"), "{e}");
         nostr_timing_fits(2812, SHORT_SECONDS, CLAIM_CUTOFF_SECONDS).unwrap();
-    }
-}
-
-#[cfg(test)]
-mod initial_retry_tests {
-    use super::*;
-    #[test]
-    fn legacy_timeout_bridge_never_reopens_genuine_refusals() {
-        for text in [
-            "mint nostr://example keysets: Operation timeout (no mint NUT error; ambiguous)",
-            "mint https://example keysets: timed out",
-            "no answer within the CDK wallet bound",
-            "CDK wallet request not answered",
-            "Http transport error None: no relay reachable for mint nostr://example",
-            "Http transport error Some(503): unavailable",
-            "mint nostr://example keysets: Http transport error None: no relay reachable (no mint NUT error; ambiguous)",
-            "mint https://example checkstate: HTTP 503 Service Unavailable (body withheld)",
-            "mint nostr://example backing off (timeout), 30s left; request not sent",
-            "mint nostr://example backing off (429), 2s left; request not sent",
-        ] {
-            assert!(legacy_unanswered(text), "{text}");
-        }
-        for text in [
-            "no funds",
-            "caps",
-            "fee terms",
-            "conflicting request-id reuse",
-            "mint example swap: NUT 50000 timeout",
-            "timeout",
-            "bad terms timeout",
-            "Http transport error Some(400): bad request",
-            "mint nostr://example keysets: Http transport error Some(400): Operation timeout (no mint NUT error; ambiguous)",
-            "Http transport error Some(500): internal",
-            "mint https://example checkstate: HTTP 400 Bad Request (body withheld)",
-            "mint example backing off (bad terms), 30s left; request not sent",
-            "mint example backing off (timeout), nonsense s left; request not sent",
-        ] {
-            assert!(!legacy_unanswered(text), "{text}");
-        }
     }
 }

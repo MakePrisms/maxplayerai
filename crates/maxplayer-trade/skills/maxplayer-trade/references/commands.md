@@ -56,21 +56,23 @@ Never use a lab-feature binary for the human's funds.
 
 `doctor <mint> --mint-relay <url> --json` makes one read-only info request to that
 explicit nostr mint/relay pair. It needs no home and creates no seed or journal; no
-market connection, keysets, swap, checkstate or restore probe. There are no scheduled
-retransmissions (SDK authentication can resend the same event). `--timeout-seconds`
+market connection, keysets, swap, checkstate or restore probe. It re-sends the identical
+event every 5 s, like trade admission. `--timeout-seconds`
 changes only this read-only budget, never monetary windows.
 
 Doctor exits **0** for usable info (unknown compatibility warns), **1** for proven
 incompatibility, **2** for an unsuccessful diagnostic. A missing relay ACK means
 acceptance unknown, not unsent. An accepted request without a mint reply cannot
 distinguish an offline, incompatible, unsubscribed mint or lost reply. Signed errors
-and unsupported envelope versions are reported separately; error-body text is withheld.
+are reported separately; error-body text is withheld. A reply in an unsupported envelope
+version is ignored (exit 1 once the budget ends without a usable reply).
 A real reply above 5 seconds warns about slowness, never refuses on that basis.
 
 List/take admission, including previews and serve IPC, reuse existing info/keysets
-reads. Explicit missing capabilities refuse new effects: upgrade the mint sidecar
-and repeat preflight. Missing version with otherwise passing checks produces
-**WARNING: compatibility unknown**, not an invented historical minimum. The new gate
+reads. A recognised schema-1 block missing a required capability refuses new effects:
+upgrade the mint sidecar and repeat preflight. A missing version, or a capability schema
+this tool does not recognise, produces **WARNING: compatibility unknown**, not a refusal
+or an invented historical minimum. The new gate
 never blocks existing-trade recovery. Both mints must remain reachable throughout a
 trade; info is no guarantee of later claims, refunds or spent-witness emission.
 
@@ -192,14 +194,13 @@ in one process:
   taker's claim is still never sent past its cutoff. The same rounds (`nostr://` mints
   only) cover the checks a claim depends on: the taker's check of the maker's lock (until
   its claim cutoff) and the maker's NUT-07 watch for the claim witness (until `long`).
-- **Unanswered trade messages are kept:** a counterparty message (initial request,
-  quote, lock, claim notice) whose check fails only because a mint did not answer is journaled and retried
+- **Unanswered trade messages are kept:** a counterparty message (quote, lock, claim
+  notice) whose check fails only because a mint did not answer is journaled and retried
   on every serve/recover tick (also after a restart) until it is handled, refused by
   the mint or by validation, superseded, or past its deadline. serve logs `trade message
-  waits for its mint (no answer); retained`. Initial requests are bounded (64 globally,
-  4 per peer), persisted before retry and rechecked for digest, terms, availability
-  and expiry. Matching legacy timeout rejections are reopened without discarding
-  their digest protection. Validation failures are still rejected.
+  waits for its mint (no answer); retained`. Validation failures are still rejected.
+  An initial request that failed only because a mint did not answer is not queued and
+  not recorded as rejected: a later delivery of the same event is handled fresh.
 - `fund` polls its quote every 5 s (6 polls), not every second.
 
 ## Funding
