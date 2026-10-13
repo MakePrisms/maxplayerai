@@ -227,7 +227,15 @@ impl Tap {
                         response["ok"]["version"] = serde_json::Value::Null;
                     }
                     3 => response["v"] = 2.into(),
-                    5 => response["ok"]["maxplayer_mint"]["schema"] = 2.into(),
+                    // A newer schema whose shape this tool cannot judge: even a missing
+                    // holder op is not proof of incompatibility.
+                    5 => {
+                        response["ok"]["maxplayer_mint"]["schema"] = 2.into();
+                        response["ok"]["maxplayer_mint"]["holder_ops"]
+                            .as_array_mut()
+                            .unwrap()
+                            .retain(|v| v != "restore");
+                    }
                     4 => {
                         response.as_object_mut().unwrap().remove("ok");
                         response["err"] = serde_json::json!({"code":"internal","detail":"private payload must not echo"});
